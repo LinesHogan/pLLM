@@ -1,18 +1,26 @@
 """A separate planner consumes closed imports without source graphs or weights."""
 
-from dataclasses import replace
 import subprocess
 import sys
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from pllm.contracts.region_imports import BorrowedTensorImport, RegionTensorImport
+from pllm.contracts.region_imports import BorrowedTensorImport
 from pllm.contracts.region_payload import RegionPayload
+from pllm.contracts.region_program import (
+    AffineIndex,
+    Block,
+    BorrowedResource,
+    Coordinate,
+    Region,
+    ScalarType,
+    TensorType,
+)
 from pllm.contracts.region_proposal import RegionScheduleProposal
-from pllm.contracts.region_program import AffineIndex, Block, BorrowedResource, Coordinate, Program, Region, ScalarType, TensorType
 from pllm.contracts.region_streams import RegionStreamExploration
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.exported_cell import ExportedCell
@@ -34,12 +42,16 @@ def test_import_only_planner_roundtrip_matches_local_graphs_without_initializing
     block = body.program.entry.block
     value, coordinate = block.arguments
     assert coordinate.type is ScalarType.INDEX
-    program = replace(body.program, entry=Region(Block((value,),
-        (Coordinate((), (coordinate,), AffineIndex(0)), *block.operations), block.yields)))
+    program = replace(
+        body.program,
+        entry=Region(Block((value,), (Coordinate((), (coordinate,), AffineIndex(0)), *block.operations), block.yields)),
+    )
     imports = import_region_functions(program, functions)
     schedule = analyze_region_program(program, optimize=False).reference_schedule
     expected = analyze_region_payload(program, schedule, functions)
-    expected_streams = explore_region_streams(program, functions, schedule=analyze_region_program(program, parallel_only=True).candidates[-1].schedule_map)
+    expected_streams = explore_region_streams(
+        program, functions, schedule=analyze_region_program(program, parallel_only=True).candidates[-1].schedule_map
+    )
     assert expected_streams.candidates
     script = """
 import sys
@@ -67,8 +79,14 @@ with patch('pllm.execution.region_storage.import_tensor_access_graph', forbidden
 assert not torch.cuda.is_initialized()
 print(encode_boundary((payload, streams)))
 """
-    completed = subprocess.run([sys.executable, "-c", script], input=encode_boundary((program, imports)),
-        capture_output=True, text=True, check=True, timeout=45)
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        input=encode_boundary((program, imports)),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=45,
+    )
     payload, streams = decode_boundary(completed.stdout, tuple[RegionPayload, RegionStreamExploration])
     assert payload == expected and streams == expected_streams
     parallel = RegionScheduleProposal(streams.candidates[0].payload, streams.candidates[0])
@@ -81,7 +99,9 @@ print(encode_boundary((payload, streams)))
         assert analyze_region_payload(program, schedule, imports) == expected
     # Descriptor-only input still passes through native ABI validation.
     borrowed = next(item for item in imports if isinstance(item, BorrowedTensorImport))
-    forged = replace(borrowed, declaration=replace(borrowed.declaration, outputs=(TensorType((999,), "torch.float32", "cuda:0"),)))
+    forged = replace(
+        borrowed, declaration=replace(borrowed.declaration, outputs=(TensorType((999,), "torch.float32", "cuda:0"),))
+    )
     with pytest.raises(ValueError):
         analyze_region_payload(program, schedule, tuple(forged if item == borrowed else item for item in imports))
     with pytest.raises(ValueError, match="complete distinct"):

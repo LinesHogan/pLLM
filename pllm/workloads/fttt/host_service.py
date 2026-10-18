@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from collections import deque
 from dataclasses import dataclass, replace
 from hashlib import blake2b
-import re
 
-from pllm.contracts.feedback import BarrierState, ControlReason, RewardOutcome, RetryAction, RetryControl, UpdateBarrier
-
+from pllm.contracts.feedback import BarrierState, ControlReason, RetryAction, RetryControl, RewardOutcome, UpdateBarrier
 from pllm.execution.host_runtime import CompletionInput, HostReceipt, NoHostRequest
 from pllm.workloads.fttt.judge import FTTTJudgeService
 from pllm.workloads.fttt.types import (
@@ -87,9 +86,7 @@ class FTTTFeedbackService:
         dropped_feedback = self._dropped_feedback
         for row, completion in enumerate(batch.completions.entries):
             judged = self._judge.judge(completion)
-            feedback_text = judged.feedback_text or (
-                "correct" if judged.is_correct else "Your answer is incorrect."
-            )
+            feedback_text = judged.feedback_text or ("correct" if judged.is_correct else "Your answer is incorrect.")
             outcome = RewardOutcome(
                 completion,
                 judged.reward,
@@ -97,12 +94,7 @@ class FTTTFeedbackService:
                 feedback_text,
                 judged.judge,
                 judged.label,
-                judged.skip_reason
-                or (
-                    ControlReason.CORRECT_OUTPUT.value
-                    if judged.is_correct
-                    else ""
-                ),
+                judged.skip_reason or (ControlReason.CORRECT_OUTPUT.value if judged.is_correct else ""),
             )
             outcomes.append(outcome)
             key = (completion.group_id, completion.identity.prompt_idx)
@@ -122,8 +114,7 @@ class FTTTFeedbackService:
                 record = FTTTFeedbackRecord(
                     completion,
                     feedback_text,
-                    judged.feedback_token_ids
-                    or self._feedback_token_ids(feedback_text),
+                    judged.feedback_token_ids or self._feedback_token_ids(feedback_text),
                     judged.reward,
                 )
                 decision = self._decision(record, previous)
@@ -180,7 +171,9 @@ class FTTTFeedbackService:
             tuple(transitions),
         )
         transaction = FTTTHostTransaction(
-            batch, tuple(selected_rows), intent,
+            batch,
+            tuple(selected_rows),
+            intent,
         )
         self._queue.append(transaction)
         self._projected_instances = projected_instances
@@ -218,16 +211,9 @@ class FTTTFeedbackService:
         settled = dict(self._instances)
         for transition in intent.transitions:
             current = settled.get(transition.key, FTTTInstanceState())
-            if (
-                current.retries != transition.previous.retries
-                or current.stopped != transition.previous.stopped
-            ):
+            if current.retries != transition.previous.retries or current.stopped != transition.previous.stopped:
                 raise RuntimeError("FTTT lifecycle transition is stale")
-            version = (
-                intent.adapter_version
-                if transition.trained
-                else current.adapter_version
-            )
+            version = intent.adapter_version if transition.trained else current.adapter_version
             settled[transition.key] = replace(
                 transition.next,
                 adapter_version=version,
@@ -271,7 +257,8 @@ class FTTTFeedbackService:
         positive = {"correct", "right", "solved", "passed", "positive"}
         if (
             record.reward >= self._config.positive_reward_threshold
-            or bool(tokens & positive) and not bool(tokens & negative)
+            or bool(tokens & positive)
+            and not bool(tokens & negative)
         ):
             return _LifecycleDecision(
                 False,
@@ -280,17 +267,12 @@ class FTTTFeedbackService:
                 ControlReason.POSITIVE_FEEDBACK,
             )
         retries = current.retries + 1
-        stopped = (
-            self._config.max_retries > 0
-            and retries >= self._config.max_retries
-        )
+        stopped = self._config.max_retries > 0 and retries >= self._config.max_retries
         return _LifecycleDecision(
             True,
             FTTTInstanceState(retries, stopped, current.adapter_version),
             RetryAction.STOP if stopped else RetryAction.RETRY,
-            ControlReason.RETRY_LIMIT
-            if stopped
-            else ControlReason.FEEDBACK_UPDATE,
+            ControlReason.RETRY_LIMIT if stopped else ControlReason.FEEDBACK_UPDATE,
         )
 
     @staticmethod

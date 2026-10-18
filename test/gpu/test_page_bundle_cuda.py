@@ -1,39 +1,54 @@
 """Evidence 13: actual CUDA PageBundle COW and exact event-gated reclamation."""
 
-
-from pllm.execution.ptts.page_bundle_planning import compile_page_bundle_plan
-from pllm.contracts.semantic_graph import AnchorId
-from dataclasses import replace
 import multiprocessing as mp
+from dataclasses import replace
 
 import pytest
 import torch
 
-from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw
-from pllm.execution.codec import decode_boundary, encode_boundary
-from pllm.execution.ptts.page_bundle import PageBundleArena
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.workloads.esamp_request import ESampRequestWorkload
-from pllm.workloads.esamp_request import ESampRequestConfig
-from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
 from pllm.contracts.compilation import PlanBundle
+from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from pllm.contracts.semantic_graph import AnchorSymbol, SchedulerTimeline, TimelineAnchor
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import LayoutFieldId
+from pllm.execution.codec import decode_boundary, encode_boundary
+from pllm.execution.ptts.page_bundle import PageBundleArena
+from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
+from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw
+from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
 from test.backend_facts import backend_facts
 
 
 def _plan(shared=False, rank=2, memory_bytes=10000):
-    bindings = tuple(PackedHiddenResourceBinding(str(layer),
-        HiddenLayerKind.INDEX, HiddenSite.BLOCK_OUTPUT, f"model.layers[{layer}]") for layer in (0, -1))
-    facts = backend_facts(4, bindings, SchedulerTimeline(tuple(TimelineAnchor(AnchorSymbol(name), index)
-            for index, name in enumerate(("model.execute", "sampler.pre_draw", "token.commit", "next.prepare"))),
-            ("compute/cuda@1", "state/dense_page_cuda@1")),
-        PageBundleProviderFacts("test.page_bundle@1", 6, StateDeviceKind.CUDA, 0, shared_memory=shared), memory_bytes=memory_bytes)
+    bindings = tuple(
+        PackedHiddenResourceBinding(
+            str(layer), HiddenLayerKind.INDEX, HiddenSite.BLOCK_OUTPUT, f"model.layers[{layer}]"
+        )
+        for layer in (0, -1)
+    )
+    facts = backend_facts(
+        4,
+        bindings,
+        SchedulerTimeline(
+            tuple(
+                TimelineAnchor(AnchorSymbol(name), index)
+                for index, name in enumerate(("model.execute", "sampler.pre_draw", "token.commit", "next.prepare"))
+            ),
+            ("compute/cuda@1", "state/dense_page_cuda@1"),
+        ),
+        PageBundleProviderFacts("test.page_bundle@1", 6, StateDeviceKind.CUDA, 0, shared_memory=shared),
+        memory_bytes=memory_bytes,
+    )
     declaration = ESampRequestWorkload(ESampRequestConfig(rank=rank)).declaration(facts)
-    return compile_page_bundle_plan((declaration.graph, declaration.layouts), facts.timeline, facts.providers,
-        facts.max_admitted_lineages, facts.state_memory_budget_bytes, facts.device)
+    return compile_page_bundle_plan(
+        (declaration.graph, declaration.layouts),
+        facts.timeline,
+        facts.providers,
+        facts.max_admitted_lineages,
+        facts.state_memory_budget_bytes,
+        facts.device,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -47,8 +62,10 @@ def test_cuda_ptts_waits_for_exact_fence_before_reclaim() -> None:
     write = arena.prepare_admission(("request_distiller",) * 2, writer)
     roots = arena.writable_roots(write)
     with torch.cuda.stream(writer):
-        initial = tuple(torch.arange(root[0].numel(), device=device, dtype=torch.float32) / 10 + index
-            for index, root in enumerate(roots))
+        initial = tuple(
+            torch.arange(root[0].numel(), device=device, dtype=torch.float32) / 10 + index
+            for index, root in enumerate(roots)
+        )
         for root, value in zip(roots, initial, strict=True):
             root[0].copy_(value)
     admitted = arena.publish(write)
@@ -59,7 +76,9 @@ def test_cuda_ptts_waits_for_exact_fence_before_reclaim() -> None:
     update = arena.prepare_transition(admitted.after_refs, writer)
     fields = AdamWFields(*(LayoutFieldId(index) for index in range(5)))
     with torch.cuda.stream(writer):
-        gradients = tuple(torch.full_like(value, gradient) for value, gradient in zip(initial, (0.25, -0.5), strict=True))
+        gradients = tuple(
+            torch.full_like(value, gradient) for value, gradient in zip(initial, (0.25, -0.5), strict=True)
+        )
         apply_adamw(arena.writable_roots(update), fields, AdamWConfig(0.01, (0.9, 0.999), 1e-8, 0.0), gradients)
     publication = arena.publish(update)
     arena.settle(publication)
@@ -106,9 +125,9 @@ def test_cuda_ptts_waits_for_exact_fence_before_reclaim() -> None:
 
 
 def _paged_linear_lifecycle():
+    from pllm.execution.ptts.page_capture import PagedKernel
     from pllm.kernels.paged_gemm import split_linear
     from pllm.kernels.paged_linear import PagedRows, TensorRows
-    from pllm.execution.ptts.page_capture import PagedKernel
 
     for transposed in (False, True):
         pool = torch.randn((4, 7, 129) if transposed else (4, 129, 7), device="cuda")
@@ -137,17 +156,18 @@ def _paged_linear_lifecycle():
         assert rows.slots.numel() == moments.slots.numel() == len(pin.refs)
         x = torch.arange(12, device=arena.device, dtype=torch.float32).reshape(3, 4).requires_grad_()
         weights = [arena.snapshot(pin, ref)[0][:16].view(4, 4).requires_grad_() for ref in pin.refs]
-        tensor_rows = TensorRows(torch.stack([weight.detach().flatten() for weight in weights]),
-            torch.tensor([1, 0, 1], device=arena.device))
+        tensor_rows = TensorRows(
+            torch.stack([weight.detach().flatten() for weight in weights]), torch.tensor([1, 0, 1], device=arena.device)
+        )
         reference = torch.stack([x[i] @ weights[state] for i, state in enumerate((1, 0, 1))])
         with pytest.raises(ValueError, match="explicit derivatives"):
             rows.linear(x, 0, (4, 4))
         torch.testing.assert_close(rows.linear(x.detach(), 0, (4, 4)), reference)
         torch.testing.assert_close(tensor_rows.linear(x.detach(), 0, (4, 4)), reference)
         dy = torch.linspace(-1, 1, 12, device=arena.device).view(3, 4)
-        dx_mask = torch.tensor([[1.], [0.], [1.]], device=arena.device)
+        dx_mask = torch.tensor([[1.0], [0.0], [1.0]], device=arena.device)
         dw_mask = 1 - dx_mask
-        dx, = torch.autograd.grad(reference, x, dy * dx_mask, retain_graph=True)
+        (dx,) = torch.autograd.grad(reference, x, dy * dx_mask, retain_graph=True)
         dw = torch.autograd.grad(reference, weights, dy * dw_mask)
         torch.testing.assert_close(rows.input_gradient(dy * dx_mask, 0, (4, 4)), dx)
         torch.testing.assert_close(rows.parameter_gradient(x.detach(), dy * dw_mask), torch.stack(dw))
@@ -157,19 +177,25 @@ def _paged_linear_lifecycle():
                 compact = implementation.parameter_gradient(x.detach(), dy * dw_mask, selection)
                 torch.testing.assert_close(compact, torch.stack(dw).index_select(0, selection))
                 assert compact.untyped_storage().nbytes() == compact.numel() * compact.element_size()
-        repeated, = arena.paged_rows((pin, pin), pin.refs, (LayoutFieldId(0),), (1, 0, 1) * 11)
-        torch.testing.assert_close(repeated.parameter_gradient(x.detach().repeat(11, 1),
-            (dy * dw_mask).repeat(11, 1), selected_states), torch.stack(dw).flip(0) * 11)
+        (repeated,) = arena.paged_rows((pin, pin), pin.refs, (LayoutFieldId(0),), (1, 0, 1) * 11)
+        torch.testing.assert_close(
+            repeated.parameter_gradient(x.detach().repeat(11, 1), (dy * dw_mask).repeat(11, 1), selected_states),
+            torch.stack(dw).flip(0) * 11,
+        )
         strided_mask = torch.stack((dx_mask.flatten().bool(), dw_mask.flatten().bool()), dim=1)[:, 0]
         dx_rows, dx_moments = PagedRows.select_rows((rows, moments), strided_mask)
-        dw_rows, = PagedRows.select_rows((rows,), dw_mask.flatten().bool())
-        restricted, = PagedRows.select_rows((dx_rows,), torch.tensor(True, device=arena.device).expand(3))
+        (dw_rows,) = PagedRows.select_rows((rows,), dw_mask.flatten().bool())
+        (restricted,) = PagedRows.select_rows((dx_rows,), torch.tensor(True, device=arena.device).expand(3))
         torch.testing.assert_close(restricted.active, dx_rows.active)
         torch.testing.assert_close(restricted.offsets, dx_rows.offsets)
         assert dx_rows.order is dx_moments.order and dx_rows.offsets is dx_moments.offsets
         torch.testing.assert_close(dx_rows.input_gradient(dy.masked_fill(~dx_mask.bool(), float("nan")), 0, (4, 4)), dx)
-        torch.testing.assert_close(dw_rows.parameter_gradient(x.detach().masked_fill(~dw_mask.bool(), float("nan")),
-            dy.masked_fill(~dw_mask.bool(), float("nan"))), torch.stack(dw))
+        torch.testing.assert_close(
+            dw_rows.parameter_gradient(
+                x.detach().masked_fill(~dw_mask.bool(), float("nan")), dy.masked_fill(~dw_mask.bool(), float("nan"))
+            ),
+            torch.stack(dw),
+        )
         with pytest.raises(ValueError, match="boolean"):
             PagedRows.select_rows((rows,), dx_mask.flatten())
         with pytest.raises(RuntimeError, match="private PageWrite"):
@@ -181,52 +207,88 @@ def _paged_linear_lifecycle():
         before = rows.linear(x.detach(), 0, (4, 4))
         with pytest.raises(RuntimeError, match="private PageWrite"):
             rows.write(rows.pool.new_zeros((2, rows.pool.shape[1])), torch.arange(2, device=arena.device))
-        inputs = (x.detach(), dy, torch.tensor([1, 0, 1], device=arena.device),
-            *(torch.ones(3, device=arena.device, dtype=torch.bool) for _ in range(3)), selected_states[:1].clone())
+        inputs = (
+            x.detach(),
+            dy,
+            torch.tensor([1, 0, 1], device=arena.device),
+            *(torch.ones(3, device=arena.device, dtype=torch.bool) for _ in range(3)),
+            selected_states[:1].clone(),
+        )
+
         def selective(fields, inputs):
-            forward, = PagedRows.select_rows(fields, inputs[3])
-            dx, = PagedRows.select_rows(fields, inputs[4])
-            dw, = PagedRows.select_rows(fields, inputs[5])
-            return (forward.linear(inputs[0], 0, (4, 4)), dx.input_gradient(inputs[1], 0, (4, 4)),
-                dw.parameter_gradient(inputs[0], inputs[1]), dw.parameter_gradient(inputs[0], inputs[1], inputs[6]))
+            (forward,) = PagedRows.select_rows(fields, inputs[3])
+            (dx,) = PagedRows.select_rows(fields, inputs[4])
+            (dw,) = PagedRows.select_rows(fields, inputs[5])
+            return (
+                forward.linear(inputs[0], 0, (4, 4)),
+                dx.input_gradient(inputs[1], 0, (4, 4)),
+                dw.parameter_gradient(inputs[0], inputs[1]),
+                dw.parameter_gradient(inputs[0], inputs[1], inputs[6]),
+            )
+
         capture = arena.capture_kernel(pin, pin.refs, (LayoutFieldId(0),), inputs, PagedKernel.rows(2, selective))
         stable = tuple(tensor.data_ptr() for tensor in capture.results)
-        for masks in (((True, False, True), (False, True, False), (True, True, False)),
-                      ((False,) * 3,) * 3, ((True,) * 3,) * 3):
+        for masks in (
+            ((True, False, True), (False, True, False), (True, True, False)),
+            ((False,) * 3,) * 3,
+            ((True,) * 3,) * 3,
+        ):
             for buffer, mask in zip(inputs[3:6], masks, strict=True):
                 buffer.copy_(torch.tensor(mask, device=arena.device))
             inputs[6].sub_(1).neg_()
             arena.replay_captured(capture)
             expected_dx = torch.stack([dy[i] @ weights[state].detach().T for i, state in enumerate((1, 0, 1))])
-            expected_dw = torch.stack([sum((torch.outer(x[i].detach(), dy[i]) * masks[2][i]
-                for i, state in enumerate((1, 0, 1)) if state == owner), torch.zeros((4, 4), device=arena.device))
-                for owner in range(2)])
-            for actual, expected in zip(capture.results,
-                    (reference.detach() * inputs[3].unsqueeze(1), expected_dx * inputs[4].unsqueeze(1),
-                     expected_dw, expected_dw.index_select(0, inputs[6])), strict=True):
+            expected_dw = torch.stack(
+                [
+                    sum(
+                        (
+                            torch.outer(x[i].detach(), dy[i]) * masks[2][i]
+                            for i, state in enumerate((1, 0, 1))
+                            if state == owner
+                        ),
+                        torch.zeros((4, 4), device=arena.device),
+                    )
+                    for owner in range(2)
+                ]
+            )
+            for actual, expected in zip(
+                capture.results,
+                (
+                    reference.detach() * inputs[3].unsqueeze(1),
+                    expected_dx * inputs[4].unsqueeze(1),
+                    expected_dw,
+                    expected_dw.index_select(0, inputs[6]),
+                ),
+                strict=True,
+            ):
                 torch.testing.assert_close(actual, expected)
             assert stable == tuple(tensor.data_ptr() for tensor in capture.results)
         for count in (0, 65537):
             state_rows = torch.arange(count, device=arena.device).remainder(2)
             mask = torch.arange(count, device=arena.device).remainder(3) == 0
+
             def select(fields, inputs):
-                chosen, = PagedRows.select_rows(fields, inputs[1])
+                (chosen,) = PagedRows.select_rows(fields, inputs[1])
                 return chosen.order, chosen.offsets, chosen.active
-            selected = arena.capture_kernel(pin, pin.refs, (LayoutFieldId(0),),
-                (state_rows, mask), PagedKernel.rows(0, select))
+
+            selected = arena.capture_kernel(
+                pin, pin.refs, (LayoutFieldId(0),), (state_rows, mask), PagedKernel.rows(0, select)
+            )
             for _ in range(2):
                 arena.replay_captured(selected)
                 expected = torch.cat(tuple(torch.where(mask & (state_rows == state))[0] for state in range(2)))
-                torch.testing.assert_close(selected.results[0][:len(expected)], expected)
-                torch.testing.assert_close(selected.results[1], torch.stack(tuple((mask & (state_rows <= state)).sum()
-                    for state in range(2))).int())
+                torch.testing.assert_close(selected.results[0][: len(expected)], expected)
+                torch.testing.assert_close(
+                    selected.results[1],
+                    torch.stack(tuple((mask & (state_rows <= state)).sum() for state in range(2))).int(),
+                )
                 torch.testing.assert_close(selected.results[2], mask)
                 mask.logical_not_()
     update = arena.prepare_transition(pin.refs, stream)
     with torch.cuda.stream(stream):
         for root in arena.writable_roots(update):
             root[0].add_(2)
-        private, = arena.paged_rows((update, update), update.after_refs, (LayoutFieldId(0),), (0, 1, 0))
+        (private,) = arena.paged_rows((update, update), update.after_refs, (LayoutFieldId(0),), (0, 1, 0))
         assert rows.pool.data_ptr() == private.pool.data_ptr()
         private.linear(x.detach(), 0, (4, 4))
         selected = torch.tensor([1, -1, 0, -1], device=arena.device)[::2]
@@ -251,10 +313,17 @@ def _paged_linear_lifecycle():
             return ()
 
         with pytest.raises(ValueError, match="private admission"):
-            arena.capture_kernel(update, update.after_refs, (LayoutFieldId(0),),
-                (values, row_indices), PagedKernel.rows(1, increment), preserve_fields=False)
-        capture = arena.capture_kernel(update, update.after_refs, (LayoutFieldId(0),),
-            (values, row_indices), PagedKernel.rows(1, increment))
+            arena.capture_kernel(
+                update,
+                update.after_refs,
+                (LayoutFieldId(0),),
+                (values, row_indices),
+                PagedKernel.rows(1, increment),
+                preserve_fields=False,
+            )
+        capture = arena.capture_kernel(
+            update, update.after_refs, (LayoutFieldId(0),), (values, row_indices), PagedKernel.rows(1, increment)
+        )
         assert capture.buffers == ()
         for root, original in zip(arena.writable_roots(update), originals, strict=True):
             torch.testing.assert_close(root[0], original, rtol=0, atol=0)
@@ -285,8 +354,14 @@ def _paged_linear_lifecycle():
     arena.collect_completed(wait=True)
     assert arena.free_pages == 6
     cold = arena.prepare_admission(("request_distiller",) * 2, stream)
-    disposable = arena.capture_kernel(cold, cold.after_refs, (LayoutFieldId(0),),
-        (values, row_indices), PagedKernel.rows(1, increment), preserve_fields=False)
+    disposable = arena.capture_kernel(
+        cold,
+        cold.after_refs,
+        (LayoutFieldId(0),),
+        (values, row_indices),
+        PagedKernel.rows(1, increment),
+        preserve_fields=False,
+    )
     with torch.cuda.stream(stream):
         for root in arena.writable_roots(cold):
             torch.testing.assert_close(root[0], torch.full_like(root[0], 9))
@@ -300,6 +375,7 @@ def _paged_linear_lifecycle():
 def _paged_adamw_lifecycle(captured=True):
     from pllm.execution.ptts.page_capture import PagedKernel
     from pllm.kernels.paged_linear import PagedRows
+
     for rank in (2, 41):
         arena = PageBundleArena(_plan(rank=rank, memory_bytes=100000))
         stream = torch.cuda.Stream(device=arena.device)
@@ -315,14 +391,22 @@ def _paged_adamw_lifecycle(captured=True):
             initial = arena.pin_exact(publication.after_refs, stream)
             originals = tuple(arena.snapshot(initial, ref) for ref in initial.refs)
             parameters = [value[0].clone().requires_grad_() for value in originals]
-            reference = torch.optim.AdamW(parameters, lr=config.lr, betas=config.betas,
-                eps=config.eps, weight_decay=config.weight_decay, foreach=False)
+            reference = torch.optim.AdamW(
+                parameters,
+                lr=config.lr,
+                betas=config.betas,
+                eps=config.eps,
+                weight_decay=config.weight_decay,
+                foreach=False,
+            )
             current = list(initial.refs)
             with torch.cuda.stream(stream):
                 gradients = torch.zeros((2, parameters[0].numel()), device=arena.device)
+
             def compute(view, inputs):
                 view.arena.adamw_captured(view, inputs[0], config)
                 return ()
+
             kernel = PagedKernel(compute)
             with pytest.raises(RuntimeError, match="private PageWrite"):
                 arena.capture_kernel(initial, initial.refs, fields, (gradients,), kernel)
@@ -353,7 +437,7 @@ def _paged_adamw_lifecycle(captured=True):
                     if captured:
                         arena.replay_captured(view)
                     else:
-                        PagedRows.adamw(pages, gradients[:len(owners)], config)
+                        PagedRows.adamw(pages, gradients[: len(owners)], config)
                     reference.step()
                 publication = arena.publish(write)
                 arena.settle(publication)
@@ -361,7 +445,13 @@ def _paged_adamw_lifecycle(captured=True):
                 for row, owner in enumerate(owners):
                     parameter = parameters[owner]
                     state = reference.state[parameter]
-                    expected = (parameter, parameter.grad, state["step"].to(arena.device), state["exp_avg"], state["exp_avg_sq"])
+                    expected = (
+                        parameter,
+                        parameter.grad,
+                        state["step"].to(arena.device),
+                        state["exp_avg"],
+                        state["exp_avg_sq"],
+                    )
                     for actual, value in zip(arena.snapshot(pin, pin.refs[row]), expected, strict=True):
                         torch.testing.assert_close(actual, value, rtol=1e-5, atol=1e-7)
                     current[owner] = pin.refs[row]
@@ -395,11 +485,19 @@ def _cuda_ipc_worker(control, read_channel, wire, outcome):
             read = PageBundleArena.receive_field(plan, read_channel, stream=stream)
             storage = read.descriptor.cuda_storage
             assert storage is not None and read.tensor.is_cuda
-            for invalid in (replace(storage, device_uuid="different GPU"), replace(storage, size_bytes=storage.size_bytes + 4),
-                            replace(storage, handle="")):
+            for invalid in (
+                replace(storage, device_uuid="different GPU"),
+                replace(storage, size_bytes=storage.size_bytes + 4),
+                replace(storage, handle=""),
+            ):
                 with pytest.raises(ValueError):
-                    invalid.map(storage.size_bytes, read.tensor.dtype, read.descriptor.storage_offset,
-                        tuple(read.tensor.shape), stream)
+                    invalid.map(
+                        storage.size_bytes,
+                        read.tensor.dtype,
+                        read.descriptor.storage_offset,
+                        tuple(read.tensor.shape),
+                        stream,
+                    )
             control.send_bytes(b"prepared")
             assert control.recv_bytes() == b"run"
             expected = torch.arange(read.tensor.numel(), device=stream.device, dtype=read.tensor.dtype)
@@ -440,12 +538,13 @@ def _cuda_ipc_lifecycle():
             del field
         initial = arena.publish(initial)
         arena.settle(initial)
-        ref, = initial.after_refs
+        (ref,) = initial.after_refs
         pin = arena.pin_exact((ref,), stream)
         control, child_control = context.Pipe()
         read_channel, child_read = context.Pipe()
-        process = context.Process(target=_cuda_ipc_worker,
-            args=(child_control, child_read, encode_boundary(plan), outcome))
+        process = context.Process(
+            target=_cuda_ipc_worker, args=(child_control, child_read, encode_boundary(plan), outcome)
+        )
         process.start()
         child_control.close()
         child_read.close()
@@ -453,8 +552,12 @@ def _cuda_ipc_lifecycle():
             descriptor = arena.send_field(pin, ref, LayoutFieldId(0), read_channel, process.pid)
             assert descriptor.ref is ref and descriptor.cuda_storage is not None
             assert control.poll(20) and control.recv_bytes() == b"prepared"
-            for invalid in (replace(descriptor, owner_id=0), replace(descriptor, storage_offset=10**9),
-                            replace(descriptor, resource="unsigned"), replace(descriptor, compilation_signature="b" * 64)):
+            for invalid in (
+                replace(descriptor, owner_id=0),
+                replace(descriptor, storage_offset=10**9),
+                replace(descriptor, resource="unsigned"),
+                replace(descriptor, compilation_signature="b" * 64),
+            ):
                 sender, receiver = context.Pipe()
                 try:
                     sender.send_bytes(encode_boundary(invalid).encode())
@@ -505,17 +608,19 @@ def test_cuda_graph_pagebundle_keeps_stable_addresses_across_versions() -> None:
     fields = (LayoutFieldId(0), LayoutFieldId(2))
     write = arena.prepare_admission(("request_distiller",), stream)
     with torch.cuda.stream(stream):
-        initial = torch.arange(arena.write_field(write, 0, fields[0]).numel(), device=arena.device,
-            dtype=torch.float32).reshape_as(arena.write_field(write, 0, fields[0]))
+        initial = torch.arange(
+            arena.write_field(write, 0, fields[0]).numel(), device=arena.device, dtype=torch.float32
+        ).reshape_as(arena.write_field(write, 0, fields[0]))
         arena.write_field(write, 0, fields[0]).copy_(initial)
         arena.write_field(write, 0, fields[1]).fill_(1)
     admitted = arena.publish(write)
     arena.settle(admitted)
-    current, = admitted.after_refs
+    (current,) = admitted.after_refs
     original = arena.pin_exact((current,), stream)
-    read = arena.capture_kernel(original, (current,), fields, (),
-        lambda values, inputs: (values[0][0] * values[1][0] + 3,))
-    result, = read.results
+    read = arena.capture_kernel(
+        original, (current,), fields, (), lambda values, inputs: (values[0][0] * values[1][0] + 3,)
+    )
+    (result,) = read.results
     indices, buffers, graph = read.indices, read.buffers, read.graph
     stable = (*arena.pool_addresses, *read.addresses, result.data_ptr())
     arena.replay_captured(read)
@@ -529,8 +634,14 @@ def test_cuda_graph_pagebundle_keeps_stable_addresses_across_versions() -> None:
         with pytest.raises(ValueError, match="distinct nonempty"):
             arena.select_captured(read, original, invalid)
     with pytest.raises(ValueError, match="alias"):
-        arena.capture_fields(original, (current,), fields, indices,
-            (arena.borrow_field(original, current, fields[0]).unsqueeze(0), buffers[1]), graph)
+        arena.capture_fields(
+            original,
+            (current,),
+            fields,
+            indices,
+            (arena.borrow_field(original, current, fields[0]).unsqueeze(0), buffers[1]),
+            graph,
+        )
     with pytest.raises(ValueError, match="address"):
         arena.select_captured(replace(read, indices=indices.clone()), original, (current,))
     other_stream = torch.cuda.Stream(device=arena.device)
@@ -556,7 +667,7 @@ def test_cuda_graph_pagebundle_keeps_stable_addresses_across_versions() -> None:
             arena.write_field(update, 0, fields[0]).add_(2)
         publication = arena.publish(update)
         arena.settle(publication)
-        current, = publication.after_refs
+        (current,) = publication.after_refs
         pin = arena.pin_exact((current,), stream)
         arena.select_captured(read, pin, (current,))
         arena.replay_captured(read)
@@ -571,10 +682,12 @@ def test_cuda_graph_pagebundle_keeps_stable_addresses_across_versions() -> None:
 
     # Captured writes only target original private pages; publication stays outside the graph.
     update = arena.prepare_transition((current,), stream, fields=(fields,))
+
     def increment(values, inputs):
         values[0].add_(5)
         values[1].add_(1)
         return ()
+
     private = arena.capture_kernel(update, update.after_refs, fields, (), increment)
     abandoned_done = torch.cuda.Event()
     with torch.cuda.stream(stream):
@@ -594,14 +707,16 @@ def test_cuda_graph_pagebundle_keeps_stable_addresses_across_versions() -> None:
         arena.settle(publication)
         with pytest.raises(RuntimeError, match="consumed"):
             arena.replay_captured(private)
-        current, = publication.after_refs
+        (current,) = publication.after_refs
         pin = arena.pin_exact((current,), stream)
         arena.select_captured(read, pin, (current,))
         arena.replay_captured(read)
         arena.wait_release(arena.release_pin(pin))
         torch.testing.assert_close(result, (initial + 8 + 5 * iteration) * (1 + iteration) + 3)
         with torch.cuda.stream(stream):
-            torch.testing.assert_close(arena.borrow_field(old, old.refs[0], fields[0]), initial + 8 + 5 * (iteration - 1))
+            torch.testing.assert_close(
+                arena.borrow_field(old, old.refs[0], fields[0]), initial + 8 + 5 * (iteration - 1)
+            )
         arena.wait_release(arena.release_pin(old))
         assert stable == (*arena.pool_addresses, *read.addresses, result.data_ptr())
     arena.retire((current,))

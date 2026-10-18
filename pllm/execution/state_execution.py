@@ -10,23 +10,37 @@ from typing import Generic, Protocol, TypeVar
 
 import torch
 
+from pllm.contracts.compilation import PlanBundle
+from pllm.contracts.packed_rows import PackedPhaseRow
+from pllm.contracts.request_identity import RequestIdentity
+from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
+from pllm.contracts.semantic_graph import (
+    AnchorId,
+    ImplementationId,
+    PhysicalPlan,
+    SamplerFeedbackInputSource,
+    StateEffectKind,
+    StateScope,
+    TaskSymbol,
+)
+from pllm.contracts.state_ref import StateRef
+from pllm.contracts.state_representation import StatePhysicalPlan
+from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.execution import TaskGraphExecution, TaskGraphImplementation, TaskGraphInvocation
-from pllm.execution.ptts.page_bundle import PageBundleArena, PageBundleUsage, PagePin, PagePublication, PageRelease, PageWrite
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
+from pllm.execution.ptts.page_bundle import (
+    PageBundleArena,
+    PageBundleUsage,
+    PagePin,
+    PagePublication,
+    PageRelease,
+    PageWrite,
+)
 from pllm.execution.ptts.page_capture import KernelCapture
 from pllm.execution.ptts.request_state import RequestStateDirectory, RequestStateSelection
 from pllm.execution.replay import LayerReplayPrimitive, TokenwiseReplayPrimitive
 from pllm.execution.trace import ExecutionTrace, TracePhase
-from pllm.contracts.request_identity import RequestIdentity
-from pllm.contracts.packed_rows import PackedPhaseRow
-from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
-from pllm.contracts.semantic_graph import AnchorId, ImplementationId, PhysicalPlan, SamplerFeedbackInputSource, StateEffectKind, StateScope, TaskSymbol
-from pllm.contracts.compilation import PlanBundle
-from pllm.contracts.state_ref import StateRef
-from pllm.contracts.tensor_layout import LayoutFieldId
-from pllm.contracts.state_representation import StatePhysicalPlan
-
 
 InputT = TypeVar("InputT", contravariant=True)
 InputContra = TypeVar("InputContra", contravariant=True)
@@ -56,7 +70,9 @@ class StateTaskContext(Generic[DataT]):
     trace: ExecutionTrace
     invocation_id: int
     value: DataT | None = None
-    results: dict[tuple[TaskSymbol, str], torch.Tensor] = field(default_factory=lambda: dict[tuple[TaskSymbol, str], torch.Tensor]())
+    results: dict[tuple[TaskSymbol, str], torch.Tensor] = field(
+        default_factory=lambda: dict[tuple[TaskSymbol, str], torch.Tensor]()
+    )
     # These collections replace the single-write lifecycle. Every entry is an
     # original arena-issued capability; no independently mutable latest map.
     page_writes: dict[PageWrite, None] = field(default_factory=lambda: dict[PageWrite, None]())
@@ -77,7 +93,9 @@ class StateTaskContext(Generic[DataT]):
     cancel_requested: Event = field(default_factory=Event)
     borrowed_roots: tuple[BorrowedStateRoot, ...] = ()
     held_input: HeldInput | None = None
-    injected_refs: dict[RequestIdentity, set[StateRef]] = field(default_factory=lambda: dict[RequestIdentity, set[StateRef]]())
+    injected_refs: dict[RequestIdentity, set[StateRef]] = field(
+        default_factory=lambda: dict[RequestIdentity, set[StateRef]]()
+    )
     input_step_id: int = -1
 
     def data(self) -> DataT:
@@ -138,8 +156,9 @@ class StateTaskContext(Generic[DataT]):
         if self.cancel_requested.is_set():
             raise RuntimeError("state invocation was cancelled")
 
-    def prepare_owned_write(self, sources: tuple[StateRef, ...],
-                            fields: tuple[tuple[LayoutFieldId, ...], ...]) -> PageWrite:
+    def prepare_owned_write(
+        self, sources: tuple[StateRef, ...], fields: tuple[tuple[LayoutFieldId, ...], ...]
+    ) -> PageWrite:
         self.check_page_execution()
         authorized = {self.current_owned_ref(ref) for ref in self.pin.refs}
         if not set(sources) <= authorized:
@@ -155,8 +174,9 @@ class StateTaskContext(Generic[DataT]):
         receipt = self.arena.publish(token)
         self.page_publications[receipt] = False
         del self.page_writes[token]
-        self.trace.record(TracePhase.PUBLISH, self.invocation_id, refs=receipt.after_refs,
-            operation_id=receipt.operation_id)
+        self.trace.record(
+            TracePhase.PUBLISH, self.invocation_id, refs=receipt.after_refs, operation_id=receipt.operation_id
+        )
         return receipt
 
     def settle_owned_publication(self, receipt: PagePublication) -> None:
@@ -220,10 +240,17 @@ class MathBinding(Generic[InputT, DataT, ResultT]):
     def local_resources(self, plan: PlanBundle) -> tuple[str, ...]:
         states = plan.semantic_graph.states
         borrowed = set(self.borrowed_resources)
-        if (len(borrowed) != len(self.borrowed_resources) or not borrowed <= {state.resource for state in states}
+        if (
+            len(borrowed) != len(self.borrowed_resources)
+            or not borrowed <= {state.resource for state in states}
             or any(state.scope is not StateScope.INSTANCE for state in states if state.resource in borrowed)
-            or any(effect.kind is not StateEffectKind.READ for task in plan.semantic_graph.tasks
-                for effect in task.effects if effect.resource in borrowed)):
+            or any(
+                effect.kind is not StateEffectKind.READ
+                for task in plan.semantic_graph.tasks
+                for effect in task.effects
+                if effect.resource in borrowed
+            )
+        ):
             raise ValueError("borrowed bindings require distinct read-only instance resources from the original plan")
         return tuple(str(state.resource) for state in states if state.resource not in borrowed)
 
@@ -237,8 +264,11 @@ class MathBinding(Generic[InputT, DataT, ResultT]):
         for group in arena.plan.semantic_graph.input_groups:
             if set(group.borrowed_resources) != set(self.borrowed_resources):
                 raise ValueError("conditional input must cover the complete signed borrowed resource group")
-            guarded = {task.implementation_id for task in arena.plan.schedule_physical.tasks
-                if arena.plan.semantic_graph.tasks[task.task_id].symbol in group.tasks}
+            guarded = {
+                task.implementation_id
+                for task in arena.plan.schedule_physical.tasks
+                if arena.plan.semantic_graph.tasks[task.task_id].symbol in group.tasks
+            }
             if guarded != {task.implementation_id for task in self.tasks if isinstance(task, ConditionalProducerTask)}:
                 raise ValueError("conditional producer bindings differ from the signed task closure")
         if set(arena.owned_resources) != set(self.local_resources(arena.plan)):
@@ -246,8 +276,14 @@ class MathBinding(Generic[InputT, DataT, ResultT]):
         # A borrowed binding owns only its local directory; test_video verifies no remote lineage.
         if self.borrowed_resources:
             states = tuple(state for state in states if state.resource in arena.owned_resources)
-        execution = StateExecution(arena, RequestStateDirectory(arena, states), self.math, self.tasks, sampler_anchor_id,
-            _borrowed_resources=self.borrowed_resources)
+        execution = StateExecution(
+            arena,
+            RequestStateDirectory(arena, states),
+            self.math,
+            self.tasks,
+            sampler_anchor_id,
+            _borrowed_resources=self.borrowed_resources,
+        )
         return execution
 
 
@@ -298,15 +334,25 @@ class StateSettlementError(RuntimeError, Generic[DataT]):
 
 
 class StateExecution(Generic[InputT, DataT, ResultT]):
-    def __init__(self, arena: PageBundleArena, directory: RequestStateDirectory,
-                 math: StateMath[InputT, DataT, ResultT],
-                 implementations: tuple[TaskGraphImplementation[StateTaskContext[DataT]], ...],
-                 sampler_anchor_id: AnchorId, *, _borrowed_resources: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self,
+        arena: PageBundleArena,
+        directory: RequestStateDirectory,
+        math: StateMath[InputT, DataT, ResultT],
+        implementations: tuple[TaskGraphImplementation[StateTaskContext[DataT]], ...],
+        sampler_anchor_id: AnchorId,
+        *,
+        _borrowed_resources: tuple[str, ...] = (),
+    ) -> None:
         self.arena, self.directory, self.math = arena, directory, math
         self.sampler_anchor_id = sampler_anchor_id
         self.trace = ExecutionTrace(arena.plan.schedule_physical)
-        self._values = tuple((task.symbol, output.name) for task in arena.plan.semantic_graph.tasks for output in task.outputs)
-        self._runner = TaskGraphExecution(arena.plan.schedule_physical, implementations, self.trace, self._release_values)
+        self._values = tuple(
+            (task.symbol, output.name) for task in arena.plan.semantic_graph.tasks for output in task.outputs
+        )
+        self._runner = TaskGraphExecution(
+            arena.plan.schedule_physical, implementations, self.trace, self._release_values
+        )
         self._active: dict[int, TaskGraphInvocation[StateTaskContext[DataT]]] = {}
         self._next_invocation = 1
         self._loss_count = self._update_count = self._trained_rows = self._sampler_count = 0
@@ -327,13 +373,20 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         """Internal transport handoff; no change to workload authoring signatures."""
         with self._lock:
             self._require_borrow_live()
-            if not self._borrowed_resources or self._active or self._pending_borrows is not None or self._pending_hold is not None:
+            if (
+                not self._borrowed_resources
+                or self._active
+                or self._pending_borrows is not None
+                or self._pending_hold is not None
+            ):
                 raise RuntimeError("read-only staging requires an idle borrowed execution")
             self._pending_borrows = roots  # Retain even invalid incoming mappings until the session terminates.
             try:
-                if (len(roots) != len(self._borrowed_resources)
+                if (
+                    len(roots) != len(self._borrowed_resources)
                     or {root.resource for root in roots} != set(self._borrowed_resources)
-                    or any(root.signature != self.arena.plan.schedule_decision.signature for root in roots)):
+                    or any(root.signature != self.arena.plan.schedule_decision.signature for root in roots)
+                ):
                     raise ValueError("received roots differ from the required signed resources")
                 for root in roots:
                     root.claim(self.arena.allocation_ranges)
@@ -346,16 +399,27 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         with self._lock:
             self._require_borrow_live()
             try:
-                if self.arena.plan.semantic_graph.input_groups and not self.arena.plan.semantic_graph.input_groups[0].allow_absent:
+                if (
+                    self.arena.plan.semantic_graph.input_groups
+                    and not self.arena.plan.semantic_graph.input_groups[0].allow_absent
+                ):
                     raise RuntimeError("missing activation input: signed STOP policy stops the instance")
-                if (not self.arena.plan.semantic_graph.input_groups
-                    or not self.arena.plan.semantic_graph.input_groups[0].allow_absent or not self._borrowed_resources
-                    or self._active or self._pending_borrows is not None or self._pending_hold is not None
-                    or reason not in ("absent", "end") or step_id < 0 or not identities
-                    or any(identity not in self._successful_inputs for identity in identities)):
+                if (
+                    not self.arena.plan.semantic_graph.input_groups
+                    or not self.arena.plan.semantic_graph.input_groups[0].allow_absent
+                    or not self._borrowed_resources
+                    or self._active
+                    or self._pending_borrows is not None
+                    or self._pending_hold is not None
+                    or reason not in ("absent", "end")
+                    or step_id < 0
+                    or not identities
+                    or any(identity not in self._successful_inputs for identity in identities)
+                ):
                     raise RuntimeError("HOLD requires a signed idle input branch and a first successful injection")
-                self._pending_hold = HeldInput(reason, step_id,
-                    tuple((identity, *self._successful_inputs[identity]) for identity in identities))
+                self._pending_hold = HeldInput(
+                    reason, step_id, tuple((identity, *self._successful_inputs[identity]) for identity in identities)
+                )
             except Exception:
                 self._borrow_failed = True
                 raise
@@ -386,15 +450,17 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             original = self.implementation(implementation.implementation_id)
             if isinstance(original, ConditionalProducerTask) != isinstance(implementation, ConditionalProducerTask):
                 raise ValueError("rebinding cannot remove or add a signed conditional producer guard")
-            self._runner.implementations = tuple(implementation if item is original else item
-                                                for item in self._runner.implementations)
+            self._runner.implementations = tuple(
+                implementation if item is original else item for item in self._runner.implementations
+            )
 
     @property
     def device(self) -> torch.device:
         return self.arena.device
 
-    def admit(self, identities: tuple[RequestIdentity, ...],
-              stream: torch.cuda.Stream | None = None) -> tuple[StateRef, ...]:
+    def admit(
+        self, identities: tuple[RequestIdentity, ...], stream: torch.cuda.Stream | None = None
+    ) -> tuple[StateRef, ...]:
         with self._lock:
             # Only borrowing executions have a terminal transport state; test_video covers it.
             if self._borrowed_resources:
@@ -405,8 +471,9 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             try:
                 if batch.write is not None:
                     with nullcontext() if stream is None else torch.cuda.stream(stream):
-                        self.math.initialize(self.arena.writable_roots(batch.write),
-                            tuple(str(key.resource) for key in batch.keys))
+                        self.math.initialize(
+                            self.arena.writable_roots(batch.write), tuple(str(key.resource) for key in batch.keys)
+                        )
                 receipt = self.directory.commit_admission(batch)
             except Exception:
                 self.directory.abort_admission(batch)
@@ -418,18 +485,23 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             if receipt is None:
                 self.trace.record(TracePhase.ADMIT, 0, identities=identities, refs=refs)
             else:
-                self.trace.record(TracePhase.ADMIT, 0, identities=identities, refs=refs,
-                    operation_id=receipt.operation_id)
+                self.trace.record(
+                    TracePhase.ADMIT, 0, identities=identities, refs=refs, operation_id=receipt.operation_id
+                )
             return refs
 
-    def begin(self, rows: tuple[PackedPhaseRow, ...],
-              stream: torch.cuda.Stream | None = None) -> TaskGraphInvocation[StateTaskContext[DataT]]:
+    def begin(
+        self, rows: tuple[PackedPhaseRow, ...], stream: torch.cuda.Stream | None = None
+    ) -> TaskGraphInvocation[StateTaskContext[DataT]]:
         with self._lock:
             # Complete exact input before any local pin/write; test_video rejects missing staging.
             if self._borrowed_resources:
                 self._require_borrow_live()
-                if self._active or (self._pending_hold is None and self._pending_borrows is None) or any(
-                    root.stream != stream for root in self._pending_borrows or ()):
+                if (
+                    self._active
+                    or (self._pending_hold is None and self._pending_borrows is None)
+                    or any(root.stream != stream for root in self._pending_borrows or ())
+                ):
                     self._borrow_failed = True
                     raise RuntimeError("borrowed step requires complete staged roots on the receiving stream")
             self.arena.collect_completed()
@@ -454,11 +526,18 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                         root.bind(pin)
                 except Exception as exc:
                     self._failed(invocation, context, exc)
-            self.trace.record(TracePhase.BEGIN, invocation.invocation_id, refs=pin.refs, pin_id=pin.pin_id,
-                identities=tuple(row.identity for row in selection.rows))
+            self.trace.record(
+                TracePhase.BEGIN,
+                invocation.invocation_id,
+                refs=pin.refs,
+                pin_id=pin.pin_id,
+                identities=tuple(row.identity for row in selection.rows),
+            )
             return invocation
 
-    def start_step(self, value: InputT, stream: torch.cuda.Stream | None = None) -> TaskGraphInvocation[StateTaskContext[DataT]]:
+    def start_step(
+        self, value: InputT, stream: torch.cuda.Stream | None = None
+    ) -> TaskGraphInvocation[StateTaskContext[DataT]]:
         with self._lock:
             invocation = self.begin(self.math.rows(value), stream)
             self.submit_input(invocation, value)
@@ -474,8 +553,12 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                     self.complete_sampler(invocation, stream)
             return self.finish_step(invocation)
 
-    def submit_input(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], value: InputT,
-                     readiness: CudaStreamReadiness | None = None) -> None:
+    def submit_input(
+        self,
+        invocation: TaskGraphInvocation[StateTaskContext[DataT]],
+        value: InputT,
+        readiness: CudaStreamReadiness | None = None,
+    ) -> None:
         """Consume original inputs, ordering an external CUDA producer when supplied."""
         with self._lock:
             context = self._context(invocation)
@@ -508,8 +591,9 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             except Exception as exc:
                 self._failed(invocation, context, exc)
 
-    def sampler_guidance(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]],
-                         stream: torch.cuda.Stream | None = None) -> PackedSamplerGuidanceBatch:
+    def sampler_guidance(
+        self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], stream: torch.cuda.Stream | None = None
+    ) -> PackedSamplerGuidanceBatch:
         with self._lock:
             context = self._context(invocation)
             if context.guidance is None:
@@ -527,8 +611,13 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                 context.sampler_phase, context.sampler_stream = _SamplerPhase.BORROWED, stream
             return context.guidance
 
-    def complete_sampler(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]],
-                         stream: torch.cuda.Stream | None = None, *, feedback: SamplerFeedback | None = None) -> None:
+    def complete_sampler(
+        self,
+        invocation: TaskGraphInvocation[StateTaskContext[DataT]],
+        stream: torch.cuda.Stream | None = None,
+        *,
+        feedback: SamplerFeedback | None = None,
+    ) -> None:
         with self._lock:
             context = self._context(invocation)
             if invocation.last_anchor_id < self.sampler_anchor_id:
@@ -541,13 +630,18 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                 raise RuntimeError("CUDA sampler completion requires its original stream")
             if context.sampler_phase is _SamplerPhase.BORROWED and context.sampler_stream != stream:
                 raise RuntimeError("sampler completion differs from the borrowed stream")
-            required = any(isinstance(item.source, SamplerFeedbackInputSource)
-                for task in self.arena.plan.semantic_graph.tasks for item in task.inputs)
+            required = any(
+                isinstance(item.source, SamplerFeedbackInputSource)
+                for task in self.arena.plan.semantic_graph.tasks
+                for item in task.inputs
+            )
             if required != (feedback is not None):
                 raise ValueError("sampler feedback differs from the signed input contract")
-            if feedback is not None and (context.guidance is None
+            if feedback is not None and (
+                context.guidance is None
                 or feedback.sampler_rows is not context.guidance.sampler_rows
-                or feedback.base_logits.device != self.device):
+                or feedback.base_logits.device != self.device
+            ):
                 raise ValueError("sampler feedback requires original guidance rows and device")
             self._order_sampler(invocation, stream)
             context.sampler_feedback = feedback
@@ -561,11 +655,17 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             if context.sampler_phase is not _SamplerPhase.COMPLETE:
                 raise RuntimeError("state invocation requires sampler completion")
             try:
-                if context.held_input is not None and (context.borrowed_roots or context.page_writes
-                    or context.page_publications or context.update_count
+                if context.held_input is not None and (
+                    context.borrowed_roots
+                    or context.page_writes
+                    or context.page_publications
+                    or context.update_count
                     or set(context.injected_refs) != {identity for identity, _, _ in context.held_input.successful}
-                    or any(not context.injected_refs[identity] <= set(refs)
-                        for identity, refs, _ in context.held_input.successful)):
+                    or any(
+                        not context.injected_refs[identity] <= set(refs)
+                        for identity, refs, _ in context.held_input.successful
+                    )
+                ):
                     raise RuntimeError("HOLD settlement requires actual pinned injection without producer effects")
                 result = self.math.output(context)
                 if not invocation.finished:
@@ -593,10 +693,15 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             for invocation in tuple(self._active.values()):
                 self.cancel_step(invocation)
 
-    def _failed(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], context: StateTaskContext[DataT], exc: Exception) -> None:
+    def _failed(
+        self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], context: StateTaskContext[DataT], exc: Exception
+    ) -> None:
         context.cancel_requested.set()
-        self.trace.record(TracePhase.FAILED, invocation.invocation_id,
-            operation_id=None if context.publication is None else context.publication.operation_id)
+        self.trace.record(
+            TracePhase.FAILED,
+            invocation.invocation_id,
+            operation_id=None if context.publication is None else context.publication.operation_id,
+        )
         # Quarantine borrowed failures, including exception-frame aliases; test_video covers both publication outcomes.
         if context.borrowed_roots or context.held_input is not None:
             self._borrow_failed = True
@@ -611,7 +716,9 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         self.cancel_step(invocation)
         raise exc
 
-    def _release(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], context: StateTaskContext[DataT]) -> None:
+    def _release(
+        self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], context: StateTaskContext[DataT]
+    ) -> None:
         # Only borrowed steps clear aliases and ACK before settlement; test_video checks ACK/failure ordering.
         if context.borrowed_roots:
             context.value = None
@@ -635,9 +742,13 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         release = context.release
         if release is None:
             raise RuntimeError("state settlement requires the original pin release")
-        self.trace.record(TracePhase.SETTLED, invocation.invocation_id, pin_id=context.pin.pin_id,
+        self.trace.record(
+            TracePhase.SETTLED,
+            invocation.invocation_id,
+            pin_id=context.pin.pin_id,
             release_id=release.release_id,
-            operation_id=None if context.publication is None else context.publication.operation_id)
+            operation_id=None if context.publication is None else context.publication.operation_id,
+        )
         if context.publication is not None or invocation.finished:
             self._loss_count += context.loss_count
             self._update_count += context.update_count
@@ -649,7 +760,9 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             self._hold_count += 1
             self._last_hold = context.held_input
 
-    def _order_sampler(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], stream: torch.cuda.Stream | None) -> None:
+    def _order_sampler(
+        self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], stream: torch.cuda.Stream | None
+    ) -> None:
         consumer = invocation.context.pin.stream
         if stream is not None and consumer is not None:
             CudaStreamReadiness(stream).order_on(consumer)
@@ -657,8 +770,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     def _context(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]]) -> StateTaskContext[DataT]:
         if self._borrowed_resources:
             self._require_borrow_live()
-        if (self._active.get(invocation.invocation_id) is not invocation
-            or invocation.execution is not self._runner):
+        if self._active.get(invocation.invocation_id) is not invocation or invocation.execution is not self._runner:
             raise RuntimeError("state invocation is not registered as active")
         return invocation.context
 
@@ -711,6 +823,16 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     def diagnostics(self) -> StateDiagnostics:
         with self._lock:
             self.arena.collect_completed()
-            return StateDiagnostics(self.directory.active_count, self.directory.inference_pin_count, self._loss_count, self._update_count,
-                self._trained_rows, self._sampler_count, self.arena.pending_pin_releases, self.plan.fallback_count, self.arena.usage(),
-                self._hold_count, self._last_hold)
+            return StateDiagnostics(
+                self.directory.active_count,
+                self.directory.inference_pin_count,
+                self._loss_count,
+                self._update_count,
+                self._trained_rows,
+                self._sampler_count,
+                self.arena.pending_pin_releases,
+                self.plan.fallback_count,
+                self.arena.usage(),
+                self._hold_count,
+                self._last_hold,
+            )

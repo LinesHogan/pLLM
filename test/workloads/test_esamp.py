@@ -1,50 +1,56 @@
 """Evidence 25: independent gated-residual/AdamW oracle and exact request views."""
 
-
-from pllm.execution.ptts.page_bundle_planning import compile_page_bundle_plan
-from dataclasses import replace
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import Annotated
 
 import pytest
 import torch
-import pllm
 import torch.nn.functional as F
 
-
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.ptts.page_bundle import PageBundleArena, PagePublication, PageWrite
-from pllm.workloads.esamp_request import (
-    ESampRequestWorkload,
-)
-from pllm.execution.state_execution import StateSettlementError, StateTaskContext
-from pllm.authoring import FunctionMath, TensorResult
-from pllm.authoring import TensorStepInput
-from pllm.execution.tensor_binding import TensorFrame
+import pllm
+from pllm.authoring import FunctionMath, TensorResult, TensorStepInput
 from pllm.config import ExecutionOptions
-from pllm.workloads.esamp_request import (
-    ESampRequestConfig,
-)
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
 from pllm.contracts.packed_hidden import (
-    PackedHiddenResourceBinding, PackedHiddenSnapshot, PackedHiddenSnapshotBatch,
+    PackedHiddenResourceBinding,
+    PackedHiddenSnapshot,
+    PackedHiddenSnapshotBatch,
 )
 from pllm.contracts.packed_rows import (
-    PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink,
+    PackedPhaseRow,
+    PackedPhaseRowBatch,
+    PackedSamplerRowBatch,
+    PackedSamplerRowLink,
 )
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.semantic_graph import (
-    AnchorId, AnchorSymbol, SchedulerTimeline, TimelineAnchor, SemanticOutputKind,
+    AnchorId,
+    AnchorSymbol,
+    SchedulerTimeline,
+    SemanticOutputKind,
+    TimelineAnchor,
 )
 from pllm.contracts.state_representation import StateDeviceKind
+from pllm.execution.ptts.page_bundle import PageBundleArena, PagePublication, PageWrite
+from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
+from pllm.execution.state_execution import StateSettlementError, StateTaskContext
+from pllm.execution.tensor_binding import TensorFrame
+from pllm.workloads.esamp_request import (
+    ESampRequestConfig,
+    ESampRequestWorkload,
+)
 from test.backend_facts import assert_capture_preflight, backend_facts
 
 
 def _reference(source: torch.Tensor, parameters: torch.Tensor) -> torch.Tensor:
     up, gate, down, bias, scale, shift = parameters.split((8, 8, 8, 2, 4, 4))
-    residual = ((source @ up.reshape(4, 2)) * F.silu(
-        source @ gate.reshape(4, 2) + bias,
-    )) @ down.reshape(2, 4)
+    residual = (
+        (source @ up.reshape(4, 2))
+        * F.silu(
+            source @ gate.reshape(4, 2) + bias,
+        )
+    ) @ down.reshape(2, 4)
     return F.layer_norm(source + residual, (4,)) * scale + shift
 
 
@@ -57,19 +63,32 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(
         with pytest.raises(ValueError):
             ESampRequestConfig(learning_rate=value)
     bindings = tuple(
-        PackedHiddenResourceBinding(str(layer), HiddenLayerKind.INDEX,
-            HiddenSite.BLOCK_OUTPUT, f"model.layers[{layer}]")
+        PackedHiddenResourceBinding(
+            str(layer), HiddenLayerKind.INDEX, HiddenSite.BLOCK_OUTPUT, f"model.layers[{layer}]"
+        )
         for layer in (0, -1)
     )
     config = ESampRequestConfig(
-        rank=2, intervention=True, intervention_beta=0.2, learning_rate=0.03,
-        weight_decay=0.1, key_fields=(RequestKeyField.REQUEST_ID, RequestKeyField.PROMPT_IDX,
-            RequestKeyField.SAMPLE_IDX),
+        rank=2,
+        intervention=True,
+        intervention_beta=0.2,
+        learning_rate=0.03,
+        weight_decay=0.1,
+        key_fields=(RequestKeyField.REQUEST_ID, RequestKeyField.PROMPT_IDX, RequestKeyField.SAMPLE_IDX),
     )
     timeline = SchedulerTimeline(
-        tuple(TimelineAnchor(AnchorSymbol(name), index) for index, name in enumerate((
-            "model.execute", "sampler.pre_draw", "token.commit", "next.prepare",
-        ))), ("compute/cpu@1", "state/dense_page_cpu@1"),
+        tuple(
+            TimelineAnchor(AnchorSymbol(name), index)
+            for index, name in enumerate(
+                (
+                    "model.execute",
+                    "sampler.pre_draw",
+                    "token.commit",
+                    "next.prepare",
+                )
+            )
+        ),
+        ("compute/cpu@1", "state/dense_page_cpu@1"),
     )
     workload = ESampRequestWorkload(config)
     facts = backend_facts(4, bindings, timeline, PageBundleProviderFacts("test.esamp@1", 6))
@@ -77,8 +96,10 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(
     for paged in (False, True):
         assert_capture_preflight(ESampRequestWorkload(replace(bounded.config, paged=paged)), facts, monkeypatch)
     specialized = bounded.specialize(facts, ExecutionOptions())
+
     def shifted_source(self, source, up, gate, down, bias, scale, shift):
         return source + shift
+
     with monkeypatch.context() as changed:
         changed.setattr(ESampRequestWorkload, "forward", shifted_source)
         with pytest.raises(ValueError, match="resource_facts declaration"):
@@ -87,16 +108,29 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(
             bounded.compile_backend(specialized)
         changed.setattr(ESampRequestWorkload, "resource_facts", lambda self, facts, options: facts.timeline)
         assert bounded.compile_backend(specialized).execution.arena.active_lineages == 0
-    state_shape, = next(item for item in specialized.timeline.task_resources if item.task == "train").input_shapes
-    resources = tuple(replace(item, resident_bytes=32,
-        input_shapes=(item.input_shapes[0], item.input_shapes[0], state_shape, (item.input_shapes[0][0],)))
-        if item.task == "loss" else item for item in specialized.timeline.task_resources)
+    (state_shape,) = next(item for item in specialized.timeline.task_resources if item.task == "train").input_shapes
+    resources = tuple(
+        replace(
+            item,
+            resident_bytes=32,
+            input_shapes=(item.input_shapes[0], item.input_shapes[0], state_shape, (item.input_shapes[0][0],)),
+        )
+        if item.task == "loss"
+        else item
+        for item in specialized.timeline.task_resources
+    )
     # Loss and optimizer share one capture entitlement; signed loss residency cannot fund an unreserved optimizer.
     with pytest.raises(ValueError, match="train workspace/residency"):
         bounded.compile_backend(replace(specialized, timeline=replace(specialized.timeline, task_resources=resources)))
     declaration = workload.declaration(facts)
-    plan = compile_page_bundle_plan((declaration.graph, declaration.layouts), timeline, facts.providers,
-        facts.max_admitted_lineages, facts.state_memory_budget_bytes, facts.device)
+    plan = compile_page_bundle_plan(
+        (declaration.graph, declaration.layouts),
+        timeline,
+        facts.providers,
+        facts.max_admitted_lineages,
+        facts.state_memory_budget_bytes,
+        facts.device,
+    )
     binding = workload.bind_math(facts, plan)
     with pytest.raises(ValueError, match="request-id"):
         workload.declare(facts)
@@ -107,46 +141,70 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(
         with pytest.raises(ValueError, match="signed declaration"):
             workload.bind_math(facts, plan)
     with pytest.raises(ValueError, match="bindings"):
-        workload.bind_math(replace(facts, probe=replace(facts.probe,
-            hidden_resources=facts.probe.hidden_resources[:1])), plan)
+        workload.bind_math(
+            replace(facts, probe=replace(facts.probe, hidden_resources=facts.probe.hidden_resources[:1])), plan
+        )
     # Frozen dataclasses block plain rebinding; drive the drift behind the freeze to
     # prove an already bound execution keeps its own signed mathematics.
     object.__setattr__(workload, "config", replace(config, intervention_beta=0.9, learning_rate=0.9))
     execution = replace(binding, tasks=tuple(reversed(binding.tasks))).bind(
-        PageBundleArena(plan), next(AnchorId(item.ordinal)
-            for item in plan.timeline.anchors if item.symbol == "sampler.pre_draw"))
+        PageBundleArena(plan),
+        next(AnchorId(item.ordinal) for item in plan.timeline.anchors if item.symbol == "sampler.pre_draw"),
+    )
     assert execution.device.type == "cpu"
     identities = (RequestIdentity("shared-id", 0, 0), RequestIdentity("shared-id", 0, 1))
     latest = list(execution.admit(identities))
     parameters = [execution.snapshot(ref)[0].requires_grad_() for ref in latest]
-    optimizers = [torch.optim.AdamW((parameter,), lr=config.learning_rate,
-        betas=config.betas, eps=config.eps, weight_decay=config.weight_decay)
-        for parameter in parameters]
+    optimizers = [
+        torch.optim.AdamW(
+            (parameter,), lr=config.learning_rate, betas=config.betas, eps=config.eps, weight_decay=config.weight_decay
+        )
+        for parameter in parameters
+    ]
     generator = torch.Generator().manual_seed(7)
     for parameter in parameters:
-        expected = torch.cat((*(torch.empty(8).normal_(0.0, 0.02, generator=generator)
-            for _ in range(3)), torch.ones(2), torch.ones(4), torch.zeros(4)))
+        expected = torch.cat(
+            (
+                *(torch.empty(8).normal_(0.0, 0.02, generator=generator) for _ in range(3)),
+                torch.ones(2),
+                torch.ones(4),
+                torch.zeros(4),
+            )
+        )
         torch.testing.assert_close(parameter, expected, rtol=0, atol=0)
 
     source = torch.tensor([[0.2, -0.1, 0.4, 0.3], [-0.5, 0.7, 0.1, -0.2], [0.1, 0.3, -0.2, 0.8]])
     target = torch.tensor([[0.6, 0.0, -0.3, 0.2], [0.4, -0.2, 0.8, 0.1], [-0.2, 0.5, 0.1, 0.4]])
     for step_id, owners in enumerate(((0, 1, 0), (0,))):
         count = len(owners)
-        rows = PackedPhaseRowBatch(1, step_id, count, tuple(
-            PackedPhaseRow(index, index, step_id, HiddenPhase.DECODE, identities[owner])
-            for index, owner in enumerate(owners)
-        ))
+        rows = PackedPhaseRowBatch(
+            1,
+            step_id,
+            count,
+            tuple(
+                PackedPhaseRow(index, index, step_id, HiddenPhase.DECODE, identities[owner])
+                for index, owner in enumerate(owners)
+            ),
+        )
         tensors = {bindings[0]: source[:count], bindings[1]: target[:count]}
-        step = TensorStepInput(rows,
+        step = TensorStepInput(
+            rows,
             PackedSamplerRowBatch(rows, tuple(PackedSamplerRowLink(i, i) for i in range(count))),
-            PackedHiddenSnapshotBatch(rows, tuple(PackedHiddenSnapshot(resource, tensors[resource])
-                for resource in sorted(bindings, key=lambda item: item.locator_key))),
+            PackedHiddenSnapshotBatch(
+                rows,
+                tuple(
+                    PackedHiddenSnapshot(resource, tensors[resource])
+                    for resource in sorted(bindings, key=lambda item: item.locator_key)
+                ),
+            ),
         )
         indexed = execution.math.rows(step)
         selected = execution.directory.select(indexed)
         assert selected.rows is indexed
         assert all(selected_row is original for selected_row, original in zip(selected.rows, rows.rows, strict=True))
-        assert tuple(selected.ref_for(identities[owner]) for owner in owners) == tuple(latest[owner] for owner in owners)
+        assert tuple(selected.ref_for(identities[owner]) for owner in owners) == tuple(
+            latest[owner] for owner in owners
+        )
         before = [execution.snapshot(ref) for ref in latest]
         for last_anchor in (0, 1):
             cancelled = execution.start_step(step)
@@ -164,7 +222,8 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(
                 execution.cancel_step(cancelled)
 
         def reject_publication(
-            self: PageBundleArena, batch: PageWrite,
+            self: PageBundleArena,
+            batch: PageWrite,
         ) -> PagePublication:
             raise RuntimeError("injected publication failure")
 
@@ -183,10 +242,9 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(
         handle = execution.start_step(step)
         execution.execute_anchor(handle, AnchorId(0))
         guidance = execution.sampler_guidance(handle)
-        expected_prediction = torch.cat(tuple(
-            _reference(source[i:i + 1], parameters[owner]).detach()
-            for i, owner in enumerate(owners)
-        ))
+        expected_prediction = torch.cat(
+            tuple(_reference(source[i : i + 1], parameters[owner]).detach() for i, owner in enumerate(owners))
+        )
         if step_id == 0:
             assert guidance.affected_row_ids == ()
         else:
@@ -203,8 +261,10 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(
         execution.execute_anchor(handle, AnchorId(2))
         publication = handle.context.publication
         retained_loss = handle.context.loss
+
         def reject_output(self: FunctionMath, context: StateTaskContext[TensorFrame]) -> TensorResult:
             raise RuntimeError("injected postpublication output failure")
+
         with monkeypatch.context() as fault:
             fault.setattr(FunctionMath, "output", reject_output)
             with pytest.raises(StateSettlementError) as failed:
@@ -230,7 +290,8 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(
             assert latest[owner].version_id == step_id + 1
             root = execution.snapshot(latest[owner])
             state = optimizer.state[parameters[owner]]
-            for actual, expected in zip(root,
+            for actual, expected in zip(
+                root,
                 (parameters[owner], parameters[owner].grad, state["step"], state["exp_avg"], state["exp_avg_sq"]),
                 strict=True,
             ):
@@ -275,39 +336,57 @@ def _ordinary_request_distillation() -> None:
     from pllm.execution.runtime_facts import RuntimeFacts
 
     class Distillation(pllm.Workload):
-        heads = pllm.RequestState({"weight": lambda m: (m.hidden_size, m.hidden_size)},
-            optimizer=pllm.AdamW(lr=0.03, weight_decay=0.1), keys=(RequestKeyField.PROMPT_IDX, RequestKeyField.SAMPLE_IDX),
-            memory={"carry": lambda m: (m.hidden_size,)})
+        heads = pllm.RequestState(
+            {"weight": lambda m: (m.hidden_size, m.hidden_size)},
+            optimizer=pllm.AdamW(lr=0.03, weight_decay=0.1),
+            keys=(RequestKeyField.PROMPT_IDX, RequestKeyField.SAMPLE_IDX),
+            memory={"carry": lambda m: (m.hidden_size,)},
+        )
 
         def ready(self, versions: Annotated[torch.Tensor, pllm.StateVersion("heads")]) -> torch.Tensor:
             return versions > 0
 
         @pllm.on(pllm.Phase.BEFORE_SAMPLE, rows="ready")
         @pllm.guide_sampling(beta=0.2)
-        def predict(self, source: Annotated[torch.Tensor, pllm.Hidden(0)],
-                    weight: Annotated[torch.Tensor, pllm.Parameter("heads", "weight")],
-                    versions: Annotated[torch.Tensor, pllm.StateVersion("heads")]) -> torch.Tensor:
+        def predict(
+            self,
+            source: Annotated[torch.Tensor, pllm.Hidden(0)],
+            weight: Annotated[torch.Tensor, pllm.Parameter("heads", "weight")],
+            versions: Annotated[torch.Tensor, pllm.StateVersion("heads")],
+        ) -> torch.Tensor:
             return torch.bmm(source.unsqueeze(1), weight).squeeze(1)
 
         @pllm.on(pllm.Phase.AFTER_SAMPLE)
         @pllm.train(state="heads", reduction="state_mean")
-        def train(self, source: Annotated[torch.Tensor, pllm.Hidden(0), pllm.Capture("heads", "carry")],
-                  target: Annotated[torch.Tensor, pllm.Hidden(-1)],
-                  weight: Annotated[torch.Tensor, pllm.Parameter("heads", "weight")],
-                  carry: Annotated[torch.Tensor, pllm.Parameter("heads", "carry")],
-                  groups: Annotated[torch.Tensor, pllm.StateIndex("heads")]) -> torch.Tensor:
+        def train(
+            self,
+            source: Annotated[torch.Tensor, pllm.Hidden(0), pllm.Capture("heads", "carry")],
+            target: Annotated[torch.Tensor, pllm.Hidden(-1)],
+            weight: Annotated[torch.Tensor, pllm.Parameter("heads", "weight")],
+            carry: Annotated[torch.Tensor, pllm.Parameter("heads", "carry")],
+            groups: Annotated[torch.Tensor, pllm.StateIndex("heads")],
+        ) -> torch.Tensor:
             prediction = torch.bmm(source.unsqueeze(1), weight).squeeze(1) + carry
             losses = (prediction - target).square().mean(1)
             counts = torch.bincount(groups).to(losses)
             return losses.new_zeros(counts.shape).index_add(0, groups, losses) / counts
 
-    bindings = tuple(PackedHiddenResourceBinding(str(layer), HiddenLayerKind.INDEX,
-        HiddenSite.BLOCK_OUTPUT, f"model.layers[{layer}]") for layer in (0, -1))
+    bindings = tuple(
+        PackedHiddenResourceBinding(
+            str(layer), HiddenLayerKind.INDEX, HiddenSite.BLOCK_OUTPUT, f"model.layers[{layer}]"
+        )
+        for layer in (0, -1)
+    )
     for device_name in ("cpu", "cuda:0") if torch.cuda.is_available() else ("cpu",):
         device = torch.device(device_name)
         stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
-        facts = backend_facts(4, bindings, RuntimeFacts(device).timeline(),
-            PageBundleProviderFacts("test.plain@1", 9, StateDeviceKind(device.type)), max_lineages=3)
+        facts = backend_facts(
+            4,
+            bindings,
+            RuntimeFacts(device).timeline(),
+            PageBundleProviderFacts("test.plain@1", 9, StateDeviceKind(device.type)),
+            max_lineages=3,
+        )
         workload = Distillation()
         deployment = workload.compile_backend(facts)
         execution = deployment.execution
@@ -322,22 +401,49 @@ def _ordinary_request_distillation() -> None:
         # Cross-step memory: carries hold each lineage's last published capture; step 0 reads zeros.
         carries = [torch.zeros(4, device=device) for _ in identities]
         for step_id, owners in enumerate(((0, 1, 0), (2, 0, 0))):
-            rows = PackedPhaseRowBatch(1, step_id, 3, tuple(PackedPhaseRow(i, i, step_id,
-                HiddenPhase.DECODE, identities[owner]) for i, owner in enumerate(owners)))
+            rows = PackedPhaseRowBatch(
+                1,
+                step_id,
+                3,
+                tuple(
+                    PackedPhaseRow(i, i, step_id, HiddenPhase.DECODE, identities[owner])
+                    for i, owner in enumerate(owners)
+                ),
+            )
             order = (2, 0, 1)
             sampler = PackedSamplerRowBatch(rows, tuple(PackedSamplerRowLink(i, row) for i, row in enumerate(order)))
-            value = TensorStepInput(rows, sampler, PackedHiddenSnapshotBatch(rows,
-                tuple(sorted((PackedHiddenSnapshot(bindings[0], source), PackedHiddenSnapshot(bindings[1], target)),
-                    key=lambda item: item.resource.locator_key))),
-                hidden_readiness=None if stream is None else CudaStreamReadiness(stream))
+            value = TensorStepInput(
+                rows,
+                sampler,
+                PackedHiddenSnapshotBatch(
+                    rows,
+                    tuple(
+                        sorted(
+                            (PackedHiddenSnapshot(bindings[0], source), PackedHiddenSnapshot(bindings[1], target)),
+                            key=lambda item: item.resource.locator_key,
+                        )
+                    ),
+                ),
+                hidden_readiness=None if stream is None else CudaStreamReadiness(stream),
+            )
             active_links = tuple(link for link in sampler.links if latest[owners[link.packed_row_index]].version_id > 0)
-            expected = (torch.stack(tuple(source[link.packed_row_index] @ weights[owners[link.packed_row_index]].detach()
-                for link in active_links)) if active_links else source.new_empty((0, 4)))
+            expected = (
+                torch.stack(
+                    tuple(
+                        source[link.packed_row_index] @ weights[owners[link.packed_row_index]].detach()
+                        for link in active_links
+                    )
+                )
+                if active_links
+                else source.new_empty((0, 4))
+            )
             result = execution.step(value, stream)
             assert result.guidance.affected_row_ids == tuple(link.sampler_row_index for link in active_links)
             assert result.guidance.beta == 0.2
             torch.testing.assert_close(result.guidance.values, expected)
-            for before, after, loss in zip(result.publication.before_refs, result.publication.after_refs, result.loss, strict=True):
+            for before, after, loss in zip(
+                result.publication.before_refs, result.publication.after_refs, result.loss, strict=True
+            ):
                 owner = latest.index(before)
                 selected = [index for index, selected_owner in enumerate(owners) if selected_owner == owner]
                 optimizer = optimizers[owner]
@@ -349,9 +455,18 @@ def _ordinary_request_distillation() -> None:
                 state = optimizer.state[weights[owner]]
                 # Each lineage's memory receives its last selected row's captured source.
                 carries[owner] = source[selected[-1]].clone()
-                for actual, expected_field in zip(execution.snapshot(after, stream), (weights[owner].flatten(),
-                    weights[owner].grad.flatten(), state["step"].to(device), state["exp_avg"].flatten(),
-                    state["exp_avg_sq"].flatten(), carries[owner]), strict=True):
+                for actual, expected_field in zip(
+                    execution.snapshot(after, stream),
+                    (
+                        weights[owner].flatten(),
+                        weights[owner].grad.flatten(),
+                        state["step"].to(device),
+                        state["exp_avg"].flatten(),
+                        state["exp_avg_sq"].flatten(),
+                        carries[owner],
+                    ),
+                    strict=True,
+                ):
                     torch.testing.assert_close(actual, expected_field)
                 latest[owner] = after
         for ref in initial:
@@ -367,46 +482,107 @@ def _esamp_native_oracle(monkeypatch, device, explicit=False):
     from pllm.execution.cuda_stream import CudaStreamReadiness
 
     stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
-    bindings = tuple(PackedHiddenResourceBinding(str(layer), HiddenLayerKind.INDEX,
-        HiddenSite.BLOCK_OUTPUT, f"model.layers[{layer}]") for layer in (0, -1))
-    for paged, normalized, captured in ((False, False, False), (False, True, False),
-            *(((True, False, False), (True, True, False), (True, True, True)) if device.type == "cuda" and not explicit else ())):
-        config = ESampRequestConfig(rank=4, paged=paged, output_layernorm=normalized,
-            intervention=True, intervention_beta=0.2, learning_rate=0.03, weight_decay=0.1)
+    bindings = tuple(
+        PackedHiddenResourceBinding(
+            str(layer), HiddenLayerKind.INDEX, HiddenSite.BLOCK_OUTPUT, f"model.layers[{layer}]"
+        )
+        for layer in (0, -1)
+    )
+    for paged, normalized, captured in (
+        (False, False, False),
+        (False, True, False),
+        *(
+            ((True, False, False), (True, True, False), (True, True, True))
+            if device.type == "cuda" and not explicit
+            else ()
+        ),
+    ):
+        config = ESampRequestConfig(
+            rank=4,
+            paged=paged,
+            output_layernorm=normalized,
+            intervention=True,
+            intervention_beta=0.2,
+            learning_rate=0.03,
+            weight_decay=0.1,
+        )
         workload = ESampRequestWorkload(config)
-        timeline = SchedulerTimeline(tuple(TimelineAnchor(AnchorSymbol(name), index) for index, name in enumerate((
-            "model.execute", "sampler.pre_draw", "token.commit", "next.prepare"))),
-            (f"compute/{device.type}@1", f"state/dense_page_{device.type}@1"))
-        facts = backend_facts(8, bindings, timeline, PageBundleProviderFacts("test.paged@1", 8,
-            StateDeviceKind(device.type), 0), max_lineages=3, memory_bytes=100000)
-        facts = workload.specialize(facts, ExecutionOptions(capture=captured,
-            capture_memory_bytes=16 * 1024**2, explicit_math=explicit))
+        timeline = SchedulerTimeline(
+            tuple(
+                TimelineAnchor(AnchorSymbol(name), index)
+                for index, name in enumerate(("model.execute", "sampler.pre_draw", "token.commit", "next.prepare"))
+            ),
+            (f"compute/{device.type}@1", f"state/dense_page_{device.type}@1"),
+        )
+        facts = backend_facts(
+            8,
+            bindings,
+            timeline,
+            PageBundleProviderFacts("test.paged@1", 8, StateDeviceKind(device.type), 0),
+            max_lineages=3,
+            memory_bytes=100000,
+        )
+        facts = workload.specialize(
+            facts, ExecutionOptions(capture=captured, capture_memory_bytes=16 * 1024**2, explicit_math=explicit)
+        )
         timeline = facts.timeline
         with pytest.raises(ValueError, match="workspace"):
-            workload.compile_backend(replace(facts, timeline=replace(timeline, task_resources=tuple(
-                replace(item, workspace_bytes=0) if item.task == "loss" else item for item in timeline.task_resources))))
+            workload.compile_backend(
+                replace(
+                    facts,
+                    timeline=replace(
+                        timeline,
+                        task_resources=tuple(
+                            replace(item, workspace_bytes=0) if item.task == "loss" else item
+                            for item in timeline.task_resources
+                        ),
+                    ),
+                )
+            )
         with pytest.raises(ValueError, match="output storage"):
-            workload.compile_backend(replace(facts, timeline=replace(timeline,
-                value_resources=tuple(replace(item, bytes=0) for item in timeline.value_resources))))
+            workload.compile_backend(
+                replace(
+                    facts,
+                    timeline=replace(
+                        timeline, value_resources=tuple(replace(item, bytes=0) for item in timeline.value_resources)
+                    ),
+                )
+            )
         if (paged or explicit) and not captured:
+
             def modified_forward(self, source, up, gate, down, bias, scale, shift):
                 return source + shift
+
             with monkeypatch.context() as changed:
                 changed.setattr(ESampRequestWorkload, "forward", modified_forward)
                 with pytest.raises(ValueError, match="customized mathematics"):
                     workload.compile_backend(facts)
             with monkeypatch.context() as changed:
-                changed.setitem(ESampRequestWorkload.predict.__annotations__, "source",
-                    Annotated[torch.Tensor, pllm.Hidden(-1)])
+                changed.setitem(
+                    ESampRequestWorkload.predict.__annotations__, "source", Annotated[torch.Tensor, pllm.Hidden(-1)]
+                )
                 with pytest.raises(ValueError, match="customized mathematics"):
                     workload.compile_backend(facts)
         declaration = workload.declaration(facts)
-        plan = compile_page_bundle_plan((declaration.graph, declaration.layouts), timeline, facts.providers,
-            facts.max_admitted_lineages, facts.state_memory_budget_bytes, device)
-        assert next(task for task in plan.semantic_graph.tasks if task.symbol == "loss").outputs[0].kind is SemanticOutputKind.HOST
-        workload.plan_backend(replace(facts, timeline=replace(timeline, memory_budget_bytes=plan.schedule_decision.peak_memory_bytes)))
+        plan = compile_page_bundle_plan(
+            (declaration.graph, declaration.layouts),
+            timeline,
+            facts.providers,
+            facts.max_admitted_lineages,
+            facts.state_memory_budget_bytes,
+            device,
+        )
+        assert (
+            next(task for task in plan.semantic_graph.tasks if task.symbol == "loss").outputs[0].kind
+            is SemanticOutputKind.HOST
+        )
+        workload.plan_backend(
+            replace(facts, timeline=replace(timeline, memory_budget_bytes=plan.schedule_decision.peak_memory_bytes))
+        )
         with pytest.raises(ValueError):
-            workload.plan_backend(replace(facts, timeline=replace(timeline, memory_budget_bytes=plan.state_physical.reserved_bytes)))
+            workload.plan_backend(
+                replace(facts, timeline=replace(timeline, memory_budget_bytes=plan.state_physical.reserved_bytes))
+            )
         execution = workload.bind_math(facts, plan).bind(PageBundleArena(plan), AnchorId(1))
         identities = tuple(RequestIdentity(str(i), i, 0) for i in range(3))
         initial = execution.admit(identities, stream)
@@ -414,9 +590,16 @@ def _esamp_native_oracle(monkeypatch, device, explicit=False):
         with nullcontext() if stream is None else torch.cuda.stream(stream):
             parameters = [execution.snapshot(ref, stream)[0].requires_grad_() for ref in initial]
             originals = [parameter.detach().clone() for parameter in parameters]
-            optimizers = [torch.optim.AdamW((parameter,), lr=config.learning_rate, weight_decay=config.weight_decay,
-                capturable=stream is not None, foreach=True)
-                for parameter in parameters]
+            optimizers = [
+                torch.optim.AdamW(
+                    (parameter,),
+                    lr=config.learning_rate,
+                    weight_decay=config.weight_decay,
+                    capturable=stream is not None,
+                    foreach=True,
+                )
+                for parameter in parameters
+            ]
             source = torch.linspace(-0.7, 0.9, 48, device=device).view(3, 16)[:, ::2]
             target = source.flip(1) * 0.7
 
@@ -428,37 +611,73 @@ def _esamp_native_oracle(monkeypatch, device, explicit=False):
                 return F.layer_norm(y, (8,)) * p[:, 100:108] + p[:, 108:] if normalized else y
 
             for step_id, owners in enumerate(((1, 0, 1), (0,))):
-                rows = PackedPhaseRowBatch(1, step_id, len(owners), tuple(PackedPhaseRow(i, i, step_id,
-                    HiddenPhase.DECODE, identities[owner]) for i, owner in enumerate(owners)))
-                values = {bindings[0]: source[:len(owners)], bindings[1]: target[:len(owners)]}
-                value = TensorStepInput(rows, PackedSamplerRowBatch(rows, tuple(PackedSamplerRowLink(i, i)
-                    for i in range(len(owners)))), PackedHiddenSnapshotBatch(rows, tuple(PackedHiddenSnapshot(key, values[key])
-                        for key in sorted(bindings, key=lambda item: item.locator_key))),
-                    hidden_readiness=None if stream is None else CudaStreamReadiness(stream))
+                rows = PackedPhaseRowBatch(
+                    1,
+                    step_id,
+                    len(owners),
+                    tuple(
+                        PackedPhaseRow(i, i, step_id, HiddenPhase.DECODE, identities[owner])
+                        for i, owner in enumerate(owners)
+                    ),
+                )
+                values = {bindings[0]: source[: len(owners)], bindings[1]: target[: len(owners)]}
+                value = TensorStepInput(
+                    rows,
+                    PackedSamplerRowBatch(rows, tuple(PackedSamplerRowLink(i, i) for i in range(len(owners)))),
+                    PackedHiddenSnapshotBatch(
+                        rows,
+                        tuple(
+                            PackedHiddenSnapshot(key, values[key])
+                            for key in sorted(bindings, key=lambda item: item.locator_key)
+                        ),
+                    ),
+                    hidden_readiness=None if stream is None else CudaStreamReadiness(stream),
+                )
                 if step_id == 0:
                     excess = replace(rows, total_rows=4, rows=(*rows.rows, replace(rows.rows[0], packed_row_index=3)))
                     with pytest.raises(ValueError, match="signed workspace envelope"):
-                        execution.start_step(replace(value, rows=excess,
-                            sampler_rows=PackedSamplerRowBatch(excess, tuple(PackedSamplerRowLink(i, i) for i in range(4))),
-                            hidden=PackedHiddenSnapshotBatch(excess, tuple(PackedHiddenSnapshot(snapshot.resource,
-                                torch.cat((snapshot.hidden, snapshot.hidden[:1]))) for snapshot in value.hidden.snapshots))), stream)
+                        execution.start_step(
+                            replace(
+                                value,
+                                rows=excess,
+                                sampler_rows=PackedSamplerRowBatch(
+                                    excess, tuple(PackedSamplerRowLink(i, i) for i in range(4))
+                                ),
+                                hidden=PackedHiddenSnapshotBatch(
+                                    excess,
+                                    tuple(
+                                        PackedHiddenSnapshot(
+                                            snapshot.resource, torch.cat((snapshot.hidden, snapshot.hidden[:1]))
+                                        )
+                                        for snapshot in value.hidden.snapshots
+                                    ),
+                                ),
+                            ),
+                            stream,
+                        )
                 for optimizer in optimizers:
                     optimizer.zero_grad()
-                expected_prediction = reference(source[:len(owners)], torch.stack([parameters[owner] for owner in owners]))
-                row_losses = (expected_prediction - target[:len(owners)]).square().mean(1)
-                expected_losses = {owner: row_losses[[i for i, key in enumerate(owners) if key == owner]].mean()
-                    for owner in set(owners)}
+                expected_prediction = reference(
+                    source[: len(owners)], torch.stack([parameters[owner] for owner in owners])
+                )
+                row_losses = (expected_prediction - target[: len(owners)]).square().mean(1)
+                expected_losses = {
+                    owner: row_losses[[i for i, key in enumerate(owners) if key == owner]].mean()
+                    for owner in set(owners)
+                }
                 sum(expected_losses.values()).backward()
                 invocation = execution.start_step(value, stream)
                 assert not invocation.context.results
                 execution.cancel_step(invocation)
                 saved_sources = []
                 saved_shapes = []
+
                 def save(tensor):
                     saved_shapes.append(tuple(tensor.shape))
                     if tensor.shape == (len(owners), 1, 8):
                         saved_sources.append(tensor.untyped_storage().data_ptr())
                     return tensor
+
                 with torch.autograd.graph.saved_tensors_hooks(save, lambda tensor: tensor):
                     result = execution.step(value, stream)
                 if not paged and not captured and not explicit:
@@ -476,10 +695,26 @@ def _esamp_native_oracle(monkeypatch, device, explicit=False):
                     optimizer.step()
                     state = optimizer.state[parameters[owner]]
                     actual = execution.snapshot(ref, stream)
-                    for tensor, target_value in zip(actual, (parameters[owner], parameters[owner].grad,
-                        state["step"].to(device), state["exp_avg"], state["exp_avg_sq"]), strict=True):
-                        torch.testing.assert_close(tensor, target_value, rtol=1e-4, atol=1e-6,
-                            msg=lambda message: f"paged={paged}, normalized={normalized}, captured={captured}, step={step_id}: {message}")
+                    for tensor, target_value in zip(
+                        actual,
+                        (
+                            parameters[owner],
+                            parameters[owner].grad,
+                            state["step"].to(device),
+                            state["exp_avg"],
+                            state["exp_avg_sq"],
+                        ),
+                        strict=True,
+                    ):
+                        torch.testing.assert_close(
+                            tensor,
+                            target_value,
+                            rtol=1e-4,
+                            atol=1e-6,
+                            msg=lambda message: (
+                                f"paged={paged}, normalized={normalized}, captured={captured}, step={step_id}: {message}"
+                            ),
+                        )
             for ref, expected in zip(initial, originals, strict=True):
                 torch.testing.assert_close(execution.arena.snapshot(old_pin, ref)[0], expected, rtol=0, atol=0)
         execution.arena.wait_release(execution.arena.release_pin(old_pin))

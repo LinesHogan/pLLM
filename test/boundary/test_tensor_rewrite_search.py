@@ -1,17 +1,21 @@
 """Bounded multi-step mathematics retains evidence and real storage costs."""
 
-from dataclasses import replace
 import warnings
+from dataclasses import replace
 
 import pytest
 import torch
 
 from pllm.config import ExecutionOptions
-from pllm.contracts.tensor_rewrite import MatmulReassociation
-from pllm.execution.codec import tensor_graph_structure_digest, tensor_graph_expression_digest
-from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
-from pllm.execution.region_optimization import optimize_region, PreparedRegionCandidate, bind_region_candidate, assess_region_candidates
 from pllm.contracts.region_selection import RegionPayloadLimit
+from pllm.contracts.tensor_rewrite import MatmulReassociation
+from pllm.execution.codec import tensor_graph_expression_digest, tensor_graph_structure_digest
+from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
+from pllm.execution.region_optimization import (
+    PreparedRegionCandidate,
+    bind_region_candidate,
+    optimize_region,
+)
 from pllm.execution.tensor_access import profile_tensor_memory
 from pllm.execution.tensor_rewrites import TensorRewritePath, explore_tensor_combinations, replay_tensor_rewrites
 from test.boundary.test_region_native_capacity import single_call
@@ -19,17 +23,22 @@ from test.boundary.test_region_native_capacity import single_call
 
 def reassociation_paths(source: ExportedCell, **kwargs) -> tuple[TensorRewritePath[MatmulReassociation], ...]:
     """Multi-step reassociation search through the general explore/replay door."""
-    return tuple(TensorRewritePath(replay_tensor_rewrites(source, rs), rs)
-                 for rs in explore_tensor_combinations((source,), **kwargs)
-                 if all(isinstance(r, MatmulReassociation) for r in rs))
+    return tuple(
+        TensorRewritePath(replay_tensor_rewrites(source, rs), rs)
+        for rs in explore_tensor_combinations((source,), **kwargs)
+        if all(isinstance(r, MatmulReassociation) for r in rs)
+    )
 
 
 def example(device="cpu", balanced=False):
     tensors = tuple(torch.ones(shape, dtype=torch.float64, device=device) for shape in ((4, 2), (2, 8), (8, 4), (4, 2)))
+
     def chain(a, b, c, d):
         return (((a @ b) @ c) @ d,)
+
     def tree(a, b, c, d):
         return ((a @ b) @ (c @ d),)
+
     cell = ExportedCell.capture(tree if balanced else chain, ("a", "b", "c", "d"), ("out",), tensors)
     return cell, tensors
 
@@ -38,8 +47,10 @@ def example(device="cpu", balanced=False):
 def test_search_deduplicates_inverse_cycles_and_preserves_the_original_graph(balanced):
     source, _ = example(balanced=balanced)
     original = str(source.graph.graph)
+
     def forbidden(*args):
         raise AssertionError("search must not execute user mathematics")
+
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         paths = reassociation_paths(replace(source, function=forbidden), max_depth=6, max_candidates=32)
@@ -48,7 +59,9 @@ def test_search_deduplicates_inverse_cycles_and_preserves_the_original_graph(bal
     # Different orders for independent products can remain physical candidates.
     assert len({tensor_graph_expression_digest(p.cell.graph) for p in paths}) == 4
     assert len({tensor_graph_structure_digest(p.cell.graph) for p in paths}) == len(paths)
-    assert all(tensor_graph_expression_digest(p.cell.graph) != tensor_graph_expression_digest(source.graph) for p in paths)
+    assert all(
+        tensor_graph_expression_digest(p.cell.graph) != tensor_graph_expression_digest(source.graph) for p in paths
+    )
     assert len(paths) < 32
     assert source.transformations == () and str(source.graph.graph) == original
     assert any(len(p.rewrites) == 2 for p in paths)
@@ -70,8 +83,7 @@ def test_depth_and_candidate_budgets_do_not_greedily_prune_by_local_cost():
 
 def test_two_step_search_crosses_a_local_compute_and_memory_minimum():
     tensors = tuple(torch.ones(shape, dtype=torch.float64) for shape in ((1, 1), (1, 3), (3, 4), (4, 2)))
-    source = ExportedCell.capture(lambda a, b, c, d: (((a @ b) @ c) @ d,),
-        ("a", "b", "c", "d"), ("out",), tensors)
+    source = ExportedCell.capture(lambda a, b, c, d: (((a @ b) @ c) @ d,), ("a", "b", "c", "d"), ("out",), tensors)
     before = profile_tensor_memory(source).devices[0].peak_new_tensor_bytes
     shallow = reassociation_paths(source, max_depth=1)
     assert len(shallow) == 2
@@ -102,18 +114,27 @@ def test_every_step_replays_and_final_access_graph_is_recomputed(device):
         replayed = replay_tensor_rewrites(source, path.rewrites)
         assert str(replayed.graph.graph) == str(path.cell.graph.graph)
         assert replayed.declaration == source.declaration
-        torch.testing.assert_close(replayed(*tensors)[0], tensors[0] @ tensors[1] @ tensors[2] @ tensors[3], rtol=0, atol=0)
+        torch.testing.assert_close(
+            replayed(*tensors)[0], tensors[0] @ tensors[1] @ tensors[2] @ tensors[3], rtol=0, atol=0
+        )
         assert profile_tensor_memory(replayed) == profile_tensor_memory(path.cell)
-    assert min(profile_tensor_memory(p.cell).devices[0].peak_new_tensor_bytes for p in paths) < original.devices[0].peak_new_tensor_bytes
+    assert (
+        min(profile_tensor_memory(p.cell).devices[0].peak_new_tensor_bytes for p in paths)
+        < original.devices[0].peak_new_tensor_bytes
+    )
 
 
 def test_missing_reordered_duplicated_or_forged_steps_cannot_replay():
     source, _ = example()
     path = next(p for p in reassociation_paths(source) if len(p.rewrites) == 2)
     first, second = path.rewrites
-    for records in ((second,), (second, first), (first, first),
-                    (first, replace(second, input_graph_digest=first.input_graph_digest)),
-                    (first, replace(second, after=replace(second.after, flops=0)))):
+    for records in (
+        (second,),
+        (second, first),
+        (first, first),
+        (first, replace(second, input_graph_digest=first.input_graph_digest)),
+        (first, replace(second, after=replace(second.after, flops=0))),
+    ):
         with pytest.raises(ValueError, match="source"):
             replay_tensor_rewrites(source, records)
     with pytest.raises(ValueError, match="original exported"):
@@ -122,9 +143,11 @@ def test_missing_reordered_duplicated_or_forged_steps_cannot_replay():
 
 def test_multistep_search_preserves_functional_mutation_and_returned_views():
     tensors = (*example()[1], torch.zeros(4, 2, dtype=torch.float64))
+
     def update(a, b, c, d, state):
         state.copy_(((a @ b) @ c) @ d)
         return state, state[:1]
+
     source = ExportedCell.capture(update, ("a", "b", "c", "d", "state"), ("new", "view"), tensors)
     path = next(p for p in reassociation_paths(source) if len(p.rewrites) == 2)
     replayed = replay_tensor_rewrites(source, path.rewrites)
@@ -139,26 +162,50 @@ def test_multistep_search_preserves_functional_mutation_and_returned_views():
 
 def test_native_selection_binds_the_whole_selected_chain_and_rejects_a_prefix(monkeypatch):
     import pllm.execution.region_optimization as tuning
+
     source, tensors = example()
     inputs = dict(zip(("in0", "in1", "in2", "in3"), tensors))
+
     def measure(execution, *args):
         cell = execution._cells[source.digest]
         return 1 if len(cell.transformations) == 2 else 100
+
     monkeypatch.setattr(tuning, "_measure", measure)
     with pytest.warns(NumericalTransformWarning):
-        selected = optimize_region(single_call(source), {source.digest: source}, inputs,
-            payload_limits=(RegionPayloadLimit("cpu", 10000),), options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"),
-            warmup_rounds=0, measurement_rounds=1)
+        selected = optimize_region(
+            single_call(source),
+            {source.digest: source},
+            inputs,
+            payload_limits=(RegionPayloadLimit("cpu", 10000),),
+            options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"),
+            warmup_rounds=0,
+            measurement_rounds=1,
+        )
     assert len(selected.rewrites) == 2
     partial = replay_tensor_rewrites(source, selected.rewrites[:1])
     with pytest.raises(ValueError, match="admitted imports"):
-        bind_region_candidate(PreparedRegionCandidate(single_call(source), selected.request.candidates[selected.selection.selected],
-            selected.rewrites[:1], {source.digest: partial}), selected.request.payload_limits, selected.selection.candidates[selected.selection.selected])
-    actual, = selected.execution.run(inputs).values
+        bind_region_candidate(
+            PreparedRegionCandidate(
+                single_call(source),
+                selected.request.candidates[selected.selection.selected],
+                selected.rewrites[:1],
+                {source.digest: partial},
+            ),
+            selected.request.payload_limits,
+            selected.selection.candidates[selected.selection.selected],
+        )
+    (actual,) = selected.execution.run(inputs).values
     torch.testing.assert_close(actual, tensors[0] @ tensors[1] @ tensors[2] @ tensors[3], rtol=0, atol=0)
     for depth, expected_candidates in ((0, 1), (1, 3)):
-        limited = optimize_region(single_call(source), {source.digest: source}, inputs,
-            payload_limits=(RegionPayloadLimit("cpu", 10000),), options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"),
-            warmup_rounds=0, measurement_rounds=1, max_rewrite_depth=depth)
+        limited = optimize_region(
+            single_call(source),
+            {source.digest: source},
+            inputs,
+            payload_limits=(RegionPayloadLimit("cpu", 10000),),
+            options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"),
+            warmup_rounds=0,
+            measurement_rounds=1,
+            max_rewrite_depth=depth,
+        )
         assert len(limited.request.candidates) == expected_candidates
         assert limited.rewrites == ()  # All measured times tie without depth two.

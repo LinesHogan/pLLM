@@ -13,9 +13,9 @@ from vllm.config.compilation import CompilationMode
 from vllm.model_executor.models.qwen2 import Qwen2MLP
 
 from pllm.backends.vllm.region_kernels import bind_vllm_tensor_kernel
-from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.region_composition import inline_region
 from pllm.contracts.region_program import Block, Region, Value
+from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.region_selection import RegionPayloadLimit, RegionSelectionPolicy
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.exported_region import import_exported_region
@@ -32,20 +32,27 @@ def test_import_retains_torch_state_update_signature_without_implicit_publicatio
         def __init__(self):
             super().__init__()
             self.register_buffer("counter", torch.arange(4, dtype=torch.float32))
+
         def forward(self, x):
             self.counter.add_(1)
             x.mul_(2)
             return x + self.counter
+
     module = Stateful()
     x = torch.arange(4, dtype=torch.float32)
     old = module.counter.clone(), x.clone()
     exported = torch.export.export(module, (x,))
+
     def forbidden(partition):
         raise AssertionError("ordinary functional ATen must not need a native backend")
+
     imported = import_exported_region(exported, bind_kernel=forbidden)
     program, sources = imported.program, imported.functions
     assert tuple(spec.kind for spec in imported.signature.output_specs) == (
-        OutputKind.BUFFER_MUTATION, OutputKind.USER_INPUT_MUTATION, OutputKind.USER_OUTPUT)
+        OutputKind.BUFFER_MUTATION,
+        OutputKind.USER_INPUT_MUTATION,
+        OutputKind.USER_OUTPUT,
+    )
     schedule = analyze_region_program(program, optimize=False).reference_schedule
     imports = import_region_functions(program, sources)
     proposal = RegionScheduleProposal(analyze_region_payload(program, schedule, imports))
@@ -82,9 +89,17 @@ def test_original_qwen_export_retains_swiglu_and_enters_measured_selection(dtype
         y_port = Value("y", next(value.type for value in arguments if value.name == "x"))
         first = inline_region(program, arguments, "first")
         second = inline_region(program, tuple(y_port if value.name == "x" else value for value in arguments), "second")
-        program = replace(program, entry=Region(Block((*arguments, y_port), (*first.operations, *second.operations),
-            tuple(value.name for value in (*first.results, *second.results)))))
-        native, = (cell for cell in sources.values() if isinstance(cell, FunctionalKernelPrimitive))
+        program = replace(
+            program,
+            entry=Region(
+                Block(
+                    (*arguments, y_port),
+                    (*first.operations, *second.operations),
+                    tuple(value.name for value in (*first.results, *second.results)),
+                )
+            ),
+        )
+        (native,) = (cell for cell in sources.values() if isinstance(cell, FunctionalKernelPrimitive))
         assert sum(isinstance(cell, ExportedCell) for cell in sources.values()) == 2
         assert native.implementation is not None and not native.declaration.resources
         # auto_functionalized_v2 allocates the result base. The original graph
@@ -103,15 +118,21 @@ def test_original_qwen_export_retains_swiglu_and_enters_measured_selection(dtype
         inputs = {**dict(model.named_parameters()), "x": x, "y": y}
         before = {name: value.clone() for name, value in inputs.items()}
         expected = model(x), model(y)
-        with patch("pllm.execution.region_native.copy_data", side_effect=AssertionError("redundant kernel wrapper copy")):
+        with patch(
+            "pllm.execution.region_native.copy_data", side_effect=AssertionError("redundant kernel wrapper copy")
+        ):
             for actual, reference in zip(original.run(inputs).values, expected, strict=True):
                 torch.testing.assert_close(actual, reference, rtol=0, atol=0)
         assert all(device.call_scratch_bytes_upper_bound == 0 for device in payload.capacity.devices)
         alias = deepcopy(native.graph)
         output = next(node for node in alias.graph.nodes if node.op == "output")
-        argument = next(node for node, type_ in zip(
-            (node for node in alias.graph.nodes if node.op == "placeholder"), native.declaration.inputs, strict=True)
-            if type_ == native.declaration.outputs[0])
+        argument = next(
+            node
+            for node, type_ in zip(
+                (node for node in alias.graph.nodes if node.op == "placeholder"), native.declaration.inputs, strict=True
+            )
+            if type_ == native.declaration.outputs[0]
+        )
         output.args = ((argument,),)
         alias.recompile()
         with pytest.raises(ValueError, match="own distinct complete backings"):
@@ -125,15 +146,26 @@ def test_original_qwen_export_retains_swiglu_and_enters_measured_selection(dtype
         with pytest.raises(ValueError, match="copying kernel ABI"):
             NativePrimitive(native.declaration, lambda values, resources: values, native.implementation)
         with pytest.raises(ValueError, match="include every owned result"):
-            analyze_region_payload(program, schedule, tuple(
-                replace(item, allocations=()) if item == native.implementation else item for item in imports))
+            analyze_region_payload(
+                program,
+                schedule,
+                tuple(replace(item, allocations=()) if item == native.implementation else item for item in imports),
+            )
         streams = RegionStreamBindings(torch.cuda.Stream(), (torch.cuda.Stream(),))
         streams.owner.wait_stream(torch.cuda.current_stream())
         # The test assesses source scheduling. Numerical rewrites have their
         # own fixed-tolerance tests; no tolerance changes hide a source mismatch.
-        selected = optimize_region(program, sources, inputs, payload_limits=(RegionPayloadLimit("cuda:0", 1 << 20),),
-            options=replace(RegionSelectionPolicy(allow_numerical_transforms=False), tuning="measured"), streams=streams,
-            warmup_rounds=1, measurement_rounds=1, max_candidates=2)
+        selected = optimize_region(
+            program,
+            sources,
+            inputs,
+            payload_limits=(RegionPayloadLimit("cuda:0", 1 << 20),),
+            options=replace(RegionSelectionPolicy(allow_numerical_transforms=False), tuning="measured"),
+            streams=streams,
+            warmup_rounds=1,
+            measurement_rounds=1,
+            max_candidates=2,
+        )
         assert len(selected.request.candidates) == 2
         assert all(candidate.elapsed_ns for candidate in selected.request.candidates)
         result = selected.execution.run(inputs, streams=streams).values
@@ -149,5 +181,14 @@ def test_original_qwen_export_retains_swiglu_and_enters_measured_selection(dtype
         for actual, reference in zip(original.run({**changed, "x": x, "y": y}).values, expected_changed, strict=True):
             torch.testing.assert_close(actual, reference, rtol=0, atol=0)
         with pytest.raises(ValueError, match="audited pure kernels"):
-            optimize_region(program, {**sources, native.declaration.name: NativePrimitive(native.declaration, lambda values, resources: values)}, inputs,
-                payload_limits=proposal.peak_bytes, max_candidates=1, options=RegionSelectionPolicy(tuning="measured"))
+            optimize_region(
+                program,
+                {
+                    **sources,
+                    native.declaration.name: NativePrimitive(native.declaration, lambda values, resources: values),
+                },
+                inputs,
+                payload_limits=proposal.peak_bytes,
+                max_candidates=1,
+                options=RegionSelectionPolicy(tuning="measured"),
+            )

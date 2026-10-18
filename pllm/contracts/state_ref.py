@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import NewType
 
-
 LayoutId = NewType("LayoutId", int)
 LineageId = NewType("LineageId", int)
 VersionId = NewType("VersionId", int)

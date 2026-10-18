@@ -38,24 +38,8 @@ class RequestStateKey:
             raise ValueError("route state key requires a user-computed route value")
         return cls(
             fields=fields,
-            request_id=(
-                identity.request_id
-                if RequestKeyField.REQUEST_ID in fields
-                else ""
-            ),
-            prompt_idx=(
-                identity.prompt_idx
-                if RequestKeyField.PROMPT_IDX in fields
-                else -1
-            ),
-            sample_idx=(
-                identity.sample_idx
-                if RequestKeyField.SAMPLE_IDX in fields
-                else -1
-            ),
-            route=(
-                identity.route
-                if RequestKeyField.ROUTE in fields
-                else ""
-            ),
+            request_id=(identity.request_id if RequestKeyField.REQUEST_ID in fields else ""),
+            prompt_idx=(identity.prompt_idx if RequestKeyField.PROMPT_IDX in fields else -1),
+            sample_idx=(identity.sample_idx if RequestKeyField.SAMPLE_IDX in fields else -1),
+            route=(identity.route if RequestKeyField.ROUTE in fields else ""),
         )

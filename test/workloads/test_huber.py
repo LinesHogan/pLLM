@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from examples.huber import HuberWorkload
-from pllm.authoring import TensorStepInput, TensorResult
+from pllm.authoring import TensorResult, TensorStepInput
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding, PackedHiddenSnapshot, PackedHiddenSnapshotBatch
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
@@ -14,8 +14,8 @@ from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
-from test.backend_facts import backend_facts
 from test import reference_huber as oracle
+from test.backend_facts import backend_facts
 
 
 def test_huber() -> None:
@@ -27,11 +27,20 @@ def test_huber() -> None:
 def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
     device = torch.device(device_name)
     stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
-    bindings = tuple(PackedHiddenResourceBinding(str(layer), HiddenLayerKind.INDEX,
-        HiddenSite.BLOCK_OUTPUT, f"model.layers[{layer}]") for layer in (0, -1))
-    facts = backend_facts(hidden, bindings, RuntimeFacts(device).timeline(),
+    bindings = tuple(
+        PackedHiddenResourceBinding(
+            str(layer), HiddenLayerKind.INDEX, HiddenSite.BLOCK_OUTPUT, f"model.layers[{layer}]"
+        )
+        for layer in (0, -1)
+    )
+    facts = backend_facts(
+        hidden,
+        bindings,
+        RuntimeFacts(device).timeline(),
         PageBundleProviderFacts("test.huber@1", 12, StateDeviceKind(device.type)),
-        max_lineages=3, memory_bytes=100000)
+        max_lineages=3,
+        memory_bytes=100000,
+    )
     execution = HuberWorkload(rank).compile_backend(facts).execution
     identities = tuple(RequestIdentity(str(i), 0, 0) for i in range(3))
     latest = list(execution.admit(identities, stream))
@@ -52,14 +61,31 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
         count = len(owners)
         source = torch.linspace(-0.8 + step_id * 0.1, 0.9, count * hidden, device=device).reshape(count, hidden)
         target = source.flip(1) * -0.6 + 0.13
-        rows = PackedPhaseRowBatch(1, step_id, count, tuple(PackedPhaseRow(i, i, step_id,
-            HiddenPhase.DECODE, identities[owner]) for i, owner in enumerate(owners)))
-        sampler = PackedSamplerRowBatch(rows, tuple(PackedSamplerRowLink(i, row)
-            for i, row in enumerate(reversed(range(count)))))
-        step = TensorStepInput(rows, sampler, PackedHiddenSnapshotBatch(rows,
-            tuple(sorted((PackedHiddenSnapshot(bindings[0], source), PackedHiddenSnapshot(bindings[1], target)),
-                key=lambda item: item.resource.locator_key))),
-            hidden_readiness=None if stream is None else CudaStreamReadiness(stream))
+        rows = PackedPhaseRowBatch(
+            1,
+            step_id,
+            count,
+            tuple(
+                PackedPhaseRow(i, i, step_id, HiddenPhase.DECODE, identities[owner]) for i, owner in enumerate(owners)
+            ),
+        )
+        sampler = PackedSamplerRowBatch(
+            rows, tuple(PackedSamplerRowLink(i, row) for i, row in enumerate(reversed(range(count))))
+        )
+        step = TensorStepInput(
+            rows,
+            sampler,
+            PackedHiddenSnapshotBatch(
+                rows,
+                tuple(
+                    sorted(
+                        (PackedHiddenSnapshot(bindings[0], source), PackedHiddenSnapshot(bindings[1], target)),
+                        key=lambda item: item.resource.locator_key,
+                    )
+                ),
+            ),
+            hidden_readiness=None if stream is None else CudaStreamReadiness(stream),
+        )
         before = tuple(execution.snapshot(ref, stream) for ref in latest)
         for last_anchor in (0, execution.sampler_anchor_id):
             cancelled = execution.start_step(step, stream)
@@ -73,9 +99,19 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
         active = tuple(link for link in sampler.links if latest[owners[link.packed_row_index]].version_id > 0)
-        predicted = (torch.cat([oracle.predict(source[link.packed_row_index:link.packed_row_index + 1],
-            parameters[owners[link.packed_row_index]]).detach() for link in active])
-            if active else source.new_empty((0, hidden)))
+        predicted = (
+            torch.cat(
+                [
+                    oracle.predict(
+                        source[link.packed_row_index : link.packed_row_index + 1],
+                        parameters[owners[link.packed_row_index]],
+                    ).detach()
+                    for link in active
+                ]
+            )
+            if active
+            else source.new_empty((0, hidden))
+        )
         handle = execution.start_step(step, stream)
         for anchor in range(execution.sampler_anchor_id + 1):
             execution.execute_anchor(handle, AnchorId(anchor))
@@ -91,23 +127,28 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
         execution.complete_sampler(handle, stream)
         pointers = {parameter.untyped_storage().data_ptr() for parameter in handle.context.value.parameters}
         saved_parameters = []
+
         def save(tensor):
             if tensor.shape == (count, rank, hidden):
                 saved_parameters.append((tensor.untyped_storage().data_ptr(), tensor.stride(0)))
             return tensor
+
         with torch.autograd.graph.saved_tensors_hooks(save, lambda tensor: tensor):
             for timeline_anchor in execution.arena.plan.timeline.anchors:
                 if timeline_anchor.ordinal > execution.sampler_anchor_id:
                     execution.execute_anchor(handle, AnchorId(timeline_anchor.ordinal))
         if len(set(owners)) == 1:
-            assert saved_parameters and all(pointer in pointers and (count == 1 or stride == 0)
-                for pointer, stride in saved_parameters)
+            assert saved_parameters and all(
+                pointer in pointers and (count == 1 or stride == 0) for pointer, stride in saved_parameters
+            )
         result = execution.finish_step(handle)
         assert isinstance(result, TensorResult)
         assert handle.context.value is None and handle.context.loss is None
         assert result.publication is not None and result.loss is not None
         assert result.guidance is guidance
-        for old, new, loss in zip(result.publication.before_refs, result.publication.after_refs, result.loss, strict=True):
+        for old, new, loss in zip(
+            result.publication.before_refs, result.publication.after_refs, result.loss, strict=True
+        ):
             owner = latest.index(old)
             selected = [i for i, candidate in enumerate(owners) if candidate == owner]
             pair, optimizer = parameters[owner], optimizers[owner]
@@ -120,10 +161,13 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
             gradient = torch.cat(gradients)
             torch.testing.assert_close(result.parameter_gradients[old], gradient, rtol=1e-4, atol=1e-7)
             state_a, state_b = (optimizer.state[p] for p in pair)
-            expected_fields = (torch.cat([p.flatten() for p in pair]), gradient,
+            expected_fields = (
+                torch.cat([p.flatten() for p in pair]),
+                gradient,
                 state_a["step"].to(device),
                 torch.cat([state_a["exp_avg"].flatten(), state_b["exp_avg"].flatten()]),
-                torch.cat([state_a["exp_avg_sq"].flatten(), state_b["exp_avg_sq"].flatten()]))
+                torch.cat([state_a["exp_avg_sq"].flatten(), state_b["exp_avg_sq"].flatten()]),
+            )
             torch.testing.assert_close(state_a["step"], state_b["step"])
             for actual, expected in zip(execution.snapshot(new, stream), expected_fields, strict=True):
                 torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-7)

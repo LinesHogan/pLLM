@@ -7,15 +7,28 @@ import torch
 
 from pllm import _core
 from pllm.contracts.region_imports import ExportedTensorImport, NativeTensorImport, RegionTensorImport
-from pllm.contracts.region_program import BankType, Block, Call, Function, If, Program, Region, ScalarType, Scan, SizeParameter, TensorType, Value
+from pllm.contracts.region_program import (
+    BankType,
+    Block,
+    Call,
+    Function,
+    If,
+    Program,
+    Region,
+    ScalarType,
+    Scan,
+    SizeParameter,
+    TensorType,
+    Value,
+)
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_adamw import AdamWRegion
 from pllm.execution.region_compilation import analyze_region_program, lower_region_bindings, lower_region_schedule
 from pllm.execution.region_execution import RegionExecution
 from pllm.execution.region_native import NativePrimitive
-from pllm.execution.region_values import Bank
 from pllm.execution.region_storage import analyze_region_capacity, analyze_region_storage, validate_region_capacity
+from pllm.execution.region_values import Bank
 from pllm.execution.tensor_access import import_tensor_access_graph
 from pllm.execution.tensor_scan import TensorScan
 from pllm.kernels.adamw import AdamWConfig
@@ -26,8 +39,16 @@ def single_call(cell):
     declaration = cell.declaration
     inputs = tuple(Value(f"in{i}", t) for i, t in enumerate(declaration.inputs))
     outputs = tuple(Value(f"out{i}", t) for i, t in enumerate(declaration.outputs))
-    return Program(Region(Block(inputs, (Call(tuple(v.name for v in inputs), outputs, declaration.name),),
-                                tuple(v.name for v in outputs))), (declaration,))
+    return Program(
+        Region(
+            Block(
+                inputs,
+                (Call(tuple(v.name for v in inputs), outputs, declaration.name),),
+                tuple(v.name for v in outputs),
+            )
+        ),
+        (declaration,),
+    )
 
 
 @pytest.mark.parametrize("device", ("cpu", "cuda:0"))
@@ -36,10 +57,12 @@ def test_native_duplicate_views_become_independent_roots_and_preserve_input(devi
         pytest.skip("requires CUDA")
     full = TensorType((4, 4), "torch.float32", device)
     small = TensorType((1, 4), "torch.float32", device)
+
     def update(inputs, resources):
-        x, = inputs
+        (x,) = inputs
         x.add_(1)
         return x[:1], x[:1]
+
     cell = NativePrimitive(Function("native.views", (full,), (small, small)), update)
     program = single_call(cell)
     source = analyze_region_program(program)
@@ -47,15 +70,19 @@ def test_native_duplicate_views_become_independent_roots_and_preserve_input(devi
     storage = analyze_region_storage(program, source.reference_schedule, cells)
     bound = analyze_region_capacity(program, source.reference_schedule, cells)
     assert [r.bytes for r in storage.roots] == [64, 16, 16]
-    facts, = bound.devices
+    (facts,) = bound.devices
     assert facts.entry_copy_bytes_upper_bound == 64
     assert facts.live_tensor_bytes_upper_bound == 96
     assert facts.call_scratch_bytes_upper_bound == 64
     assert facts.peak_tensor_bytes_upper_bound == 160
     assert facts.logical_read_bytes_upper_bound == facts.logical_write_bytes_upper_bound == 160
     assert bound.unknown_functions == (cell.declaration.name,)
-    execution = RegionExecution(program, lower_region_schedule(program, source.reference_schedule),
-        lower_region_bindings(program, source.reference_schedule), cells)
+    execution = RegionExecution(
+        program,
+        lower_region_schedule(program, source.reference_schedule),
+        lower_region_bindings(program, source.reference_schedule),
+        cells,
+    )
     x = torch.ones((4, 4), device=device)
     with StorageObserver((x,)) as observed:
         result = execution.run({"in0": x})
@@ -71,12 +98,21 @@ def test_native_duplicate_views_become_independent_roots_and_preserve_input(devi
 
 def test_export_aliases_and_native_copies_have_distinct_storage_rules():
     exported = ExportedCell.capture(lambda x: (x.view(x.shape),), ("x",), ("view",), (torch.ones(4),))
-    t, = exported.declaration.inputs
+    (t,) = exported.declaration.inputs
     native = NativePrimitive(Function("native.identity", (t,), (t,)), lambda args, resources: args)
-    program = Program(Region(Block((Value("x", t),), (
-        Call(("x",), (Value("view", t),), exported.digest),
-        Call(("view",), (Value("copy", t),), native.declaration.name),
-    ), ("view", "copy"))), (exported.declaration, native.declaration))
+    program = Program(
+        Region(
+            Block(
+                (Value("x", t),),
+                (
+                    Call(("x",), (Value("view", t),), exported.digest),
+                    Call(("view",), (Value("copy", t),), native.declaration.name),
+                ),
+                ("view", "copy"),
+            )
+        ),
+        (exported.declaration, native.declaration),
+    )
     schedule = analyze_region_program(program).reference_schedule
     cells = {exported.digest: exported, native.declaration.name: native}
     storage = analyze_region_storage(program, schedule, cells)
@@ -84,7 +120,10 @@ def test_export_aliases_and_native_copies_have_distinct_storage_rules():
     assert len(storage.roots) == 2
     assert bound.devices[0].peak_tensor_bytes_upper_bound == 48
     assert bound.unknown_functions == (native.declaration.name,)
-    for imported in (ExportedTensorImport(import_tensor_access_graph(exported)), NativeTensorImport(native.declaration)):
+    for imported in (
+        ExportedTensorImport(import_tensor_access_graph(exported)),
+        NativeTensorImport(native.declaration),
+    ):
         assert decode_boundary(encode_boundary(imported), RegionTensorImport) == imported
 
 
@@ -95,7 +134,7 @@ def test_native_parametric_carry_and_zero_trip_keep_wrapper_costs_separate():
         scan = TensorScan(cell, count, carry=1, invariants=0)
         schedule = analyze_region_program(scan.program).reference_schedule
         bound = analyze_region_capacity(scan.program, schedule, {cell.declaration.name: cell})
-        facts, = bound.devices
+        (facts,) = bound.devices
         if count == 0:
             assert facts.peak_tensor_bytes_upper_bound == 16
             assert facts.call_scratch_bytes_upper_bound == 0
@@ -110,12 +149,14 @@ def test_native_parametric_carry_and_zero_trip_keep_wrapper_costs_separate():
 def test_native_nested_bank_copies_use_symbolic_leaf_lifetimes_and_original_versions():
     tensor = TensorType((4,), "torch.float32", "cpu")
     bank = BankType(BankType(tensor, "n"), 2)
+
     def update(inputs, resources):
-        values, = inputs
+        (values,) = inputs
         for row in values.elements:
             for value in row.elements:
                 value.add_(1)
         return values, values
+
     cell = NativePrimitive(Function("native.bank_update", (bank,), (bank, bank)), update)
     program = replace(single_call(cell), parameters=(SizeParameter("n", 0, 5),))
     cells = {cell.declaration.name: cell}
@@ -123,14 +164,15 @@ def test_native_nested_bank_copies_use_symbolic_leaf_lifetimes_and_original_vers
     storage = analyze_region_storage(program, schedule, cells)
     capacity = analyze_region_capacity(program, schedule, cells)
     assert len(storage.roots) == 3 and all(root.bytes == 16 for root in storage.roots)
-    facts, = capacity.devices
+    (facts,) = capacity.devices
     assert facts.entry_copy_bytes_upper_bound == facts.call_scratch_bytes_upper_bound == 160
     assert facts.live_tensor_bytes_upper_bound == 480
     assert facts.peak_tensor_bytes_upper_bound == 640
     assert facts.logical_read_bytes_upper_bound == facts.logical_write_bytes_upper_bound == 640
     assert capacity.unknown_functions == (cell.declaration.name,)
-    execution = RegionExecution(program, lower_region_schedule(program, schedule),
-        lower_region_bindings(program, schedule), cells)
+    execution = RegionExecution(
+        program, lower_region_schedule(program, schedule), lower_region_bindings(program, schedule), cells
+    )
     original = torch.arange(4, dtype=torch.float32)
     for count in (0, 2, 5):
         # Every input leaf aliases the same original storage. Native copies
@@ -177,29 +219,49 @@ def test_native_import_boundary_rejects_changed_declarations_and_unsupported_por
             analyze(encode_boundary(program), schedule, encode_boundary((forged,)))
         with pytest.raises(ValueError, match="complete and sorted"):
             analyze(encode_boundary(program), schedule, encode_boundary(()))
-    scalar = NativePrimitive(Function("native.scalar", (ScalarType.INT,), (ScalarType.INT,)), lambda args, resources: args)
+    scalar = NativePrimitive(
+        Function("native.scalar", (ScalarType.INT,), (ScalarType.INT,)), lambda args, resources: args
+    )
     program = single_call(scalar)
-    bound = analyze_region_capacity(program, analyze_region_program(program).reference_schedule, {scalar.declaration.name: scalar})
+    bound = analyze_region_capacity(
+        program, analyze_region_program(program).reference_schedule, {scalar.declaration.name: scalar}
+    )
     assert not bound.devices and bound.unknown_functions == (scalar.declaration.name,)
 
 
 def test_nested_parameterized_scan_bounds_follow_slot_release_instead_of_trip_count():
     tensor = TensorType((16,), "torch.float32")
-    cell = NativePrimitive(Function("copy", (ScalarType.INDEX, tensor), (tensor,)), lambda inputs, resources: (inputs[1],))
-    body = Region(Block((Value("i", ScalarType.INDEX), Value("x", tensor)), (
-        Call(("i", "x"), (Value("next", tensor),), cell.declaration.name),
-    ), ("next",)))
+    cell = NativePrimitive(
+        Function("copy", (ScalarType.INDEX, tensor), (tensor,)), lambda inputs, resources: (inputs[1],)
+    )
+    body = Region(
+        Block(
+            (Value("i", ScalarType.INDEX), Value("x", tensor)),
+            (Call(("i", "x"), (Value("next", tensor),), cell.declaration.name),),
+            ("next",),
+        )
+    )
     yes = Region(Block((Value("x", tensor),), (Scan(("x",), (Value("final", tensor),), "n", body),), ("final",)))
     no = Region(Block((Value("x", tensor),), (), ("x",)))
-    program = Program(Region(Block((Value("enabled", ScalarType.BOOL), Value("x", tensor)), (
-        If(("enabled", "x"), (Value("result", tensor),), yes, no),
-    ), ("result",))), (cell.declaration,), parameters=(SizeParameter("n", 0, 1_000_000),))
+    program = Program(
+        Region(
+            Block(
+                (Value("enabled", ScalarType.BOOL), Value("x", tensor)),
+                (If(("enabled", "x"), (Value("result", tensor),), yes, no),),
+                ("result",),
+            )
+        ),
+        (cell.declaration,),
+        parameters=(SizeParameter("n", 0, 1_000_000),),
+    )
     cells = {cell.declaration.name: cell}
     schedule = analyze_region_program(program, optimize=False).reference_schedule
     bound = analyze_region_capacity(program, schedule, cells)
     assert bound.devices[0].peak_tensor_bytes_upper_bound < 1024
     assert bound.unknown_functions == (cell.declaration.name,)
-    runner = RegionExecution(program, lower_region_schedule(program, schedule), lower_region_bindings(program, schedule), cells)
+    runner = RegionExecution(
+        program, lower_region_schedule(program, schedule), lower_region_bindings(program, schedule), cells
+    )
     x = torch.arange(16, dtype=torch.float32)
     for enabled, n in ((False, 37), (True, 0), (True, 1), (True, 19)):
         with StorageObserver((x,)) as observed:
@@ -214,13 +276,22 @@ def test_adamw_bridge_capacity_covers_real_wrapper_overlap(monkeypatch, device):
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     import pllm.execution.region_adamw as imported
+
     # Remove kernel internals from this storage measurement. The production
     # test separately checks the unchanged real kernel and original reservation.
     monkeypatch.setattr(imported, "apply_adamw", lambda *args: None)
     shapes = ((2, 3), (3,))
     optimizer = AdamWRegion(tuple(TensorType(s, "torch.float32", device) for s in shapes), AdamWConfig(0.01))
-    roots = tuple((torch.ones(s, device=device), torch.zeros(s, device=device), torch.tensor(0., device=device),
-                   torch.zeros(s, device=device), torch.zeros(s, device=device)) for s in shapes)
+    roots = tuple(
+        (
+            torch.ones(s, device=device),
+            torch.zeros(s, device=device),
+            torch.tensor(0.0, device=device),
+            torch.zeros(s, device=device),
+            torch.zeros(s, device=device),
+        )
+        for s in shapes
+    )
     gradients = tuple(torch.ones(s, device=device) for s in shapes)
     external = (*tuple(t for group in roots for t in group), *gradients)
     external_bytes = sum(t.untyped_storage().nbytes() for t in external)

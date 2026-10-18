@@ -1,9 +1,7 @@
 """Source-derived capacity, measured selection, and selected-only rewrite binding."""
 
-from pllm.contracts.region_selection import RegionSelectionPolicy
-
-from dataclasses import replace
 import warnings
+from dataclasses import replace
 
 import pytest
 import torch
@@ -11,29 +9,43 @@ import torch
 from pllm import _core
 from pllm.config import ExecutionOptions
 from pllm.contracts.region_selection import (
-    RegionCandidate, RegionPayloadLimit, RegionSelection, RegionSelectionRequest,
+    RegionCandidate,
+    RegionPayloadLimit,
+    RegionSelectionPolicy,
+    RegionSelectionRequest,
 )
-from pllm.execution.codec import boundary_digest, decode_boundary, encode_boundary
+from pllm.execution.codec import boundary_digest
 from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
 from pllm.execution.region_compilation import analyze_region_program
-from pllm.execution.region_optimization import warn_region_transforms, assess_region_candidates, optimize_region, select_region_candidate, PreparedRegionCandidate, bind_region_candidate
+from pllm.execution.region_optimization import (
+    PreparedRegionCandidate,
+    assess_region_candidates,
+    bind_region_candidate,
+    optimize_region,
+    select_region_candidate,
+    warn_region_transforms,
+)
 from pllm.execution.region_storage import import_region_functions
-from test.boundary.test_tensor_rewrites import reassociation_candidates
 from test.boundary.test_region_native_capacity import single_call
-from test.boundary.test_region_tensor import tensor_grid, inputs_for
+from test.boundary.test_region_tensor import inputs_for, tensor_grid
+from test.boundary.test_tensor_rewrites import reassociation_candidates
 
 
 def example(device="cpu", shapes=((4, 1), (1, 4), (4, 32))):
     tensors = tuple(torch.ones(shape, dtype=torch.float64, device=device) for shape in shapes)
     cell = ExportedCell.capture(lambda a, b, c: ((a @ b) @ c,), ("a", "b", "c"), ("out",), tensors)
     program = single_call(cell)
-    variant, = reassociation_candidates(cell)
+    (variant,) = reassociation_candidates(cell)
     schedule = analyze_region_program(program).reference_schedule
     original = import_region_functions(program, {cell.digest: cell})
     rewritten = import_region_functions(program, {cell.digest: variant.cell})
-    request = RegionSelectionRequest(original, (RegionCandidate(schedule, original, (100, 101, 900)),
-        RegionCandidate(schedule, rewritten, (50, 51, 600))), (RegionPayloadLimit(device, 1 << 20),), True,
-        "deterministic timing oracle")
+    request = RegionSelectionRequest(
+        original,
+        (RegionCandidate(schedule, original, (100, 101, 900)), RegionCandidate(schedule, rewritten, (50, 51, 600))),
+        (RegionPayloadLimit(device, 1 << 20),),
+        True,
+        "deterministic timing oracle",
+    )
     inputs = dict(zip(("in0", "in1", "in2"), tensors, strict=True))
     return cell, program, variant, request, inputs
 
@@ -43,12 +55,22 @@ def test_latency_ranks_candidates_even_when_lower_flops_costs_more_storage_and_t
     selected = select_region_candidate(program, request)
     original, changed = selected.candidates
     assert variant.rewrite.after.flops < variant.rewrite.before.flops
-    assert changed.capacity.devices[0].peak_tensor_bytes_upper_bound > original.capacity.devices[0].peak_tensor_bytes_upper_bound
-    assert changed.capacity.devices[0].logical_read_bytes_upper_bound > original.capacity.devices[0].logical_read_bytes_upper_bound
+    assert (
+        changed.capacity.devices[0].peak_tensor_bytes_upper_bound
+        > original.capacity.devices[0].peak_tensor_bytes_upper_bound
+    )
+    assert (
+        changed.capacity.devices[0].logical_read_bytes_upper_bound
+        > original.capacity.devices[0].logical_read_bytes_upper_bound
+    )
     assert selected.selected == 1  # Runtime beats both bytes and FLOPs as objective.
-    slower = replace(request, candidates=(request.candidates[0], replace(request.candidates[1], elapsed_ns=(200, 201, 202))))
+    slower = replace(
+        request, candidates=(request.candidates[0], replace(request.candidates[1], elapsed_ns=(200, 201, 202)))
+    )
     assert select_region_candidate(program, slower).selected == 0
-    tied = replace(request, candidates=(request.candidates[0], replace(request.candidates[1], elapsed_ns=(101, 101, 101))))
+    tied = replace(
+        request, candidates=(request.candidates[0], replace(request.candidates[1], elapsed_ns=(101, 101, 101)))
+    )
     assert select_region_candidate(program, tied).selected == 0
     assert changed.changed_functions == (cell.digest,)
 
@@ -71,9 +93,15 @@ def test_payload_limits_and_numerical_optout_are_hard_constraints():
 def test_an_infeasible_reference_does_not_prevent_a_smaller_variant_from_being_selected():
     _, program, _, request, _ = example(shapes=((4, 3), (3, 16), (16, 2)))
     original, changed = assess_region_candidates(program, request)
-    assert changed.capacity.devices[0].peak_tensor_bytes_upper_bound < original.capacity.devices[0].peak_tensor_bytes_upper_bound
-    request = replace(request, payload_limits=(RegionPayloadLimit("cpu", changed.capacity.devices[0].peak_tensor_bytes_upper_bound),),
-        candidates=(replace(request.candidates[0], elapsed_ns=()), request.candidates[1]))
+    assert (
+        changed.capacity.devices[0].peak_tensor_bytes_upper_bound
+        < original.capacity.devices[0].peak_tensor_bytes_upper_bound
+    )
+    request = replace(
+        request,
+        payload_limits=(RegionPayloadLimit("cpu", changed.capacity.devices[0].peak_tensor_bytes_upper_bound),),
+        candidates=(replace(request.candidates[0], elapsed_ns=()), request.candidates[1]),
+    )
     selected = select_region_candidate(program, request)
     assert selected.selected == 1
     assert selected.candidates[0].median_ns is None
@@ -84,21 +112,35 @@ def test_selection_requires_the_reference_as_candidate_zero():
     with pytest.raises(ValueError, match="reference execution"):
         select_region_candidate(program, replace(request, candidates=request.candidates[::-1]))
     with pytest.raises(ValueError, match="execution measurements"):
-        select_region_candidate(program, replace(request, candidates=tuple(replace(c, elapsed_ns=()) for c in request.candidates)))
+        select_region_candidate(
+            program, replace(request, candidates=tuple(replace(c, elapsed_ns=()) for c in request.candidates))
+        )
     with pytest.raises(ValueError, match="positive measured"):
-        select_region_candidate(program, replace(request, candidates=(replace(request.candidates[0], elapsed_ns=(0,)),)))
+        select_region_candidate(
+            program, replace(request, candidates=(replace(request.candidates[0], elapsed_ns=(0,)),))
+        )
 
 
 def test_fast_measurement_cannot_authorize_an_illegal_loop_schedule():
-    cell = ExportedCell.capture(lambda h, w: (h + w, w + 1), ("h", "w"), ("nh", "nw"),
-        (torch.ones(4, dtype=torch.float64), torch.ones(4, dtype=torch.float64)))
+    cell = ExportedCell.capture(
+        lambda h, w: (h + w, w + 1),
+        ("h", "w"),
+        ("nh", "nw"),
+        (torch.ones(4, dtype=torch.float64), torch.ones(4, dtype=torch.float64)),
+    )
     program = tensor_grid(3, 2, cell)
     source = analyze_region_program(program)
     imports = import_region_functions(program, {cell.digest: cell})
-    request = RegionSelectionRequest(imports, (
-        RegionCandidate(source.reference_schedule, imports, (100,)),
-        RegionCandidate("{ S0[c,l] -> [-c,-l] : 0 <= c < 3 and 0 <= l < 2 }", imports, (1,)),
-    ), (RegionPayloadLimit("cpu", 100000),), True, "illegal schedule oracle")
+    request = RegionSelectionRequest(
+        imports,
+        (
+            RegionCandidate(source.reference_schedule, imports, (100,)),
+            RegionCandidate("{ S0[c,l] -> [-c,-l] : 0 <= c < 3 and 0 <= l < 2 }", imports, (1,)),
+        ),
+        (RegionPayloadLimit("cpu", 100000),),
+        True,
+        "illegal schedule oracle",
+    )
     with pytest.raises(ValueError):
         select_region_candidate(program, request)
 
@@ -111,20 +153,33 @@ def test_selected_rewrite_is_replayed_once_without_request_time_planning(monkeyp
     request = replace(request, measurement_context=boundary_digest(device, "selected replay"))
     selected = select_region_candidate(program, request)
     with pytest.warns(NumericalTransformWarning, match="pLLM selected"):
-        execution = bind_region_candidate(PreparedRegionCandidate(program, request.candidates[selected.selected],
-            (variant.rewrite,), {cell.digest: variant.cell}), request.payload_limits, selected.candidates[selected.selected])
+        execution = bind_region_candidate(
+            PreparedRegionCandidate(
+                program, request.candidates[selected.selected], (variant.rewrite,), {cell.digest: variant.cell}
+            ),
+            request.payload_limits,
+            selected.candidates[selected.selected],
+        )
         warn_region_transforms(execution, selected.candidates[selected.selected], selected.signature)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         warn_region_transforms(execution, selected.candidates[selected.selected], selected.signature)
     assert not any(isinstance(w.message, NumericalTransformWarning) for w in caught)
+
     def forbidden(*args):
         raise AssertionError("selected execution must not plan or select")
-    for name in ("select_region_candidate", "lower_region_schedule", "lower_region_bindings",
-                 "analyze_region_program", "analyze_region_capacity", "analyze_region_storage"):
+
+    for name in (
+        "select_region_candidate",
+        "lower_region_schedule",
+        "lower_region_bindings",
+        "analyze_region_program",
+        "analyze_region_capacity",
+        "analyze_region_storage",
+    ):
         monkeypatch.setattr(_core, name, forbidden)
     for _ in range(2):
-        result, = execution.run(inputs).values
+        (result,) = execution.run(inputs).values
         torch.testing.assert_close(result, inputs["in0"] @ (inputs["in1"] @ inputs["in2"]), rtol=0, atol=0)
         for value in inputs.values():
             assert torch.equal(value, torch.ones_like(value))
@@ -133,10 +188,13 @@ def test_selected_rewrite_is_replayed_once_without_request_time_planning(monkeyp
 def test_binding_rejects_local_import_drift_and_numerical_optout():
     cell, program, variant, request, _ = example()
     selected = select_region_candidate(program, request)
-    prepared = PreparedRegionCandidate(program, request.candidates[selected.selected],
-        (variant.rewrite,), {cell.digest: variant.cell})
+    prepared = PreparedRegionCandidate(
+        program, request.candidates[selected.selected], (variant.rewrite,), {cell.digest: variant.cell}
+    )
     with pytest.raises(ValueError, match="admitted imports"):
-        bind_region_candidate(replace(prepared, cells={cell.digest: cell}), request.payload_limits, selected.candidates[selected.selected])
+        bind_region_candidate(
+            replace(prepared, cells={cell.digest: cell}), request.payload_limits, selected.candidates[selected.selected]
+        )
     refused = assess_region_candidates(program, replace(request, allow_numerical_transforms=False))[1]
     assert not refused.feasible
     with pytest.raises(ValueError, match="numerical policy"):
@@ -146,18 +204,29 @@ def test_binding_rejects_local_import_drift_and_numerical_optout():
 @pytest.mark.parametrize("allow", (False, True))
 def test_tuner_measures_interleaved_candidates_but_only_warns_for_a_selected_rewrite(monkeypatch, allow):
     import pllm.execution.region_optimization as tuning
+
     cell, program, _, _, inputs = example()
     calls = []
+
     def time_candidate(execution, inputs, devices, sizes, streams=None, pages=None):
         assert pages is None
         calls.append(execution)
         return 100  # Equal runtimes retain source; candidates must not warn.
+
     monkeypatch.setattr(tuning, "_measure", time_candidate)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        result = optimize_region(program, {cell.digest: cell}, inputs, payload_limits=(RegionPayloadLimit("cpu", 10000),),
-            options=replace(ExecutionOptions(allow_numerical_transforms=allow, schedule_policy="serial"), tuning="measured"),
-            warmup_rounds=1, measurement_rounds=3)
+        result = optimize_region(
+            program,
+            {cell.digest: cell},
+            inputs,
+            payload_limits=(RegionPayloadLimit("cpu", 10000),),
+            options=replace(
+                ExecutionOptions(allow_numerical_transforms=allow, schedule_policy="serial"), tuning="measured"
+            ),
+            warmup_rounds=1,
+            measurement_rounds=3,
+        )
     assert result.selection.selected == 0
     assert not result.rewrites
     assert not any(isinstance(w.message, NumericalTransformWarning) for w in caught)
@@ -171,15 +240,25 @@ def test_tuner_measures_interleaved_candidates_but_only_warns_for_a_selected_rew
 def test_real_cold_tuning_executes_source_isl_candidates_on_private_inputs(device):
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    cell = ExportedCell.capture(lambda h, w: (h + w, w + 1), ("h", "w"), ("nh", "nw"),
-        (torch.ones(4, dtype=torch.float64, device=device), torch.ones(4, dtype=torch.float64, device=device)))
+    cell = ExportedCell.capture(
+        lambda h, w: (h + w, w + 1),
+        ("h", "w"),
+        ("nh", "nw"),
+        (torch.ones(4, dtype=torch.float64, device=device), torch.ones(4, dtype=torch.float64, device=device)),
+    )
     program = tensor_grid(3, 2, cell)
     inputs = inputs_for(3, 2, device)
     saved = tuple(t.clone() for bank in inputs.values() for t in bank.elements)
     cuda_rng = torch.cuda.get_rng_state(device) if device.startswith("cuda") else None
     cpu_rng = torch.get_rng_state()
-    result = optimize_region(program, {cell.digest: cell}, inputs, payload_limits=(RegionPayloadLimit(device, 1 << 20),),
-        measurement_rounds=2, options=RegionSelectionPolicy(tuning="measured"))
+    result = optimize_region(
+        program,
+        {cell.digest: cell},
+        inputs,
+        payload_limits=(RegionPayloadLimit(device, 1 << 20),),
+        measurement_rounds=2,
+        options=RegionSelectionPolicy(tuning="measured"),
+    )
     assert all(len(c.elapsed_ns) == 2 and all(t > 0 for t in c.elapsed_ns) for c in result.request.candidates)
     actual = result.execution.run(inputs)
     assert actual.invocations == 6
@@ -198,30 +277,41 @@ def test_real_cold_tuning_executes_source_isl_candidates_on_private_inputs(devic
 
 
 def test_static_preparation_never_measures_or_executes_the_source(monkeypatch):
+    from pllm import _core
     from pllm.contracts.region_program import Block, Call, Function, Program, Region, TensorType, Value
-    from pllm.execution.region_native import NativePrimitive
-    from pllm.execution.region_optimization import prepare_region_execution
     from pllm.contracts.region_selection import RegionSelectionPolicy
     from pllm.execution.region_compilation import analyze_region_program
-    from pllm import _core
+    from pllm.execution.region_native import NativePrimitive
+    from pllm.execution.region_optimization import prepare_region_execution
+
     t = TensorType((4,), "torch.float32")
     declaration = Function("original", (t,), (t,))
     calls = []
+
     def original(inputs, resources):
         calls.append(1)
         return (inputs[0] + 1,)
+
     cell = NativePrimitive(declaration, original)
-    program = Program(Region(Block((Value("x", t),),
-        (Call(("x",), (Value("y", t),), declaration.name),), ("y",))), (declaration,))
+    program = Program(
+        Region(Block((Value("x", t),), (Call(("x",), (Value("y", t),), declaration.name),), ("y",))), (declaration,)
+    )
     facts = analyze_region_program(program, optimize=False)
+
     def forbidden(*args, **kwargs):
         raise AssertionError("default preparation entered search or measurement")
+
     import pllm.execution.region_optimization as optimization
+
     monkeypatch.setattr(optimization, "_measure", forbidden)
     for name in ("explore_region_schedules", "select_region_candidate"):
         monkeypatch.setattr(_core, name, forbidden)
-    execution = prepare_region_execution(program, {declaration.name: cell},
-        payload_limits=(RegionPayloadLimit("cpu", 1024),), options=RegionSelectionPolicy(allow_numerical_transforms=False))
+    execution = prepare_region_execution(
+        program,
+        {declaration.name: cell},
+        payload_limits=(RegionPayloadLimit("cpu", 1024),),
+        options=RegionSelectionPolicy(allow_numerical_transforms=False),
+    )
     assert not calls
     assert analyze_region_program(program, optimize=False) == facts
     torch.testing.assert_close(execution.run({"x": torch.ones(4)}).values[0], torch.full((4,), 2.0))

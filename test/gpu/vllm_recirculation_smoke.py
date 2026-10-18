@@ -7,48 +7,52 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import torch
-from pllm.execution.trace import TracePhase
 from torch.nn import functional as F
 from vllm import SamplingParams
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer
 
 import pllm
-from pllm.execution.replay import TokenwiseReplayTask
-from pllm.workloads.recirculation import RecirculationConfig, RecirculationWorkload
-from pllm.backends.vllm.replay import VllmTokenwiseReplay
 from pllm.backends.vllm.region_layers import VllmDecoderBodies
+from pllm.backends.vllm.replay import VllmTokenwiseReplay
 from pllm.config import ModelConfig, VllmDType
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.region_imports import BorrowedTensorImport
 from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.execution.region_compilation import analyze_region_program
-from pllm.execution.region_execution import RegionExecutionPlan
-from pllm.execution.region_execution import RegionInstructionExecution
+from pllm.execution.region_execution import RegionExecutionPlan, RegionInstructionExecution
 from pllm.execution.region_resources import RegionResources
 from pllm.execution.region_storage import analyze_region_payload
+from pllm.execution.replay import TokenwiseReplayTask
+from pllm.execution.trace import TracePhase
+from pllm.workloads.recirculation import RecirculationConfig, RecirculationWorkload
 
 
 def main():
     config = RecirculationConfig(source_layer=-1, destination_layer=22, alpha=0.6, beta=None, ramp_tokens=2)
-    handle = pllm.make_llm(workload=RecirculationWorkload(config), config=ModelConfig(
-        "Qwen/Qwen2.5-0.5B-Instruct", VllmDType.BFLOAT16, 64, 2, 64, 0.25, seed=7))
+    handle = pllm.make_llm(
+        workload=RecirculationWorkload(config),
+        config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", VllmDType.BFLOAT16, 64, 2, 64, 0.25, seed=7),
+    )
     selection = handle.region_selection
     # The default installs a real stream plan without cold worker measurement.
     assert selection is None
     assert handle.trace_snapshot().events == ()
     assert len(handle.attachment.inputs.probe.region_bodies) == 2
     execution = handle.deployment.execution
-    installed = TokenwiseReplayTask.from_implementation(execution.implementation(
-        handle.attachment.inputs.request.task_bindings[0].implementation_id)).region
+    installed = TokenwiseReplayTask.from_implementation(
+        execution.implementation(handle.attachment.inputs.request.task_bindings[0].implementation_id)
+    ).region
     assert installed.stream_plan is not None
     assert installed.stream_plan.lanes == installed.stream_plan.pipeline_depth == 2
     issued_streams = set()
     original_invoke = RegionInstructionExecution._invoke
+
     def record_invoke(self, *args, **kwargs):
         if self is installed.execution:
             issued_streams.add(torch.cuda.current_stream().cuda_stream)
         return original_invoke(self, *args, **kwargs)
+
     layer = handle.runner.model.model.layers[23]
     native_layer, native_begin = Qwen2DecoderLayer.forward, VllmTokenwiseReplay.begin
     native_normalize, native_commit = VllmTokenwiseReplay.normalize, VllmTokenwiseReplay.commit
@@ -59,7 +63,9 @@ def main():
     suffix = provider.suffix.program
     schedule = analyze_region_program(suffix, optimize=False).reference_schedule
     proposal = RegionScheduleProposal(analyze_region_payload(suffix, schedule, provider.imports))
-    suffix_execution = RegionExecutionPlan(suffix, provider.imports, proposal, proposal.peak_bytes).bind(provider.functions)
+    suffix_execution = RegionExecutionPlan(suffix, provider.imports, proposal, proposal.peak_bytes).bind(
+        provider.functions
+    )
     events, normal_calls, replay_calls, numerical = [], [], [], []
     previous_kv = {}
     normal_outputs = []
@@ -82,27 +88,43 @@ def main():
                 # The independent oracle checks the original whole layer. Run
                 # it on private operands, then restore the current slot before
                 # the actual decomposed attention consumes the same history.
-                expected_suffixes[slot] = tuple(value.clone() for value in check_layer(
-                    module, positions, hidden.clone(), None if residual is None else residual.clone()))
+                expected_suffixes[slot] = tuple(
+                    value.clone()
+                    for value in check_layer(
+                        module, positions, hidden.clone(), None if residual is None else residual.clone()
+                    )
+                )
             finally:
                 current.copy_(saved)
         result = native_attention(provider, ordinal, positions, hidden, residual)
         if module is layer:
             owner = primitive._invocation.context
             context_resource, weight_resource = suffix.resources
-            pages = RegionResources(suffix, owner, (), borrows=(
-                primitive.bind_context(context_resource, owner), primitive.bind_weights(weight_resource, owner)),
-                tensor_borrows=tuple(item for item in provider.imports if isinstance(item, BorrowedTensorImport)))
-            actual_suffix = suffix_execution.run({"row": active_row.packed_row_index, "layer": ordinal,
-                "hidden": result[0], "residual": result[1]}, pages=pages).values
+            pages = RegionResources(
+                suffix,
+                owner,
+                (),
+                borrows=(
+                    primitive.bind_context(context_resource, owner),
+                    primitive.bind_weights(weight_resource, owner),
+                ),
+                tensor_borrows=tuple(item for item in provider.imports if isinstance(item, BorrowedTensorImport)),
+            )
+            actual_suffix = suffix_execution.run(
+                {"row": active_row.packed_row_index, "layer": ordinal, "hidden": result[0], "residual": result[1]},
+                pages=pages,
+            ).values
             expected = expected_suffixes.pop(slot)
             for actual, original in zip(actual_suffix, expected, strict=True):
                 torch.testing.assert_close(actual, original, rtol=0, atol=0)
         return result
 
     def rms(value, norm):
-        return (value.float() * torch.rsqrt(value.float().square().mean(-1, keepdim=True)
-            + norm.variance_epsilon) * norm.weight.float()).to(norm.weight.dtype)
+        return (
+            value.float()
+            * torch.rsqrt(value.float().square().mean(-1, keepdim=True) + norm.variance_epsilon)
+            * norm.weight.float()
+        ).to(norm.weight.dtype)
 
     def check_layer(module, positions, hidden, residual):
         if module is not layer:
@@ -111,7 +133,9 @@ def main():
         metadata = get_forward_context().attn_metadata[attention.attn.layer_name]
         cache, length = attention.attn.kv_cache, metadata.max_seq_len
         block_table, block_size = metadata.block_table[0], cache.shape[2]
-        prior = torch.stack([cache[int(block_table[p // block_size]), :, p % block_size].clone() for p in range(length)])
+        prior = torch.stack(
+            [cache[int(block_table[p // block_size]), :, p % block_size].clone() for p in range(length)]
+        )
         carry = hidden.float() if residual is None else hidden.float() + residual.float()
         expected_residual = carry.to(hidden.dtype)
         value = rms(carry, layer.input_layernorm)
@@ -119,9 +143,11 @@ def main():
         q, k, v = qkv.split([attention.q_size, attention.kv_size, attention.kv_size], -1)
         q, k, v = (part.reshape(-1, attention.head_dim) for part in (q, k, v))
         cos, sin = attention.rotary_emb.cos_sin_cache[int(positions.item())].chunk(2)
+
         def rotate(value):
             first, second = value.chunk(2, -1)
             return torch.cat((first * cos - second * sin, second * cos + first * sin), -1).to(hidden.dtype)
+
         q, k = rotate(q), rotate(k)
         expected_kv = torch.cat((k, v), -1)
         history = prior.clone()
@@ -133,7 +159,9 @@ def main():
         attended = (scores.softmax(-1).unsqueeze(-1) * values).sum(1).reshape(1, -1).to(hidden.dtype)
         value = F.linear(attended, attention.o_proj.weight, attention.o_proj.bias)
         residual_float = expected_residual.float() + value.float()
-        rounding_bound = 2 * torch.finfo(hidden.dtype).eps * (expected_residual.float().abs() + value.float().abs()) + 0.02
+        rounding_bound = (
+            2 * torch.finfo(hidden.dtype).eps * (expected_residual.float().abs() + value.float().abs()) + 0.02
+        )
         value = rms(residual_float, layer.post_attention_layernorm)
         gate, up = F.linear(value, layer.mlp.gate_up_proj.weight, layer.mlp.gate_up_proj.bias).chunk(2, -1)
         value = (F.silu(gate.float()) * up.float()).to(hidden.dtype)
@@ -146,7 +174,9 @@ def main():
         block, offset = divmod(int(metadata.slot_mapping.item()), int(block_size))
         torch.testing.assert_close(cache[block, :, offset], expected_kv, rtol=0.02, atol=0.02)
         for p in range(length - 1):
-            torch.testing.assert_close(cache[int(block_table[p // block_size]), :, p % block_size], prior[p], rtol=0, atol=0)
+            torch.testing.assert_close(
+                cache[int(block_table[p // block_size]), :, p % block_size], prior[p], rtol=0, atol=0
+            )
         numerical.append(active_row)
         return actual, actual_residual
 
@@ -163,8 +193,16 @@ def main():
         output = native_normalize(primitive, row, hidden, residual)
         normal_outputs.append((output, output.clone()))
         metadata = primitive._tokens[row].context.attn_metadata.values()
-        assert len({value.untyped_storage().data_ptr() for item in metadata
-            for value in (item.query_start_loc, item.seq_lens)}) == 1
+        assert (
+            len(
+                {
+                    value.untyped_storage().data_ptr()
+                    for item in metadata
+                    for value in (item.query_start_loc, item.seq_lens)
+                }
+            )
+            == 1
+        )
         return output
 
     def check_commit(primitive, row, record):
@@ -187,16 +225,24 @@ def main():
         expected = tuple(row for row in context.replay.rows if row.phase is HiddenPhase.PREFILL)
         assert tuple(replay_calls[before:]) == expected
         assert context.publication is None and context.pin.refs == ()
-        events.extend(event for event in context.trace.snapshot().events
-            if event.invocation_id == context.invocation_id and event.phase is TracePhase.REPLAY)
+        events.extend(
+            event
+            for event in context.trace.snapshot().events
+            if event.invocation_id == context.invocation_id and event.phase is TracePhase.REPLAY
+        )
 
     try:
-        with patch.object(RegionInstructionExecution, "_invoke", record_invoke), \
-             patch.object(VllmDecoderBodies, "attention", check_attention), \
-             patch.object(VllmTokenwiseReplay, "begin", check_begin), \
-            patch.object(VllmTokenwiseReplay, "normalize", check_normalize), \
-            patch.object(VllmTokenwiseReplay, "commit", check_commit), patch.object(TokenwiseReplayTask, "execute", check_task):
-            outputs = handle.generate(["The sky is", "Water freezes at"], SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True))
+        with (
+            patch.object(RegionInstructionExecution, "_invoke", record_invoke),
+            patch.object(VllmDecoderBodies, "attention", check_attention),
+            patch.object(VllmTokenwiseReplay, "begin", check_begin),
+            patch.object(VllmTokenwiseReplay, "normalize", check_normalize),
+            patch.object(VllmTokenwiseReplay, "commit", check_commit),
+            patch.object(TokenwiseReplayTask, "execute", check_task),
+        ):
+            outputs = handle.generate(
+                ["The sky is", "Water freezes at"], SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True)
+            )
         assert len(outputs) == 2 and all(len(output.outputs[0].token_ids) == 2 for output in outputs)
         assert len(replay_calls) == len(events) >= 4
         assert len(numerical) == len(normal_calls) + len(replay_calls)
@@ -205,8 +251,18 @@ def main():
         assert len(issued_streams) == 2
         diagnostics = execution.diagnostics()
         assert diagnostics.active_lineages == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
-        print(dict(normal_rows=len(normal_calls), replay_rows=len(replay_calls), numerical_comparisons=len(numerical),
-            owned_state_roots=0, fallback=0, source_bodies=2, default_install="static", issued_streams=len(issued_streams)))
+        print(
+            dict(
+                normal_rows=len(normal_calls),
+                replay_rows=len(replay_calls),
+                numerical_comparisons=len(numerical),
+                owned_state_roots=0,
+                fallback=0,
+                source_bodies=2,
+                default_install="static",
+                issued_streams=len(issued_streams),
+            )
+        )
     finally:
         handle.close()
 

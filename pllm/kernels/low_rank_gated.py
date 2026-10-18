@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+
 from pllm.kernels.paged_linear import PagedRows, TensorRows
 
 
@@ -16,11 +17,7 @@ class LowRankGatedLayout:
     output_layernorm: bool
 
     def __post_init__(self) -> None:
-        if (
-            self.hidden_size < 1
-            or self.rank < 1
-            or self.rank > self.hidden_size
-        ):
+        if self.hidden_size < 1 or self.rank < 1 or self.rank > self.hidden_size:
             raise ValueError("low-rank gated layout dimensions are invalid")
 
     @property
@@ -46,11 +43,17 @@ def low_rank_gated_forward(
     return output
 
 
-def _residual(source: torch.Tensor, pages: PagedRows | TensorRows,
-                    layout: LowRankGatedLayout) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _residual(
+    source: torch.Tensor, pages: PagedRows | TensorRows, layout: LowRankGatedLayout
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     hidden, rank = layout.hidden_size, layout.rank
-    if (source.ndim != 2 or source.shape[1] != hidden or pages.pool.shape[1] != layout.parameter_count
-        or source.device != pages.pool.device or source.dtype != pages.pool.dtype):
+    if (
+        source.ndim != 2
+        or source.shape[1] != hidden
+        or pages.pool.shape[1] != layout.parameter_count
+        or source.device != pages.pool.device
+        or source.dtype != pages.pool.dtype
+    ):
         raise ValueError("low-rank gated tensors differ from their frozen layout")
     up = pages.linear(source, 0, (hidden, rank))
     gate = pages.linear(source, hidden * rank, (hidden, rank)) + pages.values(3 * hidden * rank, rank)
@@ -58,9 +61,9 @@ def _residual(source: torch.Tensor, pages: PagedRows | TensorRows,
 
 
 @torch.no_grad()
-def low_rank_gated_loss_and_gradients(source: torch.Tensor, target: torch.Tensor,
-                                     pages: TensorRows | PagedRows,
-                                     layout: LowRankGatedLayout) -> tuple[torch.Tensor, torch.Tensor]:
+def low_rank_gated_loss_and_gradients(
+    source: torch.Tensor, target: torch.Tensor, pages: TensorRows | PagedRows, layout: LowRankGatedLayout
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Negative row indices are inactive padding in a cold captured batch envelope."""
     hidden, rank = layout.hidden_size, layout.rank
     width, norm_start = hidden * rank, 3 * hidden * rank + rank
@@ -75,8 +78,9 @@ def low_rank_gated_loss_and_gradients(source: torch.Tensor, target: torch.Tensor
         output = normalized * scale + pages.values(norm_start + hidden, hidden)
         dy = 2 * (output - target) / normalization
         extras = (pages.reduce(dy * normalized), pages.reduce(dy))
-        gradient, _, _ = torch.ops.aten.native_layer_norm_backward(dy * scale, raw, (hidden,),
-            mean, rstd, None, None, (True, False, False))
+        gradient, _, _ = torch.ops.aten.native_layer_norm_backward(
+            dy * scale, raw, (hidden,), mean, rstd, None, None, (True, False, False)
+        )
     else:
         output = raw
         gradient = 2 * (output - target) / normalization
@@ -86,7 +90,11 @@ def low_rank_gated_loss_and_gradients(source: torch.Tensor, target: torch.Tensor
     up_gradient = product_gradient * activation
     sigmoid = torch.sigmoid(gate)
     gate_gradient = product_gradient * up * sigmoid * (1 + gate * (1 - sigmoid))
-    gradients = (pages.parameter_gradient(source, up_gradient).flatten(1),
+    gradients = (
+        pages.parameter_gradient(source, up_gradient).flatten(1),
         pages.parameter_gradient(source, gate_gradient).flatten(1),
-        pages.parameter_gradient(up * activation, gradient).flatten(1), pages.reduce(gate_gradient), *extras)
+        pages.parameter_gradient(up * activation, gradient).flatten(1),
+        pages.reduce(gate_gradient),
+        *extras,
+    )
     return losses, torch.cat(gradients, dim=1)

@@ -41,17 +41,27 @@ class BorrowedTensorImport:
 
     def validate(self) -> None:
         function = self.declaration
-        if (type(self.field) is not int or self.field < 0 or self.field >= 2**63
-            or len(function.resources) != 1 or len(function.outputs) != 1
+        if (
+            type(self.field) is not int
+            or self.field < 0
+            or self.field >= 2**63
+            or len(function.resources) != 1
+            or len(function.outputs) != 1
             or not isinstance(function.outputs[0], TensorType)
             or any(type_ is not ScalarType.INDEX for type_ in function.inputs)
-            or len(function.accesses) != 1):
+            or len(function.accesses) != 1
+        ):
             raise ValueError("tensor borrowing requires one typed field and index coordinates")
-        access, = function.accesses
-        if (access.resource != function.resources[0] or access.mode is not AccessMode.READ
+        (access,) = function.accesses
+        if (
+            access.resource != function.resources[0]
+            or access.mode is not AccessMode.READ
             or len(access.ranges) != len(function.inputs)
-            or any(interval.lower != AffineIndex(0, (IndexTerm(i),))
-                or interval.upper != AffineIndex(1, (IndexTerm(i),)) for i, interval in enumerate(access.ranges))):
+            or any(
+                interval.lower != AffineIndex(0, (IndexTerm(i),)) or interval.upper != AffineIndex(1, (IndexTerm(i),))
+                for i, interval in enumerate(access.ranges)
+            )
+        ):
             raise ValueError("tensor borrowing must read exactly its original resource cell")
 
 
@@ -116,7 +126,14 @@ class CompiledTensorImport:
     # this compiler adapter's normalized-graph operator subset.
 
 
-RegionTensorImport: TypeAlias = ExportedTensorImport | NativeTensorImport | NativeKernelImport | FunctionalKernelImport | CompiledTensorImport | BorrowedTensorImport
+RegionTensorImport: TypeAlias = (
+    ExportedTensorImport
+    | NativeTensorImport
+    | NativeKernelImport
+    | FunctionalKernelImport
+    | CompiledTensorImport
+    | BorrowedTensorImport
+)
 
 
 def region_import_name(imported: RegionTensorImport) -> str:

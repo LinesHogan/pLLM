@@ -23,7 +23,11 @@ from torch.fx.passes.fake_tensor_prop import FakeTensorProp
 from pllm.contracts.region_imports import KernelAllocation
 from pllm.contracts.tensor_compilation import CompiledTensorCode, UnsupportedTensorKernel
 from pllm.execution.codec import (
-    boundary_digest, encode_boundary, preserve_torch_rng, tensor_node_metadata, tensor_graph_result_nodes,
+    boundary_digest,
+    encode_boundary,
+    preserve_torch_rng,
+    tensor_graph_result_nodes,
+    tensor_node_metadata,
 )
 
 
@@ -31,7 +35,9 @@ class _InductorConfig(Protocol):
     def patch(self, changes: dict[str, object]) -> AbstractContextManager[None]: ...
 
 
-_INDUCTOR_GEMM = frozenset({"aten.mm.default", "aten.matmul.default", "aten.bmm.default", "aten.addmm.default", "aten.linear.default"})
+_INDUCTOR_GEMM = frozenset(
+    {"aten.mm.default", "aten.matmul.default", "aten.bmm.default", "aten.addmm.default", "aten.linear.default"}
+)
 
 # Slack added to the graph-derived account for code-generation side effects the
 # graph cannot name: concat packing slack, reduction semaphores and allocator
@@ -49,25 +55,93 @@ _REDUCTION_PACKETS = frozenset({torch.ops.aten.sum, torch.ops.aten.mean})
 # cat/stack, sum/mean reductions and the plain GEMM family. Anything else can
 # lower to an external library call or an opaque workspace that a graph account
 # cannot see; those graphs stay on their original execution path instead.
-_ALLOWED_PACKETS = frozenset(packet for names in (
-    # Pointwise binary and comparison.
-    ("add", "sub", "mul", "div", "pow", "remainder", "fmod", "maximum", "minimum",
-     "eq", "ne", "lt", "le", "gt", "ge", "logical_and", "logical_or", "logical_xor", "where"),
-    # Pointwise unary and casts.
-    ("neg", "abs", "exp", "log", "sqrt", "rsqrt", "reciprocal", "sigmoid", "silu", "relu",
-     "gelu", "tanh", "erf", "clamp", "floor", "ceil", "round", "trunc", "sign",
-     "sin", "cos", "isnan", "isinf", "to", "clone", "contiguous", "detach", "type_as"),
-    # Metadata views and packing (a view never allocates; counting it anyway is
-    # a deliberate over-count, never an omission).
-    ("view", "reshape", "permute", "transpose", "t", "expand", "broadcast_to", "slice",
-     "select", "squeeze", "unsqueeze", "narrow", "as_strided", "flatten", "repeat",
-     "cat", "stack"),
-    # Bounded reductions and the plain GEMM family.
-    ("sum", "mean", "mm", "addmm", "bmm", "matmul", "linear"),
-) for packet in (getattr(torch.ops.aten, name) for name in names)) | frozenset({
-    # ATen decompositions emit pointwise prims for dtype conversion.
-    torch.ops.prims.convert_element_type,
-})
+_ALLOWED_PACKETS = frozenset(
+    packet
+    for names in (
+        # Pointwise binary and comparison.
+        (
+            "add",
+            "sub",
+            "mul",
+            "div",
+            "pow",
+            "remainder",
+            "fmod",
+            "maximum",
+            "minimum",
+            "eq",
+            "ne",
+            "lt",
+            "le",
+            "gt",
+            "ge",
+            "logical_and",
+            "logical_or",
+            "logical_xor",
+            "where",
+        ),
+        # Pointwise unary and casts.
+        (
+            "neg",
+            "abs",
+            "exp",
+            "log",
+            "sqrt",
+            "rsqrt",
+            "reciprocal",
+            "sigmoid",
+            "silu",
+            "relu",
+            "gelu",
+            "tanh",
+            "erf",
+            "clamp",
+            "floor",
+            "ceil",
+            "round",
+            "trunc",
+            "sign",
+            "sin",
+            "cos",
+            "isnan",
+            "isinf",
+            "to",
+            "clone",
+            "contiguous",
+            "detach",
+            "type_as",
+        ),
+        # Metadata views and packing (a view never allocates; counting it anyway is
+        # a deliberate over-count, never an omission).
+        (
+            "view",
+            "reshape",
+            "permute",
+            "transpose",
+            "t",
+            "expand",
+            "broadcast_to",
+            "slice",
+            "select",
+            "squeeze",
+            "unsqueeze",
+            "narrow",
+            "as_strided",
+            "flatten",
+            "repeat",
+            "cat",
+            "stack",
+        ),
+        # Bounded reductions and the plain GEMM family.
+        ("sum", "mean", "mm", "addmm", "bmm", "matmul", "linear"),
+    )
+    for packet in (getattr(torch.ops.aten, name) for name in names)
+) | frozenset(
+    {
+        # ATen decompositions emit pointwise prims for dtype conversion.
+        torch.ops.prims.convert_element_type,
+    }
+)
 
 
 def supports_inductor_tensor_graph(source: torch.fx.GraphModule) -> bool:
@@ -79,8 +153,11 @@ def supports_inductor_tensor_graph(source: torch.fx.GraphModule) -> bool:
     ports = (*(node for node in source.graph.nodes if node.op == "placeholder"), *tensor_graph_result_nodes(source))
     for node in ports:
         tensor = tensor_node_metadata(node)
-        if (tensor is None or tensor.device.type not in ("cpu", "cuda")
-            or tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64)):
+        if (
+            tensor is None
+            or tensor.device.type not in ("cpu", "cuda")
+            or tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+        ):
             return False
     operations = tuple(node for node in source.graph.nodes if node.op == "call_function")
     if any(str(node.target) in _INDUCTOR_GEMM for node in operations):
@@ -117,7 +194,8 @@ def _graph_allocations(graph: torch.fx.GraphModule) -> tuple[KernelAllocation, .
         packet = getattr(node.target, "overloadpacket", None)
         if packet not in _ALLOWED_PACKETS and node.target is not operator.getitem:
             raise UnsupportedTensorKernel(
-                f"normalized operation {node.target} stays outside the pointwise/sum-reduction/GEMM subset")
+                f"normalized operation {node.target} stays outside the pointwise/sum-reduction/GEMM subset"
+            )
         value = node.meta.get("val")
         if not isinstance(value, torch.Tensor):
             continue
@@ -131,8 +209,9 @@ def _graph_allocations(graph: torch.fx.GraphModule) -> tuple[KernelAllocation, .
                     continue
                 charge = _span_bytes(argument_value)
                 subtotal += charge
-                allocations.append(KernelAllocation(
-                    f"{node.name}#reduction{index}", str(argument_value.device), charge))
+                allocations.append(
+                    KernelAllocation(f"{node.name}#reduction{index}", str(argument_value.device), charge)
+                )
     slack = math.ceil(subtotal * COMPILER_SLACK_FRACTION)
     if slack:
         device = allocations[-1].device
@@ -179,16 +258,22 @@ def compile_inductor_tensor_graph(source: torch.fx.GraphModule) -> CompiledTenso
             extent = sum((size - 1) * stride for size, stride in zip(value.shape, value.stride())) + 2
             with value.fake_mode:
                 sample = torch.empty((extent,), dtype=value.dtype, device=value.device).as_strided(
-                    value.shape, value.stride(), storage_offset=1)
+                    value.shape, value.stride(), storage_offset=1
+                )
             if not isinstance(sample, FakeTensor):
                 raise UnsupportedTensorKernel("compiler input normalization requires fake tensors")
             examples.append(sample)
     FakeTensorProp(graph, examples[0].fake_mode if examples else None).propagate_dont_convert_inputs(*examples)
 
     class TensorChoices(InductorChoices):
-        def _finalize_template_configs(self, template_choices: dict[str, Generator[KernelTemplateChoice, None, None]],
-                kernel_inputs: KernelInputs, templates: list[KernelTemplate | ExternKernelChoice], op_name: str,
-                kwarg_overrides: dict[str, dict[str, object]] | None = None) -> list[KernelTemplateChoice]:
+        def _finalize_template_configs(
+            self,
+            template_choices: dict[str, Generator[KernelTemplateChoice, None, None]],
+            kernel_inputs: KernelInputs,
+            templates: list[KernelTemplate | ExternKernelChoice],
+            op_name: str,
+            kwarg_overrides: dict[str, dict[str, object]] | None = None,
+        ) -> list[KernelTemplateChoice]:
             # One deterministic native Triton choice, without a second timing
             # search or a library-workspace fallback. Plain mm/bmm templates
             # carry no workspace, which the graph account relies on; an extern
@@ -207,29 +292,47 @@ def compile_inductor_tensor_graph(source: torch.fx.GraphModule) -> CompiledTenso
             raise UnsupportedTensorKernel("GEMM has no supported deterministic Triton template")
 
     patches: dict[str, object] = {
-        "fx_graph_cache": False, "fx_graph_remote_cache": False,
+        "fx_graph_cache": False,
+        "fx_graph_remote_cache": False,
         "assume_aligned_inputs": False,
         # Fusion must retain the source operators' low-precision rounding
         # boundaries, including updates to a loop-carried value.
         "emulate_precision_casts": True,
-        "max_autotune": False, "max_autotune_pointwise": False, "max_autotune_gemm": False,
-        "combo_kernels": False, "graph_partition": False, "wrap_inductor_compiled_regions": False,
+        "max_autotune": False,
+        "max_autotune_pointwise": False,
+        "max_autotune_gemm": False,
+        "combo_kernels": False,
+        "graph_partition": False,
+        "wrap_inductor_compiled_regions": False,
         # CUDA graph pools are allocator state the graph account cannot name.
-        "triton.cudagraphs": False, "triton.autotune_pointwise": False, "triton.autotune_at_compile_time": True,
-        "post_grad_custom_pre_pass": None, "post_grad_custom_post_pass": None, "_pre_fusion_custom_pass": None,
+        "triton.cudagraphs": False,
+        "triton.autotune_pointwise": False,
+        "triton.autotune_at_compile_time": True,
+        "post_grad_custom_pre_pass": None,
+        "post_grad_custom_post_pass": None,
+        "_pre_fusion_custom_pass": None,
     }
-    if any(str(node.target) in _INDUCTOR_GEMM
-           for node in graph.graph.nodes if node.op == "call_function"):
+    if any(str(node.target) in _INDUCTOR_GEMM for node in graph.graph.nodes if node.op == "call_function"):
         if any(value.device.type != "cuda" or value.dtype == torch.float64 for value in examples):
             raise UnsupportedTensorKernel("compiled GEMM requires CUDA float16, bfloat16 or float32 inputs")
-        patches.update({"max_autotune_gemm": True, "max_autotune_gemm_backends": "TRITON",
-                        "benchmark_epilogue_fusion": False, "autotune_fallback_to_aten": False})
+        patches.update(
+            {
+                "max_autotune_gemm": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "benchmark_epilogue_fusion": False,
+                "autotune_fallback_to_aten": False,
+            }
+        )
     devices = sorted({t.device.index for t in examples if t.device.type == "cuda"})
     # Use Torch's own cold compilation lock for its scoped global config hooks.
     try:
-        with (compile_lock, cast(_InductorConfig, config).patch({**patches, "_post_fusion_custom_pass": None}),
-              V.set_choices_handler(TensorChoices()),
-              torch.no_grad(), preserve_torch_rng(devices)):
+        with (
+            compile_lock,
+            cast(_InductorConfig, config).patch({**patches, "_post_fusion_custom_pass": None}),
+            V.set_choices_handler(TensorChoices()),
+            torch.no_grad(),
+            preserve_torch_rng(devices),
+        ):
             # Normalize to Inductor's ATen dialect under the same scoped
             # config/RNG guard. Only private fake inputs are traced; the
             # original graph and its output guards remain the source contract.
@@ -250,8 +353,7 @@ def compile_inductor_tensor_graph(source: torch.fx.GraphModule) -> CompiledTenso
     # Execution convention guards: the region borrows inputs read-only and
     # accounts every output copy itself, so hidden mutation, captured
     # constants or alignment copies break the contract rather than the account.
-    if (artifact.mutated_inputs or artifact.constants or artifact.torchbind_constants
-            or artifact.inputs_to_check):
+    if artifact.mutated_inputs or artifact.constants or artifact.torchbind_constants or artifact.inputs_to_check:
         raise UnsupportedTensorKernel("compiled tensor block has mutation, hidden constants or alignment copies")
 
     def invoke(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
@@ -265,10 +367,20 @@ def compile_inductor_tensor_graph(source: torch.fx.GraphModule) -> CompiledTenso
             tensors.append(value)
         return tuple(tensors)
 
-    return CompiledTensorCode(invoke, encode_boundary(("inductor-tensor-readonly@7", torch.__version__, patches,
-                                                      "first-valid-mm-bmm-template-up-to-four@1",
-                                                      f"graph-account-slack@{COMPILER_SLACK_FRACTION}")),
-        boundary_digest(artifact.source_code), tuple(allocations))
+    return CompiledTensorCode(
+        invoke,
+        encode_boundary(
+            (
+                "inductor-tensor-readonly@7",
+                torch.__version__,
+                patches,
+                "first-valid-mm-bmm-template-up-to-four@1",
+                f"graph-account-slack@{COMPILER_SLACK_FRACTION}",
+            )
+        ),
+        boundary_digest(artifact.source_code),
+        tuple(allocations),
+    )
 
 
 class InductorTensorCompiler:

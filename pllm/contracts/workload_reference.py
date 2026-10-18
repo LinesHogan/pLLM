@@ -17,8 +17,8 @@ import torch
 
 
 class WorkloadFieldKind(StrEnum):
-    VALUE = "value"                        # payload is the closed encoding of the field value
-    REFERENCE = "reference"                # module + qualname of an importable module-level object
+    VALUE = "value"  # payload is the closed encoding of the field value
+    REFERENCE = "reference"  # module + qualname of an importable module-level object
     WORKER_TRANSPORT = "worker_transport"  # payload is the field's own closed transport payload
 
 

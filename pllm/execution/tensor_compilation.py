@@ -4,13 +4,12 @@ from math import prod
 
 import torch
 
+from pllm.backends.torch_inductor import InductorTensorCompiler
 from pllm.contracts.region_imports import CompiledTensorImport
 from pllm.contracts.tensor_compilation import TensorCompiler, UnsupportedTensorKernel
-from pllm.backends.torch_inductor import InductorTensorCompiler
 from pllm.execution.exported_cell import ExportedCell, TensorSignature
 from pllm.execution.region_native import CompiledPrimitive
 from pllm.execution.tensor_access import import_tensor_access_graph
-
 
 # Default backend wiring lives here; the optimizer only consumes TensorCompiler.
 DEFAULT_TENSOR_COMPILER: TensorCompiler = InductorTensorCompiler()
@@ -41,7 +40,9 @@ def supports_tensor_compilation(source: ExportedCell, *, compiler: TensorCompile
     return compiler.supports(source.graph)
 
 
-def compile_tensor_cell(source: ExportedCell, *, compiler: TensorCompiler = DEFAULT_TENSOR_COMPILER) -> CompiledPrimitive:
+def compile_tensor_cell(
+    source: ExportedCell, *, compiler: TensorCompiler = DEFAULT_TENSOR_COMPILER
+) -> CompiledPrimitive:
     """Compile during planning with read-only inputs and explicit output copies.
 
     Every result is a fresh root, including duplicate returns, while imported
@@ -49,7 +50,9 @@ def compile_tensor_cell(source: ExportedCell, *, compiler: TensorCompiler = DEFA
     original frame's storage lifetimes without another layer of private copies.
     """
     if not supports_tensor_compilation(source, compiler=compiler):
-        raise UnsupportedTensorKernel("tensor compiler requires supported static layouts and a feasible backend implementation")
+        raise UnsupportedTensorKernel(
+            "tensor compiler requires supported static layouts and a feasible backend implementation"
+        )
     access = import_tensor_access_graph(source)
     code = compiler.compile(source.graph)
     implementation = CompiledTensorImport(access, code.backend, code.code_digest, code.allocations)

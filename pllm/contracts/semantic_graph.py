@@ -7,9 +7,8 @@ from enum import StrEnum
 from typing import Literal, NewType
 
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
-from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.region_selection import RegionSelectionPolicy
-
+from pllm.contracts.request_identity import RequestKeyField
 
 WorkloadId = NewType("WorkloadId", str)
 TaskSymbol = NewType("TaskSymbol", str)
@@ -55,7 +54,6 @@ class HiddenInputSource:
     phase: HiddenPhase
 
 
-
 @dataclass(frozen=True, slots=True)
 class StepIdInputSource:
     pass
@@ -83,19 +81,16 @@ class HostServiceInputSource:
     schema: HostPayloadSchemaId
 
 
-
 @dataclass(frozen=True, slots=True)
 class StateSelectionInputSource:
     resource: StateResource
     phase: HiddenPhase
 
 
-
 @dataclass(frozen=True, slots=True)
 class TaskResultInputSource:
     task: TaskSymbol
     output: str
-
 
 
 SemanticInputSource = (
@@ -116,7 +111,6 @@ class SemanticInput:
     source: SemanticInputSource
 
 
-
 @dataclass(frozen=True, slots=True)
 class SemanticOutput:
     name: str
@@ -124,13 +118,11 @@ class SemanticOutput:
     schema: HostPayloadSchemaId = HostPayloadSchemaId("")
 
 
-
 @dataclass(frozen=True, slots=True)
 class SemanticState:
     resource: StateResource
     scope: StateScope
     key_fields: tuple[RequestKeyField, ...]
-
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,12 +133,10 @@ class SemanticEffect:
     version: TaskSymbol | None = None
 
 
-
 @dataclass(frozen=True, slots=True)
 class TimingConstraint:
     after: AnchorSymbol
     before: AnchorSymbol
-
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,7 +144,6 @@ class TaskImplementationSpec:
     implementation_id: ImplementationId
     execution_kind: ExecutionKind
     required_capabilities: tuple[str, ...] = ()
-
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,7 +187,9 @@ class TokenwiseLayerReplay:
     cancellation: Literal["between_tokens"] = "between_tokens"
 
 
-LossReduction = Literal["none", "sum", "mean", "state_mean", "weighted_state_mean", "weighted_state_mean_then_mean", "custom"]
+LossReduction = Literal[
+    "none", "sum", "mean", "state_mean", "weighted_state_mean", "weighted_state_mean_then_mean", "custom"
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,12 +218,10 @@ class SemanticTask:
     math: MathContract | None = None
 
 
-
 @dataclass(frozen=True, slots=True)
 class SemanticEdge:
     source: TaskSymbol
     target: TaskSymbol
-
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,12 +252,10 @@ class SemanticGraph:
     input_groups: tuple[ConditionalInputGroup, ...] = ()
 
 
-
 @dataclass(frozen=True, slots=True)
 class TimelineAnchor:
     symbol: AnchorSymbol
     ordinal: int
-
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,7 +286,6 @@ class SchedulerTimeline:
     region_policy: RegionSelectionPolicy = RegionSelectionPolicy()
 
 
-
 @dataclass(frozen=True, slots=True)
 class PhysicalTask:
     task_id: TaskId
@@ -324,7 +310,6 @@ class ScheduleDecision:
     schema_version: int = 1
 
 
-
 @dataclass(frozen=True, slots=True)
 class PhysicalPlan:
     plan_epoch: int
@@ -336,9 +321,8 @@ class PhysicalPlan:
     schema_version: int = 1
 
 
-
 __all__ = [
-        "ConditionalLayerReplay",
+    "ConditionalLayerReplay",
     "TaskResourceFact",
     "ValueResourceFact",
     "AnchorId",

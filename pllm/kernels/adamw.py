@@ -8,8 +8,8 @@ from math import isfinite
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra.cuda import libdevice
 from torch.optim.adamw import adamw
+from triton.language.extra.cuda import libdevice
 
 from pllm.contracts.tensor_layout import LayoutFieldId
 
@@ -30,9 +30,7 @@ class AdamWFields:
             int(self.exp_avg),
             int(self.exp_avg_sq),
         )
-        if any(field_id < 0 for field_id in field_ids) or len(
-            set(field_ids)
-        ) != len(field_ids):
+        if any(field_id < 0 for field_id in field_ids) or len(set(field_ids)) != len(field_ids):
             raise ValueError("dense-page AdamW fields must be distinct IDs")
 
 
@@ -45,12 +43,14 @@ class AdamWConfig:
 
     def __post_init__(self) -> None:
         beta_one, beta_two = self.betas
-        if (not all(isfinite(value) for value in (self.lr, beta_one, beta_two, self.eps, self.weight_decay))
+        if (
+            not all(isfinite(value) for value in (self.lr, beta_one, beta_two, self.eps, self.weight_decay))
             or self.lr <= 0.0
             or not 0.0 <= beta_one < 1.0
             or not 0.0 <= beta_two < 1.0
             or self.eps <= 0.0
-            or self.weight_decay < 0.0):
+            or self.weight_decay < 0.0
+        ):
             raise ValueError("dense-page AdamW configuration is invalid")
 
 
@@ -67,11 +67,17 @@ def apply_adamw(
         if any(field >= len(root) for field in ids):
             raise ValueError("AdamW field is outside the signed layout")
         parameter = root[fields.parameter]
-        if (any(root[field].shape != parameter.shape or root[field].dtype != parameter.dtype
-                for field in (fields.gradient, fields.exp_avg, fields.exp_avg_sq))
-            or root[fields.step].shape != () or root[fields.step].dtype != torch.float32
-            or gradient.shape != parameter.shape or gradient.dtype != parameter.dtype
-            or gradient.device != parameter.device):
+        if (
+            any(
+                root[field].shape != parameter.shape or root[field].dtype != parameter.dtype
+                for field in (fields.gradient, fields.exp_avg, fields.exp_avg_sq)
+            )
+            or root[fields.step].shape != ()
+            or root[fields.step].dtype != torch.float32
+            or gradient.shape != parameter.shape
+            or gradient.dtype != parameter.dtype
+            or gradient.device != parameter.device
+        ):
             raise ValueError("AdamW fields or gradient differ from the signed layout")
     with torch.no_grad():
         for root, gradient in zip(roots, gradients, strict=True):
@@ -82,16 +88,33 @@ def apply_adamw(
             grads=[root[fields.gradient] for root in roots],
             exp_avgs=[root[fields.exp_avg] for root in roots],
             exp_avg_sqs=[root[fields.exp_avg_sq] for root in roots],
-            max_exp_avg_sqs=[], state_steps=[root[fields.step] for root in roots],
-            foreach=cuda, capturable=cuda, differentiable=False, fused=False,
-            amsgrad=False, beta1=config.betas[0], beta2=config.betas[1],
-            lr=config.lr, weight_decay=config.weight_decay, eps=config.eps, maximize=False,
+            max_exp_avg_sqs=[],
+            state_steps=[root[fields.step] for root in roots],
+            foreach=cuda,
+            capturable=cuda,
+            differentiable=False,
+            fused=False,
+            amsgrad=False,
+            beta1=config.betas[0],
+            beta2=config.betas[1],
+            lr=config.lr,
+            weight_decay=config.weight_decay,
+            eps=config.eps,
+            maximize=False,
         )
 
 
 @triton.jit
-def _advance_steps(steps: torch.Tensor, slots: torch.Tensor, corrections: torch.Tensor,
-                   count: tl.constexpr, stride: tl.constexpr, lr: float, beta1: float, beta2: float) -> None:
+def _advance_steps(
+    steps: torch.Tensor,
+    slots: torch.Tensor,
+    corrections: torch.Tensor,
+    count: tl.constexpr,
+    stride: tl.constexpr,
+    lr: float,
+    beta1: float,
+    beta2: float,
+) -> None:
     state = tl.program_id(0)
     slot = tl.load(slots + 2 * count + state)
     value = tl.load(steps + slot * stride, slot >= 0, 0) + 1
@@ -103,12 +126,26 @@ def _advance_steps(steps: torch.Tensor, slots: torch.Tensor, corrections: torch.
 
 
 @triton.jit
-def _paged_adamw(parameter: torch.Tensor, gradient: torch.Tensor,
-                 exp_avg: torch.Tensor, exp_avg_sq: torch.Tensor, slots: torch.Tensor, values: torch.Tensor,
-                 corrections: torch.Tensor,
-                 count: tl.constexpr, width: tl.constexpr, p_stride: tl.constexpr, g_stride: tl.constexpr,
-                 m_stride: tl.constexpr, v_stride: tl.constexpr,
-                 beta2: float, alpha1: float, alpha2: float, eps: float, decay: float) -> None:
+def _paged_adamw(
+    parameter: torch.Tensor,
+    gradient: torch.Tensor,
+    exp_avg: torch.Tensor,
+    exp_avg_sq: torch.Tensor,
+    slots: torch.Tensor,
+    values: torch.Tensor,
+    corrections: torch.Tensor,
+    count: tl.constexpr,
+    width: tl.constexpr,
+    p_stride: tl.constexpr,
+    g_stride: tl.constexpr,
+    m_stride: tl.constexpr,
+    v_stride: tl.constexpr,
+    beta2: float,
+    alpha1: float,
+    alpha2: float,
+    eps: float,
+    decay: float,
+) -> None:
     state = tl.program_id(0)
     column = tl.program_id(1) * 256 + tl.arange(0, 256)
     p = tl.load(slots + state)
@@ -119,8 +156,7 @@ def _paged_adamw(parameter: torch.Tensor, gradient: torch.Tensor,
     grad = tl.load(values + state * width + column, valid, 0)
     first = tl.load(exp_avg + m * m_stride + column, valid, 0)
     second = tl.load(exp_avg_sq + v * v_stride + column, valid, 0)
-    first = tl.where(alpha1 < 0.5, first + (grad - first) * alpha1,
-        grad - (grad - first) * (1 - alpha1))
+    first = tl.where(alpha1 < 0.5, first + (grad - first) * alpha1, grad - (grad - first) * (1 - alpha1))
     second = libdevice.mul_rn(second, beta2) + alpha2 * grad * grad
     step_size = tl.load(corrections + state * 2)
     correction2 = tl.load(corrections + state * 2 + 1)
@@ -133,22 +169,54 @@ def _paged_adamw(parameter: torch.Tensor, gradient: torch.Tensor,
     tl.store(exp_avg_sq + v * v_stride + column, second, valid)
 
 
-def paged_adamw(pools: tuple[torch.Tensor, ...], slots: torch.Tensor,
-                gradients: torch.Tensor, config: AdamWConfig) -> None:
+def paged_adamw(
+    pools: tuple[torch.Tensor, ...], slots: torch.Tensor, gradients: torch.Tensor, config: AdamWConfig
+) -> None:
     """Five original FP32 fields, authorized slot prefixes, no field packing."""
-    if len(pools) != 5 or slots.ndim != 2 or slots.shape[0] != 5 or slots.dtype != torch.long or not slots.is_contiguous():
+    if (
+        len(pools) != 5
+        or slots.ndim != 2
+        or slots.shape[0] != 5
+        or slots.dtype != torch.long
+        or not slots.is_contiguous()
+    ):
         raise ValueError("paged AdamW requires five original field-slot rows")
     parameter, gradient, step, first, second = pools
-    if (parameter.ndim < 2 or any(pool.dtype != torch.float32 or pool.device != slots.device for pool in pools)
-        or any(pool.shape != parameter.shape for pool in (gradient, first, second)) or step.shape != parameter.shape[:1]
-        or gradients.shape != (slots.shape[1], parameter[0].numel()) or gradients.dtype != torch.float32
-        or gradients.device != slots.device or not gradients.is_contiguous() or gradients.requires_grad):
+    if (
+        parameter.ndim < 2
+        or any(pool.dtype != torch.float32 or pool.device != slots.device for pool in pools)
+        or any(pool.shape != parameter.shape for pool in (gradient, first, second))
+        or step.shape != parameter.shape[:1]
+        or gradients.shape != (slots.shape[1], parameter[0].numel())
+        or gradients.dtype != torch.float32
+        or gradients.device != slots.device
+        or not gradients.is_contiguous()
+        or gradients.requires_grad
+    ):
         raise ValueError("paged AdamW fields or gradients differ from the signed layout")
     count, width = gradients.shape
     corrections = gradients.new_empty((count, 2))
     # Increment in a separate launch: no tile may observe another tile's step write.
-    _advance_steps[(count,)](step, slots, corrections, count, step.stride(0), config.lr, config.betas[0], config.betas[1])
-    _paged_adamw[(count, (width + 255) // 256)](parameter, gradient, first, second, slots, gradients, corrections,
-        count, width, parameter.stride(0), gradient.stride(0), first.stride(0), second.stride(0),
-        config.betas[1], 1 - config.betas[0], 1 - config.betas[1],
-        config.eps, 1 - config.lr * config.weight_decay)
+    _advance_steps[(count,)](
+        step, slots, corrections, count, step.stride(0), config.lr, config.betas[0], config.betas[1]
+    )
+    _paged_adamw[(count, (width + 255) // 256)](
+        parameter,
+        gradient,
+        first,
+        second,
+        slots,
+        gradients,
+        corrections,
+        count,
+        width,
+        parameter.stride(0),
+        gradient.stride(0),
+        first.stride(0),
+        second.stride(0),
+        config.betas[1],
+        1 - config.betas[0],
+        1 - config.betas[1],
+        config.eps,
+        1 - config.lr * config.weight_decay,
+    )

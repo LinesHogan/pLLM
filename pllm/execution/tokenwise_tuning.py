@@ -11,8 +11,13 @@ from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.region_selection import RegionSelection, RegionTuningSize
 from pllm.contracts.semantic_graph import ImplementationId
-from pllm.execution.region_optimization import prepare_region_candidates, select_region_candidate, warn_region_transforms, bind_region_candidate
 from pllm.execution.codec import preserve_torch_rng
+from pllm.execution.region_optimization import (
+    bind_region_candidate,
+    prepare_region_candidates,
+    select_region_candidate,
+    warn_region_transforms,
+)
 from pllm.execution.replay import TokenwiseReplayTask
 from pllm.execution.state_execution import StateExecution
 from pllm.execution.tokenwise_region import TokenwiseRegion
@@ -23,15 +28,26 @@ ResultT = TypeVar("ResultT")
 
 
 class TokenwiseTuning(Generic[InputT, DataT, ResultT]):
-    def __init__(self, execution: StateExecution[InputT, DataT, ResultT], identity: ImplementationId,
-                 proposals: tuple[RegionScheduleProposal, ...], *, stream_lanes: int = 1) -> None:
+    def __init__(
+        self,
+        execution: StateExecution[InputT, DataT, ResultT],
+        identity: ImplementationId,
+        proposals: tuple[RegionScheduleProposal, ...],
+        *,
+        stream_lanes: int = 1,
+    ) -> None:
         self.execution = execution
         self.original = TokenwiseReplayTask[DataT].from_implementation(execution.implementation(identity))
         if self.original.policy.schedule_policy == "serial" and len(proposals) != 1:
             raise ValueError("serial native policy retains only its reference schedule")
-        budget = next(fact.workspace_bytes for fact in execution.arena.plan.timeline.task_resources
-                      if fact.task == self.original.task.symbol)
-        self.source = replace(self.original, region=self.original.region.with_catalog(proposals, budget, stream_lanes=stream_lanes))
+        budget = next(
+            fact.workspace_bytes
+            for fact in execution.arena.plan.timeline.task_resources
+            if fact.task == self.original.task.symbol
+        )
+        self.source = replace(
+            self.original, region=self.original.region.with_catalog(proposals, budget, stream_lanes=stream_lanes)
+        )
         self._scope = ExitStack()
         self._visited: set[int] = set()
         self._candidate: int | None = None
@@ -42,9 +58,16 @@ class TokenwiseTuning(Generic[InputT, DataT, ResultT]):
             devices = [] if execution.device.type == "cpu" else [execution.device.index or 0]
             self._scope.enter_context(preserve_torch_rng(devices))
             region = self.source.region
-            prepared, request, assessments = prepare_region_candidates(region.program, region.functions, limits=region.payload_limits,
-                options=self.source.policy, parallel=stream_lanes > 1, retained=region.retained,
-                sizes={p.name: p.minimum for p in region.program.parameters}, catalog=region.candidate_proposals)
+            prepared, request, assessments = prepare_region_candidates(
+                region.program,
+                region.functions,
+                limits=region.payload_limits,
+                options=self.source.policy,
+                parallel=stream_lanes > 1,
+                retained=region.retained,
+                sizes={p.name: p.minimum for p in region.program.parameters},
+                catalog=region.candidate_proposals,
+            )
             self._prepared = tuple(p for p, a in zip(prepared, assessments, strict=True) if a.feasible)
             self._assessments = tuple(a for a in assessments if a.feasible)
             self._request = replace(request, candidates=tuple(p.candidate for p in self._prepared))
@@ -64,7 +87,9 @@ class TokenwiseTuning(Generic[InputT, DataT, ResultT]):
         if type(index) is not int or not 0 <= index < self.count:
             raise ValueError("native tuning has no such funded candidate")
         if index not in self._measurements:
-            bound = bind_region_candidate(self._prepared[index], self.source.region.payload_limits, self._assessments[index])
+            bound = bind_region_candidate(
+                self._prepared[index], self.source.region.payload_limits, self._assessments[index]
+            )
             self._measurements[index] = self.source.region.with_execution(bound)
         self.execution.rebind_implementation(replace(self.source, region=self._measurements[index]))
         self._candidate = index
@@ -80,16 +105,29 @@ class TokenwiseTuning(Generic[InputT, DataT, ResultT]):
         observed = tuple(RegionTuningSize(name, value) for name, value in sorted(sizes.items()))
         if self._visited and observed != self._request.tuning_sizes:
             raise ValueError("native tuning candidates must measure the same packed workload")
-        self._request = replace(self._request, tuning_sizes=observed, measurement_context="original-engine private prefill; completed generate wall time")
+        self._request = replace(
+            self._request,
+            tuning_sizes=observed,
+            measurement_context="original-engine private prefill; completed generate wall time",
+        )
         self._visited.add(self._candidate)
 
     def finish(self, samples: tuple[tuple[int, ...], ...]) -> RegionSelection:
-        if (self._closed or self._visited != set(range(self.count))
-            or len(samples) != self.count or any(not values for values in samples)):
+        if (
+            self._closed
+            or self._visited != set(range(self.count))
+            or len(samples) != self.count
+            or any(not values for values in samples)
+        ):
             raise ValueError("native tuning requires measurements for every funded candidate")
         region = self.source.region
-        request = replace(self._request, candidates=tuple(replace(candidate, elapsed_ns=elapsed)
-            for candidate, elapsed in zip(self._request.candidates, samples, strict=True)))
+        request = replace(
+            self._request,
+            candidates=tuple(
+                replace(candidate, elapsed_ns=elapsed)
+                for candidate, elapsed in zip(self._request.candidates, samples, strict=True)
+            ),
+        )
         selection = select_region_candidate(region.program, request)
         # The visited-set check above guarantees the winner was measured, so its
         # executor is already bound: install it instead of replaying the bind.

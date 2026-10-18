@@ -5,7 +5,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 
 from pllm.contracts.feedback import Completion, ControlReason
-
 from pllm.workloads.fttt.types import (
     FTTTJudgeResult,
 )
@@ -36,11 +35,7 @@ class FTTTDefaultJudge(FTTTJudgeService):
                 ControlReason.CORRECT_OUTPUT.value,
             )
         if completion.finish_reason.value != "stop":
-            feedback = (
-                "Generation did not finish cleanly: "
-                + completion.finish_reason.value
-                + "."
-            )
+            feedback = "Generation did not finish cleanly: " + completion.finish_reason.value + "."
         else:
             feedback = "Your answer is incorrect."
         return FTTTJudgeResult(

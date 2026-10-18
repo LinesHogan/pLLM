@@ -5,12 +5,6 @@ from __future__ import annotations
 from dataclasses import replace
 
 from pllm import _core
-from pllm.execution.codec import decode_boundary, encode_boundary
-from pllm.execution.region_replay import replay_region_workspace_bytes
-from pllm.execution.decoder_region import decoder_activations, decoder_region_workspace_bytes
-from pllm.execution.tokenwise_region import compile_tokenwise_region, compile_tokenwise_source, tokenwise_attachment_bytes
-from pllm.contracts.region_program import TensorType
-from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY
 from pllm.contracts.backend_attachment import (
     AttachmentCleanupStage,
     AttachmentKind,
@@ -20,28 +14,53 @@ from pllm.contracts.backend_attachment import (
     BackendAttachmentDecision,
     BackendAttachmentPhysicalPlan,
     BackendAttachmentRequest,
-    BackendPlacementProbe,
     BackendAttachmentSpec,
+    BackendPlacementProbe,
     SignedBackendAttachment,
     StreamDependency,
 )
 from pllm.contracts.compilation import PlanBundle
-from pllm.contracts.semantic_graph import (
-    AnchorId, ConditionalLayerReplay, SchedulerTimeline, SemanticGraph, TaskResourceFact, TaskSymbol,
-    StateEffectKind, TaskResultInputSource, TokenwiseLayerReplay, ValueResourceFact,
-)
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator
+from pllm.contracts.region_program import TensorType
+from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY
+from pllm.contracts.semantic_graph import (
+    AnchorId,
+    ConditionalLayerReplay,
+    SchedulerTimeline,
+    SemanticGraph,
+    StateEffectKind,
+    TaskResourceFact,
+    TaskResultInputSource,
+    TaskSymbol,
+    TokenwiseLayerReplay,
+    ValueResourceFact,
+)
 from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
+from pllm.execution.codec import decode_boundary, encode_boundary
+from pllm.execution.decoder_region import decoder_activations, decoder_region_workspace_bytes
+from pllm.execution.region_replay import replay_region_workspace_bytes
+from pllm.execution.tokenwise_region import (
+    compile_tokenwise_region,
+    compile_tokenwise_source,
+    tokenwise_attachment_bytes,
+)
 
 
-def attachment_buffer_bytes(probe: BackendPlacementProbe, graph: SemanticGraph,
-                            layouts: TensorLayoutRequest,
-                            attachment: BackendAttachmentSpec | BackendAttachmentRequest) -> int:
+def attachment_buffer_bytes(
+    probe: BackendPlacementProbe,
+    graph: SemanticGraph,
+    layouts: TensorLayoutRequest,
+    attachment: BackendAttachmentSpec | BackendAttachmentRequest,
+) -> int:
     """At least FP32 storage for effect buffers; excludes model/library scratch."""
     rows, hidden = probe.max_packed_rows, probe.hidden_size
     width = 8 if probe.tensor_dtype is TensorDType.FLOAT64 else 4
-    fields = {field.field_id: field for layout in layouts.layouts
-        if layout.resource == attachment.state_resource for field in layout.layout.fields}
+    fields = {
+        field.field_id: field
+        for layout in layouts.layouts
+        if layout.resource == attachment.state_resource
+        for field in layout.layout.fields
+    }
     buffers = 0
     for binding in attachment.overlay_bindings:
         first = fields[binding.fields[0]].shape
@@ -70,9 +89,14 @@ def attachment_buffer_bytes(probe: BackendPlacementProbe, graph: SemanticGraph,
     return buffers
 
 
-def derive_attachment_resources(probe: BackendPlacementProbe, graph: SemanticGraph,
-                                timeline: SchedulerTimeline, *, layouts: TensorLayoutRequest | None = None,
-                                attachment: BackendAttachmentSpec | BackendAttachmentRequest | None = None) -> SchedulerTimeline:
+def derive_attachment_resources(
+    probe: BackendPlacementProbe,
+    graph: SemanticGraph,
+    timeline: SchedulerTimeline,
+    *,
+    layouts: TensorLayoutRequest | None = None,
+    attachment: BackendAttachmentSpec | BackendAttachmentRequest | None = None,
+) -> SchedulerTimeline:
     """Fund native region candidates through the original AER workspace facts.
 
     Preserve producer task/value facts when the model reads a publication.
@@ -84,58 +108,105 @@ def derive_attachment_resources(probe: BackendPlacementProbe, graph: SemanticGra
         return timeline
     if len(tasks) != 1:
         raise ValueError("tokenwise attachment costs require one model replay task")
-    task, = tasks
+    (task,) = tasks
     for group in graph.input_groups:
-        if (attachment is None or group.resource != attachment.state_resource
-            or group.readers != (task.symbol,) or group.held_version != "input"):
+        if (
+            attachment is None
+            or group.resource != attachment.state_resource
+            or group.readers != (task.symbol,)
+            or group.held_version != "input"
+        ):
             raise ValueError("conditional tokenwise costs require the exact signed pinned READ")
         # Both branches use this same model source. Retain all producer facts:
         # the complete DAG funds the worst case, including the fresh encoding.
     if len(graph.tasks) != 1 or graph.states:
         if len(task.effects) != 1 or task.effects[0].kind is not StateEffectKind.READ:
             raise ValueError("composed tokenwise costs require an exact publication read")
-        read, = task.effects
+        (read,) = task.effects
         publication = next((candidate for candidate in graph.tasks if candidate.symbol == read.version), None)
-        if (publication is None or not any(state.resource == read.resource for state in graph.states)
-            or not any(effect.resource == read.resource and effect.kind is StateEffectKind.PUBLISH
-                for effect in publication.effects)
-            or not any(isinstance(port.source, TaskResultInputSource) and port.source.task == publication.symbol
-                and any(output.name == port.source.output for output in publication.outputs) for port in task.inputs)):
+        if (
+            publication is None
+            or not any(state.resource == read.resource for state in graph.states)
+            or not any(
+                effect.resource == read.resource and effect.kind is StateEffectKind.PUBLISH
+                for effect in publication.effects
+            )
+            or not any(
+                isinstance(port.source, TaskResultInputSource)
+                and port.source.task == publication.symbol
+                and any(output.name == port.source.output for output in publication.outputs)
+                for port in task.inputs
+            )
+        ):
             raise ValueError("composed tokenwise costs require their declared publication dependency")
     effect = task.replay
     if not isinstance(effect, TokenwiseLayerReplay) or probe.causal_domain is None:
         raise ValueError("tokenwise attachment requires its original model domain")
-    tensor = TensorType((1, probe.hidden_size), "torch." + probe.tensor_dtype.value,
-        "cpu" if probe.device_kind.value == "cpu" else f"cuda:{probe.device_ordinal}")
+    tensor = TensorType(
+        (1, probe.hidden_size),
+        "torch." + probe.tensor_dtype.value,
+        "cpu" if probe.device_kind.value == "cpu" else f"cuda:{probe.device_ordinal}",
+    )
     if task.effects and (layouts is None or attachment is None or not attachment.activation_bindings):
         raise ValueError("composed tokenwise costs require signed activation bindings and layouts")
-    activations = () if layouts is None or attachment is None else decoder_activations(
-        attachment.activation_bindings, layouts, attachment.state_resource, tensor.device)
+    activations = (
+        ()
+        if layouts is None or attachment is None
+        else decoder_activations(attachment.activation_bindings, layouts, attachment.state_resource, tensor.device)
+    )
     existing = next((fact for fact in timeline.task_resources if fact.task == task.symbol), None)
     if existing is not None:
-        region = compile_tokenwise_source(tensor, probe.max_packed_rows, probe.causal_domain, effect,
-            source_imports=probe.region_imports, function_bodies=probe.region_bodies, activations=activations)
+        region = compile_tokenwise_source(
+            tensor,
+            probe.max_packed_rows,
+            probe.causal_domain,
+            effect,
+            source_imports=probe.region_imports,
+            function_bodies=probe.region_bodies,
+            activations=activations,
+        )
         region.within_payload_budget(existing.workspace_bytes)
         task_facts = timeline.task_resources
     else:
-        region = compile_tokenwise_region(tensor, probe.max_packed_rows, probe.causal_domain, effect, timeline.region_policy,
+        region = compile_tokenwise_region(
+            tensor,
+            probe.max_packed_rows,
+            probe.causal_domain,
+            effect,
+            timeline.region_policy,
             stream_lanes=2 if REGION_STREAMS_CAPABILITY in probe.capabilities else 1,
-            source_imports=probe.region_imports, function_bodies=probe.region_bodies, activations=activations)
-        maximum, = region.payload_limits
+            source_imports=probe.region_imports,
+            function_bodies=probe.region_bodies,
+            activations=activations,
+        )
+        (maximum,) = region.payload_limits
         available = maximum.bytes
         if timeline.memory_budget_bytes is not None:
-            available = min(available, timeline.memory_budget_bytes - max(timeline.reserved_bytes, default=0)
+            available = min(
+                available,
+                timeline.memory_budget_bytes
+                - max(timeline.reserved_bytes, default=0)
                 - sum(fact.workspace_bytes + fact.resident_bytes for fact in timeline.task_resources)
-                - sum(fact.bytes for fact in timeline.value_resources))
-        funded, = region.within_payload_budget(max(0, available)).payload_limits
+                - sum(fact.bytes for fact in timeline.value_resources),
+            )
+        (funded,) = region.within_payload_budget(max(0, available)).payload_limits
         task_facts = (*timeline.task_resources, TaskResourceFact(task.symbol, funded.bytes))
     # The output lives in the original adapter's concatenation reservation;
     # the outer task runner does not allocate a second copy of this value.
     known = {(fact.task, fact.output) for fact in timeline.value_resources}
-    values = (*timeline.value_resources, *tuple(ValueResourceFact(task.symbol, output.name, 0)
-        for output in task.outputs if (task.symbol, output.name) not in known))
-    return replace(timeline, task_resources=tuple(sorted(task_facts, key=lambda fact: fact.task)),
-        value_resources=tuple(sorted(values, key=lambda fact: (fact.task, fact.output))))
+    values = (
+        *timeline.value_resources,
+        *tuple(
+            ValueResourceFact(task.symbol, output.name, 0)
+            for output in task.outputs
+            if (task.symbol, output.name) not in known
+        ),
+    )
+    return replace(
+        timeline,
+        task_resources=tuple(sorted(task_facts, key=lambda fact: fact.task)),
+        value_resources=tuple(sorted(values, key=lambda fact: (fact.task, fact.output))),
+    )
 
 
 def compile_backend_attachment(
@@ -148,7 +219,10 @@ def lower_backend_attachment(
     inputs: BackendAttachmentCompilerInputs,
     decision: BackendAttachmentDecision,
 ) -> BackendAttachmentPhysicalPlan:
-    return decode_boundary(_core.lower_backend_attachment(encode_boundary(inputs), encode_boundary(decision)), BackendAttachmentPhysicalPlan)
+    return decode_boundary(
+        _core.lower_backend_attachment(encode_boundary(inputs), encode_boundary(decision)),
+        BackendAttachmentPhysicalPlan,
+    )
 
 
 def validate_backend_attachment_physical(
@@ -169,8 +243,11 @@ def bind_attachment_tasks(
 ) -> tuple[AttachmentTaskBinding, ...]:
     bindings: list[AttachmentTaskBinding] = []
     for role, symbol in roles:
-        physical, = (task for task in plan_bundle.schedule_physical.tasks
-            if plan_bundle.semantic_graph.tasks[task.task_id].symbol == symbol)
+        (physical,) = (
+            task
+            for task in plan_bundle.schedule_physical.tasks
+            if plan_bundle.semantic_graph.tasks[task.task_id].symbol == symbol
+        )
         bindings.append(
             AttachmentTaskBinding(
                 role,
@@ -183,25 +260,34 @@ def bind_attachment_tasks(
 
 
 def bind_backend_attachment(
-    plan: PlanBundle, probe: BackendPlacementProbe, spec: BackendAttachmentSpec,
+    plan: PlanBundle,
+    probe: BackendPlacementProbe,
+    spec: BackendAttachmentSpec,
 ) -> SignedBackendAttachment:
     anchors = {anchor.symbol: anchor for anchor in plan.timeline.anchors}
     sampler = anchors[spec.sampler_anchor]
     dependencies = (
-        StreamDependency.HIDDEN_PRODUCER_TO_COMPUTE, StreamDependency.COMPUTE_TO_SAMPLER,
-        StreamDependency.SAMPLER_TO_TRANSITION, StreamDependency.TRANSITION_TO_RELEASE,
+        StreamDependency.HIDDEN_PRODUCER_TO_COMPUTE,
+        StreamDependency.COMPUTE_TO_SAMPLER,
+        StreamDependency.SAMPLER_TO_TRANSITION,
+        StreamDependency.TRANSITION_TO_RELEASE,
     )
     if spec.kind is not AttachmentKind.SAMPLER_TRAINING:
         dependencies = (StreamDependency.TRANSITION_TO_RELEASE,)
     if spec.kind is AttachmentKind.OBSERVATION:
         dependencies = (StreamDependency.HIDDEN_PRODUCER_TO_COMPUTE, StreamDependency.TRANSITION_TO_RELEASE)
     request = BackendAttachmentRequest(
-        attachment_kind=spec.kind, packed_row_schema_version=1,
+        attachment_kind=spec.kind,
+        packed_row_schema_version=1,
         task_bindings=bind_attachment_tasks(plan, spec.tasks),
-        sampler_anchor_id=AnchorId(sampler.ordinal), sampler_anchor_symbol=sampler.symbol,
-        stream_dependencies=dependencies, sampler_stage=spec.sampler_stage,
-        cleanup_stage=AttachmentCleanupStage.REQUEST_FINISH, state_resource=spec.state_resource,
-        overlay_bindings=spec.overlay_bindings, activation_bindings=spec.activation_bindings,
+        sampler_anchor_id=AnchorId(sampler.ordinal),
+        sampler_anchor_symbol=sampler.symbol,
+        stream_dependencies=dependencies,
+        sampler_stage=spec.sampler_stage,
+        cleanup_stage=AttachmentCleanupStage.REQUEST_FINISH,
+        state_resource=spec.state_resource,
+        overlay_bindings=spec.overlay_bindings,
+        activation_bindings=spec.activation_bindings,
     )
     inputs = BackendAttachmentCompilerInputs(request, probe, plan)
     decision = compile_backend_attachment(inputs)

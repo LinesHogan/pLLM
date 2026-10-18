@@ -1,24 +1,29 @@
 """Real fused backend code, read-only borrows, and graph-derived capacity facts."""
 
-from dataclasses import replace
 import math
 import warnings
+from dataclasses import replace
 
 import pytest
 import torch
 
+from pllm.backends.torch_inductor import COMPILER_SLACK_FRACTION, InductorTensorCompiler, compile_inductor_tensor_graph
 from pllm.config import ExecutionOptions
 from pllm.contracts.region_imports import RegionTensorImport
-from pllm.contracts.region_selection import RegionCandidate, RegionPayloadLimit, RegionSelectionRequest
 from pllm.contracts.region_program import Block, Call, Program, Region, ScalarType, Scan, SizeParameter, Value
-from pllm.execution.codec import decode_boundary, encode_boundary
+from pllm.contracts.region_selection import RegionCandidate, RegionPayloadLimit, RegionSelectionRequest
 from pllm.contracts.tensor_compilation import UnsupportedTensorKernel
-from pllm.backends.torch_inductor import COMPILER_SLACK_FRACTION, InductorTensorCompiler, compile_inductor_tensor_graph
+from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
 from pllm.execution.region_compilation import analyze_region_program, lower_region_bindings, lower_region_schedule
 from pllm.execution.region_execution import RegionExecution, RegionInstructionExecution
 from pllm.execution.region_native import CompiledPrimitive
-from pllm.execution.region_optimization import optimize_region, select_region_candidate, PreparedRegionCandidate, bind_region_candidate, assess_region_candidates
+from pllm.execution.region_optimization import (
+    PreparedRegionCandidate,
+    bind_region_candidate,
+    optimize_region,
+    select_region_candidate,
+)
 from pllm.execution.region_storage import analyze_region_capacity, import_region_functions
 from pllm.execution.tensor_compilation import compile_tensor_cell, supports_tensor_compilation
 from pllm.execution.tensor_scan import TensorScan
@@ -27,13 +32,17 @@ from test.boundary.test_region_native_capacity import single_call
 
 def example(device="cpu", dtype=torch.float32, *, duplicate=False):
     x, y = torch.full((128,), 2, device=device, dtype=dtype), torch.ones(128, device=device, dtype=dtype)
+
     def arithmetic(x, y):
         return ((x + y) * (x - y) + x,)
+
     def update(x, y):
         x.add_(1)
         return x, x, y
-    cell = ExportedCell.capture(update if duplicate else arithmetic, ("x", "y"),
-                                ("new", "duplicate", "old") if duplicate else ("out",), (x, y))
+
+    cell = ExportedCell.capture(
+        update if duplicate else arithmetic, ("x", "y"), ("new", "duplicate", "old") if duplicate else ("out",), (x, y)
+    )
     return cell, (x, y)
 
 
@@ -57,7 +66,7 @@ def test_codegen_exports_real_allocations_and_preserves_values_inputs_and_rng(de
     allocations = compiled.implementation.allocations
     assert sum(a.bytes for a in allocations) == subtotal + math.ceil(subtotal * COMPILER_SLACK_FRACTION)
     assert allocations[-1].name == f"compiler-slack@{COMPILER_SLACK_FRACTION}"
-    actual, = compiled.invoke(tensors, None)
+    (actual,) = compiled.invoke(tensors, None)
     torch.testing.assert_close(actual, torch.full_like(actual, 5), rtol=0, atol=0)
     torch.testing.assert_close(tensors[0], torch.full_like(tensors[0], 2), rtol=0, atol=0)
     torch.testing.assert_close(tensors[1], torch.ones_like(tensors[1]), rtol=0, atol=0)
@@ -77,7 +86,7 @@ def test_capacity_includes_entry_inputs_raw_kernel_results_and_every_output_copy
     program = single_call(source)
     schedule = analyze_region_program(program).reference_schedule
     capacity = analyze_region_capacity(program, schedule, {source.digest: compiled})
-    facts, = capacity.devices
+    (facts,) = capacity.devices
     scratch = sum(a.bytes for a in compiled.implementation.allocations)
     assert facts.entry_copy_bytes_upper_bound == 1024
     assert facts.call_scratch_bytes_upper_bound == scratch  # Graph account; inputs borrow entry roots.
@@ -85,8 +94,12 @@ def test_capacity_includes_entry_inputs_raw_kernel_results_and_every_output_copy
     # Access traffic is deliberately unknown: wrapper copies do not describe
     # the fused kernel's global/cache transactions.
     assert capacity.unknown_functions == (source.digest,)
-    run = RegionInstructionExecution(program, lower_region_schedule(program, schedule),
-        lower_region_bindings(program, schedule), {source.digest: compiled})
+    run = RegionInstructionExecution(
+        program,
+        lower_region_schedule(program, schedule),
+        lower_region_bindings(program, schedule),
+        {source.digest: compiled},
+    )
     inputs = dict(zip(("in0", "in1"), tensors))
     warmup = run.run(inputs)
     del warmup
@@ -106,8 +119,12 @@ def test_capacity_includes_entry_inputs_raw_kernel_results_and_every_output_copy
         torch.testing.assert_close(old, tensors[1], rtol=0, atol=0)
         assert len({t.untyped_storage().data_ptr() for t in actual.values}) == 3
     with pytest.raises(ValueError, match="selection decision"):
-        RegionExecution(program, lower_region_schedule(program, schedule), lower_region_bindings(program, schedule),
-                        {source.digest: compiled})
+        RegionExecution(
+            program,
+            lower_region_schedule(program, schedule),
+            lower_region_bindings(program, schedule),
+            {source.digest: compiled},
+        )
 
 
 @pytest.mark.parametrize("device", ("cpu", "cuda:0"))
@@ -115,10 +132,15 @@ def test_automatic_selection_replays_compiler_and_run_does_not_compile(device, m
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     import pllm.execution.region_optimization as tuning
+
     source, tensors = example(device)
-    monkeypatch.setattr(tuning, "_measure", lambda execution, *args:
-        1 if isinstance(execution._cells[source.digest], CompiledPrimitive) else 100)
+    monkeypatch.setattr(
+        tuning,
+        "_measure",
+        lambda execution, *args: 1 if isinstance(execution._cells[source.digest], CompiledPrimitive) else 100,
+    )
     calls = []
+
     class RecordingCompiler:
         def supports(self, graph):
             calls.append("supports")
@@ -130,26 +152,38 @@ def test_automatic_selection_replays_compiler_and_run_does_not_compile(device, m
             # A distinct provider identity exposes accidental default-backend
             # reconstruction while retaining real generated code and budgets.
             return replace(code, backend="recording-provider:" + code.backend)
+
     options = ExecutionOptions(schedule_policy="serial")
     with pytest.warns(NumericalTransformWarning, match="kernel compilation"):
-        selected = optimize_region(single_call(source), {source.digest: source}, dict(zip(("in0", "in1"), tensors)),
-            payload_limits=(RegionPayloadLimit(device, 10000),), options=replace(options, tuning="measured"), warmup_rounds=0, measurement_rounds=1,
-            compiler=RecordingCompiler())
+        selected = optimize_region(
+            single_call(source),
+            {source.digest: source},
+            dict(zip(("in0", "in1"), tensors)),
+            payload_limits=(RegionPayloadLimit(device, 10000),),
+            options=replace(options, tuning="measured"),
+            warmup_rounds=0,
+            measurement_rounds=1,
+            compiler=RecordingCompiler(),
+        )
     assert selected.selection.selected == 1 and not selected.rewrites
     assert "supports" in calls and calls.count("compile") == 1  # Candidate only; finish installs the measured executor.
     calls.clear()
     assert selected.selection.candidates[1].changed_functions == (source.digest,)
+
     def forbidden(*args, **kwargs):
         raise AssertionError("selected execution must not compile or select")
+
     monkeypatch.setattr(tuning, "compile_tensor_cell", forbidden)
     import torch._inductor.compile_fx as inductor
+
     monkeypatch.setattr(inductor, "compile_fx_inner", forbidden)
     if device.startswith("cuda"):
         import triton
         from triton.runtime.jit import JITFunction
+
         monkeypatch.setattr(triton, "compile", forbidden)
         monkeypatch.setattr(JITFunction, "_do_compile", forbidden)
-    actual, = selected.execution.run(dict(zip(("in0", "in1"), tensors))).values
+    (actual,) = selected.execution.run(dict(zip(("in0", "in1"), tensors))).values
     torch.testing.assert_close(actual, torch.full_like(actual, 5), rtol=0, atol=0)
     assert not calls
 
@@ -161,11 +195,19 @@ def test_backend_declining_compilation_preserves_original_schedule_execution():
 
         def compile(self, graph):
             raise AssertionError("a declined implementation must not be compiled")
+
     source, tensors = example()
     inputs = dict(zip(("in0", "in1"), tensors))
-    selected = optimize_region(single_call(source), {source.digest: source}, inputs,
-        payload_limits=(RegionPayloadLimit("cpu", 10000),), compiler=DecliningCompiler(),
-        options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"), warmup_rounds=0, measurement_rounds=1)
+    selected = optimize_region(
+        single_call(source),
+        {source.digest: source},
+        inputs,
+        payload_limits=(RegionPayloadLimit("cpu", 10000),),
+        compiler=DecliningCompiler(),
+        options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"),
+        warmup_rounds=0,
+        measurement_rounds=1,
+    )
     assert len(selected.request.candidates) == 1
     torch.testing.assert_close(selected.execution.run(inputs).values, (torch.full_like(tensors[0], 5),), rtol=0, atol=0)
 
@@ -178,27 +220,43 @@ def test_closed_backend_facts_are_replayed_and_cannot_be_replaced_by_zero_cost_c
     program = single_call(source)
     schedule = analyze_region_program(program).reference_schedule
     original = import_region_functions(program, {source.digest: source})
-    request = RegionSelectionRequest(original, (RegionCandidate(schedule, original, (100,)),
-        RegionCandidate(schedule, (compiled.implementation,), (1,))), (RegionPayloadLimit("cpu", 10000),), True, "backend replay oracle")
+    request = RegionSelectionRequest(
+        original,
+        (RegionCandidate(schedule, original, (100,)), RegionCandidate(schedule, (compiled.implementation,), (1,))),
+        (RegionPayloadLimit("cpu", 10000),),
+        True,
+        "backend replay oracle",
+    )
     # Old selections must be rebuilt from source; do not silently strip a
     # field from signed imports and reuse the previous capacity/selection.
-    options = ExecutionOptions(schedule_policy="serial")
     decision = select_region_candidate(program, request)
-    bind_region_candidate(PreparedRegionCandidate(program, request.candidates[1], (), {source.digest: compiled}),
-        request.payload_limits, decision.candidates[1])
-    for fake in (replace(compiled.implementation, allocations=()),
-                 replace(compiled.implementation, code_digest="0" * 64),
-                 replace(compiled.implementation, backend="another compiler")):
+    bind_region_candidate(
+        PreparedRegionCandidate(program, request.candidates[1], (), {source.digest: compiled}),
+        request.payload_limits,
+        decision.candidates[1],
+    )
+    for fake in (
+        replace(compiled.implementation, allocations=()),
+        replace(compiled.implementation, code_digest="0" * 64),
+        replace(compiled.implementation, backend="another compiler"),
+    ):
         forged = replace(request, candidates=(request.candidates[0], replace(request.candidates[1], imports=(fake,))))
         decision = select_region_candidate(program, forged)
         with pytest.raises(ValueError, match="admitted imports"):
-            bind_region_candidate(PreparedRegionCandidate(program, forged.candidates[1], (), {source.digest: compiled}),
-                forged.payload_limits, decision.candidates[1])
-    for fake in (replace(compiled.implementation, code_digest="not a digest"),
-                 replace(compiled.implementation, allocations=compiled.implementation.allocations * 2)):
+            bind_region_candidate(
+                PreparedRegionCandidate(program, forged.candidates[1], (), {source.digest: compiled}),
+                forged.payload_limits,
+                decision.candidates[1],
+            )
+    for fake in (
+        replace(compiled.implementation, code_digest="not a digest"),
+        replace(compiled.implementation, allocations=compiled.implementation.allocations * 2),
+    ):
         with pytest.raises(ValueError):
-            select_region_candidate(program, replace(request, candidates=(request.candidates[0],
-                replace(request.candidates[1], imports=(fake,)))))
+            select_region_candidate(
+                program,
+                replace(request, candidates=(request.candidates[0], replace(request.candidates[1], imports=(fake,)))),
+            )
     assert select_region_candidate(program, replace(request, allow_numerical_transforms=False)).selected == 0
 
 
@@ -214,38 +272,57 @@ def test_compiler_eliminated_view_keeps_output_copy_and_capacity_contract(device
     scratch = x.numel() * x.element_size()
     scratch += math.ceil(scratch * COMPILER_SLACK_FRACTION)
     assert sum(a.bytes for a in compiled.implementation.allocations) == scratch
-    actual, = compiled.invoke((x,), None)
+    (actual,) = compiled.invoke((x,), None)
     torch.testing.assert_close(actual, x, rtol=0, atol=0)
     assert actual.untyped_storage().data_ptr() != x.untyped_storage().data_ptr()
     program = single_call(source)
     schedule = analyze_region_program(program, optimize=False).reference_schedule
     capacity = analyze_region_capacity(program, schedule, {source.digest: compiled})
-    facts, = capacity.devices
+    (facts,) = capacity.devices
     assert facts.call_scratch_bytes_upper_bound == scratch
     assert facts.peak_tensor_bytes_upper_bound == 2 * x.numel() * x.element_size() + scratch
 
 
 def test_optout_avoids_compilation_and_capacity_can_reject_a_faster_compiled_plan(monkeypatch):
     import pllm.execution.region_optimization as tuning
+
     source, tensors = example()
     source = ExportedCell.capture(lambda x, y: (x + y,), ("x", "y"), ("out",), tensors)
     program, cells, inputs = single_call(source), {source.digest: source}, dict(zip(("in0", "in1"), tensors))
+
     def forbidden(*args, **kwargs):
         raise AssertionError("numerical optout must not compile a candidate")
+
     with monkeypatch.context() as patch:
         patch.setattr(tuning, "compile_tensor_cell", forbidden)
-        selected = optimize_region(program, cells, inputs, payload_limits=(RegionPayloadLimit("cpu", 10000),),
-            options=replace(ExecutionOptions(allow_numerical_transforms=False, schedule_policy="serial"), tuning="measured"),
-            warmup_rounds=0, measurement_rounds=1)
+        selected = optimize_region(
+            program,
+            cells,
+            inputs,
+            payload_limits=(RegionPayloadLimit("cpu", 10000),),
+            options=replace(
+                ExecutionOptions(allow_numerical_transforms=False, schedule_policy="serial"), tuning="measured"
+            ),
+            warmup_rounds=0,
+            measurement_rounds=1,
+        )
     assert len(selected.request.candidates) == 1
     original = analyze_region_capacity(program, analyze_region_program(program).reference_schedule, cells)
+
     def measure(execution, *args):
         assert not isinstance(execution._cells[source.digest], CompiledPrimitive)
         return 100
+
     monkeypatch.setattr(tuning, "_measure", measure)
-    selected = optimize_region(program, cells, inputs,
+    selected = optimize_region(
+        program,
+        cells,
+        inputs,
         payload_limits=(RegionPayloadLimit("cpu", original.devices[0].peak_tensor_bytes_upper_bound),),
-        options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"), warmup_rounds=0, measurement_rounds=1)
+        options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"),
+        warmup_rounds=0,
+        measurement_rounds=1,
+    )
     assert selected.selection.selected == 0 and not selected.selection.candidates[1].feasible
     assert selected.request.candidates[1].elapsed_ns == ()
 
@@ -269,40 +346,59 @@ def test_reduction_normalization_enters_selection_with_owned_scratch_and_readonl
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     import pllm.execution.region_optimization as tuning
+
     # Non-power-of-two rows/columns, two reduction directions, scalar output,
     # and widened accumulation exercise more than a pointwise epilogue.
     base = torch.linspace(-2, 3, 17 * 129 + 1, device=device)
     x = base[1:].view(17, 129)
     before = base.clone()
+
     def normalize(x):
         mean_square = (x * x).mean(dim=1, keepdim=True)
         return x * torch.rsqrt(mean_square + 1e-5), x.sum(dim=0), x.sum(dtype=torch.float64)
+
     source = ExportedCell.capture(normalize, ("x",), ("normalized", "columns", "total"), (x,))
-    monkeypatch.setattr(tuning, "_measure", lambda execution, *args:
-        1 if isinstance(execution._cells[source.digest], CompiledPrimitive) else 100)
+    monkeypatch.setattr(
+        tuning,
+        "_measure",
+        lambda execution, *args: 1 if isinstance(execution._cells[source.digest], CompiledPrimitive) else 100,
+    )
     with pytest.warns(NumericalTransformWarning, match="kernel compilation"):
-        selected = optimize_region(single_call(source), {source.digest: source}, {"in0": x},
+        selected = optimize_region(
+            single_call(source),
+            {source.digest: source},
+            {"in0": x},
             payload_limits=(RegionPayloadLimit(device, 1_000_000),),
-            options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"), max_candidates=2,
-            warmup_rounds=0, measurement_rounds=1)
+            options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"),
+            max_candidates=2,
+            warmup_rounds=0,
+            measurement_rounds=1,
+        )
     assert selected.selection.selected == 1
     compiled = selected.execution.cells[source.digest]
     assert isinstance(compiled, CompiledPrimitive)
     allocations = compiled.implementation.allocations
     assert allocations and sum(a.bytes for a in allocations) >= source.output_bytes
-    capacity = analyze_region_capacity(single_call(source), selected.request.candidates[1].schedule_map,
-                                       {source.digest: compiled})
+    capacity = analyze_region_capacity(
+        single_call(source), selected.request.candidates[1].schedule_map, {source.digest: compiled}
+    )
     assert capacity.devices[0].call_scratch_bytes_upper_bound == sum(a.bytes for a in allocations)
     assert capacity.unknown_functions == (source.digest,)  # Allocation facts are not measured traffic.
+
     def forbidden(*args, **kwargs):
         raise AssertionError("selected reduction must run its already-compiled kernels")
+
     monkeypatch.setattr(tuning, "compile_tensor_cell", forbidden)
     import torch._inductor.compile_fx as inductor
+
     monkeypatch.setattr(inductor, "compile_fx_inner", forbidden)
     actual = selected.execution.run({"in0": x}).values
     reference = x.double()
-    expected = ((reference / torch.sqrt((reference * reference).sum(dim=1, keepdim=True) / 129 + 1e-5)).float(),
-                reference.sum(dim=0).float(), reference.sum())
+    expected = (
+        (reference / torch.sqrt((reference * reference).sum(dim=1, keepdim=True) / 129 + 1e-5)).float(),
+        reference.sum(dim=0).float(),
+        reference.sum(),
+    )
     for result, oracle in zip(actual, expected, strict=True):
         torch.testing.assert_close(result, oracle)
     torch.testing.assert_close(base, before, rtol=0, atol=0)
@@ -311,30 +407,52 @@ def test_reduction_normalization_enters_selection_with_owned_scratch_and_readonl
 
 def test_selection_combines_compilers_across_loop_boundary_without_singleton_wins(monkeypatch):
     import pllm.execution.region_optimization as tuning
+
     x = torch.arange(1, 130, dtype=torch.float64)
     reduce = ExportedCell.capture(lambda x: ((x * x).mean(),), ("x",), ("mean",), (x,))
     advance = ExportedCell.capture(lambda x: (x * 0.5 + 1,), ("x",), ("next",), (x.mean(),))
-    t, = reduce.declaration.outputs
-    loop = Region(Block((Value("i", ScalarType.INDEX), Value("carry", t)), (
-        Call(("carry",), (Value("next", t),), advance.digest),
-    ), ("next",)))
-    program = Program(Region(Block((Value("x", reduce.declaration.inputs[0]),), (
-        Call(("x",), (Value("mean", t),), reduce.digest),
-        Scan(("mean",), (Value("result", t),), 3, loop),
-    ), ("result",))), (reduce.declaration, advance.declaration))
+    (t,) = reduce.declaration.outputs
+    loop = Region(
+        Block(
+            (Value("i", ScalarType.INDEX), Value("carry", t)),
+            (Call(("carry",), (Value("next", t),), advance.digest),),
+            ("next",),
+        )
+    )
+    program = Program(
+        Region(
+            Block(
+                (Value("x", reduce.declaration.inputs[0]),),
+                (
+                    Call(("x",), (Value("mean", t),), reduce.digest),
+                    Scan(("mean",), (Value("result", t),), 3, loop),
+                ),
+                ("result",),
+            )
+        ),
+        (reduce.declaration, advance.declaration),
+    )
+
     def measure(execution, *args):
         count = sum(isinstance(cell, CompiledPrimitive) for cell in execution._cells.values())
         return (100, 200, 1)[count]  # Either individual change loses; their combination wins.
+
     monkeypatch.setattr(tuning, "_measure", measure)
     with pytest.warns(NumericalTransformWarning, match="kernel compilation"):
-        selected = optimize_region(program, {reduce.digest: reduce, advance.digest: advance}, {"x": x},
+        selected = optimize_region(
+            program,
+            {reduce.digest: reduce, advance.digest: advance},
+            {"x": x},
             payload_limits=(RegionPayloadLimit("cpu", 10000),),
-            options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"), max_candidates=4,
-            warmup_rounds=0, measurement_rounds=1)
+            options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"),
+            max_candidates=4,
+            warmup_rounds=0,
+            measurement_rounds=1,
+        )
     assert selected.selection.selected == 1
     assert len(selected.selection.candidates[1].changed_functions) == 2
     assert all(not c.outlines for c in selected.request.candidates)
-    actual, = selected.execution.run({"x": x}).values
+    (actual,) = selected.execution.run({"x": x}).values
     expected = sum(i * i for i in range(1, 130)) / 129
     for _ in range(3):
         expected = expected * 0.5 + 1
@@ -354,9 +472,11 @@ def test_readonly_kernel_borrows_overlapping_unaligned_inputs_without_hidden_cop
     before = base.clone()
     expected = (x + 1, x + 1, y.clone()) if duplicate else ((x + y) * (x - y) + x,)
     observed = []
+
     def record(*inputs):
         observed.append(tuple(t.data_ptr() for t in inputs))
         return compiled.function(*inputs)
+
     run = replace(compiled, function=record)
     # Compile and warm before observing allocation. The next call may neither
     # copy its borrows nor hide an alignment copy inside the generated wrapper.
@@ -381,8 +501,10 @@ def test_readonly_kernel_borrows_overlapping_unaligned_inputs_without_hidden_cop
 @pytest.mark.parametrize("violation", ("mutation", "alignment"))
 def test_readonly_import_rejects_backend_writes_and_hidden_alignment_copies(violation, monkeypatch):
     import torch._inductor.compile_fx as inductor
+
     source, _ = example()
     original = inductor.compile_fx_inner
+
     def with_violation(*args, **kwargs):
         artifact = original(*args, **kwargs)
         if violation == "mutation":
@@ -390,6 +512,7 @@ def test_readonly_import_rejects_backend_writes_and_hidden_alignment_copies(viol
         else:
             artifact.inputs_to_check = (0,)
         return artifact
+
     monkeypatch.setattr(inductor, "compile_fx_inner", with_violation)
     with pytest.raises(UnsupportedTensorKernel, match="mutation.*alignment copies"):
         compile_tensor_cell(source)
@@ -399,12 +522,13 @@ def test_readonly_codegen_overrides_and_restores_global_alignment_policy():
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA alignment checks")
     from torch._inductor import config
+
     source, _ = example("cuda:0")
     with config.patch(assume_aligned_inputs=True):
         compiled = compile_tensor_cell(source)
         assert config.assume_aligned_inputs
     base = torch.ones(129, device="cuda:0")
-    actual, = compiled.invoke((base[1:], base[1:]), None)
+    (actual,) = compiled.invoke((base[1:], base[1:]), None)
     torch.testing.assert_close(actual, torch.ones_like(actual), rtol=0, atol=0)
 
 
@@ -417,21 +541,34 @@ def test_compiled_borrow_keeps_region_view_origin_and_old_versions(device):
     update, _ = example(device, duplicate=True)
     compiled = compile_tensor_cell(update)
     observed = []
+
     def record(*inputs):
         observed.append(tuple((t.storage_offset(), t.data_ptr()) for t in inputs))
         return compiled.function(*inputs)
-    t, = view.declaration.outputs
-    program = Program(Region(Block((Value("base", view.declaration.inputs[0]),), (
-        Call(("base",), (Value("view", t),), view.digest),
-        Call(("view", "view"), (Value("new", t), Value("again", t), Value("old", t)), update.digest),
-    ), ("base", "view", "new", "again", "old"))), (view.declaration, update.declaration))
+
+    (t,) = view.declaration.outputs
+    program = Program(
+        Region(
+            Block(
+                (Value("base", view.declaration.inputs[0]),),
+                (
+                    Call(("base",), (Value("view", t),), view.digest),
+                    Call(("view", "view"), (Value("new", t), Value("again", t), Value("old", t)), update.digest),
+                ),
+                ("base", "view", "new", "again", "old"),
+            )
+        ),
+        (view.declaration, update.declaration),
+    )
     cells = {view.digest: view, update.digest: replace(compiled, function=record)}
     schedule = analyze_region_program(program).reference_schedule
     capacity = analyze_region_capacity(program, schedule, cells)
     assert capacity.devices[0].call_scratch_bytes_upper_bound == sum(
-        a.bytes for a in compiled.implementation.allocations)
-    run = RegionInstructionExecution(program, lower_region_schedule(program, schedule),
-        lower_region_bindings(program, schedule), cells)
+        a.bytes for a in compiled.implementation.allocations
+    )
+    run = RegionInstructionExecution(
+        program, lower_region_schedule(program, schedule), lower_region_bindings(program, schedule), cells
+    )
     old_base, old_view, new, again, old = run.run({"base": base}).values
     assert old_view.untyped_storage().data_ptr() == old_base.untyped_storage().data_ptr()
     assert observed == [((1, old_view.data_ptr()), (1, old_view.data_ptr()))]
@@ -447,21 +584,46 @@ def test_outlined_calls_can_be_selected_as_one_real_backend_kernel(device, monke
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     import pllm.execution.region_optimization as tuning
+
     x, y = torch.full((128,), 2.0, device=device), torch.ones(128, device=device)
     first = ExportedCell.capture(lambda x, y: (x + y, x - y), ("x", "y"), ("sum", "diff"), (x, y))
     second = ExportedCell.capture(lambda s, d, x: (s * d + x,), ("sum", "diff", "x"), ("out",), (x + y, x - y, x))
-    t, = second.declaration.outputs
-    program = Program(Region(Block((Value("x", t), Value("y", t)), (
-        Call(("x", "y"), (Value("sum", t), Value("diff", t)), first.digest),
-        Call(("sum", "diff", "x"), (Value("out", t),), second.digest),
-    ), ("out",))), (first.declaration, second.declaration))
+    (t,) = second.declaration.outputs
+    program = Program(
+        Region(
+            Block(
+                (Value("x", t), Value("y", t)),
+                (
+                    Call(("x", "y"), (Value("sum", t), Value("diff", t)), first.digest),
+                    Call(("sum", "diff", "x"), (Value("out", t),), second.digest),
+                ),
+                ("out",),
+            )
+        ),
+        (first.declaration, second.declaration),
+    )
     sources = {first.digest: first, second.digest: second}
-    monkeypatch.setattr(tuning, "_measure", lambda execution, *args:
-        1 if any(isinstance(cell, CompiledPrimitive) and name not in sources for name, cell in execution._cells.items()) else 100)
+    monkeypatch.setattr(
+        tuning,
+        "_measure",
+        lambda execution, *args: (
+            1
+            if any(
+                isinstance(cell, CompiledPrimitive) and name not in sources for name, cell in execution._cells.items()
+            )
+            else 100
+        ),
+    )
     with pytest.warns(NumericalTransformWarning, match="kernel compilation"):
-        selected = optimize_region(program, sources, {"x": x, "y": y},
-            payload_limits=(RegionPayloadLimit(device, 10000),), options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"),
-            warmup_rounds=0, measurement_rounds=1)
+        selected = optimize_region(
+            program,
+            sources,
+            {"x": x, "y": y},
+            payload_limits=(RegionPayloadLimit(device, 10000),),
+            options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"),
+            warmup_rounds=0,
+            measurement_rounds=1,
+        )
     candidate = selected.request.candidates[selected.selection.selected]
     assert len(candidate.outlines) == 1
     compiled = [c for c in selected.execution.cells.values() if isinstance(c, CompiledPrimitive)]
@@ -476,17 +638,31 @@ def test_zero_length_tuning_compiles_once_for_other_legal_scan_lengths(device, m
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     import pllm.execution.region_optimization as tuning
+
     x = torch.ones(128, device=device)
     cell = ExportedCell.capture(lambda x: (x * 2 + 1,), ("x",), ("out",), (x,))
     scan = TensorScan(cell, SizeParameter("steps", 0, 1_000_000), carry=1, invariants=0)
-    monkeypatch.setattr(tuning, "_measure", lambda execution, *args:
-        1 if isinstance(execution._cells[cell.digest], CompiledPrimitive) else 100)
+    monkeypatch.setattr(
+        tuning,
+        "_measure",
+        lambda execution, *args: 1 if isinstance(execution._cells[cell.digest], CompiledPrimitive) else 100,
+    )
     with pytest.warns(NumericalTransformWarning, match="kernel compilation"):
-        selected, selected_report = scan.optimized((x,), (), (), count=0, payload_limits=(RegionPayloadLimit(device, 10000),),
-            options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"), warmup_rounds=0, measurement_rounds=1)
+        selected, selected_report = scan.optimized(
+            (x,),
+            (),
+            (),
+            count=0,
+            payload_limits=(RegionPayloadLimit(device, 10000),),
+            options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"),
+            warmup_rounds=0,
+            measurement_rounds=1,
+        )
     assert selected_report.selection.candidates[selected_report.selection.selected].changed_functions == (cell.digest,)
+
     def forbidden(*args, **kwargs):
         raise AssertionError("another loop count must not trigger compilation")
+
     monkeypatch.setattr(tuning, "compile_tensor_cell", forbidden)
     for count in (0, 1, 3):
         result = selected((x,), (), (), count=count)

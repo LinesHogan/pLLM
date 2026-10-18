@@ -13,18 +13,15 @@ class FinishReason(StrEnum):
     ERROR = "error"
 
 
-
 class RetryAction(StrEnum):
     ACCEPT = "accept"
     RETRY = "retry"
     STOP = "stop"
 
 
-
 class BarrierState(StrEnum):
     READY = "ready"
     BLOCKED = "blocked"
-
 
 
 class ControlReason(StrEnum):
@@ -41,7 +38,6 @@ class ControlReason(StrEnum):
     NO_REWARD = "no-trainable-reward"
 
 
-
 @dataclass(frozen=True, slots=True)
 class Completion:
     identity: RequestIdentity
@@ -56,7 +52,6 @@ class Completion:
             raise ValueError("completion is not closed")
 
 
-
 @dataclass(frozen=True, slots=True)
 class CompletionBatch:
     entries: tuple[Completion, ...]
@@ -65,7 +60,6 @@ class CompletionBatch:
         identities = tuple(entry.identity for entry in self.entries)
         if not self.entries or len(set(identities)) != len(identities):
             raise ValueError("completion batch requires unique exact entries")
-
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,14 +73,12 @@ class RewardOutcome:
     skip_reason: str
 
 
-
 @dataclass(frozen=True, slots=True)
 class RetryControl:
     completion: Completion
     action: RetryAction
     reason: ControlReason
     retry_after_update: bool
-
 
 
 @dataclass(frozen=True, slots=True)

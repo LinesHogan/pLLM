@@ -127,6 +127,7 @@ def test_capture_rejects_python_effects_that_cannot_enter_the_tensor_graph():
         def forward(self, x):
             self.events.append("executed")
             return x + 1
+
     module = Source()
     with pytest.raises(RuntimeError, match="side effects"):
         capture_module_export(module, (torch.ones(4),))
@@ -144,9 +145,12 @@ def test_original_qwen_forward_is_partitioned_with_mutations_and_none_guard(has_
     layer.self_attn = Attention(calls, kv)
     layer.post_attention_layernorm = Norm(calls, "post-norm")
     layer.mlp = Dense(calls)
-    piece = capture_module_partition(layer, stateful=("self_attn",),
+    piece = capture_module_partition(
+        layer,
+        stateful=("self_attn",),
         readonly=("input_layernorm", "post_attention_layernorm", "mlp"),
-        none_inputs=() if has_residual else ("residual",))
+        none_inputs=() if has_residual else ("residual",),
+    )
     assert not calls
     positions, hidden = torch.tensor([2]), torch.randn((1, 4), dtype=torch.float64)
     residual = torch.randn_like(hidden) if has_residual else None

@@ -23,16 +23,25 @@ class BorrowedStateRoot:
     def __init__(self, plan: PlanBundle, resource: str, ref: StateRef, pages: tuple[BorrowedPage, ...]) -> None:
         self.resource, self.ref, self.pages = resource, ref, pages
         self.signature = plan.schedule_decision.signature
-        layout, = (entry.layout for entry in plan.tensor_layout_request.layouts if entry.resource == resource)
-        if (not pages or len(pages) != len(layout.fields)
-            or any(page.descriptor.compilation_signature != self.signature or page.descriptor.resource != resource
-                or page.descriptor.ref != ref or page.descriptor.field_id != field.field_id
-                or page.descriptor.owner_id != pages[0].descriptor.owner_id or page.stream != pages[0].stream
-                for page, field in zip(pages, layout.fields, strict=True))):
+        (layout,) = (entry.layout for entry in plan.tensor_layout_request.layouts if entry.resource == resource)
+        if (
+            not pages
+            or len(pages) != len(layout.fields)
+            or any(
+                page.descriptor.compilation_signature != self.signature
+                or page.descriptor.resource != resource
+                or page.descriptor.ref != ref
+                or page.descriptor.field_id != field.field_id
+                or page.descriptor.owner_id != pages[0].descriptor.owner_id
+                or page.stream != pages[0].stream
+                for page, field in zip(pages, layout.fields, strict=True)
+            )
+        ):
             raise ValueError("borrowed root requires every field of one exact grant owner and version")
         self.stream = pages[0].stream
-        self._view: ReadonlyTensorView | None = ReadonlyTensorView(BorrowedResource(resource, ()),
-            (ReadonlyTensorCell.bind((), tuple(page.tensor for page in pages)),))
+        self._view: ReadonlyTensorView | None = ReadonlyTensorView(
+            BorrowedResource(resource, ()), (ReadonlyTensorCell.bind((), tuple(page.tensor for page in pages)),)
+        )
         self._claimed = False
         self._pin: PagePin | None = None
 

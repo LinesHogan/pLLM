@@ -1,36 +1,47 @@
 """Evidence 29: independent reward/Adam oracle and original publication settlement."""
 
-from dataclasses import replace
 from collections.abc import Mapping
+from dataclasses import replace
 
 import pytest
 import torch
-from pllm import make_llm
-import pllm
 
-from pllm.execution.host_runtime import HostRuntimeFacts, CompletionInput
-from pllm.execution.ptts.page_bundle import PageBundleArena
-from pllm.execution.state_execution import StateSettlementError
-from pllm.workloads.ttrl import TTRLConfig, TTRLData, TTRLWorkload, boxed_label
+import pllm
+from pllm import make_llm
 from pllm.authoring import FunctionMath
 from pllm.contracts.feedback import BarrierState, Completion, CompletionBatch, FinishReason, RetryAction
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId
+from pllm.execution.host_runtime import CompletionInput, HostRuntimeFacts
+from pllm.execution.ptts.page_bundle import PageBundleArena
+from pllm.execution.state_execution import StateSettlementError
+from pllm.workloads.ttrl import TTRLConfig, TTRLData, TTRLWorkload, boxed_label
 
 
 def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest.MonkeyPatch) -> None:
     assert boxed_label(r"old \boxed{0}, final \boxed{ \frac{ A }{ b } }") == r"\frac{a}{b}"
     assert boxed_label(r"\boxed{unfinished") == ""
     assert boxed_label(r"\fbox{ TWO Words }") == "twowords"
-    completions = CompletionBatch(tuple(Completion(RequestIdentity(str(i), i // 3, i % 3), 0,
-        f"group-{i // 3}", (1,), text, FinishReason.STOP) for i, text in enumerate((
-            r"\boxed{ B }", r"\boxed{A}", "missing", r"\boxed{2}", r"\boxed{1}", r"\boxed{1}"))))
+    completions = CompletionBatch(
+        tuple(
+            Completion(RequestIdentity(str(i), i // 3, i % 3), 0, f"group-{i // 3}", (1,), text, FinishReason.STOP)
+            for i, text in enumerate(
+                (r"\boxed{ B }", r"\boxed{A}", "missing", r"\boxed{2}", r"\boxed{1}", r"\boxed{1}")
+            )
+        )
+    )
     config = TTRLConfig(rank=2, learning_rate=0.02, votes_per_prompt=3, samples_per_prompt=2)
     for device in (torch.device("cpu"), *((torch.device("cuda", 0),) if torch.cuda.is_available() else ())):
         stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
         workload = TTRLWorkload(config)
-        facts = HostRuntimeFacts(device, hidden_size=4, initialization_seed=11, state_memory_budget_bytes=65536,
-            max_input_rows=6, memory_budget_bytes=1 << 20)
+        facts = HostRuntimeFacts(
+            device,
+            hidden_size=4,
+            initialization_seed=11,
+            state_memory_budget_bytes=65536,
+            max_input_rows=6,
+            memory_budget_bytes=1 << 20,
+        )
         execution = make_llm(workload=workload, config=facts)
         plan = execution.arena.plan
         peak = plan.schedule_decision.peak_memory_bytes
@@ -43,7 +54,7 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         assert binding.facts is facts
         execution = binding.compile()
         assert execution.arena.plan.timeline.memory_budget_bytes == peak
-        initial, = execution.admit((), stream)
+        (initial,) = execution.admit((), stream)
         old_pin = execution.arena.pin_exact((initial,), stream)
         original = execution.snapshot(initial, stream)
         source = torch.linspace(-1, 1, 24, device=device).reshape(6, 4)
@@ -60,8 +71,9 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         expected_rewards = [1.0, 0.0, None, 0.0, 1.0, 1.0]
         latest = initial
         extra = replace(completions.entries[0], identity=RequestIdentity("excess", 2, 0))
-        excess = CompletionInput.capture(CompletionBatch((*completions.entries, extra)),
-            torch.ones(7, 4, device=device), producer)
+        excess = CompletionInput.capture(
+            CompletionBatch((*completions.entries, extra)), torch.ones(7, 4, device=device), producer
+        )
         with pytest.raises(ValueError, match="signed input capacity"):
             execution.step(excess, stream)
         assert execution.arena.latest(initial.lineage_id) == initial
@@ -70,15 +82,29 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
             if stream is not None:
                 stream.synchronize()
             assert result.publication is not None and result.publication.before_refs == (latest,)
-            latest, = result.publication.after_refs
+            (latest,) = result.publication.after_refs
             assert result.state_ref is latest
             assert [item.reward for item in result.reward_outcomes] == expected_rewards
             assert [item.action for item in result.retry_controls] == [
-                RetryAction.ACCEPT, RetryAction.RETRY, RetryAction.RETRY,
-                RetryAction.RETRY, RetryAction.ACCEPT, RetryAction.ACCEPT]
-            assert [item.retry_after_update for item in result.retry_controls] == [False, True, False, True, False, False]
+                RetryAction.ACCEPT,
+                RetryAction.RETRY,
+                RetryAction.RETRY,
+                RetryAction.RETRY,
+                RetryAction.ACCEPT,
+                RetryAction.ACCEPT,
+            ]
+            assert [item.retry_after_update for item in result.retry_controls] == [
+                False,
+                True,
+                False,
+                True,
+                False,
+                False,
+            ]
             assert all(item.state is BarrierState.READY and item.ready_count == 2 for item in result.update_barriers)
-            for completion, reward, control in zip(completions.entries, result.reward_outcomes, result.retry_controls, strict=True):
+            for completion, reward, control in zip(
+                completions.entries, result.reward_outcomes, result.retry_controls, strict=True
+            ):
                 assert reward.completion is control.completion is completion
             optimizer.zero_grad()
             prediction = batch.hidden[selected] @ down.T @ up.T
@@ -90,10 +116,13 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
             actual = execution.snapshot(latest, stream)
             if stream is not None:
                 stream.synchronize()
-            expected = (torch.cat((down.flatten(), up.flatten())), torch.cat((down.grad.flatten(), up.grad.flatten())),
+            expected = (
+                torch.cat((down.flatten(), up.flatten())),
+                torch.cat((down.grad.flatten(), up.grad.flatten())),
                 optimizer.state[down]["step"].to(device),
                 torch.cat((optimizer.state[down]["exp_avg"].flatten(), optimizer.state[up]["exp_avg"].flatten())),
-                torch.cat((optimizer.state[down]["exp_avg_sq"].flatten(), optimizer.state[up]["exp_avg_sq"].flatten())))
+                torch.cat((optimizer.state[down]["exp_avg_sq"].flatten(), optimizer.state[up]["exp_avg_sq"].flatten())),
+            )
             for value, reference in zip(actual, expected, strict=True):
                 torch.testing.assert_close(value, reference)
         for value, reference in zip(execution.arena.snapshot(old_pin, initial), original, strict=True):
@@ -103,15 +132,19 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         execution.execute_anchor(pending, AnchorId(0))
         execution.cancel_step(pending)
         assert execution.arena.latest(initial.lineage_id) == latest
+
         def fail_publish(self, write):
             raise RuntimeError("publication failed")
+
         with monkeypatch.context() as fault:
             fault.setattr(PageBundleArena, "publish", fail_publish)
             with pytest.raises(RuntimeError, match="publication failed"):
                 execution.step(batch, stream)
         assert execution.arena.latest(initial.lineage_id) == latest
+
         def fail_output(self, context):
             raise RuntimeError("output failed")
+
         with monkeypatch.context() as fault:
             fault.setattr(FunctionMath, "output", fail_output)
             with pytest.raises(StateSettlementError) as failure:
@@ -121,19 +154,25 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         assert execution.diagnostics().update_count == 3
         with pytest.raises(RuntimeError, match="not registered"):
             execution.finish_step(failure.value.invocation)
-        missing = replace(batch, completions=CompletionBatch(tuple(replace(c, text="missing") for c in completions.entries)))
+        missing = replace(
+            batch, completions=CompletionBatch(tuple(replace(c, text="missing") for c in completions.entries))
+        )
         result = execution.step(missing, stream)
         assert result.loss is result.publication is None
         assert all(item.reward is None for item in result.reward_outcomes)
         assert all(item.state is BarrierState.BLOCKED and item.ready_count == 0 for item in result.update_barriers)
         with pytest.raises(ValueError, match="vote group"):
-            execution.step(replace(batch, completions=CompletionBatch((completions.entries[0],)), hidden=batch.hidden[:1]), stream)
+            execution.step(
+                replace(batch, completions=CompletionBatch((completions.entries[0],)), hidden=batch.hidden[:1]), stream
+            )
         execution.retire(())
         diagnostics = execution.diagnostics()
         assert diagnostics.active_lineages == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
 
-    disabled = make_llm(workload=TTRLWorkload(replace(config, enabled=False)), config=HostRuntimeFacts(
-        torch.device("cpu"), hidden_size=4, state_memory_budget_bytes=65536))
+    disabled = make_llm(
+        workload=TTRLWorkload(replace(config, enabled=False)),
+        config=HostRuntimeFacts(torch.device("cpu"), hidden_size=4, state_memory_budget_bytes=65536),
+    )
     disabled.admit(())
     result = disabled.step(CompletionInput.capture(completions, torch.zeros(6, 4)))
     assert result.loss is result.publication is None
@@ -168,7 +207,7 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         make_llm(workload=LooseBudget(config), config=replace(facts, max_input_rows=6, memory_budget_bytes=1))
     binding = zero.declare_host(facts)
     execution = binding.compile()
-    initial, = execution.admit(())
+    (initial,) = execution.admit(())
     before = execution.snapshot(initial)
     with monkeypatch.context() as changed:
         changed.setattr(ZeroLoss, "scale", 1.0)

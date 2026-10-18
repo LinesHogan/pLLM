@@ -5,20 +5,19 @@ not infer purity from a module name, execute leaf kernels during capture, or
 reimplement their mathematics. Source modules must be trusted for FX tracing.
 """
 
-from dataclasses import dataclass
-from contextlib import AbstractContextManager, nullcontext
 import operator
-from typing import Protocol, cast
 from collections.abc import Callable, Iterator, Mapping
+from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass
+from typing import Protocol, cast
 
 import torch
 from torch import _dynamo
-from torch.fx import _symbolic_trace
 from torch.export.graph_signature import InputKind, TensorArgument
+from torch.fx import _symbolic_trace
 
-from pllm.execution.codec import boundary_digest, check_functional_aten, tensor_graph_outputs, tensor_node_metadata
 from pllm.contracts.region_imports import KernelAllocation
-
+from pllm.execution.codec import boundary_digest, check_functional_aten, tensor_graph_outputs, tensor_node_metadata
 
 _ASSERT_IS_NONE: object = getattr(_symbolic_trace, "_assert_is_none")
 
@@ -28,7 +27,9 @@ class _CaptureConfig(Protocol):
 
 
 class _Reparameterize(Protocol):
-    def __call__(self, module: torch.nn.Module, parameters: dict[str, torch.Tensor]) -> AbstractContextManager[None]: ...
+    def __call__(
+        self, module: torch.nn.Module, parameters: dict[str, torch.Tensor]
+    ) -> AbstractContextManager[None]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,8 +43,9 @@ class ModuleExport:
         self._check()
 
 
-def capture_module_export(module: torch.nn.Module, examples: tuple[torch.Tensor, ...], *,
-                          parameters: Mapping[str, torch.Tensor] | None = None) -> ModuleExport:
+def capture_module_export(
+    module: torch.nn.Module, examples: tuple[torch.Tensor, ...], *, parameters: Mapping[str, torch.Tensor] | None = None
+) -> ModuleExport:
     """Retain the graph and executable guards from one original Torch capture.
 
     Only private input samples and fake tensor execution are used. Lifted fields
@@ -54,27 +56,44 @@ def capture_module_export(module: torch.nn.Module, examples: tuple[torch.Tensor,
     from torch._dynamo import convert_frame
     from torch._dynamo.convert_frame import FrameInfo, fullgraph_capture
     from torch._dynamo.functional_export import ExportTracerOutput
-    from torch._guards import Source
     from torch._dynamo.utils import dynamo_timed, get_metrics_context
     from torch._dynamo.variables.torch_function import torch_function_mode_stack_state_mgr
+    from torch._guards import Source
     from torch.fx.experimental.proxy_tensor import make_fx
-    from torch.utils._pytree import TreeSpec, tree_flatten, tree_unflatten
     from torch.nn.utils import stateless
+    from torch.utils._pytree import TreeSpec, tree_flatten, tree_unflatten
 
     bindings = tuple(ModuleCallBinding.bind(child) for child in module.modules())
     samples = tuple(value.detach().clone() for value in examples)
     state = None if parameters is None else dict(parameters)
     reparameterize = cast(_Reparameterize, getattr(stateless, "_reparametrize_module"))
-    get_frame = cast(Callable[[Callable[..., object], tuple[torch.Tensor, ...]], FrameInfo], getattr(convert_frame, "_get_frame"))
+    get_frame = cast(
+        Callable[[Callable[..., object], tuple[torch.Tensor, ...]], FrameInfo], getattr(convert_frame, "_get_frame")
+    )
+
     def scope() -> AbstractContextManager[None]:
         return nullcontext() if state is None else reparameterize(module, dict(state))
+
     def invoke(*values: torch.Tensor) -> object:
         return ExportTracerOutput(*tree_flatten(module(*values)))
-    with (scope(), torch.no_grad(), get_metrics_context(), dynamo_timed("fullgraph_capture"),
-          torch_function_mode_stack_state_mgr,
-          cast(_CaptureConfig, _dynamo.config).patch({"specialize_int": True, "specialize_float": True,
-              "assume_static_by_default": True, "automatic_dynamic_shapes": False, "side_effect_replay_policy": "error",
-              "log_graph_in_out_metadata": True})):
+
+    with (
+        scope(),
+        torch.no_grad(),
+        get_metrics_context(),
+        dynamo_timed("fullgraph_capture"),
+        torch_function_mode_stack_state_mgr,
+        cast(_CaptureConfig, _dynamo.config).patch(
+            {
+                "specialize_int": True,
+                "specialize_float": True,
+                "assume_static_by_default": True,
+                "automatic_dynamic_shapes": False,
+                "side_effect_replay_policy": "error",
+                "log_graph_in_out_metadata": True,
+            }
+        ),
+    ):
         captured = fullgraph_capture(invoke, samples)
         if captured.backend_input is None:
             raise ValueError("module source has no captured tensor computation")
@@ -155,18 +174,26 @@ def capture_module_export(module: torch.nn.Module, examples: tuple[torch.Tensor,
             if not manager.check(frame.locals):
                 reason = manager.check_verbose(frame.locals)
                 raise ValueError(f"original module no longer satisfies its Torch capture guards: {reason}")
+
     result = ModuleExport(exported, check)
     result.validate()
     return result
 
 
 def _same_tensor_view(value: torch.Tensor, field: torch.Tensor) -> bool:
-    return (value.device == field.device and value.dtype == field.dtype
-        and value.untyped_storage() == field.untyped_storage() and value.storage_offset() == field.storage_offset()
-        and tuple(value.shape) == tuple(field.shape) and tuple(value.stride()) == tuple(field.stride()))
+    return (
+        value.device == field.device
+        and value.dtype == field.dtype
+        and value.untyped_storage() == field.untyped_storage()
+        and value.storage_offset() == field.storage_offset()
+        and tuple(value.shape) == tuple(field.shape)
+        and tuple(value.stride()) == tuple(field.stride())
+    )
 
 
-def exported_parameter_fields(program: torch.export.ExportedProgram, fields: tuple[torch.Tensor, ...]) -> dict[str, int]:
+def exported_parameter_fields(
+    program: torch.export.ExportedProgram, fields: tuple[torch.Tensor, ...]
+) -> dict[str, int]:
     """Resolve lifted targets, including detached aliases, to original fields.
 
     Only identical storage views qualify. Constants unrelated to the original
@@ -178,8 +205,13 @@ def exported_parameter_fields(program: torch.export.ExportedProgram, fields: tup
             continue
         if not isinstance(spec.arg, TensorArgument) or spec.target is None:
             raise ValueError("export field binding requires lifted tensor targets")
-        value: object = (program.state_dict[spec.target] if spec.kind in (InputKind.PARAMETER, InputKind.BUFFER)
-                         else program.constants[spec.target] if spec.kind is InputKind.CONSTANT_TENSOR else None)
+        value: object = (
+            program.state_dict[spec.target]
+            if spec.kind in (InputKind.PARAMETER, InputKind.BUFFER)
+            else program.constants[spec.target]
+            if spec.kind is InputKind.CONSTANT_TENSOR
+            else None
+        )
         if not isinstance(value, torch.Tensor) or not value.is_contiguous():
             raise ValueError("export field binding requires an original contiguous tensor view")
         candidates = tuple(i for i, field in enumerate(fields) if _same_tensor_view(value, field))
@@ -237,8 +269,14 @@ def partition_tensor_graph(graph: torch.fx.GraphModule) -> tuple[TensorGraphPart
         for node in nodes:
             mapped[node] = fragment.node_copy(node, mapped.__getitem__)
         fragment.output(tuple(mapped[node] for node in outputs))
-        result.append(TensorGraphPartition(torch.fx.GraphModule({}, fragment),
-            tuple(node.name for node in inputs), tuple(node.name for node in outputs), opaque))
+        result.append(
+            TensorGraphPartition(
+                torch.fx.GraphModule({}, fragment),
+                tuple(node.name for node in inputs),
+                tuple(node.name for node in outputs),
+                opaque,
+            )
+        )
     return tuple(result)
 
 
@@ -246,6 +284,7 @@ def functionalized_kernel_operators(graph: torch.fx.GraphModule) -> tuple[str, .
     """Read original kernel identities from Torch's functionalization wrapper."""
     from torch._higher_order_ops.auto_functionalize import auto_functionalized_v2
     from torch._ops import OpOverload
+
     operators: list[str] = []
     wrapped: set[torch.fx.Node] = set()
     for node in graph.graph.nodes:
@@ -262,8 +301,14 @@ def functionalized_kernel_operators(graph: torch.fx.GraphModule) -> tuple[str, .
                 raise ValueError("functionalized kernel requires an original deterministic operator")
             operators.append(str(cast(object, target)))
             wrapped.add(node)
-        elif (node.op == "call_function" and node.target is operator.getitem and len(node.args) == 2
-              and isinstance(node.args[0], torch.fx.Node) and node.args[0] in wrapped and type(node.args[1]) is int):
+        elif (
+            node.op == "call_function"
+            and node.target is operator.getitem
+            and len(node.args) == 2
+            and isinstance(node.args[0], torch.fx.Node)
+            and node.args[0] in wrapped
+            and type(node.args[1]) is int
+        ):
             continue
         else:
             raise ValueError("opaque fragment contains an unaudited operation")
@@ -278,6 +323,7 @@ def tensor_fragment_allocations(graph: torch.fx.GraphModule) -> tuple[KernelAllo
     Tuple results include Torch's functionalization copies. Original input
     storage and duplicate aliases are excluded from this local allocation sum.
     """
+
     def tensors(value: object) -> Iterator[torch.Tensor]:
         if isinstance(value, torch.Tensor):
             yield value
@@ -286,8 +332,13 @@ def tensor_fragment_allocations(graph: torch.fx.GraphModule) -> tuple[KernelAllo
                 yield from tensors(item)
         elif value is not None:
             raise ValueError("kernel allocation metadata must contain tensors or tuples")
-    seen = {tensor.untyped_storage() for node in graph.graph.nodes if node.op == "placeholder"
-            for tensor in tensors(node.meta.get("val"))}
+
+    seen = {
+        tensor.untyped_storage()
+        for node in graph.graph.nodes
+        if node.op == "placeholder"
+        for tensor in tensors(node.meta.get("val"))
+    }
     result: list[KernelAllocation] = []
     for node in graph.graph.nodes:
         if node.op in ("placeholder", "output"):
@@ -304,8 +355,18 @@ def tensor_fragment_allocations(graph: torch.fx.GraphModule) -> tuple[KernelAllo
 
 
 def module_has_execution_hooks(module: torch.nn.Module) -> bool:
-    for owner, names in ((module, ("_forward_hooks", "_forward_pre_hooks", "_backward_hooks", "_backward_pre_hooks")),
-        (torch.nn.modules.module, ("_global_forward_hooks", "_global_forward_pre_hooks", "_global_backward_hooks", "_global_backward_pre_hooks"))):
+    for owner, names in (
+        (module, ("_forward_hooks", "_forward_pre_hooks", "_backward_hooks", "_backward_pre_hooks")),
+        (
+            torch.nn.modules.module,
+            (
+                "_global_forward_hooks",
+                "_global_forward_pre_hooks",
+                "_global_backward_hooks",
+                "_global_backward_pre_hooks",
+            ),
+        ),
+    ):
         for name in names:
             registry: object = getattr(owner, name)
             if not isinstance(registry, dict) or bool(cast(dict[int, object], registry)):
@@ -331,8 +392,10 @@ class ModuleCallBinding:
         if module is not self.module or module.forward != self.forward or module_has_execution_hooks(module):
             raise ValueError("model call changed after binding its source definition")
         parameters = tuple(module.named_parameters(recurse=False))
-        if len(parameters) != len(self.parameters) or any(name != original_name or value is not original
-                for (name, value), (original_name, original) in zip(parameters, self.parameters, strict=True)):
+        if len(parameters) != len(self.parameters) or any(
+            name != original_name or value is not original
+            for (name, value), (original_name, original) in zip(parameters, self.parameters, strict=True)
+        ):
             raise ValueError("model parameter fields changed after binding its source definition")
 
 
@@ -352,7 +415,9 @@ class ModuleGraphPartition:
 
     def run_prefix(self, inputs: tuple[torch.Tensor | None, ...]) -> tuple[torch.Tensor, ...]:
         result: object = self.prefix(*inputs)
-        if not isinstance(result, tuple) or not all(isinstance(value, torch.Tensor) for value in cast(tuple[object, ...], result)):
+        if not isinstance(result, tuple) or not all(
+            isinstance(value, torch.Tensor) for value in cast(tuple[object, ...], result)
+        ):
             raise ValueError("module partition frontier must contain tensors")
         return cast(tuple[torch.Tensor, ...], result)
 
@@ -360,8 +425,9 @@ class ModuleGraphPartition:
         return tensor_graph_outputs(self.suffix, inputs)
 
 
-def capture_module_partition(module: torch.nn.Module, *, stateful: tuple[str, ...],
-                             readonly: tuple[str, ...], none_inputs: tuple[str, ...] = ()) -> ModuleGraphPartition:
+def capture_module_partition(
+    module: torch.nn.Module, *, stateful: tuple[str, ...], readonly: tuple[str, ...], none_inputs: tuple[str, ...] = ()
+) -> ModuleGraphPartition:
     """Cut after the last stateful leaf, preserving original call order.
 
     ``readonly`` describes external state, not tensor-input mutation: both
@@ -398,7 +464,7 @@ def capture_module_partition(module: torch.nn.Module, *, stateful: tuple[str, ..
     if not cuts:
         raise ValueError("module graph has no stateful call to partition")
     cut = cuts[-1]
-    before, after = nodes[:cut + 1], nodes[cut + 1:]
+    before, after = nodes[: cut + 1], nodes[cut + 1 :]
     if not any(node.op == "call_module" for node in after):
         raise ValueError("module graph has no readonly suffix")
     before_set = set(before)
@@ -407,8 +473,9 @@ def capture_module_partition(module: torch.nn.Module, *, stateful: tuple[str, ..
     if not frontier:
         raise ValueError("module partition requires a tensor frontier")
 
-    def copy_piece(source: tuple[torch.fx.Node, ...], inputs: tuple[torch.fx.Node, ...],
-                   outputs: tuple[torch.fx.Node, ...] | None) -> torch.fx.GraphModule:
+    def copy_piece(
+        source: tuple[torch.fx.Node, ...], inputs: tuple[torch.fx.Node, ...], outputs: tuple[torch.fx.Node, ...] | None
+    ) -> torch.fx.GraphModule:
         piece = torch.fx.Graph()
         mapping = {node: piece.placeholder(f"arg{i}") for i, node in enumerate(inputs)}
         for node in source:
@@ -425,6 +492,13 @@ def capture_module_partition(module: torch.nn.Module, *, stateful: tuple[str, ..
 
     prefix = copy_piece(before, tuple(node for node in nodes if node.op == "placeholder"), frontier)
     suffix = copy_piece(after, frontier, None)
-    identity = boundary_digest("module-fx-partition@1", str(prefix.graph), str(suffix.graph),
-        stateful, readonly, none_inputs, torch.__version__)
+    identity = boundary_digest(
+        "module-fx-partition@1",
+        str(prefix.graph),
+        str(suffix.graph),
+        stateful,
+        readonly,
+        none_inputs,
+        torch.__version__,
+    )
     return ModuleGraphPartition(prefix, suffix, identity, tuple(node.name for node in frontier))

@@ -26,12 +26,23 @@ def test_functionalized_export_runs_in_scan_and_preserves_all_input_versions():
     assert "aten.add_" not in str(cell.graph.graph)
     declaration = cell.declaration
     h, w = declaration.inputs
-    body = Region(Block((Value("i", ScalarType.INDEX), Value("h", h), Value("w", w)),
-        (Call(("h", "w"), (Value("next_h", h), Value("next_w", w)), declaration.name),),
-        ("next_h", "next_w")))
-    program = Program(Region(Block((Value("h0", h), Value("w0", w)),
-        (Scan(("h0", "w0"), (Value("hf", h), Value("wf", w)), 4, body),),
-        ("hf", "wf"))), (declaration,))
+    body = Region(
+        Block(
+            (Value("i", ScalarType.INDEX), Value("h", h), Value("w", w)),
+            (Call(("h", "w"), (Value("next_h", h), Value("next_w", w)), declaration.name),),
+            ("next_h", "next_w"),
+        )
+    )
+    program = Program(
+        Region(
+            Block(
+                (Value("h0", h), Value("w0", w)),
+                (Scan(("h0", "w0"), (Value("hf", h), Value("wf", w)), 4, body),),
+                ("hf", "wf"),
+            )
+        ),
+        (declaration,),
+    )
     result = interpret(program, {"h0": hidden, "w0": weights}, functions={declaration.name: lambda args: cell(*args)})
     expected_h, expected_w = hidden.clone(), weights.clone()
     for _ in range(4):
@@ -49,6 +60,7 @@ def test_mutation_without_explicit_return_is_rejected():
     def bad(x, w):
         w.add_(x)
         return (x * 2,)
+
     with pytest.raises(ValueError, match="also be returned"):
         ExportedCell.capture(bad, ("x", "w"), ("result",), (torch.ones(2), torch.zeros(2)))
 
@@ -71,12 +83,16 @@ def test_split_views_preserve_mutation_aliases_empty_parts_and_noncontiguous_inp
 
 def test_hidden_tensor_state_and_rng_are_rejected():
     hidden = torch.ones(2)
+
     def closed(x):
         return (x + hidden,)
+
     with pytest.raises(ValueError, match="explicit input ports"):
         ExportedCell.capture(closed, ("x",), ("y",), (torch.ones(2),))
+
     def random(x):
         return (x + torch.rand_like(x),)
+
     with pytest.raises(ValueError, match="RNG"):
         ExportedCell.capture(random, ("x",), ("y",), (torch.ones(2),))
 
@@ -92,14 +108,16 @@ def test_aliasing_cannot_be_erased_by_cloning_examples():
 
 def test_fake_source_import_preserves_alias_guards_and_runs_on_real_inputs():
     from torch._subclasses.fake_tensor import FakeTensorMode
+
     def add(x, y):
         return (x + y,)
+
     with FakeTensorMode():
         x = torch.empty((2, 4))
         with pytest.raises(ValueError, match="distinct storage"):
             ExportedCell.capture(add, ("x", "y"), ("out",), (x, x.view(2, 4)))
         cell = ExportedCell.capture(add, ("x", "y"), ("out",), (x, torch.empty_like(x)))
-    actual, = cell(torch.ones((2, 4)), torch.full((2, 4), 2.0))
+    (actual,) = cell(torch.ones((2, 4)), torch.full((2, 4), 2.0))
     torch.testing.assert_close(actual, torch.full((2, 4), 3.0), rtol=0, atol=0)
 
 

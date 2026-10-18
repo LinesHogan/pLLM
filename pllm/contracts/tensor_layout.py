@@ -8,7 +8,6 @@ from typing import NewType
 
 from pllm.contracts.state_ref import LayoutId
 
-
 LayoutFieldId = NewType("LayoutFieldId", int)
 
 

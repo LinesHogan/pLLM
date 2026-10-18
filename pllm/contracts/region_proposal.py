@@ -6,7 +6,6 @@ from pllm.contracts.region_payload import RegionPayload
 from pllm.contracts.region_selection import RegionPayloadLimit
 from pllm.contracts.region_streams import RegionStreamPlan
 
-
 REGION_STREAMS_CAPABILITY = "execution/region_streams@1"
 
 

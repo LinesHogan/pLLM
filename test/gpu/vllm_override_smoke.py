@@ -12,24 +12,39 @@ from vllm import SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
 
 import pllm
-from pllm.execution.host_runtime import HostRuntimeFacts
-from pllm.workloads.fttt import FTTTWorkload
-from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload
-from pllm.workloads.override import OverRIDEConfig, OverRIDEWorkload
-from pllm.execution.state_execution import StateExecution
-from pllm.config import ModelConfig, VllmDType
 from pllm.backends.vllm.runtime import WorkloadModelRunner
 from pllm.backends.vllm.sampler import Vllm027Sampler
+from pllm.config import ModelConfig, VllmDType
+from pllm.execution.host_runtime import HostRuntimeFacts
+from pllm.execution.state_execution import StateExecution
+from pllm.workloads.fttt import FTTTWorkload
+from pllm.workloads.override import OverRIDEConfig, OverRIDEWorkload
+from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload
 
 
 def main() -> None:
     config = OverRIDEConfig(rank=2, num_iterations=3)
-    handle = pllm.make_llm(workload=OverRIDEWorkload(config),
-        config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", VllmDType.BFLOAT16,
-            64, 2, 64, 0.25, seed=7, execution=pllm.ExecutionOptions(memory_budget_bytes=1 << 30)))
+    handle = pllm.make_llm(
+        workload=OverRIDEWorkload(config),
+        config=ModelConfig(
+            "Qwen/Qwen2.5-0.5B-Instruct",
+            VllmDType.BFLOAT16,
+            64,
+            2,
+            64,
+            0.25,
+            seed=7,
+            execution=pllm.ExecutionOptions(memory_budget_bytes=1 << 30),
+        ),
+    )
     execution = handle.deployment.execution
-    reserved = dict(zip((anchor.symbol for anchor in execution.arena.plan.timeline.anchors),
-        execution.arena.plan.timeline.reserved_bytes, strict=True))
+    reserved = dict(
+        zip(
+            (anchor.symbol for anchor in execution.arena.plan.timeline.anchors),
+            execution.arena.plan.timeline.reserved_bytes,
+            strict=True,
+        )
+    )
     assert reserved["sampler.pre_draw"] > reserved["token.commit"] > reserved["model.execute"]
     assert reserved["token.commit"] == reserved["next.prepare"]
     hidden = None
@@ -39,10 +54,12 @@ def main() -> None:
     hook = None
     native_add, native_complete = Vllm027Sampler._add_logits, StateExecution.complete_sampler
     try:
+
         def capture(module, args, output):
             nonlocal hidden
             value = output[0] if isinstance(output, tuple) else output
             hidden = value.detach().float().clone()
+
         hook = handle.runner.model.model.norm.register_forward_hook(capture)
 
         def inspect_add(logits, guidance):
@@ -50,18 +67,19 @@ def main() -> None:
             assert execution.directory.inference_pin_count == 0
             base_logits = logits.detach().clone()
             assert hidden is not None
-            ref, = execution.directory.select(()).refs
+            (ref,) = execution.directory.select(()).refs
             parameters = execution.snapshot(ref, torch.cuda.current_stream(execution.device))[0]
             width, vocab = hidden.shape[1], logits.shape[1]
-            down = parameters[:4 * width].reshape(2, 2, width)
-            up = parameters[4 * width:].reshape(2, vocab, 2)
+            down = parameters[: 4 * width].reshape(2, 2, width)
+            up = parameters[4 * width :].reshape(2, vocab, 2)
             rows = guidance.guidance.sampler_rows
             expected = torch.zeros(logits.shape, device=logits.device, dtype=torch.float32)
             for link in rows.links:
                 identity = rows.row_batch.rows[link.packed_row_index].identity
                 if identity.sample_idx:
                     expected[link.sampler_row_index] = config.lambd * (
-                        hidden[link.packed_row_index] @ down[identity.sample_idx - 1].T @ up[identity.sample_idx - 1].T)
+                        hidden[link.packed_row_index] @ down[identity.sample_idx - 1].T @ up[identity.sample_idx - 1].T
+                    )
             torch.testing.assert_close(guidance.pred_dense_logits, expected, rtol=2e-4, atol=2e-5)
             result = native_add(logits, guidance)
             torch.testing.assert_close(result, logits + expected.to(logits))
@@ -76,13 +94,18 @@ def main() -> None:
             for identity, token in zip(feedback.sampler_rows.identities, feedback.sampled_tokens.tolist(), strict=True):
                 drawn.setdefault((identity.prompt_idx, identity.sample_idx), []).append(token)
 
-        with patch.object(Vllm027Sampler, "_add_logits", staticmethod(inspect_add)), patch.object(StateExecution, "complete_sampler", inspect_feedback):
+        with (
+            patch.object(Vllm027Sampler, "_add_logits", staticmethod(inspect_add)),
+            patch.object(StateExecution, "complete_sampler", inspect_feedback),
+        ):
             for iteration in range(3):
                 before = execution.diagnostics().update_count
                 drawn.clear()
-                outputs = handle.generate(["The sky is", "Water freezes at"],
+                outputs = handle.generate(
+                    ["The sky is", "Water freezes at"],
                     SamplingParams(max_tokens=3, temperature=0.8, top_k=10, top_p=0.9, ignore_eos=True),
-                    sample_index=iteration)
+                    sample_index=iteration,
+                )
                 assert len(outputs) == 2
                 for index, output in enumerate(outputs):
                     assert drawn[(iteration * 2 + index, iteration)] == list(output.outputs[0].token_ids[1:])
@@ -103,10 +126,15 @@ def main() -> None:
             return native_sample(runner, hidden_states, input_batch, grammar)
 
         with patch.object(WorkloadModelRunner, "sample", inspect_completion):
-            batch = handle.generate(["Choose 1 or 2, boxed: "] * 3,
-                SamplingParams(max_tokens=16, temperature=0.8,
-                    structured_outputs=StructuredOutputsParams(regex=r"\\boxed\{[12]\}")),
-                sample_index=2, feedback_group="vote", prompt_indices=(100, 100, 100))
+            batch = handle.generate(
+                ["Choose 1 or 2, boxed: "] * 3,
+                SamplingParams(
+                    max_tokens=16, temperature=0.8, structured_outputs=StructuredOutputsParams(regex=r"\\boxed\{[12]\}")
+                ),
+                sample_index=2,
+                feedback_group="vote",
+                prompt_indices=(100, 100, 100),
+            )
         stream = torch.cuda.current_stream(execution.device)
         batch.readiness.order_on(stream)
         assert len(batch.completions.entries) == 3
@@ -117,21 +145,34 @@ def main() -> None:
         feedback = pllm.make_llm(workload=FTTTWorkload(), config=facts)
         edited = feedback.run(batch)
         assert edited is not None and edited.update_count == 1
-        reward = pllm.make_llm(workload=TTRLWorkload(TTRLConfig(rank=2, votes_per_prompt=3, samples_per_prompt=2)),
-            config=replace(facts, max_input_rows=3, memory_budget_bytes=1 << 20))
+        reward = pllm.make_llm(
+            workload=TTRLWorkload(TTRLConfig(rank=2, votes_per_prompt=3, samples_per_prompt=2)),
+            config=replace(facts, max_input_rows=3, memory_budget_bytes=1 << 20),
+        )
         reward.admit((), stream)
         try:
             trained = reward.step(batch, stream)
             assert trained.loss is not None and reward.diagnostics().update_count == 1
-            for completion, judged, voted in zip(batch.completions.entries, edited.intent.reward_outcomes,
-                                                trained.reward_outcomes, strict=True):
+            for completion, judged, voted in zip(
+                batch.completions.entries, edited.intent.reward_outcomes, trained.reward_outcomes, strict=True
+            ):
                 assert judged.completion is voted.completion is completion
         finally:
             reward.retire(())
         assert handle.runner.completion_capture is None
-        print(dict(updates=diagnostics.update_count, sampler_checks=len(observed), sampled_tokens=12,
-            final_iteration_updates=0, feedback_completions=3, feedback_updates=1, reward_updates=1,
-            reward_planned_peak=reward.arena.plan.schedule_decision.peak_memory_bytes, fallback=0))
+        print(
+            dict(
+                updates=diagnostics.update_count,
+                sampler_checks=len(observed),
+                sampled_tokens=12,
+                final_iteration_updates=0,
+                feedback_completions=3,
+                feedback_updates=1,
+                reward_updates=1,
+                reward_planned_peak=reward.arena.plan.schedule_decision.peak_memory_bytes,
+                fallback=0,
+            )
+        )
     finally:
         if hook is not None:
             hook.remove()

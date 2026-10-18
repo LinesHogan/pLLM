@@ -6,21 +6,25 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
-from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM, Qwen2DecoderLayer
+from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM
 
-from pllm.execution.activation import low_rank_affine_delta
-from pllm.execution.ptts.request_state import RequestStateDirectory
-from pllm.execution.ptts.page_bundle import PagePin
-from pllm.execution.state_execution import DataT, StateTaskContext
-from pllm.execution.region_resources import PinnedResourceBinding, PinnedResourceCell, RegionPageOwner
-from pllm.contracts.region_program import BorrowedResource
-from pllm.contracts.backend_attachment import ActivationPatchBinding, ActivationPatchOperator, DecodeRefresh, DecodeWindow
+from pllm.contracts.backend_attachment import (
+    ActivationPatchBinding,
+    ActivationPatchOperator,
+    DecodeRefresh,
+    DecodeWindow,
+)
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRowBatch
+from pllm.contracts.region_program import BorrowedResource
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import StateResource, StateScope
 from pllm.contracts.state_ref import StateRef
-
+from pllm.execution.activation import low_rank_affine_delta
+from pllm.execution.ptts.page_bundle import PagePin
+from pllm.execution.ptts.request_state import RequestStateDirectory
+from pllm.execution.region_resources import PinnedResourceBinding, PinnedResourceCell, RegionPageOwner
+from pllm.execution.state_execution import DataT, StateTaskContext
 
 _DecoderForward = Callable[[torch.Tensor, torch.Tensor, torch.Tensor | None], tuple[torch.Tensor, torch.Tensor]]
 
@@ -43,15 +47,16 @@ class _ActivationLayer:
         self.prepared: tuple[_PatchRows, ...] = ()
         self.apply_count = 0
 
-    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor,
-                residual: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden, residual = self.original(positions, hidden_states, residual)
         if not self.prepared:
             return hidden, residual
         # Qwen2 returns a fresh down-projection output, separate from its residual.
         for item in self.prepared:
             if self.binding.operator is ActivationPatchOperator.ADD:
-                delta, = item.fields
+                (delta,) = item.fields
                 delta = delta.to(hidden.dtype).expand(item.rows.numel(), -1)
             else:
                 weight, bias, rotation = item.fields
@@ -63,7 +68,14 @@ class _ActivationLayer:
 
 
 class VllmActivationPatch:
-    def __init__(self, model: Qwen2ForCausalLM, bindings: tuple[ActivationPatchBinding, ...], resource: str, *, install: bool = True) -> None:
+    def __init__(
+        self,
+        model: Qwen2ForCausalLM,
+        bindings: tuple[ActivationPatchBinding, ...],
+        resource: str,
+        *,
+        install: bool = True,
+    ) -> None:
         self.resource = StateResource(resource)
         self.installed = install
         self.row_count = 0
@@ -76,10 +88,13 @@ class VllmActivationPatch:
     def apply_count(self) -> int:
         return sum(handle.apply_count for handle in self.layers)
 
-    def prepare(self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT],
-                directory: RequestStateDirectory) -> None:
-        if context.held_input is not None and (context.held_input.step_id != rows.step_id
-            or {identity for identity, _, _ in context.held_input.successful} != {row.identity for row in rows.rows}):
+    def prepare(
+        self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT], directory: RequestStateDirectory
+    ) -> None:
+        if context.held_input is not None and (
+            context.held_input.step_id != rows.step_id
+            or {identity for identity, _, _ in context.held_input.successful} != {row.identity for row in rows.rows}
+        ):
             raise RuntimeError("HOLD input differs from its original step and request identities")
         context.input_step_id = rows.step_id
         versions: dict[tuple[RequestIdentity, bool], tuple[PagePin, StateRef]] = {}
@@ -92,19 +107,31 @@ class VllmActivationPatch:
                 refresh = phase is HiddenPhase.DECODE and handle.binding.decode_refresh is DecodeRefresh.STEP
                 for identity in dict.fromkeys(row.identity for row in phase_rows):
                     source = tuple(row for row in phase_rows if row.identity == identity)
-                    selected = tuple(row.packed_row_index for index, row in enumerate(source)
-                        if phase is HiddenPhase.DECODE or index < handle.binding.first_tokens
-                        or index >= len(source) - handle.binding.last_tokens)
+                    selected = tuple(
+                        row.packed_row_index
+                        for index, row in enumerate(source)
+                        if phase is HiddenPhase.DECODE
+                        or index < handle.binding.first_tokens
+                        or index >= len(source) - handle.binding.last_tokens
+                    )
                     if not selected:
                         continue
                     key = (identity, refresh)
                     if key not in versions:
                         pin, ref = self._version(identity, refresh, context, directory)
-                        if (not self.installed or context.arena.plan.semantic_graph.input_groups) and pin not in context.page_pins:
+                        if (
+                            not self.installed or context.arena.plan.semantic_graph.input_groups
+                        ) and pin not in context.page_pins:
                             # Admission pins belong to the request directory. Borrow
                             # the same exact version for this invocation's source view.
-                            pin = next((candidate for candidate, release in context.page_pins.items()
-                                if release is None and ref in candidate.refs), None)
+                            pin = next(
+                                (
+                                    candidate
+                                    for candidate, release in context.page_pins.items()
+                                    if release is None and ref in candidate.refs
+                                ),
+                                None,
+                            )
                             if pin is None:
                                 pin = context.arena.pin_exact((ref,), context.pin.stream)
                                 context.page_pins[pin] = None
@@ -114,18 +141,28 @@ class VllmActivationPatch:
                         if phase is HiddenPhase.DECODE:
                             raise RuntimeError("decode activation requires its first published injection")
                         continue
-                    if context.held_input is not None and not any(identity == held_identity and ref in refs
-                        for held_identity, refs, _ in context.held_input.successful):
+                    if context.held_input is not None and not any(
+                        identity == held_identity and ref in refs
+                        for held_identity, refs, _ in context.held_input.successful
+                    ):
                         raise RuntimeError("HOLD injection differs from the last successful exact ref")
-                    prepared.append(_PatchRows(torch.tensor(selected, device=context.arena.device, dtype=torch.long),
-                        tuple(context.arena.borrow_field(pin, ref, field) for field in handle.binding.fields), selected, pin, ref,
-                        identity, context.injected_refs))
+                    prepared.append(
+                        _PatchRows(
+                            torch.tensor(selected, device=context.arena.device, dtype=torch.long),
+                            tuple(context.arena.borrow_field(pin, ref, field) for field in handle.binding.fields),
+                            selected,
+                            pin,
+                            ref,
+                            identity,
+                            context.injected_refs,
+                        )
+                    )
             handle.prepared = tuple(prepared)
 
     def selected(self, row: int, layer: int) -> bool:
         if not 0 <= row < self.row_count:
             raise ValueError("activation selection is outside its original packed rows")
-        handle, = (handle for handle in self.layers if handle.binding.layer == layer)
+        (handle,) = (handle for handle in self.layers if handle.binding.layer == layer)
         for item in handle.prepared:
             if row in item.indices:
                 item.used.setdefault(item.identity, set()).add(item.ref)
@@ -133,21 +170,37 @@ class VllmActivationPatch:
         return False
 
     def bind_pinned(self, resource: BorrowedResource, layer: int, owner: RegionPageOwner) -> PinnedResourceBinding:
-        if (self.installed or len(resource.domain) != 1 or resource.domain[0] < self.row_count
-            or resource.name != f"activation.{layer}"):
+        if (
+            self.installed
+            or len(resource.domain) != 1
+            or resource.domain[0] < self.row_count
+            or resource.name != f"activation.{layer}"
+        ):
             raise ValueError("source activation requires its unhooked model binding")
-        handle, = (handle for handle in self.layers if handle.binding.layer == layer)
-        return PinnedResourceBinding.bind(resource, owner, tuple(PinnedResourceCell((row,), item.pin, item.ref, handle.binding.fields)
-            for item in handle.prepared for row in item.indices))
+        (handle,) = (handle for handle in self.layers if handle.binding.layer == layer)
+        return PinnedResourceBinding.bind(
+            resource,
+            owner,
+            tuple(
+                PinnedResourceCell((row,), item.pin, item.ref, handle.binding.fields)
+                for item in handle.prepared
+                for row in item.indices
+            ),
+        )
 
-    def _version(self, identity: RequestIdentity, refresh: bool, context: StateTaskContext[DataT],
-                 directory: RequestStateDirectory) -> tuple[PagePin, StateRef]:
+    def _version(
+        self,
+        identity: RequestIdentity,
+        refresh: bool,
+        context: StateTaskContext[DataT],
+        directory: RequestStateDirectory,
+    ) -> tuple[PagePin, StateRef]:
         if directory.scope is StateScope.INSTANCE and not refresh:
             pin = directory.inference_pin(identity, context.pin.stream)
-            ref, = (ref for ref in pin.refs if context.arena.root(ref).resource == self.resource)
+            (ref,) = (ref for ref in pin.refs if context.arena.root(ref).resource == self.resource)
             return pin, ref
         if directory.scope is StateScope.INSTANCE:
-            original, = context.selection.for_resource(self.resource).refs
+            (original,) = context.selection.for_resource(self.resource).refs
         else:
             original = context.selection.ref_for(identity, self.resource)
         ref = context.current_owned_ref(original)
@@ -156,8 +209,11 @@ class VllmActivationPatch:
             raise RuntimeError("decode STEP requires a new publication; missing-input handling is not enabled")
         if ref == original:
             return context.pin, ref
-        updated = tuple(context.current_owned_ref(candidate) for candidate in context.selection.for_resource(self.resource).refs
-            if context.current_owned_ref(candidate) != candidate)
+        updated = tuple(
+            context.current_owned_ref(candidate)
+            for candidate in context.selection.for_resource(self.resource).refs
+            if context.current_owned_ref(candidate) != candidate
+        )
         return context.borrow_published(updated), ref
 
     def clear(self) -> None:

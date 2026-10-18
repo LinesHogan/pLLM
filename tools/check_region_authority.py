@@ -24,7 +24,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # These files form the generic authority boundary.  Do not broaden this list
@@ -156,8 +155,12 @@ def _consumer_hit(text: str) -> bool:
 
 def _attribute_on(node: ast.AST, attributes: tuple[str, ...], names: tuple[str, ...]) -> bool:
     """Attribute access `name.attribute` for the given attribute and receiver names."""
-    return (isinstance(node, ast.Attribute) and node.attr in attributes
-            and isinstance(node.value, ast.Name) and node.value.id in names)
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr in attributes
+        and isinstance(node.value, ast.Name)
+        and node.value.id in names
+    )
 
 
 class _PythonAuthority(ast.NodeVisitor):
@@ -209,15 +212,28 @@ class _PythonAuthority(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
-        if self.check_redecision and _attribute_on(node.func, ("split", "partition", "rsplit"), ("executor", "implementation_id")):
+        if self.check_redecision and _attribute_on(
+            node.func, ("split", "partition", "rsplit"), ("executor", "implementation_id")
+        ):
             self._add(node, f"{self.prefix} may not parse executor strings")
-        if self.check_redecision and isinstance(node.func, ast.Name) and node.func.id == "len" and (
-            len(node.args) == 1 and _attribute_on(node.args[0], ("consumer_regions",), ("binding",))
+        if (
+            self.check_redecision
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "len"
+            and (len(node.args) == 1 and _attribute_on(node.args[0], ("consumer_regions",), ("binding",)))
         ):
             self._add(node, f"{self.prefix} may not derive materialization refcounts")
-        if self.check_sampler and isinstance(node.func, ast.Name) and node.func.id == "getattr" and (
-            len(node.args) >= 2 and isinstance(node.args[0], ast.Name) and node.args[0].id == "provider"
-            and isinstance(node.args[1], ast.Constant) and node.args[1].value == "config"
+        if (
+            self.check_sampler
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and (
+                len(node.args) >= 2
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == "provider"
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == "config"
+            )
         ):
             self._add(node, "sampler bridge may not infer policy from workload config")
         self.generic_visit(node)
@@ -230,13 +246,15 @@ class _PythonAuthority(ast.NodeVisitor):
         if self.check_eager:
             compiled = any(
                 _attribute_on(inner.func, ("compile",), ("torch",)) if isinstance(inner, ast.Call) else False
-                for statement in node.body for inner in ast.walk(statement)
+                for statement in node.body
+                for inner in ast.walk(statement)
             )
             if compiled and any(
                 (isinstance(inner, ast.Name) and inner.id == "eager")
                 or (isinstance(inner, ast.Attribute) and inner.attr == "eager")
                 or (isinstance(inner, ast.Constant) and inner.value == "eager")
-                for handler in node.handlers for inner in ast.walk(handler)
+                for handler in node.handlers
+                for inner in ast.walk(handler)
             ):
                 self._add(node, "physical path may not silently retry with eager")
         self.generic_visit(node)
@@ -272,12 +290,7 @@ def collect(root: Path = REPO_ROOT) -> list[Violation]:
 def main() -> int:
     violations = collect()
     if not violations:
-        print(
-            "OK Region authority gate "
-            "("
-            f"{len(AUTHORITY_FILES) + len(NATIVE_BINDING_FILES)} "
-            "production files)"
-        )
+        print(f"OK Region authority gate ({len(AUTHORITY_FILES) + len(NATIVE_BINDING_FILES)} production files)")
         return 0
     print("FAIL Region authority gate:", file=sys.stderr)
     for violation in violations:

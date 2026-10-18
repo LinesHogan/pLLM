@@ -42,20 +42,12 @@ class PackedHiddenSnapshotBatch:
     def __post_init__(self) -> None:
         if not self.snapshots:
             raise ValueError("packed hidden snapshots must be non-empty")
-        locator_keys = tuple(
-            snapshot.resource.locator_key for snapshot in self.snapshots
-        )
-        if tuple(sorted(locator_keys)) != locator_keys or len(
-            set(locator_keys)
-        ) != len(locator_keys):
-            raise ValueError(
-                "packed hidden snapshots must have sorted unique resources"
-            )
+        locator_keys = tuple(snapshot.resource.locator_key for snapshot in self.snapshots)
+        if tuple(sorted(locator_keys)) != locator_keys or len(set(locator_keys)) != len(locator_keys):
+            raise ValueError("packed hidden snapshots must have sorted unique resources")
         reference = self.snapshots[0].hidden
         if reference.ndim != 2 or int(reference.shape[0]) != self.row_batch.total_rows:
-            raise ValueError(
-                "packed hidden snapshots must align with one row batch"
-            )
+            raise ValueError("packed hidden snapshots must align with one row batch")
         if any(
             snapshot.hidden.shape != reference.shape
             or snapshot.hidden.dtype is not reference.dtype
@@ -63,9 +55,7 @@ class PackedHiddenSnapshotBatch:
             or torch.is_inference(snapshot.hidden)
             for snapshot in self.snapshots
         ):
-            raise ValueError(
-                "packed hidden snapshots must be aligned ordinary tensors"
-            )
+            raise ValueError("packed hidden snapshots must be aligned ordinary tensors")
 
     @property
     def plan_epoch(self) -> int:
@@ -75,9 +65,7 @@ class PackedHiddenSnapshotBatch:
     def step_id(self) -> int:
         return self.row_batch.step_id
 
-    def hidden_for(
-        self, resource: PackedHiddenResourceBinding
-    ) -> torch.Tensor:
+    def hidden_for(self, resource: PackedHiddenResourceBinding) -> torch.Tensor:
         for snapshot in self.snapshots:
             if snapshot.resource == resource:
                 return snapshot.hidden

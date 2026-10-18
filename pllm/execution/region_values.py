@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import TypeAlias
 
 import torch
@@ -29,9 +29,11 @@ def copy_data(value: Data) -> Data:
 
 def check_data(value: Data, type_: DataType, sizes: Mapping[str, int] = {}) -> None:
     if isinstance(type_, TensorType):
-        if not isinstance(value, torch.Tensor) or (
-            tuple(value.shape), str(value.dtype), str(value.device)
-        ) != (type_.shape, type_.dtype, type_.device):
+        if not isinstance(value, torch.Tensor) or (tuple(value.shape), str(value.dtype), str(value.device)) != (
+            type_.shape,
+            type_.dtype,
+            type_.device,
+        ):
             raise ValueError("region tensor violates shape, dtype or device guard")
     elif isinstance(type_, BankType):
         if not isinstance(value, Bank) or len(value.elements) != resolve_extent(type_.size, sizes):
@@ -46,4 +48,3 @@ def check_data(value: Data, type_: DataType, sizes: Mapping[str, int] = {}) -> N
             raise ValueError("region floating scalar type mismatch")
     elif type(value) is not int or not -(2**63) <= value < 2**63:
         raise ValueError("region integer/index must fit signed 64-bit range")
-

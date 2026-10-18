@@ -7,20 +7,32 @@ import torch
 
 from pllm.contracts.region_bindings import RegionBindings
 from pllm.contracts.region_program import (
-    AffineIndex, BankType, Call, Constant, Coordinate, IndexTerm, Map, Program, Scalar, ScalarKind, ScalarType,
-    Scan, Select, TensorType, Update, Value,
+    AffineIndex,
+    BankType,
+    Call,
+    Coordinate,
+    IndexTerm,
+    Map,
+    Program,
+    ScalarType,
+    Scan,
+    Select,
+    TensorType,
+    Update,
+    Value,
 )
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_compilation import (
-    analyze_region_program, lower_region_bindings, lower_region_schedule,
+    analyze_region_program,
+    lower_region_bindings,
+    lower_region_schedule,
 )
-from pllm.execution.region_frame import lookup
-from test.region_reference import interpret
 from pllm.execution.region_execution import RegionExecution
+from pllm.execution.region_frame import lookup
 from pllm.execution.region_values import Bank
 from test.boundary.test_region_program import grid_program, region
-
+from test.region_reference import interpret
 
 X = ScalarType.INDEX
 
@@ -28,19 +40,32 @@ X = ScalarType.INDEX
 def tensor_grid(chunks, layers, cell):
     tensor = cell.declaration.inputs[0]
     weights, hidden = BankType(tensor, layers), BankType(tensor, chunks)
-    layer = region((Value("l", X), Value("h", tensor), Value("w", weights)), (
-        Select(("w", "l"), (Value("old", tensor),)),
-        Call(("h", "old"), (Value("next_h", tensor), Value("next_w", tensor)), cell.digest),
-        Update(("w", "l", "next_w"), (Value("bank", weights),)),
-    ), ("next_h", "bank"))
-    chunk = region((Value("c", X), Value("w", weights), Value("h", hidden)), (
-        Select(("h", "c"), (Value("input", tensor),)),
-        Scan(("input", "w"), (Value("output", tensor), Value("next_w", weights)), layers, layer),
-        Update(("h", "c", "output"), (Value("next_h", hidden),)),
-    ), ("next_w", "next_h"))
-    return Program(region((Value("weights", weights), Value("hidden", hidden)), (
-        Scan(("weights", "hidden"), (Value("w_final", weights), Value("h_final", hidden)), chunks, chunk),
-    ), ("w_final", "h_final")), (cell.declaration,))
+    layer = region(
+        (Value("l", X), Value("h", tensor), Value("w", weights)),
+        (
+            Select(("w", "l"), (Value("old", tensor),)),
+            Call(("h", "old"), (Value("next_h", tensor), Value("next_w", tensor)), cell.digest),
+            Update(("w", "l", "next_w"), (Value("bank", weights),)),
+        ),
+        ("next_h", "bank"),
+    )
+    chunk = region(
+        (Value("c", X), Value("w", weights), Value("h", hidden)),
+        (
+            Select(("h", "c"), (Value("input", tensor),)),
+            Scan(("input", "w"), (Value("output", tensor), Value("next_w", weights)), layers, layer),
+            Update(("h", "c", "output"), (Value("next_h", hidden),)),
+        ),
+        ("next_w", "next_h"),
+    )
+    return Program(
+        region(
+            (Value("weights", weights), Value("hidden", hidden)),
+            (Scan(("weights", "hidden"), (Value("w_final", weights), Value("h_final", hidden)), chunks, chunk),),
+            ("w_final", "h_final"),
+        ),
+        (cell.declaration,),
+    )
 
 
 @pytest.fixture(scope="module")
@@ -50,13 +75,20 @@ def cell():
         h.mul_(0.5).add_(w * 0.25)
         w.add_(old * 0.0625)
         return h, w
-    return ExportedCell.capture(step, ("h", "w"), ("next_h", "next_w"),
-                                (torch.zeros(4, dtype=torch.float64), torch.ones(4, dtype=torch.float64)))
+
+    return ExportedCell.capture(
+        step,
+        ("h", "w"),
+        ("next_h", "next_w"),
+        (torch.zeros(4, dtype=torch.float64), torch.ones(4, dtype=torch.float64)),
+    )
 
 
 def inputs_for(chunks, layers, device="cpu"):
-    return {"weights": Bank(tuple(torch.full((4,), l + 1., dtype=torch.float64, device=device) for l in range(layers))),
-            "hidden": Bank(tuple(torch.full((4,), c + 2., dtype=torch.float64, device=device) for c in range(chunks)))}
+    return {
+        "weights": Bank(tuple(torch.full((4,), l + 1.0, dtype=torch.float64, device=device) for l in range(layers))),
+        "hidden": Bank(tuple(torch.full((4,), c + 2.0, dtype=torch.float64, device=device) for c in range(chunks))),
+    }
 
 
 def execute(program, schedule, cell, inputs):
@@ -71,19 +103,26 @@ def test_exported_tensors_read_identical_versions_under_isl_schedules(cell, chun
     program = tensor_grid(chunks, layers, cell)
     inputs = inputs_for(chunks, layers)
     expected_calls = []
+
     def oracle(args):
         expected_calls.append(tuple(x.clone() for x in args))
         return cell(*args)
+
     expected = interpret(program, inputs, functions={cell.digest: oracle})
     analysis = analyze_region_program(program)
     for candidate in analysis.candidates:
         actual_calls = []
+
         def observed(*args):
             actual_calls.append(tuple(x.clone() for x in args))
             return cell.function(*args)
+
         actual = execute(program, candidate.schedule_map, replace(cell, function=observed), inputs)
         from pllm.execution.region_schedule import RegionScheduleExecution
-        invocations = tuple(RegionScheduleExecution(program, lower_region_schedule(program, candidate.schedule_map)).invocations())
+
+        invocations = tuple(
+            RegionScheduleExecution(program, lower_region_schedule(program, candidate.schedule_map)).invocations()
+        )
         for invocation, args in zip(invocations, actual_calls, strict=True):
             c, l = invocation.coordinates
             for got, want in zip(args, expected_calls[c * layers + l], strict=True):
@@ -94,7 +133,9 @@ def test_exported_tensors_read_identical_versions_under_isl_schedules(cell, chun
         assert actual.invocations == chunks * layers
     for name, bank in inputs.items():
         for i, tensor in enumerate(bank.elements):
-            torch.testing.assert_close(tensor, torch.full_like(tensor, i + (1. if name == "weights" else 2.)), rtol=0, atol=0)
+            torch.testing.assert_close(
+                tensor, torch.full_like(tensor, i + (1.0 if name == "weights" else 2.0)), rtol=0, atol=0
+            )
 
 
 def test_partial_tiles_execute_tensors_and_preserve_final_banks(cell):
@@ -155,15 +196,16 @@ def test_mismatched_bindings_and_schedule_rejected_before_execution(cell):
 
 
 def test_reverse_map_rematerializes_indices_and_constants():
-    body = region((Value("i", X),), (
-        Coordinate(("i",), (Value("twice", X),), AffineIndex(0, (IndexTerm(0, 2),))),
-    ), ("twice",))
+    body = region(
+        (Value("i", X),), (Coordinate(("i",), (Value("twice", X),), AffineIndex(0, (IndexTerm(0, 2),))),), ("twice",)
+    )
     program = Program(region((), (Map((), (Value("ys", BankType(X, 7)),), 7, body),), ("ys",)))
     analysis = analyze_region_program(program)
     # Everything is affine rematerialization; no statements need to run.
     schedule = analysis.reference_schedule
-    result = RegionExecution(program, lower_region_schedule(program, schedule),
-                                   lower_region_bindings(program, schedule), {}).run({})
+    result = RegionExecution(
+        program, lower_region_schedule(program, schedule), lower_region_bindings(program, schedule), {}
+    ).run({})
     assert result.values == (Bank(tuple(2 * i for i in range(7))),)
     assert result.invocations == 0
 
@@ -171,15 +213,22 @@ def test_reverse_map_rematerializes_indices_and_constants():
 def test_dynamic_bank_index_retains_old_bank_and_reports_bounds():
     tensor = TensorType((2,), "torch.float32", "cpu")
     bank = BankType(tensor, 2)
-    program = Program(region((Value("b", bank), Value("i", X), Value("new", tensor)), (
-        Update(("b", "i", "new"), (Value("updated", bank),)),
-        Select(("b", "i"), (Value("old", tensor),)),
-        Select(("updated", "i"), (Value("selected", tensor),)),
-    ), ("b", "old", "selected")))
+    program = Program(
+        region(
+            (Value("b", bank), Value("i", X), Value("new", tensor)),
+            (
+                Update(("b", "i", "new"), (Value("updated", bank),)),
+                Select(("b", "i"), (Value("old", tensor),)),
+                Select(("updated", "i"), (Value("selected", tensor),)),
+            ),
+            ("b", "old", "selected"),
+        )
+    )
     schedule = analyze_region_program(program).candidates[-1].schedule_map
-    execution = RegionExecution(program, lower_region_schedule(program, schedule),
-                                      lower_region_bindings(program, schedule), {})
-    supplied = {"b": Bank((torch.ones(2), torch.full((2,), 2.))), "i": 1, "new": torch.full((2,), 3.)}
+    execution = RegionExecution(
+        program, lower_region_schedule(program, schedule), lower_region_bindings(program, schedule), {}
+    )
+    supplied = {"b": Bank((torch.ones(2), torch.full((2,), 2.0))), "i": 1, "new": torch.full((2,), 3.0)}
     result = execution.run(supplied)
     torch.testing.assert_close(result.values[1], supplied["b"].elements[1], rtol=0, atol=0)
     torch.testing.assert_close(result.values[2], supplied["new"], rtol=0, atol=0)

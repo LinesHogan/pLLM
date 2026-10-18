@@ -8,11 +8,11 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
-from pllm.execution.ptts.page_bundle_planning import DTYPE_BYTES
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.semantic_graph import TaskResourceFact
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
+from pllm.execution.ptts.page_bundle_planning import DTYPE_BYTES
 from pllm.kernels.paged_linear import PagedRows
 
 if TYPE_CHECKING:
@@ -46,7 +46,8 @@ class CapturedPageFields:
         from pllm.execution.codec import cuda_graph_pool_bytes
 
         return cuda_graph_pool_bytes(self.graph.pool(), self.stream.device.index or 0) + sum(
-            value.untyped_storage().nbytes() for value in (self.indices, *self.buffers))
+            value.untyped_storage().nbytes() for value in (self.indices, *self.buffers)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,12 +55,16 @@ class PagedKernel:
     compute: Callable[[CapturedPageFields, tuple[torch.Tensor, ...]], tuple[torch.Tensor, ...]]
 
     @classmethod
-    def rows(cls, row_input: int,
-             compute: Callable[[tuple[PagedRows, ...], tuple[torch.Tensor, ...]], tuple[torch.Tensor, ...]]) -> PagedKernel:
+    def rows(
+        cls,
+        row_input: int,
+        compute: Callable[[tuple[PagedRows, ...], tuple[torch.Tensor, ...]], tuple[torch.Tensor, ...]],
+    ) -> PagedKernel:
         def run(view: CapturedPageFields, inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
             if not 0 <= row_input < len(inputs):
                 raise ValueError("paged capture requires a row-index input")
             return compute(view.arena.read_paged_captured(view, inputs[row_input]), inputs)
+
         return cls(run)
 
 
@@ -87,9 +92,17 @@ class KernelCapture:
             raise ValueError("capture entitlement is absent from the original signed plan")
         # Factories own distinct input buffers; meta tensors have no usable storage address.
         input_bytes = sum(tensor.untyped_storage().nbytes() for tensor in inputs)
-        specs = next(item.layout.fields for item in plan.tensor_layout_request.layouts if item.resource == self.resource)
-        scratch_bytes = self.count * (8 * len(self.fields) + (0 if isinstance(self.compute, PagedKernel) else
-            sum(prod(specs[field].shape) * DTYPE_BYTES[specs[field].dtype] for field in self.fields)))
+        specs = next(
+            item.layout.fields for item in plan.tensor_layout_request.layouts if item.resource == self.resource
+        )
+        scratch_bytes = self.count * (
+            8 * len(self.fields)
+            + (
+                0
+                if isinstance(self.compute, PagedKernel)
+                else sum(prod(specs[field].shape) * DTYPE_BYTES[specs[field].dtype] for field in self.fields)
+            )
+        )
         if input_bytes + scratch_bytes > self.entitlement.resident_bytes:
             raise ValueError("capture inputs and field scratch exceed the signed resident bytes")
         return input_bytes
@@ -113,11 +126,14 @@ class KernelCapture:
                 arena.settle(publication)
                 pin = arena.pin_exact(publication.after_refs, stream)
                 access, refs = pin, pin.refs
-            view = arena.capture_kernel(access, refs, self.fields, inputs, self.compute,
-                preserve_fields=not self.writable)
+            view = arena.capture_kernel(
+                access, refs, self.fields, inputs, self.compute, preserve_fields=not self.writable
+            )
             required = view.resident_bytes() + input_bytes
             if required > self.entitlement.resident_bytes:
-                raise ValueError(f"capture requires {required} resident bytes, signed {self.entitlement.resident_bytes}")
+                raise ValueError(
+                    f"capture requires {required} resident bytes, signed {self.entitlement.resident_bytes}"
+                )
             self._view = view
         finally:
             if pin is not None:
@@ -127,5 +143,3 @@ class KernelCapture:
             else:
                 arena.retire(publication.after_refs)
             arena.collect_completed(wait=True)
-
-

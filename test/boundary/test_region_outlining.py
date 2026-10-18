@@ -8,8 +8,21 @@ import torch
 from pllm import _core
 from pllm.contracts.region_outlining import CallOutline, OutlinedProgram, call_outline_sites
 from pllm.contracts.region_program import (
-    BankType, Block, Call, Constant, Function, If, Map, Program, Region, Resource,
-    ScalarType, Scan, TensorType, Value, While,
+    BankType,
+    Block,
+    Call,
+    Constant,
+    Function,
+    If,
+    Map,
+    Program,
+    Region,
+    Resource,
+    ScalarType,
+    Scan,
+    TensorType,
+    Value,
+    While,
 )
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.exported_cell import ExportedCell
@@ -17,8 +30,8 @@ from pllm.execution.region_compilation import analyze_region_program, lower_regi
 from pllm.execution.region_execution import RegionExecution
 from pllm.execution.region_outlining import outline_region_calls
 from pllm.execution.region_storage import analyze_region_capacity, validate_region_capacity
-from test.boundary.test_tensor_rewrites import reassociation_candidates
 from test.boundary.test_tensor_access import StorageObserver
+from test.boundary.test_tensor_rewrites import reassociation_candidates
 
 
 def chain(device="cpu", *, escape=False):
@@ -27,18 +40,29 @@ def chain(device="cpu", *, escape=False):
     second = ExportedCell.capture(lambda ab, c: (ab @ c,), ("ab", "c"), ("out",), (tensors[0] @ tensors[1], tensors[2]))
     a, b = first.declaration.inputs
     c = second.declaration.inputs[1]
-    ab, = first.declaration.outputs
-    out, = second.declaration.outputs
-    program = Program(Region(Block((Value("a", a), Value("b", b), Value("c", c)), (
-        Call(("a", "b"), (Value("ab", ab),), first.digest),
-        Call(("ab", "c"), (Value("out", out),), second.digest),
-    ), ("out", "ab") if escape else ("out",))), (first.declaration, second.declaration))
+    (ab,) = first.declaration.outputs
+    (out,) = second.declaration.outputs
+    program = Program(
+        Region(
+            Block(
+                (Value("a", a), Value("b", b), Value("c", c)),
+                (
+                    Call(("a", "b"), (Value("ab", ab),), first.digest),
+                    Call(("ab", "c"), (Value("out", out),), second.digest),
+                ),
+                ("out", "ab") if escape else ("out",),
+            )
+        ),
+        (first.declaration, second.declaration),
+    )
     return program, {first.digest: first, second.digest: second}, dict(zip(("a", "b", "c"), tensors))
 
 
 def execution(program, cells):
     schedule = analyze_region_program(program).reference_schedule
-    return RegionExecution(program, lower_region_schedule(program, schedule), lower_region_bindings(program, schedule), cells)
+    return RegionExecution(
+        program, lower_region_schedule(program, schedule), lower_region_bindings(program, schedule), cells
+    )
 
 
 @pytest.mark.parametrize("device", ("cpu", "cuda:0"))
@@ -50,7 +74,9 @@ def test_exact_composition_preserves_escaping_versions_and_enables_cross_call_ma
     source_graphs = tuple(str(c.graph.graph) for c in cells.values())
     site = CallOutline((), 0, 2)
     result = outline_region_calls(program, cells, site)
-    native = decode_boundary(_core.outline_region_program(encode_boundary(program), encode_boundary(site)), OutlinedProgram)
+    native = decode_boundary(
+        _core.outline_region_program(encode_boundary(program), encode_boundary(site)), OutlinedProgram
+    )
     assert native == result.outlined
     assert result.cell.transformations == ()
     assert result.outlined.body.yields == (("ab", "out") if escape else ("out",))
@@ -74,35 +100,63 @@ def test_exact_composition_preserves_escaping_versions_and_enables_cross_call_ma
 
 def test_native_structural_verifier_rejects_invalid_sites_effects_and_non_tensor_calls():
     program, cells, _ = chain()
-    for site in (CallOutline((), 0, 1), CallOutline((), -1, 2), CallOutline((), True, 2),
-                 CallOutline((0,), 0, 2), CallOutline((100, 0), 0, 2), CallOutline((0, 1), 0, 2),
-                 CallOutline((), 1, 2), CallOutline((), 2**32, 2)):
+    for site in (
+        CallOutline((), 0, 1),
+        CallOutline((), -1, 2),
+        CallOutline((), True, 2),
+        CallOutline((0,), 0, 2),
+        CallOutline((100, 0), 0, 2),
+        CallOutline((0, 1), 0, 2),
+        CallOutline((), 1, 2),
+        CallOutline((), 2**32, 2),
+    ):
         with pytest.raises(ValueError):
             _core.outline_region_program(encode_boundary(program), encode_boundary(site))
     scalar = Function("scalar", (ScalarType.INT,), (ScalarType.INT,))
-    invalid = Program(Region(Block((Value("x", ScalarType.INT),), (
-        Call(("x",), (Value("a", ScalarType.INT),), scalar.name),
-        Call(("a",), (Value("b", ScalarType.INT),), scalar.name),
-    ), ("b",))), (scalar,))
+    invalid = Program(
+        Region(
+            Block(
+                (Value("x", ScalarType.INT),),
+                (
+                    Call(("x",), (Value("a", ScalarType.INT),), scalar.name),
+                    Call(("a",), (Value("b", ScalarType.INT),), scalar.name),
+                ),
+                ("b",),
+            )
+        ),
+        (scalar,),
+    )
     with pytest.raises(ValueError, match="all-tensor"):
         _core.outline_region_program(encode_boundary(invalid), encode_boundary(CallOutline((), 0, 2)))
     assert tuple(call_outline_sites(invalid)) == ()
     tensor = TensorType((4,), "torch.float32")
     effect = Function("effect", (tensor,), (tensor,), ("state",))
 
-    effectful = Program(Region(Block((Value("x", tensor),), (
-        Call(("x",), (Value("a", tensor),), effect.name),
-        Call(("a",), (Value("b", tensor),), effect.name),
-    ), ("b",))), (effect,), (Resource("state", (tensor,)),))
+    effectful = Program(
+        Region(
+            Block(
+                (Value("x", tensor),),
+                (
+                    Call(("x",), (Value("a", tensor),), effect.name),
+                    Call(("a",), (Value("b", tensor),), effect.name),
+                ),
+                ("b",),
+            )
+        ),
+        (effect,),
+        (Resource("state", (tensor,)),),
+    )
     with pytest.raises(ValueError, match="all-tensor"):
         _core.outline_region_program(encode_boundary(effectful), encode_boundary(CallOutline((), 0, 2)))
     # The source range is rederived. Supplied frontier/result/body edits are
     # not accepted merely because the transformed Program itself is valid.
     site = CallOutline((), 0, 2)
     result = outline_region_calls(program, cells, site)
-    for altered in (replace(result.outlined, body=replace(result.outlined.body, yields=())),
-                    replace(result.outlined, function=replace(result.outlined.function, name="forged")),
-                    replace(result.outlined, program=program)):
+    for altered in (
+        replace(result.outlined, body=replace(result.outlined.body, yields=())),
+        replace(result.outlined, function=replace(result.outlined.function, name="forged")),
+        replace(result.outlined, program=program),
+    ):
         with pytest.raises(ValueError, match="original calls"):
             _core.validate_region_outlining(encode_boundary(program), encode_boundary(site), encode_boundary(altered))
 
@@ -113,17 +167,28 @@ def test_normalized_alias_inputs_read_old_versions_and_keep_authoring_guard(devi
         pytest.skip("requires CUDA")
     x = torch.ones(4, dtype=torch.float64, device=device)
     view = ExportedCell.capture(lambda x: (x.view(x.shape),), ("x",), ("view",), (x,))
+
     def update(x, y):
         x.add_(1)
         return x, y
+
     update_cell = ExportedCell.capture(update, ("x", "y"), ("new", "old"), (x, x.clone()))
     with pytest.raises(ValueError, match="distinct storage"):
         update_cell(x, x.view(x.shape))
-    t, = view.declaration.inputs
-    program = Program(Region(Block((Value("x", t),), (
-        Call(("x",), (Value("v", t),), view.digest),
-        Call(("x", "v"), (Value("new", t), Value("old", t)), update_cell.digest),
-    ), ("new", "old", "x"))), (view.declaration, update_cell.declaration))
+    (t,) = view.declaration.inputs
+    program = Program(
+        Region(
+            Block(
+                (Value("x", t),),
+                (
+                    Call(("x",), (Value("v", t),), view.digest),
+                    Call(("x", "v"), (Value("new", t), Value("old", t)), update_cell.digest),
+                ),
+                ("new", "old", "x"),
+            )
+        ),
+        (view.declaration, update_cell.declaration),
+    )
     cells = {view.digest: view, update_cell.digest: update_cell}
     result = outline_region_calls(program, cells, CallOutline((), 0, 2))
     for p, imports in ((program, cells), (result.outlined.program, {**cells, result.cell.digest: result.cell})):
@@ -142,21 +207,32 @@ def test_composition_rechecks_internal_layout_guards_without_executing_callables
     transpose = ExportedCell.capture(lambda x: (x.T,), ("x",), ("t",), (x,))
     contiguous = ExportedCell.capture(lambda x: (x + 1,), ("x",), ("out",), (x,))
     t = TensorType((4, 4), "torch.float32")
-    program = Program(Region(Block((Value("x", t),), (
-        Call(("x",), (Value("t", t),), transpose.digest),
-        Call(("t",), (Value("out", t),), contiguous.digest),
-    ), ("out",))), (transpose.declaration, contiguous.declaration))
+    program = Program(
+        Region(
+            Block(
+                (Value("x", t),),
+                (
+                    Call(("x",), (Value("t", t),), transpose.digest),
+                    Call(("t",), (Value("out", t),), contiguous.digest),
+                ),
+                ("out",),
+            )
+        ),
+        (transpose.declaration, contiguous.declaration),
+    )
     cells = {transpose.digest: transpose, contiguous.digest: contiguous}
     with pytest.raises(ValueError, match="guard"):
         execution(program, cells).run({"x": x})
     with pytest.raises(ValueError, match="original call layout guard"):
         outline_region_calls(program, cells, CallOutline((), 0, 2))
     program, cells, inputs = chain()
+
     def forbidden(*args):
         raise AssertionError("composition must not execute user mathematics")
+
     cells = {name: replace(cell, function=forbidden) for name, cell in cells.items()}
     outlined = outline_region_calls(program, cells, CallOutline((), 0, 2))
-    actual, = outlined.cell.invoke(tuple(inputs.values()))
+    (actual,) = outlined.cell.invoke(tuple(inputs.values()))
     torch.testing.assert_close(actual, torch.full_like(actual, 384), rtol=0, atol=0)
 
 
@@ -165,7 +241,7 @@ def test_outlining_stays_inside_nested_control_and_preserves_unused_computation(
     x = torch.ones(4)
     first = ExportedCell.capture(lambda x: (x + 1,), ("x",), ("a",), (x,))
     second = ExportedCell.capture(lambda x: (x * 2,), ("x",), ("b",), (x,))
-    t, = first.declaration.inputs
+    (t,) = first.declaration.inputs
     arguments = (Value("x", t),)
     calls = (Call(("x",), (Value("a", t),), first.digest), Call(("a",), (Value("b", t),), second.digest))
     plain = Region(Block(arguments, calls, ("b",)))
@@ -197,7 +273,7 @@ def test_outlining_stays_inside_nested_control_and_preserves_unused_computation(
         assert combined.cell.outputs == ()
         assert sum(n.op == "call_function" for n in combined.cell.graph.graph.nodes) == 2
     for p, cells in ((program, sources), (combined.outlined.program, {**sources, combined.cell.digest: combined.cell})):
-        result, = execution(p, cells).run(supplied).values
+        (result,) = execution(p, cells).run(supplied).values
         values = result.elements if kind == "map" else (result,)
         for value, oracle in zip(values, expected, strict=True):
             torch.testing.assert_close(value, oracle, rtol=0, atol=0)
@@ -207,12 +283,21 @@ def test_outlining_may_hold_frontier_inputs_longer_and_needs_a_new_storage_analy
     x, y = torch.ones(4096), torch.ones(4096)
     first = ExportedCell.capture(lambda x: (x.sum(),), ("x",), ("sum",), (x,))
     second = ExportedCell.capture(lambda s, y: (y + s,), ("sum", "y"), ("out",), (x.sum(), y))
-    t, = first.declaration.inputs
-    scalar, = first.declaration.outputs
-    program = Program(Region(Block((Value("x", t), Value("y", t)), (
-        Call(("x",), (Value("sum", scalar),), first.digest),
-        Call(("sum", "y"), (Value("out", t),), second.digest),
-    ), ("out",))), (first.declaration, second.declaration))
+    (t,) = first.declaration.inputs
+    (scalar,) = first.declaration.outputs
+    program = Program(
+        Region(
+            Block(
+                (Value("x", t), Value("y", t)),
+                (
+                    Call(("x",), (Value("sum", scalar),), first.digest),
+                    Call(("sum", "y"), (Value("out", t),), second.digest),
+                ),
+                ("out",),
+            )
+        ),
+        (first.declaration, second.declaration),
+    )
     sources = {first.digest: first, second.digest: second}
     combined = outline_region_calls(program, sources, CallOutline((), 0, 2))
     peaks = []

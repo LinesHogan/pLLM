@@ -7,7 +7,6 @@ executable callbacks, schedules, or production runtime authority.
 from __future__ import annotations
 
 from collections.abc import Mapping
-
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TypeAlias
@@ -149,7 +148,9 @@ class While(Operation):
     body: Region
 
 
-Op: TypeAlias = Constant | Parameter | Coordinate | Scalar | Call | Select | Update | Snapshot | Publish | Scan | Map | If | While
+Op: TypeAlias = (
+    Constant | Parameter | Coordinate | Scalar | Call | Select | Update | Snapshot | Publish | Scan | Map | If | While
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,8 +320,9 @@ def verify(program: Program, *, declaration: Function | None = None) -> tuple[Da
     from pllm.contracts.codec import encode_boundary
 
     try:
-        _core.validate_region_program(encode_boundary(program),
-            None if declaration is None else encode_boundary(declaration))
+        _core.validate_region_program(
+            encode_boundary(program), None if declaration is None else encode_boundary(declaration)
+        )
     except (ValueError, TypeError, AttributeError, KeyError) as error:
         raise InvalidProgram("invalid source payload: " + str(error)) from error
     block = program.entry.block

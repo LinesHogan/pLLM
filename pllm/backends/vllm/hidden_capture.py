@@ -7,19 +7,24 @@ from threading import RLock
 
 import torch
 from torch.utils.hooks import RemovableHandle
+from vllm import __version__ as _VLLM_VERSION
 
 from pllm.authoring import TensorStepInput
-from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding, PackedHiddenSnapshot, PackedHiddenSnapshotBatch
 from pllm.contracts.packed_rows import PackedPhaseRowBatch
-
-from vllm import __version__ as _VLLM_VERSION
+from pllm.execution.cuda_stream import CudaStreamReadiness
 
 
 class Vllm027EagerPackedHiddenCapture:
-    def __init__(self, *, model: torch.nn.Module,
-                 resources: tuple[PackedHiddenResourceBinding, ...],
-                 plan_epoch: int, max_packed_rows: int, hidden_size: int) -> None:
+    def __init__(
+        self,
+        *,
+        model: torch.nn.Module,
+        resources: tuple[PackedHiddenResourceBinding, ...],
+        plan_epoch: int,
+        max_packed_rows: int,
+        hidden_size: int,
+    ) -> None:
         if _VLLM_VERSION != "0.27.1":
             raise RuntimeError("canonical hidden capture requires vLLM 0.27.1 exactly")
         keys = tuple(resource.locator_key for resource in resources)
@@ -45,8 +50,9 @@ class Vllm027EagerPackedHiddenCapture:
                 if id(module) in self._bindings:
                     raise ValueError("signed hidden resources alias the same model module")
                 self._bindings[id(module)] = resource
-                self._handles.append(module.register_forward_hook(self._capture,
-                    prepend=False, with_kwargs=False, always_call=False))
+                self._handles.append(
+                    module.register_forward_hook(self._capture, prepend=False, with_kwargs=False, always_call=False)
+                )
         except Exception:
             self.close()
             raise
@@ -56,9 +62,11 @@ class Vllm027EagerPackedHiddenCapture:
         with self._lock:
             if self._closed or self._row_batch is not None:
                 raise RuntimeError("hidden capture is closed or already active")
-            if (row_batch.plan_epoch != self._plan_epoch
+            if (
+                row_batch.plan_epoch != self._plan_epoch
                 or row_batch.step_id <= self._finished_high_watermark
-                or not 0 < row_batch.total_rows <= self._max_packed_rows):
+                or not 0 < row_batch.total_rows <= self._max_packed_rows
+            ):
                 raise RuntimeError("packed rows do not match hidden capture specialization")
             self._row_batch = row_batch
 
@@ -102,8 +110,12 @@ class Vllm027EagerPackedHiddenCapture:
             self._handles.clear()
             self._closed = True
 
-    def _capture(self, module: torch.nn.Module, _inputs: tuple[torch.Tensor, ...],
-                 output: torch.Tensor | tuple[torch.Tensor, ...]) -> None:
+    def _capture(
+        self,
+        module: torch.nn.Module,
+        _inputs: tuple[torch.Tensor, ...],
+        output: torch.Tensor | tuple[torch.Tensor, ...],
+    ) -> None:
         with self._lock:
             rows = self._row_batch
             if rows is None:
@@ -140,9 +152,7 @@ class Vllm027EagerPackedHiddenCapture:
 
     @staticmethod
     def _require_eager() -> None:
-        if torch.compiler.is_compiling() or (
-            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-        ):
+        if torch.compiler.is_compiling() or (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
             raise RuntimeError("canonical hidden capture is eager-only")
 
 

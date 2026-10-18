@@ -1,8 +1,8 @@
 """Model schedule proposals survive the real command, tuning and owner paths."""
 
-from dataclasses import replace
 import subprocess
 import sys
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
@@ -12,27 +12,43 @@ from pllm.authoring import BackendCompileFacts, TensorStepInput
 from pllm.backends.vllm.replay import VllmTokenwiseReplay
 from pllm.backends.vllm.runtime import BackendCommand, VllmSession, WorkloadModelRunner
 from pllm.config import ExecutionOptions
-from pllm.contracts.backend_attachment import AttachmentGraphMode, AttachmentTopology, BackendPlacementProbe, CausalModelDomain, SignedBackendAttachment
+from pllm.contracts.backend_attachment import (
+    AttachmentGraphMode,
+    AttachmentTopology,
+    BackendPlacementProbe,
+    CausalModelDomain,
+    SignedBackendAttachment,
+)
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
-from pllm.contracts.region_program import AffineIndex, Block, BorrowedResource, Constant, Coordinate, Program, Region, ScalarType, TensorType, Value
 from pllm.contracts.region_composition import RegionFunctionBody, inline_region
 from pllm.contracts.region_imports import CompiledTensorImport, ExportedTensorImport
+from pllm.contracts.region_program import (
+    AffineIndex,
+    Block,
+    BorrowedResource,
+    Coordinate,
+    Program,
+    Region,
+    ScalarType,
+    TensorType,
+    Value,
+)
 from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY, RegionScheduleProposal
 from pllm.contracts.region_selection import RegionSelection, RegionSelectionPolicy
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
+from pllm.execution.backend_attachment import compile_backend_attachment
 from pllm.execution.codec import decode_boundary, encode_boundary
-from pllm.execution.paged_access import PagedLayer, PagedResourceView, bind_paged_access
-from pllm.execution.region_resources import HostResourceBinding, PagedResourceBinding, ReadonlyResourceBinding
-from pllm.execution.region_execution import RegionInstructionExecution
 from pllm.execution.decoder_region import decoder_normalize_function
 from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
 from pllm.execution.exported_resources import borrow_exported_inputs
+from pllm.execution.paged_access import PagedLayer, PagedResourceView, bind_paged_access
+from pllm.execution.region_execution import RegionInstructionExecution
+from pllm.execution.region_resources import HostResourceBinding, PagedResourceBinding, ReadonlyResourceBinding
 from pllm.execution.region_storage import import_region_functions
-from pllm.execution.backend_attachment import compile_backend_attachment
 from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION, TokenwiseReplayPrimitive, TokenwiseReplayTask
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
@@ -45,12 +61,15 @@ from pllm.workloads.recirculation import RecirculationWorkload
 def test_worker_tunes_and_installs_parallel_model_proposal_with_original_owner(monkeypatch):
     device = torch.device("cuda:0")
     tensor = TensorType((1, 4), "torch.float32", "cuda:0")
+
     class OriginalNorm(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.scale = torch.nn.Parameter(torch.arange(4, device=device, dtype=torch.float32) + 1)
+
         def forward(self, hidden, residual):
             return (hidden + residual) * self.scale
+
     norm = OriginalNorm()
     original_scale = norm.scale.detach().clone()
     examples = (torch.zeros((1, 4), device=device), torch.zeros((1, 4), device=device))
@@ -60,17 +79,43 @@ def test_worker_tunes_and_installs_parallel_model_proposal_with_original_owner(m
     h, r = Value("hidden", tensor), Value("residual", tensor)
     layer = Value("layer", ScalarType.INDEX)
     inlined = inline_region(borrowed.program, (h, r, layer), "norm")
-    body = RegionFunctionBody(decoder_normalize_function(tensor, 3), Program(Region(Block(
-        (Value("row", ScalarType.INDEX), h, r),
-        (Coordinate((), (layer,), AffineIndex(3)), *inlined.operations),
-        (inlined.results[0].name,))), borrowed.program.functions, (context, weights)))
+    body = RegionFunctionBody(
+        decoder_normalize_function(tensor, 3),
+        Program(
+            Region(
+                Block(
+                    (Value("row", ScalarType.INDEX), h, r),
+                    (Coordinate((), (layer,), AffineIndex(3)), *inlined.operations),
+                    (inlined.results[0].name,),
+                )
+            ),
+            borrowed.program.functions,
+            (context, weights),
+        ),
+    )
     body.validate()
     imports = import_region_functions(borrowed.program, local_sources)
     capabilities = (REGION_STREAMS_CAPABILITY, "model/tokenwise_replay@1")
-    probe = BackendPlacementProbe("test.model.proposals@1", "a" * 64, "b" * 64, "c" * 64,
-        AttachmentTopology.IN_PROCESS, AttachmentGraphMode.EAGER, StateDeviceKind.CUDA, 0, 1, 1,
-        TensorDType.FLOAT32, 4, 4, (), capabilities, causal_domain=CausalModelDomain(1, 3, 4),
-        region_imports=imports, region_bodies=(body,))
+    probe = BackendPlacementProbe(
+        "test.model.proposals@1",
+        "a" * 64,
+        "b" * 64,
+        "c" * 64,
+        AttachmentTopology.IN_PROCESS,
+        AttachmentGraphMode.EAGER,
+        StateDeviceKind.CUDA,
+        0,
+        1,
+        1,
+        TensorDType.FLOAT32,
+        4,
+        4,
+        (),
+        capabilities,
+        causal_domain=CausalModelDomain(1, 3, 4),
+        region_imports=imports,
+        region_bodies=(body,),
+    )
     facts = BackendCompileFacts(probe, RuntimeFacts(device).timeline(capabilities), (), 1, 0, 0, layer_count=3)
     workload = RecirculationWorkload()
     # The measured tuning protocol below is the explicit opt-in: specialize so
@@ -103,17 +148,28 @@ with patch.object(RegionInstructionExecution, '__init__', forbidden), patch.obje
 assert not torch.cuda.is_initialized()
 print(encode_boundary(planned))
 """
-    planned = subprocess.run([sys.executable, "-c", script], input=encode_boundary(probe),
-        capture_output=True, text=True, check=True, timeout=60)
+    planned = subprocess.run(
+        [sys.executable, "-c", script],
+        input=encode_boundary(probe),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
     attachment = decode_boundary(planned.stdout, SignedBackendAttachment)
-    with patch.object(RegionInstructionExecution, "__init__", side_effect=AssertionError("cold source must not bind an executor")):
+    with patch.object(
+        RegionInstructionExecution, "__init__", side_effect=AssertionError("cold source must not bind an executor")
+    ):
         deployment = workload.bind_backend(facts, attachment)
     assert decode_boundary(encode_boundary(probe), BackendPlacementProbe) == probe
     exported = next(item for item in imports if isinstance(item, ExportedTensorImport))
     for invalid, message in (
         (replace(probe, schema_version=1), "probe schema"),
         (replace(probe, region_imports=(*imports, imports[0])), "distinct imports"),
-        (replace(probe, region_imports=(CompiledTensorImport(exported.access, "test", "f" * 64, ()),)), "numerical selection"),
+        (
+            replace(probe, region_imports=(CompiledTensorImport(exported.access, "test", "f" * 64, ()),)),
+            "numerical selection",
+        ),
         (replace(probe, region_imports=()), "original tensor graph import"),
     ):
         with pytest.raises(ValueError, match=message):
@@ -128,11 +184,21 @@ print(encode_boundary(planned))
     with pytest.raises(ValueError, match="differs from its source function"):
         task.region.bind_functions({graph.digest: replace(graph, digest="0" * 64)})
     execution.rebind_implementation(replace(task, region=task.region.bind_functions({graph.digest: graph})))
-    source = compile_tokenwise_region(tensor, 4, probe.causal_domain, workload.config.effect(3),
-        RegionSelectionPolicy(tuning="measured"), stream_lanes=2,
-        source_imports=imports, function_bodies=(body,))
-    parallel = next(proposal for proposal in source.candidate_proposals
-        if proposal.stream_plan is not None and proposal.stream_plan.pipeline_depth == 2)
+    source = compile_tokenwise_region(
+        tensor,
+        4,
+        probe.causal_domain,
+        workload.config.effect(3),
+        RegionSelectionPolicy(tuning="measured"),
+        stream_lanes=2,
+        source_imports=imports,
+        function_bodies=(body,),
+    )
+    parallel = next(
+        proposal
+        for proposal in source.candidate_proposals
+        if proposal.stream_plan is not None and proposal.stream_plan.pipeline_depth == 2
+    )
     assert parallel.stream_plan.host_fences
     proposals = (RegionScheduleProposal(source.payload), parallel)
     budget = next(f.workspace_bytes for f in execution.arena.plan.timeline.task_resources)
@@ -161,7 +227,9 @@ print(encode_boundary(planned))
 
     def forbidden(*args, **kwargs):
         raise AssertionError("worker verification must not repeat driver search")
+
     from pllm import _core
+
     for name in ("explore_region_schedules", "explore_region_windows", "explore_region_tiling"):
         monkeypatch.setattr(_core, name, forbidden)
     public_trace = execution.trace.snapshot()
@@ -169,8 +237,12 @@ print(encode_boundary(planned))
     count = decode_boundary(command(BackendCommand.TUNE_BEGIN, encode_boundary(proposals)), int)
     assert count > 2
     candidates = session._tuning._request.candidates
-    compiled_index = next(index for index, candidate in enumerate(candidates)
-        if candidate.stream_plan is not None and any(isinstance(item, CompiledTensorImport) for item in candidate.imports))
+    compiled_index = next(
+        index
+        for index, candidate in enumerate(candidates)
+        if candidate.stream_plan is not None
+        and any(isinstance(item, CompiledTensorImport) for item in candidate.imports)
+    )
     assert candidates[compiled_index].stream_plan != parallel.stream_plan
     owner = torch.cuda.Stream(device=device)
     identity = RequestIdentity("private", 0, 0)
@@ -205,27 +277,39 @@ print(encode_boundary(planned))
             slots = torch.arange(3, device=device, dtype=torch.int64)
             layers = tuple(PagedLayer(str(i), self.cache[:, i].unsqueeze(1), table, slots) for i in range(3))
             plan = bind_paged_access(self.rows, layers)
-            return PagedResourceBinding(PagedResourceView(resource, plan, tuple((i, str(i)) for i in range(3))), context)
+            return PagedResourceBinding(
+                PagedResourceView(resource, plan, tuple((i, str(i)) for i in range(3))), context
+            )
 
         def bind_weights(self, resource, context):
-            return ReadonlyResourceBinding(ReadonlyTensorView(resource,
-                tuple(ReadonlyTensorCell.bind((i,), (norm.scale,) if i == 3 else ()) for i in range(4))), context)
+            return ReadonlyResourceBinding(
+                ReadonlyTensorView(
+                    resource, tuple(ReadonlyTensorCell.bind((i,), (norm.scale,) if i == 3 else ()) for i in range(4))
+                ),
+                context,
+            )
 
         def bind_context(self, resource, context):
             decoder = self
+
             class View:
                 namespace = id(decoder)
+
                 def validate(self):
                     assert len(decoder.rows) <= resource.domain[0]
+
                 def check(self, mode, ranges):
                     self.validate()
+
             view = View()
             view.resource = resource
             return HostResourceBinding(view, context)
 
         def begin(self, row):
             self.saved[row] = self.cache[0, :, row.token_offset].clone()
-            return torch.tensor([row.token_offset], device=device), inputs[row.packed_row_index:row.packed_row_index + 1]
+            return torch.tensor([row.token_offset], device=device), inputs[
+                row.packed_row_index : row.packed_row_index + 1
+            ]
 
         def layer(self, row, ordinal, positions, hidden, residual):
             self.calls.append((row.token_offset, ordinal, torch.cuda.current_stream(device).cuda_stream))
@@ -272,7 +356,9 @@ print(encode_boundary(planned))
         # The unaudited model callback must stay on the original stream even
         # while eligible pure statements use a parallel physical plan.
         assert {stream for _, _, stream in decoder.calls} == {owner.cuda_stream}
-        torch.testing.assert_close(decoder.output, torch.cat(tuple(decoder.expected[i] for i in range(3))), rtol=0, atol=0)
+        torch.testing.assert_close(
+            decoder.output, torch.cat(tuple(decoder.expected[i] for i in range(3))), rtol=0, atol=0
+        )
         torch.testing.assert_close(norm.scale, original_scale, rtol=0, atol=0)
         return decoder
 
@@ -281,8 +367,11 @@ print(encode_boundary(planned))
         for index in range(count):
             command(BackendCommand.TUNE_CANDIDATE, encode_boundary(index))
             session._tuning.record_rows(rows.rows)
-            with patch.object(RegionInstructionExecution, "__init__",
-                              side_effect=AssertionError("trial must bind before measured execution")):
+            with patch.object(
+                RegionInstructionExecution,
+                "__init__",
+                side_effect=AssertionError("trial must bind before measured execution"),
+            ):
                 results.append(run())
         measured = session._tuning._measurements[1]
         command(BackendCommand.TUNE_CANDIDATE, encode_boundary(1))

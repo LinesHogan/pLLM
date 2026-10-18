@@ -8,8 +8,26 @@ import pytest
 
 from pllm import _core
 from pllm.contracts.region_program import (
-    AccessMode, Block, BorrowedResource, Call, Constant, Function, InvalidProgram, Program, Publish, Region,
-    Resource, ResourceAccess, Scalar, ScalarKind, ScalarType, SizeParameter, Snapshot, TensorType, Value, verify,
+    AccessMode,
+    Block,
+    BorrowedResource,
+    Call,
+    Constant,
+    Function,
+    InvalidProgram,
+    Program,
+    Publish,
+    Region,
+    Resource,
+    ResourceAccess,
+    Scalar,
+    ScalarKind,
+    ScalarType,
+    SizeParameter,
+    Snapshot,
+    TensorType,
+    Value,
+    verify,
 )
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.region_compilation import validate_region_program
@@ -27,10 +45,19 @@ def test_nested_source_roundtrip_and_native_verification(chunks, layers):
 
 def resource_program():
     integer = ScalarType.INT
-    return Program(Region(Block((), (
-        Snapshot((), (Value("x", integer),), "w"),
-        Publish(("x",), (), "w"),
-    ), ("x",))), resources=(Resource("w", (integer,)),))
+    return Program(
+        Region(
+            Block(
+                (),
+                (
+                    Snapshot((), (Value("x", integer),), "w"),
+                    Publish(("x",), (), "w"),
+                ),
+                ("x",),
+            )
+        ),
+        resources=(Resource("w", (integer,)),),
+    )
 
 
 def test_native_verifier_accepts_explicit_state_chain():
@@ -78,22 +105,28 @@ def test_scalar_literal_types_survive_the_wire(value, type_):
 def test_source_schema_rejects_python_coercions_before_semantic_validation():
     class OtherKind(StrEnum):
         ADD = "add"
+
     class Integer(int):
         pass
+
     integer = ScalarType.INT
-    valid = Program(Region(Block((Value("x", integer),),
-        (Scalar(("x", "x"), (Value("y", integer),), ScalarKind.ADD),), ("y",))))
-    operation, = valid.entry.block.operations
-    invalid = [replace(valid, entry=Region(replace(valid.entry.block,
-        operations=(replace(operation, kind=kind),)))) for kind in ("add", OtherKind.ADD)]
-    invalid.extend((
-        Program(Region(Block((), (), ())), resources=(Resource("state", [integer]),)),
-        Program(Region(Block((Value("x", TensorType((Integer(2),), "torch.float32")),), (), ("x",)))),
-        replace(valid, parameters=(SizeParameter("n", Integer(0), 2),)),
-    ))
+    valid = Program(
+        Region(Block((Value("x", integer),), (Scalar(("x", "x"), (Value("y", integer),), ScalarKind.ADD),), ("y",)))
+    )
+    (operation,) = valid.entry.block.operations
+    invalid = [
+        replace(valid, entry=Region(replace(valid.entry.block, operations=(replace(operation, kind=kind),))))
+        for kind in ("add", OtherKind.ADD)
+    ]
+    invalid.extend(
+        (
+            Program(Region(Block((), (), ())), resources=(Resource("state", [integer]),)),
+            Program(Region(Block((Value("x", TensorType((Integer(2),), "torch.float32")),), (), ("x",)))),
+            replace(valid, parameters=(SizeParameter("n", Integer(0), 2),)),
+        )
+    )
     read = Function("read", (), (), ("borrow",), (ResourceAccess("borrow", "read"),))
-    borrowed = Program(Region(Block((), (Call((), (), read.name),), ())),
-        (read,), (BorrowedResource("borrow", ()),))
+    borrowed = Program(Region(Block((), (Call((), (), read.name),), ())), (read,), (BorrowedResource("borrow", ()),))
     invalid.append(borrowed)
     for program in invalid:
         with pytest.raises(InvalidProgram):

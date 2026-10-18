@@ -7,24 +7,24 @@ from dataclasses import dataclass
 from itertools import accumulate
 from math import prod
 from multiprocessing.connection import Connection
-from typing import Callable
 from threading import RLock
+from typing import Callable
 from weakref import WeakSet
 
 import torch
 
-from pllm.execution.ptts.page_bundle_planning import DTYPE_BYTES, page_stride_bytes
-from pllm.execution.codec import decode_boundary, encode_boundary
-from pllm.execution.shared_tensor import CudaIpcStorage, RemoteCompletion, tensor_dtype
-from pllm.execution.scheduler import validate_plan_bundle
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.semantic_graph import StateEffectKind
 from pllm.contracts.state_ref import LineageId, StateRef, VersionId
 from pllm.contracts.state_representation import StateDeviceKind, StateProviderPlan
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorLayoutSpec
-from pllm.kernels.paged_linear import PagedRows
+from pllm.execution.codec import decode_boundary, encode_boundary
+from pllm.execution.ptts.page_bundle_planning import DTYPE_BYTES, page_stride_bytes
 from pllm.execution.ptts.page_capture import CapturedPageFields, PagedKernel
+from pllm.execution.scheduler import validate_plan_bundle
+from pllm.execution.shared_tensor import CudaIpcStorage, RemoteCompletion, tensor_dtype
 from pllm.kernels.adamw import AdamWConfig, paged_adamw
+from pllm.kernels.paged_linear import PagedRows
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,8 +135,11 @@ class _Pools:
             count = capacity * stride + alignment - 1
             pool = torch.zeros(count, dtype=tensor_dtype(field.dtype), device=device)
             offset = (-pool.data_ptr() // size) % alignment
-            tensors.append(pool[offset:offset + capacity * stride].view(capacity, stride)
-                [:, :prod(field.shape)].view(capacity, *field.shape))
+            tensors.append(
+                pool[offset : offset + capacity * stride]
+                .view(capacity, stride)[:, : prod(field.shape)]
+                .view(capacity, *field.shape)
+            )
             allocated_bytes += pool.numel() * size
         self.tensors = tuple(tensors)
         self.addresses = tuple(pool.data_ptr() for pool in self.tensors)
@@ -194,9 +197,14 @@ class PageBundleArena:
     fields receive private slots. Only this arena chooses logical versions.
     """
 
-    def __init__(self, plan: PlanBundle,
-                 local_candidates: tuple[StateProviderPlan, ...] | None = None,
-                 *, device: torch.device | None = None, _owned_resources: tuple[str, ...] | None = None) -> None:
+    def __init__(
+        self,
+        plan: PlanBundle,
+        local_candidates: tuple[StateProviderPlan, ...] | None = None,
+        *,
+        device: torch.device | None = None,
+        _owned_resources: tuple[str, ...] | None = None,
+    ) -> None:
         validate_plan_bundle(plan, local_candidates=local_candidates)
         self.plan = plan
         placements = {(item.device_kind, item.device_ordinal) for item in plan.state_physical.representations}
@@ -214,7 +222,10 @@ class PageBundleArena:
         self._pools: dict[str, _Pools] = {}
         layouts = {item.resource: item.layout for item in plan.tensor_layout_request.layouts}
         self._owned_resources = tuple(layouts) if _owned_resources is None else _owned_resources
-        if len(set(self._owned_resources)) != len(self._owned_resources) or not set(self._owned_resources) <= layouts.keys():
+        if (
+            len(set(self._owned_resources)) != len(self._owned_resources)
+            or not set(self._owned_resources) <= layouts.keys()
+        ):
             raise ValueError("arena ownership must name distinct original plan resources")
         for selected in plan.state_physical.representations:
             # Partial materialization owns no remote pool; test_video tests the partition.
@@ -234,7 +245,9 @@ class PageBundleArena:
         self._poisoned = False
         self._admission_capacity_failures = 0
         self._lock = RLock()
-        self._initialization = self._record(torch.cuda.current_stream(self.device)) if self.device.type == "cuda" else None
+        self._initialization = (
+            self._record(torch.cuda.current_stream(self.device)) if self.device.type == "cuda" else None
+        )
 
     @property
     def owned_resources(self) -> tuple[str, ...]:
@@ -264,8 +277,11 @@ class PageBundleArena:
     @property
     def allocation_ranges(self) -> tuple[tuple[str, int, int], ...]:
         """Allocation metadata, including spare COW pages and alignment padding."""
-        return tuple((str(tensor.device), tensor.untyped_storage().data_ptr(), tensor.untyped_storage().nbytes())
-                     for pools in self._pools.values() for tensor in pools.tensors)
+        return tuple(
+            (str(tensor.device), tensor.untyped_storage().data_ptr(), tensor.untyped_storage().nbytes())
+            for pools in self._pools.values()
+            for tensor in pools.tensors
+        )
 
     def usage(self) -> PageBundleUsage:
         """Read original owners without waiting, collecting or retaining tensors/receipts.
@@ -279,24 +295,47 @@ class PageBundleArena:
             live = tuple(root.bundle for ref, root in self._roots.items() if ref in latest)
             retiring = tuple(root.bundle for ref, root in self._roots.items() if ref not in latest)
             private = tuple(root for write in self._writes.values() for root in write.targets)
+
             def pages(roots: tuple[PageBundle, ...]) -> set[tuple[str, LayoutFieldId, int]]:
-                return {(root.resource, LayoutFieldId(field), page.slot_id) for root in roots for field, page in enumerate(root.pages)}
+                return {
+                    (root.resource, LayoutFieldId(field), page.slot_id)
+                    for root in roots
+                    for field, page in enumerate(root.pages)
+                }
+
             live_pages = pages(live)
             private_pages = pages(private) - live_pages
             retiring_pages = pages(retiring) - live_pages - private_pages
-            sizes = {(resource, field.field_id): prod(field.shape) * DTYPE_BYTES[field.dtype]
-                for resource, pool in self._pools.items() for field in pool.layout.fields}
+            sizes = {
+                (resource, field.field_id): prod(field.shape) * DTYPE_BYTES[field.dtype]
+                for resource, pool in self._pools.items()
+                for field in pool.layout.fields
+            }
             reserved = sum(pool.selected.reserved_bytes for pool in self._pools.values())
-            return PageBundleUsage(reserved,
-                sum(sizes[root.resource, field.field_id] for root in (*live, *retiring, *private)
-                    for field in self._pools[root.resource].layout.fields),
+            return PageBundleUsage(
+                reserved,
+                sum(
+                    sizes[root.resource, field.field_id]
+                    for root in (*live, *retiring, *private)
+                    for field in self._pools[root.resource].layout.fields
+                ),
                 sum(sizes[resource, field] for resource, field, _ in live_pages | private_pages | retiring_pages),
-                reserved - sum(pool.selected.page_capacity * sizes[resource, field.field_id]
-                    for resource, pool in self._pools.items() for field in pool.layout.fields),
+                reserved
+                - sum(
+                    pool.selected.page_capacity * sizes[resource, field.field_id]
+                    for resource, pool in self._pools.items()
+                    for field in pool.layout.fields
+                ),
                 sum(len(free) for pool in self._pools.values() for free in pool.free),
-                len(live_pages), len(private_pages), len(retiring_pages), len(private), len(retiring),
-                sum(root.pins > 0 for root in self._roots.values()), len(self._publications) + len(self._releases),
-                self._admission_capacity_failures)
+                len(live_pages),
+                len(private_pages),
+                len(retiring_pages),
+                len(private),
+                len(retiring),
+                sum(root.pins > 0 for root in self._roots.values()),
+                len(self._publications) + len(self._releases),
+                self._admission_capacity_failures,
+            )
 
     def latest(self, lineage: LineageId) -> StateRef:
         with self._lock:
@@ -322,20 +361,33 @@ class PageBundleArena:
                 raise ValueError("PageBundle admission requires signed resources")
             for resource, pools in self._pools.items():
                 live = sum(ref is not None and self.root(ref).resource == resource for ref in self._lineages.values())
-                pending = sum(root.resource == resource for token, write in self._writes.items()
-                    if not token.before_refs for root in write.targets)
+                pending = sum(
+                    root.resource == resource
+                    for token, write in self._writes.items()
+                    if not token.before_refs
+                    for root in write.targets
+                )
                 if live + pending + resources.count(resource) > pools.selected.max_admitted_lineages:
                     self._admission_capacity_failures += 1
                     raise RuntimeError("PageBundle admission capacity is exhausted")
-            refs = tuple(StateRef(self._pools[resource].selected.layout_id,
-                LineageId(self._next_lineage + index), VersionId(0)) for index, resource in enumerate(resources))
+            refs = tuple(
+                StateRef(self._pools[resource].selected.layout_id, LineageId(self._next_lineage + index), VersionId(0))
+                for index, resource in enumerate(resources)
+            )
             self._next_lineage += len(refs)
-            fields = tuple(tuple(field.field_id for field in self._pools[resource].layout.fields) for resource in resources)
+            fields = tuple(
+                tuple(field.field_id for field in self._pools[resource].layout.fields) for resource in resources
+            )
             return self._prepare((), refs, resources, fields, stream)
 
-    def prepare_transition(self, sources: tuple[StateRef, ...], stream: torch.cuda.Stream | None = None,
-                           *, fields: tuple[tuple[LayoutFieldId, ...], ...] | None = None,
-                           copy_fields: tuple[LayoutFieldId, ...] | None = None) -> PageWrite:
+    def prepare_transition(
+        self,
+        sources: tuple[StateRef, ...],
+        stream: torch.cuda.Stream | None = None,
+        *,
+        fields: tuple[tuple[LayoutFieldId, ...], ...] | None = None,
+        copy_fields: tuple[LayoutFieldId, ...] | None = None,
+    ) -> PageWrite:
         """Copy chosen fields by default; an explicit subset requires overwriting the rest."""
         with self._lock:
             self._require_stream(stream)
@@ -348,40 +400,64 @@ class PageBundleArena:
                     raise RuntimeError("PageBundle transition source is not latest")
                 if any(ref in token.before_refs for token in self._writes):
                     raise RuntimeError("PageBundle lineage already has a pending write")
-            fields = fields if fields is not None else tuple(
-                tuple(field.field_id for field in self._pools[resource].layout.fields) for resource in resources)
-            if len(fields) != len(sources) or any(not chosen or chosen != tuple(sorted(set(chosen)))
+            fields = (
+                fields
+                if fields is not None
+                else tuple(
+                    tuple(field.field_id for field in self._pools[resource].layout.fields) for resource in resources
+                )
+            )
+            if len(fields) != len(sources) or any(
+                not chosen
+                or chosen != tuple(sorted(set(chosen)))
                 or any(field < 0 or field >= len(self._pools[resource].layout.fields) for field in chosen)
-                for chosen, resource in zip(fields, resources, strict=True)):
+                for chosen, resource in zip(fields, resources, strict=True)
+            ):
                 raise ValueError("PageBundle writable fields differ from the signed layout")
-            if copy_fields is not None and (copy_fields != tuple(sorted(set(copy_fields)))
-                or any(not set(copy_fields) <= set(chosen) for chosen in fields)):
+            if copy_fields is not None and (
+                copy_fields != tuple(sorted(set(copy_fields)))
+                or any(not set(copy_fields) <= set(chosen) for chosen in fields)
+            ):
                 raise ValueError("PageBundle copied fields must be an ordered subset of each private field selection")
             targets = tuple(StateRef(ref.layout_id, ref.lineage_id, VersionId(ref.version_id + 1)) for ref in sources)
             return self._prepare(sources, targets, resources, fields, stream, copy_fields=copy_fields)
 
-    def _prepare(self, sources: tuple[StateRef, ...], targets: tuple[StateRef, ...],
-                 resources: tuple[str, ...], fields: tuple[tuple[LayoutFieldId, ...], ...],
-                 stream: torch.cuda.Stream | None, *, copy_fields: tuple[LayoutFieldId, ...] | None = None) -> PageWrite:
+    def _prepare(
+        self,
+        sources: tuple[StateRef, ...],
+        targets: tuple[StateRef, ...],
+        resources: tuple[str, ...],
+        fields: tuple[tuple[LayoutFieldId, ...], ...],
+        stream: torch.cuda.Stream | None,
+        *,
+        copy_fields: tuple[LayoutFieldId, ...] | None = None,
+    ) -> PageWrite:
         demand: dict[tuple[str, LayoutFieldId], int] = {}
         for resource, chosen in zip(resources, fields, strict=True):
             for field in chosen:
                 key = (resource, field)
                 demand[key] = demand.get(key, 0) + 1
         if not sources:
-            mutable = {effect.resource for task in self.plan.semantic_graph.tasks for effect in task.effects
-                if effect.kind not in (StateEffectKind.READ, StateEffectKind.PUBLISH)}
+            mutable = {
+                effect.resource
+                for task in self.plan.semantic_graph.tasks
+                for effect in task.effects
+                if effect.kind not in (StateEffectKind.READ, StateEffectKind.PUBLISH)
+            }
             for resource in set(resources) & mutable:
                 # Borrow original owners, including prepared admissions and existing private writers.
-                headroom = resources.count(resource) + sum(ref is not None and self.root(ref).resource == resource
-                    for ref in self._lineages.values())
+                headroom = resources.count(resource) + sum(
+                    ref is not None and self.root(ref).resource == resource for ref in self._lineages.values()
+                )
                 for token, write in self._writes.items():
                     headroom += sum(root.resource == resource for root in write.targets) * (
-                        -1 if token.before_refs else 1)
+                        -1 if token.before_refs else 1
+                    )
                 for field in self._pools[resource].layout.fields:
                     demand[resource, field.field_id] += headroom
-        exhausted = {resource for (resource, field), count in demand.items()
-            if len(self._pools[resource].free[field]) < count}
+        exhausted = {
+            resource for (resource, field), count in demand.items() if len(self._pools[resource].free[field]) < count
+        }
         if exhausted:
             # Only completed owners can return pages; active pins are never evicted.
             self.collect_completed(wait=True, resources=exhausted)
@@ -436,14 +512,18 @@ class PageBundleArena:
 
     def write_field(self, token: PageWrite, root_index: int, field: LayoutFieldId) -> torch.Tensor:
         with self._lock:
-            root, = self._capture_roots(token, (token.after_refs[root_index],), (field,))
+            (root,) = self._capture_roots(token, (token.after_refs[root_index],), (field,))
             return self._pools[root.resource].tensor(field, root.pages[field])
 
     def writable_roots(self, token: PageWrite) -> tuple[tuple[torch.Tensor, ...], ...]:
         with self._lock:
             write = self._issued_write(token)
-            return tuple(tuple(self.write_field(token, index, field.field_id)
-                for field in self._pools[root.resource].layout.fields) for index, root in enumerate(write.targets))
+            return tuple(
+                tuple(
+                    self.write_field(token, index, field.field_id) for field in self._pools[root.resource].layout.fields
+                )
+                for index, root in enumerate(write.targets)
+            )
 
     def publish(self, token: PageWrite) -> PagePublication:
         with self._lock:
@@ -513,11 +593,16 @@ class PageBundleArena:
         owned exports use snapshot. The original pin owns completion and reclamation.
         """
         with self._lock:
-            root, = self._capture_roots(pin, (ref,), (field,))
+            (root,) = self._capture_roots(pin, (ref,), (field,))
             return self._pools[root.resource].tensor(field, root.pages[field]).detach()
 
-    def paged_rows(self, access: tuple[PagePin | PageWrite, ...], refs: tuple[StateRef, ...],
-                   fields: tuple[LayoutFieldId, ...], rows: tuple[int, ...]) -> tuple[PagedRows, ...]:
+    def paged_rows(
+        self,
+        access: tuple[PagePin | PageWrite, ...],
+        refs: tuple[StateRef, ...],
+        fields: tuple[LayoutFieldId, ...],
+        rows: tuple[int, ...],
+    ) -> tuple[PagedRows, ...]:
         """Derive immutable row mappings from issued exact-version capabilities.
 
         No mapping is reused or overwritten by a later invocation. Allocations
@@ -526,11 +611,16 @@ class PageBundleArena:
         with self._lock:
             if not refs or not fields or len(access) != len(refs) or any(i < 0 or i >= len(refs) for i in rows):
                 raise ValueError("paged rows require original state indices and access")
-            roots = tuple(self._capture_roots(token, (ref,), fields)[0]
-                for token, ref in zip(access, refs, strict=True))
+            roots = tuple(
+                self._capture_roots(token, (ref,), fields)[0] for token, ref in zip(access, refs, strict=True)
+            )
             stream = access[0].stream
-            if (self.device.type != "cuda" or stream is None or any(token.stream != stream for token in access)
-                or len({root.resource for root in roots}) != 1):
+            if (
+                self.device.type != "cuda"
+                or stream is None
+                or any(token.stream != stream for token in access)
+                or len({root.resource for root in roots}) != 1
+            ):
                 raise ValueError("paged rows require one CUDA resource and consumer stream")
 
             def validate() -> None:
@@ -550,24 +640,60 @@ class PageBundleArena:
             counts = [0] * len(refs)
             for state in rows:
                 counts[state] += 1
+
             def index(values: tuple[int, ...]) -> torch.Tensor:
                 return torch.tensor(values, device=self.device, dtype=torch.long)
+
             row_order, row_states = index(order), index(rows)
             offsets = torch.tensor(tuple(accumulate(counts)), device=self.device, dtype=torch.int32)
             active = torch.ones(len(rows), device=self.device, dtype=torch.bool)
             pools = self._pools[roots[0].resource]
-            slots = torch.tensor(tuple(tuple(root.pages[field].slot_id for root in roots) for field in fields),
-                device=self.device, dtype=torch.long)
-            write_slots = slots if all(isinstance(token, PageWrite) for token in access) else torch.tensor(
-                tuple(tuple(root.pages[field].slot_id if isinstance(token, PageWrite) else -1
-                    for root, token in zip(roots, access, strict=True)) for field in fields), device=self.device, dtype=torch.long)
-            return tuple(PagedRows(pools.tensors[field].reshape(pools.tensors[field].shape[0], -1).detach(),
-                slots[index], row_order, offsets, row_states, validate, active,
-                write_slots[index], validate_write=validate_write) for index, field in enumerate(fields))
+            slots = torch.tensor(
+                tuple(tuple(root.pages[field].slot_id for root in roots) for field in fields),
+                device=self.device,
+                dtype=torch.long,
+            )
+            write_slots = (
+                slots
+                if all(isinstance(token, PageWrite) for token in access)
+                else torch.tensor(
+                    tuple(
+                        tuple(
+                            root.pages[field].slot_id if isinstance(token, PageWrite) else -1
+                            for root, token in zip(roots, access, strict=True)
+                        )
+                        for field in fields
+                    ),
+                    device=self.device,
+                    dtype=torch.long,
+                )
+            )
+            return tuple(
+                PagedRows(
+                    pools.tensors[field].reshape(pools.tensors[field].shape[0], -1).detach(),
+                    slots[index],
+                    row_order,
+                    offsets,
+                    row_states,
+                    validate,
+                    active,
+                    write_slots[index],
+                    validate_write=validate_write,
+                )
+                for index, field in enumerate(fields)
+            )
 
-    def capture_fields(self, access: PagePin | PageWrite, refs: tuple[StateRef, ...], fields: tuple[LayoutFieldId, ...],
-                       indices: torch.Tensor, buffers: tuple[torch.Tensor, ...],
-                       graph: torch.cuda.CUDAGraph, *, paged: bool = False) -> CapturedPageFields:
+    def capture_fields(
+        self,
+        access: PagePin | PageWrite,
+        refs: tuple[StateRef, ...],
+        fields: tuple[LayoutFieldId, ...],
+        indices: torch.Tensor,
+        buffers: tuple[torch.Tensor, ...],
+        graph: torch.cuda.CUDAGraph,
+        *,
+        paged: bool = False,
+    ) -> CapturedPageFields:
         """Bind cold scratch to a signed pool. Budget scratch as AER workspace.
 
         Capture read_captured/write_captured on access.stream; select_captured and
@@ -582,15 +708,32 @@ class PageBundleArena:
             root = self._capture_roots(access, refs, fields)[0]
             if not self._pools[root.resource].selected.capture_stable:
                 raise ValueError("signed provider does not support captured page selection")
-            view = CapturedPageFields(self, root.resource, fields, indices, buffers,
-                tuple(value.data_ptr() for value in (indices, *buffers)), access.stream, graph, access, refs, paged=paged)
+            view = CapturedPageFields(
+                self,
+                root.resource,
+                fields,
+                indices,
+                buffers,
+                tuple(value.data_ptr() for value in (indices, *buffers)),
+                access.stream,
+                graph,
+                access,
+                refs,
+                paged=paged,
+            )
             self.select_captured(view, access, refs)
             return view
 
-    def capture_kernel(self, access: PagePin | PageWrite, refs: tuple[StateRef, ...], fields: tuple[LayoutFieldId, ...],
-                       inputs: tuple[torch.Tensor, ...],
-                       kernel: Callable[[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]], tuple[torch.Tensor, ...]] | PagedKernel,
-                       *, preserve_fields: bool = True) -> CapturedPageFields:
+    def capture_kernel(
+        self,
+        access: PagePin | PageWrite,
+        refs: tuple[StateRef, ...],
+        fields: tuple[LayoutFieldId, ...],
+        inputs: tuple[torch.Tensor, ...],
+        kernel: Callable[[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]], tuple[torch.Tensor, ...]] | PagedKernel,
+        *,
+        preserve_fields: bool = True,
+    ) -> CapturedPageFields:
         """Cold capture of explicit tensor mathematics; no kernel selection or fallback.
 
         Fields have a fixed leading capacity axis, with current refs in prefix
@@ -608,9 +751,19 @@ class PageBundleArena:
                 raise ValueError("disposable capture requires private admission pages")
             specs = self._pools[root.resource].layout.fields
             indices = torch.empty((len(fields), len(refs)), device=self.device, dtype=torch.int64)
-            buffers = () if isinstance(kernel, PagedKernel) else tuple(torch.empty((len(refs), *specs[field].shape), device=self.device,
-                dtype=tensor_dtype(specs[field].dtype)) for field in fields)
-            view = self.capture_fields(access, refs, fields, indices, buffers, torch.cuda.CUDAGraph(), paged=isinstance(kernel, PagedKernel))
+            buffers = (
+                ()
+                if isinstance(kernel, PagedKernel)
+                else tuple(
+                    torch.empty(
+                        (len(refs), *specs[field].shape), device=self.device, dtype=tensor_dtype(specs[field].dtype)
+                    )
+                    for field in fields
+                )
+            )
+            view = self.capture_fields(
+                access, refs, fields, indices, buffers, torch.cuda.CUDAGraph(), paged=isinstance(kernel, PagedKernel)
+            )
             view.inputs = inputs
 
             def compute() -> tuple[torch.Tensor, ...]:
@@ -618,9 +771,16 @@ class PageBundleArena:
                     return kernel.compute(view, inputs)
                 return kernel(self.read_captured(view), inputs)
 
-            originals = tuple((value, value.clone()) for ref in refs for field in fields
-                for value in (self.write_field(access, access.after_refs.index(ref), field),)
-                ) if preserve_fields and isinstance(access, PageWrite) and view.paged else ()
+            originals = (
+                tuple(
+                    (value, value.clone())
+                    for ref in refs
+                    for field in fields
+                    for value in (self.write_field(access, access.after_refs.index(ref), field),)
+                )
+                if preserve_fields and isinstance(access, PageWrite) and view.paged
+                else ()
+            )
             try:
                 for _ in range(3):
                     compute()
@@ -635,8 +795,9 @@ class PageBundleArena:
                         destination.copy_(original)
             return view
 
-    def _capture_roots(self, access: PagePin | PageWrite, refs: tuple[StateRef, ...],
-                       fields: tuple[LayoutFieldId, ...]) -> tuple[PageBundle, ...]:
+    def _capture_roots(
+        self, access: PagePin | PageWrite, refs: tuple[StateRef, ...], fields: tuple[LayoutFieldId, ...]
+    ) -> tuple[PageBundle, ...]:
         if not refs or len(set(refs)) != len(refs):
             raise ValueError("captured selection requires distinct nonempty original refs")
         match access:
@@ -660,39 +821,62 @@ class PageBundleArena:
         return roots
 
     def _captured_pool(self, view: CapturedPageFields) -> _Pools:
-        if (view.arena is not self or view.indices.device != self.device or view.indices.dtype != torch.int64
-            or view.indices.ndim != 2 or view.indices.shape[0] != len(view.fields)
-            or not 0 < len(view.refs) <= view.indices.shape[1] or not view.indices.is_contiguous()
+        if (
+            view.arena is not self
+            or view.indices.device != self.device
+            or view.indices.dtype != torch.int64
+            or view.indices.ndim != 2
+            or view.indices.shape[0] != len(view.fields)
+            or not 0 < len(view.refs) <= view.indices.shape[1]
+            or not view.indices.is_contiguous()
             or len(view.buffers) != (0 if view.paged else len(view.fields))
-            or tuple(value.data_ptr() for value in (view.indices, *view.buffers)) != view.addresses):
+            or tuple(value.data_ptr() for value in (view.indices, *view.buffers)) != view.addresses
+        ):
             raise ValueError("captured page scratch address or layout changed")
         pools = self._pools[view.resource]
         if any(pools.tensors[field].data_ptr() != pools.addresses[field] for field in view.fields):
             raise ValueError("captured pool address changed")
-        ranges = tuple((value.data_ptr(), value.data_ptr() + value.numel() * value.element_size())
-            for value in (view.indices, *view.buffers))
-        bank_ranges = tuple((value.data_ptr(), value.data_ptr() + value.shape[0] * value.stride(0) * value.element_size())
-            for value in pools.tensors)
-        if any(max(start, other_start) < min(end, other_end)
+        ranges = tuple(
+            (value.data_ptr(), value.data_ptr() + value.numel() * value.element_size())
+            for value in (view.indices, *view.buffers)
+        )
+        bank_ranges = tuple(
+            (value.data_ptr(), value.data_ptr() + value.shape[0] * value.stride(0) * value.element_size())
+            for value in pools.tensors
+        )
+        if any(
+            max(start, other_start) < min(end, other_end)
             for index, (start, end) in enumerate(ranges)
-            for other_start, other_end in (*ranges[index + 1:], *bank_ranges)):
+            for other_start, other_end in (*ranges[index + 1 :], *bank_ranges)
+        ):
             raise ValueError("captured scratch must not alias another buffer or arena page")
         for field, buffer in zip(() if view.paged else view.fields, view.buffers, strict=True):
             spec = pools.layout.fields[field]
-            if (pools.tensors[field].data_ptr() != pools.addresses[field]
-                or buffer.shape != (view.indices.shape[1], *spec.shape) or buffer.dtype != tensor_dtype(spec.dtype)
-                or buffer.device != self.device or not buffer.is_contiguous() or buffer.requires_grad):
+            if (
+                pools.tensors[field].data_ptr() != pools.addresses[field]
+                or buffer.shape != (view.indices.shape[1], *spec.shape)
+                or buffer.dtype != tensor_dtype(spec.dtype)
+                or buffer.device != self.device
+                or not buffer.is_contiguous()
+                or buffer.requires_grad
+            ):
                 raise ValueError("captured field scratch differs from the signed layout")
         return pools
 
-    def select_captured(self, view: CapturedPageFields, access: PagePin | PageWrite, refs: tuple[StateRef, ...]) -> None:
+    def select_captured(
+        self, view: CapturedPageFields, access: PagePin | PageWrite, refs: tuple[StateRef, ...]
+    ) -> None:
         with self._lock, torch.no_grad():
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("page selection must happen outside graph capture")
             self._captured_pool(view)
             roots = self._capture_roots(access, refs, view.fields)
-            if (access.stream is None or roots[0].resource != view.resource
-                or type(access) is not type(view.access) or len(refs) > view.indices.shape[1]):
+            if (
+                access.stream is None
+                or roots[0].resource != view.resource
+                or type(access) is not type(view.access)
+                or len(refs) > view.indices.shape[1]
+            ):
                 raise ValueError("captured selection changed its original stream, resource or access mode")
             if access.stream != view.stream:
                 access.stream.wait_stream(view.stream)
@@ -731,13 +915,21 @@ class PageBundleArena:
                         raise RuntimeError("paged capture must use the original consumer stream")
 
             validate()
+
             def validate_write() -> None:
                 validate()
                 if not isinstance(view.access, PageWrite):
                     raise RuntimeError("paged writes require an original private PageWrite")
 
-            return PagedRows.from_fields(tuple(pools.tensors[field].reshape(pools.tensors[field].shape[0], -1).detach() for field in view.fields),
-                view.indices, rows, validate, validate_write)
+            return PagedRows.from_fields(
+                tuple(
+                    pools.tensors[field].reshape(pools.tensors[field].shape[0], -1).detach() for field in view.fields
+                ),
+                view.indices,
+                rows,
+                validate,
+                validate_write,
+            )
 
     def adamw_captured(self, view: CapturedPageFields, gradients: torch.Tensor, config: AdamWConfig) -> None:
         with self._lock:
@@ -767,8 +959,13 @@ class PageBundleArena:
                 # Padding reduces into the first private row with the neutral value;
                 # each real slot has exactly one writer, including NaN/Inf values.
                 value.masked_fill_((slots < 0).reshape(shape), neutral)
-                destination.scatter_reduce_(0, torch.where(slots >= 0, slots, slots[0]).reshape(shape).expand_as(value),
-                    value, reduce="amax", include_self=False)
+                destination.scatter_reduce_(
+                    0,
+                    torch.where(slots >= 0, slots, slots[0]).reshape(shape).expand_as(value),
+                    value,
+                    reduce="amax",
+                    include_self=False,
+                )
 
     def replay_captured(self, view: CapturedPageFields) -> None:
         with self._lock, torch.cuda.stream(view.stream):
@@ -776,8 +973,9 @@ class PageBundleArena:
             self._capture_roots(view.access, view.refs, view.fields)
             view.graph.replay()
 
-    def send_field(self, pin: PagePin, ref: StateRef, field: LayoutFieldId,
-                   connection: Connection, peer_pid: int) -> PageFieldTransfer:
+    def send_field(
+        self, pin: PagePin, ref: StateRef, field: LayoutFieldId, connection: Connection, peer_pid: int
+    ) -> PageFieldTransfer:
         """Export over a dedicated channel; the original pin owns remote completion."""
         with self._lock:
             value = self.borrow_field(pin, ref, field)
@@ -788,37 +986,69 @@ class PageBundleArena:
             connection.send_bytes(encode_boundary(descriptor).encode())
             return descriptor
 
-    def _export(self, root: PageBundle, field: LayoutFieldId, value: torch.Tensor,
-                owner_id: int, connection: Connection,
-                stream: torch.cuda.Stream | None) -> tuple[PageFieldTransfer, RemoteCompletion]:
-        if (stream is None or value.device.type != "cuda"
-            or "state/shared_cuda@1" not in self._pools[root.resource].selected.capabilities):
+    def _export(
+        self,
+        root: PageBundle,
+        field: LayoutFieldId,
+        value: torch.Tensor,
+        owner_id: int,
+        connection: Connection,
+        stream: torch.cuda.Stream | None,
+    ) -> tuple[PageFieldTransfer, RemoteCompletion]:
+        if (
+            stream is None
+            or value.device.type != "cuda"
+            or "state/shared_cuda@1" not in self._pools[root.resource].selected.capabilities
+        ):
             raise ValueError("page export requires a signed shared CUDA provider and stream")
-        held_reads = (read for reads in (*self._pins.values(), *(release.remote_reads for release in self._releases))
-            for read in reads)
+        held_reads = (
+            read
+            for reads in (*self._pins.values(), *(release.remote_reads for release in self._releases))
+            for read in reads
+        )
         if any(remote.connection is connection for remote in held_reads):
             raise ValueError("each remote page access requires its own completion channel")
-        descriptor = PageFieldTransfer(self.plan.schedule_decision.signature, owner_id, root.ref,
-            root.resource, field, root.pages[field], int(value.storage_offset()),
-            CudaIpcStorage.export(value, stream) if value.numel() else None)
+        descriptor = PageFieldTransfer(
+            self.plan.schedule_decision.signature,
+            owner_id,
+            root.ref,
+            root.resource,
+            field,
+            root.pages[field],
+            int(value.storage_offset()),
+            CudaIpcStorage.export(value, stream) if value.numel() else None,
+        )
         return descriptor, RemoteCompletion(connection, encode_boundary(descriptor).encode())
 
     @staticmethod
-    def receive_field(plan: PlanBundle, connection: Connection,
-                      *, stream: torch.cuda.Stream | None = None) -> BorrowedPage:
+    def receive_field(
+        plan: PlanBundle, connection: Connection, *, stream: torch.cuda.Stream | None = None
+    ) -> BorrowedPage:
         descriptor = decode_boundary(connection.recv_bytes(65536).decode(), PageFieldTransfer)
-        if (descriptor.compilation_signature != plan.schedule_decision.signature or descriptor.owner_id < 1
-            or descriptor.ref.lineage_id < 1 or descriptor.ref.version_id < 0):
+        if (
+            descriptor.compilation_signature != plan.schedule_decision.signature
+            or descriptor.owner_id < 1
+            or descriptor.ref.lineage_id < 1
+            or descriptor.ref.version_id < 0
+        ):
             raise ValueError("shared page belongs to another compilation or owner")
-        entries = tuple((entry, binding, provider)
-            for entry, binding in zip(plan.tensor_layout_request.layouts, plan.tensor_layout_decision.bindings, strict=True)
+        entries = tuple(
+            (entry, binding, provider)
+            for entry, binding in zip(
+                plan.tensor_layout_request.layouts, plan.tensor_layout_decision.bindings, strict=True
+            )
             for provider in plan.state_physical.representations
-            if entry.resource == binding.resource == provider.resource == descriptor.resource)
+            if entry.resource == binding.resource == provider.resource == descriptor.resource
+        )
         if len(entries) != 1:
             raise ValueError("shared page resource is absent from the original plan")
         entry, binding, provider = entries[0]
-        if (provider.device_kind is not StateDeviceKind.CUDA or "state/shared_cuda@1" not in provider.capabilities
-            or binding.layout_id != descriptor.ref.layout_id or not 0 <= descriptor.field_id < len(entry.layout.fields)):
+        if (
+            provider.device_kind is not StateDeviceKind.CUDA
+            or "state/shared_cuda@1" not in provider.capabilities
+            or binding.layout_id != descriptor.ref.layout_id
+            or not 0 <= descriptor.field_id < len(entry.layout.fields)
+        ):
             raise ValueError("shared page differs from the signed layout or placement")
         spec = entry.layout.fields[descriptor.field_id]
         capacity = provider.page_capacity
@@ -826,8 +1056,7 @@ class PageBundleArena:
         stride = page_stride_bytes(spec) // size
         alignment = max(spec.alignment_bytes // size, 1)
         head = descriptor.storage_offset - descriptor.page.slot_id * stride
-        if (not 0 <= descriptor.page.slot_id < capacity or descriptor.page.generation < 0
-            or not 0 <= head < alignment):
+        if not 0 <= descriptor.page.slot_id < capacity or descriptor.page.generation < 0 or not 0 <= head < alignment:
             raise ValueError("shared page slot or offset is outside signed capacity")
         nbytes = (capacity * stride + alignment - 1) * size
         if stream is None or stream.device != torch.device("cuda", provider.device_ordinal):
@@ -835,7 +1064,9 @@ class PageBundleArena:
         if prod(spec.shape):
             if descriptor.cuda_storage is None:
                 raise ValueError("remote CUDA page is missing its storage handle")
-            tensor = descriptor.cuda_storage.map(nbytes, tensor_dtype(spec.dtype), descriptor.storage_offset, spec.shape, stream)
+            tensor = descriptor.cuda_storage.map(
+                nbytes, tensor_dtype(spec.dtype), descriptor.storage_offset, spec.shape, stream
+            )
             if tensor.data_ptr() % spec.alignment_bytes:
                 raise ValueError("CUDA IPC page mapping violates the signed alignment")
         else:
@@ -898,13 +1129,23 @@ class PageBundleArena:
             self._require_live()
             if wait:
                 for receipt, settled in self._publications.items():
-                    if (settled and receipt.completion is not None
-                        and (resources is None or any(self.root(ref).resource in resources
-                            for ref in (*receipt.before_refs, *receipt.after_refs)))):
+                    if (
+                        settled
+                        and receipt.completion is not None
+                        and (
+                            resources is None
+                            or any(
+                                self.root(ref).resource in resources
+                                for ref in (*receipt.before_refs, *receipt.after_refs)
+                            )
+                        )
+                    ):
                         receipt.completion.synchronize()
                 for release in self._releases:
-                    if resources is not None and (not any(self.root(ref).resource in resources for ref in release.pin.refs)
-                        or any(not read.query() for read in release.remote_reads)):
+                    if resources is not None and (
+                        not any(self.root(ref).resource in resources for ref in release.pin.refs)
+                        or any(not read.query() for read in release.remote_reads)
+                    ):
                         continue
                     if release.completion is not None:
                         release.completion.synchronize()
@@ -927,8 +1168,11 @@ class PageBundleArena:
     def _reclaim(self) -> None:
         for ref, stored in tuple(self._roots.items()):
             bundle = stored.bundle
-            if (not stored.pins and self._lineages[ref.lineage_id] != ref
-                and (bundle.readiness is None or bundle.readiness.query())):
+            if (
+                not stored.pins
+                and self._lineages[ref.lineage_id] != ref
+                and (bundle.readiness is None or bundle.readiness.query())
+            ):
                 self._pools[bundle.resource].release(bundle.pages)
                 self._roots.pop(ref)
         retained = {ref.lineage_id for ref in self._roots}
@@ -961,8 +1205,12 @@ class PageBundleArena:
 
     def _require_stream(self, stream: torch.cuda.Stream | None) -> None:
         self._require_live()
-        if (self.device.type == "cpu" and stream is not None
-            or self.device.type == "cuda" and (stream is None or stream.device != self.device)):
+        if (
+            self.device.type == "cpu"
+            and stream is not None
+            or self.device.type == "cuda"
+            and (stream is None or stream.device != self.device)
+        ):
             raise RuntimeError("PageBundle stream differs from its signed device")
         self._order(self._initialization, stream)
 

@@ -9,17 +9,12 @@ from dataclasses import dataclass
 from typing import Annotated
 
 import torch
+from vllm import SamplingParams
 
 import pllm
 from pllm import TensorUpdate
-from vllm import SamplingParams
-
-from pllm.workloads.inplace_ttt import (
-    InPlaceTTTConfig,
-    InPlaceTTTWorkload,
-)
-from pllm.config import ModelConfig, VllmDType
 from pllm.backends.vllm.runtime import VllmLlm
+from pllm.config import ModelConfig, VllmDType
 from pllm.contracts.parameter_overlay import (
     ParameterModuleKind,
     ParameterOverlayOperator,
@@ -28,6 +23,10 @@ from pllm.contracts.parameter_overlay import (
 )
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
+from pllm.workloads.inplace_ttt import (
+    InPlaceTTTConfig,
+    InPlaceTTTWorkload,
+)
 
 
 @dataclass(frozen=True)
@@ -36,20 +35,29 @@ class RequestLowRankTTT(pllm.Workload):
 
     @property
     def factors(self) -> pllm.RequestState:
-        return pllm.RequestState({
-            "a": pllm.Buffer(lambda inputs, outputs: (2, inputs)),
-            "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2)),
-        })
+        return pllm.RequestState(
+            {
+                "a": pllm.Buffer(lambda inputs, outputs: (2, inputs)),
+                "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2)),
+            }
+        )
 
     @pllm.on(pllm.Phase.MODEL_UPDATE)
-    @pllm.overlay(state="factors",
+    @pllm.overlay(
+        state="factors",
         targets=(ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT),),
-        operator=ParameterOverlayOperator.LOW_RANK_ADD, factors=("a", "b"), scale=0.5)
-    def transition(self, hidden: Annotated[torch.Tensor, pllm.Operand.INPUT],
-                   desired: Annotated[torch.Tensor, pllm.Operand.TARGET],
-                   base: Annotated[torch.Tensor, pllm.Operand.WEIGHT],
-                   a: Annotated[torch.Tensor, pllm.Parameter("factors", "a")],
-                   b: Annotated[torch.Tensor, pllm.Parameter("factors", "b")]) -> TensorUpdate:
+        operator=ParameterOverlayOperator.LOW_RANK_ADD,
+        factors=("a", "b"),
+        scale=0.5,
+    )
+    def transition(
+        self,
+        hidden: Annotated[torch.Tensor, pllm.Operand.INPUT],
+        desired: Annotated[torch.Tensor, pllm.Operand.TARGET],
+        base: Annotated[torch.Tensor, pllm.Operand.WEIGHT],
+        a: Annotated[torch.Tensor, pllm.Parameter("factors", "a")],
+        b: Annotated[torch.Tensor, pllm.Parameter("factors", "b")],
+    ) -> TensorUpdate:
         output = hidden @ (base + 0.5 * b @ a).T
         error = output - desired
         gradient_b = 2 * error.T @ (hidden @ a.T) / hidden.shape[0]
@@ -73,26 +81,38 @@ class ImportedLowRank(pllm.Workload):
         if not timeline.task_resources and timeline.memory_budget_bytes is None and options.memory_budget_bytes is None:
             return timeline
         # The import copies into roots and checks one original field at a time.
-        layout, = self.declaration(facts).layouts.layouts
+        (layout,) = self.declaration(facts).layouts.layouts
         workspace = 16 * max(prod(field.shape) for field in layout.layout.fields)
-        return replace(timeline,
-            task_resources=(TaskResourceFact(TaskSymbol("publish"), 0),
-                TaskResourceFact(TaskSymbol("update"), workspace)),
-            value_resources=(ValueResourceFact(TaskSymbol("publish"), "publication", 0),
-                ValueResourceFact(TaskSymbol("update"), "updated", 0)))
+        return replace(
+            timeline,
+            task_resources=(
+                TaskResourceFact(TaskSymbol("publish"), 0),
+                TaskResourceFact(TaskSymbol("update"), workspace),
+            ),
+            value_resources=(
+                ValueResourceFact(TaskSymbol("publish"), "publication", 0),
+                ValueResourceFact(TaskSymbol("update"), "updated", 0),
+            ),
+        )
 
     @property
     def factors(self) -> pllm.RequestState:
-        return pllm.RequestState({
-            "a": pllm.Buffer(lambda inputs, outputs: (2, inputs)),
-            "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2)),
-        })
+        return pllm.RequestState(
+            {
+                "a": pllm.Buffer(lambda inputs, outputs: (2, inputs)),
+                "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2)),
+            }
+        )
 
     @property
     def adapter(self) -> pllm.Overlay:
-        return pllm.Overlay("factors",
+        return pllm.Overlay(
+            "factors",
             (ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT),),
-            operator=ParameterOverlayOperator.LOW_RANK_ADD, factors=("a", "b"), scale=0.5)
+            operator=ParameterOverlayOperator.LOW_RANK_ADD,
+            factors=("a", "b"),
+            scale=0.5,
+        )
 
 
 @dataclass(frozen=True)
@@ -101,20 +121,30 @@ class RoutedLowRankTTT(pllm.Workload):
 
     @property
     def factors(self) -> pllm.RequestState:
-        return pllm.RequestState({
-            "a": pllm.Buffer(lambda inputs, outputs: (2, inputs)),
-            "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2)),
-        }, keys=(pllm.RequestKeyField.ROUTE,))
+        return pllm.RequestState(
+            {
+                "a": pllm.Buffer(lambda inputs, outputs: (2, inputs)),
+                "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2)),
+            },
+            keys=(pllm.RequestKeyField.ROUTE,),
+        )
 
     @pllm.on(pllm.Phase.MODEL_UPDATE)
-    @pllm.overlay(state="factors",
+    @pllm.overlay(
+        state="factors",
         targets=(ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT),),
-        operator=ParameterOverlayOperator.LOW_RANK_ADD, factors=("a", "b"), scale=0.5)
-    def transition(self, hidden: Annotated[torch.Tensor, pllm.Operand.INPUT],
-                   desired: Annotated[torch.Tensor, pllm.Operand.TARGET],
-                   base: Annotated[torch.Tensor, pllm.Operand.WEIGHT],
-                   a: Annotated[torch.Tensor, pllm.Parameter("factors", "a")],
-                   b: Annotated[torch.Tensor, pllm.Parameter("factors", "b")]) -> TensorUpdate:
+        operator=ParameterOverlayOperator.LOW_RANK_ADD,
+        factors=("a", "b"),
+        scale=0.5,
+    )
+    def transition(
+        self,
+        hidden: Annotated[torch.Tensor, pllm.Operand.INPUT],
+        desired: Annotated[torch.Tensor, pllm.Operand.TARGET],
+        base: Annotated[torch.Tensor, pllm.Operand.WEIGHT],
+        a: Annotated[torch.Tensor, pllm.Parameter("factors", "a")],
+        b: Annotated[torch.Tensor, pllm.Parameter("factors", "b")],
+    ) -> TensorUpdate:
         output = hidden @ (base + 0.5 * b @ a).T
         error = output - desired
         gradient_b = 2 * error.T @ (hidden @ a.T) / hidden.shape[0]
@@ -127,6 +157,7 @@ class RoutedLowRankTTT(pllm.Workload):
 def _route(prompt: str) -> str:
     """The framework signs the key declaration; users compute the value."""
     import re
+
     return "math" if re.search(r"\d|plus|sum", prompt) else "code"
 
 
@@ -144,10 +175,14 @@ def _check_routed(handle: VllmLlm[object, object]) -> dict[str, object]:
     diagnostics = handle.deployment.execution.diagnostics()
     # Three retired requests, two route lineages still resident: the two math
     # prompts shared one adapter, and the dormant pool outlives its requests.
-    if (diagnostics.active_lineages != 2 or diagnostics.update_count < 1
-            or handle.runner.overlay_apply_count < 3
-            or handle.runner.overlay_updated_apply_count < 1
-            or diagnostics.pending_state_releases != 0 or diagnostics.fallback_count != 0):
+    if (
+        diagnostics.active_lineages != 2
+        or diagnostics.update_count < 1
+        or handle.runner.overlay_apply_count < 3
+        or handle.runner.overlay_updated_apply_count < 1
+        or diagnostics.pending_state_releases != 0
+        or diagnostics.fallback_count != 0
+    ):
         raise RuntimeError("routed overlay lifecycle evidence is incomplete")
     return {
         "text": tuple(output.outputs[0].text for output in outputs),
@@ -160,10 +195,6 @@ def _check_routed(handle: VllmLlm[object, object]) -> dict[str, object]:
     }
 
 
-
-    return RequestStateKey.project(RequestIdentity("", prompt_index, 0), (RequestKeyField.PROMPT_IDX,))
-
-
 def _key(prompt_index: int) -> RequestStateKey:
     return RequestStateKey.project(RequestIdentity("", prompt_index, 0), (RequestKeyField.PROMPT_IDX,))
 
@@ -171,7 +202,7 @@ def _key(prompt_index: int) -> RequestStateKey:
 def _check_imported(handle: VllmLlm[object, object]) -> dict[str, object]:
     prompts = ["The sky is", "Water freezes at"]
     sampling = SamplingParams(max_tokens=2, temperature=0.0, n=1, ignore_eos=True)
-    layout, = handle.attachment.inputs.plan.tensor_layout_request.layouts
+    (layout,) = handle.attachment.inputs.plan.tensor_layout_request.layouts
     down_shape, up_shape = (tuple(field.shape) for field in layout.layout.fields[:2])
     device = handle.device
     # No import: every row reads its zero-initialized request state, identical to the base model.
@@ -182,22 +213,33 @@ def _check_imported(handle: VllmLlm[object, object]) -> dict[str, object]:
     generator = torch.Generator().manual_seed(11)
     down = torch.randn(down_shape, generator=generator).to(device=device, dtype=torch.bfloat16)
     up = torch.randn(up_shape, generator=generator).to(device=device, dtype=torch.bfloat16)
-    mixed = handle.generate(prompts, sampling, prompt_indices=(2, 3),
-        auxiliary=pllm.StateTensorUpdate((down.unsqueeze(0), up.unsqueeze(0)), (_key(2),)))
+    mixed = handle.generate(
+        prompts,
+        sampling,
+        prompt_indices=(2, 3),
+        auxiliary=pllm.StateTensorUpdate((down.unsqueeze(0), up.unsqueeze(0)), (_key(2),)),
+    )
     mixed_texts = tuple(output.outputs[0].text for output in mixed)
     if mixed_texts[0] == baseline[0] or mixed_texts[1] != baseline[1]:
         raise RuntimeError("imported factors must move exactly their own request's outputs")
     # Imported zero factors are an exact no-op on fresh requests.
-    zeros = (torch.zeros((2, *down_shape), device=device, dtype=torch.bfloat16),
-        torch.zeros((2, *up_shape), device=device, dtype=torch.bfloat16))
-    replayed = handle.generate(prompts, sampling, prompt_indices=(4, 5),
-        auxiliary=pllm.StateTensorUpdate(zeros, (_key(4), _key(5))))
+    zeros = (
+        torch.zeros((2, *down_shape), device=device, dtype=torch.bfloat16),
+        torch.zeros((2, *up_shape), device=device, dtype=torch.bfloat16),
+    )
+    replayed = handle.generate(
+        prompts, sampling, prompt_indices=(4, 5), auxiliary=pllm.StateTensorUpdate(zeros, (_key(4), _key(5)))
+    )
     replayed_texts = tuple(output.outputs[0].text for output in replayed)
     if replayed_texts != baseline:
         raise RuntimeError("imported zero factors must reproduce the base model exactly")
     diagnostics = handle.deployment.execution.diagnostics()
-    if (diagnostics.update_count != 3 or diagnostics.active_lineages != 0
-            or diagnostics.pending_state_releases != 0 or diagnostics.fallback_count != 0):
+    if (
+        diagnostics.update_count != 3
+        or diagnostics.active_lineages != 0
+        or diagnostics.pending_state_releases != 0
+        or diagnostics.fallback_count != 0
+    ):
         raise RuntimeError("imported overlay lifecycle evidence is incomplete")
     return {
         "text": mixed_texts,

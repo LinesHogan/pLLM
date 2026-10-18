@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from hashlib import blake2b
 import re
+from hashlib import blake2b
 
 import torch
 from torch.nn import functional as F
@@ -23,22 +23,14 @@ def feedback_features(
     for token in tokens:
         digest = blake2b(token.encode("utf-8"), digest_size=8).digest()
         bucket = int.from_bytes(digest[:4], byteorder="little") % feature_size
-        sign = (
-            1.0
-            if int.from_bytes(digest[4:], byteorder="little") % 2 == 0
-            else -1.0
-        )
+        sign = 1.0 if int.from_bytes(digest[4:], byteorder="little") % 2 == 0 else -1.0
         features[bucket] += sign
     return F.normalize(features, p=2.0, dim=0, eps=1.0)
 
 
 def record_feature_text(record: FTTTFeedbackRecord) -> str:
-    failed_tokens = " ".join(
-        f"failed_tok_{token_id}" for token_id in record.completion.token_ids
-    )
-    feedback_tokens = " ".join(
-        f"feedback_tok_{token_id}" for token_id in record.feedback_token_ids
-    )
+    failed_tokens = " ".join(f"failed_tok_{token_id}" for token_id in record.completion.token_ids)
+    feedback_tokens = " ".join(f"feedback_tok_{token_id}" for token_id in record.feedback_token_ids)
     return "\n".join(
         (
             "feedback: " + record.feedback_text,

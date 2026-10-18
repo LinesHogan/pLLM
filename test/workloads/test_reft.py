@@ -1,25 +1,25 @@
 """Evidence 26: independent LoReFT math, explicit publication and no-update path."""
 
+import json
 from dataclasses import dataclass, replace
 from importlib.util import find_spec
-import json
 from types import SimpleNamespace
 
 import pytest
 import torch
-import pllm
 
-from pllm.execution.activation import low_rank_affine_delta
-from pllm.execution.backend_attachment import compile_backend_attachment
-from pllm.execution.codec import encode_boundary
-from test.revalidation import validate_backend_attachment
+import pllm
 from pllm.authoring import BackendCompileFacts, StateTensorUpdate, TensorStepInput
 from pllm.contracts.auxiliary import validate_auxiliary
-from pllm.execution.shared_tensor import SharedTensor
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.runtime_facts import RuntimeFacts
-from pllm.workloads.reft import ActivationConfig, ActivationWorkload, load_loreft_interventions
-from pllm.contracts.backend_attachment import ActivationPatchOperator, AttachmentGraphMode, AttachmentTopology, BackendPlacementProbe, DecodeWindow, DecodeRefresh, MissingPolicy
+from pllm.contracts.backend_attachment import (
+    ActivationPatchOperator,
+    AttachmentGraphMode,
+    AttachmentTopology,
+    BackendPlacementProbe,
+    DecodeRefresh,
+    DecodeWindow,
+    MissingPolicy,
+)
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
@@ -27,21 +27,53 @@ from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.semantic_graph import AnchorId, StateScope
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
+from pllm.execution.activation import low_rank_affine_delta
+from pllm.execution.backend_attachment import compile_backend_attachment
+from pllm.execution.codec import encode_boundary
+from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
+from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.shared_tensor import SharedTensor
+from pllm.workloads.reft import ActivationConfig, ActivationWorkload, load_loreft_interventions
 from test.backend_facts import assert_auxiliary_preflight, assert_finite_resources
+from test.revalidation import validate_backend_attachment
 
 
 def test_reft_matches_loreft_math_and_publish_skip_semantics(tmp_path) -> None:
     device = torch.device("cpu")
-    facts = BackendCompileFacts(BackendPlacementProbe("test.activation@1", "a" * 64, "b" * 64, "c" * 64,
-        AttachmentTopology.IN_PROCESS, AttachmentGraphMode.EAGER, StateDeviceKind.CPU, 0, 1, 1,
-        TensorDType.FLOAT64, 4, 8, (), ()), RuntimeFacts(device).timeline(("transition/full_root@1",)),
-        (PageBundleProviderFacts("test.page@1", 4),), 2, 65536, 0)
+    facts = BackendCompileFacts(
+        BackendPlacementProbe(
+            "test.activation@1",
+            "a" * 64,
+            "b" * 64,
+            "c" * 64,
+            AttachmentTopology.IN_PROCESS,
+            AttachmentGraphMode.EAGER,
+            StateDeviceKind.CPU,
+            0,
+            1,
+            1,
+            TensorDType.FLOAT64,
+            4,
+            8,
+            (),
+            (),
+        ),
+        RuntimeFacts(device).timeline(("transition/full_root@1",)),
+        (PageBundleProviderFacts("test.page@1", 4),),
+        2,
+        65536,
+        0,
+    )
     workload = ActivationWorkload(ActivationConfig((0,), 2, first_tokens=1, last_tokens=1))
     deployment = workload.compile_backend(assert_finite_resources(workload, facts))
     execution, signed = deployment.execution, deployment.attachment
     _decode_declarations_require_resigning(facts, signed)
-    assert_auxiliary_preflight(signed, StateTensorUpdate(tuple(torch.empty(shape, device="meta", dtype=torch.float64)
-        for shape in ((2, 5), (2,), (4, 2)))))
+    assert_auxiliary_preflight(
+        signed,
+        StateTensorUpdate(
+            tuple(torch.empty(shape, device="meta", dtype=torch.float64) for shape in ((2, 5), (2,), (4, 2)))
+        ),
+    )
     rows = PackedPhaseRowBatch(1, 0, 0, ())
     value = TensorStepInput(rows, PackedSamplerRowBatch(rows, ()))
     (initial,) = execution.admit(())
@@ -67,36 +99,63 @@ def test_reft_matches_loreft_math_and_publish_skip_semantics(tmp_path) -> None:
     assert execution.arena.latest(initial.lineage_id) == publication.after_refs[0]
     hidden = torch.randn((5, 4), dtype=torch.float64, generator=generator)
     weight, bias, rotation = fields
-    expected = torch.stack(tuple(sum((sum(row[j] * weight[k, j] for j in range(4)) + bias[k]
-        - sum(row[j] * rotation[j, k] for j in range(4))) * rotation[:, k] for k in range(2)) for row in hidden))
+    expected = torch.stack(
+        tuple(
+            sum(
+                (
+                    sum(row[j] * weight[k, j] for j in range(4))
+                    + bias[k]
+                    - sum(row[j] * rotation[j, k] for j in range(4))
+                )
+                * rotation[:, k]
+                for k in range(2)
+            )
+            for row in hidden
+        )
+    )
     torch.testing.assert_close(low_rank_affine_delta(hidden, *fields), expected)
-    binding, = signed.inputs.request.activation_bindings
-    changed = replace(signed.inputs, request=replace(signed.inputs.request,
-        activation_bindings=(replace(binding, last_tokens=2),)))
+    (binding,) = signed.inputs.request.activation_bindings
+    changed = replace(
+        signed.inputs, request=replace(signed.inputs.request, activation_bindings=(replace(binding, last_tokens=2),))
+    )
     assert compile_backend_attachment(changed) != signed.decision
     with pytest.raises(ValueError):
         validate_backend_attachment(changed, signed.decision)
     if find_spec("vllm") is not None:
-        _decode_low_rank_keeps_parameters_and_recomputes_delta(deployment, value, update, identity, hidden, expected, bias, rotation)
+        _decode_low_rank_keeps_parameters_and_recomputes_delta(
+            deployment, value, update, identity, hidden, expected, bias, rotation
+        )
     execution.retire((identity,))
     execution.retire(())
     diagnostics = execution.diagnostics()
     assert diagnostics.update_count == (2 if find_spec("vllm") is not None else 1)
-    assert diagnostics.active_lineages == diagnostics.inference_pins == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
+    assert (
+        diagnostics.active_lineages
+        == diagnostics.inference_pins
+        == diagnostics.pending_state_releases
+        == diagnostics.fallback_count
+        == 0
+    )
     if find_spec("vllm") is not None:
         _request_edits_share_publication_and_exact_prefill_rows(facts)
 
 
-def _decode_low_rank_keeps_parameters_and_recomputes_delta(deployment, value, update, identity, hidden, expected, bias, rotation):
+def _decode_low_rank_keeps_parameters_and_recomputes_delta(
+    deployment, value, update, identity, hidden, expected, bias, rotation
+):
     from pllm.backends.vllm.activation import VllmActivationPatch
+
     execution = deployment.execution
-    binding, = deployment.attachment.inputs.request.activation_bindings
+    (binding,) = deployment.attachment.inputs.request.activation_bindings
     layer = SimpleNamespace(forward=lambda positions, hidden, residual: (hidden.clone(), residual))
-    adapter = VllmActivationPatch(SimpleNamespace(model=SimpleNamespace(layers=[layer])),
+    adapter = VllmActivationPatch(
+        SimpleNamespace(model=SimpleNamespace(layers=[layer])),
         (replace(binding, decode=DecodeWindow.ALL, decode_refresh=DecodeRefresh.STEP),),
-        deployment.attachment.inputs.request.state_resource)
-    rows = PackedPhaseRowBatch(1, 0, len(hidden), tuple(PackedPhaseRow(i, 0, i, HiddenPhase.DECODE, identity)
-        for i in range(len(hidden))))
+        deployment.attachment.inputs.request.state_resource,
+    )
+    rows = PackedPhaseRowBatch(
+        1, 0, len(hidden), tuple(PackedPhaseRow(i, 0, i, HiddenPhase.DECODE, identity) for i in range(len(hidden)))
+    )
     invocation = execution.start_step(replace(value, auxiliary=update))
     execution.execute_anchor(invocation, AnchorId(0))
     try:
@@ -128,14 +187,18 @@ def _decode_declarations_require_resigning(facts, signed):
     with pytest.raises(TypeError):
         pllm.Activation("intervention", (0,), 1, 1, ActivationPatchOperator.ADD, DecodeWindow.ALL)
     assert (legacy.decode, legacy.decode_refresh, legacy.on_missing) == (
-        DecodeWindow.NONE, DecodeRefresh.INHERIT, MissingPolicy.STOP)
+        DecodeWindow.NONE,
+        DecodeRefresh.INHERIT,
+        MissingPolicy.STOP,
+    )
     for change in (dict(decode_refresh=DecodeRefresh.STEP), dict(on_missing=MissingPolicy.HOLD)):
         with pytest.raises(ValueError, match="decode window is off"):
             replace(legacy, **change)
         # Direct compiler callers cannot bypass the author-side check.
-        binding, = signed.inputs.request.activation_bindings
-        invalid = replace(signed.inputs, request=replace(signed.inputs.request,
-            activation_bindings=(replace(binding, **change),)))
+        (binding,) = signed.inputs.request.activation_bindings
+        invalid = replace(
+            signed.inputs, request=replace(signed.inputs.request, activation_bindings=(replace(binding, **change),))
+        )
         with pytest.raises(ValueError, match="decode window is off"):
             compile_backend_attachment(invalid)
 
@@ -154,9 +217,12 @@ def _decode_declarations_require_resigning(facts, signed):
     assert len({plan.inputs.plan.semantic_graph.execution_parameters_digest for plan in plans}) == 4
     assert len({plan.decision.signature for plan in plans}) == 4
     for declaration, plan in zip(declarations, plans, strict=True):
-        binding, = plan.inputs.request.activation_bindings
+        (binding,) = plan.inputs.request.activation_bindings
         assert (binding.decode, binding.decode_refresh, binding.on_missing) == (
-            declaration.decode, declaration.decode_refresh, declaration.on_missing)
+            declaration.decode,
+            declaration.decode_refresh,
+            declaration.on_missing,
+        )
     for previous, current in zip(plans, plans[1:]):
         # Changing only the attachment contract also requires a new signature.
         changed = replace(previous.inputs, request=current.inputs.request)
@@ -184,16 +250,25 @@ def _decode_declarations_require_resigning(facts, signed):
 
 def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:
     from pllm.backends.vllm.activation import VllmActivationPatch
-    config = ActivationConfig((0,), first_tokens=0, last_tokens=1, operator=ActivationPatchOperator.ADD, scope=StateScope.REQUEST)
+
+    config = ActivationConfig(
+        (0,), first_tokens=0, last_tokens=1, operator=ActivationPatchOperator.ADD, scope=StateScope.REQUEST
+    )
     deployment = ActivationWorkload(config).compile_backend(facts)
     execution = deployment.execution
     identities = (RequestIdentity("a", 7, 1), RequestIdentity("b", 9, 1))
     initial = execution.admit(identities)
     old_pin = execution.arena.pin_exact(initial)
-    rows = PackedPhaseRowBatch(1, 0, 3, tuple(PackedPhaseRow(index, 0 if index < 2 else 1,
-        index if index < 2 else 0, HiddenPhase.PREFILL, identity)
-        for index, identity in enumerate((identities[0], identities[0], identities[1]))))
-    delta = torch.tensor([[-0.25, 0.5, -1., 0.75], [1., -2., 3., -4.]])
+    rows = PackedPhaseRowBatch(
+        1,
+        0,
+        3,
+        tuple(
+            PackedPhaseRow(index, 0 if index < 2 else 1, index if index < 2 else 0, HiddenPhase.PREFILL, identity)
+            for index, identity in enumerate((identities[0], identities[0], identities[1]))
+        ),
+    )
+    delta = torch.tensor([[-0.25, 0.5, -1.0, 0.75], [1.0, -2.0, 3.0, -4.0]])
     keys = tuple(RequestStateKey.project(identity, (RequestKeyField.PROMPT_IDX,)) for identity in reversed(identities))
     value = TensorStepInput(rows, PackedSamplerRowBatch(rows, ()), auxiliary=StateTensorUpdate((delta,), keys))
     # Queued checkpoint rows are not simultaneous arena admissions.
@@ -202,8 +277,9 @@ def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:
     for index, identity in enumerate(identities):
         serial.execution.admit((identity,))
         one = PackedPhaseRowBatch(1, index, 1, (PackedPhaseRow(0, 0, 0, HiddenPhase.PREFILL, identity),))
-        publication = serial.execution.step(TensorStepInput(one, PackedSamplerRowBatch(one, ()),
-            auxiliary=value.auxiliary)).publication
+        publication = serial.execution.step(
+            TensorStepInput(one, PackedSamplerRowBatch(one, ()), auxiliary=value.auxiliary)
+        ).publication
         assert publication is not None and len(publication.after_refs) == 1
         torch.testing.assert_close(serial.execution.snapshot(publication.after_refs[0])[0], delta[1 - index])
         serial.execution.retire((identity,))
@@ -219,14 +295,19 @@ def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:
     execution.execute_anchor(invocation, AnchorId(0))
     context = invocation.context
     assert context.publication is not None and context.update_count == 2
+
     class Layer(torch.nn.Module):
         def forward(self, positions, hidden_states, residual=None):
             # Like Qwen2's down projection, the layer owns a fresh output.
             self.output = hidden_states.clone()
             return self.output, residual
+
     layer = Layer()
-    adapter = VllmActivationPatch(SimpleNamespace(model=SimpleNamespace(layers=[layer])),
-        deployment.attachment.inputs.request.activation_bindings, deployment.attachment.inputs.request.state_resource)
+    adapter = VllmActivationPatch(
+        SimpleNamespace(model=SimpleNamespace(layers=[layer])),
+        deployment.attachment.inputs.request.activation_bindings,
+        deployment.attachment.inputs.request.state_resource,
+    )
     try:
         adapter.prepare(rows, context, execution.directory)
         assert context.published_pin is not None and context.published_pin.refs == context.publication.after_refs
@@ -249,7 +330,9 @@ def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:
                 execution.complete_sampler(invocation)
         assert execution.finish_step(invocation).publication is context.publication
         assert context.published_release.pin is context.published_pin
-        assert execution.step(value).publication is None, "a request imports its edit once, even if the input batch remains staged"
+        assert execution.step(value).publication is None, (
+            "a request imports its edit once, even if the input batch remains staged"
+        )
     finally:
         adapter.close()
         execution.arena.wait_release(execution.arena.release_pin(old_pin))

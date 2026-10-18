@@ -32,25 +32,65 @@ GLOBAL = StateResource("global_factors")
 def multistate_arena(*, route=False, instance=True):
     plan = _arena(heterogeneous=True).plan
     dense, global_ = plan.tensor_layout_request.layouts
-    layouts = TensorLayoutRequest((dense, StateTensorLayout(str(AUX), replace(global_.layout,
-        namespace="test.auxiliary@1", fields=(replace(global_.layout.fields[0], shape=(3,)),))),
-        *((global_,) if instance else ())))
+    layouts = TensorLayoutRequest(
+        (
+            dense,
+            StateTensorLayout(
+                str(AUX),
+                replace(
+                    global_.layout,
+                    namespace="test.auxiliary@1",
+                    fields=(replace(global_.layout.fields[0], shape=(3,)),),
+                ),
+            ),
+            *((global_,) if instance else ()),
+        )
+    )
     states = plan.semantic_graph.states
-    graph = replace(plan.semantic_graph, states=(states[0],
-        SemanticState(AUX, StateScope.REQUEST, (RequestKeyField.ROUTE,) if route else states[0].key_fields),
-        *((states[1],) if instance else ())))
+    graph = replace(
+        plan.semantic_graph,
+        states=(
+            states[0],
+            SemanticState(AUX, StateScope.REQUEST, (RequestKeyField.ROUTE,) if route else states[0].key_fields),
+            *((states[1],) if instance else ()),
+        ),
+    )
     bindings = intern_tensor_layouts(layouts)
     provider = PageBundleProviderFacts("test.multistate@1", 6)
-    candidates = tuple(provider.materialize_plan(resource=entry.resource, layout=entry.layout,
-        binding=binding, max_admitted_lineages=2)
-        for entry, binding in zip(layouts.layouts, bindings.bindings, strict=True))
-    request = StateRepresentationRequest(8192, tuple(StateLayoutRequirement(
-        binding.resource, binding.layout_id, binding.layout_namespace, binding.layout_digest, 2,
-    ) for binding in bindings.bindings), candidates)
+    candidates = tuple(
+        provider.materialize_plan(
+            resource=entry.resource, layout=entry.layout, binding=binding, max_admitted_lineages=2
+        )
+        for entry, binding in zip(layouts.layouts, bindings.bindings, strict=True)
+    )
+    request = StateRepresentationRequest(
+        8192,
+        tuple(
+            StateLayoutRequirement(
+                binding.resource,
+                binding.layout_id,
+                binding.layout_namespace,
+                binding.layout_digest,
+                2,
+            )
+            for binding in bindings.bindings
+        ),
+        candidates,
+    )
     decision, physical, schedule, scheduled = compile_state_schedule(graph, plan.timeline, request)
-    return PageBundleArena(replace(plan, semantic_graph=graph, schedule_decision=schedule,
-        schedule_physical=scheduled, state_request=request, state_decision=decision,
-        state_physical=physical, tensor_layout_request=layouts, tensor_layout_decision=bindings))
+    return PageBundleArena(
+        replace(
+            plan,
+            semantic_graph=graph,
+            schedule_decision=schedule,
+            schedule_physical=scheduled,
+            state_request=request,
+            state_decision=decision,
+            state_physical=physical,
+            tensor_layout_request=layouts,
+            tensor_layout_decision=bindings,
+        )
+    )
 
 
 @dataclass
@@ -65,28 +105,44 @@ class Task:
         if self.runner is None:
             return
         self.context = context
-        pages = RegionResources(self.program, context, tuple(
-            ResourcePageCell(str(group.resource), (i,), ref, (LayoutFieldId(0),))
-            for group in context.selection.groups for i, ref in enumerate(group.refs)))
+        pages = RegionResources(
+            self.program,
+            context,
+            tuple(
+                ResourcePageCell(str(group.resource), (i,), ref, (LayoutFieldId(0),))
+                for group in context.selection.groups
+                for i, ref in enumerate(group.refs)
+            ),
+        )
         self.result = self.runner.run({}, pages=pages)
 
 
 def fixture(*, route=False, instance=True):
     arena = multistate_arena(route=route, instance=instance)
     initialized, batches = [], []
+
     def initializer(name, value):
         def initialize(roots):
             initialized.append((name, len(roots)))
             for root in roots:
                 for field in root:
                     field.fill_(value)
+
         return initialize
+
     def prepare(rows, batch):
         batches.append(batch)
         return rows
-    functions = FunctionMath({str(state.resource): initializer(state.resource, value)
-        for state, value in zip(arena.plan.semantic_graph.states, (1, 10, 100))},
-        lambda rows: rows, prepare, lambda rows, output: output.selection)
+
+    functions = FunctionMath(
+        {
+            str(state.resource): initializer(state.resource, value)
+            for state, value in zip(arena.plan.semantic_graph.states, (1, 10, 100))
+        },
+        lambda rows: rows,
+        prepare,
+        lambda rows, output: output.selection,
+    )
     tasks = tuple(Task(task.implementation_id) for task in arena.plan.schedule_physical.tasks)
     execution = MathBinding(functions, tasks).bind(arena, AnchorId(arena.plan.timeline.anchors[-1].ordinal))
     return execution, tasks[0], initialized, batches
@@ -106,18 +162,24 @@ def bind_region(task, execution, rows):
         functions[cell.digest] = cell
         tensor = cell.declaration.inputs[0]
 
-        body = region((Value("i", ScalarType.INDEX),), (
-            Snapshot(("i",), (Value("old", tensor),), name),
-            Call(("old",), (Value("new", tensor),), cell.digest),
-            Publish(("new", "i"), (), name),
-        ), ())
+        body = region(
+            (Value("i", ScalarType.INDEX),),
+            (
+                Snapshot(("i",), (Value("old", tensor),), name),
+                Call(("old",), (Value("new", tensor),), cell.digest),
+                Publish(("new", "i"), (), name),
+            ),
+            (),
+        )
         resources.append(Resource(name, (tensor,), (len(group.refs),)))
         operations.append(Scan((), (), len(group.refs), body))
-    program = Program(region((), tuple(operations), ()),
-        tuple(cell.declaration for cell in functions.values()), tuple(resources))
+    program = Program(
+        region((), tuple(operations), ()), tuple(cell.declaration for cell in functions.values()), tuple(resources)
+    )
     schedule = analyze_region_program(program).reference_schedule
-    task.runner = RegionExecution(program, lower_region_schedule(program, schedule),
-        lower_region_bindings(program, schedule), functions)
+    task.runner = RegionExecution(
+        program, lower_region_schedule(program, schedule), lower_region_bindings(program, schedule), functions
+    )
     task.program = program
 
 
@@ -131,14 +193,16 @@ def assert_reclaimed(execution):
 
 def test_heterogeneous_resources_run_in_one_original_invocation(monkeypatch):
     execution, task, initialized, batches = fixture()
-    global_ref, = execution.admit(())
+    (global_ref,) = execution.admit(())
     a, b = RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0)
     publications = []
     publish = execution.arena.publish
+
     def record(write):
         receipt = publish(write)
         publications.append(receipt)
         return receipt
+
     monkeypatch.setattr(execution.arena, "publish", record)
     refs = execution.admit((a, b))
     assert len(publications) == 1 and len(publications[0].after_refs) == 4
@@ -161,12 +225,13 @@ def test_heterogeneous_resources_run_in_one_original_invocation(monkeypatch):
     for old, expected in zip(refs, (2, 2, 11, 11, 101), strict=True):
         current = context.current_owned_ref(old)
         assert current.version_id == old.version_id + 1
-        torch.testing.assert_close(execution.snapshot(current)[0],
-            torch.full_like(execution.snapshot(current)[0], expected), rtol=0, atol=0)
+        torch.testing.assert_close(
+            execution.snapshot(current)[0], torch.full_like(execution.snapshot(current)[0], expected), rtol=0, atol=0
+        )
     # Request inference still owns the original global version after publication.
     pin = execution.directory.inference_pin(a)
     assert pin.refs == (global_ref,)
-    torch.testing.assert_close(execution.arena.snapshot(pin, global_ref)[0], torch.full((2, 5), 100.), rtol=0, atol=0)
+    torch.testing.assert_close(execution.arena.snapshot(pin, global_ref)[0], torch.full((2, 5), 100.0), rtol=0, atol=0)
     execution.retire((a, b))
     execution.retire(())
     assert_reclaimed(execution)
@@ -177,17 +242,21 @@ def test_admission_failure_rolls_back_all_resources_and_inference_pins(monkeypat
     execution, _, _, _ = fixture()
     execution.admit(())
     a, b = RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0)
+
     def fail(*args):
         raise RuntimeError("injected admission failure")
+
     with monkeypatch.context() as changed:
         if failure == "initialize":
             changed.setitem(execution.math.initializers, str(AUX), fail)
         elif failure == "pin":
             pin_exact, count = execution.arena.pin_exact, 0
+
             def pin(*args):
                 nonlocal count
                 count += 1
                 return fail() if count == 2 else pin_exact(*args)
+
             changed.setattr(execution.arena, "pin_exact", pin)
         else:
             changed.setattr(execution.arena, "publish", fail)
@@ -252,10 +321,12 @@ def test_failure_between_resource_publications_keeps_committed_prefix(monkeypatc
     bind_region(task, execution, rows)
     invocation = execution.start_step(rows)
     original = execution.arena.write_field
+
     def fail_second(token, index, field):
         if token.before_refs[0].lineage_id == refs[1].lineage_id:
             raise RuntimeError("injected second resource failure")
         return original(token, index, field)
+
     with monkeypatch.context() as changed:
         changed.setattr(execution.arena, "write_field", fail_second)
         with pytest.raises(StateSettlementError):
@@ -277,7 +348,7 @@ def test_failure_between_resource_publications_keeps_committed_prefix(monkeypatc
 
 def test_mixed_retirement_cancels_own_invocation_then_releases_instance_pin():
     execution, _, _, _ = fixture(route=True)
-    global_ref, = execution.admit(())
+    (global_ref,) = execution.admit(())
     a, b = RequestIdentity("a", 0, 0, "math"), RequestIdentity("b", 1, 0, "math")
     execution.admit((a, b))
     invocation = execution.begin(rows_for(a))
@@ -307,8 +378,10 @@ def test_incomplete_or_misindexed_selection_cannot_bypass_resource_leases():
     a = RequestIdentity("a", 0, 0)
     execution.admit((a,))
     selected = execution.directory.select(rows_for(a))
-    for forged in (replace(selected, groups=selected.groups[:1]),
-                   replace(selected, groups=(selected.groups[0], replace(selected.groups[1], state_indices=(0,))))):
+    for forged in (
+        replace(selected, groups=selected.groups[:1]),
+        replace(selected, groups=(selected.groups[0], replace(selected.groups[1], state_indices=(0,)))),
+    ):
         with pytest.raises(RuntimeError, match="differs from its resources"):
             execution.directory.acquire_transition_lease(forged)
     invocation = execution.begin(rows_for(a))

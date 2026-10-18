@@ -5,16 +5,16 @@ scheduler. The backend must keep its original cache and page tables stable until
 the original invocation completes. Shared read-only prefixes are permitted.
 """
 
-from dataclasses import dataclass, replace
 from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from heapq import heappop, heappush
 from types import MappingProxyType
 
 import torch
 
 from pllm.contracts.packed_rows import PackedPhaseRow
-from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.region_program import AccessMode, BorrowedResource
+from pllm.contracts.request_identity import RequestIdentity
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,9 +50,15 @@ class CausalAccess:
         last = min(self.count - 1, (write.end - 1 - self.address) // self.stride)
         if first > last:
             return False
-        return not (first == last and self.layer == write.layer and self.request == write.request
-            and self.head == write.head and self.first + first == write.first
-            and self.address + first * self.stride == write.address and self.width == write.width)
+        return not (
+            first == last
+            and self.layer == write.layer
+            and self.request == write.request
+            and self.head == write.head
+            and self.first + first == write.first
+            and self.address + first * self.stride == write.address
+            and self.width == write.width
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,12 +90,17 @@ class PagedResourceView:
             raise ValueError("paged resource requires request, layer and position domains")
         ordinals = tuple(ordinal for ordinal, _ in self.layers)
         names = tuple(name for _, name in self.layers)
-        if (len(set(ordinals)) != len(ordinals) or len(set(names)) != len(names)
+        if (
+            len(set(ordinals)) != len(ordinals)
+            or len(set(names)) != len(names)
             or set(names) != set(self.plan.layers)
-            or any(type(ordinal) is not int or not 0 <= ordinal < domain[1] for ordinal in ordinals)):
+            or any(type(ordinal) is not int or not 0 <= ordinal < domain[1] for ordinal in ordinals)
+        ):
             raise ValueError("paged resource layer projection differs from its original plan")
-        if any(not 0 <= request < domain[0] or not 0 <= first < end <= domain[2]
-               for (_, request), (first, end) in self.plan.ranges.items()):
+        if any(
+            not 0 <= request < domain[0] or not 0 <= first < end <= domain[2]
+            for (_, request), (first, end) in self.plan.ranges.items()
+        ):
             raise ValueError("paged resource rows exceed the declared logical domain")
 
     def check(self, mode: AccessMode, ranges: tuple[tuple[int, int], ...]) -> None:
@@ -116,13 +127,23 @@ class PagedResourceView:
 def validate_paged_views(views: tuple[PagedResourceView, ...], protected: tuple[tuple[str, int, int], ...]) -> None:
     """Check separation between resource names and every original arena allocation."""
     if len(views) > 1:
-        reads = tuple(replace(access, layer=str((view.resource.name, access.layer))) for view in views for access in view.plan.reads)
-        writes = tuple(replace(access, layer=str((view.resource.name, access.layer))) for view in views for access in view.plan.writes)
+        reads = tuple(
+            replace(access, layer=str((view.resource.name, access.layer)))
+            for view in views
+            for access in view.plan.reads
+        )
+        writes = tuple(
+            replace(access, layer=str((view.resource.name, access.layer)))
+            for view in views
+            for access in view.plan.writes
+        )
         _validate_aliases(reads, writes)
     for view in views:
         for access in (*view.plan.reads, *view.plan.writes):
-            if any(device == access.device and start < access.end and access.address < start + size
-                   for device, start, size in protected):
+            if any(
+                device == access.device and start < access.end and access.address < start + size
+                for device, start, size in protected
+            ):
                 raise ValueError("borrowed paged access overlaps original arena storage")
 
 
@@ -165,16 +186,20 @@ def bind_paged_access(rows: tuple[PackedPhaseRow, ...], layers: tuple[PagedLayer
     limits: dict[int, int] = {}
     row_ids: set[int] = set()
     for row in rows:
-        if (row.packed_row_index in row_ids
+        if (
+            row.packed_row_index in row_ids
             or identities.setdefault(row.request_ordinal, row.identity) != row.identity
             or ordinals.setdefault(row.identity, row.request_ordinal) != row.request_ordinal
-            or row.request_ordinal in limits and row.token_offset != limits[row.request_ordinal]):
+            or row.request_ordinal in limits
+            and row.token_offset != limits[row.request_ordinal]
+        ):
             raise ValueError("KV rows require unique packed identities and consecutive request positions")
         row_ids.add(row.packed_row_index)
         limits[row.request_ordinal] = row.token_offset + 1
     if any(not layer.name for layer in layers) or len({layer.name for layer in layers}) != len(layers):
         raise ValueError("paged layers require distinct logical names")
     hosts: dict[tuple[str, int, tuple[int, ...], tuple[int, ...], torch.dtype], torch.Tensor] = {}
+
     def host(value: torch.Tensor) -> torch.Tensor:
         if value.dtype not in (torch.int32, torch.int64):
             raise ValueError("page tables and slots require integer metadata")
@@ -182,6 +207,7 @@ def bind_paged_access(rows: tuple[PackedPhaseRow, ...], layers: tuple[PagedLayer
         if key not in hosts:
             hosts[key] = value.detach().cpu()
         return hosts[key]
+
     reads: list[CausalAccess] = []
     writes: list[CausalAccess] = []
     slots: dict[tuple[str, int], tuple[PackedPhaseRow, int, int]] = {}
@@ -200,14 +226,24 @@ def bind_paged_access(rows: tuple[PackedPhaseRow, ...], layers: tuple[PagedLayer
         request_count = max(limits, default=-1) + 1
         page_count = max(((length + block_size - 1) // block_size for length in limits.values()), default=0)
         table = host(layer.block_table[:request_count, :page_count])
-        mapping = host(layer.slots[:max(row_ids, default=-1) + 1])
+        mapping = host(layer.slots[: max(row_ids, default=-1) + 1])
         element = cache.element_size()
         base, device = cache.data_ptr(), str(cache.device)
         strides = cache.stride()
+
         def access(request: int, head: int, first: int, count: int, block: int, offset: int) -> CausalAccess:
-            return CausalAccess(layer.name, identities[request], head, first, count, device,
+            return CausalAccess(
+                layer.name,
+                identities[request],
+                head,
+                first,
+                count,
+                device,
                 base + element * (block * strides[0] + head * strides[1] + offset * strides[2]),
-                (strides[2] if block_size > 1 else content) * element, content * element)
+                (strides[2] if block_size > 1 else content) * element,
+                content * element,
+            )
+
         pages: dict[int, tuple[int, ...]] = {}
         for request, length in limits.items():
             count = (length + block_size - 1) // block_size
@@ -234,13 +270,20 @@ def bind_paged_access(rows: tuple[PackedPhaseRow, ...], layers: tuple[PagedLayer
             if int(mapping[row.packed_row_index].item()) != block * block_size + offset:
                 raise ValueError("KV write slot differs from its causal page-table position")
             slots[(layer.name, row.packed_row_index)] = (row, block, offset)
-            writes.extend(access(row.request_ordinal, head, row.token_offset, 1, block, offset) for head in range(heads))
+            writes.extend(
+                access(row.request_ordinal, head, row.token_offset, 1, block, offset) for head in range(heads)
+            )
     ranges: dict[tuple[str, int], tuple[int, int]] = {}
     for (layer_name, _), (row, _, _) in slots.items():
         key = (layer_name, row.request_ordinal)
         first, end = ranges.get(key, (row.token_offset, row.token_offset + 1))
         ranges[key] = (min(first, row.token_offset), max(end, row.token_offset + 1))
-    result = PagedAccessPlan(tuple(reads), tuple(writes), MappingProxyType(slots),
-                            tuple(layer.name for layer in layers), MappingProxyType(ranges))
+    result = PagedAccessPlan(
+        tuple(reads),
+        tuple(writes),
+        MappingProxyType(slots),
+        tuple(layer.name for layer in layers),
+        MappingProxyType(ranges),
+    )
     _validate_aliases(result.reads, result.writes)
     return result

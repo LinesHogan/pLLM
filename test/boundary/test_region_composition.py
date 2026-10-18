@@ -8,12 +8,30 @@ import torch
 from pllm.backends.vllm.region_layers import VllmDecoderBodies, decoder_partition_bodies
 from pllm.contracts.backend_attachment import CausalModelDomain
 from pllm.contracts.region_composition import RegionFunctionBody, inline_function_bodies, inline_region
-from pllm.contracts.region_program import AffineIndex, BankType, Block, BorrowedResource, Call, Constant, Coordinate, Function, Map, Program, Region, ScalarType, SizeParameter, TensorType, Value
+from pllm.contracts.region_program import (
+    AffineIndex,
+    BankType,
+    Block,
+    BorrowedResource,
+    Call,
+    Constant,
+    Coordinate,
+    Function,
+    Map,
+    Program,
+    Region,
+    ScalarType,
+    SizeParameter,
+    TensorType,
+    Value,
+)
 from pllm.execution.module_graph import ModuleCallBinding
 from pllm.execution.region_compilation import analyze_region_program, lower_region_schedule
 
 
-@pytest.mark.parametrize("invalid", ("output", "resource", "borrow_access", "parameter", "capture", "self_call", "self_import"))
+@pytest.mark.parametrize(
+    "invalid", ("output", "resource", "borrow_access", "parameter", "capture", "self_call", "self_import")
+)
 def test_outer_function_signature_is_checked_without_becoming_a_callable(invalid):
     integer = ScalarType.INT
     program = Program(Region(Block((Value("x", integer),), (), ("x",))))
@@ -31,8 +49,16 @@ def test_outer_function_signature_is_checked_without_becoming_a_callable(invalid
     elif invalid == "capture":
         program = replace(program, entry=Region(replace(program.entry.block, yields=("hidden",))))
     elif invalid == "self_call":
-        program = replace(program, entry=Region(replace(program.entry.block,
-            operations=(Call(("x",), (Value("y", integer),), declaration.name),), yields=("y",))))
+        program = replace(
+            program,
+            entry=Region(
+                replace(
+                    program.entry.block,
+                    operations=(Call(("x",), (Value("y", integer),), declaration.name),),
+                    yields=("y",),
+                )
+            ),
+        )
     else:
         program = replace(program, functions=(declaration,))
     with pytest.raises(ValueError):
@@ -41,17 +67,27 @@ def test_outer_function_signature_is_checked_without_becoming_a_callable(invalid
 
 def test_inlining_preserves_argument_aliases_duplicate_returns_and_fresh_names():
     integer = ScalarType.INT
-    leaf = Program(Region(Block((Value("x", integer),), (
-        Constant((), (Value("one", integer),), 1),
-    ), ("x", "one", "one"))))
+    leaf = Program(
+        Region(Block((Value("x", integer),), (Constant((), (Value("one", integer),), 1),), ("x", "one", "one")))
+    )
     declaration = Function("leaf", (integer,), (integer, integer, integer))
     body = RegionFunctionBody(declaration, leaf)
-    caller = Program(Region(Block((Value("seed", integer), Value("body0_one", integer)), (
-        Call(("seed",), (Value("a", integer), Value("b", integer), Value("c", integer)), "leaf"),
-        Call(("a",), (Value("d", integer), Value("e", integer), Value("f", integer)), "leaf"),
-    ), ("a", "b", "c", "d", "e", "f", "body0_one"))), (declaration,))
+    caller = Program(
+        Region(
+            Block(
+                (Value("seed", integer), Value("body0_one", integer)),
+                (
+                    Call(("seed",), (Value("a", integer), Value("b", integer), Value("c", integer)), "leaf"),
+                    Call(("a",), (Value("d", integer), Value("e", integer), Value("f", integer)), "leaf"),
+                ),
+                ("a", "b", "c", "d", "e", "f", "body0_one"),
+            )
+        ),
+        (declaration,),
+    )
     expanded = inline_function_bodies(caller, (body,))
     from test.region_reference import interpret
+
     assert interpret(expanded, {"seed": 7, "body0_one": 99}).values == (7, 1, 1, 7, 1, 1, 99)
     invalid = replace(leaf, entry=Region(replace(leaf.entry.block, yields=("hidden",))))
     with pytest.raises(ValueError, match="captures must be explicit"):
@@ -60,25 +96,34 @@ def test_inlining_preserves_argument_aliases_duplicate_returns_and_fresh_names()
 
 def test_data_ports_preserve_effects_and_reject_effectful_maps():
     from pllm.execution.region_compilation import validate_region_program
-    from test.region_reference import interpret
     from test.boundary.test_region_external import external_program
+    from test.region_reference import interpret
 
     original = external_program()
     assert original.entry.block.arguments == ()
     validate_region_program(original)
     events = []
+
     def call(inputs):
         events.append(len(events) + 1)
         return (events[-1],)
+
     result = interpret(original, {}, functions={f.name: call for f in original.functions})
     assert result.values == (1, 2) and events == [1, 2]
     assert [event.resource for event in result.effects] == ["first", "second"]
 
-    body = Region(Block((Value("i", ScalarType.INDEX),),
-        (Call((), (Value("x", ScalarType.INT),), original.functions[0].name),), ("x",)))
-    forbidden = Program(Region(Block((),
-        (Map((), (Value("out", BankType(ScalarType.INT, 2)),), 2, body),), ("out",))),
-        original.functions, original.resources)
+    body = Region(
+        Block(
+            (Value("i", ScalarType.INDEX),),
+            (Call((), (Value("x", ScalarType.INT),), original.functions[0].name),),
+            ("x",),
+        )
+    )
+    forbidden = Program(
+        Region(Block((), (Map((), (Value("out", BankType(ScalarType.INT, 2)),), 2, body),), ("out",))),
+        original.functions,
+        original.resources,
+    )
     with pytest.raises(ValueError, match="pure region"):
         validate_region_program(forbidden)
 
@@ -100,8 +145,9 @@ def test_decoder_imports_custom_readonly_modules_without_suffix_class_rules():
         torch.nn.Module.__init__(layer.self_attn)
         layer.input_layernorm = RMSNorm(4)
         layer.post_attention_layernorm = ResidualSum()
-        layer.mlp = torch.nn.Sequential(torch.nn.Linear(4, width, bias=False), torch.nn.SiLU(),
-                                        torch.nn.Linear(width, 4, bias=False))
+        layer.mlp = torch.nn.Sequential(
+            torch.nn.Linear(4, width, bias=False), torch.nn.SiLU(), torch.nn.Linear(width, 4, bias=False)
+        )
         return layer
 
     config = VllmConfig(compilation_config=CompilationConfig(mode=CompilationMode.NONE))
@@ -146,23 +192,37 @@ def test_decoder_imports_custom_readonly_modules_without_suffix_class_rules():
         varied.validate(layers)
         program = varied.suffix.program
         schedule = analyze_region_program(program, optimize=False).reference_schedule
-        runner = RegionExecution(program, lower_region_schedule(program, schedule),
-                                 lower_region_bindings(program, schedule), varied.functions)
+        runner = RegionExecution(
+            program,
+            lower_region_schedule(program, schedule),
+            lower_region_bindings(program, schedule),
+            varied.functions,
+        )
         execution, _, rows, _ = owner_fixture(rounds=1)
         invocation = execution.start_step(rows)
         resources = {resource.name: resource for resource in program.resources}
-        weight_cells = (*(ReadonlyTensorCell.bind((i,), tuple(item.parameters())) for i, item in enumerate(layers)),
-                        ReadonlyTensorCell.bind((2,), ()))
+        weight_cells = (
+            *(ReadonlyTensorCell.bind((i,), tuple(item.parameters())) for i, item in enumerate(layers)),
+            ReadonlyTensorCell.bind((2,), ()),
+        )
         context_cells = tuple(ReadonlyTensorCell.bind((i,), ()) for i in range(2))
         loans = tuple(item for item in varied.imports if isinstance(item, BorrowedTensorImport))
-        pages = RegionResources(program, invocation.context, (), borrows=(
-            ReadonlyResourceBinding(ReadonlyTensorView(resources["weights"], weight_cells), invocation.context),
-            ReadonlyResourceBinding(ReadonlyTensorView(resources["context"], context_cells), invocation.context)),
-            tensor_borrows=loans)
+        pages = RegionResources(
+            program,
+            invocation.context,
+            (),
+            borrows=(
+                ReadonlyResourceBinding(ReadonlyTensorView(resources["weights"], weight_cells), invocation.context),
+                ReadonlyResourceBinding(ReadonlyTensorView(resources["context"], context_cells), invocation.context),
+            ),
+            tensor_borrows=loans,
+        )
         try:
             for i in range(len(layers)):
                 expected = varied.graphs[i][0].run_suffix(inputs)
-                actual = runner.run({"row": 0, "layer": i, "hidden": inputs[0], "residual": inputs[1]}, pages=pages).values
+                actual = runner.run(
+                    {"row": 0, "layer": i, "hidden": inputs[0], "residual": inputs[1]}, pages=pages
+                ).values
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         finally:
             execution.cancel_step(invocation)
@@ -190,13 +250,30 @@ def test_model_source_exposes_kv_before_feed_forward_without_weakening_causality
     function = body.declaration
     index = ScalarType.INDEX
     position = TensorType((1,), "torch.int64")
-    source = Program(Region(Block((Value("x", tensor), Value("position", position)), (
-        Coordinate((), (Value("zero", index),), AffineIndex(0)), Coordinate((), (Value("one", index),), AffineIndex(1)),
-        Call(("zero", "zero", "zero", "zero", "position", "x"),
-             (Value("h0", tensor), Value("r0", tensor)), function.name),
-        Call(("one", "zero", "one", "zero", "position", "x"),
-             (Value("h1", tensor), Value("r1", tensor)), function.name),
-    ), ("h0", "r0", "h1", "r1"))), (function,), body.program.resources)
+    source = Program(
+        Region(
+            Block(
+                (Value("x", tensor), Value("position", position)),
+                (
+                    Coordinate((), (Value("zero", index),), AffineIndex(0)),
+                    Coordinate((), (Value("one", index),), AffineIndex(1)),
+                    Call(
+                        ("zero", "zero", "zero", "zero", "position", "x"),
+                        (Value("h0", tensor), Value("r0", tensor)),
+                        function.name,
+                    ),
+                    Call(
+                        ("one", "zero", "one", "zero", "position", "x"),
+                        (Value("h1", tensor), Value("r1", tensor)),
+                        function.name,
+                    ),
+                ),
+                ("h0", "r0", "h1", "r1"),
+            )
+        ),
+        (function,),
+        body.program.resources,
+    )
     expanded = inline_function_bodies(source, bodies)
     analysis = analyze_region_program(expanded, optimize=False)
     assert len(analysis.statements) == 4
@@ -207,7 +284,15 @@ def test_model_source_exposes_kv_before_feed_forward_without_weakening_causality
     with pytest.raises(ValueError):
         lower_region_schedule(expanded, "{ S0[] -> [1]; S1[] -> [2]; S2[] -> [0]; S3[] -> [3] }")
     with pytest.raises(ValueError, match="original resource family"):
-        bad = replace(body, program=replace(body.program, resources=decoder_partition_bodies(tensor, CausalModelDomain(1, 1, 3), 2, "test-source-graph")[0].program.resources))
+        bad = replace(
+            body,
+            program=replace(
+                body.program,
+                resources=decoder_partition_bodies(tensor, CausalModelDomain(1, 1, 3), 2, "test-source-graph")[
+                    0
+                ].program.resources,
+            ),
+        )
         inline_function_bodies(source, (bad,))
 
 

@@ -3,35 +3,60 @@
 from collections.abc import Callable, Mapping
 from dataclasses import KW_ONLY, dataclass, field, fields, is_dataclass, replace
 from enum import Enum
-from inspect import Parameter as SignatureParameter, signature
+from inspect import Parameter as SignatureParameter
+from inspect import signature
 from types import FunctionType, MethodType
 from typing import Annotated, ClassVar, TypeVar, cast, get_args, get_origin
 
 import torch
 
-from pllm.authoring import BackendWorkload, BackendCompileFacts, BackendRequirements, TensorStepInput
-from pllm.contracts.backend_attachment import BackendAttachmentSpec, ActivationPatchOperator, AttachmentKind, DecodeWindow, DecodeRefresh, MissingPolicy
+from pllm.authoring import BackendCompileFacts, BackendRequirements, BackendWorkload, TensorStepInput
+from pllm.contracts.backend_attachment import (
+    ActivationPatchOperator,
+    AttachmentKind,
+    BackendAttachmentSpec,
+    DecodeRefresh,
+    DecodeWindow,
+    MissingPolicy,
+)
 from pllm.contracts.compilation import PlanBundle
-from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorLayoutRequest
-from pllm.contracts.hidden_locator import HiddenSite, HiddenPhase
-from pllm.contracts.parameter_overlay import ParameterTarget, ParameterOverlayOperator
-from pllm.contracts.request_identity import RequestKeyField
+from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.packed_rows import PackedPhaseRow
+from pllm.contracts.parameter_overlay import ParameterOverlayOperator, ParameterTarget
+from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.sampler import SamplerStage
-from pllm.contracts.semantic_graph import LossReduction, TaskImplementationSpec, TaskResourceFact
-from pllm.contracts.semantic_graph import ConditionalLayerReplay
-from pllm.contracts.semantic_graph import HiddenInputSource, MathContract, SemanticGraph, SemanticInputSource, StateScope, TaskResultInputSource, TaskSymbol, SamplerFeedbackInputSource
+from pllm.contracts.semantic_graph import (
+    ConditionalLayerReplay,
+    HiddenInputSource,
+    LossReduction,
+    MathContract,
+    SamplerFeedbackInputSource,
+    SemanticGraph,
+    SemanticInputSource,
+    StateScope,
+    TaskImplementationSpec,
+    TaskResourceFact,
+    TaskResultInputSource,
+    TaskSymbol,
+)
+from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorLayoutRequest
 from pllm.execution.codec import boundary_digest
 from pllm.execution.declaration import Call, Dimensions, Shape, State, When
-from pllm.execution.tensor_binding import Buffer as Buffer, TensorUpdate as TensorUpdate
-from pllm.execution.tensor_binding import TensorBinding, TensorFrame, TensorPort, Tensors, TensorOutput as TensorOutput, SGD as SGD
-from pllm.execution.freeze import NativeMath, fingerprint, freeze, members as _members, owner_snapshot, owner_values, reachable_functions
-from pllm.execution.tensor_program import FunctionMath, Roots, InvocationOutput
-from pllm.execution.state_execution import MathBinding, StateExecution
+from pllm.execution.freeze import NativeMath, fingerprint, freeze, owner_snapshot, owner_values, reachable_functions
+from pllm.execution.freeze import members as _members
 from pllm.execution.host_runtime import (
-    HostWorkload, HostRuntimeFacts, TensorHostBinding,
+    HostRuntimeFacts,
+    HostWorkload,
+    TensorHostBinding,
 )
 from pllm.execution.replay import Recurrence as Recurrence
+from pllm.execution.state_execution import MathBinding, StateExecution
+from pllm.execution.tensor_binding import SGD as SGD
+from pllm.execution.tensor_binding import Buffer as Buffer
+from pllm.execution.tensor_binding import TensorBinding, TensorFrame, TensorPort, Tensors
+from pllm.execution.tensor_binding import TensorOutput as TensorOutput
+from pllm.execution.tensor_binding import TensorUpdate as TensorUpdate
+from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots
 from pllm.kernels.adamw import AdamWConfig
 
 F = TypeVar("F", bound=Callable[..., torch.Tensor | TensorUpdate])
@@ -86,6 +111,7 @@ class Capture:
     """Second Annotated marker: on a training task, write this input's value into
     the state's memory field at publication — the next step reads it as the input
     version. Per lineage, the last selected row wins."""
+
     state: str
     field: str
 
@@ -172,7 +198,8 @@ class Activation:
 
     def __post_init__(self) -> None:
         if self.decode is DecodeWindow.NONE and (
-            self.decode_refresh is not DecodeRefresh.INHERIT or self.on_missing is not MissingPolicy.STOP):
+            self.decode_refresh is not DecodeRefresh.INHERIT or self.on_missing is not MissingPolicy.STOP
+        ):
             raise ValueError("decode window is off; refresh and missing policies require decode rows")
 
 
@@ -180,6 +207,7 @@ class Activation:
 class Overlay:
     """Externally produced parameter overlay: field values arrive as a StateTensorUpdate,
     are imported into private roots and published before the model runs."""
+
     state: str
     targets: tuple[ParameterTarget, ...]
     weight: str = "value"
@@ -236,12 +264,15 @@ class _Gradient:
     parameter_rows: str = ""
 
 
-def differentiate(*, inputs: tuple[str, ...] = (), parameters: bool = False,
-                  input_rows: str = "", parameter_rows: str = "") -> Callable[[F], F]:
+def differentiate(
+    *, inputs: tuple[str, ...] = (), parameters: bool = False, input_rows: str = "", parameter_rows: str = ""
+) -> Callable[[F], F]:
     """Keep the declared derivative edges; parameters may stay frozen while inputs differentiate."""
+
     def decorate(function: F) -> F:
         setattr(function, "__pllm_gradient__", _Gradient(inputs, parameters, input_rows, parameter_rows))
         return function
+
     return decorate
 
 
@@ -258,15 +289,28 @@ class _Overlay:
     replay: ConditionalLayerReplay | Config | None
 
 
-def overlay(*, state: str, targets: tuple[ParameterTarget, ...] | Config, weight: str = "value",
-            operator: ParameterOverlayOperator | Config = ParameterOverlayOperator.DENSE_ADD,
-            factors: tuple[str, str] | Config = ("a", "b"), scale: float | Config = 1.0,
-            prefill: bool | Config = True, decode: bool | Config = False,
-            replay: ConditionalLayerReplay | Config | None = None) -> Callable[[F], F]:
+def overlay(
+    *,
+    state: str,
+    targets: tuple[ParameterTarget, ...] | Config,
+    weight: str = "value",
+    operator: ParameterOverlayOperator | Config = ParameterOverlayOperator.DENSE_ADD,
+    factors: tuple[str, str] | Config = ("a", "b"),
+    scale: float | Config = 1.0,
+    prefill: bool | Config = True,
+    decode: bool | Config = False,
+    replay: ConditionalLayerReplay | Config | None = None,
+) -> Callable[[F], F]:
     """Apply request-state fields to model parameters; dense uses `weight`, low-rank the factor pair."""
+
     def decorate(function: F) -> F:
-        setattr(function, "__pllm_effect__", _Overlay(state, targets, weight, operator, factors, scale, prefill, decode, replay))
+        setattr(
+            function,
+            "__pllm_effect__",
+            _Overlay(state, targets, weight, operator, factors, scale, prefill, decode, replay),
+        )
         return function
+
     return decorate
 
 
@@ -275,22 +319,32 @@ def on(phase: Phase, *, rows: str = "") -> Callable[[F], F]:
         setattr(function, "__pllm_phase__", phase)
         setattr(function, "__pllm_rows__", rows)
         return function
+
     return decorate
 
 
 def hook(layer: int | Config, *, site: HiddenSite = HiddenSite.BLOCK_OUTPUT) -> Callable[[F], F]:
     """Declare a supported hidden capture; never register an eager Python model hook."""
+
     def decorate(function: F) -> F:
         setattr(function, "__pllm_hidden__", Hidden(layer, site))
         return function
+
     return decorate
 
 
-def export(*, name: str | Config = "value", every: int | Config = 1, max_rows: int | Config = 1,
-           max_cols: int | Config = 16, enabled: bool | Config = True) -> Callable[[F], F]:
+def export(
+    *,
+    name: str | Config = "value",
+    every: int | Config = 1,
+    max_rows: int | Config = 1,
+    max_cols: int | Config = 16,
+    enabled: bool | Config = True,
+) -> Callable[[F], F]:
     def decorate(function: F) -> F:
         setattr(function, "__pllm_effect__", _Export(name, every, max_rows, max_cols, enabled))
         return function
+
     return decorate
 
 
@@ -301,17 +355,21 @@ def add_logits(function: F) -> F:
 
 def guide_sampling(*, beta: float | Config) -> Callable[[F], F]:
     """Project selected hidden predictions through the original post-filter sampler."""
+
     def decorate(function: F) -> F:
         setattr(function, "__pllm_effect__", _Sampler(SamplerStage.PACKED_POST_FILTER_EXACT, beta))
         return function
+
     return decorate
 
 
-def train(*, state: str, update: str = "", reduction: LossReduction = "mean",
-          steps: int | Config = 1, reset: str = "") -> Callable[[F], F]:
+def train(
+    *, state: str, update: str = "", reduction: LossReduction = "mean", steps: int | Config = 1, reset: str = ""
+) -> Callable[[F], F]:
     def decorate(function: F) -> F:
         setattr(function, "__pllm_effect__", _Train(state, update, reduction, steps, reset))
         return function
+
     return decorate
 
 
@@ -343,9 +401,12 @@ def _snapshot(owner: C, borrowed: tuple[object, ...] = ()) -> C:
     return owner_snapshot(owner, (InstanceState, Activation, Overlay, Recurrence), borrowed)
 
 
-def _arguments(function: Callable[..., torch.Tensor | TensorUpdate], hidden: Hidden | None = None,
-               result_type: type[torch.Tensor] | type[TensorUpdate] = torch.Tensor,
-               captures: dict[str, Capture] | None = None) -> tuple[tuple[str, object], ...]:
+def _arguments(
+    function: Callable[..., torch.Tensor | TensorUpdate],
+    hidden: Hidden | None = None,
+    result_type: type[torch.Tensor] | type[TensorUpdate] = torch.Tensor,
+    captures: dict[str, Capture] | None = None,
+) -> tuple[tuple[str, object], ...]:
     result: list[tuple[str, object]] = []
     unmarked = 0
     for name, parameter in signature(function, eval_str=False).parameters.items():
@@ -359,7 +420,9 @@ def _arguments(function: Callable[..., torch.Tensor | TensorUpdate], hidden: Hid
             result.append((name, hidden))
             continue
         if get_origin(annotation) is not Annotated:
-            raise TypeError(f"{name}: input source requires Annotated[Tensor, source]; string annotations are not evaluated")
+            raise TypeError(
+                f"{name}: input source requires Annotated[Tensor, source]; string annotations are not evaluated"
+            )
         args: tuple[object, ...] = get_args(annotation)
         if len(args) == 3 and isinstance(args[2], Capture) and captures is not None:
             if args[0] is not torch.Tensor:
@@ -378,11 +441,15 @@ def _arguments(function: Callable[..., torch.Tensor | TensorUpdate], hidden: Hid
 def _invoke(function: Callable[..., torch.Tensor], names: tuple[str, ...]) -> Callable[[Tensors], torch.Tensor]:
     def invoke(inputs: Tensors) -> torch.Tensor:
         return function(**{name: inputs[name] for name in names})
+
     return invoke
 
 
-class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
-               HostWorkload[StateExecution[TensorStepInput, TensorFrame, TensorOutput]]):
+class Workload(
+    NativeMath,
+    BackendWorkload[TensorFrame, TensorOutput],
+    HostWorkload[StateExecution[TensorStepInput, TensorFrame, TensorOutput]],
+):
     """Python methods and effects compiled once, not runtime hooks or a second IR."""
 
     name: ClassVar[str] = "python.workload"
@@ -408,14 +475,26 @@ class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
         for name, member in members.items():
             if isinstance(member, FunctionType) and isinstance(getattr(member, "__pllm_phase__", None), Phase):
                 seeds.append(member)
-            elif isinstance(member, property) and member.fget is not None and (
-                signature(member.fget, eval_str=False).return_annotation in (InstanceState, RequestState, Activation, Overlay, Recurrence)):
+            elif (
+                isinstance(member, property)
+                and member.fget is not None
+                and (
+                    signature(member.fget, eval_str=False).return_annotation
+                    in (InstanceState, RequestState, Activation, Overlay, Recurrence)
+                )
+            ):
                 seeds.append(member.fget)
             for attribute in ("__pllm_effect__", "__pllm_gradient__", "__pllm_rows__"):
                 marker = getattr(member, attribute, None)
-                texts = (marker,) if isinstance(marker, str) else (
-                    tuple(getattr(marker, item.name) for item in fields(marker))
-                    if is_dataclass(marker) and not isinstance(marker, type) else ())
+                texts = (
+                    (marker,)
+                    if isinstance(marker, str)
+                    else (
+                        tuple(getattr(marker, item.name) for item in fields(marker))
+                        if is_dataclass(marker) and not isinstance(marker, type)
+                        else ()
+                    )
+                )
                 seeds.extend(candidates[text] for text in texts if isinstance(text, str) and text in candidates)
         for value in values.values():
             if isinstance(value, InstanceState) and value.initialize is not None:
@@ -436,11 +515,20 @@ class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
         parameters: dict[tuple[str, str], SemanticInputSource | TensorPort] = {}
         definitions: list[tuple[str, str]] = helpers
         # Method-overlay states are created by parameter_overlay with their own buffer layout.
-        overlay_states = {effect.state for member in members.values()
-            if isinstance((effect := getattr(member, "__pllm_effect__", None)), _Overlay)}
+        overlay_states = {
+            effect.state
+            for member in members.values()
+            if isinstance((effect := getattr(member, "__pllm_effect__", None)), _Overlay)
+        }
         for name, member in members.items():
-            if isinstance(member, property) and member.fget is not None and (
-                signature(member.fget, eval_str=False).return_annotation in (InstanceState, RequestState, Activation, Overlay, Recurrence)):
+            if (
+                isinstance(member, property)
+                and member.fget is not None
+                and (
+                    signature(member.fget, eval_str=False).return_annotation
+                    in (InstanceState, RequestState, Activation, Overlay, Recurrence)
+                )
+            ):
                 values[name] = member.__get__(owner)
             elif isinstance(member, InstanceState) and name not in values:
                 values[name] = member
@@ -458,14 +546,18 @@ class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                     if isinstance(shape, Buffer):
                         raise TypeError("tensor states require tensor shapes, not overlay buffers")
                     shapes[key] = shape
-                state, ports = b.parameters(name, shapes, optimizer=definition.optimizer,
+                state, ports = b.parameters(
+                    name,
+                    shapes,
+                    optimizer=definition.optimizer,
                     namespace=definition.namespace,
                     initialize=None if definition.initialize is None else freeze(definition.initialize),
                     scope=StateScope.REQUEST if isinstance(definition, RequestState) else StateScope.INSTANCE,
                     dtype=TensorDType(str(definition.dtype).removeprefix("torch.")),
                     alignment=definition.alignment,
                     keys=definition.keys if isinstance(definition, RequestState) else (),
-                    memory=definition.memory)
+                    memory=definition.memory,
+                )
                 states[name] = state
                 parameters.update({(name, field): port for field, port in ports.items()})
         for name, effect in values.items():
@@ -480,10 +572,17 @@ class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                 buffers = _buffers(definition)
                 applied = (effect.weight,) if effect.operator is ParameterOverlayOperator.DENSE_ADD else effect.factors
                 definitions.append((name, fingerprint(effect)))
-                b.import_overlay(effect.state, buffers, targets=effect.targets, applied=applied,
-                    operator=effect.operator, scale=effect.scale, namespace=definition.namespace,
+                b.import_overlay(
+                    effect.state,
+                    buffers,
+                    targets=effect.targets,
+                    applied=applied,
+                    operator=effect.operator,
+                    scale=effect.scale,
+                    namespace=definition.namespace,
                     keys=definition.keys if isinstance(definition, RequestState) else (),
-                    scope=StateScope.REQUEST if isinstance(definition, RequestState) else StateScope.INSTANCE)
+                    scope=StateScope.REQUEST if isinstance(definition, RequestState) else StateScope.INSTANCE,
+                )
                 continue
             if not isinstance(effect, Activation):
                 continue
@@ -491,11 +590,20 @@ class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
             if not isinstance(definition, InstanceState):
                 raise ValueError("activation replacement requires a declared state")
             definitions.append((name, fingerprint(effect)))
-            b.activation_patch(effect.state, _buffers(definition), layers=effect.layers, operator=effect.operator,
-                first_tokens=effect.first_tokens, last_tokens=effect.last_tokens, namespace=definition.namespace,
-                decode=effect.decode, decode_refresh=effect.decode_refresh, on_missing=effect.on_missing,
+            b.activation_patch(
+                effect.state,
+                _buffers(definition),
+                layers=effect.layers,
+                operator=effect.operator,
+                first_tokens=effect.first_tokens,
+                last_tokens=effect.last_tokens,
+                namespace=definition.namespace,
+                decode=effect.decode,
+                decode_refresh=effect.decode_refresh,
+                on_missing=effect.on_missing,
                 scope=StateScope.REQUEST if isinstance(definition, RequestState) else StateScope.INSTANCE,
-                keys=definition.keys if isinstance(definition, RequestState) else ())
+                keys=definition.keys if isinstance(definition, RequestState) else (),
+            )
 
         def port(source: object) -> SemanticInputSource | TensorPort:
             match source:
@@ -573,21 +681,43 @@ class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                     raise TypeError("overlay replay requires a conditional layer replay")
                 identity = fingerprint(transition)
                 transition = freeze(transition)
-                def invoke(inputs: Tensors, function: Callable[..., TensorUpdate] = transition,
-                           bindings: Mapping[str, str] = bindings_overlay) -> TensorUpdate:
+
+                def invoke(
+                    inputs: Tensors,
+                    function: Callable[..., TensorUpdate] = transition,
+                    bindings: Mapping[str, str] = bindings_overlay,
+                ) -> TensorUpdate:
                     return function(**{key: inputs[source] for key, source in bindings.items()})
-                b.parameter_overlay(name, effect.state, buffers, targets=resolved_targets,
-                    applied=applied, namespace=definition.namespace, keys=definition.keys,
-                    phases=tuple(p for p, enabled in ((HiddenPhase.PREFILL, effect.prefill), (HiddenPhase.DECODE, effect.decode))
-                        if _setting(enabled, owner, bool)), replay=replay, identity=f"python:{identity}",
-                    operator=operator, scale=scale, function=invoke)
+
+                b.parameter_overlay(
+                    name,
+                    effect.state,
+                    buffers,
+                    targets=resolved_targets,
+                    applied=applied,
+                    namespace=definition.namespace,
+                    keys=definition.keys,
+                    phases=tuple(
+                        p
+                        for p, enabled in ((HiddenPhase.PREFILL, effect.prefill), (HiddenPhase.DECODE, effect.decode))
+                        if _setting(enabled, owner, bool)
+                    ),
+                    replay=replay,
+                    identity=f"python:{identity}",
+                    operator=operator,
+                    scale=scale,
+                    function=invoke,
+                )
                 definitions.append((name, boundary_digest(identity, bindings_overlay, operator, scale, applied)))
                 continue
             function = cast(Callable[..., torch.Tensor], getattr(owner, name))
             hidden: object = getattr(member, "__pllm_hidden__", None)
             capture_marks: dict[str, Capture] = {}
-            arguments = _arguments(function, hidden if isinstance(hidden, Hidden) else None,
-                captures=capture_marks if isinstance(effect, _Train) else None)
+            arguments = _arguments(
+                function,
+                hidden if isinstance(hidden, Hidden) else None,
+                captures=capture_marks if isinstance(effect, _Train) else None,
+            )
             if isinstance(effect, _Train):
                 definition = values.get(effect.state)
                 if not isinstance(definition, InstanceState):
@@ -595,14 +725,27 @@ class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                 if isinstance(definition.optimizer, SGD):
                     if capture_marks:
                         raise ValueError("SGD batch training manages its own state writes")
-                    if (gradient is not None or forward_rows or effect.update or not effect.reset
-                        or effect.reduction != "weighted_state_mean_then_mean" or phase is not Phase.AFTER_SAMPLE):
-                        raise ValueError("SGD batch training requires reset, weighted reduction and AFTER_SAMPLE without inference-row selectors")
+                    if (
+                        gradient is not None
+                        or forward_rows
+                        or effect.update
+                        or not effect.reset
+                        or effect.reduction != "weighted_state_mean_then_mean"
+                        or phase is not Phase.AFTER_SAMPLE
+                    ):
+                        raise ValueError(
+                            "SGD batch training requires reset, weighted reduction and AFTER_SAMPLE without inference-row selectors"
+                        )
                     batch_sources: dict[str, tuple[str, str]] = {}
                     for key, source in arguments:
                         if isinstance(source, Batch) and source.field in ("hidden", "base_logits", "labels", "weights"):
                             batch_sources[key] = "batch", source.field
-                        elif isinstance(source, Parameter) and source.state == effect.state and source.field in definition.fields and not source.per_row:
+                        elif (
+                            isinstance(source, Parameter)
+                            and source.state == effect.state
+                            and source.field in definition.fields
+                            and not source.per_row
+                        ):
                             batch_sources[key] = "parameter", source.field
                         else:
                             raise ValueError("batch training inputs must name its batch tensors or own parameters")
@@ -612,17 +755,35 @@ class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                     if training is not None:
                         raise ValueError("tensor sampler attachment requires one training operation")
                     state = states[effect.state]
-                    training = b.weighted_train(name, state, identity=f"python:{identity}", optimizer=definition.optimizer,
-                        steps=_setting(effect.steps, owner, int), reset=freeze(reset), function=_invoke(freeze(function), tuple(batch_sources)),
-                        arguments=batch_sources), state
+                    training = (
+                        b.weighted_train(
+                            name,
+                            state,
+                            identity=f"python:{identity}",
+                            optimizer=definition.optimizer,
+                            steps=_setting(effect.steps, owner, int),
+                            reset=freeze(reset),
+                            function=_invoke(freeze(function), tuple(batch_sources)),
+                            arguments=batch_sources,
+                        ),
+                        state,
+                    )
                     continue
                 if effect.reset or effect.steps != 1:
                     raise ValueError("multi-step/reset training requires explicit SGD batch parameters")
             inputs = {key: port(source) for key, source in arguments}
             identity = fingerprint(function)
             function = freeze(function)
-            definitions.append((name, boundary_digest(identity,
-                tuple((key, fingerprint(source)) for key, source in arguments), fingerprint(capture_marks))))
+            definitions.append(
+                (
+                    name,
+                    boundary_digest(
+                        identity,
+                        tuple((key, fingerprint(source)) for key, source in arguments),
+                        fingerprint(capture_marks),
+                    ),
+                )
+            )
             update: State | None = None
             math: MathContract = MathContract()
             parameter_names = tuple(key for key, source in arguments if isinstance(source, Parameter))
@@ -631,29 +792,55 @@ class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                 raise ValueError("parameter gradients require declared Parameter inputs")
             if demand.input_rows and not demand.inputs or demand.parameter_rows and not demand.parameters:
                 raise ValueError("gradient row selectors require their declared derivative edges")
-            if (len(set(demand.inputs)) != len(demand.inputs) or any(key not in inputs or key in parameter_names for key in demand.inputs)):
+            if len(set(demand.inputs)) != len(demand.inputs) or any(
+                key not in inputs or key in parameter_names for key in demand.inputs
+            ):
                 raise ValueError("input gradients must name distinct nonparameter inputs")
-            if any(key in demand.inputs and isinstance(source, (Samples, SampledTokens, StateIndex, StateVersion)) for key, source in arguments):
+            if any(
+                key in demand.inputs and isinstance(source, (Samples, SampledTokens, StateIndex, StateVersion))
+                for key, source in arguments
+            ):
                 raise ValueError("indices, versions and drawn tokens are nondifferentiable inputs")
             if isinstance(effect, _Export) and (demand.inputs or demand.parameters or forward_rows):
                 raise ValueError("bounded host exports use their own row limits and are gradient boundaries")
             if isinstance(gradient, _Gradient) or isinstance(effect, _Train):
-                math = MathContract(input_gradients=demand.inputs,
-                    parameter_gradients=tuple(dict.fromkeys(states[source.state].declaration.resource
-                        for _, source in arguments if isinstance(source, Parameter))) if demand.parameters else (),
-                    detached_inputs=tuple(key for key, source in arguments if not isinstance(source, Parameter) and key not in demand.inputs))
+                math = MathContract(
+                    input_gradients=demand.inputs,
+                    parameter_gradients=tuple(
+                        dict.fromkeys(
+                            states[source.state].declaration.resource
+                            for _, source in arguments
+                            if isinstance(source, Parameter)
+                        )
+                    )
+                    if demand.parameters
+                    else (),
+                    detached_inputs=tuple(
+                        key
+                        for key, source in arguments
+                        if not isinstance(source, Parameter) and key not in demand.inputs
+                    ),
+                )
             if isinstance(effect, _Train):
                 update = states[effect.state]
-                math = replace(math, update_states=parameter_names[0] if parameter_names else "__update_state", reduction=effect.reduction)
+                math = replace(
+                    math,
+                    update_states=parameter_names[0] if parameter_names else "__update_state",
+                    reduction=effect.reduction,
+                )
             captures: dict[str, LayoutFieldId] = {}
             for key, capture in capture_marks.items():
                 if update is None or capture.state != cast(_Train, effect).state:
                     raise ValueError("memory captures target the task's own training state")
-                if capture.field not in {field.name for field in update.fields[update.optimizer_fields:]}:
+                if capture.field not in {field.name for field in update.fields[update.optimizer_fields :]}:
                     raise ValueError(f"{capture.field}: captures name a declared memory field")
                 captures[key] = update.field(capture.field)
-            domains = {"forward_rows": forward_rows, "input_gradient_rows": demand.input_rows,
-                "parameter_gradient_rows": demand.parameter_rows, "update_states": effect.update if isinstance(effect, _Train) else ""}
+            domains = {
+                "forward_rows": forward_rows,
+                "input_gradient_rows": demand.input_rows,
+                "parameter_gradient_rows": demand.parameter_rows,
+                "update_states": effect.update if isinstance(effect, _Train) else "",
+            }
             selectors: dict[str, Call] = {}
             sources = dict(arguments)
             for domain, method in domains.items():
@@ -666,20 +853,35 @@ class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                 if method not in selectors:
                     identity_selector = fingerprint(selector)
                     definitions.append((method, identity_selector))
-                    selectors[method] = b.tensor(f"__{name}_{method}", when=phase.value,
-                        identity=f"python:{identity_selector}:{name}:{method}", inputs={key: inputs[key] for key, _ in selected_args})(
-                            _invoke(freeze(selector), tuple(key for key, _ in selected_args)))
+                    selectors[method] = b.tensor(
+                        f"__{name}_{method}",
+                        when=phase.value,
+                        identity=f"python:{identity_selector}:{name}:{method}",
+                        inputs={key: inputs[key] for key, _ in selected_args},
+                    )(_invoke(freeze(selector), tuple(key for key, _ in selected_args)))
                 key = f"__{domain}"
                 if key in inputs:
                     raise ValueError(f"{key} is reserved for a row-domain input")
                 inputs[key] = TaskResultInputSource(selectors[method].symbol, "value")
                 math = replace(math, **{domain: key})
-            call = b.tensor(name, inputs=inputs, when=phase.value, identity=f"python:{identity}",
-                update=update, math=math, captures=captures)(_invoke(function, tuple(key for key, _ in arguments)))
+            call = b.tensor(
+                name,
+                inputs=inputs,
+                when=phase.value,
+                identity=f"python:{identity}",
+                update=update,
+                math=math,
+                captures=captures,
+            )(_invoke(function, tuple(key for key, _ in arguments)))
             if isinstance(effect, _Export):
-                b.export(call, name=_setting(effect.name, owner, str), every=_setting(effect.every, owner, int),
-                    max_rows=_setting(effect.max_rows, owner, int), max_cols=_setting(effect.max_cols, owner, int),
-                    enabled=_setting(effect.enabled, owner, bool))
+                b.export(
+                    call,
+                    name=_setting(effect.name, owner, str),
+                    every=_setting(effect.every, owner, int),
+                    max_rows=_setting(effect.max_rows, owner, int),
+                    max_cols=_setting(effect.max_cols, owner, int),
+                    enabled=_setting(effect.enabled, owner, bool),
+                )
             elif isinstance(effect, _Train):
                 if training is not None:
                     raise ValueError("tensor sampler attachment requires one training operation")
@@ -701,60 +903,118 @@ class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
             b.logits(call, *training, stage=sampler.stage, beta=_setting(sampler.beta, owner, float))
         if any(isinstance(value, Recurrence) for value in values.values()):
             attachment = b.attachment
-            composed = (attachment is not None and attachment.activation_bindings
+            composed = (
+                attachment is not None
+                and attachment.activation_bindings
                 and {state.resource for state in b.graph.states} == {attachment.state_resource}
-                and {task.symbol for task in b.graph.tasks} == {symbol for _, symbol in attachment.tasks})
+                and {task.symbol for task in b.graph.tasks} == {symbol for _, symbol in attachment.tasks}
+            )
             if not composed and (len(b.graph.tasks) != 1 or b.graph.states):
                 raise ValueError("tokenwise recurrence requires a standalone model effect")
         declared = {state.resource for state in b.graph.states}
         if any(name not in declared for name, value in values.items() if isinstance(value, InstanceState)):
             raise ValueError("state buffers require an overlay effect; unused state is not allocated")
         # Include instance-local function replacements and configuration in the original signature.
-        b.graph = replace(b.graph, execution_parameters_digest=boundary_digest(
-            b.graph.execution_parameters_digest, definitions, bindings))
+        b.graph = replace(
+            b.graph,
+            execution_parameters_digest=boundary_digest(b.graph.execution_parameters_digest, definitions, bindings),
+        )
 
     def declaration(self, facts: BackendCompileFacts | None = None) -> TensorBinding:
-        dimensions = None if facts is None else Dimensions(facts.probe.hidden_size, facts.vocab_size,
-            tuple((target.input_size, target.output_size) for target in facts.targets), facts.probe.tensor_dtype, facts.layer_count)
-        b = TensorBinding(self.name, boundary_digest(getattr(self, "config", ()), dimensions,
-            None if facts is None else facts.initialization_seed), dimensions)
+        dimensions = (
+            None
+            if facts is None
+            else Dimensions(
+                facts.probe.hidden_size,
+                facts.vocab_size,
+                tuple((target.input_size, target.output_size) for target in facts.targets),
+                facts.probe.tensor_dtype,
+                facts.layer_count,
+            )
+        )
+        b = TensorBinding(
+            self.name,
+            boundary_digest(
+                getattr(self, "config", ()), dimensions, None if facts is None else facts.initialization_seed
+            ),
+            dimensions,
+        )
         b.resources = () if facts is None else facts.timeline.task_resources
         b.probe = None if facts is None else facts.probe
         self._build(b)
         resources = () if facts is None else facts.timeline.task_resources
-        b.graph = replace(b.graph, tasks=tuple(replace(task,
-            implementations=self.implementations(str(task.symbol), resources,
-                explicit_math=facts is not None and "compute/explicit_math@1" in facts.timeline.capabilities)
-            or task.implementations) for task in b.graph.tasks))
-        if facts is not None and b.overlay_targets and tuple(target.target for target in facts.targets) != b.overlay_targets:
+        b.graph = replace(
+            b.graph,
+            tasks=tuple(
+                replace(
+                    task,
+                    implementations=self.implementations(
+                        str(task.symbol),
+                        resources,
+                        explicit_math=facts is not None and "compute/explicit_math@1" in facts.timeline.capabilities,
+                    )
+                    or task.implementations,
+                )
+                for task in b.graph.tasks
+            ),
+        )
+        if (
+            facts is not None
+            and b.overlay_targets
+            and tuple(target.target for target in facts.targets) != b.overlay_targets
+        ):
             raise ValueError("overlay targets differ from backend specialization")
         return b
 
     def backend_requirements(self) -> BackendRequirements:
         b = self.declaration()
-        return BackendRequirements(tuple(dict.fromkeys(value.source for task in b.graph.tasks for value in task.inputs
-            if isinstance(value.source, HiddenInputSource))), b.overlay_targets,
-            activation_layers=() if b.attachment is None else tuple(binding.layer for binding in b.attachment.activation_bindings),
-            sampler_stage=b.attachment.sampler_stage if b.attachment is not None and b.attachment.kind is AttachmentKind.SAMPLER_TRAINING else None,
-            sampler_feedback=any(isinstance(port.source, SamplerFeedbackInputSource) for task in b.graph.tasks for port in task.inputs))
+        return BackendRequirements(
+            tuple(
+                dict.fromkeys(
+                    value.source
+                    for task in b.graph.tasks
+                    for value in task.inputs
+                    if isinstance(value.source, HiddenInputSource)
+                )
+            ),
+            b.overlay_targets,
+            activation_layers=()
+            if b.attachment is None
+            else tuple(binding.layer for binding in b.attachment.activation_bindings),
+            sampler_stage=b.attachment.sampler_stage
+            if b.attachment is not None and b.attachment.kind is AttachmentKind.SAMPLER_TRAINING
+            else None,
+            sampler_feedback=any(
+                isinstance(port.source, SamplerFeedbackInputSource) for task in b.graph.tasks for port in task.inputs
+            ),
+        )
 
     def declare(self, facts: BackendCompileFacts) -> tuple[SemanticGraph, TensorLayoutRequest, BackendAttachmentSpec]:
         return self.declaration(facts).finish()
 
-    def _functions(self, b: TensorBinding, device: torch.device, seed: int) -> FunctionMath[TensorStepInput, TensorFrame, TensorOutput]:
+    def _functions(
+        self, b: TensorBinding, device: torch.device, seed: int
+    ) -> FunctionMath[TensorStepInput, TensorFrame, TensorOutput]:
         generator = torch.Generator(device=device).manual_seed(seed)
+
         def initializer(resource: str) -> Callable[[Roots], None]:
             init = b.initializers.get(resource)
+
             def initialize(roots: Roots) -> None:
                 if init is not None:
                     for root in roots:
                         init(root, generator)
+
             return initialize
+
         def output(data: TensorFrame, invocation: InvocationOutput) -> TensorOutput:
             return invocation.value
+
         if b.graph.states:
+
             def output(data: TensorFrame, invocation: InvocationOutput) -> TensorOutput:
                 return b.result(data, invocation)
+
         def rows(value: TensorStepInput) -> tuple[PackedPhaseRow, ...]:
             if b.probe is not None and value.rows.total_rows > b.probe.max_packed_rows:
                 raise ValueError("packed input exceeds the signed backend row capacity")
@@ -763,38 +1023,85 @@ class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
             if b.attachment is not None and b.attachment.kind is AttachmentKind.MODEL_REPLAY:
                 return ()
             return value.rows.request_rows if b.overlay_targets else value.rows.decode_rows
-        return FunctionMath({str(state.resource): initializer(str(state.resource)) for state in b.graph.states},
-            rows, b.bind_prepare(), output)
 
-    def bind_math(self, facts: BackendCompileFacts, plan: PlanBundle) -> MathBinding[TensorStepInput, TensorFrame, TensorOutput]:
+        return FunctionMath(
+            {str(state.resource): initializer(str(state.resource)) for state in b.graph.states},
+            rows,
+            b.bind_prepare(),
+            output,
+        )
+
+    def bind_math(
+        self, facts: BackendCompileFacts, plan: PlanBundle
+    ) -> MathBinding[TensorStepInput, TensorFrame, TensorOutput]:
         owner = _snapshot(self)
         b = owner.declaration(facts)
         if b.graph != plan.semantic_graph or b.layouts != plan.tensor_layout_request:
             raise ValueError("tensor mathematics differ from the original signed declaration")
         return owner.operations(facts, plan, b)
 
-    def implementations(self, operation: str, resources: tuple[TaskResourceFact, ...], *,
-                        explicit_math: bool = False) -> tuple[TaskImplementationSpec, ...]:
+    def implementations(
+        self, operation: str, resources: tuple[TaskResourceFact, ...], *, explicit_math: bool = False
+    ) -> tuple[TaskImplementationSpec, ...]:
         if explicit_math:
             raise ValueError("this workload has no explicit tensor implementation")
         return ()
 
-    def operations(self, facts: BackendCompileFacts, plan: PlanBundle,
-                   b: TensorBinding) -> MathBinding[TensorStepInput, TensorFrame, TensorOutput]:
+    def operations(
+        self, facts: BackendCompileFacts, plan: PlanBundle, b: TensorBinding
+    ) -> MathBinding[TensorStepInput, TensorFrame, TensorOutput]:
         if plan.timeline.task_resources:
             self.require_resources(plan, self.minimum_resources(facts, plan))
-        return MathBinding(self._functions(b, facts.device, facts.initialization_seed),
-            b.bind_all(plan, model_probe=facts.probe))
+        return MathBinding(
+            self._functions(b, facts.device, facts.initialization_seed), b.bind_all(plan, model_probe=facts.probe)
+        )
 
     def declare_host(self, facts: HostRuntimeFacts) -> TensorHostBinding[TensorStepInput, TensorFrame, TensorOutput]:
-        b = TensorBinding(self.name, boundary_digest(getattr(self, "config", ()), facts.hidden_size, facts.initialization_seed),
-            Dimensions(facts.hidden_size, 0), host=True)
+        b = TensorBinding(
+            self.name,
+            boundary_digest(getattr(self, "config", ()), facts.hidden_size, facts.initialization_seed),
+            Dimensions(facts.hidden_size, 0),
+            host=True,
+        )
         self._build(b)
         if b.graph.states:
             raise ValueError("ordinary host tensor authoring currently supports stateless observations")
-        return TensorHostBinding(b.graph, b.layouts, MathBinding(self._functions(b, facts.device, facts.initialization_seed), b.bind_all()), facts)
+        return TensorHostBinding(
+            b.graph,
+            b.layouts,
+            MathBinding(self._functions(b, facts.device, facts.initialization_seed), b.bind_all()),
+            facts,
+        )
 
 
-__all__ = ["Workload", "Phase", "on", "hook", "export", "add_logits", "guide_sampling", "train", "Config", "Hidden", "Samples",
-    "BaseLogits", "SampledTokens", "Parameter", "StateIndex", "StateVersion", "Result", "InstanceState", "RequestState",
-    "overlay", "Operand", "Buffer", "TensorUpdate", "differentiate", "Activation", "Overlay", "Recurrence", "SGD", "Batch"]
+__all__ = [
+    "Workload",
+    "Phase",
+    "on",
+    "hook",
+    "export",
+    "add_logits",
+    "guide_sampling",
+    "train",
+    "Config",
+    "Hidden",
+    "Samples",
+    "BaseLogits",
+    "SampledTokens",
+    "Parameter",
+    "StateIndex",
+    "StateVersion",
+    "Result",
+    "InstanceState",
+    "RequestState",
+    "overlay",
+    "Operand",
+    "Buffer",
+    "TensorUpdate",
+    "differentiate",
+    "Activation",
+    "Overlay",
+    "Recurrence",
+    "SGD",
+    "Batch",
+]

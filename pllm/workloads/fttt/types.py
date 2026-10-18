@@ -7,11 +7,11 @@ from math import isfinite
 
 import torch
 
-from pllm.execution.host_runtime import CompletionInput
 from pllm.authoring import AdamW, StateTensorUpdate
+from pllm.contracts.feedback import Completion, RetryControl, RewardOutcome, UpdateBarrier
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
-from pllm.contracts.feedback import Completion, RewardOutcome, RetryControl, UpdateBarrier
+from pllm.execution.host_runtime import CompletionInput
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,8 +33,13 @@ class FTTTResult:
 
     def state_update(self) -> StateTensorUpdate[torch.Tensor]:
         """Borrow the original delta rows for a signed single-layer additive patch."""
-        return StateTensorUpdate((self.edit_delta,), tuple(RequestStateKey.project(record.completion.identity,
-            (RequestKeyField.PROMPT_IDX,)) for record in self.intent.feedback_records))
+        return StateTensorUpdate(
+            (self.edit_delta,),
+            tuple(
+                RequestStateKey.project(record.completion.identity, (RequestKeyField.PROMPT_IDX,))
+                for record in self.intent.feedback_records
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,9 +56,17 @@ class FTTTConfig:
 
     def __post_init__(self) -> None:
         AdamW(self.learning_rate, self.betas, self.eps)
-        if (self.rank < 1 or self.feedback_feature_size < 1 or self.max_queue_size < 0 or self.max_retries < 0
-            or not isfinite(self.edit_scale) or self.edit_scale < 0.0 or not isfinite(self.positive_reward_threshold)):
+        if (
+            self.rank < 1
+            or self.feedback_feature_size < 1
+            or self.max_queue_size < 0
+            or self.max_retries < 0
+            or not isfinite(self.edit_scale)
+            or self.edit_scale < 0.0
+            or not isfinite(self.positive_reward_threshold)
+        ):
             raise ValueError("FTTT configuration is invalid")
+
 
 @dataclass(frozen=True, slots=True)
 class FTTTJudgeResult:
@@ -85,10 +98,7 @@ class FTTTInstanceState:
     adapter_version: int = 0
 
     def __post_init__(self) -> None:
-        if (
-            self.retries < 0
-            or self.adapter_version < 0
-        ):
+        if self.retries < 0 or self.adapter_version < 0:
             raise ValueError("FTTT instance state is invalid")
 
 

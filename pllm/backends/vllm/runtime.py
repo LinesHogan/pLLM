@@ -9,50 +9,58 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from hashlib import sha256
 from time import perf_counter_ns
-from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar, overload
 from types import TracebackType
+from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar, overload
 
 import torch
+from vllm import RequestOutput, SamplingParams
+from vllm import __version__ as _VLLM_VERSION
+from vllm.config import CacheConfig, VllmConfig
+from vllm.entrypoints.llm import LLM
+from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
+from vllm.sequence import IntermediateTensors
+from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.engine.core_client import InprocClient
+from vllm.v1.executor.uniproc_executor import UniProcExecutor
+from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.sample.sampler import Sampler as Mrv1Sampler
+from vllm.v1.worker.gpu.async_utils import AsyncOutput
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner as UpstreamModelRunner
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
+from vllm.v1.worker.gpu.sample.sampler import Sampler
+from vllm.v1.worker.gpu_worker import Worker
 
-from pllm.config import ModelConfig, RunnerKind, VllmDType
-from pllm.execution.execution import TaskGraphInvocation
-from pllm.execution.state_execution import StateDiagnostics, StateTaskContext
-from pllm.authoring import BackendCompileFacts, BackendDeployment, BackendRequirements, BackendWorkload, AuxiliaryInput, StateTensorUpdate, map_auxiliary, DataT, ResultT, TensorStepInput
-from pllm.contracts.auxiliary import validate_auxiliary
-from pllm.execution.codec import decode_boundary, encode_boundary
-from pllm.execution.cuda_stream import CudaStreamReadiness
-from pllm.execution.host_runtime import CompletionCapture, CompletionInput
-from pllm.execution.shared_tensor import SharedTensor
-from pllm.execution.trace import ExecutionTrace, TraceSelection, TraceSnapshot, TRACE_SCHEMA_VERSION
-from pllm.execution.tokenwise_tuning import TokenwiseTuning
-from pllm.execution.tokenwise_region import compile_tokenwise_region
-from pllm.execution.decoder_region import decoder_activations
-from pllm.contracts.region_program import TensorType
-from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY, RegionScheduleProposal
-from pllm.contracts.region_selection import RegionSelection
-from pllm.contracts.feedback import BarrierState, Completion, CompletionBatch, CompletionFeedback, FinishReason, RetryAction
-
-from pllm.execution.backend_attachment import attachment_buffer_bytes
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.ptts.page_borrow import BorrowedStateRoot
-from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.authoring import (
+    AuxiliaryInput,
+    BackendCompileFacts,
+    BackendDeployment,
+    BackendRequirements,
+    BackendWorkload,
+    DataT,
+    ResultT,
+    StateTensorUpdate,
+    TensorStepInput,
+    map_auxiliary,
+)
 from pllm.backends.vllm.activation import VllmActivationPatch
-from pllm.backends.vllm.replay import VllmLayerReplay, VllmTokenwiseReplay
-from pllm.backends.vllm.region_kernels import qwen_region_kernels
-from pllm.backends.vllm.region_layers import VllmDecoderBodies
+from pllm.backends.vllm.hidden_capture import Vllm027EagerPackedHiddenCapture
+from pllm.backends.vllm.packed_rows import encode_mrv2_rows
 from pllm.backends.vllm.parameter_overlay import (
     VllmParameterOverlay,
     inspect_parameter_targets,
 )
-from pllm.backends.vllm.hidden_capture import Vllm027EagerPackedHiddenCapture
-from pllm.backends.vllm.packed_rows import encode_mrv2_rows
-from pllm.contracts.packed_rows import PackedSamplerRowBatch
+from pllm.backends.vllm.region_kernels import qwen_region_kernels
+from pllm.backends.vllm.region_layers import VllmDecoderBodies
+from pllm.backends.vllm.replay import VllmLayerReplay, VllmTokenwiseReplay
 from pllm.backends.vllm.sampler import (
-    Vllm027Sampler,
     SamplerGuidance,
     SignedSamplerGuidance,
+    Vllm027Sampler,
 )
-from pllm.contracts.sampler import SamplerStage
+from pllm.config import ModelConfig, RunnerKind, VllmDType
+from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
     AttachmentHiddenResource,
@@ -63,32 +71,48 @@ from pllm.contracts.backend_attachment import (
     DecodeWindow,
     SignedBackendAttachment,
 )
+from pllm.contracts.feedback import (
+    BarrierState,
+    Completion,
+    CompletionBatch,
+    CompletionFeedback,
+    FinishReason,
+    RetryAction,
+)
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
+from pllm.contracts.packed_rows import PackedSamplerRowBatch
+from pllm.contracts.region_program import TensorType
+from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY, RegionScheduleProposal
+from pllm.contracts.region_selection import RegionSelection
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
+from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
-    AnchorId, ConditionalLayerReplay, SamplerFeedbackInputSource, SchedulerTimeline, StateScope, HiddenInputSource, TokenwiseLayerReplay, TaskId,
+    AnchorId,
+    ConditionalLayerReplay,
+    HiddenInputSource,
+    SamplerFeedbackInputSource,
+    SchedulerTimeline,
+    StateScope,
+    TaskId,
+    TokenwiseLayerReplay,
 )
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorFieldSpec
-
-from vllm import RequestOutput, SamplingParams, __version__ as _VLLM_VERSION
-from vllm.config import CacheConfig, VllmConfig
-from vllm.v1.sample.sampler import Sampler as Mrv1Sampler
-from vllm.entrypoints.llm import LLM
-from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
-from vllm.sequence import IntermediateTensors
-from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.engine.core_client import InprocClient
-from vllm.v1.executor.uniproc_executor import UniProcExecutor
-from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.worker.gpu.async_utils import AsyncOutput
-from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
-from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.model_runner import GPUModelRunner as UpstreamModelRunner
-from vllm.v1.worker.gpu.sample.output import SamplerOutput
-from vllm.v1.worker.gpu.sample.sampler import Sampler
-from vllm.v1.worker.gpu_worker import Worker
+from pllm.execution.backend_attachment import attachment_buffer_bytes
+from pllm.execution.codec import decode_boundary, encode_boundary
+from pllm.execution.cuda_stream import CudaStreamReadiness
+from pllm.execution.decoder_region import decoder_activations
+from pllm.execution.execution import TaskGraphInvocation
+from pllm.execution.host_runtime import CompletionCapture, CompletionInput
+from pllm.execution.ptts.page_borrow import BorrowedStateRoot
+from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
+from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.shared_tensor import SharedTensor
+from pllm.execution.state_execution import StateDiagnostics, StateTaskContext
+from pllm.execution.tokenwise_region import compile_tokenwise_region
+from pllm.execution.tokenwise_tuning import TokenwiseTuning
+from pllm.execution.trace import TRACE_SCHEMA_VERSION, ExecutionTrace, TraceSelection, TraceSnapshot
 
 if TYPE_CHECKING:
     from pllm.backends.vllm.mrv1 import Mrv1Runner
@@ -156,7 +180,9 @@ class _RunnerSession(Protocol):
     def apply_count(self) -> int: ...
     @property
     def updated_apply_count(self) -> int: ...
-    def stage_input(self, batch: AuxiliaryInput[torch.Tensor] | None, identities: tuple[RequestIdentity, ...]) -> None: ...
+    def stage_input(
+        self, batch: AuxiliaryInput[torch.Tensor] | None, identities: tuple[RequestIdentity, ...]
+    ) -> None: ...
     def bind_readonly_input(self, receiver: ReadonlyStepReceiver) -> None: ...
     def identity(self, request_id: str) -> RequestIdentity: ...
     def before_execute(self, scheduler_output: SchedulerOutput) -> None: ...
@@ -204,59 +230,104 @@ class ReadonlyStepEnd:
     step_id: int
 
 
-ReadonlyStepReceiver = Callable[[PackedSamplerRowBatch, torch.cuda.Stream], ReadonlyStepInput | ReadonlyStepAbsent | ReadonlyStepEnd]
+ReadonlyStepReceiver = Callable[
+    [PackedSamplerRowBatch, torch.cuda.Stream], ReadonlyStepInput | ReadonlyStepAbsent | ReadonlyStepEnd
+]
 
 
 class VllmSession(Generic[DataT, ResultT]):
     """Model primitives over one original signed tensor-state invocation."""
 
-    def __init__(self, deployment: BackendDeployment[DataT, ResultT],
-                 model: Qwen2ForCausalLM, sampler: SamplerGuidance | None, max_sampler_rows: int) -> None:
+    def __init__(
+        self,
+        deployment: BackendDeployment[DataT, ResultT],
+        model: Qwen2ForCausalLM,
+        sampler: SamplerGuidance | None,
+        max_sampler_rows: int,
+    ) -> None:
         attachment = deployment.attachment
         plan = attachment.inputs.plan
-        self._capture_feedback = any(isinstance(port.source, SamplerFeedbackInputSource)
-            for task in plan.semantic_graph.tasks for port in task.inputs)
-        required = _input_reservations(attachment.inputs.probe, plan.timeline, max_sampler_rows,
-            model.lm_head.weight.shape[0], attachment.inputs.request.sampler_stage if sampler is not None else None,
-            self._capture_feedback)
-        buffers = attachment_buffer_bytes(attachment.inputs.probe, plan.semantic_graph,
-            plan.tensor_layout_request, attachment.inputs.request)
+        self._capture_feedback = any(
+            isinstance(port.source, SamplerFeedbackInputSource)
+            for task in plan.semantic_graph.tasks
+            for port in task.inputs
+        )
+        required = _input_reservations(
+            attachment.inputs.probe,
+            plan.timeline,
+            max_sampler_rows,
+            model.lm_head.weight.shape[0],
+            attachment.inputs.request.sampler_stage if sampler is not None else None,
+            self._capture_feedback,
+        )
+        buffers = attachment_buffer_bytes(
+            attachment.inputs.probe, plan.semantic_graph, plan.tensor_layout_request, attachment.inputs.request
+        )
         required = tuple(value + buffers for value in required)
         if len(plan.timeline.reserved_bytes) != len(required) or any(
-            actual < minimum for actual, minimum in zip(plan.timeline.reserved_bytes, required, strict=True)):
+            actual < minimum for actual, minimum in zip(plan.timeline.reserved_bytes, required, strict=True)
+        ):
             raise ValueError("signed timeline underfunds the backend input/sampler/effect buffers")
         self._deployment = deployment
         self.trace = deployment.execution.trace
         probe = attachment.inputs.probe
         resources = tuple(resource.binding for resource in probe.hidden_resources)
-        self._capture = Vllm027EagerPackedHiddenCapture(model=model, resources=resources,
-            plan_epoch=attachment.physical.plan_epoch, max_packed_rows=probe.max_packed_rows,
-            hidden_size=probe.hidden_size) if resources else None
+        self._capture = (
+            Vllm027EagerPackedHiddenCapture(
+                model=model,
+                resources=resources,
+                plan_epoch=attachment.physical.plan_epoch,
+                max_packed_rows=probe.max_packed_rows,
+                hidden_size=probe.hidden_size,
+            )
+            if resources
+            else None
+        )
         overlay_bindings = attachment.inputs.request.overlay_bindings
         self._overlay_import = bool(overlay_bindings) and (
-            plan.semantic_graph.tasks[attachment.inputs.request.task_bindings[0].task_id].timing.after == "request.prepare")
-        self._overlay = VllmParameterOverlay(model, overlay_bindings,
-            capture=not self._overlay_import) if overlay_bindings else None
+            plan.semantic_graph.tasks[attachment.inputs.request.task_bindings[0].task_id].timing.after
+            == "request.prepare"
+        )
+        self._overlay = (
+            VllmParameterOverlay(model, overlay_bindings, capture=not self._overlay_import)
+            if overlay_bindings
+            else None
+        )
         tasks = tuple(task for task in attachment.inputs.plan.semantic_graph.tasks if task.replay is not None)
-        self._activation = VllmActivationPatch(model, attachment.inputs.request.activation_bindings,
-            attachment.inputs.request.state_resource, install=not any(isinstance(task.replay, TokenwiseLayerReplay) for task in tasks)) if (
-            attachment.inputs.request.activation_bindings) else None
-        self._decode_injection = any(binding.decode is DecodeWindow.ALL for binding in attachment.inputs.request.activation_bindings)
+        self._activation = (
+            VllmActivationPatch(
+                model,
+                attachment.inputs.request.activation_bindings,
+                attachment.inputs.request.state_resource,
+                install=not any(isinstance(task.replay, TokenwiseLayerReplay) for task in tasks),
+            )
+            if (attachment.inputs.request.activation_bindings)
+            else None
+        )
+        self._decode_injection = any(
+            binding.decode is DecodeWindow.ALL for binding in attachment.inputs.request.activation_bindings
+        )
         self._token_frontiers: dict[RequestIdentity, int] = {}
         self._readonly_receiver: ReadonlyStepReceiver | None = None
         self._received_readonly: ReadonlyStepInput | ReadonlyStepAbsent | ReadonlyStepEnd | None = None
         self._input_failed = False
         self._replay: VllmLayerReplay | VllmTokenwiseReplay[DataT, ResultT] | None = None
         if tasks:
-            task, = tasks
+            (task,) = tasks
             if probe.causal_domain is None or probe.causal_domain.layers != len(model.model.layers):
                 raise ValueError("backend replay requires its signed causal model domain")
             if isinstance(task.replay, ConditionalLayerReplay) and self._overlay is not None:
                 self._replay = VllmLayerReplay(model, task.replay, self._overlay, probe.causal_domain)
             elif isinstance(task.replay, TokenwiseLayerReplay):
-                self._replay = VllmTokenwiseReplay(model, task, deployment.execution,
-                    attachment.inputs.request.task_bindings[0].anchor_id, source_imports=probe.region_imports,
-                    function_bodies=probe.region_bodies, activation=self._activation)
+                self._replay = VllmTokenwiseReplay(
+                    model,
+                    task,
+                    deployment.execution,
+                    attachment.inputs.request.task_bindings[0].anchor_id,
+                    source_imports=probe.region_imports,
+                    function_bodies=probe.region_bodies,
+                    activation=self._activation,
+                )
             else:
                 raise ValueError("backend replay does not match its signed primitives")
         self._sampler = sampler
@@ -283,10 +354,20 @@ class VllmSession(Generic[DataT, ResultT]):
     def bind_readonly_input(self, receiver: ReadonlyStepReceiver) -> None:
         """Install example-owned transport before requests; it supplies no model mathematics."""
         self._require_input_live()
-        if (self._readonly_receiver is not None or self._step is not None or self._next_step_id
-            or self._identities or self._pending_identities or self._auxiliary is not None or self._tuning is not None
-            or self._activation is None or all(state.resource in self._deployment.execution.arena.owned_resources
-                for state in self.attachment.inputs.plan.semantic_graph.states)):
+        if (
+            self._readonly_receiver is not None
+            or self._step is not None
+            or self._next_step_id
+            or self._identities
+            or self._pending_identities
+            or self._auxiliary is not None
+            or self._tuning is not None
+            or self._activation is None
+            or all(
+                state.resource in self._deployment.execution.arena.owned_resources
+                for state in self.attachment.inputs.plan.semantic_graph.states
+            )
+        ):
             raise RuntimeError("read-only step input requires an idle borrowed activation session")
         self._readonly_receiver = receiver
 
@@ -303,8 +384,11 @@ class VllmSession(Generic[DataT, ResultT]):
             if (received.plan_epoch, received.step_id) != (rows.plan_epoch, rows.step_id):
                 raise ValueError("read-only input differs from the original epoch/step; grants retained")
             if isinstance(received, (ReadonlyStepAbsent, ReadonlyStepEnd)):
-                self._deployment.execution.stage_hold(tuple(rows.identities),
-                    "end" if isinstance(received, ReadonlyStepEnd) else "absent", step_id=rows.step_id)
+                self._deployment.execution.stage_hold(
+                    tuple(rows.identities),
+                    "end" if isinstance(received, ReadonlyStepEnd) else "absent",
+                    step_id=rows.step_id,
+                )
             else:
                 if any(root.stream != stream for root in received.roots):
                     raise ValueError("read-only input differs from the receiving stream; grants retained")
@@ -332,13 +416,19 @@ class VllmSession(Generic[DataT, ResultT]):
         self._require_tuning_idle()
         if self._tuning is not None or self._next_step_id != 0:
             raise RuntimeError("native tuning is only available before the first request")
-        if (not isinstance(self._replay, VllmTokenwiseReplay)
+        if (
+            not isinstance(self._replay, VllmTokenwiseReplay)
             or self.attachment.inputs.plan.semantic_graph.states
-            or self.attachment.inputs.plan.timeline.region_policy.schedule_policy == "serial"):
+            or self.attachment.inputs.plan.timeline.region_policy.schedule_policy == "serial"
+        ):
             return 0
         identity = self.attachment.inputs.request.task_bindings[0].implementation_id
-        tuning = TokenwiseTuning(self._deployment.execution, identity, proposals,
-            stream_lanes=2 if REGION_STREAMS_CAPABILITY in self.attachment.inputs.probe.capabilities else 1)
+        tuning = TokenwiseTuning(
+            self._deployment.execution,
+            identity,
+            proposals,
+            stream_lanes=2 if REGION_STREAMS_CAPABILITY in self.attachment.inputs.probe.capabilities else 1,
+        )
         if tuning.count == 1:
             tuning.abort()
             return 0
@@ -383,13 +473,17 @@ class VllmSession(Generic[DataT, ResultT]):
         self._require_input_live()
         if self._step is not None:
             raise RuntimeError("prior vLLM workload step is still active")
-        if self._decode_injection and (scheduler_output.preempted_req_ids or scheduler_output.scheduled_cached_reqs.resumed_req_ids):
+        if self._decode_injection and (
+            scheduler_output.preempted_req_ids or scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        ):
             self._input_failed = True
             raise RuntimeError("per-decode activation injection and vLLM preemption cannot be enabled together")
         execution = self._deployment.execution
         execution.arena.collect_completed()
-        finished = tuple(self._identities[request_id] for request_id in sorted(
-            self._identities.keys() & scheduler_output.finished_req_ids))
+        finished = tuple(
+            self._identities[request_id]
+            for request_id in sorted(self._identities.keys() & scheduler_output.finished_req_ids)
+        )
         self._retire(finished)
         pending: list[RequestIdentity] = []
         for request in scheduler_output.scheduled_new_reqs:
@@ -424,9 +518,13 @@ class VllmSession(Generic[DataT, ResultT]):
         if self._decode_injection:
             if any(row.token_offset < self._token_frontiers.get(row.identity, 0) for row in rows.row_batch.rows):
                 self._input_failed = True
-                raise RuntimeError("per-decode activation injection and vLLM preemption/history recomputation cannot be enabled together")
+                raise RuntimeError(
+                    "per-decode activation injection and vLLM preemption/history recomputation cannot be enabled together"
+                )
             for row in rows.row_batch.rows:
-                self._token_frontiers[row.identity] = max(self._token_frontiers.get(row.identity, 0), row.token_offset + 1)
+                self._token_frontiers[row.identity] = max(
+                    self._token_frontiers.get(row.identity, 0), row.token_offset + 1
+                )
         requests = rows.identities
         self._next_step_id += 1
         step = _PackedStep[DataT](rows)
@@ -435,8 +533,9 @@ class VllmSession(Generic[DataT, ResultT]):
             self._capture.begin(rows.row_batch)
         if isinstance(self._replay, VllmTokenwiseReplay) and self._activation is None:
             execution = self._deployment.execution
-            invocation = execution.start_step(TensorStepInput(rows.row_batch, rows),
-                torch.cuda.current_stream(execution.device))
+            invocation = execution.start_step(
+                TensorStepInput(rows.row_batch, rows), torch.cuda.current_stream(execution.device)
+            )
             step.invocation = invocation
             self._advance(invocation, "request.prepare")
             self._replay.prepare(rows.row_batch, invocation)
@@ -446,8 +545,9 @@ class VllmSession(Generic[DataT, ResultT]):
         if adapter is None and self._activation is None:
             return
         execution = self._deployment.execution
-        identities = tuple(sorted(requests,
-            key=lambda identity: (identity.request_id, identity.prompt_idx, identity.sample_idx)))
+        identities = tuple(
+            sorted(requests, key=lambda identity: (identity.request_id, identity.prompt_idx, identity.sample_idx))
+        )
         stream = torch.cuda.current_stream(execution.device)
         if execution.directory.scope is StateScope.INSTANCE or self._activation is not None or self._overlay_import:
             self._receive_readonly(rows, stream)
@@ -458,8 +558,12 @@ class VllmSession(Generic[DataT, ResultT]):
             step.invocation = invocation
             self._advance(invocation, "request.prepare")
             # Offline publication precedes admission; existing request pins remain unchanged.
-            pending = tuple(identity for identity in identities if execution.directory.scope is StateScope.INSTANCE
-                and not execution.directory.has_inference_pin(identity))
+            pending = tuple(
+                identity
+                for identity in identities
+                if execution.directory.scope is StateScope.INSTANCE
+                and not execution.directory.has_inference_pin(identity)
+            )
             if pending:
                 execution.admit(pending, stream)
         else:
@@ -487,8 +591,11 @@ class VllmSession(Generic[DataT, ResultT]):
         if self._capture is not None:
             value = self._capture.publish(value)
         phases = {resource.phase for resource in self._deployment.attachment.inputs.probe.hidden_resources}
-        if step.invocation is None and not operands and not any(
-            row.phase in phases for row in step.rows.row_batch.rows):
+        if (
+            step.invocation is None
+            and not operands
+            and not any(row.phase in phases for row in step.rows.row_batch.rows)
+        ):
             if self._capture is not None:
                 self._capture.finish()
             self._step = None
@@ -528,8 +635,11 @@ class VllmSession(Generic[DataT, ResultT]):
         guidance = execution.sampler_guidance(self._invocation(), torch.cuda.current_stream(execution.device))
         if guidance.stage is not self._deployment.attachment.inputs.request.sampler_stage:
             raise ValueError("guidance stage differs from its signed attachment")
-        logits = (guidance.values if guidance.stage is SamplerStage.PACKED_PRE_FILTER_ADD else
-            model.compute_logits(guidance.values.to(dtype=model.lm_head.weight.dtype)))
+        logits = (
+            guidance.values
+            if guidance.stage is SamplerStage.PACKED_PRE_FILTER_ADD
+            else model.compute_logits(guidance.values.to(dtype=model.lm_head.weight.dtype))
+        )
         if type(logits) is not torch.Tensor:
             raise RuntimeError("Qwen2 LM head did not produce dense logits")
         self._sampler.begin_guidance(SignedSamplerGuidance(guidance, logits, self._capture_feedback))
@@ -572,8 +682,11 @@ class VllmSession(Generic[DataT, ResultT]):
 
     def _retire(self, identities: tuple[RequestIdentity, ...]) -> None:
         execution = self._deployment.execution
-        held = (tuple(identity for identity in identities if execution.directory.has_inference_pin(identity))
-            if execution.directory.scope is StateScope.INSTANCE else identities)
+        held = (
+            tuple(identity for identity in identities if execution.directory.has_inference_pin(identity))
+            if execution.directory.scope is StateScope.INSTANCE
+            else identities
+        )
         if held:
             execution.retire(held)
         for identity in identities:
@@ -614,6 +727,7 @@ class VllmSession(Generic[DataT, ResultT]):
                 return
         raise RuntimeError("backend event is absent from the original timeline")
 
+
 SamplerT = TypeVar("SamplerT", Sampler | None, Mrv1Sampler)
 
 
@@ -650,8 +764,9 @@ class Runner(Generic[SamplerT]):
             raise RuntimeError("canonical runner already owns a workload session")
         if self.cache_config.enable_prefix_caching and deployment.attachment.inputs.request.activation_bindings:
             raise ValueError("signed activation injection does not support shared prefix caching")
-        if self.cache_config.enable_prefix_caching and any(task.replay is not None
-            for task in deployment.attachment.inputs.plan.semantic_graph.tasks):
+        if self.cache_config.enable_prefix_caching and any(
+            task.replay is not None for task in deployment.attachment.inputs.plan.semantic_graph.tasks
+        ):
             raise ValueError("signed KV replay does not support shared prefix caching")
         match self.model:
             case Qwen2ForCausalLM() as model:
@@ -661,8 +776,11 @@ class Runner(Generic[SamplerT]):
         upstream = self.sampler
         if upstream is None or type(upstream) not in (Sampler, Mrv1Sampler):
             raise RuntimeError("vLLM workload requires the original stock sampler")
-        adapter = self._make_sampler(upstream) if (
-            deployment.attachment.inputs.request.attachment_kind is AttachmentKind.SAMPLER_TRAINING) else None
+        adapter = (
+            self._make_sampler(upstream)
+            if (deployment.attachment.inputs.request.attachment_kind is AttachmentKind.SAMPLER_TRAINING)
+            else None
+        )
         if adapter is not None and not isinstance(adapter, SamplerGuidance):
             raise TypeError("backend sampler must share the original guidance lifecycle")
         session = VllmSession(deployment, model, adapter, self.max_num_reqs)
@@ -685,12 +803,19 @@ class Runner(Generic[SamplerT]):
         self._workload_upstream_sampler = None
         self.completion_capture = None
 
-    def stage_workload_input(self, batch: AuxiliaryInput[torch.Tensor] | None, identities: tuple[RequestIdentity, ...],
-                              completion: torch.Tensor | None = None) -> None:
+    def stage_workload_input(
+        self,
+        batch: AuxiliaryInput[torch.Tensor] | None,
+        identities: tuple[RequestIdentity, ...],
+        completion: torch.Tensor | None = None,
+    ) -> None:
         session = self.require_session()
         if self.completion_capture is not None:
             raise RuntimeError("previous completion capture has not finished")
-        if completion is not None and completion.shape != (len(identities), session.attachment.inputs.probe.hidden_size):
+        if completion is not None and completion.shape != (
+            len(identities),
+            session.attachment.inputs.probe.hidden_size,
+        ):
             raise ValueError("completion destination differs from the original backend probe")
         capture = None if completion is None else CompletionCapture(identities, completion)
         session.stage_input(batch, identities)
@@ -735,8 +860,12 @@ class Runner(Generic[SamplerT]):
 class WorkloadModelRunner(Runner[Sampler | None], UpstreamModelRunner):
     runner_kind = RunnerKind.MRV2
 
-    def __init__(self, vllm_config: VllmConfig, device: torch.device,
-                 topology: AttachmentTopology = AttachmentTopology.IN_PROCESS) -> None:
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        topology: AttachmentTopology = AttachmentTopology.IN_PROCESS,
+    ) -> None:
         super().__init__(vllm_config, device)
         self._initialize_workload(topology)
 
@@ -753,9 +882,14 @@ class WorkloadModelRunner(Runner[Sampler | None], UpstreamModelRunner):
         input_batch = super().prepare_inputs(scheduler_output, batch_desc)
         session = self._workload_session
         if session is not None:
-            session.prepare_input(encode_mrv2_rows(input_batch,
-                tuple(session.identity(request_id) for request_id in input_batch.req_ids),
-                plan_epoch=session.attachment.physical.plan_epoch, step_id=session.next_step_id))
+            session.prepare_input(
+                encode_mrv2_rows(
+                    input_batch,
+                    tuple(session.identity(request_id) for request_id in input_batch.req_ids),
+                    plan_epoch=session.attachment.physical.plan_epoch,
+                    step_id=session.next_step_id,
+                )
+            )
         return input_batch
 
     def execute_model(
@@ -813,8 +947,10 @@ class WorkloadModelRunner(Runner[Sampler | None], UpstreamModelRunner):
             sampled = super().sample(hidden_states, input_batch, grammar_output)
             session.complete_sampler(active)
             if self.completion_capture is not None:
-                self.completion_capture.write(tuple(session.identity(request_id) for request_id in input_batch.req_ids),
-                    hidden_states[input_batch.logits_indices])
+                self.completion_capture.write(
+                    tuple(session.identity(request_id) for request_id in input_batch.req_ids),
+                    hidden_states[input_batch.logits_indices],
+                )
         except Exception:
             session.abort_active()
             raise
@@ -840,6 +976,7 @@ class WorkloadModelRunner(Runner[Sampler | None], UpstreamModelRunner):
         if self._workload_session is not None:
             self.detach_workload()
         super().shutdown()
+
 
 class BackendCommand(StrEnum):
     PROBE = "probe"
@@ -896,29 +1033,48 @@ class VllmLlm(Generic[DataT, ResultT]):
 
     def tune_native_schedules(self) -> None:
         policy = self.attachment.inputs.plan.timeline.region_policy
-        if (policy.schedule_policy == "serial"
-            or not any(isinstance(task.replay, TokenwiseLayerReplay)
-                       for task in self.attachment.inputs.plan.semantic_graph.tasks)):
+        if policy.schedule_policy == "serial" or not any(
+            isinstance(task.replay, TokenwiseLayerReplay) for task in self.attachment.inputs.plan.semantic_graph.tasks
+        ):
             return
         if policy.tuning == "heuristic":
             # Static preparation already installed the funded execution,
             # including stream placement; no private generation is needed.
             return
-        task = next(task for task in self.attachment.inputs.plan.semantic_graph.tasks
-                    if isinstance(task.replay, TokenwiseLayerReplay))
+        task = next(
+            task
+            for task in self.attachment.inputs.plan.semantic_graph.tasks
+            if isinstance(task.replay, TokenwiseLayerReplay)
+        )
         probe = self.attachment.inputs.probe
         if not isinstance(task.replay, TokenwiseLayerReplay) or probe.causal_domain is None:
             raise ValueError("native tuning requires its signed causal model domain")
         tensor = TensorType((1, probe.hidden_size), "torch." + probe.tensor_dtype.value, str(self._facts.device))
-        budget = next(fact.workspace_bytes for fact in self.attachment.inputs.plan.timeline.task_resources
-                      if fact.task == task.symbol)
-        proposals = compile_tokenwise_region(tensor, probe.max_packed_rows, probe.causal_domain, task.replay,
-            self.attachment.inputs.plan.timeline.region_policy,
-            stream_lanes=2 if REGION_STREAMS_CAPABILITY in probe.capabilities else 1,
-            source_imports=probe.region_imports, function_bodies=probe.region_bodies,
-            activations=decoder_activations(self.attachment.inputs.request.activation_bindings,
-                self.attachment.inputs.plan.tensor_layout_request, self.attachment.inputs.request.state_resource,
-                tensor.device)).within_payload_budget(budget).candidate_proposals
+        budget = next(
+            fact.workspace_bytes
+            for fact in self.attachment.inputs.plan.timeline.task_resources
+            if fact.task == task.symbol
+        )
+        proposals = (
+            compile_tokenwise_region(
+                tensor,
+                probe.max_packed_rows,
+                probe.causal_domain,
+                task.replay,
+                self.attachment.inputs.plan.timeline.region_policy,
+                stream_lanes=2 if REGION_STREAMS_CAPABILITY in probe.capabilities else 1,
+                source_imports=probe.region_imports,
+                function_bodies=probe.region_bodies,
+                activations=decoder_activations(
+                    self.attachment.inputs.request.activation_bindings,
+                    self.attachment.inputs.plan.tensor_layout_request,
+                    self.attachment.inputs.request.state_resource,
+                    tensor.device,
+                ),
+            )
+            .within_payload_budget(budget)
+            .candidate_proposals
+        )
         count = decode_boundary(self.command(BackendCommand.TUNE_BEGIN, encode_boundary(proposals), timeout=600.0), int)
         if not count:
             return
@@ -950,8 +1106,14 @@ class VllmLlm(Generic[DataT, ResultT]):
                         raise RuntimeError("native schedule changed the private sample's greedy output")
                     if trial:
                         samples[index].append(finished)
-            self.region_selection = decode_boundary(self.command(BackendCommand.TUNE_FINISH,
-                encode_boundary(tuple(tuple(elapsed) for elapsed in samples)), timeout=600.0), RegionSelection)
+            self.region_selection = decode_boundary(
+                self.command(
+                    BackendCommand.TUNE_FINISH,
+                    encode_boundary(tuple(tuple(elapsed) for elapsed in samples)),
+                    timeout=600.0,
+                ),
+                RegionSelection,
+            )
             completed = True
         finally:
             if not completed and not self._closed:
@@ -980,8 +1142,9 @@ class VllmLlm(Generic[DataT, ResultT]):
             raise RuntimeError("model handle is closed")
         return self
 
-    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None,
-                 traceback: TracebackType | None) -> None:
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, traceback: TracebackType | None
+    ) -> None:
         try:
             self.close()
         except Exception as cleanup:
@@ -1023,8 +1186,11 @@ class VllmLlm(Generic[DataT, ResultT]):
     def trace_snapshot(self) -> TraceSnapshot:
         if self._closed:
             raise RuntimeError("vLLM workload handle is closed")
-        snapshot = (self._runner.trace.snapshot() if self._runner is not None else
-            decode_boundary(self.command(BackendCommand.TRACE), TraceSnapshot))
+        snapshot = (
+            self._runner.trace.snapshot()
+            if self._runner is not None
+            else decode_boundary(self.command(BackendCommand.TRACE), TraceSnapshot)
+        )
         if snapshot.schema_version != TRACE_SCHEMA_VERSION:
             raise RuntimeError("worker trace differs from the original schema")
         return snapshot
@@ -1065,14 +1231,20 @@ class VllmLlm(Generic[DataT, ResultT]):
             self._pending_input.close()
             self._pending_input = None
 
-    def generate_feedback(self, prompts: list[str], sampling_params: SamplingParams, *,
-                          feedback: Callable[[CompletionInput], FeedbackT | None], feedback_group: str,
-                          max_rounds: int, prompt_indices: tuple[int, ...] | None = None,
-                          use_tqdm: bool = False,
-                          completion_device: torch.device | None = None,
-                          edit: Callable[[FeedbackT], StateTensorUpdate[torch.Tensor] | None] | None = None,
-                          routes: tuple[str, ...] | None = None,
-                          ) -> Iterator[tuple[CompletionInput, FeedbackT]]:
+    def generate_feedback(
+        self,
+        prompts: list[str],
+        sampling_params: SamplingParams,
+        *,
+        feedback: Callable[[CompletionInput], FeedbackT | None],
+        feedback_group: str,
+        max_rounds: int,
+        prompt_indices: tuple[int, ...] | None = None,
+        use_tqdm: bool = False,
+        completion_device: torch.device | None = None,
+        edit: Callable[[FeedbackT], StateTensorUpdate[torch.Tensor] | None] | None = None,
+        routes: tuple[str, ...] | None = None,
+    ) -> Iterator[tuple[CompletionInput, FeedbackT]]:
         """Generate, settle feedback, then retry eligible original prompts within a finite bound.
 
         The callable runs locally after generate has released backend requests; it is
@@ -1085,40 +1257,62 @@ class VllmLlm(Generic[DataT, ResultT]):
         if type(max_rounds) is not int or max_rounds < 1 or type(prompts) is not list or not prompts:
             raise ValueError("feedback generation requires a nonempty prompt list and positive finite round bound")
         texts: list[str] = list(prompts)
-        indices: tuple[int, ...] = (tuple(range(self._next_prompt_index, self._next_prompt_index + len(texts)))
-            if prompt_indices is None else prompt_indices)
+        indices: tuple[int, ...] = (
+            tuple(range(self._next_prompt_index, self._next_prompt_index + len(texts)))
+            if prompt_indices is None
+            else prompt_indices
+        )
         route_values: list[str] | None = list(routes) if routes is not None else None
         auxiliary: AuxiliaryInput[torch.Tensor] | None = None
         to_worker: Callable[[torch.Tensor], torch.Tensor] = lambda tensor: tensor.to(self.runner.device)
         for attempt in range(max_rounds):
-            batch: CompletionInput = self.generate(texts, sampling_params, use_tqdm=use_tqdm, feedback_group=feedback_group,
-                prompt_indices=indices, sample_index=attempt, auxiliary=auxiliary, completion_device=completion_device,
-                routes=None if route_values is None else tuple(route_values))
+            batch: CompletionInput = self.generate(
+                texts,
+                sampling_params,
+                use_tqdm=use_tqdm,
+                feedback_group=feedback_group,
+                prompt_indices=indices,
+                sample_index=attempt,
+                auxiliary=auxiliary,
+                completion_device=completion_device,
+                routes=None if route_values is None else tuple(route_values),
+            )
             result = feedback(batch)
             if result is None:
                 raise RuntimeError("completion feedback returned no settled control result")
             entries, controls = batch.completions.entries, result.retry_controls
-            if len(controls) != len(entries) or any(control.completion is not entry
-                for control, entry in zip(controls, entries, strict=True)):
+            if len(controls) != len(entries) or any(
+                control.completion is not entry for control, entry in zip(controls, entries, strict=True)
+            ):
                 raise ValueError("feedback controls must reference the original ordered completions")
             by_request = {entry.identity.request_id: entry for entry in entries}
             covered: set[str] = set()
             ready: set[str] = set()
             for barrier in result.update_barriers:
                 members = set(barrier.request_ids)
-                if (not members or len(members) != len(barrier.request_ids) or covered.intersection(members)
-                    or not members.issubset(by_request) or not 0 <= barrier.ready_count <= len(members)
-                    or any(by_request[request].group_id != barrier.group_id for request in members)):
+                if (
+                    not members
+                    or len(members) != len(barrier.request_ids)
+                    or covered.intersection(members)
+                    or not members.issubset(by_request)
+                    or not 0 <= barrier.ready_count <= len(members)
+                    or any(by_request[request].group_id != barrier.group_id for request in members)
+                ):
                     raise ValueError("feedback barriers must partition original completion identities")
                 covered.update(members)
                 if barrier.state is BarrierState.READY and barrier.ready_count > 0 and result.update_count > 0:
                     ready.update(members)
             if covered != by_request.keys():
                 raise ValueError("feedback barriers omitted a completion")
-            retry = {control.completion.identity.request_id for control in controls
-                if control.action is RetryAction.RETRY and (not control.retry_after_update
-                    or control.completion.identity.request_id in ready)}
-            stopped = {control.completion.identity.request_id for control in controls if control.action is RetryAction.STOP}
+            retry = {
+                control.completion.identity.request_id
+                for control in controls
+                if control.action is RetryAction.RETRY
+                and (not control.retry_after_update or control.completion.identity.request_id in ready)
+            }
+            stopped = {
+                control.completion.identity.request_id for control in controls if control.action is RetryAction.STOP
+            }
             for barrier in result.update_barriers:
                 members = set(barrier.request_ids)
                 if members.intersection(retry):
@@ -1126,7 +1320,9 @@ class VllmLlm(Generic[DataT, ResultT]):
                         retry.difference_update(members)
                     else:
                         retry.update(members)
-            selected: tuple[int, ...] = tuple(index for index, entry in enumerate(entries) if entry.identity.request_id in retry)
+            selected: tuple[int, ...] = tuple(
+                index for index, entry in enumerate(entries) if entry.identity.request_id in retry
+            )
             auxiliary = edit(result) if edit is not None and selected and attempt + 1 < max_rounds else None
             if auxiliary is not None and self._runner is not None:
                 validate_auxiliary(auxiliary, self.attachment.inputs.plan, SharedTensor.describe)
@@ -1140,18 +1336,34 @@ class VllmLlm(Generic[DataT, ResultT]):
                 route_values = [route_values[index] for index in selected]
 
     @overload
-    def generate(self, prompts: str | list[str], sampling_params: SamplingParams, *,
-                 use_tqdm: bool = False, auxiliary: AuxiliaryInput[torch.Tensor] | None = None,
-                 sample_index: int = 0, feedback_group: None = None,
-                 prompt_indices: tuple[int, ...] | None = None, completion_device: torch.device | None = None,
-                 routes: tuple[str, ...] | None = None) -> list[RequestOutput]: ...
+    def generate(
+        self,
+        prompts: str | list[str],
+        sampling_params: SamplingParams,
+        *,
+        use_tqdm: bool = False,
+        auxiliary: AuxiliaryInput[torch.Tensor] | None = None,
+        sample_index: int = 0,
+        feedback_group: None = None,
+        prompt_indices: tuple[int, ...] | None = None,
+        completion_device: torch.device | None = None,
+        routes: tuple[str, ...] | None = None,
+    ) -> list[RequestOutput]: ...
 
     @overload
-    def generate(self, prompts: str | list[str], sampling_params: SamplingParams, *,
-                 use_tqdm: bool = False, auxiliary: AuxiliaryInput[torch.Tensor] | None = None,
-                 sample_index: int = 0, feedback_group: str,
-                 prompt_indices: tuple[int, ...] | None = None, completion_device: torch.device | None = None,
-                 routes: tuple[str, ...] | None = None) -> CompletionInput: ...
+    def generate(
+        self,
+        prompts: str | list[str],
+        sampling_params: SamplingParams,
+        *,
+        use_tqdm: bool = False,
+        auxiliary: AuxiliaryInput[torch.Tensor] | None = None,
+        sample_index: int = 0,
+        feedback_group: str,
+        prompt_indices: tuple[int, ...] | None = None,
+        completion_device: torch.device | None = None,
+        routes: tuple[str, ...] | None = None,
+    ) -> CompletionInput: ...
 
     def generate(
         self,
@@ -1183,30 +1395,35 @@ class VllmLlm(Generic[DataT, ResultT]):
             or (type(prompts) is str and not prompts)
             or (
                 type(prompts) is list
-                and (
-                    not prompts
-                    or any(type(prompt) is not str or not prompt for prompt in prompts)
-                )
+                and (not prompts or any(type(prompt) is not str or not prompt for prompt in prompts))
             )
             or type(sampling_params) is not SamplingParams
             or sampling_params.n != 1
             or type(use_tqdm) is not bool
-            or type(sample_index) is not int or sample_index < 0
-            or feedback_group is not None and (type(feedback_group) is not str or not feedback_group)
+            or type(sample_index) is not int
+            or sample_index < 0
+            or feedback_group is not None
+            and (type(feedback_group) is not str or not feedback_group)
         ):
             raise ValueError("vLLM workload generate requires non-empty text and n=1")
         texts = [prompts] if isinstance(prompts, str) else prompts
-        indices = (tuple(range(self._next_prompt_index, self._next_prompt_index + len(texts)))
-            if prompt_indices is None else prompt_indices)
+        indices = (
+            tuple(range(self._next_prompt_index, self._next_prompt_index + len(texts)))
+            if prompt_indices is None
+            else prompt_indices
+        )
         if len(indices) != len(texts) or any(type(index) is not int or index < 0 for index in indices):
             raise ValueError("prompt indices must align with the original input prompts")
         # A route value is user-computed (regex, discriminator, tenant); the signed
         # graph only declares whether any request state keys on it.
-        signed_route = any(RequestKeyField.ROUTE in state.key_fields
-            for state in self.attachment.inputs.plan.semantic_graph.states)
+        signed_route = any(
+            RequestKeyField.ROUTE in state.key_fields for state in self.attachment.inputs.plan.semantic_graph.states
+        )
         if routes is not None and (
-            not signed_route or len(routes) != len(texts)
-            or any(type(route) is not str or not route for route in routes)):
+            not signed_route
+            or len(routes) != len(texts)
+            or any(type(route) is not str or not route for route in routes)
+        ):
             raise ValueError("routes require a signed route-keyed state and one value per prompt")
         if signed_route and routes is None:
             raise ValueError("a route-keyed request state requires per-prompt routes")
@@ -1221,17 +1438,26 @@ class VllmLlm(Generic[DataT, ResultT]):
         lifetime = ExitStack()
         try:
             request_ids = llm.enqueue(prompts, sampling_params, use_tqdm=use_tqdm)
-            identities = tuple(RequestIdentity(request_id, index, sample_index, route)
-                for request_id, index, route in zip(request_ids, indices,
-                    routes if routes is not None else ("",) * len(texts), strict=True))
+            identities = tuple(
+                RequestIdentity(request_id, index, sample_index, route)
+                for request_id, index, route in zip(
+                    request_ids, indices, routes if routes is not None else ("",) * len(texts), strict=True
+                )
+            )
             # Borrow vLLM's exact frontend mapping before completed entries are removed.
-            external = {llm.llm_engine.output_processor.request_states[identity.request_id].external_req_id: identity
-                for identity in identities}
+            external = {
+                llm.llm_engine.output_processor.request_states[identity.request_id].external_req_id: identity
+                for identity in identities
+            }
             destination = None
             completion_wire = None
             if feedback_group is not None:
-                field = TensorFieldSpec(LayoutFieldId(0), (len(identities), self.attachment.inputs.probe.hidden_size),
-                    TensorDType.FLOAT32, 4)
+                field = TensorFieldSpec(
+                    LayoutFieldId(0),
+                    (len(identities), self.attachment.inputs.probe.hidden_size),
+                    TensorDType.FLOAT32,
+                    4,
+                )
                 with torch.inference_mode(False):
                     if self._runner is None:
                         destination, completion_wire = SharedTensor.allocate(field, lifetime, output_device)
@@ -1239,7 +1465,9 @@ class VllmLlm(Generic[DataT, ResultT]):
                         destination = torch.empty(field.shape, device=output_device, dtype=torch.float32)
             if self._runner is None:
                 auxiliary_wire = map_auxiliary(auxiliary, lambda tensor: SharedTensor.export(tensor, lifetime))
-                self.command(BackendCommand.STAGE, encode_boundary(BackendStage(identities, auxiliary_wire, completion_wire)))
+                self.command(
+                    BackendCommand.STAGE, encode_boundary(BackendStage(identities, auxiliary_wire, completion_wire))
+                )
             else:
                 self.runner.stage_workload_input(auxiliary, identities, destination)
             self._next_prompt_index = max(self._next_prompt_index, max(indices) + 1)
@@ -1253,11 +1481,17 @@ class VllmLlm(Generic[DataT, ResultT]):
                     if not output.finished or len(output.outputs) != 1:
                         raise RuntimeError("completion feedback requires final n=1 outputs")
                     identity = external[output.request_id]
-                    completion, = output.outputs
+                    (completion,) = output.outputs
                     if identity in completions:
                         raise RuntimeError("duplicate completion for a submitted request")
-                    completions[identity] = Completion(identity, completion.index, feedback_group,
-                        tuple(completion.token_ids), completion.text, FinishReason(completion.finish_reason))
+                    completions[identity] = Completion(
+                        identity,
+                        completion.index,
+                        feedback_group,
+                        tuple(completion.token_ids),
+                        completion.text,
+                        FinishReason(completion.finish_reason),
+                    )
                 if len(completions) != len(identities):
                     raise RuntimeError("completion feedback did not finish every submitted request")
                 batch = CompletionBatch(tuple(completions[identity] for identity in identities))
@@ -1270,8 +1504,13 @@ class VllmLlm(Generic[DataT, ResultT]):
             if batch is not None and self._runner is None:
                 if destination is None:
                     raise RuntimeError("completion output was not allocated")
-                result = CompletionInput(batch, destination, CudaStreamReadiness(torch.cuda.current_stream(destination.device))
-                    if destination.device.type == "cuda" else None)
+                result = CompletionInput(
+                    batch,
+                    destination,
+                    CudaStreamReadiness(torch.cuda.current_stream(destination.device))
+                    if destination.device.type == "cuda"
+                    else None,
+                )
             return result
         except Exception as original:
             try:
@@ -1296,15 +1535,19 @@ class VllmLlm(Generic[DataT, ResultT]):
 def create_vllm_llm(
     workload: BackendWorkload[DataT, ResultT],
     config: ModelConfig,
-    *, definition: str | None = None,
+    *,
+    definition: str | None = None,
 ) -> VllmLlm[DataT, ResultT]:
-    if config.enable_prefix_caching and (workload.backend_requirements().parameter_targets
-        or workload.backend_requirements().activation_layers):
+    if config.enable_prefix_caching and (
+        workload.backend_requirements().parameter_targets or workload.backend_requirements().activation_layers
+    ):
         raise ValueError("parameter-version overlays do not support shared prefix caching")
     if _VLLM_VERSION != _SUPPORTED_VLLM_VERSION:
         raise RuntimeError("vLLM workload requires vLLM 0.27.1 exactly")
-    environment = {_MP_ENV: "1" if config.multiprocessing else "0",
-        _V2_RUNNER_ENV: "1" if config.runner is RunnerKind.MRV2 else "0"}
+    environment = {
+        _MP_ENV: "1" if config.multiprocessing else "0",
+        _V2_RUNNER_ENV: "1" if config.runner is RunnerKind.MRV2 else "0",
+    }
     if config.multiprocessing:
         environment["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     previous_environment = {name: os.environ.get(name) for name in environment}
@@ -1344,15 +1587,20 @@ def create_vllm_llm(
     with ExitStack() as construction:
         construction.callback(llm.llm_engine.engine_core.shutdown)
         if config.multiprocessing:
-            replies = llm.collective_rpc("workload_command", timeout=30.0,
-                args=(BackendCommand.PROBE.value, encode_boundary(workload.backend_requirements())))
+            replies = llm.collective_rpc(
+                "workload_command",
+                timeout=30.0,
+                args=(BackendCommand.PROBE.value, encode_boundary(workload.backend_requirements())),
+            )
             if len(replies) != 1:
                 raise RuntimeError("canonical probe requires the exact single-worker quorum")
             facts = workload.specialize(decode_boundary(replies[0], BackendCompileFacts), config.execution)
             attachment = workload.plan_backend(facts)
             handle = VllmLlm[DataT, ResultT](llm, None, None, attachment, facts)
-            installed = decode_boundary(handle.command(BackendCommand.INSTALL,
-                encode_boundary(BackendInstall(attachment, definition or ""))), BackendWorkerState)
+            installed = decode_boundary(
+                handle.command(BackendCommand.INSTALL, encode_boundary(BackendInstall(attachment, definition or ""))),
+                BackendWorkerState,
+            )
             if installed.process_id == os.getpid():
                 raise RuntimeError("EngineCore did not install the original signed compilation in its child")
         else:
@@ -1372,6 +1620,7 @@ def create_vllm_llm(
                 case _:
                     raise RuntimeError("vLLM workload did not construct its worker")
             from pllm.backends.vllm.mrv1 import Mrv1Runner
+
             match worker.model_runner:
                 case WorkloadModelRunner() | Mrv1Runner() as runner:
                     pass
@@ -1386,17 +1635,32 @@ def create_vllm_llm(
         return handle
 
 
-def _input_reservations(probe: BackendPlacementProbe, timeline: SchedulerTimeline, rows: int,
-                        vocab: int, stage: SamplerStage | None, feedback: bool) -> tuple[int, ...]:
+def _input_reservations(
+    probe: BackendPlacementProbe,
+    timeline: SchedulerTimeline,
+    rows: int,
+    vocab: int,
+    stage: SamplerStage | None,
+    feedback: bool,
+) -> tuple[int, ...]:
     hidden = len(probe.hidden_resources) * probe.max_packed_rows * probe.hidden_size * 4
     # FP32 envelope for original logits, conversion, projection and rowwise arithmetic.
     # Excludes upstream sampling/GEMM library scratch, model weights and KV storage.
-    workspace = (rows * (36 * vocab + 4 * probe.hidden_size + 8) if stage is SamplerStage.PACKED_POST_FILTER_EXACT
-        else rows * (12 * vocab + 8) if stage is SamplerStage.PACKED_PRE_FILTER_ADD else 0)
+    workspace = (
+        rows * (36 * vocab + 4 * probe.hidden_size + 8)
+        if stage is SamplerStage.PACKED_POST_FILTER_EXACT
+        else rows * (12 * vocab + 8)
+        if stage is SamplerStage.PACKED_PRE_FILTER_ADD
+        else 0
+    )
     retained = rows * (4 * vocab + 8) if feedback else 0
     sampler = next(anchor.ordinal for anchor in timeline.anchors if anchor.symbol == "sampler.pre_draw")
-    return tuple(hidden + (workspace if anchor.symbol in ("sampler.pre_draw", "sampler.complete") else 0)
-        + (retained if anchor.ordinal >= sampler else 0) for anchor in timeline.anchors)
+    return tuple(
+        hidden
+        + (workspace if anchor.symbol in ("sampler.pre_draw", "sampler.complete") else 0)
+        + (retained if anchor.ordinal >= sampler else 0)
+        for anchor in timeline.anchors
+    )
 
 
 def probe_backend(
@@ -1413,58 +1677,130 @@ def probe_backend(
     if model.quant_config is not None:
         raise RuntimeError("vLLM workload requires an unquantized model")
     if requirements.model_source is not None and requirements.model_source != (
-        runner.model_config.model, runner.model_config.revision or "main"):
+        runner.model_config.model,
+        runner.model_config.revision or "main",
+    ):
         raise ValueError("causal training and inference must use the same model source and revision")
     layer_count = len(model.model.layers)
     if any(layer < 0 or layer >= layer_count for layer in requirements.activation_layers):
         raise ValueError("activation layer is outside the backend model")
-    hidden_resources = tuple(sorted((AttachmentHiddenResource(_hidden_binding(source, layer_count), source.phase)
-        for source in requirements.hidden_inputs), key=lambda resource: resource.resource_key))
+    hidden_resources = tuple(
+        sorted(
+            (
+                AttachmentHiddenResource(_hidden_binding(source, layer_count), source.phase)
+                for source in requirements.hidden_inputs
+            ),
+            key=lambda resource: resource.resource_key,
+        )
+    )
     targets = inspect_parameter_targets(model, requirements.parameter_targets, runner.dtype)
-    replay_capabilities = ("model/layer_replay@1", "model/tokenwise_replay@1", REGION_STREAMS_CAPABILITY) if runner.runner_kind is RunnerKind.MRV2 else ()
-    probe = _base_probe(runner,
-        model_fingerprint=_digest((
-            f"model={runner.model_config.model}", f"revision={runner.model_config.revision or ''}",
-            "class=vllm.model_executor.models.qwen2.Qwen2ForCausalLM",
-            f"hidden_size={model.config.hidden_size}", f"layers={layer_count}",
-            f"vocab_size={model.config.vocab_size}",
-            *(f"hidden={resource.binding.module_path}" for resource in hidden_resources),
-            *(f"activation_layer={layer}" for layer in requirements.activation_layers),
-            *(f"target={target.target}:{target.input_size}:{target.output_size}" for target in targets),
-        )),
-        hidden_size=model.config.hidden_size, layer_count=layer_count, hidden_resources=hidden_resources,
-        capabilities=tuple(sorted(set((*_REQUEST_CAPABILITIES, *_OVERLAY_CAPABILITIES, *replay_capabilities,
-            f"backend/vllm_{runner.runner_kind.value}@1")))))
+    replay_capabilities = (
+        ("model/layer_replay@1", "model/tokenwise_replay@1", REGION_STREAMS_CAPABILITY)
+        if runner.runner_kind is RunnerKind.MRV2
+        else ()
+    )
+    probe = _base_probe(
+        runner,
+        model_fingerprint=_digest(
+            (
+                f"model={runner.model_config.model}",
+                f"revision={runner.model_config.revision or ''}",
+                "class=vllm.model_executor.models.qwen2.Qwen2ForCausalLM",
+                f"hidden_size={model.config.hidden_size}",
+                f"layers={layer_count}",
+                f"vocab_size={model.config.vocab_size}",
+                *(f"hidden={resource.binding.module_path}" for resource in hidden_resources),
+                *(f"activation_layer={layer}" for layer in requirements.activation_layers),
+                *(f"target={target.target}:{target.input_size}:{target.output_size}" for target in targets),
+            )
+        ),
+        hidden_size=model.config.hidden_size,
+        layer_count=layer_count,
+        hidden_resources=hidden_resources,
+        capabilities=tuple(
+            sorted(
+                set(
+                    (
+                        *_REQUEST_CAPABILITIES,
+                        *_OVERLAY_CAPABILITIES,
+                        *replay_capabilities,
+                        f"backend/vllm_{runner.runner_kind.value}@1",
+                    )
+                )
+            )
+        ),
+    )
     if runner.runner_kind is RunnerKind.MRV2:
-        probe = replace(probe, region_imports=qwen_region_kernels(model.model.norm,
-            TensorType((1, probe.hidden_size), str(runner.dtype), str(runner.device)), layer_count))
-        if (probe.causal_domain is not None and not requirements.hidden_inputs
-            and not requirements.parameter_targets):
-            bodies = VllmDecoderBodies.inspect(tuple(model.model.layers),
-                TensorType((1, probe.hidden_size), str(runner.dtype), str(runner.device)), probe.causal_domain, probe.max_packed_rows)
+        probe = replace(
+            probe,
+            region_imports=qwen_region_kernels(
+                model.model.norm, TensorType((1, probe.hidden_size), str(runner.dtype), str(runner.device)), layer_count
+            ),
+        )
+        if probe.causal_domain is not None and not requirements.hidden_inputs and not requirements.parameter_targets:
+            bodies = VllmDecoderBodies.inspect(
+                tuple(model.model.layers),
+                TensorType((1, probe.hidden_size), str(runner.dtype), str(runner.device)),
+                probe.causal_domain,
+                probe.max_packed_rows,
+            )
             if bodies is not None:
-                probe = replace(probe, region_bodies=bodies.definitions, region_imports=(*probe.region_imports, *bodies.imports))
-    observed = RuntimeFacts(runner.device).timeline((
-        "state/dense_page_cuda@1", "state/fenced_reclaim@1", "transition/full_root@1", "optimizer/adamw@1",
-        *replay_capabilities,
-        *(("compute/cuda_graph@1",) if timeline is not None and "compute/cuda_graph@1" in timeline.capabilities else ())))
-    required = _input_reservations(probe, observed, runner.max_num_reqs, model.lm_head.weight.shape[0],
-        requirements.sampler_stage, requirements.sampler_feedback)
+                probe = replace(
+                    probe, region_bodies=bodies.definitions, region_imports=(*probe.region_imports, *bodies.imports)
+                )
+    observed = RuntimeFacts(runner.device).timeline(
+        (
+            "state/dense_page_cuda@1",
+            "state/fenced_reclaim@1",
+            "transition/full_root@1",
+            "optimizer/adamw@1",
+            *replay_capabilities,
+            *(
+                ("compute/cuda_graph@1",)
+                if timeline is not None and "compute/cuda_graph@1" in timeline.capabilities
+                else ()
+            ),
+        )
+    )
+    required = _input_reservations(
+        probe,
+        observed,
+        runner.max_num_reqs,
+        model.lm_head.weight.shape[0],
+        requirements.sampler_stage,
+        requirements.sampler_feedback,
+    )
     required = tuple(value + requirements.resident_bytes for value in required)
     observed = replace(observed, reserved_bytes=required)
     if timeline is None:
         timeline = observed
-    elif (timeline.anchors != observed.anchors or timeline.capabilities != observed.capabilities
-          or timeline.schema_version != observed.schema_version):
+    elif (
+        timeline.anchors != observed.anchors
+        or timeline.capabilities != observed.capabilities
+        or timeline.schema_version != observed.schema_version
+    ):
         raise ValueError("worker timeline differs from the supported single-device anchors and capabilities")
     elif len(timeline.reserved_bytes) != len(required) or any(
-            actual < minimum for actual, minimum in zip(timeline.reserved_bytes, required, strict=True)):
+        actual < minimum for actual, minimum in zip(timeline.reserved_bytes, required, strict=True)
+    ):
         raise ValueError("worker timeline underfunds the backend input/sampler buffers")
     free_bytes, _total_bytes = torch.cuda.mem_get_info(runner.device)
     # One current and one private root per scheduled request, with publication overlap.
-    return BackendCompileFacts(probe, timeline, (PageBundleProviderFacts("canonical.page_bundle_cuda@1", 2 * runner.max_num_reqs + 2,
-        probe.device_kind, probe.device_ordinal),), runner.max_num_reqs, free_bytes,
-        runner.model_config.seed, targets, model.config.vocab_size, layer_count)
+    return BackendCompileFacts(
+        probe,
+        timeline,
+        (
+            PageBundleProviderFacts(
+                "canonical.page_bundle_cuda@1", 2 * runner.max_num_reqs + 2, probe.device_kind, probe.device_ordinal
+            ),
+        ),
+        runner.max_num_reqs,
+        free_bytes,
+        runner.model_config.seed,
+        targets,
+        model.config.vocab_size,
+        layer_count,
+    )
 
 
 def _require_runner(runner: WorkloadModelRunner | Mrv1Runner) -> None:
@@ -1481,9 +1817,7 @@ def _require_runner(runner: WorkloadModelRunner | Mrv1Runner) -> None:
         or runner.max_num_reqs < 1
         or type(runner.sampler) is not (Sampler if runner.runner_kind is RunnerKind.MRV2 else Mrv1Sampler)
     ):
-        raise RuntimeError(
-            "vLLM workload requires eager TP1/PP1/DP1 non-spec execution"
-        )
+        raise RuntimeError("vLLM workload requires eager TP1/PP1/DP1 non-spec execution")
 
 
 def _base_probe(
@@ -1527,8 +1861,6 @@ def _base_probe(
     )
 
 
-
-
 def _hidden_binding(source: HiddenInputSource, layer_count: int) -> PackedHiddenResourceBinding:
     layer = source.layer
     if source.site is HiddenSite.MODEL_OUTPUT and layer == -1:
@@ -1544,8 +1876,6 @@ def _hidden_binding(source: HiddenInputSource, layer_count: int) -> PackedHidden
         HiddenSite.BLOCK_OUTPUT,
         f"model.layers.{module_index}",
     )
-
-
 
 
 __all__ = [

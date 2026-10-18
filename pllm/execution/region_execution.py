@@ -5,31 +5,40 @@ Resource access goes through the original invocation's page capabilities.
 """
 
 from collections.abc import Mapping
-from dataclasses import dataclass
 from contextlib import nullcontext
+from dataclasses import dataclass
 
 import torch
 
 from pllm.contracts.region_bindings import RegionBindings
+from pllm.contracts.region_imports import RegionTensorImport
 from pllm.contracts.region_program import Program, bind_sizes
+from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.region_schedule import Statement
 from pllm.contracts.region_selection import RegionPayloadLimit
-from pllm.contracts.region_imports import RegionTensorImport
-from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.region_streams import RegionStreamPlan
 from pllm.contracts.schedule_instructions import LoweredSchedule
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_compilation import lower_region_bindings, lower_region_schedule
-from pllm.execution.region_resources import RegionResources
-from pllm.execution.region_native import BorrowedTensorPrimitive, CompiledPrimitive, FunctionalKernelPrimitive, NativePrimitive, RegionFunction
-from pllm.execution.region_frame import RegionValueFrame
 from pllm.execution.region_control import RegionActions
+from pllm.execution.region_frame import RegionValueFrame
+from pllm.execution.region_native import (
+    BorrowedTensorPrimitive,
+    CompiledPrimitive,
+    FunctionalKernelPrimitive,
+    NativePrimitive,
+    RegionFunction,
+)
+from pllm.execution.region_resources import RegionResources
 from pllm.execution.region_schedule import RegionScheduleExecution
-from pllm.execution.region_values import Data, copy_data
 from pllm.execution.region_storage import import_region_functions
 from pllm.execution.region_streams import (
-    RegionStreamBindings, RegionStreamFrame, record_stream, validate_stream_budget,
+    RegionStreamBindings,
+    RegionStreamFrame,
+    record_stream,
+    validate_stream_budget,
 )
+from pllm.execution.region_values import Data, copy_data
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,9 +71,13 @@ class RegionExecutionPlan:
         if self.stream_plan is not None and self.stream_plan.payload != self.proposal.payload:
             raise ValueError("execution plan and stream plan require the same payload")
         budgets = {limit.device: limit.bytes for limit in self.payload_limits}
-        if len(budgets) != len(self.payload_limits) or any(type(value) is not int or value < 0 for value in budgets.values()):
+        if len(budgets) != len(self.payload_limits) or any(
+            type(value) is not int or value < 0 for value in budgets.values()
+        ):
             raise ValueError("execution plan budgets must be distinct nonnegative device bounds")
-        if any(limit.device not in budgets or limit.bytes > budgets[limit.device] for limit in self.proposal.peak_bytes):
+        if any(
+            limit.device not in budgets or limit.bytes > budgets[limit.device] for limit in self.proposal.peak_bytes
+        ):
             raise ValueError("execution plan exceeds its original payload reservation")
 
     @property
@@ -72,22 +85,37 @@ class RegionExecutionPlan:
         return self.proposal.stream_plan
 
     def bind(self, cells: Mapping[str, RegionFunction]) -> "RegionInstructionExecution":
-        if any(isinstance(cell, CompiledPrimitive) or isinstance(cell, ExportedCell) and cell.transformations for cell in cells.values()):
+        if any(
+            isinstance(cell, CompiledPrimitive) or isinstance(cell, ExportedCell) and cell.transformations
+            for cell in cells.values()
+        ):
             raise ValueError("transformed cells require a numerical selection decision")
         if import_region_functions(self.program, cells) != self.imports:
             raise ValueError("local functions differ from the planned source imports")
         schedule = self.proposal.payload.capacity.schedule_map
-        return RegionInstructionExecution(self.program, lower_region_schedule(self.program, schedule),
-            lower_region_bindings(self.program, schedule), cells, stream_plan=self.stream_plan,
-            payload_limits=self.payload_limits)
+        return RegionInstructionExecution(
+            self.program,
+            lower_region_schedule(self.program, schedule),
+            lower_region_bindings(self.program, schedule),
+            cells,
+            stream_plan=self.stream_plan,
+            payload_limits=self.payload_limits,
+        )
 
 
 class RegionInstructionExecution:
     """Cold-bind imported cells and one fixed schedule, then execute fresh frames."""
 
-    def __init__(self, program: Program, lowered: LoweredSchedule, bindings: RegionBindings,
-                 cells: Mapping[str, RegionFunction], *, stream_plan: RegionStreamPlan | None = None,
-                 payload_limits: tuple[RegionPayloadLimit, ...] = ()) -> None:
+    def __init__(
+        self,
+        program: Program,
+        lowered: LoweredSchedule,
+        bindings: RegionBindings,
+        cells: Mapping[str, RegionFunction],
+        *,
+        stream_plan: RegionStreamPlan | None = None,
+        payload_limits: tuple[RegionPayloadLimit, ...] = (),
+    ) -> None:
         self._schedule = RegionScheduleExecution(program, lowered)
         if bindings.program_digest != lowered.program_digest or bindings.schedule_map != lowered.schedule_map:
             raise ValueError("tensor bindings and loop instructions must describe the same schedule")
@@ -99,7 +127,13 @@ class RegionInstructionExecution:
             raise ValueError("region cell bindings must be complete and exact")
         for declaration in program.functions:
             cell = cells[declaration.name]
-            if type(cell) not in (ExportedCell, NativePrimitive, FunctionalKernelPrimitive, CompiledPrimitive, BorrowedTensorPrimitive):
+            if type(cell) not in (
+                ExportedCell,
+                NativePrimitive,
+                FunctionalKernelPrimitive,
+                CompiledPrimitive,
+                BorrowedTensorPrimitive,
+            ):
                 raise ValueError("region calls require an exported cell or explicit native import")
             if cell.declaration != declaration:
                 raise ValueError("cell differs from its imported source declaration")
@@ -110,7 +144,9 @@ class RegionInstructionExecution:
         self._cells = dict(cells)
         self._actions = RegionActions(program, cells)
         self._stream_plan = stream_plan
-        self._tensor_borrows = {name: cell.implementation for name, cell in cells.items() if isinstance(cell, BorrowedTensorPrimitive)}
+        self._tensor_borrows = {
+            name: cell.implementation for name, cell in cells.items() if isinstance(cell, BorrowedTensorPrimitive)
+        }
 
     @property
     def stream_plan(self) -> RegionStreamPlan | None:
@@ -121,8 +157,15 @@ class RegionInstructionExecution:
         """The bound local implementations, as checked at bind time."""
         return self._cells
 
-    def _invoke(self, frame: RegionValueFrame, statement: Statement, coordinates: tuple[int, ...],
-                pages: RegionResources | None, sizes: Mapping[str, int], stream: torch.cuda.Stream | None = None) -> None:
+    def _invoke(
+        self,
+        frame: RegionValueFrame,
+        statement: Statement,
+        coordinates: tuple[int, ...],
+        pages: RegionResources | None,
+        sizes: Mapping[str, int],
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
         # Keep operand/result temporaries in one invocation's scope. Otherwise
         # Python's loop locals can retain the previous result through the next
         # kernel, after the native last-use plan has released its frame slot.
@@ -134,8 +177,14 @@ class RegionInstructionExecution:
         for output, value in zip(statement.outputs, result, strict=True):
             frame.put(output, coordinates, value)
 
-    def run(self, inputs: Mapping[str, Data], *, pages: RegionResources | None = None,
-            sizes: Mapping[str, int] = {}, streams: RegionStreamBindings | None = None) -> RegionExecutionResult:
+    def run(
+        self,
+        inputs: Mapping[str, Data],
+        *,
+        pages: RegionResources | None = None,
+        sizes: Mapping[str, int] = {},
+        streams: RegionStreamBindings | None = None,
+    ) -> RegionExecutionResult:
         sizes = bind_sizes(self._program, sizes)
         if streams is None and self._stream_plan is not None:
             raise ValueError("borrowed streams and a verified physical stream plan must be supplied together")
@@ -154,8 +203,9 @@ class RegionInstructionExecution:
             raise ValueError("resource programs require PTTS primitive bindings")
         if pages is not None:
             pages.validate(self._program, sizes)
-            pages.validate_native_kernels({name: cell.implementation for name, cell in self._cells.items()
-                                           if isinstance(cell, NativePrimitive)})
+            pages.validate_native_kernels(
+                {name: cell.implementation for name, cell in self._cells.items() if isinstance(cell, NativePrimitive)}
+            )
             pages.validate_tensor_borrows(self._tensor_borrows)
         scope = pages.scope() if pages is not None else (nullcontext() if owner is None else torch.cuda.stream(owner))
         with torch.no_grad(), scope:
@@ -169,8 +219,13 @@ class RegionInstructionExecution:
                     if pages is not None:
                         pages.before_statement()
                     statement = self._lowered.statements[invocation.statement_id]
-                    stream = None if concurrent is None else concurrent.enter(
-                        frame.time_for(statement.id, invocation.coordinates), statement.id, invocation.coordinates)
+                    stream = (
+                        None
+                        if concurrent is None
+                        else concurrent.enter(
+                            frame.time_for(statement.id, invocation.coordinates), statement.id, invocation.coordinates
+                        )
+                    )
                     # The completion window either finishes the previous phase
                     # or holds its references under the signed pipeline budget.
                     frame.advance(statement.id, invocation.coordinates)
@@ -200,8 +255,12 @@ class RegionInstructionExecution:
 class RegionExecution(RegionInstructionExecution):
     """Bind original source imports; optimized variants need selection replay."""
 
-    def __init__(self, program: Program, lowered: LoweredSchedule, bindings: RegionBindings,
-                 cells: Mapping[str, RegionFunction]) -> None:
-        if any(isinstance(cell, CompiledPrimitive) or isinstance(cell, ExportedCell) and cell.transformations for cell in cells.values()):
+    def __init__(
+        self, program: Program, lowered: LoweredSchedule, bindings: RegionBindings, cells: Mapping[str, RegionFunction]
+    ) -> None:
+        if any(
+            isinstance(cell, CompiledPrimitive) or isinstance(cell, ExportedCell) and cell.transformations
+            for cell in cells.values()
+        ):
             raise ValueError("transformed cells require a numerical selection decision")
         super().__init__(program, lowered, bindings, cells)

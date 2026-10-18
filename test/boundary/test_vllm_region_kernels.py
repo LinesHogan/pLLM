@@ -1,4 +1,3 @@
-from test.boundary.test_region_streams import stream_execution
 """The actual vLLM normalization kernel uses the original resource bindings."""
 
 from dataclasses import replace
@@ -11,19 +10,38 @@ from vllm.config.compilation import CompilationMode
 from vllm.model_executor.layers.layernorm import RMSNorm
 
 from pllm.backends.vllm.region_kernels import VllmRmsNormKernel
-from pllm.contracts.backend_attachment import AttachmentGraphMode, AttachmentTopology, BackendPlacementProbe, CausalModelDomain
+from pllm.contracts.backend_attachment import (
+    AttachmentGraphMode,
+    AttachmentTopology,
+    BackendPlacementProbe,
+    CausalModelDomain,
+)
 from pllm.contracts.region_imports import NativeKernelImport
-from pllm.contracts.region_program import AffineIndex, BorrowedResource, Call, Constant, Coordinate, Program, ScalarType, TensorType, Value
+from pllm.contracts.region_program import (
+    AffineIndex,
+    BorrowedResource,
+    Call,
+    Coordinate,
+    Program,
+    ScalarType,
+    TensorType,
+    Value,
+)
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.region_native import external_primitive
-from pllm.execution.region_resources import ExternalFunction, HostResourceBinding, ReadonlyResourceBinding, RegionResources
+from pllm.execution.region_resources import (
+    ExternalFunction,
+    HostResourceBinding,
+    ReadonlyResourceBinding,
+    RegionResources,
+)
 from pllm.execution.region_streams import RegionStreamBindings, lower_region_streams
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
 from test.boundary.test_region_pages import owner_fixture
 from test.boundary.test_region_program import region
-from test.boundary.test_region_streams import limits
+from test.boundary.test_region_streams import limits, stream_execution
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -36,21 +54,45 @@ def test_model_norm_contract_binds_actual_kernel_on_both_original_streams(dtype)
         kernel = VllmRmsNormKernel.inspect(norm, tensor, 3)
         assert kernel is not None and kernel.implementation.allocations == ()
         assert decode_boundary(encode_boundary(kernel.implementation), NativeKernelImport) == kernel.implementation
-        probe = BackendPlacementProbe("test.norm@1", "a" * 64, "b" * 64, "c" * 64,
-            AttachmentTopology.IN_PROCESS, AttachmentGraphMode.EAGER, StateDeviceKind.CUDA, 0, 1, 1,
-            TensorDType.FLOAT32 if dtype is torch.float32 else TensorDType.BFLOAT16, 16, 2, (), (),
-            causal_domain=CausalModelDomain(1, 3, 2), region_imports=(kernel.implementation,))
+        probe = BackendPlacementProbe(
+            "test.norm@1",
+            "a" * 64,
+            "b" * 64,
+            "c" * 64,
+            AttachmentTopology.IN_PROCESS,
+            AttachmentGraphMode.EAGER,
+            StateDeviceKind.CUDA,
+            0,
+            1,
+            1,
+            TensorDType.FLOAT32 if dtype is torch.float32 else TensorDType.BFLOAT16,
+            16,
+            2,
+            (),
+            (),
+            causal_domain=CausalModelDomain(1, 3, 2),
+            region_imports=(kernel.implementation,),
+        )
         assert decode_boundary(encode_boundary(probe), BackendPlacementProbe) == probe
         with ir.ops.fused_add_rms_norm.set_priority(["native"]):
             assert VllmRmsNormKernel.inspect(norm, tensor, 3) is None
         function = kernel.implementation.declaration
         context, weights = BorrowedResource("context", (2,)), BorrowedResource("weights", (4,))
         index = ScalarType.INDEX
-        program = Program(region((Value("h", tensor), Value("r", tensor)), (
-            Coordinate((), (Value("zero", index),), AffineIndex(0)), Coordinate((), (Value("one", index),), AffineIndex(1)),
-            Call(("zero", "h", "r"), (Value("a", tensor),), function.name),
-            Call(("one", "h", "r"), (Value("b", tensor),), function.name),
-        ), ("a", "b")), (function,), (context, weights))
+        program = Program(
+            region(
+                (Value("h", tensor), Value("r", tensor)),
+                (
+                    Coordinate((), (Value("zero", index),), AffineIndex(0)),
+                    Coordinate((), (Value("one", index),), AffineIndex(1)),
+                    Call(("zero", "h", "r"), (Value("a", tensor),), function.name),
+                    Call(("one", "h", "r"), (Value("b", tensor),), function.name),
+                ),
+                ("a", "b"),
+            ),
+            (function,),
+            (context, weights),
+        )
         cells = {function.name: external_primitive(function, kernel.implementation)}
         plan = lower_region_streams(program, "{ S0[] -> [0]; S1[] -> [1] }", cells, axis=0, lanes=2, pipeline_depth=2)
         assert not plan.host_fences
@@ -60,30 +102,51 @@ def test_model_norm_contract_binds_actual_kernel_on_both_original_streams(dtype)
         streams = RegionStreamBindings(torch.cuda.Stream(), (torch.cuda.Stream(),))
         execution, _, rows, _ = owner_fixture(rounds=1, stream=streams.owner)
         invocation = execution.start_step(rows, streams.owner)
-        view = ReadonlyTensorView(weights, tuple(ReadonlyTensorCell.bind((i,), (norm.weight,) if i == 3 else ()) for i in range(4)))
+        view = ReadonlyTensorView(
+            weights, tuple(ReadonlyTensorCell.bind((i,), (norm.weight,) if i == 3 else ()) for i in range(4))
+        )
+
         class Context:
             resource = context
             namespace = id(invocation)
+
             def validate(self):
                 invocation.context.check_page_execution()
+
             def check(self, mode, ranges):
                 self.validate()
                 assert ranges in (((0, 1),), ((1, 2),))
+
         launches = []
+
         def normalize(inputs):
             _, h, r = inputs
             launches.append(torch.cuda.current_stream().cuda_stream)
             return (kernel.run(h, r),)
+
         def resources(abi):
-            return RegionResources(program, invocation.context, (), (ExternalFunction(function, normalize, abi),), borrows=(
-                ReadonlyResourceBinding(view, invocation.context), HostResourceBinding(Context(), invocation.context)))
+            return RegionResources(
+                program,
+                invocation.context,
+                (),
+                (ExternalFunction(function, normalize, abi),),
+                borrows=(
+                    ReadonlyResourceBinding(view, invocation.context),
+                    HostResourceBinding(Context(), invocation.context),
+                ),
+            )
+
         h, r = torch.randn((1, 16), dtype=dtype, device="cuda:0"), torch.randn((1, 16), dtype=dtype, device="cuda:0")
         expected, _ = norm.forward(h.clone(), r.clone())
         original = h.clone(), r.clone()
         streams.owner.wait_stream(torch.cuda.current_stream())
         try:
             with pytest.raises(ValueError, match="execution contract"):
-                runner.run({"h": h, "r": r}, pages=resources(replace(kernel.implementation, implementation="different")), streams=streams)
+                runner.run(
+                    {"h": h, "r": r},
+                    pages=resources(replace(kernel.implementation, implementation="different")),
+                    streams=streams,
+                )
             assert not launches
             result = runner.run({"h": h, "r": r}, pages=resources(kernel.implementation), streams=streams)
             assert set(launches) == {streams.owner.cuda_stream, streams.auxiliary[0].cuda_stream}

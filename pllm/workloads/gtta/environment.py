@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from collections import deque
-from pllm.execution.host_runtime import HostReceipt
 
+from pllm.execution.host_runtime import HostReceipt
 from pllm.workloads.gtta.types import (
     DynamicsEvent,
     GTTAConfig,
@@ -51,9 +51,7 @@ class GTTAEnvironmentService:
         return self.enqueue_event(
             DynamicsEvent(
                 task_id=feedback.task_id.strip(),
-                state_signature=canonical_state_signature(
-                    feedback.previous_observation
-                ),
+                state_signature=canonical_state_signature(feedback.previous_observation),
                 action=feedback.action.strip(),
                 previous_observation=feedback.previous_observation,
                 next_observation=feedback.next_observation,
@@ -72,16 +70,10 @@ class GTTAEnvironmentService:
     def begin(self, request: GTTAHostRequest) -> GTTAHostTransaction:
         if self._active is not None:
             raise RuntimeError("GTTA active transaction is unresolved")
-        count = (
-            len(self._queue)
-            if request.limit == 0
-            else min(request.limit, len(self._queue))
-        )
+        count = len(self._queue) if request.limit == 0 else min(request.limit, len(self._queue))
         transaction = GTTAHostTransaction(
             self._next_transaction_id,
-            GTTATrajectoryBatch(
-                tuple(self._queue.popleft() for _ in range(count))
-            ),
+            GTTATrajectoryBatch(tuple(self._queue.popleft() for _ in range(count))),
             request.query,
         )
         self._next_transaction_id += 1
@@ -103,9 +95,7 @@ class GTTAEnvironmentService:
             self._queue.appendleft(event)
         self._active = None
 
-    def _active_transaction(
-        self, transaction: GTTAHostTransaction
-    ) -> None:
+    def _active_transaction(self, transaction: GTTAHostTransaction) -> None:
         if self._active is not transaction:
             raise RuntimeError("GTTA transaction does not match the active batch")
 

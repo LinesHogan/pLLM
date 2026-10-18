@@ -9,23 +9,35 @@ import torch
 from vllm import SamplingParams
 
 import pllm
-from pllm.workloads.reft import ActivationConfig, ActivationWorkload
 from pllm.config import ModelConfig, VllmDType
+from pllm.workloads.reft import ActivationConfig, ActivationWorkload
 
 
 def main() -> None:
-    handle = pllm.make_llm(workload=ActivationWorkload(ActivationConfig((23,), 2, first_tokens=1, last_tokens=1)),
-        config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", VllmDType.BFLOAT16,
-            64, 2, 64, 0.25, seed=7, execution=pllm.ExecutionOptions(memory_budget_bytes=1 << 30)))
+    handle = pllm.make_llm(
+        workload=ActivationWorkload(ActivationConfig((23,), 2, first_tokens=1, last_tokens=1)),
+        config=ModelConfig(
+            "Qwen/Qwen2.5-0.5B-Instruct",
+            VllmDType.BFLOAT16,
+            64,
+            2,
+            64,
+            0.25,
+            seed=7,
+            execution=pllm.ExecutionOptions(memory_budget_bytes=1 << 30),
+        ),
+    )
     execution = handle.deployment.execution
     baseline = []
     observed = []
     hook = None
     try:
         layer = handle.runner.model.model.layers[23]
+
         def capture(module, args, output):
             if args[0].numel() > 2:
                 baseline.append(tuple(value.detach().clone() for value in output))
+
         hook = layer.register_forward_hook(capture)
         prompts = ["The sky is", "Water freezes at"]
         sampling = SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True)
@@ -35,16 +47,20 @@ def main() -> None:
         hidden, residual = baseline[0]
         width, device = hidden.shape[1], hidden.device
         generator = torch.Generator(device=device).manual_seed(23)
-        parameters = tuple(torch.randn(shape, device=device, dtype=hidden.dtype, generator=generator) * 0.02
-            for shape in ((2, width), (2,), (width, 2)))
+        parameters = tuple(
+            torch.randn(shape, device=device, dtype=hidden.dtype, generator=generator) * 0.02
+            for shape in ((2, width), (2,), (width, 2))
+        )
+
         def check(module, args, output):
             if args[0].numel() <= 2:
                 return
             positions = args[0]
             starts = (positions == 0).nonzero().flatten().tolist()
             ends = [*starts[1:], positions.numel()]
-            selected = torch.tensor(sorted({index for begin, end in zip(starts, ends) for index in (begin, end - 1)}),
-                device=device)
+            selected = torch.tensor(
+                sorted({index for begin, end in zip(starts, ends) for index in (begin, end - 1)}), device=device
+            )
             weight, bias, rotation = parameters
             expected = hidden.clone()
             rows = hidden[selected]
@@ -54,6 +70,7 @@ def main() -> None:
             torch.testing.assert_close(output[1], residual, rtol=0, atol=0)
             assert torch.count_nonzero(output[0] - hidden) > 0
             observed.append(selected.numel())
+
         hook = layer.register_forward_hook(check)
         handle.generate(prompts, sampling, auxiliary=pllm.StateTensorUpdate(parameters))
         assert observed == [4]

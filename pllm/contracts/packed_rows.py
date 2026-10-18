@@ -19,20 +19,10 @@ class PackedPhaseRow:
     identity: RequestIdentity
 
     def __post_init__(self) -> None:
-        if (
-            self.packed_row_index < 0
-            or self.request_ordinal < 0
-            or self.token_offset < 0
-        ):
+        if self.packed_row_index < 0 or self.request_ordinal < 0 or self.token_offset < 0:
             raise ValueError("packed phase row indices must be non-negative")
-        if (
-            not self.identity.request_id
-            or self.identity.prompt_idx < 0
-            or self.identity.sample_idx < 0
-        ):
-            raise ValueError(
-                "packed phase row requires a resolved request identity"
-            )
+        if not self.identity.request_id or self.identity.prompt_idx < 0 or self.identity.sample_idx < 0:
+            raise ValueError("packed phase row requires a resolved request identity")
         if self.phase not in (HiddenPhase.PREFILL, HiddenPhase.DECODE):
             raise ValueError("packed row requires prefill or decode phase")
 
@@ -53,12 +43,8 @@ class PackedPhaseRowBatch:
             raise ValueError("packed phase batch facts must be non-negative")
         if self.total_rows != len(self.rows):
             raise ValueError("packed phase batch must contain every planned row")
-        if tuple(row.packed_row_index for row in self.rows) != tuple(
-            range(self.total_rows)
-        ):
-            raise ValueError(
-                "packed phase batch rows must preserve packed plan order"
-            )
+        if tuple(row.packed_row_index for row in self.rows) != tuple(range(self.total_rows)):
+            raise ValueError("packed phase batch rows must preserve packed plan order")
 
     @property
     def identities(self) -> tuple[RequestIdentity, ...]:
@@ -68,20 +54,20 @@ class PackedPhaseRowBatch:
     def request_rows(self) -> tuple[PackedPhaseRow, ...]:
         """Borrow each request's final original row in stable identity order."""
         last = {row.identity: row for row in self.rows}
-        return tuple(sorted(last.values(), key=lambda row:
-            (row.identity.request_id, row.identity.prompt_idx, row.identity.sample_idx)))
+        return tuple(
+            sorted(
+                last.values(),
+                key=lambda row: (row.identity.request_id, row.identity.prompt_idx, row.identity.sample_idx),
+            )
+        )
 
     @property
     def prefill_rows(self) -> tuple[PackedPhaseRow, ...]:
-        return tuple(
-            row for row in self.rows if row.phase is HiddenPhase.PREFILL
-        )
+        return tuple(row for row in self.rows if row.phase is HiddenPhase.PREFILL)
 
     @property
     def decode_rows(self) -> tuple[PackedPhaseRow, ...]:
-        return tuple(
-            row for row in self.rows if row.phase is HiddenPhase.DECODE
-        )
+        return tuple(row for row in self.rows if row.phase is HiddenPhase.DECODE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,16 +90,9 @@ class PackedSamplerRowBatch:
     links: tuple[PackedSamplerRowLink, ...]
 
     def __post_init__(self) -> None:
-        if tuple(link.sampler_row_index for link in self.links) != tuple(
-            range(len(self.links))
-        ):
-            raise ValueError(
-                "packed sampler links must preserve sampler row order"
-            )
-        if any(
-            link.packed_row_index >= self.row_batch.total_rows
-            for link in self.links
-        ):
+        if tuple(link.sampler_row_index for link in self.links) != tuple(range(len(self.links))):
+            raise ValueError("packed sampler links must preserve sampler row order")
+        if any(link.packed_row_index >= self.row_batch.total_rows for link in self.links):
             raise ValueError("packed sampler link is outside its packed row batch")
 
     @property
@@ -126,10 +105,7 @@ class PackedSamplerRowBatch:
 
     @property
     def identities(self) -> tuple[RequestIdentity, ...]:
-        return tuple(
-            self.row_batch.rows[link.packed_row_index].identity
-            for link in self.links
-        )
+        return tuple(self.row_batch.rows[link.packed_row_index].identity for link in self.links)
 
 
 __all__ = [

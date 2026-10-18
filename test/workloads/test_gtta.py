@@ -4,12 +4,16 @@ import json
 from dataclasses import replace
 
 import torch
-from pllm import make_llm
 
+from pllm import make_llm
 from pllm.execution.host_runtime import HostRuntimeFacts
 from pllm.workloads.gtta import (
-    GTTAConfig, GTTAHostRequest, GTTAPromptPosition,
-    GTTAQuery, GTTAWorkload, TrajectoryFeedback,
+    GTTAConfig,
+    GTTAHostRequest,
+    GTTAPromptPosition,
+    GTTAQuery,
+    GTTAWorkload,
+    TrajectoryFeedback,
 )
 from pllm.workloads.gtta.environment import GTTAEnvironmentService
 
@@ -26,11 +30,18 @@ def test_gtta_updates_environment_and_rolls_back_fifo() -> None:
     )
     assert all(service.enqueue_feedback(event) for event in feedback)
     assert not service.enqueue_feedback(feedback[0])
-    request = GTTAHostRequest(GTTAQuery(
-        prompt_idx=4, task_id="maps", candidate_actions=("clear", "unknown", "open"),
-        observation="map results", state_signature="", action="", max_records=0,
-        position=GTTAPromptPosition.SUFFIX,
-    ))
+    request = GTTAHostRequest(
+        GTTAQuery(
+            prompt_idx=4,
+            task_id="maps",
+            candidate_actions=("clear", "unknown", "open"),
+            observation="map results",
+            state_signature="",
+            action="",
+            max_records=0,
+            position=GTTAPromptPosition.SUFFIX,
+        )
+    )
     interrupted = service.begin(GTTAHostRequest(request.query, limit=2))
     receipt = execution.execute(interrupted)
     execution.abort(receipt)

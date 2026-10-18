@@ -4,10 +4,10 @@ from dataclasses import dataclass
 from typing import Literal
 
 from pllm.contracts.region_capacity import RegionCapacity
-from pllm.contracts.region_payload import RegionPayload
-from pllm.contracts.region_retention import RetainedAllocation
 from pllm.contracts.region_imports import RegionTensorImport
 from pllm.contracts.region_outlining import CallOutlineEvidence
+from pllm.contracts.region_payload import RegionPayload
+from pllm.contracts.region_retention import RetainedAllocation
 from pllm.contracts.region_streams import RegionStreamPlan
 
 

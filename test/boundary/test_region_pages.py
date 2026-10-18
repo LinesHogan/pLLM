@@ -8,8 +8,16 @@ import torch
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.region_program import (
-    AffineIndex, Call, Coordinate, Program, Publish, Resource, ScalarType, Scan,
-    Snapshot, Value,
+    AffineIndex,
+    Call,
+    Coordinate,
+    Program,
+    Publish,
+    Resource,
+    ScalarType,
+    Scan,
+    Snapshot,
+    Value,
 )
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId
@@ -17,12 +25,11 @@ from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.region_compilation import analyze_region_program, lower_region_bindings, lower_region_schedule
-from pllm.execution.region_resources import RegionResources, ResourcePageCell
 from pllm.execution.region_execution import RegionExecution
+from pllm.execution.region_resources import RegionResources, ResourcePageCell
 from pllm.execution.state_execution import StateExecution, StateSettlementError
 from test.boundary.test_page_bundle import _arena
 from test.boundary.test_region_program import region
-
 
 X = ScalarType.INDEX
 
@@ -30,22 +37,32 @@ X = ScalarType.INDEX
 def page_program(cell, rounds=8):
     tensor = cell.declaration.inputs[0]
 
-    layer = region((Value("l", X),), (
-        Snapshot(("l",), (Value("w", tensor),), "layers"),
-        Call(("w",), (Value("new", tensor),), cell.digest),
-        Publish(("new", "l"), (), "layers"),
-    ), ())
-    chunk = region((Value("c", X),), (
-        Scan((), (), 2, layer),
-    ), ())
-    return Program(region((), (
-        Coordinate((), (Value("zero", X),), AffineIndex(0)),
-        Coordinate((), (Value("one", X),), AffineIndex(1)),
-        Snapshot(("zero",), (Value("old", tensor),), "layers"),
-        Scan((), (), rounds, chunk),
-        Snapshot(("zero",), (Value("first", tensor),), "layers"),
-        Snapshot(("one",), (Value("second", tensor),), "layers"),
-    ), ("old", "first", "second")), (cell.declaration,), (Resource("layers", (tensor,), (2,)),))
+    layer = region(
+        (Value("l", X),),
+        (
+            Snapshot(("l",), (Value("w", tensor),), "layers"),
+            Call(("w",), (Value("new", tensor),), cell.digest),
+            Publish(("new", "l"), (), "layers"),
+        ),
+        (),
+    )
+    chunk = region((Value("c", X),), (Scan((), (), 2, layer),), ())
+    return Program(
+        region(
+            (),
+            (
+                Coordinate((), (Value("zero", X),), AffineIndex(0)),
+                Coordinate((), (Value("one", X),), AffineIndex(1)),
+                Snapshot(("zero",), (Value("old", tensor),), "layers"),
+                Scan((), (), rounds, chunk),
+                Snapshot(("zero",), (Value("first", tensor),), "layers"),
+                Snapshot(("one",), (Value("second", tensor),), "layers"),
+            ),
+            ("old", "first", "second"),
+        ),
+        (cell.declaration,),
+        (Resource("layers", (tensor,), (2,)),),
+    )
 
 
 class Math:
@@ -54,10 +71,13 @@ class Math:
             for field in root:
                 field.zero_()
             root[0].fill_(i + 1)
+
     def rows(self, value):
         return value
+
     def prepare(self, value, context):
         return value
+
     def output(self, context):
         return tuple(context.current_owned_ref(ref) for ref in context.pin.refs)
 
@@ -71,11 +91,15 @@ class Task:
     context = None
     inputs = None
     fields = (LayoutFieldId(0),)
+
     def execute(self, context):
         if self.region is not None:
             self.context = context
-            pages = RegionResources(self.program, context, tuple(
-                ResourcePageCell("layers", (i,), ref, self.fields) for i, ref in enumerate(context.pin.refs)))
+            pages = RegionResources(
+                self.program,
+                context,
+                tuple(ResourcePageCell("layers", (i,), ref, self.fields) for i, ref in enumerate(context.pin.refs)),
+            )
             self.result = self.region.run({} if self.inputs is None else self.inputs, pages=pages)
 
 
@@ -84,35 +108,72 @@ def owner_fixture(*, rounds=8, wrap=None, stream=None, function=None):
     if stream is not None:
         from pllm.authoring import BackendCompileFacts, ParameterTargetShape
         from pllm.contracts.backend_attachment import (
-            BackendPlacementProbe, AttachmentTopology, AttachmentGraphMode,
+            AttachmentGraphMode,
+            AttachmentTopology,
+            BackendPlacementProbe,
         )
-        from pllm.contracts.parameter_overlay import ParameterTarget, ParameterModuleKind, ParameterRole
+        from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
         from pllm.contracts.state_representation import StateDeviceKind
         from pllm.contracts.tensor_layout import TensorDType
         from pllm.execution.ptts.page_bundle import PageBundleArena
         from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
         from pllm.execution.runtime_facts import RuntimeFacts
         from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
+
         target = ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT)
-        facts = BackendCompileFacts(BackendPlacementProbe("test.region.cuda@1", "a" * 64, "b" * 64, "c" * 64,
-            AttachmentTopology.IN_PROCESS, AttachmentGraphMode.EAGER, StateDeviceKind.CUDA, 0, 1, 1,
-            TensorDType.FLOAT32, 3, 8, (), ()), RuntimeFacts(stream.device).timeline(("transition/full_root@1", "state/fenced_reclaim@1")),
+        facts = BackendCompileFacts(
+            BackendPlacementProbe(
+                "test.region.cuda@1",
+                "a" * 64,
+                "b" * 64,
+                "c" * 64,
+                AttachmentTopology.IN_PROCESS,
+                AttachmentGraphMode.EAGER,
+                StateDeviceKind.CUDA,
+                0,
+                1,
+                1,
+                TensorDType.FLOAT32,
+                3,
+                8,
+                (),
+                (),
+            ),
+            RuntimeFacts(stream.device).timeline(("transition/full_root@1", "state/fenced_reclaim@1")),
             (PageBundleProviderFacts("test.region.cuda@1", 6, StateDeviceKind.CUDA),),
-            2, 4096, 0, (ParameterTargetShape(target, 3, 2),))
+            2,
+            4096,
+            0,
+            (ParameterTargetShape(target, 3, 2),),
+        )
         workload = InPlaceTTTWorkload(InPlaceTTTConfig((target,), chunk_size=2))
         arena = PageBundleArena(workload.plan_backend(facts).inputs.plan)
     spec = arena.plan.tensor_layout_request.layouts[0].layout.fields[0]
-    cell = ExportedCell.capture((lambda w: (w + 1,)) if function is None else function, ("w",), ("new",), (torch.zeros(spec.shape, device=arena.device),))
+    cell = ExportedCell.capture(
+        (lambda w: (w + 1,)) if function is None else function,
+        ("w",),
+        ("new",),
+        (torch.zeros(spec.shape, device=arena.device),),
+    )
     if wrap is not None:
         cell = replace(cell, function=wrap(arena, cell.function))
     program = page_program(cell, rounds)
     candidate = analyze_region_program(program).candidates[-1]
-    runner = RegionExecution(program, lower_region_schedule(program, candidate.schedule_map),
-                                    lower_region_bindings(program, candidate.schedule_map), {cell.digest: cell})
+    runner = RegionExecution(
+        program,
+        lower_region_schedule(program, candidate.schedule_map),
+        lower_region_bindings(program, candidate.schedule_map),
+        {cell.digest: cell},
+    )
     tasks = tuple(Task(t.implementation_id) for t in arena.plan.schedule_physical.tasks)
     tasks[0].region, tasks[0].program = runner, program
-    execution = StateExecution(arena, RequestStateDirectory(arena, arena.plan.semantic_graph.states[0]),
-                               Math(), tasks, AnchorId(arena.plan.timeline.anchors[-1].ordinal))
+    execution = StateExecution(
+        arena,
+        RequestStateDirectory(arena, arena.plan.semantic_graph.states[0]),
+        Math(),
+        tasks,
+        AnchorId(arena.plan.timeline.anchors[-1].ordinal),
+    )
     identities = (RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0))
     refs = execution.admit(identities, stream)
     rows = tuple(PackedPhaseRow(i, i, 0, HiddenPhase.PREFILL, identity) for i, identity in enumerate(identities))
@@ -127,7 +188,7 @@ def test_rescheduled_region_publishes_many_versions_through_original_owner():
     assert not context.page_writes and all(context.page_publications.values())
     assert all(release is not None for release in context.page_pins.values())
     assert tuple(ref.version_id for ref in final) == (8, 8)
-    for value, expected in zip(task.result.values, (1., 9., 10.), strict=True):
+    for value, expected in zip(task.result.values, (1.0, 9.0, 10.0), strict=True):
         torch.testing.assert_close(value, torch.full_like(value, expected), rtol=0, atol=0)
     pin = execution.arena.pin_exact(final)
     for ref in final:
@@ -142,8 +203,14 @@ def test_rescheduled_region_publishes_many_versions_through_original_owner():
     assert execution.arena.usage().private_versions == 0
     torch.testing.assert_close(task.result.values[0], torch.ones_like(task.result.values[0]), rtol=0, atol=0)
     with pytest.raises(RuntimeError, match="released"):
-        task.region.run({}, pages=RegionResources(task.program, context, tuple(
-            ResourcePageCell("layers", (i,), ref, (LayoutFieldId(0),)) for i, ref in enumerate(original))))
+        task.region.run(
+            {},
+            pages=RegionResources(
+                task.program,
+                context,
+                tuple(ResourcePageCell("layers", (i,), ref, (LayoutFieldId(0),)) for i, ref in enumerate(original)),
+            ),
+        )
 
 
 def test_resource_aliases_and_missing_cells_rejected_before_effects():
@@ -167,8 +234,10 @@ def test_failure_after_publish_retains_original_receipt_and_cannot_replay(monkey
     execution, task, rows, refs = owner_fixture(rounds=2)
     invocation = execution.start_step(rows)
     settle = execution.arena.settle
+
     def fail(receipt):
         raise RuntimeError("injected settlement failure")
+
     monkeypatch.setattr(execution.arena, "settle", fail)
     anchor = execution.plan.tasks[0].anchor_id
     with pytest.raises(StateSettlementError) as failed:
@@ -191,8 +260,10 @@ def test_failure_before_publish_aborts_original_private_write(monkeypatch):
     execution, task, rows, _ = owner_fixture(rounds=1)
     invocation = execution.start_step(rows)
     original = execution.arena.write_field
+
     def fail(*args):
         raise RuntimeError("injected write failure")
+
     monkeypatch.setattr(execution.arena, "write_field", fail)
     with pytest.raises(RuntimeError, match="injected write"):
         execution.execute_anchor(invocation, execution.plan.tasks[0].anchor_id)
@@ -206,6 +277,7 @@ def test_failure_before_publish_aborts_original_private_write(monkeypatch):
 def test_foreign_publication_cannot_silently_replace_snapshot_version():
     foreign = []
     refs = []
+
     def wrap(arena, function):
         def changed(*args):
             if not foreign:
@@ -217,22 +289,32 @@ def test_foreign_publication_cannot_silently_replace_snapshot_version():
                 arena.settle(receipt)
                 foreign.append(receipt)
             return function(*args)
+
         return changed
+
     execution, task, rows, originals = owner_fixture(rounds=1, wrap=wrap)
     refs.extend(originals)
     # Use the serial candidate so the injected foreign write hits the first
     # cell whose exact snapshot has just been read.
     schedule = analyze_region_program(task.program).reference_schedule
-    task.region = RegionExecution(task.program, lower_region_schedule(task.program, schedule),
-        lower_region_bindings(task.program, schedule), task.region._cells)
+    task.region = RegionExecution(
+        task.program,
+        lower_region_schedule(task.program, schedule),
+        lower_region_bindings(task.program, schedule),
+        task.region._cells,
+    )
     invocation = execution.start_step(rows)
     with pytest.raises(RuntimeError, match="not latest"):
         execution.execute_anchor(invocation, execution.plan.tasks[0].anchor_id)
     assert not invocation.context.page_publications
     assert invocation.context.release is not None
     pin = execution.arena.pin_exact(foreign[0].after_refs)
-    torch.testing.assert_close(execution.arena.snapshot(pin, pin.refs[0])[0],
-                               torch.full_like(execution.arena.snapshot(pin, pin.refs[0])[0], 99), rtol=0, atol=0)
+    torch.testing.assert_close(
+        execution.arena.snapshot(pin, pin.refs[0])[0],
+        torch.full_like(execution.arena.snapshot(pin, pin.refs[0])[0], 99),
+        rtol=0,
+        atol=0,
+    )
     execution.arena.wait_release(execution.arena.release_pin(pin))
 
 
@@ -244,11 +326,13 @@ def test_cuda_region_uses_original_stream_and_completion_receipts():
     final = execution.step(rows, stream)
     context = task.context
     assert all(receipt.completion is not None for receipt in context.page_publications)
-    assert all(pin.stream is stream and release.pin is pin and release.completion is not None
-               for pin, release in context.page_pins.items())
+    assert all(
+        pin.stream is stream and release.pin is pin and release.completion is not None
+        for pin, release in context.page_pins.items()
+    )
     # Consumers explicitly wait for the original invocation's producer stream.
     torch.cuda.current_stream().wait_stream(stream)
-    for value, expected in zip(task.result.values, (1., 9., 10.), strict=True):
+    for value, expected in zip(task.result.values, (1.0, 9.0, 10.0), strict=True):
         torch.testing.assert_close(value, torch.full_like(value, expected), rtol=0, atol=0)
     assert tuple(ref.version_id for ref in final) == (8, 8)
     assert execution.arena.pool_addresses == addresses
@@ -269,6 +353,6 @@ def test_exported_input_views_survive_original_page_reclamation():
     admitted = execution.arena.prepare_admission(("dense_fast_weights", "dense_fast_weights"))
     for root in execution.arena.writable_roots(admitted):
         root[0].fill_(99)
-    for value, expected in zip(task.result.values, (1., 1., 2.), strict=True):
+    for value, expected in zip(task.result.values, (1.0, 1.0, 2.0), strict=True):
         torch.testing.assert_close(value, torch.full_like(value, expected), rtol=0, atol=0)
     execution.arena.abort(admitted)

@@ -1,6 +1,5 @@
 """The emitted loop tree must implement the fixed schedule, without expansion."""
 
-from dataclasses import replace
 from itertools import islice
 
 import pytest
@@ -37,8 +36,10 @@ def test_tiled_schedule_handles_partial_tiles_with_exact_coverage():
 def test_negative_time_and_nonunit_steps_preserve_integer_division():
     index = ScalarType.INDEX
     body = region((Value("i", index),), (Call(("i",), (Value("y", index),), "f"),), ("y",))
-    program = Program(region((), (Map((), (Value("ys", BankType(index, 6)),), 6, body),), ("ys",)),
-                      (Function("f", (index,), (index,)),))
+    program = Program(
+        region((), (Map((), (Value("ys", BankType(index, 6)),), 6, body),), ("ys",)),
+        (Function("f", (index,), (index,)),),
+    )
     schedule = "{ S0[i] -> [-2*i] : 0<=i<6 }"
     lowered = lower_region_schedule(program, schedule)
     actual = tuple(RegionScheduleExecution(program, lowered).invocations())

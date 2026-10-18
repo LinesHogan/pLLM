@@ -6,10 +6,22 @@ import triton.language as tl
 
 
 @triton.jit
-def _select_rows(order: torch.Tensor, offsets: torch.Tensor, active: torch.Tensor, mask: torch.Tensor,
-                 selected: torch.Tensor, ends: torch.Tensor, enabled: torch.Tensor, blocks: torch.Tensor,
-                 rows: int, states: int, mask_stride: tl.constexpr, row_tile: tl.constexpr,
-                 state_tile: tl.constexpr, count_only: tl.constexpr) -> None:
+def _select_rows(
+    order: torch.Tensor,
+    offsets: torch.Tensor,
+    active: torch.Tensor,
+    mask: torch.Tensor,
+    selected: torch.Tensor,
+    ends: torch.Tensor,
+    enabled: torch.Tensor,
+    blocks: torch.Tensor,
+    rows: int,
+    states: int,
+    mask_stride: tl.constexpr,
+    row_tile: tl.constexpr,
+    state_tile: tl.constexpr,
+    count_only: tl.constexpr,
+) -> None:
     block = tl.program_id(0)
     row = block * row_tile + tl.arange(0, row_tile)
     live = tl.load(offsets + states - 1)
@@ -29,24 +41,62 @@ def _select_rows(order: torch.Tensor, offsets: torch.Tensor, active: torch.Tenso
         tl.store(ends + state, tl.where(end > 0, count, 0), (state < states) & owned)
 
 
-def select_rows(order: torch.Tensor, offsets: torch.Tensor, active: torch.Tensor,
-                mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def select_rows(
+    order: torch.Tensor, offsets: torch.Tensor, active: torch.Tensor, mask: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     selected, ends, enabled = torch.empty_like(order), torch.empty_like(offsets), torch.empty_like(active)
     tile = min(16384, triton.next_power_of_2(max(1, order.numel())))
     count = max(1, (order.numel() + tile - 1) // tile)
     blocks = torch.empty(count, dtype=torch.int32, device=order.device) if count > 1 else ends
     if count > 1:
-        _select_rows[(count,)](order, offsets, active, mask, selected, ends, enabled, blocks, order.numel(),
-            offsets.numel(), mask.stride(0), tile, triton.next_power_of_2(offsets.numel()), True)
+        _select_rows[(count,)](
+            order,
+            offsets,
+            active,
+            mask,
+            selected,
+            ends,
+            enabled,
+            blocks,
+            order.numel(),
+            offsets.numel(),
+            mask.stride(0),
+            tile,
+            triton.next_power_of_2(offsets.numel()),
+            True,
+        )
         torch.cumsum(blocks, 0, dtype=torch.int32, out=blocks)
-    _select_rows[(count,)](order, offsets, active, mask, selected, ends, enabled, blocks, order.numel(),
-        offsets.numel(), mask.stride(0), tile, triton.next_power_of_2(offsets.numel()), False)
+    _select_rows[(count,)](
+        order,
+        offsets,
+        active,
+        mask,
+        selected,
+        ends,
+        enabled,
+        blocks,
+        order.numel(),
+        offsets.numel(),
+        mask.stride(0),
+        tile,
+        triton.next_power_of_2(offsets.numel()),
+        False,
+    )
     return selected, ends, enabled
 
 
 @triton.jit
-def _write_pages(pool: torch.Tensor, slots: torch.Tensor, selected: torch.Tensor, values: torch.Tensor,
-                 width: tl.constexpr, stride: tl.constexpr, selected_stride: tl.constexpr, add: tl.constexpr, scale: float) -> None:
+def _write_pages(
+    pool: torch.Tensor,
+    slots: torch.Tensor,
+    selected: torch.Tensor,
+    values: torch.Tensor,
+    width: tl.constexpr,
+    stride: tl.constexpr,
+    selected_stride: tl.constexpr,
+    add: tl.constexpr,
+    scale: float,
+) -> None:
     state = tl.program_id(0)
     column = tl.program_id(1) * 256 + tl.arange(0, 256)
     slot = tl.load(slots + tl.load(selected + state * selected_stride))
@@ -57,16 +107,31 @@ def _write_pages(pool: torch.Tensor, slots: torch.Tensor, selected: torch.Tensor
     tl.store(pool + slot * stride + column, value, valid)
 
 
-def write_pages(pool: torch.Tensor, slots: torch.Tensor, selected: torch.Tensor, values: torch.Tensor, *, add: bool, scale: float) -> None:
-    _write_pages[(selected.numel(), (pool.shape[1] + 255) // 256)](pool, slots, selected, values.contiguous(),
-        pool.shape[1], pool.stride(0), selected.stride(0), add, scale)
+def write_pages(
+    pool: torch.Tensor, slots: torch.Tensor, selected: torch.Tensor, values: torch.Tensor, *, add: bool, scale: float
+) -> None:
+    _write_pages[(selected.numel(), (pool.shape[1] + 255) // 256)](
+        pool, slots, selected, values.contiguous(), pool.shape[1], pool.stride(0), selected.stride(0), add, scale
+    )
 
 
 @triton.jit
-def _split_inner(a: torch.Tensor, b: torch.Tensor, slots: torch.Tensor, states: torch.Tensor, active: torch.Tensor,
-                 output: torch.Tensor, k: tl.constexpr, n: tl.constexpr,
-                 a0: tl.constexpr, a1: tl.constexpr, b0: tl.constexpr, b1: tl.constexpr, b2: tl.constexpr,
-                 n_tile: tl.constexpr) -> None:
+def _split_inner(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    slots: torch.Tensor,
+    states: torch.Tensor,
+    active: torch.Tensor,
+    output: torch.Tensor,
+    k: tl.constexpr,
+    n: tl.constexpr,
+    a0: tl.constexpr,
+    a1: tl.constexpr,
+    b0: tl.constexpr,
+    b1: tl.constexpr,
+    b2: tl.constexpr,
+    n_tile: tl.constexpr,
+) -> None:
     chunk, row = tl.program_id(0), tl.program_id(1)
     valid = tl.load(active + row)
     ni = tl.arange(0, n_tile)
@@ -75,28 +140,58 @@ def _split_inner(a: torch.Tensor, b: torch.Tensor, slots: torch.Tensor, states: 
         slot = tl.load(slots + tl.load(states + row))
         ki = chunk * 256 + tl.arange(0, 256)
         lhs = tl.load(a + row * a0 + ki * a1, ki < k, 0)
-        rhs = tl.load(b + slot * b0 + ki[:, None] * b1 + ni[None, :] * b2,
-            (ki[:, None] < k) & (ni[None, :] < n), 0)
+        rhs = tl.load(b + slot * b0 + ki[:, None] * b1 + ni[None, :] * b2, (ki[:, None] < k) & (ni[None, :] < n), 0)
         result = tl.sum(lhs[:, None] * rhs, axis=0)
     tl.store(output + (row * tl.cdiv(k, 256) + chunk) * n + ni, result, ni < n)
 
 
-def split_linear(inputs: torch.Tensor, matrices: torch.Tensor, slots: torch.Tensor, states: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+def split_linear(
+    inputs: torch.Tensor, matrices: torch.Tensor, slots: torch.Tensor, states: torch.Tensor, active: torch.Tensor
+) -> torch.Tensor:
     rows, inner = inputs.shape
     width = matrices.shape[2]
     chunks, tile = (inner + 255) // 256, 1 << (width - 1).bit_length()
     partials = inputs.new_empty((rows, chunks, width))
-    _split_inner[(chunks, rows)](inputs, matrices, slots, states, active, partials, inner, width,
-        inputs.stride(0), inputs.stride(1), matrices.stride(0), matrices.stride(1), matrices.stride(2), tile)
+    _split_inner[(chunks, rows)](
+        inputs,
+        matrices,
+        slots,
+        states,
+        active,
+        partials,
+        inner,
+        width,
+        inputs.stride(0),
+        inputs.stride(1),
+        matrices.stride(0),
+        matrices.stride(1),
+        matrices.stride(2),
+        tile,
+    )
     return partials.sum(1)
 
 
 @triton.jit
-def _grouped(a: torch.Tensor, b: torch.Tensor, offsets: torch.Tensor, output: torch.Tensor,
-             slots: torch.Tensor, order: torch.Tensor, selected: torch.Tensor, selected_stride: tl.constexpr,
-             m: tl.constexpr, n: tl.constexpr, k: tl.constexpr,
-             a0: tl.constexpr, a1: tl.constexpr, b0: tl.constexpr, b1: tl.constexpr, b2: tl.constexpr,
-             weight_gradient: tl.constexpr, n_tile: tl.constexpr) -> None:
+def _grouped(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    offsets: torch.Tensor,
+    output: torch.Tensor,
+    slots: torch.Tensor,
+    order: torch.Tensor,
+    selected: torch.Tensor,
+    selected_stride: tl.constexpr,
+    m: tl.constexpr,
+    n: tl.constexpr,
+    k: tl.constexpr,
+    a0: tl.constexpr,
+    a1: tl.constexpr,
+    b0: tl.constexpr,
+    b1: tl.constexpr,
+    b2: tl.constexpr,
+    weight_gradient: tl.constexpr,
+    n_tile: tl.constexpr,
+) -> None:
     output_group = tl.program_id(2)
     group = tl.load(selected + output_group * selected_stride) if selected_stride >= 0 else output_group
     begin = tl.load(offsets + group - 1, group > 0, 0)
@@ -116,13 +211,16 @@ def _grouped(a: torch.Tensor, b: torch.Tensor, offsets: torch.Tensor, output: to
             for block in tl.range(tl.cdiv(end - begin, 32)):
                 rows = begin + block * 32 + ki
                 original = tl.load(order + rows, rows < end, 0)
-                lhs = tl.load(a + mi[:, None] * a1 + original[None, :] * a0,
-                    (mi[:, None] < m) & (rows[None, :] < end), 0)
-                rhs = tl.load(b + original[:, None] * b0 + ni[None, :] * b1,
-                    (rows[:, None] < end) & (ni[None, :] < n), 0)
+                lhs = tl.load(
+                    a + mi[:, None] * a1 + original[None, :] * a0, (mi[:, None] < m) & (rows[None, :] < end), 0
+                )
+                rhs = tl.load(
+                    b + original[:, None] * b0 + ni[None, :] * b1, (rows[:, None] < end) & (ni[None, :] < n), 0
+                )
                 acc = tl.dot(lhs, rhs, acc, input_precision="ieee")
-        tl.store(output + output_group * m * n + mi[:, None] * n + ni[None, :], acc,
-            (mi[:, None] < m) & (ni[None, :] < n))
+        tl.store(
+            output + output_group * m * n + mi[:, None] * n + ni[None, :], acc, (mi[:, None] < m) & (ni[None, :] < n)
+        )
     else:
         if begin + tl.program_id(0) * 16 < end:
             slot = tl.load(slots + group)
@@ -135,36 +233,80 @@ def _grouped(a: torch.Tensor, b: torch.Tensor, offsets: torch.Tensor, output: to
             else:
                 for block in range(tl.cdiv(k, 32)):
                     inner = block * 32 + ki
-                    lhs = tl.load(a + original[:, None] * a0 + inner[None, :] * a1,
-                        (begin + mi[:, None] < end) & (inner[None, :] < k), 0)
-                    rhs = tl.load(b + slot * b0 + inner[:, None] * b1 + ni[None, :] * b2,
-                        (inner[:, None] < k) & (ni[None, :] < n), 0)
+                    lhs = tl.load(
+                        a + original[:, None] * a0 + inner[None, :] * a1,
+                        (begin + mi[:, None] < end) & (inner[None, :] < k),
+                        0,
+                    )
+                    rhs = tl.load(
+                        b + slot * b0 + inner[:, None] * b1 + ni[None, :] * b2,
+                        (inner[:, None] < k) & (ni[None, :] < n),
+                        0,
+                    )
                     acc = tl.dot(lhs, rhs, acc, input_precision="ieee")
-            tl.store(output + original[:, None] * n + ni[None, :], acc,
-                (begin + mi[:, None] < end) & (ni[None, :] < n))
+            tl.store(output + original[:, None] * n + ni[None, :], acc, (begin + mi[:, None] < end) & (ni[None, :] < n))
 
 
-def grouped_linear(inputs: torch.Tensor, matrices: torch.Tensor, offsets: torch.Tensor,
-                   slots: torch.Tensor, order: torch.Tensor) -> torch.Tensor:
+def grouped_linear(
+    inputs: torch.Tensor, matrices: torch.Tensor, offsets: torch.Tensor, slots: torch.Tensor, order: torch.Tensor
+) -> torch.Tensor:
     rows, inner = inputs.shape
     width = matrices.shape[2]
     tile = 128 if inner <= 8 and width >= 128 else 32
     output = inputs.new_empty((rows, width))
-    _grouped[((rows + 15) // 16, (width + tile - 1) // tile, offsets.numel())](inputs, matrices, offsets, output,
-        slots, order, offsets, -1, 0, width, inner, inputs.stride(0), inputs.stride(1),
-        matrices.stride(0), matrices.stride(1), matrices.stride(2), False, tile)
+    _grouped[((rows + 15) // 16, (width + tile - 1) // tile, offsets.numel())](
+        inputs,
+        matrices,
+        offsets,
+        output,
+        slots,
+        order,
+        offsets,
+        -1,
+        0,
+        width,
+        inner,
+        inputs.stride(0),
+        inputs.stride(1),
+        matrices.stride(0),
+        matrices.stride(1),
+        matrices.stride(2),
+        False,
+        tile,
+    )
     return output
 
 
-def grouped_parameter_gradient(inputs: torch.Tensor, gradients: torch.Tensor,
-                               offsets: torch.Tensor, order: torch.Tensor, selected: torch.Tensor | None = None) -> torch.Tensor:
+def grouped_parameter_gradient(
+    inputs: torch.Tensor,
+    gradients: torch.Tensor,
+    offsets: torch.Tensor,
+    order: torch.Tensor,
+    selected: torch.Tensor | None = None,
+) -> torch.Tensor:
     inner = inputs.shape[1]
     width = gradients.shape[1]
     small = inputs.shape[0] <= 16
     tile = 128 if small and width >= 128 else 32
     output = inputs.new_empty((offsets.numel() if selected is None else selected.numel(), inner, width))
-    _grouped[((inner + 15) // 16, (width + tile - 1) // tile, output.shape[0])](inputs, gradients, offsets, output,
-        offsets, order, offsets if selected is None else selected, -1 if selected is None else selected.stride(0),
-        inner, width, -1 if small else 0, inputs.stride(0), inputs.stride(1),
-        gradients.stride(0), gradients.stride(1), 0, True, tile)
+    _grouped[((inner + 15) // 16, (width + tile - 1) // tile, output.shape[0])](
+        inputs,
+        gradients,
+        offsets,
+        output,
+        offsets,
+        order,
+        offsets if selected is None else selected,
+        -1 if selected is None else selected.stride(0),
+        inner,
+        width,
+        -1 if small else 0,
+        inputs.stride(0),
+        inputs.stride(1),
+        gradients.stride(0),
+        gradients.stride(1),
+        0,
+        True,
+        tile,
+    )
     return output

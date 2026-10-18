@@ -1,8 +1,7 @@
 """Actual Triton GEMM code, readonly ports and source-selected batch lowering."""
 
-from dataclasses import replace
-
 import math
+from dataclasses import replace
 
 import pytest
 import torch
@@ -23,8 +22,10 @@ def test_gemm_epilogue_is_one_generated_kernel_with_unaligned_readonly_borrows(b
         pytest.skip("requires CUDA Triton templates")
     leading = (2,) if batch else ()
     shapes = ((*leading, 32, 64), (*leading, 64, 48))
-    bases = tuple(torch.arange(1 + torch.Size(shape).numel(), device="cuda", dtype=torch.float32)
-                  .remainder(7).to(torch.bfloat16) for shape in shapes)
+    bases = tuple(
+        torch.arange(1 + torch.Size(shape).numel(), device="cuda", dtype=torch.float32).remainder(7).to(torch.bfloat16)
+        for shape in shapes
+    )
     tensors = tuple(base[1:].reshape(shape) for base, shape in zip(bases, shapes, strict=True))
     before = tuple(base.clone() for base in bases)
     source = ExportedCell.capture(lambda x, w: ((x @ w) + 1,), ("x", "w"), ("out",), tensors)
@@ -35,12 +36,12 @@ def test_gemm_epilogue_is_one_generated_kernel_with_unaligned_readonly_borrows(b
     # spans the account counts deliberately — an over-count, not an omission.
     # The plain Triton template carries no workspace, so only slack is added.
     input_bytes = sum(t.numel() * t.element_size() for t in tensors)
-    subtotal = (4 * input_bytes + 3 * source.output_bytes) if batch else (
-        2 * input_bytes + 2 * source.output_bytes)
+    subtotal = (4 * input_bytes + 3 * source.output_bytes) if batch else (2 * input_bytes + 2 * source.output_bytes)
     assert sum(buffer.bytes for buffer in compiled.implementation.allocations) == (
-        subtotal + math.ceil(subtotal * COMPILER_SLACK_FRACTION))
+        subtotal + math.ceil(subtotal * COMPILER_SLACK_FRACTION)
+    )
     expected = (tensors[0].float() @ tensors[1].float()).to(torch.bfloat16) + 1
-    result, = compiled.invoke(tensors, None)
+    (result,) = compiled.invoke(tensors, None)
     torch.testing.assert_close(result, expected)
     for actual, saved in zip(bases, before, strict=True):
         torch.testing.assert_close(actual, saved, rtol=0, atol=0)
@@ -53,36 +54,66 @@ def test_automatic_batching_can_select_compiled_gemm_with_packing_and_output_cop
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA Triton templates")
     import pllm.execution.region_optimization as tuning
+
     shapes = ((32, 64), (64, 48), (32, 64), (64, 48))
-    tensors = tuple(torch.arange(torch.Size(shape).numel(), device="cuda", dtype=torch.float32)
-                    .remainder(7).reshape(shape).to(torch.bfloat16) for shape in shapes)
+    tensors = tuple(
+        torch.arange(torch.Size(shape).numel(), device="cuda", dtype=torch.float32)
+        .remainder(7)
+        .reshape(shape)
+        .to(torch.bfloat16)
+        for shape in shapes
+    )
     source = ExportedCell.capture(lambda x, w: (x @ w,), ("x", "w"), ("out",), tensors[:2])
     left, right = source.declaration.inputs
-    output, = source.declaration.outputs
+    (output,) = source.declaration.outputs
     names = ("a", "b", "c", "d")
-    program = Program(Region(Block(tuple(Value(name, type_) for name, type_ in zip(
-        names, (left, right, left, right), strict=True)), (
-        Call(("a", "b"), (Value("first", output),), source.digest),
-        Call(("c", "d"), (Value("second", output),), source.digest),
-    ), ("first", "second"))), (source.declaration,))
-    monkeypatch.setattr(tuning, "_measure", lambda execution, *args:
-        1 if any(isinstance(cell, CompiledPrimitive) and any("batching" in t for t in cell.transformations)
-                 for cell in execution._cells.values()) else 100)
+    program = Program(
+        Region(
+            Block(
+                tuple(Value(name, type_) for name, type_ in zip(names, (left, right, left, right), strict=True)),
+                (
+                    Call(("a", "b"), (Value("first", output),), source.digest),
+                    Call(("c", "d"), (Value("second", output),), source.digest),
+                ),
+                ("first", "second"),
+            )
+        ),
+        (source.declaration,),
+    )
+    monkeypatch.setattr(
+        tuning,
+        "_measure",
+        lambda execution, *args: (
+            1
+            if any(
+                isinstance(cell, CompiledPrimitive) and any("batching" in t for t in cell.transformations)
+                for cell in execution._cells.values()
+            )
+            else 100
+        ),
+    )
     # The graph-derived account charges the packed operands twice (pack and
     # view) plus their f32 upcasts — a deliberate over-count the payload
     # limit must leave room for; the bound stays a bound, not an estimate.
     with pytest.warns(NumericalTransformWarning, match="batching.*kernel compilation"):
-        selected = optimize_region(program, {source.digest: source}, dict(zip(names, tensors)),
+        selected = optimize_region(
+            program,
+            {source.digest: source},
+            dict(zip(names, tensors)),
             payload_limits=(RegionPayloadLimit("cuda:0", 200000),),
-            options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"), warmup_rounds=0, measurement_rounds=1)
-    record, = selected.rewrites
+            options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"),
+            warmup_rounds=0,
+            measurement_rounds=1,
+        )
+    (record,) = selected.rewrites
     compiled = selected.execution.cells[record.source_digest]
     assert isinstance(compiled, CompiledPrimitive)
     # Normalized account: pack + view charge the packed operands twice, their
     # f32 upcasts twice more; the bmm result and both select views follow.
     subtotal = 4 * record.packed_operand_bytes + 4 * source.output_bytes
     assert sum(a.bytes for a in compiled.implementation.allocations) == (
-        subtotal + math.ceil(subtotal * COMPILER_SLACK_FRACTION))
+        subtotal + math.ceil(subtotal * COMPILER_SLACK_FRACTION)
+    )
     # The second returned source slice has a nonzero offset in the batched
     # allocation. The selected compiled ABI still returns independent roots.
     warm = selected.execution.run(dict(zip(names, tensors)))
@@ -90,15 +121,19 @@ def test_automatic_batching_can_select_compiled_gemm_with_packing_and_output_cop
     torch.cuda.synchronize()
     allocated = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
+
     def forbidden(*args, **kwargs):
         raise AssertionError("selected GEMM must not compile during execution")
+
     monkeypatch.setattr(tuning, "compile_tensor_cell", forbidden)
     from triton.runtime.jit import JITFunction
+
     monkeypatch.setattr(JITFunction, "_do_compile", forbidden)
     actual = selected.execution.run(dict(zip(names, tensors))).values
     torch.cuda.synchronize()
     assert torch.cuda.max_memory_allocated() - allocated <= (
-        selected.selection.candidates[selected.selection.selected].capacity.devices[0].peak_tensor_bytes_upper_bound)
+        selected.selection.candidates[selected.selection.selected].capacity.devices[0].peak_tensor_bytes_upper_bound
+    )
     for result, x, w in zip(actual, tensors[::2], tensors[1::2], strict=True):
         torch.testing.assert_close(result, (x.float() @ w.float()).to(torch.bfloat16))
     assert actual[0].untyped_storage().data_ptr() != actual[1].untyped_storage().data_ptr()
@@ -117,17 +152,16 @@ def test_fused_bfloat16_recurrence_preserves_intermediate_rounding():
     x, y = torch.cat(inputs), torch.cat(targets)
 
     def step(delta, base, x, y):
-        return delta + .017 * (y.T @ x), x @ (base + delta).T
+        return delta + 0.017 * (y.T @ x), x @ (base + delta).T
 
-    source = ExportedCell.capture(step, ("delta", "base", "x", "y"), ("next", "out"),
-                                  (delta, base, x[:3], y[:3]))
+    source = ExportedCell.capture(step, ("delta", "base", "x", "y"), ("next", "out"), (delta, base, x[:3], y[:3]))
     compiled = compile_tensor_cell(source)
     actual, expected = delta, delta
     # The second update exposes rounding lost by fusing the bf16 multiply
     # into the carry addition; it also changes the subsequent remainder.
     for start in (0, 3):
-        actual, output = compiled.invoke((actual, base, x[start:start + 3], y[start:start + 3]), None)
-        expected, reference = step(expected, base, x[start:start + 3], y[start:start + 3])
+        actual, output = compiled.invoke((actual, base, x[start : start + 3], y[start : start + 3]), None)
+        expected, reference = step(expected, base, x[start : start + 3], y[start : start + 3])
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         torch.testing.assert_close(output, reference, rtol=0, atol=0)
     torch.testing.assert_close(x[6:] @ (base + actual).T, x[6:] @ (base + expected).T, rtol=0, atol=0)
@@ -147,8 +181,9 @@ def test_transposed_weight_borrow_keeps_stride_offset_and_has_no_materialization
     # graph input — no copy, no transpose materialization in the account.
     subtotal = 4 * (x.numel() + weight.numel()) + source.output_bytes
     assert sum(buffer.bytes for buffer in compiled.implementation.allocations) == (
-        subtotal + math.ceil(subtotal * COMPILER_SLACK_FRACTION))
-    result, = compiled.invoke((x, weight), None)
+        subtotal + math.ceil(subtotal * COMPILER_SLACK_FRACTION)
+    )
+    (result,) = compiled.invoke((x, weight), None)
     torch.testing.assert_close(result, (x.float() @ weight.float()).to(torch.bfloat16))
     torch.testing.assert_close(base, before, rtol=0, atol=0)
     # Compiler facts contain only the raw GEMM result; the borrow has neither
@@ -157,6 +192,6 @@ def test_transposed_weight_borrow_keeps_stride_offset_and_has_no_materialization
     torch.cuda.synchronize()
     allocated = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
-    result, = compiled.invoke((x, weight), None)
+    (result,) = compiled.invoke((x, weight), None)
     torch.cuda.synchronize()
     assert torch.cuda.max_memory_allocated() - allocated == 2 * source.output_bytes

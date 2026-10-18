@@ -27,6 +27,7 @@ RULES: dict[str, frozenset[str]] = {
 # serialization may not reach model adapters or compiler implementations.
 DEFAULT_COMPILER_IMPORT = (Path("execution/tensor_compilation.py"), "pllm.backends.torch_inductor")
 
+
 def _scan_file(path: Path) -> list[str]:
     relative = path.relative_to(PKG_ROOT)
     if len(relative.parts) == 1:
@@ -39,9 +40,14 @@ def _scan_file(path: Path) -> list[str]:
     violations: list[str] = []
 
     def visit(node: ast.AST) -> None:
-        if isinstance(node, ast.If) and (isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING"
-            or isinstance(node.test, ast.Attribute) and isinstance(node.test.value, ast.Name)
-            and node.test.value.id == "typing" and node.test.attr == "TYPE_CHECKING"):
+        if isinstance(node, ast.If) and (
+            isinstance(node.test, ast.Name)
+            and node.test.id == "TYPE_CHECKING"
+            or isinstance(node.test, ast.Attribute)
+            and isinstance(node.test.value, ast.Name)
+            and node.test.value.id == "typing"
+            and node.test.attr == "TYPE_CHECKING"
+        ):
             for child in node.orelse:
                 visit(child)
             return
@@ -52,14 +58,23 @@ def _scan_file(path: Path) -> list[str]:
                 target = resolve_name("." * node.level + (node.module or ""), package)
                 targets = [target]
                 if target == "pllm":
-                    targets = [f"pllm.{alias.name}" for alias in node.names
-                        if (PKG_ROOT / alias.name).is_dir() or (PKG_ROOT / f"{alias.name}.py").is_file()]
+                    targets = [
+                        f"pllm.{alias.name}"
+                        for alias in node.names
+                        if (PKG_ROOT / alias.name).is_dir() or (PKG_ROOT / f"{alias.name}.py").is_file()
+                    ]
             for target in targets:
                 parts = target.split(".")
                 if importer in ("contracts", "execution") and parts[0] in ("vllm", "transformers"):
-                    violations.append(f"{path}:{node.lineno}: {importer} must use backend contracts instead of importing {target}")
-                if (len(parts) > 1 and parts[0] == "pllm" and parts[1] not in allowed
-                    and (relative, target) != DEFAULT_COMPILER_IMPORT):
+                    violations.append(
+                        f"{path}:{node.lineno}: {importer} must use backend contracts instead of importing {target}"
+                    )
+                if (
+                    len(parts) > 1
+                    and parts[0] == "pllm"
+                    and parts[1] not in allowed
+                    and (relative, target) != DEFAULT_COMPILER_IMPORT
+                ):
                     violations.append(f"{path}:{node.lineno}: {importer} cannot import {target}")
                 if importer in ("contracts", "execution") and target.startswith("torch._inductor"):
                     violations.append(f"{path}:{node.lineno}: Inductor internals belong in the tensor compiler backend")

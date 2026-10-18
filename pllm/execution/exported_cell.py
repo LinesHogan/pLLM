@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from threading import Lock
-import warnings
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
@@ -13,11 +13,16 @@ from torch.export.graph_signature import InputKind, OutputKind, TensorArgument
 
 from pllm.contracts.region_program import Function, TensorType
 from pllm.execution.codec import (
-    boundary_digest, check_functional_aten, check_static_export, compile_tensor_function,
-    functionalize_export, tensor_graph_outputs, tensor_graph_result_nodes, tensor_node_metadata,
+    boundary_digest,
+    check_functional_aten,
+    check_static_export,
+    compile_tensor_function,
+    functionalize_export,
+    tensor_graph_outputs,
+    tensor_graph_result_nodes,
+    tensor_node_metadata,
 )
 from pllm.execution.freeze import fingerprint
-
 
 CellFunction = Callable[..., tuple[torch.Tensor, ...]]
 
@@ -38,10 +43,12 @@ def warn_numerical_transforms(signature: str, transformations: tuple[str, ...]) 
             return
         _warned.add(signature)
     warnings.warn(
-        "pLLM selected " + ", ".join(transformations)
+        "pLLM selected "
+        + ", ".join(transformations)
         + "; these transformations may change floating-point results, including rounding and overflow. "
         "Set ExecutionOptions(allow_numerical_transforms=False) to retain the original numerical path.",
-        NumericalTransformWarning, stacklevel=3,
+        NumericalTransformWarning,
+        stacklevel=3,
     )
 
 
@@ -75,8 +82,11 @@ def _check_distinct_inputs(tensors: tuple[torch.Tensor, ...]) -> None:
     # separately would silently change their mutation semantics before export.
     # Metadata-only export has storage identities but no usable data pointers.
     # Preserve its alias check instead of treating every fake pointer as zero.
-    storage = [(str(t.device), t.untyped_storage() if isinstance(t, FakeTensor) else t.untyped_storage().data_ptr())
-               for t in tensors if t.numel()]
+    storage = [
+        (str(t.device), t.untyped_storage() if isinstance(t, FakeTensor) else t.untyped_storage().data_ptr())
+        for t in tensors
+        if t.numel()
+    ]
     if len(set(storage)) != len(storage):
         raise ValueError("exported cell inputs must have distinct storage; aliased input binding is not supported yet")
 
@@ -96,8 +106,13 @@ class ExportedCell:
     transformations: tuple[str, ...]
 
     @classmethod
-    def from_export(cls, program: torch.export.ExportedProgram, *, inputs: tuple[str, ...] | None = None,
-                    outputs: tuple[str, ...] | None = None) -> ExportedCell:
+    def from_export(
+        cls,
+        program: torch.export.ExportedProgram,
+        *,
+        inputs: tuple[str, ...] | None = None,
+        outputs: tuple[str, ...] | None = None,
+    ) -> ExportedCell:
         """Import an existing graph, with lifted state passed through its ports.
 
         Inputs follow ``graph_signature.input_specs``; parameter/buffer/constant
@@ -109,33 +124,54 @@ class ExportedCell:
         return cls._from_functional_export(functionalize_export(program), inputs, outputs)
 
     @classmethod
-    def _from_functional_export(cls, program: torch.export.ExportedProgram, inputs: tuple[str, ...] | None,
-                                outputs: tuple[str, ...] | None) -> ExportedCell:
+    def _from_functional_export(
+        cls, program: torch.export.ExportedProgram, inputs: tuple[str, ...] | None, outputs: tuple[str, ...] | None
+    ) -> ExportedCell:
         program.validate()
         check_static_export(program)
         signature, graph = program.graph_signature, program.graph_module
         input_defaults: list[str] = []
         for spec in signature.input_specs:
-            if (not isinstance(spec.arg, TensorArgument)
-                or spec.kind not in (InputKind.USER_INPUT, InputKind.PARAMETER, InputKind.BUFFER, InputKind.CONSTANT_TENSOR)):
+            if not isinstance(spec.arg, TensorArgument) or spec.kind not in (
+                InputKind.USER_INPUT,
+                InputKind.PARAMETER,
+                InputKind.BUFFER,
+                InputKind.CONSTANT_TENSOR,
+            ):
                 raise ValueError("export cell inputs must be explicit tensor ports, including lifted state")
             input_defaults.append(spec.target if spec.target is not None else spec.arg.name)
         inputs = tuple(input_defaults) if inputs is None else inputs
         outputs = tuple(f"result_{i}" for i in range(len(signature.output_specs))) if outputs is None else outputs
-        if (len(inputs) != len(signature.input_specs) or len(outputs) != len(signature.output_specs)
-            or len(set(inputs)) != len(inputs) or len(set(outputs)) != len(outputs)):
+        if (
+            len(inputs) != len(signature.input_specs)
+            or len(outputs) != len(signature.output_specs)
+            or len(set(inputs)) != len(inputs)
+            or len(set(outputs)) != len(outputs)
+        ):
             raise ValueError("exported cell ports must have unique names and match the complete graph signature")
         mutations: list[tuple[str, str]] = []
         for ordinal, spec in enumerate(signature.output_specs):
             if not isinstance(spec.arg, TensorArgument) or spec.kind not in (
-                OutputKind.USER_OUTPUT, OutputKind.USER_INPUT_MUTATION, OutputKind.BUFFER_MUTATION):
+                OutputKind.USER_OUTPUT,
+                OutputKind.USER_INPUT_MUTATION,
+                OutputKind.BUFFER_MUTATION,
+            ):
                 raise ValueError("export cell outputs must be tensors with explicit state updates")
             if spec.kind is OutputKind.USER_OUTPUT:
                 continue
-            targets = tuple(inputs[i] for i, source in enumerate(signature.input_specs)
-                if isinstance(source.arg, TensorArgument) and (
-                    spec.kind is OutputKind.USER_INPUT_MUTATION and source.kind is InputKind.USER_INPUT and source.arg.name == spec.target
-                    or spec.kind is OutputKind.BUFFER_MUTATION and source.kind is InputKind.BUFFER and source.target == spec.target))
+            targets = tuple(
+                inputs[i]
+                for i, source in enumerate(signature.input_specs)
+                if isinstance(source.arg, TensorArgument)
+                and (
+                    spec.kind is OutputKind.USER_INPUT_MUTATION
+                    and source.kind is InputKind.USER_INPUT
+                    and source.arg.name == spec.target
+                    or spec.kind is OutputKind.BUFFER_MUTATION
+                    and source.kind is InputKind.BUFFER
+                    and source.target == spec.target
+                )
+            )
             if len(targets) != 1:
                 raise ValueError("export state update must identify exactly one original input port")
             mutations.append((targets[0], outputs[ordinal]))
@@ -149,7 +185,11 @@ class ExportedCell:
 
         def tensor_signature(node: torch.fx.Node) -> TensorSignature:
             tensor = tensor_node_metadata(node)
-            if tensor is None or tensor.layout != torch.strided or any(type(d) is not int for d in (*tensor.shape, *tensor.stride())):
+            if (
+                tensor is None
+                or tensor.layout != torch.strided
+                or any(type(d) is not int for d in (*tensor.shape, *tensor.stride()))
+            ):
                 raise ValueError("export cell requires static strided tensor metadata")
             return TensorSignature.of(tensor)
 
@@ -161,13 +201,36 @@ class ExportedCell:
         def functional(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
             return tensor_graph_outputs(graph, args)
 
-        digest = boundary_digest("export-cell@2", str(graph.graph), str(signature), torch.__version__,
-            tuple((s.shape, s.stride, str(s.dtype), str(s.device)) for s in (*arguments, *results)), inputs, outputs)
-        return cls(digest, inputs, outputs, arguments, results, tuple(mutations), tuple(range(len(outputs))), graph, functional, ())
+        digest = boundary_digest(
+            "export-cell@2",
+            str(graph.graph),
+            str(signature),
+            torch.__version__,
+            tuple((s.shape, s.stride, str(s.dtype), str(s.device)) for s in (*arguments, *results)),
+            inputs,
+            outputs,
+        )
+        return cls(
+            digest,
+            inputs,
+            outputs,
+            arguments,
+            results,
+            tuple(mutations),
+            tuple(range(len(outputs))),
+            graph,
+            functional,
+            (),
+        )
 
     @classmethod
-    def capture(cls, function: CellFunction, inputs: tuple[str, ...], outputs: tuple[str, ...],
-                examples: tuple[torch.Tensor, ...]) -> ExportedCell:
+    def capture(
+        cls,
+        function: CellFunction,
+        inputs: tuple[str, ...],
+        outputs: tuple[str, ...],
+        examples: tuple[torch.Tensor, ...],
+    ) -> ExportedCell:
         if len(inputs) != len(examples) or len(set(inputs)) != len(inputs) or len(set(outputs)) != len(outputs):
             raise ValueError("exported cell ports must have unique names and complete tensor examples")
         _check_distinct_inputs(examples)
@@ -177,7 +240,9 @@ class ExportedCell:
             program = functionalize_export(torch.export.export(_Cell(function), samples, strict=False))
         signature = program.graph_signature
         if any(spec.kind is not InputKind.USER_INPUT for spec in signature.input_specs):
-            raise ValueError("iteration cells must receive parameters, buffers and tensor constants through explicit input ports")
+            raise ValueError(
+                "iteration cells must receive parameters, buffers and tensor constants through explicit input ports"
+            )
         if signature.buffers_to_mutate:
             raise ValueError("iteration buffer writes require explicit managed state input ports")
         if len(signature.user_inputs) != len(inputs):
@@ -186,22 +251,32 @@ class ExportedCell:
         if len(positions) != len(outputs):
             raise ValueError("iteration cell output tuple differs from its declared output ports")
         input_names = dict(zip(signature.user_inputs, inputs, strict=True))
-        output_nodes = {spec.arg.name: outputs[i] for i, spec in enumerate(
-            spec for spec in signature.output_specs if spec.kind is OutputKind.USER_OUTPUT)}
+        output_nodes = {
+            spec.arg.name: outputs[i]
+            for i, spec in enumerate(spec for spec in signature.output_specs if spec.kind is OutputKind.USER_OUTPUT)
+        }
         mutations: list[tuple[str, str]] = []
         for result, target in signature.user_inputs_to_mutate.items():
             if result not in output_nodes:
                 raise ValueError("a mutated cell input must also be returned as an explicit state output")
             mutations.append((input_names[target], output_nodes[result]))
         imported = cls._from_functional_export(program, inputs, None)
+
         def functional(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
             values = imported.function(*args)
             return tuple(values[i] for i in positions)
+
         # The authoring wrapper keeps its public result tuple and explicit-return
         # requirement. Shape facts and graph validation use the same import path.
-        return replace(imported, digest=boundary_digest(fingerprint(function), imported.digest, outputs, positions),
-            outputs=outputs, output_signatures=tuple(imported.output_signatures[i] for i in positions),
-            mutations=tuple(mutations), output_positions=positions, function=functional)
+        return replace(
+            imported,
+            digest=boundary_digest(fingerprint(function), imported.digest, outputs, positions),
+            outputs=outputs,
+            output_signatures=tuple(imported.output_signatures[i] for i in positions),
+            mutations=tuple(mutations),
+            output_positions=positions,
+            function=functional,
+        )
 
     def compiled(self, examples: tuple[torch.Tensor, ...]) -> ExportedCell:
         """Compile a chosen tensor block after structural scheduling, on private inputs.
@@ -218,13 +293,16 @@ class ExportedCell:
     @property
     def declaration(self) -> Function:
         """Import into a structured region; the original tensor graph stays available."""
-        return Function(self.digest,
+        return Function(
+            self.digest,
             tuple(TensorType(t.shape, str(t.dtype), str(t.device)) for t in self.input_signatures),
-            tuple(TensorType(t.shape, str(t.dtype), str(t.device)) for t in self.output_signatures))
+            tuple(TensorType(t.shape, str(t.dtype), str(t.device)) for t in self.output_signatures),
+        )
 
     @property
     def output_bytes(self) -> int:
         from math import prod
+
         return sum(prod(t.shape) * torch.empty((), dtype=t.dtype).element_size() for t in self.output_signatures)
 
     def __call__(self, *args: torch.Tensor) -> tuple[torch.Tensor, ...]:

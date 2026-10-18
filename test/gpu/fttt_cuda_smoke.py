@@ -3,22 +3,21 @@
 from __future__ import annotations
 
 import torch
+
 from pllm import make_llm
-
 from pllm.contracts.feedback import Completion, CompletionBatch, FinishReason, RetryAction
-
+from pllm.contracts.request_identity import RequestIdentity
 from pllm.execution.host_runtime import (
-    HostRuntimeFacts,
     CompletionInput,
+    HostRuntimeFacts,
 )
 from pllm.workloads.fttt import (
     FTTTConfig,
+    FTTTFeedbackService,
     FTTTJudgeResult,
     FTTTJudgeService,
-    FTTTFeedbackService,
     FTTTWorkload,
 )
-from pllm.contracts.request_identity import RequestIdentity
 
 
 class _CudaNegativeJudge(FTTTJudgeService):
@@ -47,8 +46,12 @@ def main() -> int:
         max_retries=2,
     )
     service = FTTTFeedbackService(config, _CudaNegativeJudge())
-    coordinator = make_llm(workload=FTTTWorkload(service), config=HostRuntimeFacts(
-        device, hidden_size=4, initialization_seed=7, max_input_rows=1, memory_budget_bytes=1 << 20))
+    coordinator = make_llm(
+        workload=FTTTWorkload(service),
+        config=HostRuntimeFacts(
+            device, hidden_size=4, initialization_seed=7, max_input_rows=1, memory_budget_bytes=1 << 20
+        ),
+    )
     execution = coordinator.execution
     identity = RequestIdentity("cuda-feedback-0", 0, 0)
     completion = Completion(
@@ -80,10 +83,7 @@ def main() -> int:
         or result.update_count != 1
         or result.state_version != 1
         or result.intent.retry_controls[0].action is not RetryAction.RETRY
-        or service.instance_state(
-            "cuda-round-0", 0
-        ).adapter_version
-        != 1
+        or service.instance_state("cuda-round-0", 0).adapter_version != 1
         or len(result.losses) != 1
         or diagnostics.transaction_count != 1
         or diagnostics.fallback_count != 0

@@ -1,7 +1,7 @@
 """Storage identity, last-use envelopes, and traffic facts consumed by AER."""
 
-from dataclasses import replace
 import weakref
+from dataclasses import replace
 
 import pytest
 import torch
@@ -28,8 +28,11 @@ class StorageObserver(TorchDispatchMode):
         outputs = result if isinstance(result, tuple) else (result,)
         self.tensors.extend(weakref.ref(t) for t in outputs if isinstance(t, torch.Tensor))
         alive = [ref() for ref in self.tensors]
-        storages = {(str(t.device), t.untyped_storage().data_ptr()): t.untyped_storage().nbytes()
-                    for t in alive if t is not None and t.untyped_storage().nbytes()}
+        storages = {
+            (str(t.device), t.untyped_storage().data_ptr()): t.untyped_storage().nbytes()
+            for t in alive
+            if t is not None and t.untyped_storage().nbytes()
+        }
         self.peak = max(self.peak, sum(storages.values()))
         return result
 
@@ -45,9 +48,9 @@ def chain(a, b, c):
 def test_less_arithmetic_can_increase_memory_traffic_and_peak_storage():
     inputs = tuple(torch.ones(shape, dtype=torch.float64) for shape in ((4, 1), (1, 4), (4, 32)))
     source = capture(chain, inputs)
-    candidate, = reassociation_candidates(source)
-    before, = profile_tensor_memory(source).devices
-    after, = profile_tensor_memory(candidate.cell).devices
+    (candidate,) = reassociation_candidates(source)
+    (before,) = profile_tensor_memory(source).devices
+    (after,) = profile_tensor_memory(candidate.cell).devices
     assert candidate.rewrite.after.flops == 512 < candidate.rewrite.before.flops == 1056
     assert before.logical_read_bytes + before.logical_write_bytes == 2368
     assert after.logical_read_bytes + after.logical_write_bytes == 2624
@@ -56,8 +59,10 @@ def test_less_arithmetic_can_increase_memory_traffic_and_peak_storage():
     assert before.result_bytes == after.result_bytes == 1024
 
 
-@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA unavailable"))])
+@pytest.mark.parametrize(
+    "device",
+    ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable"))],
+)
 def test_aliases_and_last_uses_match_real_unfused_graph_storage(device):
     def function(x):
         a = x + 1
@@ -70,7 +75,7 @@ def test_aliases_and_last_uses_match_real_unfused_graph_storage(device):
     imported = import_tensor_access_graph(source)
     original_graph = str(source.graph.graph)
     profile = profile_tensor_memory(source)
-    facts, = profile.devices
+    (facts,) = profile.devices
     assert facts.input_bytes == 48
     assert facts.result_bytes == 24  # Two outputs share one allocation.
     assert facts.peak_new_tensor_bytes == 72
@@ -97,7 +102,7 @@ def test_tiny_returned_slice_retains_the_whole_base_storage():
         return ((x + 1)[:1, :1],)
 
     source = capture(function, (torch.ones(64, 64),))
-    facts, = profile_tensor_memory(source).devices
+    (facts,) = profile_tensor_memory(source).devices
     assert source.output_bytes == 4
     assert facts.result_bytes == 64 * 64 * 4
     assert facts.peak_new_tensor_bytes == facts.result_bytes
@@ -108,7 +113,7 @@ def test_views_of_input_allocate_nothing_and_keep_original_storage():
         return x.T, x[:1]
 
     source = capture(function, (torch.ones(3, 4),), ("transposed", "slice"))
-    facts, = profile_tensor_memory(source).devices
+    (facts,) = profile_tensor_memory(source).devices
     assert facts.input_bytes == facts.result_bytes == facts.peak_live_tensor_bytes == 48
     assert facts.peak_new_tensor_bytes == facts.logical_read_bytes == facts.logical_write_bytes == 0
 
@@ -120,13 +125,13 @@ def test_rewrite_refreshes_downstream_view_aliases_and_import_ignores_stale_meta
 
     inputs = (torch.ones(4, 2), torch.ones(2, 8), torch.ones(8, 3))
     source = capture(function, inputs, ("transpose", "slice"))
-    candidate, = reassociation_candidates(source)
+    (candidate,) = reassociation_candidates(source)
     nodes = {node.name: node for node in candidate.cell.graph.graph.nodes}
     product = tensor_node_metadata(nodes[candidate.rewrite.replacement_nodes[1]])
     view = next(n for n in nodes.values() if str(n.target) == "aten.permute.default")
     assert tensor_node_metadata(view).untyped_storage() is product.untyped_storage()
     profile = profile_tensor_memory(candidate.cell)
-    facts, = profile.devices
+    (facts,) = profile.devices
     assert facts.result_bytes == 4 * 3 * 4
     # Reimport must replay fake semantics, not use arbitrary cached view metadata.
     view.meta["val"] = tensor_node_metadata(next(n for n in nodes.values() if n.op == "placeholder"))
@@ -140,15 +145,22 @@ def test_unknown_access_pattern_is_explicit_not_a_zero_traffic_estimate():
     source = capture(function, (torch.ones(8),))
     profile = profile_tensor_memory(source)
     assert profile.unknown_accesses == ("sin",)
-    facts, = profile.devices
+    (facts,) = profile.devices
     assert facts.peak_new_tensor_bytes == 32
     # These are only the known subtotal; the missing operation is mandatory
     # evidence that this profile cannot supply a complete traffic estimate.
     assert facts.logical_read_bytes == facts.logical_write_bytes == 0
 
 
-@pytest.mark.parametrize("device,dtype", [("cpu", torch.float64), pytest.param("cuda", torch.bfloat16,
-    marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable"))])
+@pytest.mark.parametrize(
+    "device,dtype",
+    [
+        ("cpu", torch.float64),
+        pytest.param(
+            "cuda", torch.bfloat16, marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+        ),
+    ],
+)
 def test_swiglu_split_keeps_shared_projection_storage_and_known_accesses(device, dtype):
     def mlp(hidden, gate_up_weight, down_weight):
         gate, up = torch.nn.functional.linear(hidden, gate_up_weight).chunk(2, dim=-1)
@@ -168,7 +180,7 @@ def test_swiglu_split_keeps_shared_projection_storage_and_known_accesses(device,
     assert values[views[0].node].storage == values[views[1].node].storage
     assert {values[view.node].offset for view in views} == {0, 6}
     with StorageObserver(inputs) as observed:
-        actual, = source(*inputs)
+        (actual,) = source(*inputs)
     torch.testing.assert_close(actual, mlp(*inputs)[0], rtol=0, atol=0)
     assert observed.peak == profile.devices[0].peak_live_tensor_bytes
     for value, original in zip(inputs, saved, strict=True):
@@ -221,7 +233,7 @@ def test_empty_and_scalar_storages(shape):
         return (x + 1,)
 
     inputs = (torch.ones(shape),)
-    facts, = profile_tensor_memory(capture(function, inputs)).devices
+    (facts,) = profile_tensor_memory(capture(function, inputs)).devices
     size = inputs[0].numel() * inputs[0].element_size()
     assert facts.input_bytes == facts.result_bytes == facts.peak_new_tensor_bytes == size
     assert facts.peak_live_tensor_bytes == size * 2

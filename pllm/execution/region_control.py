@@ -5,9 +5,30 @@ from collections.abc import Mapping
 import torch
 
 from pllm.contracts.control_instructions import (
-    ControlAction, ControlBlock, ControlIf, ControlPrimitive, ControlScan, ControlStep, ControlWhile,
+    ControlAction,
+    ControlBlock,
+    ControlIf,
+    ControlPrimitive,
+    ControlScan,
+    ControlStep,
+    ControlWhile,
 )
-from pllm.contracts.region_program import Call, Constant, Coordinate, Op, Parameter, Program, Publish, Resource, Scalar, ScalarKind, Select, Snapshot, Update, resolve_extent
+from pllm.contracts.region_program import (
+    Call,
+    Constant,
+    Coordinate,
+    Op,
+    Parameter,
+    Program,
+    Publish,
+    Resource,
+    Scalar,
+    ScalarKind,
+    Select,
+    Snapshot,
+    Update,
+    resolve_extent,
+)
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_native import RegionFunction
 from pllm.execution.region_resources import RegionResources
@@ -21,8 +42,13 @@ class RegionActions:
         self._cells = dict(cells)
         self._payload_sizes = {r.name: len(r.payload) for r in program.resources if isinstance(r, Resource)}
 
-    def execute(self, action: ControlAction, inputs: tuple[Data, ...],
-                pages: RegionResources | None, sizes: Mapping[str, int] = {}) -> tuple[Data, ...]:
+    def execute(
+        self,
+        action: ControlAction,
+        inputs: tuple[Data, ...],
+        pages: RegionResources | None,
+        sizes: Mapping[str, int] = {},
+    ) -> tuple[Data, ...]:
         if pages is not None:
             pages.before_statement()
         if isinstance(action, ControlPrimitive):
@@ -35,7 +61,7 @@ class RegionActions:
         if isinstance(action, ControlWhile):
             carry = inputs
             for _ in range(action.limit):
-                predicate, = self._block(action.condition, carry, pages, sizes)
+                (predicate,) = self._block(action.condition, carry, pages, sizes)
                 if type(predicate) is not bool:
                     raise ValueError("region loop predicate must be boolean")
                 if not predicate:
@@ -60,8 +86,13 @@ class RegionActions:
                 column.append(value)
         return tuple(Bank(tuple(column)) for column in columns)
 
-    def _block(self, block: ControlBlock, arguments: tuple[Data, ...],
-               pages: RegionResources | None, sizes: Mapping[str, int] = {}) -> tuple[Data, ...]:
+    def _block(
+        self,
+        block: ControlBlock,
+        arguments: tuple[Data, ...],
+        pages: RegionResources | None,
+        sizes: Mapping[str, int] = {},
+    ) -> tuple[Data, ...]:
         if pages is not None:
             pages.before_statement()
         values: dict[int, Data] = {}
@@ -76,8 +107,9 @@ class RegionActions:
         finally:
             values.clear()
 
-    def _step(self, step: ControlStep, values: dict[int, Data], pages: RegionResources | None,
-              sizes: Mapping[str, int]) -> None:
+    def _step(
+        self, step: ControlStep, values: dict[int, Data], pages: RegionResources | None, sizes: Mapping[str, int]
+    ) -> None:
         # Match the affine cursor's per-invocation scope: released slots must
         # not remain alive in this loop's previous result or value locals.
         inputs = tuple(values[i] for i in step.inputs)
@@ -88,8 +120,9 @@ class RegionActions:
         for slot_id in step.releases:
             del values[slot_id]
 
-    def _primitive(self, op: Op, ins: tuple[Data, ...],
-                   pages: RegionResources | None, sizes: Mapping[str, int] = {}) -> tuple[Data, ...]:
+    def _primitive(
+        self, op: Op, ins: tuple[Data, ...], pages: RegionResources | None, sizes: Mapping[str, int] = {}
+    ) -> tuple[Data, ...]:
         if isinstance(op, Constant):
             return (op.value,)
         if isinstance(op, Parameter):
@@ -145,5 +178,5 @@ class RegionActions:
                 raise ValueError("logical bank index is out of bounds")
             if isinstance(op, Select):
                 return (bank.elements[index],)
-            return (Bank((*bank.elements[:index], ins[2], *bank.elements[index + 1:])),)
+            return (Bank((*bank.elements[:index], ins[2], *bank.elements[index + 1 :])),)
         raise RuntimeError("nested region cannot execute as a primitive instruction")

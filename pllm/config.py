@@ -35,8 +35,13 @@ class ExecutionOptions:
             raise ValueError("schedule_policy must be auto or serial")
         if self.tuning not in ("heuristic", "measured"):
             raise ValueError("tuning must be heuristic or measured")
-        if (self.training_rows < 1 or self.capture_memory_bytes < 1 or self.state_memory_bytes < 0
-            or self.memory_budget_bytes is not None and self.memory_budget_bytes < 0):
+        if (
+            self.training_rows < 1
+            or self.capture_memory_bytes < 1
+            or self.state_memory_bytes < 0
+            or self.memory_budget_bytes is not None
+            and self.memory_budget_bytes < 0
+        ):
             raise ValueError("training rows/capture capacity must be positive and memory limits nonnegative")
 
 
@@ -57,7 +62,12 @@ class ModelConfig:
     execution: ExecutionOptions = ExecutionOptions()
 
     def __post_init__(self) -> None:
-        if (not self.model or self.max_model_len < 2 or self.max_num_seqs < 1
+        if (
+            not self.model
+            or self.max_model_len < 2
+            or self.max_num_seqs < 1
             or self.max_num_batched_tokens < self.max_num_seqs
-            or not 0 < self.gpu_memory_utilization < 1 or self.seed < 0):
+            or not 0 < self.gpu_memory_utilization < 1
+            or self.seed < 0
+        ):
             raise ValueError("invalid model configuration")

@@ -12,7 +12,7 @@ from pllm.execution.region_compilation import analyze_region_program, lower_regi
 from pllm.execution.region_execution import RegionExecution
 from pllm.execution.region_storage import analyze_region_capacity, validate_region_capacity
 from pllm.execution.tensor_scan import TensorScan
-from test.boundary.test_region_tensor import tensor_grid, inputs_for
+from test.boundary.test_region_tensor import inputs_for, tensor_grid
 from test.boundary.test_tensor_access import StorageObserver
 
 
@@ -33,7 +33,7 @@ def test_million_step_carry_bound_does_not_accumulate_iteration_allocations():
     cell = make_cell()
     scan = TensorScan(cell, SizeParameter("steps", 0, 1_000_000), carry=1, invariants=0)
     bound = capacity(scan, cell)
-    facts, = bound.devices
+    (facts,) = bound.devices
     assert facts.entry_copy_bytes_upper_bound == 16
     assert facts.peak_tensor_bytes_upper_bound == 48  # Sum of per-root maxima, conservative.
     assert max(root.live_instances_upper_bound for root in bound.roots) == 2
@@ -54,7 +54,7 @@ def test_view_carry_needs_one_private_copy_even_for_a_million_steps():
     cell = make_cell(view)
     scan = TensorScan(cell, SizeParameter("steps", 0, 1_000_000), carry=1, invariants=0)
     bound = capacity(scan, cell)
-    facts, = bound.devices
+    (facts,) = bound.devices
     assert len(bound.roots) == 1
     assert facts.peak_tensor_bytes_upper_bound == 16
     assert facts.logical_read_bytes_upper_bound == facts.logical_write_bytes_upper_bound == 16
@@ -86,15 +86,21 @@ def test_equal_time_independent_instances_are_not_collapsed_to_one_allocation():
     assert bound.devices[0].peak_tensor_bytes_upper_bound == 9 * 16
 
 
-@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA unavailable"))])
+@pytest.mark.parametrize(
+    "device",
+    ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable"))],
+)
 @pytest.mark.parametrize("chunks,layers", [(0, 3), (3, 0), (1, 1), (4, 3), (5, 6)])
 def test_schedule_bounds_cover_real_grid_storage(chunks, layers, device):
     def step(h, w):
         return h + w, w + 1
 
-    cell = ExportedCell.capture(step, ("h", "w"), ("nh", "nw"),
-        (torch.ones(4, dtype=torch.float64, device=device), torch.ones(4, dtype=torch.float64, device=device)))
+    cell = ExportedCell.capture(
+        step,
+        ("h", "w"),
+        ("nh", "nw"),
+        (torch.ones(4, dtype=torch.float64, device=device), torch.ones(4, dtype=torch.float64, device=device)),
+    )
     program = tensor_grid(chunks, layers, cell)
     source = analyze_region_program(program)
     supplied = inputs_for(chunks, layers, device)
@@ -102,15 +108,21 @@ def test_schedule_bounds_cover_real_grid_storage(chunks, layers, device):
     external_bytes = sum(t.untyped_storage().nbytes() for t in flat)
     schedules = [candidate.schedule_map for candidate in source.candidates]
     if chunks and layers:
-        schedules.extend((
-            f"{{ S0[c,l] -> [c+l,c] : 0 <= c < {chunks} and 0 <= l < {layers} }}",
-            f"{{ S0[c,l] -> [floor(c/2),floor(l/3),c,l] : 0 <= c < {chunks} and 0 <= l < {layers} }}",
-        ))
+        schedules.extend(
+            (
+                f"{{ S0[c,l] -> [c+l,c] : 0 <= c < {chunks} and 0 <= l < {layers} }}",
+                f"{{ S0[c,l] -> [floor(c/2),floor(l/3),c,l] : 0 <= c < {chunks} and 0 <= l < {layers} }}",
+            )
+        )
     for schedule in schedules:
         bound = analyze_region_capacity(program, schedule, {cell.digest: cell})
-        facts, = bound.devices
-        execution = RegionExecution(program, lower_region_schedule(program, schedule),
-            lower_region_bindings(program, schedule), {cell.digest: cell})
+        (facts,) = bound.devices
+        execution = RegionExecution(
+            program,
+            lower_region_schedule(program, schedule),
+            lower_region_bindings(program, schedule),
+            {cell.digest: cell},
+        )
         with StorageObserver(flat) as observed:
             result = execution.run(supplied)
         assert observed.peak - external_bytes <= facts.peak_tensor_bytes_upper_bound
@@ -139,7 +151,7 @@ def test_cell_internal_scratch_is_combined_with_outer_live_storage():
     cell = make_cell(step)
     scan = TensorScan(cell, 3, carry=1, invariants=0)
     bound = capacity(scan, cell)
-    facts, = bound.devices
+    (facts,) = bound.devices
     assert facts.call_scratch_bytes_upper_bound == 16
     assert facts.peak_tensor_bytes_upper_bound == facts.live_tensor_bytes_upper_bound + 16
 

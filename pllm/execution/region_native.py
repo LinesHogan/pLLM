@@ -13,12 +13,23 @@ from typing import TypeAlias
 
 import torch
 
-from pllm.contracts.region_program import AccessMode, Function, ScalarType, TensorType
 from pllm.contracts.region_imports import (
-    BorrowedTensorImport, CompiledTensorImport, ExportedTensorImport, FunctionalKernelImport, NativeKernelImport,
-    RegionTensorImport, region_import_name,
+    BorrowedTensorImport,
+    CompiledTensorImport,
+    ExportedTensorImport,
+    FunctionalKernelImport,
+    NativeKernelImport,
+    RegionTensorImport,
+    region_import_name,
 )
-from pllm.execution.codec import boundary_digest, refresh_tensor_metadata, tensor_graph_outputs, tensor_graph_result_nodes, tensor_node_metadata
+from pllm.contracts.region_program import AccessMode, Function, ScalarType, TensorType
+from pllm.execution.codec import (
+    boundary_digest,
+    refresh_tensor_metadata,
+    tensor_graph_outputs,
+    tensor_graph_result_nodes,
+    tensor_node_metadata,
+)
 from pllm.execution.exported_cell import CellFunction, ExportedCell
 from pllm.execution.module_graph import functionalized_kernel_operators, tensor_fragment_allocations
 from pllm.execution.region_resources import RegionResources
@@ -28,8 +39,13 @@ from pllm.execution.region_values import Data, check_data, copy_data
 class PrimitiveResources:
     """A call-scoped view of exactly its declared resources; no storage ownership."""
 
-    def __init__(self, declaration: Function, pages: RegionResources | None, inputs: tuple[Data, ...],
-                 implementation: NativeKernelImport | None = None) -> None:
+    def __init__(
+        self,
+        declaration: Function,
+        pages: RegionResources | None,
+        inputs: tuple[Data, ...],
+        implementation: NativeKernelImport | None = None,
+    ) -> None:
         if (declaration.resources or declaration.accesses) and pages is None:
             raise ValueError("effectful native import requires original resource bindings")
         self._declaration = declaration
@@ -55,9 +71,12 @@ class PrimitiveResources:
     def _permit(self, resource: str, indices: tuple[int, ...], mode: AccessMode) -> RegionResources:
         pages = self._binding(resource)
         accesses = tuple(access for access in self._accesses if access.resource == resource)
-        if accesses and not any(access.mode is mode and len(indices) == len(access.ranges)
+        if accesses and not any(
+            access.mode is mode
+            and len(indices) == len(access.ranges)
             and all(lower <= index < upper for index, (lower, upper) in zip(indices, access.ranges, strict=True))
-            for access in accesses):
+            for access in accesses
+        ):
             raise ValueError("native access exceeds its declared read/write region")
         return pages
 
@@ -90,7 +109,9 @@ class NativePrimitive:
         if self.implementation is not None and self.implementation.declaration != self.declaration:
             raise ValueError("native kernel implementation differs from its source declaration")
 
-    def invoke(self, inputs: tuple[Data, ...], pages: RegionResources | None, sizes: Mapping[str, int] = {}) -> tuple[Data, ...]:
+    def invoke(
+        self, inputs: tuple[Data, ...], pages: RegionResources | None, sizes: Mapping[str, int] = {}
+    ) -> tuple[Data, ...]:
         for value, type_ in zip(inputs, self.declaration.inputs, strict=True):
             check_data(value, type_, sizes)
         # Native tensor kernels may update their arguments. Private mathematical
@@ -131,7 +152,10 @@ class FunctionalKernelPrimitive:
         inputs = tuple(node for node in self.graph.graph.nodes if node.op == "placeholder")
         outputs = tensor_graph_result_nodes(self.graph)
         backings: set[torch.UntypedStorage] = set()
-        for nodes, types, result in ((inputs, self.declaration.inputs, False), (outputs, self.declaration.outputs, True)):
+        for nodes, types, result in (
+            (inputs, self.declaration.inputs, False),
+            (outputs, self.declaration.outputs, True),
+        ):
             for node, type_ in zip(nodes, types, strict=True):
                 tensor = tensor_node_metadata(node)
                 if tensor is None or not isinstance(type_, TensorType) or not tensor.is_contiguous():
@@ -140,20 +164,26 @@ class FunctionalKernelPrimitive:
                 if str(tensor.device) != self.implementation.device:
                     raise ValueError("functional kernel ports must use their execution device")
                 storage = tensor.untyped_storage()
-                if result and (storage in backings or tensor.storage_offset() != 0
-                        or storage.nbytes() != tensor.numel() * tensor.element_size()):
+                if result and (
+                    storage in backings
+                    or tensor.storage_offset() != 0
+                    or storage.nbytes() != tensor.numel() * tensor.element_size()
+                ):
                     raise ValueError("functional kernel results must own distinct complete backings")
                 backings.add(storage)
         required = sum(item.bytes for item in tensor_fragment_allocations(self.graph))
-        if (any(item.device != self.implementation.device for item in self.implementation.allocations)
-                or required > sum(item.bytes for item in self.implementation.allocations)):
+        if any(item.device != self.implementation.device for item in self.implementation.allocations) or required > sum(
+            item.bytes for item in self.implementation.allocations
+        ):
             raise ValueError("functional kernel allocations do not cover its original graph")
 
     @property
     def declaration(self) -> Function:
         return self.implementation.declaration
 
-    def invoke(self, inputs: tuple[Data, ...], pages: RegionResources | None, sizes: Mapping[str, int] = {}) -> tuple[Data, ...]:
+    def invoke(
+        self, inputs: tuple[Data, ...], pages: RegionResources | None, sizes: Mapping[str, int] = {}
+    ) -> tuple[Data, ...]:
         tensors: list[torch.Tensor] = []
         for value, type_ in zip(inputs, self.declaration.inputs, strict=True):
             check_data(value, type_, sizes)
@@ -187,7 +217,9 @@ class CompiledPrimitive:
     def transformations(self) -> tuple[str, ...]:
         return (*self.source.transformations, "tensor kernel compilation")
 
-    def invoke(self, inputs: tuple[Data, ...], pages: RegionResources | None, sizes: Mapping[str, int] = {}) -> tuple[Data, ...]:
+    def invoke(
+        self, inputs: tuple[Data, ...], pages: RegionResources | None, sizes: Mapping[str, int] = {}
+    ) -> tuple[Data, ...]:
         tensors: list[torch.Tensor] = []
         for value, guard in zip(inputs, self.source.input_signatures, strict=True):
             if not isinstance(value, torch.Tensor):
@@ -219,13 +251,17 @@ class BorrowedTensorPrimitive:
     def declaration(self) -> Function:
         return self.implementation.declaration
 
-    def invoke(self, inputs: tuple[Data, ...], pages: RegionResources | None, sizes: Mapping[str, int] = {}) -> tuple[Data, ...]:
+    def invoke(
+        self, inputs: tuple[Data, ...], pages: RegionResources | None, sizes: Mapping[str, int] = {}
+    ) -> tuple[Data, ...]:
         if pages is None:
             raise ValueError("tensor borrowing requires its original resource owner")
         return (pages.borrow_tensor(self.implementation, inputs),)
 
 
-RegionFunction: TypeAlias = ExportedCell | NativePrimitive | FunctionalKernelPrimitive | CompiledPrimitive | BorrowedTensorPrimitive
+RegionFunction: TypeAlias = (
+    ExportedCell | NativePrimitive | FunctionalKernelPrimitive | CompiledPrimitive | BorrowedTensorPrimitive
+)
 TensorSource: TypeAlias = ExportedCell | BorrowedTensorPrimitive | NativePrimitive | FunctionalKernelPrimitive
 
 
@@ -258,8 +294,9 @@ def original_region_sources(cells: Mapping[str, RegionFunction]) -> dict[str, Te
     return result
 
 
-def source_region_functions(declarations: tuple[Function, ...], builtins: Mapping[str, RegionFunction],
-                            imports: tuple[RegionTensorImport, ...]) -> dict[str, RegionFunction]:
+def source_region_functions(
+    declarations: tuple[Function, ...], builtins: Mapping[str, RegionFunction], imports: tuple[RegionTensorImport, ...]
+) -> dict[str, RegionFunction]:
     """Bind resource adapters; leave remote tensor graphs explicitly unbound.
 
     Builtins are the caller's own computation. Export descriptors carry no
@@ -290,8 +327,9 @@ def source_region_functions(declarations: tuple[Function, ...], builtins: Mappin
                 raise ValueError("pure backend functions require an original tensor graph binding")
             if imported is not None and imported.declaration != declaration:
                 raise ValueError("backend source import differs from its declaration")
-            result[declaration.name] = external_primitive(declaration,
-                imported if isinstance(imported, NativeKernelImport) else None)
+            result[declaration.name] = external_primitive(
+                declaration, imported if isinstance(imported, NativeKernelImport) else None
+            )
     return result
 
 
@@ -299,8 +337,10 @@ def external_primitive(declaration: Function, implementation: NativeKernelImport
     """Cold import descriptor; the endpoint is bound by the original invocation."""
     if not declaration.resources:
         raise ValueError("external import must declare its owned resource effects")
+
     def invoke(inputs: tuple[Data, ...], resources: PrimitiveResources) -> tuple[Data, ...]:
         return resources.external(inputs)
+
     return NativePrimitive(declaration, invoke, implementation)
 
 
@@ -317,8 +357,9 @@ def tensor_item(type_: TensorType) -> NativePrimitive:
     else:
         raise ValueError("tensor item import requires a supported real scalar dtype")
     declaration = Function("native.tensor_item@1:" + boundary_digest(type_), (type_,), (result_type,))
+
     def read(inputs: tuple[Data, ...], resources: PrimitiveResources) -> tuple[Data, ...]:
-        tensor, = inputs
+        (tensor,) = inputs
         if not isinstance(tensor, torch.Tensor):
             raise ValueError("tensor item import received a non-tensor")
         if result_type is ScalarType.BOOL:
@@ -326,6 +367,7 @@ def tensor_item(type_: TensorType) -> NativePrimitive:
         if result_type is ScalarType.INT:
             return (int(tensor.item()),)
         return (float(tensor.item()),)
+
     # The only device allocation is the native wrapper's private scalar copy.
     # Tensor.item completes that copy/read on the issuing stream before return.
     implementation = NativeKernelImport(declaration, "native.scalar_read.current_stream@1", type_.device, ())

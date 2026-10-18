@@ -11,18 +11,18 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import pllm
 import torch
 from vllm import SamplingParams
 
+import pllm
+from pllm.authoring import BackendCompileFacts, BackendRequirements
+from pllm.backends.vllm.mrv1 import Mrv1Runner
+from pllm.backends.vllm.runtime import VllmLlm, WorkloadModelRunner, probe_backend
+from pllm.config import ExecutionOptions, ModelConfig, VllmDType
 from pllm.workloads.esamp_request import (
+    ESampRequestConfig,
     ESampRequestWorkload,
 )
-from pllm.workloads.esamp_request import ESampRequestConfig
-from pllm.config import ExecutionOptions, ModelConfig, VllmDType
-from pllm.backends.vllm.runtime import VllmLlm, WorkloadModelRunner, probe_backend
-from pllm.backends.vllm.mrv1 import Mrv1Runner
-from pllm.authoring import BackendCompileFacts, BackendRequirements
 
 
 def checked_probe(requirements: BackendRequirements, runner: WorkloadModelRunner | Mrv1Runner) -> BackendCompileFacts:
@@ -30,8 +30,14 @@ def checked_probe(requirements: BackendRequirements, runner: WorkloadModelRunner
     timeline = facts.timeline
     for index in range(len(timeline.anchors)):
         try:
-            probe_backend(requirements, runner, replace(timeline,
-                reserved_bytes=tuple(size - int(i == index) for i, size in enumerate(timeline.reserved_bytes))))
+            probe_backend(
+                requirements,
+                runner,
+                replace(
+                    timeline,
+                    reserved_bytes=tuple(size - int(i == index) for i, size in enumerate(timeline.reserved_bytes)),
+                ),
+            )
         except ValueError as error:
             assert "input/sampler buffers" in str(error)
         else:
@@ -42,15 +48,22 @@ def checked_probe(requirements: BackendRequirements, runner: WorkloadModelRunner
 
 def main() -> int:
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-    plain = pllm.make_llm(ModelConfig(
-        model="Qwen/Qwen2.5-0.5B-Instruct", dtype=VllmDType.BFLOAT16,
-        gpu_memory_utilization=0.25, max_model_len=64,
-        enable_prefix_caching=False, seed=7,
-        max_num_seqs=1, max_num_batched_tokens=64,
-    ))
+    plain = pllm.make_llm(
+        ModelConfig(
+            model="Qwen/Qwen2.5-0.5B-Instruct",
+            dtype=VllmDType.BFLOAT16,
+            gpu_memory_utilization=0.25,
+            max_model_len=64,
+            enable_prefix_caching=False,
+            seed=7,
+            max_num_seqs=1,
+            max_num_batched_tokens=64,
+        )
+    )
     try:
         outputs = plain.generate(
-            ["The sky is"], SamplingParams(max_tokens=3, temperature=0.0),
+            ["The sky is"],
+            SamplingParams(max_tokens=3, temperature=0.0),
             use_tqdm=False,
         )
         if not outputs[0].outputs[0].text:
@@ -93,14 +106,25 @@ def main() -> int:
         probe = handle.attachment.inputs.probe
         owned_hidden_bytes = len(probe.hidden_resources) * probe.max_packed_rows * probe.hidden_size * 4
         for anchor, size in zip(plan.timeline.anchors, plan.timeline.reserved_bytes, strict=True):
-            assert size > owned_hidden_bytes if anchor.symbol in ("sampler.pre_draw", "sampler.complete") else size == owned_hidden_bytes
+            assert (
+                size > owned_hidden_bytes
+                if anchor.symbol in ("sampler.pre_draw", "sampler.complete")
+                else size == owned_hidden_bytes
+            )
         assert plan.schedule_decision.peak_memory_bytes >= plan.state_physical.reserved_bytes + owned_hidden_bytes
-        with patch("pllm.workloads.esamp_request.low_rank_gated_loss_and_gradients",
-                side_effect=AssertionError("eager loss on captured task")), \
-             patch("pllm.workloads.esamp_request.apply_adamw",
-                side_effect=AssertionError("eager optimizer on captured task")):
-            outputs = handle.generate(["The sky is"], SamplingParams(max_tokens=3,
-                temperature=0.0, n=1, ignore_eos=True))
+        with (
+            patch(
+                "pllm.workloads.esamp_request.low_rank_gated_loss_and_gradients",
+                side_effect=AssertionError("eager loss on captured task"),
+            ),
+            patch(
+                "pllm.workloads.esamp_request.apply_adamw",
+                side_effect=AssertionError("eager optimizer on captured task"),
+            ),
+        ):
+            outputs = handle.generate(
+                ["The sky is"], SamplingParams(max_tokens=3, temperature=0.0, n=1, ignore_eos=True)
+            )
         execution = handle.deployment.execution
         assert sum("cuda_graph" in task.implementation_id for task in execution.plan.tasks) == 2
         diagnostics = execution.diagnostics()
@@ -122,9 +146,7 @@ def main() -> int:
                 "update_count": diagnostics.update_count,
                 "active_lineages": diagnostics.active_lineages,
                 "fallback_count": execution.plan.fallback_count,
-                "attachment": (
-                    handle.deployment.attachment.physical.bundle_signature[:12]
-                ),
+                "attachment": (handle.deployment.attachment.physical.bundle_signature[:12]),
             }
         )
     finally:

@@ -27,6 +27,7 @@ class GTTAConfig:
         if self.max_queue_size < 0 or not 0.0 <= self.score_momentum <= 1.0:
             raise ValueError("GTTA configuration values are invalid")
 
+
 def canonical_state_signature(observation: str) -> str:
     return " ".join(observation.split()).casefold()
 

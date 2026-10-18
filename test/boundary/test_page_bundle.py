@@ -1,59 +1,103 @@
 """PTTS evidence 9/10/12: state values, atomic failure and issued generations."""
 
-
-from pllm.contracts.semantic_graph import AnchorId
 from dataclasses import replace
 
 import pytest
 import torch
-from pllm.authoring import ParameterTargetShape, BackendCompileFacts
-from pllm.contracts.backend_attachment import BackendPlacementProbe, AttachmentTopology, AttachmentGraphMode
-from pllm.contracts.state_representation import StateDeviceKind
 
+from pllm.authoring import BackendCompileFacts, ParameterTargetShape
+from pllm.contracts.backend_attachment import AttachmentGraphMode, AttachmentTopology, BackendPlacementProbe
+from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
+from pllm.contracts.semantic_graph import SemanticState, StateResource, StateScope
+from pllm.contracts.state_representation import StateDeviceKind, StateLayoutRequirement, StateRepresentationRequest
+from pllm.contracts.tensor_layout import LayoutFieldId, StateTensorLayout, TensorDType, TensorLayoutRequest
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
-from pllm.execution.scheduler import compile_state_schedule
-from pllm.execution.scheduler import intern_tensor_layouts
+from pllm.execution.scheduler import compile_state_schedule, intern_tensor_layouts
 from pllm.workloads.inplace_ttt import (
     InPlaceTTTConfig,
     InPlaceTTTWorkload,
 )
-from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
-from pllm.contracts.semantic_graph import StateResource, SemanticState, StateScope
-from pllm.contracts.state_representation import StateLayoutRequirement, StateRepresentationRequest
-from pllm.contracts.tensor_layout import LayoutFieldId, StateTensorLayout, TensorDType, TensorLayoutRequest
 
 
 def _arena(*, heterogeneous: bool = False) -> PageBundleArena:
     target = ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT)
-    facts = BackendCompileFacts(BackendPlacementProbe("test.page_bundle@1", "a" * 64, "b" * 64, "c" * 64,
-        AttachmentTopology.IN_PROCESS, AttachmentGraphMode.EAGER, StateDeviceKind.CPU, 0, 1, 1,
-        TensorDType.FLOAT32, 3, 8, (), ()), RuntimeFacts(torch.device("cpu")).timeline(("transition/full_root@1",)),
-        (PageBundleProviderFacts("test.page_bundle@1", 6),), 2, 4096, 0, (ParameterTargetShape(target, 3, 2),))
+    facts = BackendCompileFacts(
+        BackendPlacementProbe(
+            "test.page_bundle@1",
+            "a" * 64,
+            "b" * 64,
+            "c" * 64,
+            AttachmentTopology.IN_PROCESS,
+            AttachmentGraphMode.EAGER,
+            StateDeviceKind.CPU,
+            0,
+            1,
+            1,
+            TensorDType.FLOAT32,
+            3,
+            8,
+            (),
+            (),
+        ),
+        RuntimeFacts(torch.device("cpu")).timeline(("transition/full_root@1",)),
+        (PageBundleProviderFacts("test.page_bundle@1", 6),),
+        2,
+        4096,
+        0,
+        (ParameterTargetShape(target, 3, 2),),
+    )
     plan = InPlaceTTTWorkload(InPlaceTTTConfig((target,), chunk_size=2)).plan_backend(facts).inputs.plan
     if heterogeneous:
-        original, = plan.tensor_layout_request.layouts
-        layout = replace(original.layout, namespace="test.global_factors@1", fields=(
-            replace(original.layout.fields[0], shape=(2, 5)),
-        ))
+        (original,) = plan.tensor_layout_request.layouts
+        layout = replace(
+            original.layout,
+            namespace="test.global_factors@1",
+            fields=(replace(original.layout.fields[0], shape=(2, 5)),),
+        )
         layouts = TensorLayoutRequest((original, StateTensorLayout("global_factors", layout)))
         bindings = intern_tensor_layouts(layouts)
-        graph = replace(plan.semantic_graph, states=(*plan.semantic_graph.states,
-            SemanticState(StateResource("global_factors"), StateScope.INSTANCE, ())))
+        graph = replace(
+            plan.semantic_graph,
+            states=(
+                *plan.semantic_graph.states,
+                SemanticState(StateResource("global_factors"), StateScope.INSTANCE, ()),
+            ),
+        )
         facts = PageBundleProviderFacts("test.page_bundle@1", 6)
-        candidates = tuple(facts.materialize_plan(resource=entry.resource, layout=entry.layout,
-            binding=binding, max_admitted_lineages=2)
-            for entry, binding in zip(layouts.layouts, bindings.bindings, strict=True))
-        request = StateRepresentationRequest(4096, tuple(StateLayoutRequirement(
-            binding.resource, binding.layout_id, binding.layout_namespace, binding.layout_digest, 2,
-        ) for binding in bindings.bindings), candidates)
+        candidates = tuple(
+            facts.materialize_plan(
+                resource=entry.resource, layout=entry.layout, binding=binding, max_admitted_lineages=2
+            )
+            for entry, binding in zip(layouts.layouts, bindings.bindings, strict=True)
+        )
+        request = StateRepresentationRequest(
+            4096,
+            tuple(
+                StateLayoutRequirement(
+                    binding.resource,
+                    binding.layout_id,
+                    binding.layout_namespace,
+                    binding.layout_digest,
+                    2,
+                )
+                for binding in bindings.bindings
+            ),
+            candidates,
+        )
         decision, state_physical, schedule, physical = compile_state_schedule(graph, plan.timeline, request)
-        plan = replace(plan, semantic_graph=graph, schedule_decision=schedule,
+        plan = replace(
+            plan,
+            semantic_graph=graph,
+            schedule_decision=schedule,
             schedule_physical=physical,
-            state_request=request, state_decision=decision,
+            state_request=request,
+            state_decision=decision,
             state_physical=state_physical,
-            tensor_layout_request=layouts, tensor_layout_decision=bindings)
+            tensor_layout_request=layouts,
+            tensor_layout_decision=bindings,
+        )
     return PageBundleArena(plan)
 
 
@@ -86,8 +130,12 @@ def test_cpu_request_ptts_admit_cow_publish_pin_retire() -> None:
     assert usage.pinned_versions == 2 and usage.pending_receipts == 1 and usage.private_versions == 0
     free = arena.free_pages
     assert arena.usage().pending_receipts == 0 and usage.pending_receipts == 1
-    for copied in ((LayoutFieldId(-1),), (LayoutFieldId(4),), (LayoutFieldId(0), LayoutFieldId(0)),
-                   (LayoutFieldId(1), LayoutFieldId(0))):
+    for copied in (
+        (LayoutFieldId(-1),),
+        (LayoutFieldId(4),),
+        (LayoutFieldId(0), LayoutFieldId(0)),
+        (LayoutFieldId(1), LayoutFieldId(0)),
+    ):
         with pytest.raises(ValueError, match="copied fields"):
             arena.prepare_transition((a,), copy_fields=copied)
     with pytest.raises(ValueError, match="copied fields"):
@@ -106,7 +154,7 @@ def test_cpu_request_ptts_admit_cow_publish_pin_retire() -> None:
     with pytest.raises(RuntimeError, match="writable"):
         arena.write_field(update, 0, LayoutFieldId(1))
     receipt = arena.publish(update)
-    new_a, = receipt.after_refs
+    (new_a,) = receipt.after_refs
     assert new_a.version_id == 1
     assert arena.latest(a.lineage_id) == new_a
     assert arena.latest(b.lineage_id) == b
@@ -119,7 +167,10 @@ def test_cpu_request_ptts_admit_cow_publish_pin_retire() -> None:
     assert usage.live_field_pages == 2 * field_count and usage.retiring_field_pages == 1
     assert usage.retiring_versions == 1 and usage.pinned_versions == 3 and usage.pending_receipts == 1
     assert arena.borrow_field(new_pin, new_a, LayoutFieldId(0)).data_ptr() != borrowed.data_ptr()
-    assert arena.borrow_field(new_pin, new_a, LayoutFieldId(1)).data_ptr() == arena.borrow_field(pin, a, LayoutFieldId(1)).data_ptr()
+    assert (
+        arena.borrow_field(new_pin, new_a, LayoutFieldId(1)).data_ptr()
+        == arena.borrow_field(pin, a, LayoutFieldId(1)).data_ptr()
+    )
     with pytest.raises(RuntimeError, match="held"):
         arena.borrow_field(pin, new_a, LayoutFieldId(0))
     torch.testing.assert_close(borrowed, old_a[0])
@@ -161,8 +212,9 @@ def test_cpu_request_ptts_admit_cow_publish_pin_retire() -> None:
     for value in range(5):
         held = arena.pin_exact((current,))
         retained.append(held)
-        torch.testing.assert_close(arena.borrow_field(held, current, LayoutFieldId(0)),
-            torch.full_like(old_a[0], value))
+        torch.testing.assert_close(
+            arena.borrow_field(held, current, LayoutFieldId(0)), torch.full_like(old_a[0], value)
+        )
         if value < 4:
             with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
                 update = arena.prepare_transition((current,), fields=((LayoutFieldId(0),),), copy_fields=())
@@ -170,13 +222,14 @@ def test_cpu_request_ptts_admit_cow_publish_pin_retire() -> None:
             arena.write_field(update, 0, LayoutFieldId(0)).fill_(value + 1)
             published = arena.publish(update)
             arena.settle(published)
-            current, = published.after_refs
+            (current,) = published.after_refs
     assert current.version_id == 4 and arena.free_pages == 0
     with pytest.raises(RuntimeError, match="live owners"):
         arena.prepare_transition((current,), fields=((LayoutFieldId(0),),))
     for value, held in enumerate(retained):
-        torch.testing.assert_close(arena.borrow_field(held, held.refs[0], LayoutFieldId(0)),
-            torch.full_like(old_a[0], value))
+        torch.testing.assert_close(
+            arena.borrow_field(held, held.refs[0], LayoutFieldId(0)), torch.full_like(old_a[0], value)
+        )
     arena.wait_release(arena.release_pin(retained.pop(0)))
     update = arena.prepare_transition((current,), fields=((LayoutFieldId(0),),))
     arena.abort(update)
@@ -196,10 +249,12 @@ def test_multi_lineage_admission_and_publication_roll_back_atomically(monkeypatc
     assert arena.free_pages == capacity and arena.active_lineages == 0
     # Initialization fails after the first resource has already been written.
     original_zero = torch.Tensor.zero_
+
     def fail_second_resource(tensor: torch.Tensor) -> torch.Tensor:
         if tensor.shape == (2, 5):
             raise RuntimeError("injected initialization failure")
         return original_zero(tensor)
+
     with monkeypatch.context() as patch:
         patch.setattr(torch.Tensor, "zero_", fail_second_resource)
         with pytest.raises(RuntimeError, match="initialization"):
@@ -246,8 +301,14 @@ def test_multi_lineage_admission_and_publication_roll_back_atomically(monkeypatc
     with pytest.raises(ValueError, match="catalog"):
         PageBundleArena(arena.plan, local_candidates=arena.plan.state_request.candidates[:-1])
     with pytest.raises(ValueError):
-        PageBundleArena(replace(arena.plan, state_physical=replace(
-            arena.plan.state_physical, reserved_bytes=arena.plan.state_physical.reserved_bytes + 1)))
+        PageBundleArena(
+            replace(
+                arena.plan,
+                state_physical=replace(
+                    arena.plan.state_physical, reserved_bytes=arena.plan.state_physical.reserved_bytes + 1
+                ),
+            )
+        )
 
 
 def test_generation_receipt_blocks_aba_and_double_settlement() -> None:
@@ -256,7 +317,7 @@ def test_generation_receipt_blocks_aba_and_double_settlement() -> None:
     with pytest.raises(RuntimeError, match="issued"):
         arena.publish(replace(write))
     publication = arena.publish(write)
-    old_ref, = publication.after_refs
+    (old_ref,) = publication.after_refs
     pages = arena.root(old_ref).pages
     with pytest.raises(RuntimeError, match="issued"):
         arena.settle(replace(publication))
@@ -270,7 +331,7 @@ def test_generation_receipt_blocks_aba_and_double_settlement() -> None:
     arena.wait_release(release)
     arena.retire((old_ref,))
     replacement = arena.publish(arena.prepare_admission(("dense_fast_weights",)))
-    ref, = replacement.after_refs
+    (ref,) = replacement.after_refs
     assert ref.lineage_id != old_ref.lineage_id
     reused = arena.root(ref).pages
     assert tuple(page.slot_id for page in reused) == tuple(page.slot_id for page in pages)

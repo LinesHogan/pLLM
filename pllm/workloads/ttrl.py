@@ -2,22 +2,26 @@
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-
 from math import isfinite
-import re
 
 import torch
 from torch.nn import functional as F
 
 import pllm
 from pllm import authoring as a
-from pllm.contracts.semantic_graph import SchedulerTimeline, TaskResourceFact, TaskSymbol, ValueResourceFact
 from pllm.contracts.feedback import (
-    BarrierState, ControlReason, RewardOutcome, RetryAction, RetryControl, UpdateBarrier,
+    BarrierState,
+    ControlReason,
+    RetryAction,
+    RetryControl,
+    RewardOutcome,
+    UpdateBarrier,
 )
+from pllm.contracts.semantic_graph import SchedulerTimeline, TaskResourceFact, TaskSymbol, ValueResourceFact
 
 
 def boxed_label(text: str) -> str:
@@ -31,7 +35,7 @@ def boxed_label(text: str) -> str:
     for index in range(left, len(text)):
         depth += (text[index] == "{") - (text[index] == "}")
         if depth == 0:
-            answer = text[left + 1:index]
+            answer = text[left + 1 : index]
             nested = re.findall(r"\\boxed\s*\{([^{}]*)\}", answer)
             return re.sub(r"\s+", "", (nested[-1] if nested else answer).lower())
     return ""
@@ -46,9 +50,15 @@ class TTRLConfig:
     enabled: bool = True
 
     def __post_init__(self) -> None:
-        if (self.rank < 1 or not isfinite(self.learning_rate) or self.learning_rate <= 0
-            or not (self.votes_per_prompt == self.samples_per_prompt == 0
-                or 0 < self.samples_per_prompt <= self.votes_per_prompt)):
+        if (
+            self.rank < 1
+            or not isfinite(self.learning_rate)
+            or self.learning_rate <= 0
+            or not (
+                self.votes_per_prompt == self.samples_per_prompt == 0
+                or 0 < self.samples_per_prompt <= self.votes_per_prompt
+            )
+        ):
             raise ValueError("TTRL requires positive rank/rate and paired vote/sample counts")
 
 
@@ -92,26 +102,43 @@ class TTRLWorkload(pllm.CompletionWorkload[TTRLData, TTRLResult]):
         parameters = rank * (hidden + 1)
         state = self.parameters
         shape = state.fields.get("head")
-        if (state.dtype != torch.float32 or len(state.fields) != 1 or isinstance(shape, pllm.Buffer)
-            or (shape(a.Dimensions(hidden, 0)) if callable(shape) else shape) != (parameters,)):
+        if (
+            state.dtype != torch.float32
+            or len(state.fields) != 1
+            or isinstance(shape, pllm.Buffer)
+            or (shape(a.Dimensions(hidden, 0)) if callable(shape) else shape) != (parameters,)
+        ):
             raise ValueError("customized reward-head state requires its own resource_facts declaration")
         # Selected FP32 hidden/targets, two linear layers, MSE backward and foreach Adam.
         workspace = 4 * (8 * parameters + rows * (2 * hidden + 4 * rank + 8)) + 32 * rows + 64
-        return replace(timeline, reserved_bytes=(4 * rows * hidden,) * len(timeline.anchors),
-            task_resources=(TaskResourceFact(TaskSymbol("publish"), 0),
-                TaskResourceFact(TaskSymbol("train"), workspace, input_shapes=((rows, hidden),))),
-            value_resources=(ValueResourceFact(TaskSymbol("publish"), "control", 4),
-                ValueResourceFact(TaskSymbol("train"), "control", 4 * parameters + 4)))
+        return replace(
+            timeline,
+            reserved_bytes=(4 * rows * hidden,) * len(timeline.anchors),
+            task_resources=(
+                TaskResourceFact(TaskSymbol("publish"), 0),
+                TaskResourceFact(TaskSymbol("train"), workspace, input_shapes=((rows, hidden),)),
+            ),
+            value_resources=(
+                ValueResourceFact(TaskSymbol("publish"), "control", 4),
+                ValueResourceFact(TaskSymbol("train"), "control", 4 * parameters + 4),
+            ),
+        )
 
     @property
     def parameters(self) -> pllm.InstanceState:
         config = self.config
+
         def initialize(parameters: Mapping[str, torch.Tensor], generator: torch.Generator) -> None:
             head = parameters["head"]
             hidden = head.numel() // config.rank - 1
-            head[:config.rank * hidden].normal_(std=hidden ** -0.5, generator=generator)
-        return pllm.InstanceState({"head": lambda m: (config.rank * (m.hidden_size + 1),)},
-            namespace="canonical.reward_head@1", optimizer=pllm.AdamW(lr=config.learning_rate), initialize=initialize)
+            head[: config.rank * hidden].normal_(std=hidden**-0.5, generator=generator)
+
+        return pllm.InstanceState(
+            {"head": lambda m: (config.rank * (m.hidden_size + 1),)},
+            namespace="canonical.reward_head@1",
+            optimizer=pllm.AdamW(lr=config.learning_rate),
+            initialize=initialize,
+        )
 
     def trained_rows(self, data: TTRLData) -> int:
         return len(data.selected_rows)
@@ -123,8 +150,10 @@ class TTRLWorkload(pllm.CompletionWorkload[TTRLData, TTRLResult]):
         target = hidden.new_tensor([data.reward_outcomes[i].reward for i in data.selected_rows]).reshape(-1, 1)
         head = parameters["head"]
         split = self.config.rank * hidden.shape[1]
-        prediction = F.linear(F.linear(hidden, head[:split].view(self.config.rank, hidden.shape[1])),
-            head[split:].view(1, self.config.rank))
+        prediction = F.linear(
+            F.linear(hidden, head[:split].view(self.config.rank, hidden.shape[1])),
+            head[split:].view(1, self.config.rank),
+        )
         loss = F.mse_loss(prediction, target)
         data.loss = loss.detach()
         return loss
@@ -140,36 +169,69 @@ class TTRLWorkload(pllm.CompletionWorkload[TTRLData, TTRLResult]):
         barriers: list[UpdateBarrier] = []
         for prompt, indices in groups.items():
             group_id = entries[indices[0]].group_id
-            if (any(entries[i].group_id != group_id for i in indices)
-                or self.config.votes_per_prompt and len(indices) != self.config.votes_per_prompt):
+            if (
+                any(entries[i].group_id != group_id for i in indices)
+                or self.config.votes_per_prompt
+                and len(indices) != self.config.votes_per_prompt
+            ):
                 raise ValueError("TTRL requires one complete declared vote group per prompt")
             counts = Counter(labels[i] for i in indices if labels[i])
             majority[prompt] = max(counts, key=lambda label: counts[label]) if counts else ""
-            eligible = indices[:self.config.samples_per_prompt] if self.config.samples_per_prompt else indices
+            eligible = indices[: self.config.samples_per_prompt] if self.config.samples_per_prompt else indices
             trainable = [i for i in eligible if labels[i]] if self.config.enabled else []
             selected.extend(trainable)
-            barriers.append(UpdateBarrier(f"ttrl:{group_id}:{prompt}", group_id,
-                BarrierState.READY if trainable else BarrierState.BLOCKED,
-                tuple(entries[i].identity.request_id for i in indices), len(trainable),
-                ControlReason.REWARD_READY if trainable else ControlReason.NO_REWARD))
+            barriers.append(
+                UpdateBarrier(
+                    f"ttrl:{group_id}:{prompt}",
+                    group_id,
+                    BarrierState.READY if trainable else BarrierState.BLOCKED,
+                    tuple(entries[i].identity.request_id for i in indices),
+                    len(trainable),
+                    ControlReason.REWARD_READY if trainable else ControlReason.NO_REWARD,
+                )
+            )
         rewards: list[RewardOutcome] = []
         controls: list[RetryControl] = []
         for completion, label in zip(entries, labels, strict=True):
             correct = label == majority[completion.identity.prompt_idx] if label else None
-            rewards.append(RewardOutcome(completion, float(correct) if correct is not None else None,
-                correct, "", "ttrl_majority:boxed_normalized_exact", label,
-                "" if label else ControlReason.MISSING_ANSWER.value))
-            controls.append(RetryControl(completion, RetryAction.ACCEPT if correct else RetryAction.RETRY,
-                ControlReason.MAJORITY_ANSWER if correct else ControlReason.NON_MAJORITY_ANSWER if label
-                    else ControlReason.MISSING_ANSWER, correct is False))
+            rewards.append(
+                RewardOutcome(
+                    completion,
+                    float(correct) if correct is not None else None,
+                    correct,
+                    "",
+                    "ttrl_majority:boxed_normalized_exact",
+                    label,
+                    "" if label else ControlReason.MISSING_ANSWER.value,
+                )
+            )
+            controls.append(
+                RetryControl(
+                    completion,
+                    RetryAction.ACCEPT if correct else RetryAction.RETRY,
+                    ControlReason.MAJORITY_ANSWER
+                    if correct
+                    else ControlReason.NON_MAJORITY_ANSWER
+                    if label
+                    else ControlReason.MISSING_ANSWER,
+                    correct is False,
+                )
+            )
         return TTRLData(value, tuple(rewards), tuple(controls), tuple(barriers), tuple(selected))
 
     def output(self, data: TTRLData, result: pllm.InvocationOutput) -> TTRLResult:
         refs = result.publication.after_refs if result.publication is not None else result.selection.refs
-        return TTRLResult(data.reward_outcomes, data.retry_controls, data.update_barriers,
-            data.loss, refs[0], result.publication)
+        return TTRLResult(
+            data.reward_outcomes, data.retry_controls, data.update_barriers, data.loss, refs[0], result.publication
+        )
 
 
-_NATIVE = TTRLWorkload.native_methods({"prepare": TTRLWorkload.prepare, "loss": TTRLWorkload.loss,
-    "trained_rows": TTRLWorkload.trained_rows, "output": TTRLWorkload.output})
+_NATIVE = TTRLWorkload.native_methods(
+    {
+        "prepare": TTRLWorkload.prepare,
+        "loss": TTRLWorkload.loss,
+        "trained_rows": TTRLWorkload.trained_rows,
+        "output": TTRLWorkload.output,
+    }
+)
 _RESOURCES = TTRLWorkload.resource_facts

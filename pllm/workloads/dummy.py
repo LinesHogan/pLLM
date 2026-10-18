@@ -1,8 +1,10 @@
 """Bounded hidden export expressed as an ordinary replaceable tensor function."""
 
-from dataclasses import dataclass, replace
 from collections.abc import Callable
+from dataclasses import dataclass, replace
+
 import torch
+
 import pllm
 from pllm import authoring as a
 from pllm.contracts.semantic_graph import SchedulerTimeline, TaskResourceFact, TaskSymbol, ValueResourceFact
@@ -42,14 +44,21 @@ class DummyWorkload(pllm.Workload):
         width = 8 if facts.probe.tensor_dtype is TensorDType.FLOAT64 else 4
         workspace = rows * (width * hidden + 8) if self.config.enabled else 0
         output = rows * min(hidden, self.config.export_max_cols) * width if self.config.enabled else 0
-        return replace(timeline, task_resources=(TaskResourceFact(TaskSymbol("export_hidden"), workspace),),
-            value_resources=(ValueResourceFact(TaskSymbol("export_hidden"), "value", output),))
+        return replace(
+            timeline,
+            task_resources=(TaskResourceFact(TaskSymbol("export_hidden"), workspace),),
+            value_resources=(ValueResourceFact(TaskSymbol("export_hidden"), "value", output),),
+        )
 
     @pllm.on(pllm.Phase.OBSERVE)
     @pllm.hook(pllm.Config("config.layer"))
-    @pllm.export(name=pllm.Config("export_name"), every=pllm.Config("config.export_every_n_steps"),
-        max_rows=pllm.Config("config.export_max_rows"), max_cols=pllm.Config("config.export_max_cols"),
-        enabled=pllm.Config("config.enabled"))
+    @pllm.export(
+        name=pllm.Config("export_name"),
+        every=pllm.Config("config.export_every_n_steps"),
+        max_rows=pllm.Config("config.export_max_rows"),
+        max_cols=pllm.Config("config.export_max_cols"),
+        enabled=pllm.Config("config.enabled"),
+    )
     def export_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.transform(hidden)
 

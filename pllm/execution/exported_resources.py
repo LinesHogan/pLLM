@@ -5,8 +5,22 @@ from collections.abc import Mapping
 from pllm.contracts.region_composition import RegionFunctionBody, inline_region
 from pllm.contracts.region_imports import BorrowedTensorImport
 from pllm.contracts.region_program import (
-    AccessMode, AccessRange, AffineIndex, Block, BorrowedResource, Call, Function,
-    IndexTerm, Program, Region, ResourceAccess, ScalarType, TensorType, Value, DataType, verify,
+    AccessMode,
+    AccessRange,
+    AffineIndex,
+    Block,
+    BorrowedResource,
+    Call,
+    DataType,
+    Function,
+    IndexTerm,
+    Program,
+    Region,
+    ResourceAccess,
+    ScalarType,
+    TensorType,
+    Value,
+    verify,
 )
 from pllm.execution.codec import boundary_digest
 from pllm.execution.exported_cell import ExportedCell
@@ -14,8 +28,9 @@ from pllm.execution.exported_region import ExportedRegion
 from pllm.execution.region_native import BorrowedTensorPrimitive, TensorSource
 
 
-def borrow_exported_inputs(source: ExportedCell | ExportedRegion, resource: BorrowedResource,
-                           fields: Mapping[str, int]) -> tuple[RegionFunctionBody, dict[str, TensorSource]]:
+def borrow_exported_inputs(
+    source: ExportedCell | ExportedRegion, resource: BorrowedResource, fields: Mapping[str, int]
+) -> tuple[RegionFunctionBody, dict[str, TensorSource]]:
     """Outline a call whose lifted tensor ports borrow one original resource cell.
 
     ``fields`` maps source port names (normally export parameter/buffer targets)
@@ -33,17 +48,27 @@ def borrow_exported_inputs(source: ExportedCell | ExportedRegion, resource: Borr
         while any(name.startswith(prefix) for name in source.inputs):
             prefix += "_"
         outputs = tuple(Value(f"{prefix}{i}", type_) for i, type_ in enumerate(source.declaration.outputs))
-        program = Program(Region(Block(inputs, (Call(tuple(value.name for value in inputs), outputs, source.digest),),
-            tuple(value.name for value in outputs))), (source.declaration,))
+        program = Program(
+            Region(
+                Block(
+                    inputs,
+                    (Call(tuple(value.name for value in inputs), outputs, source.digest),),
+                    tuple(value.name for value in outputs),
+                )
+            ),
+            (source.declaration,),
+        )
         functions: dict[str, TensorSource] = {source.digest: source}
     else:
         program, functions = source.program, dict(source.functions)
     inputs = program.entry.block.arguments
     input_names = tuple(value.name for value in inputs)
+
     def tensor_type(type_: DataType) -> TensorType:
         if not isinstance(type_, TensorType):
             raise ValueError("export borrowing requires tensor ports")
         return type_
+
     input_types = tuple(tensor_type(value.type) for value in inputs)
     output_types = tuple(tensor_type(type_) for type_ in verify(program))
     if program.resources or program.parameters or program.constraints:
@@ -67,21 +92,35 @@ def borrow_exported_inputs(source: ExportedCell | ExportedRegion, resource: Borr
     arguments = tuple(Value(f"input{i}", inputs[i].type) for i in ordinary)
 
     def access(offset: int) -> ResourceAccess:
-        return ResourceAccess(resource.name, AccessMode.READ, tuple(
-            AccessRange(AffineIndex(0, (IndexTerm(i + offset),)), AffineIndex(1, (IndexTerm(i + offset),)))
-            for i in range(len(resource.domain))))
+        return ResourceAccess(
+            resource.name,
+            AccessMode.READ,
+            tuple(
+                AccessRange(AffineIndex(0, (IndexTerm(i + offset),)), AffineIndex(1, (IndexTerm(i + offset),)))
+                for i in range(len(resource.domain))
+            ),
+        )
 
-    declaration = Function("borrowed_graph@1:" + identity,
-        (*tuple(input_types[i] for i in ordinary), *coordinate_types), output_types,
-        (resource.name,), (access(len(arguments)),))
+    declaration = Function(
+        "borrowed_graph@1:" + identity,
+        (*tuple(input_types[i] for i in ordinary), *coordinate_types),
+        output_types,
+        (resource.name,),
+        (access(len(arguments)),),
+    )
     operations: list[Call] = []
     tensor_names = {i: f"input{i}" for i in ordinary}
     # Equal fields may feed tied parameter ports. Reuse the same read and SSA
     # value when their signatures agree; do not manufacture independent copies.
     borrowed: dict[BorrowedTensorImport, str] = {}
     for ordinal, field in selected:
-        getter = Function("borrowed_field@1:" + boundary_digest(resource, field, input_types[ordinal]),
-            coordinate_types, (input_types[ordinal],), (resource.name,), (access(0),))
+        getter = Function(
+            "borrowed_field@1:" + boundary_digest(resource, field, input_types[ordinal]),
+            coordinate_types,
+            (input_types[ordinal],),
+            (resource.name,),
+            (access(0),),
+        )
         imported = BorrowedTensorImport(getter, field)
         if imported in borrowed:
             tensor_names[ordinal] = borrowed[imported]
@@ -89,13 +128,26 @@ def borrow_exported_inputs(source: ExportedCell | ExportedRegion, resource: Borr
         primitive = BorrowedTensorPrimitive(imported)
         functions[getter.name] = primitive
         name = f"input{ordinal}"
-        operations.append(Call(tuple(value.name for value in coordinates),
-            (Value(name, inputs[ordinal].type),), getter.name))
+        operations.append(
+            Call(tuple(value.name for value in coordinates), (Value(name, inputs[ordinal].type),), getter.name)
+        )
         tensor_names[ordinal], borrowed[imported] = name, name
-    inlined = inline_region(program, tuple(Value(tensor_names[i], value.type) for i, value in enumerate(inputs)), "export")
-    body = RegionFunctionBody(declaration, Program(Region(Block(
-        (*arguments, *coordinates), (*operations, *inlined.operations),
-        tuple(value.name for value in inlined.results))),
-        tuple(function.declaration for function in functions.values()), (resource,)))
+    inlined = inline_region(
+        program, tuple(Value(tensor_names[i], value.type) for i, value in enumerate(inputs)), "export"
+    )
+    body = RegionFunctionBody(
+        declaration,
+        Program(
+            Region(
+                Block(
+                    (*arguments, *coordinates),
+                    (*operations, *inlined.operations),
+                    tuple(value.name for value in inlined.results),
+                )
+            ),
+            tuple(function.declaration for function in functions.values()),
+            (resource,),
+        ),
+    )
     body.validate()
     return body, functions

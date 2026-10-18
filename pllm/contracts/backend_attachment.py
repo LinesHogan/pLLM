@@ -5,26 +5,25 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.sampler import SamplerStage
-from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from pllm.contracts.compilation import PlanBundle
+from pllm.contracts.hidden_locator import HiddenPhase
+from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding
+from pllm.contracts.region_composition import RegionFunctionBody
+from pllm.contracts.region_imports import RegionTensorImport
+from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
     AnchorId,
-    ImplementationId,
-    TaskId,
     AnchorSymbol,
+    ImplementationId,
     StateResource,
+    TaskId,
     TaskSymbol,
 )
 from pllm.contracts.state_representation import (
     StateDeviceKind,
 )
-from pllm.contracts.tensor_layout import TensorDType
-from pllm.contracts.tensor_layout import LayoutFieldId
-from pllm.contracts.region_imports import RegionTensorImport
-from pllm.contracts.region_composition import RegionFunctionBody
+from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 
 
 class AttachmentTopology(StrEnum):

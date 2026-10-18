@@ -11,10 +11,9 @@ from collections.abc import Mapping
 from heapq import heappop, heappush
 
 from pllm.contracts.region_bindings import AccessTable, RegionBindings
-from pllm.contracts.region_program import resolve_extent, BankType, DataType
-from pllm.execution.region_schedule import evaluate_schedule_expression, checked_schedule_integer
+from pllm.contracts.region_program import BankType, DataType, resolve_extent
+from pllm.execution.region_schedule import checked_schedule_integer, evaluate_schedule_expression
 from pllm.execution.region_values import Bank, Data, check_data, copy_data
-
 
 ValuePoint = tuple[int, tuple[int, ...]]
 
@@ -31,7 +30,10 @@ def lookup(table: AccessTable | None, point: tuple[int, ...], sizes: Mapping[str
         if evaluate_schedule_expression(case.condition, variables):
             if result is not None:
                 raise RuntimeError("verified value accessor has overlapping source cases")
-            result = (case.target_id, tuple(checked_schedule_integer(evaluate_schedule_expression(c, variables)) for c in case.coordinates))
+            result = (
+                case.target_id,
+                tuple(checked_schedule_integer(evaluate_schedule_expression(c, variables)) for c in case.coordinates),
+            )
     return result
 
 
@@ -100,16 +102,23 @@ class RegionValueFrame:
         site = self._bindings.values[value_id]
         # Loop invariants keep their original definition in an enclosing
         # scope; only that scope's coordinate prefix identifies the value.
-        coordinates = coordinates[:len(site.extents)]
+        coordinates = coordinates[: len(site.extents)]
+
         def assemble(type_: DataType, indices: tuple[int, ...]) -> Data:
             if isinstance(type_, BankType):
-                return Bank(tuple(assemble(type_.element, (*indices, i)) for i in range(resolve_extent(type_.size, self._sizes))))
+                return Bank(
+                    tuple(
+                        assemble(type_.element, (*indices, i)) for i in range(resolve_extent(type_.size, self._sizes))
+                    )
+                )
             return self._read_leaf(value_id, (*coordinates, *indices))
+
         return assemble(site.type, ())
 
     def put(self, value_id: int, coordinates: tuple[int, ...], value: Data) -> None:
         site = self._bindings.values[value_id]
         check_data(value, site.type, self._sizes)
+
         def insert(item: Data, indices: tuple[int, ...]) -> None:
             if isinstance(item, Bank):
                 for i, child in enumerate(item.elements):
@@ -127,6 +136,7 @@ class RegionValueFrame:
             if not retained and last is not None:
                 heappush(self._releases, (last[1], key))
             self.peak_live_values = max(self.peak_live_values, len(self._live))
+
         insert(value, ())
 
     def results(self) -> tuple[Data, ...]:

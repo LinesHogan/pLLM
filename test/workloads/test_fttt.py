@@ -1,33 +1,37 @@
 """Evidence 21: independent Adam/edit oracle, rollback and judge retry settlement."""
 
+import re
 from dataclasses import replace
 from hashlib import blake2b
 from importlib.util import find_spec
-import re
 
-import torch
 import pytest
+import torch
+
 from pllm import make_llm
-
 from pllm.contracts.feedback import Completion, CompletionBatch, FinishReason, RetryAction
-
+from pllm.contracts.request_identity import RequestIdentity
 from pllm.execution.host_runtime import (
-    HostRuntimeFacts, CompletionInput, NO_HOST_REQUEST,
+    NO_HOST_REQUEST,
+    CompletionInput,
+    HostRuntimeFacts,
 )
 from pllm.workloads.fttt import (
     FTTTConfig,
-    FTTTFeedbackService, FTTTJudgeResult,
-    FTTTJudgeService, FTTTWorkload,
+    FTTTFeedbackService,
+    FTTTJudgeResult,
+    FTTTJudgeService,
+    FTTTWorkload,
+    tasks,
 )
-from pllm.contracts.request_identity import RequestIdentity
-from pllm.workloads.fttt import tasks
 
 
 class ArithmeticJudge(FTTTJudgeService):
     def judge(self, completion: Completion) -> FTTTJudgeResult:
         correct = completion.text == "4"
-        return FTTTJudgeResult(correct, float(correct), "correct" if correct else "wrong carry",
-                              (11, 12), "arithmetic", "exact", "")
+        return FTTTJudgeResult(
+            correct, float(correct), "correct" if correct else "wrong carry", (11, 12), "arithmetic", "exact", ""
+        )
 
 
 def test_fttt_matches_edit_oracle_and_settles_judge_retry(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -39,13 +43,16 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry(monkeypatch: pytest.Mo
     config = FTTTConfig(rank=2, learning_rate=0.05, feedback_feature_size=3, max_retries=2)
     service = FTTTFeedbackService(config, ArithmeticJudge())
     workload = FTTTWorkload(service)
-    facts = HostRuntimeFacts(torch.device("cpu"), hidden_size=4, initialization_seed=7,
-        max_input_rows=1, memory_budget_bytes=1 << 20)
+    facts = HostRuntimeFacts(
+        torch.device("cpu"), hidden_size=4, initialization_seed=7, max_input_rows=1, memory_budget_bytes=1 << 20
+    )
     coordinator = make_llm(workload=workload, config=facts)
     peak = coordinator.execution.schedule_bundle.schedule_decision.peak_memory_bytes
     with monkeypatch.context() as guarded:
+
         def allocate(*args):
             raise AssertionError("state allocation before finite admission")
+
         guarded.setattr(tasks, "initialize_edit_state", allocate)
         with pytest.raises(ValueError):
             make_llm(workload=workload, config=replace(facts, memory_budget_bytes=peak - 1))
@@ -95,7 +102,7 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry(monkeypatch: pytest.Mo
     inputs = torch.cat((hidden, feature[None], torch.zeros(1, 1)), dim=1)
     target = torch.cat((feature, torch.zeros(1)))[None]
     generator = torch.Generator().manual_seed(7)
-    down = (torch.randn(2, 8, generator=generator) / (8 ** 0.5)).requires_grad_()
+    down = (torch.randn(2, 8, generator=generator) / (8**0.5)).requires_grad_()
     up = torch.zeros(4, 2, requires_grad=True)
     optimizer = torch.optim.Adam((down, up), lr=config.learning_rate, betas=config.betas, eps=config.eps)
     for version, action in ((1, RetryAction.RETRY), (2, RetryAction.STOP)):
@@ -126,9 +133,10 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry(monkeypatch: pytest.Mo
 
 
 def _automatic_retry_uses_original_control_and_quorum() -> None:
+    from vllm import SamplingParams
+
     from pllm.backends.vllm.runtime import VllmLlm
     from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload
-    from vllm import SamplingParams
 
     class Generation:
         generate_feedback = VllmLlm.generate_feedback
@@ -139,28 +147,55 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
             self.calls = []
             self.votes = votes
 
-        def generate(self, prompts, sampling_params, *, use_tqdm, feedback_group, prompt_indices, sample_index, auxiliary=None,
-                     completion_device=None, routes=None):
+        def generate(
+            self,
+            prompts,
+            sampling_params,
+            *,
+            use_tqdm,
+            feedback_group,
+            prompt_indices,
+            sample_index,
+            auxiliary=None,
+            completion_device=None,
+            routes=None,
+        ):
             assert routes is None
             self.calls.append(prompt_indices)
-            entries = tuple(Completion(RequestIdentity(f"request-{sample_index}-{row}", index, sample_index),
-                0, feedback_group, (1,), (r"\boxed{1}" if row < 2 else r"\boxed{2}") if self.votes
-                else "4" if index == 7 else "3", FinishReason.STOP)
-                for row, index in enumerate(prompt_indices))
+            entries = tuple(
+                Completion(
+                    RequestIdentity(f"request-{sample_index}-{row}", index, sample_index),
+                    0,
+                    feedback_group,
+                    (1,),
+                    (r"\boxed{1}" if row < 2 else r"\boxed{2}") if self.votes else "4" if index == 7 else "3",
+                    FinishReason.STOP,
+                )
+                for row, index in enumerate(prompt_indices)
+            )
             return CompletionInput.capture(CompletionBatch(entries), torch.ones(len(entries), 4))
 
     service = FTTTFeedbackService(FTTTConfig(rank=2, max_retries=2), ArithmeticJudge())
-    processor = make_llm(workload=FTTTWorkload(service), config=HostRuntimeFacts(
-        torch.device("cpu"), hidden_size=4))
+    processor = make_llm(workload=FTTTWorkload(service), config=HostRuntimeFacts(torch.device("cpu"), hidden_size=4))
     generator = Generation()
-    rounds = list(generator.generate_feedback(["accepted", "retry"], SamplingParams(max_tokens=1),
-        feedback=processor.run, feedback_group="retry", max_rounds=5, prompt_indices=(7, 9)))
+    rounds = list(
+        generator.generate_feedback(
+            ["accepted", "retry"],
+            SamplingParams(max_tokens=1),
+            feedback=processor.run,
+            feedback_group="retry",
+            max_rounds=5,
+            prompt_indices=(7, 9),
+        )
+    )
     assert generator.calls == [(7, 9), (9,)]
     assert service.instance_state("retry", 9).retries == 2
     for batch, result in rounds:
         assert result.retry_controls is result.intent.retry_controls
         assert result.update_barriers is result.intent.update_barriers
-        assert all(control.completion is entry for control, entry in zip(result.retry_controls, batch.completions.entries))
+        assert all(
+            control.completion is entry for control, entry in zip(result.retry_controls, batch.completions.entries)
+        )
     assert rounds[-1][1].retry_controls[0].action is RetryAction.STOP
     assert service.queued_transactions == service.queued_feedback == 0
     update = rounds[0][1].state_update()
@@ -169,25 +204,58 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
     def no_published_update(batch):
         result = processor.run(batch)
         return replace(result, update_count=0)
+
     blocked = Generation()
-    assert len(list(blocked.generate_feedback(["retry"], SamplingParams(max_tokens=1), feedback=no_published_update,
-        feedback_group="blocked", max_rounds=5, prompt_indices=(9,)))) == 1
+    assert (
+        len(
+            list(
+                blocked.generate_feedback(
+                    ["retry"],
+                    SamplingParams(max_tokens=1),
+                    feedback=no_published_update,
+                    feedback_group="blocked",
+                    max_rounds=5,
+                    prompt_indices=(9,),
+                )
+            )
+        )
+        == 1
+    )
 
     def copied_completion(batch):
         result = processor.run(batch)
         controls = tuple(replace(control, completion=replace(control.completion)) for control in result.retry_controls)
         return replace(result, intent=replace(result.intent, retry_controls=controls))
-    with pytest.raises(ValueError, match="original ordered"):
-        list(Generation().generate_feedback(["retry"], SamplingParams(max_tokens=1), feedback=copied_completion,
-            feedback_group="copied", max_rounds=2, prompt_indices=(9,)))
 
-    reward = make_llm(workload=TTRLWorkload(TTRLConfig(rank=2, votes_per_prompt=3, samples_per_prompt=3)),
-        config=HostRuntimeFacts(torch.device("cpu"), hidden_size=4))
+    with pytest.raises(ValueError, match="original ordered"):
+        list(
+            Generation().generate_feedback(
+                ["retry"],
+                SamplingParams(max_tokens=1),
+                feedback=copied_completion,
+                feedback_group="copied",
+                max_rounds=2,
+                prompt_indices=(9,),
+            )
+        )
+
+    reward = make_llm(
+        workload=TTRLWorkload(TTRLConfig(rank=2, votes_per_prompt=3, samples_per_prompt=3)),
+        config=HostRuntimeFacts(torch.device("cpu"), hidden_size=4),
+    )
     reward.admit(())
     votes = Generation(votes=True)
     try:
-        rounds = list(votes.generate_feedback(["vote"] * 3, SamplingParams(max_tokens=1), feedback=reward.step,
-            feedback_group="votes", max_rounds=2, prompt_indices=(11, 11, 11)))
+        rounds = list(
+            votes.generate_feedback(
+                ["vote"] * 3,
+                SamplingParams(max_tokens=1),
+                feedback=reward.step,
+                feedback_group="votes",
+                max_rounds=2,
+                prompt_indices=(11, 11, 11),
+            )
+        )
         assert votes.calls == [(11, 11, 11), (11, 11, 11)]
         assert len(rounds) == 2 and reward.diagnostics().update_count == 2
     finally:

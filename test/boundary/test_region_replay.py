@@ -13,8 +13,9 @@ from test.boundary.test_region_pages import owner_fixture
 
 
 @pytest.mark.parametrize("cuda", (False, True))
-@pytest.mark.parametrize("limit,mode", ((0, "same"), (1, "same"), (6, "same"),
-    (6, "converge"), (4, "nan_distance"), (4, "nonfinite")))
+@pytest.mark.parametrize(
+    "limit,mode", ((0, "same"), (1, "same"), (6, "same"), (6, "converge"), (4, "nan_distance"), (4, "nonfinite"))
+)
 def test_replay_control_matches_original_loop_without_hot_compilation(monkeypatch, cuda, limit, mode):
     if cuda and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -22,14 +23,17 @@ def test_replay_control_matches_original_loop_without_hot_compilation(monkeypatc
     execution, _, rows, _ = owner_fixture(rounds=1, stream=stream)
     invocation = execution.start_step(rows, stream)
     device = execution.arena.device
-    initial = torch.full((1, 2), 1e30 if mode == "nan_distance" else 1., device=device)
+    initial = torch.full((1, 2), 1e30 if mode == "nan_distance" else 1.0, device=device)
     effect = ConditionalLayerReplay((0,), max_iterations=limit, relative_l2_ppm=100_000)
     compiled = ConditionalReplayRegion(TensorType((1, 2), "torch.float32", str(device)), effect)
+
     def cold_only(*args, **kwargs):
         raise AssertionError("replay compiled inside a model invocation")
+
     for name in ("analyze_region_program", "lower_region_schedule", "lower_region_bindings"):
         monkeypatch.setattr(_core, name, cold_only)
     calls, observed, recorded = [], [], []
+
     def step(carry):
         if stream is not None:
             assert torch.cuda.current_stream(device) == stream
@@ -41,10 +45,13 @@ def test_replay_control_matches_original_loop_without_hot_compilation(monkeypatc
         if mode == "nonfinite":
             return carry * float("inf")
         return carry * 0.5 + 0.25
+
     def observe(value, iteration):
         observed.append((iteration, value.clone()))
+
     def record(iteration, relative):
         recorded.append((iteration, relative))
+
     context = torch.cuda.stream(stream) if stream is not None else torch.no_grad()
     with context:
         if mode == "nonfinite":
@@ -61,8 +68,16 @@ def test_replay_control_matches_original_loop_without_hot_compilation(monkeypatc
         carry = initial
         for iteration in range(limit):
             result = carry if mode == "same" else -carry if mode == "nan_distance" else carry * 0.5 + 0.25
-            relative = None if previous is None else float(((result.float() - previous.float()).square().sum().sqrt()
-                / previous.float().square().sum().sqrt().clamp_min(1e-12)).item())
+            relative = (
+                None
+                if previous is None
+                else float(
+                    (
+                        (result.float() - previous.float()).square().sum().sqrt()
+                        / previous.float().square().sum().sqrt().clamp_min(1e-12)
+                    ).item()
+                )
+            )
             expected.append((iteration, result.clone(), relative))
             carry = previous = result
             if relative is not None and relative <= 0.1:

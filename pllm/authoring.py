@@ -7,47 +7,128 @@ from dataclasses import dataclass, replace
 from typing import Generic, Protocol, TypeVar
 
 import torch
-from pllm.execution.declaration import (
-    Builder as Builder, Call as Call, Dimensions as Dimensions, Field as Field, State as State, When as When,
-    adam_fields as adam_fields, native as native,
-)
-from pllm.execution.tensor_program import (
-    FunctionMath as FunctionMath, InvocationOutput as InvocationOutput, Roots as Roots, Observation as Observation,
-    TaskOutput as TaskOutput, TensorBatch as TensorBatch, TensorOperation as TensorOperation,
-)
-from pllm.execution.cuda_stream import CudaStreamReadiness
-from pllm.execution.backend_attachment import attachment_buffer_bytes, bind_backend_attachment, derive_attachment_resources, validate_backend_attachment_physical
-from pllm.execution.ptts.page_bundle import PageBundleArena
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
-from pllm.execution.state_execution import MathBinding as MathBinding, StateExecution, StateTaskContext as StateTaskContext
+
+from pllm.config import ExecutionOptions
+from pllm.contracts.auxiliary import AuxiliaryInput as AuxiliaryInput
+from pllm.contracts.auxiliary import CausalTrainBatch as CausalTrainBatch
+from pllm.contracts.auxiliary import StateTensorUpdate as StateTensorUpdate
+from pllm.contracts.auxiliary import WeightedCEBatch as WeightedCEBatch
+from pllm.contracts.auxiliary import map_auxiliary as map_auxiliary
 from pllm.contracts.backend_attachment import BackendAttachmentSpec, BackendPlacementProbe, SignedBackendAttachment
 from pllm.contracts.compilation import PlanBundle as PlanBundle
-from pllm.kernels.adamw import AdamWConfig
-from pllm.contracts.hidden_locator import HiddenPhase as HiddenPhase, HiddenSite as HiddenSite
-from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage as SamplerStage
-from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
+from pllm.contracts.hidden_locator import HiddenPhase as HiddenPhase
+from pllm.contracts.hidden_locator import HiddenSite as HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenSnapshotBatch
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
-from pllm.contracts.parameter_overlay import ParameterTarget, CapturedParameterOperand
-from pllm.contracts.semantic_graph import HiddenInputSource, SchedulerTimeline, SemanticGraph, StateScope, TaskResourceFact, ValueResourceFact
-from pllm.contracts.auxiliary import (AuxiliaryInput as AuxiliaryInput, CausalTrainBatch as CausalTrainBatch,
-    StateTensorUpdate as StateTensorUpdate, WeightedCEBatch as WeightedCEBatch, map_auxiliary as map_auxiliary)
-from pllm.config import ExecutionOptions
+from pllm.contracts.parameter_overlay import CapturedParameterOperand, ParameterTarget
+from pllm.contracts.sampler import PackedSamplerGuidanceBatch
+from pllm.contracts.sampler import SamplerStage as SamplerStage
+from pllm.contracts.semantic_graph import (
+    HiddenInputSource,
+    SchedulerTimeline,
+    SemanticGraph,
+    StateScope,
+    TaskResourceFact,
+    ValueResourceFact,
+)
 from pllm.contracts.semantic_graph import MathContract as MathContract
+from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
+from pllm.execution.backend_attachment import (
+    attachment_buffer_bytes,
+    bind_backend_attachment,
+    derive_attachment_resources,
+    validate_backend_attachment_physical,
+)
+from pllm.execution.cuda_stream import CudaStreamReadiness
+from pllm.execution.declaration import (
+    Builder as Builder,
+)
+from pllm.execution.declaration import (
+    Call as Call,
+)
+from pllm.execution.declaration import (
+    Dimensions as Dimensions,
+)
+from pllm.execution.declaration import (
+    Field as Field,
+)
+from pllm.execution.declaration import (
+    State as State,
+)
+from pllm.execution.declaration import (
+    When as When,
+)
+from pllm.execution.declaration import (
+    adam_fields as adam_fields,
+)
+from pllm.execution.declaration import (
+    native as native,
+)
+from pllm.execution.ptts.page_bundle import PageBundleArena
+from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
+from pllm.execution.state_execution import MathBinding as MathBinding
+from pllm.execution.state_execution import StateExecution
+from pllm.execution.state_execution import StateTaskContext as StateTaskContext
 from pllm.execution.tensor_binding import TensorResult as TensorResult
+from pllm.execution.tensor_program import (
+    FunctionMath as FunctionMath,
+)
+from pllm.execution.tensor_program import (
+    InvocationOutput as InvocationOutput,
+)
+from pllm.execution.tensor_program import (
+    Observation as Observation,
+)
+from pllm.execution.tensor_program import (
+    Roots as Roots,
+)
+from pllm.execution.tensor_program import (
+    TaskOutput as TaskOutput,
+)
+from pllm.execution.tensor_program import (
+    TensorBatch as TensorBatch,
+)
+from pllm.execution.tensor_program import (
+    TensorOperation as TensorOperation,
+)
 from pllm.execution.trace import MAX_SNAPSHOT_BYTES as MAX_SNAPSHOT_BYTES
-
+from pllm.kernels.adamw import AdamWConfig
 
 DataT = TypeVar("DataT")
 ResultT = TypeVar("ResultT")
 AdamW = AdamWConfig
 Guidance = PackedSamplerGuidanceBatch
-__all__ = ["AdamW", "Guidance", "Builder", "When", "Field", "State", "Call",
-    "Dimensions", "MathContract", "FunctionMath", "TensorBatch", "TaskOutput", "InvocationOutput", "Observation",
-    "BackendCompileFacts", "TensorStepInput", "MathBinding", "PlanBundle", "Roots", "HiddenPhase", "HiddenSite",
-    "SamplerStage", "CausalTrainBatch", "StateTensorUpdate", "WeightedCEBatch", "native", "adam_fields",
+__all__ = [
+    "AdamW",
+    "Guidance",
+    "Builder",
+    "When",
+    "Field",
+    "State",
+    "Call",
+    "Dimensions",
+    "MathContract",
+    "FunctionMath",
+    "TensorBatch",
+    "TaskOutput",
+    "InvocationOutput",
+    "Observation",
+    "BackendCompileFacts",
+    "TensorStepInput",
+    "MathBinding",
+    "PlanBundle",
+    "Roots",
+    "HiddenPhase",
+    "HiddenSite",
+    "SamplerStage",
+    "CausalTrainBatch",
+    "StateTensorUpdate",
+    "WeightedCEBatch",
+    "native",
+    "adam_fields",
     "TensorResult",
-    "MAX_SNAPSHOT_BYTES"]
+    "MAX_SNAPSHOT_BYTES",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,8 +150,11 @@ class TensorStepInput:
             if self.hidden.row_batch is not self.rows:
                 raise ValueError("hidden input belongs to another packed step")
             device = self.hidden.snapshots[0].hidden.device
-            if ((device.type == "cuda") != (self.hidden_readiness is not None)
-                or self.hidden_readiness is not None and self.hidden_readiness.device != device):
+            if (
+                (device.type == "cuda") != (self.hidden_readiness is not None)
+                or self.hidden_readiness is not None
+                and self.hidden_readiness.device != device
+            ):
                 raise ValueError("hidden snapshots require readiness from their original device")
 
     def hidden_batch(self, stream: torch.cuda.Stream | None) -> PackedHiddenSnapshotBatch:
@@ -128,7 +212,9 @@ class CausalModel(Protocol):
     def model_source(self) -> tuple[str, str]: ...
     @property
     def resident_bytes(self) -> int: ...
-    def logits(self, batch: CausalTrainBatch[torch.Tensor], factors: tuple[torch.Tensor, ...] | None) -> torch.Tensor: ...
+    def logits(
+        self, batch: CausalTrainBatch[torch.Tensor], factors: tuple[torch.Tensor, ...] | None
+    ) -> torch.Tensor: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,7 +231,11 @@ class BackendCompileFacts:
 
     @property
     def device(self) -> torch.device:
-        return torch.device("cuda", self.probe.device_ordinal) if self.probe.device_kind.value == "cuda" else torch.device("cpu")
+        return (
+            torch.device("cuda", self.probe.device_ordinal)
+            if self.probe.device_kind.value == "cuda"
+            else torch.device("cpu")
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,13 +248,17 @@ class BackendDeployment(Generic[DataT, ResultT]):
             raise ValueError("backend deployment requires the original execution plan")
 
 
-_ZERO_WORKSPACE_IMPLEMENTATIONS = frozenset({
-    # Framework-owned canonical import/publish tasks: copies land directly in allocated
-    # private pages and publication moves metadata, so their derived workspace is zero.
-    "canonical.overlay:import@1", "canonical.activation:import@1",
-    "canonical.state:publish@1", "canonical.state:publish_parameter_overlay@1",
-    "canonical.state:cuda_publish_parameter_overlay@1",
-})
+_ZERO_WORKSPACE_IMPLEMENTATIONS = frozenset(
+    {
+        # Framework-owned canonical import/publish tasks: copies land directly in allocated
+        # private pages and publication moves metadata, so their derived workspace is zero.
+        "canonical.overlay:import@1",
+        "canonical.activation:import@1",
+        "canonical.state:publish@1",
+        "canonical.state:publish_parameter_overlay@1",
+        "canonical.state:cuda_publish_parameter_overlay@1",
+    }
+)
 
 
 def derive_framework_resources(graph: SemanticGraph, timeline: SchedulerTimeline) -> SchedulerTimeline:
@@ -174,22 +268,33 @@ def derive_framework_resources(graph: SemanticGraph, timeline: SchedulerTimeline
     mathematics, never the framework's import/publish plumbing (whose copies land directly
     in allocated private pages and whose receipts are host metadata).
     """
-    canonical = tuple(task for task in graph.tasks
-        if task.implementations and all(
+    canonical = tuple(
+        task
+        for task in graph.tasks
+        if task.implementations
+        and all(
             implementation.implementation_id in _ZERO_WORKSPACE_IMPLEMENTATIONS
-            for implementation in task.implementations))
+            for implementation in task.implementations
+        )
+    )
     if not canonical:
         return timeline
     known_tasks = {fact.task for fact in timeline.task_resources}
     known_values = {(fact.task, fact.output) for fact in timeline.value_resources}
     tasks = tuple(TaskResourceFact(task.symbol, 0) for task in canonical if task.symbol not in known_tasks)
-    values = tuple(ValueResourceFact(task.symbol, output.name, 0) for task in canonical
-        for output in task.outputs if (task.symbol, output.name) not in known_values)
+    values = tuple(
+        ValueResourceFact(task.symbol, output.name, 0)
+        for task in canonical
+        for output in task.outputs
+        if (task.symbol, output.name) not in known_values
+    )
     if not tasks and not values:
         return timeline
-    return replace(timeline,
+    return replace(
+        timeline,
         task_resources=tuple(sorted((*timeline.task_resources, *tasks), key=lambda fact: fact.task)),
-        value_resources=tuple(sorted((*timeline.value_resources, *values), key=lambda fact: (fact.task, fact.output))))
+        value_resources=tuple(sorted((*timeline.value_resources, *values), key=lambda fact: (fact.task, fact.output))),
+    )
 
 
 def strip_framework_resources(graph: SemanticGraph, timeline: SchedulerTimeline) -> SchedulerTimeline:
@@ -200,17 +305,28 @@ def strip_framework_resources(graph: SemanticGraph, timeline: SchedulerTimeline)
     timeline, so the recompute must see the same view or cost guards diverge across the
     process boundary.
     """
-    canonical = {task.symbol for task in graph.tasks
-        if task.implementations and all(
+    canonical = {
+        task.symbol
+        for task in graph.tasks
+        if task.implementations
+        and all(
             implementation.implementation_id in _ZERO_WORKSPACE_IMPLEMENTATIONS
-            for implementation in task.implementations)}
+            for implementation in task.implementations
+        )
+    }
     if not canonical:
         return timeline
-    return replace(timeline,
-        task_resources=tuple(fact for fact in timeline.task_resources
-            if fact.task not in canonical or fact != TaskResourceFact(fact.task, 0)),
-        value_resources=tuple(fact for fact in timeline.value_resources
-            if fact.task not in canonical or fact.bytes != 0))
+    return replace(
+        timeline,
+        task_resources=tuple(
+            fact
+            for fact in timeline.task_resources
+            if fact.task not in canonical or fact != TaskResourceFact(fact.task, 0)
+        ),
+        value_resources=tuple(
+            fact for fact in timeline.value_resources if fact.task not in canonical or fact.bytes != 0
+        ),
+    )
 
 
 class BackendAuthoring(ABC):
@@ -224,29 +340,56 @@ class BackendAuthoring(ABC):
 
     def specialize(self, facts: BackendCompileFacts, options: ExecutionOptions) -> BackendCompileFacts:
         from pllm.contracts.region_selection import RegionSelectionPolicy
-        facts = replace(facts, timeline=replace(facts.timeline,
-            region_policy=RegionSelectionPolicy(options.allow_numerical_transforms, options.schedule_policy,
-                options.tuning)))
+
+        facts = replace(
+            facts,
+            timeline=replace(
+                facts.timeline,
+                region_policy=RegionSelectionPolicy(
+                    options.allow_numerical_transforms, options.schedule_policy, options.tuning
+                ),
+            ),
+        )
         if options.state_memory_bytes:
             if options.state_memory_bytes > facts.state_memory_budget_bytes:
                 raise ValueError("requested state capacity exceeds available backend memory")
             facts = replace(facts, state_memory_budget_bytes=options.state_memory_bytes)
         timeline = self.resource_facts(facts, options)
-        budgets = tuple(value for value in (facts.timeline.memory_budget_bytes, timeline.memory_budget_bytes,
-            options.memory_budget_bytes) if value is not None)
+        budgets = tuple(
+            value
+            for value in (facts.timeline.memory_budget_bytes, timeline.memory_budget_bytes, options.memory_budget_bytes)
+            if value is not None
+        )
         if options.capture and facts.device.type != "cuda":
             raise ValueError("capture requires CUDA")
-        capabilities = tuple(sorted(set((*timeline.capabilities,
-            *(("compute/cuda_graph@1",) if options.capture else ()),
-            *(("compute/explicit_math@1",) if options.explicit_math else ())))))
-        timeline = replace(timeline, capabilities=capabilities, memory_budget_bytes=min(budgets, default=None),
-                           region_policy=facts.timeline.region_policy)
+        capabilities = tuple(
+            sorted(
+                set(
+                    (
+                        *timeline.capabilities,
+                        *(("compute/cuda_graph@1",) if options.capture else ()),
+                        *(("compute/explicit_math@1",) if options.explicit_math else ()),
+                    )
+                )
+            )
+        )
+        timeline = replace(
+            timeline,
+            capabilities=capabilities,
+            memory_budget_bytes=min(budgets, default=None),
+            region_policy=facts.timeline.region_policy,
+        )
         graph, layouts, attachment = self.declare(replace(facts, timeline=timeline))
         timeline = derive_framework_resources(graph, timeline)
         buffers = attachment_buffer_bytes(facts.probe, graph, layouts, attachment)
-        reserved = (tuple(value + buffers for value in (timeline.reserved_bytes or (0,) * len(timeline.anchors)))
-            if buffers else timeline.reserved_bytes)
-        timeline = derive_attachment_resources(facts.probe, graph, replace(timeline, reserved_bytes=reserved), layouts=layouts, attachment=attachment)
+        reserved = (
+            tuple(value + buffers for value in (timeline.reserved_bytes or (0,) * len(timeline.anchors)))
+            if buffers
+            else timeline.reserved_bytes
+        )
+        timeline = derive_attachment_resources(
+            facts.probe, graph, replace(timeline, reserved_bytes=reserved), layouts=layouts, attachment=attachment
+        )
         return replace(facts, timeline=timeline)
 
     @abstractmethod
@@ -256,10 +399,21 @@ class BackendAuthoring(ABC):
 
     def plan_backend(self, facts: BackendCompileFacts) -> SignedBackendAttachment:
         graph, layouts, attachment = self.declare(facts)
-        timeline = derive_attachment_resources(facts.probe, graph, derive_framework_resources(graph, facts.timeline), layouts=layouts, attachment=attachment)
-        plan = compile_page_bundle_plan((graph, layouts), timeline, facts.providers,
+        timeline = derive_attachment_resources(
+            facts.probe,
+            graph,
+            derive_framework_resources(graph, facts.timeline),
+            layouts=layouts,
+            attachment=attachment,
+        )
+        plan = compile_page_bundle_plan(
+            (graph, layouts),
+            timeline,
+            facts.providers,
             facts.max_admitted_lineages if any(state.scope is StateScope.REQUEST for state in graph.states) else 1,
-            facts.state_memory_budget_bytes, facts.device)
+            facts.state_memory_budget_bytes,
+            facts.device,
+        )
         return bind_backend_attachment(plan, facts.probe, attachment)
 
 
@@ -276,8 +430,9 @@ class BackendWorkload(BackendAuthoring, Generic[DataT, ResultT]):
         never saw when it declared costs; strip exactly those so cost guards inside
         resource_facts decide identically on driver and worker.
         """
-        return self.resource_facts(replace(facts,
-            timeline=strip_framework_resources(plan.semantic_graph, facts.timeline)), ExecutionOptions())
+        return self.resource_facts(
+            replace(facts, timeline=strip_framework_resources(plan.semantic_graph, facts.timeline)), ExecutionOptions()
+        )
 
     @staticmethod
     def require_resources(plan: PlanBundle, minimum: SchedulerTimeline) -> None:
@@ -285,32 +440,58 @@ class BackendWorkload(BackendAuthoring, Generic[DataT, ResultT]):
         tasks = {item.task: item for item in plan.timeline.task_resources}
         for required in minimum.task_resources:
             actual = tasks.get(required.task)
-            if (actual is None or actual.input_shapes != required.input_shapes
-                or actual.workspace_bytes < required.workspace_bytes or actual.resident_bytes < required.resident_bytes):
+            if (
+                actual is None
+                or actual.input_shapes != required.input_shapes
+                or actual.workspace_bytes < required.workspace_bytes
+                or actual.resident_bytes < required.resident_bytes
+            ):
                 raise ValueError(f"{required.task} workspace/residency differs from its signed envelope")
         values = {(item.task, item.output): item.bytes for item in plan.timeline.value_resources}
         for required in minimum.value_resources:
             if values.get((required.task, required.output), -1) < required.bytes:
-                raise ValueError(f"{required.task}.{required.output} output storage is smaller than its signed envelope")
+                raise ValueError(
+                    f"{required.task}.{required.output} output storage is smaller than its signed envelope"
+                )
 
-    def bind_backend(self, facts: BackendCompileFacts, attachment: SignedBackendAttachment) -> BackendDeployment[DataT, ResultT]:
+    def bind_backend(
+        self, facts: BackendCompileFacts, attachment: SignedBackendAttachment
+    ) -> BackendDeployment[DataT, ResultT]:
         plan = attachment.inputs.plan
-        if (attachment.inputs.probe != facts.probe
-            or plan.timeline != derive_attachment_resources(facts.probe, plan.semantic_graph,
-                derive_framework_resources(plan.semantic_graph, facts.timeline), layouts=plan.tensor_layout_request,
-                attachment=attachment.inputs.request)):
+        if attachment.inputs.probe != facts.probe or plan.timeline != derive_attachment_resources(
+            facts.probe,
+            plan.semantic_graph,
+            derive_framework_resources(plan.semantic_graph, facts.timeline),
+            layouts=plan.tensor_layout_request,
+            attachment=attachment.inputs.request,
+        ):
             raise ValueError("worker backend facts differ from the original signed attachment")
-        if (plan.state_decision.reserved_bytes > facts.state_memory_budget_bytes
-            or any(item.max_admitted_lineages > facts.max_admitted_lineages for item in plan.state_request.states)):
+        if plan.state_decision.reserved_bytes > facts.state_memory_budget_bytes or any(
+            item.max_admitted_lineages > facts.max_admitted_lineages for item in plan.state_request.states
+        ):
             raise ValueError("worker capacity is smaller than the signed entitlement")
-        candidates = tuple(provider.materialize_plan(resource=entry.resource, layout=entry.layout, binding=binding,
-            max_admitted_lineages=requirement.max_admitted_lineages)
-            for entry, binding, requirement in zip(plan.tensor_layout_request.layouts,
-                plan.tensor_layout_decision.bindings, plan.state_request.states, strict=True)
-            for provider in facts.providers)
+        candidates = tuple(
+            provider.materialize_plan(
+                resource=entry.resource,
+                layout=entry.layout,
+                binding=binding,
+                max_admitted_lineages=requirement.max_admitted_lineages,
+            )
+            for entry, binding, requirement in zip(
+                plan.tensor_layout_request.layouts,
+                plan.tensor_layout_decision.bindings,
+                plan.state_request.states,
+                strict=True,
+            )
+            for provider in facts.providers
+        )
         validate_backend_attachment_physical(attachment.inputs, attachment.decision, attachment.physical)
         math = self.bind_math(facts, plan)
-        device = torch.device("cpu") if facts.probe.device_kind.value == "cpu" else torch.device("cuda", facts.probe.device_ordinal)
+        device = (
+            torch.device("cpu")
+            if facts.probe.device_kind.value == "cpu"
+            else torch.device("cuda", facts.probe.device_ordinal)
+        )
         arena = PageBundleArena(plan, candidates, device=device, _owned_resources=math.local_resources(plan))
         return BackendDeployment(math.bind(arena, attachment.inputs.request.sampler_anchor_id), attachment)
 

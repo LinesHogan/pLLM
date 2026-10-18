@@ -6,32 +6,44 @@ import pytest
 import torch
 
 from pllm import _core
+from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.region_selection import RegionPayloadLimit
 from pllm.contracts.region_streams import RegionStreamPlan
-from pllm.contracts.region_proposal import RegionScheduleProposal
-from pllm.execution.region_storage import import_region_functions
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_compilation import analyze_region_program, lower_region_bindings, lower_region_schedule
 from pllm.execution.region_execution import RegionExecution, RegionExecutionPlan
 from pllm.execution.region_frame import lookup
 from pllm.execution.region_schedule import RegionScheduleExecution
-from pllm.execution.region_streams import RegionStreamBindings, RegionStreamFrame, explore_region_streams, lower_region_streams
+from pllm.execution.region_storage import import_region_functions
+from pllm.execution.region_streams import (
+    RegionStreamBindings,
+    RegionStreamFrame,
+    explore_region_streams,
+    lower_region_streams,
+)
 from test.boundary.test_region_tensor import inputs_for, tensor_grid
 
 
 def stream_execution(program, cells, plan, *, payload_limits):
-    return RegionExecutionPlan(program, import_region_functions(program, cells),
-        RegionScheduleProposal(plan.payload, plan), payload_limits).bind(cells)
+    return RegionExecutionPlan(
+        program, import_region_functions(program, cells), RegionScheduleProposal(plan.payload, plan), payload_limits
+    ).bind(cells)
 
 
 def grid(device="cpu", chunks=3, layers=5):
-    cell = ExportedCell.capture(lambda h, w: ((h + w) * 0.5, w + h * 0.25), ("h", "w"), ("nh", "nw"),
-        (torch.ones(4, dtype=torch.float64, device=device), torch.ones(4, dtype=torch.float64, device=device)))
+    cell = ExportedCell.capture(
+        lambda h, w: ((h + w) * 0.5, w + h * 0.25),
+        ("h", "w"),
+        ("nh", "nw"),
+        (torch.ones(4, dtype=torch.float64, device=device), torch.ones(4, dtype=torch.float64, device=device)),
+    )
     program = tensor_grid(chunks, layers, cell)
     source = analyze_region_program(program)
     cells = {cell.digest: cell}
-    plan, = explore_region_streams(program, cells, schedule=analyze_region_program(program, parallel_only=True).candidates[-1].schedule_map).candidates
+    (plan,) = explore_region_streams(
+        program, cells, schedule=analyze_region_program(program, parallel_only=True).candidates[-1].schedule_map
+    ).candidates
     plan = lower_region_streams(program, plan.schedule_map, cells, axis=plan.axis, lanes=2)
     return program, cell, source, plan
 
@@ -47,13 +59,16 @@ def test_phase_legality_capacity_and_transport():
     phase_capacity = plan.payload.capacity.devices[0]
     assert phase_capacity.call_scratch_bytes_upper_bound > 0
     assert plan.devices[0].concurrent_scratch_bytes_upper_bound == 2 * phase_capacity.call_scratch_bytes_upper_bound
-    assert plan.devices[0].peak_bytes_upper_bound == plan.payload.devices[0].peak_bytes_upper_bound + phase_capacity.call_scratch_bytes_upper_bound
+    assert (
+        plan.devices[0].peak_bytes_upper_bound
+        == plan.payload.devices[0].peak_bytes_upper_bound + phase_capacity.call_scratch_bytes_upper_bound
+    )
     times = {t.input_id: t for t in lower_region_bindings(program, plan.phase_schedule).times}
     placements = {t.input_id: t for t in plan.placements}
     groups = {}
     for point in RegionScheduleExecution(program, lower_region_schedule(program, plan.phase_schedule)).invocations():
         phase = lookup(times[point.statement_id], point.coordinates)[1]
-        lane, = lookup(placements[point.statement_id], point.coordinates)[1]
+        (lane,) = lookup(placements[point.statement_id], point.coordinates)[1]
         groups.setdefault(phase, []).append((point.coordinates, lane))
     assert any(len(points) == 2 and {lane for _, lane in points} == {0, 1} for points in groups.values())
     assert all(len({sum(coordinates) for coordinates, _ in points}) == 1 for points in groups.values())
@@ -84,10 +99,13 @@ def test_pipeline_frontiers_cover_each_grid_predecessor_and_fund_pending_values(
                 if min(predecessor) < 0:
                     continue
                 phase = lookup(times[0], predecessor)[1]
-                lane, = lookup(placements[0], predecessor)[1]
+                (lane,) = lookup(placements[0], predecessor)[1]
                 expected[lane] = max(expected.get(lane, phase), phase)
-            actual = {lane: result[1] for lane, tables in waits.items()
-                if (result := lookup(tables.get(0), (i, j))) is not None}
+            actual = {
+                lane: result[1]
+                for lane, tables in waits.items()
+                if (result := lookup(tables.get(0), (i, j))) is not None
+            }
             assert actual == expected
     with pytest.raises(ValueError, match="budget|reservation"):
         stream_execution(program, cells, plan, payload_limits=limits(base))
@@ -97,15 +115,22 @@ def test_pipeline_frontiers_cover_each_grid_predecessor_and_fund_pending_values(
 @pytest.mark.parametrize("depth", (1, 3))
 def test_wavefront_uses_borrowed_streams_drains_completion_and_keeps_exact_versions(monkeypatch, depth):
     program, cell, source, plan = grid("cuda:0")
-    plan = lower_region_streams(program, plan.schedule_map, {cell.digest: cell}, axis=plan.axis, lanes=2, pipeline_depth=depth)
+    plan = lower_region_streams(
+        program, plan.schedule_map, {cell.digest: cell}, axis=plan.axis, lanes=2, pipeline_depth=depth
+    )
     owner, auxiliary = torch.cuda.Stream(), torch.cuda.Stream()
     streams = RegionStreamBindings(owner, (auxiliary,))
     inputs = inputs_for(3, 5, "cuda:0")
     owner.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(owner):
-        reference = RegionExecution(program, lower_region_schedule(program, source.reference_schedule),
-            lower_region_bindings(program, source.reference_schedule), {cell.digest: cell}).run(inputs)
+        reference = RegionExecution(
+            program,
+            lower_region_schedule(program, source.reference_schedule),
+            lower_region_bindings(program, source.reference_schedule),
+            {cell.digest: cell},
+        ).run(inputs)
     launches, completions = [], []
+
     def observed(*args):
         launches.append(torch.cuda.current_stream().cuda_stream)
         result = cell.function(*args)
@@ -113,9 +138,14 @@ def test_wavefront_uses_borrowed_streams_drains_completion_and_keeps_exact_versi
         event.record()
         completions.append(event)
         return result
-    execution = stream_execution(program, {cell.digest: replace(cell, function=observed)}, plan, payload_limits=limits(plan))
+
+    execution = stream_execution(
+        program, {cell.digest: replace(cell, function=observed)}, plan, payload_limits=limits(plan)
+    )
+
     def forbidden(*args):
         raise AssertionError("runtime cannot plan, prove or allocate streams")
+
     for name in ("lower_region_streams", "lower_region_schedule", "lower_region_bindings"):
         monkeypatch.setattr(_core, name, forbidden)
     # Reject invalid lane bindings before touching any mathematical input.
@@ -136,22 +166,29 @@ def test_wavefront_uses_borrowed_streams_drains_completion_and_keeps_exact_versi
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("fail", (False, True))
 def test_pipeline_issues_later_phases_before_completion_and_drains_on_failure(monkeypatch, fail):
-    from test.boundary.test_native_kernel_streams import native_scan
-    from pllm.execution.tensor_scan import TensorScan
     from pllm.execution.region_values import Bank
+    from pllm.execution.tensor_scan import TensorScan
+    from test.boundary.test_native_kernel_streams import native_scan
+
     _, native, _ = native_scan("cuda:0")
     scan = TensorScan(native, 6, carry=0, invariants=0)
     cells = {native.declaration.name: native}
-    base, = explore_region_streams(scan.program, cells,
-        schedule=analyze_region_program(scan.program, parallel_only=True).candidates[-1].schedule_map).candidates
-    plans = tuple(lower_region_streams(scan.program, base.schedule_map, cells, axis=base.axis, lanes=2, pipeline_depth=d)
-                  for d in (1, 2, 3))
+    (base,) = explore_region_streams(
+        scan.program,
+        cells,
+        schedule=analyze_region_program(scan.program, parallel_only=True).candidates[-1].schedule_map,
+    ).candidates
+    plans = tuple(
+        lower_region_streams(scan.program, base.schedule_map, cells, axis=base.axis, lanes=2, pipeline_depth=d)
+        for d in (1, 2, 3)
+    )
     assert tuple(plan.pipeline_depth for plan in plans) == (1, 2, 3)
     plan = plans[-1]
     streams = RegionStreamBindings(torch.cuda.Stream(), (torch.cuda.Stream(),))
     events, issued_early, overlapped, windows = [], [], [], []
     calls = 0
     recording = False
+
     def kernel(inputs, resources):
         nonlocal calls
         if not recording:
@@ -173,11 +210,14 @@ def test_pipeline_issues_later_phases_before_completion_and_drains_on_failure(mo
         if fail and calls == 5:
             raise RuntimeError("failure with earlier phases pending")
         return result
+
     retire = RegionStreamFrame._retire
+
     def retiring(frame):
         windows.append(len(frame._pending))
         assert frame._pending[0].values
         retire(frame)
+
     monkeypatch.setattr(RegionStreamFrame, "_retire", retiring)
     cells = {native.declaration.name: replace(native, function=kernel)}
     runner = stream_execution(scan.program, cells, plan, payload_limits=limits(plan))
@@ -194,7 +234,7 @@ def test_pipeline_issues_later_phases_before_completion_and_drains_on_failure(mo
         with pytest.raises(RuntimeError, match="earlier phases pending"):
             runner.run({"arg0": Bank(values)}, streams=streams)
     else:
-        result, = runner.run({"arg0": Bank(values)}, streams=streams).values
+        (result,) = runner.run({"arg0": Bank(values)}, streams=streams).values
         for i, output in enumerate(result.elements):
             torch.testing.assert_close(output, torch.full_like(output, i + 2), rtol=0, atol=0)
     assert issued_early == [True]
@@ -208,6 +248,7 @@ def test_exception_joins_already_launched_auxiliary_work_before_frame_release():
     program, cell, _, plan = grid("cuda:0")
     owner, auxiliary = torch.cuda.Stream(), torch.cuda.Stream()
     completions = []
+
     def failing(*args):
         result = cell.function(*args)
         if torch.cuda.current_stream() == auxiliary:
@@ -217,7 +258,10 @@ def test_exception_joins_already_launched_auxiliary_work_before_frame_release():
             completions.append(event)
             raise RuntimeError("injected after auxiliary launch")
         return result
-    runner = stream_execution(program, {cell.digest: replace(cell, function=failing)}, plan, payload_limits=limits(plan))
+
+    runner = stream_execution(
+        program, {cell.digest: replace(cell, function=failing)}, plan, payload_limits=limits(plan)
+    )
     inputs = inputs_for(3, 5, "cuda:0")
     owner.wait_stream(torch.cuda.current_stream())
     with pytest.raises(RuntimeError, match="injected"):
@@ -231,6 +275,7 @@ def test_exception_joins_already_launched_auxiliary_work_before_frame_release():
 def test_page_effects_remain_on_original_pin_stream(depth):
     from pllm.execution.region_resources import RegionResources, ResourcePageCell
     from test.boundary.test_region_pages import owner_fixture
+
     owner, auxiliary = torch.cuda.Stream(), torch.cuda.Stream()
     execution, task, rows, refs = owner_fixture(rounds=2, stream=owner)
     original = task.region
@@ -242,8 +287,11 @@ def test_page_effects_remain_on_original_pin_stream(depth):
     plan = lower_region_streams(program, candidate.schedule_map, original._cells, axis=0, lanes=2, pipeline_depth=depth)
     runner = stream_execution(program, original._cells, plan, payload_limits=limits(plan))
     invocation = execution.start_step(rows, owner)
-    pages = RegionResources(program, invocation.context, tuple(ResourcePageCell("layers", (i,), ref, task.fields)
-        for i, ref in enumerate(invocation.context.pin.refs)))
+    pages = RegionResources(
+        program,
+        invocation.context,
+        tuple(ResourcePageCell("layers", (i,), ref, task.fields) for i, ref in enumerate(invocation.context.pin.refs)),
+    )
     try:
         with pytest.raises(ValueError, match="original PTTS pin stream"):
             runner.run({}, pages=pages, streams=RegionStreamBindings(auxiliary, (owner,)))
@@ -260,18 +308,20 @@ def test_page_effects_remain_on_original_pin_stream(depth):
 
 def test_fixed_default_mapping_honors_budget_without_a_catalog(monkeypatch):
     from pllm.execution.region_streams import plan_region_schedule
+
     program, cell, analysis, _ = grid()
+
     def forbidden(*args, **kwargs):
         raise AssertionError("fixed mapping regenerated a schedule catalog")
+
     monkeypatch.setattr(_core, "explore_region_schedules", forbidden)
     cells = {cell.digest: cell}
-    tight = plan_region_schedule(program, cells, parallel=True,
-        payload_limits=(RegionPayloadLimit("cpu", 768),))
+    tight = plan_region_schedule(program, cells, parallel=True, payload_limits=(RegionPayloadLimit("cpu", 768),))
     assert tight is not None and tight.stream_plan is None
-    assert tight.payload.capacity.schedule_map == lower_region_schedule(program, analysis.reference_schedule).schedule_map
-    funded = plan_region_schedule(program, cells, parallel=True,
-        payload_limits=(RegionPayloadLimit("cpu", 2112),))
+    assert (
+        tight.payload.capacity.schedule_map == lower_region_schedule(program, analysis.reference_schedule).schedule_map
+    )
+    funded = plan_region_schedule(program, cells, parallel=True, payload_limits=(RegionPayloadLimit("cpu", 2112),))
     assert funded.stream_plan.lanes == funded.stream_plan.pipeline_depth == 2
     assert funded.peak_bytes[0].bytes == 2112
-    assert plan_region_schedule(program, cells, parallel=True,
-        payload_limits=(RegionPayloadLimit("cpu", 1),)) is None
+    assert plan_region_schedule(program, cells, parallel=True, payload_limits=(RegionPayloadLimit("cpu", 1),)) is None

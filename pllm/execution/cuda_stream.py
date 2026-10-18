@@ -21,10 +21,7 @@ class CudaStreamReadiness:
         return self._producer_stream.device
 
     def order_on(self, consumer_stream: torch.cuda.Stream) -> None:
-        if (
-            type(consumer_stream) is not torch.cuda.Stream
-            or consumer_stream.device != self._producer_stream.device
-        ):
+        if type(consumer_stream) is not torch.cuda.Stream or consumer_stream.device != self._producer_stream.device:
             raise RuntimeError("CUDA readiness consumer uses another device")
         consumer_stream.wait_event(self._event)
 

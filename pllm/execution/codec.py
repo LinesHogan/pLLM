@@ -2,24 +2,32 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from copy import deepcopy
 from dataclasses import dataclass
-import json
-import torch
 from pathlib import Path
 from typing import Protocol, cast
 from uuid import UUID
 
-from torch._ops import OpOverload
+import torch
 from torch import _decomp
+from torch._ops import OpOverload
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.fx.passes.fake_tensor_prop import FakeTensorProp
 
 from pllm.contracts.codec import (
-    boundary_digest as boundary_digest, decode_boundary as decode_boundary, encode_boundary as encode_boundary,
+    boundary_digest as boundary_digest,
+)
+from pllm.contracts.codec import (
     boundary_scalar as _primitive,
+)
+from pllm.contracts.codec import (
+    decode_boundary as decode_boundary,
+)
+from pllm.contracts.codec import (
+    encode_boundary as encode_boundary,
 )
 
 
@@ -171,8 +179,9 @@ class TensorGraphCall:
     output_positions: tuple[int, ...]
 
 
-def inline_tensor_graphs(inputs: tuple[tuple[str, FakeTensor], ...], calls: tuple[TensorGraphCall, ...],
-                         outputs: tuple[str, ...]) -> torch.fx.GraphModule:
+def inline_tensor_graphs(
+    inputs: tuple[tuple[str, FakeTensor], ...], calls: tuple[TensorGraphCall, ...], outputs: tuple[str, ...]
+) -> torch.fx.GraphModule:
     """Copy functional operators in order, then prove internal layout guards.
 
     This never executes user Python or allocates real tensors. The resulting
@@ -184,8 +193,9 @@ def inline_tensor_graphs(inputs: tuple[tuple[str, FakeTensor], ...], calls: tupl
     for index, (name, sample) in enumerate(inputs):
         node = graph.placeholder(f"arg_{index}")
         with mode:
-            node.meta["val"] = torch.empty_strided(tuple(sample.shape), tuple(sample.stride()),
-                                                   dtype=sample.dtype, device=sample.device)
+            node.meta["val"] = torch.empty_strided(
+                tuple(sample.shape), tuple(sample.stride()), dtype=sample.dtype, device=sample.device
+            )
         values[name] = node
     guards: list[tuple[str, FakeTensor]] = []
     for call in calls:
@@ -219,22 +229,34 @@ def inline_tensor_graphs(inputs: tuple[tuple[str, FakeTensor], ...], calls: tupl
     for name, expected in guards:
         actual = tensor_node_metadata(nodes[name])
         if actual is None or (tuple(actual.shape), tuple(actual.stride()), actual.dtype, actual.device) != (
-                tuple(expected.shape), tuple(expected.stride()), expected.dtype, expected.device):
+            tuple(expected.shape),
+            tuple(expected.stride()),
+            expected.dtype,
+            expected.device,
+        ):
             raise ValueError("composed graph does not satisfy an original call layout guard")
     return result
 
 
-def replace_matmul_nodes(graph: torch.fx.GraphModule, inner_name: str, outer_name: str,
-                         operands: tuple[str, str, str], *, right_associated: bool
-                         ) -> tuple[torch.fx.GraphModule, tuple[str, str]]:
+def replace_matmul_nodes(
+    graph: torch.fx.GraphModule,
+    inner_name: str,
+    outer_name: str,
+    operands: tuple[str, str, str],
+    *,
+    right_associated: bool,
+) -> tuple[torch.fx.GraphModule, tuple[str, str]]:
     """Mechanically rebuild a checked two-product site on a private FX graph."""
     result = deepcopy(graph)
     nodes = {n.name: n for n in result.graph.nodes}
     inner, outer = nodes[inner_name], nodes[outer_name]
     inner_target, outer_target = inner.target, outer.target
-    if (not isinstance(inner_target, OpOverload) or not isinstance(outer_target, OpOverload)
+    if (
+        not isinstance(inner_target, OpOverload)
+        or not isinstance(outer_target, OpOverload)
         or inner_target not in (torch.ops.aten.mm.default, torch.ops.aten.matmul.default)
-        or outer_target not in (torch.ops.aten.mm.default, torch.ops.aten.matmul.default)):
+        or outer_target not in (torch.ops.aten.mm.default, torch.ops.aten.matmul.default)
+    ):
         raise ValueError("matmul rewrite requires two imported matrix products")
     inner_operator = cast(OpOverload, inner_target)
     outer_operator = cast(OpOverload, outer_target)
@@ -266,8 +288,9 @@ def replace_matmul_nodes(graph: torch.fx.GraphModule, inner_name: str, outer_nam
     return refresh_tensor_metadata(result), (first.name, final.name)
 
 
-def batch_matmul_nodes(graph: torch.fx.GraphModule, names: tuple[str, ...]
-                       ) -> tuple[torch.fx.GraphModule, tuple[str, ...]]:
+def batch_matmul_nodes(
+    graph: torch.fx.GraphModule, names: tuple[str, ...]
+) -> tuple[torch.fx.GraphModule, tuple[str, ...]]:
     """Pack independent rank-two products on a private imported FX graph.
 
     Requiring every operand before the first product makes this local rewrite
@@ -283,7 +306,7 @@ def batch_matmul_nodes(graph: torch.fx.GraphModule, names: tuple[str, ...]
     if tuple(sorted(products, key=ordered.index)) != products:
         raise ValueError("matrix batching must preserve the source product order")
     arguments: list[tuple[torch.fx.Node, torch.fx.Node]] = []
-    available = set(ordered[:ordered.index(products[0])])
+    available = set(ordered[: ordered.index(products[0])])
     for product in products:
         pair = matmul_node_arguments(product)
         if pair is None or any(value not in available for value in pair):
@@ -293,8 +316,9 @@ def batch_matmul_nodes(graph: torch.fx.GraphModule, names: tuple[str, ...]
         left = result.graph.call_function(torch.ops.aten.stack.default, ([pair[0] for pair in arguments], 0))
         right = result.graph.call_function(torch.ops.aten.stack.default, ([pair[1] for pair in arguments], 0))
         batch = result.graph.call_function(torch.ops.aten.bmm.default, (left, right))
-        outputs = tuple(result.graph.call_function(torch.ops.aten.select.int, (batch, 0, index))
-                        for index in range(len(products)))
+        outputs = tuple(
+            result.graph.call_function(torch.ops.aten.select.int, (batch, 0, index)) for index in range(len(products))
+        )
     for product, output in zip(products, outputs, strict=True):
         product.replace_all_uses_with(output)
         result.graph.erase_node(product)
@@ -322,8 +346,11 @@ def _tensor_graph_search_key(graph: torch.fx.GraphModule, *, ordered: bool) -> s
         if type(value) is complex:
             return {"complex": (value.real.hex(), value.imag.hex())}
         if isinstance(value, (tuple, list)):
-            return {"tuple" if isinstance(value, tuple) else "list": tuple(
-                argument(v) for v in cast(tuple[object, ...] | list[object], value))}
+            return {
+                "tuple" if isinstance(value, tuple) else "list": tuple(
+                    argument(v) for v in cast(tuple[object, ...] | list[object], value)
+                )
+            }
         if isinstance(value, dict):
             fields = cast(dict[object, object], value)
             if any(type(key) is not str for key in fields):
@@ -398,9 +425,16 @@ class _CudaStorage(Protocol):
     def _share_cuda_(self) -> CudaStorageHandle: ...
 
     @staticmethod
-    def _new_shared_cuda(device: int, handle: bytes, size: int, offset: int,
-                         counter: bytes, counter_offset: int, event: bytes,
-                         wait: bool) -> torch.UntypedStorage: ...
+    def _new_shared_cuda(
+        device: int,
+        handle: bytes,
+        size: int,
+        offset: int,
+        counter: bytes,
+        counter_offset: int,
+        event: bytes,
+        wait: bool,
+    ) -> torch.UntypedStorage: ...
 
     def share(self) -> CudaStorageHandle:
         return self._share_cuda_()
@@ -471,10 +505,17 @@ def cuda_profile_totals(path: Path) -> CudaProfileTotals:
     events = cast(list[dict[str, object]], payload["traceEvents"])
     kernels, kernel_us, transfer = 0, 0.0, 0
     spans: dict[str, dict[tuple[str, str], list[tuple[float, float]]]] = {
-        kind: {} for kind in ("api", "enqueue", "wait", "gpu", "launch", "graph")}
+        kind: {} for kind in ("api", "enqueue", "wait", "gpu", "launch", "graph")
+    }
     for event in events:
         category = event.get("cat")
-        if event.get("ph") != "X" or category not in ("kernel", "cuda_runtime", "cuda_driver", "gpu_memcpy", "gpu_memset"):
+        if event.get("ph") != "X" or category not in (
+            "kernel",
+            "cuda_runtime",
+            "cuda_driver",
+            "gpu_memcpy",
+            "gpu_memset",
+        ):
             continue
         duration = _primitive(event["dur"], float)
         start = _primitive(event["ts"], float)
@@ -499,5 +540,14 @@ def cuda_profile_totals(path: Path) -> CudaProfileTotals:
                     if "graphlaunch" in name:
                         spans["graph"].setdefault(key, []).append(interval)
     totals = {key: _span_totals(value) for key, value in spans.items()}
-    return CudaProfileTotals(kernels, kernel_us, totals["api"][1], totals["enqueue"][1],
-        totals["wait"][1], totals["gpu"][1], transfer, totals["launch"][0], totals["graph"][0])
+    return CudaProfileTotals(
+        kernels,
+        kernel_us,
+        totals["api"][1],
+        totals["enqueue"][1],
+        totals["wait"][1],
+        totals["gpu"][1],
+        transfer,
+        totals["launch"][0],
+        totals["graph"][0],
+    )

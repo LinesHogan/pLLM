@@ -10,8 +10,13 @@ from pllm import _core
 from pllm.contracts.region_outlining import CallOutline, OutlinedProgram
 from pllm.contracts.region_program import Call, Program
 from pllm.execution.codec import (
-    TensorGraphCall, decode_boundary, encode_boundary, inline_tensor_graphs,
-    tensor_graph_outputs, tensor_graph_result_nodes, tensor_node_metadata,
+    TensorGraphCall,
+    decode_boundary,
+    encode_boundary,
+    inline_tensor_graphs,
+    tensor_graph_outputs,
+    tensor_graph_result_nodes,
+    tensor_node_metadata,
 )
 from pllm.execution.exported_cell import ExportedCell, TensorSignature
 from pllm.execution.region_native import TensorSource, is_original_region_source
@@ -21,7 +26,9 @@ from pllm.execution.tensor_access import import_tensor_access_graph
 
 def outline_region_program(program: Program, site: CallOutline) -> OutlinedProgram:
     """Derive the original calls and escaping values with the native authority."""
-    return decode_boundary(_core.outline_region_program(encode_boundary(program), encode_boundary(site)), OutlinedProgram)
+    return decode_boundary(
+        _core.outline_region_program(encode_boundary(program), encode_boundary(site)), OutlinedProgram
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,10 +81,18 @@ def outline_region_calls(program: Program, sources: Mapping[str, TensorSource], 
     def functional(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
         return tensor_graph_outputs(graph, args)
 
-    cell = ExportedCell(outlined.function.name, tuple(v.name for v in outlined.body.arguments), outlined.body.yields,
+    cell = ExportedCell(
+        outlined.function.name,
+        tuple(v.name for v in outlined.body.arguments),
+        outlined.body.yields,
         tuple(signature(n) for n in graph.graph.nodes if n.op == "placeholder"),
-        tuple(signature(n) for n in tensor_graph_result_nodes(graph)), (), tuple(range(len(outlined.body.yields))),
-        graph, functional, ())
+        tuple(signature(n) for n in tensor_graph_result_nodes(graph)),
+        (),
+        tuple(range(len(outlined.body.yields))),
+        graph,
+        functional,
+        (),
+    )
     if cell.declaration != outlined.function:
         raise ValueError("composed tensor graph differs from the outlined source ABI")
     import_tensor_access_graph(cell)

@@ -5,14 +5,33 @@ from dataclasses import replace
 import pytest
 
 from pllm.contracts.region_program import (
-    AffineIndex, BankType, Block, Call, Constant, Coordinate, Function, If, IndexTerm, Program, Publish,
-    Region, Resource, Scalar, ScalarKind, ScalarType, Scan, Select, Snapshot, Update, Value,
+    AffineIndex,
+    BankType,
+    Call,
+    Constant,
+    Coordinate,
+    Function,
+    If,
+    IndexTerm,
+    Program,
+    Publish,
+    Region,
+    Resource,
+    Scalar,
+    ScalarKind,
+    ScalarType,
+    Scan,
+    Select,
+    Snapshot,
+    Update,
+    Value,
 )
 from pllm.execution.region_compilation import (
-    analyze_region_program, preview_region_schedule, validate_region_schedule,
+    analyze_region_program,
+    preview_region_schedule,
+    validate_region_schedule,
 )
 from test.boundary.test_region_program import grid_program, region
-
 
 I, X, B = ScalarType.INT, ScalarType.INDEX, ScalarType.BOOL
 
@@ -70,12 +89,15 @@ def test_zero_trip_loops_have_no_scheduled_instances(shape):
     assert preview_region_schedule(program, analysis.reference_schedule, max_instances=0) == ()
 
 
-@pytest.mark.parametrize("schedule", [
-    "{ S0[c,l] -> [-c,l] : 0<=c<3 and 0<=l<3 }",
-    "{ S0[c,l] -> [0,0] : 0<=c<3 and 0<=l<3 }",
-    "{ S0[c,l] -> [c,l] : 0<=c<2 and 0<=l<3 }",
-    "{ S0[c,l] -> [t,l] : 0<=c<3 and 0<=l<3 and c<=t<=c+1 }",
-])
+@pytest.mark.parametrize(
+    "schedule",
+    [
+        "{ S0[c,l] -> [-c,l] : 0<=c<3 and 0<=l<3 }",
+        "{ S0[c,l] -> [0,0] : 0<=c<3 and 0<=l<3 }",
+        "{ S0[c,l] -> [c,l] : 0<=c<2 and 0<=l<3 }",
+        "{ S0[c,l] -> [t,l] : 0<=c<3 and 0<=l<3 and c<=t<=c+1 }",
+    ],
+)
 def test_missing_collapsed_reversed_and_multivalued_witnesses_are_rejected(schedule):
     with pytest.raises(ValueError):
         validate_region_schedule(grid_program(3, 3), schedule)
@@ -83,13 +105,20 @@ def test_missing_collapsed_reversed_and_multivalued_witnesses_are_rejected(sched
 
 def test_old_bank_reads_do_not_accidentally_become_reads_of_the_new_version():
     bank = BankType(I, 2)
-    program = Program(region((Value("w", bank),), (
-        Coordinate((), (Value("zero", X),), AffineIndex(0)),
-        Select(("w", "zero"), (Value("old", I),)),
-        Call(("old",), (Value("new", I),), "update"),
-        Update(("w", "zero", "new"), (Value("next_bank", bank),)),
-        Call(("w",), (Value("observed", I),), "observe"),
-    ), ("next_bank", "observed")), (Function("update", (I,), (I,)), Function("observe", (bank,), (I,))))
+    program = Program(
+        region(
+            (Value("w", bank),),
+            (
+                Coordinate((), (Value("zero", X),), AffineIndex(0)),
+                Select(("w", "zero"), (Value("old", I),)),
+                Call(("old",), (Value("new", I),), "update"),
+                Update(("w", "zero", "new"), (Value("next_bank", bank),)),
+                Call(("w",), (Value("observed", I),), "observe"),
+            ),
+            ("next_bank", "observed"),
+        ),
+        (Function("update", (I,), (I,)), Function("observe", (bank,), (I,))),
+    )
     reversed_order = "{ S0[] -> [1]; S1[] -> [0] }"
     validate_region_schedule(program, reversed_order)  # Observing the old bank is independent.
     block = program.entry.block
@@ -105,8 +134,9 @@ def test_discarding_state_updates_changes_the_derived_dependencies():
     inner = outer.body.block.operations[1]
     inner = replace(inner, body=Region(replace(inner.body.block, yields=("next_h", "w"))))
     body = replace(outer.body.block, operations=(outer.body.block.operations[0], inner, outer.body.block.operations[2]))
-    independent = replace(program, entry=Region(replace(program.entry.block,
-        operations=(replace(outer, body=Region(body)),))))
+    independent = replace(
+        program, entry=Region(replace(program.entry.block, operations=(replace(outer, body=Region(body)),)))
+    )
     reverse_chunks = "{ S0[c,l] -> [-c,l] : 0<=c<3 and 0<=l<3 }"
     validate_region_schedule(independent, reverse_chunks)
     with pytest.raises(ValueError, match="dependency"):
@@ -117,12 +147,19 @@ def test_final_layer_feedback_prevents_the_grid_wavefront():
     bank = BankType(I, 4)
     base = grid_program(3, 4)
     layer_body = base.entry.block.operations[0].body.block.operations[1].body
-    chunk_body = region((Value("c", X), Value("h", I), Value("w", bank)), (
-        Scan(("h", "w"), (Value("h_final", I), Value("w_final", bank)), 4, layer_body),
-    ), ("h_final", "w_final"))
-    program = Program(region((Value("input", I), Value("weights", bank)), (
-        Scan(("input", "weights"), (Value("output", I), Value("result", bank)), 3, chunk_body),
-    ), ("output", "result")), base.functions)
+    chunk_body = region(
+        (Value("c", X), Value("h", I), Value("w", bank)),
+        (Scan(("h", "w"), (Value("h_final", I), Value("w_final", bank)), 4, layer_body),),
+        ("h_final", "w_final"),
+    )
+    program = Program(
+        region(
+            (Value("input", I), Value("weights", bank)),
+            (Scan(("input", "weights"), (Value("output", I), Value("result", bank)), 3, chunk_body),),
+            ("output", "result"),
+        ),
+        base.functions,
+    )
     analysis = analyze_region_program(program)
     for candidate in analysis.candidates:
         validate_region_schedule(program, candidate.schedule_map)
@@ -132,14 +169,20 @@ def test_final_layer_feedback_prevents_the_grid_wavefront():
 
 def resource_loop(indexed):
     indices = ("i",) if indexed else ()
-    body = region((Value("i", X),), (
-        Snapshot(indices, (Value("w", I),), "state"),
-        Call(("w",), (Value("next_w", I),), "cell"),
-        Publish(("next_w", *indices), (), "state"),
-    ), ())
-    return Program(region((), (
-        Scan((), (), 4, body),
-    ), ()), (Function("cell", (I,), (I,)),), (Resource("state", (I,), (4,) if indexed else ()),))
+    body = region(
+        (Value("i", X),),
+        (
+            Snapshot(indices, (Value("w", I),), "state"),
+            Call(("w",), (Value("next_w", I),), "cell"),
+            Publish(("next_w", *indices), (), "state"),
+        ),
+        (),
+    )
+    return Program(
+        region((), (Scan((), (), 4, body),), ()),
+        (Function("cell", (I,), (I,)),),
+        (Resource("state", (I,), (4,) if indexed else ()),),
+    )
 
 
 def test_resource_indices_allow_independent_publications_without_dropping_atomicity():
@@ -152,23 +195,46 @@ def test_resource_indices_allow_independent_publications_without_dropping_atomic
 def test_proven_branches_can_move_but_checked_arithmetic_keeps_a_boundary():
     then = region((Value("x", I),), (Call(("x",), (Value("out", I),), "f"),), ("out",))
     other = region((Value("x", I),), (), ("x",))
-    program = Program(region((Value("x", I), Value("p", B)), (
-        Call(("x",), (Value("a", I),), "f"),
-        If(("p", "x"), (Value("b", I),), then, other),
-        Call(("x",), (Value("c", I),), "f"),
-    ), ("a", "b", "c")), (Function("f", (I,), (I,)),))
+    program = Program(
+        region(
+            (Value("x", I), Value("p", B)),
+            (
+                Call(("x",), (Value("a", I),), "f"),
+                If(("p", "x"), (Value("b", I),), then, other),
+                Call(("x",), (Value("c", I),), "f"),
+            ),
+            ("a", "b", "c"),
+        ),
+        (Function("f", (I,), (I,)),),
+    )
     analysis = analyze_region_program(program)
     assert not any(s.opaque for s in analysis.statements)
     assert analysis.statements[1].path == (1,)
     reverse = "{ S0[] -> [2]; S1[] -> [1]; S2[] -> [0] }"
     validate_region_schedule(program, reverse)
-    checked = region((Value("x", I),), (
-        Constant((), (Value("one", I),), 1),
-        Scalar(("x", "one"), (Value("unused", I),), ScalarKind.ADD),
-    ), ("x",))
+    checked = region(
+        (Value("x", I),),
+        (
+            Constant((), (Value("one", I),), 1),
+            Scalar(("x", "one"), (Value("unused", I),), ScalarKind.ADD),
+        ),
+        ("x",),
+    )
     block = program.entry.block
-    guarded = replace(program, entry=replace(program.entry, block=replace(block,
-        operations=(block.operations[0], replace(block.operations[1], then_region=checked), block.operations[2]))))
+    guarded = replace(
+        program,
+        entry=replace(
+            program.entry,
+            block=replace(
+                block,
+                operations=(
+                    block.operations[0],
+                    replace(block.operations[1], then_region=checked),
+                    block.operations[2],
+                ),
+            ),
+        ),
+    )
     assert [s.opaque for s in analyze_region_program(guarded).statements] == [False, True, False]
     with pytest.raises(ValueError, match="dependency"):
         validate_region_schedule(guarded, reverse)
@@ -176,38 +242,58 @@ def test_proven_branches_can_move_but_checked_arithmetic_keeps_a_boundary():
 
 def test_affine_scaled_indices_are_analyzed_but_unknown_indices_stay_opaque():
     bank = BankType(I, 8)
-    body = region((Value("i", X), Value("w", bank)), (
-        Coordinate(("i",), (Value("even", X),), AffineIndex(0, (IndexTerm(0, 2),))),
-        Select(("w", "even"), (Value("x", I),)),
-        Call(("x",), (Value("next", I),), "f"),
-        Update(("w", "even", "next"), (Value("out", bank),)),
-    ), ("out",))
-    program = Program(region((Value("w", bank),), (Scan(("w",), (Value("out", bank),), 4, body),), ("out",)),
-                      (Function("f", (I,), (I,)),))
+    body = region(
+        (Value("i", X), Value("w", bank)),
+        (
+            Coordinate(("i",), (Value("even", X),), AffineIndex(0, (IndexTerm(0, 2),))),
+            Select(("w", "even"), (Value("x", I),)),
+            Call(("x",), (Value("next", I),), "f"),
+            Update(("w", "even", "next"), (Value("out", bank),)),
+        ),
+        ("out",),
+    )
+    program = Program(
+        region((Value("w", bank),), (Scan(("w",), (Value("out", bank),), 4, body),), ("out",)),
+        (Function("f", (I,), (I,)),),
+    )
     analysis = analyze_region_program(program)
     assert len(analysis.statements) == 1 and not analysis.statements[0].opaque
     validate_region_schedule(program, "{ S0[i] -> [-i] : 0<=i<4 }")
-    unknown = Program(region((Value("w", bank), Value("index", X)), (
-        Select(("w", "index"), (Value("x", I),)),
-    ), ("x",)))
+    unknown = Program(
+        region((Value("w", bank), Value("index", X)), (Select(("w", "index"), (Value("x", I),)),), ("x",))
+    )
     assert analyze_region_program(unknown).statements[0].opaque
 
 
 def test_unproven_resource_index_cannot_move_after_an_unrelated_publication():
-    program = Program(region((Value("index", X), Value("new", I)), (
-        Snapshot(("index",), (Value("old", I),), "a"),
-        Publish(("new",), (), "b"),
-    ), ()), resources=(Resource("a", (I,), (3,)), Resource("b", (I,))))
+    program = Program(
+        region(
+            (Value("index", X), Value("new", I)),
+            (
+                Snapshot(("index",), (Value("old", I),), "a"),
+                Publish(("new",), (), "b"),
+            ),
+            (),
+        ),
+        resources=(Resource("a", (I,), (3,)), Resource("b", (I,))),
+    )
     assert analyze_region_program(program).statements[0].opaque
     with pytest.raises(ValueError, match="dependency"):
         validate_region_schedule(program, "{ S0[] -> [1]; S1[] -> [0] }")
 
 
 def test_potential_integer_overflow_preserves_its_order_relative_to_effects():
-    program = Program(region((Value("x", I), Value("one", I)), (
-        Scalar(("x", "one"), (Value("result", I),), ScalarKind.ADD),
-        Publish(("one",), (), "w"),
-    ), ("result",)), resources=(Resource("w", (I,)),))
+    program = Program(
+        region(
+            (Value("x", I), Value("one", I)),
+            (
+                Scalar(("x", "one"), (Value("result", I),), ScalarKind.ADD),
+                Publish(("one",), (), "w"),
+            ),
+            ("result",),
+        ),
+        resources=(Resource("w", (I,)),),
+    )
     assert analyze_region_program(program).statements[0].opaque
     with pytest.raises(ValueError, match="dependency"):
         validate_region_schedule(program, "{ S0[] -> [1]; S1[] -> [0] }")

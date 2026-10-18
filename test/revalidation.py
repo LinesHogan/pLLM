@@ -52,13 +52,23 @@ def validate_region_bindings(program: Program, bindings: RegionBindings) -> None
     _core.validate_region_bindings(encode_boundary(program), encode_boundary(bindings))
 
 
-def validate_region_payload(program: Program, cells: RegionImportSource, retained: tuple[RetainedAllocation, ...],
-                            payload: RegionPayload) -> None:
-    _core.validate_region_payload(encode_boundary(program), encode_boundary(import_region_functions(program, cells)),
-        encode_boundary(retained), encode_boundary(payload))
+def validate_region_payload(
+    program: Program, cells: RegionImportSource, retained: tuple[RetainedAllocation, ...], payload: RegionPayload
+) -> None:
+    _core.validate_region_payload(
+        encode_boundary(program),
+        encode_boundary(import_region_functions(program, cells)),
+        encode_boundary(retained),
+        encode_boundary(payload),
+    )
 
 
-def validate_region_streams(program: Program, cells: RegionImportSource, plan: RegionStreamPlan,
-                            retained: tuple[RetainedAllocation, ...] = ()) -> None:
-    _core.validate_region_streams(encode_boundary(program), encode_boundary(import_region_functions(program, cells)),
-                                 encode_boundary(retained), encode_boundary(plan))
+def validate_region_streams(
+    program: Program, cells: RegionImportSource, plan: RegionStreamPlan, retained: tuple[RetainedAllocation, ...] = ()
+) -> None:
+    _core.validate_region_streams(
+        encode_boundary(program),
+        encode_boundary(import_region_functions(program, cells)),
+        encode_boundary(retained),
+        encode_boundary(plan),
+    )

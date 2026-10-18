@@ -19,7 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 # Both concrete runner adapters target this exact vLLM release.
 vllm027 = ["vllm==0.27.1"]
-test = ["pytest==9.0.3", "maturin>=1.14,<2.0", "pyright==1.1.411"]
+test = ["pytest==9.0.3", "maturin>=1.14,<2.0", "pyright==1.1.411", "ruff==0.17.1"]
 tlm = ["transformers>=5.0,<6", "peft>=0.20,<0.21", "safetensors>=0.4,<1"]
 
 [tool.maturin]
@@ -27,3 +27,16 @@ manifest-path = "rust/pllm_core/Cargo.toml"
 python-source = "."
 module-name = "pllm._core"
 features = ["pyo3/extension-module"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["rust", "typings", "doc", "*.md"]
+
+[tool.ruff.lint]
+select = ["F", "E4", "E7", "E9", "I"]
+# Short TypeVar names (I, R) and assigned lambdas are idiomatic here.
+ignore = ["E741", "E731"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pllm", "test"]

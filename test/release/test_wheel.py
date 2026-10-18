@@ -1,9 +1,9 @@
 """Evidence 39: a fresh wheel owns its Python entry point and Rust codec."""
 
-from pathlib import Path
 import subprocess
 import sys
 import tarfile
+from pathlib import Path
 from zipfile import ZipFile
 
 
@@ -11,43 +11,56 @@ def test_isolated_wheel_imports_and_executes_rust_codec(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[2]
     subprocess.run(
         [sys.executable, "-m", "maturin", "sdist", "--out", str(tmp_path)],
-        cwd=root, check=True, capture_output=True, text=True,
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
     )
-    source_archive, = tmp_path.glob("pllm-*.tar.gz")
+    (source_archive,) = tmp_path.glob("pllm-*.tar.gz")
     source = tmp_path / "source"
     with tarfile.open(source_archive) as archive:
         archive.extractall(source, filter="data")
-    project, = source.iterdir()
+    (project,) = source.iterdir()
     subprocess.run(
         [sys.executable, "-m", "maturin", "build", "--release", "--offline", "--out", str(tmp_path)],
-        cwd=project, check=True, capture_output=True, text=True,
+        cwd=project,
+        check=True,
+        capture_output=True,
+        text=True,
     )
-    wheel, = tmp_path.glob("pllm-*.whl")
+    (wheel,) = tmp_path.glob("pllm-*.whl")
     with ZipFile(wheel) as archive:
-        expected_sources = {path.relative_to(root).as_posix() for path in (root / "pllm").rglob("*")
-            if path.suffix in (".py", ".pyi")}
-        packaged_sources = {name for name in archive.namelist()
-            if name.startswith("pllm/") and Path(name).suffix in (".py", ".pyi")}
+        expected_sources = {
+            path.relative_to(root).as_posix() for path in (root / "pllm").rglob("*") if path.suffix in (".py", ".pyi")
+        }
+        packaged_sources = {
+            name for name in archive.namelist() if name.startswith("pllm/") and Path(name).suffix in (".py", ".pyi")
+        }
         assert packaged_sources == expected_sources
-        license_path, = (name for name in archive.namelist() if name.endswith("/licenses/LICENSE"))
+        (license_path,) = (name for name in archive.namelist() if name.endswith("/licenses/LICENSE"))
         assert b"Apache License" in archive.read(license_path)
-        assert not any(
-            name.startswith(("pllm/runtime/", "pllm/ports/", "pllm/common/"))
-            for name in archive.namelist()
+        assert not any(name.startswith(("pllm/runtime/", "pllm/ports/", "pllm/common/")) for name in archive.namelist())
+        assert not set(archive.namelist()).intersection(
+            {
+                "pllm/backends/vllm/overlay_state.py",
+                "pllm/backends/vllm/versioned_parameter_overlay.py",
+                "pllm/backends/vllm/dense_parameter_overlay.py",
+            }
         )
-        assert not set(archive.namelist()).intersection({
-            "pllm/backends/vllm/overlay_state.py",
-            "pllm/backends/vllm/versioned_parameter_overlay.py",
-            "pllm/backends/vllm/dense_parameter_overlay.py",
-        })
     installed = tmp_path / "installed"
     subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--no-deps", "--no-index",
-         "--target", str(installed), str(wheel)],
-        cwd=tmp_path, check=True, capture_output=True, text=True,
+        [sys.executable, "-m", "pip", "install", "--no-deps", "--no-index", "--target", str(installed), str(wheel)],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
     )
     result = subprocess.run(
-        [sys.executable, "-I", "-c", """
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            """
 import importlib.metadata
 import importlib
 import json
@@ -85,7 +98,13 @@ execution = pllm.make_llm(workload=DummyWorkload(),
     config=HostRuntimeFacts(torch.device('cpu')))
 assert execution.plan.fallback_count == 0 and not torch.cuda.is_initialized()
 print('isolated wheel: Rust layout codec executed')
-""", str(installed), next(installed.glob("pllm-*.dist-info")).name],
-        cwd=tmp_path, check=True, capture_output=True, text=True,
+""",
+            str(installed),
+            next(installed.glob("pllm-*.dist-info")).name,
+        ],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
     )
     assert "Rust layout codec executed" in result.stdout

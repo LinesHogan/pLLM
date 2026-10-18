@@ -9,6 +9,7 @@ change already-signed behavior.
 
 from __future__ import annotations
 
+import sys
 from collections import Counter
 from collections.abc import Callable, Mapping
 from copy import deepcopy
@@ -18,7 +19,6 @@ from enum import Enum
 from hashlib import blake2b, sha256
 from inspect import getclosurevars, signature
 from marshal import dumps
-import sys
 from types import CellType, CodeType, FunctionType, MethodType, ModuleType
 from typing import Annotated, TypeVar, cast, get_args, get_origin
 
@@ -42,10 +42,16 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset(), *, structured
         globals_used = _global_names(value.__code__)
         if globals_used & {"getattr", "setattr", "hasattr", "globals", "locals", "vars", "eval", "exec", "__import__"}:
             raise ValueError("reflective mathematics requires an explicit native binding")
-        dependencies = {**{key: value.__globals__[key] for key in globals_used if key in value.__globals__}, **closure.nonlocals}
-        return boundary_digest(sha256(dumps(_code(value.__code__))).hexdigest(),
+        dependencies = {
+            **{key: value.__globals__[key] for key in globals_used if key in value.__globals__},
+            **closure.nonlocals,
+        }
+        return boundary_digest(
+            sha256(dumps(_code(value.__code__))).hexdigest(),
             tuple((key, fingerprint(item, seen, structured=structured)) for key, item in sorted(dependencies.items())),
-            fingerprint(value.__defaults__, seen, structured=structured), fingerprint(value.__kwdefaults__, seen, structured=structured))
+            fingerprint(value.__defaults__, seen, structured=structured),
+            fingerprint(value.__kwdefaults__, seen, structured=structured),
+        )
     if isinstance(value, ModuleType):
         if structured and value.__name__ == "re":
             return boundary_digest(value.__name__, sys.version)
@@ -57,35 +63,59 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset(), *, structured
     if isinstance(value, Enum):
         return boundary_digest(type(value).__qualname__, fingerprint(value.value, seen))
     from pllm.execution.tensor_binding import TensorUpdate
+
     if value is TensorUpdate:
         return TensorUpdate.__qualname__
     if structured and is_dataclass(value) and isinstance(value, type):
-        return boundary_digest(value.__module__, value.__qualname__,
+        return boundary_digest(
+            value.__module__,
+            value.__qualname__,
             tuple((item.name, str(item.type)) for item in fields(value)),
-            fingerprint(value.__init__, seen, structured=True), fingerprint(getattr(value, "__post_init__", None), seen, structured=True))
+            fingerprint(value.__init__, seen, structured=True),
+            fingerprint(getattr(value, "__post_init__", None), seen, structured=True),
+        )
     if isinstance(value, type):
         if value is torch.Tensor:
             return value.__qualname__
         if structured and value in (object, Counter, blake2b):
             return boundary_digest(value.__module__, value.__qualname__, sys.version)
         if structured and issubclass(value, Enum):
-            return boundary_digest(value.__module__, value.__qualname__,
-                tuple((name, fingerprint(member.value, seen, structured=True)) for name, member in value.__members__.items()))
+            return boundary_digest(
+                value.__module__,
+                value.__qualname__,
+                tuple(
+                    (name, fingerprint(member.value, seen, structured=True))
+                    for name, member in value.__members__.items()
+                ),
+            )
         raise ValueError("dynamic type dependencies require an explicit native binding")
     if is_dataclass(value) and not isinstance(value, type):
-        return boundary_digest(type(value).__qualname__, tuple((field.name,
-            fingerprint(getattr(value, field.name), seen, structured=structured)) for field in fields(value)))
+        return boundary_digest(
+            type(value).__qualname__,
+            tuple(
+                (field.name, fingerprint(getattr(value, field.name), seen, structured=structured))
+                for field in fields(value)
+            ),
+        )
     if isinstance(value, Mapping):
         items = cast(Mapping[str, object], value)
-        return boundary_digest(tuple((key, fingerprint(item, seen, structured=structured)) for key, item in sorted(items.items())))
+        return boundary_digest(
+            tuple((key, fingerprint(item, seen, structured=structured)) for key, item in sorted(items.items()))
+        )
     if isinstance(value, (tuple, list)):
-        return boundary_digest(tuple(fingerprint(item, seen, structured=structured) for item in cast(tuple[object, ...], value)))
+        return boundary_digest(
+            tuple(fingerprint(item, seen, structured=structured) for item in cast(tuple[object, ...], value))
+        )
     return boundary_digest(value)
 
 
 def _code(code: CodeType) -> CodeType:
-    return code.replace(co_filename="", co_firstlineno=0, co_linetable=b"", co_consts=tuple(
-        _code(value) if isinstance(value, CodeType) else value for value in code.co_consts))
+    return code.replace(
+        co_filename="",
+        co_firstlineno=0,
+        co_linetable=b"",
+        co_consts=tuple(_code(value) if isinstance(value, CodeType) else value for value in code.co_consts),
+    )
 
 
 def _global_names(code: CodeType) -> set[str]:
@@ -103,15 +133,21 @@ def _self_attributes(code: CodeType, self_name: str, references: set[str]) -> bo
     for index, instruction in enumerate(instructions):
         if instruction.opname == "LOAD_SUPER_ATTR" or instruction.argval == "super":
             precise = False  # super() resolution crosses the class walk; sign the whole class
-        elif instruction.opname in ("LOAD_FAST", "LOAD_DEREF", "LOAD_FAST_CHECK", "LOAD_FAST_AND_CLEAR",
-                                    "LOAD_CLASSDEREF") and instruction.argval == self_name:
+        elif (
+            instruction.opname
+            in ("LOAD_FAST", "LOAD_DEREF", "LOAD_FAST_CHECK", "LOAD_FAST_AND_CLEAR", "LOAD_CLASSDEREF")
+            and instruction.argval == self_name
+        ):
             follower = instructions[index + 1] if index + 1 < len(instructions) else None
             if follower is not None and follower.opname in ("LOAD_ATTR", "LOAD_METHOD"):
                 references.add(str(follower.argval))
             else:
                 precise = False  # aliased, passed, or stored — any method may be reached
-        elif instruction.opname in ("STORE_FAST", "STORE_DEREF", "STORE_NAME", "STORE_GLOBAL",
-                                    "DELETE_FAST", "DELETE_DEREF") and instruction.argval == self_name:
+        elif (
+            instruction.opname
+            in ("STORE_FAST", "STORE_DEREF", "STORE_NAME", "STORE_GLOBAL", "DELETE_FAST", "DELETE_DEREF")
+            and instruction.argval == self_name
+        ):
             precise = False
     for value in code.co_consts:
         if isinstance(value, CodeType):
@@ -119,8 +155,7 @@ def _self_attributes(code: CodeType, self_name: str, references: set[str]) -> bo
     return precise
 
 
-def reachable_functions(candidates: Mapping[str, FunctionType],
-                        seeds: tuple[FunctionType, ...]) -> frozenset[str]:
+def reachable_functions(candidates: Mapping[str, FunctionType], seeds: tuple[FunctionType, ...]) -> frozenset[str]:
     """Candidate methods reachable from signed functions through the owner reference.
 
     Cold reachability: attribute loads directly on the owner parameter, chased helper-to-helper
@@ -153,11 +188,27 @@ def freeze(function: G) -> G:
     global_values = dict(function.__globals__)
     for key in globals_used & global_values.keys():
         value = global_values[key]
-        global_values[key] = freeze(value) if isinstance(value, FunctionType) else (
-            value if isinstance(value, (ModuleType, type)) else deepcopy(value))
-    copied = FunctionType(function.__code__, global_values, function.__name__, deepcopy(function.__defaults__),
-        None if function.__closure__ is None else tuple(CellType(freeze(cell.cell_contents)
-            if isinstance(cell.cell_contents, FunctionType) else deepcopy(cell.cell_contents)) for cell in function.__closure__))
+        global_values[key] = (
+            freeze(value)
+            if isinstance(value, FunctionType)
+            else (value if isinstance(value, (ModuleType, type)) else deepcopy(value))
+        )
+    copied = FunctionType(
+        function.__code__,
+        global_values,
+        function.__name__,
+        deepcopy(function.__defaults__),
+        None
+        if function.__closure__ is None
+        else tuple(
+            CellType(
+                freeze(cell.cell_contents)
+                if isinstance(cell.cell_contents, FunctionType)
+                else deepcopy(cell.cell_contents)
+            )
+            for cell in function.__closure__
+        ),
+    )
     copied.__annotations__ = dict(function.__annotations__)
     copied.__kwdefaults__ = deepcopy(function.__kwdefaults__)
     return cast(G, copied)
@@ -172,8 +223,11 @@ def members(owner: object) -> dict[str, object]:
 
 def owner_values(owner: object, marker_types: tuple[type, ...]) -> dict[str, object]:
     """Authoring values: scalar/class-level markers plus instance and dataclass fields."""
-    result: dict[str, object] = {name: member for name, member in members(owner).items() if not name.startswith("__")
-        and isinstance(member, (str, int, float, bool, tuple, *marker_types))}
+    result: dict[str, object] = {
+        name: member
+        for name, member in members(owner).items()
+        if not name.startswith("__") and isinstance(member, (str, int, float, bool, tuple, *marker_types))
+    }
     result.update(vars(owner))
     if is_dataclass(owner) and not isinstance(owner, type):
         result.update((item.name, getattr(owner, item.name)) for item in fields(owner))
@@ -195,19 +249,37 @@ class NativeMath:
     @staticmethod
     def native_methods(functions: Mapping[str, Callable[..., object]]) -> Mapping[str, str]:
         """Freeze code and decorator/source contracts for an explicit native binding."""
-        return {name: boundary_digest(fingerprint(function, structured=True),
-            tuple((key, fingerprint(getattr(function, key, None))) for key in (
-                "__pllm_phase__", "__pllm_effect__", "__pllm_gradient__", "__pllm_rows__", "__pllm_hidden__")),
-            tuple((key, fingerprint(get_args(parameter.annotation)[1]))
-                for key, parameter in signature(function, eval_str=False).parameters.items()
-                if get_origin(parameter.annotation) is Annotated)) for name, function in functions.items()}
+        return {
+            name: boundary_digest(
+                fingerprint(function, structured=True),
+                tuple(
+                    (key, fingerprint(getattr(function, key, None)))
+                    for key in (
+                        "__pllm_phase__",
+                        "__pllm_effect__",
+                        "__pllm_gradient__",
+                        "__pllm_rows__",
+                        "__pllm_hidden__",
+                    )
+                ),
+                tuple(
+                    (key, fingerprint(get_args(parameter.annotation)[1]))
+                    for key, parameter in signature(function, eval_str=False).parameters.items()
+                    if get_origin(parameter.annotation) is Annotated
+                ),
+            )
+            for name, function in functions.items()
+        }
 
-    def require_native_methods(self, reference: Mapping[str, str], *,
-                               resource_declaration: Callable[..., object] | None = None) -> None:
+    def require_native_methods(
+        self, reference: Mapping[str, str], *, resource_declaration: Callable[..., object] | None = None
+    ) -> None:
         """Reject inherited kernel/cost assumptions after ordinary mathematics changes."""
         if resource_declaration is not None:
             declaration = getattr(self, "resource_facts")
-            if (declaration.__func__ if isinstance(declaration, MethodType) else declaration) is not resource_declaration:
+            if (
+                declaration.__func__ if isinstance(declaration, MethodType) else declaration
+            ) is not resource_declaration:
                 return
         current = self.native_methods({name: getattr(self, name) for name in reference})
         for name, signed in reference.items():

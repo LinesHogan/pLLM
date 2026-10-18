@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TypeAlias
 
-from pllm.contracts.region_schedule import Statement
 from pllm.contracts.control_instructions import ControlAction
+from pllm.contracts.region_schedule import Statement
 
 
 class ScheduleOperator(StrEnum):

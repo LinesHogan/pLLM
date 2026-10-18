@@ -13,8 +13,13 @@ import torch
 
 from pllm.contracts.tensor_rewrite import MatmulAssociation, MatmulCost, MatmulReassociation, TensorRewrite
 from pllm.execution.codec import (
-    boundary_digest, matmul_node_arguments, replace_matmul_nodes,
-    tensor_graph_outputs, tensor_graph_structure_digest, tensor_graph_expression_digest, tensor_node_metadata,
+    boundary_digest,
+    matmul_node_arguments,
+    replace_matmul_nodes,
+    tensor_graph_expression_digest,
+    tensor_graph_outputs,
+    tensor_graph_structure_digest,
+    tensor_node_metadata,
 )
 from pllm.execution.exported_cell import ExportedCell, TensorSignature
 from pllm.execution.tensor_batching import batching_steps
@@ -48,16 +53,16 @@ def _matrix_signature(node: torch.fx.Node) -> TensorSignature | None:
     return TensorSignature.of(tensor)
 
 
-def _candidate(cell: ExportedCell, outer: torch.fx.Node, association: MatmulAssociation
-               ) -> TensorRewriteCandidate[MatmulReassociation] | None:
+def _candidate(
+    cell: ExportedCell, outer: torch.fx.Node, association: MatmulAssociation
+) -> TensorRewriteCandidate[MatmulReassociation] | None:
     outer_args = matmul_node_arguments(outer)
     if outer_args is None:
         return None
     to_right = association is MatmulAssociation.LEFT_TO_RIGHT
     inner = outer_args[0] if to_right else outer_args[1]
     inner_args = matmul_node_arguments(inner)
-    if (inner_args is None or tuple(inner.users) != (outer,)
-            or sum(arg is inner for arg in outer_args) != 1):
+    if inner_args is None or tuple(inner.users) != (outer,) or sum(arg is inner for arg in outer_args) != 1:
         return None
     a, b, c = (*inner_args, outer_args[1]) if to_right else (outer_args[0], *inner_args)
     sa, sb, sc, si, so = (_matrix_signature(n) for n in (a, b, c, inner, outer))
@@ -73,22 +78,38 @@ def _candidate(cell: ExportedCell, outer: torch.fx.Node, association: MatmulAsso
     left = MatmulCost(2 * (m * k * n + m * n * p), m * n * item_bytes)
     right = MatmulCost(2 * (k * n * p + m * k * p), k * p * item_bytes)
     operands = (a.name, b.name, c.name)
-    graph, replacement = replace_matmul_nodes(cell.graph, inner.name, outer.name, operands,
-                                               right_associated=to_right)
+    graph, replacement = replace_matmul_nodes(cell.graph, inner.name, outer.name, operands, right_associated=to_right)
     result_node = next(node for node in graph.graph.nodes if node.name == replacement[1])
     if _matrix_signature(result_node) != so:
         return None  # Layout is part of the exported ABI, even for internal users.
-    record = MatmulReassociation(cell.digest, boundary_digest(str(cell.graph.graph)),
-        boundary_digest(str(graph.graph)), association, (inner.name, outer.name), replacement,
-        operands, (m, k, n, p), str(sa.dtype), str(sa.device),
-        left if to_right else right, right if to_right else left)
+    record = MatmulReassociation(
+        cell.digest,
+        boundary_digest(str(cell.graph.graph)),
+        boundary_digest(str(graph.graph)),
+        association,
+        (inner.name, outer.name),
+        replacement,
+        operands,
+        (m, k, n, p),
+        str(sa.dtype),
+        str(sa.device),
+        left if to_right else right,
+        right if to_right else left,
+    )
 
     def functional(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
         values = tensor_graph_outputs(graph, args)
         return tuple(values[i] for i in cell.output_positions)
 
-    return TensorRewriteCandidate(replace(cell, graph=graph, function=functional,
-        transformations=(*cell.transformations, f"matmul reassociation: {association.value}")), record)
+    return TensorRewriteCandidate(
+        replace(
+            cell,
+            graph=graph,
+            function=functional,
+            transformations=(*cell.transformations, f"matmul reassociation: {association.value}"),
+        ),
+        record,
+    )
 
 
 def _steps(cell: ExportedCell) -> Iterator[TensorRewriteCandidate[MatmulReassociation]]:
@@ -117,8 +138,11 @@ def replay_tensor_rewrites(source: ExportedCell, records: tuple[TensorRewrite, .
     return _replay(source, records, _all_steps)
 
 
-def _replay(source: ExportedCell, records: tuple[RewriteT, ...],
-            steps: Callable[[ExportedCell], Iterator[TensorRewriteCandidate[RewriteT]]]) -> ExportedCell:
+def _replay(
+    source: ExportedCell,
+    records: tuple[RewriteT, ...],
+    steps: Callable[[ExportedCell], Iterator[TensorRewriteCandidate[RewriteT]]],
+) -> ExportedCell:
     if source.transformations:
         raise ValueError("tensor rewrite replay requires the original exported cell")
     current = source
@@ -134,8 +158,9 @@ def _replay(source: ExportedCell, records: tuple[RewriteT, ...],
     return current
 
 
-def explore_tensor_combinations(sources: tuple[ExportedCell, ...], *, max_depth: int = 2,
-                                max_candidates: int = 16) -> tuple[tuple[TensorRewrite, ...], ...]:
+def explore_tensor_combinations(
+    sources: tuple[ExportedCell, ...], *, max_depth: int = 2, max_candidates: int = 16
+) -> tuple[tuple[TensorRewrite, ...], ...]:
     """Joint bounded search over reassociation and independent GEMM batching.
 
     Changing only one call can leave another call's large temporary unchanged.
@@ -147,18 +172,23 @@ def explore_tensor_combinations(sources: tuple[ExportedCell, ...], *, max_depth:
     cycles from creating candidates just by giving their nodes new names.
     """
     ordered = tuple(sorted(sources, key=lambda cell: cell.digest))
-    return tuple(tuple(record for path in state for record in path.rewrites)
-                 for state in _explore(ordered, max_depth, max_candidates, _all_steps))
+    return tuple(
+        tuple(record for path in state for record in path.rewrites)
+        for state in _explore(ordered, max_depth, max_candidates, _all_steps)
+    )
 
 
-def _explore(sources: tuple[ExportedCell, ...], max_depth: int,
-             max_candidates: int, steps: Callable[[ExportedCell], Iterator[TensorRewriteCandidate[RewriteT]]]
-             ) -> Iterator[tuple[TensorRewritePath[RewriteT], ...]]:
+def _explore(
+    sources: tuple[ExportedCell, ...],
+    max_depth: int,
+    max_candidates: int,
+    steps: Callable[[ExportedCell], Iterator[TensorRewriteCandidate[RewriteT]]],
+) -> Iterator[tuple[TensorRewritePath[RewriteT], ...]]:
     if any(source.transformations for source in sources):
         raise ValueError("rewrite search requires the original exported cell")
     if len({source.digest for source in sources}) != len(sources):
         raise ValueError("rewrite search requires unique source function identities")
-    if (type(max_depth) is not int or max_depth < 0 or type(max_candidates) is not int or max_candidates < 0):
+    if type(max_depth) is not int or max_depth < 0 or type(max_candidates) is not int or max_candidates < 0:
         raise ValueError("rewrite search requires nonnegative depth and candidate limits")
     if not sources or max_depth == 0 or max_candidates == 0:
         return
@@ -175,14 +205,14 @@ def _explore(sources: tuple[ExportedCell, ...], max_depth: int,
         for index, parent in enumerate(state):
             for candidate in steps(parent.cell):
                 key = tensor_graph_structure_digest(candidate.cell.graph)
-                next_keys = (*keys[:index], key, *keys[index + 1:])
+                next_keys = (*keys[:index], key, *keys[index + 1 :])
                 if next_keys in seen:
                     continue
                 seen.add(next_keys)
                 if tensor_graph_expression_digest(candidate.cell.graph) == original_expressions[index]:
                     continue  # No mathematical change; do not select an inverse cycle.
                 path = TensorRewritePath(candidate.cell, (*parent.rewrites, candidate.rewrite))
-                next_state = (*state[:index], path, *state[index + 1:])
+                next_state = (*state[:index], path, *state[index + 1 :])
                 yield next_state
                 produced += 1
                 if produced == max_candidates:

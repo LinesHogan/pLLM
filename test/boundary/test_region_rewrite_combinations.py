@@ -1,9 +1,7 @@
 """Joint mathematical choices are assessed with the region's real lifetimes."""
 
-from pllm.contracts.region_selection import RegionSelectionPolicy
-
-from dataclasses import replace
 import warnings
+from dataclasses import replace
 
 import pytest
 import torch
@@ -12,23 +10,27 @@ from pllm.config import ExecutionOptions
 from pllm.contracts.region_program import Block, Call, Program, Region, Value
 from pllm.contracts.region_selection import RegionPayloadLimit
 from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
-from pllm.execution.region_optimization import optimize_region, PreparedRegionCandidate, bind_region_candidate, assess_region_candidates
+from pllm.execution.region_optimization import PreparedRegionCandidate, bind_region_candidate, optimize_region
 from pllm.execution.tensor_rewrites import explore_tensor_combinations, replay_tensor_rewrites
 from test.boundary.test_tensor_access import StorageObserver
 from test.boundary.test_tensor_rewrite_search import example as deep_example
 
 
 def example(device="cpu"):
-    tensors = tuple(torch.ones(shape, dtype=torch.float64, device=device)
-                    for shape in ((4, 3), (3, 128), (128, 2)))
+    tensors = tuple(torch.ones(shape, dtype=torch.float64, device=device) for shape in ((4, 3), (3, 128), (128, 2)))
+
     def first(a, b, c):
         return ((a @ b) @ c,)
+
     def second(a, b, c):
         return (torch.matmul(torch.matmul(a, b), c),)
+
     cells = tuple(ExportedCell.capture(f, ("a", "b", "c"), ("out",), tensors) for f in (first, second))
     arguments = tuple(Value(name, t) for name, t in zip(("a", "b", "c"), cells[0].declaration.inputs))
-    calls = tuple(Call(("a", "b", "c"), (Value(f"out{i}", cell.declaration.outputs[0]),), cell.digest)
-                  for i, cell in enumerate(cells))
+    calls = tuple(
+        Call(("a", "b", "c"), (Value(f"out{i}", cell.declaration.outputs[0]),), cell.digest)
+        for i, cell in enumerate(cells)
+    )
     program = Program(Region(Block(arguments, calls, ("out0", "out1"))), tuple(c.declaration for c in cells))
     return program, {c.digest: c for c in cells}, dict(zip(("a", "b", "c"), tensors))
 
@@ -36,8 +38,10 @@ def example(device="cpu"):
 def test_joint_search_is_bounded_canonical_and_deduplicates_commuting_steps():
     _, cells, _ = example()
     original_graphs = tuple(str(c.graph.graph) for c in cells.values())
+
     def forbidden(*args):
         raise AssertionError("search must not execute user mathematics")
+
     sources = tuple(replace(c, function=forbidden) for c in cells.values())
     with warnings.catch_warnings(record=True) as caught:
         paths = explore_tensor_combinations(sources, max_depth=6)
@@ -57,8 +61,12 @@ def test_depth_is_shared_across_functions_and_each_chain_replays_in_order():
     sources = (deep, simple)
     paths = explore_tensor_combinations(sources, max_depth=3, max_candidates=100)
     assert all(1 <= len(path) <= 3 for path in paths)
-    both = [path for path in paths if sum(r.source_digest == deep.digest for r in path) == 2
-            and sum(r.source_digest == simple.digest for r in path) == 1]
+    both = [
+        path
+        for path in paths
+        if sum(r.source_digest == deep.digest for r in path) == 2
+        and sum(r.source_digest == simple.digest for r in path) == 1
+    ]
     assert both
     shallow = explore_tensor_combinations(sources, max_depth=2, max_candidates=100)
     assert all(len(path) <= 2 for path in shallow)
@@ -66,7 +74,7 @@ def test_depth_is_shared_across_functions_and_each_chain_replays_in_order():
         for source, args, expected in ((deep, tensors, 64), (simple, tuple(inputs.values()), 384)):
             records = tuple(r for r in path if r.source_digest == source.digest)
             replayed = replay_tensor_rewrites(source, records)
-            result, = replayed(*args)
+            (result,) = replayed(*args)
             torch.testing.assert_close(result, torch.full_like(result, expected), rtol=0, atol=0)
 
 
@@ -75,6 +83,7 @@ def test_only_joint_rewrite_fits_and_only_feasible_candidates_are_measured(devic
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     import pllm.execution.region_optimization as tuning
+
     program, cells, inputs = example(device)
     # Isolate combinations that retain both call boundaries. Outlining has
     # its own end-to-end selection tests and adds another candidate family.
@@ -84,23 +93,33 @@ def test_only_joint_rewrite_fits_and_only_feasible_candidates_are_measured(devic
     cuda_rng = torch.cuda.get_rng_state(device).clone() if device.startswith("cuda") else None
     measure = tuning._measure
     measured = []
+
     def checked_measure(execution, *args):
         # Each original call needs a 4*128*8-byte internal product. Changing
         # just one call leaves that maximum scratch requirement in the region.
         assert all(len(c.transformations) == 1 for c in execution._cells.values())
         measured.append(execution)
         return measure(execution, *args)
+
     monkeypatch.setattr(tuning, "_measure", checked_measure)
     options = ExecutionOptions(schedule_policy="serial")
     with pytest.warns(NumericalTransformWarning):
-        selected = optimize_region(program, cells, inputs,
-            payload_limits=(RegionPayloadLimit(device, 5392),), options=replace(options, tuning="measured"),
-            warmup_rounds=0, measurement_rounds=2)
+        selected = optimize_region(
+            program,
+            cells,
+            inputs,
+            payload_limits=(RegionPayloadLimit(device, 5392),),
+            options=replace(options, tuning="measured"),
+            warmup_rounds=0,
+            measurement_rounds=2,
+        )
     assert len(measured) == 2
     winner = selected.selection.selected
     assert winner != 0 and selected.selection.candidates[winner].feasible
     assert selected.selection.candidates[winner].capacity.devices[0].peak_tensor_bytes_upper_bound == 5392
-    assert all(c.elapsed_ns == () for c, a in zip(selected.request.candidates, selected.selection.candidates) if not a.feasible)
+    assert all(
+        c.elapsed_ns == () for c, a in zip(selected.request.candidates, selected.selection.candidates) if not a.feasible
+    )
     assert len(selected.request.candidates[winner].elapsed_ns) == 2
     assert selected.selection.candidates[winner].changed_functions == tuple(sorted(cells))
     with StorageObserver(tuple(inputs.values())) as observed:
@@ -115,35 +134,57 @@ def test_only_joint_rewrite_fits_and_only_feasible_candidates_are_measured(devic
     for before, after in zip(saved, inputs.values(), strict=True):
         torch.testing.assert_close(before, after, rtol=0, atol=0)
     from pllm.execution.tensor_rewrites import replay_tensor_rewrites
+
     first, second = selected.rewrites
     partial = {**cells, first.source_digest: replay_tensor_rewrites(cells[first.source_digest], (first,))}
     with pytest.raises(ValueError, match="admitted imports"):
-        bind_region_candidate(PreparedRegionCandidate(program, selected.request.candidates[winner], (first,), partial),
-            selected.request.payload_limits, selected.selection.candidates[winner])
+        bind_region_candidate(
+            PreparedRegionCandidate(program, selected.request.candidates[winner], (first,), partial),
+            selected.request.payload_limits,
+            selected.selection.candidates[winner],
+        )
     with pytest.raises(ValueError, match="source graph"):
         replay_tensor_rewrites(cells[second.source_digest], (replace(second, after=replace(second.after, flops=0)),))
     # Independent rule chains commute. Bind their locally replayed artifacts.
     reversed_records = selected.rewrites[::-1]
-    rebuilt = {name: replay_tensor_rewrites(cell, tuple(r for r in reversed_records if r.source_digest == name))
-               for name, cell in cells.items()}
-    rebound = bind_region_candidate(PreparedRegionCandidate(program, selected.request.candidates[winner], reversed_records, rebuilt),
-        selected.request.payload_limits, selected.selection.candidates[winner])
+    rebuilt = {
+        name: replay_tensor_rewrites(cell, tuple(r for r in reversed_records if r.source_digest == name))
+        for name, cell in cells.items()
+    }
+    rebound = bind_region_candidate(
+        PreparedRegionCandidate(program, selected.request.candidates[winner], reversed_records, rebuilt),
+        selected.request.payload_limits,
+        selected.selection.candidates[winner],
+    )
     for actual, expected in zip(rebound.run(inputs).values, selected.execution.run(inputs).values, strict=True):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_optout_and_search_budgets_do_not_authorize_an_over_budget_candidate(monkeypatch):
     import pllm.execution.region_optimization as tuning
+
     program, cells, inputs = example()
     monkeypatch.setattr(tuning, "_outline_candidates", lambda *args: iter(()))
+
     def forbidden(*args):
         raise AssertionError("an infeasible candidate must not be measured")
+
     monkeypatch.setattr(tuning, "_measure", forbidden)
     with warnings.catch_warnings(record=True) as caught:
-        for kwargs in ({"max_rewrite_depth": 1}, {"max_candidates": 1},
-                       {"options": ExecutionOptions(allow_numerical_transforms=False, schedule_policy="serial")}):
+        for kwargs in (
+            {"max_rewrite_depth": 1},
+            {"max_candidates": 1},
+            {"options": ExecutionOptions(allow_numerical_transforms=False, schedule_policy="serial")},
+        ):
             settings = {"options": ExecutionOptions(schedule_policy="serial"), **kwargs}
             with pytest.raises(ValueError, match="no region candidate"):
-                optimize_region(program, cells, inputs, payload_limits=(RegionPayloadLimit("cpu", 5392),),
-                                warmup_rounds=0, measurement_rounds=1, **{**settings, "options": replace(settings["options"], tuning="measured")})
+                optimize_region(
+                    program,
+                    cells,
+                    inputs,
+                    payload_limits=(RegionPayloadLimit("cpu", 5392),),
+                    warmup_rounds=0,
+                    measurement_rounds=1,
+                    **{**settings, "options": replace(settings["options"], tuning="measured")},
+                )
     assert not any(isinstance(w.message, NumericalTransformWarning) for w in caught)

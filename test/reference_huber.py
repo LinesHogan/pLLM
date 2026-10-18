@@ -16,10 +16,13 @@ import torch
 from torch.nn import functional as F
 
 
-def initialize(hidden: int, rank: int, generator: torch.Generator,
-               device: torch.device) -> tuple[torch.nn.Parameter, torch.nn.Parameter]:
-    return (torch.nn.Parameter(torch.empty(hidden, rank, device=device).normal_(0.0, 0.02, generator=generator)),
-        torch.nn.Parameter(torch.empty(rank, hidden, device=device).normal_(0.0, 0.02, generator=generator)))
+def initialize(
+    hidden: int, rank: int, generator: torch.Generator, device: torch.device
+) -> tuple[torch.nn.Parameter, torch.nn.Parameter]:
+    return (
+        torch.nn.Parameter(torch.empty(hidden, rank, device=device).normal_(0.0, 0.02, generator=generator)),
+        torch.nn.Parameter(torch.empty(rank, hidden, device=device).normal_(0.0, 0.02, generator=generator)),
+    )
 
 
 def optimizer(parameters: tuple[torch.nn.Parameter, torch.nn.Parameter]) -> torch.optim.AdamW:
@@ -31,8 +34,12 @@ def predict(source: torch.Tensor, parameters: tuple[torch.nn.Parameter, torch.nn
     return source + (source @ a) @ b
 
 
-def step(source: torch.Tensor, target: torch.Tensor, parameters: tuple[torch.nn.Parameter, torch.nn.Parameter],
-         update: torch.optim.AdamW) -> torch.Tensor:
+def step(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    parameters: tuple[torch.nn.Parameter, torch.nn.Parameter],
+    update: torch.optim.AdamW,
+) -> torch.Tensor:
     update.zero_grad(set_to_none=True)
     loss = F.huber_loss(predict(source, parameters), target, delta=0.25, reduction="mean")
     loss.backward()

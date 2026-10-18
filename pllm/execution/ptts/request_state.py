@@ -2,20 +2,20 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cached_property
-from types import MappingProxyType
-from collections.abc import Mapping
 from threading import RLock
+from types import MappingProxyType
 
 import torch
 
-from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin, PagePublication, PageWrite
-from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.packed_rows import PackedPhaseRow
+from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.semantic_graph import SemanticState, StateResource, StateScope
 from pllm.contracts.state_ref import LineageId, StateRef
+from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin, PagePublication, PageWrite
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,9 +90,12 @@ class RequestStateDirectory:
 
     def __init__(self, arena: PageBundleArena, state: SemanticState | tuple[SemanticState, ...] | None) -> None:
         states = state if isinstance(state, tuple) else () if state is None else (state,)
-        if (len(set(s.resource for s in states)) != len(states)
+        if (
+            len(set(s.resource for s in states)) != len(states)
             or any(s not in arena.plan.semantic_graph.states for s in states)
-            or not states and arena.plan.semantic_graph.states):
+            or not states
+            and arena.plan.semantic_graph.states
+        ):
             raise ValueError("directory requires its original semantic states, or a stateless graph")
         self.arena, self.states = arena, states
         self._lineages: dict[StateAddress, LineageId] = {}
@@ -143,12 +146,21 @@ class RequestStateDirectory:
         return identity in self._inference_pins
 
     def _addresses(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateAddress, ...]:
-        return tuple(StateAddress(state.resource, key) for state in self.states
-            for key in ((None,) if state.scope is StateScope.INSTANCE else
-                tuple(dict.fromkeys(RequestStateKey.project(identity, state.key_fields) for identity in identities))))
+        return tuple(
+            StateAddress(state.resource, key)
+            for state in self.states
+            for key in (
+                (None,)
+                if state.scope is StateScope.INSTANCE
+                else tuple(
+                    dict.fromkeys(RequestStateKey.project(identity, state.key_fields) for identity in identities)
+                )
+            )
+        )
 
-    def prepare_admission(self, identities: tuple[RequestIdentity, ...],
-                          stream: torch.cuda.Stream | None = None) -> RequestStateAdmissionBatch:
+    def prepare_admission(
+        self, identities: tuple[RequestIdentity, ...], stream: torch.cuda.Stream | None = None
+    ) -> RequestStateAdmissionBatch:
         with self._lock:
             if not self.states:
                 raise RuntimeError("stateless graph has no state to admit")
@@ -164,11 +176,18 @@ class RequestStateDirectory:
                 holds: tuple[tuple[RequestIdentity, StateAddress], ...] = ()
                 instances: tuple[StateRef, ...] = ()
             else:
-                if any((s.resource, identity) in self._identity_holds for s in self.request_states for identity in identities):
+                if any(
+                    (s.resource, identity) in self._identity_holds
+                    for s in self.request_states
+                    for identity in identities
+                ):
                     raise RuntimeError("request admission requires distinct unadmitted requests")
                 new = tuple(key for key in addresses if key.key is not None and key not in self._lineages)
-                holds = tuple((identity, StateAddress(s.resource, RequestStateKey.project(identity, s.key_fields)))
-                    for s in self.request_states for identity in identities)
+                holds = tuple(
+                    (identity, StateAddress(s.resource, RequestStateKey.project(identity, s.key_fields)))
+                    for s in self.request_states
+                    for identity in identities
+                )
                 instances = tuple(self._latest(key) for key in addresses if key.key is None)
                 if instances and any(identity in self._inference_pins for identity in identities):
                     raise ValueError("instance inference admission requires distinct new requests")
@@ -217,7 +236,11 @@ class RequestStateDirectory:
         try:
             return self.arena.latest(self._lineages[key])
         except KeyError as exc:
-            message = "instance state is not admitted" if key.key is None else "request selection references an unadmitted key"
+            message = (
+                "instance state is not admitted"
+                if key.key is None
+                else "request selection references an unadmitted key"
+            )
             raise RuntimeError(message) from exc
 
     def latest_refs(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateRef, ...]:
@@ -272,14 +295,25 @@ class RequestStateDirectory:
                 pins: tuple[PagePin, ...] = ()
                 leaving: tuple[StateAddress, ...] = ()
             else:
-                if any((s.resource, identity) not in self._identity_holds for s in self.request_states for identity in identities):
+                if any(
+                    (s.resource, identity) not in self._identity_holds
+                    for s in self.request_states
+                    for identity in identities
+                ):
                     raise RuntimeError("request retirement references an unadmitted key")
                 pins = tuple(self._inference_pins[identity] for identity in identities) if self.instance_states else ()
                 leaving = tuple(key for key in addresses if key.key is not None)
-                members = {key: {identity for identity in identities
-                    if self._identity_holds[key.resource, identity] == key} for key in leaving}
-                releasing = tuple(key for key in leaving if members[key] == self._holders.get(key, set())
-                    and key.key is not None and RequestKeyField.ROUTE not in key.key.fields)
+                members = {
+                    key: {identity for identity in identities if self._identity_holds[key.resource, identity] == key}
+                    for key in leaving
+                }
+                releasing = tuple(
+                    key
+                    for key in leaving
+                    if members[key] == self._holders.get(key, set())
+                    and key.key is not None
+                    and RequestKeyField.ROUTE not in key.key.fields
+                )
             if self._leases.keys() & set(releasing):
                 raise RuntimeError("request retirement requires keys without an active step")
             refs = tuple(self._latest(key) for key in releasing)

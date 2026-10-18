@@ -26,8 +26,10 @@ def test_existing_model_graph_import_does_not_recapture_execute_or_bind_weights(
     program = torch.export.export(model, (x,))
     source_text = str(program.graph)
     saved = tuple(parameter.clone() for parameter in model.parameters())
-    with patch.object(torch.export, "export", side_effect=AssertionError("must not recapture")), \
-         patch.object(program.graph_module, "forward", side_effect=AssertionError("must not execute graph")):
+    with (
+        patch.object(torch.export, "export", side_effect=AssertionError("must not recapture")),
+        patch.object(program.graph_module, "forward", side_effect=AssertionError("must not execute graph")),
+    ):
         cell = ExportedCell.from_export(program)
     assert cell.inputs == ("left", "right", "x")
     # Functionalization may derive a normalized graph; the supplied source is
@@ -35,14 +37,14 @@ def test_existing_model_graph_import_does_not_recapture_execute_or_bind_weights(
     assert not tuple(cell.graph.parameters()) and not tuple(cell.graph.buffers())
     assert str(program.graph) == source_text
     expected = model(x)
-    actual, = cell(model.left, model.right, x)
+    (actual,) = cell(model.left, model.right, x)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    candidate, = reassociation_candidates(cell)
-    rewritten, = candidate.cell(model.left, model.right, x)
+    (candidate,) = reassociation_candidates(cell)
+    (rewritten,) = candidate.cell(model.left, model.right, x)
     torch.testing.assert_close(rewritten, expected, rtol=1e-12, atol=1e-12)
     # Another version is an explicit input, never an implicit read from model.
     next_left = model.left.detach() * 2
-    changed, = cell(next_left, model.right, x)
+    (changed,) = cell(next_left, model.right, x)
     torch.testing.assert_close(changed, (x @ next_left) @ model.right, rtol=0, atol=0)
     for parameter, original in zip(model.parameters(), saved, strict=True):
         torch.testing.assert_close(parameter, original, rtol=0, atol=0)
@@ -81,8 +83,9 @@ def test_tensor_import_cannot_silently_specialize_dynamic_constraints_or_scalar_
         def forward(self, x, scale=2):
             return x * scale
 
-    dynamic = torch.export.export(Scale(), (torch.ones(3, 4),),
-        dynamic_shapes=({0: torch.export.Dim("rows", min=1, max=8)},))
+    dynamic = torch.export.export(
+        Scale(), (torch.ones(3, 4),), dynamic_shapes=({0: torch.export.Dim("rows", min=1, max=8)},)
+    )
     with pytest.raises(ValueError, match="symbolic constraints"):
         ExportedCell.from_export(dynamic)
     specialized = torch.export.export(Scale(), (torch.ones(3, 4), 2))
@@ -90,8 +93,10 @@ def test_tensor_import_cannot_silently_specialize_dynamic_constraints_or_scalar_
         ExportedCell.from_export(specialized)
 
 
-@pytest.mark.parametrize("device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="requires CUDA"))))
+@pytest.mark.parametrize(
+    "device",
+    ("cpu", pytest.param("cuda:0", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"))),
+)
 def test_original_activation_graph_uses_backend_support_without_an_operator_whitelist(device):
     class Activation(torch.nn.Module):
         def __init__(self):
@@ -107,12 +112,13 @@ def test_original_activation_graph_uses_backend_support_without_an_operator_whit
     assert source.inputs == ("scale", "x")
     saved = model.scale.clone(), x.clone()
     compiled = compile_tensor_cell(source)
-    actual, = compiled.invoke((model.scale, x), None)
+    (actual,) = compiled.invoke((model.scale, x), None)
     torch.testing.assert_close(actual, model(x), rtol=1e-5, atol=1e-6)
     # Graph-derived account: silu decomposes to five pointwise values at the
     # pinned Torch version; each is charged one span, plus the named slack.
     subtotal = 5 * x.numel() * x.element_size()
     assert sum(allocation.bytes for allocation in compiled.implementation.allocations) == (
-        subtotal + math.ceil(subtotal * COMPILER_SLACK_FRACTION))
+        subtotal + math.ceil(subtotal * COMPILER_SLACK_FRACTION)
+    )
     for value, original in zip((model.scale, x), saved, strict=True):
         torch.testing.assert_close(value, original, rtol=0, atol=0)

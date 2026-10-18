@@ -8,18 +8,35 @@ import torch
 
 from pllm import _core
 from pllm.config import ExecutionOptions
-from pllm.contracts.region_program import Call, Function, Program, Publish, Resource, ScalarType, Scan, SizeParameter, Snapshot, Value
+from pllm.contracts.region_program import (
+    Call,
+    Function,
+    Program,
+    Publish,
+    Resource,
+    ScalarType,
+    Scan,
+    SizeParameter,
+    Snapshot,
+    Value,
+)
 from pllm.contracts.region_selection import RegionPayloadLimit
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_compilation import (
-    analyze_region_program, explore_region_schedules, explore_region_tiling, explore_region_windows, lower_region_bindings, lower_region_schedule, preview_region_schedule,
+    analyze_region_program,
+    explore_region_schedules,
+    explore_region_tiling,
+    explore_region_windows,
+    lower_region_bindings,
+    lower_region_schedule,
+    preview_region_schedule,
 )
 from pllm.execution.region_execution import RegionExecution
 from pllm.execution.region_optimization import optimize_region
 from pllm.execution.region_storage import analyze_region_capacity
 from test.boundary.test_region_program import grid_program, region
 from test.boundary.test_region_schedule import evaluate_grid
-from test.boundary.test_region_tensor import tensor_grid, inputs_for
+from test.boundary.test_region_tensor import inputs_for, tensor_grid
 from test.boundary.test_tensor_access import StorageObserver
 
 
@@ -27,15 +44,21 @@ from test.boundary.test_tensor_access import StorageObserver
 def test_lazy_catalog_matches_complete_family_merge_including_ties(limit):
     program = grid_program(9, 7)
     source = analyze_region_program(program)
-    streams = [iter(source.candidates[1:]),
+    streams = [
+        iter(source.candidates[1:]),
         iter(explore_region_windows(program, sizes=(2, 4), depth=1, max_candidates=limit - 1).candidates),
-        iter(explore_region_tiling(program, max_candidates=limit - 1).candidates)]
+        iter(explore_region_tiling(program, max_candidates=limit - 1).candidates),
+    ]
+
     def order(candidate):
         instances = preview_region_schedule(program, candidate.schedule_map)
         # Equal-time groups retain simultaneity; arbitrary ordering inside a
         # tie must not make two different partial orders look equivalent.
-        return tuple(frozenset((point.statement_id, point.coordinates) for point in group)
-                     for _, group in groupby(instances, key=lambda point: point.time))
+        return tuple(
+            frozenset((point.statement_id, point.coordinates) for point in group)
+            for _, group in groupby(instances, key=lambda point: point.time)
+        )
+
     expected = [source.candidates[0]]
     orders = [order(expected[0])]
     # Each family turn pulls until one distinct order arrives; duplicates do
@@ -127,17 +150,21 @@ def test_tiling_search_is_bounded_and_rejects_invalid_sizes():
 
 def test_tiles_keep_each_state_address_snapshot_update_publish_order():
     integer, index = ScalarType.INT, ScalarType.INDEX
-    inner = region((Value("l", index),), (
-        Snapshot(("l",), (Value("w", integer),), "state"),
-        Call(("w",), (Value("next", integer),), "step"),
-        Publish(("next", "l"), (), "state"),
-    ), ())
-    outer = region((Value("c", index),), (
-        Scan((), (), 4, inner),
-    ), ())
-    program = Program(region((), (
-        Scan((), (), 3, outer),
-    ), ()), (Function("step", (integer,), (integer,)),), (Resource("state", (integer,), (4,)),))
+    inner = region(
+        (Value("l", index),),
+        (
+            Snapshot(("l",), (Value("w", integer),), "state"),
+            Call(("w",), (Value("next", integer),), "step"),
+            Publish(("next", "l"), (), "state"),
+        ),
+        (),
+    )
+    outer = region((Value("c", index),), (Scan((), (), 4, inner),), ())
+    program = Program(
+        region((), (Scan((), (), 3, outer),), ()),
+        (Function("step", (integer,), (integer,)),),
+        (Resource("state", (integer,), (4,)),),
+    )
     candidates = explore_region_tiling(program, tile_sizes=(2, 3)).candidates
     assert candidates
     for candidate in candidates:
@@ -156,8 +183,12 @@ def test_tiles_keep_each_state_address_snapshot_update_publish_order():
 def test_generated_tiles_execute_real_tensors_inside_source_capacity(device):
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    cell = ExportedCell.capture(lambda h, w: (h + w, w + 1), ("h", "w"), ("nh", "nw"),
-        (torch.ones(4, dtype=torch.float64, device=device), torch.ones(4, dtype=torch.float64, device=device)))
+    cell = ExportedCell.capture(
+        lambda h, w: (h + w, w + 1),
+        ("h", "w"),
+        ("nh", "nw"),
+        (torch.ones(4, dtype=torch.float64, device=device), torch.ones(4, dtype=torch.float64, device=device)),
+    )
     chunks, layers = 5, 7
     program = tensor_grid(chunks, layers, cell)
     inputs = inputs_for(chunks, layers, device)
@@ -166,8 +197,12 @@ def test_generated_tiles_execute_real_tensors_inside_source_capacity(device):
     cells = {cell.digest: cell}
     for candidate in explore_region_tiling(program).candidates:
         capacity = analyze_region_capacity(program, candidate.schedule_map, cells)
-        execution = RegionExecution(program, lower_region_schedule(program, candidate.schedule_map),
-            lower_region_bindings(program, candidate.schedule_map), cells)
+        execution = RegionExecution(
+            program,
+            lower_region_schedule(program, candidate.schedule_map),
+            lower_region_bindings(program, candidate.schedule_map),
+            cells,
+        )
         with StorageObserver(external) as observed:
             result = execution.run(inputs)
         assert observed.peak - external_bytes <= capacity.devices[0].peak_tensor_bytes_upper_bound
@@ -182,23 +217,52 @@ def test_generated_tiles_execute_real_tensors_inside_source_capacity(device):
 
 def test_million_row_parameterized_tiles_are_symbolic_and_reach_the_tuner(monkeypatch):
     import pllm.execution.region_optimization as tuning
-    cell = ExportedCell.capture(lambda h, w: (h + w, w + 1), ("h", "w"), ("nh", "nw"),
-        (torch.ones(4, dtype=torch.float64), torch.ones(4, dtype=torch.float64)))
-    program = replace(tensor_grid("chunks", "layers", cell),
-        parameters=(SizeParameter("chunks", 0, 1_000_000), SizeParameter("layers", 0, 16)))
+
+    cell = ExportedCell.capture(
+        lambda h, w: (h + w, w + 1),
+        ("h", "w"),
+        ("nh", "nw"),
+        (torch.ones(4, dtype=torch.float64), torch.ones(4, dtype=torch.float64)),
+    )
+    program = replace(
+        tensor_grid("chunks", "layers", cell),
+        parameters=(SizeParameter("chunks", 0, 1_000_000), SizeParameter("layers", 0, 16)),
+    )
     tiled = explore_region_tiling(program)
     assert tiled.candidates and len(tiled.candidates) <= 8
     assert all(len(c.schedule_map) < 3000 and len(c.schedule_tree) < 4000 for c in tiled.candidates)
     target = tiled.candidates[0].schedule_map
     lowered_target = lower_region_schedule(program, target).schedule_map
-    monkeypatch.setattr(tuning, "_measure", lambda execution, *args: 1 if execution._lowered.schedule_map == lowered_target else 100)
-    selected = optimize_region(program, {cell.digest: cell}, inputs_for(2, 3), sizes={"chunks": 2, "layers": 3},
-        payload_limits=(RegionPayloadLimit("cpu", 1 << 30),), options=replace(ExecutionOptions(allow_numerical_transforms=False), tuning="measured"),
-        warmup_rounds=0, measurement_rounds=1)
-    assert lower_region_schedule(program, selected.request.candidates[selected.selection.selected].schedule_map).schedule_map == lowered_target
+    monkeypatch.setattr(
+        tuning, "_measure", lambda execution, *args: 1 if execution._lowered.schedule_map == lowered_target else 100
+    )
+    selected = optimize_region(
+        program,
+        {cell.digest: cell},
+        inputs_for(2, 3),
+        sizes={"chunks": 2, "layers": 3},
+        payload_limits=(RegionPayloadLimit("cpu", 1 << 30),),
+        options=replace(ExecutionOptions(allow_numerical_transforms=False), tuning="measured"),
+        warmup_rounds=0,
+        measurement_rounds=1,
+    )
+    assert (
+        lower_region_schedule(
+            program, selected.request.candidates[selected.selection.selected].schedule_map
+        ).schedule_map
+        == lowered_target
+    )
+
     def forbidden(*args):
         raise AssertionError("execution must not generate tiles or recompile")
-    for name in ("explore_region_tiling", "analyze_region_program", "select_region_candidate", "lower_region_schedule", "lower_region_bindings"):
+
+    for name in (
+        "explore_region_tiling",
+        "analyze_region_program",
+        "select_region_candidate",
+        "lower_region_schedule",
+        "lower_region_bindings",
+    ):
         monkeypatch.setattr(_core, name, forbidden)
     for chunks, layers in ((0, 0), (0, 7), (3, 0), (1, 1), (5, 7)):
         result = selected.execution.run(inputs_for(chunks, layers), sizes={"chunks": chunks, "layers": layers})

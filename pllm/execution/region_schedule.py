@@ -10,8 +10,15 @@ from collections.abc import Iterator, Mapping
 
 from pllm.contracts.region_program import Program, bind_sizes, resolve_extent
 from pllm.contracts.schedule_instructions import (
-    LoweredSchedule, ScheduleExpression, ScheduleInstruction, ScheduleInteger,
-    ScheduleInvoke, ScheduleIterator, ScheduleLoop, ScheduleOperator, ScheduleSequence,
+    LoweredSchedule,
+    ScheduleExpression,
+    ScheduleInstruction,
+    ScheduleInteger,
+    ScheduleInvoke,
+    ScheduleIterator,
+    ScheduleLoop,
+    ScheduleOperator,
+    ScheduleSequence,
     StatementInvocation,
 )
 
@@ -29,11 +36,17 @@ def evaluate_schedule_expression(expression: ScheduleExpression, variables: dict
         return variables[expression.name]
     op, args = expression.operator, expression.arguments
     if op in (ScheduleOperator.AND, ScheduleOperator.AND_THEN):
-        return bool(evaluate_schedule_expression(args[0], variables)) and bool(evaluate_schedule_expression(args[1], variables))
+        return bool(evaluate_schedule_expression(args[0], variables)) and bool(
+            evaluate_schedule_expression(args[1], variables)
+        )
     if op in (ScheduleOperator.OR, ScheduleOperator.OR_ELSE):
-        return bool(evaluate_schedule_expression(args[0], variables)) or bool(evaluate_schedule_expression(args[1], variables))
+        return bool(evaluate_schedule_expression(args[0], variables)) or bool(
+            evaluate_schedule_expression(args[1], variables)
+        )
     if op in (ScheduleOperator.CONDITIONAL, ScheduleOperator.SELECT):
-        return evaluate_schedule_expression(args[1] if evaluate_schedule_expression(args[0], variables) else args[2], variables)
+        return evaluate_schedule_expression(
+            args[1] if evaluate_schedule_expression(args[0], variables) else args[2], variables
+        )
     numbers = tuple(checked_schedule_integer(evaluate_schedule_expression(a, variables)) for a in args)
     if op is ScheduleOperator.MIN:
         return min(numbers)
@@ -82,14 +95,20 @@ def evaluate_schedule_expression(expression: ScheduleExpression, variables: dict
 
 def _walk(instruction: ScheduleInstruction, variables: dict[str, int]) -> Iterator[StatementInvocation]:
     if isinstance(instruction, ScheduleInvoke):
-        yield StatementInvocation(instruction.statement_id,
-            tuple(checked_schedule_integer(evaluate_schedule_expression(c, variables)) for c in instruction.coordinates))
+        yield StatementInvocation(
+            instruction.statement_id,
+            tuple(
+                checked_schedule_integer(evaluate_schedule_expression(c, variables)) for c in instruction.coordinates
+            ),
+        )
     elif isinstance(instruction, ScheduleSequence):
         for child in instruction.children:
             yield from _walk(child, variables)
     elif isinstance(instruction, ScheduleLoop):
         previous = variables.get(instruction.iterator)
-        variables[instruction.iterator] = checked_schedule_integer(evaluate_schedule_expression(instruction.initial, variables))
+        variables[instruction.iterator] = checked_schedule_integer(
+            evaluate_schedule_expression(instruction.initial, variables)
+        )
         try:
             while evaluate_schedule_expression(instruction.condition, variables):
                 yield from _walk(instruction.body, variables)
@@ -103,7 +122,11 @@ def _walk(instruction: ScheduleInstruction, variables: dict[str, int]) -> Iterat
             else:
                 variables[instruction.iterator] = previous
     else:
-        branch = instruction.if_true if evaluate_schedule_expression(instruction.condition, variables) else instruction.if_false
+        branch = (
+            instruction.if_true
+            if evaluate_schedule_expression(instruction.condition, variables)
+            else instruction.if_false
+        )
         yield from _walk(branch, variables)
 
 
@@ -118,7 +141,9 @@ class RegionScheduleExecution:
         sizes = bind_sizes(self._program, sizes)
         for invocation in _walk(self._lowered.body, {f"__size_{name}": value for name, value in sizes.items()}):
             statement = self._lowered.statements[invocation.statement_id]
-            if any(not 0 <= coordinate < resolve_extent(extent, sizes) for coordinate, extent in
-                   zip(invocation.coordinates, statement.extents, strict=True)):
+            if any(
+                not 0 <= coordinate < resolve_extent(extent, sizes)
+                for coordinate, extent in zip(invocation.coordinates, statement.extents, strict=True)
+            ):
                 raise RuntimeError("lowered invocation is outside its verified source domain")
             yield invocation

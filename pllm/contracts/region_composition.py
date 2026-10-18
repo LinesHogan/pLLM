@@ -3,8 +3,23 @@
 from dataclasses import dataclass, replace
 
 from pllm.contracts.region_program import (
-    AffineIndex, Block, Call, Coordinate, Function, If, Map, Op, Program, Region, Scalar, ScalarKind,
-    ScalarType, Scan, Value, While, verify,
+    AffineIndex,
+    Block,
+    Call,
+    Coordinate,
+    Function,
+    If,
+    Map,
+    Op,
+    Program,
+    Region,
+    Scalar,
+    ScalarKind,
+    ScalarType,
+    Scan,
+    Value,
+    While,
+    verify,
 )
 
 
@@ -48,7 +63,7 @@ def select_function_bodies(bodies: tuple[RegionFunctionBody, ...], *, selector: 
     functions: dict[str, Function] = {}
     for body in bodies:
         body.validate()
-        if (body.declaration != first.declaration or body.program.resources != first.program.resources):
+        if body.declaration != first.declaration or body.program.resources != first.program.resources:
             raise ValueError("source variants must share their external ports and resource domain")
         for function in body.program.functions:
             if function.name in functions and functions[function.name] != function:
@@ -57,25 +72,42 @@ def select_function_bodies(bodies: tuple[RegionFunctionBody, ...], *, selector: 
     if all(body == first for body in bodies):
         return first
     used = {value.name for value in arguments}
+
     def fresh(name: str) -> str:
         while name in used:
             name += "_"
         used.add(name)
         return name
+
     results = tuple(Value(fresh(f"selected{i}"), type_) for i, type_ in enumerate(first.declaration.outputs))
     split, before = Value(fresh("split_index"), ScalarType.INDEX), Value(fresh("before_split"), ScalarType.BOOL)
+
     def select(start: int, stop: int) -> Region:
         if all(body == bodies[start] for body in bodies[start:stop]):
             inlined = _inline_block(bodies[start].program.entry.block, arguments, "source")
             return Region(Block(arguments, inlined.operations, tuple(value.name for value in inlined.results)))
         middle = (start + stop) // 2
-        return Region(Block(arguments, (
-            Coordinate((), (split,), AffineIndex(middle)),
-            Scalar((selector, split.name), (before,), ScalarKind.LESS),
-            If((before.name, *(value.name for value in arguments)), results, select(start, middle), select(middle, stop)),
-        ), tuple(value.name for value in results)))
-    result = RegionFunctionBody(first.declaration, Program(select(0, len(bodies)),
-        tuple(functions[name] for name in sorted(functions)), first.program.resources))
+        return Region(
+            Block(
+                arguments,
+                (
+                    Coordinate((), (split,), AffineIndex(middle)),
+                    Scalar((selector, split.name), (before,), ScalarKind.LESS),
+                    If(
+                        (before.name, *(value.name for value in arguments)),
+                        results,
+                        select(start, middle),
+                        select(middle, stop),
+                    ),
+                ),
+                tuple(value.name for value in results),
+            )
+        )
+
+    result = RegionFunctionBody(
+        first.declaration,
+        Program(select(0, len(bodies)), tuple(functions[name] for name in sorted(functions)), first.program.resources),
+    )
     result.validate()
     return result
 
@@ -146,7 +178,9 @@ def inline_function_bodies(program: Program, bodies: tuple[RegionFunctionBody, .
             if isinstance(operation, (Scan, Map)):
                 operation = replace(operation, body=compose(operation.body))
             elif isinstance(operation, If):
-                operation = replace(operation, then_region=compose(operation.then_region), else_region=compose(operation.else_region))
+                operation = replace(
+                    operation, then_region=compose(operation.then_region), else_region=compose(operation.else_region)
+                )
             elif isinstance(operation, While):
                 operation = replace(operation, condition=compose(operation.condition), body=compose(operation.body))
             body = definitions.get(operation.function) if isinstance(operation, Call) else None
@@ -172,11 +206,15 @@ def inline_function_bodies(program: Program, bodies: tuple[RegionFunctionBody, .
                     prefix += "_"
                 used.update(introduced)
                 operations.extend(inlined.operations)
-                names.update((old.name, value.name) for old, value in zip(original.outputs, inlined.results, strict=True))
+                names.update(
+                    (old.name, value.name) for old, value in zip(original.outputs, inlined.results, strict=True)
+                )
             types.update((value.name, value.type) for value in original.outputs)
         return Region(Block(block.arguments, tuple(operations), tuple(names[name] for name in block.yields)))
 
     entry = compose(program.entry)
-    result = replace(program, entry=entry, functions=tuple(value for name, value in functions.items() if name not in expanded))
+    result = replace(
+        program, entry=entry, functions=tuple(value for name, value in functions.items() if name not in expanded)
+    )
     verify(result)
     return result

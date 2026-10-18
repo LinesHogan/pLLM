@@ -5,21 +5,30 @@ from itertools import count
 
 import pytest
 import torch
-from pllm import make_llm
-import pllm
-from pllm.execution.codec import decode_boundary, encode_boundary
-from pllm.execution.trace import TracePhase, TraceSnapshot
-from pllm.execution import trace as trace_module
 
+import pllm
+from pllm import make_llm
+from pllm.execution import trace as trace_module
+from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.host_runtime import (
-    HostRuntimeFacts, HostExecution, HostReceipt, HostSettlementError,
+    HostExecution,
+    HostReceipt,
+    HostRuntimeFacts,
+    HostSettlementError,
 )
-from pllm.workloads.gtta.environment import GTTAEnvironmentService
-from pllm.workloads.gtta.types import (
-    GTTAConfig, GTTAHostRequest, GTTAHostTransaction, GTTAPromptPosition, GTTAQuery, GTTAResult, TrajectoryFeedback,
-)
-from pllm.workloads.gtta.state import GTTADynamicsSnapshot, GTTADynamicsState, GTTAStepContext
+from pllm.execution.trace import TracePhase, TraceSnapshot
 from pllm.workloads.gtta import state as gtta_math
+from pllm.workloads.gtta.environment import GTTAEnvironmentService
+from pllm.workloads.gtta.state import GTTADynamicsSnapshot, GTTADynamicsState, GTTAStepContext
+from pllm.workloads.gtta.types import (
+    GTTAConfig,
+    GTTAHostRequest,
+    GTTAHostTransaction,
+    GTTAPromptPosition,
+    GTTAQuery,
+    GTTAResult,
+    TrajectoryFeedback,
+)
 from pllm.workloads.gtta.workload import GTTAWorkload
 
 
@@ -41,8 +50,16 @@ def test_typed_host_transaction_abort_requeue_and_postpublish_settlement(monkeyp
         raise RuntimeError("query interrupted after update")
 
     facts = pllm.HostRuntimeFacts(torch.device("cpu"))
-    binding = pllm.transaction("local.dynamics", facts, config=service.config,
-        state_factory=lambda: original_state, service=service, update=update, query=failed_query, publish=gtta_math.publish)
+    binding = pllm.transaction(
+        "local.dynamics",
+        facts,
+        config=service.config,
+        state_factory=lambda: original_state,
+        service=service,
+        update=update,
+        query=failed_query,
+        publish=gtta_math.publish,
+    )
     assert binding.service is service
     local = binding.compile()
     assert local.service is service
@@ -54,7 +71,9 @@ def test_typed_host_transaction_abort_requeue_and_postpublish_settlement(monkeyp
     original_service_commit = service.commit
 
     def reject_publication(
-        self: GTTAEnvironmentService, transaction: GTTAHostTransaction, receipt: HostReceipt[GTTAResult],
+        self: GTTAEnvironmentService,
+        transaction: GTTAHostTransaction,
+        receipt: HostReceipt[GTTAResult],
     ) -> None:
         raise RuntimeError("publication rejected before commit")
 
@@ -69,7 +88,9 @@ def test_typed_host_transaction_abort_requeue_and_postpublish_settlement(monkeyp
     published: list[HostReceipt[GTTAResult]] = []
 
     def record_publication(
-        self: GTTAEnvironmentService, transaction: GTTAHostTransaction, receipt: HostReceipt[GTTAResult],
+        self: GTTAEnvironmentService,
+        transaction: GTTAHostTransaction,
+        receipt: HostReceipt[GTTAResult],
     ) -> None:
         original_service_commit(transaction, receipt)
         published.append(receipt)
@@ -85,7 +106,7 @@ def test_typed_host_transaction_abort_requeue_and_postpublish_settlement(monkeyp
         fault.setattr(HostExecution, "commit", reject_settlement)
         with pytest.raises(HostSettlementError) as failure:
             coordinator.run(request)
-    receipt, = published
+    (receipt,) = published
     assert failure.value.receipt is receipt
     assert service.queued_trajectories == 0
     assert execution.diagnostics().state_version == 1

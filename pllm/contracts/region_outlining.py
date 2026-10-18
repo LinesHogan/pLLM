@@ -1,10 +1,19 @@
 """Exact extraction of adjacent tensor calls, before physical scheduling."""
 
-from dataclasses import dataclass
 from collections.abc import Iterator
+from dataclasses import dataclass
 
 from pllm.contracts.region_program import (
-    Block, Call, Function, If, Map, Program, Region, Scan, TensorType, While,
+    Block,
+    Call,
+    Function,
+    If,
+    Map,
+    Program,
+    Region,
+    Scan,
+    TensorType,
+    While,
 )
 from pllm.contracts.tensor_access import TensorAccessGraph
 
@@ -37,9 +46,13 @@ class OutlinedProgram:
 
 def call_outline_sites(program: Program, *, functions: frozenset[str] | None = None) -> Iterator[CallOutline]:
     """Enumerate contiguous pure tensor groups, retaining all control boundaries."""
-    eligible = {f.name for f in program.functions if not f.resources
-                and all(isinstance(t, TensorType) for t in (*f.inputs, *f.outputs))
-                and (functions is None or f.name in functions)}
+    eligible = {
+        f.name
+        for f in program.functions
+        if not f.resources
+        and all(isinstance(t, TensorType) for t in (*f.inputs, *f.outputs))
+        and (functions is None or f.name in functions)
+    }
 
     def walk(region: Region, path: tuple[int, ...]) -> Iterator[CallOutline]:
         ops = region.block.operations
@@ -56,12 +69,16 @@ def call_outline_sites(program: Program, *, functions: frozenset[str] | None = N
                     yield CallOutline(path, start, count)
             first = max(first + 1, end)
         for index, op in enumerate(ops):
-            children = ((op.body,) if isinstance(op, (Scan, Map)) else
-                        (op.then_region, op.else_region) if isinstance(op, If) else
-                        (op.condition, op.body) if isinstance(op, While) else ())
+            children = (
+                (op.body,)
+                if isinstance(op, (Scan, Map))
+                else (op.then_region, op.else_region)
+                if isinstance(op, If)
+                else (op.condition, op.body)
+                if isinstance(op, While)
+                else ()
+            )
             for child, nested in enumerate(children):
                 yield from walk(nested, (*path, index, child))
 
     yield from walk(program.entry, ())
-
-

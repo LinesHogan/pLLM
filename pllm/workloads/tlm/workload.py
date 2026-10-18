@@ -2,23 +2,27 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from collections.abc import Mapping
+from dataclasses import dataclass
 from enum import StrEnum
 from math import isfinite
 
 import torch
 from torch.nn import functional as F
-import pllm
 
+import pllm
 from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole
 
 
 def _sentence_cross_entropy(logits: torch.Tensor, labels: torch.Tensor, ignore_index: int) -> torch.Tensor:
     shifted = labels[..., 1:].contiguous()
     valid = shifted.ne(ignore_index)
-    losses = F.cross_entropy(logits[..., :-1, :].contiguous().view(-1, logits.shape[-1]),
-        shifted.view(-1), reduction="none", ignore_index=ignore_index).view_as(shifted)
+    losses = F.cross_entropy(
+        logits[..., :-1, :].contiguous().view(-1, logits.shape[-1]),
+        shifted.view(-1),
+        reduction="none",
+        ignore_index=ignore_index,
+    ).view_as(shifted)
     return (losses * valid).sum(-1) / valid.sum(-1).clamp_min(1)
 
 
@@ -36,8 +40,7 @@ class TLMConfig:
     ignore_index: int = -100
 
     def __post_init__(self) -> None:
-        if (not isfinite(self.threshold)
-            or not isfinite(self.lamb) or self.lamb < 0):
+        if not isfinite(self.threshold) or not isfinite(self.lamb) or self.lamb < 0:
             raise ValueError("TLM objective configuration is not finite or closed")
 
 
@@ -63,8 +66,11 @@ class TLMWorkload(pllm.CausalAdapterWorkload[TLMData, TLMResult]):
     model: pllm.CausalModel
 
     def __post_init__(self) -> None:
-        if any(item.target.module is not ParameterModuleKind.ATTENTION or item.target.role not in (
-            ParameterRole.QUERY_PROJECTION_WEIGHT, ParameterRole.VALUE_PROJECTION_WEIGHT) for item in self.model.targets):
+        if any(
+            item.target.module is not ParameterModuleKind.ATTENTION
+            or item.target.role not in (ParameterRole.QUERY_PROJECTION_WEIGHT, ParameterRole.VALUE_PROJECTION_WEIGHT)
+            for item in self.model.targets
+        ):
             raise ValueError("TLM factor topology must name q/v targets")
 
     @property
@@ -91,8 +97,12 @@ class TLMWorkload(pllm.CausalAdapterWorkload[TLMData, TLMResult]):
         selection = None
         if config.mode.value == "offline":
             with torch.no_grad():
-                selection = _sentence_cross_entropy(model.logits(data.batch, None), data.batch.labels, config.ignore_index)
-        sentence = _sentence_cross_entropy(model.logits(data.batch, tuple(parameters.values())), data.batch.labels, config.ignore_index)
+                selection = _sentence_cross_entropy(
+                    model.logits(data.batch, None), data.batch.labels, config.ignore_index
+                )
+        sentence = _sentence_cross_entropy(
+            model.logits(data.batch, tuple(parameters.values())), data.batch.labels, config.ignore_index
+        )
         selection = sentence.detach() if selection is None else selection
         selected = selection > config.threshold
         weighted = sentence * (config.lamb * torch.exp(selection - config.threshold)) * selected.to(sentence.dtype)

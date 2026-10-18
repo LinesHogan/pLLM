@@ -2,40 +2,77 @@
 
 from __future__ import annotations
 
+import struct
 from collections.abc import Callable, Mapping
 from copy import copy
 from functools import lru_cache, partial
 from types import MappingProxyType
-import struct
 
 import torch
 
-from pllm.contracts.region_composition import RegionFunctionBody, inline_function_bodies, inline_region
-from pllm.contracts.region_program import (
-    AccessMode, AccessRange, AffineIndex, BankType, Block, BorrowedResource, Call, Coordinate, Function, If, IndexTerm, Op,
-    Parameter, ParameterTerm, Program, Region, ResourceAccess, ScalarType, Scan, Select,
-    SizeConstraint, SizeParameter, TensorType, Value,
-)
 from pllm.contracts.backend_attachment import CausalModelDomain
-from pllm.contracts.semantic_graph import TokenwiseLayerReplay
-from pllm.contracts.region_retention import RetainedAllocation, RetentionEndpoint
+from pllm.contracts.region_composition import RegionFunctionBody, inline_function_bodies, inline_region
 from pllm.contracts.region_imports import BorrowedTensorImport, NativeKernelImport, RegionTensorImport
-from pllm.contracts.region_proposal import RegionScheduleProposal
-from pllm.contracts.region_streams import RegionStreamPlan
-from pllm.contracts.region_selection import (
-    RegionPayloadLimit, RegionSelectionPolicy,
+from pllm.contracts.region_program import (
+    AccessMode,
+    AccessRange,
+    AffineIndex,
+    BankType,
+    Block,
+    BorrowedResource,
+    Call,
+    Coordinate,
+    Function,
+    If,
+    IndexTerm,
+    Op,
+    Parameter,
+    ParameterTerm,
+    Program,
+    Region,
+    ResourceAccess,
+    ScalarType,
+    Scan,
+    Select,
+    SizeConstraint,
+    SizeParameter,
+    TensorType,
+    Value,
 )
+from pllm.contracts.region_proposal import RegionScheduleProposal
+from pllm.contracts.region_retention import RetainedAllocation, RetentionEndpoint
+from pllm.contracts.region_selection import (
+    RegionPayloadLimit,
+    RegionSelectionPolicy,
+)
+from pllm.contracts.region_streams import RegionStreamPlan
+from pllm.contracts.semantic_graph import TokenwiseLayerReplay
 from pllm.execution.codec import boundary_digest
-from pllm.execution.decoder_region import DecoderActivation, DecoderSource, RowLayerForward, activation_selected_function, decoder_normalize_function, index_cell, kv_resource
+from pllm.execution.decoder_region import (
+    DecoderActivation,
+    DecoderSource,
+    RowLayerForward,
+    activation_selected_function,
+    decoder_normalize_function,
+    index_cell,
+    kv_resource,
+)
 from pllm.execution.region_compilation import analyze_region_program, explore_region_schedules
 from pllm.execution.region_execution import RegionExecutionPlan, RegionInstructionExecution
-from pllm.execution.region_optimization import prepare_region_execution
 from pllm.execution.region_native import NativePrimitive, PrimitiveResources, RegionFunction, source_region_functions
-from pllm.execution.region_resources import ExternalFunction, HostResourceBinding, PagedResourceBinding, PinnedResourceBinding, ReadonlyResourceBinding, RegionPageOwner, RegionResources
-from pllm.execution.region_values import Bank, Data
+from pllm.execution.region_optimization import prepare_region_execution
+from pllm.execution.region_resources import (
+    ExternalFunction,
+    HostResourceBinding,
+    PagedResourceBinding,
+    PinnedResourceBinding,
+    ReadonlyResourceBinding,
+    RegionPageOwner,
+    RegionResources,
+)
 from pllm.execution.region_storage import analyze_region_payload, import_region_functions
-from pllm.execution.region_streams import RegionStreamBindings, plan_region_schedule, arrange_region_schedule
-
+from pllm.execution.region_streams import RegionStreamBindings, arrange_region_schedule, plan_region_schedule
+from pllm.execution.region_values import Bank, Data
 
 Mix = Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor]
 Begin = Callable[[int], tuple[torch.Tensor, torch.Tensor]]
@@ -43,17 +80,19 @@ Normalize = Callable[[int, torch.Tensor, torch.Tensor], torch.Tensor]
 Observe = Callable[[int, torch.Tensor], None]
 
 
-def mix_layer_outputs(effect: TokenwiseLayerReplay, source: torch.Tensor,
-                      destination: torch.Tensor, position: int) -> torch.Tensor:
+def mix_layer_outputs(
+    effect: TokenwiseLayerReplay, source: torch.Tensor, destination: torch.Tensor, position: int
+) -> torch.Tensor:
     alpha = struct.unpack("!d", struct.pack("!Q", effect.alpha_bits))[0]
     beta = None if effect.beta_bits is None else struct.unpack("!d", struct.pack("!Q", effect.beta_bits))[0]
     if effect.ramp_tokens:
         alpha *= min(position, effect.ramp_tokens) / effect.ramp_tokens
     source_float, destination_float = source.float(), destination.float()
-    normalized = source_float / source_float.square().sum(-1, keepdim=True).sqrt().clamp_min(torch.finfo(torch.float32).tiny)
+    normalized = source_float / source_float.square().sum(-1, keepdim=True).sqrt().clamp_min(
+        torch.finfo(torch.float32).tiny
+    )
     normalized *= destination_float.square().sum(-1, keepdim=True).sqrt()
     return ((1.0 - alpha if beta is None else beta) * destination_float + alpha * normalized).to(destination.dtype)
-
 
 
 def tokenwise_retained_bytes(hidden: int, width: int, layers: int) -> int:
@@ -63,10 +102,18 @@ def tokenwise_retained_bytes(hidden: int, width: int, layers: int) -> int:
 
 
 class TokenwiseRegion:
-    def __init__(self, tensor: TensorType, max_rows: int, domain: CausalModelDomain, effect: TokenwiseLayerReplay, mix: Mix, *,
-                 source_imports: tuple[RegionTensorImport, ...] = (),
-                 function_bodies: tuple[RegionFunctionBody, ...] = (),
-                 activations: tuple[DecoderActivation, ...] = ()) -> None:
+    def __init__(
+        self,
+        tensor: TensorType,
+        max_rows: int,
+        domain: CausalModelDomain,
+        effect: TokenwiseLayerReplay,
+        mix: Mix,
+        *,
+        source_imports: tuple[RegionTensorImport, ...] = (),
+        function_bodies: tuple[RegionFunctionBody, ...] = (),
+        activations: tuple[DecoderActivation, ...] = (),
+    ) -> None:
         if domain.layers != effect.layer_count:
             raise ValueError("tokenwise source differs from the signed model layer domain")
         self.weights = BorrowedResource("weights", (domain.layers + 1,))
@@ -74,48 +121,116 @@ class TokenwiseRegion:
         self.trace = BorrowedResource("trace", ())
         self.activations = activations
         self.activation_resources = tuple(item.resource(max_rows) for item in activations)
-        self.normal = DecoderSource(tensor, tuple(range(effect.layer_count)), domain,
-            taps=(effect.source_layer, effect.destination_layer), weights=self.weights, context=self.context,
-            source_imports=source_imports, function_bodies=function_bodies, activations=activations)
-        self.replay = DecoderSource(tensor, tuple(range(effect.destination_layer + 1, effect.layer_count)), domain,
-            weights=self.weights, context=self.context, source_imports=source_imports, function_bodies=function_bodies, activations=activations)
+        self.normal = DecoderSource(
+            tensor,
+            tuple(range(effect.layer_count)),
+            domain,
+            taps=(effect.source_layer, effect.destination_layer),
+            weights=self.weights,
+            context=self.context,
+            source_imports=source_imports,
+            function_bodies=function_bodies,
+            activations=activations,
+        )
+        self.replay = DecoderSource(
+            tensor,
+            tuple(range(effect.destination_layer + 1, effect.layer_count)),
+            domain,
+            weights=self.weights,
+            context=self.context,
+            source_imports=source_imports,
+            function_bodies=function_bodies,
+            activations=activations,
+        )
         self.function_bodies = function_bodies
         index, boolean = ScalarType.INDEX, ScalarType.BOOL
         positions = TensorType((1,), "torch.int64", tensor.device)
         self.domain = domain
         self.kv = kv_resource(domain)
-        normal_layers, replay_layers = BankType(index, len(self.normal.layers)), BankType(index, len(self.replay.layers))
+        normal_layers, replay_layers = (
+            BankType(index, len(self.normal.layers)),
+            BankType(index, len(self.replay.layers)),
+        )
         digest = boundary_digest(tensor, max_rows, domain, effect)
-        backups = ResourceAccess("kv", AccessMode.READ,
-            (index_cell(1), AccessRange(AffineIndex(), AffineIndex(domain.layers)), index_cell(2)))
+        backups = ResourceAccess(
+            "kv",
+            AccessMode.READ,
+            (index_cell(1), AccessRange(AffineIndex(), AffineIndex(domain.layers)), index_cell(2)),
+        )
         context_read = ResourceAccess(self.context.name, AccessMode.READ, (index_cell(0),))
         context_write = ResourceAccess(self.context.name, AccessMode.WRITE, (index_cell(0),))
         trace_write = ResourceAccess(self.trace.name, AccessMode.WRITE, ())
-        self.begin = Function("tokenwise.begin@3:" + digest, (index, index, index), (positions, tensor), ("context", "kv"), (context_write, backups))
+        self.begin = Function(
+            "tokenwise.begin@3:" + digest,
+            (index, index, index),
+            (positions, tensor),
+            ("context", "kv"),
+            (context_write, backups),
+        )
         self.normalize = decoder_normalize_function(tensor, domain.layers)
-        self.observe = Function("tokenwise.observe@3:" + digest, (index, tensor), (), ("context", "trace"), (context_read, trace_write))
-        self.complete = Function("tokenwise.complete@2:" + digest, (index, boolean), (), ("context", "trace"), (context_write, trace_write))
+        self.observe = Function(
+            "tokenwise.observe@3:" + digest, (index, tensor), (), ("context", "trace"), (context_read, trace_write)
+        )
+        self.complete = Function(
+            "tokenwise.complete@2:" + digest, (index, boolean), (), ("context", "trace"), (context_write, trace_write)
+        )
         blend = Function("tokenwise.mix@1:" + digest, (tensor, tensor, index), (tensor,))
+
         def blend_(inputs: tuple[Data, ...], resources: PrimitiveResources) -> tuple[Data, ...]:
             source, destination, position = inputs
-            if not isinstance(source, torch.Tensor) or not isinstance(destination, torch.Tensor) or type(position) is not int:
+            if (
+                not isinstance(source, torch.Tensor)
+                or not isinstance(destination, torch.Tensor)
+                or type(position) is not int
+            ):
                 raise ValueError("token mixture requires hidden tensors and the original token offset")
             return (mix(source, destination, position),)
 
-        args = (Value("row", index), Value("request", index), Value("positions", positions), Value("source", tensor), Value("destination", tensor),
-                Value("offset", index), Value("layer_ids", replay_layers))
-        replay = inline_region(self.replay.program,
-            (Value("row", index), Value("request", index), Value("offset", index), Value("layer_ids", replay_layers),
-             Value("positions", positions), Value("mixed", tensor)), "replay")
-        replay_body = Region(Block(args, (
-            Call(("source", "destination", "offset"), (Value("mixed", tensor),), blend.name),
-            Call(("row", "mixed"), (), self.observe.name),
-            *replay.operations,
-        ), ()))
+        args = (
+            Value("row", index),
+            Value("request", index),
+            Value("positions", positions),
+            Value("source", tensor),
+            Value("destination", tensor),
+            Value("offset", index),
+            Value("layer_ids", replay_layers),
+        )
+        replay = inline_region(
+            self.replay.program,
+            (
+                Value("row", index),
+                Value("request", index),
+                Value("offset", index),
+                Value("layer_ids", replay_layers),
+                Value("positions", positions),
+                Value("mixed", tensor),
+            ),
+            "replay",
+        )
+        replay_body = Region(
+            Block(
+                args,
+                (
+                    Call(("source", "destination", "offset"), (Value("mixed", tensor),), blend.name),
+                    Call(("row", "mixed"), (), self.observe.name),
+                    *replay.operations,
+                ),
+                (),
+            )
+        )
         skip = Region(Block(args, (), ()))
-        normal = inline_region(self.normal.program,
-            (Value("row", index), Value("request", index), Value("offset", index), Value("normal_layers", normal_layers),
-             Value("positions", positions), Value("seed", tensor)), "normal")
+        normal = inline_region(
+            self.normal.program,
+            (
+                Value("row", index),
+                Value("request", index),
+                Value("offset", index),
+                Value("normal_layers", normal_layers),
+                Value("positions", positions),
+                Value("seed", tensor),
+            ),
+            "normal",
+        )
         hidden, residual, source, destination = normal.results
         parameters: list[SizeParameter] = []
         constraints: list[SizeConstraint] = []
@@ -126,34 +241,82 @@ class TokenwiseRegion:
             count = SizeParameter(f"tokens{request}", 0, min(max_rows, domain.positions))
             prefix = SizeParameter(f"prefix{request}", 0, domain.positions - 1)
             parameters.extend((count, prefix))
-            constraints.append(SizeConstraint((ParameterTerm(prefix.name), ParameterTerm(count.name)), domain.positions))
+            constraints.append(
+                SizeConstraint((ParameterTerm(prefix.name), ParameterTerm(count.name)), domain.positions)
+            )
             flags = BankType(boolean, count.name)
             arguments.append(Value(f"eligible{request}", flags))
-            invariants = (Value("eligible", flags), Value("normal_layers", normal_layers), Value("replay_layers", replay_layers),
-                     Value("base", index), Value("prefix", index))
-            body = Region(Block((Value("token", index), *invariants), (
-                Coordinate((), (Value("request", index),), AffineIndex(request)),
-                Coordinate(("base", "token"), (Value("row", index),), AffineIndex(0, (IndexTerm(0), IndexTerm(1)))),
-                Coordinate(("prefix", "token"), (Value("offset", index),), AffineIndex(0, (IndexTerm(0), IndexTerm(1)))),
-                Select(("eligible", "token"), (Value("enabled", boolean),)),
-                Call(("row", "request", "offset"),
-                    (Value("positions", positions), Value("seed", tensor)), self.begin.name),
-                *normal.operations,
-                Call(("row", hidden.name, residual.name),
-                    (Value("normal_output", tensor),), self.normalize.name),
-                If(("enabled", "row", "request", "positions", source.name, destination.name, "offset", "replay_layers"), (), replay_body, skip),
-                Call(("row", "enabled"), (), self.complete.name),
-            ), ("normal_output",)))
+            invariants = (
+                Value("eligible", flags),
+                Value("normal_layers", normal_layers),
+                Value("replay_layers", replay_layers),
+                Value("base", index),
+                Value("prefix", index),
+            )
+            body = Region(
+                Block(
+                    (Value("token", index), *invariants),
+                    (
+                        Coordinate((), (Value("request", index),), AffineIndex(request)),
+                        Coordinate(
+                            ("base", "token"), (Value("row", index),), AffineIndex(0, (IndexTerm(0), IndexTerm(1)))
+                        ),
+                        Coordinate(
+                            ("prefix", "token"), (Value("offset", index),), AffineIndex(0, (IndexTerm(0), IndexTerm(1)))
+                        ),
+                        Select(("eligible", "token"), (Value("enabled", boolean),)),
+                        Call(
+                            ("row", "request", "offset"),
+                            (Value("positions", positions), Value("seed", tensor)),
+                            self.begin.name,
+                        ),
+                        *normal.operations,
+                        Call(
+                            ("row", hidden.name, residual.name), (Value("normal_output", tensor),), self.normalize.name
+                        ),
+                        If(
+                            (
+                                "enabled",
+                                "row",
+                                "request",
+                                "positions",
+                                source.name,
+                                destination.name,
+                                "offset",
+                                "replay_layers",
+                            ),
+                            (),
+                            replay_body,
+                            skip,
+                        ),
+                        Call(("row", "enabled"), (), self.complete.name),
+                    ),
+                    ("normal_output",),
+                )
+            )
             outputs = (Value(f"rows{request}", BankType(tensor, count.name)),)
-            operations.extend((
-                Parameter((), (Value(prefix.name, index),), prefix.name),
-                Parameter((), (Value(count.name, index),), count.name),
-                Scan((f"eligible{request}", "normal_layers", "replay_layers", f"base{request}", prefix.name),
-                    outputs, count.name, body, invariants=len(invariants)),
-                Coordinate((f"base{request}", count.name), (Value(f"base{request + 1}", index),), AffineIndex(0, (IndexTerm(0), IndexTerm(1)))),
-            ))
+            operations.extend(
+                (
+                    Parameter((), (Value(prefix.name, index),), prefix.name),
+                    Parameter((), (Value(count.name, index),), count.name),
+                    Scan(
+                        (f"eligible{request}", "normal_layers", "replay_layers", f"base{request}", prefix.name),
+                        outputs,
+                        count.name,
+                        body,
+                        invariants=len(invariants),
+                    ),
+                    Coordinate(
+                        (f"base{request}", count.name),
+                        (Value(f"base{request + 1}", index),),
+                        AffineIndex(0, (IndexTerm(0), IndexTerm(1))),
+                    ),
+                )
+            )
             rows.append(outputs[-1].name)
-        constraints.append(SizeConstraint(tuple(ParameterTerm(f"tokens{request}") for request in range(domain.requests)), max_rows))
+        constraints.append(
+            SizeConstraint(tuple(ParameterTerm(f"tokens{request}") for request in range(domain.requests)), max_rows)
+        )
         endpoints = (self.begin, self.normalize, self.observe, self.complete)
         declarations: dict[str, Function] = {}
         for declaration in (*endpoints, *self.normal.program.functions, *self.replay.program.functions, blend):
@@ -163,19 +326,30 @@ class TokenwiseRegion:
         cells: dict[str, RegionFunction] = dict(self.normal.functions)
         cells.update(self.replay.functions)
         cells[blend.name] = NativePrimitive(blend, blend_)
-        self.program = Program(Region(Block(tuple(arguments), tuple(operations), tuple(rows))),
+        self.program = Program(
+            Region(Block(tuple(arguments), tuple(operations), tuple(rows))),
             tuple(declarations.values()),
-            (self.context, self.kv, self.trace, self.weights, *self.activation_resources), tuple(parameters), tuple(constraints))
+            (self.context, self.kv, self.trace, self.weights, *self.activation_resources),
+            tuple(parameters),
+            tuple(constraints),
+        )
         self.program = inline_function_bodies(self.program, function_bodies) if function_bodies else self.program
         self.functions: Mapping[str, RegionFunction] = MappingProxyType(
-            source_region_functions(self.program.functions, cells, source_imports))
+            source_region_functions(self.program.functions, cells, source_imports)
+        )
         self.imports = import_region_functions(self.program, self.functions, catalog=source_imports)
         schedule = analyze_region_program(self.program, optimize=False).reference_schedule
         width = 8 if tensor.dtype == "torch.float64" else 4
         retained = tokenwise_retained_bytes(tensor.shape[1], width, domain.layers)
         self.retained = (
-            RetainedAllocation("tokenwise.recovery", RetentionEndpoint(self.begin.name, 0),
-                RetentionEndpoint(self.complete.name, 0), tensor.device, retained),)
+            RetainedAllocation(
+                "tokenwise.recovery",
+                RetentionEndpoint(self.begin.name, 0),
+                RetentionEndpoint(self.complete.name, 0),
+                tensor.device,
+                retained,
+            ),
+        )
         # Reference evidence remains available after selecting a schedule.
         # The catalog's per-device maxima fund the attachment; the selected
         # selected execution retains its own physical stream plan.
@@ -189,8 +363,9 @@ class TokenwiseRegion:
         # the original combined tensor/recovery reservation.
         if self.retention.allocations[0].peak_bytes_upper_bound > retained:
             raise ValueError("tokenwise schedule exceeds the original recovery reservation")
-        self._plan: RegionExecutionPlan = RegionExecutionPlan(self.program, self.imports,
-            self.candidate_proposals[0], self.payload_limits)
+        self._plan: RegionExecutionPlan = RegionExecutionPlan(
+            self.program, self.imports, self.candidate_proposals[0], self.payload_limits
+        )
         self._execution: RegionInstructionExecution | None = None
         self._policy = RegionSelectionPolicy(allow_numerical_transforms=False, schedule_policy="serial")
         self._bind: Callable[[Mapping[str, RegionFunction]], RegionInstructionExecution] = self._plan.bind
@@ -202,8 +377,13 @@ class TokenwiseRegion:
         region = copy(self)
         region._policy = policy
         region._parallel = stream_lanes > 1 and any(d.device.startswith("cuda") for d in self.payload.devices)
-        proposal = plan_region_schedule(region.program, region.imports, retained=region.retained,
-            parallel=region._parallel, policy=policy.schedule_policy)
+        proposal = plan_region_schedule(
+            region.program,
+            region.imports,
+            retained=region.retained,
+            parallel=region._parallel,
+            policy=policy.schedule_policy,
+        )
         if proposal is None:
             raise ValueError("tokenwise region has no legal source arrangement")
         proposals = [RegionScheduleProposal(region.payload)]
@@ -213,8 +393,13 @@ class TokenwiseRegion:
             for candidate in explore_region_schedules(region.program, max_candidates=4).candidates:
                 if len(proposals) == 4:
                     break
-                extra = arrange_region_schedule(region.program, candidate.schedule_map, region.imports,
-                    parallel=region._parallel, retained=region.retained)
+                extra = arrange_region_schedule(
+                    region.program,
+                    candidate.schedule_map,
+                    region.imports,
+                    parallel=region._parallel,
+                    retained=region.retained,
+                )
                 if extra not in proposals:
                     proposals.append(extra)
         region.candidate_proposals = tuple(proposals)
@@ -223,9 +408,18 @@ class TokenwiseRegion:
 
     def _install_plan(self, proposal: RegionScheduleProposal) -> None:
         self._plan = RegionExecutionPlan(self.program, self.imports, proposal, self.payload_limits)
-        self._bind = (partial(prepare_region_execution, self.program, payload_limits=self.payload_limits,
-            options=self._policy, parallel=self._parallel, retained=self.retained)
-            if self._policy.tuning == "heuristic" else self._plan.bind)
+        self._bind = (
+            partial(
+                prepare_region_execution,
+                self.program,
+                payload_limits=self.payload_limits,
+                options=self._policy,
+                parallel=self._parallel,
+                retained=self.retained,
+            )
+            if self._policy.tuning == "heuristic"
+            else self._plan.bind
+        )
 
     @property
     def stream_plan(self) -> RegionStreamPlan | None:
@@ -264,19 +458,30 @@ class TokenwiseRegion:
         if any(device.peak_bytes_upper_bound > budget for device in self.payload.devices):
             raise ValueError("tokenwise reference payload exceeds the original task workspace budget")
         result = copy(self)
-        result.candidate_proposals = tuple(proposal for proposal in self.candidate_proposals
-            if all(device.bytes <= budget for device in proposal.peak_bytes))
+        result.candidate_proposals = tuple(
+            proposal
+            for proposal in self.candidate_proposals
+            if all(device.bytes <= budget for device in proposal.peak_bytes)
+        )
         result._funded_limits = tuple(RegionPayloadLimit(device.device, budget) for device in self.payload.devices)
         if self._policy.tuning == "heuristic":
-            proposal = plan_region_schedule(self.program, self.imports, payload_limits=result.payload_limits,
-                retained=self.retained, parallel=self._parallel, policy=self._policy.schedule_policy)
+            proposal = plan_region_schedule(
+                self.program,
+                self.imports,
+                payload_limits=result.payload_limits,
+                retained=self.retained,
+                parallel=self._parallel,
+                policy=self._policy.schedule_policy,
+            )
             if proposal is None:
                 raise ValueError("tokenwise region exceeds the signed payload budget")
             result.candidate_proposals = tuple(dict.fromkeys((RegionScheduleProposal(self.payload), proposal)))
             result._install_plan(proposal)
         return result
 
-    def with_catalog(self, proposals: tuple[RegionScheduleProposal, ...], budget: int, *, stream_lanes: int = 1) -> TokenwiseRegion:
+    def with_catalog(
+        self, proposals: tuple[RegionScheduleProposal, ...], budget: int, *, stream_lanes: int = 1
+    ) -> TokenwiseRegion:
         """Check driver proposals against this source and the signed workspace.
 
         The wire checkpoint is codec parsing plus local consistency: the
@@ -286,12 +491,21 @@ class TokenwiseRegion:
         if not proposals:
             raise ValueError("native schedule catalog requires its original reference")
         reference, *_ = proposals
-        if (len(proposals) > 8
-            or reference != RegionScheduleProposal(self.payload) or type(budget) is not int or budget < 0
-            or type(stream_lanes) is not int or not 1 <= stream_lanes <= 8):
+        if (
+            len(proposals) > 8
+            or reference != RegionScheduleProposal(self.payload)
+            or type(budget) is not int
+            or budget < 0
+            or type(stream_lanes) is not int
+            or not 1 <= stream_lanes <= 8
+        ):
             raise ValueError("native schedule catalog requires the original reference and workspace")
-        if len({(p.payload.capacity.schedule_map, None if p.stream_plan is None else p.stream_plan.signature)
-                for p in proposals}) != len(proposals):
+        if len(
+            {
+                (p.payload.capacity.schedule_map, None if p.stream_plan is None else p.stream_plan.signature)
+                for p in proposals
+            }
+        ) != len(proposals):
             raise ValueError("native schedule catalog contains duplicate physical proposals")
         limits = tuple(RegionPayloadLimit(device.device, budget) for device in self.payload.devices)
         for proposal in proposals:
@@ -312,44 +526,70 @@ class TokenwiseRegion:
         result._execution = execution
         return result
 
-    def run(self, owner: RegionPageOwner, eligible: tuple[bool, ...], requests: tuple[int, ...], offsets: tuple[int, ...], *,
-            kv: PagedResourceBinding, weights: ReadonlyResourceBinding, context: HostResourceBinding, trace: HostResourceBinding,
-            begin: Begin, layer: RowLayerForward, normalize: Normalize, observe: Observe,
-            commit: Callable[[int, Callable[[], None]], None], record: Callable[[int], None],
-            restore: Callable[[], None], streams: RegionStreamBindings | None = None,
-            kernel_imports: tuple[NativeKernelImport, ...] = (), function_bodies: tuple[RegionFunctionBody, ...] = (),
-            model_endpoints: tuple[ExternalFunction, ...] = (),
-            activation_borrows: tuple[PinnedResourceBinding | ReadonlyResourceBinding, ...] = (),
-            activation_selected: Callable[[int, int], bool] | None = None) -> tuple[torch.Tensor, ...]:
+    def run(
+        self,
+        owner: RegionPageOwner,
+        eligible: tuple[bool, ...],
+        requests: tuple[int, ...],
+        offsets: tuple[int, ...],
+        *,
+        kv: PagedResourceBinding,
+        weights: ReadonlyResourceBinding,
+        context: HostResourceBinding,
+        trace: HostResourceBinding,
+        begin: Begin,
+        layer: RowLayerForward,
+        normalize: Normalize,
+        observe: Observe,
+        commit: Callable[[int, Callable[[], None]], None],
+        record: Callable[[int], None],
+        restore: Callable[[], None],
+        streams: RegionStreamBindings | None = None,
+        kernel_imports: tuple[NativeKernelImport, ...] = (),
+        function_bodies: tuple[RegionFunctionBody, ...] = (),
+        model_endpoints: tuple[ExternalFunction, ...] = (),
+        activation_borrows: tuple[PinnedResourceBinding | ReadonlyResourceBinding, ...] = (),
+        activation_selected: Callable[[int, int], bool] | None = None,
+    ) -> tuple[torch.Tensor, ...]:
         if function_bodies != self.function_bodies:
             raise ValueError("local model source differs from its signed function bodies")
+
         def begin_(inputs: tuple[Data, ...]) -> tuple[Data, ...]:
             row, request, token = inputs
-            if (type(row) is not int or type(request) is not int or type(token) is not int
-                or (request, token) != (requests[row], offsets[row])):
+            if (
+                type(row) is not int
+                or type(request) is not int
+                or type(token) is not int
+                or (request, token) != (requests[row], offsets[row])
+            ):
                 raise ValueError("token preparation differs from its original KV coordinates")
             return begin(row)
+
         def normalize_(inputs: tuple[Data, ...]) -> tuple[Data, ...]:
             row, hidden, residual = inputs
-            if (type(row) is not int
-                or not isinstance(hidden, torch.Tensor) or not isinstance(residual, torch.Tensor)):
+            if type(row) is not int or not isinstance(hidden, torch.Tensor) or not isinstance(residual, torch.Tensor):
                 raise ValueError("normal output requires its row and residual carry")
             return (normalize(row, hidden, residual),)
+
         def observe_(inputs: tuple[Data, ...]) -> tuple[Data, ...]:
             row, hidden = inputs
             if type(row) is not int or not isinstance(hidden, torch.Tensor):
                 raise ValueError("token observation requires its row and hidden value")
             observe(row, hidden)
             return ()
+
         def complete_(inputs: tuple[Data, ...]) -> tuple[Data, ...]:
             row, enabled = inputs
             if type(row) is not int or type(enabled) is not bool:
                 raise ValueError("token completion requires an index and branch predicate")
+
             def record_() -> None:
                 if enabled:
                     record(row)
+
             commit(row, record_)
             return ()
+
         if len(eligible) != len(requests) or len(requests) != len(offsets):
             raise ValueError("token metadata must describe the same packed rows")
         if any(type(request) is not int or not 0 <= request < self.domain.requests for request in requests):
@@ -364,8 +604,9 @@ class TokenwiseRegion:
             while end < len(requests) and requests[end] == request:
                 end += 1
             prefix = offsets[start] if end > start else 0
-            if (type(prefix) is not int or any(type(offsets[row]) is not int or offsets[row] != prefix + row - start
-                                              for row in range(start, end))):
+            if type(prefix) is not int or any(
+                type(offsets[row]) is not int or offsets[row] != prefix + row - start for row in range(start, end)
+            ):
                 raise ValueError("token offsets must form the original consecutive request span")
             sizes[f"tokens{request}"], sizes[f"prefix{request}"] = end - start, prefix
             inputs[f"eligible{request}"] = Bank(eligible[start:end])
@@ -374,26 +615,48 @@ class TokenwiseRegion:
         if len(kernels) != len(kernel_imports):
             raise ValueError("local backend kernel catalog contains duplicate declarations")
         layer_endpoints: dict[str, ExternalFunction] = {}
-        for endpoint in (*self.normal.externals(layer, kernel_imports), *self.replay.externals(layer, kernel_imports), *model_endpoints):
+        for endpoint in (
+            *self.normal.externals(layer, kernel_imports),
+            *self.replay.externals(layer, kernel_imports),
+            *model_endpoints,
+        ):
             if endpoint.declaration.name in layer_endpoints:
                 if layer_endpoints[endpoint.declaration.name].declaration != endpoint.declaration:
                     raise ValueError("model endpoints contain conflicting declarations")
             else:
                 layer_endpoints[endpoint.declaration.name] = endpoint
+
         def activation_endpoint(activation: DecoderActivation) -> ExternalFunction:
             def selected(inputs: tuple[Data, ...]) -> tuple[Data, ...]:
-                row, = inputs
+                (row,) = inputs
                 if type(row) is not int or activation_selected is None:
                     raise ValueError("activation selection requires its original packed row")
                 return (activation_selected(row, activation.binding.layer),)
+
             return ExternalFunction(activation_selected_function(activation), selected)
-        resources = RegionResources(self.program, owner, (), (
-            *(ExternalFunction(declaration, callback, kernels.get(declaration.name)) for declaration, callback in (
-                (self.begin, begin_), (self.normalize, normalize_), (self.observe, observe_), (self.complete, complete_))
-                if declaration.name in self.functions),
-            *layer_endpoints.values(), *(activation_endpoint(item) for item in self.activations)),
-            sizes=sizes, borrows=(kv, weights, context, trace, *activation_borrows),
-            tensor_borrows=tuple(item for item in self.imports if isinstance(item, BorrowedTensorImport)))
+
+        resources = RegionResources(
+            self.program,
+            owner,
+            (),
+            (
+                *(
+                    ExternalFunction(declaration, callback, kernels.get(declaration.name))
+                    for declaration, callback in (
+                        (self.begin, begin_),
+                        (self.normalize, normalize_),
+                        (self.observe, observe_),
+                        (self.complete, complete_),
+                    )
+                    if declaration.name in self.functions
+                ),
+                *layer_endpoints.values(),
+                *(activation_endpoint(item) for item in self.activations),
+            ),
+            sizes=sizes,
+            borrows=(kv, weights, context, trace, *activation_borrows),
+            tensor_borrows=tuple(item for item in self.imports if isinstance(item, BorrowedTensorImport)),
+        )
         try:
             results = self.execution.run(inputs, pages=resources, sizes=sizes, streams=streams).values
         except Exception:
@@ -411,30 +674,60 @@ class TokenwiseRegion:
 
 
 @lru_cache(maxsize=8)
-def compile_tokenwise_source(tensor: TensorType, max_rows: int, domain: CausalModelDomain,
-                             effect: TokenwiseLayerReplay, *, source_imports: tuple[RegionTensorImport, ...] = (),
-                             function_bodies: tuple[RegionFunctionBody, ...] = (),
-                             activations: tuple[DecoderActivation, ...] = ()) -> TokenwiseRegion:
+def compile_tokenwise_source(
+    tensor: TensorType,
+    max_rows: int,
+    domain: CausalModelDomain,
+    effect: TokenwiseLayerReplay,
+    *,
+    source_imports: tuple[RegionTensorImport, ...] = (),
+    function_bodies: tuple[RegionFunctionBody, ...] = (),
+    activations: tuple[DecoderActivation, ...] = (),
+) -> TokenwiseRegion:
     """Reconstruct source and reference lifetimes without optimization search."""
+
     def mix(source: torch.Tensor, destination: torch.Tensor, position: int) -> torch.Tensor:
         return mix_layer_outputs(effect, source, destination, position)
-    return TokenwiseRegion(tensor, max_rows, domain, effect, mix, source_imports=source_imports,
-        function_bodies=function_bodies, activations=activations)
+
+    return TokenwiseRegion(
+        tensor,
+        max_rows,
+        domain,
+        effect,
+        mix,
+        source_imports=source_imports,
+        function_bodies=function_bodies,
+        activations=activations,
+    )
 
 
 @lru_cache(maxsize=8)
-def compile_tokenwise_region(tensor: TensorType, max_rows: int, domain: CausalModelDomain,
-                             effect: TokenwiseLayerReplay, policy: RegionSelectionPolicy = RegionSelectionPolicy(), *,
-                             stream_lanes: int = 1, source_imports: tuple[RegionTensorImport, ...] = (),
-                             function_bodies: tuple[RegionFunctionBody, ...] = (),
-                             activations: tuple[DecoderActivation, ...] = ()) -> TokenwiseRegion:
+def compile_tokenwise_region(
+    tensor: TensorType,
+    max_rows: int,
+    domain: CausalModelDomain,
+    effect: TokenwiseLayerReplay,
+    policy: RegionSelectionPolicy = RegionSelectionPolicy(),
+    *,
+    stream_lanes: int = 1,
+    source_imports: tuple[RegionTensorImport, ...] = (),
+    function_bodies: tuple[RegionFunctionBody, ...] = (),
+    activations: tuple[DecoderActivation, ...] = (),
+) -> TokenwiseRegion:
     """Reuse cold source/lifetime/lowering work across attachment and task binding.
 
     The cached plan has no invocation, model tensors, page capabilities or RNG.
     Every run creates fresh frames and borrows its original owner's resources.
     """
-    return compile_tokenwise_source(tensor, max_rows, domain, effect, source_imports=source_imports,
-        function_bodies=function_bodies, activations=activations).planned(policy, stream_lanes=stream_lanes)
+    return compile_tokenwise_source(
+        tensor,
+        max_rows,
+        domain,
+        effect,
+        source_imports=source_imports,
+        function_bodies=function_bodies,
+        activations=activations,
+    ).planned(policy, stream_lanes=stream_lanes)
 
 
 def tokenwise_attachment_bytes(hidden: int, width: int, max_rows: int) -> int:

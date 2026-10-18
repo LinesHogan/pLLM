@@ -26,11 +26,7 @@ class RuntimeFacts:
         self,
         extra_capabilities: tuple[str, ...] = (),
     ) -> SchedulerTimeline:
-        compute = (
-            "compute/cpu@1"
-            if self.device.type == "cpu"
-            else "compute/cuda@1"
-        )
+        compute = "compute/cpu@1" if self.device.type == "cpu" else "compute/cuda@1"
         return SchedulerTimeline(
             anchors=(
                 TimelineAnchor(AnchorSymbol("request.prepare"), 0),
@@ -42,9 +38,7 @@ class RuntimeFacts:
                 TimelineAnchor(AnchorSymbol("request.finish"), 6),
                 TimelineAnchor(AnchorSymbol("next.prepare"), 7),
             ),
-            capabilities=tuple(
-                sorted((compute, "host/service@1", *extra_capabilities))
-            ),
+            capabilities=tuple(sorted((compute, "host/service@1", *extra_capabilities))),
         )
 
 

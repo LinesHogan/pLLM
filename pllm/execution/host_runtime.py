@@ -2,34 +2,34 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
 from abc import ABC, abstractmethod
-from contextlib import nullcontext
 from collections.abc import Callable
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
 from typing import Generic, Protocol, TypeVar
 
 import torch
 
-from pllm.execution.cuda_stream import CudaStreamReadiness
+from pllm.contracts.compilation import ScheduleBundle
 from pllm.contracts.feedback import CompletionBatch
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.execution.execution import TaskGraphExecution, TaskGraphImplementation, TaskGraphInvocation
-from pllm.execution.trace import ExecutionTrace, TracePhase
-from pllm.execution.scheduler import compile_schedule, lower_physical_plan
-from pllm.execution.state_execution import MathBinding, StateExecution
-from pllm.execution.ptts.page_bundle import PageBundleArena
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
-from pllm.contracts.state_representation import StateDeviceKind
-from pllm.contracts.tensor_layout import TensorLayoutRequest
-from pllm.contracts.compilation import ScheduleBundle
 from pllm.contracts.semantic_graph import (
-    AnchorId, AnchorSymbol,
+    AnchorId,
+    AnchorSymbol,
     PhysicalPlan,
-    SemanticGraph,
     SchedulerTimeline,
+    SemanticGraph,
     TimelineAnchor,
 )
-
+from pllm.contracts.state_representation import StateDeviceKind
+from pllm.contracts.tensor_layout import TensorLayoutRequest
+from pllm.execution.cuda_stream import CudaStreamReadiness
+from pllm.execution.execution import TaskGraphExecution, TaskGraphImplementation, TaskGraphInvocation
+from pllm.execution.ptts.page_bundle import PageBundleArena
+from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
+from pllm.execution.scheduler import compile_schedule, lower_physical_plan
+from pllm.execution.state_execution import MathBinding, StateExecution
+from pllm.execution.trace import ExecutionTrace, TracePhase
 
 RequestT = TypeVar("RequestT")
 TransactionT = TypeVar("TransactionT")
@@ -68,13 +68,32 @@ class TensorHostBinding(Generic[InputT, DataT, ResultT]):
     def compile(self) -> StateExecution[InputT, DataT, ResultT]:
         facts = self.facts
         timeline = facts.timeline() if self.timeline is None else self.timeline
-        limits = tuple(value for value in (timeline.memory_budget_bytes, facts.memory_budget_bytes) if value is not None)
+        limits = tuple(
+            value for value in (timeline.memory_budget_bytes, facts.memory_budget_bytes) if value is not None
+        )
         timeline = replace(timeline, memory_budget_bytes=min(limits, default=None))
-        providers = (PageBundleProviderFacts(f"canonical.page_bundle_{facts.device.type}@1", 3,
-            StateDeviceKind(facts.device.type), facts.device.index or 0),) if self.layouts.layouts else ()
-        plan = compile_page_bundle_plan((self.graph, self.layouts), timeline, providers,
-            1, facts.state_memory_budget_bytes, facts.device, plan_epoch=facts.plan_epoch)
-        anchor, = (AnchorId(item.ordinal) for item in timeline.anchors if item.symbol == self.sampler_anchor)
+        providers = (
+            (
+                PageBundleProviderFacts(
+                    f"canonical.page_bundle_{facts.device.type}@1",
+                    3,
+                    StateDeviceKind(facts.device.type),
+                    facts.device.index or 0,
+                ),
+            )
+            if self.layouts.layouts
+            else ()
+        )
+        plan = compile_page_bundle_plan(
+            (self.graph, self.layouts),
+            timeline,
+            providers,
+            1,
+            facts.state_memory_budget_bytes,
+            facts.device,
+            plan_epoch=facts.plan_epoch,
+        )
+        (anchor,) = (AnchorId(item.ordinal) for item in timeline.anchors if item.symbol == self.sampler_anchor)
         return self.math.bind(PageBundleArena(plan, device=facts.device), anchor)
 
 
@@ -90,10 +109,13 @@ class TransactionHostBinding(Generic[RequestT, TransactionT, ContextT, SnapshotT
     def compile(self) -> HostTransactionCoordinator[RequestT, TransactionT, ResultT]:
         facts = self.facts
         timeline = facts.timeline() if self.timeline is None else self.timeline
-        limits = tuple(value for value in (timeline.memory_budget_bytes, facts.memory_budget_bytes) if value is not None)
+        limits = tuple(
+            value for value in (timeline.memory_budget_bytes, facts.memory_budget_bytes) if value is not None
+        )
         timeline = replace(timeline, memory_budget_bytes=min(limits, default=None))
-        execution = HostExecution(self.graph, timeline, self.state_factory, self.tasks,
-            facts.device, plan_epoch=facts.plan_epoch)
+        execution = HostExecution(
+            self.graph, timeline, self.state_factory, self.tasks, facts.device, plan_epoch=facts.plan_epoch
+        )
         return HostTransactionCoordinator(self.service, execution)
 
 
@@ -106,20 +128,28 @@ class CompletionInput:
     readiness: CudaStreamReadiness | None = None
 
     @classmethod
-    def capture(cls, completions: CompletionBatch, hidden: torch.Tensor,
-                stream: torch.cuda.Stream | None = None) -> CompletionInput:
-        if ((hidden.device.type == "cuda") != (stream is not None)
-            or stream is not None and stream.device != hidden.device):
+    def capture(
+        cls, completions: CompletionBatch, hidden: torch.Tensor, stream: torch.cuda.Stream | None = None
+    ) -> CompletionInput:
+        if (
+            (hidden.device.type == "cuda") != (stream is not None)
+            or stream is not None
+            and stream.device != hidden.device
+        ):
             raise ValueError("completion input requires its original producer stream")
-        with (nullcontext() if stream is None else torch.cuda.stream(stream)), torch.inference_mode(False):
+        with nullcontext() if stream is None else torch.cuda.stream(stream), torch.inference_mode(False):
             owned = hidden.detach().to(dtype=torch.float32, copy=True)
             return cls(completions, owned, CudaStreamReadiness(stream) if stream is not None else None)
 
     def __post_init__(self) -> None:
-        if (self.hidden.ndim != 2 or self.hidden.shape[0] != len(self.completions.entries)
-            or self.hidden.dtype != torch.float32 or torch.is_inference(self.hidden)
+        if (
+            self.hidden.ndim != 2
+            or self.hidden.shape[0] != len(self.completions.entries)
+            or self.hidden.dtype != torch.float32
+            or torch.is_inference(self.hidden)
             or self.hidden.device.type not in ("cpu", "cuda")
-            or (self.hidden.device.type == "cuda") != (self.readiness is not None)):
+            or (self.hidden.device.type == "cuda") != (self.readiness is not None)
+        ):
             raise ValueError("completion input requires owned float32 rows aligned to completions")
 
 
@@ -127,15 +157,21 @@ class CompletionCapture:
     """Write final sampling rows directly into the original owned output tensor."""
 
     def __init__(self, identities: tuple[RequestIdentity, ...], hidden: torch.Tensor) -> None:
-        if (hidden.ndim != 2 or hidden.shape[0] != len(identities) or hidden.dtype != torch.float32
-            or hidden.device.type not in ("cpu", "cuda") or torch.is_inference(hidden)
-            or len(set(identities)) != len(identities)):
+        if (
+            hidden.ndim != 2
+            or hidden.shape[0] != len(identities)
+            or hidden.dtype != torch.float32
+            or hidden.device.type not in ("cpu", "cuda")
+            or torch.is_inference(hidden)
+            or len(set(identities)) != len(identities)
+        ):
             raise ValueError("completion capture requires distinct identities and owned float32 rows")
         self.identities, self.hidden = identities, hidden
         self._indices = {identity: index for index, identity in enumerate(identities)}
         self._written: set[RequestIdentity] = set()
-        self._readiness = (CudaStreamReadiness(torch.cuda.current_stream(hidden.device))
-            if hidden.device.type == "cuda" else None)
+        self._readiness = (
+            CudaStreamReadiness(torch.cuda.current_stream(hidden.device)) if hidden.device.type == "cuda" else None
+        )
 
     def write(self, identities: tuple[RequestIdentity, ...], rows: torch.Tensor) -> None:
         if rows.shape != (len(identities), self.hidden.shape[1]):
@@ -228,9 +264,7 @@ class HostExecution(Generic[TransactionT, ContextT, SnapshotT, ResultT]):
         self._runner = TaskGraphExecution(physical, implementations, self.trace)
         self._state = state_factory()
         self._device = device
-        self._initialization = (
-            CudaStreamReadiness(torch.cuda.current_stream(device)) if device.type == "cuda" else None
-        )
+        self._initialization = CudaStreamReadiness(torch.cuda.current_stream(device)) if device.type == "cuda" else None
         self._active: _Pending[ResultT, SnapshotT] | _Failed | None = None
         self._next_receipt_id = 1
         self._transaction_count = 0
@@ -313,23 +347,17 @@ class HostExecution(Generic[TransactionT, ContextT, SnapshotT, ResultT]):
         return HostDiagnostics(self._transaction_count, self._state.version, self.plan.fallback_count)
 
 
-class HostTransactionService(
-    Protocol[RequestT_contra, TransactionT, ResultT]
-):
+class HostTransactionService(Protocol[RequestT_contra, TransactionT, ResultT]):
     def begin(self, request: RequestT_contra) -> TransactionT | None: ...
 
-    def commit(
-        self, transaction: TransactionT, receipt: HostReceipt[ResultT]
-    ) -> None:
+    def commit(self, transaction: TransactionT, receipt: HostReceipt[ResultT]) -> None:
         """Publish atomically: an exception must leave the transaction abortable."""
         ...
 
     def abort(self, transaction: TransactionT) -> None: ...
 
 
-class HostTransactionExecution(
-    Protocol[TransactionT_contra, ResultT]
-):
+class HostTransactionExecution(Protocol[TransactionT_contra, ResultT]):
     @property
     def trace(self) -> ExecutionTrace: ...
 
@@ -361,9 +389,7 @@ class HostSettlementError(RuntimeError, Generic[ResultT]):
 
 
 @dataclass(frozen=True, slots=True)
-class HostTransactionCoordinator(
-    Generic[RequestT, TransactionT, ResultT]
-):
+class HostTransactionCoordinator(Generic[RequestT, TransactionT, ResultT]):
     """Atomically settle one typed host transaction and execution receipt."""
 
     service: HostTransactionService[RequestT, TransactionT, ResultT]
@@ -410,10 +436,13 @@ class HostRuntimeFacts:
         if (
             self.device.type not in ("cpu", "cuda")
             or self.plan_epoch < 1
-            or self.hidden_size < 0 or self.initialization_seed < 0
+            or self.hidden_size < 0
+            or self.initialization_seed < 0
             or self.state_memory_budget_bytes < 0
-            or self.max_input_rows is not None and self.max_input_rows < 0
-            or self.memory_budget_bytes is not None and self.memory_budget_bytes < 0
+            or self.max_input_rows is not None
+            and self.max_input_rows < 0
+            or self.memory_budget_bytes is not None
+            and self.memory_budget_bytes < 0
         ):
             raise ValueError("canonical host runtime facts are not closed")
 
@@ -421,11 +450,7 @@ class HostRuntimeFacts:
         self,
         extra_capabilities: tuple[str, ...] = (),
     ) -> SchedulerTimeline:
-        compute_capability = (
-            "compute/cpu@1"
-            if self.device.type == "cpu"
-            else "compute/cuda@1"
-        )
+        compute_capability = "compute/cpu@1" if self.device.type == "cpu" else "compute/cuda@1"
         return SchedulerTimeline(
             memory_budget_bytes=self.memory_budget_bytes,
             anchors=(

@@ -12,14 +12,30 @@ from typing import TypeAlias
 
 import torch
 
-from pllm.execution.region_values import Bank, Data, check_data, copy_data
-
 from pllm.contracts.region_program import (
-    BankType, Call, Constant, Coordinate, DataType, If, Map, Parameter, Program, Resource, Publish,
-    Region, Scalar, ScalarKind, Scan, Select, Snapshot,
-    Update, verify, bind_sizes, resolve_extent,
+    BankType,
+    Call,
+    Constant,
+    Coordinate,
+    DataType,
+    If,
+    Map,
+    Parameter,
+    Program,
+    Publish,
+    Region,
+    Resource,
+    Scalar,
+    ScalarKind,
+    Scan,
+    Select,
+    Snapshot,
+    Update,
+    bind_sizes,
+    resolve_extent,
+    verify,
 )
-
+from pllm.execution.region_values import Bank, Data, check_data, copy_data
 
 ReferenceFunction: TypeAlias = Callable[[tuple[Data, ...]], tuple[Data, ...]]
 
@@ -56,10 +72,14 @@ def _scalar(op: Scalar, inputs: tuple[Data, ...]) -> tuple[Data, ...]:
     return (left == right,)
 
 
-def interpret(program: Program, inputs: Mapping[str, Data], *,
-              resources: Mapping[str, tuple[Data, ...]] | None = None,
-              functions: Mapping[str, ReferenceFunction] | None = None,
-              sizes: Mapping[str, int] = {}) -> ReferenceResult:
+def interpret(
+    program: Program,
+    inputs: Mapping[str, Data],
+    *,
+    resources: Mapping[str, tuple[Data, ...]] | None = None,
+    functions: Mapping[str, ReferenceFunction] | None = None,
+    sizes: Mapping[str, int] = {},
+) -> ReferenceResult:
     """Execute verified reference order; all input tensors remain caller-owned.
 
     Function implementations here are trusted test/import adapters. For an
@@ -83,7 +103,9 @@ def interpret(program: Program, inputs: Mapping[str, Data], *,
     declarations = {f.name: f for f in program.functions}
     if set(implementations) != set(declarations):
         raise ValueError("reference function bindings must be complete and exact")
-    state = {r.name: tuple(copy_data(v) for v in supplied[r.name]) for r in program.resources if isinstance(r, Resource)}
+    state = {
+        r.name: tuple(copy_data(v) for v in supplied[r.name]) for r in program.resources if isinstance(r, Resource)
+    }
     storage_types: dict[str, tuple[DataType, ...]] = {}
     for r in program.resources:
         if not isinstance(r, Resource):
@@ -100,8 +122,7 @@ def interpret(program: Program, inputs: Mapping[str, Data], *,
     effects: list[EffectEvent] = []
     calls: list[tuple[str, tuple[int, ...]]] = []
 
-    def advance(resource: str, kind: str, coordinates: tuple[int, ...],
-                indices: tuple[int, ...] = ()) -> None:
+    def advance(resource: str, kind: str, coordinates: tuple[int, ...], indices: tuple[int, ...] = ()) -> None:
         sequences[resource] += 1
         effects.append(EffectEvent(kind, resource, sequences[resource], coordinates, indices))
 
@@ -127,10 +148,9 @@ def interpret(program: Program, inputs: Mapping[str, Data], *,
         if not isinstance(value, Bank) or not 0 <= index < len(value.elements):
             raise ValueError("resource family index out of bounds")
         cell = replace_cell(value.elements[index], indices[1:], replacement)
-        return Bank((*value.elements[:index], cell, *value.elements[index + 1:]))
+        return Bank((*value.elements[:index], cell, *value.elements[index + 1 :]))
 
-    def run(region: Region, args: tuple[Data, ...],
-            coordinates: tuple[int, ...]) -> tuple[Data, ...]:
+    def run(region: Region, args: tuple[Data, ...], coordinates: tuple[int, ...]) -> tuple[Data, ...]:
         block = region.block
         env: dict[str, Data] = {}
         for spec, value in zip(block.arguments, args, strict=True):
@@ -163,18 +183,19 @@ def interpret(program: Program, inputs: Mapping[str, Data], *,
                     result = (bank.elements[index],)
                 else:
                     replacement = ins[2]
-                    result = (Bank((*bank.elements[:index], replacement, *bank.elements[index + 1:])),)
+                    result = (Bank((*bank.elements[:index], replacement, *bank.elements[index + 1 :])),)
             elif isinstance(op, Snapshot):
-                indices = indices_of(ins[:ranks[op.resource]])
+                indices = indices_of(ins[: ranks[op.resource]])
                 contents = tuple(copy_data(select_cell(v, indices)) for v in state[op.resource])
                 advance(op.resource, "snapshot", coordinates, indices)
                 result = contents
             elif isinstance(op, Publish):
                 width = len(storage_types[op.resource])
                 values = ins[:width]
-                indices = indices_of(ins[width:width + ranks[op.resource]])
-                contents = tuple(replace_cell(old, indices, value) for old, value in
-                    zip(state[op.resource], values, strict=True))
+                indices = indices_of(ins[width : width + ranks[op.resource]])
+                contents = tuple(
+                    replace_cell(old, indices, value) for old, value in zip(state[op.resource], values, strict=True)
+                )
                 advance(op.resource, "publish", coordinates, indices)
                 state[op.resource] = contents
                 result = ()
@@ -185,7 +206,7 @@ def interpret(program: Program, inputs: Mapping[str, Data], *,
                 returned = implementations[f.name]((*data, *resource_data))
                 if len(returned) != len(f.outputs) + len(resource_data):
                     raise ValueError("reference function result arity mismatch")
-                data_outputs, changed = returned[:len(f.outputs)], returned[len(f.outputs):]
+                data_outputs, changed = returned[: len(f.outputs)], returned[len(f.outputs) :]
                 for value, type_ in zip(data_outputs, f.outputs, strict=True):
                     check_data(value, type_, sizes)
                 replacements: dict[str, tuple[Data, ...]] = {}
@@ -194,7 +215,7 @@ def interpret(program: Program, inputs: Mapping[str, Data], *,
                     if name not in storage_types:
                         continue
                     types = storage_types[name]
-                    contents = changed[offset:offset + len(types)]
+                    contents = changed[offset : offset + len(types)]
                     offset += len(types)
                     for value, type_ in zip(contents, types, strict=True):
                         check_data(value, type_, sizes)
@@ -239,5 +260,4 @@ def interpret(program: Program, inputs: Mapping[str, Data], *,
     entry_args = tuple(copy_data(inputs[v.name]) for v in arguments)
     with torch.no_grad():
         returned = run(program.entry, entry_args, ())
-    return ReferenceResult(tuple(copy_data(v) for v in returned),
-                           state, tuple(effects), tuple(calls))
+    return ReferenceResult(tuple(copy_data(v) for v in returned), state, tuple(effects), tuple(calls))

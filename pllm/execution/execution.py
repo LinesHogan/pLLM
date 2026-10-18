@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Generic, Protocol, TypeVar
 
 import torch
 
-from pllm.execution.trace import ExecutionTrace
 from pllm.contracts.semantic_graph import AnchorId, ImplementationId, PhysicalPlan
-
+from pllm.execution.trace import ExecutionTrace
 
 ExecutionContextT = TypeVar("ExecutionContextT")
 TaskContextT = TypeVar("TaskContextT", contravariant=True)
@@ -34,25 +33,30 @@ class TaskGraphExecution(Generic[ExecutionContextT]):
 
     def __post_init__(self) -> None:
         bindings = {implementation.implementation_id: implementation for implementation in self.implementations}
-        if (len(bindings) != len(self.implementations)
-            or set(bindings) != {task.implementation_id for task in self.plan.tasks}):
+        if len(bindings) != len(self.implementations) or set(bindings) != {
+            task.implementation_id for task in self.plan.tasks
+        }:
             raise ValueError("native bindings must name exactly the Rust-selected implementations")
-        self.implementations = tuple(bindings[task.implementation_id]
-            for task in sorted(self.plan.tasks, key=lambda task: task.task_id))
-        if self.trace.plan is not self.plan or len(self.plan.tasks) != len(self.implementations) or any(
-            self.implementations[int(task.task_id)].implementation_id
-            != task.implementation_id
-            for task in self.plan.tasks
-        ):
-            raise ValueError(
-                "task-graph implementation differs from the Rust physical plan"
+        self.implementations = tuple(
+            bindings[task.implementation_id] for task in sorted(self.plan.tasks, key=lambda task: task.task_id)
+        )
+        if (
+            self.trace.plan is not self.plan
+            or len(self.plan.tasks) != len(self.implementations)
+            or any(
+                self.implementations[int(task.task_id)].implementation_id != task.implementation_id
+                for task in self.plan.tasks
             )
+        ):
+            raise ValueError("task-graph implementation differs from the Rust physical plan")
+
 
 class TaskGraphInvocation(Generic[ExecutionContextT]):
     """One cursor for synchronous host and externally staged execution."""
 
-    def __init__(self, execution: TaskGraphExecution[ExecutionContextT], context: ExecutionContextT,
-                 invocation_id: int) -> None:
+    def __init__(
+        self, execution: TaskGraphExecution[ExecutionContextT], context: ExecutionContextT, invocation_id: int
+    ) -> None:
         self.execution, self.context, self.invocation_id = execution, context, invocation_id
         self._next_task_index = 0
         self.last_anchor_id = -1
@@ -68,14 +72,10 @@ class TaskGraphInvocation(Generic[ExecutionContextT]):
         dense_anchor = int(anchor_id)
         if self.finished or dense_anchor < 0 or dense_anchor < self.last_anchor_id:
             raise RuntimeError("task invocation anchor progression is invalid")
-        if (
-            self._next_task_index < len(plan.tasks)
-            and int(plan.tasks[self._next_task_index].anchor_id) < dense_anchor
-        ):
+        if self._next_task_index < len(plan.tasks) and int(plan.tasks[self._next_task_index].anchor_id) < dense_anchor:
             raise RuntimeError("task invocation skipped a signed execution anchor")
         while (
-            self._next_task_index < len(plan.tasks)
-            and int(plan.tasks[self._next_task_index].anchor_id) == dense_anchor
+            self._next_task_index < len(plan.tasks) and int(plan.tasks[self._next_task_index].anchor_id) == dense_anchor
         ):
             end = next(end for end in plan.region_ends if end > self._next_task_index)
             while self._next_task_index < end:
