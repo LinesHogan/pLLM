@@ -114,11 +114,9 @@ class Vllm027Sampler(Sampler, SamplerGuidance):
 
     __slots__ = ("_active_guidance",)
 
-    def __init__(self, upstream: Sampler, *, eager: bool) -> None:
+    def __init__(self, upstream: Sampler) -> None:
         if type(upstream) is not Sampler:
             raise TypeError("canonical sampler requires an exact vLLM 0.27.1 Sampler")
-        if type(eager) is not bool or not eager:
-            raise ValueError("canonical post-filter sampler requires eager execution")
         if upstream.num_speculative_tokens != 1:
             raise ValueError("canonical post-filter sampler does not support speculative decoding")
 

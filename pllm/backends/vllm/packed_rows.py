@@ -24,14 +24,12 @@ def encode_mrv2_rows(
         raise RuntimeError("canonical MRv2 packed rows require vLLM 0.27.1 exactly")
     if type(input_batch) is not InputBatch:
         raise TypeError("MRv2 packed rows require concrete signed inputs")
-    if torch.compiler.is_compiling() or (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
-        raise RuntimeError("canonical MRv2 packed rows are eager-only")
     count = input_batch.num_reqs
     if (
         count < 1
         or len(input_batch.req_ids) != count
-        or input_batch.num_reqs_after_padding != count
-        or input_batch.num_tokens_after_padding != input_batch.num_tokens
+        or input_batch.num_reqs_after_padding < count
+        or input_batch.num_tokens_after_padding < input_batch.num_tokens
         or input_batch.num_draft_tokens != 0
         or input_batch.num_draft_tokens_per_req is not None
         or any(
@@ -48,7 +46,7 @@ def encode_mrv2_rows(
         or input_batch.logits_indices.device.type != "cuda"
         or input_batch.logits_indices.numel() != count
     ):
-        raise RuntimeError("vLLM MRv2 InputBatch is not an eager n=1 non-speculative batch")
+        raise RuntimeError("vLLM MRv2 InputBatch is not an n=1 non-speculative batch")
     request_ids = tuple(identity.request_id for identity in identities)
     if (
         tuple(input_batch.req_ids) != request_ids
@@ -94,8 +92,6 @@ def encode_mrv1_rows(
         or logits_indices.device.type != "cuda"
     ):
         raise ValueError("MRv1 rows require the exact non-speculative persistent input batch")
-    if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("MRv1 workload packed rows are eager-only")
     scheduled = [scheduler.num_scheduled_tokens[key] for key in batch.req_ids]
     if any(count < 1 for count in scheduled):
         raise ValueError("MRv1 input batch contains an unscheduled request")

@@ -17,6 +17,7 @@ import torch
 from vllm import RequestOutput, SamplingParams
 from vllm import __version__ as _VLLM_VERSION
 from vllm.config import CacheConfig, VllmConfig
+from vllm.config import ModelConfig as VllmModelConfig
 from vllm.entrypoints.llm import LLM
 from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
 from vllm.sequence import IntermediateTensors
@@ -127,7 +128,7 @@ _WORKER_CLASS = "pllm.worker.GPUWorker"
 _SUPPORTED_VLLM_VERSION = "0.27.1"
 _BACKEND_ABI_FIELDS = (
     "vllm=0.27.1",
-    "mode=in_process|engine_core/eager/tp1/pp1/dp1/non_spec",
+    "mode=in_process|engine_core/tp1/pp1/dp1/non_spec",
     "rows=one_logit_per_request",
     "attachment=shared_plan_v7",
     "attachments=sampler_training|parameter_overlay|activation_patch",
@@ -725,6 +726,7 @@ class Runner(Generic[SamplerT]):
     sampler: SamplerT
     model: torch.nn.Module
     cache_config: CacheConfig
+    model_config: VllmModelConfig
     device: torch.device
     max_num_tokens: int
     runner_kind: RunnerKind
@@ -778,6 +780,14 @@ class Runner(Generic[SamplerT]):
             task.replay is not None for task in deployment.attachment.inputs.plan.semantic_graph.tasks
         ):
             raise ValueError("signed KV replay does not support shared prefix caching")
+        request = deployment.attachment.inputs.request
+        in_model = (
+            request.overlay_bindings
+            or request.activation_bindings
+            or any(task.replay is not None for task in deployment.attachment.inputs.plan.semantic_graph.tasks)
+        )
+        if in_model and not self.model_config.enforce_eager:
+            raise ValueError("parameter overlays, activation patches and layer replay do not run under CUDA graphs yet")
         match self.model:
             case Qwen2ForCausalLM() as model:
                 pass
@@ -886,7 +896,7 @@ class WorkloadModelRunner(Runner[Sampler | None], UpstreamModelRunner):
     def _make_sampler(self, upstream: Sampler | None) -> Sampler:
         if upstream is None:
             raise RuntimeError("MRv2 sampler has not been initialized")
-        return Vllm027Sampler(upstream, eager=True)
+        return Vllm027Sampler(upstream)
 
     def prepare_inputs(
         self,
@@ -1558,8 +1568,9 @@ def create_vllm_llm(
         raise ValueError("parameter-version overlays do not support shared prefix caching")
     if _VLLM_VERSION != _SUPPORTED_VLLM_VERSION:
         raise RuntimeError("vLLM workload requires vLLM 0.27.1 exactly")
-    if config.cuda_graphs:
-        raise ValueError("workloads do not run under vLLM CUDA graphs yet; use ModelConfig(cuda_graphs=False)")
+    requirements = workload.backend_requirements()
+    if config.cuda_graphs and (requirements.parameter_targets or requirements.activation_layers):
+        raise ValueError("parameter overlays and activation patches do not run under CUDA graphs yet")
     environment = {
         _MP_ENV: "1" if config.multiprocessing else "0",
         _V2_RUNNER_ENV: "1" if config.runner is RunnerKind.MRV2 else "0",
@@ -1585,7 +1596,7 @@ def create_vllm_llm(
             data_parallel_size=1,
             distributed_executor_backend="uni",
             worker_cls=_WORKER_CLASS,
-            enforce_eager=True,
+            enforce_eager=not config.cuda_graphs,
             max_model_len=config.max_model_len,
             max_num_seqs=config.max_num_seqs,
             max_num_batched_tokens=config.max_num_batched_tokens,
@@ -1825,7 +1836,6 @@ def probe_backend(
 def _require_runner(runner: WorkloadModelRunner | Mrv1Runner) -> None:
     if (
         _VLLM_VERSION != _SUPPORTED_VLLM_VERSION
-        or not runner.model_config.enforce_eager
         or runner.parallel_config.tensor_parallel_size != 1
         or runner.parallel_config.pipeline_parallel_size != 1
         or runner.parallel_config.data_parallel_size != 1
@@ -1836,7 +1846,7 @@ def _require_runner(runner: WorkloadModelRunner | Mrv1Runner) -> None:
         or runner.max_num_reqs < 1
         or type(runner.sampler) is not (Sampler if runner.runner_kind is RunnerKind.MRV2 else Mrv1Sampler)
     ):
-        raise RuntimeError("vLLM workload requires eager TP1/PP1/DP1 non-spec execution")
+        raise RuntimeError("vLLM workload requires TP1/PP1/DP1 non-spec execution")
 
 
 def _base_probe(
@@ -1853,7 +1863,13 @@ def _base_probe(
         raise RuntimeError("vLLM workload requires an ordinal CUDA device")
     return BackendPlacementProbe(
         adapter_id=f"canonical.vllm_{runner.runner_kind.value}@1",
-        backend_abi_digest=_digest((*_BACKEND_ABI_FIELDS, f"runner={runner.runner_kind.value}")),
+        backend_abi_digest=_digest(
+            (
+                *_BACKEND_ABI_FIELDS,
+                f"runner={runner.runner_kind.value}",
+                f"cuda_graphs={not runner.model_config.enforce_eager}",
+            )
+        ),
         runner_fingerprint=_digest(
             (
                 runner.runner_kind.value,
