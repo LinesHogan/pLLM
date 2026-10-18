@@ -184,82 +184,63 @@ class TensorPort:
     rowwise: bool = True
 
 
+def take_rows(values: torch.Tensor, rows: Sequence[int], device_rows: torch.Tensor | None = None) -> torch.Tensor:
+    """`values[rows]` along dim 0: a view when the rows repeat one row or run consecutively, else one gather."""
+    first = rows[0] if rows else 0
+    if len(set(rows)) == 1:
+        return values[first : first + 1].expand(len(rows), *values.shape[1:])
+    if tuple(rows) == tuple(range(first, first + len(rows))):
+        return values.narrow(0, first, len(rows))
+    if device_rows is None:
+        device_rows = torch.tensor(rows, dtype=torch.long, device=values.device)
+    return values.index_select(0, device_rows)
+
+
+_COLUMNS = ("packed", "sampler", "samples", "states", "versions")
+
+
 @dataclass(frozen=True, slots=True)
 class RowIndex:
-    """Per-row index tables of one invocation, built on the host and copied to the device once.
+    """Per-row index columns of one invocation; entry i describes `TensorFrame.rows[i]`.
 
-    Entry i describes operation row i (`TensorFrame.rows[i]`). Every tensor input reads its
-    rows through these tables, so one invocation issues a single small host-to-device copy.
+    The columns are built on the host and copied to the device once per invocation, so reading
+    many tensor inputs costs one small host-to-device copy.
     """
 
-    packed: torch.Tensor  # row in the packed hidden batch
-    sampler: torch.Tensor  # row in the sampler batch; -1 if the row was not sampled
-    samples: torch.Tensor  # sample index of the row's request
-    states: torch.Tensor  # position of the row's state in the selection; 0 without state
-    versions: torch.Tensor  # version of that state; 0 without state
-    sampled: bool  # every row has a sampler row
-    # Host facts that let common cases borrow instead of copy.
-    packed_start: int | None  # packed rows are start, start+1, ...
-    sampler_start: int | None  # sampler rows are start, start+1, ...
-    single_state: int | None  # every row reads this one state
-    host_states: tuple[int, ...]  # `states` on the host
+    packed: tuple[int, ...]  # row in the packed hidden batch
+    sampler: tuple[int, ...]  # row in the sampler batch; -1 if the row was not sampled
+    samples: tuple[int, ...]  # sample index of the row's request
+    states: tuple[int, ...]  # position of the row's state in the selection; 0 without state
+    versions: tuple[int, ...]  # version of that state; 0 without state
+    device: torch.Tensor  # the five columns above, stacked on the device
 
-    @property
-    def count(self) -> int:
-        return self.packed.numel()
+    def column(self, name: str) -> torch.Tensor:
+        return self.device[_COLUMNS.index(name)]
 
-    def packed_rows(self, values: torch.Tensor) -> torch.Tensor:
-        """Rows of a packed-batch tensor, in operation-row order."""
-        if self.packed_start is not None:
-            return values.narrow(0, self.packed_start, self.count)
-        return values.index_select(0, self.packed)
-
-    def sampler_rows(self, values: torch.Tensor) -> torch.Tensor:
-        """Rows of a sampler-batch tensor, in operation-row order."""
-        if not self.sampled:
-            raise ValueError("sampler values are only available for sampled rows")
-        if self.sampler_start is not None:
-            return values.narrow(0, self.sampler_start, self.count)
-        return values.index_select(0, self.sampler)
-
-    def state_rows(self, values: torch.Tensor) -> torch.Tensor:
-        """Expand per-state values `[states, ...]` to one entry per row."""
-        if self.single_state is not None:
-            value = values[self.single_state]
-            return value.unsqueeze(0).expand(self.count, *value.shape)
-        return values.index_select(0, self.states)
+    def take(self, values: torch.Tensor, name: str) -> torch.Tensor:
+        """Rows of `values` selected by one column, in operation-row order."""
+        rows: tuple[int, ...] = getattr(self, name)
+        if -1 in rows:
+            raise ValueError(f"some rows have no {name} row")
+        return take_rows(values, rows, self.column(name))
 
     @classmethod
     def build(cls, data: "TensorFrame", batch: TensorBatch, device: torch.device) -> "RowIndex":
         links = {link.packed_row_index: link.sampler_row_index for link in data.step.sampler_rows.links}
         selection = batch.selection
-        states = [selection.row_states[row.identity] for row in data.rows] if selection.groups else [0] * len(data.rows)
-        versions = [int(selection.refs[index].version_id) for index in states] if selection.groups else states
-        sampler = [links.get(row.packed_row_index, -1) for row in data.rows]
-        packed = [row.packed_row_index for row in data.rows]
-
-        def start(values: list[int]) -> int | None:
-            first = values[0] if values else 0
-            return first if values == list(range(first, first + len(values))) else None
-
-        table = torch.tensor(
-            [
-                packed,
-                sampler,
-                [row.identity.sample_idx for row in data.rows],
-                states,
-                versions,
-            ],
-            dtype=torch.long,
-        ).to(device)
-        return cls(
-            *table.unbind(),
-            sampled=all(index >= 0 for index in sampler),
-            packed_start=start(packed),
-            sampler_start=start(sampler),
-            single_state=states[0] if states and len(set(states)) == 1 else None,
-            host_states=tuple(states),
+        states = (
+            tuple(selection.row_states[row.identity] for row in data.rows)
+            if selection.groups
+            else (0,) * len(data.rows)
         )
+        columns = (
+            tuple(row.packed_row_index for row in data.rows),
+            tuple(links.get(row.packed_row_index, -1) for row in data.rows),
+            tuple(row.identity.sample_idx for row in data.rows),
+            states,
+            tuple(int(selection.refs[index].version_id) for index in states) if selection.groups else states,
+        )
+        return cls(*columns, device=torch.tensor(columns, dtype=torch.long).to(device))
 
 
 def row_index(data: "TensorFrame", batch: TensorBatch, device: torch.device) -> RowIndex:
@@ -273,17 +254,8 @@ def _field_rows(data: "TensorFrame", batch: TensorBatch, field: int, start: int,
     """`field[start:start+size]` of each row's state, `[rows, size]`; copies only that slice."""
     pool, slots = batch.field_slots(field)
     view = pool.reshape(len(pool), -1).narrow(1, start, size)
-    index = row_index(data, batch, pool.device)
-    if index.single_state is not None:
-        value = view[slots[index.single_state]]
-        return value.unsqueeze(0).expand(index.count, size)
-    key = (field, slots)
-    rows = data.slot_rows.get(key)
-    if rows is None:
-        rows = data.slot_rows[key] = torch.tensor(
-            [slots[state] for state in index.host_states], dtype=torch.long, device=pool.device
-        )
-    return view.index_select(0, rows)
+    rows = tuple(slots[state] for state in row_index(data, batch, pool.device).states)
+    return take_rows(view, rows)
 
 
 def _state_rows(batch: TensorBatch, field: int) -> torch.Tensor:
@@ -349,10 +321,6 @@ class TensorFrame:
     # Differentiable [states, parameters] copy of the flat optimizer field, shared by the
     # invocation's differentiable tasks and cleared by the training task that consumes it.
     leaf: torch.Tensor | None = None
-    # Device row-slot tables keyed by (field, state slots), so each is uploaded once per invocation.
-    slot_rows: dict[tuple[int, tuple[int, ...]], torch.Tensor] = field(
-        default_factory=lambda: dict[tuple[int, tuple[int, ...]], torch.Tensor]()
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -394,7 +362,7 @@ def _feedback(read: Callable[[SamplerFeedback], torch.Tensor]) -> TensorPort:
         if feedback is None:
             raise RuntimeError("tensor function requires completed sampler feedback")
         values = read(feedback)
-        return row_index(data, batch, values.device).sampler_rows(values)
+        return row_index(data, batch, values.device).take(values, "sampler")
 
     return TensorPort(SamplerFeedbackInputSource(), resolve)
 
@@ -480,14 +448,14 @@ def _port(source: SemanticInputSource | TensorPort) -> TensorPort:
                     if item.resource.locator_key == (str(layer), "index", site.value)
                 )
                 index = row_index(data, batch, snapshot.hidden.device)
-                return index.packed_rows(snapshot.hidden)[:, : data.columns]
+                return index.take(snapshot.hidden, "packed")[:, : data.columns]
 
             return TensorPort(source, hidden)
         case PackedSamplerRowsInputSource():
 
             def samples(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
                 device = data.step.hidden_batch(batch.stream).snapshots[0].hidden.device
-                return row_index(data, batch, device).samples
+                return row_index(data, batch, device).column("samples")
 
             return TensorPort(source, samples)
         case SamplerFeedbackInputSource():
@@ -956,7 +924,7 @@ class TensorBinding(Builder[TensorFrame]):
                     size = prod(shape)
                     if field_index == 0 and data.leaf is not None:
                         leaf = data.leaf.narrow(1, start or 0, size)
-                        rows = row_index(data, batch, leaf.device).state_rows(leaf)
+                        rows = row_index(data, batch, leaf.device).take(leaf, "states")
                     else:
                         rows = _field_rows(data, batch, field_index, start or 0, size)
                     return rows.view(len(rows), *shape)
@@ -1162,7 +1130,7 @@ class TensorBinding(Builder[TensorFrame]):
                     dtype=torch.long,
                 )
             index = row_index(data, batch, batch.roots[0][0].device)
-            return index.versions if version else index.states
+            return index.column("versions" if version else "states")
 
         return TensorPort(state.read(), read)
 
@@ -1246,7 +1214,7 @@ class TensorBinding(Builder[TensorFrame]):
                         else tuple(range(len(data.rows)))
                     )
                     selected = (
-                        replace(data, rows=tuple(data.rows[index] for index in rows), index=None, slot_rows={})
+                        replace(data, rows=tuple(data.rows[index] for index in rows), index=None)
                         if policy.forward_rows
                         else data
                     )

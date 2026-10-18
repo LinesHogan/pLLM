@@ -671,10 +671,13 @@ def _independent_domains(facts, binding, monkeypatch) -> None:
                             for event in packing.key_averages()
                             if event.key == "aten::index_select"
                         )
-                        == (len(parameters) + len(forward))
+                        == (
+                            len(parameters)
+                            + (0 if forward == list(range(forward[0], forward[0] + len(forward))) else len(forward))
+                        )
                         * 4
                         * 7
-                        * hidden.element_size()  # [states, field] leaf + packed rows
+                        * hidden.element_size()  # [states, field] leaf, plus packed rows unless consecutive
                     )
                 with pytest.raises(RuntimeError, match="sampler completion"):
                     execution.execute_anchor(invocation, AnchorId(5))
