@@ -125,11 +125,12 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
         with pytest.raises(RuntimeError, match="sampler completion"):
             execution.execute_anchor(handle, AnchorId(execution.sampler_anchor_id + 1))
         execution.complete_sampler(handle, stream)
-        pointers = {parameter.untyped_storage().data_ptr() for parameter in handle.context.value.parameters}
+        pointers = set()
         saved_parameters = []
 
         def save(tensor):
             if tensor.shape == (count, rank, hidden):
+                pointers.add(handle.context.value.leaf.untyped_storage().data_ptr())
                 saved_parameters.append((tensor.untyped_storage().data_ptr(), tensor.stride(0)))
             return tensor
 

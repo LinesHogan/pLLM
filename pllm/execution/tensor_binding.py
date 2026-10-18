@@ -184,6 +184,123 @@ class TensorPort:
     rowwise: bool = True
 
 
+@dataclass(frozen=True, slots=True)
+class RowIndex:
+    """Per-row index tables of one invocation, built on the host and copied to the device once.
+
+    Entry i describes operation row i (`TensorFrame.rows[i]`). Every tensor input reads its
+    rows through these tables, so one invocation issues a single small host-to-device copy.
+    """
+
+    packed: torch.Tensor  # row in the packed hidden batch
+    sampler: torch.Tensor  # row in the sampler batch; -1 if the row was not sampled
+    samples: torch.Tensor  # sample index of the row's request
+    states: torch.Tensor  # position of the row's state in the selection; 0 without state
+    versions: torch.Tensor  # version of that state; 0 without state
+    sampled: bool  # every row has a sampler row
+    # Host facts that let common cases borrow instead of copy.
+    packed_start: int | None  # packed rows are start, start+1, ...
+    sampler_start: int | None  # sampler rows are start, start+1, ...
+    single_state: int | None  # every row reads this one state
+    host_states: tuple[int, ...]  # `states` on the host
+
+    @property
+    def count(self) -> int:
+        return self.packed.numel()
+
+    def packed_rows(self, values: torch.Tensor) -> torch.Tensor:
+        """Rows of a packed-batch tensor, in operation-row order."""
+        if self.packed_start is not None:
+            return values.narrow(0, self.packed_start, self.count)
+        return values.index_select(0, self.packed)
+
+    def sampler_rows(self, values: torch.Tensor) -> torch.Tensor:
+        """Rows of a sampler-batch tensor, in operation-row order."""
+        if not self.sampled:
+            raise ValueError("sampler values are only available for sampled rows")
+        if self.sampler_start is not None:
+            return values.narrow(0, self.sampler_start, self.count)
+        return values.index_select(0, self.sampler)
+
+    def state_rows(self, values: torch.Tensor) -> torch.Tensor:
+        """Expand per-state values `[states, ...]` to one entry per row."""
+        if self.single_state is not None:
+            value = values[self.single_state]
+            return value.unsqueeze(0).expand(self.count, *value.shape)
+        return values.index_select(0, self.states)
+
+    @classmethod
+    def build(cls, data: "TensorFrame", batch: TensorBatch, device: torch.device) -> "RowIndex":
+        links = {link.packed_row_index: link.sampler_row_index for link in data.step.sampler_rows.links}
+        selection = batch.selection
+        states = [selection.row_states[row.identity] for row in data.rows] if selection.groups else [0] * len(data.rows)
+        versions = [int(selection.refs[index].version_id) for index in states] if selection.groups else states
+        sampler = [links.get(row.packed_row_index, -1) for row in data.rows]
+        packed = [row.packed_row_index for row in data.rows]
+
+        def start(values: list[int]) -> int | None:
+            first = values[0] if values else 0
+            return first if values == list(range(first, first + len(values))) else None
+
+        table = torch.tensor(
+            [
+                packed,
+                sampler,
+                [row.identity.sample_idx for row in data.rows],
+                states,
+                versions,
+            ],
+            dtype=torch.long,
+        ).to(device)
+        return cls(
+            *table.unbind(),
+            sampled=all(index >= 0 for index in sampler),
+            packed_start=start(packed),
+            sampler_start=start(sampler),
+            single_state=states[0] if states and len(set(states)) == 1 else None,
+            host_states=tuple(states),
+        )
+
+
+def row_index(data: "TensorFrame", batch: TensorBatch, device: torch.device) -> RowIndex:
+    """The invocation's row tables, built on first use."""
+    if data.index is None:
+        data.index = RowIndex.build(data, batch, device)
+    return data.index
+
+
+def _field_rows(data: "TensorFrame", batch: TensorBatch, field: int, start: int, size: int) -> torch.Tensor:
+    """`field[start:start+size]` of each row's state, `[rows, size]`; copies only that slice."""
+    pool, slots = batch.field_slots(field)
+    view = pool.reshape(len(pool), -1).narrow(1, start, size)
+    index = row_index(data, batch, pool.device)
+    if index.single_state is not None:
+        value = view[slots[index.single_state]]
+        return value.unsqueeze(0).expand(index.count, size)
+    key = (field, slots)
+    rows = data.slot_rows.get(key)
+    if rows is None:
+        rows = data.slot_rows[key] = torch.tensor(
+            [slots[state] for state in index.host_states], dtype=torch.long, device=pool.device
+        )
+    return view.index_select(0, rows)
+
+
+def _state_rows(batch: TensorBatch, field: int) -> torch.Tensor:
+    """One row per selected state: `[states, *field_shape]`, a view when there is a single state."""
+    pool, slots = batch.field_slots(field)
+    if len(slots) == 1:
+        return pool[slots[0] : slots[0] + 1]
+    return pool.index_select(0, torch.tensor(slots, dtype=torch.long, device=pool.device))
+
+
+def state_leaf(data: "TensorFrame", batch: TensorBatch) -> torch.Tensor:
+    """The invocation's differentiable parameters, created on first use."""
+    if data.leaf is None:
+        data.leaf = _state_rows(batch, 0).detach().requires_grad_(True)
+    return data.leaf
+
+
 @dataclass(slots=True)
 class TensorFrame:
     step: TensorStepInput
@@ -205,6 +322,14 @@ class TensorFrame:
     selected: tuple[int, ...] = ()
     trained_rows: int = 0
     replacements: tuple[tuple[int, tuple[torch.Tensor, ...]], ...] = ()
+    index: RowIndex | None = None
+    # Differentiable [states, parameters] copy of the flat optimizer field, shared by the
+    # invocation's differentiable tasks and cleared by the training task that consumes it.
+    leaf: torch.Tensor | None = None
+    # Device row-slot tables keyed by (field, state slots), so each is uploaded once per invocation.
+    slot_rows: dict[tuple[int, tuple[int, ...]], torch.Tensor] = field(
+        default_factory=lambda: dict[tuple[int, tuple[int, ...]], torch.Tensor]()
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,8 +370,8 @@ def _feedback(read: Callable[[SamplerFeedback], torch.Tensor]) -> TensorPort:
         feedback = batch.feedback
         if feedback is None:
             raise RuntimeError("tensor function requires completed sampler feedback")
-        links = {link.packed_row_index: link.sampler_row_index for link in data.step.sampler_rows.links}
-        return select_rows(read(feedback), tuple(links[row.packed_row_index] for row in data.rows))
+        values = read(feedback)
+        return row_index(data, batch, values.device).sampler_rows(values)
 
     return TensorPort(SamplerFeedbackInputSource(), resolve)
 
@@ -331,14 +456,15 @@ def _port(source: SemanticInputSource | TensorPort) -> TensorPort:
                     for item in data.step.hidden_batch(batch.stream).snapshots
                     if item.resource.locator_key == (str(layer), "index", site.value)
                 )
-                return select_rows(snapshot.hidden, tuple(row.packed_row_index for row in data.rows))[:, : data.columns]
+                index = row_index(data, batch, snapshot.hidden.device)
+                return index.packed_rows(snapshot.hidden)[:, : data.columns]
 
             return TensorPort(source, hidden)
         case PackedSamplerRowsInputSource():
 
             def samples(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
                 device = data.step.hidden_batch(batch.stream).snapshots[0].hidden.device
-                return torch.tensor([row.identity.sample_idx for row in data.rows], device=device, dtype=torch.long)
+                return row_index(data, batch, device).samples
 
             return TensorPort(source, samples)
         case SamplerFeedbackInputSource():
@@ -752,6 +878,8 @@ class TensorBinding(Builder[TensorFrame]):
         if dimensions is None:
             return state, {key: state.read() for key in (*shapes, *memory)}
         views: dict[str, Callable[[tuple[torch.Tensor, ...]], torch.Tensor]] = {}
+        # Where each named view lives: (field index, start, size, shape); start is None for whole fields.
+        locations: dict[str, tuple[int, int | None, tuple[int, ...]]] = {}
         offset = 0
         for index, (key, shape) in enumerate(zip(shapes, sizes(dimensions), strict=True)):
             size = prod(shape)
@@ -766,15 +894,28 @@ class TensorBinding(Builder[TensorFrame]):
                 return root[index] if raw else root[0].narrow(0, start, size).view(shape)
 
             views[key] = view
+            locations[key] = (index, None, shape) if raw else (0, offset, shape)
             offset += size
         # Memory fields follow the optimizer-expanded parameter fields.
         base = len(shapes) if raw else 5
-        for index, key in enumerate(memory):
+        for index, (key, memory_shape) in enumerate(memory.items()):
 
             def memory_view(root: tuple[torch.Tensor, ...], index: int = base + index) -> torch.Tensor:
                 return root[index]
 
             views[key] = memory_view
+            locations[key] = (
+                base + index,
+                None,
+                memory_shape(dimensions) if callable(memory_shape) else memory_shape,
+            )
+
+        if initialize is not None:
+
+            def init(root: tuple[torch.Tensor, ...], generator: torch.Generator) -> None:
+                initialize({key: view(root) for key, view in views.items()}, generator)
+
+            self.initializers[str(state.declaration.resource)] = init
 
         def port(view: Callable[[tuple[torch.Tensor, ...]], torch.Tensor]) -> TensorPort:
             return TensorPort(
@@ -785,22 +926,22 @@ class TensorBinding(Builder[TensorFrame]):
 
         if scope is StateScope.REQUEST:
 
-            def port(view: Callable[[tuple[torch.Tensor, ...]], torch.Tensor]) -> TensorPort:
+            def request_port(key: str) -> TensorPort:
+                field_index, start, shape = locations[key]
+
                 def read(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
-                    indices = tuple(batch.selection.row_states[row.identity] for row in data.rows)
-                    if not indices or all(index == indices[0] for index in indices):
-                        value = view(batch.roots[indices[0] if indices else 0])
-                        return value.unsqueeze(0).expand(len(indices), *value.shape)
-                    return torch.stack(tuple(view(batch.roots[index]) for index in indices))
+                    size = prod(shape)
+                    if field_index == 0 and data.leaf is not None:
+                        leaf = data.leaf.narrow(1, start or 0, size)
+                        rows = row_index(data, batch, leaf.device).state_rows(leaf)
+                    else:
+                        rows = _field_rows(data, batch, field_index, start or 0, size)
+                    return rows.view(len(rows), *shape)
 
                 return TensorPort(state.read(), read)
 
-        if initialize is not None:
+            return state, {key: request_port(key) for key in views}
 
-            def init(root: tuple[torch.Tensor, ...], generator: torch.Generator) -> None:
-                initialize({key: view(root) for key, view in views.items()}, generator)
-
-            self.initializers[str(state.declaration.resource)] = init
         return state, {key: port(view) for key, view in views.items()}
 
     def weighted_train(
@@ -997,9 +1138,8 @@ class TensorBinding(Builder[TensorFrame]):
                     device=tensors[0].device,
                     dtype=torch.long,
                 )
-            indices = tuple(batch.selection.row_states[row.identity] for row in data.rows)
-            values = tuple(batch.selection.refs[index].version_id for index in indices) if version else indices
-            return torch.tensor(values, device=batch.roots[0][0].device, dtype=torch.long)
+            index = row_index(data, batch, batch.roots[0][0].device)
+            return index.versions if version else index.states
 
         return TensorPort(state.read(), read)
 
@@ -1070,12 +1210,9 @@ class TensorBinding(Builder[TensorFrame]):
 
                 def values(data: TensorFrame, batch: TensorBatch) -> tuple[dict[str, torch.Tensor], tuple[int, ...]]:
                     if policy.parameter_gradients:
+                        leaf = state_leaf(data, batch)
                         batch = replace(
-                            batch,
-                            roots=tuple(
-                                (parameter, *root[1:])
-                                for parameter, root in zip(data.parameters, batch.roots, strict=True)
-                            ),
+                            batch, roots=tuple((leaf[index], *root[1:]) for index, root in enumerate(batch.roots))
                         )
                     inputs = {key: ports[key].read(data, batch) for key in domains}
                     for key in domains:
@@ -1088,7 +1225,9 @@ class TensorBinding(Builder[TensorFrame]):
                         else tuple(range(len(data.rows)))
                     )
                     selected = (
-                        replace(data, rows=tuple(data.rows[index] for index in rows)) if policy.forward_rows else data
+                        replace(data, rows=tuple(data.rows[index] for index in rows), index=None, slot_rows={})
+                        if policy.forward_rows
+                        else data
                     )
                     for key, port in ports.items():
                         source = sources[key]
@@ -1163,7 +1302,9 @@ class TensorBinding(Builder[TensorFrame]):
                             active = tuple(sorted({indices[data.rows[row].identity] for row in selected}))
                             if not rows:
                                 outcome = TaskOutput(
-                                    gradients=tuple(torch.zeros_like(data.parameters[index]) for index in active),
+                                    gradients=tuple(
+                                        torch.zeros_like(state_leaf(data, batch)[index]) for index in active
+                                    ),
                                     gradient_indices=active,
                                     update_count=len(active),
                                 )
@@ -1180,24 +1321,22 @@ class TensorBinding(Builder[TensorFrame]):
                                     raise ValueError(
                                         "optimizer functions must return a scalar loss or declare state_mean"
                                     )
-                                targets = (*data.parameters, *data.derivative_sources.values())
+                                leaf = state_leaf(data, batch)
+                                targets = (leaf, *data.derivative_sources.values())
                                 derivatives = (
                                     torch.autograd.grad(objective, targets, allow_unused=True, materialize_grads=True)
                                     if objective.requires_grad
                                     else tuple(torch.zeros_like(target) for target in targets)
                                 )
-                                gradients = tuple(derivatives[index] for index in active)
+                                state_gradients = derivatives[0].detach()
+                                gradients = tuple(state_gradients[index] for index in active)
                                 data.parameter_gradient_fields.update(
-                                    (ref, (value.detach(),))
-                                    for ref, value in zip(
-                                        batch.selection.refs, derivatives[: len(data.parameters)], strict=True
-                                    )
+                                    (ref, (value,))
+                                    for ref, value in zip(batch.selection.refs, state_gradients.unbind(), strict=True)
                                 )
                                 data.input_gradients.update(
                                     (key, value.detach())
-                                    for key, value in zip(
-                                        data.derivative_sources, derivatives[len(data.parameters) :], strict=True
-                                    )
+                                    for key, value in zip(data.derivative_sources, derivatives[1:], strict=True)
                                 )
                                 batch.results[symbol, output] = loss = loss.detach()
                                 outcome = TaskOutput(
@@ -1238,7 +1377,7 @@ class TensorBinding(Builder[TensorFrame]):
                                     )
                         # validate_gradients binds every derivative path to this sole sink.
                         data.derivative_sources.clear()
-                        data.parameters = ()
+                        data.leaf = None
                         for key, value in batch.results.items():
                             batch.results[key] = value.detach()
                         return outcome
@@ -1685,14 +1824,7 @@ class TensorBinding(Builder[TensorFrame]):
                 for snapshot in snapshots
             ):
                 raise ValueError("sampler hidden input differs from parameter specialization")
-            data = TensorFrame(
-                value,
-                row_selection(value),
-                parameters=()
-                if self.weighted_training
-                else tuple(root[0].detach().requires_grad_(True) for root in batch.roots),
-            )
-            return data
+            return TensorFrame(value, row_selection(value))
 
         return prepare
 

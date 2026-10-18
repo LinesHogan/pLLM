@@ -596,6 +596,21 @@ class PageBundleArena:
             (root,) = self._capture_roots(pin, (ref,), (field,))
             return self._pools[root.resource].tensor(field, root.pages[field]).detach()
 
+    def field_slots(
+        self, access: tuple[PagePin | PageWrite, ...], refs: tuple[StateRef, ...], field: LayoutFieldId
+    ) -> tuple[torch.Tensor, tuple[int, ...]]:
+        """A field's whole page pool `[capacity, *shape]` and the slot of each ref's page in it.
+
+        Each ref is checked against the pin or write that grants access to it, so indexing the
+        pool at the returned slots reads exactly those versions.
+        """
+        with self._lock:
+            roots = tuple(
+                self._capture_roots(token, (ref,), (field,))[0] for token, ref in zip(access, refs, strict=True)
+            )
+            pool = self._pools[roots[0].resource].tensors[field].detach()
+            return pool, tuple(root.pages[field].slot_id for root in roots)
+
     def paged_rows(
         self,
         access: tuple[PagePin | PageWrite, ...],

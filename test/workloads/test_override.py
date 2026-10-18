@@ -650,7 +650,7 @@ def _independent_domains(facts, binding, monkeypatch) -> None:
                         for anchor in range(4):
                             execution.execute_anchor(invocation, AnchorId(anchor))
                 if forward and not request:
-                    parameter = invocation.context.value.parameters[0]
+                    parameter = invocation.context.value.leaf
                     assert saved_weights and all(
                         stride[0] == 0 and pointer == parameter.untyped_storage().data_ptr()
                         for stride, pointer in saved_weights
@@ -666,8 +666,15 @@ def _independent_domains(facts, binding, monkeypatch) -> None:
                     )
                 if packing is not None:
                     assert (
-                        sum(event.cpu_memory_usage for event in packing.key_averages() if event.key == "aten::stack")
-                        == len(forward) * 4 * 7 * hidden.element_size()
+                        sum(
+                            event.cpu_memory_usage
+                            for event in packing.key_averages()
+                            if event.key == "aten::index_select"
+                        )
+                        == (len(parameters) + len(forward))
+                        * 4
+                        * 7
+                        * hidden.element_size()  # [states, field] leaf + packed rows
                     )
                 with pytest.raises(RuntimeError, match="sampler completion"):
                     execution.execute_anchor(invocation, AnchorId(5))
