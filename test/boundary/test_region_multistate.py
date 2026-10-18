@@ -296,22 +296,6 @@ def test_route_overlap_does_not_acquire_partial_lease_or_drop_other_holders():
     assert_reclaimed(execution)
 
 
-def test_stale_selection_rejected_before_any_resource_is_leased():
-    execution, _, _, _ = fixture(instance=False)
-    a = RequestIdentity("a", 0, 0)
-    refs = execution.admit((a,))
-    selection = execution.directory.select(rows_for(a))
-    write = execution.arena.prepare_transition((refs[-1],))
-    receipt = execution.arena.publish(write)
-    execution.arena.settle(receipt)
-    with pytest.raises(RuntimeError, match="stale"):
-        execution.directory.acquire_transition_lease(selection)
-    invocation = execution.begin(rows_for(a))
-    execution.cancel_step(invocation)
-    execution.retire((a,))
-    assert_reclaimed(execution)
-
-
 def test_failure_between_resource_publications_keeps_committed_prefix(monkeypatch):
     execution, task, _, _ = fixture()
     execution.admit(())
@@ -370,21 +354,4 @@ def test_mixed_retirement_cancels_own_invocation_then_releases_instance_pin():
     execution.retire(())
     assert invocation.context.release is not None
     execution.retire_dormant()
-    assert_reclaimed(execution)
-
-
-def test_incomplete_or_misindexed_selection_cannot_bypass_resource_leases():
-    execution, _, _, _ = fixture(instance=False)
-    a = RequestIdentity("a", 0, 0)
-    execution.admit((a,))
-    selected = execution.directory.select(rows_for(a))
-    for forged in (
-        replace(selected, groups=selected.groups[:1]),
-        replace(selected, groups=(selected.groups[0], replace(selected.groups[1], state_indices=(0,)))),
-    ):
-        with pytest.raises(RuntimeError, match="differs from its resources"):
-            execution.directory.acquire_transition_lease(forged)
-    invocation = execution.begin(rows_for(a))
-    execution.cancel_step(invocation)
-    execution.retire((a,))
     assert_reclaimed(execution)

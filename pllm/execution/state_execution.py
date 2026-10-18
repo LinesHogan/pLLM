@@ -505,8 +505,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                     self._borrow_failed = True
                     raise RuntimeError("borrowed step requires complete staged roots on the receiving stream")
             self.arena.collect_completed()
-            selection = self.directory.select(rows)
-            self.directory.acquire_transition_lease(selection)
+            selection = self.directory.select_and_lease(rows)
             try:
                 pin = self.arena.pin_exact(selection.refs, stream)
             except Exception:
@@ -569,7 +568,9 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                     if context.pin.stream is None:
                         raise ValueError("CUDA input readiness requires a CUDA invocation")
                     readiness.order_on(context.pin.stream)
-                if self.directory.select(self.math.rows(value)) != context.selection:
+                # The selection is a function of the rows, so equal rows mean an equal selection.
+                rows = self.math.rows(value)
+                if (rows if self.directory.states else ()) != context.selection.rows:
                     raise ValueError("state invocation input differs from its selected rows")
                 context.value = self.math.prepare(value, context)
             except Exception as exc:

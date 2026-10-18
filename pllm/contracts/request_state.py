@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 
 from pllm.contracts.request_identity import (
@@ -22,6 +23,7 @@ class RequestStateKey:
     route: str = ""
 
     @classmethod
+    @functools.lru_cache(maxsize=1 << 16)  # identities repeat every decode step
     def project(
         cls,
         identity: RequestIdentity,

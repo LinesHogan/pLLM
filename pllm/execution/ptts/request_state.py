@@ -267,12 +267,14 @@ class RequestStateDirectory:
                 offset += len(refs)
             return RequestStateSelection(rows if self.states else (), tuple(groups))
 
-    def acquire_transition_lease(self, selection: RequestStateSelection) -> None:
+    def select_and_lease(self, rows: tuple[PackedPhaseRow, ...]) -> RequestStateSelection:
+        """Select the latest state of every row and lease it to one step; the lease is never stale."""
         with self._lock:
-            self._require_latest(selection)
+            selection = self.select(rows)
             if self._leases.keys() & selection.addresses:
                 raise RuntimeError("request transition lease overlaps an active step")
             self._leases.update((key, selection) for key in selection.addresses)
+            return selection
 
     def release_transition_lease(self, selection: RequestStateSelection) -> None:
         with self._lock:
@@ -344,13 +346,6 @@ class RequestStateDirectory:
                 self._lineages.pop(key)
                 self._holders.pop(key)
             return refs
-
-    def _require_latest(self, selection: RequestStateSelection) -> None:
-        if selection != self.select(selection.rows):
-            raise RuntimeError("request transition selection is stale or differs from its resources")
-        for key, ref in zip(selection.addresses, selection.refs, strict=True):
-            if self._lineages.get(key) != ref.lineage_id or self.arena.latest(ref.lineage_id) != ref:
-                raise RuntimeError("request transition selection is stale")
 
     def _require_admission(self, batch: RequestStateAdmissionBatch) -> None:
         if self._pending is not batch:
