@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from typing import Generic, Literal, TypeVar
@@ -43,7 +43,7 @@ class TensorBatch:
     """Borrowed mathematical operands, never a storage or publication capability."""
 
     selection: RequestStateSelection
-    roots: Roots
+    roots: Sequence[tuple[torch.Tensor, ...]]
     after_refs: tuple[StateRef, ...]
     stream: torch.cuda.Stream | None
     feedback: SamplerFeedback | None = None
@@ -169,15 +169,7 @@ def _read(context: StateTaskContext[D], version: Literal["input", "private", "pu
         versions = dict(zip(receipt.before_refs, receipt.after_refs, strict=True))
         refs = tuple(versions.get(ref, ref) for ref in refs)
         access = tuple(pin if ref in versions else context.pin for ref in context.pin.refs)
-    roots = tuple(
-        tuple(
-            context.arena.borrow_field(token, ref, LayoutFieldId(i))
-            if isinstance(token, PagePin)
-            else context.arena.write_field(token, token.after_refs.index(ref), LayoutFieldId(i))
-            for i in range(len(context.arena.root(original).pages))
-        )
-        for token, ref, original in zip(access, refs, context.pin.refs, strict=True)
-    )
+    roots = context.arena.lazy_roots(access, refs)
     return TensorBatch(
         context.selection,
         roots,

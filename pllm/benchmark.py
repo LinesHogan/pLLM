@@ -40,6 +40,7 @@ class BenchmarkOptions:
     capture_memory_bytes: int = 256 * 1024**2
     state_memory_bytes: int = 256 * 1024**2
     memory_budget_bytes: int | None = None
+    sampling_n: int = 16  # completions per prompt, as in the aligned throughput settings
 
     @classmethod
     def parse(cls, parser: argparse.ArgumentParser | None = None) -> BenchmarkOptions:
@@ -49,6 +50,7 @@ class BenchmarkOptions:
         parser.add_argument("--tokens", type=int, default=256)
         parser.add_argument("--rounds", type=int, default=3)
         parser.add_argument("--warmup", type=int, default=1)
+        parser.add_argument("--sampling-n", type=int, default=16)
         parser.add_argument("--gpu-memory-utilization", type=float, default=0.25)
         parser.add_argument(
             "--profile", type=Path, help="directory for a separate replay of the measured rounds per arm"
@@ -79,11 +81,20 @@ class BenchmarkOptions:
             args.capture_memory_mib * 1024**2,
             args.state_memory_mib * 1024**2,
             None if args.execution_memory_mib is None else args.execution_memory_mib * 1024**2,
+            sampling_n=args.sampling_n,
         )
 
     def __post_init__(self) -> None:
         if (
-            min(self.batch, self.tokens, self.rounds, self.warmup, self.capture_memory_bytes, self.state_memory_bytes)
+            min(
+                self.batch,
+                self.tokens,
+                self.rounds,
+                self.warmup,
+                self.sampling_n,
+                self.capture_memory_bytes,
+                self.state_memory_bytes,
+            )
             < 1
         ):
             raise ValueError("positive batch, tokens, rounds, warmup and capture/state capacities required")
@@ -92,8 +103,8 @@ class BenchmarkOptions:
         return ModelConfig(
             self.model,
             max_model_len=max(512, self.tokens + 64),
-            max_num_seqs=self.batch,
-            max_num_batched_tokens=max(512, self.batch * 64),
+            max_num_seqs=self.batch * self.sampling_n,
+            max_num_batched_tokens=max(512, self.batch * self.sampling_n * 64),
             gpu_memory_utilization=self.gpu_memory_utilization,
             seed=7,
         )
@@ -123,6 +134,31 @@ class BenchmarkResult:
         return self.output_tokens, self.loss_count, self.update_count, self.trained_rows
 
 
+def _vanilla(options: BenchmarkOptions, prompts: list[str], sampling: SamplingParams, cuda_graphs: bool) -> float:
+    """Plain vLLM output tokens per second for the same prompts and sampling."""
+    llm = make_llm(replace(options.model_config(), cuda_graphs=cuda_graphs))
+    for _ in range(options.warmup):
+        llm.generate(prompts, sampling, use_tqdm=False)
+    torch.cuda.synchronize()
+    started = perf_counter()
+    tokens = 0
+    for _ in range(options.rounds):
+        outputs = llm.generate(prompts, sampling, use_tqdm=False)
+        tokens += sum(len(completion.token_ids) for output in outputs for completion in output.outputs)
+    torch.cuda.synchronize()
+    elapsed = perf_counter() - started
+    del llm
+    gc.collect()
+    torch.cuda.empty_cache()
+    rate = tokens / elapsed
+    print(
+        json.dumps(
+            {"implementation": f"vanilla_{'graph' if cuda_graphs else 'eager'}", "output_tokens_per_second": rate}
+        )
+    )
+    return rate
+
+
 def compare(
     workload: BackendWorkload[D, R],
     options: BenchmarkOptions,
@@ -139,9 +175,18 @@ def compare(
     indices = tuple(range(options.batch)) if prompt_indices is None else prompt_indices
     if len(indices) != options.batch or any(index < 0 for index in indices):
         raise ValueError("benchmark prompt indices must cover the original request batch")
+    # Workload generate takes n=1, so each prompt is repeated sampling_n times for every arm,
+    # vanilla included; without prefix caching vLLM prefills each completion of n>1 anyway.
+    indices = tuple(index for index in indices for _ in range(options.sampling_n))
     prompts = [f"Explain the mathematical idea numbered {index}:" for index in indices]
     sampling = SamplingParams(
-        max_tokens=options.tokens, temperature=0.8, top_p=0.95, top_k=-1, ignore_eos=True, seed=7, n=1
+        max_tokens=options.tokens,
+        temperature=0.8,
+        top_p=0.95,
+        top_k=-1,
+        ignore_eos=True,
+        seed=7,
+        n=1,
     )
     reports: list[BenchmarkResult] = []
     print(
@@ -152,7 +197,7 @@ def compare(
                 "cuda": torch.version.cuda,
                 "workload": type(workload).__name__,
                 "options": asdict(options),
-                "sampling_n": 1,
+                "sampling_n": options.sampling_n,
                 "prompt_indices": indices,
             },
             default=str,
@@ -172,6 +217,8 @@ def compare(
             path = options.profile / f"{name}.json"
             if path.exists():
                 raise FileExistsError(f"profile output already exists: {path}")
+    vanilla_graph = _vanilla(options, prompts, sampling, cuda_graphs=True)
+    _vanilla(options, prompts, sampling, cuda_graphs=False)
     # CUPTI can affect later launches even after the profiling context exits.
     runs = tuple(
         (directory, *case)
@@ -251,7 +298,7 @@ def compare(
                 after.state_usage,
             )
             if (
-                tokens != options.batch * options.tokens * options.rounds
+                tokens != options.batch * options.sampling_n * options.tokens * options.rounds
                 or require_training
                 and (report.loss_count <= 0 or report.update_count <= 0 or report.trained_rows <= 0)
                 or after.inference_pins
@@ -266,6 +313,7 @@ def compare(
                         {
                             **asdict(report),
                             "output_tokens_per_second": tokens / sum(elapsed),
+                            "vs_vanilla_graph": tokens / sum(elapsed) / vanilla_graph,
                             "peak_extra_allocated_bytes": report.peak_allocated_bytes - baseline,
                         }
                     )

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from itertools import accumulate
 from math import prod
 from multiprocessing.connection import Connection
 from threading import RLock
-from typing import Callable
+from typing import overload
 from weakref import WeakSet
 
 import torch
@@ -120,6 +121,38 @@ class _Root:
 class _Write:
     targets: tuple[PageBundle, ...]
     fields: tuple[tuple[LayoutFieldId, ...], ...]
+
+
+class LazyRoots(Sequence[tuple[torch.Tensor, ...]]):
+    """Field views of each selected state, built on first read.
+
+    Access was validated when the sequence was created; each view still checks that its
+    page has not been reclaimed, so a stale read fails instead of seeing reused memory.
+    """
+
+    __slots__ = ("_arena", "_roots", "_views")
+
+    def __init__(self, arena: "PageBundleArena", roots: tuple[tuple[PageBundle, frozenset[int] | None], ...]) -> None:
+        self._arena = arena
+        self._roots = roots
+        self._views: list[tuple[torch.Tensor, ...] | None] = [None] * len(roots)
+
+    def __len__(self) -> int:
+        return len(self._roots)
+
+    @overload
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> tuple[tuple[torch.Tensor, ...], ...]: ...
+
+    def __getitem__(self, index: int | slice) -> tuple[torch.Tensor, ...] | tuple[tuple[torch.Tensor, ...], ...]:
+        if isinstance(index, slice):
+            return tuple(self[i] for i in range(*index.indices(len(self))))
+        views = self._views[index]
+        if views is None:
+            views = self._views[index] = self._arena._root_views(*self._roots[index])  # pyright: ignore[reportPrivateUsage]
+        return views
 
 
 class _Pools:
@@ -494,17 +527,34 @@ class PageBundleArena:
             self._roots[ref].pins += 1
         try:
             with self._scope(stream), torch.no_grad():
+                # Group page writes per pool so each field costs one batched copy, not one per state.
+                zeros: dict[tuple[str, int], list[int]] = {}
+                copies: dict[tuple[str, int], tuple[list[int], list[int]]] = {}
                 for index, (target, chosen) in enumerate(zip(allocated, fields, strict=True)):
-                    pools = self._pools[target.resource]
                     source = self.root(sources[index]) if sources else None
                     if source is not None:
                         self._order(source.readiness, stream)
                     for field in chosen:
-                        tensor = pools.tensor(field, target.pages[field])
+                        destination = target.pages[field].slot_id
                         if source is None:
-                            tensor.zero_()
+                            zeros.setdefault((target.resource, field), []).append(destination)
                         elif copy_fields is None or field in copy_fields:
-                            tensor.copy_(pools.tensor(field, source.pages[field]))
+                            pair = copies.setdefault((target.resource, field), ([], []))
+                            pair[0].append(source.pages[field].slot_id)
+                            pair[1].append(destination)
+                for (resource, field), slots in zeros.items():
+                    pool = self._pools[resource].tensors[field]
+                    if len(slots) == 1:
+                        pool[slots[0]].zero_()
+                    else:
+                        pool.index_fill_(0, torch.tensor(slots, device=pool.device), 0)
+                for (resource, field), (origins, slots) in copies.items():
+                    pool = self._pools[resource].tensors[field]
+                    if len(slots) == 1:
+                        pool[slots[0]].copy_(pool[origins[0]])
+                    else:
+                        indices = torch.tensor([origins, slots], device=pool.device)
+                        pool.index_copy_(0, indices[1], pool.index_select(0, indices[0]))
         except Exception:
             self.abort(token)
             raise
@@ -517,13 +567,8 @@ class PageBundleArena:
 
     def writable_roots(self, token: PageWrite) -> tuple[tuple[torch.Tensor, ...], ...]:
         with self._lock:
-            write = self._issued_write(token)
-            return tuple(
-                tuple(
-                    self.write_field(token, index, field.field_id) for field in self._pools[root.resource].layout.fields
-                )
-                for index, root in enumerate(write.targets)
-            )
+            self._issued_write(token)
+            return self.borrow_roots((token,) * len(token.after_refs), token.after_refs)
 
     def publish(self, token: PageWrite) -> PagePublication:
         with self._lock:
@@ -596,6 +641,65 @@ class PageBundleArena:
             (root,) = self._capture_roots(pin, (ref,), (field,))
             return self._pools[root.resource].tensor(field, root.pages[field]).detach()
 
+    def _held_roots(
+        self, access: tuple[PagePin | PageWrite, ...], refs: tuple[StateRef, ...]
+    ) -> tuple[tuple[PageBundle, frozenset[int] | None], ...]:
+        """Each ref's root under the pin or write that grants it, with the write's writable fields.
+
+        Every distinct token is validated once, so a batch over many states costs O(states).
+        Pinned roots carry None: all their fields are readable.
+        """
+        pins: dict[int, frozenset[StateRef]] = {}
+        writes: dict[int, tuple[_Write, dict[StateRef, int]]] = {}
+        result: list[tuple[PageBundle, frozenset[int] | None]] = []
+        for token, ref in zip(access, refs, strict=True):
+            match token:
+                case PagePin():
+                    held = pins.get(id(token))
+                    if held is None:
+                        self._issued_pin(token)
+                        held = pins[id(token)] = frozenset(token.refs)
+                    if ref not in held:
+                        raise RuntimeError("PageBundle root is not held by this pin")
+                    result.append((self.root(ref), None))
+                case PageWrite():
+                    entry = writes.get(id(token))
+                    if entry is None:
+                        entry = writes[id(token)] = (
+                            self._issued_write(token),
+                            {after: index for index, after in enumerate(token.after_refs)},
+                        )
+                    write, positions = entry
+                    index = positions.get(ref)
+                    if index is None:
+                        raise RuntimeError("PageBundle root is not written by this transaction")
+                    result.append((write.targets[index], frozenset(int(field) for field in write.fields[index])))
+        return tuple(result)
+
+    def lazy_roots(self, access: tuple[PagePin | PageWrite, ...], refs: tuple[StateRef, ...]) -> "LazyRoots":
+        """Like borrow_roots, but builds each state's field views only when it is read."""
+        with self._lock:
+            self._require_live()
+            return LazyRoots(self, self._held_roots(access, refs))
+
+    def _root_views(self, root: PageBundle, writable: frozenset[int] | None) -> tuple[torch.Tensor, ...]:
+        with self._lock:
+            self._require_live()
+            pools = self._pools[root.resource]
+            if writable is not None and len(writable) != len(root.pages):
+                raise RuntimeError("PageBundle field is not writable in this transaction")
+            if writable is None:
+                return tuple(pools.tensor(field, page).detach() for field, page in enumerate(root.pages))
+            return tuple(pools.tensor(field, page) for field, page in enumerate(root.pages))
+
+    def borrow_roots(
+        self, access: tuple[PagePin | PageWrite, ...], refs: tuple[StateRef, ...]
+    ) -> tuple[tuple[torch.Tensor, ...], ...]:
+        """Every field of every ref, read under its pin (read-only views) or write (writable)."""
+        with self._lock:
+            self._require_live()
+            return tuple(self._root_views(root, writable) for root, writable in self._held_roots(access, refs))
+
     def field_slots(
         self, access: tuple[PagePin | PageWrite, ...], refs: tuple[StateRef, ...], field: LayoutFieldId
     ) -> tuple[torch.Tensor, tuple[int, ...]]:
@@ -605,11 +709,14 @@ class PageBundleArena:
         pool at the returned slots reads exactly those versions.
         """
         with self._lock:
-            roots = tuple(
-                self._capture_roots(token, (ref,), (field,))[0] for token, ref in zip(access, refs, strict=True)
-            )
-            pool = self._pools[roots[0].resource].tensors[field].detach()
-            return pool, tuple(root.pages[field].slot_id for root in roots)
+            self._require_live()
+            roots = self._held_roots(access, refs)
+            if any(writable is not None and int(field) not in writable for _, writable in roots):
+                raise RuntimeError("PageBundle field is not writable in this transaction")
+            if len({root.resource for root, _ in roots}) != 1:
+                raise ValueError("field slots require one resource layout")
+            pool = self._pools[roots[0][0].resource].tensors[field].detach()
+            return pool, tuple(root.pages[field].slot_id for root, _ in roots)
 
     def paged_rows(
         self,
@@ -818,12 +925,16 @@ class PageBundleArena:
         match access:
             case PagePin():
                 self._issued_pin(access)
-                if any(ref not in access.refs for ref in refs):
+                held = set(access.refs) if len(refs) > 1 else access.refs
+                if any(ref not in held for ref in refs):
                     raise RuntimeError("PageBundle root is not held by this pin")
                 roots = tuple(self.root(ref) for ref in refs)
             case PageWrite():
                 write = self._issued_write(access)
-                indices = tuple(access.after_refs.index(ref) for ref in refs)
+                positions = {ref: index for index, ref in enumerate(access.after_refs)}
+                if any(ref not in positions for ref in refs):
+                    raise RuntimeError("PageBundle root is not written by this transaction")
+                indices = tuple(positions[ref] for ref in refs)
                 for index in indices:
                     for field in fields:
                         if field not in write.fields[index]:

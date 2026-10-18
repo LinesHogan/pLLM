@@ -199,7 +199,7 @@ def make_llm(
             gpu_memory_utilization=config.gpu_memory_utilization,
             seed=config.seed,
             enable_prefix_caching=config.enable_prefix_caching,
-            enforce_eager=True,
+            enforce_eager=not config.cuda_graphs,
             trust_remote_code=config.trust_remote_code,
             revision=config.revision,
         )

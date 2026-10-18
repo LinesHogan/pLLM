@@ -20,7 +20,7 @@ class LLM:
         data_parallel_size: Literal[1],
         distributed_executor_backend: Literal["uni"],
         worker_cls: str,
-        enforce_eager: Literal[True],
+        enforce_eager: bool,
         max_model_len: int,
         max_num_seqs: int,
         max_num_batched_tokens: int,

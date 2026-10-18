@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from math import isfinite
 
@@ -55,7 +56,7 @@ class AdamWConfig:
 
 
 def apply_adamw(
-    roots: tuple[tuple[torch.Tensor, ...], ...],
+    roots: Sequence[tuple[torch.Tensor, ...]],
     fields: AdamWFields,
     config: AdamWConfig,
     gradients: tuple[torch.Tensor, ...],

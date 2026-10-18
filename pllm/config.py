@@ -60,6 +60,9 @@ class ModelConfig:
     multiprocessing: bool = False
     runner: RunnerKind = RunnerKind.MRV2
     execution: ExecutionOptions = ExecutionOptions()
+    # Let vLLM capture decode steps as CUDA graphs. Workloads still require eager execution
+    # until the graph-mode backend lands; the default flips once every workload supports it.
+    cuda_graphs: bool = False
 
     def __post_init__(self) -> None:
         if (

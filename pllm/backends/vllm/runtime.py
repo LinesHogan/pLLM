@@ -1544,6 +1544,8 @@ def create_vllm_llm(
         raise ValueError("parameter-version overlays do not support shared prefix caching")
     if _VLLM_VERSION != _SUPPORTED_VLLM_VERSION:
         raise RuntimeError("vLLM workload requires vLLM 0.27.1 exactly")
+    if config.cuda_graphs:
+        raise ValueError("workloads do not run under vLLM CUDA graphs yet; use ModelConfig(cuda_graphs=False)")
     environment = {
         _MP_ENV: "1" if config.multiprocessing else "0",
         _V2_RUNNER_ENV: "1" if config.runner is RunnerKind.MRV2 else "0",
