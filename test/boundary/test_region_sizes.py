@@ -12,7 +12,7 @@ from pllm.contracts.region_program import (
 )
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.region_compilation import analyze_region_program, validate_region_program
-from pllm.execution.region_reference import interpret
+from test.region_reference import interpret
 from pllm.execution.region_values import Bank
 from test.boundary.test_region_program import region
 

@@ -53,14 +53,10 @@
 - [ISL 调度](design/isl-scheduling.md)
 - [In-Place-TTT 稠密 overlay 语义](design/inplace-ttt.md)
 - [实现状态台账](design/implementation-status.md) —— 唯一进度入口
-- [精简路线](design/post-implementation-simplification.md)
-- [调度精简施工记录](design/scheduling-simplification-work-order.md)
 - [E1 上下文包：跨进程页授权](design/e1-cross-process-page-authorization.md) —— 复杂工程任务交接
 - [E3 上下文包：模型与算法迁移（管线驱动）](design/e3-model-migration.md) —— 第 3 步程序与阶段任务卡
-- [审计记录](audits/)（调度复杂度、未用代码、实现结果数据）
 
-历史归档（只读背景，不代表当前接口）：[history/](history/) —— 整合计划、
-AER/PTTS 研究原稿、早期架构报告与其修订。验收证据快照在
+验收证据快照在
 [design/evidence/](design/evidence/)；可执行证据清单在
 `test/evidence_manifest.toml`。已退役的 API 指南与迁移报告不与当前架构
 并存维护。

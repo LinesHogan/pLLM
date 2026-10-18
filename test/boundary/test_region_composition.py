@@ -51,7 +51,7 @@ def test_inlining_preserves_argument_aliases_duplicate_returns_and_fresh_names()
         Call(("a",), (Value("d", integer), Value("e", integer), Value("f", integer)), "leaf"),
     ), ("a", "b", "c", "d", "e", "f", "body0_one"))), (declaration,))
     expanded = inline_function_bodies(caller, (body,))
-    from pllm.execution.region_reference import interpret
+    from test.region_reference import interpret
     assert interpret(expanded, {"seed": 7, "body0_one": 99}).values == (7, 1, 1, 7, 1, 1, 99)
     invalid = replace(leaf, entry=Region(replace(leaf.entry.block, yields=("hidden",))))
     with pytest.raises(ValueError, match="captures must be explicit"):
@@ -60,7 +60,7 @@ def test_inlining_preserves_argument_aliases_duplicate_returns_and_fresh_names()
 
 def test_data_ports_preserve_effects_and_reject_effectful_maps():
     from pllm.execution.region_compilation import validate_region_program
-    from pllm.execution.region_reference import interpret
+    from test.region_reference import interpret
     from test.boundary.test_region_external import external_program
 
     original = external_program()

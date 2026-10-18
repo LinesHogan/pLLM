@@ -282,7 +282,6 @@ validity 是必须满足的顺序；coincidence 和 proximity 表达优化偏好
 - [普通 overlay 的绑定](../../pllm/execution/tensor_binding.py)
 - [vLLM 的 forward 边界](../../pllm/backends/vllm/runtime.py)
 - [状态页所有权](../../pllm/execution/ptts/page_bundle.py)
-- [既有通用编程设计](../history/programmable-inference-next-design.md)
 - [ISL 官方手册](https://libisl.sourceforge.io/user.html)：Scheduling、Dependence Analysis、AST Generation。
 - [isl-rs 0.3.1](https://docs.rs/isl-rs/0.3.1/isl_rs/)；实验使用本地已构建的该版本，
   语义与接口同时核对了其随附 ISL `doc/user.pod`。

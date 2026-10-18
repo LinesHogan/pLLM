@@ -13,7 +13,7 @@ from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.region_compilation import analyze_region_program, validate_region_program, validate_region_schedule
 from pllm.execution.region_native import external_primitive
 from pllm.execution.region_resources import ExternalFunction, RegionResources
-from pllm.execution.region_reference import interpret
+from test.region_reference import interpret
 from test.boundary.test_region_control import bind
 from test.boundary.test_region_pages import owner_fixture
 from test.boundary.test_region_program import region

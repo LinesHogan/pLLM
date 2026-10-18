@@ -17,7 +17,7 @@ from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_compilation import analyze_region_program, lower_region_bindings, lower_region_schedule
 from pllm.execution.region_execution import RegionExecution
-from pllm.execution.region_reference import interpret
+from test.region_reference import interpret
 from pllm.execution.region_values import Bank
 from test.boundary.test_region_program import region
 

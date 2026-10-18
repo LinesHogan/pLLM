@@ -9,7 +9,7 @@ from pllm.contracts.region_program import (
     Program, Publish, Region, Resource, Scalar, ScalarKind,
     ScalarType, Scan, Select, Snapshot, Update, Value, While, verify,
 )
-from pllm.execution.region_reference import Bank, interpret
+from test.region_reference import Bank, interpret
 from pllm.execution.region_compilation import validate_region_program
 
 

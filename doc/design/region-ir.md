@@ -164,7 +164,7 @@ dtype 和 device。新状态通过显式输出返回，共享旧值不表示可�
   作用域、封闭签名、carry、分支和线性效果链。
 - [Rust verifier](../../rust/pllm_core/src/planning/region_program.rs) 从原始闭合
   程序独立重做这些检查，不读取 Python 的“已验证”标记。
-- [参考解释器](../../pllm/execution/region_reference.py) 用不可变值和串行控制
+- [参考解释器](../../test/region_reference.py) 用不可变值和串行控制
   流执行算法；复制张量以暴露快照语义。其资源字典只是语义对照，不是第二套
   PTTS，也不进入 worker 的 fallback。参考函数适配器显式接收与返回张量状态
   内容，因此后续 snapshot 可以观察其效果；opaque 外部资源不伪造状态内容，

@@ -13,7 +13,7 @@ from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_compilation import validate_region_program
-from pllm.execution.region_reference import interpret
+from test.region_reference import interpret
 from test.boundary.test_region_control import bind
 from test.boundary.test_region_pages import owner_fixture
 from test.boundary.test_region_program import region

@@ -175,5 +175,4 @@ loss/A/B 梯度，两种 replay 都暴露其进位。过滤器不会通过共享
 replay 之后的显式快照受支持。这些观测不蕴含确定性的全模型 replay 或未插桩
 性能声称。
 
-维护中的支持矩阵在 [README](../../README.md)；验收标准与显式排除项在
-[整合计划](../history/architecture-consolidation-10k-plan.md)。
+维护中的支持矩阵在 [README](../../README.md)。

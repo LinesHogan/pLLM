@@ -112,7 +112,6 @@ If 从 10 降为 2。存储归属推导拆为调度无关的 provenance（一次
 - 除源摘要外，新旧分析事实和候选完全一致；此前值编号缩减通过了 ISL 来源／依赖等价对照。
 
 这些数量是源表示和编译产物的缩减，不能解释为 GPU 流量、显存或吞吐按相同比例改善。
-可复核过程见 [中段精简审计](../history/recirculation-middle-end-audit.md)。
 后续层号清理又将数学值位置从 89 降为 85，具体对照见下方 DecoderSource 收口；
 后续新源不再是只删除 Order 的逐字投影。
 
@@ -583,7 +582,7 @@ smoke 复跑见 [图帐改造证据](evidence/graph-account-results.json)。
 
 ## 可读性验收（路线 2.5）
 
-按 post-implementation-simplification §6.5，五个阅读任务各由一个未参与
+五个阅读任务各由一个未参与
 实现的 fresh agent 执行并记录阻碍，全部完成（答案链均落到具体源码
 位置）。任务涉及文件数 11/6/12/6/29。统计基线（2026-09-15）：Rust 调度
 核心 11,767 行，Python 运行时 11,419 行，图变换 411 行，后端适配 3,509
@@ -642,9 +641,7 @@ B[i' = i] : ... }"），兑现 isl-scheduling.md"哪些边阻止并行"的
 **确定性准备加 funded 流重叠**——一个 ISL parallel 配置，固定
 lanes=2 / pipeline_depth=2，按稳定轴序取第一个合法且预算内的映射即停；
 reference 保留为容量与合法性基线，连 reference 都容纳不下则准备失败。
-只有 tuning="measured" 才进入调度目录探索、实现变体与计时协议。施工
-记录与验证明细见 [调度精简施工记录](scheduling-simplification-work-order.md)
-和 [实现结果数据](../audits/scheduling-implementation-results.json)。
+只有 tuning="measured" 才进入调度目录探索、实现变体与计时协议。
 
 结构收敛：region_optimization.py 518→332 行（净 −524 含测试适配共 43
 文件 +750/−827）；删除 _physical_candidates、_compiled_variants、

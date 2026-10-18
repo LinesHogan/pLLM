@@ -12,7 +12,7 @@ from pllm.contracts.region_program import (
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_native import NativePrimitive, tensor_item
 from pllm.execution.region_values import Bank
-from pllm.execution.region_reference import interpret
+from test.region_reference import interpret
 from test.boundary.test_region_control import bind
 from test.boundary.test_region_program import region
 from test.boundary.test_region_pages import owner_fixture

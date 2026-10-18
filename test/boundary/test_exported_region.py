@@ -7,7 +7,7 @@ import torch
 
 from pllm.contracts.region_program import Block, Call, Program, Region, ScalarType, Scan, Value
 from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning, warn_numerical_transforms
-from pllm.execution.region_reference import interpret
+from test.region_reference import interpret
 
 
 def update_cell(hidden, weights):

@@ -15,7 +15,7 @@ from pllm.execution.region_compilation import (
 )
 from pllm.execution.region_execution import RegionExecution
 from pllm.execution.region_native import NativePrimitive
-from pllm.execution.region_reference import interpret
+from test.region_reference import interpret
 from pllm.execution.region_schedule import RegionScheduleExecution
 from pllm.execution.region_values import Bank
 from pllm.execution.tensor_scan import TensorScan

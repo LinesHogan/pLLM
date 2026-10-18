@@ -15,7 +15,7 @@ from pllm.execution.region_compilation import (
     analyze_region_program, lower_region_bindings, lower_region_schedule, validate_region_program,
 )
 from pllm.execution.region_execution import RegionExecution
-from pllm.execution.region_reference import interpret
+from test.region_reference import interpret
 from pllm.execution.region_values import Bank
 from pllm.execution.region_storage import analyze_region_capacity
 from pllm.execution.tensor_scan import TensorScan
