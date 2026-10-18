@@ -33,6 +33,10 @@ class Mrv1Runner(Runner[Sampler], GPUModelRunner):
             raise ValueError("MRv1 workload requires synchronous persistent batch metadata")
         self._initialize_workload(topology)
 
+    def load_model(self, load_dummy_weights: bool = False) -> None:
+        super().load_model(load_dummy_weights)
+        self._install_hidden_taps()
+
     def _make_sampler(self, upstream: Sampler) -> Sampler:
         return Mrv1Sampler(upstream)
 

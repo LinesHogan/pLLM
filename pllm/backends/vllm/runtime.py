@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack
@@ -45,7 +46,7 @@ from pllm.authoring import (
     map_auxiliary,
 )
 from pllm.backends.vllm.activation import VllmActivationPatch
-from pllm.backends.vllm.hidden_capture import Vllm027EagerPackedHiddenCapture
+from pllm.backends.vllm.hidden_capture import HiddenTaps
 from pllm.backends.vllm.packed_rows import encode_mrv2_rows
 from pllm.backends.vllm.parameter_overlay import (
     VllmParameterOverlay,
@@ -79,7 +80,7 @@ from pllm.contracts.feedback import (
     FinishReason,
     RetryAction,
 )
-from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
+from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from pllm.contracts.packed_rows import PackedSamplerRowBatch
 from pllm.contracts.region_program import TensorType
@@ -120,6 +121,8 @@ if TYPE_CHECKING:
 
 _MP_ENV = "VLLM_ENABLE_V1_MULTIPROCESSING"
 _V2_RUNNER_ENV = "VLLM_USE_V2_MODEL_RUNNER"
+# Hidden sources the driver announces before construction, so the worker taps them at load time.
+_TAPS_ENV = "PLLM_HIDDEN_TAPS"
 _WORKER_CLASS = "pllm.worker.GPUWorker"
 _SUPPORTED_VLLM_VERSION = "0.27.1"
 _BACKEND_ABI_FIELDS = (
@@ -244,6 +247,7 @@ class VllmSession(Generic[DataT, ResultT]):
         model: Qwen2ForCausalLM,
         sampler: SamplerGuidance | None,
         max_sampler_rows: int,
+        taps: HiddenTaps | None = None,
     ) -> None:
         attachment = deployment.attachment
         plan = attachment.inputs.plan
@@ -271,18 +275,10 @@ class VllmSession(Generic[DataT, ResultT]):
         self._deployment = deployment
         self.trace = deployment.execution.trace
         probe = attachment.inputs.probe
-        resources = tuple(resource.binding for resource in probe.hidden_resources)
-        self._capture = (
-            Vllm027EagerPackedHiddenCapture(
-                model=model,
-                resources=resources,
-                plan_epoch=attachment.physical.plan_epoch,
-                max_packed_rows=probe.max_packed_rows,
-                hidden_size=probe.hidden_size,
-            )
-            if resources
-            else None
-        )
+        self._hidden_resources = tuple(resource.binding for resource in probe.hidden_resources)
+        if self._hidden_resources and taps is None:
+            raise ValueError("hidden inputs require taps installed when the model was loaded")
+        self._taps = taps
         overlay_bindings = attachment.inputs.request.overlay_bindings
         self._overlay_import = bool(overlay_bindings) and (
             plan.semantic_graph.tasks[attachment.inputs.request.task_bindings[0].task_id].timing.after
@@ -529,8 +525,6 @@ class VllmSession(Generic[DataT, ResultT]):
         self._next_step_id += 1
         step = _PackedStep[DataT](rows)
         self._step = step
-        if self._capture is not None:
-            self._capture.begin(rows.row_batch)
         if isinstance(self._replay, VllmTokenwiseReplay) and self._activation is None:
             execution = self._deployment.execution
             invocation = execution.start_step(
@@ -588,16 +582,14 @@ class VllmSession(Generic[DataT, ResultT]):
         stream = torch.cuda.current_stream(execution.device)
         operands = () if self._overlay is None else self._overlay.take_captures()
         value = TensorStepInput(step.rows.row_batch, step.rows, operands=operands, auxiliary=self._auxiliary)
-        if self._capture is not None:
-            value = self._capture.publish(value)
+        if self._taps is not None and self._hidden_resources:
+            value = self._taps.publish(value, self._hidden_resources)
         phases = {resource.phase for resource in self._deployment.attachment.inputs.probe.hidden_resources}
         if (
             step.invocation is None
             and not operands
             and not any(row.phase in phases for row in step.rows.row_batch.rows)
         ):
-            if self._capture is not None:
-                self._capture.finish()
             self._step = None
             return
         if step.invocation is None:
@@ -610,21 +602,17 @@ class VllmSession(Generic[DataT, ResultT]):
 
     def _finish_effects(self) -> None:
         """End-of-forward lifecycle for every active optional primitive."""
-        if self._capture is not None:
-            self._capture.finish()
         for effect in (self._overlay, self._activation, self._replay):
             if effect is not None:
                 effect.clear()
 
     def _abort_effects(self) -> None:
-        if self._capture is not None:
-            self._capture.abort_if_active()
         for effect in (self._overlay, self._activation):
             if effect is not None:
                 effect.clear()
 
     def _close_effects(self) -> None:
-        for effect in (self._capture, self._overlay, self._activation, self._replay):
+        for effect in (self._overlay, self._activation, self._replay):
             if effect is not None:
                 effect.close()
 
@@ -737,8 +725,30 @@ class Runner(Generic[SamplerT]):
     sampler: SamplerT
     model: torch.nn.Module
     cache_config: CacheConfig
+    device: torch.device
+    max_num_tokens: int
     runner_kind: RunnerKind
     max_num_reqs: int
+
+    hidden_taps: HiddenTaps | None = None
+
+    def _install_hidden_taps(self) -> None:
+        """Tap the announced hidden outputs before vLLM compiles and captures the model."""
+        requested: list[tuple[int, str]] = json.loads(os.environ.get(_TAPS_ENV, "[]"))
+        if not requested:
+            return
+        match self.model:
+            case Qwen2ForCausalLM() as model:
+                pass
+            case _:
+                raise RuntimeError("hidden taps currently require Qwen2")
+        layers = len(model.model.layers)
+        paths = (
+            _hidden_binding(HiddenInputSource(layer, HiddenSite(site), HiddenPhase.DECODE), layers).module_path
+            for layer, site in requested
+        )
+        hidden_size = model.lm_head.weight.shape[1]
+        self.hidden_taps = HiddenTaps(model, paths, self.max_num_tokens, hidden_size, self.device)
 
     def _initialize_workload(self, topology: AttachmentTopology) -> None:
         self.workload_topology = topology
@@ -783,7 +793,7 @@ class Runner(Generic[SamplerT]):
         )
         if adapter is not None and not isinstance(adapter, SamplerGuidance):
             raise TypeError("backend sampler must share the original guidance lifecycle")
-        session = VllmSession(deployment, model, adapter, self.max_num_reqs)
+        session = VllmSession(deployment, model, adapter, self.max_num_reqs, self.hidden_taps)
         self._workload_upstream_sampler = upstream
         self._workload_session = session
         if adapter is not None:
@@ -868,6 +878,10 @@ class WorkloadModelRunner(Runner[Sampler | None], UpstreamModelRunner):
     ) -> None:
         super().__init__(vllm_config, device)
         self._initialize_workload(topology)
+
+    def load_model(self, load_dummy_weights: bool = False) -> None:
+        super().load_model(load_dummy_weights)  # pyright: ignore[reportUnknownMemberType]
+        self._install_hidden_taps()
 
     def _make_sampler(self, upstream: Sampler | None) -> Sampler:
         if upstream is None:
@@ -1549,6 +1563,9 @@ def create_vllm_llm(
     environment = {
         _MP_ENV: "1" if config.multiprocessing else "0",
         _V2_RUNNER_ENV: "1" if config.runner is RunnerKind.MRV2 else "0",
+        _TAPS_ENV: json.dumps(
+            [[source.layer, source.site.value] for source in workload.backend_requirements().hidden_inputs]
+        ),
     }
     if config.multiprocessing:
         environment["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
