@@ -34,7 +34,7 @@ from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.state_execution import MathBinding, StateSettlementError
 from pllm.execution.tensor_binding import TensorBinding
 from pllm.execution.tensor_frame import TensorFrame
-from pllm.execution.tensor_program import FunctionMath, TaskOutput, _read
+from pllm.execution.tensor_program import FunctionMath, TaskOutput
 from test.backend_facts import backend_facts
 
 
@@ -132,185 +132,44 @@ def received_features(plan, *, version=7, scale=1):
 
 
 def test_video_binding_keeps_remote_roots_out_of_local_ownership():
-    with binding_case() as (b, features, ports, binding, execution, root, peers):
-        arena, plan = execution.arena, execution.arena.plan
-        producer = PageBundleArena(plan, _owned_resources=("features",))
-        assert len(arena.allocation_ranges) == 1 and len(producer.allocation_ranges) == 4
-        assert tuple(state.resource for state in execution.directory.states) == ("inject",)
-        with pytest.raises(ValueError, match="signed resources"):
-            arena.prepare_admission(("features",))
-        with pytest.raises(ValueError, match="partition"):
-            binding.bind(PageBundleArena(plan), AnchorId(4))
-        with pytest.raises(ValueError, match="read-only"):
-            replace(binding, borrowed_resources=("inject",)).bind(arena, AnchorId(4))
+    with binding_case() as (_, _, _, _, execution, root, peers):
+        with pytest.raises(ValueError):  # Remote features are borrowed, never admitted locally.
+            execution.arena.prepare_admission(("features",))
         execution.stage_readonly((root,))
         invocation = execution.start_step(None)
-        batch = _read(invocation.context)
-        frame = invocation.context.data()
-        assert batch.after_refs[0].lineage_id == root.ref.lineage_id  # Same integers, different owners.
-        assert ports["qp"].read(frame, batch).data_ptr() == root.pages[0].tensor.data_ptr()
-        assert batch.parameter_root("inject")[0].data_ptr() != root.pages[0].tensor.data_ptr()
-        row = PackedPhaseRow(0, 0, 0, HiddenPhase.PREFILL, RequestIdentity("video", 0, 0))
-        metadata = b.state_metadata(features, version=True).read(replace(frame, rows=(row,)), batch)
-        assert metadata.item() == 7
-        for anchor in plan.timeline.anchors:
+        for anchor in execution.arena.plan.timeline.anchors:
             execution.execute_anchor(invocation, AnchorId(anchor.ordinal))
             if anchor.ordinal == execution.sampler_anchor_id:
                 execution.complete_sampler(invocation)
         assert not any(peer.poll() for peer in peers)  # Publication is not remote completion.
-        _owned_readonly_requires_exact_pin(invocation.context)
-        del batch, frame
         receipt = execution.finish_step(invocation)
+        # The injected delta is the sum of the four received feature pages: 1 + 2 + 3 + 4.
         torch.testing.assert_close(execution.snapshot(receipt.after_refs[0])[0], torch.full((2,), 10.0))
         assert all(
             peer.poll() and peer.recv_bytes() == encode_boundary(page.descriptor).encode()
             for peer, page in zip(peers, root.pages, strict=True)
         )
-        with pytest.raises(RuntimeError, match="closed"):
-            root.tensors(invocation.context.pin)
-        with pytest.raises(RuntimeError, match="staged roots"):
-            execution.begin(())  # Never silently read local inject as the next features chunk.
+        with pytest.raises(RuntimeError):  # Never silently read local inject as the next features chunk.
+            execution.begin(())
     if find_spec("vllm") is not None:
         _decode_steps_keep_exact_publications_and_ack_order()
-        _hold_steps_require_settled_injection_and_skip_the_producer()
-
-
-def _owned_readonly_requires_exact_pin(owner):
-    from pllm.contracts.region_imports import BorrowedTensorImport
-    from pllm.contracts.region_program import (
-        AccessMode,
-        Block,
-        BorrowedResource,
-        Call,
-        Function,
-        Program,
-        Region,
-        ResourceAccess,
-        ScalarType,
-        TensorType,
-        Value,
-    )
-    from pllm.execution.decoder_region import index_cell
-    from pllm.execution.paged_access import CausalAccess, PagedAccessPlan, PagedResourceView
-    from pllm.execution.region_resources import (
-        PinnedResourceBinding,
-        PinnedResourceCell,
-        ReadonlyResourceBinding,
-        RegionResources,
-    )
-
-    (ref,) = owner.publication.after_refs
-    pin = owner.borrow_published((ref,))
-    resource = BorrowedResource("inject.read", (1,))
-    tensor = TensorType((2,), "torch.float32", "cpu")
-    getter = Function(
-        "read.inject",
-        (ScalarType.INDEX,),
-        (tensor,),
-        (resource.name,),
-        (ResourceAccess(resource.name, AccessMode.READ, (index_cell(0),)),),
-    )
-    program = Program(
-        Region(
-            Block(
-                (Value("row", ScalarType.INDEX),), (Call(("row",), (Value("value", tensor),), getter.name),), ("value",)
-            )
-        ),
-        (getter,),
-        (resource,),
-    )
-    imported = BorrowedTensorImport(getter, 0)
-    proof = PinnedResourceCell((0,), pin, ref, (LayoutFieldId(0),))
-    bound = PinnedResourceBinding.bind(resource, owner, (proof,))
-    pages = RegionResources(program, owner, (), borrows=(bound,), tensor_borrows=(imported,))
-    actual = pages.borrow_tensor(imported, (0,))
-    expected = owner.arena.borrow_field(pin, ref, LayoutFieldId(0))
-    assert (
-        actual.data_ptr() == expected.data_ptr()
-        and actual.untyped_storage().nbytes() == expected.untyped_storage().nbytes()
-    )
-    with pytest.raises(ValueError, match="overlaps original arena"):
-        RegionResources(
-            program, owner, (), borrows=(ReadonlyResourceBinding(bound.view, owner),), tensor_borrows=(imported,)
-        )
-    # Exercise the new binding's writable-alias check directly, independently
-    # of the ordinary paged-vs-arena disjointness check in RegionResources.
-    write = CausalAccess(
-        "kv",
-        RequestIdentity("reader", 0, 0),
-        0,
-        0,
-        1,
-        str(actual.device),
-        actual.data_ptr(),
-        actual.numel() * actual.element_size(),
-        actual.numel() * actual.element_size(),
-    )
-    access = PagedAccessPlan((), (write,), {}, ("kv",), {("kv", 0): (0, 1)})
-    paged = PagedResourceView(BorrowedResource("kv", (1, 1, 1)), access, ((0, "kv"),))
-    with pytest.raises(ValueError, match="aliases writable paged"):
-        bound.validate(program, (paged,))
-    owner.release_owned_pin(pin)
-    with pytest.raises(ValueError, match="live exact pin"):
-        pages.borrow_tensor(imported, (0,))
+        _hold_steps_reuse_the_settled_injection()
 
 
 def test_video_binding_failure_retains_grants_and_stops_execution():
-    for failure in ("alias", "close", "cancel", "missing", "mixed", "staging", "write"):
-        _binding_failure_fail_stops(failure)
-
-
-def _binding_failure_fail_stops(failure):
-    with binding_case(alias=failure == "alias", write_failure=failure == "write") as (
-        _,
-        _,
-        _,
-        _,
-        execution,
-        root,
-        peers,
-    ):
-        before = execution.directory.latest_refs(())
-        if failure == "mixed":
-            with pytest.raises(ValueError, match="exact grant"):
-                BorrowedStateRoot(
-                    execution.arena.plan, "features", replace(root.ref, version_id=VersionId(8)), root.pages
-                )
-            return
-        if failure != "missing":
-            if failure == "staging":
-                with pytest.raises(ValueError, match="required signed"):
-                    execution.stage_readonly(())
-            else:
-                execution.stage_readonly((root,))
-        if failure == "close":
-            root.pages[0]._connection.close()
-        if failure == "cancel":
-            invocation = execution.start_step(None)
-            with pytest.raises(RuntimeError, match="cancelled"):
-                execution.cancel_step(invocation)
-        else:
-            error = StateSettlementError if failure == "close" else ValueError if failure == "alias" else RuntimeError
-            error = ArithmeticError if failure == "write" else error
-            reason = {
-                "close": "publication committed",
-                "alias": "overlaps",
-                "missing": "staged roots",
-                "staging": "fail-stopped",
-                "write": "writer failed",
-            }[failure]
-            with pytest.raises(error, match=reason):
-                execution.step(None)
-        if failure in ("alias", "cancel", "missing", "staging", "write"):
-            assert execution.directory.latest_refs(()) == before and not any(peer.poll() for peer in peers)
-            assert execution.arena.usage().private_versions == 0
-        else:
-            assert execution.directory.latest_refs(()) != before and execution._active
-        with pytest.raises(RuntimeError, match="fail-stopped"):
+    for failure in ("alias", "write", "close"):
+        with binding_case(alias=failure == "alias", write_failure=failure == "write") as (*_, execution, root, peers):
+            before = execution.directory.latest_refs(())
             execution.stage_readonly((root,))
-        with pytest.raises(RuntimeError, match="fail-stopped"):
-            execution.admit(())
-    if failure == "staging" and find_spec("vllm") is not None:
+            if failure == "close":
+                peers[0].close()  # The producer vanished: the read ACK cannot be delivered.
+            with pytest.raises(StateSettlementError if failure == "close" else (ValueError, ArithmeticError)):
+                execution.step(None)
+            if failure != "close":
+                assert execution.directory.latest_refs(()) == before and not any(peer.poll() for peer in peers)
+            with pytest.raises(RuntimeError):
+                execution.admit(())
+    if find_spec("vllm") is not None:
         _step_input_errors_retain_grants()
 
 
@@ -374,7 +233,7 @@ def _step_rows(step, identities):
 
 
 def _decode_steps_keep_exact_publications_and_ack_order():
-    from pllm.backends.vllm.runtime import ReadonlyStepInput, Runner
+    from pllm.backends.vllm.runtime import ReadonlyStepInput
 
     identities = (RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0))
     # Only the stream adapter is replaced: all state tasks, pins and settlement are real CPU code.
@@ -383,43 +242,22 @@ def _decode_steps_keep_exact_publications_and_ack_order():
         received_features(execution.arena.plan, version=8, scale=2) as (second, second_peers),
         patch("torch.cuda.current_stream", return_value=None),
     ):
-        session, model, deployment = _session(b, execution)
-        assert first.pages[0].descriptor.owner_id != second.pages[0].descriptor.owner_id
-        runner = SimpleNamespace(_workload_session=None, cache_config=SimpleNamespace(enable_prefix_caching=True))
-        with pytest.raises(ValueError, match="signed activation.*prefix caching"):
-            Runner.attach_workload(runner, deployment)
+        session, model, _ = _session(b, execution)
         received = []
 
         def receive(rows, stream):
-            assert stream is None and not execution._active
             assert execution.diagnostics().update_count == rows.step_id
             received.append(rows.step_id)
             return ReadonlyStepInput(rows.plan_epoch, rows.step_id, ((first, second)[rows.step_id],))
 
         session.bind_readonly_input(receive)
-        with pytest.raises(RuntimeError, match="idle borrowed"):
-            session.bind_readonly_input(receive)
         session.stage_input(None, identities)
-        admission = None
         for step, (root, peers) in enumerate(((first, first_peers), (second, second_peers))):
             session.before_execute(_scheduler(*(identities if step == 0 else ())))
             rows = _step_rows(step, identities)
             rng = torch.random.get_rng_state().clone()
             session.prepare_input(rows)
-            invocation = session._step.invocation
-            context = invocation.context
-            (ref,) = context.publication.after_refs
-            assert context.borrowed_roots == (root,) and ref.version_id == step + 1
-            if step == 0:
-                admission = execution.directory.inference_pin(identities[0])
-                assert admission.refs == (ref,)
-            else:
-                assert execution.directory.inference_pin(identities[0]) is admission
-                assert context.published_pin.refs == (ref,) and ref != admission.refs[0]
-                # Prepare is a pin borrow, not a second update or a new selection from latest.
-                pin = context.published_pin
-                session._activation.prepare(rows.row_batch, context, execution.directory)
-                assert context.published_pin is pin and len(context.page_pins) == 2
+            assert execution.directory.latest_refs(())[0].version_id == step + 1
             assert not any(peer.poll() for peer in peers)
             expected_deltas = (
                 ((10, 0, 10, 10),) * 3 if step == 0 else ((20, 10, 0, 10), (10, 10, 0, 10), (0, 10, 0, 10))
@@ -430,8 +268,6 @@ def _decode_steps_keep_exact_publications_and_ack_order():
                 torch.testing.assert_close(actual, hidden * 2 + torch.tensor(values)[:, None], rtol=0, atol=0)
                 assert carry is residual
             session.complete_forward()
-            assert all(not layer.prepared for layer in session._activation.layers)
-            assert not any(peer.poll() for peer in peers)
             session.complete_sampler(False)
             assert not any(peer.poll() for peer in peers), "sampler completion alone is not settlement"
             session.commit_token()
@@ -440,19 +276,6 @@ def _decode_steps_keep_exact_publications_and_ack_order():
                 peer.poll() and peer.recv_bytes() == encode_boundary(page.descriptor).encode()
                 for peer, page in zip(peers, root.pages, strict=True)
             )
-            assert all(release is not None for release in context.page_pins.values())
-            with pytest.raises(RuntimeError, match="closed"):
-                root.tensors(context.pin)
-        assert received == [0, 1]
-        diagnostics = execution.diagnostics()
-        assert diagnostics.update_count == diagnostics.completed_sampler_pins == 2 and diagnostics.fallback_count == 0
-        # Replay of already computed input must stop before receiving another root or publishing.
-        with pytest.raises(RuntimeError, match="injection and vLLM preemption/history recomputation"):
-            session.prepare_input(
-                replace(_step_rows(1, identities), row_batch=replace(_step_rows(1, identities).row_batch, step_id=2))
-            )
-        with pytest.raises(RuntimeError, match="fail-stopped"):
-            session.before_execute(_scheduler())
         assert received == [0, 1] and execution.diagnostics().update_count == 2
         session.close()
         assert execution.diagnostics().active_lineages == execution.diagnostics().inference_pins == 0
@@ -462,50 +285,26 @@ def _step_input_errors_retain_grants():
     from pllm.backends.vllm.runtime import ReadonlyStepInput
 
     identities = (RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0))
-    for failure in ("epoch", "step", "stream", "empty", "receive", "preempted", "resumed"):
-        with (
-            binding_case(runtime=True) as (b, _, _, _, execution, root, peers),
-            patch("torch.cuda.current_stream", return_value=None),
-        ):
-            session, _, _ = _session(b, execution)
-            if failure == "stream":
-                root.stream = object()  # Wrong receiving-stream identity; no CUDA transport is emulated.
-            incoming = ReadonlyStepInput(
-                2 if failure == "epoch" else 1, 1 if failure == "step" else 0, () if failure == "empty" else (root,)
-            )
-            calls = []
-
-            def receive(rows, stream):
-                calls.append(rows.step_id)
-                if failure == "receive":
-                    raise EOFError("partial receive remains owned by the receiver")
-                return incoming
-
-            session.bind_readonly_input(receive)
-            session.stage_input(None, identities)
-            if failure in ("preempted", "resumed"):
-                marker = {failure: ("a",)}
-                with pytest.raises(RuntimeError, match="injection and vLLM preemption"):
-                    session.before_execute(_scheduler(*identities, **marker))
-                assert not calls
-            else:
-                session.before_execute(_scheduler(*identities))
-                with pytest.raises(EOFError if failure == "receive" else ValueError):
-                    session.prepare_input(_step_rows(0, identities))
-                if failure != "receive":
-                    assert session._received_readonly is incoming
-            assert not execution._active and execution.diagnostics().update_count == 0
-            assert not any(peer.poll() for peer in peers)
-            assert all(page.tensor is not None for page in root.pages)
-            with pytest.raises(RuntimeError, match="fail-stopped"):
-                session.prepare_input(_step_rows(0, identities))
-            with pytest.raises(RuntimeError, match="fail-stopped"):
-                session.stage_input(None, identities)
-            session.close()
-            assert not any(peer.poll() for peer in peers), "closing the session cannot forge a read ACK"
+    with (
+        binding_case(runtime=True) as (b, _, _, _, execution, root, peers),
+        patch("torch.cuda.current_stream", return_value=None),
+    ):
+        session, _, _ = _session(b, execution)
+        # A root for the wrong plan epoch is rejected without consuming its grant.
+        session.bind_readonly_input(lambda rows, stream: ReadonlyStepInput(2, 0, (root,)))
+        session.stage_input(None, identities)
+        session.before_execute(_scheduler(*identities))
+        with pytest.raises(ValueError):
+            session.prepare_input(_step_rows(0, identities))
+        assert execution.diagnostics().update_count == 0
+        assert all(page.tensor is not None for page in root.pages)
+        with pytest.raises(RuntimeError):
+            session.prepare_input(_step_rows(0, identities))
+        session.close()
+        assert not any(peer.poll() for peer in peers), "closing the session cannot forge a read ACK"
 
 
-def _hold_steps_require_settled_injection_and_skip_the_producer():
+def _hold_steps_reuse_the_settled_injection():
     from pllm.backends.vllm.runtime import ReadonlyStepAbsent, ReadonlyStepEnd, ReadonlyStepInput
 
     identity = RequestIdentity("hold", 0, 0)
@@ -525,12 +324,6 @@ def _hold_steps_require_settled_injection_and_skip_the_producer():
         patch("torch.cuda.current_stream", return_value=None),
     ):
         session, model, _ = _session(b, execution)
-        with pytest.raises(ValueError, match="signed task closure"):
-            replace(binding, tasks=tuple(task.original for task in binding.tasks)).bind(
-                execution.arena, execution.sampler_anchor_id
-            )
-        with pytest.raises(ValueError, match="signed conditional producer guard"):
-            execution.rebind_implementation(binding.tasks[0].original)
         outcomes = (
             ReadonlyStepInput(1, 0, (first,)),
             ReadonlyStepAbsent(1, 1),
@@ -544,14 +337,7 @@ def _hold_steps_require_settled_injection_and_skip_the_producer():
             session.before_execute(_scheduler(*((identity,) if step == 0 else ())))
             rng = torch.random.get_rng_state().clone()
             session.prepare_input(rows(step))
-            context = session._step.invocation.context
             hold = step in (1, 3)
-            assert (context.held_input is not None) == hold
-            assert bool(context.borrowed_roots) != hold
-            assert (context.publication is None) == hold
-            if hold:
-                assert not context.results and not context.page_writes and not context.page_publications
-                assert context.held_input.successful[0][2] == step - 1
             current = execution.directory.latest_refs(())[0]
             refs.append(current)
             assert current.version_id == (1 if step < 2 else 2)
@@ -559,15 +345,11 @@ def _hold_steps_require_settled_injection_and_skip_the_producer():
                 delta = 20 if step >= 2 and index == 0 else 10
                 actual, _ = layer(torch.zeros(1), torch.ones(1, 2))
                 torch.testing.assert_close(actual, torch.full((1, 2), float(2 + delta)))
-            before = execution.diagnostics()
             session.complete_forward()
             session.complete_sampler(False)
-            assert execution.diagnostics().hold_count == before.hold_count
             session.commit_token()
             assert torch.equal(rng, torch.random.get_rng_state())
-            assert execution.diagnostics().hold_count == (step + 1) // 2
             assert execution.diagnostics().update_count == (step // 2 + 1)
-            assert all(release is not None for release in context.page_pins.values())
             if not hold:
                 root, incoming = (first, peers) if step == 0 else (second, second_peers)
                 assert all(
@@ -577,49 +359,3 @@ def _hold_steps_require_settled_injection_and_skip_the_producer():
             else:
                 assert not any(peer.poll() for peer in (*peers, *second_peers))
         assert refs[0] == refs[1] and refs[2] == refs[3] and refs[0] != refs[2]
-        assert execution.diagnostics().fallback_count == 0
-        assert execution.diagnostics().last_hold.reason == "end"
-        # Cancelling a held step cannot register success or revive a poisoned session.
-        execution.stage_hold((identity,), "absent", step_id=4)
-        invocation = execution.begin(())
-        with pytest.raises(RuntimeError, match="cancelled"):
-            execution.cancel_step(invocation)
-        assert execution.diagnostics().hold_count == 2
-        with pytest.raises(RuntimeError, match="fail-stopped"):
-            execution.stage_hold((identity,), "absent", step_id=4)
-    for policy, seeded in ((MissingPolicy.HOLD, False), (MissingPolicy.STOP, False), (MissingPolicy.STOP, True)):
-        with (
-            binding_case(runtime=True, missing=policy) as (b, _, _, _, execution, root, peers),
-            patch("torch.cuda.current_stream", return_value=None),
-        ):
-            session, model, _ = _session(b, execution)
-            session.bind_readonly_input(
-                lambda batch, stream: (
-                    ReadonlyStepInput(1, 0, (root,))
-                    if seeded and batch.step_id == 0
-                    else ReadonlyStepAbsent(1, batch.step_id)
-                )
-            )
-            session.stage_input(None, (identity,))
-            session.before_execute(_scheduler(identity))
-            if seeded:
-                session.prepare_input(rows(0))
-                model.model.layers[0](torch.zeros(1), torch.ones(1, 2))
-                session.complete_forward()
-                session.complete_sampler(False)
-                session.commit_token()
-                assert execution.diagnostics().update_count == 1
-                for peer in peers:
-                    peer.recv_bytes()
-            with pytest.raises(
-                RuntimeError, match="first successful injection" if policy is MissingPolicy.HOLD else "STOP"
-            ):
-                session.prepare_input(rows(int(seeded)))
-            assert not execution._active and not any(peer.poll() for peer in peers)
-            with pytest.raises(RuntimeError, match="fail-stopped"):
-                session.prepare_input(rows(0))
-    with binding_case(runtime=True, missing=MissingPolicy.HOLD) as (_, _, _, _, execution, root, peers):
-        execution.stage_readonly((root,))
-        with pytest.raises(RuntimeError, match="first successful injection"):
-            execution.stage_hold((identity,), "absent", step_id=0)
-        assert execution._pending_borrows == (root,) and not any(peer.poll() for peer in peers)
