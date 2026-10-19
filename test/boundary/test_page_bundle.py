@@ -143,7 +143,7 @@ def test_cpu_request_ptts_admit_cow_publish_pin_retire() -> None:
     assert arena.free_pages == free
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
         partial = arena.prepare_transition((a,), copy_fields=(LayoutFieldId(0),))
-    assert sum(event.name == "aten::copy_" for event in profile.events()) == 1
+    assert sum(event.name in ("aten::copy_", "aten::index_copy_") for event in profile.events()) == 1
     torch.testing.assert_close(arena.write_field(partial, 0, LayoutFieldId(0)), old_a[0])
     for index in range(1, len(old_a)):
         arena.write_field(partial, 0, LayoutFieldId(index)).fill_(99)
@@ -248,15 +248,15 @@ def test_multi_lineage_admission_and_publication_roll_back_atomically(monkeypatc
         arena.prepare_admission(("dense_fast_weights",) * 3)
     assert arena.free_pages == capacity and arena.active_lineages == 0
     # Initialization fails after the first resource has already been written.
-    original_zero = torch.Tensor.zero_
+    original_fill = torch.Tensor.index_fill_
 
-    def fail_second_resource(tensor: torch.Tensor) -> torch.Tensor:
-        if tensor.shape == (2, 5):
+    def fail_second_resource(tensor: torch.Tensor, *args: object) -> torch.Tensor:
+        if tensor.shape[1:] == (2, 5):
             raise RuntimeError("injected initialization failure")
-        return original_zero(tensor)
+        return original_fill(tensor, *args)
 
     with monkeypatch.context() as patch:
-        patch.setattr(torch.Tensor, "zero_", fail_second_resource)
+        patch.setattr(torch.Tensor, "index_fill_", fail_second_resource)
         with pytest.raises(RuntimeError, match="initialization"):
             arena.prepare_admission(resources)
     assert arena.free_pages == capacity and arena.active_lineages == 0

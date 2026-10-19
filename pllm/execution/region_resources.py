@@ -266,7 +266,7 @@ class RegionResources:
                 or len(types) != len(cell.fields)
                 or cell.fields != tuple(sorted(set(cell.fields)))
                 or any(
-                    type(f) is not int or f < 0 or f >= len(owner.arena.root(cell.original).pages) for f in cell.fields
+                    type(f) is not int or f < 0 or f >= len(owner.arena.root(cell.original).slots) for f in cell.fields
                 )
             ):
                 raise ValueError("page payload fields must be complete, nonempty and ordered")

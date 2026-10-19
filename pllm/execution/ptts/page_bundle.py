@@ -39,12 +39,22 @@ class PageSlot:
     generation: int
 
 
-@dataclass(frozen=True, slots=True)
+Slots = npt.NDArray[np.int64]
+
+
+@dataclass(frozen=True, slots=True, eq=False)
 class PageBundle:
+    """One state version: the page slot and allocation generation holding each field."""
+
     ref: StateRef
     resource: str
-    pages: tuple[PageSlot, ...]
+    slots: Slots  # [fields]
+    generations: Slots  # [fields]
     readiness: torch.cuda.Event | None
+
+    @property
+    def pages(self) -> tuple[PageSlot, ...]:
+        return tuple(PageSlot(int(slot), int(generation)) for slot, generation in zip(self.slots, self.generations))
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -207,55 +217,40 @@ class _Pools:
     def free_count(self, field: int) -> int:
         return int(np.count_nonzero(self.holders[field] == 0))
 
-    def allocate(self, field: int, count: int) -> list[PageSlot]:
-        """`count` free pages of one field, smallest slots first."""
+    def allocate(self, field: int, count: int) -> tuple[Slots, Slots]:
+        """`count` free pages of one field, smallest slots first, with their generations."""
         slots = np.flatnonzero(self.holders[field] == 0)[:count]
         if len(slots) < count:
             raise RuntimeError("PageBundle capacity is exhausted")
         self.holders[field, slots] = 1
-        return [PageSlot(int(slot), int(generation)) for slot, generation in zip(slots, self.generations[field, slots])]
+        return slots, self.generations[field, slots]
 
-    def share(self, field: int, page: PageSlot) -> PageSlot:
-        """Let another version hold the same page (fields a transition does not write)."""
-        self.holders[field, page.slot_id] += 1
-        return page
+    def share(self, field: int, slots: Slots) -> None:
+        """Let more versions hold these pages (fields a transition does not write)."""
+        np.add.at(self.holders[field], slots, 1)
 
     def tensor(self, field: int, page: PageSlot) -> torch.Tensor:
         if self.generations[field, page.slot_id] != page.generation or self.holders[field, page.slot_id] < 1:
             raise RuntimeError("PageBundle allocation generation was reclaimed")
         return self.tensors[field][page.slot_id]
 
-    def release_many(self, roots: list[tuple[PageSlot, ...]]) -> None:
-        """Drop one hold on every page of several roots at once."""
-        slots: npt.NDArray[np.int64] = np.array([[page.slot_id for page in pages] for pages in roots], dtype=np.int64)
-        generations: npt.NDArray[np.int64] = np.array(
-            [[page.generation for page in pages] for pages in roots], dtype=np.int64
-        )
-        fields: npt.NDArray[np.int64] = np.broadcast_to(np.arange(slots.shape[1], dtype=np.int64), slots.shape)
+    def views(self, slots: Slots, generations: Slots) -> tuple[torch.Tensor, ...]:
+        """One tensor view per field of a version, after checking none of its pages was reclaimed."""
+        fields = np.arange(len(slots))
+        if (self.generations[fields, slots] != generations).any() or (self.holders[fields, slots] < 1).any():
+            raise RuntimeError("PageBundle allocation generation was reclaimed")
+        return tuple(tensor[slot] for tensor, slot in zip(self.tensors, slots.tolist()))
+
+    def release(self, slots: Slots, generations: Slots) -> None:
+        """Drop one hold on each page of `slots` `[versions, fields]` (or one version `[fields]`)."""
+        slots, generations = np.atleast_2d(slots), np.atleast_2d(generations)
+        fields: Slots = np.broadcast_to(np.arange(slots.shape[1], dtype=np.int64), slots.shape)
         if (self.generations[fields, slots] != generations).any() or (self.holders[fields, slots] < 1).any():
             raise RuntimeError("PageBundle allocation generation was reclaimed")
         np.subtract.at(self.holders, (fields, slots), 1)
-        freed = np.zeros_like(self.holders, dtype=np.bool_)
-        freed[fields, slots] = True
-        self.generations[freed & (self.holders == 0)] += 1
-
-    def release(self, pages: tuple[PageSlot, ...]) -> None:
-        for field, page in enumerate(pages):
-            if self.generations[field, page.slot_id] != page.generation or self.holders[field, page.slot_id] < 1:
-                raise RuntimeError("PageBundle allocation generation was reclaimed")
-            self.holders[field, page.slot_id] -= 1
-            if not self.holders[field, page.slot_id]:
-                self.generations[field, page.slot_id] += 1
-
-
-def demand_fresh(
-    resources: tuple[str, ...], fields: tuple[tuple[LayoutFieldId, ...], ...], transition: bool, widths: dict[str, int]
-) -> Counter[tuple[str, LayoutFieldId]]:
-    """Fresh pages per (resource, field): written fields of a transition, or every field of an admission."""
-    demand: Counter[tuple[str, LayoutFieldId]] = Counter()
-    for resource, chosen in zip(resources, fields, strict=True):
-        demand.update((resource, LayoutFieldId(field)) for field in (chosen if transition else range(widths[resource])))
-    return demand
+        touched = np.zeros_like(self.holders, dtype=np.bool_)
+        touched[fields, slots] = True
+        self.generations[touched & (self.holders == 0)] += 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -557,32 +552,7 @@ class PageBundleArena:
             if not sources:
                 self._admission_capacity_failures += 1
             raise RuntimeError("PageBundle capacity is exhausted by live owners")
-        # Capacity was checked above, so allocation cannot fail part way. Fields a transition
-        # does not write keep sharing the source's page; every other field gets a fresh page.
-        sources_roots = tuple(self.root(ref) for ref in sources)
-        fresh = {
-            key: iter(self._pools[key[0]].allocate(key[1], count))
-            for key, count in demand_fresh(
-                resources,
-                fields,
-                bool(sources),
-                {resource: len(self._pools[resource].tensors) for resource in resources},
-            ).items()
-        }
-        allocated = [
-            PageBundle(
-                ref,
-                resource,
-                tuple(
-                    self._pools[resource].share(field, sources_roots[index].pages[field])
-                    if sources and field not in chosen
-                    else next(fresh[resource, LayoutFieldId(field)])
-                    for field in range(len(self._pools[resource].tensors))
-                ),
-                None,
-            )
-            for index, (ref, resource, chosen) in enumerate(zip(targets, resources, fields, strict=True))
-        ]
+        allocated = self._allocate_versions(sources, targets, resources, fields)
         token = PageWrite(self._next_operation, sources, targets, stream)
         self._next_operation += 1
         self._writes[token] = _Write(
@@ -598,38 +568,81 @@ class PageBundleArena:
             self._roots[ref].pins += 1
         try:
             with self._scope(stream), torch.no_grad():
-                # Group page writes per pool so each field costs one batched copy, not one per state.
-                zeros: dict[tuple[str, int], list[int]] = {}
-                copies: dict[tuple[str, int], tuple[list[int], list[int]]] = {}
-                for index, (target, chosen) in enumerate(zip(allocated, fields, strict=True)):
-                    source = self.root(sources[index]) if sources else None
-                    if source is not None:
-                        self._order(source.readiness, stream)
-                    for field in chosen:
-                        destination = target.pages[field].slot_id
-                        if source is None:
-                            zeros.setdefault((target.resource, field), []).append(destination)
-                        elif copy_fields is None or field in copy_fields:
-                            pair = copies.setdefault((target.resource, field), ([], []))
-                            pair[0].append(source.pages[field].slot_id)
-                            pair[1].append(destination)
-                for (resource, field), slots in zeros.items():
-                    pool = self._pools[resource].tensors[field]
-                    if len(slots) == 1:
-                        pool[slots[0]].zero_()
-                    else:
-                        pool.index_fill_(0, upload(slots, pool.device), 0)
-                for (resource, field), (origins, slots) in copies.items():
-                    pool = self._pools[resource].tensors[field]
-                    if len(slots) == 1:
-                        pool[slots[0]].copy_(pool[origins[0]])
-                    else:
-                        indices = upload([origins, slots], pool.device)
-                        pool.index_copy_(0, indices[1], pool.index_select(0, indices[0]))
+                for event in {id(root.readiness): root.readiness for root in map(self.root, sources)}.values():
+                    self._order(event, stream)
+                self._fill_versions(sources, allocated, fields, copy_fields)
         except Exception:
             self.abort(token)
             raise
         return token
+
+    def _allocate_versions(
+        self,
+        sources: tuple[StateRef, ...],
+        targets: tuple[StateRef, ...],
+        resources: tuple[str, ...],
+        fields: tuple[tuple[LayoutFieldId, ...], ...],
+    ) -> list[PageBundle]:
+        """Pages for new versions: fresh pages for written fields, shared pages for the rest.
+
+        An admission (no sources) writes every field. Capacity was checked by the caller.
+        """
+        allocated: list[PageBundle | None] = [None] * len(targets)
+        for resource in dict.fromkeys(resources):
+            pools = self._pools[resource]
+            group = [index for index, name in enumerate(resources) if name == resource]
+            width = len(pools.tensors)
+            written = np.ones((len(group), width), dtype=np.bool_)
+            slots = np.zeros((len(group), width), dtype=np.int64)
+            generations = np.zeros_like(slots)
+            if sources:
+                origins = [self.root(sources[index]) for index in group]
+                slots[:] = [root.slots for root in origins]
+                generations[:] = [root.generations for root in origins]
+                written[:] = False
+                for row, index in enumerate(group):
+                    written[row, list(fields[index])] = True
+            for field in range(width):
+                rows = written[:, field]
+                if rows.any():
+                    slots[rows, field], generations[rows, field] = pools.allocate(field, int(rows.sum()))
+                if not rows.all():
+                    pools.share(field, slots[~rows, field])
+            for row, index in enumerate(group):
+                allocated[index] = PageBundle(targets[index], resource, slots[row], generations[row], None)
+        return [root for root in allocated if root is not None]
+
+    def _fill_versions(
+        self,
+        sources: tuple[StateRef, ...],
+        targets: list[PageBundle],
+        fields: tuple[tuple[LayoutFieldId, ...], ...],
+        copy_fields: tuple[LayoutFieldId, ...] | None,
+    ) -> None:
+        """Zero an admission's pages, or copy a transition's written fields from the source version.
+
+        One batched copy per (resource, field), however many states the write covers.
+        """
+        for resource in dict.fromkeys(root.resource for root in targets):
+            pools = self._pools[resource]
+            group = [index for index, root in enumerate(targets) if root.resource == resource]
+            width = len(pools.tensors)
+            destination: Slots = np.stack([targets[index].slots for index in group])
+            origin: Slots = np.stack([self.root(sources[index]).slots for index in group]) if sources else destination
+            written: npt.NDArray[np.bool_] = np.zeros((len(group), width), dtype=np.bool_)
+            for row, index in enumerate(group):
+                written[row, list(fields[index])] = True
+            if sources and copy_fields is not None:
+                written[:, [field for field in range(width) if field not in copy_fields]] = False
+            for field, pool in enumerate(pools.tensors):
+                rows = written[:, field]
+                if not rows.any():
+                    continue
+                if not sources:
+                    pool.index_fill_(0, upload(destination[rows, field].tolist(), self.device), 0)
+                    continue
+                pairs = upload([origin[rows, field].tolist(), destination[rows, field].tolist()], self.device)
+                pool.index_copy_(0, pairs[1], pool.index_select(0, pairs[0]))
 
     def write_field(self, token: PageWrite, root_index: int, field: LayoutFieldId) -> torch.Tensor:
         with self._lock:
@@ -651,7 +664,9 @@ class PageBundleArena:
             receipt = PagePublication(token.operation_id, token.before_refs, token.after_refs, completion)
             for target in write.targets:
                 ref = target.ref
-                self._roots[ref] = _Root(PageBundle(ref, target.resource, target.pages, completion), pins=1)
+                self._roots[ref] = _Root(
+                    PageBundle(ref, target.resource, target.slots, target.generations, completion), pins=1
+                )
                 self._lineages[ref.lineage_id] = ref
                 self._root_count[ref.lineage_id] += 1
             self._stale.update(token.before_refs)
@@ -678,7 +693,7 @@ class PageBundleArena:
                 self._poisoned = True
                 raise
             for root in write.targets:
-                self._pools[root.resource].release(root.pages)
+                self._pools[root.resource].release(root.slots, root.generations)
             for ref in token.before_refs:
                 self._roots[ref].pins -= 1
             self._writing.difference_update(ref.lineage_id for ref in token.before_refs)
@@ -745,11 +760,11 @@ class PageBundleArena:
         with self._lock:
             self._require_live()
             pools = self._pools[root.resource]
-            if writable is not None and len(writable) != len(root.pages):
+            if writable is not None and len(writable) != len(root.slots):
                 raise RuntimeError("PageBundle field is not writable in this transaction")
             if writable is None:
-                return tuple(pools.tensor(field, page).detach() for field, page in enumerate(root.pages))
-            return tuple(pools.tensor(field, page) for field, page in enumerate(root.pages))
+                return tuple(view.detach() for view in pools.views(root.slots, root.generations))
+            return pools.views(root.slots, root.generations)
 
     def borrow_roots(
         self, access: tuple[PagePin | PageWrite, ...], refs: tuple[StateRef, ...]
@@ -781,7 +796,7 @@ class PageBundleArena:
             if len({root.resource for root, _ in roots}) != 1:
                 raise ValueError("field slots require one resource layout")
             pool = self._pools[roots[0][0].resource].tensors[field].detach()
-            return pool, tuple(root.pages[field].slot_id for root, _ in roots)
+            return pool, tuple(int(root.slots[field]) for root, _ in roots)
 
     def paged_rows(
         self,
@@ -836,7 +851,7 @@ class PageBundleArena:
             active = torch.ones(len(rows), device=self.device, dtype=torch.bool)
             pools = self._pools[roots[0].resource]
             slots = torch.tensor(
-                tuple(tuple(root.pages[field].slot_id for root in roots) for field in fields),
+                tuple(tuple(int(root.slots[field]) for root in roots) for field in fields),
                 device=self.device,
                 dtype=torch.long,
             )
@@ -846,7 +861,7 @@ class PageBundleArena:
                 else torch.tensor(
                     tuple(
                         tuple(
-                            root.pages[field].slot_id if isinstance(token, PageWrite) else -1
+                            int(root.slots[field]) if isinstance(token, PageWrite) else -1
                             for root, token in zip(roots, access, strict=True)
                         )
                         for field in fields
@@ -1006,7 +1021,7 @@ class PageBundleArena:
                 roots = tuple(write.targets[index] for index in indices)
         if len({root.resource for root in roots}) != 1:
             raise ValueError("captured selection must use one original resource layout")
-        if any(not 0 <= field < len(roots[0].pages) for field in fields):
+        if any(not 0 <= field < len(roots[0].slots) for field in fields):
             raise ValueError("PageBundle field is outside the signed layout")
         return roots
 
@@ -1075,7 +1090,7 @@ class PageBundleArena:
                 view.indices.fill_(-1)
                 for index, field in enumerate(view.fields):
                     for row, root in enumerate(roots):
-                        view.indices[index, row].fill_(root.pages[field].slot_id)
+                        view.indices[index, row].fill_(int(root.slots[field]))
             view.access, view.refs = access, refs
 
     def read_captured(self, view: CapturedPageFields) -> tuple[torch.Tensor, ...]:
@@ -1360,13 +1375,13 @@ class PageBundleArena:
 
     def _reclaim(self) -> None:
         """Release stale roots that no pin holds and whose last GPU writer has finished."""
-        released: dict[str, list[tuple[PageSlot, ...]]] = {}
+        released: dict[str, list[PageBundle]] = {}
         for ref in tuple(self._stale):
             stored = self._roots[ref]
             bundle = stored.bundle
             if stored.pins or (bundle.readiness is not None and not bundle.readiness.query()):
                 continue
-            released.setdefault(bundle.resource, []).append(bundle.pages)
+            released.setdefault(bundle.resource, []).append(bundle)
             del self._roots[ref]
             self._stale.discard(ref)
             self._root_count[ref.lineage_id] -= 1
@@ -1375,8 +1390,10 @@ class PageBundleArena:
                 if ref.lineage_id in self._retiring:
                     self._retiring.discard(ref.lineage_id)
                     del self._lineages[ref.lineage_id]
-        for resource, pages in released.items():
-            self._pools[resource].release_many(pages)
+        for resource, bundles in released.items():
+            self._pools[resource].release(
+                np.stack([bundle.slots for bundle in bundles]), np.stack([bundle.generations for bundle in bundles])
+            )
 
     def _issued_write(self, token: PageWrite) -> _Write:
         self._require_live()
