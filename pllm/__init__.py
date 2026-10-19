@@ -44,8 +44,6 @@ from pllm.execution.host_runtime import (
 from pllm.execution.ptts.page_bundle import PagePublication as PagePublication
 from pllm.execution.tensor_binding import TensorResult as TensorResult
 from pllm.execution.tensor_program import InvocationOutput as InvocationOutput
-from pllm.kernels.paged_linear import PagedRows as PagedRows
-from pllm.kernels.paged_linear import TensorRows as TensorRows
 from pllm.learning import (
     CausalAdapterWorkload as CausalAdapterWorkload,
 )
@@ -274,8 +272,6 @@ __all__ = [
     "CausalAdapterWorkload",
     "CausalModel",
     "CausalTrainBatch",
-    "TensorRows",
-    "PagedRows",
     "SGD",
     "Batch",
     "WeightedCEBatch",

@@ -6,7 +6,6 @@ from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
-from itertools import accumulate
 from math import prod
 from multiprocessing.connection import Connection
 from threading import RLock
@@ -27,7 +26,6 @@ from pllm.execution.cuda_stream import upload
 from pllm.execution.ptts.page_bundle_planning import DTYPE_BYTES, page_stride_bytes
 from pllm.execution.scheduler import validate_plan_bundle
 from pllm.execution.shared_tensor import CudaIpcStorage, RemoteCompletion, tensor_dtype
-from pllm.kernels.paged_linear import PagedRows
 
 
 @dataclass(frozen=True, slots=True)
@@ -879,93 +877,6 @@ class PageBundleArena:
         """The field pool and each selected exact-version slot."""
         resource, slots = self.slots(access, refs)
         return self._pools[resource].tensors[field].detach(), tuple(slots[:, field].tolist())
-
-    def paged_rows(
-        self,
-        access: tuple[PagePin | PageWrite, ...],
-        refs: tuple[StateRef, ...],
-        fields: tuple[LayoutFieldId, ...],
-        rows: tuple[int, ...],
-    ) -> tuple[PagedRows, ...]:
-        """Derive immutable row mappings from issued exact-version capabilities.
-
-        No mapping is reused or overwritten by a later invocation. Allocations
-        and consumption use the original stream and its release/publication fence.
-        """
-        with self._lock:
-            if not refs or not fields or len(access) != len(refs) or any(i < 0 or i >= len(refs) for i in rows):
-                raise ValueError("paged rows require original state indices and access")
-            roots = tuple(
-                self._held_fields(token, (ref,), fields)[0] for token, ref in zip(access, refs, strict=True)
-            )
-            stream = access[0].stream
-            if (
-                self.device.type != "cuda"
-                or stream is None
-                or any(token.stream != stream for token in access)
-                or len({root.resource for root in roots}) != 1
-            ):
-                raise ValueError("paged rows require one CUDA resource and consumer stream")
-
-            def validate() -> None:
-                with self._lock:
-                    if torch.cuda.current_stream(self.device) != stream:
-                        raise RuntimeError("paged computation must use its original consumer stream")
-                    for token, ref in zip(access, refs, strict=True):
-                        self._held_fields(token, (ref,), fields)
-
-            def validate_write() -> None:
-                validate()
-                if not any(isinstance(token, PageWrite) for token in access):
-                    raise RuntimeError("paged writes require an original private PageWrite")
-
-            validate()
-            order = tuple(sorted(range(len(rows)), key=rows.__getitem__))
-            counts = [0] * len(refs)
-            for state in rows:
-                counts[state] += 1
-
-            def index(values: tuple[int, ...]) -> torch.Tensor:
-                return upload(values, self.device)
-
-            row_order, row_states = index(order), index(rows)
-            offsets = upload(tuple(accumulate(counts)), self.device, torch.int32)
-            active = torch.ones(len(rows), device=self.device, dtype=torch.bool)
-            pools = self._pools[roots[0].resource]
-            slots = torch.tensor(
-                tuple(tuple(int(root.slots[field]) for root in roots) for field in fields),
-                device=self.device,
-                dtype=torch.long,
-            )
-            write_slots = (
-                slots
-                if all(isinstance(token, PageWrite) for token in access)
-                else torch.tensor(
-                    tuple(
-                        tuple(
-                            int(root.slots[field]) if isinstance(token, PageWrite) else -1
-                            for root, token in zip(roots, access, strict=True)
-                        )
-                        for field in fields
-                    ),
-                    device=self.device,
-                    dtype=torch.long,
-                )
-            )
-            return tuple(
-                PagedRows(
-                    pools.tensors[field].reshape(pools.tensors[field].shape[0], -1).detach(),
-                    slots[index],
-                    row_order,
-                    offsets,
-                    row_states,
-                    validate,
-                    active,
-                    write_slots[index],
-                    validate_write=validate_write,
-                )
-                for index, field in enumerate(fields)
-            )
 
     def _held_fields(
         self, access: PagePin | PageWrite, refs: tuple[StateRef, ...], fields: tuple[LayoutFieldId, ...]

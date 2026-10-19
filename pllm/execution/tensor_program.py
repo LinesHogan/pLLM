@@ -22,7 +22,6 @@ from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.state_execution import StateTaskContext
 from pllm.execution.trace import TracePhase
 from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw, paged_adamw
-from pllm.kernels.paged_linear import PagedRows, TensorRows
 
 if TYPE_CHECKING:
     from pllm.execution.step_capture import StepCapture
@@ -33,10 +32,6 @@ I = TypeVar("I")
 D = TypeVar("D")
 R = TypeVar("R")
 Roots = tuple[tuple[torch.Tensor, ...], ...]
-
-
-def _no_pages(fields: tuple[int, ...], rows: tuple[int, ...]) -> tuple[PagedRows, ...]:
-    raise RuntimeError("this mathematical batch has no issued page access")
 
 
 def _no_slots(field: int) -> tuple[torch.Tensor, tuple[int, ...]]:
@@ -58,7 +53,6 @@ class TensorBatch:
     feedback: SamplerFeedback | None = None
     epoch: int = 1
     observing: bool = False
-    paged: Callable[[tuple[int, ...], tuple[int, ...]], tuple[PagedRows, ...]] = _no_pages
     # Field pool and the slot of every selected state's page, in selection order.
     field_slots: Callable[[int], tuple[torch.Tensor, tuple[int, ...]]] = _no_slots
     slot_matrix: Callable[[], tuple[str, Slots]] = _no_matrix
@@ -80,25 +74,6 @@ class TensorBatch:
         group = self.selection.for_resource(StateResource(resource))
         (ref,) = group.refs
         return self.roots[self.selection.refs.index(ref)]
-
-    def tensor_rows(self, fields: tuple[int, ...], rows: tuple[int, ...]) -> tuple[TensorRows, ...]:
-        """Pack fields once per logical state; share one mapping or an existing equal-row grouping."""
-        count = len(self.roots)
-        group = len(rows) // count if count else 0
-        indices = (
-            group
-            if group and len(rows) == count * group and rows == tuple(index // group for index in range(len(rows)))
-            else upload(rows, self.roots[0][0].device)
-        )
-        return tuple(
-            TensorRows(
-                self.roots[0][field].flatten().unsqueeze(0)
-                if count == 1
-                else torch.stack(tuple(root[field].flatten() for root in self.roots)),
-                indices,
-            )
-            for field in fields
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,9 +166,6 @@ def _read(context: StateTaskContext[D], version: Literal["input", "private", "pu
         results=context.results,
         borrowed_roots=context.borrowed_roots,
         local_pin=context.pin,
-        paged=lambda fields, rows: context.arena.paged_rows(
-            access, refs, tuple(LayoutFieldId(field) for field in fields), rows
-        ),
         field_slots=roots.field_slots,
         slot_matrix=roots.slot_matrix,
     )
