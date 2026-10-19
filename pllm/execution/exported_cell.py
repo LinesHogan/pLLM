@@ -299,12 +299,6 @@ class ExportedCell:
             tuple(TensorType(t.shape, str(t.dtype), str(t.device)) for t in self.output_signatures),
         )
 
-    @property
-    def output_bytes(self) -> int:
-        from math import prod
-
-        return sum(prod(t.shape) * torch.empty((), dtype=t.dtype).element_size() for t in self.output_signatures)
-
     def __call__(self, *args: torch.Tensor) -> tuple[torch.Tensor, ...]:
         _check_distinct_inputs(args)
         return self.invoke(args)

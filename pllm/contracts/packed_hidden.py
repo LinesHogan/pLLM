@@ -75,12 +75,6 @@ class PackedHiddenSnapshotBatch:
     def step_id(self) -> int:
         return self.row_batch.step_id
 
-    def hidden_for(self, resource: PackedHiddenResourceBinding) -> torch.Tensor:
-        for snapshot in self.snapshots:
-            if snapshot.resource == resource:
-                return snapshot.hidden
-        raise KeyError(resource)
-
 
 __all__ = [
     "PackedHiddenResourceBinding",
