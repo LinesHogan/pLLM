@@ -7,7 +7,7 @@ parameters for those rows through a single per-invocation RowIndex. Used by Tens
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, overload
 
@@ -27,6 +27,7 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.state_ref import StateRef
 from pllm.execution.codec import register_gradient_hook
 from pllm.execution.cuda_stream import upload
+from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.tensor_program import Observation, TaskOutput, TensorBatch
 
 if TYPE_CHECKING:
@@ -142,17 +143,13 @@ class RowIndex:
     def build(cls, data: "TensorFrame", batch: TensorBatch, device: torch.device) -> "RowIndex":
         links = {link.packed_row_index: link.sampler_row_index for link in data.step.sampler_rows.links}
         selection = batch.selection
-        states = (
-            tuple(selection.row_states[row.identity] for row in data.rows)
-            if selection.groups
-            else (0,) * len(data.rows)
-        )
+        states = selection.indices(data.rows) if selection.groups else (0,) * len(data.rows)
         columns = (
             tuple(row.packed_row_index for row in data.rows),
             tuple(links.get(row.packed_row_index, -1) for row in data.rows),
             tuple(row.identity.sample_idx for row in data.rows),
             states,
-            tuple(int(selection.refs[index].version_id) for index in states) if selection.groups else states,
+            tuple(selection.refs.versions[list(states)].tolist()) if selection.groups else states,
         )
         return cls(*columns, device=upload(columns, device))
 
@@ -244,6 +241,40 @@ def state_leaf(data: "TensorFrame", batch: TensorBatch) -> torch.Tensor:
     return data.leaf
 
 
+class ParameterGradients(MutableMapping[StateRef, tuple[torch.Tensor, ...]]):
+    """Stacked parameter derivatives; per-state views are created only when inspected."""
+
+    def __init__(
+        self, refs: StateRefs, values: torch.Tensor, previous: Mapping[StateRef, tuple[torch.Tensor, ...]]
+    ) -> None:
+        if isinstance(previous, ParameterGradients) and previous._fields is None and previous.refs == refs:
+            previous = previous.previous
+        self.refs, self.stacked = refs, values
+        self.previous: Mapping[StateRef, tuple[torch.Tensor, ...]] = previous
+        self._fields: dict[StateRef, tuple[torch.Tensor, ...]] | None = None
+
+    def _materialize(self) -> dict[StateRef, tuple[torch.Tensor, ...]]:
+        if self._fields is None:
+            self._fields = dict(self.previous)
+            self._fields.update((ref, (value,)) for ref, value in zip(self.refs, self.stacked.unbind(), strict=True))
+        return self._fields
+
+    def __getitem__(self, ref: StateRef) -> tuple[torch.Tensor, ...]:
+        return self._materialize()[ref]
+
+    def __setitem__(self, ref: StateRef, values: tuple[torch.Tensor, ...]) -> None:
+        self._materialize()[ref] = values
+
+    def __delitem__(self, ref: StateRef) -> None:
+        del self._materialize()[ref]
+
+    def __iter__(self) -> Iterator[StateRef]:
+        return iter(self._materialize())
+
+    def __len__(self) -> int:
+        return len(self._materialize())
+
+
 @dataclass(slots=True)
 class TensorFrame:
     step: TensorStepInput
@@ -257,7 +288,7 @@ class TensorFrame:
     input_gradients: dict[tuple[str, str], torch.Tensor] = field(
         default_factory=lambda: dict[tuple[str, str], torch.Tensor]()
     )
-    parameter_gradient_fields: dict[StateRef, tuple[torch.Tensor, ...]] = field(
+    parameter_gradient_fields: MutableMapping[StateRef, tuple[torch.Tensor, ...]] = field(
         default_factory=lambda: dict[StateRef, tuple[torch.Tensor, ...]]()
     )
     pending_update: TaskOutput | None = None

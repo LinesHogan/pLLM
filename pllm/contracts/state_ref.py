@@ -18,13 +18,5 @@ class StateRef:
     lineage_id: LineageId
     version_id: VersionId
 
-    def __post_init__(self) -> None:
-        if int(self.layout_id) < 0:
-            raise ValueError("state layout id must be non-negative")
-        if int(self.lineage_id) < 1:
-            raise ValueError("state lineage id must be positive")
-        if int(self.version_id) < 0:
-            raise ValueError("state version id must be non-negative")
-
 
 __all__ = ["LayoutId", "LineageId", "StateRef", "VersionId"]

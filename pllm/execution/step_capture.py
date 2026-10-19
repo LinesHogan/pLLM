@@ -21,7 +21,7 @@ from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.codec import cuda_graph_pool_bytes
 from pllm.execution.cuda_stream import PinnedStaging
 from pllm.execution.state_execution import StateTaskContext
-from pllm.execution.tensor_frame import FieldRoots, RowIndex, TensorFrame, training_observations
+from pllm.execution.tensor_frame import FieldRoots, ParameterGradients, RowIndex, TensorFrame, training_observations
 from pllm.execution.tensor_program import PoolAdamW, TaskOutput, TensorBatch
 from pllm.execution.tensor_task import TensorTask
 from pllm.kernels.adamw import AdamWFields, apply_adamw, paged_adamw
@@ -154,10 +154,12 @@ class StepCapture:
         links = {link.packed_row_index: link.sampler_row_index for link in data.step.sampler_rows.links}
         if self.feedback_names and any(row.packed_row_index not in links for row in data.rows):
             raise ValueError("sampler feedback must cover every operation row")
-        states = np.fromiter(
-            (batch.selection.row_states[row.identity] if batch.roots else 0 for row in data.rows), np.int64, count
+        states = (
+            np.asarray(batch.selection.indices(data.rows), dtype=np.int64)
+            if batch.roots
+            else np.zeros(count, dtype=np.int64)
         )
-        versions = np.fromiter((ref.version_id for ref in batch.selection.refs), np.int64) if batch.roots else states
+        versions = batch.selection.refs.versions if batch.roots else states
         rows[0, :count] = [row.packed_row_index for row in data.rows]
         rows[1, :count] = [links.get(row.packed_row_index, 0) for row in data.rows]
         rows[2, :count] = [row.identity.sample_idx for row in data.rows]
@@ -350,9 +352,15 @@ class StepCapture:
         if not self.pools and batch.roots:
             self.pools = tuple(batch.field_slots(i)[0] for i in range(len(batch.roots[0])))
         if self.optimizer is not None:
-            self.updated = tuple(sorted({batch.selection.row_states[row.identity] for row in data.rows}))
+            self.updated = tuple(sorted(set(batch.selection.indices(data.rows))))
             context.write = context.arena.prepare_transition(
-                tuple(batch.selection.refs[i] for i in self.updated), batch.stream, copy_fields=()
+                (
+                    batch.selection.refs
+                    if len(self.updated) == len(batch.selection.refs)
+                    else batch.selection.refs.take(self.updated)
+                ),
+                batch.stream,
+                copy_fields=(),
             )
         self._prepare(data, batch, context)
         if self.graph is None:
@@ -407,8 +415,8 @@ class StepCapture:
         data.input_gradients.update(
             (key, value[: len(data.rows)].clone()) for key, value in self.input_gradients.items()
         )
-        data.parameter_gradient_fields.update(
-            (ref, (gradient,)) for ref, gradient in zip(batch.selection.refs, gradients.unbind(), strict=True)
+        data.parameter_gradient_fields = ParameterGradients(
+            batch.selection.refs, gradients, data.parameter_gradient_fields
         )
         return TaskOutput(
             loss=result,

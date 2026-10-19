@@ -8,6 +8,7 @@ from functools import cached_property
 from threading import RLock
 from types import MappingProxyType
 
+import numpy as np
 import torch
 
 from pllm.contracts.packed_rows import PackedPhaseRow
@@ -16,6 +17,7 @@ from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.semantic_graph import SemanticState, StateResource, StateScope
 from pllm.contracts.state_ref import LineageId, StateRef
 from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin, PagePublication, PageWrite
+from pllm.execution.ptts.state_refs import Indices, StateRefs
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,7 +27,7 @@ class StateAddress:
 
 
 # One state's resource, keys, key lineages and per-row positions within a selection.
-_Projection = tuple[StateResource, tuple["RequestStateKey | None", ...], tuple[LineageId, ...], tuple[int, ...]]
+_Projection = tuple[StateResource, tuple["RequestStateKey | None", ...], StateRefs, tuple[int, ...]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,7 +42,7 @@ class RequestStateAdmissionBatch:
 class ResourceSelection:
     resource: StateResource
     keys: tuple[RequestStateKey | None, ...]
-    refs: tuple[StateRef, ...]
+    refs: StateRefs
     # Indices into the containing selection's flat refs, aligned to its rows.
     state_indices: tuple[int, ...]
 
@@ -51,8 +53,8 @@ class RequestStateSelection:
     groups: tuple[ResourceSelection, ...]
 
     @cached_property
-    def refs(self) -> tuple[StateRef, ...]:
-        return tuple(ref for group in self.groups for ref in group.refs)
+    def refs(self) -> StateRefs:
+        return StateRefs.join(tuple(group.refs for group in self.groups))
 
     @cached_property
     def addresses(self) -> tuple[StateAddress, ...]:
@@ -81,6 +83,12 @@ class RequestStateSelection:
     def row_states(self) -> Mapping[RequestIdentity, int]:
         return MappingProxyType({row.identity: index for row, index in zip(self.rows, self.state_indices, strict=True)})
 
+    def indices(self, rows: tuple[PackedPhaseRow, ...]) -> tuple[int, ...]:
+        """Reuse the directory's projection when a tensor invocation covers the selected rows."""
+        if rows == self.rows:
+            return self.state_indices
+        return tuple(self.row_states[row.identity] for row in rows)
+
     def ref_for(self, identity: RequestIdentity, resource: StateResource | None = None) -> StateRef:
         group = self._sole_group() if resource is None else self.for_resource(resource)
         for row, index in zip(self.rows, group.state_indices, strict=True):
@@ -106,7 +114,7 @@ class RequestStateDirectory:
         self._holders: dict[StateAddress, set[RequestIdentity]] = {}
         self._identity_holds: dict[tuple[StateResource, RequestIdentity], StateAddress] = {}
         self._inference_pins: dict[RequestIdentity, PagePin] = {}
-        self._leases: dict[StateAddress, RequestStateSelection] = {}
+        self._leases: dict[int, RequestStateSelection] = {}
         self._pending: RequestStateAdmissionBatch | None = None
         self._projection: tuple[tuple[RequestIdentity, ...], tuple[_Projection, ...]] | None = None
         self._lock = RLock()
@@ -287,7 +295,7 @@ class RequestStateDirectory:
                 indices = {key: offset + i for i, key in enumerate(keys)}
                 positions = tuple(indices[key] for key in projected)
             lineages = tuple(self._lineage(StateAddress(state.resource, key)) for key in keys)
-            projections.append((state.resource, keys, lineages, positions))
+            projections.append((state.resource, keys, self.arena.resolve_lineages(state.resource, lineages), positions))
             offset += len(keys)
         return tuple(projections)
 
@@ -295,17 +303,22 @@ class RequestStateDirectory:
         """Select the latest state of every row and lease it to one step; the lease is never stale."""
         with self._lock:
             selection = self.select(rows)
-            if self._leases.keys() & selection.addresses:
+            if self._overlaps(selection.refs.lineages):
                 raise RuntimeError("request transition lease overlaps an active step")
-            self._leases.update((key, selection) for key in selection.addresses)
+            self._leases[id(selection)] = selection
             return selection
 
     def release_transition_lease(self, selection: RequestStateSelection) -> None:
         with self._lock:
-            if any(self._leases.get(key) is not selection for key in selection.addresses):
+            if self._leases.get(id(selection)) is not selection:
                 raise RuntimeError("request transition selection is not the active lease")
-            for key in selection.addresses:
-                self._leases.pop(key)
+            del self._leases[id(selection)]
+
+    def _overlaps(self, lineages: Indices) -> bool:
+        return any(np.isin(lineages, lease.refs.lineages).any() for lease in self._leases.values())
+
+    def _leased(self, addresses: tuple[StateAddress, ...]) -> bool:
+        return self._overlaps(np.asarray([self._lineage(key) for key in addresses], dtype=np.int64))
 
     def retire(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateRef, ...]:
         with self._lock:
@@ -340,7 +353,7 @@ class RequestStateDirectory:
                     and key.key is not None
                     and RequestKeyField.ROUTE not in key.key.fields
                 )
-            if self._leases.keys() & set(releasing):
+            if self._leased(releasing):
                 raise RuntimeError("request retirement requires keys without an active step")
             refs = tuple(self._latest(key) for key in releasing)
             if refs:
@@ -362,7 +375,7 @@ class RequestStateDirectory:
     def retire_dormant(self) -> tuple[StateRef, ...]:
         with self._lock:
             dormant = tuple(key for key, holders in self._holders.items() if not holders)
-            if self._leases.keys() & set(dormant):
+            if self._leased(dormant):
                 raise RuntimeError("dormant retirement requires keys without an active step")
             refs = tuple(self._latest(key) for key in dormant)
             if refs:

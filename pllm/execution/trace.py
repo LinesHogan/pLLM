@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from base64 import b64decode, b64encode
 from collections import deque
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from enum import StrEnum
@@ -66,7 +66,7 @@ class TraceEvent:
     invocation_id: int
     task_id: TaskId | None = None
     identities: tuple[RequestIdentity, ...] = ()
-    refs: tuple[StateRef, ...] = ()
+    refs: Sequence[StateRef] = ()
     operation_id: int | None = None
     pin_id: int | None = None
     release_id: int | None = None
@@ -243,7 +243,7 @@ class ExecutionTrace:
         *,
         identities: tuple[RequestIdentity, ...] = (),
         row: PackedPhaseRow | None = None,
-        refs: tuple[StateRef, ...] = (),
+        refs: Sequence[StateRef] = (),
         iteration: int | None = None,
         gradient: bool = False,
         step_id: int | None = None,
@@ -363,7 +363,7 @@ class ExecutionTrace:
         *,
         task_id: TaskId | None = None,
         identities: tuple[RequestIdentity, ...] = (),
-        refs: tuple[StateRef, ...] = (),
+        refs: Sequence[StateRef] = (),
         operation_id: int | None = None,
         pin_id: int | None = None,
         release_id: int | None = None,

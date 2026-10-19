@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from threading import Event, RLock
 from typing import Generic, Protocol, TypeVar
 
+import numpy as np
 import torch
 
 from pllm.contracts.compilation import PlanBundle
@@ -38,6 +40,7 @@ from pllm.execution.ptts.page_bundle import (
     PageWrite,
 )
 from pllm.execution.ptts.request_state import RequestStateDirectory, RequestStateSelection
+from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.replay import LayerReplayPrimitive, TokenwiseReplayPrimitive
 from pllm.execution.trace import ExecutionTrace, TracePhase
 
@@ -87,7 +90,7 @@ class StateTaskContext(Generic[DataT]):
     update_count: int = 0
     trained_rows: int = 0
     replay: LayerReplayPrimitive | TokenwiseReplayPrimitive | None = None
-    updated_refs: tuple[StateRef, ...] = ()
+    updated_refs: Sequence[StateRef] = ()
     replay_started: bool = False
     cancel_requested: Event = field(default_factory=Event)
     borrowed_roots: tuple[BorrowedStateRoot, ...] = ()
@@ -203,12 +206,16 @@ class StateTaskContext(Generic[DataT]):
                 raise RuntimeError("legacy state invocation already owns its publication receipt")
             self.publish_owned_write(token)
 
-    def borrow_published(self, refs: tuple[StateRef, ...]) -> PagePin:
+    def borrow_published(self, refs: Sequence[StateRef]) -> PagePin:
         self.check_page_execution()
-        if not refs or not all(any(ref in receipt.after_refs for receipt in self.page_publications) for ref in refs):
+        refs = StateRefs.of(refs)
+        authorized = np.zeros(len(refs), dtype=np.bool_)
+        for receipt in self.page_publications:
+            authorized |= receipt.after_refs.positions(refs) >= 0
+        if not refs or not authorized.all():
             raise ValueError("published borrow requires this invocation's original receipts")
         for pin, release in self.page_pins.items():
-            if release is None and set(refs) <= set(pin.refs):
+            if release is None and (pin.refs.positions(refs) >= 0).all():
                 return pin
         pin = self.arena.pin_exact(refs, self.pin.stream)
         self.page_pins[pin] = None

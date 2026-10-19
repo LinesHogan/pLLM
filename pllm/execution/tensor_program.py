@@ -19,6 +19,7 @@ from pllm.execution.cuda_stream import CudaStreamReadiness, upload
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot, borrowed_root
 from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin, PagePublication, PageWrite, Slots
 from pllm.execution.ptts.request_state import RequestStateSelection
+from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.state_execution import StateTaskContext
 from pllm.execution.trace import TracePhase
 from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw, paged_adamw
@@ -48,7 +49,7 @@ class TensorBatch:
 
     selection: RequestStateSelection
     roots: Sequence[tuple[torch.Tensor, ...]]
-    after_refs: tuple[StateRef, ...]
+    after_refs: Sequence[StateRef]
     stream: torch.cuda.Stream | None
     feedback: SamplerFeedback | None = None
     epoch: int = 1
@@ -145,15 +146,15 @@ def _read(context: StateTaskContext[D], version: Literal["input", "private", "pu
     access: tuple[PagePin | PageWrite, ...] = (context.pin,) * len(refs)
     if version == "private" and context.write is not None:
         write = context.write
-        positions = {ref: i for i, ref in enumerate(write.before_refs)}
-        refs = tuple(write.after_refs[positions[ref]] if ref in positions else ref for ref in refs)
-        access = tuple(write if ref in positions else context.pin for ref in context.pin.refs)
+        positions = write.before_refs.positions(refs)
+        refs = refs.replace_versions(write.before_refs, write.after_refs)
+        access = tuple(write if index >= 0 else context.pin for index in positions.tolist())
     elif version in ("private", "published") and context.publication is not None:
         receipt = context.publication
         pin = context.borrow_published(receipt.after_refs)
-        versions = dict(zip(receipt.before_refs, receipt.after_refs, strict=True))
-        refs = tuple(versions.get(ref, ref) for ref in refs)
-        access = tuple(pin if ref in versions else context.pin for ref in context.pin.refs)
+        positions = receipt.before_refs.positions(refs)
+        refs = refs.replace_versions(receipt.before_refs, receipt.after_refs)
+        access = tuple(pin if index >= 0 else context.pin for index in positions.tolist())
     roots = context.arena.lazy_roots(access, refs)
     return TensorBatch(
         context.selection,
@@ -270,7 +271,7 @@ class TensorOperation(Generic[D]):
                 raise ValueError("update selection is outside the original state batch")
             if self.mode == "transition" and selected:
                 context.write = context.arena.prepare_transition(
-                    tuple(context.pin.refs[i] for i in selected), stream, copy_fields=self.copy_fields
+                    context.pin.refs.take(selected), stream, copy_fields=self.copy_fields
                 )
                 batch = _read(context, "private")
             if self.step is None:
@@ -295,7 +296,7 @@ class TensorOperation(Generic[D]):
                 ):
                     raise ValueError("gradients require an explicit matching optimizer update")
                 context.write = context.arena.prepare_transition(
-                    tuple(context.pin.refs[i] for i in selected), stream, copy_fields=self.copy_fields
+                    context.pin.refs.take(selected), stream, copy_fields=self.copy_fields
                 )
                 if not (
                     isinstance(self.optimizer, PoolAdamW)
@@ -318,10 +319,10 @@ class TensorOperation(Generic[D]):
             if self.mode != "read":
                 changed = output.changed or (selected if output.gradients else ())
                 transition = context.publication if context.publication is not None else context.write
-                versions = (
-                    {} if transition is None else dict(zip(transition.before_refs, transition.after_refs, strict=True))
-                )
-                context.updated_refs = tuple(versions.get(batch.after_refs[i], batch.after_refs[i]) for i in changed)
+                refs = StateRefs.of(batch.after_refs)
+                if transition is not None:
+                    refs = refs.replace_versions(transition.before_refs, transition.after_refs)
+                context.updated_refs = refs.take(changed) if changed else ()
             if output.guidance is not None:
                 context.guidance = output.guidance
                 context.guidance_ready = CudaStreamReadiness(stream) if stream is not None else None
