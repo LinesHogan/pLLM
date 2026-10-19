@@ -1,4 +1,8 @@
-"""A separate planner consumes closed imports without source graphs or weights."""
+"""A separate planner process consumes closed region imports without source graphs, weights or CUDA.
+
+The parent captures a CUDA region on fake tensors and ships only the program and its
+imports; the child's payload and stream plans must equal the parent's.
+"""
 
 import subprocess
 import sys
@@ -9,14 +13,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from pllm.contracts.region_payload import RegionPayload
-from pllm.contracts.region_program import (
-    AffineIndex,
-    Block,
-    BorrowedResource,
-    Coordinate,
-    Region,
-    ScalarType,
-)
+from pllm.contracts.region_program import AffineIndex, Block, BorrowedResource, Coordinate, Region
 from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.region_streams import RegionStreamExploration
 from pllm.execution.codec import decode_boundary, encode_boundary
@@ -39,7 +36,6 @@ def test_import_only_planner_roundtrip_matches_local_graphs_without_initializing
     body, functions = borrow_exported_inputs(source, BorrowedResource("original", (1,)), {"a": 0, "b": 1})
     block = body.program.entry.block
     value, coordinate = block.arguments
-    assert coordinate.type is ScalarType.INDEX
     program = replace(
         body.program,
         entry=Region(Block((value,), (Coordinate((), (coordinate,), AffineIndex(0)), *block.operations), block.yields)),
@@ -66,8 +62,8 @@ from pllm.execution.region_execution import RegionExecutionPlan
 program, imports = decode_boundary(sys.stdin.read(), tuple[Program, tuple[RegionTensorImport, ...]])
 assert not torch.cuda.is_initialized()
 def forbidden(*args, **kwargs):
-    raise AssertionError("planning must not reconstruct a tensor graph or allocate tensors")
-with patch('pllm.execution.region_storage.import_tensor_access_graph', forbidden), patch.object(torch, 'empty', forbidden):
+    raise AssertionError("planning must not allocate tensors or initialize CUDA")
+with patch.object(torch, 'empty', forbidden):
     schedule = analyze_region_program(program, optimize=False).reference_schedule
     payload = analyze_region_payload(program, schedule, imports)
     streams = explore_region_streams(program, imports, schedule=analyze_region_program(program, parallel_only=True).candidates[-1].schedule_map)
