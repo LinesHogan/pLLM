@@ -62,7 +62,7 @@ from pllm.backends.vllm.sampler import (
     SignedSamplerGuidance,
     Vllm027Sampler,
 )
-from pllm.config import ExecutionOptions, ModelConfig, RunnerKind, VllmDType
+from pllm.config import ModelConfig, RunnerKind, VllmDType
 from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
@@ -73,6 +73,7 @@ from pllm.contracts.backend_attachment import (
     DecodeWindow,
     SignedBackendAttachment,
 )
+from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.feedback import (
     BarrierState,
     Completion,
@@ -243,6 +244,24 @@ ReadonlyStepReceiver = Callable[
 ]
 
 
+def _post_sample_overlaps(plan: PlanBundle, sampler_anchor: AnchorId) -> bool:
+    """Whether post-sampler work can run on a side stream while readers see lagged versions.
+
+    Only a read-only, gradient-free prefix before the sampler can read a lagged version while
+    the post-sampler writer extends the latest one. Model mutations and borrowed activations
+    have their own strict admission and replay lifecycle and never qualify.
+    """
+    tasks = plan.schedule_physical.tasks
+    before = tuple(plan.semantic_graph.tasks[task.task_id] for task in tasks if task.anchor_id <= sampler_anchor)
+    return (
+        any(task.anchor_id > sampler_anchor for task in tasks)
+        and all(effect.kind is StateEffectKind.READ for task in before for effect in task.effects)
+        and all(
+            task.math is None or not (task.math.input_gradients or task.math.parameter_gradients) for task in before
+        )
+    )
+
+
 class VllmSession(Generic[DataT, ResultT]):
     """Model primitives over one original signed tensor-state invocation."""
 
@@ -341,37 +360,16 @@ class VllmSession(Generic[DataT, ResultT]):
         self._auxiliary: AuxiliaryInput[torch.Tensor] | None = None
         self._tuning: TokenwiseTuning[TensorStepInput, DataT, ResultT] | None = None
         execution = deployment.execution
-        # Model mutations/borrowed activations have their own strict admission and replay
-        # lifecycle. Only a read-only prefix can switch from lagged reads to latest writes.
-        scheduled = plan.schedule_physical.tasks
-        sampler_anchor = execution.sampler_anchor_id
-        overlap = (
-            publish_lag > 0
-            and not overlay_bindings
-            and not attachment.inputs.request.activation_bindings
-            and not tasks
-            and any(task.anchor_id > sampler_anchor for task in scheduled)
-            and all(
-                effect.kind is StateEffectKind.READ
-                for task in scheduled
-                if task.anchor_id <= sampler_anchor
-                for effect in plan.semantic_graph.tasks[task.task_id].effects
-            )
-            and all(
-                math is None or not (math.input_gradients or math.parameter_gradients)
-                for task in scheduled
-                if task.anchor_id <= sampler_anchor
-                for math in (plan.semantic_graph.tasks[task.task_id].math,)
-            )
-        )
+        in_model = bool(overlay_bindings or attachment.inputs.request.activation_bindings or tasks)
         self._post_sample = (
             PostSampleOverlap(
                 execution.arena,
                 publish_lag,
                 execution.device,
-                readers=self._capture_feedback or any(task.anchor_id <= sampler_anchor for task in scheduled),
+                readers=self._capture_feedback
+                or any(task.anchor_id <= execution.sampler_anchor_id for task in plan.schedule_physical.tasks),
             )
-            if overlap
+            if publish_lag > 0 and not in_model and _post_sample_overlaps(plan, execution.sampler_anchor_id)
             else None
         )
         if execution.directory.scope is StateScope.INSTANCE:
@@ -1106,18 +1104,12 @@ class BackendProbe:
     requirements: BackendRequirements
     publish_lag: int = 1
 
-    def __post_init__(self) -> None:
-        ExecutionOptions(publish_lag=self.publish_lag)
-
 
 @dataclass(frozen=True, slots=True)
 class BackendInstall:
     attachment: SignedBackendAttachment
     definition: str
     publish_lag: int = 1
-
-    def __post_init__(self) -> None:
-        ExecutionOptions(publish_lag=self.publish_lag)
 
 
 @dataclass(frozen=True, slots=True)
