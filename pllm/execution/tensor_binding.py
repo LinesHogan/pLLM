@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from math import isfinite, prod
@@ -288,6 +289,16 @@ class _LeafRoots(Sequence[tuple[torch.Tensor, ...]]):
         if isinstance(index, slice):
             return tuple(self[i] for i in range(*index.indices(len(self))))
         return (self._leaf[index], *self._roots[index][1:])
+
+
+def state_means(losses: torch.Tensor, states: Sequence[int], count: int) -> torch.Tensor:
+    """Mean per-row loss of each of `count` states (0 for a state without rows).
+
+    Row-to-state membership is known on the host, so this needs no device-to-host read.
+    """
+    sizes = Counter(states)
+    totals = losses.new_zeros(count).index_add(0, upload(states, losses.device), losses)
+    return totals / upload([max(sizes[state], 1) for state in range(count)], losses.device, losses.dtype)
 
 
 def state_leaf(data: "TensorFrame", batch: TensorBatch) -> torch.Tensor:
@@ -1200,7 +1211,11 @@ class TensorBinding(Builder[TensorFrame]):
                         "parameter gradient rows require Parameter(..., per_row=True) for shared parameters"
                     )
 
-                def values(data: TensorFrame, batch: TensorBatch) -> tuple[dict[str, torch.Tensor], tuple[int, ...]]:
+                def values(
+                    data: TensorFrame, batch: TensorBatch, *, compact: bool = True
+                ) -> tuple[dict[str, torch.Tensor], tuple[int, ...]]:
+                    # compact=False evaluates every row and lets the caller mask the result, which
+                    # avoids reading the row selector back to the host.
                     if policy.parameter_gradients:
                         leaf = state_leaf(data, batch)
                         batch = replace(batch, roots=_LeafRoots(leaf, batch.roots))
@@ -1209,15 +1224,14 @@ class TensorBinding(Builder[TensorFrame]):
                         mask = inputs[key]
                         if mask.dtype != torch.bool or mask.shape != (len(data.rows),):
                             raise ValueError("row domain must be a boolean mask over the original operation rows")
+                    compacted = bool(policy.forward_rows) and compact
                     rows = (
                         tuple(int(index.item()) for index in inputs[policy.forward_rows].nonzero().flatten().cpu())
-                        if policy.forward_rows
+                        if compacted
                         else tuple(range(len(data.rows)))
                     )
                     selected = (
-                        replace(data, rows=tuple(data.rows[index] for index in rows), index=None)
-                        if policy.forward_rows
-                        else data
+                        replace(data, rows=tuple(data.rows[index] for index in rows), index=None) if compacted else data
                     )
                     for key, port in ports.items():
                         source = sources[key]
@@ -1235,7 +1249,7 @@ class TensorBinding(Builder[TensorFrame]):
                                 raise ValueError("input gradients require floating tensors")
                             value = value.detach().requires_grad_(True)
                             data.derivative_sources[str(symbol), key] = value
-                        if policy.forward_rows and port.rowwise and key not in domains and not state_rows:
+                        if compacted and port.rowwise and key not in domains and not state_rows:
                             mask = inputs[policy.forward_rows]
                             if value.ndim == 0 or value.shape[0] != len(data.rows) or value.device != mask.device:
                                 raise ValueError("forward rows require aligned logical row tensors on the same device")
@@ -1246,7 +1260,7 @@ class TensorBinding(Builder[TensorFrame]):
                             else policy.input_gradient_rows
                         )
                         if differentiable and domain:
-                            mask = select_rows(inputs[domain], rows) if policy.forward_rows else inputs[domain]
+                            mask = select_rows(inputs[domain], rows) if compacted else inputs[domain]
                             if (
                                 not port.rowwise
                                 or value.ndim == 0
@@ -1260,8 +1274,11 @@ class TensorBinding(Builder[TensorFrame]):
                     return inputs, rows
 
                 def evaluate(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
-                    with torch.set_grad_enabled(bool(policy.input_gradients or policy.parameter_gradients)):
-                        inputs, rows = values(data, batch)
+                    differentiable = bool(policy.input_gradients or policy.parameter_gradients)
+                    with torch.set_grad_enabled(differentiable):
+                        # Pure predictions run on every row and mask the result; differentiable
+                        # forwards still compact so gradients see only the selected rows.
+                        inputs, rows = values(data, batch, compact=differentiable)
                         result = function(inputs)
                         # Borrowed inputs cannot escape as result aliases; test_video exercises rejection.
                         for borrowed in batch.borrowed_roots:
@@ -1269,7 +1286,12 @@ class TensorBinding(Builder[TensorFrame]):
                         if policy.forward_rows:
                             if result.ndim == 0 or result.shape[0] != len(rows):
                                 raise ValueError("selected forward functions must preserve their logical row axis")
-                            if len(rows) != len(data.rows):
+                            if not differentiable:
+                                mask = inputs[policy.forward_rows].reshape(-1, *(1,) * (result.ndim - 1))
+                                result = torch.where(
+                                    mask, result, torch.zeros((), dtype=result.dtype, device=result.device)
+                                )
+                            elif len(rows) != len(data.rows):
                                 result = result.new_zeros((len(data.rows), *result.shape[1:])).index_copy_(
                                     0, inputs[policy.forward_rows].nonzero().flatten(), result
                                 )
@@ -1302,10 +1324,12 @@ class TensorBinding(Builder[TensorFrame]):
                                 loss = function(inputs)
                                 objective = loss
                                 if policy.reduction == "state_mean":
-                                    if loss.shape != (len(batch.roots),):
+                                    if loss.shape != (len(rows),):
                                         raise ValueError(
-                                            "state_mean requires one mean loss per original selected state"
+                                            "state_mean training returns one loss per row; pllm averages them per state"
                                         )
+                                    states = [indices[data.rows[row].identity] for row in rows]
+                                    loss = state_means(loss, states, len(batch.roots))
                                     objective = loss.sum()
                                 elif loss.ndim != 0:
                                     raise ValueError(
@@ -1544,17 +1568,16 @@ class TensorBinding(Builder[TensorFrame]):
                 result = batch.results[prediction.symbol, prediction.outputs[0]]
                 if result.shape != (len(data.rows), width):
                     raise ValueError("sampler output differs from its signed row and feature dimensions")
-                indices = {row.packed_row_index for row in data.rows}
-                links = tuple(link for link in data.step.sampler_rows.links if link.packed_row_index in indices)
+                local = {row.packed_row_index: index for index, row in enumerate(data.rows)}
+                links = tuple(link for link in data.step.sampler_rows.links if link.packed_row_index in local)
+                weights = None
                 if stage is SamplerStage.PACKED_POST_FILTER_EXACT:
-                    local = {row.packed_row_index: index for index, row in enumerate(data.rows)}
-                    selected = (
-                        set(range(len(data.rows)))
-                        if mask is None
-                        else {int(index.item()) for index in mask.read(data, batch).nonzero().flatten().cpu()}
-                    )
-                    links = tuple(link for link in links if local[link.packed_row_index] in selected)
-                    result = select_rows(result, tuple(local[link.packed_row_index] for link in links))
+                    positions = tuple(local[link.packed_row_index] for link in links)
+                    result = take_rows(result, positions)
+                    # Unselected rows keep weight 0, so the sampler leaves their logits unchanged;
+                    # selecting rows on the host would need a device-to-host read.
+                    if mask is not None:
+                        weights = take_rows(mask.read(data, batch), positions).to(result.dtype)
                 observations = (
                     tuple(
                         Observation(
@@ -1578,6 +1601,7 @@ class TensorBinding(Builder[TensorFrame]):
                         tuple(link.sampler_row_index for link in links),
                         beta,
                         stage=stage,
+                        row_weights=weights,
                     ),
                     observations=observations,
                 )

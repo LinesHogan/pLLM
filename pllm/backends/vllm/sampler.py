@@ -88,16 +88,14 @@ class SamplerGuidance:
         if not guidance.guidance.affected_row_ids or guidance.guidance.beta == 0.0:
             return processed_logits
         dense = guidance.guidance.affected_row_ids == tuple(range(processed_logits.shape[0]))
-        rows = torch.tensor(
-            () if dense else guidance.guidance.affected_row_ids, device=processed_logits.device, dtype=torch.long
-        )
+        rows = upload(() if dense else guidance.guidance.affected_row_ids, processed_logits.device)
         survivors = processed_logits if dense else processed_logits.index_select(0, rows)
         prediction = guidance.pred_dense_logits.to(processed_logits)
-        reweighted = torch.where(
-            torch.isfinite(survivors),
-            (1.0 + guidance.guidance.beta) * survivors - guidance.guidance.beta * prediction,
-            survivors,
+        weights = guidance.guidance.row_weights
+        beta = (
+            guidance.guidance.beta if weights is None else guidance.guidance.beta * weights.to(survivors).unsqueeze(1)
         )
+        reweighted = torch.where(torch.isfinite(survivors), (1.0 + beta) * survivors - beta * prediction, survivors)
         if dense:
             return reweighted
         output = processed_logits.clone()

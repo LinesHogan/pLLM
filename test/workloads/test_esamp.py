@@ -43,6 +43,14 @@ from pllm.workloads.esamp_request import (
 from test.backend_facts import assert_capture_preflight, backend_facts
 
 
+def effective(guidance):
+    """Rows the guidance actually changes (nonzero weight) and their predictions."""
+    if guidance.row_weights is None:
+        return guidance.affected_row_ids, guidance.values
+    keep = [index for index, weight in enumerate(guidance.row_weights.tolist()) if weight]
+    return tuple(guidance.affected_row_ids[index] for index in keep), guidance.values[keep]
+
+
 def _reference(source: torch.Tensor, parameters: torch.Tensor) -> torch.Tensor:
     up, gate, down, bias, scale, shift = parameters.split((8, 8, 8, 2, 4, 4))
     residual = (
@@ -245,11 +253,12 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(
         expected_prediction = torch.cat(
             tuple(_reference(source[i : i + 1], parameters[owner]).detach() for i, owner in enumerate(owners))
         )
+        rows, values = effective(guidance)
         if step_id == 0:
-            assert guidance.affected_row_ids == ()
+            assert rows == ()
         else:
-            assert guidance.affected_row_ids == (0,)
-            torch.testing.assert_close(guidance.values, expected_prediction)
+            assert rows == (0,)
+            torch.testing.assert_close(values, expected_prediction)
         # No update or version change is allowed before sampler completion.
         for ref, root in zip(latest, before, strict=True):
             for actual, expected in zip(execution.snapshot(ref), root, strict=True):
@@ -364,12 +373,9 @@ def _ordinary_request_distillation() -> None:
             target: Annotated[torch.Tensor, pllm.Hidden(-1)],
             weight: Annotated[torch.Tensor, pllm.Parameter("heads", "weight")],
             carry: Annotated[torch.Tensor, pllm.Parameter("heads", "carry")],
-            groups: Annotated[torch.Tensor, pllm.StateIndex("heads")],
         ) -> torch.Tensor:
             prediction = torch.bmm(source.unsqueeze(1), weight).squeeze(1) + carry
-            losses = (prediction - target).square().mean(1)
-            counts = torch.bincount(groups).to(losses)
-            return losses.new_zeros(counts.shape).index_add(0, groups, losses) / counts
+            return (prediction - target).square().mean(1)
 
     bindings = tuple(
         PackedHiddenResourceBinding(
@@ -438,9 +444,10 @@ def _ordinary_request_distillation() -> None:
                 else source.new_empty((0, 4))
             )
             result = execution.step(value, stream)
-            assert result.guidance.affected_row_ids == tuple(link.sampler_row_index for link in active_links)
+            rows, values = effective(result.guidance)
+            assert rows == tuple(link.sampler_row_index for link in active_links)
             assert result.guidance.beta == 0.2
-            torch.testing.assert_close(result.guidance.values, expected)
+            torch.testing.assert_close(values, expected)
             for before, after, loss in zip(
                 result.publication.before_refs, result.publication.after_refs, result.loss, strict=True
             ):

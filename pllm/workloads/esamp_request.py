@@ -192,11 +192,8 @@ class ESampRequestWorkload(pllm.Workload):
         bias: Annotated[torch.Tensor, pllm.Parameter("request_distiller", "bias")],
         scale: Annotated[torch.Tensor, pllm.Parameter("request_distiller", "scale")],
         shift: Annotated[torch.Tensor, pllm.Parameter("request_distiller", "shift")],
-        groups: Annotated[torch.Tensor, pllm.StateIndex("request_distiller")],
     ) -> torch.Tensor:
-        losses = (self.forward(source, up, gate, down, bias, scale, shift) - target).square().mean(1)
-        counts = torch.bincount(groups).to(losses)
-        return losses.new_zeros(counts.shape).index_add(0, groups, losses) / counts
+        return (self.forward(source, up, gate, down, bias, scale, shift) - target).square().mean(1)
 
     @property
     def optimizer(self) -> a.AdamW:

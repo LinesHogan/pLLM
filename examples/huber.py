@@ -55,10 +55,5 @@ class HuberWorkload(pllm.Workload):
         target: Annotated[torch.Tensor, pllm.Hidden(-1)],
         a: Annotated[torch.Tensor, pllm.Parameter("adapter", "a")],
         b: Annotated[torch.Tensor, pllm.Parameter("adapter", "b")],
-        groups: Annotated[torch.Tensor, pllm.StateIndex("adapter")],
     ) -> torch.Tensor:
-        losses = torch.nn.functional.huber_loss(self.forward(source, a, b), target, delta=0.25, reduction="none").mean(
-            1
-        )
-        counts = torch.bincount(groups).to(losses)
-        return losses.new_zeros(counts.shape).index_add(0, groups, losses) / counts
+        return torch.nn.functional.huber_loss(self.forward(source, a, b), target, delta=0.25, reduction="none").mean(1)

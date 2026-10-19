@@ -50,16 +50,19 @@ def main() -> None:
     def inspect_reweight(logits, guidance):
         nonlocal sampler_checks, affected_checks
         expected = logits.clone()
+        weights = guidance.guidance.row_weights
+        weights = [1.0] * len(guidance.guidance.affected_row_ids) if weights is None else weights.tolist()
         for index, row in enumerate(guidance.guidance.affected_row_ids):
             finite = torch.isfinite(logits[row])
-            expected[row, finite] = (1 + guidance.guidance.beta) * logits[row, finite] - (
-                guidance.guidance.beta * guidance.pred_dense_logits[index, finite].to(logits)
+            beta = guidance.guidance.beta * weights[index]
+            expected[row, finite] = (1 + beta) * logits[row, finite] - (
+                beta * guidance.pred_dense_logits[index, finite].to(logits)
             )
         actual = native_reweight(logits, guidance)
         assert torch.equal(torch.isfinite(actual), torch.isfinite(logits))
         torch.testing.assert_close(actual, expected)
         sampler_checks += 1
-        affected_checks += len(guidance.guidance.affected_row_ids)
+        affected_checks += sum(1 for weight in weights if weight)
         return actual
 
     try:

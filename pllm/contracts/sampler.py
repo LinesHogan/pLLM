@@ -42,6 +42,8 @@ class PackedSamplerGuidanceBatch:
     affected_row_ids: tuple[int, ...]
     beta: float = 0.0
     stage: SamplerStage = SamplerStage.PACKED_POST_FILTER_EXACT
+    # Optional per-row multiplier of beta on the device; rows with weight 0 are left unchanged.
+    row_weights: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         if self.beta < 0.0 or self.values.ndim != 2 or int(self.values.shape[0]) != len(self.affected_row_ids):

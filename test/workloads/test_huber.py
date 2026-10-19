@@ -18,6 +18,14 @@ from test import reference_huber as oracle
 from test.backend_facts import backend_facts
 
 
+def effective(guidance):
+    """Rows the guidance actually changes (nonzero weight) and their predictions."""
+    if guidance.row_weights is None:
+        return guidance.affected_row_ids, guidance.values
+    keep = [index for index, weight in enumerate(guidance.row_weights.tolist()) if weight]
+    return tuple(guidance.affected_row_ids[index] for index in keep), guidance.values[keep]
+
+
 def test_huber() -> None:
     for device_name in ("cpu", "cuda:0") if torch.cuda.is_available() else ("cpu",):
         for hidden, rank in ((4, 2), (8, 3)):
@@ -116,9 +124,10 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
         for anchor in range(execution.sampler_anchor_id + 1):
             execution.execute_anchor(handle, AnchorId(anchor))
         guidance = execution.sampler_guidance(handle, stream)
-        assert guidance.affected_row_ids == tuple(link.sampler_row_index for link in active)
+        rows, values = effective(guidance)
+        assert rows == tuple(link.sampler_row_index for link in active)
         assert guidance.beta == 0.2
-        torch.testing.assert_close(guidance.values, predicted)
+        torch.testing.assert_close(values, predicted)
         for ref, snapshot in zip(latest, before, strict=True):
             for actual, expected in zip(execution.snapshot(ref, stream), snapshot, strict=True):
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
