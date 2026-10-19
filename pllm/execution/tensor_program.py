@@ -17,7 +17,7 @@ from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.cuda_stream import CudaStreamReadiness, upload
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot, borrowed_root
-from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin, PagePublication, PageWrite
+from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin, PagePublication, PageWrite, Slots
 from pllm.execution.ptts.page_capture import KernelCapture
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.state_execution import StateTaskContext
@@ -44,6 +44,10 @@ def _no_slots(field: int) -> tuple[torch.Tensor, tuple[int, ...]]:
     raise RuntimeError("this mathematical batch has no issued page access")
 
 
+def _no_matrix() -> tuple[str, Slots]:
+    raise RuntimeError("this mathematical batch has no issued page access")
+
+
 @dataclass(frozen=True, slots=True)
 class TensorBatch:
     """Borrowed mathematical operands, never a storage or publication capability."""
@@ -59,6 +63,7 @@ class TensorBatch:
     paged: Callable[[tuple[int, ...], tuple[int, ...]], tuple[PagedRows, ...]] = _no_pages
     # Field pool and the slot of every selected state's page, in selection order.
     field_slots: Callable[[int], tuple[torch.Tensor, tuple[int, ...]]] = _no_slots
+    slot_matrix: Callable[[], tuple[str, Slots]] = _no_matrix
     results: dict[tuple[TaskSymbol, str], torch.Tensor] = field(
         default_factory=lambda: dict[tuple[TaskSymbol, str], torch.Tensor]()
     )
@@ -192,6 +197,7 @@ def _read(context: StateTaskContext[D], version: Literal["input", "private", "pu
             access, refs, tuple(LayoutFieldId(field) for field in fields), rows
         ),
         field_slots=roots.field_slots,
+        slot_matrix=roots.slot_matrix,
     )
 
 

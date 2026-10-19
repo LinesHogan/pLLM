@@ -159,14 +159,12 @@ class StepCapture:
         sources[:] = -1
         destinations[:] = -1
         write = context.write
-        written = (
-            None if write is None else context.arena.lazy_roots((write,) * len(write.after_refs), write.after_refs)
-        )
-        for field in range(layout.fields):
-            slots = batch.field_slots(field)[1]
-            sources[field, : len(slots)] = slots
-            if written is not None:
-                destinations[field, list(self.updated)] = written.field_slots(field)[1]
+        if batch.roots:
+            _, slots = batch.slot_matrix()
+            sources[:, : len(slots)] = slots.T
+        if write is not None:
+            _, slots = context.arena.slots((write,) * len(write.after_refs), write.after_refs)
+            destinations[:, list(self.updated)] = slots.T
         for row, value in zip(feedback, self.feedback_values, strict=True):
             row[:] = (value.data_ptr(), value.stride(0), value.stride(1) if value.ndim > 1 else 1)
         return host

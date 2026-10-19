@@ -1,8 +1,7 @@
-"""One version, generation and completion owner for signed tensor PageBundles."""
+"""Array-backed page ownership and GPU completion for PTTS execution, capture, and remote reads."""
 
 from __future__ import annotations
 
-from collections import Counter
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
@@ -126,51 +125,123 @@ class BorrowedPage:
         self._connection.send_bytes(encode_boundary(self.descriptor).encode())
 
 
+class _Table:
+    """Latest versions and lineage ownership for one resource; rows survive retirement until the last hold."""
+
+    def __init__(self, resource: str, pools: _Pools) -> None:
+        self.resource, self.pools = resource, pools
+        capacity, width = pools.holders.shape[1], len(pools.tensors)
+        self.row_of: dict[LineageId, int] = {}
+        self.lineages = np.zeros(capacity, dtype=np.int64)
+        self.slots = np.zeros((capacity, width), dtype=np.int64)
+        self.generations = np.zeros_like(self.slots)
+        self.versions = np.zeros(capacity, dtype=np.int64)
+        self.readiness: npt.NDArray[np.object_] = np.full(capacity, None, dtype=object)
+        self.status = np.zeros(capacity, dtype=np.int8)  # 0 free, 1 pending, 2 live, 3 retired
+        # Row holds recycle metadata; only the pool's holders decide page lifetime.
+        self.owners = np.zeros(capacity, dtype=np.int64)
+        self.writing = np.zeros(capacity, dtype=np.bool_)
+
+    def reserve(self, refs: tuple[StateRef, ...]) -> Slots:
+        rows = np.flatnonzero(self.status == 0)[: len(refs)]
+        assert len(rows) == len(refs)
+        self.lineages[rows] = [ref.lineage_id for ref in refs]
+        self.status[rows] = 1
+        self.row_of.update((ref.lineage_id, int(row)) for ref, row in zip(refs, rows))
+        return rows
+
+    def ref(self, row: int) -> StateRef:
+        return StateRef(
+            self.pools.selected.layout_id, LineageId(int(self.lineages[row])), VersionId(int(self.versions[row]))
+        )
+
+    def reclaim(self) -> None:
+        rows = np.flatnonzero((self.owners == 0) & (self.status != 0))
+        for lineage in self.lineages[rows].tolist():
+            del self.row_of[lineage]
+        self.status[rows] = 0
+        self.readiness[rows] = None
+
+
 @dataclass(slots=True)
-class _Root:
-    bundle: PageBundle
-    pins: int = 0
+class _Pages:
+    """An exact batch of pages, owned by a pin, writer, or completion receipt."""
+
+    table: _Table
+    refs: tuple[StateRef, ...]
+    rows: Slots
+    slots: Slots
+    generations: Slots
+    readiness: tuple[torch.cuda.Event | None, ...] = ()
+    written: npt.NDArray[np.bool_] | None = None
+    _positions: dict[StateRef, int] | None = None
+
+    def position(self, ref: StateRef) -> int | None:
+        if self._positions is None:
+            self._positions = {ref: index for index, ref in enumerate(self.refs)}
+        return self._positions.get(ref)
+
+    def bundle(self, index: int) -> PageBundle:
+        return PageBundle(
+            self.refs[index],
+            self.table.resource,
+            self.slots[index],
+            self.generations[index],
+            self.readiness[index] if self.readiness else None,
+        )
+
+    def hold(self) -> None:
+        self.table.pools.hold(self.slots)
+        np.add.at(self.table.owners, self.rows, 1)
+
+    def release(self) -> None:
+        self.table.pools.release(self.slots)
+        np.subtract.at(self.table.owners, self.rows, 1)
+        self.table.reclaim()
 
 
 @dataclass(frozen=True, slots=True)
 class _Write:
-    targets: tuple[PageBundle, ...]
-    fields: tuple[tuple[LayoutFieldId, ...], ...]
-    # after_ref -> (private root, writable field ids), built once per write.
-    by_ref: dict[StateRef, tuple[PageBundle, frozenset[int]]]
+    targets: tuple[_Pages, ...]
+    sources: tuple[_Pages, ...]
+
+
+@dataclass(slots=True)
+class _Publication:
+    write: _Write
+    settled: bool = False
 
 
 @dataclass(slots=True)
 class _Pin:
-    """An issued pin: the exact roots it holds, and remote reads that must finish before release."""
-
-    roots: dict[StateRef, PageBundle]
+    pages: tuple[_Pages, ...]
     remote: list[RemoteCompletion] = dataclass_field(default_factory=lambda: list[RemoteCompletion]())
 
 
 class LazyRoots(Sequence[tuple[torch.Tensor, ...]]):
-    """Field views of each selected state, built on first read.
+    """Batch slot access with tensor views and individual bundles materialized only on demand."""
 
-    Access was validated when the sequence was created; each view still checks that its
-    page has not been reclaimed, so a stale read fails instead of seeing reused memory.
-    """
-
-    __slots__ = ("_arena", "_roots", "_views", "_slots")
-
-    def __init__(self, arena: "PageBundleArena", roots: tuple[tuple[PageBundle, frozenset[int] | None], ...]) -> None:
-        self._arena = arena
-        self._roots = roots
-        self._views: list[tuple[torch.Tensor, ...] | None] = [None] * len(roots)
-        self._slots: dict[int, tuple[torch.Tensor, tuple[int, ...]]] = {}
+    def __init__(
+        self, arena: PageBundleArena, access: tuple[PagePin | PageWrite, ...], refs: tuple[StateRef, ...]
+    ) -> None:
+        self._arena, self._access, self._refs = arena, access, refs
+        self._views: dict[int, tuple[torch.Tensor, ...]] = {}
+        self._matrix: tuple[str, Slots] | None = None
 
     def __len__(self) -> int:
-        return len(self._roots)
+        return len(self._refs)
+
+    def slot_matrix(self) -> tuple[str, Slots]:
+        """One matrix for all fields, in selection order."""
+        if self._matrix is None:
+            self._matrix = self._arena.slots(self._access, self._refs)
+        return self._matrix
 
     def field_slots(self, field: int) -> tuple[torch.Tensor, tuple[int, ...]]:
-        """The field's page pool and each state's slot in it, from the access validated at creation."""
-        if field not in self._slots:
-            self._slots[field] = self._arena._slots_of(self._roots, LayoutFieldId(field))  # pyright: ignore[reportPrivateUsage]
-        return self._slots[field]
+        """The field pool and selected slots, without walking the refs again."""
+        resource, slots = self.slot_matrix()
+        pool = self._arena._pools[resource].tensors[field]  # pyright: ignore[reportPrivateUsage]
+        return pool.detach(), tuple(slots[:, field].tolist())
 
     @overload
     def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]: ...
@@ -181,10 +252,9 @@ class LazyRoots(Sequence[tuple[torch.Tensor, ...]]):
     def __getitem__(self, index: int | slice) -> tuple[torch.Tensor, ...] | tuple[tuple[torch.Tensor, ...], ...]:
         if isinstance(index, slice):
             return tuple(self[i] for i in range(*index.indices(len(self))))
-        views = self._views[index]
-        if views is None:
-            views = self._views[index] = self._arena._root_views(*self._roots[index])  # pyright: ignore[reportPrivateUsage]
-        return views
+        if index not in self._views:
+            self._views[index] = self._arena.borrow_roots((self._access[index],), (self._refs[index],))[0]
+        return self._views[index]
 
 
 class _Pools:
@@ -241,16 +311,16 @@ class _Pools:
             raise RuntimeError("PageBundle allocation generation was reclaimed")
         return tuple(tensor[slot] for tensor, slot in zip(self.tensors, slots.tolist()))
 
-    def release(self, slots: Slots, generations: Slots) -> None:
-        """Drop one hold on each page of `slots` `[versions, fields]` (or one version `[fields]`)."""
-        slots, generations = np.atleast_2d(slots), np.atleast_2d(generations)
-        fields: Slots = np.broadcast_to(np.arange(slots.shape[1], dtype=np.int64), slots.shape)
-        if (self.generations[fields, slots] != generations).any() or (self.holders[fields, slots] < 1).any():
-            raise RuntimeError("PageBundle allocation generation was reclaimed")
+    def hold(self, slots: Slots) -> None:
+        """Add a batch of exact-version holders, including repeated shared pages."""
+        np.add.at(self.holders, (np.arange(slots.shape[1], dtype=np.int64), slots), 1)
+
+    def release(self, slots: Slots) -> None:
+        """Drop a batch of holders; only the last holder advances the allocation generation."""
+        fields = np.arange(slots.shape[1], dtype=np.int64)
         np.subtract.at(self.holders, (fields, slots), 1)
-        touched = np.zeros_like(self.holders, dtype=np.bool_)
-        touched[fields, slots] = True
-        self.generations[touched & (self.holders == 0)] += 1
+        # Repeated shared slots must advance their generation just once.
+        self.generations[fields, slots] += self.holders[fields, slots] == 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,17 +383,11 @@ class PageBundleArena:
             # Partial materialization owns no remote pool; test_video tests the partition.
             if selected.resource in self._owned_resources:
                 self._pools[selected.resource] = _Pools(layouts[selected.resource], selected, self.device)
-        self._roots: dict[StateRef, _Root] = {}
-        self._lineages: dict[LineageId, StateRef | None] = {}
+        self._tables = {resource: _Table(resource, pools) for resource, pools in self._pools.items()}
         self._writes: dict[PageWrite, _Write] = {}
-        # Bookkeeping that keeps per-step work proportional to what changed:
-        self._stale: set[StateRef] = set()  # roots that are no longer latest; reclamation candidates
-        self._retiring: set[LineageId] = set()  # retired lineages that still own roots
-        self._root_count: Counter[LineageId] = Counter()  # roots per lineage
-        self._writing: set[LineageId] = set()  # lineages with a pending private write
         self._pins: dict[PagePin, _Pin] = {}
-        self._publications: dict[PagePublication, bool] = {}
-        self._releases: set[PageRelease] = set()
+        self._publications: dict[PagePublication, _Publication] = {}
+        self._releases: dict[PageRelease, _Pin] = {}
         self._issued_releases: WeakSet[PageRelease] = WeakSet()
         self._next_lineage = 1
         self._next_operation = 1
@@ -345,7 +409,7 @@ class PageBundleArena:
     def active_lineages(self) -> int:
         with self._lock:
             self.collect_completed()
-            return len(self._lineages)
+            return sum(int(np.count_nonzero(table.status >= 2)) for table in self._tables.values())
 
     @property
     def free_pages(self) -> int:
@@ -378,10 +442,22 @@ class PageBundleArena:
         version logically. These are ownership states, not GPU activity states.
         """
         with self._lock:
-            latest = set(self._lineages.values())
-            live = tuple(root.bundle for ref, root in self._roots.items() if ref in latest)
-            retiring = tuple(root.bundle for ref, root in self._roots.items() if ref not in latest)
-            private = tuple(root for write in self._writes.values() for root in write.targets)
+            live = tuple(
+                self._table_bundle(table, int(row))
+                for table in self._tables.values()
+                for row in np.flatnonzero(table.status == 2)
+            )
+            held: dict[StateRef, PageBundle] = {}
+            for group in self._held_pages():
+                held.update((ref, group.bundle(i)) for i, ref in enumerate(group.refs))
+            latest = {root.ref for root in live}
+            retiring = tuple(root for ref, root in held.items() if ref not in latest)
+            private = tuple(
+                group.bundle(i)
+                for write in self._writes.values()
+                for group in write.targets
+                for i in range(len(group.refs))
+            )
 
             def pages(roots: tuple[PageBundle, ...]) -> set[tuple[str, LayoutFieldId, int]]:
                 return {
@@ -419,26 +495,81 @@ class PageBundleArena:
                 len(retiring_pages),
                 len(private),
                 len(retiring),
-                sum(root.pins > 0 for root in self._roots.values()),
+                len(held),
                 len(self._publications) + len(self._releases),
                 self._admission_capacity_failures,
             )
 
+    def _held_pages(self) -> Sequence[_Pages]:
+        return (
+            tuple(group for pin in (*self._pins.values(), *self._releases.values()) for group in pin.pages)
+            + tuple(
+                group
+                for publication in self._publications.values()
+                for group in (*publication.write.sources, *publication.write.targets)
+            )
+            + tuple(group for write in self._writes.values() for group in write.sources)
+        )
+
+    @staticmethod
+    def _table_bundle(table: _Table, row: int) -> PageBundle:
+        return PageBundle(
+            table.ref(row), table.resource, table.slots[row].copy(), table.generations[row].copy(), table.readiness[row]
+        )
+
     def latest(self, lineage: LineageId) -> StateRef:
         with self._lock:
             self._require_live()
-            latest = self._lineages.get(lineage)
-            if latest is None:
-                raise RuntimeError("PageBundle lineage is unadmitted or retiring")
-            return latest
+            for table in self._tables.values():
+                row = table.row_of.get(lineage)
+                if row is not None and table.status[row] == 2:
+                    return table.ref(row)
+            raise RuntimeError("PageBundle lineage is unadmitted or retiring")
 
     def root(self, ref: StateRef) -> PageBundle:
         with self._lock:
             self._require_live()
-            try:
-                return self._roots[ref].bundle
-            except KeyError as exc:
-                raise RuntimeError("PageBundle root is unknown or reclaimed") from exc
+            for table in self._tables.values():
+                row = table.row_of.get(ref.lineage_id)
+                if row is not None and table.status[row] == 2 and table.versions[row] == ref.version_id:
+                    return self._table_bundle(table, row)
+            for group in self._held_pages():
+                index = group.position(ref)
+                if index is not None:
+                    return group.bundle(index)
+            raise RuntimeError("PageBundle root is unknown or reclaimed")
+
+    def _select(self, refs: tuple[StateRef, ...], *, latest: bool = True) -> tuple[_Pages, ...]:
+        groups: list[_Pages] = []
+        for table in self._tables.values():
+            selected = refs if len(self._tables) == 1 else tuple(ref for ref in refs if ref.lineage_id in table.row_of)
+            if not selected:
+                continue
+            rows = np.fromiter((table.row_of[ref.lineage_id] for ref in selected), dtype=np.int64, count=len(selected))
+            versions = np.fromiter((ref.version_id for ref in selected), dtype=np.int64, count=len(selected))
+            if (table.status[rows] != 2).any():
+                raise RuntimeError("PageBundle lineage is retiring; no new pins or writes may start")
+            if (table.versions[rows] == versions).all():
+                groups.append(
+                    _Pages(
+                        table, selected, rows, table.slots[rows], table.generations[rows], tuple(table.readiness[rows])
+                    )
+                )
+            elif latest:
+                raise RuntimeError("PageBundle transition source is not latest")
+            else:
+                roots = tuple(self.root(ref) for ref in selected)
+                groups.append(
+                    _Pages(
+                        table,
+                        selected,
+                        rows,
+                        np.stack([root.slots for root in roots]),
+                        np.stack([root.generations for root in roots]),
+                        tuple(root.readiness for root in roots),
+                    )
+                )
+        return tuple(groups)
 
     def prepare_admission(self, resources: tuple[str, ...], stream: torch.cuda.Stream | None = None) -> PageWrite:
         with self._lock:
@@ -446,26 +577,74 @@ class PageBundleArena:
             self.collect_completed()
             if not resources or any(resource not in self._pools for resource in resources):
                 raise ValueError("PageBundle admission requires signed resources")
-            for resource, pools in self._pools.items():
-                live = sum(ref is not None and self.root(ref).resource == resource for ref in self._lineages.values())
-                pending = sum(
-                    root.resource == resource
-                    for token, write in self._writes.items()
-                    if not token.before_refs
-                    for root in write.targets
-                )
-                if live + pending + resources.count(resource) > pools.selected.max_admitted_lineages:
+            for resource, table in self._tables.items():
+                if (
+                    np.count_nonzero((table.status == 1) | (table.status == 2)) + resources.count(resource)
+                    > table.pools.selected.max_admitted_lineages
+                ):
                     self._admission_capacity_failures += 1
                     raise RuntimeError("PageBundle admission capacity is exhausted")
             refs = tuple(
-                StateRef(self._pools[resource].selected.layout_id, LineageId(self._next_lineage + index), VersionId(0))
-                for index, resource in enumerate(resources)
+                StateRef(self._pools[resource].selected.layout_id, LineageId(self._next_lineage + i), VersionId(0))
+                for i, resource in enumerate(resources)
             )
+            self._check_capacity(resources)
             self._next_lineage += len(refs)
-            fields = tuple(
-                tuple(field.field_id for field in self._pools[resource].layout.fields) for resource in resources
-            )
-            return self._prepare((), refs, resources, fields, stream)
+            targets: list[_Pages] = []
+            for resource in dict.fromkeys(resources):
+                table = self._tables[resource]
+                selected = tuple(ref for ref, name in zip(refs, resources) if name == resource)
+                rows = table.reserve(selected)
+                slots = np.empty((len(rows), len(table.pools.tensors)), dtype=np.int64)
+                generations = np.empty_like(slots)
+                for field in range(slots.shape[1]):
+                    slots[:, field], generations[:, field] = table.pools.allocate(field, len(rows))
+                table.owners[rows] += 1
+                targets.append(
+                    _Pages(table, selected, rows, slots, generations, written=np.ones(slots.shape, dtype=np.bool_))
+                )
+            return self._prepare((), refs, _Write(tuple(targets), ()), stream, None)
+
+    def _check_capacity(
+        self,
+        resources: tuple[str, ...],
+        sources: tuple[_Pages, ...] = (),
+        masks: tuple[npt.NDArray[np.bool_], ...] = (),
+    ) -> None:
+        demand: dict[str, Slots] = {}
+        if sources:
+            demand = {group.table.resource: mask.sum(axis=0) for group, mask in zip(sources, masks)}
+        else:
+            mutable = {
+                effect.resource
+                for task in self.plan.semantic_graph.tasks
+                for effect in task.effects
+                if effect.kind not in (StateEffectKind.READ, StateEffectKind.PUBLISH)
+            }
+            for resource in set(resources):
+                table = self._tables[resource]
+                count = resources.count(resource)
+                headroom = (
+                    count + np.count_nonzero((table.status == 1) | ((table.status == 2) & ~table.writing))
+                    if resource in mutable
+                    else 0
+                )
+                demand[resource] = np.full(len(table.pools.tensors), count + headroom, dtype=np.int64)
+        exhausted = {
+            resource
+            for resource, counts in demand.items()
+            if any(self._pools[resource].free_count(field) < count for field, count in enumerate(counts))
+        }
+        if exhausted:
+            self.collect_completed(wait=True, resources=exhausted)
+        if any(
+            self._pools[resource].free_count(field) < count
+            for resource, counts in demand.items()
+            for field, count in enumerate(counts)
+        ):
+            if not sources:
+                self._admission_capacity_failures += 1
+            raise RuntimeError("PageBundle capacity is exhausted by live owners")
 
     def prepare_transition(
         self,
@@ -475,176 +654,87 @@ class PageBundleArena:
         fields: tuple[tuple[LayoutFieldId, ...], ...] | None = None,
         copy_fields: tuple[LayoutFieldId, ...] | None = None,
     ) -> PageWrite:
-        """Copy chosen fields by default; an explicit subset requires overwriting the rest."""
+        """Allocate private writable fields; unchanged fields share the exact source pages."""
         with self._lock:
             self._require_stream(stream)
-            self.collect_completed()
-            if not sources or len({ref.lineage_id for ref in sources}) != len(sources):
-                raise ValueError("PageBundle transition requires distinct lineages")
-            resources = tuple(self.root(ref).resource for ref in sources)
-            for ref in sources:
-                if self.latest(ref.lineage_id) != ref:
-                    raise RuntimeError("PageBundle transition source is not latest")
-                if ref.lineage_id in self._writing:
-                    raise RuntimeError("PageBundle lineage already has a pending write")
-            fields = (
-                fields
-                if fields is not None
-                else tuple(
-                    tuple(field.field_id for field in self._pools[resource].layout.fields) for resource in resources
-                )
-            )
-            if len(fields) != len(sources) or any(
-                not chosen
-                or chosen != tuple(sorted(set(chosen)))
-                or any(field < 0 or field >= len(self._pools[resource].layout.fields) for field in chosen)
-                for chosen, resource in zip(fields, resources, strict=True)
-            ):
-                raise ValueError("PageBundle writable fields differ from the signed layout")
-            if copy_fields is not None and (
-                copy_fields != tuple(sorted(set(copy_fields)))
-                or any(not set(copy_fields) <= set(chosen) for chosen in fields)
-            ):
-                raise ValueError("PageBundle copied fields must be an ordered subset of each private field selection")
+            groups = self._select(sources)
+            if any(group.table.writing[group.rows].any() for group in groups):
+                raise RuntimeError("PageBundle lineage already has a pending write")
+            masks = self._write_masks(groups, sources, fields)
+            self._check_capacity((), groups, masks)
             targets = tuple(StateRef(ref.layout_id, ref.lineage_id, VersionId(ref.version_id + 1)) for ref in sources)
-            return self._prepare(sources, targets, resources, fields, stream, copy_fields=copy_fields)
+            allocated: list[_Pages] = []
+            for group, mask in zip(groups, masks):
+                table = group.table
+                slots, generations = group.slots.copy(), group.generations.copy()
+                for field in range(slots.shape[1]):
+                    rows = mask[:, field]
+                    slots[rows, field], generations[rows, field] = table.pools.allocate(field, int(rows.sum()))
+                    table.pools.share(field, slots[~rows, field])
+                refs = targets if len(groups) == 1 else tuple(targets[sources.index(ref)] for ref in group.refs)
+                allocated.append(_Pages(table, refs, group.rows, slots, generations, written=mask))
+                table.owners[group.rows] += 1
+                group.hold()
+                table.writing[group.rows] = True
+            return self._prepare(sources, targets, _Write(tuple(allocated), groups), stream, copy_fields)
+
+    @staticmethod
+    def _write_masks(
+        groups: tuple[_Pages, ...], refs: tuple[StateRef, ...], fields: tuple[tuple[LayoutFieldId, ...], ...] | None
+    ) -> tuple[npt.NDArray[np.bool_], ...]:
+        masks: list[npt.NDArray[np.bool_]] = []
+        for group in groups:
+            mask = np.ones(group.slots.shape, dtype=np.bool_)
+            if fields is not None:
+                chosen = fields if len(groups) == 1 else tuple(fields[refs.index(ref)] for ref in group.refs)
+                mask[:] = False
+                if all(value == chosen[0] for value in chosen):
+                    mask[:, chosen[0]] = True
+                else:
+                    for row, value in enumerate(chosen):
+                        mask[row, value] = True
+            masks.append(mask)
+        return tuple(masks)
 
     def _prepare(
         self,
         sources: tuple[StateRef, ...],
         targets: tuple[StateRef, ...],
-        resources: tuple[str, ...],
-        fields: tuple[tuple[LayoutFieldId, ...], ...],
+        write: _Write,
         stream: torch.cuda.Stream | None,
-        *,
-        copy_fields: tuple[LayoutFieldId, ...] | None = None,
+        copy_fields: tuple[LayoutFieldId, ...] | None,
     ) -> PageWrite:
-        demand: dict[tuple[str, LayoutFieldId], int] = {}
-        for resource, chosen in zip(resources, fields, strict=True):
-            for field in chosen:
-                key = (resource, field)
-                demand[key] = demand.get(key, 0) + 1
-        if not sources:
-            mutable = {
-                effect.resource
-                for task in self.plan.semantic_graph.tasks
-                for effect in task.effects
-                if effect.kind not in (StateEffectKind.READ, StateEffectKind.PUBLISH)
-            }
-            for resource in set(resources) & mutable:
-                # Borrow original owners, including prepared admissions and existing private writers.
-                headroom = resources.count(resource) + sum(
-                    ref is not None and self.root(ref).resource == resource for ref in self._lineages.values()
-                )
-                for token, write in self._writes.items():
-                    headroom += sum(root.resource == resource for root in write.targets) * (
-                        -1 if token.before_refs else 1
-                    )
-                for field in self._pools[resource].layout.fields:
-                    demand[resource, field.field_id] += headroom
-        exhausted = {
-            resource for (resource, field), count in demand.items() if self._pools[resource].free_count(field) < count
-        }
-        if exhausted:
-            # Only completed owners can return pages; active pins are never evicted.
-            self.collect_completed(wait=True, resources=exhausted)
-        if any(self._pools[resource].free_count(field) < count for (resource, field), count in demand.items()):
-            if not sources:
-                self._admission_capacity_failures += 1
-            raise RuntimeError("PageBundle capacity is exhausted by live owners")
-        allocated = self._allocate_versions(sources, targets, resources, fields)
         token = PageWrite(self._next_operation, sources, targets, stream)
         self._next_operation += 1
-        self._writes[token] = _Write(
-            tuple(allocated),
-            fields,
-            {
-                root.ref: (root, frozenset(int(field) for field in chosen))
-                for root, chosen in zip(allocated, fields, strict=True)
-            },
-        )
-        self._writing.update(ref.lineage_id for ref in sources)
-        for ref in sources:
-            self._roots[ref].pins += 1
+        self._writes[token] = write
         try:
             with self._scope(stream), torch.no_grad():
-                for event in {id(root.readiness): root.readiness for root in map(self.root, sources)}.values():
+                for event in dict.fromkeys(event for group in write.sources for event in group.readiness):
                     self._order(event, stream)
-                self._fill_versions(sources, allocated, fields, copy_fields)
+                self._fill_versions(write, copy_fields)
         except Exception:
             self.abort(token)
             raise
         return token
 
-    def _allocate_versions(
-        self,
-        sources: tuple[StateRef, ...],
-        targets: tuple[StateRef, ...],
-        resources: tuple[str, ...],
-        fields: tuple[tuple[LayoutFieldId, ...], ...],
-    ) -> list[PageBundle]:
-        """Pages for new versions: fresh pages for written fields, shared pages for the rest.
-
-        An admission (no sources) writes every field. Capacity was checked by the caller.
-        """
-        allocated: list[PageBundle | None] = [None] * len(targets)
-        for resource in dict.fromkeys(resources):
-            pools = self._pools[resource]
-            group = [index for index, name in enumerate(resources) if name == resource]
-            width = len(pools.tensors)
-            written = np.ones((len(group), width), dtype=np.bool_)
-            slots = np.zeros((len(group), width), dtype=np.int64)
-            generations = np.zeros_like(slots)
-            if sources:
-                origins = [self.root(sources[index]) for index in group]
-                slots[:] = [root.slots for root in origins]
-                generations[:] = [root.generations for root in origins]
-                written[:] = False
-                for row, index in enumerate(group):
-                    written[row, list(fields[index])] = True
-            for field in range(width):
-                rows = written[:, field]
-                if rows.any():
-                    slots[rows, field], generations[rows, field] = pools.allocate(field, int(rows.sum()))
-                if not rows.all():
-                    pools.share(field, slots[~rows, field])
-            for row, index in enumerate(group):
-                allocated[index] = PageBundle(targets[index], resource, slots[row], generations[row], None)
-        return [root for root in allocated if root is not None]
-
-    def _fill_versions(
-        self,
-        sources: tuple[StateRef, ...],
-        targets: list[PageBundle],
-        fields: tuple[tuple[LayoutFieldId, ...], ...],
-        copy_fields: tuple[LayoutFieldId, ...] | None,
-    ) -> None:
-        """Zero an admission's pages, or copy a transition's written fields from the source version.
-
-        One batched copy per (resource, field), however many states the write covers.
-        """
-        if sources and copy_fields == ():
+    def _fill_versions(self, write: _Write, copy_fields: tuple[LayoutFieldId, ...] | None) -> None:
+        if write.sources and copy_fields == ():
             return
-        for resource in dict.fromkeys(root.resource for root in targets):
-            pools = self._pools[resource]
-            group = [index for index, root in enumerate(targets) if root.resource == resource]
-            width = len(pools.tensors)
-            destination: Slots = np.stack([targets[index].slots for index in group])
-            origin: Slots = np.stack([self.root(sources[index]).slots for index in group]) if sources else destination
-            written: npt.NDArray[np.bool_] = np.zeros((len(group), width), dtype=np.bool_)
-            for row, index in enumerate(group):
-                written[row, list(fields[index])] = True
-            if sources and copy_fields is not None:
-                written[:, [field for field in range(width) if field not in copy_fields]] = False
-            for field, pool in enumerate(pools.tensors):
-                rows = written[:, field]
+        for index, target in enumerate(write.targets):
+            assert target.written is not None
+            for field, pool in enumerate(target.table.pools.tensors):
+                if write.sources and copy_fields is not None and field not in copy_fields:
+                    continue
+                rows = target.written[:, field]
                 if not rows.any():
                     continue
-                if not sources:
-                    pool.index_fill_(0, upload(destination[rows, field].tolist(), self.device), 0)
-                    continue
-                pairs = upload([origin[rows, field].tolist(), destination[rows, field].tolist()], self.device)
-                pool.index_copy_(0, pairs[1], pool.index_select(0, pairs[0]))
+                destination = target.slots[rows, field].tolist()
+                if not write.sources:
+                    pool.index_fill_(0, upload(destination, self.device), 0)
+                else:
+                    origin = write.sources[index].slots[rows, field].tolist()
+                    pairs = upload([origin, destination], self.device)
+                    pool.index_copy_(0, pairs[1], pool.index_select(0, pairs[0]))
 
     def write_field(self, token: PageWrite, root_index: int, field: LayoutFieldId) -> torch.Tensor:
         with self._lock:
@@ -659,30 +749,30 @@ class PageBundleArena:
     def publish(self, token: PageWrite) -> PagePublication:
         with self._lock:
             write = self._issued_write(token)
-            for source in token.before_refs:
-                if self.latest(source.lineage_id) != source:
-                    raise RuntimeError("PageBundle publication source is no longer latest")
             completion = self._record(token.stream)
             receipt = PagePublication(token.operation_id, token.before_refs, token.after_refs, completion)
             for target in write.targets:
-                ref = target.ref
-                self._roots[ref] = _Root(
-                    PageBundle(ref, target.resource, target.slots, target.generations, completion), pins=1
-                )
-                self._lineages[ref.lineage_id] = ref
-                self._root_count[ref.lineage_id] += 1
-            self._stale.update(token.before_refs)
-            self._writing.difference_update(ref.lineage_id for ref in token.before_refs)
+                table, rows = target.table, target.rows
+                target.hold()  # The table and the publication each own the new pages.
+                table.slots[rows], table.generations[rows] = target.slots, target.generations
+                table.versions[rows] = table.versions[rows] + 1 if token.before_refs else 0
+                table.readiness[rows] = completion
+                table.status[rows] = 2
+                table.writing[rows] = False
+                target.readiness = (completion,) * len(rows)
+            for source in write.sources:
+                # The writer's source hold now protects the old table pages until completion.
+                source.release()
             self._writes.pop(token)
-            self._publications[receipt] = False
+            self._publications[receipt] = _Publication(write)
             return receipt
 
     def settle(self, receipt: PagePublication) -> None:
         with self._lock:
-            self.collect_completed()
-            if self._publications.get(receipt) is not False:
+            publication = self._publications.get(receipt)
+            if publication is None or publication.settled:
                 raise RuntimeError("PageBundle publication is not an issued receipt or is already settled")
-            self._publications[receipt] = True
+            publication.settled = True
 
     def abort(self, token: PageWrite) -> None:
         with self._lock:
@@ -694,29 +784,22 @@ class PageBundleArena:
             except Exception:
                 self._poisoned = True
                 raise
-            for root in write.targets:
-                self._pools[root.resource].release(root.slots, root.generations)
-            for ref in token.before_refs:
-                self._roots[ref].pins -= 1
-            self._writing.difference_update(ref.lineage_id for ref in token.before_refs)
+            for group in (*write.targets, *write.sources):
+                group.table.writing[group.rows] = False
+                group.release()
             self._writes.pop(token)
-            self._reclaim()
 
     def pin_exact(self, refs: tuple[StateRef, ...], stream: torch.cuda.Stream | None = None) -> PagePin:
         with self._lock:
             self._require_stream(stream)
-            if (not refs and self._pools) or len(refs) != len(set(refs)):
-                raise ValueError("PageBundle pin requires distinct exact roots")
-            roots = tuple(self.root(ref) for ref in refs)
-            for root in roots:
-                if self._lineages[root.ref.lineage_id] is None:
-                    raise RuntimeError("PageBundle lineage is retiring; no new pins may start")
-                self._order(root.readiness, stream)
+            groups = self._select(refs, latest=False)
+            for event in dict.fromkeys(event for group in groups for event in group.readiness):
+                self._order(event, stream)
+            for group in groups:
+                group.hold()
             token = PagePin(self._next_pin, refs, stream)
             self._next_pin += 1
-            for ref in refs:
-                self._roots[ref].pins += 1
-            self._pins[token] = _Pin(dict(zip(refs, roots, strict=True)))
+            self._pins[token] = _Pin(groups)
             return token
 
     def borrow_field(self, pin: PagePin, ref: StateRef, field: LayoutFieldId) -> torch.Tensor:
@@ -729,34 +812,50 @@ class PageBundleArena:
             (root,) = self._capture_roots(pin, (ref,), (field,))
             return self._pools[root.resource].tensor(field, root.pages[field]).detach()
 
+    def _access_pages(self, access: PagePin | PageWrite) -> tuple[_Pages, ...]:
+        return self._issued_pin(access).pages if isinstance(access, PagePin) else self._issued_write(access).targets
+
     def _held_roots(
         self, access: tuple[PagePin | PageWrite, ...], refs: tuple[StateRef, ...]
     ) -> tuple[tuple[PageBundle, frozenset[int] | None], ...]:
-        """Each ref's root under the pin or write that grants it, with the write's writable fields.
-
-        Every distinct token is validated once, so a batch over many states costs O(states).
-        Pinned roots carry None: all their fields are readable.
-        """
         result: list[tuple[PageBundle, frozenset[int] | None]] = []
         for token, ref in zip(access, refs, strict=True):
-            match token:
-                case PagePin():
-                    root = self._issued_pin(token).roots.get(ref)
-                    if root is None:
-                        raise RuntimeError("PageBundle root is not held by this pin")
-                    result.append((root, None))
-                case PageWrite():
-                    entry = self._issued_write(token).by_ref.get(ref)
-                    if entry is None:
-                        raise RuntimeError("PageBundle root is not written by this transaction")
-                    result.append(entry)
+            for group in self._access_pages(token):
+                index = group.position(ref)
+                if index is not None:
+                    writable = (
+                        None if group.written is None else frozenset(np.flatnonzero(group.written[index]).tolist())
+                    )
+                    result.append((group.bundle(index), writable))
+                    break
+            else:
+                raise RuntimeError("PageBundle root is not held or written by this transaction")
         return tuple(result)
 
-    def lazy_roots(self, access: tuple[PagePin | PageWrite, ...], refs: tuple[StateRef, ...]) -> "LazyRoots":
-        """Like borrow_roots, but builds each state's field views only when it is read."""
+    def slots(self, access: tuple[PagePin | PageWrite, ...], refs: tuple[StateRef, ...]) -> tuple[str, Slots]:
+        """Resolve all field slots once for a homogeneous resource selection."""
         with self._lock:
-            self._require_live()
-            return LazyRoots(self, self._held_roots(access, refs))
+            tokens = tuple(dict.fromkeys(access))
+            if len(tokens) == 1:
+                groups = self._access_pages(tokens[0])
+                for group in groups:
+                    if refs is group.refs or refs == group.refs:
+                        return group.table.resource, group.slots
+                positions = {ref: (group, i) for group in groups for i, ref in enumerate(group.refs)}
+                selected = [positions[ref] for ref in refs]
+            else:
+                positions = {
+                    token: {ref: (group, i) for group in self._access_pages(token) for i, ref in enumerate(group.refs)}
+                    for token in tokens
+                }
+                selected = [positions[token][ref] for token, ref in zip(access, refs)]
+            resource = selected[0][0].table.resource
+            assert all(group.table.resource == resource for group, _ in selected)
+            return resource, np.stack([group.slots[i] for group, i in selected])
+
+    def lazy_roots(self, access: tuple[PagePin | PageWrite, ...], refs: tuple[StateRef, ...]) -> LazyRoots:
+        """Defer individual tensor views; batch slots stay in their exact pin/write matrix."""
+        return LazyRoots(self, access, refs)
 
     def _root_views(self, root: PageBundle, writable: frozenset[int] | None) -> tuple[torch.Tensor, ...]:
         with self._lock:
@@ -779,26 +878,9 @@ class PageBundleArena:
     def field_slots(
         self, access: tuple[PagePin | PageWrite, ...], refs: tuple[StateRef, ...], field: LayoutFieldId
     ) -> tuple[torch.Tensor, tuple[int, ...]]:
-        """A field's whole page pool `[capacity, *shape]` and the slot of each ref's page in it.
-
-        Each ref is checked against the pin or write that grants access to it, so indexing the
-        pool at the returned slots reads exactly those versions.
-        """
-        with self._lock:
-            self._require_live()
-            return self._slots_of(self._held_roots(access, refs), field)
-
-    def _slots_of(
-        self, roots: tuple[tuple[PageBundle, frozenset[int] | None], ...], field: LayoutFieldId
-    ) -> tuple[torch.Tensor, tuple[int, ...]]:
-        with self._lock:
-            self._require_live()
-            if any(writable is not None and int(field) not in writable for _, writable in roots):
-                raise RuntimeError("PageBundle field is not writable in this transaction")
-            if len({root.resource for root, _ in roots}) != 1:
-                raise ValueError("field slots require one resource layout")
-            pool = self._pools[roots[0][0].resource].tensors[field].detach()
-            return pool, tuple(int(root.slots[field]) for root, _ in roots)
+        """The field pool and each selected exact-version slot."""
+        resource, slots = self.slots(access, refs)
+        return self._pools[resource].tensors[field].detach(), tuple(slots[:, field].tolist())
 
     def paged_rows(
         self,
@@ -1004,23 +1086,10 @@ class PageBundleArena:
     ) -> tuple[PageBundle, ...]:
         if not refs or len(set(refs)) != len(refs):
             raise ValueError("captured selection requires distinct nonempty original refs")
-        match access:
-            case PagePin():
-                held = self._issued_pin(access).roots
-                if any(ref not in held for ref in refs):
-                    raise RuntimeError("PageBundle root is not held by this pin")
-                roots = tuple(held[ref] for ref in refs)
-            case PageWrite():
-                write = self._issued_write(access)
-                positions = {ref: index for index, ref in enumerate(access.after_refs)}
-                if any(ref not in positions for ref in refs):
-                    raise RuntimeError("PageBundle root is not written by this transaction")
-                indices = tuple(positions[ref] for ref in refs)
-                for index in indices:
-                    for field in fields:
-                        if field not in write.fields[index]:
-                            raise RuntimeError("PageBundle field is not writable in this transaction")
-                roots = tuple(write.targets[index] for index in indices)
+        held = self._held_roots((access,) * len(refs), refs)
+        if any(writable is not None and not set(fields) <= writable for _, writable in held):
+            raise RuntimeError("PageBundle field is not writable in this transaction")
+        roots = tuple(root for root, _ in held)
         if len({root.resource for root in roots}) != 1:
             raise ValueError("captured selection must use one original resource layout")
         if any(not 0 <= field < len(roots[0].slots) for field in fields):
@@ -1186,7 +1255,7 @@ class PageBundleArena:
         """Export over a dedicated channel; the original pin owns remote completion."""
         with self._lock:
             value = self.borrow_field(pin, ref, field)
-            root = self.root(ref)
+            (root,) = self._capture_roots(pin, (ref,), (field,))
             descriptor, completion = self._export(root, field, value, pin.pin_id, connection, pin.stream)
             self._issued_pin(pin).remote.append(completion)
             # Retain completion before sending: even a partial send may expose the mapping.
@@ -1287,10 +1356,7 @@ class PageBundleArena:
 
     def snapshot(self, pin: PagePin, ref: StateRef) -> tuple[torch.Tensor, ...]:
         with self._lock:
-            self._issued_pin(pin)
-            if ref not in pin.refs:
-                raise RuntimeError("PageBundle root is not held by this pin")
-            root = self.root(ref)
+            ((root, _),) = self._held_roots((pin,), (ref,))
             pools = self._pools[root.resource]
             with self._scope(pin.stream):
                 return tuple(pools.tensor(field, page).detach().clone() for field, page in enumerate(root.pages))
@@ -1302,7 +1368,7 @@ class PageBundleArena:
             self._next_release += 1
             self._pins.pop(pin)
             self._issued_releases.add(receipt)
-            self._releases.add(receipt)
+            self._releases[receipt] = held
             return receipt
 
     def wait_release(self, receipt: PageRelease) -> None:
@@ -1323,79 +1389,53 @@ class PageBundleArena:
     def retire(self, refs: tuple[StateRef, ...]) -> None:
         with self._lock:
             self._require_live()
-            if not refs or len(set(refs)) != len(refs):
-                raise ValueError("PageBundle retirement requires distinct latest roots")
-            for ref in refs:
-                if self.latest(ref.lineage_id) != ref or ref.lineage_id in self._writing:
-                    raise RuntimeError("PageBundle retirement overlaps a write or stale version")
-            for ref in refs:
-                self._lineages[ref.lineage_id] = None
-                self._retiring.add(ref.lineage_id)
-            self._stale.update(refs)
+            groups = self._select(refs)
+            if any(group.table.writing[group.rows].any() for group in groups):
+                raise RuntimeError("PageBundle retirement overlaps a write or stale version")
+            for group in groups:
+                group.table.status[group.rows] = 3
+                group.release()
             self.collect_completed()
 
     def collect_completed(self, *, wait: bool = False, resources: set[str] | None = None) -> None:
         with self._lock:
             self._require_live()
-            if wait:
-                for receipt, settled in self._publications.items():
-                    if (
-                        settled
-                        and receipt.completion is not None
-                        and (
-                            resources is None
-                            or any(
-                                self.root(ref).resource in resources
-                                for ref in (*receipt.before_refs, *receipt.after_refs)
-                            )
-                        )
-                    ):
+            completed: list[_Pages] = []
+            publications: list[PagePublication] = []
+            releases: list[PageRelease] = []
+            for receipt, publication in self._publications.items():
+                if not publication.settled:
+                    continue
+                groups = (*publication.write.sources, *publication.write.targets)
+                relevant = resources is None or any(group.table.resource in resources for group in groups)
+                if wait and relevant and receipt.completion is not None:
+                    receipt.completion.synchronize()
+                if receipt.completion is None or receipt.completion.query():
+                    completed.extend(groups)
+                    publications.append(receipt)
+            for receipt, pin in self._releases.items():
+                relevant = resources is None or any(group.table.resource in resources for group in pin.pages)
+                if wait and relevant and (resources is None or all(read.query() for read in receipt.remote_reads)):
+                    if receipt.completion is not None:
                         receipt.completion.synchronize()
-                for release in self._releases:
-                    if resources is not None and (
-                        not any(self.root(ref).resource in resources for ref in release.pin.refs)
-                        or any(not read.query() for read in release.remote_reads)
-                    ):
-                        continue
-                    if release.completion is not None:
-                        release.completion.synchronize()
-                    for read in release.remote_reads:
+                    for read in receipt.remote_reads:
                         read.synchronize()
-            for receipt, settled in tuple(self._publications.items()):
-                if settled and (receipt.completion is None or receipt.completion.query()):
-                    for ref in (*receipt.before_refs, *receipt.after_refs):
-                        self._roots[ref].pins -= 1
-                    self._publications.pop(receipt)
-            for receipt in tuple(self._releases):
                 if (receipt.completion is None or receipt.completion.query()) and all(
                     read.query() for read in receipt.remote_reads
                 ):
-                    for ref in receipt.pin.refs:
-                        self._roots[ref].pins -= 1
-                    self._releases.remove(receipt)
-            self._reclaim()
-
-    def _reclaim(self) -> None:
-        """Release stale roots that no pin holds and whose last GPU writer has finished."""
-        released: dict[str, list[PageBundle]] = {}
-        for ref in tuple(self._stale):
-            stored = self._roots[ref]
-            bundle = stored.bundle
-            if stored.pins or (bundle.readiness is not None and not bundle.readiness.query()):
-                continue
-            released.setdefault(bundle.resource, []).append(bundle)
-            del self._roots[ref]
-            self._stale.discard(ref)
-            self._root_count[ref.lineage_id] -= 1
-            if not self._root_count[ref.lineage_id]:
-                del self._root_count[ref.lineage_id]
-                if ref.lineage_id in self._retiring:
-                    self._retiring.discard(ref.lineage_id)
-                    del self._lineages[ref.lineage_id]
-        for resource, bundles in released.items():
-            self._pools[resource].release(
-                np.stack([bundle.slots for bundle in bundles]), np.stack([bundle.generations for bundle in bundles])
-            )
+                    completed.extend(pin.pages)
+                    releases.append(receipt)
+            # A failed remote proof must leave every owner recorded for the next collection.
+            for table in self._tables.values():
+                groups = [group for group in completed if group.table is table]
+                if groups:
+                    table.pools.release(np.concatenate([group.slots for group in groups]))
+                    np.subtract.at(table.owners, np.concatenate([group.rows for group in groups]), 1)
+                    table.reclaim()
+            for receipt in publications:
+                del self._publications[receipt]
+            for receipt in releases:
+                del self._releases[receipt]
 
     def _issued_write(self, token: PageWrite) -> _Write:
         self._require_live()
