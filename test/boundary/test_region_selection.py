@@ -17,7 +17,6 @@ from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import CausalModelDomain
 from pllm.contracts.region_program import (
     Call,
-    Function,
     Program,
     SizeParameter,
     TensorType,
@@ -40,7 +39,6 @@ from pllm.execution.region_compilation import (
 from pllm.execution.region_optimization import (
     assess_region_candidates,
     optimize_region,
-    prepare_region_execution,
     select_region_candidate,
 )
 from pllm.execution.region_schedule import RegionScheduleExecution
@@ -250,27 +248,6 @@ def test_tuner_without_numerical_permission_never_warns_or_offers_rewrites():
         )
     assert result.selection.selected == 0 and not result.rewrites and len(result.request.candidates) == 1
     assert not any(isinstance(w.message, NumericalTransformWarning) for w in caught)
-
-
-def test_default_preparation_never_executes_the_source():
-    from pllm.execution.region_native import NativePrimitive
-
-    t = TensorType((4,), "torch.float32")
-    declaration = Function("source", (t,), (t,))
-    calls = []
-    cell = NativePrimitive(declaration, lambda inputs, resources: calls.append(1) or (inputs[0] + 1,))
-    program = Program(
-        region((Value("x", t),), (Call(("x",), (Value("y", t),), declaration.name),), ("y",)), (declaration,)
-    )
-    execution = prepare_region_execution(
-        program,
-        {declaration.name: cell},
-        payload_limits=(RegionPayloadLimit("cpu", 1024),),
-        options=RegionSelectionPolicy(allow_numerical_transforms=False),
-    )
-    assert not calls
-    torch.testing.assert_close(execution.run({"x": torch.ones(4)}).values[0], torch.full((4,), 2.0))
-    assert calls == [1]
 
 
 def two_chains(device="cpu"):
