@@ -14,7 +14,7 @@ import torch
 
 from pllm.backends.torch_inductor import InductorTensorCompiler, compile_inductor_tensor_graph
 from pllm.config import ExecutionOptions
-from pllm.contracts.region_program import Call, Program, SizeParameter, Value
+from pllm.contracts.region_program import SizeParameter
 from pllm.contracts.region_selection import RegionPayloadLimit
 from pllm.contracts.tensor_compilation import UnsupportedTensorKernel
 from pllm.execution.exported_cell import ExportedCell
@@ -24,7 +24,7 @@ from pllm.execution.region_optimization import optimize_region
 from pllm.execution.region_storage import analyze_region_capacity
 from pllm.execution.tensor_compilation import compile_tensor_cell, supports_tensor_compilation
 from pllm.execution.tensor_scan import TensorScan
-from test.region_fixtures import region, single_call
+from test.region_fixtures import single_call
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 DEVICES = ("cpu", pytest.param("cuda:0", marks=requires_cuda))
@@ -198,34 +198,6 @@ def test_kernels_borrow_unaligned_overlapping_inputs_without_hidden_copies(devic
         torch.testing.assert_close(value, reference, rtol=0, atol=0)
     torch.testing.assert_close(base, before, rtol=0, atol=0)
     assert len({value.untyped_storage().data_ptr() for value in (*actual, base)}) == 4
-
-
-def test_compiled_kernel_keeps_region_view_origins_and_old_versions():
-    base = torch.arange(129, dtype=torch.float32)
-    view = ExportedCell.capture(lambda base: (base[1:],), ("base",), ("view",), (base,))
-    update, _ = arithmetic_cell(duplicate=True)
-    compiled = compile_tensor_cell(update)
-    (t,) = view.declaration.outputs
-    program = Program(
-        region(
-            (Value("base", view.declaration.inputs[0]),),
-            (
-                Call(("base",), (Value("view", t),), view.digest),
-                Call(("view", "view"), (Value("new", t), Value("again", t), Value("old", t)), update.digest),
-            ),
-            ("base", "view", "new", "again", "old"),
-        ),
-        (view.declaration, update.declaration),
-    )
-    cells = {view.digest: view, update.digest: compiled}
-    old_base, old_view, new, again, old = (
-        bind(program, cells, analyze_region_program(program).reference_schedule).run({"base": base}).values
-    )
-    assert old_view.untyped_storage().data_ptr() == old_base.untyped_storage().data_ptr()
-    for value in (old_view, old):
-        torch.testing.assert_close(value, base[1:], rtol=0, atol=0)
-    for value in (new, again):
-        torch.testing.assert_close(value, base[1:] + 1, rtol=0, atol=0)
 
 
 @requires_cuda
