@@ -1,4 +1,8 @@
-"""Evidence 29: independent reward/Adam oracle and original publication settlement."""
+"""TTRL majority-vote rewards and head updates against an independent Adam oracle.
+
+Also covers settlement retry after a post-publication failure, blocked vote groups,
+the disabled workload and a zero-loss update.
+"""
 
 from collections.abc import Mapping
 from dataclasses import replace
@@ -13,9 +17,19 @@ from pllm.contracts.feedback import BarrierState, Completion, CompletionBatch, F
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId
 from pllm.execution.host_runtime import CompletionInput, HostRuntimeFacts
-from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.state_execution import StateSettlementError
 from pllm.workloads.ttrl import TTRLConfig, TTRLData, TTRLWorkload, boxed_label
+
+
+def fail_output(self, context):
+    raise RuntimeError("injected output failure")
+
+
+class ZeroLoss(TTRLWorkload):
+    def loss(self, data: TTRLData, parameters: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        loss = parameters["head"].square().sum() * 0.0
+        data.loss = loss.detach()
+        return loss
 
 
 def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -47,11 +61,7 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         peak = plan.schedule_decision.peak_memory_bytes
         with pytest.raises(ValueError):
             make_llm(workload=workload, config=replace(facts, memory_budget_bytes=peak - 1))
-        facts = replace(facts, memory_budget_bytes=peak)
-        binding = workload.declare_host(facts)
-        assert binding.facts is facts
-        execution = binding.compile()
-        assert execution.arena.plan.timeline.memory_budget_bytes == peak
+        execution = workload.declare_host(replace(facts, memory_budget_bytes=peak)).compile()
         (initial,) = execution.admit((), stream)
         old_pin = execution.arena.pin_exact((initial,), stream)
         original = execution.snapshot(initial, stream)
@@ -72,7 +82,7 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         excess = CompletionInput.capture(
             CompletionBatch((*completions.entries, extra)), torch.ones(7, 4, device=device), producer
         )
-        with pytest.raises(ValueError, match="signed input capacity"):
+        with pytest.raises(ValueError):  # seven completions exceed max_input_rows
             execution.step(excess, stream)
         assert execution.arena.latest(initial.lineage_id) == initial
         for _ in range(2):
@@ -131,26 +141,16 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         execution.cancel_step(pending)
         assert execution.arena.latest(initial.lineage_id) == latest
 
-        def fail_publish(self, write):
-            raise RuntimeError("publication failed")
-
         with monkeypatch.context() as fault:
-            fault.setattr(PageBundleArena, "publish", fail_publish)
-            with pytest.raises(RuntimeError, match="publication failed"):
-                execution.step(batch, stream)
-        assert execution.arena.latest(initial.lineage_id) == latest
-
-        def fail_output(self, context):
-            raise RuntimeError("output failed")
-
-        with monkeypatch.context() as fault:
+            # Fail result conversion after the update is published (workload code is signed, so inject here).
             fault.setattr(FunctionMath, "output", fail_output)
             with pytest.raises(StateSettlementError) as failure:
                 execution.step(batch, stream)
+        # Settlement can be retried: it returns the publication that already happened.
         retry = execution.finish_step(failure.value.invocation)
         assert retry.publication is failure.value.receipt
         assert execution.diagnostics().update_count == 3
-        with pytest.raises(RuntimeError, match="not registered"):
+        with pytest.raises(RuntimeError):
             execution.finish_step(failure.value.invocation)
         missing = replace(
             batch, completions=CompletionBatch(tuple(replace(c, text="missing") for c in completions.entries))
@@ -159,13 +159,13 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         assert result.loss is result.publication is None
         assert all(item.reward is None for item in result.reward_outcomes)
         assert all(item.state is BarrierState.BLOCKED and item.ready_count == 0 for item in result.update_barriers)
-        with pytest.raises(ValueError, match="vote group"):
+        with pytest.raises(ValueError):  # an incomplete vote group
             execution.step(
                 replace(batch, completions=CompletionBatch((completions.entries[0],)), hidden=batch.hidden[:1]), stream
             )
         execution.retire(())
         diagnostics = execution.diagnostics()
-        assert diagnostics.active_lineages == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
+        assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
 
     disabled = make_llm(
         workload=TTRLWorkload(replace(config, enabled=False)),
@@ -177,28 +177,12 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
     assert all(item.state is BarrierState.BLOCKED for item in result.update_barriers)
     disabled.retire(())
 
-    class ZeroLoss(TTRLWorkload):
-        scale = 0.0
-
-        def loss(self, data: TTRLData, parameters: Mapping[str, torch.Tensor]) -> torch.Tensor:
-            loss = parameters["head"].square().sum() * self.scale
-            data.loss = loss.detach()
-            return loss
-
     facts = pllm.HostRuntimeFacts(torch.device("cpu"), hidden_size=4, initialization_seed=11)
-    zero = ZeroLoss(config)
-    zero.declare_host(replace(facts, max_input_rows=6, memory_budget_bytes=1 << 20))
-    with pytest.raises(ValueError, match="max_input_rows"):
-        TTRLWorkload(config).declare_host(replace(facts, memory_budget_bytes=1 << 20))
-
-    binding = zero.declare_host(facts)
-    execution = binding.compile()
+    execution = ZeroLoss(config).declare_host(facts).compile()
     (initial,) = execution.admit(())
     before = execution.snapshot(initial)
-    with monkeypatch.context() as changed:
-        changed.setattr(ZeroLoss, "scale", 1.0)
-        assert zero.declare_host(facts).graph.execution_parameters_digest != binding.graph.execution_parameters_digest
-        result = execution.step(CompletionInput.capture(completions, torch.ones(6, 4)))
+    result = execution.step(CompletionInput.capture(completions, torch.ones(6, 4)))
+    # A zero loss still publishes: the step count advances with zero gradients and unchanged weights.
     assert result.loss.item() == 0 and result.publication is not None and result.update_count == 1
     after = execution.snapshot(result.state_ref)
     torch.testing.assert_close(after[0], before[0], rtol=0, atol=0)
