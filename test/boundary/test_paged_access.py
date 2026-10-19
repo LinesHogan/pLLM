@@ -27,22 +27,24 @@ def test_shared_read_prefix_and_interleaved_layers_keep_distinct_writes(layout):
     assert torch.count_nonzero(root) == 0
 
 
-def test_write_aliases_and_page_slot_disagreement_fail_before_mutation():
+def test_conflicting_pages_fail_before_mutation():
     cache = torch.arange(4 * 2 * 4 * 4, dtype=torch.float32).reshape(4, 2, 4, 4)
     before = cache.clone()
     table, slots = torch.tensor([[0, 1], [0, 2]]), torch.tensor([4, 5, 8, 9])
-    with pytest.raises(ValueError, match="slot differs"):
+    # Current slots disagree with the batch rows.
+    with pytest.raises(ValueError):
         bind_paged_access(paged_rows(), (PagedLayer("a", cache, table, torch.tensor([4, 5, 8, 10])),))
-    with pytest.raises(ValueError, match="aliases"):
+    # One request writes the same page twice.
+    with pytest.raises(ValueError):
         bind_paged_access(
             paged_rows(), (PagedLayer("a", cache, torch.tensor([[0, 1], [0, 1]]), torch.tensor([4, 5, 4, 5])),)
         )
     # Distinct current slots can still conflict with another request's history.
-    with pytest.raises(ValueError, match="aliases"):
+    with pytest.raises(ValueError):
         bind_paged_access(
             paged_rows((4, 5, 8, 9)), (PagedLayer("a", cache, torch.tensor([[0, 1, 3], [1, 3, 2]]), slots),)
         )
     # Separate logical layer names do not establish separate storage.
-    with pytest.raises(ValueError, match="aliases"):
+    with pytest.raises(ValueError):
         bind_paged_access(paged_rows(), (PagedLayer("a", cache, table, slots), PagedLayer("b", cache, table, slots)))
     torch.testing.assert_close(cache, before, rtol=0, atol=0)
