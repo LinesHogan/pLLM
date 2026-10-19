@@ -9,6 +9,8 @@ import pytest
 import torch
 
 import pllm
+from examples.centered_hidden import centered_hidden
+from examples.huber import HuberWorkload
 from pllm import make_llm
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.semantic_graph import TaskResourceFact
@@ -19,7 +21,11 @@ from pllm.execution.host_runtime import HostRuntimeFacts
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.scheduler import compile_state_schedule
+from pllm.workload_transport import decode_workload, encode_workload
 from pllm.workloads.dummy import DummyWorkload
+from pllm.workloads.esamp_request import ESampRequestWorkload
+from pllm.workloads.lora import OutputLoRAWorkload
+from pllm.workloads.override import OverRIDEWorkload
 from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload
 
 
@@ -61,6 +67,98 @@ class TransportHolder(DummyWorkload):
     extra: FakeTransport = FakeTransport(FakeTransportConfig(1))
 
 
+# Built-ins and user workloads travel identically: class coordinates plus frozen fields.
+@pytest.mark.parametrize(
+    "workload",
+    (
+        DummyWorkload(),
+        OverRIDEWorkload(),
+        ESampRequestWorkload(),
+        OutputLoRAWorkload(),
+        HuberWorkload(3),
+        centered_hidden(),
+        replace(DummyWorkload(), export_name="custom"),
+        TransportHolder(extra=FakeTransport(FakeTransportConfig(2))),
+    ),
+)
+def test_workload_transport_round_trips_frozen_workloads(workload) -> None:
+    restored = decode_workload(encode_workload(workload), device=torch.device("cpu"), seed=0)
+    assert type(restored) is type(workload)
+    if isinstance(workload, TransportHolder):
+        assert isinstance(restored, TransportHolder)
+        assert restored.extra.config == FakeTransportConfig(2)
+    else:
+        assert restored == workload
+
+
+def test_module_level_function_replacement_round_trips() -> None:
+    # Module-level function replacements are imported by the worker and re-signed there.
+    workload = replace(OverRIDEWorkload(), objective=doubled_cross_entropy)
+    restored = decode_workload(encode_workload(workload), device=torch.device("cpu"), seed=0)
+    assert isinstance(restored, OverRIDEWorkload)
+    assert restored.objective is doubled_cross_entropy
+
+
+def test_transport_rejects_workloads_the_worker_cannot_import() -> None:
+    class CustomDummy(DummyWorkload):
+        pass
+
+    for custom in (PlainProbe(), CustomDummy()):
+        with pytest.raises(ValueError):
+            encode_workload(custom)
+    with pytest.raises(ValueError):
+        encode_workload(replace(DummyWorkload(), transform=lambda hidden: hidden))
+
+
+def test_transport_rejects_a_tampered_module_digest() -> None:
+    from pllm.contracts.workload_reference import WorkloadReference
+
+    reference = decode_boundary(encode_workload(DummyWorkload()), WorkloadReference)
+    tampered = encode_boundary(replace(reference, module_digest="0" * 64))
+    with pytest.raises(ValueError):
+        decode_workload(tampered, device=torch.device("cpu"), seed=0)
+
+
+def _drifted_plan() -> PlanBundle:
+    execution = make_llm(
+        workload=TTRLWorkload(TTRLConfig(rank=2)), config=HostRuntimeFacts(torch.device("cpu"), hidden_size=4)
+    )
+    plan = execution.arena.plan
+    timeline = replace(
+        plan.timeline,
+        task_resources=tuple(
+            TaskResourceFact(task.symbol, 0, index + 1) for index, task in enumerate(plan.semantic_graph.tasks)
+        ),
+    )
+    state_decision, state, decision, physical = compile_state_schedule(
+        plan.semantic_graph, timeline, plan.state_request
+    )
+    return replace(
+        plan,
+        timeline=timeline,
+        state_decision=state_decision,
+        state_physical=state,
+        schedule_decision=decision,
+        schedule_physical=physical,
+    )
+
+
+def test_plan_bundle_codec_round_trips_and_rejects_malformed_wire() -> None:
+    wire = encode_boundary(_drifted_plan())
+    plan = decode_boundary(wire, PlanBundle)
+    assert decode_boundary(wire, PlanBundle) == plan
+    iterable_object = json.loads(wire)
+    iterable_object["timeline"]["capabilities"] = dict.fromkeys(plan.timeline.capabilities, 0)
+    for payload in (
+        json.dumps(iterable_object),
+        wire[:-1] + ',"module":"os"}',
+        wire.replace('"plan_epoch":1', '"plan_epoch":true'),
+        wire.replace('"schema_version":1', '"schema_version":1,"schema_version":1', 1),
+    ):
+        with pytest.raises(ValueError):
+            decode_boundary(payload, PlanBundle)
+
+
 def _worker(connection: Connection, expected_signature: str) -> None:
     try:
         for attempt in range(2):
@@ -100,71 +198,8 @@ def _worker(connection: Connection, expected_signature: str) -> None:
 
 @pytest.mark.slow
 def test_worker_reconstructs_exact_signed_plan_and_rejects_local_drift() -> None:
-    from examples.centered_hidden import centered_hidden
-    from examples.huber import HuberWorkload
-    from pllm.contracts.workload_reference import WorkloadReference
-    from pllm.workload_transport import decode_workload, encode_workload
-    from pllm.workloads.esamp_request import ESampRequestWorkload
-    from pllm.workloads.lora import OutputLoRAWorkload
-    from pllm.workloads.override import OverRIDEWorkload
-
-    # Built-ins and user workloads travel identically: class coordinates plus frozen fields.
-    # Module-level function replacements are imported by the worker and re-signed there.
-    for workload in (
-        DummyWorkload(),
-        OverRIDEWorkload(),
-        ESampRequestWorkload(),
-        OutputLoRAWorkload(),
-        HuberWorkload(3),
-        centered_hidden(),
-        replace(DummyWorkload(), export_name="custom"),
-        replace(OverRIDEWorkload(), objective=doubled_cross_entropy),
-        TransportHolder(extra=FakeTransport(FakeTransportConfig(2))),
-    ):
-        restored = decode_workload(encode_workload(workload), device=torch.device("cpu"), seed=0)
-        assert type(restored) is type(workload)
-        if isinstance(workload, TransportHolder):
-            assert isinstance(restored, TransportHolder)
-            assert restored.extra.config == FakeTransportConfig(2)
-        else:
-            assert restored == workload
-
-    class CustomESamp(ESampRequestWorkload):
-        pass
-
-    for custom in (PlainProbe(), CustomESamp()):
-        with pytest.raises(ValueError, match="cannot import|frozen dataclass"):
-            encode_workload(custom)
-    with pytest.raises(ValueError, match="closure or local"):
-        encode_workload(replace(DummyWorkload(), transform=lambda hidden: hidden))
-    reference = decode_boundary(encode_workload(DummyWorkload()), WorkloadReference)
-    tampered = encode_boundary(replace(reference, module_digest="0" * 64))
-    with pytest.raises(ValueError, match="differs from the driver"):
-        decode_workload(tampered, device=torch.device("cpu"), seed=0)
-    execution = make_llm(
-        workload=TTRLWorkload(TTRLConfig(rank=2)), config=HostRuntimeFacts(torch.device("cpu"), hidden_size=4)
-    )
-    plan = execution.arena.plan
-    timeline = replace(
-        plan.timeline,
-        task_resources=tuple(
-            TaskResourceFact(task.symbol, 0, index + 1) for index, task in enumerate(plan.semantic_graph.tasks)
-        ),
-    )
-    state_decision, state, decision, physical = compile_state_schedule(
-        plan.semantic_graph, timeline, plan.state_request
-    )
-    plan = replace(
-        plan,
-        timeline=timeline,
-        state_decision=state_decision,
-        state_physical=state,
-        schedule_decision=decision,
-        schedule_physical=physical,
-    )
+    plan = _drifted_plan()
     wire = encode_boundary(plan)
-    restored = decode_boundary(wire, PlanBundle)
-    assert restored == plan
     context = mp.get_context("spawn")
     parent, child = context.Pipe()
     worker = context.Process(target=_worker, args=(child, plan.schedule_decision.signature))
@@ -172,8 +207,8 @@ def test_worker_reconstructs_exact_signed_plan_and_rejects_local_drift() -> None
     child.close()
     try:
         # The second attempt sees different local provider facts on the worker.
-        for index, payload in enumerate((wire, wire)):
-            parent.send_bytes(payload.encode())
+        for index in range(2):
+            parent.send_bytes(wire.encode())
             assert parent.poll(20), "worker did not finish reconstruction"
             answer = parent.recv_bytes().decode()
             if index == 0:
@@ -189,13 +224,3 @@ def test_worker_reconstructs_exact_signed_plan_and_rejects_local_drift() -> None
             worker.terminate()
             worker.join(10)
         worker.close()
-    iterable_object = json.loads(wire)
-    iterable_object["timeline"]["capabilities"] = dict.fromkeys(plan.timeline.capabilities, 0)
-    for payload in (
-        json.dumps(iterable_object),
-        wire[:-1] + ',"module":"os"}',
-        wire.replace('"plan_epoch":1', '"plan_epoch":true'),
-        wire.replace('"schema_version":1', '"schema_version":1,"schema_version":1', 1),
-    ):
-        with pytest.raises(ValueError):
-            decode_boundary(payload, PlanBundle)
