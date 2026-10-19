@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from functools import partial
 from hashlib import sha256
 from time import perf_counter_ns
 from types import TracebackType
@@ -87,7 +88,7 @@ from pllm.contracts.region_program import TensorType
 from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY, RegionScheduleProposal
 from pllm.contracts.region_selection import RegionSelection
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
-from pllm.contracts.sampler import SamplerStage
+from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
 from pllm.contracts.semantic_graph import (
     AnchorId,
     ConditionalLayerReplay,
@@ -210,6 +211,7 @@ class _RunnerSession(Protocol):
 class _PackedStep(Generic[DataT]):
     rows: PackedSamplerRowBatch
     invocation: TaskGraphInvocation[StateTaskContext[DataT]] | None = None
+    forward_done: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -576,8 +578,9 @@ class VllmSession(Generic[DataT, ResultT]):
 
     def complete_forward(self) -> None:
         step = self._step
-        if step is None:
+        if step is None or step.forward_done:
             return
+        step.forward_done = True
         execution = self._deployment.execution
         stream = torch.cuda.current_stream(execution.device)
         operands = () if self._overlay is None else self._overlay.take_captures()
@@ -616,22 +619,43 @@ class VllmSession(Generic[DataT, ResultT]):
             if effect is not None:
                 effect.close()
 
+    def compute_logits(self, model: Qwen2ForCausalLM, hidden: torch.Tensor) -> torch.Tensor | None:
+        """vLLM's LM head. Post-filter guidance projects its predicted hidden rows in the same call.
+
+        Decode-time LM heads are bound by reading the [vocab, hidden] weight, so projecting the
+        prediction alongside the model's rows costs about as much as the model's rows alone. A request
+        for logits means the transformer forward is over; MRv1 asks before it reports completion.
+        """
+        with torch.inference_mode(False), torch.enable_grad():
+            self.complete_forward()
+        lm_head = Qwen2ForCausalLM.compute_logits
+        if (
+            self._step is None
+            or self._sampler is None
+            or self._deployment.attachment.inputs.request.sampler_stage is not SamplerStage.PACKED_POST_FILTER_EXACT
+        ):
+            return lm_head(model, hidden)
+        guidance = self._sampler_guidance()
+        logits = lm_head(model, torch.cat((hidden, guidance.values.to(hidden.dtype))))
+        assert logits is not None
+        self._sampler.begin_guidance(SignedSamplerGuidance(guidance, logits[len(hidden) :], self._capture_feedback))
+        return logits[: len(hidden)]
+
     def begin_sampler(self, model: Qwen2ForCausalLM) -> bool:
         if self._step is None or self._sampler is None:
             return False
+        # Post-filter guidance began with the LM head; additive logits need no projection.
+        if self._deployment.attachment.inputs.request.sampler_stage is SamplerStage.PACKED_PRE_FILTER_ADD:
+            guidance = self._sampler_guidance()
+            self._sampler.begin_guidance(SignedSamplerGuidance(guidance, guidance.values, self._capture_feedback))
+        return True
+
+    def _sampler_guidance(self) -> PackedSamplerGuidanceBatch:
         execution = self._deployment.execution
         guidance = execution.sampler_guidance(self._invocation(), torch.cuda.current_stream(execution.device))
         if guidance.stage is not self._deployment.attachment.inputs.request.sampler_stage:
             raise ValueError("guidance stage differs from its signed attachment")
-        logits = (
-            guidance.values
-            if guidance.stage is SamplerStage.PACKED_PRE_FILTER_ADD
-            else model.compute_logits(guidance.values.to(dtype=model.lm_head.weight.dtype))
-        )
-        if type(logits) is not torch.Tensor:
-            raise RuntimeError("Qwen2 LM head did not produce dense logits")
-        self._sampler.begin_guidance(SignedSamplerGuidance(guidance, logits, self._capture_feedback))
-        return True
+        return guidance
 
     def complete_sampler(self, active: bool) -> None:
         if self._step is None:
@@ -803,6 +827,8 @@ class Runner(Generic[SamplerT]):
         self._workload_session = session
         if adapter is not None:
             self.sampler = adapter
+            # Both runner ABIs call model.compute_logits; guidance shares that LM-head read.
+            setattr(model, "compute_logits", partial(session.compute_logits, model))
 
     def detach_workload(self) -> None:
         session = self._workload_session
@@ -814,6 +840,7 @@ class Runner(Generic[SamplerT]):
             self.completion_capture.synchronize()
         if self.sampler is not upstream:
             self.sampler = upstream
+            self.model.__dict__.pop("compute_logits", None)
         self._workload_session = None
         self._workload_upstream_sampler = None
         self.completion_capture = None
