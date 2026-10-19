@@ -59,8 +59,9 @@ from pllm.execution.replay import (
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.scheduler import compile_schedule
 from pllm.execution.state_execution import MathBinding
-from pllm.execution.tensor_binding import TensorBinding, TensorFrame
+from pllm.execution.tensor_binding import TensorBinding
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
+from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import FunctionMath, TaskOutput
 from pllm.execution.tokenwise_region import compile_tokenwise_region
 from pllm.execution.tokenwise_tuning import TokenwiseTuning

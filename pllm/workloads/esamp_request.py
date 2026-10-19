@@ -23,14 +23,8 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorLayoutRequest
 from pllm.execution.ptts.page_capture import CapturedPageFields, KernelCapture, PagedKernel
-from pllm.execution.tensor_binding import (
-    TensorBinding,
-    TensorFrame,
-    TensorOutput,
-    Tensors,
-    select_rows,
-    training_observations,
-)
+from pllm.execution.tensor_binding import TensorBinding, TensorOutput
+from pllm.execution.tensor_frame import TensorFrame, Tensors, select_rows, training_observations
 from pllm.kernels.adamw import AdamWFields, apply_adamw
 from pllm.kernels.low_rank_gated import LowRankGatedLayout, low_rank_gated_forward, low_rank_gated_loss_and_gradients
 from pllm.kernels.paged_linear import PagedRows, TensorRows, paged_workspace

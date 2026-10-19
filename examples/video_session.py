@@ -29,7 +29,8 @@ from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle import BorrowedPage, PageBundleArena, PageFieldTransfer, PageRelease
 from pllm.execution.scheduler import validate_plan_bundle
 from pllm.execution.state_execution import StateExecution
-from pllm.execution.tensor_binding import TensorFrame, TensorOutput
+from pllm.execution.tensor_binding import TensorOutput
+from pllm.execution.tensor_frame import TensorFrame
 from pllm.workloads.video import VideoWorkload, frame_features
 
 if TYPE_CHECKING:

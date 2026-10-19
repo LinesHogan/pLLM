@@ -23,14 +23,8 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.ptts.page_capture import KernelCapture, PagedKernel
-from pllm.execution.tensor_binding import (
-    TensorBinding,
-    TensorFrame,
-    TensorOutput,
-    Tensors,
-    select_rows,
-    weighted_training_output,
-)
+from pllm.execution.tensor_binding import TensorBinding, TensorOutput, weighted_training_output
+from pllm.execution.tensor_frame import TensorFrame, Tensors, select_rows
 from pllm.kernels.paged_linear import PagedRows, TensorRows, paged_workspace
 
 _TRAIN = TaskSymbol("train")

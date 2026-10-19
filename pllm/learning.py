@@ -45,7 +45,8 @@ from pllm.execution.region_adamw import AdamWRegion
 from pllm.execution.replay import Recurrence
 from pllm.execution.shared_tensor import tensor_dtype
 from pllm.execution.state_execution import MathBinding, StateExecution
-from pllm.execution.tensor_binding import Buffer, Tensors
+from pllm.execution.tensor_binding import Buffer
+from pllm.execution.tensor_frame import Tensors
 from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots, TensorBatch, autograd_loss
 from pllm.kernels.adamw import AdamWConfig
 from pllm.usage import Activation, InstanceState, Overlay, Phase, RequestState

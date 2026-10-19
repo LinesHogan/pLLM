@@ -35,7 +35,7 @@ from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.ptts.page_bundle import PageBundleArena, PagePublication, PageWrite
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
 from pllm.execution.state_execution import StateSettlementError, StateTaskContext
-from pllm.execution.tensor_binding import TensorFrame
+from pllm.execution.tensor_frame import TensorFrame
 from pllm.workloads.esamp_request import (
     ESampRequestConfig,
     ESampRequestWorkload,

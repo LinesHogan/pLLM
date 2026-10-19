@@ -16,7 +16,8 @@ from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_streams import RegionStreamBindings
 from pllm.execution.shared_tensor import tensor_dtype
-from pllm.execution.tensor_binding import TensorBinding, TensorFrame, TensorOutput, Tensors
+from pllm.execution.tensor_binding import TensorBinding, TensorOutput
+from pllm.execution.tensor_frame import TensorFrame, Tensors
 from pllm.execution.tensor_scan import TensorScan
 
 Input = Annotated[torch.Tensor, pllm.Operand.INPUT]

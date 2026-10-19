@@ -32,7 +32,8 @@ from pllm.execution.ptts.page_bundle import BorrowedPage, PageBundleArena, PageF
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.state_execution import MathBinding, StateSettlementError
-from pllm.execution.tensor_binding import TensorBinding, TensorFrame
+from pllm.execution.tensor_binding import TensorBinding
+from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import FunctionMath, TaskOutput, _read
 from test.backend_facts import backend_facts
 

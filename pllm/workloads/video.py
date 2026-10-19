@@ -36,7 +36,8 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorLayoutRequest
 from pllm.execution.codec import boundary_digest
 from pllm.execution.declaration import Field, When, native
-from pllm.execution.tensor_binding import TensorBinding, TensorFrame, TensorOutput
+from pllm.execution.tensor_binding import TensorBinding, TensorOutput
+from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import TaskOutput, TensorBatch
 
 FEATURES = ("qp", "residual_energy", "motion_magnitude", "segmentation")

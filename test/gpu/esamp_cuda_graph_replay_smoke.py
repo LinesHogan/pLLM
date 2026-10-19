@@ -44,7 +44,7 @@ from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.scheduler import compile_schedule
 from pllm.execution.state_execution import StateExecution
-from pllm.execution.tensor_binding import TensorFrame
+from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.trace import TracePhase, TraceSelection
 from pllm.kernels import low_rank_gated
 from pllm.kernels.adamw import apply_adamw

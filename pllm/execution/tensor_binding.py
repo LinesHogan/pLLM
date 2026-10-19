@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from math import isfinite, prod
-from typing import TYPE_CHECKING, overload
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -23,16 +22,15 @@ from pllm.contracts.backend_attachment import (
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding, ParameterOverlayOperator, ParameterTarget
-from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
+from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
-from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback, SamplerStage
+from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
 from pllm.contracts.semantic_graph import (
     ConditionalLayerReplay,
     HiddenInputSource,
     HostPayloadSchemaId,
     MathContract,
     PackedSamplerRowsInputSource,
-    SamplerFeedbackInputSource,
     SemanticEffect,
     SemanticInput,
     SemanticInputSource,
@@ -45,37 +43,34 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
-from pllm.execution.codec import register_gradient_hook
-from pllm.execution.cuda_stream import upload
 from pllm.execution.declaration import Builder, Call, Dimensions, Field, Shape, State, When, native
 from pllm.execution.ptts.page_borrow import borrowed_root
 from pllm.execution.ptts.page_bundle import PagePublication
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION, Recurrence
 from pllm.execution.shared_tensor import tensor_dtype
+from pllm.execution.tensor_frame import (
+    OverlayEntry,
+    OverlayTargetResult,
+    TensorFrame,
+    TensorMath,
+    TensorPort,
+    Tensors,
+    TensorUpdate,
+    feedback_port,
+    field_rows,
+    flat_gradient,
+    input_port,
+    row_index,
+    take_rows,
+)
 from pllm.execution.tensor_program import InvocationOutput, Observation, TaskOutput, TensorBatch
+from pllm.execution.tensor_task import TensorTask
 from pllm.execution.trace import MAX_SNAPSHOT_BYTES
 from pllm.kernels.adamw import AdamWConfig
 
 if TYPE_CHECKING:
     from pllm.authoring import TensorStepInput
-
-Tensors = Mapping[str, torch.Tensor]
-TensorMath = Callable[[Tensors], torch.Tensor]
-TensorReader = Callable[["TensorFrame", TensorBatch], torch.Tensor]
-
-
-def select_rows(value: torch.Tensor, rows: tuple[int, ...]) -> torch.Tensor:
-    """Borrow consecutive original rows; pack only an irregular selection."""
-    if not rows:
-        return value[:0]
-    if rows == tuple(range(rows[0], rows[0] + len(rows))):
-        return value.narrow(0, rows[0], len(rows))
-    return value[list(rows)]
-
-
-def _flat_gradient(fields: tuple[torch.Tensor, ...]) -> torch.Tensor:
-    return fields[0].flatten() if len(fields) == 1 else torch.cat(tuple(value.flatten() for value in fields))
 
 
 def _check_overlay_fields(
@@ -116,13 +111,6 @@ def _check_overlay_shapes(
             raise ValueError("overlay fields must match their operator, target shape and dtype")
 
 
-def _gradient_rows(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    # Give this consumer its own gradient edge without copying the forward value.
-    result = value.view_as(value)
-    register_gradient_hook(result, lambda gradient: gradient.masked_fill(~mask, 0))
-    return result
-
-
 @dataclass(frozen=True)
 class SGD:
     lr: float
@@ -152,189 +140,6 @@ def _buffer_field(name: str, buffer: Buffer, dimensions: Callable[[Dimensions], 
     )
 
 
-@dataclass(frozen=True)
-class TensorUpdate:
-    output: torch.Tensor
-    changed: bool = False
-    update_count: int = 0
-    trained_rows: int = 0
-    metrics: Mapping[str, int] = field(default_factory=lambda: dict[str, int]())
-
-
-@dataclass(frozen=True, slots=True)
-class OverlayTargetResult:
-    target: ParameterTarget
-    update: TensorUpdate
-
-
-@dataclass(frozen=True, slots=True)
-class OverlayEntry:
-    identity: RequestIdentity
-    before_ref: StateRef
-    after_ref: StateRef
-    targets: tuple[OverlayTargetResult, ...]
-
-    @property
-    def changed(self) -> bool:
-        return any(target.update.changed for target in self.targets)
-
-
-@dataclass(frozen=True, slots=True)
-class TensorPort:
-    source: SemanticInputSource
-    read: TensorReader
-    rowwise: bool = True
-
-
-def take_rows(values: torch.Tensor, rows: Sequence[int], device_rows: torch.Tensor | None = None) -> torch.Tensor:
-    """`values[rows]` along dim 0: a view when the rows repeat one row or run consecutively, else one gather."""
-    first = rows[0] if rows else 0
-    if len(set(rows)) == 1:
-        return values[first : first + 1].expand(len(rows), *values.shape[1:])
-    if tuple(rows) == tuple(range(first, first + len(rows))):
-        return values.narrow(0, first, len(rows))
-    if device_rows is None:
-        device_rows = upload(rows, values.device)
-    return values.index_select(0, device_rows)
-
-
-_COLUMNS = ("packed", "sampler", "samples", "states", "versions")
-
-
-@dataclass(frozen=True, slots=True)
-class RowIndex:
-    """Per-row index columns of one invocation; entry i describes `TensorFrame.rows[i]`.
-
-    The columns are built on the host and copied to the device once per invocation, so reading
-    many tensor inputs costs one small host-to-device copy.
-    """
-
-    packed: tuple[int, ...]  # row in the packed hidden batch
-    sampler: tuple[int, ...]  # row in the sampler batch; -1 if the row was not sampled
-    samples: tuple[int, ...]  # sample index of the row's request
-    states: tuple[int, ...]  # position of the row's state in the selection; 0 without state
-    versions: tuple[int, ...]  # version of that state; 0 without state
-    device: torch.Tensor  # the five columns above, stacked on the device
-
-    def column(self, name: str) -> torch.Tensor:
-        return self.device[_COLUMNS.index(name)]
-
-    def take(self, values: torch.Tensor, name: str) -> torch.Tensor:
-        """Rows of `values` selected by one column, in operation-row order."""
-        rows: tuple[int, ...] = getattr(self, name)
-        if -1 in rows:
-            raise ValueError(f"some rows have no {name} row")
-        return take_rows(values, rows, self.column(name))
-
-    @classmethod
-    def build(cls, data: "TensorFrame", batch: TensorBatch, device: torch.device) -> "RowIndex":
-        links = {link.packed_row_index: link.sampler_row_index for link in data.step.sampler_rows.links}
-        selection = batch.selection
-        states = (
-            tuple(selection.row_states[row.identity] for row in data.rows)
-            if selection.groups
-            else (0,) * len(data.rows)
-        )
-        columns = (
-            tuple(row.packed_row_index for row in data.rows),
-            tuple(links.get(row.packed_row_index, -1) for row in data.rows),
-            tuple(row.identity.sample_idx for row in data.rows),
-            states,
-            tuple(int(selection.refs[index].version_id) for index in states) if selection.groups else states,
-        )
-        return cls(*columns, device=upload(columns, device))
-
-
-def row_index(data: "TensorFrame", batch: TensorBatch, device: torch.device) -> RowIndex:
-    """The invocation's row tables, built on first use."""
-    if data.index is None:
-        data.index = RowIndex.build(data, batch, device)
-    return data.index
-
-
-def _field_rows(data: "TensorFrame", batch: TensorBatch, field: int, start: int, size: int) -> torch.Tensor:
-    """`field[start:start+size]` of each row's state, `[rows, size]`; copies only that slice."""
-    pool, slots = batch.field_slots(field)
-    view = pool.reshape(len(pool), -1).narrow(1, start, size)
-    rows = tuple(slots[state] for state in row_index(data, batch, pool.device).states)
-    return take_rows(view, rows)
-
-
-def _state_rows(batch: TensorBatch, field: int) -> torch.Tensor:
-    """One row per selected state: `[states, *field_shape]`, a view when there is a single state."""
-    pool, slots = batch.field_slots(field)
-    if len(slots) == 1:
-        return pool[slots[0] : slots[0] + 1]
-    return pool.index_select(0, upload(slots, pool.device))
-
-
-class _LeafRoots(Sequence[tuple[torch.Tensor, ...]]):
-    """State roots whose first field reads the differentiable leaf; other fields are borrowed lazily."""
-
-    __slots__ = ("_leaf", "_roots")
-
-    def __init__(self, leaf: torch.Tensor, roots: Sequence[tuple[torch.Tensor, ...]]) -> None:
-        self._leaf, self._roots = leaf, roots
-
-    def __len__(self) -> int:
-        return len(self._roots)
-
-    @overload
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]: ...
-
-    @overload
-    def __getitem__(self, index: slice) -> tuple[tuple[torch.Tensor, ...], ...]: ...
-
-    def __getitem__(self, index: int | slice) -> tuple[torch.Tensor, ...] | tuple[tuple[torch.Tensor, ...], ...]:
-        if isinstance(index, slice):
-            return tuple(self[i] for i in range(*index.indices(len(self))))
-        return (self._leaf[index], *self._roots[index][1:])
-
-
-def state_means(losses: torch.Tensor, states: Sequence[int], count: int) -> torch.Tensor:
-    """Mean per-row loss of each of `count` states (0 for a state without rows).
-
-    Row-to-state membership is known on the host, so this needs no device-to-host read.
-    """
-    sizes = Counter(states)
-    totals = losses.new_zeros(count).index_add(0, upload(states, losses.device), losses)
-    return totals / upload([max(sizes[state], 1) for state in range(count)], losses.device, losses.dtype)
-
-
-def state_leaf(data: "TensorFrame", batch: TensorBatch) -> torch.Tensor:
-    """The invocation's differentiable parameters, created on first use."""
-    if data.leaf is None:
-        data.leaf = _state_rows(batch, 0).detach().requires_grad_(True)
-    return data.leaf
-
-
-@dataclass(slots=True)
-class TensorFrame:
-    step: TensorStepInput
-    rows: tuple[PackedPhaseRow, ...]
-    columns: int | None = None
-    entries: list[OverlayEntry] = field(default_factory=lambda: list[OverlayEntry]())
-    parameters: tuple[torch.Tensor, ...] = ()
-    derivative_sources: dict[tuple[str, str], torch.Tensor] = field(
-        default_factory=lambda: dict[tuple[str, str], torch.Tensor]()
-    )
-    input_gradients: dict[tuple[str, str], torch.Tensor] = field(
-        default_factory=lambda: dict[tuple[str, str], torch.Tensor]()
-    )
-    parameter_gradient_fields: dict[StateRef, tuple[torch.Tensor, ...]] = field(
-        default_factory=lambda: dict[StateRef, tuple[torch.Tensor, ...]]()
-    )
-    pending_update: TaskOutput | None = None
-    batch_inputs: tuple[torch.Tensor, ...] = ()
-    selected: tuple[int, ...] = ()
-    trained_rows: int = 0
-    replacements: tuple[tuple[int, tuple[torch.Tensor, ...]], ...] = ()
-    index: RowIndex | None = None
-    # Differentiable [states, parameters] copy of the flat optimizer field, shared by the
-    # invocation's differentiable tasks and cleared by the training task that consumes it.
-    leaf: torch.Tensor | None = None
-
-
 @dataclass(frozen=True, slots=True)
 class TensorResult:
     value: torch.Tensor | None
@@ -350,7 +155,7 @@ class TensorResult:
     @property
     def parameter_gradients(self) -> Mapping[StateRef, torch.Tensor]:
         """Explicit flat inspection; execution retains the original gradient fields."""
-        return {ref: _flat_gradient(values) for ref, values in self.parameter_gradient_fields.items()}
+        return {ref: flat_gradient(values) for ref, values in self.parameter_gradient_fields.items()}
 
     @property
     def loss(self) -> torch.Tensor | None:
@@ -366,35 +171,6 @@ class TensorResult:
 
 
 TensorOutput = TensorResult | torch.Tensor | None
-
-
-def _feedback(read: Callable[[SamplerFeedback], torch.Tensor]) -> TensorPort:
-    def resolve(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
-        feedback = batch.feedback
-        if feedback is None:
-            raise RuntimeError("tensor function requires completed sampler feedback")
-        values = read(feedback)
-        return row_index(data, batch, values.device).take(values, "sampler")
-
-    return TensorPort(SamplerFeedbackInputSource(), resolve)
-
-
-def training_observations(
-    data: TensorFrame, batch: TensorBatch, losses: torch.Tensor, inputs: Tensors, rows: tuple[int, ...]
-) -> tuple[Observation, ...]:
-    if not batch.observing:
-        return ()
-    return tuple(
-        Observation(name, tensor, data.rows[row], ref, data.step.rows.step_id, gradient)
-        for position, row in enumerate(rows)
-        for index in (batch.selection.row_states[data.rows[row].identity],)
-        for ref in (batch.selection.refs[index],)
-        for name, tensor, gradient in (
-            *((name, tensor[position], False) for name, tensor in inputs.items()),
-            ("loss", losses if losses.ndim == 0 else losses[index], False),
-            ("parameters.grad", _flat_gradient(data.parameter_gradient_fields[ref]), True),
-        )
-    )
 
 
 @torch.no_grad()
@@ -445,37 +221,6 @@ def weighted_training_output(
         changed=data.selected,
         observations=observations,
     )
-
-
-def _port(source: SemanticInputSource | TensorPort) -> TensorPort:
-    match source:
-        case TensorPort():
-            return source
-        case HiddenInputSource(layer=layer, site=site, phase=HiddenPhase.DECODE):
-
-            def hidden(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
-                (snapshot,) = (
-                    item
-                    for item in data.step.hidden_batch(batch.stream).snapshots
-                    if item.resource.locator_key == (str(layer), "index", site.value)
-                )
-                index = row_index(data, batch, snapshot.hidden.device)
-                return index.take(snapshot.hidden, "packed")[:, : data.columns]
-
-            return TensorPort(source, hidden)
-        case PackedSamplerRowsInputSource():
-
-            def samples(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
-                device = data.step.hidden_batch(batch.stream).snapshots[0].hidden.device
-                return row_index(data, batch, device).column("samples")
-
-            return TensorPort(source, samples)
-        case SamplerFeedbackInputSource():
-            return _feedback(lambda feedback: feedback.base_logits)
-        case TaskResultInputSource(task=task, output=output):
-            return TensorPort(source, lambda data, batch: batch.results[task, output])
-        case _:
-            raise ValueError("unsupported ordinary tensor input; use an explicit native binding")
 
 
 @dataclass(frozen=True, slots=True)
@@ -837,7 +582,7 @@ class TensorBinding(Builder[TensorFrame]):
 
     @staticmethod
     def sampled_tokens() -> TensorPort:
-        return _feedback(lambda feedback: feedback.sampled_tokens)
+        return feedback_port(lambda feedback: feedback.sampled_tokens)
 
     def parameters(
         self,
@@ -938,7 +683,7 @@ class TensorBinding(Builder[TensorFrame]):
                         leaf = data.leaf.narrow(1, start or 0, size)
                         rows = row_index(data, batch, leaf.device).take(leaf, "states")
                     else:
-                        rows = _field_rows(data, batch, field_index, start or 0, size)
+                        rows = field_rows(data, batch, field_index, start or 0, size)
                     return rows.view(len(rows), *shape)
 
                 return TensorPort(state.read(), read)
@@ -1118,7 +863,7 @@ class TensorBinding(Builder[TensorFrame]):
     def parameter_rows(self, source: SemanticInputSource | TensorPort) -> SemanticInputSource | TensorPort:
         if self.dimensions is None:
             return source
-        port = _port(source)
+        port = input_port(source)
         if port.rowwise:
             return port
 
@@ -1188,19 +933,7 @@ class TensorBinding(Builder[TensorFrame]):
             execute: Callable[[TensorFrame, TensorBatch], TaskOutput] | None = None
             # Discovery builds only the graph; executable readers require real model facts.
             if self.dimensions is not None:
-                ports = {key: _port(value) for key, value in inputs.items()}
-                domains = tuple(
-                    dict.fromkeys(
-                        key
-                        for key in (
-                            policy.forward_rows,
-                            policy.input_gradient_rows,
-                            policy.parameter_gradient_rows,
-                            policy.update_states,
-                        )
-                        if key and not isinstance(sources[key], StateSelectionInputSource)
-                    )
-                )
+                ports = {key: input_port(value) for key, value in inputs.items()}
                 if policy.parameter_gradient_rows and any(
                     not port.rowwise
                     for port in ports.values()
@@ -1210,193 +943,8 @@ class TensorBinding(Builder[TensorFrame]):
                     raise ValueError(
                         "parameter gradient rows require Parameter(..., per_row=True) for shared parameters"
                     )
-
-                def values(
-                    data: TensorFrame, batch: TensorBatch, *, compact: bool = True
-                ) -> tuple[dict[str, torch.Tensor], tuple[int, ...]]:
-                    # compact=False evaluates every row and lets the caller mask the result, which
-                    # avoids reading the row selector back to the host.
-                    if policy.parameter_gradients:
-                        leaf = state_leaf(data, batch)
-                        batch = replace(batch, roots=_LeafRoots(leaf, batch.roots))
-                    inputs = {key: ports[key].read(data, batch) for key in domains}
-                    for key in domains:
-                        mask = inputs[key]
-                        if mask.dtype != torch.bool or mask.shape != (len(data.rows),):
-                            raise ValueError("row domain must be a boolean mask over the original operation rows")
-                    compacted = bool(policy.forward_rows) and compact
-                    rows = (
-                        tuple(int(index.item()) for index in inputs[policy.forward_rows].nonzero().flatten().cpu())
-                        if compacted
-                        else tuple(range(len(data.rows)))
-                    )
-                    selected = (
-                        replace(data, rows=tuple(data.rows[index] for index in rows), index=None) if compacted else data
-                    )
-                    for key, port in ports.items():
-                        source = sources[key]
-                        state_rows = isinstance(source, StateSelectionInputSource) and port.rowwise
-                        value = inputs[key] if key in domains else port.read(selected if state_rows else data, batch)
-                        differentiable = key not in policy.detached_inputs and (
-                            source.resource in policy.parameter_gradients
-                            if isinstance(source, StateSelectionInputSource)
-                            else key in policy.input_gradients
-                        )
-                        if not differentiable:
-                            value = value.detach()
-                        elif not isinstance(source, (StateSelectionInputSource, TaskResultInputSource)):
-                            if not value.is_floating_point():
-                                raise ValueError("input gradients require floating tensors")
-                            value = value.detach().requires_grad_(True)
-                            data.derivative_sources[str(symbol), key] = value
-                        if compacted and port.rowwise and key not in domains and not state_rows:
-                            mask = inputs[policy.forward_rows]
-                            if value.ndim == 0 or value.shape[0] != len(data.rows) or value.device != mask.device:
-                                raise ValueError("forward rows require aligned logical row tensors on the same device")
-                            value = select_rows(value, rows)
-                        domain = (
-                            policy.parameter_gradient_rows
-                            if isinstance(source, StateSelectionInputSource)
-                            else policy.input_gradient_rows
-                        )
-                        if differentiable and domain:
-                            mask = select_rows(inputs[domain], rows) if compacted else inputs[domain]
-                            if (
-                                not port.rowwise
-                                or value.ndim == 0
-                                or value.shape[0] != len(rows)
-                                or mask.device != value.device
-                            ):
-                                raise ValueError("gradient rows require aligned logical row tensors on the same device")
-                            if value.requires_grad:
-                                value = _gradient_rows(value, mask.reshape(len(rows), *([1] * (value.ndim - 1))))
-                        inputs[key] = value
-                    return inputs, rows
-
-                def evaluate(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
-                    differentiable = bool(policy.input_gradients or policy.parameter_gradients)
-                    with torch.set_grad_enabled(differentiable):
-                        # Pure predictions run on every row and mask the result; differentiable
-                        # forwards still compact so gradients see only the selected rows.
-                        inputs, rows = values(data, batch, compact=differentiable)
-                        result = function(inputs)
-                        # Borrowed inputs cannot escape as result aliases; test_video exercises rejection.
-                        for borrowed in batch.borrowed_roots:
-                            borrowed.check_output(result)
-                        if policy.forward_rows:
-                            if result.ndim == 0 or result.shape[0] != len(rows):
-                                raise ValueError("selected forward functions must preserve their logical row axis")
-                            if not differentiable:
-                                mask = inputs[policy.forward_rows].reshape(-1, *(1,) * (result.ndim - 1))
-                                result = torch.where(
-                                    mask, result, torch.zeros((), dtype=result.dtype, device=result.device)
-                                )
-                            elif len(rows) != len(data.rows):
-                                result = result.new_zeros((len(data.rows), *result.shape[1:])).index_copy_(
-                                    0, inputs[policy.forward_rows].nonzero().flatten(), result
-                                )
-                    batch.results[symbol, output] = result
-                    return TaskOutput()
-
-                execute = evaluate
-                if update is not None:
-
-                    def training(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
-                        with torch.enable_grad():
-                            inputs, rows = values(data, batch)
-                            selected = rows
-                            if policy.update_states in domains:
-                                selected = tuple(
-                                    int(index.item())
-                                    for index in inputs[policy.update_states].nonzero().flatten().cpu()
-                                )
-                            indices = batch.selection.row_states
-                            active = tuple(sorted({indices[data.rows[row].identity] for row in selected}))
-                            if not rows:
-                                outcome = TaskOutput(
-                                    gradients=tuple(
-                                        torch.zeros_like(state_leaf(data, batch)[index]) for index in active
-                                    ),
-                                    gradient_indices=active,
-                                    update_count=len(active),
-                                )
-                            else:
-                                loss = function(inputs)
-                                objective = loss
-                                if policy.reduction == "state_mean":
-                                    if loss.shape != (len(rows),):
-                                        raise ValueError(
-                                            "state_mean training returns one loss per row; pllm averages them per state"
-                                        )
-                                    states = [indices[data.rows[row].identity] for row in rows]
-                                    loss = state_means(loss, states, len(batch.roots))
-                                    objective = loss.sum()
-                                elif loss.ndim != 0:
-                                    raise ValueError(
-                                        "optimizer functions must return a scalar loss or declare state_mean"
-                                    )
-                                leaf = state_leaf(data, batch)
-                                targets = (leaf, *data.derivative_sources.values())
-                                derivatives = (
-                                    torch.autograd.grad(objective, targets, allow_unused=True, materialize_grads=True)
-                                    if objective.requires_grad
-                                    else tuple(torch.zeros_like(target) for target in targets)
-                                )
-                                state_gradients = derivatives[0].detach()
-                                gradients = tuple(state_gradients[index] for index in active)
-                                data.parameter_gradient_fields.update(
-                                    (ref, (value,))
-                                    for ref, value in zip(batch.selection.refs, state_gradients.unbind(), strict=True)
-                                )
-                                data.input_gradients.update(
-                                    (key, value.detach())
-                                    for key, value in zip(data.derivative_sources, derivatives[1:], strict=True)
-                                )
-                                batch.results[symbol, output] = loss = loss.detach()
-                                outcome = TaskOutput(
-                                    loss=loss,
-                                    gradients=gradients,
-                                    gradient_indices=active,
-                                    loss_count=len({indices[data.rows[row].identity] for row in rows})
-                                    if policy.reduction == "state_mean"
-                                    else 1,
-                                    update_count=len(active),
-                                    trained_rows=len(rows),
-                                    observations=training_observations(
-                                        data,
-                                        batch,
-                                        loss,
-                                        {
-                                            key: inputs[key]
-                                            for key in inputs
-                                            if isinstance(sources[key], HiddenInputSource)
-                                        },
-                                        rows,
-                                    ),
-                                )
-                                if captures:
-                                    # Each lineage's memory receives its last selected row's value.
-                                    per_lineage = {indices[data.rows[row].identity]: row for row in rows}
-                                    outcome = replace(
-                                        outcome,
-                                        field_writes=tuple(
-                                            (
-                                                field_id,
-                                                torch.stack(
-                                                    tuple(inputs[key][per_lineage[index]].detach() for index in active)
-                                                ),
-                                            )
-                                            for key, field_id in captures.items()
-                                        ),
-                                    )
-                        # validate_gradients binds every derivative path to this sole sink.
-                        data.derivative_sources.clear()
-                        data.leaf = None
-                        for key, value in batch.results.items():
-                            batch.results[key] = value.detach()
-                        return outcome
-
-                    execute = training
+                task = TensorTask(symbol, function, ports, sources, policy, output, captures)
+                execute = task.evaluate if update is None else task.train
             return self.compute(
                 name,
                 inputs=sources,
@@ -1534,7 +1082,9 @@ class TensorBinding(Builder[TensorFrame]):
             )
         prediction_task = next(task for task in self.graph.tasks if task.symbol == prediction.symbol)
         domain = "" if prediction_task.math is None else prediction_task.math.forward_rows
-        mask = _port(next(port.source for port in prediction_task.inputs if port.name == domain)) if domain else None
+        mask = (
+            input_port(next(port.source for port in prediction_task.inputs if port.name == domain)) if domain else None
+        )
         self.graph = replace(
             self.graph,
             tasks=tuple(

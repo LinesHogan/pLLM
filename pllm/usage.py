@@ -53,9 +53,10 @@ from pllm.execution.replay import Recurrence as Recurrence
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.tensor_binding import SGD as SGD
 from pllm.execution.tensor_binding import Buffer as Buffer
-from pllm.execution.tensor_binding import TensorBinding, TensorFrame, TensorPort, Tensors
+from pllm.execution.tensor_binding import TensorBinding
 from pllm.execution.tensor_binding import TensorOutput as TensorOutput
-from pllm.execution.tensor_binding import TensorUpdate as TensorUpdate
+from pllm.execution.tensor_frame import TensorFrame, TensorPort, Tensors
+from pllm.execution.tensor_frame import TensorUpdate as TensorUpdate
 from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots
 from pllm.kernels.adamw import AdamWConfig
 

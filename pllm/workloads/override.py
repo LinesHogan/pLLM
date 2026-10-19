@@ -11,7 +11,8 @@ from torch.nn import functional as F
 import pllm
 from pllm import authoring as a
 from pllm.contracts.semantic_graph import SchedulerTimeline, TaskResourceFact, TaskSymbol, ValueResourceFact
-from pllm.execution.tensor_binding import TensorBinding, TensorFrame, TensorOutput
+from pllm.execution.tensor_binding import TensorBinding, TensorOutput
+from pllm.execution.tensor_frame import TensorFrame
 
 
 @dataclass(frozen=True, slots=True)
