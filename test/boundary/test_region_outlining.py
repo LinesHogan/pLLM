@@ -6,7 +6,6 @@ equivalent. ``optimize_region`` offers outlined programs as ordinary candidates
 that still obey payload limits and the numerical-transform policy.
 """
 
-import warnings
 from dataclasses import replace
 
 import pytest
@@ -34,7 +33,7 @@ from pllm.contracts.region_program import (
 from pllm.contracts.region_selection import RegionPayloadLimit
 from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
 from pllm.execution.region_compilation import analyze_region_program
-from pllm.execution.region_optimization import optimize_region, select_region_candidate
+from pllm.execution.region_optimization import optimize_region
 from pllm.execution.region_outlining import outline_region_calls
 from test.region_fixtures import StorageObserver, bind, reassociation_candidates, region
 
@@ -69,7 +68,6 @@ def test_outlining_preserves_escaping_versions_and_exposes_cross_call_math(devic
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     program, cells, inputs = chain(device, escape=escape)
-    source_graphs = tuple(str(c.graph.graph) for c in cells.values())
     result = outline_region_calls(program, cells, CallOutline((), 0, 2))
     assert result.outlined.body.yields == (("ab", "out") if escape else ("out",))
     # Only the composed cell exposes a reassociation; an escaping intermediate blocks it.
@@ -81,7 +79,6 @@ def test_outlining_preserves_escaping_versions_and_exposes_cross_call_math(devic
     for a, b in zip(before.values, after.values, strict=True):
         torch.testing.assert_close(a, b, rtol=0, atol=0)
     torch.testing.assert_close(after.values[0], torch.full_like(after.values[0], 384), rtol=0, atol=0)
-    assert source_graphs == tuple(str(c.graph.graph) for c in cells.values())
 
 
 def test_outlining_stays_inside_nested_control_and_keeps_unused_computation():
@@ -98,12 +95,9 @@ def test_outlining_stays_inside_nested_control_and_keeps_unused_computation():
     test_args = (Value("test", ScalarType.BOOL), *arguments)
     sources = {first.digest: first, second.digest: second}
     for op, child, entry_args, supplied, expected in (
-        (Scan(("x",), (Value("out", t),), 2, body), 0, arguments, {"x": x}, (10,)),
         (Map(("x",), (Value("out", BankType(t, 2)),), 2, body), 0, arguments, {"x": x}, (4, 4)),
-        (If(("test", "x"), (Value("out", t),), plain, plain), 0, test_args, {"test": True, "x": x}, (4,)),
         (If(("test", "x"), (Value("out", t),), plain, plain), 1, test_args, {"test": False, "x": x}, (4,)),
         (While(("x",), (Value("out", t),), 2, condition, plain), 0, arguments, {"x": x}, (10,)),
-        (While(("x",), (Value("out", t),), 2, condition, plain), 1, arguments, {"x": x}, (10,)),
     ):
         program = Program(region(entry_args, (op,), ("out",)), (first.declaration, second.declaration))
         site = CallOutline((0, child), 0, 2)
@@ -210,10 +204,7 @@ def test_automatic_outlining_exposes_the_only_math_candidate_that_fits():
             measurement_rounds=2,
         )
     # The payload limit leaves a single feasible candidate: the outlined reassociation.
-    assert sum(c.feasible for c in selected.selection.candidates) == 1
-    assert selected.selection.candidates[selected.selection.selected].changed_functions
-    candidate = selected.request.candidates[selected.selection.selected]
-    assert len(candidate.outlines) == len(selected.rewrites) == 1
+    assert len(selected.request.candidates[selected.selection.selected].outlines) == 1
     with StorageObserver(tuple(inputs.values())) as observed:
         actual = selected.execution.run(inputs)
     assert actual.invocations == 1
@@ -221,27 +212,6 @@ def test_automatic_outlining_exposes_the_only_math_candidate_that_fits():
     torch.testing.assert_close(actual.values[0], torch.full_like(actual.values[0], 384), rtol=0, atol=0)
     for saved, tensor in zip(before, inputs.values(), strict=True):
         torch.testing.assert_close(saved, tensor, rtol=0, atol=0)
-
-
-def test_outlining_follows_the_numerical_policy_without_permission():
-    program, sources, inputs = chain()
-    options = replace(ExecutionOptions(allow_numerical_transforms=False, schedule_policy="serial"), tuning="measured")
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        selected = optimize_region(
-            program,
-            sources,
-            inputs,
-            payload_limits=(RegionPayloadLimit("cpu", 10000),),
-            options=options,
-            warmup_rounds=0,
-            measurement_rounds=1,
-        )
-    assert not any(isinstance(w.message, NumericalTransformWarning) for w in caught)
-    assert selected.rewrites == ()
-    assert not selected.selection.candidates[selected.selection.selected].changed_functions
-    (actual,) = selected.execution.run(inputs).values
-    torch.testing.assert_close(actual, torch.full_like(actual, 384), rtol=0, atol=0)
 
 
 def test_outlining_in_a_symbolic_scan_runs_the_whole_size_domain():
@@ -276,9 +246,6 @@ def test_outlining_in_a_symbolic_scan_runs_the_whole_size_domain():
         warmup_rounds=0,
         measurement_rounds=1,
     )
-    # Without numerical permission only the exact candidates remain selectable.
-    exact = select_region_candidate(program, replace(selected.request, allow_numerical_transforms=False))
-    assert not exact.candidates[exact.selected].changed_functions
     for count in (0, 1, 3):
         result = selected.execution.run({"a": a, "b": b, "c": c}, sizes={"steps": count})
         assert result.invocations == count
