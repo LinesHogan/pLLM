@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import heapq
 from collections import Counter
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
@@ -14,6 +13,7 @@ from threading import RLock
 from typing import overload
 from weakref import WeakSet
 
+import numpy as np
 import torch
 
 from pllm.contracts.compilation import PlanBundle
@@ -182,33 +182,50 @@ class _Pools:
             allocated_bytes += pool.numel() * size
         self.tensors = tuple(tensors)
         self.addresses = tuple(pool.data_ptr() for pool in self.tensors)
-        self.free = [list(range(capacity)) for _ in layout.fields]
-        self.generations = [[0] * capacity for _ in layout.fields]
-        self.users = [[0] * capacity for _ in layout.fields]
+        # Per field and slot: how many versions share the page (0 = free), and how often it was reused.
+        self.holders = np.zeros((len(layout.fields), capacity), dtype=np.int32)
+        self.generations = np.zeros((len(layout.fields), capacity), dtype=np.int64)
         if allocated_bytes != selected.reserved_bytes:
             raise ValueError("PageBundle pool allocation differs from signed capacity")
 
-    def allocate(self, field: int) -> PageSlot:
-        if not self.free[field]:
+    def free_count(self, field: int) -> int:
+        return int(np.count_nonzero(self.holders[field] == 0))
+
+    def allocate(self, field: int, count: int) -> list[PageSlot]:
+        """`count` free pages of one field, smallest slots first."""
+        slots = np.flatnonzero(self.holders[field] == 0)[:count]
+        if len(slots) < count:
             raise RuntimeError("PageBundle capacity is exhausted")
-        slot = heapq.heappop(self.free[field])
-        self.users[field][slot] = 1
-        return PageSlot(slot, self.generations[field][slot])
+        self.holders[field, slots] = 1
+        return [PageSlot(int(slot), int(generation)) for slot, generation in zip(slots, self.generations[field, slots])]
+
+    def share(self, field: int, page: PageSlot) -> PageSlot:
+        """Let another version hold the same page (fields a transition does not write)."""
+        self.holders[field, page.slot_id] += 1
+        return page
 
     def tensor(self, field: int, page: PageSlot) -> torch.Tensor:
-        if self.generations[field][page.slot_id] != page.generation or self.users[field][page.slot_id] < 1:
+        if self.generations[field, page.slot_id] != page.generation or self.holders[field, page.slot_id] < 1:
             raise RuntimeError("PageBundle allocation generation was reclaimed")
         return self.tensors[field][page.slot_id]
 
     def release(self, pages: tuple[PageSlot, ...]) -> None:
         for field, page in enumerate(pages):
-            if self.generations[field][page.slot_id] != page.generation or self.users[field][page.slot_id] < 1:
+            if self.generations[field, page.slot_id] != page.generation or self.holders[field, page.slot_id] < 1:
                 raise RuntimeError("PageBundle allocation generation was reclaimed")
-            self.users[field][page.slot_id] -= 1
-            if self.users[field][page.slot_id] == 0:
-                self.generations[field][page.slot_id] += 1
-                # A min-heap keeps allocation smallest-slot-first without re-sorting.
-                heapq.heappush(self.free[field], page.slot_id)
+            self.holders[field, page.slot_id] -= 1
+            if not self.holders[field, page.slot_id]:
+                self.generations[field, page.slot_id] += 1
+
+
+def demand_fresh(
+    resources: tuple[str, ...], fields: tuple[tuple[LayoutFieldId, ...], ...], transition: bool, widths: dict[str, int]
+) -> Counter[tuple[str, LayoutFieldId]]:
+    """Fresh pages per (resource, field): written fields of a transition, or every field of an admission."""
+    demand: Counter[tuple[str, LayoutFieldId]] = Counter()
+    for resource, chosen in zip(resources, fields, strict=True):
+        demand.update((resource, LayoutFieldId(field)) for field in (chosen if transition else range(widths[resource])))
+    return demand
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,7 +326,7 @@ class PageBundleArena:
     def free_pages(self) -> int:
         with self._lock:
             self.collect_completed()
-            return sum(min(map(len, pools.free)) for pools in self._pools.values())
+            return sum(min(map(pools.free_count, range(len(pools.tensors)))) for pools in self._pools.values())
 
     @property
     def pending_pin_releases(self) -> int:
@@ -371,7 +388,7 @@ class PageBundleArena:
                     for resource, pool in self._pools.items()
                     for field in pool.layout.fields
                 ),
-                sum(len(free) for pool in self._pools.values() for free in pool.free),
+                sum(pool.free_count(field) for pool in self._pools.values() for field in range(len(pool.tensors))),
                 len(live_pages),
                 len(private_pages),
                 len(retiring_pages),
@@ -501,37 +518,41 @@ class PageBundleArena:
                 for field in self._pools[resource].layout.fields:
                     demand[resource, field.field_id] += headroom
         exhausted = {
-            resource for (resource, field), count in demand.items() if len(self._pools[resource].free[field]) < count
+            resource for (resource, field), count in demand.items() if self._pools[resource].free_count(field) < count
         }
         if exhausted:
             # Only completed owners can return pages; active pins are never evicted.
             self.collect_completed(wait=True, resources=exhausted)
-        if any(len(self._pools[resource].free[field]) < count for (resource, field), count in demand.items()):
+        if any(self._pools[resource].free_count(field) < count for (resource, field), count in demand.items()):
             if not sources:
                 self._admission_capacity_failures += 1
             raise RuntimeError("PageBundle capacity is exhausted by live owners")
-        allocated: list[PageBundle] = []
-        try:
-            for index, (ref, resource, chosen) in enumerate(zip(targets, resources, fields, strict=True)):
-                pools = self._pools[resource]
-                source = self.root(sources[index]) if sources else None
-                pages: list[PageSlot] = []
-                try:
-                    for field in range(len(pools.layout.fields)):
-                        if source is not None and field not in chosen:
-                            page = source.pages[field]
-                            pools.users[field][page.slot_id] += 1
-                        else:
-                            page = pools.allocate(field)
-                        pages.append(page)
-                except Exception:
-                    pools.release(tuple(pages))
-                    raise
-                allocated.append(PageBundle(ref, resource, tuple(pages), None))
-        except Exception:
-            for root in allocated:
-                self._pools[root.resource].release(root.pages)
-            raise
+        # Capacity was checked above, so allocation cannot fail part way. Fields a transition
+        # does not write keep sharing the source's page; every other field gets a fresh page.
+        sources_roots = tuple(self.root(ref) for ref in sources)
+        fresh = {
+            key: iter(self._pools[key[0]].allocate(key[1], count))
+            for key, count in demand_fresh(
+                resources,
+                fields,
+                bool(sources),
+                {resource: len(self._pools[resource].tensors) for resource in resources},
+            ).items()
+        }
+        allocated = [
+            PageBundle(
+                ref,
+                resource,
+                tuple(
+                    self._pools[resource].share(field, sources_roots[index].pages[field])
+                    if sources and field not in chosen
+                    else next(fresh[resource, LayoutFieldId(field)])
+                    for field in range(len(self._pools[resource].tensors))
+                ),
+                None,
+            )
+            for index, (ref, resource, chosen) in enumerate(zip(targets, resources, fields, strict=True))
+        ]
         token = PageWrite(self._next_operation, sources, targets, stream)
         self._next_operation += 1
         self._writes[token] = _Write(tuple(allocated), fields)
