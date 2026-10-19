@@ -11,7 +11,6 @@ import torch
 from torch.nn import functional as F
 
 import pllm
-from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole
 
 
 def _sentence_cross_entropy(logits: torch.Tensor, labels: torch.Tensor, ignore_index: int) -> torch.Tensor:
@@ -67,8 +66,9 @@ class TLMWorkload(pllm.CausalAdapterWorkload[TLMData, TLMResult]):
 
     def __post_init__(self) -> None:
         if any(
-            item.target.module is not ParameterModuleKind.ATTENTION
-            or item.target.role not in (ParameterRole.QUERY_PROJECTION_WEIGHT, ParameterRole.VALUE_PROJECTION_WEIGHT)
+            item.target.module is not pllm.ParameterModuleKind.ATTENTION
+            or item.target.role
+            not in (pllm.ParameterRole.QUERY_PROJECTION_WEIGHT, pllm.ParameterRole.VALUE_PROJECTION_WEIGHT)
             for item in self.model.targets
         ):
             raise ValueError("TLM factor topology must name q/v targets")

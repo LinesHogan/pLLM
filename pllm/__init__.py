@@ -16,7 +16,9 @@ from pllm.contracts.backend_attachment import ActivationPatchOperator as Activat
 from pllm.contracts.backend_attachment import DecodeRefresh as DecodeRefresh
 from pllm.contracts.backend_attachment import DecodeWindow as DecodeWindow
 from pllm.contracts.backend_attachment import MissingPolicy as MissingPolicy
+from pllm.contracts.parameter_overlay import ParameterModuleKind as ParameterModuleKind
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator as ParameterOverlayOperator
+from pllm.contracts.parameter_overlay import ParameterRole as ParameterRole
 from pllm.contracts.parameter_overlay import ParameterTarget as ParameterTarget
 from pllm.contracts.request_identity import RequestKeyField as RequestKeyField
 from pllm.contracts.semantic_graph import ConditionalLayerReplay as ConditionalLayerReplay
@@ -257,6 +259,8 @@ __all__ = [
     "DecodeRefresh",
     "MissingPolicy",
     "StateScope",
+    "ParameterModuleKind",
+    "ParameterRole",
     "Tensors",
     "StateTensorUpdate",
     "load_tensor_fields",
