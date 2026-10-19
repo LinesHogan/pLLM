@@ -62,27 +62,14 @@ class TransportHolder(DummyWorkload):
     extra: FakeTransport = FakeTransport(FakeTransportConfig(1))
 
 
-# Built-ins and user workloads travel identically: class coordinates plus frozen fields; module-level
-# function replacements are imported by the worker.
-@pytest.mark.parametrize(
-    "workload",
-    (
-        DummyWorkload(),
-        replace(OverRIDEWorkload(), objective=doubled_cross_entropy),
-        HuberWorkload(3),
-        TransportHolder(extra=FakeTransport(FakeTransportConfig(2))),
-    ),
-)
-def test_workload_transport_round_trips_frozen_workloads(workload) -> None:
-    restored = decode_workload(encode_workload(workload), device=torch.device("cpu"), seed=0)
-    assert type(restored) is type(workload)
-    if isinstance(restored, TransportHolder):
-        assert restored.extra.config == FakeTransportConfig(2)
-    else:
-        assert restored == workload
-
-
-def test_transport_rejects_workloads_the_worker_cannot_import_or_verify() -> None:
+def test_workload_transport_round_trips_frozen_workloads_and_rejects_what_the_worker_cannot_import() -> None:
+    # Built-ins and user workloads travel identically: class coordinates plus frozen fields;
+    # module-level function replacements are imported by the worker.
+    for workload in (DummyWorkload(), replace(OverRIDEWorkload(), objective=doubled_cross_entropy), HuberWorkload(3)):
+        assert decode_workload(encode_workload(workload), device=torch.device("cpu"), seed=0) == workload
+    holder = TransportHolder(extra=FakeTransport(FakeTransportConfig(2)))
+    restored = decode_workload(encode_workload(holder), device=torch.device("cpu"), seed=0)
+    assert isinstance(restored, TransportHolder) and restored.extra.config == FakeTransportConfig(2)
     for workload in (PlainProbe(), replace(DummyWorkload(), transform=lambda hidden: hidden)):
         with pytest.raises(ValueError):
             encode_workload(workload)
