@@ -68,6 +68,17 @@ class TableLayout:
         return rows, counts, last, sources, destinations, feedback
 
 
+def reads_rows(task: TensorTask, tasks: Mapping[TaskSymbol, TensorTask]) -> bool:
+    """Whether the task reads per-row inputs (hidden, feedback, request state), directly or upstream.
+
+    Only such tasks have a row table to capture; the rest stay on the plain TensorTask path.
+    """
+    return any(
+        reads_rows(tasks[source.task], tasks) if isinstance(source, TaskResultInputSource) else task.ports[key].rowwise
+        for key, source in task.sources.items()
+    )
+
+
 @dataclass
 class StepCapture:
     """One task's packed index table, static outputs, and private graph pool."""

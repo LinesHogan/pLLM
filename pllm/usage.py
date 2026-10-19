@@ -57,7 +57,7 @@ from pllm.execution.host_runtime import (
 )
 from pllm.execution.replay import Recurrence as Recurrence
 from pllm.execution.state_execution import MathBinding, StateExecution
-from pllm.execution.step_capture import StepCapture
+from pllm.execution.step_capture import StepCapture, reads_rows
 from pllm.execution.tensor_binding import SGD as SGD
 from pllm.execution.tensor_binding import Buffer as Buffer
 from pllm.execution.tensor_binding import TensorBinding
@@ -1111,7 +1111,8 @@ class Workload(
     def operations(
         self, facts: BackendCompileFacts, plan: PlanBundle, b: TensorBinding
     ) -> MathBinding[TensorStepInput, TensorFrame, TensorOutput]:
-        if plan.timeline.task_resources and b.tensor_tasks and type(self).operations is Workload.operations:
+        captured = {symbol: task for symbol, task in b.tensor_tasks.items() if reads_rows(task, b.tensor_tasks)}
+        if plan.timeline.task_resources and captured and type(self).operations is Workload.operations:
             capture = "compute/cuda_graph@1" in plan.timeline.capabilities
             limits = {fact.task: fact for fact in plan.timeline.task_resources}
             states = (
@@ -1120,12 +1121,12 @@ class Workload(
             conditional = any(
                 task.policy.update_states in task.domains
                 or (b.operations[symbol].optimizer and task.policy.forward_rows)
-                for symbol, task in b.tensor_tasks.items()
+                for symbol, task in captured.items()
             )
             if conditional and capture:
                 raise ValueError("step capture needs row-wise independent training without dynamic update selection")
             if not conditional:
-                for symbol, task in b.tensor_tasks.items():
+                for symbol, task in captured.items():
                     operation = b.operations[symbol]
                     optimizer = operation.optimizer
                     assert optimizer is None or isinstance(optimizer, PoolAdamW)

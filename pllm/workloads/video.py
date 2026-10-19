@@ -96,14 +96,6 @@ class _VideoEncoder(pllm.Workload):
     hidden_size: int
     gain: float
 
-    def operations(
-        self, facts: BackendCompileFacts, plan: PlanBundle, b: TensorBinding
-    ) -> MathBinding[TensorStepInput, TensorFrame, TensorOutput]:
-        """Bind native borrowed-state math under the composed VideoWorkload's resource declaration."""
-        return MathBinding(
-            self._functions(b, facts.device, facts.initialization_seed), b.bind_all(plan, model_probe=facts.probe)
-        )
-
     @property
     def features(self) -> pllm.InstanceState:
         return pllm.InstanceState(
