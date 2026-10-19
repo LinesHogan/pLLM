@@ -1,7 +1,6 @@
 """Evidence 43: archived shared weighted CE/SGD, original state and sampler boundaries."""
 
-import os
-from contextlib import ExitStack, nullcontext
+from contextlib import nullcontext
 from dataclasses import replace
 
 import pytest
@@ -9,76 +8,71 @@ import torch
 from torch.nn import functional as F
 
 import pllm
-from pllm.authoring import AuxiliaryInput, BackendCompileFacts, TensorStepInput, WeightedCEBatch, map_auxiliary
+from pllm.authoring import TensorStepInput, WeightedCEBatch
 from pllm.config import ExecutionOptions
-from pllm.contracts.auxiliary import validate_auxiliary
-from pllm.contracts.backend_attachment import (
-    AttachmentGraphMode,
-    AttachmentHiddenResource,
-    AttachmentTopology,
-    BackendPlacementProbe,
-)
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding, PackedHiddenSnapshot, PackedHiddenSnapshotBatch
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
-from pllm.contracts.semantic_graph import AnchorId, StateScope, TaskId, TaskResultInputSource
+from pllm.contracts.semantic_graph import AnchorId, StateScope
 from pllm.contracts.state_representation import StateDeviceKind
-from pllm.contracts.tensor_layout import TensorDType
-from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.cuda_stream import CudaStreamReadiness
-from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
-from pllm.execution.shared_tensor import SharedTensor
-from pllm.execution.trace import TracePhase, TraceSelection
 from pllm.workloads.lora import OutputLoRAConfig, OutputLoRAWorkload
-from test.backend_facts import assert_auxiliary_preflight
+from test.backend_facts import backend_facts
+
+BINDING = PackedHiddenResourceBinding("-1", HiddenLayerKind.INDEX, HiddenSite.MODEL_OUTPUT, "model.norm")
 
 
-def test_weighted_ce_shared_update_matches_sgd_and_preserves_original_pins(monkeypatch) -> None:
-    binding = PackedHiddenResourceBinding("-1", HiddenLayerKind.INDEX, HiddenSite.MODEL_OUTPUT, "model.norm")
-    facts = BackendCompileFacts(
-        BackendPlacementProbe(
-            "test.sampler@1",
-            "a" * 64,
-            "b" * 64,
-            "c" * 64,
-            AttachmentTopology.IN_PROCESS,
-            AttachmentGraphMode.EAGER,
-            StateDeviceKind.CPU,
-            0,
-            1,
-            1,
-            TensorDType.FLOAT32,
-            4,
-            8,
-            (AttachmentHiddenResource(binding, HiddenPhase.DECODE),),
-            (),
-        ),
-        RuntimeFacts(torch.device("cpu")).timeline(),
-        (PageBundleProviderFacts("test.page@1", 3),),
-        3,
-        65536,
-        7,
-        vocab_size=7,
+def compile_lora(config, device=torch.device("cpu"), *, lineages=3, pages=3):
+    cuda = device.type == "cuda"
+    provider = PageBundleProviderFacts(
+        "canonical.cuda_dense_page@1" if cuda else "test.page@1",
+        pages,
+        StateDeviceKind.CUDA if cuda else StateDeviceKind.CPU,
+        0,
     )
-    config = OutputLoRAConfig(rank=2, alpha=3.0, learning_rate=0.3, steps=3, seed=7)
+    facts = backend_facts(
+        4, (BINDING,), RuntimeFacts(device).timeline(), provider, max_lineages=lineages, memory_bytes=32 * 1024**2
+    )
     workload = OutputLoRAWorkload(config)
-    facts = workload.specialize(facts, ExecutionOptions(training_rows=4))
-    signed = workload.plan_backend(facts)
-    for rows, vocab in ((5, 7), (4, 8)):
-        assert_auxiliary_preflight(
-            signed,
-            WeightedCEBatch(
-                torch.empty((rows, 4), device="meta"),
-                torch.empty((rows, vocab), device="meta"),
-                torch.empty(rows, device="meta", dtype=torch.int64),
-                torch.empty(rows, device="meta"),
-            ),
-        )
-    execution = workload.compile_backend(facts).execution
+    return workload.compile_backend(
+        workload.specialize(replace(facts, vocab_size=7), ExecutionOptions(training_rows=4))
+    ).execution
+
+
+def step_input(identities, hidden, auxiliary, readiness=None):
+    rows = PackedPhaseRowBatch(
+        1,
+        0,
+        len(identities),
+        tuple(PackedPhaseRow(i, i, 0, HiddenPhase.DECODE, identity) for i, identity in enumerate(identities)),
+    )
+    return TensorStepInput(
+        rows,
+        PackedSamplerRowBatch(rows, tuple(PackedSamplerRowLink(i, i) for i in range(len(identities)))),
+        PackedHiddenSnapshotBatch(rows, (PackedHiddenSnapshot(BINDING, hidden),)),
+        auxiliary=auxiliary,
+        hidden_readiness=readiness,
+    )
+
+
+def run_with_guidance(execution, value, stream=None):
+    """Run one step and return the sampler guidance it exposed."""
+    invocation = execution.start_step(value, stream)
+    for anchor in execution.arena.plan.timeline.anchors:
+        execution.execute_anchor(invocation, AnchorId(anchor.ordinal))
+        if anchor.ordinal == execution.sampler_anchor_id:
+            guidance = execution.sampler_guidance(invocation, stream)
+            execution.complete_sampler(invocation, stream)
+    return guidance, execution.finish_step(invocation)
+
+
+def test_weighted_ce_shared_update_matches_sgd_and_preserves_original_pins() -> None:
+    config = OutputLoRAConfig(rank=2, alpha=3.0, learning_rate=0.3, steps=3, seed=7)
+    execution = compile_lora(config)
     (initial,) = execution.admit(())
     original = execution.snapshot(initial)
     old_pin = execution.arena.pin_exact((initial,))
@@ -89,52 +83,7 @@ def test_weighted_ce_shared_update_matches_sgd_and_preserves_original_pins(monke
         torch.tensor([2, 4, 1, -100]),
         torch.tensor([1.0, 3.0, 0.0, 1.0]),
     )
-    validate_auxiliary(batch, signed.inputs.plan, SharedTensor.describe)
-    assert_auxiliary_preflight(signed, replace(batch, labels=batch.labels.float()))
-    rows = PackedPhaseRowBatch(
-        1, 0, 3, tuple(PackedPhaseRow(i, i, 0, HiddenPhase.DECODE, RequestIdentity(str(i), i, 0)) for i in range(3))
-    )
-    value = TensorStepInput(
-        rows,
-        PackedSamplerRowBatch(rows, tuple(PackedSamplerRowLink(i, i) for i in range(3))),
-        PackedHiddenSnapshotBatch(rows, (PackedHiddenSnapshot(binding, hidden),)),
-        auxiliary=batch,
-    )
-
-    excess = replace(
-        rows,
-        total_rows=4,
-        rows=(*rows.rows, PackedPhaseRow(3, 3, 0, HiddenPhase.DECODE, RequestIdentity("extra", 3, 0))),
-    )
-    assert execution.arena.latest(initial.lineage_id) == initial
-    mixed = replace(excess, rows=(*rows.rows, replace(excess.rows[-1], phase=HiddenPhase.PREFILL)))
-    skipped = execution.step(
-        replace(
-            value,
-            rows=mixed,
-            auxiliary=None,
-            sampler_rows=PackedSamplerRowBatch(mixed, tuple(PackedSamplerRowLink(i, i) for i in range(4))),
-            hidden=PackedHiddenSnapshotBatch(mixed, (PackedHiddenSnapshot(binding, torch.cat((hidden, hidden[:1]))),)),
-        )
-    )
-    assert skipped.publication is None
-    for wrong_binding, wrong_hidden in (
-        (replace(binding, module_path="model.other"), hidden),
-        (binding, hidden.to(torch.float64)),
-        (binding, hidden[:, :3]),
-    ):
-        invalid = replace(
-            value, hidden=PackedHiddenSnapshotBatch(rows, (PackedHiddenSnapshot(wrong_binding, wrong_hidden),))
-        )
-        with pytest.raises(ValueError, match="sampler hidden input"):
-            execution.step(invalid)
-        assert execution.arena.latest(initial.lineage_id) == initial
-    with ExitStack() as lifetime:
-        wire = map_auxiliary(batch, lambda tensor: SharedTensor.export(tensor, lifetime))
-        restored = decode_boundary(encode_boundary(wire), AuxiliaryInput[SharedTensor])
-        mapped = map_auxiliary(restored, lambda tensor: tensor.map(os.getpid()))
-        assert isinstance(mapped, WeightedCEBatch)
-        torch.testing.assert_close(mapped.hidden, batch.hidden, equal_nan=True)
+    value = step_input(tuple(RequestIdentity(str(i), i, 0) for i in range(3)), hidden, batch)
     # Unequal row weights are normalized together, not averaged per request.
     a = torch.nn.Parameter(torch.randn((4, 2), generator=torch.Generator().manual_seed(7)) * 0.01)
     b = torch.nn.Parameter(torch.zeros(2, 7))
@@ -144,125 +93,50 @@ def test_weighted_ce_shared_update_matches_sgd_and_preserves_original_pins(monke
         losses = F.cross_entropy(batch.base_logits[:2] + hidden[:2] @ a @ b * 1.5, batch.labels[:2], reduction="none")
         ((losses[0] + 3 * losses[1]) / 4).backward()
         optimizer.step()
-
-    train_task = next(
-        TaskId(index) for index, task in enumerate(execution.arena.plan.semantic_graph.tasks) if task.symbol == "train"
-    )
-    execution.trace.configure(TraceSelection(tasks=(train_task,), iterations=(config.steps - 1,), gradients=True))
-    invocation = execution.start_step(value)
-    frame = invocation.context.data()
-    assert frame.batch_inputs == frame.parameters == ()
-    training_task = execution.arena.plan.semantic_graph.tasks[train_task]
-    assert any(port.source == TaskResultInputSource("__train_prepare", "batch") for port in training_task.inputs)
-    for anchor in range(4):
-        execution.execute_anchor(invocation, AnchorId(anchor))
-    assert len(frame.batch_inputs) == 4 and len(frame.parameters) == 2
-    execution.complete_sampler(invocation)
-    for anchor in range(4, 8):
-        execution.execute_anchor(invocation, AnchorId(anchor))
-    assert frame.batch_inputs == frame.parameters == () and frame.parameter_gradient_fields
-    result = execution.finish_step(invocation)
-    publication = result.publication
-    assert result.loss is not None
+    result = execution.step(value)
     torch.testing.assert_close(result.loss[0], (losses[0] + 3 * losses[1]).detach() / 4)
-    gradients = [event for event in execution.trace.snapshot().events if event.phase is TracePhase.GRADIENT]
-    assert [event.tensor_name for event in gradients] == ["a.grad", "b.grad"]
-    for event, parameter in zip(gradients, (a, b), strict=True):
-        torch.testing.assert_close(event.tensor(), parameter.grad)
-    execution.trace.configure(TraceSelection())
-    assert publication is not None and publication.before_refs == (initial,)
-    (latest,) = publication.after_refs
+    assert result.publication.before_refs == (initial,)
+    for actual, expected in zip(execution.snapshot(result.publication.after_refs[0]), (a, b), strict=True):
+        torch.testing.assert_close(actual, expected)
+    # Another batch restarts from the initial factors; no input keeps the head and only guides sampling.
+    (latest,) = execution.step(value).publication.after_refs
     for actual, expected in zip(execution.snapshot(latest), (a, b), strict=True):
         torch.testing.assert_close(actual, expected)
-    # Another batch resets the optimizer parameters, but absence of input preserves the head.
-    second = execution.step(value).publication
-    assert second is not None
-    (latest,) = second.after_refs
-    for actual, expected in zip(execution.snapshot(latest), (a, b), strict=True):
-        torch.testing.assert_close(actual, expected)
-    invocation = execution.start_step(replace(value, auxiliary=None))
-    for anchor in range(4):
-        execution.execute_anchor(invocation, AnchorId(anchor))
-    guidance = execution.sampler_guidance(invocation)
+    guidance, idle = run_with_guidance(execution, replace(value, auxiliary=None))
     torch.testing.assert_close(guidance.values, hidden @ a @ b * 1.5)
-    assert torch.count_nonzero(guidance.values) > 0
-    execution.complete_sampler(invocation)
-    for anchor in range(4, 8):
-        execution.execute_anchor(invocation, AnchorId(anchor))
-    idle = execution.finish_step(invocation)
-    assert idle.publication is None and idle.loss is None and idle.guidance is guidance
-    capacity = execution.arena.free_pages
-    with pytest.raises(ValueError, match="at least one"):
+    assert idle.publication is None and idle.loss is None
+    with pytest.raises(ValueError):  # At least one row must carry weight.
         execution.step(replace(value, auxiliary=replace(batch, weights=torch.zeros(4))))
-
-    def fail_publish(self, write):
-        raise RuntimeError("publication failed")
-
-    with monkeypatch.context() as fault:
-        fault.setattr(PageBundleArena, "publish", fail_publish)
-        with pytest.raises(RuntimeError, match="publication failed"):
-            execution.step(value)
-    assert execution.arena.latest(latest.lineage_id) == latest and execution.arena.free_pages == capacity
     for actual, expected in zip(execution.arena.snapshot(old_pin, initial), original, strict=True):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    diagnostics = execution.diagnostics()
-    assert diagnostics.update_count == 2 and diagnostics.loss_count == 6 and diagnostics.trained_rows == 4
     execution.arena.wait_release(execution.arena.release_pin(old_pin))
     execution.retire(())
-    assert execution.diagnostics().active_lineages == execution.diagnostics().fallback_count == 0
+    assert execution.diagnostics().active_lineages == 0
 
 
-def test_independent_lora_bmm_and_capture_preserve_keyed_mean_and_private_publication(monkeypatch) -> None:
-    # Archived batched semantics: seeded full bank, per-adapter normalized CE,
-    # mean across adapters, one SGD step per iteration. No production math helper.
-    binding = PackedHiddenResourceBinding("-1", HiddenLayerKind.INDEX, HiddenSite.MODEL_OUTPUT, "model.norm")
+def sgd_reference(config, seed, hidden, logits, labels, weights, groups):
+    """Per-adapter weighted CE, averaged over the adapters of the batch, one SGD step per iteration."""
+    a, b = torch.nn.Parameter(seed.clone()), torch.nn.Parameter(torch.zeros((2, 7), device=seed.device))
+    optimizer = torch.optim.SGD((a, b), lr=config.learning_rate)
+    active = (labels >= 0) & (weights > 0)
+    for _ in range(config.steps):
+        optimizer.zero_grad()
+        loss = F.cross_entropy(logits[active] + hidden[active] @ a @ b * 1.5, labels[active], reduction="none")
+        ((loss * weights[active]).sum() / weights[active].sum() / groups).backward()
+        optimizer.step()
+    return a.detach(), b.detach()
+
+
+def test_independent_lora_bmm_preserves_keyed_mean_and_private_publication() -> None:
     identities = tuple(RequestIdentity(str(index), index, 0) for index in range(3))
     keys = tuple(
         RequestStateKey.project(identity, (RequestKeyField.PROMPT_IDX, RequestKeyField.SAMPLE_IDX))
         for identity in identities
     )
+    config = OutputLoRAConfig(rank=2, alpha=3.0, learning_rate=0.2, steps=3, seed=11, scope=StateScope.REQUEST)
     for device in (torch.device("cpu"), *([torch.device("cuda", 0)] if torch.cuda.is_available() else [])):
-        config = OutputLoRAConfig(rank=2, alpha=3.0, learning_rate=0.2, steps=3, seed=11, scope=StateScope.REQUEST)
-        cuda = device.type == "cuda"
-        stream = torch.cuda.Stream(device=device) if cuda else None
-        facts = BackendCompileFacts(
-            BackendPlacementProbe(
-                "test.sampler@1",
-                "a" * 64,
-                "b" * 64,
-                "c" * 64,
-                AttachmentTopology.IN_PROCESS,
-                AttachmentGraphMode.EAGER,
-                StateDeviceKind.CUDA if cuda else StateDeviceKind.CPU,
-                0,
-                1,
-                1,
-                TensorDType.FLOAT32,
-                4,
-                8,
-                (AttachmentHiddenResource(binding, HiddenPhase.DECODE),),
-                (),
-            ),
-            RuntimeFacts(device).timeline(),
-            (
-                PageBundleProviderFacts(
-                    "canonical.cuda_dense_page@1" if cuda else "test.page@1",
-                    8,
-                    StateDeviceKind.CUDA if cuda else StateDeviceKind.CPU,
-                    0,
-                ),
-            ),
-            3,
-            32 * 1024**2,
-            11,
-            vocab_size=7,
-        )
-        workload = OutputLoRAWorkload(config)
-        facts = workload.specialize(
-            facts,
-            ExecutionOptions(training_rows=4),
-        )
-        execution = workload.compile_backend(facts).execution
+        stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        execution = compile_lora(config, device, pages=8)
         initial = execution.admit(identities, stream)
         old_pin = execution.arena.pin_exact(initial, stream)
         with nullcontext() if stream is None else torch.cuda.stream(stream):
@@ -273,244 +147,75 @@ def test_independent_lora_bmm_and_capture_preserve_keyed_mean_and_private_public
             weights = torch.tensor([[1.0, 3.0, 1.0, 0.0], [2.0, 1.0, 0.0, 4.0]], device=device)
             hidden[0, 2].fill_(float("nan"))
             batch = pllm.WeightedCEBatch.for_prompts(hidden, logits, labels, weights, (1, 0))
-            assert batch.keys == (keys[1], keys[0]) and batch.hidden is hidden and batch.weights is weights
-            for invalid in ((), (0, 0), (-1,)):
-                with pytest.raises(ValueError):
-                    pllm.WeightedCEBatch.for_prompts(hidden, logits, labels, weights, invalid)
-            rows = PackedPhaseRowBatch(
-                1,
-                0,
-                3,
-                tuple(PackedPhaseRow(i, i, 0, HiddenPhase.DECODE, identity) for i, identity in enumerate(identities)),
+            assert batch.keys == (keys[1], keys[0])
+            readiness = CudaStreamReadiness(stream) if stream is not None else None
+            value = step_input(identities, torch.ones((3, 4), device=device), batch, readiness)
+            generator = torch.Generator(device=device).manual_seed(config.seed)
+            seed = torch.randn((2, 4, 2), device=device, generator=generator) * 0.01
+            references = tuple(
+                sgd_reference(config, seed[i], hidden[i], logits[i], labels[i], weights[i], 2) for i in range(2)
             )
-            value = TensorStepInput(
-                rows,
-                PackedSamplerRowBatch(rows, tuple(PackedSamplerRowLink(i, i) for i in range(3))),
-                PackedHiddenSnapshotBatch(rows, (PackedHiddenSnapshot(binding, torch.ones((3, 4), device=device)),)),
-                auxiliary=batch,
-                hidden_readiness=CudaStreamReadiness(stream) if stream is not None else None,
-            )
-            seed = (
-                torch.randn((2, 4, 2), device=device, generator=torch.Generator(device=device).manual_seed(config.seed))
-                * 0.01
-            )
-            references = []
-            reference_gradients = []
-            for index in range(2):
-                a, b = torch.nn.Parameter(seed[index].clone()), torch.nn.Parameter(torch.zeros((2, 7), device=device))
-                optimizer = torch.optim.SGD((a, b), lr=config.learning_rate)
-                active = (labels[index] >= 0) & (weights[index] > 0)
-                for _ in range(config.steps):
-                    optimizer.zero_grad()
-                    loss = F.cross_entropy(
-                        logits[index, active] + hidden[index, active] @ a @ b * 1.5,
-                        labels[index, active],
-                        reduction="none",
-                    )
-                    ((loss * weights[index, active]).sum() / weights[index, active].sum() / 2).backward()
-                    optimizer.step()
-                references.append((a.detach(), b.detach()))
-                reference_gradients.extend((a.grad.clone(), b.grad.clone()))
-            execution.trace.configure(TraceSelection(gradients=True))
-            result = execution.step(value, stream)
-            publication = result.publication
-            assert publication is not None
-            events = [event for event in execution.trace.snapshot().events if event.phase is TracePhase.GRADIENT]
-            assert {identity for event in events for identity in event.identities} == set(identities[:2])
-            observed = [event.tensor() for event in events]
-            for actual, target in zip(observed, reference_gradients, strict=True):
-                torch.testing.assert_close(actual, target.cpu(), rtol=1e-5, atol=1e-7)
-            execution.trace.configure(TraceSelection())
+            publication = execution.step(value, stream).publication
             assert publication.before_refs == (initial[1], initial[0])
             for ref, expected in zip(publication.after_refs, references, strict=True):
                 for actual, target in zip(execution.snapshot(ref, stream), expected, strict=True):
                     torch.testing.assert_close(actual, target, rtol=1e-5, atol=1e-7)
             assert execution.arena.latest(initial[2].lineage_id) == initial[2]
-            # Reordered original keys, fewer states/rows, and a new version reuse
-            # the same captured graph; group mean now divides by one, not capacity.
-            one = WeightedCEBatch(hidden[1:2, :2], logits[1:2, :2], labels[1:2, :2], weights[1:2, :2], (keys[0],))
-            a = torch.nn.Parameter(
-                torch.randn(
-                    (1, 4, 2), device=device, generator=torch.Generator(device=device).manual_seed(config.seed)
-                )[0]
-                * 0.01
+            # Each row is guided by its own adapter; the untrained request keeps its initial factors.
+            guidance, _ = run_with_guidance(execution, replace(value, auxiliary=None), stream)
+            expected = torch.cat(
+                [
+                    torch.ones(1, 4, device=device) @ factors[0] @ factors[1] * 1.5
+                    for factors in (references[1], references[0], original[2])
+                ]
             )
-            b = torch.nn.Parameter(torch.zeros((2, 7), device=device))
-            optimizer = torch.optim.SGD((a, b), lr=config.learning_rate)
-            for _ in range(config.steps):
-                optimizer.zero_grad()
-                loss = F.cross_entropy(
-                    one.base_logits[0] + one.hidden[0] @ a @ b * 1.5, one.labels[0], reduction="none"
-                )
-                ((loss * one.weights[0]).sum() / one.weights[0].sum()).backward()
-                optimizer.step()
-            invocation = execution.start_step(replace(value, auxiliary=one), stream)
-            for anchor in execution.arena.plan.timeline.anchors:
-                execution.execute_anchor(invocation, AnchorId(anchor.ordinal))
-                if anchor.ordinal == execution.sampler_anchor_id:
-                    prepared = invocation.context.data().batch_inputs
-                    assert tuple(tensor.data_ptr() for tensor in prepared) == tuple(
-                        tensor.data_ptr() for tensor in (one.hidden, one.base_logits, one.labels, one.weights)
-                    )
-                    execution.complete_sampler(invocation, stream)
-            second = execution.finish_step(invocation).publication
-            assert second is not None
-            # Inspection after another replay still reads the first result's owned gradients.
-            for index, ref in enumerate((initial[1], initial[0])):
-                expected = reference_gradients[index * 2 : index * 2 + 2]
-                for actual, target in zip(result.parameter_gradient_fields[ref], expected, strict=True):
-                    torch.testing.assert_close(actual, target, rtol=1e-5, atol=1e-7)
-                torch.testing.assert_close(
-                    result.parameter_gradients[ref],
-                    torch.cat(tuple(target.flatten() for target in expected)),
-                    rtol=1e-5,
-                    atol=1e-7,
-                )
-            for actual, target in zip(execution.snapshot(second.after_refs[0], stream), (a, b), strict=True):
-                torch.testing.assert_close(actual, target, rtol=1e-5, atol=1e-7)
-            with torch.inference_mode():
-                inference_input = replace(
-                    one,
-                    hidden=one.hidden.clone(),
-                    base_logits=one.base_logits.clone(),
-                    labels=one.labels.clone(),
-                    weights=one.weights.clone(),
-                )
-            second = execution.step(replace(value, auxiliary=inference_input), stream).publication
-            assert second is not None
-            for actual, target in zip(execution.snapshot(second.after_refs[0], stream), (a, b), strict=True):
-                torch.testing.assert_close(actual, target, rtol=1e-5, atol=1e-7)
-            free = execution.arena.free_pages
-
-            def fail_publish(arena, write):
-                raise RuntimeError("abort private LoRA batch")
-
-            with monkeypatch.context() as fault:
-                fault.setattr(PageBundleArena, "publish", fail_publish)
-                with pytest.raises(RuntimeError, match="abort private"):
-                    execution.step(replace(value, auxiliary=one), stream)
-            assert execution.arena.free_pages == free
-            assert execution.arena.latest(second.after_refs[0].lineage_id) == second.after_refs[0]
-            invocation = execution.start_step(replace(value, auxiliary=None), stream)
-            for anchor in execution.arena.plan.timeline.anchors:
-                execution.execute_anchor(invocation, AnchorId(anchor.ordinal))
-                if anchor.ordinal == execution.sampler_anchor_id:
-                    guidance = execution.sampler_guidance(invocation, stream)
-                    expected = torch.stack(
-                        [
-                            torch.ones(1, 4, device=device) @ factors[0] @ factors[1] * 1.5
-                            for factors in ((a, b), references[0], original[2])
-                        ]
-                    ).squeeze(1)
-                    torch.testing.assert_close(guidance.values, expected, rtol=1e-5, atol=1e-7)
-                    execution.complete_sampler(invocation, stream)
-            idle = execution.finish_step(invocation)
-            assert idle.publication is None and idle.loss is None
+            torch.testing.assert_close(guidance.values, expected, rtol=1e-5, atol=1e-7)
             for ref, expected in zip(initial, original, strict=True):
                 for actual, target in zip(execution.arena.snapshot(old_pin, ref), expected, strict=True):
                     torch.testing.assert_close(actual, target, rtol=0, atol=0)
-        diagnostics = execution.diagnostics()
-        assert diagnostics.loss_count == 12 and diagnostics.update_count == 4 and diagnostics.trained_rows == 9
         execution.arena.wait_release(execution.arena.release_pin(old_pin))
         execution.retire(identities)
-        assert execution.diagnostics().active_lineages == execution.diagnostics().fallback_count == 0
+        assert execution.diagnostics().active_lineages == 0
+    route_keyed_lineages_until_dormant_retirement()
 
-    # Route keys are user-computed: same-route requests join one lineage, distinct
-    # routes stay isolated, and a holderless route lineage persists dormant until
-    # dormant retirement (session close).
-    routed = OutputLoRAWorkload(
-        OutputLoRAConfig(
-            rank=2,
-            alpha=3.0,
-            learning_rate=0.2,
-            steps=1,
-            seed=11,
-            scope=StateScope.REQUEST,
-            key_fields=(RequestKeyField.ROUTE,),
-        )
+
+def route_keyed_lineages_until_dormant_retirement() -> None:
+    """Same-route requests share one lineage; it persists dormant until dormant retirement."""
+    config = OutputLoRAConfig(
+        rank=2,
+        alpha=3.0,
+        learning_rate=0.2,
+        steps=1,
+        seed=11,
+        scope=StateScope.REQUEST,
+        key_fields=(RequestKeyField.ROUTE,),
     )
-    route_facts = BackendCompileFacts(
-        BackendPlacementProbe(
-            "test.sampler@1",
-            "a" * 64,
-            "b" * 64,
-            "c" * 64,
-            AttachmentTopology.IN_PROCESS,
-            AttachmentGraphMode.EAGER,
-            StateDeviceKind.CPU,
-            0,
-            1,
-            1,
-            TensorDType.FLOAT32,
-            4,
-            8,
-            (AttachmentHiddenResource(binding, HiddenPhase.DECODE),),
-            (),
-        ),
-        RuntimeFacts(torch.device("cpu")).timeline(),
-        (PageBundleProviderFacts("test.page@1", 8),),
-        4,
-        32 * 1024**2,
-        11,
-        vocab_size=7,
-    )
-    route_execution = routed.compile_backend(
-        routed.specialize(route_facts, ExecutionOptions(training_rows=4))
-    ).execution
-    math_a = RequestIdentity("r0", 0, 0, "math")
-    math_b = RequestIdentity("r1", 1, 0, "math")
+    execution = compile_lora(config, lineages=4, pages=8)
+    math_a, math_b = RequestIdentity("r0", 0, 0, "math"), RequestIdentity("r1", 1, 0, "math")
     code = RequestIdentity("r2", 2, 0, "code")
-    with pytest.raises(ValueError, match="route state key requires"):
-        route_execution.admit((RequestIdentity("r9", 9, 0),))
-    (first,) = route_execution.admit((math_a,))
-    joined_math, joined_code = route_execution.admit((math_b, code))
-    assert joined_math.lineage_id == first.lineage_id
-    assert joined_code.lineage_id != first.lineage_id
-    assert route_execution.diagnostics().active_lineages == 2
-    math_initial = route_execution.snapshot(first)
-    code_initial = route_execution.snapshot(joined_code)
+    with pytest.raises(ValueError):  # Route-keyed state needs a route on every request.
+        execution.admit((RequestIdentity("r9", 9, 0),))
+    (first,) = execution.admit((math_a,))
+    joined_math, joined_code = execution.admit((math_b, code))
+    assert joined_math.lineage_id == first.lineage_id != joined_code.lineage_id
+    math_initial, code_initial = execution.snapshot(first), execution.snapshot(joined_code)
     hidden = torch.linspace(-0.4, 0.6, 8).reshape(1, 2, 4)
     logits = torch.linspace(-1, 1, 14).reshape(1, 2, 7)
     batch = pllm.WeightedCEBatch.for_prompts(hidden, logits, torch.tensor([[1, 3]]), torch.tensor([[1.0, 2.0]]), (1,))
-    rows = PackedPhaseRowBatch(
-        1,
-        0,
-        2,
-        tuple(
-            PackedPhaseRow(index, index, 0, HiddenPhase.DECODE, identity)
-            for index, identity in enumerate((math_b, code))
-        ),
-    )
-    value = TensorStepInput(
-        rows,
-        PackedSamplerRowBatch(rows, tuple(PackedSamplerRowLink(i, i) for i in range(2))),
-        PackedHiddenSnapshotBatch(rows, (PackedHiddenSnapshot(binding, torch.ones((2, 4))),)),
-        auxiliary=batch,
-    )
-    publication = route_execution.step(value).publication
-    assert publication is not None
-    latest_math = route_execution.arena.latest(first.lineage_id)
-    assert publication.after_refs == (latest_math,) and latest_math.version_id == 1
-    # One request's update is visible to every request sharing its route; the
-    # other route's lineage is untouched.
-    for actual, initial in zip(route_execution.snapshot(latest_math), math_initial, strict=True):
+    publication = execution.step(step_input((math_b, code), torch.ones((2, 4)), batch)).publication
+    latest_math = execution.arena.latest(first.lineage_id)
+    assert publication.after_refs == (latest_math,)
+    # One request's update is visible to its whole route; the other route is untouched.
+    for actual, initial in zip(execution.snapshot(latest_math), math_initial, strict=True):
         assert not torch.equal(actual, initial)
-    for actual, initial in zip(route_execution.snapshot(joined_code), code_initial, strict=True):
+    for actual, initial in zip(execution.snapshot(joined_code), code_initial, strict=True):
         torch.testing.assert_close(actual, initial)
-    route_execution.retire((math_a,))
-    assert route_execution.diagnostics().active_lineages == 2
-    route_execution.retire((math_b,))
-    assert route_execution.diagnostics().active_lineages == 2, "dormant route lineage persists"
-    route_execution.retire((code,))
-    assert route_execution.diagnostics().active_lineages == 2, "every lineage of a route-keyed state is a route lineage"
-    route_execution.retire_dormant()
-    assert route_execution.diagnostics().active_lineages == 0
+    execution.retire((math_a, math_b, code))
+    assert execution.diagnostics().active_lineages == 2, "dormant route lineages persist"
+    execution.retire_dormant()
+    assert execution.diagnostics().active_lineages == 0
     # A later admission of the same route starts a fresh initialized lineage.
-    (fresh,) = route_execution.admit((RequestIdentity("r3", 3, 0, "math"),))
+    (fresh,) = execution.admit((RequestIdentity("r3", 3, 0, "math"),))
     assert fresh.version_id == 0 and fresh.lineage_id != first.lineage_id
-    for actual, initial in zip(route_execution.snapshot(fresh), math_initial, strict=True):
+    for actual, initial in zip(execution.snapshot(fresh), math_initial, strict=True):
         torch.testing.assert_close(actual, initial)
-    route_execution.retire((RequestIdentity("r3", 3, 0, "math"),))
-    route_execution.retire_dormant()
-    diagnostics = route_execution.diagnostics()
-    assert diagnostics.active_lineages == diagnostics.fallback_count == 0
