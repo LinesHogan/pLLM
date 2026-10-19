@@ -18,7 +18,6 @@ from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.cuda_stream import CudaStreamReadiness, upload
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot, borrowed_root
 from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin, PagePublication, PageWrite, Slots
-from pllm.execution.ptts.page_capture import KernelCapture
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.state_execution import StateTaskContext
 from pllm.execution.trace import TracePhase
@@ -57,7 +56,6 @@ class TensorBatch:
     after_refs: tuple[StateRef, ...]
     stream: torch.cuda.Stream | None
     feedback: SamplerFeedback | None = None
-    captured: tuple[torch.Tensor, ...] | None = None
     epoch: int = 1
     observing: bool = False
     paged: Callable[[tuple[int, ...], tuple[int, ...]], tuple[PagedRows, ...]] = _no_pages
@@ -285,9 +283,6 @@ class TensorOperation(Generic[D]):
     mode: Literal["read", "transition", "update", "gradient"] = "read"
     select: Callable[[D, RequestStateSelection], tuple[int, ...]] | None = None
     optimizer: Callable[[Roots, tuple[torch.Tensor, ...]], None] | None = None
-    capture: KernelCapture | None = None
-    capture_inputs: Callable[[D, TensorBatch], tuple[torch.Tensor, ...]] | None = None
-    capture_padding: tuple[float, ...] = ()
     publish: bool = False
     gradient_fields: int = 1
     version: Literal["input", "private", "published"] = "input"
@@ -306,31 +301,6 @@ class TensorOperation(Generic[D]):
                     tuple(context.pin.refs[i] for i in selected), stream, copy_fields=self.copy_fields
                 )
                 batch = _read(context, "private")
-            if self.capture is not None and selected:
-                if self.version != "input":
-                    raise ValueError("this capture binding requires the invocation input version")
-                if self.capture_inputs is None:
-                    raise ValueError("captured operation requires explicit tensor inputs")
-                view = self.capture.view
-                values = self.capture_inputs(data, batch)
-                if len(values) != len(view.inputs) or any(
-                    value.ndim != buffer.ndim
-                    or any(size > bound for size, bound in zip(value.shape, buffer.shape, strict=True))
-                    for value, buffer in zip(values, view.inputs, strict=True)
-                ):
-                    raise ValueError("input differs from its signed captured shapes")
-                if self.capture.writable:
-                    if context.write is None:
-                        raise ValueError("captured mutation requires a private transition")
-                    context.arena.select_captured(view, context.write, context.write.after_refs)
-                else:
-                    context.arena.select_captured(view, context.pin, context.pin.refs)
-                for i, (value, buffer) in enumerate(zip(values, view.inputs, strict=True)):
-                    if value.shape != buffer.shape:
-                        buffer.fill_(self.capture_padding[i] if self.capture_padding else 0)
-                    buffer[tuple(slice(0, size) for size in value.shape)].copy_(value)
-                context.arena.replay_captured(view)
-                batch = replace(batch, captured=tuple(value[: len(selected)].clone() for value in view.results))
             if self.step is None:
                 output = self.function(data, batch)
             else:

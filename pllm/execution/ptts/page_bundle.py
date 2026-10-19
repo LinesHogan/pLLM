@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
@@ -25,10 +25,8 @@ from pllm.contracts.tensor_layout import LayoutFieldId, TensorLayoutSpec
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.cuda_stream import upload
 from pllm.execution.ptts.page_bundle_planning import DTYPE_BYTES, page_stride_bytes
-from pllm.execution.ptts.page_capture import CapturedPageFields, PagedKernel
 from pllm.execution.scheduler import validate_plan_bundle
 from pllm.execution.shared_tensor import CudaIpcStorage, RemoteCompletion, tensor_dtype
-from pllm.kernels.adamw import AdamWConfig, paged_adamw
 from pllm.kernels.paged_linear import PagedRows
 
 
@@ -738,7 +736,7 @@ class PageBundleArena:
 
     def write_field(self, token: PageWrite, root_index: int, field: LayoutFieldId) -> torch.Tensor:
         with self._lock:
-            (root,) = self._capture_roots(token, (token.after_refs[root_index],), (field,))
+            (root,) = self._held_fields(token, (token.after_refs[root_index],), (field,))
             return self._pools[root.resource].tensor(field, root.pages[field])
 
     def writable_roots(self, token: PageWrite) -> tuple[tuple[torch.Tensor, ...], ...]:
@@ -809,7 +807,7 @@ class PageBundleArena:
         owned exports use snapshot. The original pin owns completion and reclamation.
         """
         with self._lock:
-            (root,) = self._capture_roots(pin, (ref,), (field,))
+            (root,) = self._held_fields(pin, (ref,), (field,))
             return self._pools[root.resource].tensor(field, root.pages[field]).detach()
 
     def _access_pages(self, access: PagePin | PageWrite) -> tuple[_Pages, ...]:
@@ -898,7 +896,7 @@ class PageBundleArena:
             if not refs or not fields or len(access) != len(refs) or any(i < 0 or i >= len(refs) for i in rows):
                 raise ValueError("paged rows require original state indices and access")
             roots = tuple(
-                self._capture_roots(token, (ref,), fields)[0] for token, ref in zip(access, refs, strict=True)
+                self._held_fields(token, (ref,), fields)[0] for token, ref in zip(access, refs, strict=True)
             )
             stream = access[0].stream
             if (
@@ -914,7 +912,7 @@ class PageBundleArena:
                     if torch.cuda.current_stream(self.device) != stream:
                         raise RuntimeError("paged computation must use its original consumer stream")
                     for token, ref in zip(access, refs, strict=True):
-                        self._capture_roots(token, (ref,), fields)
+                        self._held_fields(token, (ref,), fields)
 
             def validate_write() -> None:
                 validate()
@@ -969,119 +967,7 @@ class PageBundleArena:
                 for index, field in enumerate(fields)
             )
 
-    def capture_fields(
-        self,
-        access: PagePin | PageWrite,
-        refs: tuple[StateRef, ...],
-        fields: tuple[LayoutFieldId, ...],
-        indices: torch.Tensor,
-        buffers: tuple[torch.Tensor, ...],
-        graph: torch.cuda.CUDAGraph,
-        *,
-        paged: bool = False,
-    ) -> CapturedPageFields:
-        """Bind cold scratch to a signed pool. Budget scratch as AER workspace.
-
-        Capture read_captured/write_captured on access.stream; select_captured and
-        replay_captured gate subsequent launches with the original pin/write.
-        Queue replay before releasing its pin or publishing/aborting its write.
-        The bound graph may access only these fields and independent workspace;
-        retain the arena and scratch until the original completion has finished.
-        """
-        with self._lock:
-            if access.stream is None or not fields or fields != tuple(sorted(set(fields))):
-                raise ValueError("captured fields require a CUDA stream and distinct ordered fields")
-            root = self._capture_roots(access, refs, fields)[0]
-            if not self._pools[root.resource].selected.capture_stable:
-                raise ValueError("signed provider does not support captured page selection")
-            view = CapturedPageFields(
-                self,
-                root.resource,
-                fields,
-                indices,
-                buffers,
-                tuple(value.data_ptr() for value in (indices, *buffers)),
-                access.stream,
-                graph,
-                access,
-                refs,
-                paged=paged,
-            )
-            self.select_captured(view, access, refs)
-            return view
-
-    def capture_kernel(
-        self,
-        access: PagePin | PageWrite,
-        refs: tuple[StateRef, ...],
-        fields: tuple[LayoutFieldId, ...],
-        inputs: tuple[torch.Tensor, ...],
-        kernel: Callable[[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]], tuple[torch.Tensor, ...]] | PagedKernel,
-        *,
-        preserve_fields: bool = True,
-    ) -> CapturedPageFields:
-        """Cold capture of explicit tensor mathematics; no kernel selection or fallback.
-
-        Fields have a fixed leading capacity axis, with current refs in prefix
-        order and zero-filled inactive rows. Inputs and result
-        buffers stay fixed across replays. Private fields are restored after
-        warmup unless the caller supplies disposable admission pages and disables
-        preservation. The caller must abort those pages after capture.
-        The callable is consumed here, never stored in a runtime or wire contract.
-        """
-        if access.stream is None:
-            raise ValueError("kernel capture requires its original CUDA stream")
-        with self._lock, torch.cuda.stream(access.stream), torch.inference_mode(False), torch.enable_grad():
-            root = self._capture_roots(access, refs, fields)[0]
-            if not preserve_fields and (not isinstance(access, PageWrite) or access.before_refs):
-                raise ValueError("disposable capture requires private admission pages")
-            specs = self._pools[root.resource].layout.fields
-            indices = torch.empty((len(fields), len(refs)), device=self.device, dtype=torch.int64)
-            buffers = (
-                ()
-                if isinstance(kernel, PagedKernel)
-                else tuple(
-                    torch.empty(
-                        (len(refs), *specs[field].shape), device=self.device, dtype=tensor_dtype(specs[field].dtype)
-                    )
-                    for field in fields
-                )
-            )
-            view = self.capture_fields(
-                access, refs, fields, indices, buffers, torch.cuda.CUDAGraph(), paged=isinstance(kernel, PagedKernel)
-            )
-            view.inputs = inputs
-
-            def compute() -> tuple[torch.Tensor, ...]:
-                if isinstance(kernel, PagedKernel):
-                    return kernel.compute(view, inputs)
-                return kernel(self.read_captured(view), inputs)
-
-            originals = (
-                tuple(
-                    (value, value.clone())
-                    for ref in refs
-                    for field in fields
-                    for value in (self.write_field(access, access.after_refs.index(ref), field),)
-                )
-                if preserve_fields and isinstance(access, PageWrite) and view.paged
-                else ()
-            )
-            try:
-                for _ in range(3):
-                    compute()
-                access.stream.synchronize()
-                with torch.cuda.graph(view.graph, stream=access.stream):
-                    view.results = compute()
-                    if isinstance(access, PageWrite) and not view.paged:
-                        self.write_captured(view)
-            finally:
-                with torch.no_grad():
-                    for destination, original in originals:
-                        destination.copy_(original)
-            return view
-
-    def _capture_roots(
+    def _held_fields(
         self, access: PagePin | PageWrite, refs: tuple[StateRef, ...], fields: tuple[LayoutFieldId, ...]
     ) -> tuple[PageBundle, ...]:
         if not refs or len(set(refs)) != len(refs):
@@ -1096,166 +982,13 @@ class PageBundleArena:
             raise ValueError("PageBundle field is outside the signed layout")
         return roots
 
-    def _captured_pool(self, view: CapturedPageFields) -> _Pools:
-        if (
-            view.arena is not self
-            or view.indices.device != self.device
-            or view.indices.dtype != torch.int64
-            or view.indices.ndim != 2
-            or view.indices.shape[0] != len(view.fields)
-            or not 0 < len(view.refs) <= view.indices.shape[1]
-            or not view.indices.is_contiguous()
-            or len(view.buffers) != (0 if view.paged else len(view.fields))
-            or tuple(value.data_ptr() for value in (view.indices, *view.buffers)) != view.addresses
-        ):
-            raise ValueError("captured page scratch address or layout changed")
-        pools = self._pools[view.resource]
-        if any(pools.tensors[field].data_ptr() != pools.addresses[field] for field in view.fields):
-            raise ValueError("captured pool address changed")
-        ranges = tuple(
-            (value.data_ptr(), value.data_ptr() + value.numel() * value.element_size())
-            for value in (view.indices, *view.buffers)
-        )
-        bank_ranges = tuple(
-            (value.data_ptr(), value.data_ptr() + value.shape[0] * value.stride(0) * value.element_size())
-            for value in pools.tensors
-        )
-        if any(
-            max(start, other_start) < min(end, other_end)
-            for index, (start, end) in enumerate(ranges)
-            for other_start, other_end in (*ranges[index + 1 :], *bank_ranges)
-        ):
-            raise ValueError("captured scratch must not alias another buffer or arena page")
-        for field, buffer in zip(() if view.paged else view.fields, view.buffers, strict=True):
-            spec = pools.layout.fields[field]
-            if (
-                pools.tensors[field].data_ptr() != pools.addresses[field]
-                or buffer.shape != (view.indices.shape[1], *spec.shape)
-                or buffer.dtype != tensor_dtype(spec.dtype)
-                or buffer.device != self.device
-                or not buffer.is_contiguous()
-                or buffer.requires_grad
-            ):
-                raise ValueError("captured field scratch differs from the signed layout")
-        return pools
-
-    def select_captured(
-        self, view: CapturedPageFields, access: PagePin | PageWrite, refs: tuple[StateRef, ...]
-    ) -> None:
-        with self._lock, torch.no_grad():
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("page selection must happen outside graph capture")
-            self._captured_pool(view)
-            roots = self._capture_roots(access, refs, view.fields)
-            if (
-                access.stream is None
-                or roots[0].resource != view.resource
-                or type(access) is not type(view.access)
-                or len(refs) > view.indices.shape[1]
-            ):
-                raise ValueError("captured selection changed its original stream, resource or access mode")
-            if access.stream != view.stream:
-                access.stream.wait_stream(view.stream)
-            view.stream = access.stream
-            with torch.cuda.stream(view.stream):
-                view.indices.fill_(-1)
-                for index, field in enumerate(view.fields):
-                    for row, root in enumerate(roots):
-                        view.indices[index, row].fill_(int(root.slots[field]))
-            view.access, view.refs = access, refs
-
-    def read_captured(self, view: CapturedPageFields) -> tuple[torch.Tensor, ...]:
-        with self._lock:
-            if view.paged:
-                raise ValueError("paged captures do not own gathered field buffers")
-            pools = self._captured_pool(view)
-            self._capture_roots(view.access, view.refs, view.fields)
-            if torch.cuda.current_stream(self.device) != view.stream:
-                raise RuntimeError("capture must use the original consumer stream")
-            for index, (field, output) in enumerate(zip(view.fields, view.buffers, strict=True)):
-                slots = view.indices[index]
-                torch.index_select(pools.tensors[field], 0, torch.where(slots >= 0, slots, slots[0]), out=output)
-                output.masked_fill_((slots < 0).reshape(-1, *(1 for _ in output.shape[1:])), 0)
-            return view.buffers
-
-    def read_paged_captured(self, view: CapturedPageFields, rows: torch.Tensor) -> tuple[PagedRows, ...]:
-        with self._lock:
-            pools = self._captured_pool(view)
-            if not view.paged or rows.ndim != 1 or rows.dtype != torch.long or rows.device != self.device:
-                raise ValueError("paged capture requires its signed device row indices")
-
-            def validate() -> None:
-                with self._lock:
-                    self._capture_roots(view.access, view.refs, view.fields)
-                    if torch.cuda.current_stream(self.device) != view.stream:
-                        raise RuntimeError("paged capture must use the original consumer stream")
-
-            validate()
-
-            def validate_write() -> None:
-                validate()
-                if not isinstance(view.access, PageWrite):
-                    raise RuntimeError("paged writes require an original private PageWrite")
-
-            return PagedRows.from_fields(
-                tuple(
-                    pools.tensors[field].reshape(pools.tensors[field].shape[0], -1).detach() for field in view.fields
-                ),
-                view.indices,
-                rows,
-                validate,
-                validate_write,
-            )
-
-    def adamw_captured(self, view: CapturedPageFields, gradients: torch.Tensor, config: AdamWConfig) -> None:
-        with self._lock:
-            if not isinstance(view.access, PageWrite) or not view.paged:
-                raise RuntimeError("paged AdamW requires an original private PageWrite")
-            pools = self._captured_pool(view)
-            self._capture_roots(view.access, view.refs, view.fields)
-            if torch.cuda.current_stream(self.device) != view.stream:
-                raise RuntimeError("paged AdamW must use the original writer stream")
-            paged_adamw(tuple(pools.tensors[field] for field in view.fields), view.indices, gradients, config)
-
-    def write_captured(self, view: CapturedPageFields) -> None:
-        with self._lock:
-            if not isinstance(view.access, PageWrite) or view.paged:
-                raise RuntimeError("captured writes require an original private PageWrite")
-            pools = self._captured_pool(view)
-            self._capture_roots(view.access, view.refs, view.fields)
-            if torch.cuda.current_stream(self.device) != view.stream:
-                raise RuntimeError("capture must use the original writer stream")
-            for index, (field, value) in enumerate(zip(view.fields, view.buffers, strict=True)):
-                slots = view.indices[index]
-                shape = (-1, *(1 for _ in value.shape[1:]))
-                destination = pools.tensors[field]
-                if value.dtype is torch.bool:
-                    destination, value = destination.view(torch.uint8), value.view(torch.uint8)
-                neutral = float("-inf") if value.is_floating_point() else torch.iinfo(value.dtype).min
-                # Padding reduces into the first private row with the neutral value;
-                # each real slot has exactly one writer, including NaN/Inf values.
-                value.masked_fill_((slots < 0).reshape(shape), neutral)
-                destination.scatter_reduce_(
-                    0,
-                    torch.where(slots >= 0, slots, slots[0]).reshape(shape).expand_as(value),
-                    value,
-                    reduce="amax",
-                    include_self=False,
-                )
-
-    def replay_captured(self, view: CapturedPageFields) -> None:
-        with self._lock, torch.cuda.stream(view.stream):
-            self._captured_pool(view)
-            self._capture_roots(view.access, view.refs, view.fields)
-            view.graph.replay()
-
     def send_field(
         self, pin: PagePin, ref: StateRef, field: LayoutFieldId, connection: Connection, peer_pid: int
     ) -> PageFieldTransfer:
         """Export over a dedicated channel; the original pin owns remote completion."""
         with self._lock:
             value = self.borrow_field(pin, ref, field)
-            (root,) = self._capture_roots(pin, (ref,), (field,))
+            (root,) = self._held_fields(pin, (ref,), (field,))
             descriptor, completion = self._export(root, field, value, pin.pin_id, connection, pin.stream)
             self._issued_pin(pin).remote.append(completion)
             # Retain completion before sending: even a partial send may expose the mapping.

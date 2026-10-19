@@ -37,7 +37,6 @@ from pllm.execution.ptts.page_bundle import (
     PageRelease,
     PageWrite,
 )
-from pllm.execution.ptts.page_capture import KernelCapture
 from pllm.execution.ptts.request_state import RequestStateDirectory, RequestStateSelection
 from pllm.execution.replay import LayerReplayPrimitive, TokenwiseReplayPrimitive
 from pllm.execution.trace import ExecutionTrace, TracePhase
@@ -234,7 +233,6 @@ class MathBinding(Generic[InputT, DataT, ResultT]):
 
     math: StateMath[InputT, DataT, ResultT]
     tasks: tuple[TaskGraphImplementation[StateTaskContext[DataT]], ...]
-    captures: tuple[KernelCapture, ...] = ()
     borrowed_resources: tuple[str, ...] = ()
 
     def local_resources(self, plan: PlanBundle) -> tuple[str, ...]:
@@ -255,11 +253,6 @@ class MathBinding(Generic[InputT, DataT, ResultT]):
         return tuple(str(state.resource) for state in states if state.resource not in borrowed)
 
     def bind(self, arena: PageBundleArena, sampler_anchor_id: AnchorId) -> StateExecution[InputT, DataT, ResultT]:
-        # Reject any underfunded kernel before allocating/capturing the first one's inputs.
-        for capture in self.captures:
-            capture.check_inputs(arena.plan, capture.inputs(torch.device("meta")))
-        for capture in self.captures:
-            capture.bind(arena)
         states = arena.plan.semantic_graph.states
         for group in arena.plan.semantic_graph.input_groups:
             if set(group.borrowed_resources) != set(self.borrowed_resources):
