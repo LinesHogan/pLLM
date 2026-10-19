@@ -1,108 +1,14 @@
 """PTTS evidence 9/10/12: state values, atomic failure and issued generations."""
 
-from dataclasses import replace
-
 import pytest
 import torch
 
-from pllm.authoring import BackendCompileFacts, ParameterTargetShape
-from pllm.contracts.backend_attachment import AttachmentGraphMode, AttachmentTopology, BackendPlacementProbe
-from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
-from pllm.contracts.semantic_graph import SemanticState, StateResource, StateScope
-from pllm.contracts.state_representation import StateDeviceKind, StateLayoutRequirement, StateRepresentationRequest
-from pllm.contracts.tensor_layout import LayoutFieldId, StateTensorLayout, TensorDType, TensorLayoutRequest
-from pllm.execution.ptts.page_bundle import PageBundleArena
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.runtime_facts import RuntimeFacts
-from pllm.execution.scheduler import compile_state_schedule, intern_tensor_layouts
-from pllm.workloads.inplace_ttt import (
-    InPlaceTTTConfig,
-    InPlaceTTTWorkload,
-)
-
-
-def _arena(*, heterogeneous: bool = False) -> PageBundleArena:
-    target = ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT)
-    facts = BackendCompileFacts(
-        BackendPlacementProbe(
-            "test.page_bundle@1",
-            "a" * 64,
-            "b" * 64,
-            "c" * 64,
-            AttachmentTopology.IN_PROCESS,
-            AttachmentGraphMode.EAGER,
-            StateDeviceKind.CPU,
-            0,
-            1,
-            1,
-            TensorDType.FLOAT32,
-            3,
-            8,
-            (),
-            (),
-        ),
-        RuntimeFacts(torch.device("cpu")).timeline(("transition/full_root@1",)),
-        (PageBundleProviderFacts("test.page_bundle@1", 6),),
-        2,
-        4096,
-        0,
-        (ParameterTargetShape(target, 3, 2),),
-    )
-    plan = InPlaceTTTWorkload(InPlaceTTTConfig((target,), chunk_size=2)).plan_backend(facts).inputs.plan
-    if heterogeneous:
-        (original,) = plan.tensor_layout_request.layouts
-        layout = replace(
-            original.layout,
-            namespace="test.global_factors@1",
-            fields=(replace(original.layout.fields[0], shape=(2, 5)),),
-        )
-        layouts = TensorLayoutRequest((original, StateTensorLayout("global_factors", layout)))
-        bindings = intern_tensor_layouts(layouts)
-        graph = replace(
-            plan.semantic_graph,
-            states=(
-                *plan.semantic_graph.states,
-                SemanticState(StateResource("global_factors"), StateScope.INSTANCE, ()),
-            ),
-        )
-        facts = PageBundleProviderFacts("test.page_bundle@1", 6)
-        candidates = tuple(
-            facts.materialize_plan(
-                resource=entry.resource, layout=entry.layout, binding=binding, max_admitted_lineages=2
-            )
-            for entry, binding in zip(layouts.layouts, bindings.bindings, strict=True)
-        )
-        request = StateRepresentationRequest(
-            4096,
-            tuple(
-                StateLayoutRequirement(
-                    binding.resource,
-                    binding.layout_id,
-                    binding.layout_namespace,
-                    binding.layout_digest,
-                    2,
-                )
-                for binding in bindings.bindings
-            ),
-            candidates,
-        )
-        decision, state_physical, schedule, physical = compile_state_schedule(graph, plan.timeline, request)
-        plan = replace(
-            plan,
-            semantic_graph=graph,
-            schedule_decision=schedule,
-            schedule_physical=physical,
-            state_request=request,
-            state_decision=decision,
-            state_physical=state_physical,
-            tensor_layout_request=layouts,
-            tensor_layout_decision=bindings,
-        )
-    return PageBundleArena(plan)
+from pllm.contracts.tensor_layout import LayoutFieldId
+from test.region_fixtures import page_arena
 
 
 def test_cpu_request_ptts_admit_cow_publish_pin_retire() -> None:
-    arena = _arena()
+    arena = page_arena()
     write = arena.prepare_admission(("dense_fast_weights", "dense_fast_weights"))
     field_count = len(arena.plan.tensor_layout_request.layouts[0].layout.fields)
     prepared_usage = arena.usage()
@@ -224,7 +130,7 @@ def test_cpu_request_ptts_admit_cow_publish_pin_retire() -> None:
 
 
 def test_multi_lineage_admission_and_publication_roll_back_atomically(monkeypatch: pytest.MonkeyPatch) -> None:
-    arena = _arena(heterogeneous=True)
+    arena = page_arena(heterogeneous=True)
     resources = ("dense_fast_weights", "global_factors")
     capacity = arena.free_pages
     with pytest.raises(RuntimeError, match="capacity"):
@@ -282,7 +188,7 @@ def test_multi_lineage_admission_and_publication_roll_back_atomically(monkeypatc
 
 
 def test_page_reuse_bumps_generation_and_blocks_double_settlement() -> None:
-    arena = _arena()
+    arena = page_arena()
     write = arena.prepare_admission(("dense_fast_weights",))
     publication = arena.publish(write)
     (old_ref,) = publication.after_refs

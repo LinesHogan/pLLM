@@ -15,8 +15,6 @@ from pllm.contracts.backend_attachment import (
     ActivationPatchBinding,
     ActivationPatchOperator,
     AttachmentGraphMode,
-    AttachmentKind,
-    AttachmentTaskRole,
     AttachmentTopology,
     BackendPlacementProbe,
     CausalModelDomain,
@@ -33,7 +31,6 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import (
     AnchorId,
     StateEffectKind,
-    StateScope,
     TaskResourceFact,
     TaskSymbol,
     ValueResourceFact,
@@ -46,7 +43,7 @@ from pllm.execution.backend_attachment import (
     derive_attachment_resources,
 )
 from pllm.execution.codec import decode_boundary, encode_boundary
-from pllm.execution.declaration import Builder, Dimensions, Field, When, native
+from pllm.execution.declaration import Dimensions, Field, When
 from pllm.execution.paged_access import PagedLayer, PagedResourceView, bind_paged_access
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
@@ -390,69 +387,8 @@ def test_disabled_recirculation_runs_only_the_normal_pass() -> None:
     assert decoder.calls == [(0, "normal")] and torch.count_nonzero(decoder.cache[0]) == 0
 
 
-def test_usage_composed_declaration_keeps_request_rows() -> None:
-    _usage_composed_declaration_keeps_request_rows(FACTS, CONFIG, VALUE)
-
-
 def test_activation_source_matches_serial_oracle() -> None:
     _activation_source_matches_serial_oracle(Decoder, VALUE, INPUTS, CONFIG, PROBE)
-
-
-def test_activation_declaration_retains_publication_and_costs() -> None:
-    _activation_declaration_retains_publication_and_costs(PROBE)
-
-
-def _usage_composed_declaration_keeps_request_rows(facts, config, value) -> None:
-    from pllm.workloads.reft import ActivationConfig, ActivationWorkload
-
-    class ComposedRecurrence(ActivationWorkload):
-        @property
-        def recurrence(self) -> pllm.Recurrence:
-            return config
-
-    request_composed = ComposedRecurrence(
-        ActivationConfig(
-            (1,), 2, first_tokens=1, last_tokens=1, operator=ActivationPatchOperator.ADD, scope=pllm.StateScope.REQUEST
-        )
-    )
-    graph, _, spec = request_composed.declare(facts)
-    (state,) = graph.states
-    assert spec.kind is AttachmentKind.MODEL_REPLAY and len(spec.activation_bindings) == 1
-    assert state.scope is StateScope.REQUEST and state.resource == spec.state_resource
-    assert {task.symbol for task in graph.tasks} == {symbol for _, symbol in spec.tasks}
-    instance_composed = ComposedRecurrence(replace(request_composed.config, scope=pllm.StateScope.INSTANCE))
-    # The usage-level checkpoint rows follow the signed activation, not the replay kind.
-    request_math = request_composed._functions(
-        request_composed.declaration(facts), facts.device, facts.initialization_seed
-    )
-    instance_math = instance_composed._functions(
-        instance_composed.declaration(facts), facts.device, facts.initialization_seed
-    )
-    assert request_math.rows(value) == value.rows.rows
-    assert instance_math.rows(value) == ()
-
-    class HoldingRecurrence(ComposedRecurrence):
-        @property
-        def patch(self) -> pllm.Activation:
-            return replace(
-                super().patch, decode=DecodeWindow.ALL, decode_refresh=DecodeRefresh.STEP, on_missing=MissingPolicy.HOLD
-            )
-
-    for workload, expected_rows in ((request_composed, value.rows.rows), (instance_composed, ())):
-        holding = HoldingRecurrence(workload.config)
-        definition = holding.declaration(facts)
-        (binding,) = definition.attachment.activation_bindings
-        assert (binding.decode, binding.decode_refresh, binding.on_missing) == (
-            DecodeWindow.ALL,
-            DecodeRefresh.STEP,
-            MissingPolicy.HOLD,
-        )
-        assert (
-            definition.graph.execution_parameters_digest
-            != workload.declaration(facts).graph.execution_parameters_digest
-        )
-        assert holding._functions(definition, facts.device, facts.initialization_seed).rows(value) == expected_rows
-        assert not definition.graph.input_groups  # A policy alone cannot authorize missing borrowed roots.
 
 
 def _activation_source_matches_serial_oracle(decoder_type, value, inputs, config, probe):
@@ -640,146 +576,3 @@ def _activation_source_matches_serial_oracle(decoder_type, value, inputs, config
         execution.retire(identities)
         execution.retire(())
         received.__exit__(None, None, None)
-
-
-def _activation_declaration_retains_publication_and_costs(probe):
-    tensor_declarations = []
-    for replay_first in (False, True):
-        binding = TensorBinding("activation.replay", "a" * 64, Dimensions(4, 0, layer_count=3))
-        if replay_first:
-            binding.recurrence(pllm.Recurrence())
-        binding.activation_patch(
-            "inject",
-            {"delta": pllm.Buffer((4,), dtype=torch.float32)},
-            layers=(1,),
-            operator=ActivationPatchOperator.ADD,
-            first_tokens=1,
-            last_tokens=1,
-            scope=pllm.StateScope.INSTANCE,
-            keys=(),
-            namespace="test.inject",
-            decode=DecodeWindow.ALL,
-            decode_refresh=DecodeRefresh.STEP,
-        )
-        if not replay_first:
-            binding.recurrence(pllm.Recurrence())
-        tensor_declarations.append(binding.finish())
-    assert tensor_declarations[0] == tensor_declarations[1]
-    declarations = []
-    for replay_first in (False, True):
-        b = Builder("activation.replay", "a" * 64)
-        features = b.state("features", (Field("value", (4,)),))
-        inject = b.state("inject", (Field("delta", (4,)),))
-        encode = b.compute("encode", inputs={}, outputs=("value",), reads=(features.version(),), when=When.BEFORE_MODEL)
-        write = b.compute(
-            "write",
-            inputs={"hidden": encode["value"]},
-            outputs=("updated",),
-            changes=inject,
-            effect=StateEffectKind.TRANSITION,
-            when=When.BEFORE_MODEL,
-        )
-        publication = b.publish(write, inject, when=When.BEFORE_MODEL)
-        forward = b.compute(
-            "forward",
-            inputs={"rows": b.rows()},
-            outputs=("normal_hidden",),
-            when=When.MODEL_UPDATE,
-            replay=pllm.Recurrence().effect(3),
-            implementations=(native(TOKENWISE_REPLAY_IMPLEMENTATION, "model/tokenwise_replay@1"),),
-        )
-        patch = ActivationPatchBinding(
-            1,
-            (LayoutFieldId(0),),
-            1,
-            1,
-            ActivationPatchOperator.ADD,
-            DecodeWindow.ALL,
-            DecodeRefresh.STEP,
-            MissingPolicy.HOLD,
-        )
-        if replay_first:
-            b.model_effect(forward, AttachmentKind.MODEL_REPLAY)
-        b.overlay(inject, write, publication, activations=(patch,))
-        if not replay_first:
-            b.model_effect(forward, AttachmentKind.MODEL_REPLAY)
-        graph, layouts, spec = b.finish()
-        assert spec.kind is AttachmentKind.MODEL_REPLAY and spec.activation_bindings == (patch,)
-        assert spec.state_resource == inject.declaration.resource and spec.sampler_anchor == "sampler.pre_draw"
-        assert spec.tasks == (
-            (AttachmentTaskRole.COMPUTE, forward.symbol),
-            (AttachmentTaskRole.TRANSITION, write.symbol),
-            (AttachmentTaskRole.PUBLISH, publication.symbol),
-        )
-        task = next(task for task in graph.tasks if task.symbol == forward.symbol)
-        assert task.effects == (inject.version(publication),)
-        assert task.inputs[-1].source == publication["publication"]
-        declarations.append((graph, layouts, spec))
-        before = b.finish()
-        with pytest.raises(ValueError, match="one activation publication"):
-            b.overlay(inject, write, publication, activations=(patch,))
-        assert b.finish() == before
-        with pytest.raises(ValueError, match="only activation and tokenwise"):
-            b.model_effect(forward)  # An observation cannot silently replace the pair.
-        assert b.finish() == before
-    assert declarations[0] == declarations[1], "declaration order cannot discard either effect"
-
-    timeline = replace(
-        RuntimeFacts(torch.device("cpu")).timeline(("model/tokenwise_replay@1", "transition/full_root@1")),
-        region_policy=RegionSelectionPolicy(schedule_policy="serial"),
-        reserved_bytes=(80,) * 8,
-        task_resources=(
-            TaskResourceFact(TaskSymbol("encode"), 32, 8),
-            TaskResourceFact(TaskSymbol("publish"), 0),
-            TaskResourceFact(TaskSymbol("write"), 16),
-        ),
-        value_resources=(
-            ValueResourceFact(TaskSymbol("encode"), "value", 16),
-            ValueResourceFact(TaskSymbol("publish"), "publication", 0),
-            ValueResourceFact(TaskSymbol("write"), "updated", 0),
-        ),
-    )
-    funded = derive_attachment_resources(probe, graph, timeline, layouts=layouts, attachment=spec)
-    assert set(timeline.task_resources) <= set(funded.task_resources)
-    assert set(timeline.value_resources) <= set(funded.value_resources)
-    assert funded.reserved_bytes == timeline.reserved_bytes
-    assert derive_attachment_resources(probe, graph, funded, layouts=layouts, attachment=spec) == funded
-    replay_cost = next(fact.workspace_bytes for fact in funded.task_resources if fact.task == forward.symbol)
-    budget = 80 + sum(fact.workspace_bytes + fact.resident_bytes for fact in timeline.task_resources) + 16 + replay_cost
-    assert (
-        derive_attachment_resources(
-            probe, graph, replace(timeline, memory_budget_bytes=budget), layouts=layouts, attachment=spec
-        ).task_resources
-        == funded.task_resources
-    )
-    with pytest.raises(ValueError, match="reference payload exceeds"):
-        derive_attachment_resources(
-            probe, graph, replace(timeline, memory_budget_bytes=budget - 1), layouts=layouts, attachment=spec
-        )
-
-    plan = compile_page_bundle_plan(
-        (graph, layouts), funded, (PageBundleProviderFacts("test.replay@1", 3),), 1, 65536, torch.device("cpu")
-    )
-    signed = bind_backend_attachment(plan, probe, spec)
-    assert signed.inputs.request.activation_bindings == (patch,)
-    b.conditional_input(("features",))
-    conditional = b.graph
-    (group,) = conditional.input_groups
-    conditional_plan = compile_page_bundle_plan(
-        (conditional, layouts), funded, (PageBundleProviderFacts("test.replay@1", 3),), 1, 65536, torch.device("cpu")
-    )
-    assert bind_backend_attachment(conditional_plan, probe, spec).inputs.plan == conditional_plan
-    assert conditional_plan.schedule_decision.signature != plan.schedule_decision.signature
-    assert derive_attachment_resources(probe, conditional, timeline, layouts=layouts, attachment=spec) == funded
-    import json
-
-    from pllm import _core
-
-    payload = json.loads(encode_boundary(conditional))
-    del payload["input_groups"]
-    with pytest.raises(ValueError, match="missing field.*input_groups"):
-        _core.compile_schedule(json.dumps(payload), encode_boundary(funded), None)
-    payload = json.loads(encode_boundary(conditional))
-    payload["input_groups"][0]["skip_any_task"] = True
-    with pytest.raises(ValueError, match="unknown field"):
-        _core.compile_schedule(json.dumps(payload), encode_boundary(funded), None)

@@ -255,8 +255,12 @@ def _owned_readonly_requires_exact_pin(owner):
         pages.borrow_tensor(imported, (0,))
 
 
-@pytest.mark.parametrize("failure", ("alias", "close", "cancel", "missing", "mixed", "staging", "write"))
-def test_video_binding_failure_retains_grants_and_stops_execution(failure):
+def test_video_binding_failure_retains_grants_and_stops_execution():
+    for failure in ("alias", "close", "cancel", "missing", "mixed", "staging", "write"):
+        _binding_failure_fail_stops(failure)
+
+
+def _binding_failure_fail_stops(failure):
     with binding_case(alias=failure == "alias", write_failure=failure == "write") as (
         _,
         _,

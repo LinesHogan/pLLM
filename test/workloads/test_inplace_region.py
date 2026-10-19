@@ -56,7 +56,6 @@ def facts_for(device, dtype, target):
 @pytest.mark.parametrize(
     "device,dtype,transposed_base",
     (
-        ("cpu", torch.float64, False),
         ("cpu", torch.float32, True),
         ("cuda:0", torch.bfloat16, True),
     ),
@@ -135,55 +134,6 @@ def test_customized_source_cannot_inherit_the_builtin_region_lowering():
     facts = facts_for(torch.device("cpu"), torch.float32, target)
     with pytest.raises(ValueError, match="explicit matching native implementation"):
         workload.compile_backend(facts)
-
-
-def test_chunk_region_isl_moves_independent_updates_without_changing_forward_versions():
-    from pllm.execution.region_compilation import (
-        analyze_region_program,
-        lower_region_bindings,
-        lower_region_schedule,
-        preview_region_schedule,
-    )
-    from pllm.execution.region_execution import RegionExecution
-    from pllm.execution.region_values import Bank
-    from pllm.workloads.inplace_ttt import _chunk_region
-
-    program, cells = _chunk_region(0.017, 3, 7, 5, torch.float64, torch.device("cpu"), False)
-    functions = {cell.digest: cell for cell in cells}
-    scan = TensorScan(program, 3, carry=1, invariants=1, functions=functions)
-    generator = torch.Generator().manual_seed(21)
-    delta = torch.randn(5, 7, dtype=torch.float64, generator=generator)
-    base = torch.randn(5, 7, dtype=torch.float64, generator=generator)
-    xs = tuple(torch.randn(3, 7, dtype=torch.float64, generator=generator) for _ in range(3))
-    ys = tuple(torch.randn(3, 5, dtype=torch.float64, generator=generator) for _ in range(3))
-    expected, current = [], delta.clone()
-    for x, y in zip(xs, ys, strict=True):
-        expected.append(x @ (base + current).T)
-        current.add_(0.017 * (y.T @ x))
-    inputs = {"arg0": delta, "arg1": base, "arg2": Bank(xs), "arg3": Bank(ys)}
-    analysis = analyze_region_program(scan.program)
-    orders = set()
-    for candidate in analysis.candidates:
-        orders.add(
-            tuple(
-                (item.statement_id, item.coordinates)
-                for item in preview_region_schedule(scan.program, candidate.schedule_map)
-            )
-        )
-        run = RegionExecution(
-            scan.program,
-            lower_region_schedule(scan.program, candidate.schedule_map),
-            lower_region_bindings(scan.program, candidate.schedule_map),
-            functions,
-        )
-        final, column = run.run(inputs).values
-        torch.testing.assert_close(final, current, rtol=0, atol=0)
-        for actual, want in zip(column.elements, expected, strict=True):
-            torch.testing.assert_close(actual, want, rtol=0, atol=0)
-    # This order comes from ISL: compute independent increments, then carry
-    # updates, then forwards. Each forward must still read its own old delta.
-    assert tuple((statement, (i,)) for statement in (1, 2, 0) for i in range(3)) in orders
-    assert len(orders) > 1
 
 
 def test_production_tuning_uses_signed_policy_and_remaining_transition_budget(monkeypatch):

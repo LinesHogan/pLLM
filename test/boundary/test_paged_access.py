@@ -3,17 +3,8 @@
 import pytest
 import torch
 
-from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.packed_rows import PackedPhaseRow
-from pllm.contracts.request_identity import RequestIdentity
 from pllm.execution.paged_access import PagedLayer, bind_paged_access
-
-
-def rows(positions=(4, 5, 4, 5)):
-    return tuple(
-        PackedPhaseRow(i, i // 2, position, HiddenPhase.PREFILL, RequestIdentity(str(i // 2), i // 2, 0))
-        for i, position in enumerate(positions)
-    )
+from test.region_fixtures import paged_rows
 
 
 @pytest.mark.parametrize("layout", ("HND", "NHD"))
@@ -22,7 +13,7 @@ def test_shared_read_prefix_and_interleaved_layers_keep_distinct_writes(layout):
     caches = tuple(root[:, :, i] if layout == "HND" else root[:, i].permute(0, 2, 1, 3) for i in range(2))
     table, slots = torch.tensor([[0, 1], [0, 2]]), torch.tensor([4, 5, 8, 9])
     layers = tuple(PagedLayer(str(i), cache, table, slots) for i, cache in enumerate(caches))
-    batch = rows()
+    batch = paged_rows()
     plan = bind_paged_access(batch, layers)
     expected = {
         cache[1 if row.request_ordinal == 0 else 2, head, row.token_offset % 4].data_ptr()
@@ -41,13 +32,17 @@ def test_write_aliases_and_page_slot_disagreement_fail_before_mutation():
     before = cache.clone()
     table, slots = torch.tensor([[0, 1], [0, 2]]), torch.tensor([4, 5, 8, 9])
     with pytest.raises(ValueError, match="slot differs"):
-        bind_paged_access(rows(), (PagedLayer("a", cache, table, torch.tensor([4, 5, 8, 10])),))
+        bind_paged_access(paged_rows(), (PagedLayer("a", cache, table, torch.tensor([4, 5, 8, 10])),))
     with pytest.raises(ValueError, match="aliases"):
-        bind_paged_access(rows(), (PagedLayer("a", cache, torch.tensor([[0, 1], [0, 1]]), torch.tensor([4, 5, 4, 5])),))
+        bind_paged_access(
+            paged_rows(), (PagedLayer("a", cache, torch.tensor([[0, 1], [0, 1]]), torch.tensor([4, 5, 4, 5])),)
+        )
     # Distinct current slots can still conflict with another request's history.
     with pytest.raises(ValueError, match="aliases"):
-        bind_paged_access(rows((4, 5, 8, 9)), (PagedLayer("a", cache, torch.tensor([[0, 1, 3], [1, 3, 2]]), slots),))
+        bind_paged_access(
+            paged_rows((4, 5, 8, 9)), (PagedLayer("a", cache, torch.tensor([[0, 1, 3], [1, 3, 2]]), slots),)
+        )
     # Separate logical layer names do not establish separate storage.
     with pytest.raises(ValueError, match="aliases"):
-        bind_paged_access(rows(), (PagedLayer("a", cache, table, slots), PagedLayer("b", cache, table, slots)))
+        bind_paged_access(paged_rows(), (PagedLayer("a", cache, table, slots), PagedLayer("b", cache, table, slots)))
     torch.testing.assert_close(cache, before, rtol=0, atol=0)
