@@ -1,4 +1,7 @@
-"""TLM evidence 11/24: independent factor AdamW and causal objective semantics."""
+"""TLM evidence 11/24: independent factor AdamW and causal objective semantics.
+
+The real HF/PEFT model path is covered by test/gpu/vllm_tlm_smoke.py.
+"""
 
 from dataclasses import replace
 
@@ -20,7 +23,7 @@ from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.kernels.adamw import AdamWConfig
-from pllm.workloads.tlm import HfQvConfig, HfQvModel, TLMConfig, TLMMode, TLMWorkload
+from pllm.workloads.tlm import TLMConfig, TLMMode, TLMWorkload
 
 
 class TinyCausalModel:
@@ -196,92 +199,3 @@ def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None
         assert result.publication is None and result.selected_count == 0
         assert skipped.arena.latest(initial.lineage_id) == initial
         skipped.retire(())
-
-    for device in (torch.device("cpu"), *((torch.device("cuda", 0),) if torch.cuda.is_available() else ())):
-        _hf_matches_reference(device)
-
-
-def _hf_matches_reference(device: torch.device) -> None:
-    # Actual HF/PEFT forward/backward, compared against an independently optimized
-    # model. Only the mathematical state is copied into the test reference.
-    from copy import deepcopy
-
-    from transformers import Qwen2Config
-    from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
-
-    torch.manual_seed(17)
-    base = Qwen2ForCausalLM(
-        Qwen2Config(
-            vocab_size=11,
-            hidden_size=8,
-            intermediate_size=16,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            attention_dropout=0.0,
-            tie_word_embeddings=True,
-        )
-    )
-    base.to(device=device, dtype=torch.float32)
-    hf = HfQvModel(base, HfQvConfig("tiny.qwen2", "test", True, False, 2, 4, 0.0, TensorDType.FLOAT32))
-    frozen = tuple(value.clone() for value in hf.initial_factors)
-    batch = CausalTrainBatch(
-        torch.tensor([[1, 2, 3, 4], [2, 3, 4, 0]], device=device),
-        torch.tensor([[1, 2, 3, 4], [2, 3, 4, -100]], device=device),
-        torch.tensor([[1, 1, 1, 1], [1, 1, 1, 0]], device=device),
-    )
-    stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
-    for mode in TLMMode:
-        config = TLMConfig(mode=mode, threshold=0.0)
-        execution = _compile(hf, config)
-        execution.admit((), stream)
-        reference_model = deepcopy(hf.model)
-        parameters = [
-            parameter.requires_grad_(True) for name, parameter in reference_model.named_parameters() if ".lora_" in name
-        ]
-        optimizer = torch.optim.AdamW(
-            parameters,
-            lr=config.optimizer.lr,
-            betas=config.optimizer.betas,
-            eps=config.optimizer.eps,
-            weight_decay=config.optimizer.weight_decay,
-            foreach=False,
-        )
-        for _ in range(2):
-            logits = reference_model(
-                input_ids=batch.input_ids, attention_mask=batch.attention_mask, use_cache=False, return_dict=True
-            ).logits
-            if mode is TLMMode.OFFLINE:
-                with torch.no_grad(), reference_model.disable_adapter():
-                    selector = reference_model(
-                        input_ids=batch.input_ids,
-                        attention_mask=batch.attention_mask,
-                        use_cache=False,
-                        return_dict=True,
-                    ).logits
-            else:
-                selector = logits.detach()
-            labels = batch.labels[:, 1:]
-            valid = labels != -100
-
-            def sentence_ce(value):
-                losses = F.cross_entropy(
-                    value[:, :-1].reshape(-1, 11), labels.reshape(-1), ignore_index=-100, reduction="none"
-                ).reshape_as(labels)
-                return losses.sum(-1) / valid.sum(-1)
-
-            loss = (sentence_ce(logits) * config.lamb * sentence_ce(selector).detach().exp()).mean()
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            result = execution.step(batch, stream)
-            torch.testing.assert_close(result.loss, loss.detach())
-            (version,) = result.publication.after_refs
-            values = execution.snapshot(version, stream)
-            for index, parameter in enumerate(parameters):
-                torch.testing.assert_close(values[5 * index], parameter)
-                torch.testing.assert_close(values[5 * index + 1], parameter.grad)
-        for original, expected in zip(hf.initial_factors, frozen, strict=True):
-            torch.testing.assert_close(original, expected)
-        execution.retire(())
-        assert execution.diagnostics().active_lineages == 0
