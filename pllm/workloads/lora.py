@@ -14,9 +14,6 @@ from torch.nn import functional as F
 
 import pllm
 from pllm import authoring as a
-from pllm.contracts.request_identity import RequestKeyField, canonical_request_key_fields
-from pllm.contracts.semantic_graph import StateScope
-from pllm.execution.tensor_frame import Tensors
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,8 +23,8 @@ class OutputLoRAConfig:
     learning_rate: float = 1e-3
     steps: int = 1
     seed: int = 0
-    scope: StateScope = StateScope.INSTANCE
-    key_fields: tuple[RequestKeyField, ...] = (RequestKeyField.PROMPT_IDX, RequestKeyField.SAMPLE_IDX)
+    scope: pllm.StateScope = pllm.StateScope.INSTANCE
+    key_fields: tuple[pllm.RequestKeyField, ...] = (pllm.RequestKeyField.PROMPT_IDX, pllm.RequestKeyField.SAMPLE_IDX)
 
     def __post_init__(self) -> None:
         if (
@@ -39,10 +36,8 @@ class OutputLoRAConfig:
             or not 0 <= self.seed < 2**63
         ):
             raise ValueError("output LoRA requires positive rank/steps/scale/rate and a nonnegative seed")
-        if self.scope not in (StateScope.INSTANCE, StateScope.REQUEST):
+        if self.scope not in (pllm.StateScope.INSTANCE, pllm.StateScope.REQUEST):
             raise ValueError("output LoRA supports instance or independent request state")
-        if self.scope is StateScope.REQUEST:
-            canonical_request_key_fields(self.key_fields)
 
 
 @dataclass(frozen=True)
@@ -54,7 +49,7 @@ class OutputLoRAWorkload(pllm.Workload):
     def output_factors(self) -> pllm.InstanceState:
         rank, seed = self.config.rank, self.config.seed
 
-        def initialize(parameters: Tensors, generator: torch.Generator) -> None:
+        def initialize(parameters: pllm.Tensors, generator: torch.Generator) -> None:
             parameters["a"].normal_(std=0.01, generator=generator.manual_seed(seed))
             parameters["b"].zero_()
 
@@ -62,7 +57,7 @@ class OutputLoRAWorkload(pllm.Workload):
             "a": lambda m: (m.hidden_size, rank),
             "b": lambda m: (rank, m.vocab_size),
         }
-        if self.config.scope is StateScope.REQUEST:
+        if self.config.scope is pllm.StateScope.REQUEST:
             return pllm.RequestState(
                 fields,
                 optimizer=pllm.SGD(self.config.learning_rate),
@@ -77,7 +72,7 @@ class OutputLoRAWorkload(pllm.Workload):
             namespace="canonical.output_lora@1",
         )
 
-    def reset(self, parameters: Tensors, generator: torch.Generator) -> None:
+    def reset(self, parameters: pllm.Tensors, generator: torch.Generator) -> None:
         down = parameters["a"]
         down.copy_(
             torch.randn(

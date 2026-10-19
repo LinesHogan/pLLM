@@ -8,13 +8,6 @@ import torch
 
 import pllm
 from pllm import authoring as a
-from pllm.contracts.backend_attachment import BackendAttachmentSpec
-from pllm.contracts.request_identity import RequestKeyField, canonical_request_key_fields
-from pllm.contracts.semantic_graph import (
-    SemanticGraph,
-)
-from pllm.contracts.tensor_layout import TensorLayoutRequest
-from pllm.execution.tensor_frame import Tensors
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,17 +21,15 @@ class ESampRequestConfig:
     betas: tuple[float, float] = (0.9, 0.999)
     eps: float = 1e-8
     weight_decay: float = 0.0
-    key_fields: tuple[RequestKeyField, ...] = (RequestKeyField.REQUEST_ID,)
-    paged: bool = False
+    key_fields: tuple[pllm.RequestKeyField, ...] = (pllm.RequestKeyField.REQUEST_ID,)
 
     def __post_init__(self) -> None:
         a.AdamW(self.learning_rate, self.betas, self.eps, self.weight_decay)
-        canonical_request_key_fields(self.key_fields)
         if self.rank < 1 or not isfinite(self.intervention_beta) or self.intervention_beta < 0.0:
             raise ValueError("ESamp request configuration is invalid")
 
 
-def initialize(parameters: Tensors, generator: torch.Generator) -> None:
+def initialize(parameters: pllm.Tensors, generator: torch.Generator) -> None:
     for name in ("up", "gate", "down"):
         parameters[name].normal_(0.0, 0.02, generator=generator)
     parameters["bias"].fill_(1.0)
@@ -129,8 +120,10 @@ class ESampRequestWorkload(pllm.Workload):
         config = self.config
         return a.AdamW(config.learning_rate, config.betas, config.eps, config.weight_decay)
 
-    def declare(self, facts: a.BackendCompileFacts) -> tuple[SemanticGraph, TensorLayoutRequest, BackendAttachmentSpec]:
-        if self.config.key_fields != (RequestKeyField.REQUEST_ID,):
+    def declare(
+        self, facts: a.BackendCompileFacts
+    ) -> tuple[a.SemanticGraph, a.TensorLayoutRequest, a.BackendAttachmentSpec]:
+        if self.config.key_fields != (pllm.RequestKeyField.REQUEST_ID,):
             raise ValueError("attached ESamp requires request-id state keys")
         return super().declare(facts)
 

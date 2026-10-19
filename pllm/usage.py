@@ -25,7 +25,7 @@ from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator, ParameterTarget
-from pllm.contracts.request_identity import RequestKeyField
+from pllm.contracts.request_identity import RequestKeyField, canonical_request_key_fields
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
     ConditionalLayerReplay,
@@ -190,6 +190,10 @@ class RequestState(InstanceState):
     """Per-request parameters, read as tensors aligned to the current operation's rows."""
 
     keys: tuple[RequestKeyField, ...] = (RequestKeyField.REQUEST_ID,)
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        canonical_request_key_fields(self.keys)
 
 
 @dataclass(frozen=True)

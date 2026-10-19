@@ -43,6 +43,7 @@ from pllm.execution.host_runtime import (
 )
 from pllm.execution.ptts.page_bundle import PagePublication as PagePublication
 from pllm.execution.tensor_binding import TensorResult as TensorResult
+from pllm.execution.tensor_frame import Tensors as Tensors
 from pllm.execution.tensor_program import InvocationOutput as InvocationOutput
 from pllm.learning import (
     CausalAdapterWorkload as CausalAdapterWorkload,
@@ -256,6 +257,7 @@ __all__ = [
     "DecodeRefresh",
     "MissingPolicy",
     "StateScope",
+    "Tensors",
     "StateTensorUpdate",
     "load_tensor_fields",
     "Recurrence",
