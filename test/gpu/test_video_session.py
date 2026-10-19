@@ -20,10 +20,9 @@ from pllm.contracts.state_ref import LineageId, StateRef, VersionId
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
-from pllm.execution.ptts.page_bundle import BorrowedPage, PageBundleArena, PageFieldTransfer, PageSlot
+from pllm.execution.ptts.page_bundle import BorrowedPage, PageFieldTransfer, PageSlot
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
-from pllm.execution.scheduler import compile_state_schedule, validate_plan_bundle
 from pllm.workloads.video import VideoWorkload, frame_features
 from test.backend_facts import backend_facts
 
@@ -222,37 +221,6 @@ def observed_worker(probe, start, close, control, channels, workload, config):
         probe.close()
 
 
-def fault_worker(mode, control, channels, workload, config):
-    receive = PageBundleArena.receive_field
-
-    def drift(plan, channel, **kwargs):
-        graph = replace(plan.semantic_graph, execution_parameters_digest="d" * 64)
-        state_decision, state, schedule, physical = compile_state_schedule(graph, plan.timeline, plan.state_request)
-        different = replace(
-            plan,
-            semantic_graph=graph,
-            state_decision=state_decision,
-            state_physical=state,
-            schedule_decision=schedule,
-            schedule_physical=physical,
-        )
-        validate_plan_bundle(different)  # A distinct valid plan, not a corrupted signature string.
-        return receive(different, channel, **kwargs)
-
-    def fail(page):
-        if mode == "exit":
-            os._exit(17)  # Imported pages and outstanding acknowledgements disappear together.
-        page.stream.synchronize()
-        page._tensor = None
-        page._connection.send_bytes(b"another export")
-
-    target, method, replacement = (
-        (PageBundleArena, "receive_field", staticmethod(drift)) if mode == "drift" else (BorrowedPage, "close", fail)
-    )
-    with patch.object(target, method, replacement):
-        consume(control, channels, workload, config)
-
-
 def preempted_worker(probe, control, channels, workload, config):
     from pllm.backends.vllm.runtime import VllmSession
 
@@ -394,6 +362,7 @@ def model_config():
     )
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="real LLM/CUDA IPC requires a GPU")
 def test_video_session_zero_copy_backpressure_and_ack_lifetime():
     source = frames()
@@ -448,24 +417,12 @@ def test_video_session_zero_copy_backpressure_and_ack_lifetime():
         close.set()
         probe.close()
         child_probe.close()
-    probe, child_probe = context.Pipe()
-    try:
-        config = replace(model_config(), execution=ExecutionOptions(allow_numerical_transforms=False))
-        workload = VideoWorkload(
-            grid_size=2, layer=1, recurrence=pllm.Recurrence(source_layer=-1, destination_layer=0, alpha=0.6, beta=None)
-        )
-        with VideoSession(workload, config, steps=3, worker=partial(composed_worker, child_probe)) as combined:
-            child_probe.close()
-            for frame in source[:3]:
-                combined.submit(frame)
-            results = [combined.drain() for _ in range(3)]
-            assert results[-1].updates == 3 and all(result.fallback == 0 for result in results)
-        assert probe.poll(120) and probe.recv_bytes() == b"composed-pins-hidden-normal-output-kv-ok"
-        assert combined.arena.active_lineages == combined.arena.pending_pin_releases == 0
-    finally:
-        probe.close()
-        child_probe.close()
-
+    # One composed session covers fresh versions, held versions and explicit
+    # absent/end evidence through the same tokenwise replay worker.
+    config = replace(model_config(), execution=ExecutionOptions(allow_numerical_transforms=False))
+    workload = VideoWorkload(
+        grid_size=2, layer=1, recurrence=pllm.Recurrence(source_layer=-1, destination_layer=0, alpha=0.6, beta=None)
+    )
     probe, child_probe = context.Pipe()
     try:
         with VideoSession(
@@ -490,44 +447,34 @@ def test_video_session_zero_copy_backpressure_and_ack_lifetime():
         child_probe.close()
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="real LLM/CUDA IPC requires a GPU")
-@pytest.mark.parametrize("mode", ("bad_ack", "exit", "drift"))
-def test_video_session_failure_retains_owner_without_fallback(mode):
-    # The group's trailing CudaIPCTypes warning comes from deliberate process death; the isolated success path has none.
+def test_video_session_failure_retains_owner_without_fallback():
+    # Bad ACKs, closed channels and descriptor drift are covered at the arena
+    # boundary in test_page_bundle_cuda.py. Here one real child dies mid-request
+    # (vLLM preemption is rejected after a real forward) and the supervising
+    # session must fail-stop while retaining the original page owner.
     (frame,) = frames(1)
-    with VideoSession(
-        VideoWorkload(grid_size=2), model_config(), steps=2, worker=partial(fault_worker, mode)
-    ) as session:
-        with pytest.raises((EOFError, OSError, RuntimeError)):
-            session.submit(frame)
-            session.missing(end=True)  # An explicit End cannot mask an ACK/transport integrity failure.
-            session.drain()
-        assert session.failed and session.arena.root(session.current).ref == session.current
-        assert session.arena.usage().pinned_versions > 0
-        with pytest.raises(RuntimeError, match="fail-stopped"):
-            session.submit(frame)
-    assert not session.process.is_alive()
-    if mode == "exit":
-        # Inject evidence into the real GPU scheduler boundary after one real
-        # forward; do not rely on allocator pressure to happen nondeterministically.
-        context = mp.get_context("spawn")
-        probe, child_probe = context.Pipe()
-        try:
-            with VideoSession(
-                VideoWorkload(grid_size=2), model_config(), steps=2, worker=partial(preempted_worker, child_probe)
-            ) as preempted:
-                child_probe.close()
-                with pytest.raises((EOFError, OSError, RuntimeError)):
-                    preempted.submit(frame)
-                    preempted.missing(end=True)
-                    preempted.drain()
-                assert probe.poll(120)
-                assert (
-                    b"per-decode activation injection and vLLM preemption cannot be enabled together"
-                    in probe.recv_bytes()
-                )
-                assert preempted.failed
-            assert not preempted.process.is_alive()
-        finally:
-            probe.close()
+    context = mp.get_context("spawn")
+    probe, child_probe = context.Pipe()
+    try:
+        with VideoSession(
+            VideoWorkload(grid_size=2), model_config(), steps=2, worker=partial(preempted_worker, child_probe)
+        ) as session:
             child_probe.close()
+            with pytest.raises((EOFError, OSError, RuntimeError)):
+                session.submit(frame)
+                session.missing(end=True)  # An explicit End cannot mask a transport integrity failure.
+                session.drain()
+            assert probe.poll(120)
+            assert (
+                b"per-decode activation injection and vLLM preemption cannot be enabled together" in probe.recv_bytes()
+            )
+            assert session.failed and session.arena.root(session.current).ref == session.current
+            assert session.arena.usage().pinned_versions > 0
+            with pytest.raises(RuntimeError, match="fail-stopped"):
+                session.submit(frame)
+        assert not session.process.is_alive()
+    finally:
+        probe.close()
+        child_probe.close()

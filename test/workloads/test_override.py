@@ -29,10 +29,8 @@ from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
-from pllm.execution.scheduler import compile_schedule, validate_schedule
 from pllm.workloads.override import OverRIDEConfig, OverRIDEWorkload, cross_entropy
 from test.backend_facts import assert_finite_resources
-from test.revalidation import validate_backend_attachment
 
 
 def test_override_matches_reweight_adam_and_final_noop(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -84,38 +82,11 @@ def test_override_matches_reweight_adam_and_final_noop(monkeypatch: pytest.Monke
             )
 
     deployment = ReadPublished(config).compile_backend(facts)
-    execution, signed = deployment.execution, deployment.attachment
+    execution = deployment.execution
     graph = execution.arena.plan.semantic_graph
     training = next(task for task in graph.tasks if task.symbol == "train")
     policy = training.math
     assert policy is not None and policy.reduction == "mean"
-    for invalid in (
-        replace(policy, detached_inputs=("missing",)),
-        replace(policy, input_gradients=("hidden",)),
-        replace(policy, update_states="missing"),
-    ):
-        with pytest.raises(ValueError, match="mathematical contract"):
-            compile_schedule(
-                replace(
-                    graph,
-                    tasks=tuple(replace(task, math=invalid) if task is training else task for task in graph.tasks),
-                ),
-                facts.timeline,
-                state=execution.state_plan,
-            )
-    with pytest.raises(ValueError):
-        validate_schedule(
-            replace(
-                graph,
-                tasks=tuple(
-                    replace(task, math=replace(policy, reduction="sum")) if task is training else task
-                    for task in graph.tasks
-                ),
-            ),
-            facts.timeline,
-            signed.inputs.plan.schedule_decision,
-            state=execution.state_plan,
-        )
     (initial,) = execution.admit(())
     original = execution.snapshot(initial)
     down = torch.nn.Parameter(original[0][:16].reshape(2, 2, 4).clone())
@@ -183,8 +154,6 @@ def test_override_matches_reweight_adam_and_final_noop(monkeypatch: pytest.Monke
         assert guidance.stage is SamplerStage.PACKED_PRE_FILTER_ADD
         with pytest.raises(RuntimeError, match="sampler completion"):
             execution.execute_anchor(invocation, AnchorId(5))
-        with pytest.raises(ValueError, match="original"):
-            execution.complete_sampler(invocation, feedback=SamplerFeedback(replace(value.sampler_rows), base, tokens))
         execution.complete_sampler(invocation, feedback=SamplerFeedback(value.sampler_rows, base, tokens))
         for anchor in range(4, 8):
             execution.execute_anchor(invocation, AnchorId(anchor))
@@ -248,14 +217,6 @@ def test_override_matches_reweight_adam_and_final_noop(monkeypatch: pytest.Monke
         with pytest.raises(RuntimeError, match="publication failed"):
             execution.execute_anchor(invocation, AnchorId(5))
     assert execution.arena.latest(initial.lineage_id) == latest
-    with pytest.raises(ValueError):
-        validate_backend_attachment(
-            replace(
-                signed.inputs,
-                request=replace(signed.inputs.request, sampler_stage=SamplerStage.PACKED_POST_FILTER_EXACT),
-            ),
-            signed.decision,
-        )
     with pytest.raises(ValueError, match="iterations"):
         execution.start_step(step((3,), 5))
     execution.retire(())

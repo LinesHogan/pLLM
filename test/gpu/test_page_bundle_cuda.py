@@ -51,6 +51,7 @@ def _plan(shared=False, rank=2, memory_bytes=10000):
     )
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cuda_ptts_waits_for_exact_fence_before_reclaim() -> None:
     arena = PageBundleArena(_plan())

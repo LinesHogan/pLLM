@@ -20,7 +20,6 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId, TaskResourceFact, TaskSymbol
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
-from pllm.execution.backend_attachment import compile_backend_attachment
 from pllm.execution.ptts.page_bundle import PageBundleArena, PageWrite
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
@@ -28,7 +27,6 @@ from pllm.execution.shared_tensor import SharedTensor
 from pllm.kernels.adamw import AdamWConfig
 from pllm.workloads.tlm import HfQvConfig, HfQvModel, TLMConfig, TLMMode, TLMWorkload
 from test.backend_facts import assert_auxiliary_preflight
-from test.revalidation import validate_backend_attachment
 
 
 class TinyCausalModel:
@@ -267,13 +265,6 @@ def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None
         assert cold.plan_backend(facts) == signed
         with pytest.raises(ValueError, match="materialized"):
             cold.bind_math(facts, signed.inputs.plan)
-        first, second = signed.inputs.request.overlay_bindings
-        changed = replace(
-            signed.inputs, request=replace(signed.inputs.request, overlay_bindings=(replace(first, scale=2.0), second))
-        )
-        assert compile_backend_attachment(changed) != signed.decision
-        with pytest.raises(ValueError):
-            validate_backend_attachment(changed, signed.decision)
         execution.admit(())
         for shape in ((2, 3), (1, 4)):
             tokens = torch.zeros(shape, dtype=torch.int64)

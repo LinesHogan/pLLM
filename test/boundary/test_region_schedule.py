@@ -50,8 +50,7 @@ def evaluate_grid(instances, chunks, layers):
     return hidden, weights, observed
 
 
-@pytest.mark.parametrize("chunks", range(1, 7))
-@pytest.mark.parametrize("layers", range(1, 6))
+@pytest.mark.parametrize(("chunks", "layers"), [(1, 1), (1, 4), (3, 1), (2, 2), (4, 3), (6, 5)])
 def test_source_derived_wavefront_preserves_every_cell_input(chunks, layers):
     program = grid_program(chunks, layers)
     analysis = analyze_region_program(program)

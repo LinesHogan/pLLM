@@ -67,7 +67,7 @@ def test_native_verifier_accepts_explicit_state_chain():
 
 
 @pytest.mark.parametrize("change", ["undefined", "missing_payload", "extra_payload", "unknown", "extra_field"])
-def test_forged_wire_cannot_bypass_resource_or_closed_schema_rules(change):
+def test_malformed_wire_cannot_bypass_resource_or_closed_schema_rules(change):
     wire = json.loads(encode_boundary(resource_program()))
     block = wire["entry"]["block"]
     if change == "undefined":

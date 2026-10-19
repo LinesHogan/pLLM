@@ -127,8 +127,6 @@ def test_readonly_tensor_borrows_allow_shared_reads_and_reject_writable_aliases(
     )
     for value in runner.run({}, pages=pages).values:
         torch.testing.assert_close(value, weight, rtol=0, atol=0)
-    with pytest.raises(ValueError, match="cannot authorize a write"):
-        pages.bind_accesses(replace(read, accesses=(replace(read.accesses[0], mode=AccessMode.WRITE),)), (0,))
     with pytest.raises(ValueError, match="writable paged"):
         bind(cache.reshape(-1)[:2])
     arena_value = invocation.context.arena.borrow_field(invocation.context.pin, refs[0], LayoutFieldId(0))

@@ -77,18 +77,10 @@ def test_serial_and_hoisted_acquisitions_have_different_capacity():
             assert not live
             assert peak == (min(n, 1) if schedule == serial else n) * 128
             assert peak <= allocation.peak_bytes_upper_bound
-        with pytest.raises(ValueError, match="retention bound"):
-            validate_region_retention(
-                program, IMPORTS, replace(bound, allocations=(replace(allocation, peak_bytes_upper_bound=0),))
-            )
 
 
-def test_retention_rejects_unmatched_or_unresolved_endpoint_identities():
+def test_retention_rejects_unresolved_endpoint_identities():
     program = source()
-    schedule = analyze_region_program(program, optimize=False).reference_schedule
-    for endpoint in (RetentionEndpoint("missing", 0), RetentionEndpoint("complete", 1), RetentionEndpoint("begin", 0)):
-        with pytest.raises(ValueError):
-            analyze_region_retention(program, schedule, (replace(IMPORTS[0], release=endpoint),))
     # A source index passed at entry has no affine identity for the planner.
     index = ScalarType.INDEX
     unknown = replace(

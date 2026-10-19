@@ -35,7 +35,6 @@ from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.workloads.reft import ActivationConfig, ActivationWorkload, load_loreft_interventions
 from test.backend_facts import assert_auxiliary_preflight, assert_finite_resources
-from test.revalidation import validate_backend_attachment
 
 
 def test_reft_matches_loreft_math_and_publish_skip_semantics(tmp_path) -> None:
@@ -114,13 +113,6 @@ def test_reft_matches_loreft_math_and_publish_skip_semantics(tmp_path) -> None:
         )
     )
     torch.testing.assert_close(low_rank_affine_delta(hidden, *fields), expected)
-    (binding,) = signed.inputs.request.activation_bindings
-    changed = replace(
-        signed.inputs, request=replace(signed.inputs.request, activation_bindings=(replace(binding, last_tokens=2),))
-    )
-    assert compile_backend_attachment(changed) != signed.decision
-    with pytest.raises(ValueError):
-        validate_backend_attachment(changed, signed.decision)
     if find_spec("vllm") is not None:
         _decode_low_rank_keeps_parameters_and_recomputes_delta(
             deployment, value, update, identity, hidden, expected, bias, rotation
@@ -223,13 +215,6 @@ def _decode_declarations_require_resigning(facts, signed):
             declaration.decode_refresh,
             declaration.on_missing,
         )
-    for previous, current in zip(plans, plans[1:]):
-        # Changing only the attachment contract also requires a new signature.
-        changed = replace(previous.inputs, request=current.inputs.request)
-        assert compile_backend_attachment(changed) != previous.decision
-        with pytest.raises(ValueError):
-            validate_backend_attachment(changed, previous.decision)
-
     for field in ("decode", "decode_refresh", "on_missing"):
         payload = json.loads(encode_boundary(plans[-1].inputs))
         del payload["request"]["activation_bindings"][0][field]

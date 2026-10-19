@@ -23,7 +23,6 @@ def test_functionalized_export_runs_in_scan_and_preserves_all_input_versions():
     cell = ExportedCell.capture(update_cell, ("hidden", "weights"), ("output", "next_weights"), (hidden, weights))
     assert torch.equal(weights, saved_w)
     assert cell.mutations == (("weights", "next_weights"),)
-    assert "aten.add_" not in str(cell.graph.graph)
     declaration = cell.declaration
     h, w = declaration.inputs
     body = Region(

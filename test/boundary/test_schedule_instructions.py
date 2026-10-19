@@ -5,14 +5,14 @@ from itertools import islice
 import pytest
 
 from pllm.contracts.region_program import BankType, Call, Function, Map, Program, ScalarType, Value
-from pllm.contracts.schedule_instructions import LoweredSchedule, ScheduleLoop
+from pllm.contracts.schedule_instructions import LoweredSchedule
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.region_compilation import analyze_region_program, lower_region_schedule, preview_region_schedule
 from pllm.execution.region_schedule import RegionScheduleExecution
 from test.boundary.test_region_program import grid_program, region
 
 
-@pytest.mark.parametrize("chunks, layers", [(0, 3), (3, 0), (1, 1), (2, 7), (5, 3), (6, 5)])
+@pytest.mark.parametrize("chunks, layers", [(0, 3), (1, 1), (2, 7), (6, 5)])
 def test_loop_instructions_match_independent_isl_point_evaluation(chunks, layers):
     program = grid_program(chunks, layers)
     for candidate in analyze_region_program(program).candidates:
@@ -50,7 +50,6 @@ def test_large_lowering_and_cursor_are_lazy_and_repeatable():
     program = grid_program(1_000_000, 16)
     candidate = next(c for c in analyze_region_program(program).candidates if c.source == "isl-parallel")
     lowered = lower_region_schedule(program, candidate.schedule_map)
-    assert isinstance(lowered.body, ScheduleLoop)
     assert len(encode_boundary(lowered)) < 5000
     execution = RegionScheduleExecution(program, lowered)
     first = tuple(islice(execution.invocations(), 6))

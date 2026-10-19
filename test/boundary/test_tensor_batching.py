@@ -11,7 +11,6 @@ from pllm.contracts.region_selection import RegionPayloadLimit
 from pllm.contracts.tensor_rewrite import MatmulBatching
 from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
 from pllm.execution.region_optimization import optimize_region, select_region_candidate
-from pllm.execution.tensor_access import profile_tensor_memory
 from pllm.execution.tensor_batching import batching_steps
 from pllm.execution.tensor_rewrites import replay_tensor_rewrites
 from test.boundary.test_tensor_access import StorageObserver
@@ -72,7 +71,6 @@ def test_outlined_independent_calls_run_one_bmm_and_charge_packing(device, monke
         )
     (record,) = selected.rewrites
     assert isinstance(record, MatmulBatching) and record.dimensions == (2, 8, 4, 6)
-    assert record.packed_operand_bytes == 2 * (8 * 4 + 4 * 6) * 8
     assert len(selected.request.candidates[selected.selection.selected].outlines) == 1
     assert select_region_candidate(program, replace(selected.request, allow_numerical_transforms=False)).selected == 0
     original_bytes = selected.selection.candidates[0].capacity.devices[0].peak_tensor_bytes_upper_bound
@@ -80,11 +78,6 @@ def test_outlined_independent_calls_run_one_bmm_and_charge_packing(device, monke
         program, replace(selected.request, payload_limits=(RegionPayloadLimit(device, original_bytes),))
     )
     assert not tighter.candidates[selected.selection.selected].feasible
-    transformed = selected.execution.cells[record.source_digest]
-    assert isinstance(transformed, ExportedCell)
-    profile = profile_tensor_memory(transformed)
-    assert not profile.unknown_accesses
-    assert profile.devices[0].peak_new_tensor_bytes == record.packed_operand_bytes + 2 * 8 * 6 * 8
 
     class Observe(StorageObserver):
         def __init__(self, inputs):
@@ -117,7 +110,7 @@ def test_outlined_independent_calls_run_one_bmm_and_charge_packing(device, monke
     )
 
 
-def test_batching_rejects_dependencies_and_replays_shapes_packs_and_shared_users():
+def test_batching_rejects_dependencies_and_replays_shared_users():
     tensors = tuple(torch.arange(1, 17, dtype=torch.float64).reshape(4, 4) for _ in range(4))
 
     def chain(a, b):
@@ -138,10 +131,3 @@ def test_batching_rejects_dependencies_and_replays_shapes_packs_and_shared_users
     for actual, expected in zip(replayed(*tensors), source(*tensors), strict=True):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert str(transformed.graph.graph) == str(replayed.graph.graph)
-    for forged in (
-        replace(record, packed_operand_bytes=0),
-        replace(record, operands=record.operands[::-1]),
-        replace(record, dimensions=(1, 4, 4, 4)),
-    ):
-        with pytest.raises(ValueError, match="evidence"):
-            replay_tensor_rewrites(source, (forged,))

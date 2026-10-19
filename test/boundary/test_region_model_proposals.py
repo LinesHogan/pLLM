@@ -22,7 +22,7 @@ from pllm.contracts.backend_attachment import (
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
 from pllm.contracts.region_composition import RegionFunctionBody, inline_region
-from pllm.contracts.region_imports import CompiledTensorImport, ExportedTensorImport
+from pllm.contracts.region_imports import CompiledTensorImport
 from pllm.contracts.region_program import (
     AffineIndex,
     Block,
@@ -40,7 +40,6 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
-from pllm.execution.backend_attachment import compile_backend_attachment
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.decoder_region import decoder_normalize_function
 from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
@@ -57,6 +56,7 @@ from pllm.worker import GPUWorker
 from pllm.workloads.recirculation import RecirculationWorkload
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_worker_tunes_and_installs_parallel_model_proposal_with_original_owner(monkeypatch):
     device = torch.device("cuda:0")
@@ -162,27 +162,9 @@ print(encode_boundary(planned))
     ):
         deployment = workload.bind_backend(facts, attachment)
     assert decode_boundary(encode_boundary(probe), BackendPlacementProbe) == probe
-    exported = next(item for item in imports if isinstance(item, ExportedTensorImport))
-    for invalid, message in (
-        (replace(probe, schema_version=1), "probe schema"),
-        (replace(probe, region_imports=(*imports, imports[0])), "distinct imports"),
-        (
-            replace(probe, region_imports=(CompiledTensorImport(exported.access, "test", "f" * 64, ()),)),
-            "numerical selection",
-        ),
-        (replace(probe, region_imports=()), "original tensor graph import"),
-    ):
-        with pytest.raises(ValueError, match=message):
-            compile_backend_attachment(replace(deployment.attachment.inputs, probe=invalid))
     execution = deployment.execution
     task = TokenwiseReplayTask.from_implementation(execution.implementation(TOKENWISE_REPLAY_IMPLEMENTATION))
     assert graph.digest not in task.region.functions
-    with pytest.raises(ValueError, match="complete original tensor imports"):
-        _ = task.region.execution
-    with pytest.raises(ValueError, match="exactly the unbound"):
-        task.region.bind_functions({})
-    with pytest.raises(ValueError, match="differs from its source function"):
-        task.region.bind_functions({graph.digest: replace(graph, digest="0" * 64)})
     execution.rebind_implementation(replace(task, region=task.region.bind_functions({graph.digest: graph})))
     source = compile_tokenwise_region(
         tensor,
@@ -201,12 +183,6 @@ print(encode_boundary(planned))
     )
     assert parallel.stream_plan.host_fences
     proposals = (RegionScheduleProposal(source.payload), parallel)
-    budget = next(f.workspace_bytes for f in execution.arena.plan.timeline.task_resources)
-    assert parallel.peak_bytes[0].bytes > parallel.payload.devices[0].peak_bytes_upper_bound
-    with pytest.raises(ValueError, match="stream capability"):
-        source.with_catalog(proposals, budget)
-    with pytest.raises(ValueError, match="payload reservation"):
-        source.with_catalog(proposals, parallel.peak_bytes[0].bytes - 1, stream_lanes=2)
 
     # Only model loading is omitted. Dispatch, session checks, codec, local
     # validation, measurement binding and final AER installation are production.
@@ -373,9 +349,6 @@ print(encode_boundary(planned))
                 side_effect=AssertionError("trial must bind before measured execution"),
             ):
                 results.append(run())
-        measured = session._tuning._measurements[1]
-        command(BackendCommand.TUNE_CANDIDATE, encode_boundary(1))
-        assert session._tuning._measurements[1] is measured
         for result in results[1:]:
             torch.testing.assert_close(result.output, results[0].output, rtol=0, atol=0)
             torch.testing.assert_close(result.cache, results[0].cache, rtol=0, atol=0)

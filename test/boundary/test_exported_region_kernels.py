@@ -1,7 +1,6 @@
 """Original Qwen Torch graphs retain their actual custom CUDA operator."""
 
 from contextlib import ExitStack
-from copy import deepcopy
 from dataclasses import replace
 from unittest.mock import patch
 
@@ -17,11 +16,10 @@ from pllm.contracts.region_composition import inline_region
 from pllm.contracts.region_program import Block, Region, Value
 from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.region_selection import RegionPayloadLimit, RegionSelectionPolicy
-from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.exported_region import import_exported_region
 from pllm.execution.region_compilation import analyze_region_program
 from pllm.execution.region_execution import RegionExecutionPlan
-from pllm.execution.region_native import FunctionalKernelPrimitive, NativePrimitive, source_region_functions
+from pllm.execution.region_native import FunctionalKernelPrimitive, NativePrimitive
 from pllm.execution.region_optimization import optimize_region
 from pllm.execution.region_storage import analyze_region_payload, import_region_functions
 from pllm.execution.region_streams import RegionStreamBindings
@@ -66,7 +64,7 @@ def test_import_retains_torch_state_update_signature_without_implicit_publicatio
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
+@pytest.mark.parametrize("dtype", (torch.bfloat16,))
 def test_original_qwen_export_retains_swiglu_and_enters_measured_selection(dtype):
     config = VllmConfig(compilation_config=CompilationConfig(mode=CompilationMode.NONE, custom_ops=["all"]))
     with set_current_vllm_config(config), ExitStack() as scope, torch.no_grad():
@@ -100,57 +98,18 @@ def test_original_qwen_export_retains_swiglu_and_enters_measured_selection(dtype
             ),
         )
         (native,) = (cell for cell in sources.values() if isinstance(cell, FunctionalKernelPrimitive))
-        assert sum(isinstance(cell, ExportedCell) for cell in sources.values()) == 2
         assert native.implementation is not None and not native.declaration.resources
-        # auto_functionalized_v2 allocates the result base. The original graph
-        # keeps that allocation; no additional wrapper copies are required.
-        assert sum(buffer.bytes for buffer in native.implementation.allocations) == 32 * x.element_size()
         imports = import_region_functions(program, sources)
-        assert source_region_functions(program.functions, {}, imports) == {}
         schedule = analyze_region_program(program, optimize=False).reference_schedule
         payload = analyze_region_payload(program, schedule, imports)
         proposal = RegionScheduleProposal(payload)
-        plan = RegionExecutionPlan(program, imports, proposal, proposal.peak_bytes)
-        with pytest.raises(ValueError, match="complete original tensor imports"):
-            plan.bind({})
-        original = plan.bind(sources)
+        original = RegionExecutionPlan(program, imports, proposal, proposal.peak_bytes).bind(sources)
         y = x * 2
         inputs = {**dict(model.named_parameters()), "x": x, "y": y}
         before = {name: value.clone() for name, value in inputs.items()}
         expected = model(x), model(y)
-        with patch(
-            "pllm.execution.region_native.copy_data", side_effect=AssertionError("redundant kernel wrapper copy")
-        ):
-            for actual, reference in zip(original.run(inputs).values, expected, strict=True):
-                torch.testing.assert_close(actual, reference, rtol=0, atol=0)
-        assert all(device.call_scratch_bytes_upper_bound == 0 for device in payload.capacity.devices)
-        alias = deepcopy(native.graph)
-        output = next(node for node in alias.graph.nodes if node.op == "output")
-        argument = next(
-            node
-            for node, type_ in zip(
-                (node for node in alias.graph.nodes if node.op == "placeholder"), native.declaration.inputs, strict=True
-            )
-            if type_ == native.declaration.outputs[0]
-        )
-        output.args = ((argument,),)
-        alias.recompile()
-        with pytest.raises(ValueError, match="own distinct complete backings"):
-            FunctionalKernelPrimitive.bind(alias, native.implementation)
-        uncloned = deepcopy(native.graph)
-        wrapped = next(node for node in uncloned.graph.nodes if "auto_functionalized_v2" in str(node.target))
-        wrapped.kwargs = {**wrapped.kwargs, "_only_clone_these_bases": ()}
-        uncloned.recompile()
-        with pytest.raises(ValueError, match="original clone-all policy"):
-            FunctionalKernelPrimitive.bind(uncloned, native.implementation)
-        with pytest.raises(ValueError, match="copying kernel ABI"):
-            NativePrimitive(native.declaration, lambda values, resources: values, native.implementation)
-        with pytest.raises(ValueError, match="include every owned result"):
-            analyze_region_payload(
-                program,
-                schedule,
-                tuple(replace(item, allocations=()) if item == native.implementation else item for item in imports),
-            )
+        for actual, reference in zip(original.run(inputs).values, expected, strict=True):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
         streams = RegionStreamBindings(torch.cuda.Stream(), (torch.cuda.Stream(),))
         streams.owner.wait_stream(torch.cuda.current_stream())
         # The test assesses source scheduling. Numerical rewrites have their

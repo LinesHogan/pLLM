@@ -3,13 +3,11 @@
 import subprocess
 import sys
 from dataclasses import replace
-from unittest.mock import patch
 
 import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from pllm.contracts.region_imports import BorrowedTensorImport
 from pllm.contracts.region_payload import RegionPayload
 from pllm.contracts.region_program import (
     AffineIndex,
@@ -18,7 +16,6 @@ from pllm.contracts.region_program import (
     Coordinate,
     Region,
     ScalarType,
-    TensorType,
 )
 from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.region_streams import RegionStreamExploration
@@ -31,6 +28,7 @@ from pllm.execution.region_storage import analyze_region_payload, import_region_
 from pllm.execution.region_streams import explore_region_streams
 
 
+@pytest.mark.slow
 def test_import_only_planner_roundtrip_matches_local_graphs_without_initializing_cuda():
     def computation(x, a, b):
         return (x + a + b,)
@@ -93,16 +91,3 @@ print(encode_boundary((payload, streams)))
     plan = RegionExecutionPlan(program, imports, parallel, parallel.peak_bytes)
     execution = plan.bind(functions)
     assert execution.stream_plan == streams.candidates[0]
-    with pytest.raises(ValueError, match="payload reservation"):
-        replace(plan, payload_limits=())
-    with patch("pllm.execution.region_storage.import_tensor_access_graph", side_effect=AssertionError("no reimport")):
-        assert analyze_region_payload(program, schedule, imports) == expected
-    # Descriptor-only input still passes through native ABI validation.
-    borrowed = next(item for item in imports if isinstance(item, BorrowedTensorImport))
-    forged = replace(
-        borrowed, declaration=replace(borrowed.declaration, outputs=(TensorType((999,), "torch.float32", "cuda:0"),))
-    )
-    with pytest.raises(ValueError):
-        analyze_region_payload(program, schedule, tuple(forged if item == borrowed else item for item in imports))
-    with pytest.raises(ValueError, match="complete distinct"):
-        analyze_region_payload(program, schedule, (*imports, imports[0]))

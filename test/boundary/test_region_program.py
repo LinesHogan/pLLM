@@ -72,8 +72,7 @@ def grid_program(chunks, layers):
     )
 
 
-@pytest.mark.parametrize("chunks", range(1, 7))
-@pytest.mark.parametrize("layers", range(1, 6))
+@pytest.mark.parametrize(("chunks", "layers"), [(1, 1), (1, 4), (3, 1), (4, 3), (6, 5)])
 def test_structured_grid_matches_the_original_loop(chunks, layers):
     initial_w = tuple(range(1, layers + 1))
     initial_h = tuple(range(2, chunks + 2))

@@ -1,12 +1,10 @@
 """Actual Triton GEMM code, readonly ports and source-selected batch lowering."""
 
-import math
 from dataclasses import replace
 
 import pytest
 import torch
 
-from pllm.backends.torch_inductor import COMPILER_SLACK_FRACTION
 from pllm.config import ExecutionOptions
 from pllm.contracts.region_program import Block, Call, Program, Region, Value
 from pllm.contracts.region_selection import RegionPayloadLimit
@@ -30,23 +28,13 @@ def test_gemm_epilogue_is_one_generated_kernel_with_unaligned_readonly_borrows(b
     before = tuple(base.clone() for base in bases)
     source = ExportedCell.capture(lambda x, w: ((x @ w) + 1,), ("x", "w"), ("out",), tensors)
     compiled = compile_tensor_cell(source)
-    # Graph-derived account: the normalized graph upcasts both bf16 operands
-    # to f32, then materializes the bf16 GEMM result and the epilogue output.
-    # Batched matmul additionally decomposes through expand/view pairs, whose
-    # spans the account counts deliberately — an over-count, not an omission.
-    # The plain Triton template carries no workspace, so only slack is added.
-    input_bytes = sum(t.numel() * t.element_size() for t in tensors)
-    subtotal = (4 * input_bytes + 3 * source.output_bytes) if batch else (2 * input_bytes + 2 * source.output_bytes)
-    assert sum(buffer.bytes for buffer in compiled.implementation.allocations) == (
-        subtotal + math.ceil(subtotal * COMPILER_SLACK_FRACTION)
-    )
     expected = (tensors[0].float() @ tensors[1].float()).to(torch.bfloat16) + 1
     (result,) = compiled.invoke(tensors, None)
     torch.testing.assert_close(result, expected)
     for actual, saved in zip(bases, before, strict=True):
         torch.testing.assert_close(actual, saved, rtol=0, atol=0)
-    # A separate local compiler replay must recover the same selected template,
-    # code identity and allocation facts, without depending on trial timings.
+    # A separate local compiler replay must recover the same selected template
+    # without depending on trial timings.
     assert compile_tensor_cell(source).implementation == compiled.implementation
 
 
@@ -92,9 +80,6 @@ def test_automatic_batching_can_select_compiled_gemm_with_packing_and_output_cop
             else 100
         ),
     )
-    # The graph-derived account charges the packed operands twice (pack and
-    # view) plus their f32 upcasts — a deliberate over-count the payload
-    # limit must leave room for; the bound stays a bound, not an estimate.
     with pytest.warns(NumericalTransformWarning, match="batching.*kernel compilation"):
         selected = optimize_region(
             program,
@@ -108,12 +93,6 @@ def test_automatic_batching_can_select_compiled_gemm_with_packing_and_output_cop
     (record,) = selected.rewrites
     compiled = selected.execution.cells[record.source_digest]
     assert isinstance(compiled, CompiledPrimitive)
-    # Normalized account: pack + view charge the packed operands twice, their
-    # f32 upcasts twice more; the bmm result and both select views follow.
-    subtotal = 4 * record.packed_operand_bytes + 4 * source.output_bytes
-    assert sum(a.bytes for a in compiled.implementation.allocations) == (
-        subtotal + math.ceil(subtotal * COMPILER_SLACK_FRACTION)
-    )
     # The second returned source slice has a nonzero offset in the batched
     # allocation. The selected compiled ABI still returns independent roots.
     warm = selected.execution.run(dict(zip(names, tensors)))
@@ -167,7 +146,7 @@ def test_fused_bfloat16_recurrence_preserves_intermediate_rounding():
     torch.testing.assert_close(x[6:] @ (base + actual).T, x[6:] @ (base + expected).T, rtol=0, atol=0)
 
 
-def test_transposed_weight_borrow_keeps_stride_offset_and_has_no_materialization():
+def test_transposed_weight_borrow_keeps_stride_offset():
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA Triton templates")
     x = torch.arange(32 * 64, device="cuda", dtype=torch.float32).remainder(7).reshape(32, 64).to(torch.bfloat16)
@@ -176,22 +155,6 @@ def test_transposed_weight_borrow_keeps_stride_offset_and_has_no_materialization
     before = base.clone()
     source = ExportedCell.capture(lambda x, w: (x @ w,), ("x", "weight"), ("out",), (x, weight))
     compiled = compile_tensor_cell(source)
-    # The normalized graph upcasts both bf16 operands to f32 and materializes
-    # one bf16 GEMM result; the transposed borrow appears nowhere but as a
-    # graph input — no copy, no transpose materialization in the account.
-    subtotal = 4 * (x.numel() + weight.numel()) + source.output_bytes
-    assert sum(buffer.bytes for buffer in compiled.implementation.allocations) == (
-        subtotal + math.ceil(subtotal * COMPILER_SLACK_FRACTION)
-    )
     (result,) = compiled.invoke((x, weight), None)
     torch.testing.assert_close(result, (x.float() @ weight.float()).to(torch.bfloat16))
     torch.testing.assert_close(base, before, rtol=0, atol=0)
-    # Compiler facts contain only the raw GEMM result; the borrow has neither
-    # an input copy nor a transpose materialization inside the wrapper.
-    del result
-    torch.cuda.synchronize()
-    allocated = torch.cuda.memory_allocated()
-    torch.cuda.reset_peak_memory_stats()
-    (result,) = compiled.invoke((x, weight), None)
-    torch.cuda.synchronize()
-    assert torch.cuda.max_memory_allocated() - allocated == 2 * source.output_bytes

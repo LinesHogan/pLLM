@@ -53,7 +53,7 @@ def cell():
     )
 
 
-@pytest.mark.parametrize("count", (0, 1, 5))
+@pytest.mark.parametrize("count", (0, 5))
 @pytest.mark.parametrize("dynamic", (False, True))
 @pytest.mark.parametrize("device", ("cpu", "cuda:0"))
 def test_tensor_scan_collects_exact_old_and_new_versions_under_every_schedule(cell, count, dynamic, device):

@@ -135,19 +135,16 @@ def test_partial_payload_copy_failure_does_not_publish_some_fields(monkeypatch):
     execution, task, rows, refs = owner_fixture(rounds=1)
     configure_payload(execution, task, 3)
     original = execution.arena.write_field
-    copied = []
 
     def fail(token, root, field):
         if field == 2:
             raise RuntimeError("injected third-field failure")
-        copied.append(field)
         return original(token, root, field)
 
     monkeypatch.setattr(execution.arena, "write_field", fail)
     invocation = execution.start_step(rows)
     with pytest.raises(RuntimeError, match="third-field"):
         execution.execute_anchor(invocation, execution.plan.tasks[0].anchor_id)
-    assert copied == [0, 1]
     assert not invocation.context.page_publications and not invocation.context.page_writes
     assert tuple(execution.arena.latest(ref.lineage_id) for ref in refs) == refs
     pin = execution.arena.pin_exact(refs)

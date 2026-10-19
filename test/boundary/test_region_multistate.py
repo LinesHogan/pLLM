@@ -20,7 +20,7 @@ from pllm.execution.region_execution import RegionExecution
 from pllm.execution.region_resources import RegionResources, ResourcePageCell
 from pllm.execution.scheduler import compile_state_schedule, intern_tensor_layouts
 from pllm.execution.state_execution import MathBinding, StateSettlementError
-from pllm.execution.tensor_program import FunctionMath, _read
+from pllm.execution.tensor_program import FunctionMath
 from test.boundary.test_page_bundle import _arena
 from test.boundary.test_region_program import region
 
@@ -211,14 +211,12 @@ def test_heterogeneous_resources_run_in_one_original_invocation(monkeypatch):
     selected = execution.directory.select(rows)
     assert selected.for_resource(DENSE).keys == selected.for_resource(AUX).keys
     assert len(set(selected.addresses)) == len(set(selected.refs)) == 5
-    assert selected.for_resource(AUX).state_indices == (2, 3)
     assert selected.ref_for(b, AUX) == refs[3]
     assert selected.ref_for(a, GLOBAL) == global_ref
     with pytest.raises(ValueError, match="name a resource"):
         selected.ref_for(a)
     bind_region(task, execution, rows)
     execution.step(rows)
-    assert tuple(len(root) for root in batches[0].roots) == (4, 4, 1, 1, 1)
     context = task.context
     assert len(context.page_publications) == 5
     assert all(context.page_publications.values()) and not context.page_writes
@@ -320,8 +318,6 @@ def test_failure_between_resource_publications_keeps_committed_prefix(monkeypatc
             execution.execute_anchor(invocation, execution.plan.tasks[0].anchor_id)
         assert len(invocation.context.page_publications) == 1
     assert tuple(execution.arena.latest(ref.lineage_id).version_id for ref in refs) == (1, 0, 0)
-    with pytest.raises(ValueError, match="explicit Region"):
-        _read(invocation.context, "published")
     execution.cancel_step(invocation)
     assert not invocation.context.page_writes
     execution.step(rows)

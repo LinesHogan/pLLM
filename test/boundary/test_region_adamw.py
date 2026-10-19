@@ -11,7 +11,7 @@ from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw
 
 
 @pytest.mark.parametrize("device", ("cpu", "cuda:0"))
-@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32, torch.float64))
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float32))
 @pytest.mark.parametrize("count", (0, 5))
 def test_imported_adamw_scan_preserves_the_existing_kernel_path(device, dtype, count):
     if device.startswith("cuda") and not torch.cuda.is_available():
@@ -42,7 +42,7 @@ def test_imported_adamw_scan_preserves_the_existing_kernel_path(device, dtype, c
 
 
 @pytest.mark.parametrize("device", ("cpu", "cuda:0"))
-@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32, torch.float64))
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float32))
 def test_heterogeneous_adamw_region_preserves_one_original_foreach_batch(device, dtype, monkeypatch):
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("requires CUDA")

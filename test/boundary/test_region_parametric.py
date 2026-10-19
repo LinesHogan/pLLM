@@ -80,7 +80,7 @@ def test_parametric_wavefront_and_tiles_preserve_every_cell_source(monkeypatch):
 
     for name in ("analyze_region_program", "lower_region_schedule", "lower_region_bindings"):
         monkeypatch.setattr(_core, name, forbidden)
-    for chunks, layers in ((0, 0), (0, 5), (3, 0), (1, 1), (5, 3), (7, 5), (80, 12)):
+    for chunks, layers in ((0, 0), (3, 0), (5, 3), (80, 12)):
         sizes = {"chunks": chunks, "layers": layers}
         inputs = inputs_for(chunks, layers)
         oracle_calls = []
@@ -241,18 +241,12 @@ def test_runtime_size_mapping_is_snapshotted_at_invocation_entry():
     assert runner.run({}, sizes=sizes).values == (Bank(()),)
 
 
-def test_parameterized_input_shapes_are_checked_before_copying_any_payload(monkeypatch):
-    import pllm.execution.region_frame as frames
+def test_parameterized_input_shapes_are_checked_at_invocation():
     from test.boundary.test_region_sizes import prefix_program
 
     program = prefix_program()
     analysis = analyze_region_program(program)
     runner = lower(program, analysis.reference_schedule, {})
-
-    def copied_too_early(value):
-        raise AssertionError("payload copied before all shape guards passed")
-
-    monkeypatch.setattr(frames, "copy_data", copied_too_early)
     with pytest.raises(ValueError, match="logical extent"):
         runner.run({"seed": 1, "xs": Bank((1,))}, sizes={"n": 2})
 

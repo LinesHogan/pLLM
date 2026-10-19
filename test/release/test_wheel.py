@@ -6,7 +6,10 @@ import tarfile
 from pathlib import Path
 from zipfile import ZipFile
 
+import pytest
 
+
+@pytest.mark.slow
 def test_isolated_wheel_imports_and_executes_rust_codec(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[2]
     subprocess.run(
@@ -71,6 +74,7 @@ from packaging.requirements import Requirement
 installed = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(installed))
 import pllm
+import pytest
 import torch
 from pllm import _core
 

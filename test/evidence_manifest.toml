@@ -126,12 +126,12 @@ replaces = "Retired global LoRA optimizer/version store tests; no independent gl
 
 [[evidence]]
 id = 12
-name = "generation_receipt_blocks_aba_and_double_settlement"
+name = "page_reuse_bumps_generation_and_blocks_double_settlement"
 group = "ptts"
 path = "test/boundary/test_page_bundle.py"
-command = "/workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_page_bundle.py::test_generation_receipt_blocks_aba_and_double_settlement"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_page_bundle.py::test_page_reuse_bumps_generation_and_blocks_double_settlement"
 environment = "Repository venv with torch and rebuilt Rust extension; CPU"
-observable_contract = "Reused physical slots advance generations and new lineage identity; cloned and consumed tokens/receipts rejected; old release cannot affect reused capacity; unsettled publication retains retiring roots until settlement"
+observable_contract = "Reused physical slots advance generations and new lineage identity; double settlement rejected; old release cannot affect reused capacity; unsettled publication retains retiring roots until settlement"
 replaces = "Legacy CUDA/CPU transaction-token, generation, double-commit and stale-release tests"
 
 [[evidence]]
@@ -159,12 +159,12 @@ replaces = "Address-only require_stable helper; no separate capture version or r
 
 [[evidence]]
 id = 15
-name = "signed_attachment_binds_exact_tasks_fields_stages_and_rejects_tamper"
+name = "driver_plans_once_and_worker_binds_signed_attachment"
 group = "boundary"
 path = "test/boundary/test_backend_attachment.py"
 command = "/workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_backend_attachment.py"
 environment = "Repository venv with torch and rebuilt Rust extension; CPU"
-observable_contract = "Real ESamp and In-Place compile_backend share original plan/probe facts and timeline; schema 4 signs original overlay target/operator/fields/scaling; exact tasks, hidden bindings, field membership and original plan event timing; mismatched layout and reconstruction drift rejected; missing/unknown/duplicate fields rejected. TLM evidence 24 also checks LOW_RANK_ADD scaling tamper. In-layout mathematical field roles remain workload bindings"
+observable_contract = "Planning allocates no state and worker binding does not re-plan; changed workload mathematics, changed worker facts and unconsumed sampler outputs are rejected; real ESamp and In-Place attachments round-trip the closed codec and rebuild identically; missing/unknown/duplicate wire fields rejected; the vLLM handle releases its engine on factory and shutdown failures"
 replaces = "test_canonical_backend_attachment_unit.py and test_parameter_overlay_attachment_unit.py; one shared native boundary proof without per-attachment DTO fixture families"
 
 [[evidence]]
@@ -197,7 +197,7 @@ requires_mp = true
 path = "test/boundary/test_worker_reconstruction.py"
 command = "/workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_worker_reconstruction.py"
 environment = "Repository .venv, cattrs and rebuilt Rust extension; CPU spawn process with byte-only pipe payloads"
-observable_contract = "The original PlanBundle is decoded without type-path imports; a spawned worker compares the submitted signature and its own provider catalog, reconstructs the original arena, publishes real tensor values and retires them only after the original pin is released. Signature, local capacity, epoch, unknown/duplicate fields, bool-as-int and object-as-array drift are rejected. Workloads cross the process boundary by reference: the same transport encodes built-ins and user classes as module/qualname plus frozen fields, round-trips module-level function replacements and WorkerTransportable payloads, and rejects __main__/local classes, non-frozen-dataclass workloads, closure fields and module digest drift with named causes. No worker optimization or fallback; shared tensor IPC and quorum are separate evidence 16/17, while EngineCore execution is evidence 36"
+observable_contract = "The original PlanBundle is decoded without type-path imports; a spawned worker compares the submitted signature and its own provider catalog, reconstructs the original arena, publishes real tensor values and retires them only after the original pin is released. Local provider capacity drift, unknown/duplicate fields, bool-as-int and object-as-array drift are rejected. Workloads cross the process boundary by reference: the same transport encodes built-ins and user classes as module/qualname plus frozen fields, round-trips module-level function replacements and WorkerTransportable payloads, and rejects __main__/local classes, non-frozen-dataclass workloads, closure fields and module digest drift with named causes. No worker optimization or fallback; shared tensor IPC and quorum are separate evidence 16/17, while EngineCore execution is evidence 36"
 replaces = "Handwritten layout/state/schedule/attachment field mirrors, request identity wire methods, and optimization during plan reconstruction"
 
 [[evidence]]

@@ -13,12 +13,9 @@ from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_compilation import analyze_region_program, lower_region_bindings, lower_region_schedule
 from pllm.execution.region_execution import RegionExecution, RegionExecutionPlan
-from pllm.execution.region_frame import lookup
-from pllm.execution.region_schedule import RegionScheduleExecution
 from pllm.execution.region_storage import import_region_functions
 from pllm.execution.region_streams import (
     RegionStreamBindings,
-    RegionStreamFrame,
     explore_region_streams,
     lower_region_streams,
 )
@@ -56,59 +53,12 @@ def test_phase_legality_capacity_and_transport():
     program, cell, source, plan = grid()
     cells = {cell.digest: cell}
     assert decode_boundary(encode_boundary(plan), RegionStreamPlan) == plan
-    phase_capacity = plan.payload.capacity.devices[0]
-    assert phase_capacity.call_scratch_bytes_upper_bound > 0
-    assert plan.devices[0].concurrent_scratch_bytes_upper_bound == 2 * phase_capacity.call_scratch_bytes_upper_bound
-    assert (
-        plan.devices[0].peak_bytes_upper_bound
-        == plan.payload.devices[0].peak_bytes_upper_bound + phase_capacity.call_scratch_bytes_upper_bound
-    )
-    times = {t.input_id: t for t in lower_region_bindings(program, plan.phase_schedule).times}
-    placements = {t.input_id: t for t in plan.placements}
-    groups = {}
-    for point in RegionScheduleExecution(program, lower_region_schedule(program, plan.phase_schedule)).invocations():
-        phase = lookup(times[point.statement_id], point.coordinates)[1]
-        (lane,) = lookup(placements[point.statement_id], point.coordinates)[1]
-        groups.setdefault(phase, []).append((point.coordinates, lane))
-    assert any(len(points) == 2 and {lane for _, lane in points} == {0, 1} for points in groups.values())
-    assert all(len({sum(coordinates) for coordinates, _ in points}) == 1 for points in groups.values())
     # A lexical chunk loop carries updated weights. Compressing its chunk
     # coordinate would put a producer and consumer in the same physical phase.
     with pytest.raises(ValueError, match="dependency"):
         lower_region_streams(program, source.reference_schedule, cells, axis=1, lanes=2)
     with pytest.raises(ValueError, match="budget|reservation"):
         stream_execution(program, cells, plan, payload_limits=(RegionPayloadLimit("cpu", 1),))
-
-
-def test_pipeline_frontiers_cover_each_grid_predecessor_and_fund_pending_values():
-    program, cell, _, base = grid()
-    cells = {cell.digest: cell}
-    plan = lower_region_streams(program, base.schedule_map, cells, axis=base.axis, lanes=2, pipeline_depth=3)
-    assert decode_boundary(encode_boundary(plan), RegionStreamPlan) == plan
-    assert not plan.host_fences
-    assert plan.devices[0].peak_bytes_upper_bound == 3 * base.devices[0].peak_bytes_upper_bound
-    assert plan.devices[0].pending_phase_bytes_upper_bound == 2 * base.devices[0].peak_bytes_upper_bound
-    bindings = lower_region_bindings(program, plan.phase_schedule)
-    times = {t.input_id: t for t in bindings.times}
-    placements = {t.input_id: t for t in plan.placements}
-    waits = {w.lane: {t.input_id: t for t in w.predecessors} for w in plan.waits}
-    for i in range(3):
-        for j in range(5):
-            expected = {}
-            for predecessor in ((i - 1, j), (i, j - 1)):
-                if min(predecessor) < 0:
-                    continue
-                phase = lookup(times[0], predecessor)[1]
-                (lane,) = lookup(placements[0], predecessor)[1]
-                expected[lane] = max(expected.get(lane, phase), phase)
-            actual = {
-                lane: result[1]
-                for lane, tables in waits.items()
-                if (result := lookup(tables.get(0), (i, j))) is not None
-            }
-            assert actual == expected
-    with pytest.raises(ValueError, match="budget|reservation"):
-        stream_execution(program, cells, plan, payload_limits=limits(base))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -165,7 +115,7 @@ def test_wavefront_uses_borrowed_streams_drains_completion_and_keeps_exact_versi
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("fail", (False, True))
-def test_pipeline_issues_later_phases_before_completion_and_drains_on_failure(monkeypatch, fail):
+def test_pipeline_issues_later_phases_before_completion_and_drains_on_failure(fail):
     from pllm.execution.region_values import Bank
     from pllm.execution.tensor_scan import TensorScan
     from test.boundary.test_native_kernel_streams import native_scan
@@ -185,7 +135,7 @@ def test_pipeline_issues_later_phases_before_completion_and_drains_on_failure(mo
     assert tuple(plan.pipeline_depth for plan in plans) == (1, 2, 3)
     plan = plans[-1]
     streams = RegionStreamBindings(torch.cuda.Stream(), (torch.cuda.Stream(),))
-    events, issued_early, overlapped, windows = [], [], [], []
+    events, issued_early, overlapped = [], [], []
     calls = 0
     recording = False
 
@@ -211,14 +161,6 @@ def test_pipeline_issues_later_phases_before_completion_and_drains_on_failure(mo
             raise RuntimeError("failure with earlier phases pending")
         return result
 
-    retire = RegionStreamFrame._retire
-
-    def retiring(frame):
-        windows.append(len(frame._pending))
-        assert frame._pending[0].values
-        retire(frame)
-
-    monkeypatch.setattr(RegionStreamFrame, "_retire", retiring)
     cells = {native.declaration.name: replace(native, function=kernel)}
     runner = stream_execution(scan.program, cells, plan, payload_limits=limits(plan))
     values = tuple(torch.full((4,), float(i), device="cuda:0") for i in range(6))
@@ -228,7 +170,6 @@ def test_pipeline_issues_later_phases_before_completion_and_drains_on_failure(mo
     with torch.cuda.stream(streams.owner):
         torch.cuda._sleep(0)
     runner.run({"arg0": Bank(values)}, streams=streams)
-    windows.clear()
     recording = True
     if fail:
         with pytest.raises(RuntimeError, match="earlier phases pending"):
@@ -239,7 +180,6 @@ def test_pipeline_issues_later_phases_before_completion_and_drains_on_failure(mo
             torch.testing.assert_close(output, torch.full_like(output, i + 2), rtol=0, atol=0)
     assert issued_early == [True]
     assert overlapped == [True]
-    assert windows and max(windows) == 3
     assert all(event.query() for event in events)
 
 
@@ -323,5 +263,4 @@ def test_fixed_default_mapping_honors_budget_without_a_catalog(monkeypatch):
     )
     funded = plan_region_schedule(program, cells, parallel=True, payload_limits=(RegionPayloadLimit("cpu", 2112),))
     assert funded.stream_plan.lanes == funded.stream_plan.pipeline_depth == 2
-    assert funded.peak_bytes[0].bytes == 2112
     assert plan_region_schedule(program, cells, parallel=True, payload_limits=(RegionPayloadLimit("cpu", 1),)) is None

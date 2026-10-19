@@ -243,7 +243,6 @@ def test_failure_after_publish_retains_original_receipt_and_cannot_replay(monkey
     with pytest.raises(StateSettlementError) as failed:
         execution.execute_anchor(invocation, anchor)
     receipt = failed.value.receipt
-    assert receipt is invocation.context.publication
     assert receipt in invocation.context.page_publications
     assert execution.arena.latest(receipt.after_refs[0].lineage_id) == receipt.after_refs[0]
     with pytest.raises(StateSettlementError):

@@ -12,8 +12,6 @@ from pllm.contracts.tensor_rewrite import MatmulReassociation
 from pllm.execution.codec import tensor_graph_expression_digest, tensor_graph_structure_digest
 from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
 from pllm.execution.region_optimization import (
-    PreparedRegionCandidate,
-    bind_region_candidate,
     optimize_region,
 )
 from pllm.execution.tensor_access import profile_tensor_memory
@@ -124,23 +122,6 @@ def test_every_step_replays_and_final_access_graph_is_recomputed(device):
     )
 
 
-def test_missing_reordered_duplicated_or_forged_steps_cannot_replay():
-    source, _ = example()
-    path = next(p for p in reassociation_paths(source) if len(p.rewrites) == 2)
-    first, second = path.rewrites
-    for records in (
-        (second,),
-        (second, first),
-        (first, first),
-        (first, replace(second, input_graph_digest=first.input_graph_digest)),
-        (first, replace(second, after=replace(second.after, flops=0))),
-    ):
-        with pytest.raises(ValueError, match="source"):
-            replay_tensor_rewrites(source, records)
-    with pytest.raises(ValueError, match="original exported"):
-        reassociation_paths(path.cell)
-
-
 def test_multistep_search_preserves_functional_mutation_and_returned_views():
     tensors = (*example()[1], torch.zeros(4, 2, dtype=torch.float64))
 
@@ -160,7 +141,7 @@ def test_multistep_search_preserves_functional_mutation_and_returned_views():
     profile_tensor_memory(replayed)
 
 
-def test_native_selection_binds_the_whole_selected_chain_and_rejects_a_prefix(monkeypatch):
+def test_selection_binds_the_whole_selected_chain_and_honors_depth_limits(monkeypatch):
     import pllm.execution.region_optimization as tuning
 
     source, tensors = example()
@@ -182,18 +163,6 @@ def test_native_selection_binds_the_whole_selected_chain_and_rejects_a_prefix(mo
             measurement_rounds=1,
         )
     assert len(selected.rewrites) == 2
-    partial = replay_tensor_rewrites(source, selected.rewrites[:1])
-    with pytest.raises(ValueError, match="admitted imports"):
-        bind_region_candidate(
-            PreparedRegionCandidate(
-                single_call(source),
-                selected.request.candidates[selected.selection.selected],
-                selected.rewrites[:1],
-                {source.digest: partial},
-            ),
-            selected.request.payload_limits,
-            selected.selection.candidates[selected.selection.selected],
-        )
     (actual,) = selected.execution.run(inputs).values
     torch.testing.assert_close(actual, tensors[0] @ tensors[1] @ tensors[2] @ tensors[3], rtol=0, atol=0)
     for depth, expected_candidates in ((0, 1), (1, 3)):

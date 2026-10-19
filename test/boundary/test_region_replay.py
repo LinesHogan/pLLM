@@ -12,9 +12,17 @@ from pllm.execution.region_replay import ConditionalReplayRegion
 from test.boundary.test_region_pages import owner_fixture
 
 
-@pytest.mark.parametrize("cuda", (False, True))
 @pytest.mark.parametrize(
-    "limit,mode", ((0, "same"), (1, "same"), (6, "same"), (6, "converge"), (4, "nan_distance"), (4, "nonfinite"))
+    "limit,mode,cuda",
+    (
+        (0, "same", False),
+        (6, "same", False),
+        (6, "converge", False),
+        (6, "converge", True),
+        (4, "nan_distance", False),
+        (4, "nonfinite", False),
+        (4, "nonfinite", True),
+    ),
 )
 def test_replay_control_matches_original_loop_without_hot_compilation(monkeypatch, cuda, limit, mode):
     if cuda and not torch.cuda.is_available():

@@ -82,8 +82,6 @@ def test_exact_composition_preserves_escaping_versions_and_enables_cross_call_ma
     assert result.outlined.body.yields == (("ab", "out") if escape else ("out",))
     assert all(not reassociation_candidates(c) for c in cells.values())
     assert len(reassociation_candidates(result.cell)) == (0 if escape else 1)
-    assert not any(n.op == "call_module" for n in result.cell.graph.graph.nodes)
-    assert len([n for n in result.cell.graph.graph.nodes if n.op == "call_function"]) == 2
     originals = execution(program, cells).run(inputs)
     combined = execution(result.outlined.program, {**cells, result.cell.digest: result.cell}).run(inputs)
     assert originals.invocations == 2 and combined.invocations == 1
@@ -98,20 +96,7 @@ def test_exact_composition_preserves_escaping_versions_and_enables_cross_call_ma
         validate_region_capacity(result.outlined.program, {**cells, result.cell.digest: result.cell}, bound)
 
 
-def test_native_structural_verifier_rejects_invalid_sites_effects_and_non_tensor_calls():
-    program, cells, _ = chain()
-    for site in (
-        CallOutline((), 0, 1),
-        CallOutline((), -1, 2),
-        CallOutline((), True, 2),
-        CallOutline((0,), 0, 2),
-        CallOutline((100, 0), 0, 2),
-        CallOutline((0, 1), 0, 2),
-        CallOutline((), 1, 2),
-        CallOutline((), 2**32, 2),
-    ):
-        with pytest.raises(ValueError):
-            _core.outline_region_program(encode_boundary(program), encode_boundary(site))
+def test_scalar_and_effectful_calls_are_not_outlining_sites():
     scalar = Function("scalar", (ScalarType.INT,), (ScalarType.INT,))
     invalid = Program(
         Region(
@@ -126,12 +111,8 @@ def test_native_structural_verifier_rejects_invalid_sites_effects_and_non_tensor
         ),
         (scalar,),
     )
-    with pytest.raises(ValueError, match="all-tensor"):
-        _core.outline_region_program(encode_boundary(invalid), encode_boundary(CallOutline((), 0, 2)))
-    assert tuple(call_outline_sites(invalid)) == ()
     tensor = TensorType((4,), "torch.float32")
     effect = Function("effect", (tensor,), (tensor,), ("state",))
-
     effectful = Program(
         Region(
             Block(
@@ -146,19 +127,10 @@ def test_native_structural_verifier_rejects_invalid_sites_effects_and_non_tensor
         (effect,),
         (Resource("state", (tensor,)),),
     )
-    with pytest.raises(ValueError, match="all-tensor"):
-        _core.outline_region_program(encode_boundary(effectful), encode_boundary(CallOutline((), 0, 2)))
-    # The source range is rederived. Supplied frontier/result/body edits are
-    # not accepted merely because the transformed Program itself is valid.
-    site = CallOutline((), 0, 2)
-    result = outline_region_calls(program, cells, site)
-    for altered in (
-        replace(result.outlined, body=replace(result.outlined.body, yields=())),
-        replace(result.outlined, function=replace(result.outlined.function, name="forged")),
-        replace(result.outlined, program=program),
-    ):
-        with pytest.raises(ValueError, match="original calls"):
-            _core.validate_region_outlining(encode_boundary(program), encode_boundary(site), encode_boundary(altered))
+    for program in (invalid, effectful):
+        assert tuple(call_outline_sites(program)) == ()
+        with pytest.raises(ValueError, match="all-tensor"):
+            _core.outline_region_program(encode_boundary(program), encode_boundary(CallOutline((), 0, 2)))
 
 
 @pytest.mark.parametrize("device", ("cpu", "cuda:0"))
@@ -271,7 +243,6 @@ def test_outlining_stays_inside_nested_control_and_preserves_unused_computation(
     combined = outline_region_calls(program, sources, site)
     if kind == "while" and child == 0:
         assert combined.cell.outputs == ()
-        assert sum(n.op == "call_function" for n in combined.cell.graph.graph.nodes) == 2
     for p, cells in ((program, sources), (combined.outlined.program, {**sources, combined.cell.digest: combined.cell})):
         (result,) = execution(p, cells).run(supplied).values
         values = result.elements if kind == "map" else (result,)

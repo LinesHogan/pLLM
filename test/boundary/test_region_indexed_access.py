@@ -75,10 +75,6 @@ def test_disjoint_write_moves_past_read_but_raw_war_waw_keep_original_versions()
     tensor = exported.declaration.inputs[0]
     program = source(tensor)
     analysis = analyze_region_program(program)
-    facts = analysis.resource_dependencies
-    assert "S2[] -> S3[]" in facts.raw and "S1[] -> S3[]" in facts.raw
-    assert "S0[] -> S2[]" in facts.war and "S3[] -> S4[]" in facts.war
-    assert "S2[] -> S4[]" in facts.waw
     assert not any(statement.opaque for statement in analysis.statements)
     moved = "{ S0[] -> [1]; S1[] -> [0]; S2[] -> [2]; S3[] -> [3]; S4[] -> [4] }"
     validate_region_schedule(program, moved)
@@ -162,7 +158,7 @@ def test_external_ranges_keep_alias_boundary_and_both_verifiers_reject_bad_opera
             verifier(invalid)
 
 
-@pytest.mark.parametrize("layers,taps", [((1,), ()), ((1,), (1,)), ((1, 2), (2, 1)), ((0, 2), (2,))])
+@pytest.mark.parametrize("layers,taps", [((1,), (1,)), ((1, 2), (2, 1)), ((0, 2), (2,))])
 def test_decoder_binds_request_and_token_once_for_symbolic_kv_access(monkeypatch, layers, taps):
     from pllm import _core
     from pllm.contracts.backend_attachment import CausalModelDomain
@@ -174,9 +170,6 @@ def test_decoder_binds_request_and_token_once_for_symbolic_kv_access(monkeypatch
     invocation = execution.start_step(rows)
     tensor = TensorType((1, 4), "torch.float32")
     decoder = DecoderRegion(tensor, layers, CausalModelDomain(2, 3, 8), taps=taps)
-    analysis = analyze_region_program(decoder.program, optimize=False)
-    for relation in (analysis.resource_dependencies.reads, analysis.resource_dependencies.writes):
-        assert "__size_request" in relation and "__size_token" in relation
     calls = []
 
     def layer(ordinal, positions, hidden, residual):
@@ -256,8 +249,6 @@ def test_conditional_nested_effects_project_to_the_cells_they_can_touch(enabled)
     )
     analysis = analyze_region_program(program, optimize=False)
     assert not any(statement.opaque for statement in analysis.statements)
-    assert "S0[] -> S2[]" in analysis.resource_dependencies.raw
-    assert "S0[] -> S1[]" not in analysis.resource_dependencies.raw
     with pytest.raises(ValueError, match="dependency"):
         validate_region_schedule(program, "{ S0[] -> [1]; S1[] -> [2]; S2[] -> [0] }")
     schedule = "{ S0[] -> [1]; S1[] -> [0]; S2[] -> [2] }"

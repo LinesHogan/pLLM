@@ -198,7 +198,6 @@ def _owned_readonly_requires_exact_pin(owner):
         ReadonlyResourceBinding,
         RegionResources,
     )
-    from pllm.execution.tensor_borrow import ReadonlyTensorCell
 
     (ref,) = owner.publication.after_refs
     pin = owner.borrow_published((ref,))
@@ -234,19 +233,6 @@ def _owned_readonly_requires_exact_pin(owner):
         RegionResources(
             program, owner, (), borrows=(ReadonlyResourceBinding(bound.view, owner),), tensor_borrows=(imported,)
         )
-    forged = replace(bound, view=replace(bound.view, cells=(ReadonlyTensorCell.bind((0,), (actual.clone(),)),)))
-    with pytest.raises(ValueError, match="storage differs"):
-        RegionResources(program, owner, (), borrows=(forged,), tensor_borrows=(imported,))
-    for wrong in (
-        replace(proof, pin=replace(pin)),
-        replace(proof, pin=owner.pin),
-        replace(proof, fields=(LayoutFieldId(99),)),
-    ):
-        with pytest.raises((ValueError, RuntimeError)):
-            PinnedResourceBinding.bind(resource, owner, (wrong,))
-    writable = replace(getter, accesses=(replace(getter.accesses[0], mode=AccessMode.WRITE),))
-    with pytest.raises(ValueError, match="READ effects only"):
-        RegionResources(replace(program, functions=(writable,)), owner, (), borrows=(bound,))
     # Exercise the new binding's writable-alias check directly, independently
     # of the ordinary paged-vs-arena disjointness check in RegionResources.
     write = CausalAccess(

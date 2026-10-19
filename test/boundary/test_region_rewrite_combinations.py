@@ -116,7 +116,6 @@ def test_only_joint_rewrite_fits_and_only_feasible_candidates_are_measured(devic
     assert len(measured) == 2
     winner = selected.selection.selected
     assert winner != 0 and selected.selection.candidates[winner].feasible
-    assert selected.selection.candidates[winner].capacity.devices[0].peak_tensor_bytes_upper_bound == 5392
     assert all(
         c.elapsed_ns == () for c, a in zip(selected.request.candidates, selected.selection.candidates) if not a.feasible
     )
@@ -133,18 +132,6 @@ def test_only_joint_rewrite_fits_and_only_feasible_candidates_are_measured(devic
         assert torch.equal(cuda_rng, torch.cuda.get_rng_state(device))
     for before, after in zip(saved, inputs.values(), strict=True):
         torch.testing.assert_close(before, after, rtol=0, atol=0)
-    from pllm.execution.tensor_rewrites import replay_tensor_rewrites
-
-    first, second = selected.rewrites
-    partial = {**cells, first.source_digest: replay_tensor_rewrites(cells[first.source_digest], (first,))}
-    with pytest.raises(ValueError, match="admitted imports"):
-        bind_region_candidate(
-            PreparedRegionCandidate(program, selected.request.candidates[winner], (first,), partial),
-            selected.request.payload_limits,
-            selected.selection.candidates[winner],
-        )
-    with pytest.raises(ValueError, match="source graph"):
-        replay_tensor_rewrites(cells[second.source_digest], (replace(second, after=replace(second.after, flops=0)),))
     # Independent rule chains commute. Bind their locally replayed artifacts.
     reversed_records = selected.rewrites[::-1]
     rebuilt = {

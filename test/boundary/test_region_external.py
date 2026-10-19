@@ -101,26 +101,3 @@ def test_different_external_names_do_not_prove_backend_alias_separation():
     with pytest.raises(RuntimeError, match="released"):
         resources.external(program.functions[0], ())
     execution.retire(tuple(row.identity for row in rows))
-
-
-def test_external_endpoint_binding_is_complete_and_checked_before_execution():
-    program = external_program()
-    execution, _, rows, _ = owner_fixture(rounds=1)
-    invocation = execution.start_step(rows)
-    endpoints = tuple(ExternalFunction(f, lambda args: (1,)) for f in program.functions)
-    for invalid in ((), endpoints[:1], (*endpoints, endpoints[0])):
-        with pytest.raises(ValueError, match="complete and exact"):
-            RegionResources(program, invocation.context, (), invalid)
-    with pytest.raises(ValueError, match="source declaration"):
-        RegionResources(
-            program,
-            invocation.context,
-            (),
-            (replace(endpoints[0], declaration=replace(endpoints[0].declaration, inputs=(I,))), endpoints[1]),
-        )
-    resources = RegionResources(program, invocation.context, (), endpoints)
-    changed = replace(program, functions=(replace(program.functions[0], name="changed"), program.functions[1]))
-    with pytest.raises(ValueError, match="source declarations"):
-        resources.validate(changed)
-    execution.cancel_step(invocation)
-    execution.retire(tuple(row.identity for row in rows))

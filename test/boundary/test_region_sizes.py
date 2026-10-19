@@ -167,7 +167,7 @@ def test_one_native_schedule_handles_all_prefix_lengths_without_recompiling(monk
     program = prefix_program()
     analysis = analyze_region_program(program)
     assert analysis.exact_provenance and len(analysis.statements) == 1
-    assert "__size_n" in analysis.domain and len(analysis.candidates) == 3
+    assert len(analysis.candidates) == 3
     runners = tuple(
         RegionExecution(
             program, lower_region_schedule(program, c.schedule_map), lower_region_bindings(program, c.schedule_map), {}

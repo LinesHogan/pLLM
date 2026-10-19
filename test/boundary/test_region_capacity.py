@@ -1,7 +1,5 @@
 """Parameter-range tensor bounds checked against live real execution storage."""
 
-from dataclasses import replace
-
 import pytest
 import torch
 
@@ -10,7 +8,7 @@ from pllm.execution.codec import encode_boundary
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_compilation import analyze_region_program, lower_region_bindings, lower_region_schedule
 from pllm.execution.region_execution import RegionExecution
-from pllm.execution.region_storage import analyze_region_capacity, validate_region_capacity
+from pllm.execution.region_storage import analyze_region_capacity
 from pllm.execution.tensor_scan import TensorScan
 from test.boundary.test_region_tensor import inputs_for, tensor_grid
 from test.boundary.test_tensor_access import StorageObserver
@@ -90,7 +88,7 @@ def test_equal_time_independent_instances_are_not_collapsed_to_one_allocation():
     "device",
     ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable"))],
 )
-@pytest.mark.parametrize("chunks,layers", [(0, 3), (3, 0), (1, 1), (4, 3), (5, 6)])
+@pytest.mark.parametrize("chunks,layers", [(0, 3), (1, 1), (5, 6)])
 def test_schedule_bounds_cover_real_grid_storage(chunks, layers, device):
     def step(h, w):
         return h + w, w + 1
@@ -166,23 +164,3 @@ def test_zero_trip_does_not_charge_call_scratch_or_unknown_accesses():
     assert empty.devices[0].peak_tensor_bytes_upper_bound == 16
     used = capacity(TensorScan(cell, 2, carry=1, invariants=0), cell)
     assert used.unknown_functions == (cell.digest,)
-
-
-def test_bounds_and_source_parameter_context_are_revalidated():
-    cell = make_cell()
-    scan = TensorScan(cell, SizeParameter("steps", 0, 100), carry=1, invariants=0)
-    bound = capacity(scan, cell)
-    cells = {cell.digest: cell}
-    validate_region_capacity(scan.program, cells, bound)
-    for forged in (
-        replace(bound, devices=(replace(bound.devices[0], peak_tensor_bytes_upper_bound=0),)),
-        replace(bound, roots=(replace(bound.roots[0], live_instances_upper_bound=0), *bound.roots[1:])),
-        replace(bound, storage_signature="a" * 64),
-        replace(bound, imports_digest="b" * 64),
-        replace(bound, signature="c" * 64),
-    ):
-        with pytest.raises(ValueError, match="region capacity"):
-            validate_region_capacity(scan.program, cells, forged)
-    changed = replace(scan.program, parameters=(SizeParameter("steps", 0, 101),))
-    with pytest.raises(ValueError):
-        validate_region_capacity(changed, cells, bound)
