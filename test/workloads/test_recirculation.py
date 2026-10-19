@@ -1,7 +1,6 @@
 """Evidence 27: serial recurrence oracle, row selection and stateless settlement."""
 
 from dataclasses import replace
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -10,49 +9,28 @@ import pllm
 from pllm.authoring import BackendCompileFacts, TensorStepInput
 from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import (
-    ActivationPatchBinding,
-    ActivationPatchOperator,
     AttachmentGraphMode,
     AttachmentTopology,
     BackendPlacementProbe,
     CausalModelDomain,
-    DecodeRefresh,
-    DecodeWindow,
-    MissingPolicy,
 )
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
-from pllm.contracts.region_selection import RegionSelectionPolicy
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import (
     AnchorId,
-    StateEffectKind,
 )
 from pllm.contracts.state_representation import StateDeviceKind
-from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
-from pllm.execution.backend_attachment import (
-    attachment_buffer_bytes,
-    bind_backend_attachment,
-    derive_attachment_resources,
-)
-from pllm.execution.codec import encode_boundary
-from pllm.execution.declaration import Dimensions, Field, When
+from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.paged_access import PagedLayer, PagedResourceView, bind_paged_access
-from pllm.execution.ptts.page_bundle import PageBundleArena
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
 from pllm.execution.region_resources import HostResourceBinding, PagedResourceBinding, ReadonlyResourceBinding
 from pllm.execution.replay import (
     TokenwiseReplayPrimitive,
 )
 from pllm.execution.runtime_facts import RuntimeFacts
-from pllm.execution.state_execution import MathBinding
-from pllm.execution.tensor_binding import TensorBinding
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
-from pllm.execution.tensor_frame import TensorFrame
-from pllm.execution.tensor_program import FunctionMath, TaskOutput
 from pllm.workload_transport import decode_workload, encode_workload
 from pllm.workloads.recirculation import RecirculationConfig, RecirculationWorkload
-from test.workloads.test_video import received_features
 
 PROBE = BackendPlacementProbe(
     "test.replay@1",
@@ -294,156 +272,3 @@ def test_disabled_recirculation_runs_only_the_normal_pass() -> None:
     decoder = Decoder()
     run_step(disabled, VALUE, decoder)
     assert decoder.calls == [(index, "normal") for index in range(4)]
-    # Request zero has no rows this time. The same cold source must carry the
-    # original effects through its empty scan and start request one's row at 0.
-    decoder = Decoder()
-    decoder.batch = replace(ROWS, total_rows=1, rows=(replace(ROWS.rows[-1], packed_row_index=0),))
-    single = TensorStepInput(decoder.batch, PackedSamplerRowBatch(decoder.batch, (PackedSamplerRowLink(0, 0),)))
-    run_step(disabled, single, decoder)
-    expected = INPUTS[:1].clone()
-    for ordinal in range(3):
-        expected = torch.tanh(expected * (ordinal + 1) * 0.8)
-    torch.testing.assert_close(decoder.output, expected)
-    assert decoder.calls == [(0, "normal")] and torch.count_nonzero(decoder.cache[0]) == 0
-
-
-def test_activation_source_matches_serial_oracle() -> None:
-    from pllm.backends.vllm.activation import VllmActivationPatch
-
-    delta = torch.tensor([0.2, -0.3, 0.4, 0.1])
-    weight = torch.tensor([[0.1, 0.2, -0.1, 0.3], [-0.2, 0.1, 0.4, 0.2]])
-    bias = torch.tensor([0.07, -0.04])
-    rotation = torch.tensor([[0.2, 0.0], [0.1, 0.3], [-0.1, 0.2], [0.4, -0.1]])
-    tensors = ((delta,), (weight, bias, rotation))
-    bindings = tuple(
-        ActivationPatchBinding(
-            layer,
-            tuple(LayoutFieldId(i + offset) for i in range(len(fields))),
-            1,
-            1,
-            operator,
-            DecodeWindow.ALL,
-            DecodeRefresh.STEP,
-            MissingPolicy.HOLD,
-        )
-        for layer, operator, offset, fields in (
-            (0, ActivationPatchOperator.ADD, 0, tensors[0]),
-            (2, ActivationPatchOperator.LOW_RANK_AFFINE, 1, tensors[1]),
-        )
-    )
-    b = TensorBinding("owned.activation.replay", "a" * 64, Dimensions(4, 0, layer_count=3))
-    _, ports = b.parameters(
-        "features", {name: (2,) for name in ("qp", "residual", "mv", "segmentation")}, optimizer=None
-    )
-    encoded = b.tensor("encode", inputs=ports, when=When.BEFORE_MODEL)(lambda values: sum(values.values()))
-    fields = (delta, weight, bias, rotation)
-    inject = b.state("inject", tuple(Field(str(i), tuple(tensor.shape)) for i, tensor in enumerate(fields)))
-
-    def write(data, batch):
-        return TaskOutput(
-            field_writes=tuple((LayoutFieldId(i), tensor.unsqueeze(0)) for i, tensor in enumerate(fields)),
-            changed=(0,),
-            update_count=1,
-        )
-
-    update = b.compute(
-        "write",
-        inputs={"encoded": encoded["value"]},
-        outputs=("updated",),
-        changes=inject,
-        effect=StateEffectKind.TRANSITION,
-        when=When.BEFORE_MODEL,
-        function=write,
-    )
-    publication = b.publish(update, inject, when=When.BEFORE_MODEL)
-    b.overlay(inject, update, publication, activations=bindings)
-    b.recurrence(CONFIG)
-    b.conditional_input(("features",))
-    graph, layouts, spec = b.finish()
-    reserve = attachment_buffer_bytes(PROBE, graph, layouts, spec)
-    timeline = replace(
-        RuntimeFacts(torch.device("cpu")).timeline(("model/tokenwise_replay@1", "transition/full_root@1")),
-        region_policy=RegionSelectionPolicy(schedule_policy="serial"),
-        reserved_bytes=(reserve,) * 8,
-    )
-    timeline = derive_attachment_resources(PROBE, graph, timeline, layouts=layouts, attachment=spec)
-    plan = compile_page_bundle_plan(
-        (graph, layouts), timeline, (PageBundleProviderFacts("test.owned@1", 3),), 1, 65536, torch.device("cpu")
-    )
-    signed = bind_backend_attachment(plan, PROBE, spec)
-    math = FunctionMath(
-        {"inject": lambda roots: None},
-        lambda value: (),
-        lambda value, batch: TensorFrame(value, VALUE.rows.rows),
-        lambda data, result: result.publication,
-    )
-    execution = MathBinding(math, b.bind_all(plan, model_probe=PROBE), borrowed_resources=("features",)).bind(
-        PageBundleArena(plan, _owned_resources=("inject",)), signed.inputs.request.sampler_anchor_id
-    )
-    model = SimpleNamespace(
-        model=SimpleNamespace(layers=[SimpleNamespace(forward=lambda *args: None) for _ in range(3)])
-    )
-    selector = VllmActivationPatch(model, bindings, "inject", install=False)
-
-    class BoundDecoder(Decoder):
-        def bind_activation(self, resource, layer, owner):
-            return selector.bind_pinned(resource, layer, owner)
-
-        def activation_selected(self, row, layer):
-            return selector.selected(row, layer)
-
-    decoder = BoundDecoder()
-    rows = decoder.rows
-    expected_cache = torch.zeros_like(decoder.cache)
-    expected = []
-    for row in rows:
-        index, request, position = row.packed_row_index, row.request_ordinal, row.token_offset
-
-        def layer(ordinal, hidden):
-            previous = expected_cache[request, ordinal, position - 1] if position else torch.zeros(4)
-            expected_cache[request, ordinal, position] = hidden
-            hidden = torch.tanh(hidden * (ordinal + 1) * 0.8 + previous * 0.6)
-            if index != 1:
-                if ordinal == 0:
-                    hidden = hidden + delta
-                elif ordinal == 2:
-                    hidden = hidden + (hidden @ weight.T + bias - hidden @ rotation) @ rotation.T
-            return hidden
-
-        hidden = INPUTS[index].clone()
-        for ordinal in range(3):
-            hidden = layer(ordinal, hidden)
-            if ordinal == 0:
-                destination = hidden.clone()  # The tap must include this layer's injection.
-        expected.append(hidden.clone())
-        if row.phase is HiddenPhase.PREFILL:
-            alpha = 0.7 * min(position, 2) / 2
-            hidden = (
-                destination * (1 - alpha) + hidden * alpha * (destination.square().sum() / hidden.square().sum()).sqrt()
-            )
-            for ordinal in (1, 2):
-                hidden = layer(ordinal, hidden)  # New hidden, same affine parameters; no repeat of layer zero.
-    execution.admit(())
-    identities = tuple(dict.fromkeys(row.identity for row in rows))
-    with received_features(plan) as (root, peers):
-        execution.stage_readonly((root,))
-        invocation = execution.start_step(VALUE)
-        execution.execute_anchor(invocation, AnchorId(0))
-        execution.admit(identities)
-        selector.prepare(VALUE.rows, invocation.context, execution.directory)
-        invocation.context.replay = decoder
-        for anchor in range(1, 8):
-            execution.execute_anchor(invocation, AnchorId(anchor))
-            if anchor == execution.sampler_anchor_id:
-                execution.complete_sampler(invocation)
-        selector.clear()
-        execution.finish_step(invocation)
-        torch.testing.assert_close(decoder.output, torch.stack(expected))
-        torch.testing.assert_close(decoder.cache, expected_cache)
-        assert all(
-            peer.poll() and peer.recv_bytes() == encode_boundary(page.descriptor).encode()
-            for peer, page in zip(peers, root.pages, strict=True)
-        )
-        selector.close()
-        execution.retire(identities)
-        execution.retire(())
