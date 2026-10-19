@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import heapq
+from collections import Counter
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
@@ -273,6 +274,11 @@ class PageBundleArena:
         self._roots: dict[StateRef, _Root] = {}
         self._lineages: dict[LineageId, StateRef | None] = {}
         self._writes: dict[PageWrite, _Write] = {}
+        # Bookkeeping that keeps per-step work proportional to what changed:
+        self._stale: set[StateRef] = set()  # roots that are no longer latest; reclamation candidates
+        self._retiring: set[LineageId] = set()  # retired lineages that still own roots
+        self._root_count: Counter[LineageId] = Counter()  # roots per lineage
+        self._writing: set[LineageId] = set()  # lineages with a pending private write
         self._pins: dict[PagePin, list[RemoteCompletion]] = {}
         self._publications: dict[PagePublication, bool] = {}
         self._releases: set[PageRelease] = set()
@@ -437,7 +443,7 @@ class PageBundleArena:
             for ref in sources:
                 if self.latest(ref.lineage_id) != ref:
                     raise RuntimeError("PageBundle transition source is not latest")
-                if any(ref in token.before_refs for token in self._writes):
+                if ref.lineage_id in self._writing:
                     raise RuntimeError("PageBundle lineage already has a pending write")
             fields = (
                 fields
@@ -529,6 +535,7 @@ class PageBundleArena:
         token = PageWrite(self._next_operation, sources, targets, stream)
         self._next_operation += 1
         self._writes[token] = _Write(tuple(allocated), fields)
+        self._writing.update(ref.lineage_id for ref in sources)
         for ref in sources:
             self._roots[ref].pins += 1
         try:
@@ -584,14 +591,13 @@ class PageBundleArena:
                     raise RuntimeError("PageBundle publication source is no longer latest")
             completion = self._record(token.stream)
             receipt = PagePublication(token.operation_id, token.before_refs, token.after_refs, completion)
-            roots = dict(self._roots)
-            lineages = dict(self._lineages)
             for target in write.targets:
-                bundle = PageBundle(target.ref, target.resource, target.pages, completion)
-                roots[target.ref] = _Root(bundle, pins=1)
-                lineages[target.ref.lineage_id] = target.ref
-            # No tensor work or user code is allowed between the visibility swap and receipt issuance.
-            self._roots, self._lineages = roots, lineages
+                ref = target.ref
+                self._roots[ref] = _Root(PageBundle(ref, target.resource, target.pages, completion), pins=1)
+                self._lineages[ref.lineage_id] = ref
+                self._root_count[ref.lineage_id] += 1
+            self._stale.update(token.before_refs)
+            self._writing.difference_update(ref.lineage_id for ref in token.before_refs)
             self._writes.pop(token)
             self._publications[receipt] = False
             return receipt
@@ -617,6 +623,7 @@ class PageBundleArena:
                 self._pools[root.resource].release(root.pages)
             for ref in token.before_refs:
                 self._roots[ref].pins -= 1
+            self._writing.difference_update(ref.lineage_id for ref in token.before_refs)
             self._writes.pop(token)
             self._reclaim()
 
@@ -1254,12 +1261,12 @@ class PageBundleArena:
             if not refs or len(set(refs)) != len(refs):
                 raise ValueError("PageBundle retirement requires distinct latest roots")
             for ref in refs:
-                if self.latest(ref.lineage_id) != ref or any(ref in token.before_refs for token in self._writes):
+                if self.latest(ref.lineage_id) != ref or ref.lineage_id in self._writing:
                     raise RuntimeError("PageBundle retirement overlaps a write or stale version")
-            lineages = dict(self._lineages)
             for ref in refs:
-                lineages[ref.lineage_id] = None
-            self._lineages = lineages
+                self._lineages[ref.lineage_id] = None
+                self._retiring.add(ref.lineage_id)
+            self._stale.update(refs)
             self.collect_completed()
 
     def collect_completed(self, *, wait: bool = False, resources: set[str] | None = None) -> None:
@@ -1304,19 +1311,21 @@ class PageBundleArena:
             self._reclaim()
 
     def _reclaim(self) -> None:
-        for ref, stored in tuple(self._roots.items()):
+        """Release stale roots that no pin holds and whose last GPU writer has finished."""
+        for ref in tuple(self._stale):
+            stored = self._roots[ref]
             bundle = stored.bundle
-            if (
-                not stored.pins
-                and self._lineages[ref.lineage_id] != ref
-                and (bundle.readiness is None or bundle.readiness.query())
-            ):
-                self._pools[bundle.resource].release(bundle.pages)
-                self._roots.pop(ref)
-        retained = {ref.lineage_id for ref in self._roots}
-        for lineage, latest in tuple(self._lineages.items()):
-            if latest is None and lineage not in retained:
-                self._lineages.pop(lineage)
+            if stored.pins or (bundle.readiness is not None and not bundle.readiness.query()):
+                continue
+            self._pools[bundle.resource].release(bundle.pages)
+            del self._roots[ref]
+            self._stale.discard(ref)
+            self._root_count[ref.lineage_id] -= 1
+            if not self._root_count[ref.lineage_id]:
+                del self._root_count[ref.lineage_id]
+                if ref.lineage_id in self._retiring:
+                    self._retiring.discard(ref.lineage_id)
+                    del self._lineages[ref.lineage_id]
 
     def _issued_write(self, token: PageWrite) -> _Write:
         self._require_live()
