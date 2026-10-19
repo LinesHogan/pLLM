@@ -28,7 +28,7 @@ from pllm.contracts.state_ref import StateRef
 from pllm.execution.codec import register_gradient_hook
 from pllm.execution.cuda_stream import upload
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.execution.tensor_program import Observation, TaskOutput, TensorBatch
+from pllm.execution.tensor_program import Observation, TensorBatch
 
 if TYPE_CHECKING:
     from pllm.authoring import TensorStepInput
@@ -291,7 +291,6 @@ class TensorFrame:
     parameter_gradient_fields: MutableMapping[StateRef, tuple[torch.Tensor, ...]] = field(
         default_factory=lambda: dict[StateRef, tuple[torch.Tensor, ...]]()
     )
-    pending_update: TaskOutput | None = None
     batch_inputs: tuple[torch.Tensor, ...] = ()
     selected: tuple[int, ...] = ()
     trained_rows: int = 0

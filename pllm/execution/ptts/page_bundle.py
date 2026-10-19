@@ -545,7 +545,7 @@ class PageBundleArena:
                 rows,
             )
 
-    def latest_refs(self, resource: str, lineages: StateRefs | Sequence[LineageId]) -> StateRefs:
+    def latest_batch(self, resource: str, lineages: StateRefs | Sequence[LineageId]) -> StateRefs:
         """Read the latest versions by cached arena row, without allocating individual refs."""
         with self._lock:
             self._require_live()

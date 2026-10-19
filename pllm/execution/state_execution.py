@@ -26,7 +26,6 @@ from pllm.contracts.semantic_graph import (
     TaskSymbol,
 )
 from pllm.contracts.state_ref import StateRef
-from pllm.contracts.state_representation import StatePhysicalPlan
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.execution import TaskGraphExecution, TaskGraphImplementation, TaskGraphInvocation
@@ -431,10 +430,6 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     def _release_values(self, context: StateTaskContext[DataT], values: tuple[int, ...]) -> None:
         for value in values:
             context.results.pop(self._values[value], None)
-
-    @property
-    def state_plan(self) -> StatePhysicalPlan:
-        return self.arena.plan.state_physical
 
     def implementation(self, identity: ImplementationId) -> TaskGraphImplementation[StateTaskContext[DataT]]:
         matches = tuple(item for item in self._runner.implementations if item.implementation_id == identity)

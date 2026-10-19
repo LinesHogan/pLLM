@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from threading import RLock
 from types import MappingProxyType
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -26,8 +27,13 @@ class StateAddress:
     key: RequestStateKey | None
 
 
-# One state's resource, keys, key lineages and per-row positions within a selection.
-_Projection = tuple[StateResource, tuple["RequestStateKey | None", ...], StateRefs, tuple[int, ...]]
+class _Projection(NamedTuple):
+    """One state's resource, its keys and their lineages, and each row's position in the selection."""
+
+    resource: StateResource
+    keys: tuple[RequestStateKey | None, ...]
+    lineages: StateRefs
+    positions: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,7 +278,7 @@ class RequestStateDirectory:
             if self._projection is None or self._projection[0] != identities:
                 self._projection = identities, self._project(rows)
             groups = tuple(
-                ResourceSelection(resource, keys, self.arena.latest_refs(resource, lineages), positions)
+                ResourceSelection(resource, keys, self.arena.latest_batch(resource, lineages), positions)
                 for resource, keys, lineages, positions in self._projection[1]
             )
             return RequestStateSelection(rows if self.states else (), groups)
@@ -295,7 +301,9 @@ class RequestStateDirectory:
                 indices = {key: offset + i for i, key in enumerate(keys)}
                 positions = tuple(indices[key] for key in projected)
             lineages = tuple(self._lineage(StateAddress(state.resource, key)) for key in keys)
-            projections.append((state.resource, keys, self.arena.resolve_lineages(state.resource, lineages), positions))
+            projections.append(
+                _Projection(state.resource, keys, self.arena.resolve_lineages(state.resource, lineages), positions)
+            )
             offset += len(keys)
         return tuple(projections)
 
