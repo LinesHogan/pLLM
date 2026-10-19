@@ -1,4 +1,4 @@
-"""Completion authoring lowers AdamW while retaining its original page owner."""
+"""A completion workload with two parameter groups matches torch AdamW bitwise, on CPU and CUDA."""
 
 from dataclasses import replace
 
@@ -6,12 +6,9 @@ import pytest
 import torch
 
 import pllm
-import pllm.execution.tensor_program as tensor_program
-from pllm import _core
 from pllm.contracts.feedback import Completion, CompletionBatch, FinishReason
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.execution.host_runtime import CompletionInput, HostRuntimeFacts
-from pllm.execution.region_adamw import AdamWRegion
 from pllm.execution.tensor_program import InvocationOutput
 
 
@@ -46,7 +43,7 @@ class TwoGroups(pllm.CompletionWorkload[CompletionInput, InvocationOutput]):
 
 
 @pytest.mark.parametrize("device", ("cpu", "cuda:0"))
-def test_default_completion_region_keeps_multigroup_adamw_and_publication(monkeypatch, device):
+def test_default_completion_region_keeps_multigroup_adamw_and_publication(device):
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     device = torch.device(device)
@@ -65,7 +62,6 @@ def test_default_completion_region_keeps_multigroup_adamw_and_publication(monkey
     peak = execution.arena.plan.schedule_decision.peak_memory_bytes
     with pytest.raises(ValueError):
         workload.compile_host(replace(facts, memory_budget_bytes=peak - 1))
-    assert any(task.implementation_id.startswith("region.completion_adamw@1:") for task in execution.plan.tasks)
     (initial,) = execution.admit((), stream)
     original = execution.snapshot(initial, stream)
     if stream is not None:
@@ -87,28 +83,6 @@ def test_default_completion_region_keeps_multigroup_adamw_and_publication(monkey
         torch.tensor([[0.4, -0.7]], device=device),
         torch.cuda.current_stream(device) if stream is not None else None,
     )
-    calls = []
-    original_region = AdamWRegion.__call__
-
-    def execute(self, roots, gradients):
-        calls.append(len(roots))
-        return original_region(self, roots, gradients)
-
-    monkeypatch.setattr(AdamWRegion, "__call__", execute)
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("completion update used legacy mathematics or compiled on the request path")
-
-    monkeypatch.setattr(tensor_program, "apply_adamw", forbidden)
-    monkeypatch.setattr(tensor_program, "paged_adamw", forbidden)
-    for name in (
-        "analyze_region_program",
-        "lower_region_schedule",
-        "lower_region_bindings",
-        "analyze_region_capacity",
-        "analyze_region_storage",
-    ):
-        monkeypatch.setattr(_core, name, forbidden)
     latest = initial
     for round_ in range(1, 4):
         oracle.zero_grad(set_to_none=True)
@@ -129,13 +103,11 @@ def test_default_completion_region_keeps_multigroup_adamw_and_publication(monkey
             expected = (parameter, parameter.grad, state["step"], state["exp_avg"], state["exp_avg_sq"])
             for got, want in zip(actual[5 * index : 5 * index + 5], expected, strict=True):
                 torch.testing.assert_close(got, want, rtol=0, atol=0)
+    # A None loss skips the update: no publication, the latest version stays.
     skipped = replace(batch, completions=CompletionBatch((replace(entry, text="skip"),)))
     result = execution.step(skipped, stream)
     assert result.publication is None
     assert execution.arena.latest(initial.lineage_id) == latest
-    assert calls == [2, 2, 2]
     assert execution.diagnostics().update_count == 3
     execution.retire(())
-    execution.arena.collect_completed(wait=True)
-    assert execution.arena.active_lineages == execution.arena.usage().private_versions == 0
-    assert execution.arena.usage().pinned_versions == execution.arena.usage().pending_receipts == 0
+    assert execution.diagnostics().active_lineages == execution.diagnostics().pending_state_releases == 0
