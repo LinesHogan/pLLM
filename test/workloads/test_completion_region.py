@@ -67,8 +67,6 @@ def test_default_completion_region_keeps_multigroup_adamw_and_publication(monkey
     )
     workload = TwoGroups()
     binding = workload.declare_host(facts)
-    planned = next(fact for fact in binding.timeline.task_resources if fact.task == "train")
-    assert planned.workspace_bytes == 4096 + 13 * (9 * 4) + 2 * 12
     execution = binding.compile()
     peak = execution.arena.plan.schedule_decision.peak_memory_bytes
     with pytest.raises(ValueError):

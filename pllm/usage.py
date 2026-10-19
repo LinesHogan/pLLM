@@ -5,7 +5,6 @@ from dataclasses import KW_ONLY, dataclass, field, fields, is_dataclass, replace
 from enum import Enum
 from inspect import Parameter as SignatureParameter
 from inspect import signature
-from math import prod
 from types import FunctionType, MethodType
 from typing import Annotated, ClassVar, TypeVar, cast, get_args, get_origin
 
@@ -30,25 +29,22 @@ from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
     ConditionalLayerReplay,
     HiddenInputSource,
-    HostServiceInputSource,
     LossReduction,
     MathContract,
     SamplerFeedbackInputSource,
     SchedulerTimeline,
     SemanticGraph,
     SemanticInputSource,
-    SemanticTask,
     StateScope,
     TaskImplementationSpec,
     TaskResourceFact,
     TaskResultInputSource,
     TaskSymbol,
-    ValueResourceFact,
 )
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorLayoutRequest
 from pllm.execution.codec import boundary_digest
 from pllm.execution.declaration import Call, Dimensions, Shape, State, When, native
-from pllm.execution.freeze import NativeMath, fingerprint, freeze, owner_snapshot, owner_values, reachable_functions
+from pllm.execution.freeze import fingerprint, freeze, owner_snapshot, owner_values, reachable_functions
 from pllm.execution.freeze import members as _members
 from pllm.execution.host_runtime import (
     HostRuntimeFacts,
@@ -58,6 +54,7 @@ from pllm.execution.host_runtime import (
 from pllm.execution.replay import Recurrence as Recurrence
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.step_capture import StepCapture, reads_rows
+from pllm.execution.task_memory import derive_resources
 from pllm.execution.tensor_binding import SGD as SGD
 from pllm.execution.tensor_binding import Buffer as Buffer
 from pllm.execution.tensor_binding import TensorBinding
@@ -458,7 +455,6 @@ def _invoke(function: Callable[..., torch.Tensor], names: tuple[str, ...]) -> Ca
 
 
 class Workload(
-    NativeMath,
     BackendWorkload[TensorFrame, TensorOutput],
     HostWorkload[StateExecution[TensorStepInput, TensorFrame, TensorOutput]],
 ):
@@ -1031,7 +1027,11 @@ class Workload(
             def output(data: TensorFrame, invocation: InvocationOutput) -> TensorOutput:
                 return b.result(data, invocation)
 
-        limits = [fact.input_shapes[0][0] for fact in b.resources if fact.task in b.tensor_tasks and fact.input_shapes]
+        limits = [
+            fact.input_shapes[0][0]
+            for fact in b.resources
+            if fact.task in b.tensor_tasks and fact.task not in b.exports and fact.input_shapes
+        ]
         row_limit = min(limits) if limits and type(self).operations is Workload.operations else None
 
         def rows(value: TensorStepInput) -> tuple[PackedPhaseRow, ...]:
@@ -1065,44 +1065,7 @@ class Workload(
         """Reserve ordinary tensor scratch and each requested graph's private pool."""
         if options.explicit_math:
             raise ValueError("this workload has no explicit tensor implementation")
-        # Native workloads retain their own resource declarations.
-        if type(self).resource_facts is not Workload.resource_facts:
-            return facts.timeline
-        b = self.declaration(facts)
-        if not b.tensor_tasks and not b.weighted_training:
-            return facts.timeline
-        rows, hidden = facts.max_admitted_lineages, facts.probe.hidden_size
-        parameters = sum(prod(field.shape) for entry in b.layouts.layouts for field in entry.layout.fields)
-        resident = options.capture_memory_bytes if options.capture else 0
-        states = rows if any(state.scope is StateScope.REQUEST for state in b.graph.states) else 1
-
-        batch = (states, options.training_rows)
-
-        def input_shapes(task: SemanticTask) -> tuple[tuple[int, ...], ...]:
-            # External training batches are [states, training rows, ...]; model rows are [rows, hidden].
-            if any(isinstance(port.source, HostServiceInputSource) for port in task.inputs):
-                return ((*batch, hidden), (*batch, facts.vocab_size))
-            if task.math is not None and task.math.reduction == "weighted_state_mean_then_mean":
-                return ((*batch, hidden),)
-            return ((rows, hidden),)
-
-        return replace(
-            facts.timeline,
-            task_resources=tuple(
-                TaskResourceFact(
-                    task.symbol,
-                    4 * rows * (4 * parameters + 16 * hidden),
-                    resident if task.symbol in b.tensor_tasks else 0,
-                    input_shapes(task),
-                )
-                for task in b.graph.tasks
-            ),
-            value_resources=tuple(
-                ValueResourceFact(task.symbol, output.name, 4 * rows * (parameters + facts.probe.hidden_size))
-                for task in b.graph.tasks
-                for output in task.outputs
-            ),
-        )
+        return derive_resources(self.declaration(facts), facts, options)
 
     def implementations(
         self, operation: str, resources: tuple[TaskResourceFact, ...], *, explicit_math: bool = False

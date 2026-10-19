@@ -141,6 +141,13 @@ head = pllm.RequestState(
 路由用户特别注意：休眠 lineage 仍占准入容量（见上文路由键一节），所以
 「route 基数 × 每 lineage 字节」才是你的稳态占用，不是并发请求数。
 
+任务临时工作区使用另一项预算：`ExecutionOptions.memory_budget_bytes`。普通
+`Workload` 在最大输入形状上执行 meta/fake 张量数学，推导前向、反向、优化器临时
+张量与结果的存活峰值；别名共享存储，每次分配按 512 字节对齐。它不会初始化 CUDA，
+也不要求负载维护参数数量公式。捕获池继续由 `capture_memory_bytes` 单独预留。
+宿主有限训练需要 `max_input_rows`；若奖励等宿主元数据决定训练行，还须提供最大
+形状的 `training_example`（TTRL）或 transaction `example`（FTTT）。
+
 ## 我想看状态到底占了多少：state_usage
 
 `handle.diagnostics().state_usage` 给出 arena 的冻结快照：预留、逻辑/物理

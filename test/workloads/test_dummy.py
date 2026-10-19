@@ -183,8 +183,7 @@ def test_dummy_runs_graph_sign_plan_execute(monkeypatch: pytest.MonkeyPatch) -> 
     )
     bounded = assert_finite_resources(workload, facts)
     deployment = workload.compile_backend(bounded)
-    with pytest.raises(ValueError, match="resource_facts"):
-        centered_hidden(workload.config).specialize(facts, pllm.ExecutionOptions(memory_budget_bytes=1 << 30))
+    assert_finite_resources(centered_hidden(workload.config), facts)
     assert deployment.execution.arena.active_lineages == 0
     assert deployment.execution.step(value(2)).shape == (2, 3)
     original = value(2)

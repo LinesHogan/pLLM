@@ -271,7 +271,7 @@ class ShineStyleLoRA(pllm.Workload):
 `request.prepare` 发布 —— 在请求的第一次前向之前 —— 所以混合批次中的每一行
 读到的是自己请求的精确 pin，导入的零因子精确复现基座模型。应用、发布、隔离与
 退役与优化器产出的 overlay 完全相同；只有产出地点不同。与激活检查点一样，
-负载通过 `resource_facts` 声明导入的任务工作区（拷贝不需要自有张量）。
+框架从字段布局追踪有限值检查的工作区；拷贝直接写入私有页，不需要自有张量。
 
 ## 路由键
 
@@ -326,8 +326,8 @@ property。负层索引对真实模型解析。`beta=None` 使用互补的目标
 本节约束 Output LoRA 形态的负载：具名 SGD 状态、外部 `WeightedCEBatch` 输入、
 reset 与多步训练。这条路径把「外部数据喂入 + 实例/请求共享状态 + 多步 SGD」
 组合在一起，边界多于普通训练：缺批次的含义、发布时机、`copy_fields` 语义、
-`resource_facts` 的继承规则都在这里。改 LoRA 数学或接捕获/分页内核之前，
-先读本节末尾的原生替换与成本声明规则。
+最大输入形状与资源推导都在这里。改 LoRA 数学或接捕获/分页内核之前，
+先读本节末尾的原生替换规则。
 
 [Output LoRA](../../pllm/workloads/lora.py) 声明具名字段状态（`SGD(lr)` 与
 初始化器）、一个普通的 `@add_logits` 预测，以及一个 `AFTER_SAMPLE` 方法（
@@ -348,8 +348,8 @@ loss；绑定在每个 SGD 步微分它们的**均值**。这不是 ESamp 的独
 缺批次意味着没有 reset、没有私有写、没有发布。成功训练在所有步之后发布一次；
 取消/失败保留原始 pin 状态。归一化/reset 在原始图的 `__train_prepare` 任务中
 于采样前运行，不在调用准备期。其结果边喂给 `train`；同一帧拥有归一化张量直到
-消费后释放。LoRA 签名准备、预测与训练工作区以及预备/输出张量尺寸，特化与绑定
-检查使用同一公式。签名事实不足则在绑定失败。公开提交、反馈传输与 worker STAGE
+消费后释放。框架在最大训练形状上追踪准备、预测、SGD 前后向及保留结果，并将推导的
+任务/输出资源事实写入签名时间轴。公开提交、反馈传输与 worker STAGE
 对原始辅助张量/描述符做预检，然后才做共享存储导出、映射或设备拷贝；dtype 来自
 原始状态布局，标签为 int64。形状检查不查看张量内容，也不替代之后的有限值/选择
 检查。reset 训练与激活导入完全覆盖其私有字段，所以它们的绑定用
@@ -362,13 +362,10 @@ SGD 与加权批次，不支持持久动量、任意外部 DTO、推理行选择
 `SamplerWorkload` 与 `LoRAData` 已移除；没有平行的原生创作路径。
 
 普通 `Workload` 还暴露带类型的 `implementations` 与 `operations` 钩子，用于对其
-原始签名任务做显式原生替换 —— 不是另一张图/运行时。ESamp 与 LoRA 用它们接入
-既有的捕获与分页内核。普通数学可以局部替换；不兼容的替换在选择特化内核时被拒
-（`native_methods` 冻结参考代码/源码/效果指纹；`require_native_methods` 在绑定时
-检查它们，包括对注解的原地编辑）。这不是把任意修改过的数学自动下沉到特化内核。
-继承来的数学 `resource_facts` 公式是针对内置数学的。修改过的方法必须提供自己的
-成本声明，而不是静默继承那个信封 —— 即使在普通张量路径上。检查在特化与绑定时
-运行；显式成本覆盖不授权不兼容的原生内核。
+原始签名任务做显式原生替换，不另建图或运行时。普通张量方法的成本随其数学重新
+推导，不再需要 `native_methods`/`require_native_methods` 锁或继承的手写字节公式。
+原生替换仍须实现签名的数学：In-Place-TTT 只对内置源方法选择块扫描；自定义方法
+走自己的普通张量路径。签名与绑定的数学一致性检查仍保留。
 
 ## 高级数据流
 
@@ -467,12 +464,13 @@ prepare/output 辅助仍是显式原生宿主数学。标量配置在绑定时�
 平局规则、采样限制与重试/栅栏构造仍是它的数学，原始 completion 对象保留。
 
 有界 TTRL 张量执行：把 `HostRuntimeFacts(device, hidden_size=...,
-max_input_rows=..., memory_budget_bytes=...)` 传给同一公共工厂。内置公式包含
-原始 hidden 缓冲、选中行、head/MSE/Adam 工作区与保留结果，都在原始
-SchedulerTimeline 里。行上限在准备前检查；CUDA 输入记录其消费流。修改过的
-prepare/loss/output 数学必须提供自己的 `resource_facts(facts)`，而不是继承那个
-公式。返回的 timeline 不能擦除用户限制；缺失的任务/输出成本导致有限 Rust 准入
-失败。没有预算时普通行为不变。这不是对 completion 文本、Python 元数据/历史或
+max_input_rows=..., memory_budget_bytes=...)` 传给同一公共工厂。框架用最大形状的
+fake CPU 输入追踪 loss、反向与 Adam 工作区，并保留原始 hidden 缓冲及结果。
+TTRL 的 `training_example(facts)` 提供所有行可训练的奖励元数据；宿主选择条件
+不能只从张量形状推导。FTTT 通过 `transaction(..., example=...)` 提供上下文与回滚
+快照，由框架追踪 update/query/publish。它们不再覆盖 `resource_facts`。
+行上限在准备前检查；CUDA 输入记录其消费流。返回的 timeline 不能擦除用户限制。
+没有预算时普通行为不变。这不是对 completion 文本、Python 元数据/历史或
 外部库 scratch 的约束。宿主声明保留其原始 `HostRuntimeFacts`；高级调用方用
 `binding.compile()`，不是编译期另一套事实。
 
@@ -645,17 +643,19 @@ timeline、返回的资源事实与用户限制三者求交：任何声明都不
 （`state_memory_bytes`）与每任务捕获容量。ESamp 还声明普通张量打包/保存的
 中间量、谓词、Adam 工作区与导出的 loss/梯度存储。
 
-ESamp 与 LoRA 在拒绝资金不足
-的任务/输出事实时复用其声明公式，并在调用时强制签名的行/状态容量。Dummy、
-OverRIDE、普通 In-Place-TTT 与 ReFT 在请求有限预算（或任务成本已存在）时额外
-提供内置任务/输出成本。无界普通用法不变。它们的 worker 绑定从原始事实重算最小
-成本，连重新签名过的资金不足声称也拒绝。Dummy 在有界导出前计入全宽不规则行
-打包；OverRIDE 覆盖有界 head/CE/Adam 张量；In-Place-TTT 覆盖尾部、块输出与稠密
-更新，强制每 target 总操作数行数；ReFT 在拷贝字段前检查预算更新的有限内容。
-条件 In-Place-TTT 与 Recirculation 模型 replay、完整 HF backward 与外部库
-scratch 没有内置完整成本声明。这些路径的有限使用需要显式声明；这些公式都不是
-总 GPU 内存保证。自定义声明为其改动的数学拥有成本声称；签名图和继承检查都不
-证明任意 autograd/库 scratch 的界。
+默认 `Workload.resource_facts` 在最大输入形状上执行 meta 数学，按存储身份追踪
+活跃分配：视图共享底层存储，autograd 保存的张量和 Python 保留的结果持续计入。
+借用输入不计入任务工作区；gather、前后向和返回值计入，每次分配向上取整到
+512 字节。CUDA foreach Adam 的真实张量实现用 fake CUDA 输入追踪，规划过程不
+初始化 CUDA。`capture_memory_bytes` 仍单独预留捕获池。
+
+Dummy、OverRIDE、ESamp、LoRA、ReFT 与普通 tensor task 使用这些推导事实。
+原生 In-Place-TTT 还预留区域规划证明要求的恢复生命周期；块扫描及资源核算由框架
+实现。Video 编码同样追踪，另把生产者可与任意 worker anchor 重叠的工作区计入
+预留。原生模型 replay 保留已有的区域资源推导。修改普通数学不再要求复制手写
+成本公式；有限宿主训练仍须声明 `max_input_rows`，有数据依赖的宿主选择须提供
+最大形状样例。任意不透明外部库 scratch 或无法形状追踪的分支仍需显式资源契约，
+这些事实不是整个 GPU 进程的显存保证。
 
 原生源/目标打包在消费任务内进行；预测只打包
 合格采样行。训练结果是导出的图值，所以 AER 保留其存储到完成，不止到优化器消费。

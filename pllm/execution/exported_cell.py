@@ -8,7 +8,6 @@ from dataclasses import dataclass, replace
 from threading import Lock
 
 import torch
-from torch._subclasses.fake_tensor import FakeTensor
 from torch.export.graph_signature import InputKind, OutputKind, TensorArgument
 
 from pllm.contracts.region_program import Function, TensorType
@@ -82,11 +81,7 @@ def _check_distinct_inputs(tensors: tuple[torch.Tensor, ...]) -> None:
     # separately would silently change their mutation semantics before export.
     # Metadata-only export has storage identities but no usable data pointers.
     # Preserve its alias check instead of treating every fake pointer as zero.
-    storage = [
-        (str(t.device), t.untyped_storage() if isinstance(t, FakeTensor) else t.untyped_storage().data_ptr())
-        for t in tensors
-        if t.numel()
-    ]
+    storage = [(str(t.device), t.untyped_storage()) for t in tensors if t.numel()]
     if len(set(storage)) != len(storage):
         raise ValueError("exported cell inputs must have distinct storage; aliased input binding is not supported yet")
 

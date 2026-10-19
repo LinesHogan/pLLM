@@ -5,14 +5,13 @@ from __future__ import annotations
 import re
 from collections import Counter
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from math import isfinite
 
 import torch
 from torch.nn import functional as F
 
 import pllm
-from pllm import authoring as a
 from pllm.contracts.feedback import (
     BarrierState,
     ControlReason,
@@ -21,7 +20,7 @@ from pllm.contracts.feedback import (
     RewardOutcome,
     UpdateBarrier,
 )
-from pllm.contracts.semantic_graph import SchedulerTimeline, TaskResourceFact, TaskSymbol, ValueResourceFact
+from pllm.execution.host_memory import completion_example
 
 
 def boxed_label(text: str) -> str:
@@ -91,38 +90,12 @@ class TTRLWorkload(pllm.CompletionWorkload[TTRLData, TTRLResult]):
     name = "ttrl"
     config: TTRLConfig = TTRLConfig()
 
-    def resource_facts(self, facts: pllm.HostRuntimeFacts) -> SchedulerTimeline:
-        timeline = pllm.CompletionWorkload[TTRLData, TTRLResult].resource_facts(self, facts)
-        if facts.memory_budget_bytes is None:
-            return timeline
-        self.require_native_methods(_NATIVE, resource_declaration=_RESOURCES)
-        rows, hidden, rank = facts.max_input_rows, facts.hidden_size, self.config.rank
-        if rows is None:
-            raise ValueError("finite completion costs require max_input_rows")
-        parameters = rank * (hidden + 1)
-        state = self.parameters
-        shape = state.fields.get("head")
-        if (
-            state.dtype != torch.float32
-            or len(state.fields) != 1
-            or isinstance(shape, pllm.Buffer)
-            or (shape(a.Dimensions(hidden, 0)) if callable(shape) else shape) != (parameters,)
-        ):
-            raise ValueError("customized reward-head state requires its own resource_facts declaration")
-        # Selected FP32 hidden/targets, two linear layers, MSE backward and foreach Adam.
-        workspace = 4 * (8 * parameters + rows * (2 * hidden + 4 * rank + 8)) + 32 * rows + 64
-        return replace(
-            timeline,
-            reserved_bytes=(4 * rows * hidden,) * len(timeline.anchors),
-            task_resources=(
-                TaskResourceFact(TaskSymbol("publish"), 0),
-                TaskResourceFact(TaskSymbol("train"), workspace, input_shapes=((rows, hidden),)),
-            ),
-            value_resources=(
-                ValueResourceFact(TaskSymbol("publish"), "control", 4),
-                ValueResourceFact(TaskSymbol("train"), "control", 4 * parameters + 4),
-            ),
-        )
+    def training_example(self, facts: pllm.HostRuntimeFacts) -> TTRLData:
+        # Reward metadata cannot be inferred from tensor shapes. Select every admitted row
+        # so the loss trace covers the maximum training batch, including partial vote groups.
+        batch = completion_example(facts)
+        rewards = tuple(RewardOutcome(entry, 1.0, True, "", "shape", "0", "") for entry in batch.completions.entries)
+        return TTRLData(batch, rewards, (), (), tuple(range(len(batch.hidden))))
 
     @property
     def parameters(self) -> pllm.InstanceState:
@@ -224,14 +197,3 @@ class TTRLWorkload(pllm.CompletionWorkload[TTRLData, TTRLResult]):
         return TTRLResult(
             data.reward_outcomes, data.retry_controls, data.update_barriers, data.loss, refs[0], result.publication
         )
-
-
-_NATIVE = TTRLWorkload.native_methods(
-    {
-        "prepare": TTRLWorkload.prepare,
-        "loss": TTRLWorkload.loss,
-        "trained_rows": TTRLWorkload.trained_rows,
-        "output": TTRLWorkload.output,
-    }
-)
-_RESOURCES = TTRLWorkload.resource_facts

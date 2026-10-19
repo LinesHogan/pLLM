@@ -71,30 +71,6 @@ class RequestLowRankTTT(pllm.Workload):
 class ImportedLowRank(pllm.Workload):
     """Per-request LoRA factors produced outside the engine (e.g. by a hypernetwork)."""
 
-    def resource_facts(self, facts, options):
-        from dataclasses import replace
-        from math import prod
-
-        from pllm.contracts.semantic_graph import TaskResourceFact, TaskSymbol, ValueResourceFact
-
-        timeline = super().resource_facts(facts, options)
-        if not timeline.task_resources and timeline.memory_budget_bytes is None and options.memory_budget_bytes is None:
-            return timeline
-        # The import copies into roots and checks one original field at a time.
-        (layout,) = self.declaration(facts).layouts.layouts
-        workspace = 16 * max(prod(field.shape) for field in layout.layout.fields)
-        return replace(
-            timeline,
-            task_resources=(
-                TaskResourceFact(TaskSymbol("publish"), 0),
-                TaskResourceFact(TaskSymbol("update"), workspace),
-            ),
-            value_resources=(
-                ValueResourceFact(TaskSymbol("publish"), "publication", 0),
-                ValueResourceFact(TaskSymbol("update"), "updated", 0),
-            ),
-        )
-
     @property
     def factors(self) -> pllm.RequestState:
         return pllm.RequestState(

@@ -315,10 +315,8 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions(
         torch.testing.assert_close(applied.targets[0].update.output, hidden @ weight.T)
     low_rank.retire(requests)
 
-    # Externally produced factors (a hypernetwork's output) import through the same signed
-    # binding, publication, isolation and retirement rules as optimizer-produced ones.
-    # The framework derives the zero workspace of its own canonical import/publish tasks;
-    # memory-constrained planning needs no user-declared facts for them.
+    # External factors share the optimizer's publication, isolation and retirement rules.
+    # Import validation and publication costs are derived by the framework.
     class ImportedOverlay(pllm.Workload):
         factors = pllm.RequestState(
             {

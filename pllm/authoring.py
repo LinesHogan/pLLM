@@ -297,38 +297,6 @@ def derive_framework_resources(graph: SemanticGraph, timeline: SchedulerTimeline
     )
 
 
-def strip_framework_resources(graph: SemanticGraph, timeline: SchedulerTimeline) -> SchedulerTimeline:
-    """Remove exactly the facts derive_framework_resources would add.
-
-    Worker bindings recompute minimum costs from the signed plan timeline, which already
-    carries the derived zero-cost canonical facts; the driver decided from the raw probe
-    timeline, so the recompute must see the same view or cost guards diverge across the
-    process boundary.
-    """
-    canonical = {
-        task.symbol
-        for task in graph.tasks
-        if task.implementations
-        and all(
-            implementation.implementation_id in _ZERO_WORKSPACE_IMPLEMENTATIONS
-            for implementation in task.implementations
-        )
-    }
-    if not canonical:
-        return timeline
-    return replace(
-        timeline,
-        task_resources=tuple(
-            fact
-            for fact in timeline.task_resources
-            if fact.task not in canonical or fact != TaskResourceFact(fact.task, 0)
-        ),
-        value_resources=tuple(
-            fact for fact in timeline.value_resources if fact.task not in canonical or fact.bytes != 0
-        ),
-    )
-
-
 class BackendAuthoring(ABC):
     @abstractmethod
     def backend_requirements(self) -> BackendRequirements: ...
@@ -422,37 +390,6 @@ class BackendWorkload(BackendAuthoring, Generic[DataT, ResultT]):
     def bind_math(self, facts: BackendCompileFacts, plan: PlanBundle) -> MathBinding[TensorStepInput, DataT, ResultT]:
         """Bind mathematics to selected implementations; no storage or execution ownership."""
         ...
-
-    def minimum_resources(self, facts: BackendCompileFacts, plan: PlanBundle) -> SchedulerTimeline:
-        """Recompute the driver's minimum-cost view against a signed plan.
-
-        The signed timeline carries framework-derived zero-cost canonical facts the driver
-        never saw when it declared costs; strip exactly those so cost guards inside
-        resource_facts decide identically on driver and worker.
-        """
-        return self.resource_facts(
-            replace(facts, timeline=strip_framework_resources(plan.semantic_graph, facts.timeline)), ExecutionOptions()
-        )
-
-    @staticmethod
-    def require_resources(plan: PlanBundle, minimum: SchedulerTimeline) -> None:
-        """Check implementation costs against the original signed facts, without replanning."""
-        tasks = {item.task: item for item in plan.timeline.task_resources}
-        for required in minimum.task_resources:
-            actual = tasks.get(required.task)
-            if (
-                actual is None
-                or actual.input_shapes != required.input_shapes
-                or actual.workspace_bytes < required.workspace_bytes
-                or actual.resident_bytes < required.resident_bytes
-            ):
-                raise ValueError(f"{required.task} workspace/residency differs from its signed envelope")
-        values = {(item.task, item.output): item.bytes for item in plan.timeline.value_resources}
-        for required in minimum.value_resources:
-            if values.get((required.task, required.output), -1) < required.bytes:
-                raise ValueError(
-                    f"{required.task}.{required.output} output storage is smaller than its signed envelope"
-                )
 
     def bind_backend(
         self, facts: BackendCompileFacts, attachment: SignedBackendAttachment

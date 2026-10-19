@@ -52,6 +52,20 @@ def test_video_real_frame_math_and_signed_composition():
     )
     workload = VideoWorkload(grid_size=2)
     facts = workload.specialize(facts, ExecutionOptions())
+    if torch.cuda.is_available():
+        encoder = workload._binding(facts)[0]
+        operands = tuple(value.cuda() for value in values)
+        encoder.encode(*operands)
+        torch.cuda.synchronize()
+        baseline = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        encoded = encoder.encode(*operands)
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() - baseline
+        bound = next(fact.workspace_bytes for fact in facts.timeline.task_resources if fact.task == "encode")
+        assert peak <= bound
+        print(f"video encode max-shape CUDA peak={peak}, derived={bound}")
+        del encoded, operands
     deployment = workload.compile_backend(facts)
     execution, plan = deployment.execution, deployment.attachment.inputs.plan
     assert execution.arena.owned_resources == ("inject",)

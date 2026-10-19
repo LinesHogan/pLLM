@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from functools import partial
 
 import pllm
-from pllm.contracts.semantic_graph import SchedulerTimeline, TaskResourceFact, TaskSymbol, ValueResourceFact
 from pllm.workloads.fttt import tasks
 from pllm.workloads.fttt.host_service import FTTTFeedbackService
 from pllm.workloads.fttt.judge import FTTTDefaultJudge
@@ -29,42 +28,6 @@ class FTTTWorkload(
     def config(self) -> FTTTConfig:
         return self.feedback.config
 
-    def resource_facts(self, facts: pllm.HostRuntimeFacts) -> SchedulerTimeline:
-        timeline = facts.timeline()
-        if facts.memory_budget_bytes is None:
-            return timeline
-        if pllm.Workload.native_methods({"update": tasks.train, "query": tasks.predict}) != _NATIVE:
-            raise ValueError("modified FTTT mathematics require their own resource_facts declaration")
-        rows, hidden, rank, features = (
-            facts.max_input_rows,
-            facts.hidden_size,
-            self.config.rank,
-            self.config.feedback_feature_size,
-        )
-        if rows is None:
-            raise ValueError("finite FTTT costs require max_input_rows")
-        inputs = hidden + features + 1
-        parameters = rank * (inputs + hidden)
-        # Parameters/two moments, their rollback snapshot, and the original active hidden input.
-        reserved = 4 * (6 * parameters + rows * hidden)
-        workspace = (
-            4 * (4 * parameters + rows * (3 * inputs + 6 * hidden + 4 * rank + 8) + 4 * features) + 8 * rows + 64
-        )
-        return replace(
-            timeline,
-            reserved_bytes=(reserved,) * len(timeline.anchors),
-            task_resources=(
-                TaskResourceFact(TaskSymbol("publish"), 0),
-                TaskResourceFact(TaskSymbol("query"), 4 * rows * (rank + hidden)),
-                TaskResourceFact(TaskSymbol("update"), workspace, input_shapes=((rows, hidden),)),
-            ),
-            value_resources=(
-                ValueResourceFact(TaskSymbol("publish"), "result", 4 * (rows * hidden + 1)),
-                ValueResourceFact(TaskSymbol("query"), "context", 4 * (rows * (inputs + hidden) + 1)),
-                ValueResourceFact(TaskSymbol("update"), "context", 4 * (rows * inputs + 1)),
-            ),
-        )
-
     def declare_host(
         self, facts: pllm.HostRuntimeFacts
     ) -> pllm.TransactionHostBinding[
@@ -85,8 +48,5 @@ class FTTTWorkload(
             update=partial(tasks.train, self.config),
             query=tasks.predict,
             publish=tasks.publish,
-            timeline=self.resource_facts(facts),
+            example=partial(tasks.training_example, self.config),
         )
-
-
-_NATIVE = pllm.Workload.native_methods({"update": tasks.train, "query": tasks.predict})

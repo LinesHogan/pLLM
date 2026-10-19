@@ -31,7 +31,8 @@ from pllm.contracts.semantic_graph import AnchorSymbol, MathContract, SchedulerT
 from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
 from pllm.execution.codec import boundary_digest
 from pllm.execution.declaration import Builder, Dimensions, Field, Shape, When, native
-from pllm.execution.freeze import NativeMath, fingerprint, freeze, owner_snapshot, owner_values
+from pllm.execution.freeze import fingerprint, freeze, owner_snapshot, owner_values
+from pllm.execution.host_memory import completion_example, completion_resources, transaction_resources
 from pllm.execution.host_runtime import (
     CompletionInput,
     HostRuntimeFacts,
@@ -72,6 +73,7 @@ def transaction(
     query: Callable[[ContextT], None],
     publish: Callable[[ContextT], None],
     timeline: SchedulerTimeline | None = None,
+    example: Callable[[HostRuntimeFacts], tuple[ContextT, object]] | None = None,
 ) -> TransactionHostBinding[RequestT, TransactionT, ContextT, SnapshotT, ResultT]:
     """Bind native structured math; retain the original state, service and context."""
     b = Builder[ContextT](name, boundary_digest(config, facts))
@@ -104,6 +106,8 @@ def transaction(
         when=When.HOST_COMMIT,
         implementations=(native(f"{name}:publish@1", "host/service@1", host=True),),
     )
+    if example is not None:
+        timeline = transaction_resources(facts, example, (update, query, publish))
     return TransactionHostBinding(b.graph, state_factory, b.bind_host(), service, facts, timeline)
 
 
@@ -122,7 +126,6 @@ class _LearningMath(ABC, Generic[InputT, ContextT, ResultT]):
 
 
 class CompletionWorkload(
-    NativeMath,
     _LearningMath[CompletionInput, ContextT, ResultT],
     HostWorkload[StateExecution[CompletionInput, ContextT, ResultT]],
 ):
@@ -134,8 +137,21 @@ class CompletionWorkload(
     @abstractmethod
     def parameters(self) -> InstanceState: ...
 
+    def training_example(self, facts: HostRuntimeFacts) -> ContextT:
+        """Maximum-shape host input; override when host metadata selects training rows."""
+        return self.prepare(completion_example(facts))
+
     def resource_facts(self, facts: HostRuntimeFacts) -> SchedulerTimeline:
-        return facts.timeline()
+        """Trace the declared loss and its backward using shape-only host operands."""
+        definition = self.parameters
+        return completion_resources(
+            facts,
+            cast(Mapping[str, Shape], definition.fields),
+            definition.dtype,
+            cast(AdamWConfig, definition.optimizer),
+            self.training_example,
+            self.loss,
+        )
 
     def declare_host(self, facts: HostRuntimeFacts) -> TensorHostBinding[CompletionInput, ContextT, ResultT]:
         if facts.hidden_size < 1:

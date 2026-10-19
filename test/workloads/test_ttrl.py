@@ -45,8 +45,6 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         execution = make_llm(workload=workload, config=facts)
         plan = execution.arena.plan
         peak = plan.schedule_decision.peak_memory_bytes
-        assert len(plan.timeline.task_resources) == len(plan.timeline.value_resources) == 2
-        assert plan.timeline.reserved_bytes == (6 * 4 * 4,) * 4
         with pytest.raises(ValueError):
             make_llm(workload=workload, config=replace(facts, memory_budget_bytes=peak - 1))
         facts = replace(facts, memory_budget_bytes=peak)
@@ -189,15 +187,9 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
 
     facts = pllm.HostRuntimeFacts(torch.device("cpu"), hidden_size=4, initialization_seed=11)
     zero = ZeroLoss(config)
-    with pytest.raises(ValueError, match="resource_facts"):
-        zero.declare_host(replace(facts, max_input_rows=6, memory_budget_bytes=1 << 20))
+    zero.declare_host(replace(facts, max_input_rows=6, memory_budget_bytes=1 << 20))
     with pytest.raises(ValueError, match="max_input_rows"):
         TTRLWorkload(config).declare_host(replace(facts, memory_budget_bytes=1 << 20))
-    native_prepare = TTRLWorkload.prepare
-    with monkeypatch.context() as changed:
-        changed.setattr(TTRLWorkload, "prepare", lambda self, value: native_prepare(self, value))
-        with pytest.raises(ValueError, match="resource_facts"):
-            TTRLWorkload(config).declare_host(replace(facts, max_input_rows=6, memory_budget_bytes=1 << 20))
 
     class LooseBudget(TTRLWorkload):
         def resource_facts(self, facts):

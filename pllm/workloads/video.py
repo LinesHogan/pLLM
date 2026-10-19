@@ -27,15 +27,15 @@ from pllm.contracts.semantic_graph import (
     SchedulerTimeline,
     SemanticGraph,
     StateEffectKind,
-    TaskResourceFact,
     TaskResultInputSource,
     TaskSymbol,
-    ValueResourceFact,
     WorkloadId,
 )
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorLayoutRequest
 from pllm.execution.codec import boundary_digest
 from pllm.execution.declaration import Field, When, native
+from pllm.execution.memory import MemoryUsage, measure
+from pllm.execution.task_memory import derive_resources
 from pllm.execution.tensor_binding import TensorBinding, TensorOutput
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import TaskOutput, TensorBatch
@@ -166,24 +166,15 @@ class VideoWorkload(BackendWorkload[TensorFrame, TensorOutput]):
         )
 
     def resource_facts(self, facts: BackendCompileFacts, options: ExecutionOptions) -> SchedulerTimeline:
-        timeline = super().resource_facts(facts, options)
-        width, signals = facts.probe.hidden_size, 4 * self.grid_size**2
-        # Producer scratch may overlap any worker anchor; it is not worker task mathematics.
-        producer = 4 * (24 * (8 * self.grid_size) ** 2 + 16 * self.grid_size**2)
+        timeline = derive_resources(self._binding(facts)[1], facts, options)
+        # Producer scratch can overlap every worker anchor; it is not a worker task.
+        frame = torch.empty((8 * self.grid_size, 8 * self.grid_size), dtype=torch.uint8, device="meta")
+        previous = torch.empty_like(frame)
+        producer = measure(lambda: frame_features(frame, previous, self.grid_size)).workspace
         return replace(
             timeline,
             reserved_bytes=tuple(
                 value + producer for value in (timeline.reserved_bytes or (0,) * len(timeline.anchors))
-            ),
-            task_resources=(
-                TaskResourceFact(_ENCODE, 4 * (3 * width * signals + 8 * width + 16 * signals)),
-                TaskResourceFact(TaskSymbol("publish"), 0),
-                TaskResourceFact(TaskSymbol("write_inject"), 16 * width),
-            ),
-            value_resources=(
-                ValueResourceFact(_ENCODE, "value", 4 * width),
-                ValueResourceFact(TaskSymbol("publish"), "publication", 0),
-                ValueResourceFact(TaskSymbol("write_inject"), "updated", 0),
             ),
         )
 
@@ -202,6 +193,15 @@ class VideoWorkload(BackendWorkload[TensorFrame, TensorOutput]):
             function=_write_inject,
             implementations=(native("video.inject:write@1", "transition/full_root@1"),),
         )
+
+        def write_memory(
+            facts: BackendCompileFacts, options: ExecutionOptions
+        ) -> tuple[MemoryUsage, tuple[tuple[int, ...], ...]]:
+            hidden = torch.empty(facts.probe.hidden_size, device="meta")
+            usage = measure(lambda: torch.isfinite(hidden).all())
+            return replace(usage, output=0), ()
+
+        b.memory_probes[update.symbol] = write_memory
         publication = b.publish(update, inject, when=When.BEFORE_MODEL)
         b.overlay(
             inject,
@@ -241,5 +241,4 @@ class VideoWorkload(BackendWorkload[TensorFrame, TensorOutput]):
         encoder, b = self._binding(facts)
         if b.graph != plan.semantic_graph or b.layouts != plan.tensor_layout_request:
             raise ValueError("video binding differs from the original signed declaration")
-        self.require_resources(plan, self.minimum_resources(facts, plan))
         return replace(encoder.operations(facts, plan, b), borrowed_resources=("features",))

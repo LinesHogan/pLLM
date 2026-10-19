@@ -58,10 +58,6 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry(monkeypatch: pytest.Mo
             make_llm(workload=workload, config=replace(facts, memory_budget_bytes=peak - 1))
     with pytest.raises(ValueError, match="max_input_rows"):
         workload.declare_host(replace(facts, max_input_rows=None))
-    with monkeypatch.context() as changed:
-        changed.setattr(tasks, "train", lambda config, context: None)
-        with pytest.raises(ValueError, match="resource_facts"):
-            workload.declare_host(facts)
     coordinator = make_llm(workload=workload, config=replace(facts, memory_budget_bytes=peak))
     execution = coordinator.execution
     identity = RequestIdentity("arithmetic", 0, 0)

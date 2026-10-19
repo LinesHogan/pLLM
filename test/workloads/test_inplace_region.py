@@ -118,24 +118,6 @@ def test_bound_scan_matches_original_chunk_math_bitwise_and_compiles_only_cold(
     assert execution.arena.active_lineages == 0
 
 
-def test_customized_source_cannot_inherit_the_builtin_region_lowering():
-    # A changed ordinary method may declare new costs, but that does not prove
-    # the built-in region still implements its mathematics.
-    class Customized(InPlaceTTTWorkload):
-        def transition(self, hidden, target, base, delta, tail_input, tail_target, tail_length):
-            return hidden
-
-    original = InPlaceTTTWorkload.transition
-    Customized.transition.__annotations__ = original.__annotations__
-    for name in ("__pllm_phase__", "__pllm_effect__"):
-        setattr(Customized.transition, name, getattr(original, name))
-    target = ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT)
-    workload = Customized(InPlaceTTTConfig((target,), chunk_size=3))
-    facts = facts_for(torch.device("cpu"), torch.float32, target)
-    with pytest.raises(ValueError, match="explicit matching native implementation"):
-        workload.compile_backend(facts)
-
-
 def test_production_tuning_uses_signed_policy_and_remaining_transition_budget(monkeypatch):
     from dataclasses import replace
 

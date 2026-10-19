@@ -44,11 +44,13 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 from pllm.execution.declaration import Builder, Call, Dimensions, Field, Shape, State, When, native
+from pllm.execution.memory import MemoryUsage
 from pllm.execution.ptts.page_borrow import borrowed_root
 from pllm.execution.ptts.page_bundle import PagePublication
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION, Recurrence
 from pllm.execution.shared_tensor import tensor_dtype
+from pllm.execution.task_memory import weighted_memory
 from pllm.execution.tensor_frame import (
     OverlayEntry,
     OverlayTargetResult,
@@ -70,7 +72,8 @@ from pllm.execution.trace import MAX_SNAPSHOT_BYTES
 from pllm.kernels.adamw import AdamWConfig
 
 if TYPE_CHECKING:
-    from pllm.authoring import TensorStepInput
+    from pllm.authoring import BackendCompileFacts, TensorStepInput
+    from pllm.config import ExecutionOptions
 
 
 def _check_overlay_fields(
@@ -292,6 +295,11 @@ class TensorBinding(Builder[TensorFrame]):
     def __init__(self, name: str, digest: str, dimensions: Dimensions | None = None, *, host: bool = False) -> None:
         super().__init__(name, digest, dimensions)
         self.host = host
+        self.exports: dict[TaskSymbol, tuple[int, int, bool]] = {}
+        self.memory_probes: dict[
+            TaskSymbol,
+            Callable[[BackendCompileFacts, ExecutionOptions], tuple[MemoryUsage, tuple[tuple[int, ...], ...]]],
+        ] = {}
         self.tensor_tasks: dict[TaskSymbol, TensorTask] = {}
         self.initializers: dict[str, Callable[[tuple[torch.Tensor, ...], torch.Generator], None]] = {}
         self.weighted_training = False
@@ -710,6 +718,28 @@ class TensorBinding(Builder[TensorFrame]):
         if steps < 1 or self.weighted_training or self.host:
             raise ValueError("weighted training requires one model training sink and positive steps")
         self.weighted_training = True
+        self.memory_probes[TaskSymbol(name)] = lambda facts, options: weighted_memory(
+            self,
+            function,
+            arguments,
+            tuple(field.name for field in state.fields),
+            steps,
+            optimizer.lr,
+            facts,
+            options,
+            prepare=False,
+        )
+        self.memory_probes[TaskSymbol(f"__{name}_prepare")] = lambda facts, options: weighted_memory(
+            self,
+            function,
+            arguments,
+            tuple(field.name for field in state.fields),
+            steps,
+            optimizer.lr,
+            facts,
+            options,
+            prepare=True,
+        )
         fields = tuple(field.name for field in state.fields)
         dimensions = self.dimensions
         prepare_function: Callable[[TensorFrame, TensorBatch], TaskOutput] | None = None
@@ -1121,6 +1151,7 @@ class TensorBinding(Builder[TensorFrame]):
     def export(
         self, call: Call, *, name: str, every: int = 1, max_rows: int = 1, max_cols: int = 16, enabled: bool = True
     ) -> None:
+        self.exports[call.symbol] = (max_rows, max_cols, enabled)
         if min(every, max_rows, max_cols) < 1 or max_rows * max_cols * 8 > MAX_SNAPSHOT_BYTES:
             raise ValueError("tensor export requires positive stride and bounded snapshot dimensions")
         if self.dimensions is not None:

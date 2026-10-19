@@ -247,8 +247,7 @@ def test_override_matches_reweight_adam_and_final_noop(monkeypatch: pytest.Monke
     with pytest.raises(ValueError, match="signed declaration"):
         variant.bind_backend(facts, original_workload.plan_backend(facts))
     modified = variant.compile_backend(facts).execution
-    with pytest.raises(ValueError, match="resource_facts"):
-        variant.specialize(facts, pllm.ExecutionOptions(memory_budget_bytes=1 << 30))
+    assert_finite_resources(variant, facts)
     (ref,) = modified.admit(())
     value = step((0, 1, 2), 7)
     invocation = modified.start_step(value)

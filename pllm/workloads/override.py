@@ -1,7 +1,7 @@
 """Iterative logit heads written as tensor methods, state and sampler effects."""
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from math import isfinite
 from typing import Annotated
 
@@ -9,10 +9,6 @@ import torch
 from torch.nn import functional as F
 
 import pllm
-from pllm import authoring as a
-from pllm.contracts.semantic_graph import SchedulerTimeline, TaskResourceFact, TaskSymbol, ValueResourceFact
-from pllm.execution.tensor_binding import TensorBinding, TensorOutput
-from pllm.execution.tensor_frame import TensorFrame
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,70 +49,6 @@ class OverRIDEWorkload(pllm.Workload):
     name = "override"
     config: OverRIDEConfig = OverRIDEConfig()
     objective: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = cross_entropy
-
-    def resource_facts(self, facts: a.BackendCompileFacts, options: pllm.ExecutionOptions) -> SchedulerTimeline:
-        timeline = pllm.Workload.resource_facts(self, facts, options)
-        if not timeline.task_resources and timeline.memory_budget_bytes is None and options.memory_budget_bytes is None:
-            return timeline
-        self.require_native_methods(_NATIVE, resource_declaration=_RESOURCES)
-        rows, hidden, vocab, rank = (
-            facts.max_admitted_lineages,
-            facts.probe.hidden_size,
-            facts.vocab_size,
-            self.config.rank,
-        )
-        state = self.iteration_heads
-        dimensions = a.Dimensions(hidden, vocab)
-        expected = {
-            "down": (self.config.num_iterations - 1, rank, hidden),
-            "up": (self.config.num_iterations - 1, vocab, rank),
-        }
-        if (
-            state.dtype != torch.float32
-            or set(state.fields) != expected.keys()
-            or any(
-                (shape(dimensions) if callable(shape) else shape) != expected[name]
-                for name, shape in state.fields.items()
-            )
-            or self.declaration(facts).graph.states[0].scope is not pllm.StateScope.INSTANCE
-        ):
-            raise ValueError("customized iteration-head state requires its own resource_facts declaration")
-        head = rank * (hidden + vocab)
-        parameters = (self.config.num_iterations - 1) * head
-        # FP32 head selection, saved CE tensors, scatter gradients and foreach Adam.
-        prediction = 4 * rows * (2 * head + hidden + rank + 3 * vocab) + 32 * rows
-        training = 4 * (8 * parameters + rows * (4 * head + 2 * hidden + 3 * rank + 8 * vocab)) + 64 * rows
-        return replace(
-            timeline,
-            task_resources=(
-                TaskResourceFact(TaskSymbol("__train_eligible"), rows * 32),
-                TaskResourceFact(TaskSymbol("reweight"), prediction, input_shapes=((rows, hidden),)),
-                TaskResourceFact(TaskSymbol("train"), training, input_shapes=((rows, hidden),)),
-            ),
-            value_resources=(
-                ValueResourceFact(TaskSymbol("__train_eligible"), "value", rows),
-                ValueResourceFact(TaskSymbol("reweight"), "value", rows * vocab * 4),
-                ValueResourceFact(TaskSymbol("train"), "value", parameters * 4 + 4),
-            ),
-        )
-
-    def operations(
-        self, facts: a.BackendCompileFacts, plan: a.PlanBundle, b: TensorBinding
-    ) -> a.MathBinding[a.TensorStepInput, TensorFrame, TensorOutput]:
-        if not plan.timeline.task_resources:
-            return pllm.Workload.operations(self, facts, plan, b)
-        self.require_resources(plan, self.minimum_resources(facts, plan))
-        prepare_frame = b.bind_prepare()
-
-        def prepare(value: a.TensorStepInput, batch: a.TensorBatch) -> TensorFrame:
-            data = prepare_frame(value, batch)
-            if len(data.rows) > facts.max_admitted_lineages:
-                raise ValueError("iteration-head rows exceed the signed workspace envelope")
-            return data
-
-        return a.MathBinding(
-            replace(self._functions(b, facts.device, facts.initialization_seed), prepare_data=prepare), b.bind_all(plan)
-        )
 
     @property
     def iteration_heads(self) -> pllm.InstanceState:
@@ -159,14 +91,3 @@ class OverRIDEWorkload(pllm.Workload):
         tokens: Annotated[torch.Tensor, pllm.SampledTokens()],
     ) -> torch.Tensor:
         return self.objective(base + head_logits(hidden, down, up, samples), tokens)
-
-
-_NATIVE = pllm.Workload.native_methods(
-    {
-        "reweight": OverRIDEWorkload.reweight,
-        "eligible": OverRIDEWorkload.eligible,
-        "train": OverRIDEWorkload.train,
-        "objective": cross_entropy,
-    }
-)
-_RESOURCES = OverRIDEWorkload.resource_facts

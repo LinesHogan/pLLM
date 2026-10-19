@@ -359,6 +359,8 @@ def input_port(source: SemanticInputSource | TensorPort) -> TensorPort:
         case PackedSamplerRowsInputSource():
 
             def samples(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
+                if data.index is not None:
+                    return data.index.column("samples")
                 device = data.step.hidden_batch(batch.stream).snapshots[0].hidden.device
                 return row_index(data, batch, device).column("samples")
 

@@ -75,6 +75,13 @@ with patch('pllm.execution.region_storage.import_tensor_access_graph', forbidden
     plan = RegionExecutionPlan(program, imports, proposal, proposal.peak_bytes)
     assert plan.stream_plan is None
 assert not torch.cuda.is_initialized()
+from pllm.execution.memory import optimizer_scratch
+from pllm.execution.chunk_transition import chunk_region
+from pllm.kernels.adamw import AdamWConfig
+with patch.object(torch.cuda, '_lazy_init', forbidden):
+    optimizer_scratch((torch.empty(32, device='meta'),), AdamWConfig(.01))
+    chunk_region(.01, 2, 3, 4, torch.float32, torch.device('meta'), False)
+assert not torch.cuda.is_initialized()
 print(encode_boundary((payload, streams)))
 """
     completed = subprocess.run(

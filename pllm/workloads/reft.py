@@ -1,15 +1,12 @@
 """LoReFT and constant activation edits via checkpoint-backed state."""
 
 import re
-from dataclasses import dataclass, replace
-from math import prod
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 
 import pllm
-from pllm import authoring as a
-from pllm.contracts.semantic_graph import SchedulerTimeline, TaskResourceFact, TaskSymbol, ValueResourceFact
 
 
 def load_loreft_interventions(
@@ -59,25 +56,6 @@ class ActivationConfig:
 class ActivationWorkload(pllm.Workload):
     name = "activation"
     config: ActivationConfig
-
-    def resource_facts(self, facts: a.BackendCompileFacts, options: pllm.ExecutionOptions) -> SchedulerTimeline:
-        timeline = super().resource_facts(facts, options)
-        if not timeline.task_resources and timeline.memory_budget_bytes is None and options.memory_budget_bytes is None:
-            return timeline
-        (layout,) = self.declaration(facts).layouts.layouts
-        # isfinite/reduction visits one original field at a time; copying needs no owned tensor.
-        workspace = 16 * max(prod(field.shape) for field in layout.layout.fields)
-        return replace(
-            timeline,
-            task_resources=(
-                TaskResourceFact(TaskSymbol("publish"), 0),
-                TaskResourceFact(TaskSymbol("update"), workspace),
-            ),
-            value_resources=(
-                ValueResourceFact(TaskSymbol("publish"), "publication", 0),
-                ValueResourceFact(TaskSymbol("update"), "updated", 0),
-            ),
-        )
 
     @property
     def intervention(self) -> pllm.InstanceState:
