@@ -18,6 +18,8 @@ class RunnerKind(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class ExecutionOptions:
+    """Framework execution policy; lag counts post-sampler steps hidden from readers."""
+
     capture: bool = False
     training_rows: int = 1
     capture_memory_bytes: int = 64 * 1024**2
@@ -29,8 +31,11 @@ class ExecutionOptions:
     # Deterministic preparation and funded stream overlap by default.
     # Only "measured" searches and times additional implementations.
     tuning: Literal["heuristic", "measured"] = "heuristic"
+    publish_lag: int = 1
 
     def __post_init__(self) -> None:
+        if type(self.publish_lag) is not int or self.publish_lag < 0:
+            raise ValueError("publish_lag must be a nonnegative integer; use 0 for strict ordering")
         if self.schedule_policy not in ("auto", "serial"):
             raise ValueError("schedule_policy must be auto or serial")
         if self.tuning not in ("heuristic", "measured"):

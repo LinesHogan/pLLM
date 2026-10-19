@@ -21,6 +21,7 @@ from pllm.contracts.sampler import SamplerFeedback
 from pllm.contracts.semantic_graph import AnchorId, AnchorSymbol, SchedulerTimeline, TimelineAnchor
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.cuda_stream import CudaStreamReadiness
+from pllm.execution.post_sample import PostSampleOverlap
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
 from pllm.execution.tensor_task import TensorTask
@@ -54,7 +55,7 @@ class MeanFit(pllm.Workload):
         return (hidden * weight - target - token[:, None]).square().mean(1)
 
 
-def mean_capture() -> None:
+def mean_capture(publish_lag: int = 0) -> None:
     """Mean padding and instance gradients agree, even when sampler pointers and row counts change."""
     device = torch.device("cuda", 0)
     stream = torch.cuda.current_stream(device)
@@ -81,11 +82,15 @@ def mean_capture() -> None:
         device,
     )
     execution = workload.bind_math(facts, plan).bind(PageBundleArena(plan), AnchorId(1))
+    overlap = PostSampleOverlap(execution.arena, publish_lag, device) if publish_lag else None
     execution.admit((), stream)
     parameter = torch.nn.Parameter(torch.zeros(4, device=device, dtype=torch.float64))
     optimizer = torch.optim.AdamW((parameter,), lr=0.03, weight_decay=0, capturable=True, foreach=True)
-    hidden = torch.arange(12, device=device, dtype=torch.float32).view(3, 4) / 10
+    hidden = torch.empty((3, 4), device=device, dtype=torch.float32)
+    target_buffer = torch.empty((3, 4), device=device)
+    token_buffer = torch.empty(3, device=device, dtype=torch.long)
     for step, count in enumerate((1, 3, 2)):
+        hidden.copy_(torch.arange(12, device=device, dtype=torch.float32).view(3, 4) / 10)
         rows = PackedPhaseRowBatch(
             1,
             step,
@@ -99,8 +104,9 @@ def mean_capture() -> None:
             PackedHiddenSnapshotBatch(rows, (PackedHiddenSnapshot(resource, hidden[:count], hidden),)),
             hidden_readiness=CudaStreamReadiness(stream),
         )
-        target = torch.full((count, 4), step * 0.2, device=device)
-        tokens = torch.arange(count, device=device, dtype=torch.long)
+        target = target_buffer[:count].fill_(step * 0.2)
+        tokens = token_buffer[:count]
+        tokens.copy_(torch.arange(count, device=device, dtype=torch.long))
         oracle = (hidden[:count] * parameter - target - tokens[:, None]).square().mean()
         optimizer.zero_grad()
         oracle.backward()
@@ -111,12 +117,23 @@ def mean_capture() -> None:
             else patch.object(TensorTask, "differentiate", TensorTask.differentiate)
         )
         with guard:
-            invocation = execution.start_step(value, stream)
+            invocation = execution.start_step(value, stream, history=() if overlap is None else overlap.history)
+            assert invocation.context.pin.refs[0].version_id == max(0, step - publish_lag)
             for anchor in plan.timeline.anchors:
                 execution.execute_anchor(invocation, AnchorId(anchor.ordinal))
                 if anchor.ordinal == 1:
                     execution.complete_sampler(invocation, stream, feedback=SamplerFeedback(sampler, target, tokens))
+                    if overlap is not None:
+                        overlap.copy_inputs(invocation.context)
+                        overlap.retain(execution.resume_latest(invocation, overlap.stream))
+                        # Model taps and sampler outputs may be overwritten while training reads
+                        # its private snapshot, including during captured replay with fewer rows.
+                        hidden.fill_(999)
+                        target.fill_(999)
+                        tokens.fill_(999)
             result = execution.finish_step(invocation)
+        if overlap is not None:
+            stream.wait_stream(overlap.stream)
         torch.testing.assert_close(result.loss, oracle.detach())
         torch.testing.assert_close(execution.snapshot(result.publication.after_refs[0], stream)[0], parameter)
     # Incomplete sampler coverage is a boundary error, never an out-of-bounds graph read.
@@ -130,6 +147,8 @@ def mean_capture() -> None:
                     invocation, stream, feedback=SamplerFeedback(missing, target[:1], tokens[:1])
                 )
     torch.testing.assert_close(execution.snapshot(result.publication.after_refs[0], stream)[0], parameter)
+    if overlap is not None:
+        overlap.clear()
     execution.retire(())
     underfunded = replace(
         facts,
@@ -156,7 +175,8 @@ def main() -> None:
     with pytest.MonkeyPatch.context() as monkeypatch:
         _esamp_native_oracle(monkeypatch, torch.device("cuda", 0))
     _ordinary_request_distillation()
-    mean_capture()
+    for lag in (0, 1, 2):
+        mean_capture(lag)
     print("generic step capture: ESamp, COW, memory, instance mean, changing sampler buffers and preflight agree")
 
 

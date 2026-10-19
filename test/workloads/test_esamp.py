@@ -65,6 +65,10 @@ def _reference(source: torch.Tensor, parameters: torch.Tensor) -> torch.Tensor:
 def test_esamp_predicts_before_training_and_isolates_request_versions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    assert ExecutionOptions().publish_lag == 1
+    for lag in (-1, True, 1.5):
+        with pytest.raises(ValueError, match="publish_lag"):
+            ExecutionOptions(publish_lag=lag)
     for value in (float("nan"), float("inf")):
         with pytest.raises(ValueError):
             ESampRequestConfig(intervention_beta=value)

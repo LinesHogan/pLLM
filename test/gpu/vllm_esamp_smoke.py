@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import os
 import sys
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -19,14 +20,18 @@ from pllm.authoring import BackendCompileFacts, BackendRequirements
 from pllm.backends.vllm.mrv1 import Mrv1Runner
 from pllm.backends.vllm.runtime import VllmLlm, WorkloadModelRunner, probe_backend
 from pllm.config import ExecutionOptions, ModelConfig, VllmDType
+from pllm.contracts.state_ref import StateRef
+from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.workloads.esamp_request import (
     ESampRequestConfig,
     ESampRequestWorkload,
 )
 
 
-def checked_probe(requirements: BackendRequirements, runner: WorkloadModelRunner | Mrv1Runner) -> BackendCompileFacts:
-    facts = probe_backend(requirements, runner)
+def checked_probe(
+    requirements: BackendRequirements, runner: WorkloadModelRunner | Mrv1Runner, *, publish_lag: int = 1
+) -> BackendCompileFacts:
+    facts = probe_backend(requirements, runner, publish_lag=publish_lag)
     timeline = facts.timeline
     for index in range(len(timeline.anchors)):
         try:
@@ -37,13 +42,65 @@ def checked_probe(requirements: BackendRequirements, runner: WorkloadModelRunner
                     timeline,
                     reserved_bytes=tuple(size - int(i == index) for i, size in enumerate(timeline.reserved_bytes)),
                 ),
+                publish_lag=publish_lag,
             )
         except ValueError as error:
             assert "input/sampler buffers" in str(error)
         else:
             raise AssertionError("worker accepted an underfunded input/sampler reservation")
-    assert probe_backend(requirements, runner, timeline).timeline is timeline
+    assert probe_backend(requirements, runner, timeline, publish_lag=publish_lag).timeline is timeline
     return facts
+
+
+def lag_equivalence() -> None:
+    """Training-only generation has identical tokens, counters and every final optimizer field."""
+    states: list[tuple[torch.Tensor, ...]] = []
+    retire = PageBundleArena.retire
+
+    def snapshot(arena: PageBundleArena, refs: Sequence[StateRef]) -> None:
+        stream = torch.cuda.current_stream(arena.device)
+        pin = arena.pin_exact(refs, stream)
+        states.extend(arena.snapshot(pin, ref) for ref in refs)
+        arena.release_pin(pin)
+        retire(arena, refs)
+
+    expected: tuple[tuple[int, ...], int, int] | None = None
+    expected_states: list[tuple[torch.Tensor, ...]] = []
+    for lag in (0, 1):
+        states.clear()
+        config = ModelConfig(
+            "Qwen/Qwen2.5-0.5B-Instruct",
+            max_model_len=64,
+            max_num_seqs=2,
+            max_num_batched_tokens=64,
+            gpu_memory_utilization=0.25,
+            seed=7,
+            cuda_graphs=True,
+            execution=ExecutionOptions(capture=True, publish_lag=lag, capture_memory_bytes=16 * 1024**2),
+        )
+        with pllm.make_llm(config, workload=ESampRequestWorkload(ESampRequestConfig(rank=2))) as llm:
+            with patch.object(PageBundleArena, "retire", snapshot):
+                outputs = llm.generate(
+                    ["The sky is", "The sea is"],
+                    SamplingParams(max_tokens=16, temperature=0.8, seed=7, ignore_eos=True),
+                )
+            diagnostics = llm.diagnostics()
+            observed = (
+                tuple(token for output in outputs for token in output.outputs[0].token_ids),
+                diagnostics.loss_count,
+                diagnostics.update_count,
+            )
+            if expected is None:
+                expected, expected_states = observed, list(states)
+            else:
+                assert observed == expected
+                assert len(states) == len(expected_states) == 2
+                for actual, wanted in zip(states, expected_states, strict=True):
+                    for field, reference in zip(actual, wanted, strict=True):
+                        torch.testing.assert_close(field, reference, rtol=0, atol=0)
+        gc.collect()
+        torch.cuda.empty_cache()
+    print("publish_lag=0/1: identical beta=0 tokens, loss/update counts and all final state fields")
 
 
 def main() -> int:
@@ -103,7 +160,7 @@ def main() -> int:
     try:
         plan = handle.attachment.inputs.plan
         probe = handle.attachment.inputs.probe
-        owned_hidden_bytes = len(probe.hidden_resources) * probe.max_packed_rows * probe.hidden_size * 4
+        owned_hidden_bytes = 2 * len(probe.hidden_resources) * probe.max_packed_rows * probe.hidden_size * 4
         for anchor, size in zip(plan.timeline.anchors, plan.timeline.reserved_bytes, strict=True):
             assert (
                 size > owned_hidden_bytes
@@ -138,6 +195,10 @@ def main() -> int:
         )
     finally:
         handle.close()
+    del handle, routed
+    gc.collect()
+    torch.cuda.empty_cache()
+    lag_equivalence()
     return 0
 
 

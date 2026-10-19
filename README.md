@@ -135,6 +135,11 @@ WorkerTransportable）。默认 `multiprocessing=False` 进程内执行没有这
 私有页写入和 AdamW；ESamp 使用此通用路径。训练方法返回逐行 loss，由框架屏蔽填充行
 并执行 `mean` 或 `state_mean`，不能在用户方法中混合行。详见
 [训练与观测](doc/guides/training-and-observation.md#capture-an-ordinary-tensor-step)。
+`ExecutionOptions(publish_lag=1)` 默认让采样后的任务在框架 side stream 上执行，与下一次
+forward 重叠。采样前只读的任务固定读取延迟版本：步 N+1 可读到步 N-1 的训练结果，
+训练本身始终从最新版本继续；版本选择不取决于 GPU 完成时机。需要严格顺序的算法使用
+`publish_lag=0`，非负整数可配置更长延迟。框架先保存 hidden/feedback，再允许后端复用
+这些缓冲区；模型内修改、replay、借用 activation 和跨采样阶段的梯度链仍保持原有顺序。
 Region 默认采用静态安排：在合法且预算足够时使用复用的双 stream，不运行私有调优请求。
 `ExecutionOptions(tuning="measured")` 才启用有界候选实测；`schedule_policy="serial"`
 保留参考顺序。计算分析与分块沿用现有实现，调度层不按算法名字分派。

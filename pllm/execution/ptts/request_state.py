@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 from threading import RLock
 from types import MappingProxyType
@@ -270,7 +270,8 @@ class RequestStateDirectory:
         with self._lock:
             return tuple(self._latest(key) for key in self._addresses(identities))
 
-    def select(self, rows: tuple[PackedPhaseRow, ...]) -> RequestStateSelection:
+    def select(self, rows: tuple[PackedPhaseRow, ...], history: tuple[StateRefs, ...] = ()) -> RequestStateSelection:
+        """Select exact versions, rewinding recent step inputs newest first when lag is requested."""
         with self._lock:
             if not rows and self.request_states and not self.instance_states:
                 raise ValueError("request selection requires rows")
@@ -281,7 +282,17 @@ class RequestStateDirectory:
                 ResourceSelection(resource, keys, self.arena.latest_batch(resource, lineages), positions)
                 for resource, keys, lineages, positions in self._projection[1]
             )
+            if history:
+                groups = tuple(replace(group, refs=self._rewind(group.refs, history)) for group in groups)
             return RequestStateSelection(rows if self.states else (), groups)
+
+    @staticmethod
+    def _rewind(refs: StateRefs, history: tuple[StateRefs, ...]) -> StateRefs:
+        versions = refs.versions.copy()
+        for before in reversed(history):
+            _, selected, previous = np.intersect1d(refs.lineages, before.lineages, return_indices=True)
+            versions[selected] = before.versions[previous]
+        return StateRefs(refs.layouts, refs.lineages, versions, refs.rows)
 
     def _project(self, rows: tuple[PackedPhaseRow, ...]) -> tuple[_Projection, ...]:
         """Each state's keys, their lineages, and every row's position in the selection.
@@ -307,14 +318,24 @@ class RequestStateDirectory:
             offset += len(keys)
         return tuple(projections)
 
-    def select_and_lease(self, rows: tuple[PackedPhaseRow, ...]) -> RequestStateSelection:
-        """Select the latest state of every row and lease it to one step; the lease is never stale."""
+    def select_and_lease(
+        self, rows: tuple[PackedPhaseRow, ...], history: tuple[StateRefs, ...] = ()
+    ) -> RequestStateSelection:
+        """Lease lineages to one step, optionally selecting retained exact reader versions."""
         with self._lock:
-            selection = self.select(rows)
+            selection = self.select(rows, history)
             if self._overlaps(selection.refs.lineages):
                 raise RuntimeError("request transition lease overlaps an active step")
             self._leases[id(selection)] = selection
             return selection
+
+    def refresh_lease(self, selection: RequestStateSelection) -> RequestStateSelection:
+        """Keep the same lineage lease while moving from lagged readers to latest writers."""
+        with self._lock:
+            latest = self.select(selection.rows)
+            self.release_transition_lease(selection)
+            self._leases[id(latest)] = latest
+            return latest
 
     def release_transition_lease(self, selection: RequestStateSelection) -> None:
         with self._lock:

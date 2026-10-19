@@ -12,7 +12,7 @@ from functools import partial
 from hashlib import sha256
 from time import perf_counter_ns
 from types import TracebackType
-from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar, overload
+from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar, cast, overload
 
 import torch
 from vllm import RequestOutput, SamplingParams
@@ -62,7 +62,7 @@ from pllm.backends.vllm.sampler import (
     SignedSamplerGuidance,
     Vllm027Sampler,
 )
-from pllm.config import ModelConfig, RunnerKind, VllmDType
+from pllm.config import ExecutionOptions, ModelConfig, RunnerKind, VllmDType
 from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
@@ -95,6 +95,7 @@ from pllm.contracts.semantic_graph import (
     HiddenInputSource,
     SamplerFeedbackInputSource,
     SchedulerTimeline,
+    StateEffectKind,
     StateScope,
     TaskId,
     TokenwiseLayerReplay,
@@ -107,11 +108,13 @@ from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.decoder_region import decoder_activations
 from pllm.execution.execution import TaskGraphInvocation
 from pllm.execution.host_runtime import CompletionCapture, CompletionInput
+from pllm.execution.post_sample import PostSampleOverlap
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.state_execution import StateDiagnostics, StateTaskContext
+from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tokenwise_region import compile_tokenwise_region
 from pllm.execution.tokenwise_tuning import TokenwiseTuning
 from pllm.execution.trace import TRACE_SCHEMA_VERSION, ExecutionTrace, TraceSelection, TraceSnapshot
@@ -250,6 +253,7 @@ class VllmSession(Generic[DataT, ResultT]):
         sampler: SamplerGuidance | None,
         max_sampler_rows: int,
         taps: HiddenTaps | None = None,
+        publish_lag: int = 1,
     ) -> None:
         attachment = deployment.attachment
         plan = attachment.inputs.plan
@@ -265,6 +269,7 @@ class VllmSession(Generic[DataT, ResultT]):
             model.lm_head.weight.shape[0],
             attachment.inputs.request.sampler_stage if sampler is not None else None,
             self._capture_feedback,
+            publish_lag,
         )
         buffers = attachment_buffer_bytes(
             attachment.inputs.probe, plan.semantic_graph, plan.tensor_layout_request, attachment.inputs.request
@@ -336,6 +341,39 @@ class VllmSession(Generic[DataT, ResultT]):
         self._auxiliary: AuxiliaryInput[torch.Tensor] | None = None
         self._tuning: TokenwiseTuning[TensorStepInput, DataT, ResultT] | None = None
         execution = deployment.execution
+        # Model mutations/borrowed activations have their own strict admission and replay
+        # lifecycle. Only a read-only prefix can switch from lagged reads to latest writes.
+        scheduled = plan.schedule_physical.tasks
+        sampler_anchor = execution.sampler_anchor_id
+        overlap = (
+            publish_lag > 0
+            and not overlay_bindings
+            and not attachment.inputs.request.activation_bindings
+            and not tasks
+            and any(task.anchor_id > sampler_anchor for task in scheduled)
+            and all(
+                effect.kind is StateEffectKind.READ
+                for task in scheduled
+                if task.anchor_id <= sampler_anchor
+                for effect in plan.semantic_graph.tasks[task.task_id].effects
+            )
+            and all(
+                math is None or not (math.input_gradients or math.parameter_gradients)
+                for task in scheduled
+                if task.anchor_id <= sampler_anchor
+                for math in (plan.semantic_graph.tasks[task.task_id].math,)
+            )
+        )
+        self._post_sample = (
+            PostSampleOverlap(
+                execution.arena,
+                publish_lag,
+                execution.device,
+                readers=self._capture_feedback or any(task.anchor_id <= sampler_anchor for task in scheduled),
+            )
+            if overlap
+            else None
+        )
         if execution.directory.scope is StateScope.INSTANCE:
             execution.admit((), torch.cuda.current_stream(execution.device))
 
@@ -596,7 +634,13 @@ class VllmSession(Generic[DataT, ResultT]):
             self._step = None
             return
         if step.invocation is None:
-            step.invocation = execution.start_step(value, stream)
+            # With no pre-sampler tasks there is no reader to lag. Pin the latest state
+            # directly on the writer lane so the main stream never waits for training.
+            if self._post_sample is not None and not self._post_sample.readers:
+                stream = self._post_sample.stream
+            step.invocation = execution.start_step(
+                value, stream, history=() if self._post_sample is None else self._post_sample.history
+            )
             self._auxiliary = None
         elif step.invocation.context.value is None:
             execution.submit_input(step.invocation, value, CudaStreamReadiness(stream))
@@ -677,6 +721,13 @@ class VllmSession(Generic[DataT, ResultT]):
             return
         execution = self._deployment.execution
         invocation = self._invocation()
+        overlap = self._post_sample
+        if overlap is not None:
+            assert isinstance(invocation.context.value, TensorFrame)
+            overlap.copy_inputs(cast(StateTaskContext[TensorFrame], invocation.context))
+            if overlap.readers:
+                with torch.cuda.stream(overlap.stream):
+                    overlap.retain(execution.resume_latest(invocation, overlap.stream))
         self._advance(invocation, "next.prepare")
         execution.finish_step(invocation)
         self._step = None
@@ -689,6 +740,8 @@ class VllmSession(Generic[DataT, ResultT]):
             self._sampler.abort_guidance()
         self._abort_effects()
         self._deployment.execution.cancel_active()
+        if self._post_sample is not None:
+            self._post_sample.clear()
         self._auxiliary = None
         self._step = None
 
@@ -700,7 +753,9 @@ class VllmSession(Generic[DataT, ResultT]):
             else identities
         )
         if held:
-            execution.retire(held)
+            # Released pages remain fenced in the arena. Finishing a subset of the
+            # requests must not make the host wait for unrelated side-stream work.
+            execution.retire(held, wait=self._post_sample is None)
         for identity in identities:
             self._identities.pop(identity.request_id)
             self._token_frontiers.pop(identity, None)
@@ -710,6 +765,8 @@ class VllmSession(Generic[DataT, ResultT]):
             raise RuntimeError("canonical requests cannot retire during a step")
         if self._auxiliary is not None:
             raise RuntimeError("generation ended before the signed training input was consumed")
+        if self._post_sample is not None:
+            self._post_sample.clear()
         self._retire(tuple(self._identities[request_id] for request_id in sorted(self._identities)))
         self._pending_identities.clear()
         self._deployment.execution.arena.collect_completed(wait=True)
@@ -794,6 +851,7 @@ class Runner(Generic[SamplerT]):
     def attach_workload(
         self,
         deployment: BackendDeployment[DataT, ResultT],
+        publish_lag: int = 1,
     ) -> None:
         if self._workload_session is not None:
             raise RuntimeError("canonical runner already owns a workload session")
@@ -822,7 +880,7 @@ class Runner(Generic[SamplerT]):
         adapter = self._make_sampler(upstream) if deployment.attachment.inputs.request.guides_sampler else None
         if adapter is not None and not isinstance(adapter, SamplerGuidance):
             raise TypeError("backend sampler must share the original guidance lifecycle")
-        session = VllmSession(deployment, model, adapter, self.max_num_reqs, self.hidden_taps)
+        session = VllmSession(deployment, model, adapter, self.max_num_reqs, self.hidden_taps, publish_lag)
         self._workload_upstream_sampler = upstream
         self._workload_session = session
         if adapter is not None:
@@ -1042,9 +1100,24 @@ class BackendCommand(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class BackendProbe:
+    """Worker probe policy, shared with installation so capacity and input reservations agree."""
+
+    requirements: BackendRequirements
+    publish_lag: int = 1
+
+    def __post_init__(self) -> None:
+        ExecutionOptions(publish_lag=self.publish_lag)
+
+
+@dataclass(frozen=True, slots=True)
 class BackendInstall:
     attachment: SignedBackendAttachment
     definition: str
+    publish_lag: int = 1
+
+    def __post_init__(self) -> None:
+        ExecutionOptions(publish_lag=self.publish_lag)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1642,7 +1715,10 @@ def create_vllm_llm(
             replies = llm.collective_rpc(
                 "workload_command",
                 timeout=30.0,
-                args=(BackendCommand.PROBE.value, encode_boundary(workload.backend_requirements())),
+                args=(
+                    BackendCommand.PROBE.value,
+                    encode_boundary(BackendProbe(requirements, config.execution.publish_lag)),
+                ),
             )
             if len(replies) != 1:
                 raise RuntimeError("canonical probe requires the exact single-worker quorum")
@@ -1650,7 +1726,10 @@ def create_vllm_llm(
             attachment = workload.plan_backend(facts)
             handle = VllmLlm[DataT, ResultT](llm, None, None, attachment, facts)
             installed = decode_boundary(
-                handle.command(BackendCommand.INSTALL, encode_boundary(BackendInstall(attachment, definition or ""))),
+                handle.command(
+                    BackendCommand.INSTALL,
+                    encode_boundary(BackendInstall(attachment, definition or "", config.execution.publish_lag)),
+                ),
                 BackendWorkerState,
             )
             if installed.process_id == os.getpid():
@@ -1678,9 +1757,11 @@ def create_vllm_llm(
                     pass
                 case _:
                     raise RuntimeError("vLLM workload did not construct its selected runner")
-            facts = workload.specialize(probe_backend(workload.backend_requirements(), runner), config.execution)
+            facts = workload.specialize(
+                probe_backend(requirements, runner, publish_lag=config.execution.publish_lag), config.execution
+            )
             deployment = workload.compile_backend(facts)
-            runner.attach_workload(deployment)
+            runner.attach_workload(deployment, config.execution.publish_lag)
             handle = VllmLlm(llm, runner, deployment, deployment.attachment, facts)
         handle.tune_native_schedules()
         construction.pop_all()
@@ -1694,8 +1775,9 @@ def _input_reservations(
     vocab: int,
     stage: SamplerStage | None,
     feedback: bool,
+    publish_lag: int = 1,
 ) -> tuple[int, ...]:
-    hidden = len(probe.hidden_resources) * probe.max_packed_rows * probe.hidden_size * 4
+    hidden = (1 + bool(publish_lag)) * len(probe.hidden_resources) * probe.max_packed_rows * probe.hidden_size * 4
     # FP32 envelope for original logits, conversion, projection and rowwise arithmetic.
     # Excludes upstream sampling/GEMM library scratch, model weights and KV storage.
     workspace = (
@@ -1706,9 +1788,13 @@ def _input_reservations(
         else 0
     )
     retained = rows * (4 * vocab + 8) if feedback else 0
+    # StepCapture retains its feedback pointers until the next table is prepared.
+    # Budget both old and new private copies during handoff, including next forward.
+    private_feedback = 2 * retained if publish_lag else 0
     sampler = next(anchor.ordinal for anchor in timeline.anchors if anchor.symbol == "sampler.pre_draw")
     return tuple(
         hidden
+        + private_feedback
         + (workspace if anchor.symbol in ("sampler.pre_draw", "sampler.complete") else 0)
         + (retained if anchor.ordinal >= sampler else 0)
         for anchor in timeline.anchors
@@ -1719,6 +1805,8 @@ def probe_backend(
     requirements: BackendRequirements,
     runner: WorkloadModelRunner | Mrv1Runner,
     timeline: SchedulerTimeline | None = None,
+    *,
+    publish_lag: int = 1,
 ) -> BackendCompileFacts:
     _require_runner(runner)
     match runner.model:
@@ -1821,6 +1909,7 @@ def probe_backend(
         model.lm_head.weight.shape[0],
         requirements.sampler_stage,
         requirements.sampler_feedback,
+        publish_lag,
     )
     required = tuple(value + requirements.resident_bytes for value in required)
     observed = replace(observed, reserved_bytes=required)
@@ -1839,13 +1928,17 @@ def probe_backend(
     free_bytes, _total_bytes = torch.cuda.mem_get_info(runner.device)
     # Per scheduled request: the current root, the private root being written, and the root the GPU
     # may still read from the step before, because the host prepares a step while the GPU runs the last.
-    # With only two, every transition waits for the previous step's GPU work before it can allocate.
+    # Each lagged step additionally retains its exact input root for readers. No host wait
+    # is hidden in this capacity: current + private + GPU reader + publish_lag retained roots.
     return BackendCompileFacts(
         probe,
         timeline,
         (
             PageBundleProviderFacts(
-                "canonical.page_bundle_cuda@1", 3 * runner.max_num_reqs + 2, probe.device_kind, probe.device_ordinal
+                "canonical.page_bundle_cuda@1",
+                (3 + publish_lag) * runner.max_num_reqs + 2,
+                probe.device_kind,
+                probe.device_ordinal,
             ),
         ),
         runner.max_num_reqs,

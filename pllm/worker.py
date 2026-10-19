@@ -8,9 +8,16 @@ from typing import cast
 import torch
 from vllm.v1.worker.gpu_worker import Worker
 
-from pllm.authoring import BackendRequirements, BackendWorkload, DataT, ResultT, map_auxiliary
+from pllm.authoring import BackendWorkload, DataT, ResultT, map_auxiliary
 from pllm.backends.vllm.mrv1 import Mrv1Runner
-from pllm.backends.vllm.runtime import BackendCommand, BackendInstall, BackendStage, WorkloadModelRunner, probe_backend
+from pllm.backends.vllm.runtime import (
+    BackendCommand,
+    BackendInstall,
+    BackendProbe,
+    BackendStage,
+    WorkloadModelRunner,
+    probe_backend,
+)
 from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import AttachmentTopology, SignedBackendAttachment
 from pllm.contracts.region_proposal import RegionScheduleProposal
@@ -43,10 +50,14 @@ class GPUWorker(Worker):
             case _:
                 raise RuntimeError("canonical worker has not initialized its runner")
 
-    def _install(self, workload: BackendWorkload[DataT, ResultT], attachment: SignedBackendAttachment) -> None:
+    def _install(
+        self, workload: BackendWorkload[DataT, ResultT], attachment: SignedBackendAttachment, publish_lag: int
+    ) -> None:
         runner = self.workload_runner
-        facts = probe_backend(workload.backend_requirements(), runner, attachment.inputs.plan.timeline)
-        runner.attach_workload(workload.bind_backend(facts, attachment))
+        facts = probe_backend(
+            workload.backend_requirements(), runner, attachment.inputs.plan.timeline, publish_lag=publish_lag
+        )
+        runner.attach_workload(workload.bind_backend(facts, attachment), publish_lag)
 
     def workload_command(self, command: str, payload: str) -> str:
         runner = self.workload_runner
@@ -69,7 +80,8 @@ class GPUWorker(Worker):
         with torch.inference_mode(False):
             match operation:
                 case BackendCommand.PROBE:
-                    return encode_boundary(probe_backend(decode_boundary(payload, BackendRequirements), runner))
+                    probe = decode_boundary(payload, BackendProbe)
+                    return encode_boundary(probe_backend(probe.requirements, runner, publish_lag=probe.publish_lag))
                 case BackendCommand.INSTALL:
                     install = decode_boundary(payload, BackendInstall)
                     # The reference names an importable frozen class; the driver compares
@@ -77,7 +89,9 @@ class GPUWorker(Worker):
                     authoring = decode_workload(install.definition, device=runner.device, seed=runner.model_config.seed)
                     if not isinstance(authoring, BackendWorkload):
                         raise ValueError("referenced workload is not a backend workload")
-                    self._install(cast(BackendWorkload[object, object], authoring), install.attachment)
+                    self._install(
+                        cast(BackendWorkload[object, object], authoring), install.attachment, install.publish_lag
+                    )
                     return encode_boundary(runner.worker_state())
                 case BackendCommand.STAGE:
                     stage = decode_boundary(payload, BackendStage)

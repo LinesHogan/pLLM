@@ -52,6 +52,8 @@ def main() -> None:
     observed = []
     drawn = {}
     hook = None
+    reader_ref = None
+    native_guidance = StateExecution.sampler_guidance
     native_add, native_complete = Vllm027Sampler._add_logits, StateExecution.complete_sampler
     try:
 
@@ -62,13 +64,20 @@ def main() -> None:
 
         hook = handle.runner.model.model.norm.register_forward_hook(capture)
 
+        def inspect_guidance(owner, invocation, stream=None):
+            nonlocal reader_ref
+            (reader_ref,) = invocation.context.pin.refs
+            return native_guidance(owner, invocation, stream)
+
         def inspect_add(logits, guidance):
             nonlocal base_logits
             assert execution.directory.inference_pin_count == 0
             base_logits = logits.detach().clone()
             assert hidden is not None
-            (ref,) = execution.directory.select(()).refs
-            parameters = execution.snapshot(ref, torch.cuda.current_stream(execution.device))[0]
+            # Lagged guidance uses the invocation's exact read pin, while training
+            # may already have published a newer version in the directory.
+            assert reader_ref is not None
+            parameters = execution.snapshot(reader_ref, torch.cuda.current_stream(execution.device))[0]
             width, vocab = hidden.shape[1], logits.shape[1]
             down = parameters[: 4 * width].reshape(2, 2, width)
             up = parameters[4 * width :].reshape(2, vocab, 2)
@@ -96,6 +105,7 @@ def main() -> None:
 
         with (
             patch.object(Vllm027Sampler, "_add_logits", staticmethod(inspect_add)),
+            patch.object(StateExecution, "sampler_guidance", inspect_guidance),
             patch.object(StateExecution, "complete_sampler", inspect_feedback),
         ):
             for iteration in range(3):

@@ -276,7 +276,8 @@ def _output_lora_shared_input() -> None:
             0.25,
             seed=7,
             multiprocessing=True,
-            execution=ExecutionOptions(training_rows=2),
+            # This case asserts immediate next-draw visibility; exercise strict ordering.
+            execution=ExecutionOptions(training_rows=2, publish_lag=0),
         ),
     )
     try:
@@ -368,7 +369,8 @@ def _independent_lora_input() -> None:
     )
     try:
         prompts = ["The sky is", "Water freezes at"]
-        sampling = SamplingParams(max_tokens=3, temperature=0.0, ignore_eos=True, logprobs=1)
+        # Default lag 1 makes the first decode update visible on the fourth draw.
+        sampling = SamplingParams(max_tokens=4, temperature=0.0, ignore_eos=True, logprobs=1)
         baseline = handle.generate(prompts, sampling)
         completed = handle.generate(prompts, sampling, feedback_group="independent-lora")
         keys = tuple(
@@ -403,7 +405,7 @@ def _independent_lora_input() -> None:
         assert all(torch.isfinite(event.tensor()).all() and torch.count_nonzero(event.tensor()) > 0 for event in guided)
         for before, after in zip(baseline, trained, strict=True):
             old, new = before.outputs[0], after.outputs[0]
-            assert old.token_ids[:2] == new.token_ids[:2]
+            assert old.token_ids[:3] == new.token_ids[:3]
         assert not torch.cuda.is_initialized()
         print(
             "Independent LoRA EngineCore: captured SGD, loss=4, two exact request publications, nonzero signed sampler guidance, cleanup/fallback=0"

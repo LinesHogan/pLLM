@@ -600,15 +600,33 @@ class PageBundleArena:
             elif latest:
                 raise RuntimeError("PageBundle transition source is not latest")
             else:
-                roots = tuple(self.root(ref) for ref in selected)
+                # Lagged readers usually select an entire retained step. Resolve batches
+                # against the issued holds instead of scanning every hold for every row.
+                slots, generations = table.slots[rows].copy(), table.generations[rows].copy()
+                readiness = table.readiness[rows].copy()
+                missing = table.versions[rows] != versions
+                for held in self._held_pages():
+                    if held.table is not table or not missing.any():
+                        continue
+                    positions = held.refs.positions(selected)
+                    found = missing & (positions >= 0)
+                    indices = positions[found]
+                    slots[found], generations[found] = held.slots[indices], held.generations[indices]
+                    if held.readiness:
+                        readiness[found] = np.asarray(held.readiness, dtype=object)[indices]
+                    else:
+                        readiness[found] = None
+                    missing[found] = False
+                if missing.any():
+                    raise RuntimeError("PageBundle root is unknown or reclaimed")
                 groups.append(
                     _Pages(
                         table,
                         selected,
                         rows,
-                        np.stack([root.slots for root in roots]),
-                        np.stack([root.generations for root in roots]),
-                        tuple(root.readiness for root in roots),
+                        slots,
+                        generations,
+                        tuple(readiness),
                     )
                 )
         return tuple(groups)

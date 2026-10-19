@@ -134,7 +134,11 @@ class StateTaskContext(Generic[DataT]):
 
     @property
     def published_pin(self) -> PagePin | None:
-        return next((pin for pin in reversed(self.page_pins) if pin is not self.pin), None)
+        published = StateRefs.join(tuple(receipt.after_refs for receipt in self.page_publications))
+        return next(
+            (pin for pin in reversed(self.page_pins) if pin.refs and (published.positions(pin.refs) >= 0).all()),
+            None,
+        )
 
     @property
     def published_release(self) -> PageRelease | None:
@@ -486,7 +490,11 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             return refs
 
     def begin(
-        self, rows: tuple[PackedPhaseRow, ...], stream: torch.cuda.Stream | None = None
+        self,
+        rows: tuple[PackedPhaseRow, ...],
+        stream: torch.cuda.Stream | None = None,
+        *,
+        history: tuple[StateRefs, ...] = (),
     ) -> TaskGraphInvocation[StateTaskContext[DataT]]:
         with self._lock:
             # Complete exact input before any local pin/write; test_video rejects missing staging.
@@ -500,7 +508,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                     self._borrow_failed = True
                     raise RuntimeError("borrowed step requires complete staged roots on the receiving stream")
             self.arena.collect_completed()
-            selection = self.directory.select_and_lease(rows)
+            selection = self.directory.select_and_lease(rows, history)
             try:
                 pin = self.arena.pin_exact(selection.refs, stream)
             except Exception:
@@ -530,12 +538,38 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             return invocation
 
     def start_step(
-        self, value: InputT, stream: torch.cuda.Stream | None = None
+        self,
+        value: InputT,
+        stream: torch.cuda.Stream | None = None,
+        *,
+        history: tuple[StateRefs, ...] = (),
     ) -> TaskGraphInvocation[StateTaskContext[DataT]]:
         with self._lock:
-            invocation = self.begin(self.math.rows(value), stream)
+            invocation = self.begin(self.math.rows(value), stream, history=history)
             self.submit_input(invocation, value)
             return invocation
+
+    def resume_latest(
+        self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], stream: torch.cuda.Stream
+    ) -> PagePin:
+        """Move a completed sampler's invocation to its writer stream without losing exact read holds.
+
+        The caller orders the sampler and copies reusable inputs first. Old reader pages remain
+        pinned on the new stream until settlement, including aliases consumed by later tasks.
+        The returned extra pin retains the writer's input for subsequent lagged readers.
+        """
+        with self._lock:
+            context = self._context(invocation)
+            assert context.sampler_phase is _SamplerPhase.COMPLETE
+            assert not context.page_writes and not context.page_publications and not context.borrowed_roots
+            reader = context.pin
+            held = self.arena.pin_exact(reader.refs, stream)
+            context.page_pins[held] = None
+            context.release_owned_pin(reader)
+            context.selection = self.directory.refresh_lease(context.selection)
+            context.pin = self.arena.pin_exact(context.selection.refs, stream)
+            context.page_pins[context.pin] = None
+            return self.arena.pin_exact(context.selection.refs, stream)
 
     def step(self, value: InputT, stream: torch.cuda.Stream | None = None) -> ResultT:
         """Run without an external sampler borrower using the same staged lifecycle."""
@@ -770,14 +804,14 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             raise RuntimeError("state invocation is not registered as active")
         return invocation.context
 
-    def retire(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateRef, ...]:
+    def retire(self, identities: tuple[RequestIdentity, ...], *, wait: bool = True) -> tuple[StateRef, ...]:
         with self._lock:
             for identity in identities:
                 self._successful_inputs.pop(identity, None)
             if not self.directory.states:
                 if self._active:
                     raise RuntimeError("stateless requests cannot retire during an invocation")
-                self.arena.collect_completed(wait=True)
+                self.arena.collect_completed(wait=wait)
                 self.trace.record(TracePhase.RETIRE, 0, identities=identities)
                 return ()
             if not identities and self.directory.inference_pin_count:
@@ -794,7 +828,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                 for invocation in tuple(self._active.values()):
                     if any(row.identity in retiring for row in invocation.context.selection.rows):
                         self.cancel_step(invocation)
-            self.arena.collect_completed(wait=True)
+            self.arena.collect_completed(wait=wait)
             refs = self.directory.retire(identities)
             self.trace.record(TracePhase.RETIRE, 0, identities=identities, refs=refs)
             return refs
