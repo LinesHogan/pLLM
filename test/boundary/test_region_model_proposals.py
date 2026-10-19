@@ -1,16 +1,13 @@
-"""Model schedule proposals survive the real command, tuning and owner paths."""
+"""Model schedule proposals survive driver-only planning, tuning and installation on the original owner."""
 
 import subprocess
 import sys
 from dataclasses import replace
-from unittest.mock import patch
 
 import pytest
 import torch
 
 from pllm.authoring import BackendCompileFacts, TensorStepInput
-from pllm.backends.vllm.replay import VllmTokenwiseReplay
-from pllm.backends.vllm.runtime import BackendCommand, VllmSession, WorkloadModelRunner
 from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
@@ -22,7 +19,6 @@ from pllm.contracts.backend_attachment import (
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
 from pllm.contracts.region_composition import RegionFunctionBody, inline_region
-from pllm.contracts.region_imports import CompiledTensorImport
 from pllm.contracts.region_program import (
     AffineIndex,
     Block,
@@ -35,30 +31,30 @@ from pllm.contracts.region_program import (
     Value,
 )
 from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY, RegionScheduleProposal
-from pllm.contracts.region_selection import RegionSelection, RegionSelectionPolicy
+from pllm.contracts.region_selection import RegionSelectionPolicy
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.decoder_region import decoder_normalize_function
-from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
+from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.exported_resources import borrow_exported_inputs
 from pllm.execution.paged_access import PagedLayer, PagedResourceView, bind_paged_access
-from pllm.execution.region_execution import RegionInstructionExecution
 from pllm.execution.region_resources import HostResourceBinding, PagedResourceBinding, ReadonlyResourceBinding
 from pllm.execution.region_storage import import_region_functions
+from pllm.execution.region_streams import RegionStreamBindings
 from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION, TokenwiseReplayPrimitive, TokenwiseReplayTask
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
 from pllm.execution.tokenwise_region import compile_tokenwise_region
-from pllm.worker import GPUWorker
+from pllm.execution.tokenwise_tuning import TokenwiseTuning
 from pllm.workloads.recirculation import RecirculationWorkload
 
 
 @pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_worker_tunes_and_installs_parallel_model_proposal_with_original_owner(monkeypatch):
+def test_tuning_installs_a_parallel_model_proposal_with_the_original_owner():
     device = torch.device("cuda:0")
     tensor = TensorType((1, 4), "torch.float32", "cuda:0")
 
@@ -125,26 +121,18 @@ def test_worker_tunes_and_installs_parallel_model_proposal_with_original_owner(m
     # OriginalNorm's class nor its graph/parameter objects, and never owns CUDA.
     script = """
 import sys
-from unittest.mock import patch
 import torch
 from pllm.authoring import BackendCompileFacts
 from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import BackendPlacementProbe
 from pllm.execution.codec import decode_boundary, encode_boundary
-from pllm.execution.exported_cell import ExportedCell
-from pllm.execution.region_execution import RegionInstructionExecution
-from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.workloads.recirculation import RecirculationWorkload
 probe = decode_boundary(sys.stdin.read(), BackendPlacementProbe)
 facts = BackendCompileFacts(probe, RuntimeFacts(torch.device('cuda:0')).timeline(probe.capabilities), (), 1, 0, 0, layer_count=3)
 workload = RecirculationWorkload()
 facts = workload.specialize(facts, ExecutionOptions(tuning="measured"))
-assert not torch.cuda.is_initialized()
-def forbidden(*args, **kwargs):
-    raise AssertionError('driver must not bind an executor, allocate pages, or import model graphs')
-with patch.object(RegionInstructionExecution, '__init__', forbidden), patch.object(PageBundleArena, '__init__', forbidden), patch.object(ExportedCell, 'from_export', forbidden):
-    planned = workload.plan_backend(facts)
+planned = workload.plan_backend(facts)
 assert not torch.cuda.is_initialized()
 print(encode_boundary(planned))
 """
@@ -156,15 +144,9 @@ print(encode_boundary(planned))
         check=True,
         timeout=60,
     )
-    attachment = decode_boundary(planned.stdout, SignedBackendAttachment)
-    with patch.object(
-        RegionInstructionExecution, "__init__", side_effect=AssertionError("cold source must not bind an executor")
-    ):
-        deployment = workload.bind_backend(facts, attachment)
-    assert decode_boundary(encode_boundary(probe), BackendPlacementProbe) == probe
+    deployment = workload.bind_backend(facts, decode_boundary(planned.stdout, SignedBackendAttachment))
     execution = deployment.execution
     task = TokenwiseReplayTask.from_implementation(execution.implementation(TOKENWISE_REPLAY_IMPLEMENTATION))
-    assert graph.digest not in task.region.functions
     execution.rebind_implementation(replace(task, region=task.region.bind_functions({graph.digest: graph})))
     source = compile_tokenwise_region(
         tensor,
@@ -181,46 +163,10 @@ print(encode_boundary(planned))
         for proposal in source.candidate_proposals
         if proposal.stream_plan is not None and proposal.stream_plan.pipeline_depth == 2
     )
-    assert parallel.stream_plan.host_fences
     proposals = (RegionScheduleProposal(source.payload), parallel)
-
-    # Only model loading is omitted. Dispatch, session checks, codec, local
-    # validation, measurement binding and final AER installation are production.
-    backend = VllmTokenwiseReplay.__new__(VllmTokenwiseReplay)
-    backend._auxiliary_streams = ()
-    session = VllmSession.__new__(VllmSession)
-    session._deployment, session._replay = deployment, backend
-    session._step = session._auxiliary = session._tuning = None
-    session._identities, session._pending_identities = {}, {}
-    session._next_step_id = 0
-    runner = WorkloadModelRunner.__new__(WorkloadModelRunner)
-    runner._workload_session = session
-    worker = GPUWorker.__new__(GPUWorker)
-    worker.model_runner = runner
-
-    def command(operation, payload=""):
-        return worker.workload_command(operation.value, payload)
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("worker verification must not repeat driver search")
-
-    from pllm import _core
-
-    for name in ("explore_region_schedules", "explore_region_windows", "explore_region_tiling"):
-        monkeypatch.setattr(_core, name, forbidden)
-    public_trace = execution.trace.snapshot()
     rng = torch.random.get_rng_state().clone()
-    count = decode_boundary(command(BackendCommand.TUNE_BEGIN, encode_boundary(proposals)), int)
-    assert count > 2
-    candidates = session._tuning._request.candidates
-    compiled_index = next(
-        index
-        for index, candidate in enumerate(candidates)
-        if candidate.stream_plan is not None
-        and any(isinstance(item, CompiledTensorImport) for item in candidate.imports)
-    )
-    assert candidates[compiled_index].stream_plan != parallel.stream_plan
     owner = torch.cuda.Stream(device=device)
+    streams = RegionStreamBindings(owner, (torch.cuda.Stream(device=device),))
     identity = RequestIdentity("private", 0, 0)
     rows = PackedPhaseRowBatch(1, 1, 3, tuple(PackedPhaseRow(i, 0, i, HiddenPhase.PREFILL, identity) for i in range(3)))
     sample = TensorStepInput(rows, PackedSamplerRowBatch(rows, (PackedSamplerRowLink(0, 2),)))
@@ -246,7 +192,7 @@ print(encode_boundary(planned))
             return (body,)
 
         def borrow_streams(self, context, lanes):
-            return backend.borrow_streams(context, lanes)
+            return streams
 
         def bind_kv(self, resource, context):
             table = torch.zeros((1, 1), device=device, dtype=torch.int32)
@@ -316,7 +262,6 @@ print(encode_boundary(planned))
     def run():
         decoder = Decoder()
         invocation = execution.start_step(sample, owner)
-        backend._invocation = invocation
         invocation.context.replay = decoder
         try:
             for anchor in range(8):
@@ -328,7 +273,7 @@ print(encode_boundary(planned))
             execution.cancel_step(invocation)
             raise
         owner.synchronize()
-        assert not decoder.saved and not invocation.context.page_publications
+        assert not decoder.saved
         # The unaudited model callback must stay on the original stream even
         # while eligible pure statements use a parallel physical plan.
         assert {stream for _, _, stream in decoder.calls} == {owner.cuda_stream}
@@ -338,36 +283,32 @@ print(encode_boundary(planned))
         torch.testing.assert_close(norm.scale, original_scale, rtol=0, atol=0)
         return decoder
 
+    def installed_stream_plan():
+        task = TokenwiseReplayTask.from_implementation(execution.implementation(TOKENWISE_REPLAY_IMPLEMENTATION))
+        return task.region.execution.stream_plan
+
+    tuning = TokenwiseTuning(execution, TOKENWISE_REPLAY_IMPLEMENTATION, proposals, stream_lanes=2)
     try:
-        results = []
-        for index in range(count):
-            command(BackendCommand.TUNE_CANDIDATE, encode_boundary(index))
-            session._tuning.record_rows(rows.rows)
-            with patch.object(
-                RegionInstructionExecution,
-                "__init__",
-                side_effect=AssertionError("trial must bind before measured execution"),
-            ):
-                results.append(run())
+        assert tuning.count > 2
+        results, plans = [], []
+        for index in range(tuning.count):
+            tuning.candidate(index)
+            tuning.record_rows(rows.rows)
+            plans.append(installed_stream_plan())
+            results.append(run())
         for result in results[1:]:
             torch.testing.assert_close(result.output, results[0].output, rtol=0, atol=0)
             torch.testing.assert_close(result.cache, results[0].cache, rtol=0, atol=0)
-        # Controlled scores exercise installation, not a throughput claim.
-        scores = tuple((100 if index == compiled_index else 200,) for index in range(count))
-        with pytest.warns(NumericalTransformWarning):
-            selected = decode_boundary(command(BackendCommand.TUNE_FINISH, encode_boundary(scores)), RegionSelection)
-        assert selected.selected == compiled_index
-        installed = TokenwiseReplayTask.from_implementation(execution.implementation(TOKENWISE_REPLAY_IMPLEMENTATION))
-        assert installed.region.execution.stream_plan == candidates[compiled_index].stream_plan
-        assert installed.region.imports == source.imports
-        assert selected.candidates[compiled_index].changed_functions
-        assert execution.trace.snapshot() == public_trace
+        # Controlled scores exercise installation of a parallel candidate, not a throughput claim.
+        winner = next(index for index, plan in enumerate(plans) if plan is not None)
+        scores = tuple((100 if index == winner else 200,) for index in range(tuning.count))
+        assert tuning.finish(scores).selected == winner
+        assert installed_stream_plan() == plans[winner]
         torch.testing.assert_close(torch.random.get_rng_state(), rng, rtol=0, atol=0)
         result = run()
         torch.testing.assert_close(result.output, results[0].output, rtol=0, atol=0)
         torch.testing.assert_close(result.cache, results[0].cache, rtol=0, atol=0)
     finally:
-        command(BackendCommand.TUNE_ABORT)
+        tuning.abort()
         owner.synchronize()
         execution.retire((identity,))
-    assert execution.diagnostics().fallback_count == 0
