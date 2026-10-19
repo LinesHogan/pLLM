@@ -21,6 +21,7 @@ from vllm.v1.worker.gpu.sample.states import SamplingStates
 from vllm.v1.worker.gpu.states import RequestState
 
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback, SamplerStage
+from pllm.execution.cuda_stream import upload
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,7 +73,7 @@ class SamplerGuidance:
             raise ValueError("additive guidance differs from sampler logits")
         if guidance.guidance.affected_row_ids == tuple(range(logits.shape[0])):
             return logits + guidance.pred_dense_logits.to(logits)
-        rows = torch.tensor(guidance.guidance.affected_row_ids, device=logits.device, dtype=torch.long)
+        rows = upload(guidance.guidance.affected_row_ids, logits.device)
         output = logits.clone()
         output.index_add_(0, rows, guidance.pred_dense_logits.to(logits))
         return output

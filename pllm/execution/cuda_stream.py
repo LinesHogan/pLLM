@@ -1,8 +1,22 @@
-"""Opaque producer-to-consumer CUDA stream readiness capability."""
+"""Small CUDA helpers: stream readiness between producer and consumer, and non-blocking uploads."""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
+
+
+def upload(
+    values: Sequence[int] | Sequence[Sequence[int]], device: torch.device, dtype: torch.dtype = torch.long
+) -> torch.Tensor:
+    """Copy small host index lists to `device` without blocking the host.
+
+    `torch.tensor(values, device=cuda)` copies from pageable memory, which makes the host wait for
+    the stream. Staging through pinned memory lets the copy queue behind the GPU work instead.
+    """
+    host = torch.tensor(values, dtype=dtype)
+    return host.pin_memory().to(device, non_blocking=True) if device.type == "cuda" else host
 
 
 class CudaStreamReadiness:
@@ -29,4 +43,4 @@ class CudaStreamReadiness:
         self._event.synchronize()
 
 
-__all__ = ["CudaStreamReadiness"]
+__all__ = ["CudaStreamReadiness", "upload"]

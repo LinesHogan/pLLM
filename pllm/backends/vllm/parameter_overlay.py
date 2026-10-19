@@ -24,6 +24,7 @@ from pllm.contracts.parameter_overlay import (
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import StateScope
 from pllm.contracts.state_ref import StateRef
+from pllm.execution.cuda_stream import upload
 from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.state_execution import DataT, StateTaskContext
@@ -226,7 +227,7 @@ class VllmParameterOverlay:
             for (binding, ref, _), (pin, source, offset, size) in groups.items():
                 packed = tuple(row.packed_row_index for row in source)
                 indices = (
-                    torch.tensor(packed, dtype=torch.long, device=handle.module.weight.device)
+                    upload(packed, handle.module.weight.device)
                     if capturing or packed != tuple(range(packed[0], packed[0] + len(packed)))
                     else slice(packed[0], packed[0] + len(packed))
                 )

@@ -15,7 +15,7 @@ from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
 from pllm.contracts.semantic_graph import ImplementationId, SemanticOutputKind, StateResource, TaskSymbol
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
-from pllm.execution.cuda_stream import CudaStreamReadiness
+from pllm.execution.cuda_stream import CudaStreamReadiness, upload
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot, borrowed_root
 from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin, PagePublication, PageWrite
 from pllm.execution.ptts.page_capture import KernelCapture
@@ -79,7 +79,7 @@ class TensorBatch:
         indices = (
             group
             if group and len(rows) == count * group and rows == tuple(index // group for index in range(len(rows)))
-            else torch.tensor(rows, device=self.roots[0][0].device, dtype=torch.long)
+            else upload(rows, self.roots[0][0].device)
         )
         return tuple(
             TensorRows(
@@ -261,7 +261,7 @@ class PoolAdamW:
         roots = arena.lazy_roots((write,) * len(write.after_refs), write.after_refs)
         fields = tuple(roots.field_slots(i) for i in range(5))
         pools = tuple(pool.reshape(len(pool), -1) if index != 2 else pool for index, (pool, _) in enumerate(fields))
-        slots = torch.tensor([slots for _, slots in fields], dtype=torch.long, device=arena.device)
+        slots = upload([slots for _, slots in fields], arena.device)
         paged_adamw(pools, slots, torch.stack(gradients).reshape(len(gradients), -1), self.config)
         return True
 

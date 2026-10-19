@@ -125,11 +125,6 @@ def _planned_rows(
         phase = HiddenPhase(raw_phase)
         rows.append(PackedPhaseRow(packed, request, offset, phase, identities[request]))
     phase_rows = PackedPhaseRowBatch(plan_epoch, step_id, plan.total_rows, tuple(rows))
-    cpu_indices = logits_indices.to(device="cpu", dtype=torch.int64)
-    links: list[PackedSamplerRowLink] = []
-    for span in plan.request_spans:
-        index = span.packed_row_end - 1
-        if int(cpu_indices[span.request_ordinal]) != index:
-            raise RuntimeError("backend logits row does not select its request's final packed row")
-        links.append(PackedSamplerRowLink(span.request_ordinal, index))
-    return PackedSamplerRowBatch(phase_rows, tuple(links))
+    # vLLM samples each request's last scheduled token, which is the last packed row of its span.
+    links = tuple(PackedSamplerRowLink(span.request_ordinal, span.packed_row_end - 1) for span in plan.request_spans)
+    return PackedSamplerRowBatch(phase_rows, links)

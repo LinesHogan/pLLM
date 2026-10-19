@@ -45,6 +45,7 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 from pllm.execution.codec import register_gradient_hook
+from pllm.execution.cuda_stream import upload
 from pllm.execution.declaration import Builder, Call, Dimensions, Field, Shape, State, When, native
 from pllm.execution.ptts.page_borrow import borrowed_root
 from pllm.execution.ptts.page_bundle import PagePublication
@@ -192,7 +193,7 @@ def take_rows(values: torch.Tensor, rows: Sequence[int], device_rows: torch.Tens
     if tuple(rows) == tuple(range(first, first + len(rows))):
         return values.narrow(0, first, len(rows))
     if device_rows is None:
-        device_rows = torch.tensor(rows, dtype=torch.long, device=values.device)
+        device_rows = upload(rows, values.device)
     return values.index_select(0, device_rows)
 
 
@@ -240,7 +241,7 @@ class RowIndex:
             states,
             tuple(int(selection.refs[index].version_id) for index in states) if selection.groups else states,
         )
-        return cls(*columns, device=torch.tensor(columns, dtype=torch.long).to(device))
+        return cls(*columns, device=upload(columns, device))
 
 
 def row_index(data: "TensorFrame", batch: TensorBatch, device: torch.device) -> RowIndex:
@@ -263,7 +264,7 @@ def _state_rows(batch: TensorBatch, field: int) -> torch.Tensor:
     pool, slots = batch.field_slots(field)
     if len(slots) == 1:
         return pool[slots[0] : slots[0] + 1]
-    return pool.index_select(0, torch.tensor(slots, dtype=torch.long, device=pool.device))
+    return pool.index_select(0, upload(slots, pool.device))
 
 
 class _LeafRoots(Sequence[tuple[torch.Tensor, ...]]):

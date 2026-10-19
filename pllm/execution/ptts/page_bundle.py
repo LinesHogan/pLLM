@@ -6,6 +6,7 @@ from collections import Counter
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from itertools import accumulate
 from math import prod
 from multiprocessing.connection import Connection
@@ -14,6 +15,7 @@ from typing import overload
 from weakref import WeakSet
 
 import numpy as np
+import numpy.typing as npt
 import torch
 
 from pllm.contracts.compilation import PlanBundle
@@ -22,6 +24,7 @@ from pllm.contracts.state_ref import LineageId, StateRef, VersionId
 from pllm.contracts.state_representation import StateDeviceKind, StateProviderPlan
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorLayoutSpec
 from pllm.execution.codec import decode_boundary, encode_boundary
+from pllm.execution.cuda_stream import upload
 from pllm.execution.ptts.page_bundle_planning import DTYPE_BYTES, page_stride_bytes
 from pllm.execution.ptts.page_capture import CapturedPageFields, PagedKernel
 from pllm.execution.scheduler import validate_plan_bundle
@@ -123,6 +126,16 @@ class _Root:
 class _Write:
     targets: tuple[PageBundle, ...]
     fields: tuple[tuple[LayoutFieldId, ...], ...]
+    # after_ref -> (private root, writable field ids), built once per write.
+    by_ref: dict[StateRef, tuple[PageBundle, frozenset[int]]]
+
+
+@dataclass(slots=True)
+class _Pin:
+    """An issued pin: the exact roots it holds, and remote reads that must finish before release."""
+
+    roots: dict[StateRef, PageBundle]
+    remote: list[RemoteCompletion] = dataclass_field(default_factory=lambda: list[RemoteCompletion]())
 
 
 class LazyRoots(Sequence[tuple[torch.Tensor, ...]]):
@@ -132,19 +145,22 @@ class LazyRoots(Sequence[tuple[torch.Tensor, ...]]):
     page has not been reclaimed, so a stale read fails instead of seeing reused memory.
     """
 
-    __slots__ = ("_arena", "_roots", "_views")
+    __slots__ = ("_arena", "_roots", "_views", "_slots")
 
     def __init__(self, arena: "PageBundleArena", roots: tuple[tuple[PageBundle, frozenset[int] | None], ...]) -> None:
         self._arena = arena
         self._roots = roots
         self._views: list[tuple[torch.Tensor, ...] | None] = [None] * len(roots)
+        self._slots: dict[int, tuple[torch.Tensor, tuple[int, ...]]] = {}
 
     def __len__(self) -> int:
         return len(self._roots)
 
     def field_slots(self, field: int) -> tuple[torch.Tensor, tuple[int, ...]]:
         """The field's page pool and each state's slot in it, from the access validated at creation."""
-        return self._arena._slots_of(self._roots, LayoutFieldId(field))  # pyright: ignore[reportPrivateUsage]
+        if field not in self._slots:
+            self._slots[field] = self._arena._slots_of(self._roots, LayoutFieldId(field))  # pyright: ignore[reportPrivateUsage]
+        return self._slots[field]
 
     @overload
     def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]: ...
@@ -208,6 +224,20 @@ class _Pools:
         if self.generations[field, page.slot_id] != page.generation or self.holders[field, page.slot_id] < 1:
             raise RuntimeError("PageBundle allocation generation was reclaimed")
         return self.tensors[field][page.slot_id]
+
+    def release_many(self, roots: list[tuple[PageSlot, ...]]) -> None:
+        """Drop one hold on every page of several roots at once."""
+        slots: npt.NDArray[np.int64] = np.array([[page.slot_id for page in pages] for pages in roots], dtype=np.int64)
+        generations: npt.NDArray[np.int64] = np.array(
+            [[page.generation for page in pages] for pages in roots], dtype=np.int64
+        )
+        fields: npt.NDArray[np.int64] = np.broadcast_to(np.arange(slots.shape[1], dtype=np.int64), slots.shape)
+        if (self.generations[fields, slots] != generations).any() or (self.holders[fields, slots] < 1).any():
+            raise RuntimeError("PageBundle allocation generation was reclaimed")
+        np.subtract.at(self.holders, (fields, slots), 1)
+        freed = np.zeros_like(self.holders, dtype=np.bool_)
+        freed[fields, slots] = True
+        self.generations[freed & (self.holders == 0)] += 1
 
     def release(self, pages: tuple[PageSlot, ...]) -> None:
         for field, page in enumerate(pages):
@@ -296,7 +326,7 @@ class PageBundleArena:
         self._retiring: set[LineageId] = set()  # retired lineages that still own roots
         self._root_count: Counter[LineageId] = Counter()  # roots per lineage
         self._writing: set[LineageId] = set()  # lineages with a pending private write
-        self._pins: dict[PagePin, list[RemoteCompletion]] = {}
+        self._pins: dict[PagePin, _Pin] = {}
         self._publications: dict[PagePublication, bool] = {}
         self._releases: set[PageRelease] = set()
         self._issued_releases: WeakSet[PageRelease] = WeakSet()
@@ -555,7 +585,14 @@ class PageBundleArena:
         ]
         token = PageWrite(self._next_operation, sources, targets, stream)
         self._next_operation += 1
-        self._writes[token] = _Write(tuple(allocated), fields)
+        self._writes[token] = _Write(
+            tuple(allocated),
+            fields,
+            {
+                root.ref: (root, frozenset(int(field) for field in chosen))
+                for root, chosen in zip(allocated, fields, strict=True)
+            },
+        )
         self._writing.update(ref.lineage_id for ref in sources)
         for ref in sources:
             self._roots[ref].pins += 1
@@ -581,13 +618,13 @@ class PageBundleArena:
                     if len(slots) == 1:
                         pool[slots[0]].zero_()
                     else:
-                        pool.index_fill_(0, torch.tensor(slots, device=pool.device), 0)
+                        pool.index_fill_(0, upload(slots, pool.device), 0)
                 for (resource, field), (origins, slots) in copies.items():
                     pool = self._pools[resource].tensors[field]
                     if len(slots) == 1:
                         pool[slots[0]].copy_(pool[origins[0]])
                     else:
-                        indices = torch.tensor([origins, slots], device=pool.device)
+                        indices = upload([origins, slots], pool.device)
                         pool.index_copy_(0, indices[1], pool.index_select(0, indices[0]))
         except Exception:
             self.abort(token)
@@ -662,7 +699,7 @@ class PageBundleArena:
             self._next_pin += 1
             for ref in refs:
                 self._roots[ref].pins += 1
-            self._pins[token] = []
+            self._pins[token] = _Pin(dict(zip(refs, roots, strict=True)))
             return token
 
     def borrow_field(self, pin: PagePin, ref: StateRef, field: LayoutFieldId) -> torch.Tensor:
@@ -683,31 +720,19 @@ class PageBundleArena:
         Every distinct token is validated once, so a batch over many states costs O(states).
         Pinned roots carry None: all their fields are readable.
         """
-        pins: dict[int, frozenset[StateRef]] = {}
-        writes: dict[int, tuple[_Write, dict[StateRef, int]]] = {}
         result: list[tuple[PageBundle, frozenset[int] | None]] = []
         for token, ref in zip(access, refs, strict=True):
             match token:
                 case PagePin():
-                    held = pins.get(id(token))
-                    if held is None:
-                        self._issued_pin(token)
-                        held = pins[id(token)] = frozenset(token.refs)
-                    if ref not in held:
+                    root = self._issued_pin(token).roots.get(ref)
+                    if root is None:
                         raise RuntimeError("PageBundle root is not held by this pin")
-                    result.append((self.root(ref), None))
+                    result.append((root, None))
                 case PageWrite():
-                    entry = writes.get(id(token))
+                    entry = self._issued_write(token).by_ref.get(ref)
                     if entry is None:
-                        entry = writes[id(token)] = (
-                            self._issued_write(token),
-                            {after: index for index, after in enumerate(token.after_refs)},
-                        )
-                    write, positions = entry
-                    index = positions.get(ref)
-                    if index is None:
                         raise RuntimeError("PageBundle root is not written by this transaction")
-                    result.append((write.targets[index], frozenset(int(field) for field in write.fields[index])))
+                    result.append(entry)
         return tuple(result)
 
     def lazy_roots(self, access: tuple[PagePin | PageWrite, ...], refs: tuple[StateRef, ...]) -> "LazyRoots":
@@ -804,10 +829,10 @@ class PageBundleArena:
                 counts[state] += 1
 
             def index(values: tuple[int, ...]) -> torch.Tensor:
-                return torch.tensor(values, device=self.device, dtype=torch.long)
+                return upload(values, self.device)
 
             row_order, row_states = index(order), index(rows)
-            offsets = torch.tensor(tuple(accumulate(counts)), device=self.device, dtype=torch.int32)
+            offsets = upload(tuple(accumulate(counts)), self.device, torch.int32)
             active = torch.ones(len(rows), device=self.device, dtype=torch.bool)
             pools = self._pools[roots[0].resource]
             slots = torch.tensor(
@@ -964,11 +989,10 @@ class PageBundleArena:
             raise ValueError("captured selection requires distinct nonempty original refs")
         match access:
             case PagePin():
-                self._issued_pin(access)
-                held = set(access.refs) if len(refs) > 1 else access.refs
+                held = self._issued_pin(access).roots
                 if any(ref not in held for ref in refs):
                     raise RuntimeError("PageBundle root is not held by this pin")
-                roots = tuple(self.root(ref) for ref in refs)
+                roots = tuple(held[ref] for ref in refs)
             case PageWrite():
                 write = self._issued_write(access)
                 positions = {ref: index for index, ref in enumerate(access.after_refs)}
@@ -1147,7 +1171,7 @@ class PageBundleArena:
             value = self.borrow_field(pin, ref, field)
             root = self.root(ref)
             descriptor, completion = self._export(root, field, value, pin.pin_id, connection, pin.stream)
-            self._issued_pin(pin).append(completion)
+            self._issued_pin(pin).remote.append(completion)
             # Retain completion before sending: even a partial send may expose the mapping.
             connection.send_bytes(encode_boundary(descriptor).encode())
             return descriptor
@@ -1169,7 +1193,10 @@ class PageBundleArena:
             raise ValueError("page export requires a signed shared CUDA provider and stream")
         held_reads = (
             read
-            for reads in (*self._pins.values(), *(release.remote_reads for release in self._releases))
+            for reads in (
+                *(pin.remote for pin in self._pins.values()),
+                *(release.remote_reads for release in self._releases),
+            )
             for read in reads
         )
         if any(remote.connection is connection for remote in held_reads):
@@ -1254,7 +1281,7 @@ class PageBundleArena:
     def release_pin(self, pin: PagePin) -> PageRelease:
         with self._lock:
             held = self._issued_pin(pin)
-            receipt = PageRelease(self._next_release, pin, self._record(pin.stream), tuple(held))
+            receipt = PageRelease(self._next_release, pin, self._record(pin.stream), tuple(held.remote))
             self._next_release += 1
             self._pins.pop(pin)
             self._issued_releases.add(receipt)
@@ -1333,12 +1360,13 @@ class PageBundleArena:
 
     def _reclaim(self) -> None:
         """Release stale roots that no pin holds and whose last GPU writer has finished."""
+        released: dict[str, list[tuple[PageSlot, ...]]] = {}
         for ref in tuple(self._stale):
             stored = self._roots[ref]
             bundle = stored.bundle
             if stored.pins or (bundle.readiness is not None and not bundle.readiness.query()):
                 continue
-            self._pools[bundle.resource].release(bundle.pages)
+            released.setdefault(bundle.resource, []).append(bundle.pages)
             del self._roots[ref]
             self._stale.discard(ref)
             self._root_count[ref.lineage_id] -= 1
@@ -1347,6 +1375,8 @@ class PageBundleArena:
                 if ref.lineage_id in self._retiring:
                     self._retiring.discard(ref.lineage_id)
                     del self._lineages[ref.lineage_id]
+        for resource, pages in released.items():
+            self._pools[resource].release_many(pages)
 
     def _issued_write(self, token: PageWrite) -> _Write:
         self._require_live()
@@ -1355,7 +1385,7 @@ class PageBundleArena:
             raise RuntimeError("PageBundle write is not an issued token or is already consumed")
         return write
 
-    def _issued_pin(self, pin: PagePin) -> list[RemoteCompletion]:
+    def _issued_pin(self, pin: PagePin) -> _Pin:
         self._require_live()
         issued = self._pins.get(pin)
         if issued is None:

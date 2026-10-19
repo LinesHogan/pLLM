@@ -21,6 +21,7 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import StateResource, StateScope
 from pllm.contracts.state_ref import StateRef
 from pllm.execution.activation import low_rank_affine_delta
+from pllm.execution.cuda_stream import upload
 from pllm.execution.ptts.page_bundle import PagePin
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.region_resources import PinnedResourceBinding, PinnedResourceCell, RegionPageOwner
@@ -148,7 +149,7 @@ class VllmActivationPatch:
                         raise RuntimeError("HOLD injection differs from the last successful exact ref")
                     prepared.append(
                         _PatchRows(
-                            torch.tensor(selected, device=context.arena.device, dtype=torch.long),
+                            upload(selected, context.arena.device),
                             tuple(context.arena.borrow_field(pin, ref, field) for field in handle.binding.fields),
                             selected,
                             pin,
