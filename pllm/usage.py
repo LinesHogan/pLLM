@@ -30,12 +30,14 @@ from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
     ConditionalLayerReplay,
     HiddenInputSource,
+    HostServiceInputSource,
     LossReduction,
     MathContract,
     SamplerFeedbackInputSource,
     SchedulerTimeline,
     SemanticGraph,
     SemanticInputSource,
+    SemanticTask,
     StateScope,
     TaskImplementationSpec,
     TaskResourceFact,
@@ -459,7 +461,6 @@ class Workload(
     """Python methods and effects compiled once, not runtime hooks or a second IR."""
 
     name: ClassVar[str] = "python.workload"
-    staged_training: ClassVar[bool] = False
 
     def _build(self, b: TensorBinding) -> None:
         owner = _snapshot(self)
@@ -898,11 +899,6 @@ class Workload(
                     raise ValueError("tensor sampler attachment requires one logits operation")
                 prediction = call, effect
         b.validate_gradients(None if training is None else training[0])
-        if training is not None:
-            call, state = training
-            task = next(task for task in b.graph.tasks if task.symbol == call.symbol)
-            if self.staged_training and task.math is not None and task.math.reduction == "state_mean":
-                training = b.stage_update(call, state), state
         if prediction is not None:
             if training is None:
                 raise ValueError("logits attachment requires a training operation")
@@ -1060,19 +1056,31 @@ class Workload(
         if type(self).resource_facts is not Workload.resource_facts:
             return facts.timeline
         b = self.declaration(facts)
-        if not b.tensor_tasks:
+        if not b.tensor_tasks and not b.weighted_training:
             return facts.timeline
-        rows = facts.max_admitted_lineages
+        rows, hidden = facts.max_admitted_lineages, facts.probe.hidden_size
         parameters = sum(prod(field.shape) for entry in b.layouts.layouts for field in entry.layout.fields)
         resident = options.capture_memory_bytes if options.capture else 0
+        states = rows if any(state.scope is StateScope.REQUEST for state in b.graph.states) else 1
+
+        batch = (states, options.training_rows)
+
+        def input_shapes(task: SemanticTask) -> tuple[tuple[int, ...], ...]:
+            # External training batches are [states, training rows, ...]; model rows are [rows, hidden].
+            if any(isinstance(port.source, HostServiceInputSource) for port in task.inputs):
+                return ((*batch, hidden), (*batch, facts.vocab_size))
+            if task.math is not None and task.math.reduction == "weighted_state_mean_then_mean":
+                return ((*batch, hidden),)
+            return ((rows, hidden),)
+
         return replace(
             facts.timeline,
             task_resources=tuple(
                 TaskResourceFact(
                     task.symbol,
-                    4 * rows * (4 * parameters + 16 * facts.probe.hidden_size),
+                    4 * rows * (4 * parameters + 16 * hidden),
                     resident if task.symbol in b.tensor_tasks else 0,
-                    ((rows, facts.probe.hidden_size),),
+                    input_shapes(task),
                 )
                 for task in b.graph.tasks
             ),
@@ -1095,8 +1103,6 @@ class Workload(
     def operations(
         self, facts: BackendCompileFacts, plan: PlanBundle, b: TensorBinding
     ) -> MathBinding[TensorStepInput, TensorFrame, TensorOutput]:
-        if plan.timeline.task_resources:
-            self.require_resources(plan, self.minimum_resources(facts, plan))
         if plan.timeline.task_resources and b.tensor_tasks and type(self).operations is Workload.operations:
             capture = "compute/cuda_graph@1" in plan.timeline.capabilities
             limits = {fact.task: fact for fact in plan.timeline.task_resources}

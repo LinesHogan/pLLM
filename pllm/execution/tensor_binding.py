@@ -717,9 +717,8 @@ class TensorBinding(Builder[TensorFrame]):
             limit = next((fact for fact in self.resources if fact.task == name), None)
             if limit is not None and len(limit.input_shapes) != 1:
                 raise ValueError("weighted training requires one signed input shape")
+            # Resource derivation builds the graph before the batch bound exists; execution always has it.
             shape = None if limit is None or not limit.input_shapes else limit.input_shapes[0]
-            if state.declaration.scope is StateScope.REQUEST and shape is None:
-                raise ValueError("independent training requires signed [states, rows, hidden] input bounds")
             if shape is not None and (
                 len(shape) != 3
                 or min(shape) < 1
@@ -993,60 +992,6 @@ class TensorBinding(Builder[TensorFrame]):
         visit(training.symbol)
         if retained - visited or not resources:
             raise ValueError("training must consume the declared differentiable parameter paths")
-
-    def stage_update(self, loss: Call, state: State) -> Call:
-        """Separate the original loss result from its private optimizer mutation."""
-        task = next(task for task in self.graph.tasks if task.symbol == loss.symbol)
-        if task.math is None or task.math.forward_rows or task.math.update_states == "__update_states":
-            raise ValueError("staged state_mean requires an unconditional state update")
-        if self.dimensions is not None:
-            operation = self.operations[loss.symbol]
-
-            def evaluate(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
-                output = operation.function(data, batch)
-                data.pending_update = output
-                return TaskOutput(loss=output.loss, loss_count=output.loss_count, observations=output.observations)
-
-            self.operations[loss.symbol] = replace(operation, function=evaluate, mode="read", optimizer=None)
-        self.graph = replace(
-            self.graph,
-            tasks=tuple(
-                replace(
-                    task,
-                    effects=tuple(replace(effect, kind=StateEffectKind.READ) for effect in task.effects),
-                    math=None if task.math is None else replace(task.math, update_states=""),
-                )
-                if task.symbol == loss.symbol
-                else task
-                for task in self.graph.tasks
-            ),
-        )
-
-        def update(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
-            output = data.pending_update
-            if output is None:
-                raise RuntimeError("optimizer requires its planned loss result")
-            data.pending_update = None
-            return replace(output, loss=None, loss_count=0, observations=())
-
-        transition = self.compute(
-            "train" if loss.symbol != "train" else "train.update",
-            inputs={"gradient": loss[loss.outputs[0]], "state": state.read()},
-            outputs=("publication",),
-            result_schema="canonical.page_publication@1",
-            changes=state,
-            when=When.AFTER_SAMPLE,
-            math=MathContract(update_states="state"),
-            function=update,
-        )
-        self.graph = replace(
-            self.graph,
-            tasks=tuple(
-                replace(entry, timing=task.timing) if entry.symbol == transition.symbol else entry
-                for entry in self.graph.tasks
-            ),
-        )
-        return transition
 
     def logits(
         self,

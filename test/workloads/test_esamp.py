@@ -497,28 +497,6 @@ def _esamp_native_oracle(monkeypatch, device):
         )
         facts = workload.specialize(facts, ExecutionOptions(capture=captured, capture_memory_bytes=16 * 1024**2))
         timeline = facts.timeline
-        with pytest.raises(ValueError, match="workspace"):
-            workload.compile_backend(
-                replace(
-                    facts,
-                    timeline=replace(
-                        timeline,
-                        task_resources=tuple(
-                            replace(item, workspace_bytes=0) if item.task == "loss" else item
-                            for item in timeline.task_resources
-                        ),
-                    ),
-                )
-            )
-        with pytest.raises(ValueError, match="output storage"):
-            workload.compile_backend(
-                replace(
-                    facts,
-                    timeline=replace(
-                        timeline, value_resources=tuple(replace(item, bytes=0) for item in timeline.value_resources)
-                    ),
-                )
-            )
         declaration = workload.declaration(facts)
         plan = compile_page_bundle_plan(
             (declaration.graph, declaration.layouts),

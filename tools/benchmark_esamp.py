@@ -1,18 +1,16 @@
-"""Public ESamp eager/capture comparison."""
+"""ESamp through the public execution path, eager and with step capture."""
 
 from pllm.benchmark import BenchmarkOptions, compare
 from pllm.workloads import ESampRequestConfig, ESampRequestWorkload
 
 
 def main() -> None:
-    paged = ESampRequestWorkload(ESampRequestConfig(rank=4, paged=True))
     compare(
         ESampRequestWorkload(ESampRequestConfig(rank=4)),
         BenchmarkOptions.parse(),
-        explicit_math=True,
+        training_rows=1,
         capture=True,
         require_training=True,
-        alternatives=(("paged", paged, False), ("paged_capture", paged, True)),
     )
 
 

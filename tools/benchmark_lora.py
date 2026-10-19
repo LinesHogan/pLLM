@@ -62,17 +62,14 @@ def main() -> None:
         print(
             f"rank={config.rank}, training_rows={args.training_rows}, active_rows={active}, steps={config.steps}, state_groups={states}"
         )
-        paged = OutputLoRAWorkload(replace(config, paged=True))
         compare(
             OutputLoRAWorkload(config),
             replace(options, profile=None if options.profile is None else options.profile / scope.value),
             prepare=lambda handle: prepare(handle.hidden_size, handle.vocab_size, handle.device),
             training_rows=args.training_rows,
-            explicit_math=True,
             capture=True,
             require_training=True,
             prompt_indices=indices,
-            alternatives=(("paged", paged, False), ("paged_capture", paged, True)),
         )
 
 

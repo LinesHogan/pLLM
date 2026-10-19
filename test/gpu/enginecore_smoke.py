@@ -192,19 +192,12 @@ def _captured_esamp(runner: RunnerKind = RunnerKind.MRV2) -> None:
         ),
     )
     try:
-        assert (
-            sum(
-                "cuda_graph" in task.implementation_id for task in handle.attachment.inputs.plan.schedule_physical.tasks
-            )
-            == 2
-        )
-        selected = tuple(
-            task.task_id
-            for task in handle.attachment.inputs.plan.schedule_physical.tasks
-            if "cuda_graph" in task.implementation_id
-        )
+        tasks = handle.attachment.inputs.plan.schedule_physical.tasks
+        selected = tuple(task.task_id for task in tasks if "cuda_graph" in task.implementation_id)
+        assert len(selected) == len(tasks)
         handle.profile_tasks(selected)
-        handle.observe(TraceSelection(tasks=(selected[0],), gradients=True, kernel_calls=1))
+        loss = next(task.task_id for task in tasks if ":loss@" in task.implementation_id)
+        handle.observe(TraceSelection(tasks=(loss,), gradients=True, kernel_calls=1))
         for prompts in (["The sky is", "The sea is", "The grass is"], ["Water freezes at"]):
             handle.generate(prompts, SamplingParams(max_tokens=3, temperature=0.0, ignore_eos=True))
         diagnostics = handle.worker_state().diagnostics
