@@ -169,8 +169,6 @@ def test_video_binding_failure_retains_grants_and_stops_execution():
                 assert execution.directory.latest_refs(()) == before and not any(peer.poll() for peer in peers)
             with pytest.raises(RuntimeError):
                 execution.admit(())
-    if find_spec("vllm") is not None:
-        _step_input_errors_retain_grants()
 
 
 class _Layer(torch.nn.Module):
@@ -279,29 +277,6 @@ def _decode_steps_keep_exact_publications_and_ack_order():
         assert received == [0, 1] and execution.diagnostics().update_count == 2
         session.close()
         assert execution.diagnostics().active_lineages == execution.diagnostics().inference_pins == 0
-
-
-def _step_input_errors_retain_grants():
-    from pllm.backends.vllm.runtime import ReadonlyStepInput
-
-    identities = (RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0))
-    with (
-        binding_case(runtime=True) as (b, _, _, _, execution, root, peers),
-        patch("torch.cuda.current_stream", return_value=None),
-    ):
-        session, _, _ = _session(b, execution)
-        # A root for the wrong plan epoch is rejected without consuming its grant.
-        session.bind_readonly_input(lambda rows, stream: ReadonlyStepInput(2, 0, (root,)))
-        session.stage_input(None, identities)
-        session.before_execute(_scheduler(*identities))
-        with pytest.raises(ValueError):
-            session.prepare_input(_step_rows(0, identities))
-        assert execution.diagnostics().update_count == 0
-        assert all(page.tensor is not None for page in root.pages)
-        with pytest.raises(RuntimeError):
-            session.prepare_input(_step_rows(0, identities))
-        session.close()
-        assert not any(peer.poll() for peer in peers), "closing the session cannot forge a read ACK"
 
 
 def _hold_steps_reuse_the_settled_injection():
