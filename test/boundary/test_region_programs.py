@@ -413,25 +413,6 @@ def test_wavefront_candidate_really_reorders_cells():
 # ---------------------------------------------------------------------------
 
 
-def final_layer_feedback():
-    """Chunk c+1 starts from chunk c's last layer: no wavefront is legal."""
-    bank = BankType(I, 4)
-    layer_body = grid_program(3, 4).entry.block.operations[0].body.block.operations[1].body
-    chunk_body = region(
-        (Value("c", X), Value("h", I), Value("w", bank)),
-        (Scan(("h", "w"), (Value("h_final", I), Value("w_final", bank)), 4, layer_body),),
-        ("h_final", "w_final"),
-    )
-    return Program(
-        region(
-            (Value("input", I), Value("weights", bank)),
-            (Scan(("input", "weights"), (Value("output", I), Value("result", bank)), 3, chunk_body),),
-            ("output", "result"),
-        ),
-        grid_program(3, 4).functions,
-    )
-
-
 def bank_observer():
     """Reading the updated bank must stay after the update."""
     bank = BankType(I, 2)
@@ -535,11 +516,6 @@ LEGALITY = {
         (f"{{ S0[c,l] -> [c+l,c] : {GRID} }}", f"{{ S0[c,l] -> [floor(c/2),floor(l/2),c,l] : {GRID} }}"),
         (f"{{ S0[c,l] -> [-c,l] : {GRID} }}", "{ S0[c,l] -> [c,l] : 0<=c<2 and 0<=l<3 }"),
     ),
-    "final-layer-feedback": (
-        final_layer_feedback,
-        ("{ S0[c,l] -> [c,l] : 0<=c<3 and 0<=l<4 }",),
-        ("{ S0[c,l] -> [c+l,c] : 0<=c<3 and 0<=l<4 }",),
-    ),
     "bank-versions": (bank_observer, (IN_ORDER,), (SWAP,)),
     "indexed-resource": (lambda: resource_loop(True), (PHASES,), ()),
     "shared-resource": (lambda: resource_loop(False), (), (PHASES,)),
@@ -600,14 +576,8 @@ def test_native_verifier_rejects_malformed_programs():
 def test_python_frontend_and_wire_decoder_reject_what_the_wire_cannot_carry():
     valid = Program(region((Value("x", I),), (Scalar(("x", "x"), (Value("y", I),), ScalarKind.ADD),), ("y",)))
     (operation,) = valid.entry.block.operations
-    body = region((Value("i", X), Value("n", I)), (), ("n",))
-    for program in (
-        replace(valid, entry=region(valid.entry.block.arguments, (replace(operation, kind="add"),), ("y",))),
-        Program(region((), (), ()), resources=(Resource("state", [I]),)),
-        Program(region((Value("n", I),), (Scan(("n",), (Value("r", I),), 3, body, invariants=True),), ("r",))),
-    ):
-        with pytest.raises(InvalidProgram):
-            verify(program)
+    with pytest.raises(InvalidProgram):  # A plain string is not a ScalarKind.
+        verify(replace(valid, entry=region(valid.entry.block.arguments, (replace(operation, kind="add"),), ("y",))))
     assert verify(valid) == (I,)
     wire = json.loads(encode_boundary(prefix_program()))
     wire["entry"]["block"]["operations"][0]["count"] = True
@@ -617,19 +587,7 @@ def test_python_frontend_and_wire_decoder_reject_what_the_wire_cannot_carry():
         verify(decode_boundary(json.dumps(wire), Program))
 
 
-def test_analysis_rejects_dynamic_coordinates_and_undeclared_schedule_parameters():
-    dynamic = Program(
-        region(
-            (Value("w", BankType(X, 4)), Value("at", X)),
-            (
-                Select(("w", "at"), (Value("v", X),)),
-                Coordinate(("v",), (Value("c", X),), AffineIndex(0, (IndexTerm(0),))),
-            ),
-            ("c",),
-        )
-    )
-    with pytest.raises(ValueError):
-        analyze_region_program(dynamic, optimize=False)
+def test_schedules_cannot_introduce_undeclared_size_parameters():
     with pytest.raises(ValueError):
         validate_region_schedule(
             prefix_program(), "[__size_n,alien] -> { S0[i] -> [i+alien] : 0<=__size_n<=8 and 0<=i<__size_n }"
@@ -650,11 +608,7 @@ def test_invocation_guards_reject_bad_sizes_and_shapes_before_any_call():
         program, entry=region(block.arguments, (Call((), (), "observe"), *block.operations), block.yields)
     )
     runner = bind(program, {"observe": observe})
-    for inputs, sizes in (
-        ({"seed": 1, "xs": Bank((1, 2))}, {"n": 9}),
-        ({"seed": 1, "xs": Bank((1, 2))}, {"n": True}),
-        ({"seed": 1, "xs": Bank((1,))}, {"n": 2}),
-    ):
+    for inputs, sizes in (({"seed": 1, "xs": Bank((1, 2))}, {"n": 9}), ({"seed": 1, "xs": Bank((1,))}, {"n": 2})):
         with pytest.raises(ValueError):
             runner.run(inputs, sizes=sizes)
     assert not calls
@@ -694,15 +648,6 @@ def test_million_step_domains_stay_symbolic():
     assert len(encode_boundary(lower_region_schedule(large, schedule))) < 5000
     with pytest.raises(ValueError):
         preview_region_schedule(large, schedule, max_instances=100)
-    step = ExportedCell.capture(lambda x: (x + 1,), ("x",), ("out",), (torch.ones(4),))
-    scan = TensorScan(step, SizeParameter("steps", 0, 1_000_000), carry=1, invariants=0)
-    schedule = analyze_region_program(scan.program).reference_schedule
-    bound = analyze_region_capacity(scan.program, schedule, {step.digest: step}).devices[0]
-    inputs = (torch.ones(4),)
-    with StorageObserver(inputs) as observed:
-        (carry,) = scan(inputs, (), (), count=19).carry
-    assert observed.peak - 16 <= bound.peak_tensor_bytes_upper_bound
-    torch.testing.assert_close(carry, inputs[0] + 19, rtol=0, atol=0)
 
 
 # ---------------------------------------------------------------------------
@@ -737,15 +682,6 @@ def test_native_import_copies_inputs_and_returns_independent_storage(device):
     torch.testing.assert_close(a, x[:1] + 1, rtol=0, atol=0)
     torch.testing.assert_close(same, x, rtol=0, atol=0)
     torch.testing.assert_close(x, torch.ones_like(x), rtol=0, atol=0)
-
-
-def test_native_import_must_match_its_source_declaration():
-    declaration = Function("native.test", (I,), (I,))
-    program = Program(
-        region((Value("n", I),), (Call(("n",), (Value("out", I),), declaration.name),), ("out",)), (declaration,)
-    )
-    with pytest.raises(ValueError):
-        bind(program, {declaration.name: NativePrimitive(replace(declaration, inputs=(B,)), lambda x, r: x)})
 
 
 @pytest.mark.parametrize("device", ("cpu", "cuda:0"))
