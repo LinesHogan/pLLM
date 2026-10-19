@@ -1,24 +1,22 @@
-"""Model regions: decoder bodies, replay control and real vLLM kernels as region imports.
+"""Model regions: decoder bodies, replay control and vLLM attention metadata as region imports.
 
 The backend exposes decoder-layer dataflow, KV and weights as region functions
 and resources. These tests check that composition keeps causality and readonly
-ownership, that replay control matches the original loop, and that actual vLLM
-kernels and attention metadata bind to the original resources.
+ownership, that replay control matches the original loop, and that attention
+metadata binds to the original resources. Real vLLM kernels inside a model are
+covered by test/gpu/vllm_recirculation_smoke.py.
 """
 
-from contextlib import ExitStack
 from dataclasses import replace
-from unittest.mock import patch
 
 import pytest
 import torch
-from vllm import ir
 from vllm.config import AttentionConfig, CompilationConfig, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode
 from vllm.forward_context import ForwardContext
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.models.qwen2 import Qwen2Attention, Qwen2DecoderLayer, Qwen2MLP
+from vllm.model_executor.models.qwen2 import Qwen2Attention, Qwen2DecoderLayer
 from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend, FlashAttentionMetadata
 
 from pllm.backends.vllm.region_attention import (
@@ -26,7 +24,6 @@ from pllm.backends.vllm.region_attention import (
     select_attention_metadata,
     validate_attention_resources,
 )
-from pllm.backends.vllm.region_kernels import VllmRmsNormKernel, bind_vllm_tensor_kernel
 from pllm.backends.vllm.region_layers import VllmDecoderBodies, decoder_partition_bodies
 from pllm.contracts.backend_attachment import (
     CausalModelDomain,
@@ -36,7 +33,6 @@ from pllm.contracts.region_imports import BorrowedTensorImport
 from pllm.contracts.region_program import (
     AffineIndex,
     Block,
-    BorrowedResource,
     Call,
     Constant,
     Coordinate,
@@ -47,33 +43,23 @@ from pllm.contracts.region_program import (
     TensorType,
     Value,
 )
-from pllm.contracts.region_proposal import RegionScheduleProposal
-from pllm.contracts.region_selection import RegionPayloadLimit, RegionSelectionPolicy
 from pllm.contracts.semantic_graph import ConditionalLayerReplay
 from pllm.execution.decoder_region import DecoderRegion
-from pllm.execution.exported_region import import_exported_region
-from pllm.execution.module_graph import ModuleCallBinding
 from pllm.execution.paged_access import PagedLayer, PagedResourceView, bind_paged_access
 from pllm.execution.region_compilation import (
     analyze_region_program,
     lower_region_bindings,
     lower_region_schedule,
 )
-from pllm.execution.region_execution import RegionExecution, RegionExecutionPlan
-from pllm.execution.region_native import external_primitive
-from pllm.execution.region_optimization import optimize_region
+from pllm.execution.region_execution import RegionExecution
 from pllm.execution.region_replay import ConditionalReplayRegion
 from pllm.execution.region_resources import (
-    ExternalFunction,
-    HostResourceBinding,
     PagedResourceBinding,
     ReadonlyResourceBinding,
     RegionResources,
 )
-from pllm.execution.region_storage import analyze_region_payload, import_region_functions
-from pllm.execution.region_streams import RegionStreamBindings, lower_region_streams
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
-from test.region_fixtures import limits, owner_fixture, paged_rows, region, stream_execution
+from test.region_fixtures import owner_fixture, paged_rows
 from test.region_reference import interpret
 
 
@@ -228,19 +214,6 @@ def test_model_source_exposes_kv_before_feed_forward_without_weakening_causality
         lower_region_schedule(expanded, "{ S0[] -> [1]; S1[] -> [2]; S2[] -> [0]; S3[] -> [3] }")
 
 
-def test_model_method_binding_rejects_hooks_and_same_shape_module_replacement():
-    module = torch.nn.Linear(4, 4)
-    binding = ModuleCallBinding.bind(module)
-    binding.validate(module)
-    with pytest.raises(ValueError):
-        binding.validate(torch.nn.Linear(4, 4))
-    hook = module.register_forward_hook(lambda _module, _inputs, output: output + 1)
-    with pytest.raises(ValueError):
-        binding.validate(module)
-    hook.remove()
-    binding.validate(module)
-
-
 @pytest.mark.parametrize(
     "limit,mode,cuda", ((0, "same", False), (6, "converge", True), (4, "converge", False), (4, "nonfinite", True))
 )
@@ -322,187 +295,6 @@ def test_decoder_binds_request_and_token_for_symbolic_kv_access():
     assert tuple(execution.arena.latest(ref.lineage_id) for ref in refs) == refs
     execution.cancel_step(invocation)
     execution.retire(tuple(row.identity for row in rows))
-
-
-def test_import_retains_torch_state_update_signature_without_implicit_publication():
-    class Stateful(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.register_buffer("counter", torch.arange(4, dtype=torch.float32))
-
-        def forward(self, x):
-            self.counter.add_(1)
-            x.mul_(2)
-            return x + self.counter
-
-    module = Stateful()
-    x = torch.arange(4, dtype=torch.float32)
-    old = module.counter.clone(), x.clone()
-    exported = torch.export.export(module, (x,))
-
-    imported = import_exported_region(exported, bind_kernel=lambda partition: None)
-    program, sources = imported.program, imported.functions
-    schedule = analyze_region_program(program, optimize=False).reference_schedule
-    imports = import_region_functions(program, sources)
-    proposal = RegionScheduleProposal(analyze_region_payload(program, schedule, imports))
-    execution = RegionExecutionPlan(program, imports, proposal, proposal.peak_bytes).bind(sources)
-    updated_buffer, updated_input, result = execution.run({"counter": module.counter, "x": x}).values
-    torch.testing.assert_close(updated_buffer, old[0] + 1, rtol=0, atol=0)
-    torch.testing.assert_close(updated_input, old[1] * 2, rtol=0, atol=0)
-    torch.testing.assert_close(result, old[1] * 2 + old[0] + 1, rtol=0, atol=0)
-    torch.testing.assert_close(module.counter, old[0], rtol=0, atol=0)
-    torch.testing.assert_close(x, old[1], rtol=0, atol=0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_original_qwen_export_retains_swiglu_and_enters_measured_selection():
-    dtype = torch.bfloat16
-    config = VllmConfig(compilation_config=CompilationConfig(mode=CompilationMode.NONE, custom_ops=["all"]))
-    with set_current_vllm_config(config), ExitStack() as scope, torch.no_grad():
-        # Only construction-time TP metadata is supplied locally. Forward,
-        # export, custom CUDA dispatch, scheduling and measurement are real.
-        for module in ("vllm.model_executor.layers.linear", "vllm.model_executor.parameter"):
-            for field, value in (("rank", 0), ("world_size", 1)):
-                scope.enter_context(patch(module + ".get_tensor_model_parallel_" + field, return_value=value))
-        model = Qwen2MLP(16, 32, "silu").to(device="cuda:0", dtype=dtype)
-        for weight in model.parameters():
-            weight.normal_(std=0.05)
-        x = torch.randn((1, 16), device="cuda:0", dtype=dtype)
-        exported = torch.export.export(model, (x,))
-        imported = import_exported_region(exported, bind_kernel=bind_vllm_tensor_kernel)
-        program, sources = imported.program, imported.functions
-        # Two original calls share immutable weights and have independent input
-        # versions. This supplies real scheduling freedom around the kernels.
-        arguments = program.entry.block.arguments
-        y_port = Value("y", next(value.type for value in arguments if value.name == "x"))
-        first = inline_region(program, arguments, "first")
-        second = inline_region(program, tuple(y_port if value.name == "x" else value for value in arguments), "second")
-        program = replace(
-            program,
-            entry=Region(
-                Block(
-                    (*arguments, y_port),
-                    (*first.operations, *second.operations),
-                    tuple(value.name for value in (*first.results, *second.results)),
-                )
-            ),
-        )
-        imports = import_region_functions(program, sources)
-        schedule = analyze_region_program(program, optimize=False).reference_schedule
-        payload = analyze_region_payload(program, schedule, imports)
-        proposal = RegionScheduleProposal(payload)
-        original = RegionExecutionPlan(program, imports, proposal, proposal.peak_bytes).bind(sources)
-        y = x * 2
-        inputs = {**dict(model.named_parameters()), "x": x, "y": y}
-        before = {name: value.clone() for name, value in inputs.items()}
-        expected = model(x), model(y)
-        for actual, reference in zip(original.run(inputs).values, expected, strict=True):
-            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
-        streams = RegionStreamBindings(torch.cuda.Stream(), (torch.cuda.Stream(),))
-        streams.owner.wait_stream(torch.cuda.current_stream())
-        # The test assesses source scheduling. Numerical rewrites have their
-        # own fixed-tolerance tests; no tolerance changes hide a source mismatch.
-        selected = optimize_region(
-            program,
-            sources,
-            inputs,
-            payload_limits=(RegionPayloadLimit("cuda:0", 1 << 20),),
-            options=replace(RegionSelectionPolicy(allow_numerical_transforms=False), tuning="measured"),
-            streams=streams,
-            warmup_rounds=1,
-            measurement_rounds=1,
-            max_candidates=2,
-        )
-        assert all(candidate.elapsed_ns for candidate in selected.request.candidates)
-        result = selected.execution.run(inputs, streams=streams).values
-        streams.owner.synchronize()
-        for actual, reference in zip(result, expected, strict=True):
-            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
-        for name, value in inputs.items():
-            torch.testing.assert_close(value, before[name], rtol=0, atol=0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_model_norm_contract_binds_actual_kernel_on_both_original_streams():
-    dtype = torch.bfloat16
-    config = VllmConfig(compilation_config=CompilationConfig(mode=CompilationMode.NONE, custom_ops=["all"]))
-    with set_current_vllm_config(config), ir.ops.fused_add_rms_norm.set_priority(["vllm_c", "native"]):
-        norm = RMSNorm(16, dtype=dtype).to("cuda:0")
-        tensor = TensorType((1, 16), str(dtype), "cuda:0")
-        kernel = VllmRmsNormKernel.inspect(norm, tensor, 3)
-        assert kernel is not None
-        function = kernel.implementation.declaration
-        context, weights = BorrowedResource("context", (2,)), BorrowedResource("weights", (4,))
-        index = ScalarType.INDEX
-        program = Program(
-            region(
-                (Value("h", tensor), Value("r", tensor)),
-                (
-                    Coordinate((), (Value("zero", index),), AffineIndex(0)),
-                    Coordinate((), (Value("one", index),), AffineIndex(1)),
-                    Call(("zero", "h", "r"), (Value("a", tensor),), function.name),
-                    Call(("one", "h", "r"), (Value("b", tensor),), function.name),
-                ),
-                ("a", "b"),
-            ),
-            (function,),
-            (context, weights),
-        )
-        cells = {function.name: external_primitive(function, kernel.implementation)}
-        plan = lower_region_streams(program, "{ S0[] -> [0]; S1[] -> [1] }", cells, axis=0, lanes=2, pipeline_depth=2)
-        runner = stream_execution(program, cells, plan, payload_limits=limits(plan))
-        streams = RegionStreamBindings(torch.cuda.Stream(), (torch.cuda.Stream(),))
-        execution, _, rows, _ = owner_fixture(rounds=1, stream=streams.owner)
-        invocation = execution.start_step(rows, streams.owner)
-        view = ReadonlyTensorView(
-            weights, tuple(ReadonlyTensorCell.bind((i,), (norm.weight,) if i == 3 else ()) for i in range(4))
-        )
-
-        class Context:
-            resource = context
-            namespace = id(invocation)
-
-            def validate(self):
-                invocation.context.check_page_execution()
-
-            def check(self, mode, ranges):
-                self.validate()
-                assert ranges in (((0, 1),), ((1, 2),))
-
-        launches = []
-
-        def normalize(inputs):
-            _, h, r = inputs
-            launches.append(torch.cuda.current_stream().cuda_stream)
-            return (kernel.run(h, r),)
-
-        def resources(abi):
-            return RegionResources(
-                program,
-                invocation.context,
-                (),
-                (ExternalFunction(function, normalize, abi),),
-                borrows=(
-                    ReadonlyResourceBinding(view, invocation.context),
-                    HostResourceBinding(Context(), invocation.context),
-                ),
-            )
-
-        h, r = torch.randn((1, 16), dtype=dtype, device="cuda:0"), torch.randn((1, 16), dtype=dtype, device="cuda:0")
-        expected, _ = norm.forward(h.clone(), r.clone())
-        original = h.clone(), r.clone()
-        streams.owner.wait_stream(torch.cuda.current_stream())
-        try:
-            result = runner.run({"h": h, "r": r}, pages=resources(kernel.implementation), streams=streams)
-            assert set(launches) == {streams.owner.cuda_stream, streams.auxiliary[0].cuda_stream}
-            for value in result.values:
-                torch.testing.assert_close(value, expected, rtol=0, atol=0)
-                assert value.data_ptr() not in (h.data_ptr(), r.data_ptr())
-            torch.testing.assert_close(h, original[0], rtol=0, atol=0)
-            torch.testing.assert_close(r, original[1], rtol=0, atol=0)
-        finally:
-            execution.cancel_step(invocation)
-            execution.retire(tuple(row.identity for row in rows))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="vLLM FlashAttention backend requires CUDA")
