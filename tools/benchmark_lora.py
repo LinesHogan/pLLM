@@ -22,8 +22,7 @@ def main() -> None:
     parser.add_argument(
         "--state-groups", type=int, help="request-key groups in the synchronous batch; defaults to one per request"
     )
-    options = BenchmarkOptions.parse(parser)
-    args = parser.parse_args()
+    options, args = BenchmarkOptions.parse(parser)
     if args.scope == "both" and options.profile is not None:
         for scope in ("instance", "request"):
             subprocess.run([sys.executable, "-m", "tools.benchmark_lora", *sys.argv[1:], "--scope", scope], check=True)
