@@ -11,7 +11,7 @@ from importlib.metadata import version
 from pathlib import Path
 from statistics import median
 from time import perf_counter, process_time
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Generic, TypeVar
 
 import torch
 from vllm import SamplingParams
@@ -75,7 +75,7 @@ class BenchmarkOptions:
         parser.add_argument(
             "--eager",
             action="store_true",
-            help="run every arm without CUDA graphs and add an eager vanilla reference",
+            help="run every arm and the vanilla reference without CUDA graphs",
         )
         args = parser.parse_args()
         options = cls(
@@ -154,141 +154,146 @@ class _ProfileFootprint:
     peak_reserved_bytes: int
 
 
-def _round_rates(round_tokens: tuple[int, ...], round_seconds: tuple[float, ...]) -> tuple[float, ...]:
-    return tuple(tokens / seconds for tokens, seconds in zip(round_tokens, round_seconds, strict=True))
+@dataclass(frozen=True, slots=True)
+class _Requests:
+    """The prompts and sampling every arm generates, vanilla included."""
+
+    prompts: list[str]
+    sampling: SamplingParams
+    indices: tuple[int, ...]
+
+    def rates(self, round_seconds: tuple[float, ...]) -> tuple[float, ...]:
+        """Output tokens per second of each round; every round generates all tokens (ignore_eos)."""
+        tokens = len(self.prompts) * (self.sampling.max_tokens or 0)
+        return tuple(tokens / seconds for seconds in round_seconds)
 
 
-def _vanilla(options: BenchmarkOptions, prompts: list[str], sampling: SamplingParams, cuda_graphs: bool) -> float:
-    """Plain vLLM output tokens per second for the same prompts and sampling, as the median round rate."""
-    llm = make_llm(replace(options.model_config(), cuda_graphs=cuda_graphs))
+@dataclass(frozen=True, slots=True)
+class _Arm(Generic[D, R]):
+    name: str
+    workload: BackendWorkload[D, R]
+    captured: bool
+    explicit: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _Setup(Generic[D, R]):
+    """What every workload arm of one comparison shares."""
+
+    options: BenchmarkOptions
+    requests: _Requests
+    prepare: Callable[[VllmLlm[D, R]], AuxiliaryInput[torch.Tensor]] | None
+    training_rows: int
+    require_training: bool
+
+
+def _vanilla(options: BenchmarkOptions, requests: _Requests) -> float:
+    """Plain vLLM's median round rate for the same prompts and sampling, in the arms' CUDA-graph mode."""
+    llm = make_llm(options.model_config())
     for _ in range(options.warmup):
-        llm.generate(prompts, sampling, use_tqdm=False)
+        llm.generate(requests.prompts, requests.sampling, use_tqdm=False)
     torch.cuda.synchronize()
     round_seconds: list[float] = []
-    round_tokens: list[int] = []
     for _ in range(options.rounds):
         started = perf_counter()
-        outputs = llm.generate(prompts, sampling, use_tqdm=False)
+        llm.generate(requests.prompts, requests.sampling, use_tqdm=False)
         torch.cuda.synchronize()
         round_seconds.append(perf_counter() - started)
-        round_tokens.append(sum(len(completion.token_ids) for output in outputs for completion in output.outputs))
     del llm
     gc.collect()
     torch.cuda.empty_cache()
-    rates = _round_rates(tuple(round_tokens), tuple(round_seconds))
+    rates = requests.rates(tuple(round_seconds))
+    mode = "graph" if options.cuda_graphs else "eager"
     print(
         json.dumps(
-            {
-                "implementation": f"vanilla_{'graph' if cuda_graphs else 'eager'}",
-                "output_tokens_per_second": median(rates),
-                "round_rates": rates,
-            }
+            {"implementation": f"vanilla_{mode}", "output_tokens_per_second": median(rates), "round_rates": rates}
         )
     )
     return median(rates)
 
 
 def _generate_rounds(
-    handle: VllmLlm[D, R],
-    prompts: list[str],
-    sampling: SamplingParams,
-    auxiliary: AuxiliaryInput[torch.Tensor] | None,
-    indices: tuple[int, ...],
-    rounds: int,
-) -> tuple[tuple[float, ...], tuple[float, ...], tuple[int, ...]]:
-    """Time each round separately so arms report per-round rates, not one pooled average."""
+    handle: VllmLlm[D, R], requests: _Requests, auxiliary: AuxiliaryInput[torch.Tensor] | None, rounds: int
+) -> tuple[tuple[float, ...], tuple[float, ...], int]:
+    """Wall and process CPU seconds of each round, and the tokens generated over all rounds."""
     elapsed: list[float] = []
     cpu_elapsed: list[float] = []
-    round_tokens: list[int] = []
+    tokens = 0
     for _ in range(rounds):
         cpu_started = process_time()
         started = perf_counter()
-        outputs = handle.generate(prompts, sampling, auxiliary=auxiliary, prompt_indices=indices)
+        outputs = handle.generate(
+            requests.prompts, requests.sampling, auxiliary=auxiliary, prompt_indices=requests.indices
+        )
         torch.cuda.synchronize()
         elapsed.append(perf_counter() - started)
         cpu_elapsed.append(process_time() - cpu_started)
-        round_tokens.append(sum(len(completion.token_ids) for output in outputs for completion in output.outputs))
-    return tuple(elapsed), tuple(cpu_elapsed), tuple(round_tokens)
+        tokens += sum(len(completion.token_ids) for output in outputs for completion in output.outputs)
+    return tuple(elapsed), tuple(cpu_elapsed), tokens
 
 
 def _measure_arm(
-    options: BenchmarkOptions,
-    directory: Path | None,
-    name: str,
-    implementation: BackendWorkload[D, R],
-    captured: bool,
-    explicit: bool,
-    prepare: Callable[[VllmLlm[D, R]], AuxiliaryInput[torch.Tensor]] | None,
-    training_rows: int,
-    require_training: bool,
-    prompts: list[str],
-    sampling: SamplingParams,
-    indices: tuple[int, ...],
-) -> tuple[BenchmarkResult, tuple[int, ...], _ProfileFootprint]:
+    setup: _Setup[D, R], arm: _Arm[D, R], directory: Path | None
+) -> tuple[BenchmarkResult, _ProfileFootprint]:
     """Run one arm end to end and check the effective-work and cleanup contract."""
+    options, requests = setup.options, setup.requests
     config = replace(
         options.model_config(),
         execution=ExecutionOptions(
-            captured,
-            training_rows,
+            arm.captured,
+            setup.training_rows,
             capture_memory_bytes=options.capture_memory_bytes,
-            explicit_math=explicit,
+            explicit_math=arm.explicit,
             state_memory_bytes=options.state_memory_bytes,
             memory_budget_bytes=options.memory_budget_bytes,
         ),
     )
     started = perf_counter()
-    with make_llm(config, workload=implementation) as handle:
+    with make_llm(config, workload=arm.workload) as handle:
         cold = perf_counter() - started
-        auxiliary = None if prepare is None else prepare(handle)
+        auxiliary = None if setup.prepare is None else setup.prepare(handle)
         for _ in range(options.warmup):
-            handle.generate(prompts, sampling, auxiliary=auxiliary, prompt_indices=indices)
+            handle.generate(requests.prompts, requests.sampling, auxiliary=auxiliary, prompt_indices=requests.indices)
         before = handle.diagnostics()
         torch.cuda.synchronize()
         baseline = torch.cuda.memory_allocated()
         torch.cuda.reset_peak_memory_stats()
         allocation_before = torch.cuda.memory_stats()
         if directory is None:
-            elapsed, cpu_elapsed, round_tokens = _generate_rounds(
-                handle, prompts, sampling, auxiliary, indices, options.rounds
-            )
+            elapsed, cpu_elapsed, tokens = _generate_rounds(handle, requests, auxiliary, options.rounds)
         else:
             with torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
                 profile_memory=True,
             ) as profiler:
-                elapsed, cpu_elapsed, round_tokens = _generate_rounds(
-                    handle, prompts, sampling, auxiliary, indices, options.rounds
-                )
-            profiler.export_chrome_trace(str(directory / f"{name}.json"))
+                elapsed, cpu_elapsed, tokens = _generate_rounds(handle, requests, auxiliary, options.rounds)
+            profiler.export_chrome_trace(str(directory / f"{arm.name}.json"))
         after = handle.diagnostics()
+        plan = handle.attachment.inputs.plan
         report = BenchmarkResult(
-            name,
-            captured,
+            arm.name,
+            arm.captured,
             cold,
             elapsed,
-            sum(round_tokens),
+            tokens,
             after.loss_count - before.loss_count,
             after.update_count - before.update_count,
             after.trained_rows - before.trained_rows,
             torch.cuda.max_memory_allocated(),
             baseline,
             handle.attachment.physical.schedule_signature,
-            explicit,
+            arm.explicit,
             tuple(
-                (
-                    str(handle.attachment.inputs.plan.semantic_graph.tasks[task.task_id].symbol),
-                    str(task.implementation_id),
-                )
-                for task in handle.attachment.inputs.plan.schedule_physical.tasks
+                (str(plan.semantic_graph.tasks[task.task_id].symbol), str(task.implementation_id))
+                for task in plan.schedule_physical.tasks
             ),
-            handle.attachment.inputs.plan.schedule_decision.peak_memory_bytes,
+            plan.schedule_decision.peak_memory_bytes,
             cpu_elapsed,
             after.state_usage,
         )
         if (
             report.output_tokens != options.batch * options.sampling_n * options.tokens * options.rounds
-            or require_training
+            or setup.require_training
             and (report.loss_count <= 0 or report.update_count <= 0 or report.trained_rows <= 0)
             or after.inference_pins
             or after.pending_state_releases
@@ -301,12 +306,12 @@ def _measure_arm(
             allocation_after["allocated_bytes.all.freed"] - allocation_before["allocated_bytes.all.freed"],
             torch.cuda.max_memory_reserved(),
         )
-    return report, round_tokens, footprint
+    return report, footprint
 
 
-def _print_arm(report: BenchmarkResult, round_tokens: tuple[int, ...], vanilla: float) -> None:
+def _print_arm(report: BenchmarkResult, requests: _Requests, vanilla: float) -> None:
     """Print a measured arm as one JSON line; the headline rate is the median round rate."""
-    rates = _round_rates(round_tokens, report.round_seconds)
+    rates = requests.rates(report.round_seconds)
     rate = median(rates)
     print(
         json.dumps(
@@ -403,54 +408,35 @@ def compare(
             default=str,
         )
     )
-    cases = (
-        ("tensor", workload, False, False),
-        *((("tensor_explicit", workload, False, True),) if explicit_math else ()),
-        *((("tensor_capture", workload, True, False),) if capture else ()),
-        *((name, implementation, captured, False) for name, implementation, captured in alternatives),
+    arms = (
+        _Arm("tensor", workload, False, False),
+        *((_Arm("tensor_explicit", workload, False, True),) if explicit_math else ()),
+        *((_Arm("tensor_capture", workload, True, False),) if capture else ()),
+        *(_Arm(name, implementation, captured, False) for name, implementation, captured in alternatives),
     )
-    if len({name for name, _, _, _ in cases}) != len(cases):
+    if len({arm.name for arm in arms}) != len(arms):
         raise ValueError("benchmark implementation labels must be distinct")
     if options.profile is not None:
         options.profile.mkdir(parents=True, exist_ok=True)
-        for name, _, _, _ in cases:
-            path = options.profile / f"{name}.json"
+        for arm in arms:
+            path = options.profile / f"{arm.name}.json"
             if path.exists():
                 raise FileExistsError(f"profile output already exists: {path}")
-    # The gate compares every arm against vanilla vLLM in the same CUDA-graph mode; the eager
-    # reference arm only runs when the workloads themselves run eager.
-    vanilla = _vanilla(options, prompts, sampling, cuda_graphs=True)
-    if not options.cuda_graphs:
-        vanilla = _vanilla(options, prompts, sampling, cuda_graphs=False)
-    # CUPTI can affect later launches even after the profiling context exits.
-    runs = tuple(
-        (directory, *case)
-        for directory in ((None, options.profile) if options.profile is not None else (None,))
-        for case in cases
-    )
+    requests = _Requests(prompts, sampling, indices)
+    setup = _Setup(options, requests, prepare, training_rows, require_training)
+    vanilla = _vanilla(options, requests)
     reports: list[BenchmarkResult] = []
-    for directory, name, implementation, captured, explicit in runs:
-        report, round_tokens, footprint = _measure_arm(
-            options,
-            directory,
-            name,
-            implementation,
-            captured,
-            explicit,
-            prepare,
-            training_rows,
-            require_training,
-            prompts,
-            sampling,
-            indices,
-        )
-        if directory is None:
-            reports.append(report)
-            _print_arm(report, round_tokens, vanilla)
-        else:
-            _print_profile(options, reports, directory, report, footprint)
-        gc.collect()
-        torch.cuda.empty_cache()
+    # CUPTI can affect later launches even after the profiling context exits, so profiles run last.
+    for directory in (None,) if options.profile is None else (None, options.profile):
+        for arm in arms:
+            report, footprint = _measure_arm(setup, arm, directory)
+            if directory is None:
+                reports.append(report)
+                _print_arm(report, requests, vanilla)
+            else:
+                _print_profile(options, reports, directory, report, footprint)
+            gc.collect()
+            torch.cuda.empty_cache()
     if len({item.effective_work for item in reports}) != 1:
         raise RuntimeError("comparison arms executed different effective work")
     return tuple(reports)
