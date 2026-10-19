@@ -261,7 +261,7 @@ class _Train:
 @dataclass(frozen=True)
 class _Sampler:
     stage: SamplerStage
-    beta: float | Config = 0.0
+    beta: float | Config | None = None  # None for additive logits, which have no guidance strength
 
 
 @dataclass(frozen=True)
@@ -646,14 +646,10 @@ class Workload(
             effect: object = getattr(member, "__pllm_effect__", None)
             gradient: object = getattr(member, "__pllm_gradient__", None)
             forward_rows: object = getattr(member, "__pllm_rows__", "")
-            if (
-                isinstance(effect, _Sampler)
-                and effect.stage is SamplerStage.PACKED_POST_FILTER_EXACT
-                and _setting(effect.beta, owner, float) == 0.0
-            ):
-                continue  # Zero-strength guidance leaves sampling unchanged, so nothing is computed for it.
             if not isinstance(forward_rows, str):
                 raise TypeError("operation row selector must name a method")
+            if isinstance(effect, _Sampler) and effect.beta is not None and _setting(effect.beta, owner, float) == 0:
+                continue  # Zero-strength guidance leaves sampling unchanged, so nothing is computed for it.
             if isinstance(effect, _Overlay):
                 if gradient is not None or forward_rows:
                     raise ValueError("ordinary overlays update private buffers without cross-operation autograd")
@@ -909,7 +905,12 @@ class Workload(
             if training is None:
                 raise ValueError("logits attachment requires a training operation")
             call, sampler = prediction
-            b.logits(call, *training, stage=sampler.stage, beta=_setting(sampler.beta, owner, float))
+            b.logits(
+                call,
+                *training,
+                stage=sampler.stage,
+                beta=0.0 if sampler.beta is None else _setting(sampler.beta, owner, float),
+            )
         elif training is not None and b.attachment is None:
             b.train_from_hidden(*training)
         if any(isinstance(value, Recurrence) for value in values.values()):
