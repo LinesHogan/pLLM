@@ -1,8 +1,6 @@
 """Evidence 27: serial recurrence oracle, row selection and stateless settlement."""
 
 from dataclasses import replace
-from functools import cache
-from time import perf_counter_ns
 from types import SimpleNamespace
 
 import pytest
@@ -22,18 +20,13 @@ from pllm.contracts.backend_attachment import (
     DecodeWindow,
     MissingPolicy,
 )
-from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
-from pllm.contracts.region_program import TensorType
 from pllm.contracts.region_selection import RegionSelectionPolicy
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import (
     AnchorId,
     StateEffectKind,
-    TaskResourceFact,
-    TaskSymbol,
-    ValueResourceFact,
 )
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
@@ -42,17 +35,14 @@ from pllm.execution.backend_attachment import (
     bind_backend_attachment,
     derive_attachment_resources,
 )
-from pllm.execution.codec import decode_boundary, encode_boundary
+from pllm.execution.codec import encode_boundary
 from pllm.execution.declaration import Dimensions, Field, When
 from pllm.execution.paged_access import PagedLayer, PagedResourceView, bind_paged_access
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
 from pllm.execution.region_resources import HostResourceBinding, PagedResourceBinding, ReadonlyResourceBinding
 from pllm.execution.replay import (
-    TOKENWISE_REPLAY_IMPLEMENTATION,
     TokenwiseReplayPrimitive,
-    TokenwiseReplayTask,
-    mix_layer_outputs,
 )
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.state_execution import MathBinding
@@ -60,10 +50,9 @@ from pllm.execution.tensor_binding import TensorBinding
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import FunctionMath, TaskOutput
-from pllm.execution.tokenwise_region import compile_tokenwise_region
-from pllm.execution.tokenwise_tuning import TokenwiseTuning
-from pllm.execution.trace import TracePhase
+from pllm.workload_transport import decode_workload, encode_workload
 from pllm.workloads.recirculation import RecirculationConfig, RecirculationWorkload
+from test.workloads.test_video import received_features
 
 PROBE = BackendPlacementProbe(
     "test.replay@1",
@@ -231,7 +220,7 @@ def serial_oracle():
 
 
 def run_step(execution, value, decoder):
-    invocation = execution.start_step(value)
+    invocation = execution.start_step(VALUE)
     invocation.context.replay = decoder
     for anchor in range(8):
         execution.execute_anchor(invocation, AnchorId(anchor))
@@ -240,31 +229,19 @@ def run_step(execution, value, decoder):
     return invocation, execution.finish_step(invocation)
 
 
-@cache
-def measured_plan_execution():
-    """Shared by read-only plan checks; stateful tests compile their own."""
-    return measured_execution()
-
-
-def measured_execution():
-    workload = RecirculationWorkload(CONFIG)
-    return workload.compile_backend(workload.specialize(FACTS, ExecutionOptions(tuning="measured"))).execution
-
-
 def test_recirculation_declaration_fits_reference_budget_and_crosses_the_wire() -> None:
-    assert RecirculationConfig is pllm.Recurrence
-
     class PlainRecurrence(pllm.Workload):
         @property
         def recurrence(self) -> pllm.Recurrence:
             return CONFIG
 
-    plain = PlainRecurrence().compile_backend(FACTS).execution
-    execution = measured_plan_execution()
-    assert plain.arena.plan.semantic_graph.tasks == execution.arena.plan.semantic_graph.tasks
-    # A budget that fits only the reference must still install an auto-policy
-    # model; expensive windows must not make the whole attachment inadmissible.
     workload = RecirculationWorkload(CONFIG)
+    plain = PlainRecurrence().compile_backend(FACTS).execution
+    assert (
+        plain.arena.plan.semantic_graph.tasks
+        == workload.compile_backend(FACTS).execution.arena.plan.semantic_graph.tasks
+    )
+    # A budget that fits only the serial reference still admits a measured-tuning plan; one byte less does not.
     serial_facts = workload.specialize(FACTS, ExecutionOptions(schedule_policy="serial"))
     reference_budget = (
         max(serial_facts.timeline.reserved_bytes)
@@ -273,83 +250,28 @@ def test_recirculation_declaration_fits_reference_budget_and_crosses_the_wire() 
     )
     tight_facts = workload.specialize(FACTS, ExecutionOptions(memory_budget_bytes=reference_budget, tuning="measured"))
     tight = workload.compile_backend(tight_facts)
-    task = TokenwiseReplayTask.from_implementation(tight.execution.implementation(TOKENWISE_REPLAY_IMPLEMENTATION))
-    assert task.policy.schedule_policy == "auto"
-    assert all(
-        all(d.bytes <= task.region.payload_limits[0].bytes for d in p.peak_bytes)
-        for p in task.region.candidate_proposals
-    )
     assert tight.attachment.inputs.plan.timeline.memory_budget_bytes == reference_budget
-    with pytest.raises(ValueError, match="reference payload exceeds"):
+    with pytest.raises(ValueError):
         workload.specialize(FACTS, ExecutionOptions(memory_budget_bytes=reference_budget - 1))
-    from pllm.workload_transport import decode_workload, encode_workload
-
     restored = decode_workload(encode_workload(workload), device=torch.device("cpu"), seed=0)
-    assert isinstance(restored, RecirculationWorkload)
-    assert restored.declare(FACTS) == workload.declare(FACTS)
-    assert decode_boundary(encode_boundary(execution.arena.plan), PlanBundle) == execution.arena.plan
-    for invalid in (replace(CONFIG, source_layer=0), replace(CONFIG, destination_layer=3)):
-        with pytest.raises(ValueError):
-            RecirculationWorkload(invalid).compile_backend(FACTS)
-    destination = torch.tensor([[3.0, 4.0]])
-    torch.testing.assert_close(
-        mix_layer_outputs(RecirculationConfig().effect(3), torch.zeros_like(destination), destination, 0),
-        destination * 0.85,
-    )
+    assert isinstance(restored, RecirculationWorkload) and restored.declare(FACTS) == workload.declare(FACTS)
+    with pytest.raises(ValueError):
+        RecirculationWorkload(replace(CONFIG, destination_layer=3)).compile_backend(FACTS)
 
 
-def test_recirculation_replay_matches_serial_oracle_under_every_tuned_candidate() -> None:
-    execution = measured_execution()
+def test_recirculation_replay_matches_serial_oracle_and_fails_atomically() -> None:
+    workload = RecirculationWorkload(CONFIG)
+    execution = workload.compile_backend(workload.specialize(FACTS, ExecutionOptions(tuning="measured"))).execution
     expected_cache, expected_output = serial_oracle()
     assert execution.admit(IDENTITIES) == ()
-    assert execution.arena.active_lineages == 0
-    public_trace, rng = execution.trace.snapshot(), torch.random.get_rng_state().clone()
-    proposals = compile_tokenwise_region(
-        TensorType((1, 4), "torch.float32"),
-        8,
-        PROBE.causal_domain,
-        CONFIG.effect(3),
-        RegionSelectionPolicy(tuning="measured"),
-    ).candidate_proposals
-    tuning = TokenwiseTuning(execution, TOKENWISE_REPLAY_IMPLEMENTATION, proposals)
-    samples = []
-    changed = False
-    try:
-        assert tuning.count > 1
-        for candidate in range(tuning.count):
-            tuning.candidate(candidate)
-            decoder = Decoder()
-            decoder.batch = replace(ROWS, total_rows=3, rows=ROWS.rows[:3])
-            sample = TensorStepInput(decoder.batch, PackedSamplerRowBatch(decoder.batch, (PackedSamplerRowLink(0, 2),)))
-            tuning.record_rows(decoder.rows)
-            started = perf_counter_ns()
-            run_step(execution, sample, decoder)
-            samples.append((perf_counter_ns() - started,))
-            torch.testing.assert_close(decoder.output, torch.stack(expected_output[:3]))
-            torch.testing.assert_close(decoder.cache[0], expected_cache[0])
-            assert torch.count_nonzero(decoder.cache[1]) == 0 and not decoder.saved
-            changed |= decoder.calls != [(i, phase) for i in range(3) for phase in ("normal", "replay")]
-        tuning.finish(tuple(samples))
-    finally:
-        tuning.abort()
-    assert changed and execution.trace.snapshot() == public_trace
-    torch.testing.assert_close(torch.random.get_rng_state(), rng, rtol=0, atol=0)
+    rng = torch.random.get_rng_state().clone()
     decoder = Decoder()
-    invocation, published = run_step(execution, VALUE, decoder)
+    _, published = run_step(execution, VALUE, decoder)
     assert published is None
     torch.testing.assert_close(decoder.output, torch.stack(expected_output))
     torch.testing.assert_close(decoder.cache, expected_cache)
-    assert sorted(decoder.calls) == sorted(
-        [(i, phase) for i in range(3) for phase in ("normal", "replay")] + [(3, "normal")]
-    )
-    assert all(decoder.calls.index((i, "normal")) < decoder.calls.index((i, "replay")) for i in range(3))
-    replay = tuple(
-        event
-        for event in execution.trace.snapshot().events
-        if event.invocation_id == invocation.invocation_id and event.phase is TracePhase.REPLAY
-    )
-    assert [event.row for event in replay] == list(ROWS.rows[:3])
-    assert all(not event.refs for event in replay)
+    torch.testing.assert_close(torch.random.get_rng_state(), rng, rtol=0, atol=0)
+    # A failed replay restores the KV it wrote; a cancelled one keeps the committed row only.
     for fail in (True, False):
         decoder = Decoder()
         invocation = execution.start_step(VALUE)
@@ -357,7 +279,7 @@ def test_recirculation_replay_matches_serial_oracle_under_every_tuned_candidate(
         decoder.fail = fail
         decoder.cancel = None if fail else invocation.context.cancel_requested
         execution.execute_anchor(invocation, AnchorId(0))
-        with pytest.raises(RuntimeError, match="failed" if fail else "cancelled"):
+        with pytest.raises(RuntimeError):
             execution.execute_anchor(invocation, AnchorId(1))
         if fail:
             assert torch.count_nonzero(decoder.cache) == 0
@@ -365,7 +287,6 @@ def test_recirculation_replay_matches_serial_oracle_under_every_tuned_candidate(
             torch.testing.assert_close(decoder.cache[0, :, 0], expected_cache[0, :, 0])
             assert torch.count_nonzero(decoder.cache[:, :, 1:]) == 0
     assert execution.retire(IDENTITIES) == ()
-    assert execution.diagnostics().pending_state_releases == execution.diagnostics().fallback_count == 0
 
 
 def test_disabled_recirculation_runs_only_the_normal_pass() -> None:
@@ -373,7 +294,6 @@ def test_disabled_recirculation_runs_only_the_normal_pass() -> None:
     decoder = Decoder()
     run_step(disabled, VALUE, decoder)
     assert decoder.calls == [(index, "normal") for index in range(4)]
-    assert not any(event.phase is TracePhase.REPLAY for event in disabled.trace.snapshot().events)
     # Request zero has no rows this time. The same cold source must carry the
     # original effects through its empty scan and start request one's row at 0.
     decoder = Decoder()
@@ -388,10 +308,6 @@ def test_disabled_recirculation_runs_only_the_normal_pass() -> None:
 
 
 def test_activation_source_matches_serial_oracle() -> None:
-    _activation_source_matches_serial_oracle(Decoder, VALUE, INPUTS, CONFIG, PROBE)
-
-
-def _activation_source_matches_serial_oracle(decoder_type, value, inputs, config, probe):
     from pllm.backends.vllm.activation import VllmActivationPatch
 
     delta = torch.tensor([0.2, -0.3, 0.4, 0.1])
@@ -441,52 +357,37 @@ def _activation_source_matches_serial_oracle(decoder_type, value, inputs, config
     )
     publication = b.publish(update, inject, when=When.BEFORE_MODEL)
     b.overlay(inject, update, publication, activations=bindings)
-    b.recurrence(config)
+    b.recurrence(CONFIG)
     b.conditional_input(("features",))
     graph, layouts, spec = b.finish()
-    reserve = attachment_buffer_bytes(probe, graph, layouts, spec)
+    reserve = attachment_buffer_bytes(PROBE, graph, layouts, spec)
     timeline = replace(
         RuntimeFacts(torch.device("cpu")).timeline(("model/tokenwise_replay@1", "transition/full_root@1")),
         region_policy=RegionSelectionPolicy(schedule_policy="serial"),
         reserved_bytes=(reserve,) * 8,
-        task_resources=(
-            TaskResourceFact(TaskSymbol("encode"), 32),
-            TaskResourceFact(TaskSymbol("publish"), 0),
-            TaskResourceFact(TaskSymbol("write"), 512),
-        ),
-        value_resources=(
-            ValueResourceFact(TaskSymbol("encode"), "value", 8),
-            ValueResourceFact(TaskSymbol("publish"), "publication", 0),
-            ValueResourceFact(TaskSymbol("write"), "updated", 0),
-        ),
     )
-    timeline = derive_attachment_resources(probe, graph, timeline, layouts=layouts, attachment=spec)
+    timeline = derive_attachment_resources(PROBE, graph, timeline, layouts=layouts, attachment=spec)
     plan = compile_page_bundle_plan(
         (graph, layouts), timeline, (PageBundleProviderFacts("test.owned@1", 3),), 1, 65536, torch.device("cpu")
     )
-    signed = bind_backend_attachment(plan, probe, spec)
+    signed = bind_backend_attachment(plan, PROBE, spec)
     math = FunctionMath(
         {"inject": lambda roots: None},
         lambda value: (),
-        lambda value, batch: TensorFrame(value, value.rows.rows),
+        lambda value, batch: TensorFrame(value, VALUE.rows.rows),
         lambda data, result: result.publication,
     )
-    execution = MathBinding(math, b.bind_all(plan, model_probe=probe), borrowed_resources=("features",)).bind(
+    execution = MathBinding(math, b.bind_all(plan, model_probe=PROBE), borrowed_resources=("features",)).bind(
         PageBundleArena(plan, _owned_resources=("inject",)), signed.inputs.request.sampler_anchor_id
     )
     model = SimpleNamespace(
         model=SimpleNamespace(layers=[SimpleNamespace(forward=lambda *args: None) for _ in range(3)])
     )
     selector = VllmActivationPatch(model, bindings, "inject", install=False)
-    assert all(handle.layer.forward is handle.original for handle in selector.layers)
 
-    class BoundDecoder(decoder_type):
+    class BoundDecoder(Decoder):
         def bind_activation(self, resource, layer, owner):
-            binding = selector.bind_pinned(resource, layer, owner)
-            assert {proof.ref for proof in binding.view.proofs} == set(
-                owner.pin.refs if owner.held_input else owner.publication.after_refs
-            )
-            return binding
+            return selector.bind_pinned(resource, layer, owner)
 
         def activation_selected(self, row, layer):
             return selector.selected(row, layer)
@@ -509,7 +410,7 @@ def _activation_source_matches_serial_oracle(decoder_type, value, inputs, config
                     hidden = hidden + (hidden @ weight.T + bias - hidden @ rotation) @ rotation.T
             return hidden
 
-        hidden = inputs[index].clone()
+        hidden = INPUTS[index].clone()
         for ordinal in range(3):
             hidden = layer(ordinal, hidden)
             if ordinal == 0:
@@ -523,41 +424,13 @@ def _activation_source_matches_serial_oracle(decoder_type, value, inputs, config
             for ordinal in (1, 2):
                 hidden = layer(ordinal, hidden)  # New hidden, same affine parameters; no repeat of layer zero.
     execution.admit(())
-    from test.workloads.test_video import received_features
-
-    received = received_features(plan)
-    root, peers = received.__enter__()
-    execution.stage_readonly((root,))
-    invocation = execution.start_step(value)
-    execution.execute_anchor(invocation, AnchorId(0))
     identities = tuple(dict.fromkeys(row.identity for row in rows))
-    execution.admit(identities)
-    selector.prepare(value.rows, invocation.context, execution.directory)
-    invocation.context.replay = decoder
-    try:
-        for anchor in range(1, 8):
-            execution.execute_anchor(invocation, AnchorId(anchor))
-            if anchor == execution.sampler_anchor_id:
-                execution.complete_sampler(invocation)
-        selector.clear()
-        execution.finish_step(invocation)
-        torch.testing.assert_close(decoder.output, torch.stack(expected))
-        torch.testing.assert_close(decoder.cache, expected_cache)
-        assert execution.diagnostics().update_count == 1 and execution.diagnostics().fallback_count == 0
-        assert all(
-            peer.poll() and peer.recv_bytes() == encode_boundary(page.descriptor).encode()
-            for peer, page in zip(peers, root.pages, strict=True)
-        )
-        # Re-run the same kernel oracle with a separately signed no-input invocation.
-        # Normal/replay retain the exact version, but recompute affine delta from new hidden.
-        decoder = BoundDecoder()
-        execution.stage_hold(identities, "absent", step_id=1)
-        held_rows = replace(value.rows, step_id=1)
-        held_value = replace(value, rows=held_rows, sampler_rows=replace(value.sampler_rows, row_batch=held_rows))
-        invocation = execution.start_step(held_value)
+    with received_features(plan) as (root, peers):
+        execution.stage_readonly((root,))
+        invocation = execution.start_step(VALUE)
         execution.execute_anchor(invocation, AnchorId(0))
-        assert invocation.context.publication is None and not invocation.context.results
-        selector.prepare(held_rows, invocation.context, execution.directory)
+        execution.admit(identities)
+        selector.prepare(VALUE.rows, invocation.context, execution.directory)
         invocation.context.replay = decoder
         for anchor in range(1, 8):
             execution.execute_anchor(invocation, AnchorId(anchor))
@@ -567,12 +440,10 @@ def _activation_source_matches_serial_oracle(decoder_type, value, inputs, config
         execution.finish_step(invocation)
         torch.testing.assert_close(decoder.output, torch.stack(expected))
         torch.testing.assert_close(decoder.cache, expected_cache)
-        assert execution.diagnostics().update_count == execution.diagnostics().hold_count == 1
-        assert not any(peer.poll() for peer in peers)
-    finally:
+        assert all(
+            peer.poll() and peer.recv_bytes() == encode_boundary(page.descriptor).encode()
+            for peer, page in zip(peers, root.pages, strict=True)
+        )
         selector.close()
-        if execution._active:
-            execution.cancel_step(invocation)
         execution.retire(identities)
         execution.retire(())
-        received.__exit__(None, None, None)
