@@ -6,11 +6,14 @@ Training returns one loss per row. PTTS allocates and publishes versions outside
 
 from __future__ import annotations
 
-from collections import Counter
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
+from typing import TypeVar
 
+import numpy as np
+import numpy.typing as npt
 import torch
 
 from pllm.contracts.semantic_graph import TaskResourceFact, TaskResultInputSource, TaskSymbol
@@ -23,6 +26,8 @@ from pllm.execution.tensor_task import TensorTask
 from pllm.kernels.adamw import AdamWFields, apply_adamw, paged_adamw
 from pllm.kernels.page_copy import copy_pages, gather_rows
 
+Table = TypeVar("Table", torch.Tensor, npt.NDArray[np.int64])
+
 
 def hidden_buffer(value: torch.Tensor) -> torch.Tensor:
     """Recover the fixed tap buffer behind a snapshot's leading-row view."""
@@ -30,6 +35,44 @@ def hidden_buffer(value: torch.Tensor) -> torch.Tensor:
     row_width = (value.shape[1] - 1) * value.stride(1) + 1
     rows = 1 + (elements - row_width) // value.stride(0)
     return value.as_strided((rows, value.shape[1]), value.stride())
+
+
+@dataclass(frozen=True, slots=True)
+class TableLayout:
+    """Segments of a step's int64 index table, uploaded to the GPU in one copy per step.
+
+    rows          [6, R]   per row: packed hidden row, sampler row, sample index, state, version, weight
+    counts        [S + 1]  rows per state; index S is the padding sink
+    last          [S]      last row of each state (memory-field writes)
+    sources       [F, S+1] source page slot per field and state (-1: none)
+    destinations  [F, S]   destination page slot per field and state (-1: do not write)
+    feedback      [K, 3]   address and strides of each sampler-feedback tensor
+    """
+
+    rows: int
+    states: int
+    fields: int
+    feedback: int
+
+    @property
+    def shapes(self) -> tuple[tuple[int, ...], ...]:
+        rows, states, fields = self.rows, self.states, self.fields
+        return ((6, rows), (states + 1,), (states,), (fields, states + 1), (fields, states), (self.feedback, 3))
+
+    @property
+    def size(self) -> int:
+        return sum(math.prod(shape) for shape in self.shapes)
+
+    def split(self, table: Table) -> tuple[Table, Table, Table, Table, Table, Table]:
+        """Named views of `table` (a torch tensor or numpy array of `size` elements)."""
+        views: list[Table] = []
+        start = 0
+        for shape in self.shapes:
+            end = start + math.prod(shape)
+            views.append(table[start:end].reshape(shape))
+            start = end
+        rows, counts, last, sources, destinations, feedback = views
+        return rows, counts, last, sources, destinations, feedback
 
 
 @dataclass
@@ -92,56 +135,54 @@ class StepCapture:
     def state_count(self) -> int:
         return self.states if self.enabled else self.active_states
 
-    def _columns(self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext[TensorFrame]) -> list[int]:
-        rows, states = self.rows, self.state_count
+    @property
+    def layout(self) -> TableLayout:
+        return TableLayout(self.rows, self.state_count, len(self.pools), len(self.feedback_names))
+
+    def _fill(
+        self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext[TensorFrame]
+    ) -> npt.NDArray[np.int64]:
+        """This step's index table on the host."""
+        layout = self.layout
+        host = np.zeros(layout.size, dtype=np.int64)
+        rows, counts, last, sources, destinations, feedback = layout.split(host)
+        count = len(data.rows)
         links = {link.packed_row_index: link.sampler_row_index for link in data.step.sampler_rows.links}
         if self.feedback_names and any(row.packed_row_index not in links for row in data.rows):
             raise ValueError("sampler feedback must cover every operation row")
-        indices = (
-            [batch.selection.row_states[row.identity] for row in data.rows] if batch.roots else [0] * len(data.rows)
+        states = np.fromiter(
+            (batch.selection.row_states[row.identity] if batch.roots else 0 for row in data.rows), np.int64, count
         )
-        counts = Counter(indices)
-        columns = [
-            [row.packed_row_index for row in data.rows],
-            [links.get(row.packed_row_index, 0) for row in data.rows],
-            [row.identity.sample_idx for row in data.rows],
-            indices,
-            [int(batch.selection.refs[i].version_id) for i in indices] if batch.roots else indices,
-            [1] * len(data.rows),
-        ]
-        packed = [
-            value
-            for i, column in enumerate(columns)
-            for value in (*column, *([states if i == 3 else 0] * (rows - len(column))))
-        ]
-        packed.extend(counts[i] for i in range(states + 1))
-        last = {state: row for row, state in enumerate(indices)}
-        packed.extend(last.get(i, 0) for i in range(states))
-        for field in range(len(self.pools)):
-            _, slots = batch.field_slots(field)
-            packed.extend((*slots, *([-1] * (states + 1 - len(slots)))))
+        versions = np.fromiter((ref.version_id for ref in batch.selection.refs), np.int64) if batch.roots else states
+        rows[0, :count] = [row.packed_row_index for row in data.rows]
+        rows[1, :count] = [links.get(row.packed_row_index, 0) for row in data.rows]
+        rows[2, :count] = [row.identity.sample_idx for row in data.rows]
+        rows[3] = layout.states
+        rows[3, :count] = states
+        rows[4, :count] = versions[states] if batch.roots else 0
+        rows[5, :count] = 1
+        counts[:] = np.bincount(states, minlength=layout.states + 1)[: layout.states + 1]
+        if batch.roots:
+            last[states] = np.arange(count)  # repeated states keep their last row
+        sources[:] = -1
+        destinations[:] = -1
         write = context.write
-        roots = None if write is None else context.arena.lazy_roots((write,) * len(write.after_refs), write.after_refs)
-        for field in range(len(self.pools)):
-            slots = {} if roots is None else dict(zip(self.updated, roots.field_slots(field)[1], strict=True))
-            packed.extend(slots.get(state, -1) for state in range(states))
-        for value in self.feedback_values:
-            packed.extend((value.data_ptr(), value.stride(0), value.stride(1) if value.ndim > 1 else 1))
-        return packed
+        written = (
+            None if write is None else context.arena.lazy_roots((write,) * len(write.after_refs), write.after_refs)
+        )
+        for field in range(layout.fields):
+            slots = batch.field_slots(field)[1]
+            sources[field, : len(slots)] = slots
+            if written is not None:
+                destinations[field, list(self.updated)] = written.field_slots(field)[1]
+        for row, value in zip(feedback, self.feedback_values, strict=True):
+            row[:] = (value.data_ptr(), value.stride(0), value.stride(1) if value.ndim > 1 else 1)
+        return host
 
     def _views(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         assert self.table is not None
-        rows, states, fields = self.rows, self.state_count, len(self.pools)
-        row_end = 6 * rows
-        count_end = row_end + states + 1
-        slot_start = count_end + states
-        source_end = slot_start + fields * (states + 1)
-        return (
-            self.table[:row_end].view(6, rows),
-            self.table[row_end:count_end],
-            self.table[slot_start:source_end].view(fields, states + 1),
-            self.table[source_end : source_end + fields * states].view(fields, states),
-        )
+        rows, counts, _, sources, destinations, _ = self.layout.split(self.table)
+        return rows, counts, sources, destinations
 
     def _dependencies(self, task: TensorTask, data: TensorFrame, batch: TensorBatch) -> None:
         for source in task.sources.values():
@@ -152,10 +193,10 @@ class StepCapture:
 
     def _feedback(self, rows: torch.Tensor) -> dict[str, torch.Tensor]:
         assert self.table is not None
-        start = self.table.numel() - 3 * len(self.feedback_names)
+        locations = self.layout.split(self.table)[5]
         return {
-            name: gather_rows(self.table[start + 3 * i : start + 3 * i + 3], rows, value)
-            for i, (name, value) in enumerate(zip(self.feedback_names, self.feedback_values, strict=True))
+            name: gather_rows(location, rows, value)
+            for name, location, value in zip(self.feedback_names, locations, self.feedback_values, strict=True)
         }
 
     def _frame(self, data: TensorFrame, batch: TensorBatch) -> tuple[TensorFrame, TensorBatch]:
@@ -266,7 +307,7 @@ class StepCapture:
                 )
 
             assert self.table is not None
-            last = self.table[6 * self.rows + self.state_count + 1 : 6 * self.rows + 2 * self.state_count + 1]
+            last = self.layout.split(self.table)[2]
             for key, field in self.task.captures.items():
                 value, pool = inputs[key].detach(), self.pools[field]
                 if value.shape[1:] != pool.shape[1:] or value.dtype != pool.dtype:
@@ -333,9 +374,10 @@ class StepCapture:
             if batch.stream is not None:
                 for value in self.feedback_values:
                     value.record_stream(batch.stream)
-        values = self._columns(data, batch, context)
         device = hidden.snapshots[0].hidden.device if hidden.snapshots else self.pools[0].device
-        host = torch.tensor(values, dtype=torch.long, pin_memory=device.type == "cuda")
+        host = torch.from_numpy(self._fill(data, batch, context))  # pyright: ignore[reportUnknownMemberType]
+        if device.type == "cuda":
+            host = host.pin_memory()
         if self.table is None or not self.enabled:
             self.table = torch.empty(host.shape, dtype=torch.long, device=device)
         self.table.copy_(host, non_blocking=True)
