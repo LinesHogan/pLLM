@@ -522,6 +522,20 @@ class PageBundleArena:
                     return table.ref(row)
             raise RuntimeError("PageBundle lineage is unadmitted or retiring")
 
+    def latest_refs(self, resource: str, lineages: Sequence[LineageId]) -> tuple[StateRef, ...]:
+        """The latest version of each live lineage of one resource, read from its table at once."""
+        with self._lock:
+            self._require_live()
+            table = self._tables[resource]
+            rows = [table.row_of.get(lineage, -1) for lineage in lineages]
+            if -1 in rows or (table.status[rows] != 2).any():
+                raise RuntimeError("PageBundle lineage is unadmitted or retiring")
+            layout = table.pools.selected.layout_id
+            return tuple(
+                StateRef(layout, lineage, VersionId(version))
+                for lineage, version in zip(lineages, table.versions[rows].tolist(), strict=True)
+            )
+
     def root(self, ref: StateRef) -> PageBundle:
         with self._lock:
             self._require_live()

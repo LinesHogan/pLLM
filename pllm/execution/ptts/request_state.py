@@ -24,6 +24,10 @@ class StateAddress:
     key: RequestStateKey | None
 
 
+# One state's resource, keys, key lineages and per-row positions within a selection.
+_Projection = tuple[StateResource, tuple["RequestStateKey | None", ...], tuple[LineageId, ...], tuple[int, ...]]
+
+
 @dataclass(frozen=True, slots=True)
 class RequestStateAdmissionBatch:
     keys: tuple[StateAddress, ...]
@@ -104,6 +108,7 @@ class RequestStateDirectory:
         self._inference_pins: dict[RequestIdentity, PagePin] = {}
         self._leases: dict[StateAddress, RequestStateSelection] = {}
         self._pending: RequestStateAdmissionBatch | None = None
+        self._projection: tuple[tuple[RequestIdentity, ...], tuple[_Projection, ...]] | None = None
         self._lock = RLock()
 
     @property
@@ -216,6 +221,7 @@ class RequestStateDirectory:
                     lineages[key] = ref.lineage_id
                 receipt = self.arena.publish(batch.write)
                 self._lineages = lineages
+                self._projection = None
             for identity, key in batch.holds:
                 self._identity_holds[key.resource, identity] = key
                 self._holders.setdefault(key, set()).add(identity)
@@ -233,8 +239,11 @@ class RequestStateDirectory:
             self._pending = None
 
     def _latest(self, key: StateAddress) -> StateRef:
+        return self.arena.latest(self._lineage(key))
+
+    def _lineage(self, key: StateAddress) -> LineageId:
         try:
-            return self.arena.latest(self._lineages[key])
+            return self._lineages[key]
         except KeyError as exc:
             message = (
                 "instance state is not admitted"
@@ -251,21 +260,36 @@ class RequestStateDirectory:
         with self._lock:
             if not rows and self.request_states and not self.instance_states:
                 raise ValueError("request selection requires rows")
-            groups: list[ResourceSelection] = []
-            offset = 0
-            for state in self.states:
-                if state.scope is StateScope.INSTANCE:
-                    keys: tuple[RequestStateKey | None, ...] = (None,)
-                    positions = (offset,) * len(rows)
-                else:
-                    projected = tuple(RequestStateKey.project(row.identity, state.key_fields) for row in rows)
-                    keys = tuple(dict.fromkeys(projected))
-                    indices = {key: offset + i for i, key in enumerate(keys)}
-                    positions = tuple(indices[key] for key in projected)
-                refs = tuple(self._latest(StateAddress(state.resource, key)) for key in keys)
-                groups.append(ResourceSelection(state.resource, keys, refs, positions))
-                offset += len(refs)
-            return RequestStateSelection(rows if self.states else (), tuple(groups))
+            identities = tuple(row.identity for row in rows)
+            if self._projection is None or self._projection[0] != identities:
+                self._projection = identities, self._project(rows)
+            groups = tuple(
+                ResourceSelection(resource, keys, self.arena.latest_refs(resource, lineages), positions)
+                for resource, keys, lineages, positions in self._projection[1]
+            )
+            return RequestStateSelection(rows if self.states else (), groups)
+
+    def _project(self, rows: tuple[PackedPhaseRow, ...]) -> tuple[_Projection, ...]:
+        """Each state's keys, their lineages, and every row's position in the selection.
+
+        Decode batches repeat the same rows step after step, so `select` reuses this until the rows
+        or the admitted lineages change; only the latest versions are read again.
+        """
+        projections: list[_Projection] = []
+        offset = 0
+        for state in self.states:
+            if state.scope is StateScope.INSTANCE:
+                keys: tuple[RequestStateKey | None, ...] = (None,)
+                positions = (offset,) * len(rows)
+            else:
+                projected = tuple(RequestStateKey.project(row.identity, state.key_fields) for row in rows)
+                keys = tuple(dict.fromkeys(projected))
+                indices = {key: offset + i for i, key in enumerate(keys)}
+                positions = tuple(indices[key] for key in projected)
+            lineages = tuple(self._lineage(StateAddress(state.resource, key)) for key in keys)
+            projections.append((state.resource, keys, lineages, positions))
+            offset += len(keys)
+        return tuple(projections)
 
     def select_and_lease(self, rows: tuple[PackedPhaseRow, ...]) -> RequestStateSelection:
         """Select the latest state of every row and lease it to one step; the lease is never stale."""
@@ -331,6 +355,7 @@ class RequestStateDirectory:
                     self._holders[key].discard(identity)
             for key in releasing:
                 self._lineages.pop(key)
+                self._projection = None
                 self._holders.pop(key, None)
             return tuple(dict.fromkeys((*refs, *(ref for pin in pins for ref in pin.refs))))
 
@@ -344,6 +369,7 @@ class RequestStateDirectory:
                 self.arena.retire(refs)
             for key in dormant:
                 self._lineages.pop(key)
+                self._projection = None
                 self._holders.pop(key)
             return refs
 
