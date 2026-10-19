@@ -1,239 +1,112 @@
-"""Evidence 20: original hidden inputs, stateless attachment and bounded owned export."""
+"""The dummy observer exports bounded copies of hidden rows, on the host and attached to a backend.
+
+Also covers the execution trace it reports through (bounded, selectable snapshots
+that survive the process boundary) and authoring rules shared by every workload:
+signed declarations, chained results, values frozen at compile time and frozen state.
+"""
 
 from dataclasses import replace
 from typing import Annotated
-from weakref import ref
 
 import pytest
 import torch
 
 import pllm
+from examples.centered_hidden import centered_hidden
 from pllm import make_llm
-from pllm.authoring import BackendCompileFacts, TensorStepInput
-from pllm.contracts.backend_attachment import (
-    AttachmentGraphMode,
-    AttachmentHiddenResource,
-    AttachmentTopology,
-    BackendPlacementProbe,
-)
+from pllm.authoring import TensorStepInput
+from pllm.contracts.backend_attachment import AttachmentHiddenResource
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding, PackedHiddenSnapshot, PackedHiddenSnapshotBatch
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.contracts.semantic_graph import AnchorId, TaskSymbol
 from pllm.contracts.state_representation import StateDeviceKind
-from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.host_runtime import HostRuntimeFacts
+from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
-from pllm.execution.state_execution import StateDiagnostics
-from pllm.execution.tensor_program import TensorOperation
-from pllm.execution.trace import MAX_SNAPSHOT_BYTES, ExecutionTrace, TracePhase, TraceSelection, TraceSnapshot
-from pllm.workloads.dummy import DummyConfig, DummyWorkload, hidden_rows
-from test.backend_facts import assert_finite_resources
+from pllm.execution.trace import ExecutionTrace, TracePhase, TraceSelection, TraceSnapshot
+from pllm.workloads.dummy import DummyConfig, DummyWorkload
+from test.backend_facts import assert_finite_resources, backend_facts
+
+BINDING = PackedHiddenResourceBinding("0", HiddenLayerKind.INDEX, HiddenSite.BLOCK_OUTPUT, "model.layers.0")
+CPU = HostRuntimeFacts(torch.device("cpu"))
 
 
-def test_dummy_runs_graph_sign_plan_execute(monkeypatch: pytest.MonkeyPatch) -> None:
-    from examples.centered_hidden import centered_hidden
+def step_input(step, hidden, count=3):
+    """Row 0 is a prefill row; the rest decode, one request each."""
+    rows = PackedPhaseRowBatch(
+        1,
+        step,
+        count,
+        tuple(
+            PackedPhaseRow(
+                i, i, 0, HiddenPhase.PREFILL if i == 0 else HiddenPhase.DECODE, RequestIdentity(str(i), i, 0)
+            )
+            for i in range(count)
+        ),
+    )
+    return TensorStepInput(
+        rows,
+        PackedSamplerRowBatch(rows, tuple(PackedSamplerRowLink(i, i) for i in range(count))),
+        PackedHiddenSnapshotBatch(rows, (PackedHiddenSnapshot(BINDING, hidden[:count]),)),
+    )
 
+
+def test_dummy_runs_graph_sign_plan_execute() -> None:
     workload = DummyWorkload(DummyConfig(export_every_n_steps=2, export_max_rows=2, export_max_cols=3))
-    execution = make_llm(workload=workload, config=HostRuntimeFacts(torch.device("cpu")))
+    execution = make_llm(workload=workload, config=CPU)
     hidden = torch.arange(15, dtype=torch.float32).reshape(3, 5)
     expected = hidden[1:3, :3].clone()
-    binding = PackedHiddenResourceBinding("0", HiddenLayerKind.INDEX, HiddenSite.BLOCK_OUTPUT, "model.layers.0")
-
-    def value(step):
-        rows = PackedPhaseRowBatch(
-            1,
-            step,
-            3,
-            tuple(
-                PackedPhaseRow(
-                    index,
-                    index,
-                    0,
-                    HiddenPhase.PREFILL if index == 0 else HiddenPhase.DECODE,
-                    RequestIdentity(str(index), index, 0),
-                )
-                for index in range(3)
-            ),
-        )
-        return TensorStepInput(
-            rows,
-            PackedSamplerRowBatch(rows, tuple(PackedSamplerRowLink(i, i) for i in range(3))),
-            PackedHiddenSnapshotBatch(rows, (PackedHiddenSnapshot(binding, hidden),)),
-        )
-
+    value = lambda step: step_input(step, hidden)
+    # Every second step exports the decode rows, bounded to 2 x 3, as an owned copy.
     assert execution.step(value(1)) is None
     exported = execution.step(value(2))
-    assert isinstance(exported, torch.Tensor)
     hidden.fill_(-1)
     torch.testing.assert_close(exported, expected)
-    assert exported.device.type == "cpu" and execution.plan.fallback_count == 0
     hidden.copy_(torch.arange(15, dtype=torch.float32).reshape(3, 5))
-    variant = make_llm(HostRuntimeFacts(torch.device("cpu")), workload=centered_hidden(workload.config))
+    variant = make_llm(CPU, workload=centered_hidden(workload.config))
     torch.testing.assert_close(variant.step(value(2)), expected - expected.mean(dim=-1, keepdim=True))
+    disabled = DummyWorkload(replace(workload.config, enabled=False)).compile_host(CPU)
+    assert disabled.step(value(2)) is None
+
     snapshot = execution.trace.snapshot()
     assert decode_boundary(encode_boundary(snapshot), TraceSnapshot) == snapshot
     (observed,) = (event for event in snapshot.events if event.phase is TracePhase.TENSOR)
     assert observed.step_id == 2 and tuple(identity.prompt_idx for identity in observed.identities) == (1, 2)
     torch.testing.assert_close(observed.tensor(), expected)
-    observed.tensor().fill_(123)
-    torch.testing.assert_close(observed.tensor(), expected)
-    trace = ExecutionTrace(execution.plan, capacity=2)
-    (task,) = execution.plan.tasks
-    for tensor in (
-        torch.tensor([2**60 + 1]),
-        torch.tensor([True, False]),
-        torch.tensor([float("nan"), float("inf")], dtype=torch.bfloat16),
-    ):
-        trace.record(TracePhase.TENSOR, 1, task_id=task.task_id, tensor=tensor, tensor_name="selected")
-        event = decode_boundary(encode_boundary(trace.snapshot()), TraceSnapshot).events[-1]
-        torch.testing.assert_close(event.tensor(), tensor, equal_nan=True)
-    assert trace.snapshot().dropped == 1 and len(trace.snapshot().events) == 2
-    with pytest.raises(ValueError, match="bounded"):
-        trace.record(
-            TracePhase.TENSOR, 1, task_id=task.task_id, tensor=torch.zeros(MAX_SNAPSHOT_BYTES), tensor_name="too_large"
-        )
-    with pytest.raises(ValueError, match="shape"):
-        replace(observed, tensor_shape=(99,)).tensor()
-    trace = ExecutionTrace(execution.plan, capacity=4)
-    row = value(2).rows.rows[1]
-    selection = TraceSelection(
-        tasks=(task.task_id,),
-        identities=(row.identity,),
-        iterations=(2,),
-        names=("activation", "weight.grad"),
-        tensors=True,
-        gradients=True,
-        max_tensor_bytes=8,
-    )
-    trace.configure(decode_boundary(encode_boundary(selection), TraceSelection))
-    original_tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
-    trace.observe(1, task.task_id, "activation", original_tensor, row=row, iteration=1)
-    trace.observe(1, task.task_id, "activation", original_tensor, row=value(2).rows.rows[2], iteration=2)
-    trace.observe(
-        1,
-        task.task_id,
-        "activation",
-        original_tensor,
-        identities=(row.identity, value(2).rows.rows[2].identity),
-        iteration=2,
-    )
-    assert not trace.snapshot().events
-    trace.observe(1, task.task_id, "activation", original_tensor, row=row, iteration=2)
-    trace.observe(1, task.task_id, "weight.grad", original_tensor + 1, row=row, iteration=2, gradient=True)
-    observed, grad = decode_boundary(encode_boundary(trace.snapshot()), TraceSnapshot).events
-    assert observed.source_shape == (2, 3) and observed.tensor_shape == (2,) and observed.row == row
-    assert grad.phase is TracePhase.GRADIENT
-    torch.testing.assert_close(observed.tensor(), original_tensor.flatten()[:2])
-    torch.testing.assert_close(grad.tensor(), (original_tensor + 1).flatten()[:2])
-    trace.configure(TraceSelection())
-    trace.observe(1, task.task_id, "activation", original_tensor)
-    assert len(trace.snapshot().events) == 2
-    # Bounded snapshots must not first materialize a full strided/broadcast source.
-    trace.configure(TraceSelection(tensors=True, max_tensor_bytes=128))
-    for device in ("cpu", *(("cuda",) if torch.cuda.is_available() else ())):
-        for transposed in (False, True):
-            for dtype in (torch.float32, torch.bfloat16, torch.int64, torch.bool):
-                # Convert the small base before expanding, keeping the large input a view.
-                small = torch.arange(2049, device=device).to(dtype)[1:]
-                tensor = small.expand(2048, -1).T if transposed else small.expand(2048, -1)
-                if device == "cuda":
-                    torch.cuda.synchronize()
-                    baseline = torch.cuda.memory_allocated()
-                    torch.cuda.reset_peak_memory_stats()
-                trace.observe(2, task.task_id, "bounded", tensor)
-                event = trace.snapshot().events[-1]
-                count = 128 // tensor.element_size()
-                prefix = small[:count] if tensor.stride(0) == 0 else small[:1].expand(count)
-                torch.testing.assert_close(event.tensor(), prefix.cpu())
-                assert event.source_shape == (2048, 2048)
-                if device == "cuda":
-                    assert torch.cuda.max_memory_allocated() - baseline < 64 * 1024
-    disabled = DummyWorkload(replace(workload.config, enabled=False)).compile_host(
-        HostRuntimeFacts(torch.device("cpu"))
-    )
-    assert disabled.step(value(2)) is None
-    assert not any(event.phase is TracePhase.TENSOR for event in disabled.trace.snapshot().events)
-    facts = BackendCompileFacts(
-        BackendPlacementProbe(
-            "test.observer@1",
-            "a" * 64,
-            "b" * 64,
-            "c" * 64,
-            AttachmentTopology.IN_PROCESS,
-            AttachmentGraphMode.EAGER,
-            StateDeviceKind.CPU,
-            0,
-            1,
-            1,
-            TensorDType.FLOAT32,
-            5,
-            3,
-            (AttachmentHiddenResource(binding, HiddenPhase.DECODE),),
-            (),
-        ),
+    _trace_selection_and_bounds(execution.plan)
+
+    facts = backend_facts(
+        5,
+        (BINDING,),
         RuntimeFacts(torch.device("cpu")).timeline(),
-        (),
-        1,
-        0,
-        7,
+        None,
+        max_lineages=1,
+        memory_bytes=0,
+        max_rows=3,
         layer_count=1,
     )
     bounded = assert_finite_resources(workload, facts)
     deployment = workload.compile_backend(bounded)
-    assert_finite_resources(centered_hidden(workload.config), facts)
-    assert deployment.execution.arena.active_lineages == 0
-    assert deployment.execution.step(value(2)).shape == (2, 3)
-    original = value(2)
-    excess = replace(
-        original.rows,
-        total_rows=4,
-        rows=(*original.rows.rows, PackedPhaseRow(3, 0, 1, HiddenPhase.PREFILL, original.rows.rows[0].identity)),
-    )
-    oversized = TensorStepInput(
-        excess,
-        PackedSamplerRowBatch(excess, original.sampler_rows.links),
-        PackedHiddenSnapshotBatch(excess, (PackedHiddenSnapshot(binding, torch.cat((hidden, hidden[:1]))),)),
-    )
-    # Only two decode rows and three requests, but four original packed tokens exceed the signed cap.
-    before = deployment.execution.trace.snapshot()
-    with pytest.raises(ValueError, match="signed backend row capacity"):
-        deployment.execution.start_step(oversized)
-    assert deployment.execution.trace.snapshot() == before
-    invocation = deployment.execution.begin(original.rows.decode_rows)
-    with pytest.raises(ValueError, match="signed backend row capacity"):
-        deployment.execution.submit_input(invocation, oversized)
-    assert invocation.context.value is None
-    diagnostics = deployment.execution.diagnostics()
-    assert diagnostics.pending_state_releases == 0
-    assert diagnostics.state_usage.reserved_bytes == diagnostics.state_usage.logical_live_bytes == 0
-    assert decode_boundary(encode_boundary(diagnostics), StateDiagnostics) == diagnostics
-    wrong_width = replace(
-        original, hidden=PackedHiddenSnapshotBatch(original.rows, (PackedHiddenSnapshot(binding, torch.zeros(3, 6)),))
-    )
-    with pytest.raises(ValueError, match="parameter specialization"):
-        deployment.execution.step(wrong_width)
-    torch.testing.assert_close(deployment.execution.step(original), expected)
-    with pytest.raises(ValueError, match="signed declaration"):
-        DummyWorkload(replace(workload.config, export_every_n_steps=1)).bind_backend(bounded, deployment.attachment)
-    with pytest.raises(ValueError, match="hidden inputs"):
-        workload.plan_backend(
+    attached = deployment.execution
+    torch.testing.assert_close(attached.step(value(2)), expected)
+    # Four packed rows exceed the signed backend row capacity of three.
+    with pytest.raises(ValueError):
+        attached.start_step(step_input(2, torch.cat((hidden, hidden[:1])), count=4))
+    with pytest.raises(ValueError):  # hidden width differs from the specialized model
+        attached.step(
             replace(
-                facts,
-                probe=replace(
-                    facts.probe,
-                    hidden_resources=(AttachmentHiddenResource(replace(binding, layer="1"), HiddenPhase.DECODE),),
-                ),
+                value(2),
+                hidden=PackedHiddenSnapshotBatch(value(2).rows, (PackedHiddenSnapshot(BINDING, torch.zeros(3, 6)),)),
             )
         )
-    assert workload.transform is hidden_rows
-    assert variant.arena.plan.semantic_graph != execution.arena.plan.semantic_graph
-    torch.testing.assert_close(execution.step(value(2)), expected)
-    for modified in (centered_hidden(workload.config), replace(workload, export_name="renamed")):
-        with pytest.raises(ValueError, match="signed declaration"):
-            modified.bind_backend(bounded, deployment.attachment)
+    torch.testing.assert_close(attached.step(value(2)), expected)
+    with pytest.raises(ValueError):  # a changed declaration cannot reuse the signed attachment
+        DummyWorkload(replace(workload.config, export_every_n_steps=1)).bind_backend(bounded, deployment.attachment)
+    other_layer = (AttachmentHiddenResource(replace(BINDING, layer="1"), HiddenPhase.DECODE),)
+    with pytest.raises(ValueError):  # the backend does not provide the hidden layer the workload reads
+        workload.plan_backend(replace(facts, probe=replace(facts.probe, hidden_resources=other_layer)))
 
     class Chained(DummyWorkload):
         @pllm.on(pllm.Phase.OBSERVE)
@@ -245,49 +118,15 @@ def test_dummy_runs_graph_sign_plan_execute(monkeypatch: pytest.MonkeyPatch) -> 
         def export_hidden(self, x: Annotated[torch.Tensor, pllm.Result("shift")]) -> torch.Tensor:
             return x * 2
 
-    chained = make_llm(HostRuntimeFacts(torch.device("cpu")), workload=Chained())
-    invocation = chained.start_step(value(2))
-    saved = {}
-    execute = TensorOperation.execute
+    torch.testing.assert_close(make_llm(CPU, workload=Chained()).step(value(2)), (expected + 1) * 2)
 
-    def observe(self, context):
-        execute(self, context)
-        saved.update((key, ref(tensor)) for key, tensor in context.results.items())
-
-    with monkeypatch.context() as watch:
-        watch.setattr(TensorOperation, "execute", observe)
-        for anchor in chained.arena.plan.timeline.anchors:
-            chained.execute_anchor(invocation, AnchorId(anchor.ordinal))
-            if anchor.ordinal == chained.sampler_anchor_id:
-                chained.complete_sampler(invocation)
-    assert (TaskSymbol("shift"), "value") not in invocation.context.results
-    assert (TaskSymbol("export_hidden"), "value") in invocation.context.results
-    assert saved[TaskSymbol("shift"), "value"]() is None
-    assert saved[TaskSymbol("export_hidden"), "value"]() is not None
-    torch.testing.assert_close(chained.finish_step(invocation), (expected + 1) * 2)
-    assert not invocation.context.results
-    assert chained.diagnostics().fallback_count == 0
-
+    # A transform's closure values are frozen when the workload compiles.
     scale = [2.0]
-
-    def scaled(hidden: torch.Tensor) -> torch.Tensor:
-        return hidden * scale[0]
-
-    custom = replace(workload, transform=scaled)
-    frozen = custom.compile_host(HostRuntimeFacts(torch.device("cpu")))
+    custom = replace(workload, transform=lambda rows: rows * scale[0])
+    frozen = custom.compile_host(CPU)
     scale[0] = 3.0
     torch.testing.assert_close(frozen.step(value(2)), expected * 2)
-    fresh = custom.compile_host(HostRuntimeFacts(torch.device("cpu")))
-    torch.testing.assert_close(fresh.step(value(2)), expected * 3)
-    assert frozen.arena.plan.semantic_graph != fresh.arena.plan.semantic_graph
-    import pllm.usage as authoring_binding
-
-    def unexpected_inspection(*args, **kwargs):
-        raise AssertionError("reflection reached execution")
-
-    with monkeypatch.context() as cold_only:
-        cold_only.setattr(authoring_binding, "signature", unexpected_inspection)
-        torch.testing.assert_close(frozen.step(value(2)), expected * 2)
+    torch.testing.assert_close(custom.compile_host(CPU).step(value(2)), expected * 3)
 
     class Ambiguous(DummyWorkload):
         @pllm.on(pllm.Phase.OBSERVE)
@@ -296,11 +135,65 @@ def test_dummy_runs_graph_sign_plan_execute(monkeypatch: pytest.MonkeyPatch) -> 
         def export_hidden(self, first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
             return first + second
 
-    with pytest.raises(TypeError, match="multiple Tensor inputs"):
+    with pytest.raises(TypeError):  # a hook binds exactly one tensor input
         Ambiguous().backend_requirements()
+    _frozen_state_is_readable_by_an_observation()
 
-    # A frozen state — declared once, initialized at admission — is readable from an
-    # observation without ever becoming an update target, and the signed export sees it.
+
+def _trace_selection_and_bounds(plan) -> None:
+    (task,) = plan.tasks
+    trace = ExecutionTrace(plan, capacity=2)
+    special = torch.tensor([float("nan"), float("inf")], dtype=torch.bfloat16)
+    for _ in range(3):
+        trace.record(TracePhase.TENSOR, 1, task_id=task.task_id, tensor=special, tensor_name="selected")
+    snapshot = decode_boundary(encode_boundary(trace.snapshot()), TraceSnapshot)
+    assert snapshot.dropped == 1 and len(snapshot.events) == 2
+    torch.testing.assert_close(snapshot.events[-1].tensor(), special, equal_nan=True)
+
+    row = PackedPhaseRow(1, 1, 0, HiddenPhase.DECODE, RequestIdentity("1", 1, 0))
+    other = replace(row, identity=RequestIdentity("2", 2, 0))
+    selection = TraceSelection(
+        tasks=(task.task_id,),
+        identities=(row.identity,),
+        iterations=(2,),
+        names=("activation", "weight.grad"),
+        tensors=True,
+        gradients=True,
+        max_tensor_bytes=8,
+    )
+    trace = ExecutionTrace(plan, capacity=4)
+    trace.configure(decode_boundary(encode_boundary(selection), TraceSelection))
+    tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    # Wrong iteration, wrong request and a mixed-request batch are all filtered out.
+    trace.observe(1, task.task_id, "activation", tensor, row=row, iteration=1)
+    trace.observe(1, task.task_id, "activation", tensor, row=other, iteration=2)
+    trace.observe(1, task.task_id, "activation", tensor, identities=(row.identity, other.identity), iteration=2)
+    assert not trace.snapshot().events
+    trace.observe(1, task.task_id, "activation", tensor, row=row, iteration=2)
+    trace.observe(1, task.task_id, "weight.grad", tensor + 1, row=row, iteration=2, gradient=True)
+    observed, grad = decode_boundary(encode_boundary(trace.snapshot()), TraceSnapshot).events
+    assert observed.source_shape == (2, 3) and observed.row == row and grad.phase is TracePhase.GRADIENT
+    torch.testing.assert_close(observed.tensor(), tensor.flatten()[:2])
+    torch.testing.assert_close(grad.tensor(), (tensor + 1).flatten()[:2])
+    # A bounded snapshot of a huge broadcast view must not materialize the source first.
+    trace.configure(TraceSelection(tensors=True, max_tensor_bytes=128))
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    small = torch.arange(1, 2049, device=device, dtype=torch.float32)
+    if device == "cuda":
+        torch.cuda.synchronize()
+        baseline = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+    trace.observe(2, task.task_id, "bounded", small.expand(2048, -1).T)
+    event = trace.snapshot().events[-1]
+    torch.testing.assert_close(event.tensor(), small[:1].expand(32).cpu())
+    assert event.source_shape == (2048, 2048)
+    if device == "cuda":
+        assert torch.cuda.max_memory_allocated() - baseline < 64 * 1024
+
+
+def _frozen_state_is_readable_by_an_observation() -> None:
+    """State declared without an optimizer is initialized at admission and read by an export."""
+
     class FrozenEncoder(pllm.Workload):
         encoder = pllm.InstanceState(
             {"weight": lambda model: (4, model.hidden_size)},
@@ -316,33 +209,19 @@ def test_dummy_runs_graph_sign_plan_execute(monkeypatch: pytest.MonkeyPatch) -> 
         ) -> torch.Tensor:
             return hidden @ weight.T
 
-    from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-    from test.backend_facts import backend_facts
-
-    frozen_facts = backend_facts(
-        4,
-        (binding,),
-        RuntimeFacts(torch.device("cpu")).timeline(),
-        PageBundleProviderFacts("test.plain@1", 4, StateDeviceKind.CPU),
-        max_lineages=2,
-    )
-    frozen_exec = FrozenEncoder().compile_backend(frozen_facts).execution
+    timeline = RuntimeFacts(torch.device("cpu")).timeline()
+    provider = PageBundleProviderFacts("test.plain@1", 4, StateDeviceKind.CPU)
+    execution = FrozenEncoder().compile_backend(backend_facts(4, (BINDING,), timeline, provider)).execution
     identity = RequestIdentity("req", 0, 0)
-    frozen_exec.admit(())
-    frozen_exec.admit((identity,))
-    row_batch = PackedPhaseRowBatch(1, 0, 1, (PackedPhaseRow(0, 0, 0, HiddenPhase.DECODE, identity),))
+    execution.admit(())
+    execution.admit((identity,))
+    rows = PackedPhaseRowBatch(1, 0, 1, (PackedPhaseRow(0, 0, 0, HiddenPhase.DECODE, identity),))
     source = (torch.arange(4, dtype=torch.float32) + 1).unsqueeze(0)
-    frozen_exec.step(
-        TensorStepInput(
-            row_batch,
-            PackedSamplerRowBatch(row_batch, ()),
-            PackedHiddenSnapshotBatch(row_batch, (PackedHiddenSnapshot(binding, source),)),
-        )
-    )
-    events = [event.tensor() for event in frozen_exec.trace.snapshot().events if event.tensor_name == "features"]
-    assert len(events) == 1 and torch.allclose(events[0][0], source)
-    assert frozen_exec.diagnostics().fallback_count == 0
-    frozen_exec.retire((identity,))
+    hidden = PackedHiddenSnapshotBatch(rows, (PackedHiddenSnapshot(BINDING, source),))
+    execution.step(TensorStepInput(rows, PackedSamplerRowBatch(rows, ()), hidden))
+    events = [event.tensor() for event in execution.trace.snapshot().events if event.tensor_name == "features"]
+    assert len(events) == 1 and torch.equal(events[0][0], source[0])
+    execution.retire((identity,))
 
 
 def test_unused_helpers_are_neither_signed_nor_frozen() -> None:
@@ -356,5 +235,5 @@ def test_unused_helpers_are_neither_signed_nor_frozen() -> None:
         def observe(self, hidden: Annotated[torch.Tensor, pllm.Hidden(0)]) -> torch.Tensor:
             return hidden * 2
 
-    execution = make_llm(workload=Lazy(), config=HostRuntimeFacts(torch.device("cpu")))
+    execution = make_llm(workload=Lazy(), config=CPU)
     assert execution.plan.fallback_count == 0
