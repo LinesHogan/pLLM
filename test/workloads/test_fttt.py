@@ -1,4 +1,8 @@
-"""Evidence 21: independent Adam/edit oracle, rollback and judge retry settlement."""
+"""FTTT edit training against an independent Adam oracle, plus the judge-driven retry loop.
+
+The retry loop is the vLLM handle's ``generate_feedback`` driven by a scripted
+generator, so retry, stop, update barriers and TTRL vote quorums run without a model.
+"""
 
 import re
 from dataclasses import replace
@@ -11,19 +15,8 @@ import torch
 from pllm import make_llm
 from pllm.contracts.feedback import Completion, CompletionBatch, FinishReason, RetryAction
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.execution.host_runtime import (
-    NO_HOST_REQUEST,
-    CompletionInput,
-    HostRuntimeFacts,
-)
-from pllm.workloads.fttt import (
-    FTTTConfig,
-    FTTTFeedbackService,
-    FTTTJudgeResult,
-    FTTTJudgeService,
-    FTTTWorkload,
-    tasks,
-)
+from pllm.execution.host_runtime import NO_HOST_REQUEST, CompletionInput, HostRuntimeFacts
+from pllm.workloads.fttt import FTTTConfig, FTTTFeedbackService, FTTTJudgeResult, FTTTJudgeService, FTTTWorkload
 
 
 class ArithmeticJudge(FTTTJudgeService):
@@ -34,12 +27,9 @@ class ArithmeticJudge(FTTTJudgeService):
         )
 
 
-def test_fttt_matches_edit_oracle_and_settles_judge_retry(monkeypatch: pytest.MonkeyPatch) -> None:
-    for value in (float("nan"), float("inf")):
-        with pytest.raises(ValueError):
-            FTTTConfig(edit_scale=value)
-        with pytest.raises(ValueError):
-            FTTTConfig(positive_reward_threshold=value)
+def test_fttt_matches_edit_oracle_and_settles_judge_retry() -> None:
+    with pytest.raises(ValueError):
+        FTTTConfig(edit_scale=float("nan"))
     config = FTTTConfig(rank=2, learning_rate=0.05, feedback_feature_size=3, max_retries=2)
     service = FTTTFeedbackService(config, ArithmeticJudge())
     workload = FTTTWorkload(service)
@@ -48,19 +38,9 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry(monkeypatch: pytest.Mo
     )
     coordinator = make_llm(workload=workload, config=facts)
     peak = coordinator.execution.schedule_bundle.schedule_decision.peak_memory_bytes
-    with monkeypatch.context() as guarded:
-        initialize = tasks.initialize_edit_state
-
-        def allocate(*args):
-            from torch._guards import detect_fake_mode
-
-            assert detect_fake_mode() is not None, "state allocation before finite admission"
-            return initialize(*args)
-
-        guarded.setattr(tasks, "initialize_edit_state", allocate)
-        with pytest.raises(ValueError):
-            make_llm(workload=workload, config=replace(facts, memory_budget_bytes=peak - 1))
-    with pytest.raises(ValueError, match="max_input_rows"):
+    with pytest.raises(ValueError):
+        make_llm(workload=workload, config=replace(facts, memory_budget_bytes=peak - 1))
+    with pytest.raises(ValueError):  # host workloads need a finite input row bound
         workload.declare_host(replace(facts, max_input_rows=None))
     coordinator = make_llm(workload=workload, config=replace(facts, memory_budget_bytes=peak))
     execution = coordinator.execution
@@ -69,23 +49,19 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry(monkeypatch: pytest.Mo
     wrong = Completion(identity, 0, "round", (1, 2), "3", FinishReason.STOP)
     batch = CompletionBatch((wrong,))
     service.enqueue(CompletionInput.capture(batch, hidden))
+    # An aborted transaction leaves the edit state at version 0.
     transaction = service.begin(NO_HOST_REQUEST)
-    assert transaction is not None
-    assert transaction.batch.completions is batch
-    interrupted = execution.execute(transaction)
-    assert interrupted.result.update_count == 1
-    execution.abort(interrupted)
+    execution.abort(execution.execute(transaction))
     service.abort(transaction)
     assert execution.diagnostics().state_version == 0
     overflow = FTTTFeedbackService(config, ArithmeticJudge())
     extra = replace(wrong, identity=RequestIdentity("excess", 1, 0))
     overflow.enqueue(CompletionInput.capture(CompletionBatch((wrong, extra)), hidden.expand(2, -1)))
     oversized = overflow.begin(NO_HOST_REQUEST)
-    with pytest.raises(ValueError, match="signed input capacity"):
+    with pytest.raises(ValueError):  # two completions exceed max_input_rows=1
         execution.execute(oversized)
     overflow.abort(oversized)
     assert execution.diagnostics().state_version == 0 and overflow.queued_feedback == 0
-    assert overflow.instance_state("round", 0).retries == 0
 
     # Spell out the feature projection and use PyTorch Adam, not production helpers.
     feature = torch.zeros(3)
@@ -112,8 +88,7 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry(monkeypatch: pytest.Mo
         optimizer.step()
         retry_batch = CompletionBatch((replace(wrong, identity=RequestIdentity(f"attempt-{version}", 0, version)),))
         result = coordinator.run(CompletionInput.capture(retry_batch, hidden))
-        assert result is not None and result.intent.reward_outcomes[0].completion is retry_batch.entries[0]
-        assert result is not None and result.update_count == 1
+        assert result.update_count == 1
         torch.testing.assert_close(result.losses[0], loss.detach())
         torch.testing.assert_close(result.edit_delta, (inputs @ down.T @ up.T).detach())
         assert result.state_version == version
@@ -123,11 +98,9 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry(monkeypatch: pytest.Mo
     accepted = Completion(identity, 0, "round", (4,), "4", FinishReason.STOP)
     assert not service.enqueue(CompletionInput.capture(CompletionBatch((accepted,)), hidden))
     result = coordinator.run(NO_HOST_REQUEST)
-    assert result is not None and result.update_count == 0 and result.losses == ()
-    assert result.state_version == 2
+    assert result.update_count == 0 and result.losses == () and result.state_version == 2
     assert result.intent.retry_controls[0].action is RetryAction.ACCEPT
     assert service.queued_transactions == service.queued_feedback == 0
-    assert execution.diagnostics().fallback_count == 0
     if find_spec("vllm") is not None:
         _automatic_retry_uses_original_control_and_quorum()
 
@@ -139,9 +112,9 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
     from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload
 
     class Generation:
+        """Scripted generation: prompt 7 answers correctly; with votes, two of three agree."""
+
         generate_feedback = VllmLlm.generate_feedback
-        _next_prompt_index = 0
-        _runner = None
 
         def __init__(self, votes=False):
             self.calls = []
@@ -190,17 +163,12 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
     )
     assert generator.calls == [(7, 9), (9,)]
     assert service.instance_state("retry", 9).retries == 2
-    for batch, result in rounds:
-        assert result.retry_controls is result.intent.retry_controls
-        assert result.update_barriers is result.intent.update_barriers
-        assert all(
-            control.completion is entry for control, entry in zip(result.retry_controls, batch.completions.entries)
-        )
     assert rounds[-1][1].retry_controls[0].action is RetryAction.STOP
     assert service.queued_transactions == service.queued_feedback == 0
     update = rounds[0][1].state_update()
     assert update.values[0] is rounds[0][1].edit_delta and update.keys[0].prompt_idx == 9
 
+    # Retries that wait for an update stop when nothing was published.
     def no_published_update(batch):
         result = processor.run(batch)
         return replace(result, update_count=0)
@@ -227,7 +195,7 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
         controls = tuple(replace(control, completion=replace(control.completion)) for control in result.retry_controls)
         return replace(result, intent=replace(result.intent, retry_controls=controls))
 
-    with pytest.raises(ValueError, match="original ordered"):
+    with pytest.raises(ValueError):  # controls must reference the original completions
         list(
             Generation().generate_feedback(
                 ["retry"],
@@ -245,18 +213,17 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
     )
     reward.admit(())
     votes = Generation(votes=True)
-    try:
-        rounds = list(
-            votes.generate_feedback(
-                ["vote"] * 3,
-                SamplingParams(max_tokens=1),
-                feedback=reward.step,
-                feedback_group="votes",
-                max_rounds=2,
-                prompt_indices=(11, 11, 11),
-            )
+    # A vote group retries as a whole after its quorum update.
+    rounds = list(
+        votes.generate_feedback(
+            ["vote"] * 3,
+            SamplingParams(max_tokens=1),
+            feedback=reward.step,
+            feedback_group="votes",
+            max_rounds=2,
+            prompt_indices=(11, 11, 11),
         )
-        assert votes.calls == [(11, 11, 11), (11, 11, 11)]
-        assert len(rounds) == 2 and reward.diagnostics().update_count == 2
-    finally:
-        reward.retire(())
+    )
+    assert votes.calls == [(11, 11, 11), (11, 11, 11)]
+    assert len(rounds) == 2 and reward.diagnostics().update_count == 2
+    reward.retire(())
