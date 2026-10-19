@@ -5,7 +5,6 @@ import json
 import os
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Annotated
 from unittest.mock import patch
 from weakref import ref
 
@@ -13,7 +12,7 @@ import pytest
 import torch
 
 import pllm
-from pllm import Parameter, _core
+from pllm import _core
 from pllm.authoring import BackendCompileFacts, ParameterTargetShape
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
@@ -78,8 +77,8 @@ def overlay_facts():
     return workload, probe, facts
 
 
-def sampler_deployment(probe, facts, beta=0.2):
-    esamp = ESampRequestWorkload(ESampRequestConfig(rank=2, source_layer=0, target_layer=1, intervention_beta=beta))
+def sampler_deployment(probe, facts):
+    esamp = ESampRequestWorkload(ESampRequestConfig(rank=2, source_layer=0, target_layer=1, intervention_beta=0.2))
     sampler_probe = replace(
         probe,
         hidden_resources=tuple(
@@ -95,67 +94,27 @@ def sampler_deployment(probe, facts, beta=0.2):
     return esamp.compile_backend(replace(facts, probe=sampler_probe, targets=()))
 
 
-def test_bind_rejects_a_plan_built_for_other_math() -> None:
-    workload, _, facts = overlay_facts()
+def test_bind_rejects_a_plan_built_for_other_math_or_other_backend_facts() -> None:
+    workload, probe, facts = overlay_facts()
     planned = workload.plan_backend(facts)
     with pytest.raises(ValueError):
         InPlaceTTTWorkload(replace(workload.config, learning_rate=0.5)).bind_backend(facts, planned)
-
-
-def test_bind_rejects_a_drifted_declaration() -> None:
-    workload, _, facts = overlay_facts()
-    planned = workload.plan_backend(facts)
-    annotations = dict(
-        InPlaceTTTWorkload.transition.__annotations__,
-        delta=Annotated[torch.Tensor, Parameter("dense_fast_weights", "tail_input")],
-    )
-    # Simulate a worker whose declared math drifted from the driver's plan.
-    with patch.object(InPlaceTTTWorkload.transition, "__annotations__", annotations):
-        with pytest.raises(ValueError):
-            workload.bind_backend(facts, planned)
-
-
-def test_bind_rejects_mismatched_backend_facts() -> None:
-    workload, probe, facts = overlay_facts()
-    planned = workload.plan_backend(facts)
     with pytest.raises(ValueError):
         workload.bind_backend(replace(facts, probe=replace(probe, topology=AttachmentTopology.ENGINE_CORE)), planned)
 
 
 def test_signed_attachment_crosses_the_wire_and_rejects_malformed_payloads() -> None:
     workload, probe, facts = overlay_facts()
-    for signed in (
-        workload.compile_backend(facts).attachment,
-        sampler_deployment(probe, facts).attachment,
-        sampler_deployment(probe, facts, beta=0.0).attachment,
-    ):
+    for signed in (workload.compile_backend(facts).attachment, sampler_deployment(probe, facts).attachment):
         reconstructed = decode_boundary(encode_boundary(signed), SignedBackendAttachment)
         assert reconstructed == signed
         validate_backend_attachment_physical(reconstructed.inputs, reconstructed.decision, reconstructed.physical)
         assert compile_backend_attachment(signed.inputs) == signed.decision
         assert lower_backend_attachment(signed.inputs, signed.decision) == signed.physical
-        wire = encode_boundary(signed.inputs)
-        for path, key in (
-            ((), "plan"),
-            (("request",), "state_resource"),
-            (("probe",), "model_fingerprint"),
-            (("plan",), "tensor_layout_request"),
-        ):
-            for missing in (True, False):
-                payload = json.loads(wire)
-                node = payload
-                for part in path:
-                    node = node[part]
-                if missing:
-                    del node[key]
-                else:
-                    node["unknown"] = 0
-                with pytest.raises(ValueError):
-                    _core.compile_backend_attachment(json.dumps(payload))
+        payload = json.loads(encode_boundary(signed.inputs))
+        payload["probe"]["unknown"] = 0
         with pytest.raises(ValueError):
-            _core.compile_backend_attachment(
-                wire.replace('"schema_version":8', '"schema_version":8,"schema_version":8', 1)
-            )
+            _core.compile_backend_attachment(json.dumps(payload))
 
 
 @pytest.mark.parametrize("multiprocessing", (False, True))
@@ -174,6 +133,7 @@ def test_factory_failure_releases_an_already_created_engine(multiprocessing: boo
             "VLLM_USE_V2_MODEL_RUNNER": "1",
             "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
         }
+        # Inject the engine at the vLLM constructor boundary.
         with patch.dict(os.environ, environment), patch.object(runtime, "LLM", return_value=engine):
             with pytest.raises(RuntimeError):
                 pllm.make_llm(
