@@ -1810,13 +1810,15 @@ def probe_backend(
     ):
         raise ValueError("worker timeline underfunds the backend input/sampler buffers")
     free_bytes, _total_bytes = torch.cuda.mem_get_info(runner.device)
-    # One current and one private root per scheduled request, with publication overlap.
+    # Per scheduled request: the current root, the private root being written, and the root the GPU
+    # may still read from the step before, because the host prepares a step while the GPU runs the last.
+    # With only two, every transition waits for the previous step's GPU work before it can allocate.
     return BackendCompileFacts(
         probe,
         timeline,
         (
             PageBundleProviderFacts(
-                "canonical.page_bundle_cuda@1", 2 * runner.max_num_reqs + 2, probe.device_kind, probe.device_ordinal
+                "canonical.page_bundle_cuda@1", 3 * runner.max_num_reqs + 2, probe.device_kind, probe.device_ordinal
             ),
         ),
         runner.max_num_reqs,
