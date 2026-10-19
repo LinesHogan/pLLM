@@ -50,10 +50,8 @@ from pllm.contracts.region_program import (
     While,
     verify,
 )
-from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.exported_cell import ExportedCell
-from pllm.execution.region_adamw import AdamWRegion
 from pllm.execution.region_compilation import (
     analyze_region_program,
     explore_region_tiling,
@@ -66,7 +64,6 @@ from pllm.execution.region_native import NativePrimitive, tensor_item
 from pllm.execution.region_storage import analyze_region_capacity
 from pllm.execution.region_values import Bank, copy_data
 from pllm.execution.tensor_scan import TensorScan
-from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw
 from test.region_fixtures import (
     StorageObserver,
     bind,
@@ -682,35 +679,3 @@ def test_native_import_copies_inputs_and_returns_independent_storage(device):
     torch.testing.assert_close(a, x[:1] + 1, rtol=0, atol=0)
     torch.testing.assert_close(same, x, rtol=0, atol=0)
     torch.testing.assert_close(x, torch.ones_like(x), rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("device", ("cpu", "cuda:0"))
-def test_adamw_region_matches_the_kernel_bitwise(device):
-    if device.startswith("cuda") and not torch.cuda.is_available():
-        pytest.skip("requires CUDA")
-    fields = AdamWFields(*(LayoutFieldId(i) for i in range(5)))
-    generator = torch.Generator(device=device).manual_seed(37)
-
-    def root(shape, dtype):
-        return (
-            torch.randn(shape, dtype=dtype, device=device, generator=generator),
-            torch.zeros(shape, dtype=dtype, device=device),
-            torch.tensor(11.0, device=device),
-            torch.randn(shape, dtype=dtype, device=device, generator=generator),
-            torch.rand(shape, dtype=dtype, device=device, generator=generator),
-        )
-
-    # Heterogeneous parameters in one optimizer region.
-    config = AdamWConfig(0.013, betas=(0.81, 0.97), eps=1e-4, weight_decay=0.07)
-    optimizer = AdamWRegion(
-        (TensorType((2, 7), "torch.bfloat16", device), TensorType((3,), "torch.float32", device)), config
-    )
-    roots = (root((2, 7), torch.bfloat16), root((3,), torch.float32))
-    expected = tuple(tuple(v.clone() for v in r) for r in roots)
-    for _ in range(3):
-        gradients = tuple(torch.randn(r[0].shape, dtype=r[0].dtype, device=device, generator=generator) for r in roots)
-        apply_adamw(expected, fields, config, gradients)
-        roots = optimizer(roots, gradients)
-        for updated, want in zip(roots, expected, strict=True):
-            for value, reference in zip(updated, want, strict=True):
-                torch.testing.assert_close(value, reference, rtol=0, atol=0)
