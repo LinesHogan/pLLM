@@ -24,8 +24,7 @@ from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.semantic_graph import TaskId
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.trace import TraceSelection
-from pllm.workload_transport import decode_workload as decode_workload
-from pllm.workload_transport import encode_workload as encode_workload
+from pllm.workload_transport import decode_workload as decode_workload, encode_workload as encode_workload
 
 
 class GPUWorker(Worker):

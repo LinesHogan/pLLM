@@ -15,10 +15,8 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar, cast, overload
 
 import torch
-from vllm import RequestOutput, SamplingParams
-from vllm import __version__ as _VLLM_VERSION
-from vllm.config import CacheConfig, VllmConfig
-from vllm.config import ModelConfig as VllmModelConfig
+from vllm import RequestOutput, SamplingParams, __version__ as _VLLM_VERSION
+from vllm.config import CacheConfig, ModelConfig as VllmModelConfig, VllmConfig
 from vllm.entrypoints.llm import LLM
 from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
 from vllm.sequence import IntermediateTensors

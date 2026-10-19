@@ -40,8 +40,11 @@ from pllm.execution.region_resources import (
     RegionPageOwner,
 )
 from pllm.execution.region_streams import RegionStreamBindings
-from pllm.execution.tokenwise_region import TokenwiseRegion, compile_tokenwise_region
-from pllm.execution.tokenwise_region import mix_layer_outputs as mix_layer_outputs
+from pllm.execution.tokenwise_region import (
+    TokenwiseRegion,
+    compile_tokenwise_region,
+    mix_layer_outputs as mix_layer_outputs,
+)
 from pllm.execution.trace import TracePhase
 
 if TYPE_CHECKING:

@@ -8,8 +8,7 @@ from typing import Annotated, TypeAlias
 import torch
 
 import pllm
-from pllm import ConditionalLayerReplay, ParameterTarget, TensorUpdate
-from pllm import authoring as a
+from pllm import ConditionalLayerReplay, ParameterTarget, TensorUpdate, authoring as a
 from pllm.contracts.region_program import Block, Call, Program, Region, SizeParameter, Value
 from pllm.contracts.region_selection import RegionSelectionPolicy
 from pllm.execution.exported_cell import ExportedCell

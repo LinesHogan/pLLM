@@ -5,8 +5,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass
-from dataclasses import field as dataclass_field
+from dataclasses import dataclass, field as dataclass_field
 from math import prod
 from multiprocessing.connection import Connection
 from threading import RLock

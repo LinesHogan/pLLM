@@ -9,27 +9,27 @@ from typing import Generic, Protocol, TypeVar
 import torch
 
 from pllm.config import ExecutionOptions
-from pllm.contracts.auxiliary import AuxiliaryInput as AuxiliaryInput
-from pllm.contracts.auxiliary import CausalTrainBatch as CausalTrainBatch
-from pllm.contracts.auxiliary import StateTensorUpdate as StateTensorUpdate
-from pllm.contracts.auxiliary import WeightedCEBatch as WeightedCEBatch
-from pllm.contracts.auxiliary import map_auxiliary as map_auxiliary
+from pllm.contracts.auxiliary import (
+    AuxiliaryInput as AuxiliaryInput,
+    CausalTrainBatch as CausalTrainBatch,
+    StateTensorUpdate as StateTensorUpdate,
+    WeightedCEBatch as WeightedCEBatch,
+    map_auxiliary as map_auxiliary,
+)
 from pllm.contracts.backend_attachment import BackendAttachmentSpec, BackendPlacementProbe, SignedBackendAttachment
 from pllm.contracts.compilation import PlanBundle as PlanBundle
-from pllm.contracts.hidden_locator import HiddenPhase as HiddenPhase
-from pllm.contracts.hidden_locator import HiddenSite as HiddenSite
+from pllm.contracts.hidden_locator import HiddenPhase as HiddenPhase, HiddenSite as HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenSnapshotBatch
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.contracts.parameter_overlay import CapturedParameterOperand, ParameterTarget
-from pllm.contracts.sampler import PackedSamplerGuidanceBatch
-from pllm.contracts.sampler import SamplerStage as SamplerStage
+from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage as SamplerStage
 from pllm.contracts.semantic_graph import (
     HiddenInputSource,
+    MathContract as MathContract,
     SchedulerTimeline,
     SemanticGraph,
     StateScope,
 )
-from pllm.contracts.semantic_graph import MathContract as MathContract
 from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
 from pllm.execution.backend_attachment import (
     attachment_buffer_bytes,
@@ -40,53 +40,29 @@ from pllm.execution.backend_attachment import (
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.declaration import (
     Builder as Builder,
-)
-from pllm.execution.declaration import (
     Call as Call,
-)
-from pllm.execution.declaration import (
     Dimensions as Dimensions,
-)
-from pllm.execution.declaration import (
     Field as Field,
-)
-from pllm.execution.declaration import (
     State as State,
-)
-from pllm.execution.declaration import (
     When as When,
-)
-from pllm.execution.declaration import (
     adam_fields as adam_fields,
-)
-from pllm.execution.declaration import (
     native as native,
 )
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
-from pllm.execution.state_execution import MathBinding as MathBinding
-from pllm.execution.state_execution import StateExecution
-from pllm.execution.state_execution import StateTaskContext as StateTaskContext
+from pllm.execution.state_execution import (
+    MathBinding as MathBinding,
+    StateExecution,
+    StateTaskContext as StateTaskContext,
+)
 from pllm.execution.tensor_binding import TensorResult as TensorResult
 from pllm.execution.tensor_program import (
     FunctionMath as FunctionMath,
-)
-from pllm.execution.tensor_program import (
     InvocationOutput as InvocationOutput,
-)
-from pllm.execution.tensor_program import (
     Observation as Observation,
-)
-from pllm.execution.tensor_program import (
     Roots as Roots,
-)
-from pllm.execution.tensor_program import (
     TaskOutput as TaskOutput,
-)
-from pllm.execution.tensor_program import (
     TensorBatch as TensorBatch,
-)
-from pllm.execution.tensor_program import (
     TensorOperation as TensorOperation,
 )
 from pllm.execution.trace import MAX_SNAPSHOT_BYTES as MAX_SNAPSHOT_BYTES

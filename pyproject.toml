@@ -40,6 +40,7 @@ ignore = ["E741", "E731"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["pllm", "test"]
+combine-as-imports = true
 
 [tool.pytest.ini_options]
 # Fast developer loop: pytest -m "not slow" test/boundary test/workloads

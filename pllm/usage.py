@@ -3,8 +3,7 @@
 from collections.abc import Callable, Mapping
 from dataclasses import KW_ONLY, dataclass, field, fields, is_dataclass, replace
 from enum import Enum
-from inspect import Parameter as SignatureParameter
-from inspect import signature
+from inspect import Parameter as SignatureParameter, signature
 from types import FunctionType, MethodType
 from typing import Annotated, ClassVar, TypeVar, cast, get_args, get_origin
 
@@ -45,8 +44,14 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorLayoutRequest
 from pllm.execution.codec import boundary_digest
 from pllm.execution.declaration import Call, Dimensions, Shape, State, When, native
-from pllm.execution.freeze import fingerprint, freeze, owner_snapshot, owner_values, reachable_functions
-from pllm.execution.freeze import members as _members
+from pllm.execution.freeze import (
+    fingerprint,
+    freeze,
+    members as _members,
+    owner_snapshot,
+    owner_values,
+    reachable_functions,
+)
 from pllm.execution.host_runtime import (
     HostRuntimeFacts,
     HostWorkload,
@@ -55,12 +60,8 @@ from pllm.execution.host_runtime import (
 from pllm.execution.replay import Recurrence as Recurrence
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.task_memory import derive_resources
-from pllm.execution.tensor_binding import SGD as SGD
-from pllm.execution.tensor_binding import Buffer as Buffer
-from pllm.execution.tensor_binding import TensorBinding
-from pllm.execution.tensor_binding import TensorOutput as TensorOutput
-from pllm.execution.tensor_frame import TensorFrame, TensorPort, Tensors
-from pllm.execution.tensor_frame import TensorUpdate as TensorUpdate
+from pllm.execution.tensor_binding import SGD as SGD, Buffer as Buffer, TensorBinding, TensorOutput as TensorOutput
+from pllm.execution.tensor_frame import TensorFrame, TensorPort, Tensors, TensorUpdate as TensorUpdate
 from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots, TensorComputation
 from pllm.kernels.adamw import AdamWConfig
 

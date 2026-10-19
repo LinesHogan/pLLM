@@ -8,8 +8,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
-from dataclasses import field as dataclass_field
+from dataclasses import dataclass, field as dataclass_field, replace
 from typing import TypeVar
 
 import numpy as np

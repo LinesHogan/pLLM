@@ -7,8 +7,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 import torch
-from torch.nn import Parameter
-from torch.nn import functional as F
+from torch.nn import Parameter, functional as F
 from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
 
 from pllm.authoring import ParameterTargetShape

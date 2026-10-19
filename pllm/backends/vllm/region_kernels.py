@@ -4,8 +4,7 @@ from dataclasses import dataclass
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
-from vllm import __version__ as vllm_version
-from vllm import _custom_ops, envs
+from vllm import __version__ as vllm_version, _custom_ops, envs
 from vllm.ir.ops import fused_add_rms_norm
 from vllm.model_executor.layers.layernorm import RMSNorm
 
