@@ -112,21 +112,9 @@ def main() -> int:
                 else size == owned_hidden_bytes
             )
         assert plan.schedule_decision.peak_memory_bytes >= plan.state_physical.reserved_bytes + owned_hidden_bytes
-        with (
-            patch(
-                "pllm.workloads.esamp_request.low_rank_gated_loss_and_gradients",
-                side_effect=AssertionError("eager loss on captured task"),
-            ),
-            patch(
-                "pllm.workloads.esamp_request.apply_adamw",
-                side_effect=AssertionError("eager optimizer on captured task"),
-            ),
-        ):
-            outputs = handle.generate(
-                ["The sky is"], SamplingParams(max_tokens=3, temperature=0.0, n=1, ignore_eos=True)
-            )
+        outputs = handle.generate(["The sky is"], SamplingParams(max_tokens=3, temperature=0.0, n=1, ignore_eos=True))
         execution = handle.deployment.execution
-        assert sum("cuda_graph" in task.implementation_id for task in execution.plan.tasks) == 2
+        assert sum("cuda_graph" in task.implementation_id for task in execution.plan.tasks) == 3
         diagnostics = execution.diagnostics()
         if (
             not outputs[0].outputs[0].text

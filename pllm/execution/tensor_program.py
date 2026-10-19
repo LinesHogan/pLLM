@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
-from typing import Generic, Literal, TypeVar
+from typing import TYPE_CHECKING, Generic, Literal, TypeVar, cast
 
 import torch
 
@@ -24,6 +24,11 @@ from pllm.execution.state_execution import StateTaskContext
 from pllm.execution.trace import TracePhase
 from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw, paged_adamw
 from pllm.kernels.paged_linear import PagedRows, TensorRows
+
+if TYPE_CHECKING:
+    from pllm.execution.step_capture import StepCapture
+    from pllm.execution.tensor_frame import TensorFrame
+
 
 I = TypeVar("I")
 D = TypeVar("D")
@@ -59,6 +64,7 @@ class TensorBatch:
     )
     borrowed_roots: tuple[BorrowedStateRoot, ...] = ()
     local_pin: PagePin | None = None
+    completed: frozenset[TaskSymbol] = frozenset()
 
     def parameter_root(self, resource: str) -> tuple[torch.Tensor, ...]:
         # No borrowed state: preserve the original sole-root reader (existing workload suite).
@@ -280,6 +286,7 @@ class TensorOperation(Generic[D]):
     gradient_fields: int = 1
     version: Literal["input", "private", "published"] = "input"
     copy_fields: tuple[LayoutFieldId, ...] | None = None
+    step: StepCapture | None = None
 
     def execute(self, context: StateTaskContext[D]) -> None:
         data, stream = context.data(), context.pin.stream
@@ -318,7 +325,12 @@ class TensorOperation(Generic[D]):
                     buffer[tuple(slice(0, size) for size in value.shape)].copy_(value)
                 context.arena.replay_captured(view)
                 batch = replace(batch, captured=tuple(value[: len(selected)].clone() for value in view.results))
-            output = self.function(data, batch)
+            if self.step is None:
+                output = self.function(data, batch)
+            else:
+                output = self.step.execute(cast("StateTaskContext[TensorFrame]", context), batch)
+                if self.step.optimizer is None:
+                    output = self.function(data, replace(batch, completed=frozenset((self.step.task.symbol,))))
             if output.gradient_indices:
                 if (
                     not output.gradients

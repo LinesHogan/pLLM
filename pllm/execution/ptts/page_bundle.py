@@ -623,6 +623,8 @@ class PageBundleArena:
 
         One batched copy per (resource, field), however many states the write covers.
         """
+        if sources and copy_fields == ():
+            return
         for resource in dict.fromkeys(root.resource for root in targets):
             pools = self._pools[resource]
             group = [index for index, root in enumerate(targets) if root.resource == resource]

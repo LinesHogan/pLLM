@@ -138,3 +138,36 @@ fresh = llm.trace_snapshot().events[max(0, cursor - snapshot.dropped):]
 
 精确语义（update 掩码授权、empty 选择、detach 规则、导数掩码、行域）见
 [创作契约](../reference/authoring-contract.md#训练与梯度)。
+
+### Capture an ordinary tensor step
+
+`ExecutionOptions(capture=True)` captures ordinary CUDA prediction and AdamW training
+methods. ESamp uses this framework path. A training graph contains parameter gathering,
+the Python method's tensor operations, loss reduction, autograd, memory writes, and the
+optimizer. The CPU still allocates private versions and publishes them through PTTS.
+AdamW reads source slots and writes destination slots, so the five optimizer fields need
+no preceding COW copy. Other written fields are copied inside the graph.
+
+Captured methods must compute independently along their first (row) axis. They see the
+signed maximum operation row count, including padding. Return **one loss per row** for
+both `reduction="mean"` and `reduction="state_mean"`; do not reduce the row axis in Python
+or mix rows with batch normalization, attention, or another cross-row operation. The
+framework gives padding zero weight and a sink parameter row that is never optimized.
+Shared instance parameters use one live state; request parameters use the admitted state
+bound. Eager execution uses the same step body with the invocation's actual dimensions.
+Legacy scalar losses and data-dependent update/forward selections remain available with
+`capture=False`; dynamic training selections are rejected when capture is requested.
+
+One pinned int64 table carries row indices, masks, counts, last-row memory indices and
+source/destination page slots. Hidden reads address the fixed backend tap buffers inside
+the graph. Sampler operands use addresses and strides in that same table, so changing
+sampler allocations do not force recapture or a host readback. Prediction results and
+loss/gradient outputs are copied out before a later replay can overwrite them.
+
+The first invocation warms up on a side stream and captures into a private graph pool.
+`capture_memory_bytes` reserves resident memory **per task**; the captured pool and index
+table are checked against that reservation. Replacing hidden buffer storage starts a new
+cold capture. Subsequent invocations with fixed tap buffers perform no host-device wait.
+
+OutputLoRA still uses its native `KernelCapture` implementation. Its staged loss/update
+binding and the corresponding page-capture API remain until that workload is migrated.

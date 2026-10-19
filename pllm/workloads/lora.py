@@ -109,6 +109,8 @@ def _resources(
 
 @dataclass(frozen=True)
 class OutputLoRAWorkload(pllm.Workload):
+    # The native LoRA implementation still owns separate loss and update captures.
+    staged_training = True
     name = "lora.output_head"
     config: OutputLoRAConfig = OutputLoRAConfig()
 

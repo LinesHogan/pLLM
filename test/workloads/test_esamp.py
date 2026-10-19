@@ -40,7 +40,7 @@ from pllm.workloads.esamp_request import (
     ESampRequestConfig,
     ESampRequestWorkload,
 )
-from test.backend_facts import assert_capture_preflight, backend_facts
+from test.backend_facts import backend_facts
 
 
 def effective(guidance):
@@ -101,35 +101,13 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(
     workload = ESampRequestWorkload(config)
     facts = backend_facts(4, bindings, timeline, PageBundleProviderFacts("test.esamp@1", 6))
     bounded = ESampRequestWorkload(replace(config, key_fields=(RequestKeyField.REQUEST_ID,)))
-    for paged in (False, True):
-        assert_capture_preflight(ESampRequestWorkload(replace(bounded.config, paged=paged)), facts, monkeypatch)
     specialized = bounded.specialize(facts, ExecutionOptions())
-
-    def shifted_source(self, source, up, gate, down, bias, scale, shift):
-        return source + shift
-
+    # Ordinary source edits get a new signature and need no workload-specific lowering.
     with monkeypatch.context() as changed:
-        changed.setattr(ESampRequestWorkload, "forward", shifted_source)
-        with pytest.raises(ValueError, match="resource_facts declaration"):
-            bounded.specialize(facts, ExecutionOptions())
-        with pytest.raises(ValueError, match="resource_facts declaration"):
-            bounded.compile_backend(specialized)
-        changed.setattr(ESampRequestWorkload, "resource_facts", lambda self, facts, options: facts.timeline)
-        assert bounded.compile_backend(specialized).execution.arena.active_lineages == 0
-    (state_shape,) = next(item for item in specialized.timeline.task_resources if item.task == "train").input_shapes
-    resources = tuple(
-        replace(
-            item,
-            resident_bytes=32,
-            input_shapes=(item.input_shapes[0], item.input_shapes[0], state_shape, (item.input_shapes[0][0],)),
+        changed.setattr(
+            ESampRequestWorkload, "forward", lambda self, source, up, gate, down, bias, scale, shift: source + shift
         )
-        if item.task == "loss"
-        else item
-        for item in specialized.timeline.task_resources
-    )
-    # Loss and optimizer share one capture entitlement; signed loss residency cannot fund an unreserved optimizer.
-    with pytest.raises(ValueError, match="train workspace/residency"):
-        bounded.compile_backend(replace(specialized, timeline=replace(specialized.timeline, task_resources=resources)))
+        assert bounded.compile_backend(specialized).execution.arena.active_lineages == 0
     declaration = workload.declaration(facts)
     plan = compile_page_bundle_plan(
         (declaration.graph, declaration.layouts),
@@ -148,10 +126,6 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(
         changed.setattr(ESampRequestWorkload, "optimizer", property(lambda self: pllm.AdamW(lr=0.9)))
         with pytest.raises(ValueError, match="signed declaration"):
             workload.bind_math(facts, plan)
-    with pytest.raises(ValueError, match="bindings"):
-        workload.bind_math(
-            replace(facts, probe=replace(facts.probe, hidden_resources=facts.probe.hidden_resources[:1])), plan
-        )
     # Frozen dataclasses block plain rebinding; drive the drift behind the freeze to
     # prove an already bound execution keeps its own signed mathematics.
     object.__setattr__(workload, "config", replace(config, intervention_beta=0.9, learning_rate=0.9))
@@ -328,10 +302,9 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(
     execution.admit(identities)
     execution.retire(identities)
     assert execution.arena.free_pages == 6
-    _esamp_native_oracle(monkeypatch, torch.device("cpu"), explicit=True)
+    _esamp_native_oracle(monkeypatch, torch.device("cpu"))
     if torch.cuda.is_available():
         _esamp_native_oracle(monkeypatch, torch.device("cuda", 0))
-        _esamp_native_oracle(monkeypatch, torch.device("cuda", 0), explicit=True)
     _ordinary_request_distillation()
 
 
@@ -389,6 +362,9 @@ def _ordinary_request_distillation() -> None:
             max_lineages=3,
         )
         workload = Distillation()
+        facts = workload.specialize(
+            facts, ExecutionOptions(capture=device.type == "cuda", capture_memory_bytes=16 * 1024**2)
+        )
         deployment = workload.compile_backend(facts)
         execution = deployment.execution
         identities = tuple(RequestIdentity("same-id", 0, index) for index in range(3))
@@ -480,7 +456,7 @@ def _ordinary_request_distillation() -> None:
         assert diagnostics.active_lineages == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
 
 
-def _esamp_native_oracle(monkeypatch, device, explicit=False):
+def _esamp_native_oracle(monkeypatch, device):
     from pllm.execution.cuda_stream import CudaStreamReadiness
 
     stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
@@ -490,18 +466,13 @@ def _esamp_native_oracle(monkeypatch, device, explicit=False):
         )
         for layer in (0, -1)
     )
-    for paged, normalized, captured in (
-        (False, False, False),
-        (False, True, False),
-        *(
-            ((True, False, False), (True, True, False), (True, True, True))
-            if device.type == "cuda" and not explicit
-            else ()
-        ),
+    for normalized, captured in (
+        (False, False),
+        (True, False),
+        *(((False, True), (True, True)) if device.type == "cuda" else ()),
     ):
         config = ESampRequestConfig(
             rank=4,
-            paged=paged,
             output_layernorm=normalized,
             intervention=True,
             intervention_beta=0.2,
@@ -524,9 +495,7 @@ def _esamp_native_oracle(monkeypatch, device, explicit=False):
             max_lineages=3,
             memory_bytes=100000,
         )
-        facts = workload.specialize(
-            facts, ExecutionOptions(capture=captured, capture_memory_bytes=16 * 1024**2, explicit_math=explicit)
-        )
+        facts = workload.specialize(facts, ExecutionOptions(capture=captured, capture_memory_bytes=16 * 1024**2))
         timeline = facts.timeline
         with pytest.raises(ValueError, match="workspace"):
             workload.compile_backend(
@@ -550,21 +519,6 @@ def _esamp_native_oracle(monkeypatch, device, explicit=False):
                     ),
                 )
             )
-        if (paged or explicit) and not captured:
-
-            def modified_forward(self, source, up, gate, down, bias, scale, shift):
-                return source + shift
-
-            with monkeypatch.context() as changed:
-                changed.setattr(ESampRequestWorkload, "forward", modified_forward)
-                with pytest.raises(ValueError, match="customized mathematics"):
-                    workload.compile_backend(facts)
-            with monkeypatch.context() as changed:
-                changed.setitem(
-                    ESampRequestWorkload.predict.__annotations__, "source", Annotated[torch.Tensor, pllm.Hidden(-1)]
-                )
-                with pytest.raises(ValueError, match="customized mathematics"):
-                    workload.compile_backend(facts)
         declaration = workload.declaration(facts)
         plan = compile_page_bundle_plan(
             (declaration.graph, declaration.layouts),
@@ -671,21 +625,22 @@ def _esamp_native_oracle(monkeypatch, device, explicit=False):
                 invocation = execution.start_step(value, stream)
                 assert not invocation.context.results
                 execution.cancel_step(invocation)
-                saved_sources = []
-                saved_shapes = []
+                if captured and step_id:
+                    refs = tuple(execution.arena.latest(initial[owner].lineage_id) for owner in set(owners))
+                    before = tuple(execution.snapshot(ref, stream) for ref in refs)
+                    with monkeypatch.context() as fault:
 
-                def save(tensor):
-                    saved_shapes.append(tuple(tensor.shape))
-                    if tensor.shape == (len(owners), 1, 8):
-                        saved_sources.append(tensor.untyped_storage().data_ptr())
-                    return tensor
+                        def reject_publication(arena, write):
+                            raise RuntimeError("captured publication failure")
 
-                with torch.autograd.graph.saved_tensors_hooks(save, lambda tensor: tensor):
-                    result = execution.step(value, stream)
-                if not paged and not captured and not explicit:
-                    assert saved_sources and set(saved_sources) == {source.untyped_storage().data_ptr()}
-                if paged or explicit:
-                    assert not saved_shapes, "explicit derivatives must not build an autograd tape"
+                        fault.setattr(PageBundleArena, "publish", reject_publication)
+                        with pytest.raises(RuntimeError, match="captured publication failure"):
+                            execution.step(value, stream)
+                    for ref, tensors in zip(refs, before, strict=True):
+                        assert execution.arena.latest(ref.lineage_id) == ref
+                        for actual, expected in zip(execution.snapshot(ref, stream), tensors, strict=True):
+                            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                result = execution.step(value, stream)
                 assert result.guidance is not None and result.loss is not None and result.publication is not None
                 if step_id:
                     torch.testing.assert_close(result.guidance.values, expected_prediction, rtol=1e-5, atol=1e-6)
@@ -714,9 +669,44 @@ def _esamp_native_oracle(monkeypatch, device, explicit=False):
                             rtol=1e-4,
                             atol=1e-6,
                             msg=lambda message: (
-                                f"paged={paged}, normalized={normalized}, captured={captured}, step={step_id}: {message}"
+                                f"normalized={normalized}, captured={captured}, step={step_id}: {message}"
                             ),
                         )
+            # A task can see fewer rows than its invocation's state selection. The middle
+            # state alone gets a destination; real inactive states are not padding slots.
+            rows = PackedPhaseRowBatch(
+                1,
+                2,
+                3,
+                tuple(PackedPhaseRow(i, i, 2, HiddenPhase.DECODE, identity) for i, identity in enumerate(identities)),
+            )
+            sampler = PackedSamplerRowBatch(rows, tuple(PackedSamplerRowLink(i, i) for i in range(3)))
+            hidden = PackedHiddenSnapshotBatch(
+                rows,
+                tuple(
+                    sorted(
+                        (PackedHiddenSnapshot(bindings[0], source), PackedHiddenSnapshot(bindings[1], target)),
+                        key=lambda item: item.resource.locator_key,
+                    )
+                ),
+            )
+            value = TensorStepInput(
+                rows, sampler, hidden, hidden_readiness=None if stream is None else CudaStreamReadiness(stream)
+            )
+            refs = tuple(execution.arena.latest(ref.lineage_id) for ref in initial)
+            before = tuple(execution.snapshot(ref, stream) for ref in refs)
+            invocation = execution.start_step(value, stream)
+            invocation.context.data().rows = (rows.rows[1],)
+            for anchor in plan.timeline.anchors:
+                execution.execute_anchor(invocation, AnchorId(anchor.ordinal))
+                if anchor.ordinal == 1:
+                    execution.complete_sampler(invocation, stream)
+            result = execution.finish_step(invocation)
+            assert result.publication.before_refs == (refs[1],)
+            for index in (0, 2):
+                assert execution.arena.latest(refs[index].lineage_id) == refs[index]
+                for actual, expected in zip(execution.snapshot(refs[index], stream), before[index], strict=True):
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             for ref, expected in zip(initial, originals, strict=True):
                 torch.testing.assert_close(execution.arena.snapshot(old_pin, ref)[0], expected, rtol=0, atol=0)
         execution.arena.wait_release(execution.arena.release_pin(old_pin))

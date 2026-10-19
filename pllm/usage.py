@@ -5,12 +5,14 @@ from dataclasses import KW_ONLY, dataclass, field, fields, is_dataclass, replace
 from enum import Enum
 from inspect import Parameter as SignatureParameter
 from inspect import signature
+from math import prod
 from types import FunctionType, MethodType
 from typing import Annotated, ClassVar, TypeVar, cast, get_args, get_origin
 
 import torch
 
 from pllm.authoring import BackendCompileFacts, BackendRequirements, BackendWorkload, TensorStepInput
+from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import (
     ActivationPatchOperator,
     AttachmentKind,
@@ -31,6 +33,7 @@ from pllm.contracts.semantic_graph import (
     LossReduction,
     MathContract,
     SamplerFeedbackInputSource,
+    SchedulerTimeline,
     SemanticGraph,
     SemanticInputSource,
     StateScope,
@@ -38,10 +41,11 @@ from pllm.contracts.semantic_graph import (
     TaskResourceFact,
     TaskResultInputSource,
     TaskSymbol,
+    ValueResourceFact,
 )
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorLayoutRequest
 from pllm.execution.codec import boundary_digest
-from pllm.execution.declaration import Call, Dimensions, Shape, State, When
+from pllm.execution.declaration import Call, Dimensions, Shape, State, When, native
 from pllm.execution.freeze import NativeMath, fingerprint, freeze, owner_snapshot, owner_values, reachable_functions
 from pllm.execution.freeze import members as _members
 from pllm.execution.host_runtime import (
@@ -51,13 +55,14 @@ from pllm.execution.host_runtime import (
 )
 from pllm.execution.replay import Recurrence as Recurrence
 from pllm.execution.state_execution import MathBinding, StateExecution
+from pllm.execution.step_capture import StepCapture
 from pllm.execution.tensor_binding import SGD as SGD
 from pllm.execution.tensor_binding import Buffer as Buffer
 from pllm.execution.tensor_binding import TensorBinding
 from pllm.execution.tensor_binding import TensorOutput as TensorOutput
 from pllm.execution.tensor_frame import TensorFrame, TensorPort, Tensors
 from pllm.execution.tensor_frame import TensorUpdate as TensorUpdate
-from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots
+from pllm.execution.tensor_program import FunctionMath, InvocationOutput, PoolAdamW, Roots
 from pllm.kernels.adamw import AdamWConfig
 
 F = TypeVar("F", bound=Callable[..., torch.Tensor | TensorUpdate])
@@ -454,6 +459,7 @@ class Workload(
     """Python methods and effects compiled once, not runtime hooks or a second IR."""
 
     name: ClassVar[str] = "python.workload"
+    staged_training: ClassVar[bool] = False
 
     def _build(self, b: TensorBinding) -> None:
         owner = _snapshot(self)
@@ -895,7 +901,7 @@ class Workload(
         if training is not None:
             call, state = training
             task = next(task for task in b.graph.tasks if task.symbol == call.symbol)
-            if task.math is not None and task.math.reduction == "state_mean":
+            if self.staged_training and task.math is not None and task.math.reduction == "state_mean":
                 training = b.stage_update(call, state), state
         if prediction is not None:
             if training is None:
@@ -1016,7 +1022,12 @@ class Workload(
             def output(data: TensorFrame, invocation: InvocationOutput) -> TensorOutput:
                 return b.result(data, invocation)
 
+        limits = [fact.input_shapes[0][0] for fact in b.resources if fact.task in b.tensor_tasks and fact.input_shapes]
+        row_limit = min(limits) if limits and type(self).operations is Workload.operations else None
+
         def rows(value: TensorStepInput) -> tuple[PackedPhaseRow, ...]:
+            if row_limit is not None and len(value.rows.decode_rows) > row_limit:
+                raise ValueError("operation rows exceed the signed workspace envelope")
             if b.probe is not None and value.rows.total_rows > b.probe.max_packed_rows:
                 raise ValueError("packed input exceeds the signed backend row capacity")
             if b.attachment is not None and b.attachment.activation_bindings:
@@ -1041,11 +1052,44 @@ class Workload(
             raise ValueError("tensor mathematics differ from the original signed declaration")
         return owner.operations(facts, plan, b)
 
+    def resource_facts(self, facts: BackendCompileFacts, options: ExecutionOptions) -> SchedulerTimeline:
+        """Reserve ordinary tensor scratch and each requested graph's private pool."""
+        if options.explicit_math:
+            raise ValueError("this workload has no explicit tensor implementation")
+        # Native workloads retain their own resource declarations.
+        if type(self).resource_facts is not Workload.resource_facts:
+            return facts.timeline
+        b = self.declaration(facts)
+        if not b.tensor_tasks:
+            return facts.timeline
+        rows = facts.max_admitted_lineages
+        parameters = sum(prod(field.shape) for entry in b.layouts.layouts for field in entry.layout.fields)
+        resident = options.capture_memory_bytes if options.capture else 0
+        return replace(
+            facts.timeline,
+            task_resources=tuple(
+                TaskResourceFact(
+                    task.symbol,
+                    4 * rows * (4 * parameters + 16 * facts.probe.hidden_size),
+                    resident if task.symbol in b.tensor_tasks else 0,
+                    ((rows, facts.probe.hidden_size),),
+                )
+                for task in b.graph.tasks
+            ),
+            value_resources=tuple(
+                ValueResourceFact(task.symbol, output.name, 4 * rows * (parameters + facts.probe.hidden_size))
+                for task in b.graph.tasks
+                for output in task.outputs
+            ),
+        )
+
     def implementations(
         self, operation: str, resources: tuple[TaskResourceFact, ...], *, explicit_math: bool = False
     ) -> tuple[TaskImplementationSpec, ...]:
         if explicit_math:
             raise ValueError("this workload has no explicit tensor implementation")
+        if any(fact.task == operation and fact.resident_bytes for fact in resources):
+            return (native(f"python.cuda_graph:{self.name}:{operation}@1", "compute/cuda_graph@1"),)
         return ()
 
     def operations(
@@ -1053,6 +1097,28 @@ class Workload(
     ) -> MathBinding[TensorStepInput, TensorFrame, TensorOutput]:
         if plan.timeline.task_resources:
             self.require_resources(plan, self.minimum_resources(facts, plan))
+        if plan.timeline.task_resources and b.tensor_tasks and type(self).operations is Workload.operations:
+            capture = "compute/cuda_graph@1" in plan.timeline.capabilities
+            limits = {fact.task: fact for fact in plan.timeline.task_resources}
+            states = (
+                facts.max_admitted_lineages if any(state.scope is StateScope.REQUEST for state in b.graph.states) else 1
+            )
+            conditional = any(
+                task.policy.update_states in task.domains
+                or (b.operations[symbol].optimizer and task.policy.forward_rows)
+                for symbol, task in b.tensor_tasks.items()
+            )
+            if conditional and capture:
+                raise ValueError("step capture needs row-wise independent training without dynamic update selection")
+            if not conditional:
+                for symbol, task in b.tensor_tasks.items():
+                    operation = b.operations[symbol]
+                    optimizer = operation.optimizer
+                    assert optimizer is None or isinstance(optimizer, PoolAdamW)
+                    b.operations[symbol] = replace(
+                        operation,
+                        step=StepCapture(task, b.tensor_tasks, limits[symbol], states, optimizer, enabled=capture),
+                    )
         return MathBinding(
             self._functions(b, facts.device, facts.initialization_seed), b.bind_all(plan, model_probe=facts.probe)
         )

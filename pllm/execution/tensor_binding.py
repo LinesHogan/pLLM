@@ -292,6 +292,7 @@ class TensorBinding(Builder[TensorFrame]):
     def __init__(self, name: str, digest: str, dimensions: Dimensions | None = None, *, host: bool = False) -> None:
         super().__init__(name, digest, dimensions)
         self.host = host
+        self.tensor_tasks: dict[TaskSymbol, TensorTask] = {}
         self.initializers: dict[str, Callable[[tuple[torch.Tensor, ...], torch.Generator], None]] = {}
         self.weighted_training = False
         self.probe: BackendPlacementProbe | None = None
@@ -582,7 +583,7 @@ class TensorBinding(Builder[TensorFrame]):
 
     @staticmethod
     def sampled_tokens() -> TensorPort:
-        return feedback_port(lambda feedback: feedback.sampled_tokens)
+        return feedback_port("sampled_tokens")
 
     def parameters(
         self,
@@ -665,11 +666,13 @@ class TensorBinding(Builder[TensorFrame]):
 
             self.initializers[str(state.declaration.resource)] = init
 
-        def port(view: Callable[[tuple[torch.Tensor, ...]], torch.Tensor]) -> TensorPort:
+        def port(key: str) -> TensorPort:
+            view = views[key]
             return TensorPort(
                 state.read(),
                 lambda data, batch: view(batch.parameter_root(str(state.declaration.resource))),
                 rowwise=False,
+                field=locations[key][0],
             )
 
         if scope is StateScope.REQUEST:
@@ -686,11 +689,11 @@ class TensorBinding(Builder[TensorFrame]):
                         rows = field_rows(data, batch, field_index, start or 0, size)
                     return rows.view(len(rows), *shape)
 
-                return TensorPort(state.read(), read)
+                return TensorPort(state.read(), read, field=field_index)
 
             return state, {key: request_port(key) for key in views}
 
-        return state, {key: port(view) for key, view in views.items()}
+        return state, {key: port(key) for key in views}
 
     def weighted_train(
         self,
@@ -871,7 +874,7 @@ class TensorBinding(Builder[TensorFrame]):
             value = port.read(data, batch)
             return value.unsqueeze(0).expand(len(data.rows), *value.shape)
 
-        return TensorPort(port.source, read)
+        return TensorPort(port.source, read, field=port.field)
 
     @staticmethod
     def state_metadata(state: State, *, version: bool) -> TensorPort:
@@ -944,6 +947,7 @@ class TensorBinding(Builder[TensorFrame]):
                         "parameter gradient rows require Parameter(..., per_row=True) for shared parameters"
                     )
                 task = TensorTask(symbol, function, ports, sources, policy, output, captures)
+                self.tensor_tasks[symbol] = task
                 execute = task.evaluate if update is None else task.train
             return self.compute(
                 name,

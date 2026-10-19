@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, overload
+from typing import TYPE_CHECKING, Literal, overload
 
 import torch
 
@@ -17,7 +17,6 @@ from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.parameter_overlay import ParameterTarget
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.contracts.sampler import SamplerFeedback
 from pllm.contracts.semantic_graph import (
     HiddenInputSource,
     PackedSamplerRowsInputSource,
@@ -91,6 +90,8 @@ class TensorPort:
     source: SemanticInputSource
     read: TensorReader
     rowwise: bool = True
+    field: int | None = None
+    feedback: str = ""
 
 
 def take_rows(values: torch.Tensor, rows: Sequence[int], device_rows: torch.Tensor | None = None) -> torch.Tensor:
@@ -123,11 +124,15 @@ class RowIndex:
     versions: tuple[int, ...]  # version of that state; 0 without state
     device: torch.Tensor  # the five columns above, stacked on the device
 
+    fixed: bool = False
+
     def column(self, name: str) -> torch.Tensor:
         return self.device[_COLUMNS.index(name)]
 
     def take(self, values: torch.Tensor, name: str) -> torch.Tensor:
         """Rows of `values` selected by one column, in operation-row order."""
+        if self.fixed:
+            return values.index_select(0, self.column(name))
         rows: tuple[int, ...] = getattr(self, name)
         if -1 in rows:
             raise ValueError(f"some rows have no {name} row")
@@ -161,6 +166,9 @@ def row_index(data: "TensorFrame", batch: TensorBatch, device: torch.device) -> 
 
 def field_rows(data: "TensorFrame", batch: TensorBatch, field: int, start: int, size: int) -> torch.Tensor:
     """`field[start:start+size]` of each row's state, `[rows, size]`; copies only that slice."""
+    if data.fields:
+        value = data.fields[field].reshape(len(data.fields[field]), -1).narrow(1, start, size)
+        return row_index(data, batch, value.device).take(value, "states")
     pool, slots = batch.field_slots(field)
     view = pool.reshape(len(pool), -1).narrow(1, start, size)
     rows = tuple(slots[state] for state in row_index(data, batch, pool.device).states)
@@ -173,6 +181,27 @@ def state_rows(batch: TensorBatch, field: int) -> torch.Tensor:
     if len(slots) == 1:
         return pool[slots[0] : slots[0] + 1]
     return pool.index_select(0, upload(slots, pool.device))
+
+
+class FieldRoots(Sequence[tuple[torch.Tensor, ...]]):
+    """Lazy per-state views of gathered fields; request ports usually need no root views."""
+
+    def __init__(self, fields: tuple[torch.Tensor, ...]) -> None:
+        self.fields = fields
+
+    def __len__(self) -> int:
+        return len(self.fields[0]) if self.fields else 0
+
+    @overload
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> tuple[tuple[torch.Tensor, ...], ...]: ...
+
+    def __getitem__(self, index: int | slice) -> tuple[torch.Tensor, ...] | tuple[tuple[torch.Tensor, ...], ...]:
+        if isinstance(index, slice):
+            return tuple(self[i] for i in range(*index.indices(len(self))))
+        return tuple(value[index] for value in self.fields)
 
 
 class LeafRoots(Sequence[tuple[torch.Tensor, ...]]):
@@ -240,17 +269,24 @@ class TensorFrame:
     # Differentiable [states, parameters] copy of the flat optimizer field, shared by the
     # invocation's differentiable tasks and cleared by the training task that consumes it.
     leaf: torch.Tensor | None = None
+    fields: tuple[torch.Tensor, ...] = ()
+    weights: torch.Tensor | None = None
+    counts: torch.Tensor | None = None
+    hidden_inputs: Mapping[tuple[str, str, str], torch.Tensor] | None = None
+    feedback_inputs: Mapping[str, torch.Tensor] | None = None
 
 
-def feedback_port(read: Callable[[SamplerFeedback], torch.Tensor]) -> TensorPort:
+def feedback_port(name: Literal["base_logits", "sampled_tokens"]) -> TensorPort:
     def resolve(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
+        if data.feedback_inputs is not None:
+            return data.feedback_inputs[name]
         feedback = batch.feedback
         if feedback is None:
             raise RuntimeError("tensor function requires completed sampler feedback")
-        values = read(feedback)
+        values = feedback.base_logits if name == "base_logits" else feedback.sampled_tokens
         return row_index(data, batch, values.device).take(values, "sampler")
 
-    return TensorPort(SamplerFeedbackInputSource(), resolve)
+    return TensorPort(SamplerFeedbackInputSource(), resolve, feedback=name)
 
 
 def training_observations(
@@ -278,6 +314,9 @@ def input_port(source: SemanticInputSource | TensorPort) -> TensorPort:
         case HiddenInputSource(layer=layer, site=site, phase=HiddenPhase.DECODE):
 
             def hidden(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
+                if data.hidden_inputs is not None:
+                    value = data.hidden_inputs[str(layer), "index", site.value]
+                    return row_index(data, batch, value.device).take(value, "packed")[:, : data.columns]
                 (snapshot,) = (
                     item
                     for item in data.step.hidden_batch(batch.stream).snapshots
@@ -295,7 +334,7 @@ def input_port(source: SemanticInputSource | TensorPort) -> TensorPort:
 
             return TensorPort(source, samples)
         case SamplerFeedbackInputSource():
-            return feedback_port(lambda feedback: feedback.base_logits)
+            return feedback_port("base_logits")
         case TaskResultInputSource(task=task, output=output):
             return TensorPort(source, lambda data, batch: batch.results[task, output])
         case _:

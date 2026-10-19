@@ -37,6 +37,8 @@ from pllm.execution.tensor_program import TaskOutput, TensorBatch
 
 @dataclass(frozen=True, slots=True)
 class TensorTask:
+    """One row-wise method and its input and gradient policies."""
+
     symbol: TaskSymbol
     function: TensorMath
     ports: Mapping[str, TensorPort]
@@ -133,28 +135,30 @@ class TensorTask:
 
     def evaluate(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
         """Run a forward method and store its result for later tasks and the invocation output."""
+        if self.symbol in batch.completed:
+            return TaskOutput()
         differentiable = self.differentiable
         with torch.set_grad_enabled(differentiable):
             # Pure predictions run on every row and mask the result; differentiable forwards still
             # compact so gradients see only the selected rows.
-            inputs, rows = self.read(data, batch, compact=differentiable)
+            inputs, rows = self.read(data, batch, compact=differentiable and data.weights is None)
             result = self.function(inputs)
             # Borrowed inputs cannot escape as result aliases; test_video exercises rejection.
             for borrowed in batch.borrowed_roots:
                 borrowed.check_output(result)
             if self.policy.forward_rows:
-                result = self._expand_selected(result, inputs, rows, data)
+                result = self.expand_selected(result, inputs, rows, data)
         batch.results[self.symbol, self.output] = result
         return TaskOutput()
 
-    def _expand_selected(
+    def expand_selected(
         self, result: torch.Tensor, inputs: dict[str, torch.Tensor], rows: tuple[int, ...], data: TensorFrame
     ) -> torch.Tensor:
         """Give unselected rows a zero result, on the device."""
         if result.ndim == 0 or result.shape[0] != len(rows):
             raise ValueError("selected forward functions must preserve their row axis")
         mask = inputs[self.policy.forward_rows]
-        if not self.differentiable:
+        if not self.differentiable or data.weights is not None:
             zero = torch.zeros((), dtype=result.dtype, device=result.device)
             return torch.where(mask.reshape(-1, *(1,) * (result.ndim - 1)), result, zero)
         if len(rows) == len(data.rows):
@@ -196,14 +200,7 @@ class TensorTask:
         batch: TensorBatch,
     ) -> TaskOutput:
         indices = batch.selection.row_states
-        loss, objective = self._loss(self.function(inputs), rows, data, batch)
-        leaf = state_leaf(data, batch)
-        targets = (leaf, *data.derivative_sources.values())
-        derivatives = (
-            torch.autograd.grad(objective, targets, allow_unused=True, materialize_grads=True)
-            if objective.requires_grad
-            else tuple(torch.zeros_like(target) for target in targets)
-        )
+        loss, derivatives = self.differentiate(inputs, rows, data, batch)
         state_gradients = derivatives[0].detach()
         data.parameter_gradient_fields.update(
             (ref, (value,)) for ref, value in zip(batch.selection.refs, state_gradients.unbind(), strict=True)
@@ -226,6 +223,20 @@ class TensorTask:
             field_writes=self._memory_writes(inputs, rows, active, data, batch),
         )
 
+    def differentiate(
+        self, inputs: dict[str, torch.Tensor], rows: tuple[int, ...], data: TensorFrame, batch: TensorBatch
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        """Shared eager and captured forward, loss reduction and autograd step."""
+        loss, objective = self._loss(self.function(inputs), rows, data, batch)
+        leaf = state_leaf(data, batch)
+        targets = (leaf, *data.derivative_sources.values())
+        derivatives = (
+            torch.autograd.grad(objective, targets, allow_unused=True, materialize_grads=True)
+            if objective.requires_grad
+            else tuple(torch.zeros_like(target) for target in targets)
+        )
+        return loss, derivatives
+
     def _loss(
         self, loss: torch.Tensor, rows: tuple[int, ...], data: TensorFrame, batch: TensorBatch
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -233,11 +244,23 @@ class TensorTask:
         if self.policy.reduction == "state_mean":
             if loss.shape != (len(rows),):
                 raise ValueError("state_mean training returns one loss per row; pllm averages them per state")
-            states = [batch.selection.row_states[data.rows[row].identity] for row in rows]
-            loss = state_means(loss, states, len(batch.roots))
+            if data.weights is not None:
+                assert data.index is not None and data.counts is not None
+                loss = loss.new_zeros(len(data.counts)).index_add(
+                    0, data.index.column("states"), loss * data.weights
+                ) / data.counts.clamp_min(1)
+            else:
+                states = [batch.selection.row_states[data.rows[row].identity] for row in rows]
+                loss = state_means(loss, states, len(batch.roots))
             return loss, loss.sum()
+        if loss.ndim == 1:
+            loss = (
+                loss.mean() if data.weights is None else (loss * data.weights).sum() / data.weights.sum().clamp_min(1)
+            )
+        elif data.weights is not None:
+            raise ValueError("captured training must return one loss per row; move the row mean into pllm")
         if loss.ndim != 0:
-            raise ValueError("optimizer functions must return a scalar loss or declare state_mean")
+            raise ValueError("optimizer functions must return a scalar or one loss per row")
         return loss, loss
 
     def _memory_writes(

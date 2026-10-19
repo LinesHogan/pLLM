@@ -131,7 +131,10 @@ workload 类必须可导入（不能是 `__main__`/notebook 里的临时类）�
 dataclass、字段可封闭传输（原始配置值、typed contract、模块级函数引用或
 WorkerTransportable）。默认 `multiprocessing=False` 进程内执行没有这些要求。
 
-`ExecutionOptions(capture=True)` 捕获的是受支持的训练内核，不是整个模型。
+`ExecutionOptions(capture=True)` 将普通逐行预测或训练步骤捕获为 CUDA graph，包含 autograd、
+私有页写入和 AdamW；ESamp 使用此通用路径。训练方法返回逐行 loss，由框架屏蔽填充行
+并执行 `mean` 或 `state_mean`，不能在用户方法中混合行。详见
+[训练与观测](doc/guides/training-and-observation.md#capture-an-ordinary-tensor-step)。
 Region 默认采用静态安排：在合法且预算足够时使用复用的双 stream，不运行私有调优请求。
 `ExecutionOptions(tuning="measured")` 才启用有界候选实测；`schedule_policy="serial"`
 保留参考顺序。计算分析与分块沿用现有实现，调度层不按算法名字分派。
