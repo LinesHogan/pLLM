@@ -66,7 +66,6 @@ from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
     AttachmentHiddenResource,
-    AttachmentKind,
     AttachmentTopology,
     BackendPlacementProbe,
     CausalModelDomain,
@@ -796,11 +795,7 @@ class Runner(Generic[SamplerT]):
         upstream = self.sampler
         if upstream is None or type(upstream) not in (Sampler, Mrv1Sampler):
             raise RuntimeError("vLLM workload requires the original stock sampler")
-        adapter = (
-            self._make_sampler(upstream)
-            if (deployment.attachment.inputs.request.attachment_kind is AttachmentKind.SAMPLER_TRAINING)
-            else None
-        )
+        adapter = self._make_sampler(upstream) if deployment.attachment.inputs.request.guides_sampler else None
         if adapter is not None and not isinstance(adapter, SamplerGuidance):
             raise TypeError("backend sampler must share the original guidance lifecycle")
         session = VllmSession(deployment, model, adapter, self.max_num_reqs, self.hidden_taps)

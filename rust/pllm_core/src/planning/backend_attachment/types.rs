@@ -20,7 +20,7 @@ pub(crate) enum AttachmentTopology {
 pub(crate) enum AttachmentKind {
     Observation,
     ModelReplay,
-    SamplerTraining,
+    RequestTraining,
     ParameterOverlay,
     ActivationPatch,
 }

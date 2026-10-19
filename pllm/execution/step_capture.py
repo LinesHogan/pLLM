@@ -19,6 +19,7 @@ import torch
 from pllm.contracts.semantic_graph import TaskResourceFact, TaskResultInputSource, TaskSymbol
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.codec import cuda_graph_pool_bytes
+from pllm.execution.cuda_stream import PinnedStaging
 from pllm.execution.state_execution import StateTaskContext
 from pllm.execution.tensor_frame import FieldRoots, RowIndex, TensorFrame, training_observations
 from pllm.execution.tensor_program import PoolAdamW, TaskOutput, TensorBatch
@@ -96,6 +97,7 @@ class StepCapture:
     feedback_names: tuple[str, ...] = ()
     feedback_values: tuple[torch.Tensor, ...] = ()
     stream: torch.cuda.Stream | None = None
+    staging: PinnedStaging = dataclass_field(default_factory=PinnedStaging)
 
     def __post_init__(self) -> None:
         self.read_fields = self._read_fields(self.task)
@@ -132,11 +134,10 @@ class StepCapture:
         return TableLayout(self.rows, self.state_count, len(self.pools), len(self.feedback_names))
 
     def _fill(
-        self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext[TensorFrame]
-    ) -> npt.NDArray[np.int64]:
-        """This step's index table on the host."""
+        self, host: npt.NDArray[np.int64], data: TensorFrame, batch: TensorBatch, context: StateTaskContext[TensorFrame]
+    ) -> None:
+        """Write this step's index table into the zeroed host buffer."""
         layout = self.layout
-        host = np.zeros(layout.size, dtype=np.int64)
         rows, counts, last, sources, destinations, feedback = layout.split(host)
         count = len(data.rows)
         links = {link.packed_row_index: link.sampler_row_index for link in data.step.sampler_rows.links}
@@ -167,7 +168,6 @@ class StepCapture:
             destinations[:, list(self.updated)] = slots.T
         for row, value in zip(feedback, self.feedback_values, strict=True):
             row[:] = (value.data_ptr(), value.stride(0), value.stride(1) if value.ndim > 1 else 1)
-        return host
 
     def _views(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         assert self.table is not None
@@ -365,15 +365,19 @@ class StepCapture:
                 for value in self.feedback_values:
                     value.record_stream(batch.stream)
         device = hidden.snapshots[0].hidden.device if hidden.snapshots else self.pools[0].device
-        host = torch.from_numpy(self._fill(data, batch, context))  # pyright: ignore[reportUnknownMemberType]
+        size = self.layout.size
+        if self.table is None or self.table.numel() != size:
+            self.table = torch.empty(size, dtype=torch.long, device=device)
         if device.type == "cuda":
-            host = host.pin_memory()
-        if self.table is None or not self.enabled:
-            self.table = torch.empty(host.shape, dtype=torch.long, device=device)
-        self.table.copy_(host, non_blocking=True)
+            self._fill(self.staging.take(size).numpy(), data, batch, context)
+            self.staging.copy_to(self.table)
+        else:
+            self.table.zero_()
+            self._fill(self.table.numpy(), data, batch, context)
         if self.enabled and (self.graph is None or self.addresses != addresses):
             self._capture(data, batch)
-            self.table.copy_(host, non_blocking=True)
+            if device.type == "cuda":
+                self.staging.copy_to(self.table)
         self.addresses = addresses
 
     def _output(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:

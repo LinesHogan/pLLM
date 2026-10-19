@@ -272,7 +272,7 @@ def bind_backend_attachment(
         StreamDependency.SAMPLER_TO_TRANSITION,
         StreamDependency.TRANSITION_TO_RELEASE,
     )
-    if spec.kind is not AttachmentKind.SAMPLER_TRAINING:
+    if spec.kind is not AttachmentKind.REQUEST_TRAINING:
         dependencies = (StreamDependency.TRANSITION_TO_RELEASE,)
     if spec.kind is AttachmentKind.OBSERVATION:
         dependencies = (StreamDependency.HIDDEN_PRODUCER_TO_COMPUTE, StreamDependency.TRANSITION_TO_RELEASE)

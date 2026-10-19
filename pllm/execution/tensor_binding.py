@@ -993,6 +993,33 @@ class TensorBinding(Builder[TensorFrame]):
         if retained - visited or not resources:
             raise ValueError("training must consume the declared differentiable parameter paths")
 
+    def train_from_hidden(self, training: Call, state: State) -> None:
+        """Train request state on hidden rows every step, with no effect on the model or the sampler."""
+        self._unconditional_update(training, state)
+        self.request_training(training, state)
+
+    def _unconditional_update(self, training: Call, state: State) -> None:
+        update = next(task for task in self.graph.tasks if task.symbol == training.symbol)
+        if update.math is None or update.math.forward_rows or update.math.update_states == "__update_states":
+            raise ValueError("request training requires an unconditional request-state update")
+        self.graph = replace(
+            self.graph,
+            tasks=tuple(
+                replace(
+                    task,
+                    effects=tuple(
+                        replace(effect, kind=StateEffectKind.UPDATE)
+                        if effect.resource == state.declaration.resource
+                        else effect
+                        for effect in task.effects
+                    ),
+                )
+                if task.symbol == training.symbol
+                else task
+                for task in self.graph.tasks
+            ),
+        )
+
     def logits(
         self,
         prediction: Call,
@@ -1009,26 +1036,7 @@ class TensorBinding(Builder[TensorFrame]):
         ):
             raise ValueError("logits binding requires the backend vocabulary size")
         if stage is SamplerStage.PACKED_POST_FILTER_EXACT:
-            update = next(task for task in self.graph.tasks if task.symbol == training.symbol)
-            if update.math is None or update.math.forward_rows or update.math.update_states == "__update_states":
-                raise ValueError("post-filter guidance requires an unconditional request-state update")
-            self.graph = replace(
-                self.graph,
-                tasks=tuple(
-                    replace(
-                        task,
-                        effects=tuple(
-                            replace(effect, kind=StateEffectKind.UPDATE)
-                            if effect.resource == state.declaration.resource
-                            else effect
-                            for effect in task.effects
-                        ),
-                    )
-                    if task.symbol == training.symbol
-                    else task
-                    for task in self.graph.tasks
-                ),
-            )
+            self._unconditional_update(training, state)
         prediction_task = next(task for task in self.graph.tasks if task.symbol == prediction.symbol)
         domain = "" if prediction_task.math is None else prediction_task.math.forward_rows
         mask = (

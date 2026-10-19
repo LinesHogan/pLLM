@@ -78,7 +78,6 @@ def main() -> int:
             rank=2,
             source_layer=0,
             target_layer=-1,
-            intervention=True,
             intervention_beta=0.2,
         )
     )

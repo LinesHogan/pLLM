@@ -646,6 +646,12 @@ class Workload(
             effect: object = getattr(member, "__pllm_effect__", None)
             gradient: object = getattr(member, "__pllm_gradient__", None)
             forward_rows: object = getattr(member, "__pllm_rows__", "")
+            if (
+                isinstance(effect, _Sampler)
+                and effect.stage is SamplerStage.PACKED_POST_FILTER_EXACT
+                and _setting(effect.beta, owner, float) == 0.0
+            ):
+                continue  # Zero-strength guidance leaves sampling unchanged, so nothing is computed for it.
             if not isinstance(forward_rows, str):
                 raise TypeError("operation row selector must name a method")
             if isinstance(effect, _Overlay):
@@ -904,6 +910,8 @@ class Workload(
                 raise ValueError("logits attachment requires a training operation")
             call, sampler = prediction
             b.logits(call, *training, stage=sampler.stage, beta=_setting(sampler.beta, owner, float))
+        elif training is not None and b.attachment is None:
+            b.train_from_hidden(*training)
         if any(isinstance(value, Recurrence) for value in values.values()):
             attachment = b.attachment
             composed = (
@@ -985,7 +993,7 @@ class Workload(
             if b.attachment is None
             else tuple(binding.layer for binding in b.attachment.activation_bindings),
             sampler_stage=b.attachment.sampler_stage
-            if b.attachment is not None and b.attachment.kind is AttachmentKind.SAMPLER_TRAINING
+            if b.attachment is not None and b.attachment.guides_sampler
             else None,
             sampler_feedback=any(
                 isinstance(port.source, SamplerFeedbackInputSource) for task in b.graph.tasks for port in task.inputs

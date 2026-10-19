@@ -18,7 +18,7 @@ from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkloa
 
 def main() -> None:
     handle = make_llm(
-        workload=ESampRequestWorkload(ESampRequestConfig(rank=2, intervention=True, intervention_beta=0.2)),
+        workload=ESampRequestWorkload(ESampRequestConfig(rank=2, intervention_beta=0.2)),
         config=ModelConfig(
             "Qwen/Qwen2.5-0.5B-Instruct", VllmDType.BFLOAT16, 64, 2, 128, 0.25, seed=7, runner=RunnerKind.MRV1
         ),

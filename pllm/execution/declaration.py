@@ -542,11 +542,20 @@ class Builder(Generic[D]):
             ),
         )
         self.attachment = BackendAttachmentSpec(
-            AttachmentKind.SAMPLER_TRAINING,
+            AttachmentKind.REQUEST_TRAINING,
             ((AttachmentTaskRole.COMPUTE, prediction.symbol), (AttachmentTaskRole.TRANSITION, transition.symbol)),
             AnchorSymbol("sampler.pre_draw"),
             state.declaration.resource,
             sampler_stage=stage,
+        )
+
+    def request_training(self, transition: Call, state: State) -> None:
+        """Train request state from hidden rows without changing the model or the sampler."""
+        self.attachment = BackendAttachmentSpec(
+            AttachmentKind.REQUEST_TRAINING,
+            ((AttachmentTaskRole.TRANSITION, transition.symbol),),
+            AnchorSymbol("sampler.pre_draw"),
+            state.declaration.resource,
         )
 
     def overlay(

@@ -34,7 +34,7 @@ class AttachmentTopology(StrEnum):
 class AttachmentKind(StrEnum):
     OBSERVATION = "observation"
     MODEL_REPLAY = "model_replay"
-    SAMPLER_TRAINING = "sampler_training"
+    REQUEST_TRAINING = "request_training"
     PARAMETER_OVERLAY = "parameter_overlay"
     ACTIVATION_PATCH = "activation_patch"
 
@@ -162,6 +162,11 @@ class BackendAttachmentSpec:
     activation_bindings: tuple[ActivationPatchBinding, ...] = ()
     sampler_stage: SamplerStage = SamplerStage.PACKED_POST_FILTER_EXACT
 
+    @property
+    def guides_sampler(self) -> bool:
+        """Request training whose compute task feeds the sampler, not training alone."""
+        return self.kind is AttachmentKind.REQUEST_TRAINING and self.tasks[0][0] is AttachmentTaskRole.COMPUTE
+
 
 @dataclass(frozen=True, slots=True)
 class BackendAttachmentRequest:
@@ -177,6 +182,14 @@ class BackendAttachmentRequest:
     overlay_bindings: tuple[ParameterOverlayFieldBinding, ...] = ()
     activation_bindings: tuple[ActivationPatchBinding, ...] = ()
     schema_version: int = 7
+
+    @property
+    def guides_sampler(self) -> bool:
+        """Request training whose compute task feeds the sampler, not training alone."""
+        return (
+            self.attachment_kind is AttachmentKind.REQUEST_TRAINING
+            and self.task_bindings[0].role is AttachmentTaskRole.COMPUTE
+        )
 
 
 @dataclass(frozen=True, slots=True)

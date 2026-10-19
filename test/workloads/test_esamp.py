@@ -78,7 +78,6 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(
     )
     config = ESampRequestConfig(
         rank=2,
-        intervention=True,
         intervention_beta=0.2,
         learning_rate=0.03,
         weight_decay=0.1,
@@ -474,7 +473,6 @@ def _esamp_native_oracle(monkeypatch, device):
         config = ESampRequestConfig(
             rank=4,
             output_layernorm=normalized,
-            intervention=True,
             intervention_beta=0.2,
             learning_rate=0.03,
             weight_decay=0.1,

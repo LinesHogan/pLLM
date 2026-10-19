@@ -1,4 +1,8 @@
-"""Small CUDA helpers: stream readiness between producer and consumer, and non-blocking uploads."""
+"""Small CUDA helpers: stream readiness between producer and consumer, and non-blocking uploads.
+
+Used by the PTTS arena, the tensor executor and step capture to move small index tables to the GPU
+without making the host wait for the stream.
+"""
 
 from __future__ import annotations
 
@@ -17,6 +21,36 @@ def upload(
     """
     host = torch.tensor(values, dtype=dtype)
     return host.pin_memory().to(device, non_blocking=True) if device.type == "cuda" else host
+
+
+class PinnedStaging:
+    """Pinned host buffers reused for one recurring upload, such as a per-step index table.
+
+    `torch.Tensor.pin_memory()` allocates through the host caching allocator on every call. Here a
+    buffer is refilled once the copy that last read it has finished; that is a non-blocking event query,
+    and while every buffer is still in flight a new one is added instead of waiting.
+    """
+
+    def __init__(self) -> None:
+        self._buffers: list[tuple[torch.Tensor, torch.cuda.Event]] = []
+        self._current: tuple[torch.Tensor, torch.cuda.Event] | None = None
+
+    def take(self, size: int) -> torch.Tensor:
+        """A zeroed int64 pinned host buffer of `size` elements, valid until the next `take`."""
+        self._current = next((item for item in self._buffers if item[0].numel() >= size and item[1].query()), None)
+        if self._current is None:
+            self._current = (torch.empty(size, dtype=torch.long, pin_memory=True), torch.cuda.Event())
+            self._buffers.append(self._current)
+        host = self._current[0][:size]
+        host.zero_()
+        return host
+
+    def copy_to(self, destination: torch.Tensor) -> None:
+        """Queue the copy of the taken buffer into `destination` on the current stream."""
+        assert self._current is not None
+        host, copied = self._current
+        destination.copy_(host[: destination.numel()].view(destination.shape), non_blocking=True)
+        copied.record()
 
 
 class CudaStreamReadiness:
@@ -43,4 +77,4 @@ class CudaStreamReadiness:
         self._event.synchronize()
 
 
-__all__ = ["CudaStreamReadiness", "upload"]
+__all__ = ["CudaStreamReadiness", "PinnedStaging", "upload"]

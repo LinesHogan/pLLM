@@ -23,8 +23,7 @@ class ESampRequestConfig:
     source_layer: int = 0
     target_layer: int = -1
     output_layernorm: bool = True
-    intervention: bool = False
-    intervention_beta: float = 0.0
+    intervention_beta: float = 0.0  # 0 trains the distiller without guiding sampling
     learning_rate: float = 1e-3
     betas: tuple[float, float] = (0.9, 0.999)
     eps: float = 1e-8
@@ -74,7 +73,7 @@ class ESampRequestWorkload(pllm.Workload):
         )
 
     def ready(self, versions: Annotated[torch.Tensor, pllm.StateVersion("request_distiller")]) -> torch.Tensor:
-        return (versions > 0) & self.config.intervention
+        return versions > 0
 
     def forward(
         self,

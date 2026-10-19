@@ -53,12 +53,12 @@ fn validate_request(
     if composed_replay || !matches!(request.attachment_kind, AttachmentKind::ModelReplay | AttachmentKind::Observation) {
         require_text(&request.state_resource, "state_resource")?;
     }
-    if request.attachment_kind != AttachmentKind::SamplerTraining
+    if request.attachment_kind != AttachmentKind::RequestTraining
         && request.sampler_stage != SamplerStage::PackedPostFilterExact
     {
         return Err("sampler intervention requires a sampler attachment".into());
     }
-    if request.attachment_kind == AttachmentKind::SamplerTraining
+    if request.attachment_kind == AttachmentKind::RequestTraining
         && probe.hidden_resources.is_empty()
     {
         return Err("attachment requires hidden resources".to_owned());
@@ -81,13 +81,15 @@ fn validate_request(
                 return Err("stateless attachment requires one compute task".into());
             }
         }
-        AttachmentKind::SamplerTraining => {
-            if request.task_bindings.len() != 2
-                || request.task_bindings[0].role != AttachmentTaskRole::Compute
-                || request.task_bindings[1].role != AttachmentTaskRole::Transition
-                || request.task_bindings[0].task_id == request.task_bindings[1].task_id
+        AttachmentKind::RequestTraining => {
+            // A compute task that guides the sampler is optional; training alone binds only the transition.
+            let roles = request.task_bindings.iter().map(|binding| &binding.role).collect::<Vec<_>>();
+            if !matches!(
+                roles.as_slice(),
+                [AttachmentTaskRole::Transition] | [AttachmentTaskRole::Compute, AttachmentTaskRole::Transition]
+            ) || (roles.len() == 2 && request.task_bindings[0].task_id == request.task_bindings[1].task_id)
             {
-                return Err("sampler attachment tasks must be compute then transition".to_owned());
+                return Err("request training binds an optional compute task, then its transition".to_owned());
             }
         }
         AttachmentKind::ParameterOverlay | AttachmentKind::ActivationPatch => {
@@ -152,7 +154,7 @@ fn validate_request(
                 return Err("model replay requires the signed tokenwise primitive only".into());
             }
         }
-        AttachmentKind::SamplerTraining => {
+        AttachmentKind::RequestTraining => {
             if !request.overlay_bindings.is_empty() || !request.activation_bindings.is_empty() {
                 return Err("request sampler attachment cannot bind overlay fields".to_owned());
             }
@@ -394,7 +396,7 @@ fn has_decode_selection(task: &SemanticTask, state_resource: &str) -> bool {
     })
 }
 
-fn validate_request_sampler_training_graph(
+fn validate_request_training_graph(
     request: &BackendAttachmentRequest,
     probe: &BackendPlacementProbe,
     graph: &SemanticGraph,
@@ -410,7 +412,45 @@ fn validate_request_sampler_training_graph(
         return Err("attachment request state differs from semantic graph state".to_owned());
     }
 
-    let compute = task_for_dense_id(graph, &request.task_bindings[0])?;
+    if let [compute, _] = request.task_bindings.as_slice() {
+        validate_sampler_compute(request, task_for_dense_id(graph, compute)?)?;
+    }
+    let mut task_hidden = graph.tasks.iter()
+        .flat_map(|task| task.inputs.iter())
+        .filter_map(|input| semantic_hidden_key(&input.source))
+        .collect::<Vec<_>>();
+    let mut signed_hidden = probe
+        .hidden_resources
+        .iter()
+        .map(attachment_hidden_key)
+        .collect::<Result<Vec<_>, _>>()?;
+    task_hidden.sort_unstable();
+    task_hidden.dedup();
+    signed_hidden.sort_unstable();
+    if task_hidden != signed_hidden {
+        return Err(
+            "attachment hidden inputs differ from signed hidden resources".to_owned(),
+        );
+    }
+
+    let transition = task_for_dense_id(graph, request.task_bindings.last().unwrap())?;
+    if !transition.effects.iter().any(|effect| {
+        effect.resource == request.state_resource
+            && (effect.kind == StateEffectKind::Update
+                || (effect.kind == StateEffectKind::UpdateMaybe
+                    && request.sampler_stage == SamplerStage::PackedPreFilterAdd))
+            && effect.version.is_none()
+    }) || !has_decode_selection(transition, &request.state_resource)
+    {
+        return Err(
+            "attachment transition task is missing request-state transition semantics".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// The prediction task that feeds the sampler reads request state over packed sampler rows.
+fn validate_sampler_compute(request: &BackendAttachmentRequest, compute: &SemanticTask) -> Result<(), String> {
     if !compute.effects.iter().any(|effect| {
         effect.resource == request.state_resource
             && effect.kind == StateEffectKind::Read
@@ -433,37 +473,6 @@ fn validate_request_sampler_training_graph(
             .any(|output| output.kind == OutputKind::Sampler)
     {
         return Err("attachment compute task is missing packed sampler semantics".to_owned());
-    }
-    let mut task_hidden = graph.tasks.iter()
-        .flat_map(|task| task.inputs.iter())
-        .filter_map(|input| semantic_hidden_key(&input.source))
-        .collect::<Vec<_>>();
-    let mut signed_hidden = probe
-        .hidden_resources
-        .iter()
-        .map(attachment_hidden_key)
-        .collect::<Result<Vec<_>, _>>()?;
-    task_hidden.sort_unstable();
-    task_hidden.dedup();
-    signed_hidden.sort_unstable();
-    if task_hidden != signed_hidden {
-        return Err(
-            "attachment compute hidden inputs differ from signed hidden resources".to_owned(),
-        );
-    }
-
-    let transition = task_for_dense_id(graph, &request.task_bindings[1])?;
-    if !transition.effects.iter().any(|effect| {
-        effect.resource == request.state_resource
-            && (effect.kind == StateEffectKind::Update
-                || (effect.kind == StateEffectKind::UpdateMaybe
-                    && request.sampler_stage == SamplerStage::PackedPreFilterAdd))
-            && effect.version.is_none()
-    }) || !has_decode_selection(transition, &request.state_resource)
-    {
-        return Err(
-            "attachment transition task is missing request-state transition semantics".to_owned(),
-        );
     }
     Ok(())
 }
@@ -667,8 +676,8 @@ fn validate_cross_binding(
                 validate_activation_replay(request, probe, graph)?;
             }
         }
-        AttachmentKind::SamplerTraining => {
-            validate_request_sampler_training_graph(request, probe, graph)?;
+        AttachmentKind::RequestTraining => {
+            validate_request_training_graph(request, probe, graph)?;
         }
         AttachmentKind::ParameterOverlay | AttachmentKind::ActivationPatch => {
             validate_parameter_overlay_graph(request, graph, &request.task_bindings)?;
@@ -739,10 +748,9 @@ fn validate_cross_binding(
                 return Err("activation replay must publish at request.prepare before model forward".into());
             }
         }
-        AttachmentKind::SamplerTraining => {
-            let compute = &request.task_bindings[0];
-            let transition = &request.task_bindings[1];
-            if compute.anchor_id >= request.sampler_anchor_id
+        AttachmentKind::RequestTraining => {
+            let transition = request.task_bindings.last().unwrap();
+            if request.task_bindings.len() == 2 && request.task_bindings[0].anchor_id >= request.sampler_anchor_id
                 || transition.anchor_id <= request.sampler_anchor_id
             {
                 return Err("attachment task anchors violate sampler timing".to_owned());

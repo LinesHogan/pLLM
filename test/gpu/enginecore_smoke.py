@@ -589,7 +589,7 @@ def main() -> int:
     assert not torch.cuda.is_initialized()
     handle = pllm.make_llm(
         workload=ESampRequestWorkload(
-            ESampRequestConfig(rank=2, source_layer=0, target_layer=-1, intervention=True, intervention_beta=0.2)
+            ESampRequestConfig(rank=2, source_layer=0, target_layer=-1, intervention_beta=0.2)
         ),
         config=ModelConfig(
             model="Qwen/Qwen2.5-0.5B-Instruct",
