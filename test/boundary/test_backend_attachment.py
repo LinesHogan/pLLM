@@ -79,8 +79,8 @@ def overlay_facts():
     return workload, probe, facts
 
 
-def sampler_deployment(probe, facts):
-    esamp = ESampRequestWorkload(ESampRequestConfig(rank=2, source_layer=0, target_layer=1))
+def sampler_deployment(probe, facts, beta=0.2):
+    esamp = ESampRequestWorkload(ESampRequestConfig(rank=2, source_layer=0, target_layer=1, intervention_beta=beta))
     sampler_probe = replace(
         probe,
         hidden_resources=tuple(
@@ -137,7 +137,11 @@ def test_driver_plans_once_and_worker_binds_only_matching_math_and_facts() -> No
 
 def test_signed_attachment_crosses_the_wire_and_rejects_malformed_payloads() -> None:
     workload, probe, facts = overlay_facts()
-    for signed in (workload.compile_backend(facts).attachment, sampler_deployment(probe, facts).attachment):
+    for signed in (
+        workload.compile_backend(facts).attachment,
+        sampler_deployment(probe, facts).attachment,
+        sampler_deployment(probe, facts, beta=0.0).attachment,
+    ):
         reconstructed = decode_boundary(encode_boundary(signed), SignedBackendAttachment)
         assert reconstructed == signed
         validate_backend_attachment_physical(reconstructed.inputs, reconstructed.decision, reconstructed.physical)
@@ -163,7 +167,7 @@ def test_signed_attachment_crosses_the_wire_and_rejects_malformed_payloads() -> 
                     _core.compile_backend_attachment(json.dumps(payload))
         with pytest.raises(ValueError):
             _core.compile_backend_attachment(
-                wire.replace('"schema_version":7', '"schema_version":7,"schema_version":7', 1)
+                wire.replace('"schema_version":8', '"schema_version":8,"schema_version":8', 1)
             )
 
 

@@ -129,8 +129,8 @@ _BACKEND_ABI_FIELDS = (
     "vllm=0.27.1",
     "mode=in_process|engine_core/tp1/pp1/dp1/non_spec",
     "rows=one_logit_per_request",
-    "attachment=shared_plan_v7",
-    "attachments=sampler_training|parameter_overlay|activation_patch",
+    "attachment=shared_plan_v8",
+    "attachments=request_training|parameter_overlay|activation_patch",
     "activation=phase_windows/exact_step_pins/source_readonly@2",
     "model=causal_indexed_layer@5",
 )

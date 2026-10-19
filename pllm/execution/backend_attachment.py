@@ -266,16 +266,17 @@ def bind_backend_attachment(
 ) -> SignedBackendAttachment:
     anchors = {anchor.symbol: anchor for anchor in plan.timeline.anchors}
     sampler = anchors[spec.sampler_anchor]
-    dependencies = (
-        StreamDependency.HIDDEN_PRODUCER_TO_COMPUTE,
-        StreamDependency.COMPUTE_TO_SAMPLER,
-        StreamDependency.SAMPLER_TO_TRANSITION,
-        StreamDependency.TRANSITION_TO_RELEASE,
-    )
-    if spec.kind is not AttachmentKind.REQUEST_TRAINING:
-        dependencies = (StreamDependency.TRANSITION_TO_RELEASE,)
-    if spec.kind is AttachmentKind.OBSERVATION:
+    if spec.guides_sampler:
+        dependencies = (
+            StreamDependency.HIDDEN_PRODUCER_TO_COMPUTE,
+            StreamDependency.COMPUTE_TO_SAMPLER,
+            StreamDependency.SAMPLER_TO_TRANSITION,
+            StreamDependency.TRANSITION_TO_RELEASE,
+        )
+    elif spec.kind in (AttachmentKind.OBSERVATION, AttachmentKind.REQUEST_TRAINING):
         dependencies = (StreamDependency.HIDDEN_PRODUCER_TO_COMPUTE, StreamDependency.TRANSITION_TO_RELEASE)
+    else:
+        dependencies = (StreamDependency.TRANSITION_TO_RELEASE,)
     request = BackendAttachmentRequest(
         attachment_kind=spec.kind,
         packed_row_schema_version=1,

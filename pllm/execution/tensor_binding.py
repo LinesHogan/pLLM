@@ -1001,7 +1001,9 @@ class TensorBinding(Builder[TensorFrame]):
     def _unconditional_update(self, training: Call, state: State) -> None:
         update = next(task for task in self.graph.tasks if task.symbol == training.symbol)
         if update.math is None or update.math.forward_rows or update.math.update_states == "__update_states":
-            raise ValueError("request training requires an unconditional request-state update")
+            raise ValueError(
+                "request training updates every selected state: remove rows= and custom update_states from @pllm.train"
+            )
         self.graph = replace(
             self.graph,
             tasks=tuple(

@@ -1,7 +1,7 @@
 """Small CUDA helpers: stream readiness between producer and consumer, and non-blocking uploads.
 
-Used by the PTTS arena, the tensor executor and step capture to move small index tables to the GPU
-without making the host wait for the stream.
+The PTTS arena and the tensor executor upload small index lists with `upload`; step capture reuses
+`PinnedStaging` for its per-step index table. Neither makes the host wait for the stream.
 """
 
 from __future__ import annotations
@@ -39,18 +39,21 @@ class PinnedStaging:
         """A zeroed int64 pinned host buffer of `size` elements, valid until the next `take`."""
         self._current = next((item for item in self._buffers if item[0].numel() >= size and item[1].query()), None)
         if self._current is None:
-            self._current = (torch.empty(size, dtype=torch.long, pin_memory=True), torch.cuda.Event())
+            # Idle buffers that are too small are dropped; capacities grow in powers of two.
+            self._buffers = [item for item in self._buffers if item[0].numel() >= size or not item[1].query()]
+            capacity = 1 << max(size - 1, 0).bit_length()
+            self._current = (torch.empty(capacity, dtype=torch.long, pin_memory=True), torch.cuda.Event())
             self._buffers.append(self._current)
         host = self._current[0][:size]
         host.zero_()
         return host
 
     def copy_to(self, destination: torch.Tensor) -> None:
-        """Queue the copy of the taken buffer into `destination` on the current stream."""
+        """Queue the copy of the taken buffer into `destination` on its device's current stream."""
         assert self._current is not None
         host, copied = self._current
         destination.copy_(host[: destination.numel()].view(destination.shape), non_blocking=True)
-        copied.record()
+        copied.record(torch.cuda.current_stream(destination.device))
 
 
 class CudaStreamReadiness:

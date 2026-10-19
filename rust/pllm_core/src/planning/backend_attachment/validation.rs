@@ -53,10 +53,10 @@ fn validate_request(
     if composed_replay || !matches!(request.attachment_kind, AttachmentKind::ModelReplay | AttachmentKind::Observation) {
         require_text(&request.state_resource, "state_resource")?;
     }
-    if request.attachment_kind != AttachmentKind::RequestTraining
-        && request.sampler_stage != SamplerStage::PackedPostFilterExact
-    {
-        return Err("sampler intervention requires a sampler attachment".into());
+    let guides_sampler = request.attachment_kind == AttachmentKind::RequestTraining
+        && request.task_bindings.first().is_some_and(|binding| binding.role == AttachmentTaskRole::Compute);
+    if !guides_sampler && request.sampler_stage != SamplerStage::PackedPostFilterExact {
+        return Err("sampler_stage needs a guide_sampling or add_logits operation".into());
     }
     if request.attachment_kind == AttachmentKind::RequestTraining
         && probe.hidden_resources.is_empty()
@@ -89,7 +89,7 @@ fn validate_request(
                 [AttachmentTaskRole::Transition] | [AttachmentTaskRole::Compute, AttachmentTaskRole::Transition]
             ) || (roles.len() == 2 && request.task_bindings[0].task_id == request.task_bindings[1].task_id)
             {
-                return Err("request training binds an optional compute task, then its transition".to_owned());
+                return Err("request training binds its transition task, after an optional sampler compute task".to_owned());
             }
         }
         AttachmentKind::ParameterOverlay | AttachmentKind::ActivationPatch => {
@@ -156,20 +156,20 @@ fn validate_request(
         }
         AttachmentKind::RequestTraining => {
             if !request.overlay_bindings.is_empty() || !request.activation_bindings.is_empty() {
-                return Err("request sampler attachment cannot bind overlay fields".to_owned());
+                return Err("request training cannot bind overlay or activation fields".to_owned());
             }
-            if request.stream_dependencies
-                != vec![
+            let expected = if guides_sampler {
+                vec![
                     StreamDependency::HiddenProducerToCompute,
                     StreamDependency::ComputeToSampler,
                     StreamDependency::SamplerToTransition,
                     StreamDependency::TransitionToRelease,
                 ]
-            {
-                return Err(
-                    "request sampler training attachment requires all stream dependencies"
-                        .to_owned(),
-                );
+            } else {
+                vec![StreamDependency::HiddenProducerToCompute, StreamDependency::TransitionToRelease]
+            };
+            if request.stream_dependencies != expected {
+                return Err("request training stream dependencies differ from its task bindings".to_owned());
             }
         }
         AttachmentKind::ParameterOverlay | AttachmentKind::ActivationPatch => {
@@ -429,7 +429,7 @@ fn validate_request_training_graph(
     signed_hidden.sort_unstable();
     if task_hidden != signed_hidden {
         return Err(
-            "attachment hidden inputs differ from signed hidden resources".to_owned(),
+            "attachment hidden inputs differ from the backend's hidden resources".to_owned(),
         );
     }
 

@@ -164,7 +164,7 @@ class BackendAttachmentSpec:
 
     @property
     def guides_sampler(self) -> bool:
-        """Request training whose compute task feeds the sampler, not training alone."""
+        """True when a compute task feeds the sampler; False for training alone."""
         return self.kind is AttachmentKind.REQUEST_TRAINING and self.tasks[0][0] is AttachmentTaskRole.COMPUTE
 
 
@@ -181,11 +181,11 @@ class BackendAttachmentRequest:
     state_resource: str
     overlay_bindings: tuple[ParameterOverlayFieldBinding, ...] = ()
     activation_bindings: tuple[ActivationPatchBinding, ...] = ()
-    schema_version: int = 7
+    schema_version: int = 8
 
     @property
     def guides_sampler(self) -> bool:
-        """Request training whose compute task feeds the sampler, not training alone."""
+        """True when a compute task feeds the sampler; False for training alone."""
         return (
             self.attachment_kind is AttachmentKind.REQUEST_TRAINING
             and self.task_bindings[0].role is AttachmentTaskRole.COMPUTE
@@ -203,7 +203,7 @@ class BackendAttachmentCompilerInputs:
 class BackendAttachmentDecision:
     request_digest: str
     signature: str
-    schema_version: int = 7
+    schema_version: int = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,7 +218,7 @@ class BackendAttachmentPhysicalPlan:
     topology: AttachmentTopology
     graph_mode: AttachmentGraphMode
     bundle_signature: str
-    schema_version: int = 7
+    schema_version: int = 8
 
 
 @dataclass(frozen=True, slots=True)

@@ -6,7 +6,7 @@ use super::super::state_representation::StateDeviceKind;
 use super::super::tensor_layout::TensorDType;
 use super::super::PlanBundle;
 
-pub(crate) const SCHEMA_VERSION: u64 = 7;
+pub(crate) const SCHEMA_VERSION: u64 = 8;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
