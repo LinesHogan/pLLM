@@ -65,14 +65,14 @@ def region(arguments, operations, yields) -> Region:
     return Region(Block(tuple(arguments), tuple(operations), tuple(yields)))
 
 
-def grid_program(chunks, layers) -> Program:
-    """The author's chunk-major integer loop; no dependencies or schedule supplied."""
-    weights, hidden = BankType(I, layers), BankType(I, chunks)
+def wavefront_program(chunks, layers, element, function: Function) -> Program:
+    """The author's chunk-major loop over hidden rows and layer weights; no schedule supplied."""
+    weights, hidden = BankType(element, layers), BankType(element, chunks)
     layer = region(
-        (Value("l", X), Value("h", I), Value("w", weights)),
+        (Value("l", X), Value("h", element), Value("w", weights)),
         (
-            Select(("w", "l"), (Value("old", I),)),
-            Call(("h", "old"), (Value("next_h", I), Value("next_w", I)), "cell"),
+            Select(("w", "l"), (Value("old", element),)),
+            Call(("h", "old"), (Value("next_h", element), Value("next_w", element)), function.name),
             Update(("w", "l", "next_w"), (Value("bank", weights),)),
         ),
         ("next_h", "bank"),
@@ -80,8 +80,8 @@ def grid_program(chunks, layers) -> Program:
     chunk = region(
         (Value("c", X), Value("w", weights), Value("h", hidden)),
         (
-            Select(("h", "c"), (Value("input", I),)),
-            Scan(("input", "w"), (Value("output", I), Value("next_w", weights)), layers, layer),
+            Select(("h", "c"), (Value("input", element),)),
+            Scan(("input", "w"), (Value("output", element), Value("next_w", weights)), layers, layer),
             Update(("h", "c", "output"), (Value("next_h", hidden),)),
         ),
         ("next_w", "next_h"),
@@ -92,40 +92,18 @@ def grid_program(chunks, layers) -> Program:
             (Scan(("weights", "hidden"), (Value("w_final", weights), Value("h_final", hidden)), chunks, chunk),),
             ("w_final", "h_final"),
         ),
-        (Function("cell", (I, I), (I, I)),),
+        (function,),
     )
+
+
+def grid_program(chunks, layers) -> Program:
+    """The wavefront over integers with an opaque cell."""
+    return wavefront_program(chunks, layers, I, Function("cell", (I, I), (I, I)))
 
 
 def tensor_grid(chunks, layers, cell: ExportedCell) -> Program:
     """The same wavefront with a tensor cell updating hidden rows and layer weights."""
-    tensor = cell.declaration.inputs[0]
-    weights, hidden = BankType(tensor, layers), BankType(tensor, chunks)
-    layer = region(
-        (Value("l", X), Value("h", tensor), Value("w", weights)),
-        (
-            Select(("w", "l"), (Value("old", tensor),)),
-            Call(("h", "old"), (Value("next_h", tensor), Value("next_w", tensor)), cell.digest),
-            Update(("w", "l", "next_w"), (Value("bank", weights),)),
-        ),
-        ("next_h", "bank"),
-    )
-    chunk = region(
-        (Value("c", X), Value("w", weights), Value("h", hidden)),
-        (
-            Select(("h", "c"), (Value("input", tensor),)),
-            Scan(("input", "w"), (Value("output", tensor), Value("next_w", weights)), layers, layer),
-            Update(("h", "c", "output"), (Value("next_h", hidden),)),
-        ),
-        ("next_w", "next_h"),
-    )
-    return Program(
-        region(
-            (Value("weights", weights), Value("hidden", hidden)),
-            (Scan(("weights", "hidden"), (Value("w_final", weights), Value("h_final", hidden)), chunks, chunk),),
-            ("w_final", "h_final"),
-        ),
-        (cell.declaration,),
-    )
+    return wavefront_program(chunks, layers, cell.declaration.inputs[0], cell.declaration)
 
 
 def grid_cell(device="cpu") -> ExportedCell:
@@ -222,35 +200,35 @@ def paged_rows(positions=(4, 5, 4, 5)) -> tuple[PackedPhaseRow, ...]:
     )
 
 
+def inplace_plan(device: torch.device, provider: PageBundleProviderFacts, capabilities: tuple[str, ...]):
+    """The InPlaceTTT plan for one request-scoped dense resource on ``device``."""
+    target = ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT)
+    probe = BackendPlacementProbe(
+        provider.provider_id,
+        "a" * 64,
+        "b" * 64,
+        "c" * 64,
+        AttachmentTopology.IN_PROCESS,
+        AttachmentGraphMode.EAGER,
+        provider.device_kind,
+        0,
+        1,
+        1,
+        TensorDType.FLOAT32,
+        3,
+        8,
+        (),
+        (),
+    )
+    timeline = RuntimeFacts(device).timeline(capabilities)
+    facts = BackendCompileFacts(probe, timeline, (provider,), 2, 4096, 0, (ParameterTargetShape(target, 3, 2),))
+    return InPlaceTTTWorkload(InPlaceTTTConfig((target,), chunk_size=2)).plan_backend(facts).inputs.plan
+
+
 def page_arena(*, heterogeneous: bool = False) -> PageBundleArena:
     """A CPU arena for one request-scoped dense resource (plus an instance one)."""
-    target = ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT)
-    facts = BackendCompileFacts(
-        BackendPlacementProbe(
-            "test.page_bundle@1",
-            "a" * 64,
-            "b" * 64,
-            "c" * 64,
-            AttachmentTopology.IN_PROCESS,
-            AttachmentGraphMode.EAGER,
-            StateDeviceKind.CPU,
-            0,
-            1,
-            1,
-            TensorDType.FLOAT32,
-            3,
-            8,
-            (),
-            (),
-        ),
-        RuntimeFacts(torch.device("cpu")).timeline(("transition/full_root@1",)),
-        (PageBundleProviderFacts("test.page_bundle@1", 6),),
-        2,
-        4096,
-        0,
-        (ParameterTargetShape(target, 3, 2),),
-    )
-    plan = InPlaceTTTWorkload(InPlaceTTTConfig((target,), chunk_size=2)).plan_backend(facts).inputs.plan
+    provider = PageBundleProviderFacts("test.page_bundle@1", 6)
+    plan = inplace_plan(torch.device("cpu"), provider, ("transition/full_root@1",))
     if heterogeneous:
         (dense,) = plan.tensor_layout_request.layouts
         layout = replace(
@@ -360,7 +338,6 @@ class PageTask:
     result = None
     context = None
     inputs = None
-    fields = (LayoutFieldId(0),)
 
     def execute(self, context):
         if self.region is not None:
@@ -369,54 +346,21 @@ class PageTask:
 
     def pages(self, context, refs=None) -> RegionResources:
         refs = context.pin.refs if refs is None else refs
-        cells = tuple(ResourcePageCell("layers", (i,), ref, self.fields) for i, ref in enumerate(refs))
+        cells = tuple(ResourcePageCell("layers", (i,), ref, (LayoutFieldId(0),)) for i, ref in enumerate(refs))
         return RegionResources(self.program, context, cells)
 
 
 def cuda_arena(stream) -> PageBundleArena:
     """The same request plan, with pages and completion receipts on CUDA."""
-    target = ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT)
-    facts = BackendCompileFacts(
-        BackendPlacementProbe(
-            "test.region.cuda@1",
-            "a" * 64,
-            "b" * 64,
-            "c" * 64,
-            AttachmentTopology.IN_PROCESS,
-            AttachmentGraphMode.EAGER,
-            StateDeviceKind.CUDA,
-            0,
-            1,
-            1,
-            TensorDType.FLOAT32,
-            3,
-            8,
-            (),
-            (),
-        ),
-        RuntimeFacts(stream.device).timeline(("transition/full_root@1", "state/fenced_reclaim@1")),
-        (PageBundleProviderFacts("test.region.cuda@1", 6, StateDeviceKind.CUDA),),
-        2,
-        4096,
-        0,
-        (ParameterTargetShape(target, 3, 2),),
-    )
-    workload = InPlaceTTTWorkload(InPlaceTTTConfig((target,), chunk_size=2))
-    return PageBundleArena(workload.plan_backend(facts).inputs.plan)
+    provider = PageBundleProviderFacts("test.region.cuda@1", 6, StateDeviceKind.CUDA)
+    return PageBundleArena(inplace_plan(stream.device, provider, ("transition/full_root@1", "state/fenced_reclaim@1")))
 
 
-def owner_fixture(*, rounds=8, wrap=None, stream=None, function=None):
+def owner_fixture(*, rounds=8, stream=None):
     """Two admitted requests whose first task runs ``page_program`` on their pages."""
     arena = page_arena() if stream is None else cuda_arena(stream)
     spec = arena.plan.tensor_layout_request.layouts[0].layout.fields[0]
-    cell = ExportedCell.capture(
-        (lambda w: (w + 1,)) if function is None else function,
-        ("w",),
-        ("new",),
-        (torch.zeros(spec.shape, device=arena.device),),
-    )
-    if wrap is not None:
-        cell = replace(cell, function=wrap(arena, cell.function))
+    cell = ExportedCell.capture(lambda w: (w + 1,), ("w",), ("new",), (torch.zeros(spec.shape, device=arena.device),))
     program = page_program(cell, rounds)
     tasks = tuple(PageTask(t.implementation_id) for t in arena.plan.schedule_physical.tasks)
     tasks[0].region, tasks[0].program = bind(program, {cell.digest: cell}), program
