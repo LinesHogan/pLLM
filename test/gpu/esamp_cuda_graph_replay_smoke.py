@@ -96,7 +96,7 @@ def mean_capture() -> None:
         value = TensorStepInput(
             rows,
             sampler,
-            PackedHiddenSnapshotBatch(rows, (PackedHiddenSnapshot(resource, hidden[:count]),)),
+            PackedHiddenSnapshotBatch(rows, (PackedHiddenSnapshot(resource, hidden[:count], hidden),)),
             hidden_readiness=CudaStreamReadiness(stream),
         )
         target = torch.full((count, 4), step * 0.2, device=device)

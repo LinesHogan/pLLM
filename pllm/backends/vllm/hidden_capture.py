@@ -65,7 +65,9 @@ class HiddenTaps:
             raise ValueError(f"hidden outputs of {missing} were not tapped when the model was loaded")
         rows = value.rows.total_rows
         snapshots = tuple(
-            PackedHiddenSnapshot(resource, self.buffers[resource.module_path][:rows]) for resource in resources
+            PackedHiddenSnapshot(resource, buffer[:rows], buffer)
+            for resource in resources
+            for buffer in (self.buffers[resource.module_path],)
         )
         stream = torch.cuda.current_stream()
         return replace(

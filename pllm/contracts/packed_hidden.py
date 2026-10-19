@@ -26,10 +26,20 @@ class PackedHiddenResourceBinding:
 
 @dataclass(frozen=True, slots=True)
 class PackedHiddenSnapshot:
-    """One exact signed resource and its owned ordinary hidden tensor."""
+    """One hidden resource's rows for this step.
+
+    `hidden` holds the step's rows. `buffer`, when set, is the fixed-address tensor `hidden` is a
+    leading-row view of (a model tap); captured steps read from it so replays see new rows.
+    """
 
     resource: PackedHiddenResourceBinding
     hidden: torch.Tensor
+    buffer: torch.Tensor | None = None
+
+    @property
+    def storage(self) -> torch.Tensor:
+        """The fixed tensor to index from: the tap buffer, or the rows themselves."""
+        return self.hidden if self.buffer is None else self.buffer
 
 
 @dataclass(frozen=True, slots=True)

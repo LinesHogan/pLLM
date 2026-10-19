@@ -29,14 +29,6 @@ from pllm.kernels.page_copy import copy_pages, gather_rows
 Table = TypeVar("Table", torch.Tensor, npt.NDArray[np.int64])
 
 
-def hidden_buffer(value: torch.Tensor) -> torch.Tensor:
-    """Recover the fixed tap buffer behind a snapshot's leading-row view."""
-    elements = value.untyped_storage().nbytes() // value.element_size() - int(value.storage_offset())
-    row_width = (value.shape[1] - 1) * value.stride(1) + 1
-    rows = 1 + (elements - row_width) // value.stride(0)
-    return value.as_strided((rows, value.shape[1]), value.stride())
-
-
 @dataclass(frozen=True, slots=True)
 class TableLayout:
     """Segments of a step's int64 index table, uploaded to the GPU in one copy per step.
@@ -364,7 +356,7 @@ class StepCapture:
         hidden = data.step.hidden_batch(batch.stream)
         addresses = tuple(item.hidden.data_ptr() for item in hidden.snapshots)
         if self.hidden_inputs is None or self.addresses != addresses:
-            self.hidden_inputs = {item.resource.locator_key: hidden_buffer(item.hidden) for item in hidden.snapshots}
+            self.hidden_inputs = {item.resource.locator_key: item.storage for item in hidden.snapshots}
         if self.feedback_names:
             assert batch.feedback is not None
             self.feedback_values = tuple(
