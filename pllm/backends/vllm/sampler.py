@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import cast
 
 import numpy as np
 import torch
@@ -22,6 +24,22 @@ from vllm.v1.worker.gpu.states import RequestState
 
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback, SamplerStage
 from pllm.execution.cuda_stream import upload
+
+
+def _reweight_unfused(survivors: torch.Tensor, prediction: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+    """(1 + beta) * logits - beta * prediction on the finite survivors, as one fused kernel.
+
+    Unfused, this is seven passes over [rows, vocab] logits, more GPU time than the forward's LM head.
+    """
+    return torch.where(
+        torch.isfinite(survivors), (1.0 + beta) * survivors - beta * prediction.to(survivors.dtype), survivors
+    )
+
+
+_reweight = cast(
+    Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+    torch.compile(_reweight_unfused, dynamic=True, fullgraph=True),  # pyright: ignore[reportUnknownMemberType]
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,12 +108,13 @@ class SamplerGuidance:
         dense = guidance.guidance.affected_row_ids == tuple(range(processed_logits.shape[0]))
         rows = upload(() if dense else guidance.guidance.affected_row_ids, processed_logits.device)
         survivors = processed_logits if dense else processed_logits.index_select(0, rows)
-        prediction = guidance.pred_dense_logits.to(processed_logits)
         weights = guidance.guidance.row_weights
         beta = (
-            guidance.guidance.beta if weights is None else guidance.guidance.beta * weights.to(survivors).unsqueeze(1)
+            survivors.new_full((survivors.shape[0], 1), guidance.guidance.beta)
+            if weights is None
+            else guidance.guidance.beta * weights.to(survivors).unsqueeze(1)
         )
-        reweighted = torch.where(torch.isfinite(survivors), (1.0 + beta) * survivors - beta * prediction, survivors)
+        reweighted = _reweight(survivors, guidance.pred_dense_logits, beta)
         if dense:
             return reweighted
         output = processed_logits.clone()
