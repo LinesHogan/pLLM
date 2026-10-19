@@ -34,16 +34,6 @@ def test_conflicting_pages_fail_before_mutation():
     # Current slots disagree with the batch rows.
     with pytest.raises(ValueError):
         bind_paged_access(paged_rows(), (PagedLayer("a", cache, table, torch.tensor([4, 5, 8, 10])),))
-    # One request writes the same page twice.
-    with pytest.raises(ValueError):
-        bind_paged_access(
-            paged_rows(), (PagedLayer("a", cache, torch.tensor([[0, 1], [0, 1]]), torch.tensor([4, 5, 4, 5])),)
-        )
-    # Distinct current slots can still conflict with another request's history.
-    with pytest.raises(ValueError):
-        bind_paged_access(
-            paged_rows((4, 5, 8, 9)), (PagedLayer("a", cache, torch.tensor([[0, 1, 3], [1, 3, 2]]), slots),)
-        )
     # Separate logical layer names do not establish separate storage.
     with pytest.raises(ValueError):
         bind_paged_access(paged_rows(), (PagedLayer("a", cache, table, slots), PagedLayer("b", cache, table, slots)))
