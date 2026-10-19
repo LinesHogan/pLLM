@@ -20,7 +20,6 @@ from pllm.contracts.feedback import (
     RewardOutcome,
     UpdateBarrier,
 )
-from pllm.execution.host_memory import completion_example
 
 
 def boxed_label(text: str) -> str:
@@ -93,7 +92,7 @@ class TTRLWorkload(pllm.CompletionWorkload[TTRLData, TTRLResult]):
     def training_example(self, facts: pllm.HostRuntimeFacts) -> TTRLData:
         # Reward metadata cannot be inferred from tensor shapes. Select every admitted row
         # so the loss trace covers the maximum training batch, including partial vote groups.
-        batch = completion_example(facts)
+        batch = pllm.CompletionInput.example(facts)
         rewards = tuple(RewardOutcome(entry, 1.0, True, "", "shape", "0", "") for entry in batch.completions.entries)
         return TTRLData(batch, rewards, (), (), tuple(range(len(batch.hidden))))
 

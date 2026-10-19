@@ -371,3 +371,23 @@ def input_port(source: SemanticInputSource | TensorPort) -> TensorPort:
             return TensorPort(source, lambda data, batch: batch.results[task, output])
         case _:
             raise ValueError("unsupported ordinary tensor input; use an explicit native binding")
+
+
+def selected_rows(mask: torch.Tensor) -> tuple[int, ...]:
+    """Read a host row selection; shape tracing covers every potentially active row."""
+    return (
+        tuple(range(len(mask)))
+        if mask.is_meta
+        else tuple(int(index.item()) for index in mask.nonzero().flatten().cpu())
+    )
+
+
+def finite(value: torch.Tensor) -> bool:
+    """Validate tensor contents; meta execution can trace the check but cannot inspect its result."""
+    result = torch.isfinite(value).all()
+    return value.is_meta or bool(result)
+
+
+def export_tensor(value: torch.Tensor) -> torch.Tensor:
+    """Own an export copy; meta has no data to transfer to a host allocation."""
+    return value.detach().to(device=value.device if value.is_meta else "cpu", copy=True)

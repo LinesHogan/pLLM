@@ -9,15 +9,14 @@ change already-signed behavior.
 
 from __future__ import annotations
 
-import sys
-from collections import Counter
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import fields, is_dataclass
 from dis import get_instructions
 from enum import Enum
-from hashlib import blake2b, sha256
+from hashlib import sha256
 from inspect import getclosurevars
+from itertools import pairwise
 from marshal import dumps
 from types import CellType, CodeType, FunctionType, MethodType, ModuleType
 from typing import TypeVar, cast
@@ -30,13 +29,13 @@ G = TypeVar("G", bound=Callable[..., object])
 C = TypeVar("C")
 
 
-def fingerprint(value: object, seen: frozenset[int] = frozenset(), *, structured: bool = False) -> str:
+def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
     """Sign cold code/config dependencies, never eval annotations or execute code to trace it."""
     if id(value) in seen:
         raise ValueError("recursive authoring dependencies require an explicit native binding")
     seen = seen | {id(value)}
     if isinstance(value, MethodType):
-        return fingerprint(value.__func__, seen, structured=structured)
+        return fingerprint(value.__func__, seen)
     if isinstance(value, FunctionType):
         closure = getclosurevars(value)
         globals_used = _global_names(value.__code__)
@@ -48,13 +47,11 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset(), *, structured
         }
         return boundary_digest(
             sha256(dumps(_code(value.__code__))).hexdigest(),
-            tuple((key, fingerprint(item, seen, structured=structured)) for key, item in sorted(dependencies.items())),
-            fingerprint(value.__defaults__, seen, structured=structured),
-            fingerprint(value.__kwdefaults__, seen, structured=structured),
+            tuple((key, fingerprint(item, seen)) for key, item in sorted(dependencies.items())),
+            fingerprint(value.__defaults__, seen),
+            fingerprint(value.__kwdefaults__, seen),
         )
     if isinstance(value, ModuleType):
-        if structured and value.__name__ == "re":
-            return boundary_digest(value.__name__, sys.version)
         if not value.__name__.startswith(("torch", "math")):
             raise ValueError(f"{value.__name__}: module dependencies require an explicit native binding")
         return boundary_digest(value.__name__, torch.__version__)
@@ -66,46 +63,20 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset(), *, structured
 
     if value is TensorUpdate:
         return TensorUpdate.__qualname__
-    if structured and is_dataclass(value) and isinstance(value, type):
-        return boundary_digest(
-            value.__module__,
-            value.__qualname__,
-            tuple((item.name, str(item.type)) for item in fields(value)),
-            fingerprint(value.__init__, seen, structured=True),
-            fingerprint(getattr(value, "__post_init__", None), seen, structured=True),
-        )
     if isinstance(value, type):
         if value is torch.Tensor:
             return value.__qualname__
-        if structured and value in (object, Counter, blake2b):
-            return boundary_digest(value.__module__, value.__qualname__, sys.version)
-        if structured and issubclass(value, Enum):
-            return boundary_digest(
-                value.__module__,
-                value.__qualname__,
-                tuple(
-                    (name, fingerprint(member.value, seen, structured=True))
-                    for name, member in value.__members__.items()
-                ),
-            )
         raise ValueError("dynamic type dependencies require an explicit native binding")
     if is_dataclass(value) and not isinstance(value, type):
         return boundary_digest(
             type(value).__qualname__,
-            tuple(
-                (field.name, fingerprint(getattr(value, field.name), seen, structured=structured))
-                for field in fields(value)
-            ),
+            tuple((field.name, fingerprint(getattr(value, field.name), seen)) for field in fields(value)),
         )
     if isinstance(value, Mapping):
         items = cast(Mapping[str, object], value)
-        return boundary_digest(
-            tuple((key, fingerprint(item, seen, structured=structured)) for key, item in sorted(items.items()))
-        )
+        return boundary_digest(tuple((key, fingerprint(item, seen)) for key, item in sorted(items.items())))
     if isinstance(value, (tuple, list)):
-        return boundary_digest(
-            tuple(fingerprint(item, seen, structured=structured) for item in cast(tuple[object, ...], value))
-        )
+        return boundary_digest(tuple(fingerprint(item, seen) for item in cast(tuple[object, ...], value)))
     return boundary_digest(value)
 
 
@@ -126,56 +97,32 @@ def _global_names(code: CodeType) -> set[str]:
     return names
 
 
-def _self_attributes(code: CodeType, self_name: str, references: set[str]) -> bool:
-    """Attribute names loaded directly on the owner reference; False when it escapes analysis."""
-    instructions = tuple(get_instructions(code))
-    precise = True
-    for index, instruction in enumerate(instructions):
-        if instruction.opname == "LOAD_SUPER_ATTR" or instruction.argval == "super":
-            precise = False  # super() resolution crosses the class walk; sign the whole class
-        elif (
-            instruction.opname
-            in ("LOAD_FAST", "LOAD_DEREF", "LOAD_FAST_CHECK", "LOAD_FAST_AND_CLEAR", "LOAD_CLASSDEREF")
-            and instruction.argval == self_name
-        ):
-            follower = instructions[index + 1] if index + 1 < len(instructions) else None
-            if follower is not None and follower.opname in ("LOAD_ATTR", "LOAD_METHOD"):
-                references.add(str(follower.argval))
-            else:
-                precise = False  # aliased, passed, or stored — any method may be reached
-        elif (
-            instruction.opname
-            in ("STORE_FAST", "STORE_DEREF", "STORE_NAME", "STORE_GLOBAL", "DELETE_FAST", "DELETE_DEREF")
-            and instruction.argval == self_name
-        ):
-            precise = False
-    for value in code.co_consts:
-        if isinstance(value, CodeType):
-            precise = _self_attributes(value, self_name, references) and precise
-    return precise
-
-
 def reachable_functions(candidates: Mapping[str, FunctionType], seeds: tuple[FunctionType, ...]) -> frozenset[str]:
-    """Candidate methods reachable from signed functions through the owner reference.
-
-    Cold reachability: attribute loads directly on the owner parameter, chased helper-to-helper
-    to a fixpoint. When the owner escapes the analysis anywhere (aliased, stored, super), every
-    candidate counts as reachable — the fallback signs the whole class as before.
-    """
+    """Follow owner method loads; an escaping owner conservatively signs the whole class."""
     reachable: set[str] = set()
-    pending = list(seeds)
+    pending = [
+        (function.__code__, function.__code__.co_varnames[0]) for function in seeds if function.__code__.co_varnames
+    ]
+    loads = {"LOAD_FAST", "LOAD_DEREF", "LOAD_FAST_CHECK", "LOAD_FAST_AND_CLEAR", "LOAD_CLASSDEREF"}
     while pending:
-        code = pending.pop().__code__
-        if not code.co_varnames:
-            continue
-        references: set[str] = set()
-        if not _self_attributes(code, code.co_varnames[0], references):
-            return frozenset(candidates)
-        for name in references:
-            target = candidates.get(name)
-            if target is not None and name not in reachable:
+        code, owner = pending.pop()
+        pending.extend((value, owner) for value in code.co_consts if isinstance(value, CodeType))
+        for instruction, follower in pairwise(get_instructions(code)):
+            if instruction.opname == "LOAD_SUPER_ATTR" or instruction.argval == "super":
+                return frozenset(candidates)
+            if instruction.argval != owner:
+                continue
+            if instruction.opname.startswith(("STORE_", "DELETE_")):
+                return frozenset(candidates)
+            if instruction.opname not in loads:
+                continue
+            if follower.opname not in ("LOAD_ATTR", "LOAD_METHOD"):
+                return frozenset(candidates)
+            name = str(follower.argval)
+            if name in candidates and name not in reachable:
                 reachable.add(name)
-                pending.append(target)
+                function = candidates[name]
+                pending.append((function.__code__, function.__code__.co_varnames[0]))
     return frozenset(reachable)
 
 

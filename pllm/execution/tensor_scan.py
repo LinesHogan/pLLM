@@ -29,6 +29,7 @@ from pllm.contracts.region_program import (
 )
 from pllm.contracts.region_selection import RegionPayloadLimit, RegionSelectionPolicy
 from pllm.execution.exported_cell import ExportedCell
+from pllm.execution.memory import MemoryTrace
 from pllm.execution.region_compilation import analyze_region_program, lower_region_bindings, lower_region_schedule
 from pllm.execution.region_execution import RegionExecution, RegionInstructionExecution
 from pllm.execution.region_native import RegionFunction
@@ -38,6 +39,7 @@ from pllm.execution.region_optimization import (
     optimize_region,
     prepare_region_execution,
 )
+from pllm.execution.region_storage import analyze_region_payload
 from pllm.execution.region_streams import RegionStreamBindings
 from pllm.execution.region_values import Bank, Data
 
@@ -161,6 +163,10 @@ class TensorScan:
         )
         analysis = analyze_region_program(program, optimize=False)
         schedule = analysis.reference_schedule
+        self.payload_limits = tuple(
+            RegionPayloadLimit(item.device, item.peak_bytes_upper_bound)
+            for item in analyze_region_payload(program, schedule, cells).devices
+        )
         self.program = program
         self._cells = cells
         self._execution: RegionInstructionExecution = RegionExecution(
@@ -205,7 +211,7 @@ class TensorScan:
         invariants: tuple[torch.Tensor, ...],
         sequences: tuple[tuple[torch.Tensor, ...], ...],
         *,
-        payload_limits: tuple[RegionPayloadLimit, ...],
+        payload_limits: tuple[RegionPayloadLimit, ...] = (),
         count: int | None = None,
         options: RegionOptimizationOptions = RegionSelectionPolicy(tuning="measured"),
         warmup_rounds: int = 1,
@@ -214,13 +220,11 @@ class TensorScan:
         max_rewrite_depth: int = 2,
         streams: RegionStreamBindings | None = None,
     ) -> tuple["TensorScan", SelectedRegion]:
-        """Return a cold-tuned scan with the same callable and source contract.
+        """Time candidates on private examples; reuse the selected plan for every declared count.
 
-        Examples are privately copied. One selected symbolic plan serves every
-        declared count; timings describe only the example count. The original
-        scan stays available, and calling either scan does not tune or compile.
-        Limits cover tensor payloads, not the complete device/owner budget.
+        Empty limits use the source envelope. Limits fund tensors, not owner pages.
         """
+        payload_limits = payload_limits or self.payload_limits
         sources: dict[str, ExportedCell] = {}
         for name, cell in self._cells.items():
             if not isinstance(cell, ExportedCell):
@@ -247,11 +251,12 @@ class TensorScan:
     def prepared(
         self,
         *,
-        payload_limits: tuple[RegionPayloadLimit, ...],
+        payload_limits: tuple[RegionPayloadLimit, ...] = (),
         options: RegionOptimizationOptions,
         parallel: bool = False,
     ) -> "TensorScan":
         """Static preparation needs no example invocation or measurement."""
+        payload_limits = payload_limits or self.payload_limits
         result = copy(self)
         result._execution = prepare_region_execution(
             self.program, self._cells, payload_limits=payload_limits, options=options, parallel=parallel
@@ -271,6 +276,7 @@ class TensorScan:
         count: int | None = None,
         streams: RegionStreamBindings | None = None,
     ) -> TensorScanResult:
+        MemoryTrace.reserve(sum(limit.bytes for limit in self.payload_limits))
         inputs, sizes = self._arguments(carry, invariants, sequences, count)
         if streams is not None:
             streams.validate_available()

@@ -7,7 +7,7 @@ Training returns one loss per row. PTTS allocates and publishes versions outside
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from typing import TypeVar
@@ -16,10 +16,11 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
-from pllm.contracts.semantic_graph import TaskResourceFact, TaskResultInputSource, TaskSymbol
+from pllm.contracts.semantic_graph import TaskResourceFact, TaskSymbol
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.codec import cuda_graph_pool_bytes
 from pllm.execution.cuda_stream import PinnedStaging
+from pllm.execution.memory import MemoryUsage, measure
 from pllm.execution.state_execution import StateTaskContext
 from pllm.execution.tensor_frame import FieldRoots, ParameterGradients, RowIndex, TensorFrame, training_observations
 from pllm.execution.tensor_program import PoolAdamW, TaskOutput, TensorBatch
@@ -73,10 +74,7 @@ def reads_rows(task: TensorTask, tasks: Mapping[TaskSymbol, TensorTask]) -> bool
 
     Only such tasks have a row table to capture; the rest stay on the plain TensorTask path.
     """
-    return any(
-        reads_rows(tasks[source.task], tasks) if isinstance(source, TaskResultInputSource) else task.ports[key].rowwise
-        for key, source in task.sources.items()
-    )
+    return any(port.rowwise for item in task.dependencies(tasks) for port in item.ports.values())
 
 
 @dataclass
@@ -87,6 +85,7 @@ class StepCapture:
     tasks: Mapping[TaskSymbol, TensorTask]
     entitlement: TaskResourceFact
     states: int
+    device: torch.device
     optimizer: PoolAdamW | None = None
     enabled: bool = True
     graph: torch.cuda.CUDAGraph | None = None
@@ -110,27 +109,42 @@ class StepCapture:
     stream: torch.cuda.Stream | None = None
     staging: PinnedStaging = dataclass_field(default_factory=PinnedStaging)
 
+    @property
+    def symbol(self) -> TaskSymbol:
+        return self.task.symbol
+
+    @property
+    def training(self) -> bool:
+        return self.optimizer is not None
+
+    def memory(
+        self, data: TensorFrame, batch: TensorBatch, continuation: Callable[[TensorFrame, TensorBatch], TaskOutput]
+    ) -> MemoryUsage:
+        """Run the step body and output path on borrowed meta operands."""
+        self._inputs(data, batch)
+        self.updated = tuple(range(len(batch.roots)))
+
+        def run() -> TaskOutput:
+            self.table = torch.empty(self.layout.size, device="meta", dtype=torch.long)
+            output = self.run(data, batch)
+            return (
+                continuation(data, replace(batch, completed=frozenset((self.symbol,)))) if not self.training else output
+            )
+
+        return measure(run)
+
     def __post_init__(self) -> None:
-        self.read_fields = self._read_fields(self.task)
-        self.feedback_names = tuple(sorted(self._feedback_names(self.task)))
+        dependencies = self.task.dependencies(self.tasks)
+        self.read_fields = frozenset(
+            port.field for task in dependencies for port in task.ports.values() if port.field is not None
+        )
+        if any(task.policy.parameter_gradients for task in dependencies):
+            self.read_fields |= {0}
+        self.feedback_names = tuple(
+            sorted({port.feedback for task in dependencies for port in task.ports.values() if port.feedback})
+        )
         if self.enabled and 8 * (6 * self.rows + self.states + 1) > self.entitlement.resident_bytes:
             raise ValueError("capture index table exceeds the task resident bytes")
-
-    def _read_fields(self, task: TensorTask) -> frozenset[int]:
-        fields = {port.field for port in task.ports.values() if port.field is not None}
-        if task.policy.parameter_gradients:
-            fields.add(0)
-        for source in task.sources.values():
-            if isinstance(source, TaskResultInputSource):
-                fields.update(self._read_fields(self.tasks[source.task]))
-        return frozenset(fields)
-
-    def _feedback_names(self, task: TensorTask) -> set[str]:
-        names = {port.feedback for port in task.ports.values() if port.feedback}
-        for source in task.sources.values():
-            if isinstance(source, TaskResultInputSource):
-                names.update(self._feedback_names(self.tasks[source.task]))
-        return names
 
     @property
     def rows(self) -> int:
@@ -187,13 +201,6 @@ class StepCapture:
         rows, counts, _, sources, destinations, _ = self.layout.split(self.table)
         return rows, counts, sources, destinations
 
-    def _dependencies(self, task: TensorTask, data: TensorFrame, batch: TensorBatch) -> None:
-        for source in task.sources.values():
-            if isinstance(source, TaskResultInputSource) and (source.task, source.output) not in batch.results:
-                dependency = self.tasks[source.task]
-                self._dependencies(dependency, data, batch)
-                dependency.evaluate(data, batch)
-
     def _feedback(self, rows: torch.Tensor) -> dict[str, torch.Tensor]:
         assert self.table is not None
         locations = self.layout.split(self.table)[5]
@@ -205,7 +212,7 @@ class StepCapture:
     def _frame(self, data: TensorFrame, batch: TensorBatch) -> tuple[TensorFrame, TensorBatch]:
         columns, counts, sources, _ = self._views()
         reads = self.read_fields
-        if self.optimizer is not None and self.pools[0].dtype != torch.float32:
+        if self.optimizer is not None and (self.device.type == "cpu" or self.pools[0].dtype != torch.float32):
             reads = reads | frozenset(range(5))
         fields = tuple(
             pool.index_select(0, slots.clamp_min(0)).masked_fill(
@@ -237,7 +244,8 @@ class StepCapture:
     def _body(self, data: TensorFrame, batch: TensorBatch) -> None:
         frame, batch = self._frame(data, batch)
         _, _, sources, destinations = self._views()
-        self._dependencies(self.task, frame, batch)
+        for dependency in self.task.dependencies(self.tasks)[:-1]:
+            dependency.evaluate(frame, batch)
         with torch.set_grad_enabled(self.optimizer is not None or self.task.differentiable):
             inputs, rows = self.task.read(frame, batch, compact=False)
             self.inputs = inputs
@@ -253,21 +261,6 @@ class StepCapture:
             zip(frame.derivative_sources, (value.detach() for value in gradients[1:]), strict=True)
         )
         self._update(inputs, sources, destinations, frame.fields)
-
-    def _cpu_update(self, sources: torch.Tensor, destinations: torch.Tensor) -> None:
-        assert self.optimizer is not None and self.gradients is not None
-        roots: list[tuple[torch.Tensor, ...]] = []
-        for row in self.updated:
-            root = tuple(pool[int(destinations[field, row])] for field, pool in enumerate(self.pools))
-            for field in (0, 2, 3, 4):
-                root[field].copy_(self.pools[field][int(sources[field, row])])
-            roots.append(root)
-        apply_adamw(
-            roots,
-            AdamWFields(*(LayoutFieldId(i) for i in range(5))),
-            self.optimizer.config,
-            tuple(self.gradients[row] for row in self.updated),
-        )
 
     def _tensor_update(self, fields: tuple[torch.Tensor, ...], destinations: torch.Tensor) -> None:
         """Other parameter dtypes use the same captured step with Torch's optimizer."""
@@ -292,7 +285,7 @@ class StepCapture:
     ) -> None:
         with torch.no_grad():
             assert self.optimizer is not None and self.gradients is not None
-            if self.pools[0].is_cuda and self.pools[0].dtype == torch.float32:
+            if self.device.type == "cuda" and self.pools[0].dtype == torch.float32:
                 paged_adamw(
                     self.pools[:5],
                     destinations[:5],
@@ -300,10 +293,8 @@ class StepCapture:
                     self.optimizer.config,
                     sources[:5, : self.state_count].contiguous(),
                 )
-            elif self.pools[0].is_cuda:
-                self._tensor_update(fields, destinations)
             else:
-                self._cpu_update(sources, destinations)
+                self._tensor_update(fields, destinations)
             for field in set(range(5, len(self.pools))) - set(self.task.captures.values()):
                 copy_pages(
                     self.pools[field], self.pools[field], sources[field, : self.state_count], destinations[field]
@@ -348,9 +339,7 @@ class StepCapture:
         if batch.stream is not None and self.stream is not None and batch.stream != self.stream:
             batch.stream.wait_stream(self.stream)
         self.stream = batch.stream
-        self.active_rows, self.active_states = len(data.rows), len(batch.roots)
-        if not self.pools and batch.roots:
-            self.pools = tuple(batch.field_slots(i)[0] for i in range(len(batch.roots[0])))
+        addresses = self._inputs(data, batch)
         if self.optimizer is not None:
             self.updated = tuple(sorted(set(batch.selection.indices(data.rows))))
             context.write = context.arena.prepare_transition(
@@ -362,18 +351,25 @@ class StepCapture:
                 batch.stream,
                 copy_fields=(),
             )
-        self._prepare(data, batch, context)
+        self._prepare(data, batch, context, addresses)
+        return self.run(data, batch)
+
+    def run(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
+        """Execute the tensor body and retain the invocation's outputs."""
         if self.graph is None:
             self._body(data, batch)
         else:
             self.graph.replay()
         return self._output(data, batch)
 
-    def _prepare(self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext[TensorFrame]) -> None:
-        hidden = data.step.hidden_batch(batch.stream)
-        addresses = tuple(item.hidden.data_ptr() for item in hidden.snapshots)
+    def _inputs(self, data: TensorFrame, batch: TensorBatch) -> tuple[int, ...]:
+        self.active_rows, self.active_states = len(data.rows), len(batch.roots)
+        if not self.pools and batch.roots:
+            self.pools = tuple(batch.field_slots(i)[0] for i in range(len(batch.roots[0])))
+        snapshots = () if data.step.hidden is None else data.step.hidden_batch(batch.stream).snapshots
+        addresses = tuple(item.hidden.data_ptr() for item in snapshots)
         if self.hidden_inputs is None or self.addresses != addresses:
-            self.hidden_inputs = {item.resource.locator_key: item.storage for item in hidden.snapshots}
+            self.hidden_inputs = {item.resource.locator_key: item.storage for item in snapshots}
         if self.feedback_names:
             assert batch.feedback is not None
             self.feedback_values = tuple(
@@ -383,7 +379,12 @@ class StepCapture:
             if batch.stream is not None:
                 for value in self.feedback_values:
                     value.record_stream(batch.stream)
-        device = hidden.snapshots[0].hidden.device if hidden.snapshots else self.pools[0].device
+        return addresses
+
+    def _prepare(
+        self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext[TensorFrame], addresses: tuple[int, ...]
+    ) -> None:
+        device = next(iter(self.hidden_inputs.values())).device if self.hidden_inputs else self.pools[0].device
         size = self.layout.size
         if self.table is None or self.table.numel() != size:
             self.table = torch.empty(size, dtype=torch.long, device=device)

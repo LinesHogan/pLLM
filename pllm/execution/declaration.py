@@ -7,8 +7,6 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Generic, TypeVar
 
-import torch
-
 from pllm.contracts.backend_attachment import (
     ActivationPatchBinding,
     AttachmentKind,
@@ -69,11 +67,18 @@ from pllm.contracts.tensor_layout import (
 )
 from pllm.execution.decoder_region import decoder_activations
 from pllm.execution.execution import TaskGraphImplementation
+from pllm.execution.memory import MemoryUsage, measure
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.region_replay import ConditionalReplayRegion
 from pllm.execution.replay import REPLAY_IMPLEMENTATION, ReplayStateTask, TokenwiseReplayTask
 from pllm.execution.state_execution import ConditionalProducerTask, PublishStateTask, StateTaskContext
-from pllm.execution.tensor_program import PoolAdamW, TaskOutput, TensorBatch, TensorOperation
+from pllm.execution.tensor_program import (
+    Optimizer,
+    PoolAdamW,
+    TaskOutput,
+    TensorBatch,
+    TensorOperation,
+)
 from pllm.kernels.adamw import AdamWConfig
 
 D = TypeVar("D")
@@ -162,6 +167,10 @@ class HostOperation(Generic[D]):
     implementation_id: ImplementationId
     function: Callable[[D], None]
 
+    def memory(self, context: D) -> MemoryUsage:
+        """Trace the same host entry point used by the executor."""
+        return measure(lambda: self.execute(context))
+
     def execute(self, context: D) -> None:
         self.function(context)
 
@@ -177,6 +186,7 @@ class Builder(Generic[D]):
         self.attachment: BackendAttachmentSpec | None = None
         self.dimensions = dimensions
         self.operations: dict[TaskSymbol, TensorOperation[D]] = {}
+        self.publications: dict[TaskSymbol, PublishStateTask[D]] = {}
         self.host_operations: dict[TaskSymbol, HostOperation[D]] = {}
         self.resources = resources
 
@@ -278,8 +288,9 @@ class Builder(Generic[D]):
         math: MathContract | None = None,
         function: Callable[[D, TensorBatch], TaskOutput] | None = None,
         host_function: Callable[[D], None] | None = None,
+        operation_type: type[TensorOperation[D]] = TensorOperation,
         select: Callable[[D, RequestStateSelection], tuple[int, ...]] | None = None,
-        optimizer: Callable[[tuple[tuple[torch.Tensor, ...], ...], tuple[torch.Tensor, ...]], None] | None = None,
+        optimizer: Optimizer | None = None,
     ) -> Call:
         if any(task.symbol == name for task in self.graph.tasks):
             raise ValueError(f"duplicate operation {name}")
@@ -324,7 +335,7 @@ class Builder(Generic[D]):
                     LayoutFieldId(i) for i in range(len(changes.fields)) if i >= changes.optimizer_fields or i % 5 != 1
                 )
                 optimizer = PoolAdamW(config, groups)
-            self.operations[task.symbol] = TensorOperation(
+            self.operations[task.symbol] = operation_type(
                 implementations[0].implementation_id,
                 function,
                 "read"
@@ -334,7 +345,6 @@ class Builder(Generic[D]):
                 else "update",
                 select=select,
                 optimizer=optimizer,
-                gradient_fields=groups,
                 copy_fields=copy_fields,
             )
         if host_function is not None:
@@ -448,7 +458,7 @@ class Builder(Generic[D]):
                     )
                 )
             elif any(effect.kind is StateEffectKind.PUBLISH for effect in task.effects):
-                functions.append(PublishStateTask[D](identity))
+                functions.append(replace(self.publications[task.symbol], implementation_id=identity))
             else:
                 raise ValueError(f"{task.symbol}: no explicit native implementation")
         guarded = {
@@ -494,7 +504,8 @@ class Builder(Generic[D]):
         output: str = "publication",
         implementations: tuple[TaskImplementationSpec, ...] = (),
     ) -> Call:
-        return self.compute(
+        implementations = implementations or (native("canonical.state:publish@1", "transition/full_root@1"),)
+        call = self.compute(
             name,
             inputs={"transition": transition[transition.outputs[0]]},
             outputs=(output,),
@@ -503,8 +514,10 @@ class Builder(Generic[D]):
             source=transition,
             result_schema=schema,
             when=when,
-            implementations=implementations or (native("canonical.state:publish@1", "transition/full_root@1"),),
+            implementations=implementations,
         )
+        self.publications[call.symbol] = PublishStateTask(implementations[0].implementation_id)
+        return call
 
     def replay(self, publication: Call, state: State, effect: ConditionalLayerReplay) -> Call:
         return self.compute(

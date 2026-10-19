@@ -8,7 +8,7 @@ from math import sqrt
 import torch
 from torch.nn import functional as F
 
-from pllm.execution.host_runtime import HostRuntimeFacts
+from pllm.execution.host_runtime import CompletionInput, HostRuntimeFacts
 from pllm.workloads.fttt.math import edit_training_tensors
 from pllm.workloads.fttt.types import (
     FTTTClosedLoopIntent,
@@ -146,50 +146,15 @@ def publish(context: FTTTStepContext) -> None:
 
 
 def training_example(config: FTTTConfig, facts: HostRuntimeFacts) -> tuple[FTTTStepContext, FTTTEditState]:
-    """All rows selected, with shape-only state and feedback for cold tensor tracing.
+    """Use the host service's trainable path; feedback contents do not change tensor shapes."""
+    from pllm.workloads.fttt.host_service import FTTTFeedbackService
+    from pllm.workloads.fttt.judge import FTTTDefaultJudge
 
-    Host feedback is not inferable from tensor shapes; its contents change feature
-    values but not the tensor allocation sizes of the training path.
-    """
-    from pllm.contracts.feedback import (
-        BarrierState,
-        ControlReason,
-        RetryAction,
-        RetryControl,
-        RewardOutcome,
-        UpdateBarrier,
+    batch = CompletionInput.example(facts, torch.device("cpu"))
+    service = FTTTFeedbackService(
+        replace(config, max_queue_size=len(batch.hidden), positive_reward_threshold=1.0), FTTTDefaultJudge()
     )
-    from pllm.execution.host_memory import completion_example
-    from pllm.workloads.fttt.types import FTTTFeedbackRecord, FTTTInstanceState, FTTTLifecycleTransition
-
-    batch = completion_example(facts)
-    entries = batch.completions.entries
-    intent = FTTTClosedLoopIntent(
-        1,
-        tuple(RewardOutcome(entry, 0.0, False, "shape", "shape", "0", "") for entry in entries),
-        tuple(RetryControl(entry, RetryAction.RETRY, ControlReason.FEEDBACK_UPDATE, True) for entry in entries),
-        tuple(
-            UpdateBarrier(
-                str(i),
-                entry.group_id,
-                BarrierState.READY,
-                (entry.identity.request_id,),
-                1,
-                ControlReason.FEEDBACK_UPDATE,
-            )
-            for i, entry in enumerate(entries)
-        ),
-        tuple(FTTTFeedbackRecord(entry, "shape", (), 0.0) for entry in entries),
-        tuple(
-            FTTTLifecycleTransition(
-                (entry.identity.request_id, entry.identity.prompt_idx), FTTTInstanceState(), FTTTInstanceState(), True
-            )
-            for entry in entries
-        ),
-    )
-    down = torch.empty((config.rank, facts.hidden_size + config.feedback_feature_size + 1))
-    up = torch.empty((facts.hidden_size, config.rank))
-    state = FTTTEditState(
-        down, up, torch.empty_like(down), torch.empty_like(down), torch.empty_like(up), torch.empty_like(up), facts
-    )
-    return FTTTStepContext(FTTTHostTransaction(batch, tuple(range(len(entries))), intent), state), state.snapshot()
+    transaction = service.begin(batch)
+    assert transaction is not None
+    state = initialize_edit_state(config, replace(facts, device=torch.device("cpu")))
+    return state.prepare(transaction), state.snapshot()

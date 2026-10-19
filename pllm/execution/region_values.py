@@ -29,7 +29,11 @@ def copy_data(value: Data) -> Data:
 
 def check_data(value: Data, type_: DataType, sizes: Mapping[str, int] = {}) -> None:
     if isinstance(type_, TensorType):
-        if not isinstance(value, torch.Tensor) or (tuple(value.shape), str(value.dtype), str(value.device)) != (
+        if not isinstance(value, torch.Tensor) or (
+            tuple(value.shape),
+            str(value.dtype),
+            type_.device if value.is_meta else str(value.device),
+        ) != (
             type_.shape,
             type_.dtype,
             type_.device,

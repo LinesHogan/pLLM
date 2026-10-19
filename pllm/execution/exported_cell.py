@@ -72,7 +72,8 @@ class TensorSignature:
         return cls(tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype, tensor.device)
 
     def check(self, tensor: torch.Tensor) -> None:
-        if TensorSignature.of(tensor) != self:
+        expected = replace(self, device=tensor.device) if tensor.is_meta else self
+        if TensorSignature.of(tensor) != expected:
             raise ValueError("tensor differs from its exported shape, stride, dtype or device guard")
 
 

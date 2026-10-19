@@ -7,7 +7,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from threading import Event, RLock
-from typing import Generic, Protocol, TypeVar
+from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
 
 import numpy as np
 import torch
@@ -29,6 +29,7 @@ from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.execution import TaskGraphExecution, TaskGraphImplementation, TaskGraphInvocation
+from pllm.execution.memory import MemoryUsage
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle import (
     PageBundleArena,
@@ -42,6 +43,9 @@ from pllm.execution.ptts.request_state import RequestStateDirectory, RequestStat
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.replay import LayerReplayPrimitive, TokenwiseReplayPrimitive
 from pllm.execution.trace import ExecutionTrace, TracePhase
+
+if TYPE_CHECKING:
+    from pllm.execution.tensor_program import TensorBatch
 
 InputT = TypeVar("InputT", contravariant=True)
 InputContra = TypeVar("InputContra", contravariant=True)
@@ -309,6 +313,18 @@ class ConditionalProducerTask(Generic[DataT]):
 @dataclass(frozen=True, slots=True)
 class PublishStateTask(Generic[DataT]):
     implementation_id: ImplementationId
+
+    def memory(self, data: DataT, batch: TensorBatch) -> MemoryUsage:
+        """Publication changes ownership metadata; PTTS already funds its tensor pages."""
+        return MemoryUsage(0, 0)
+
+    def input_shapes(
+        self, rows: int, hidden: int, training_shapes: tuple[tuple[int, ...], ...]
+    ) -> tuple[tuple[int, ...], ...]:
+        return ()
+
+    def resident(self, capture_bytes: int) -> int:
+        return 0
 
     def execute(self, context: StateTaskContext[DataT]) -> None:
         context.publish()

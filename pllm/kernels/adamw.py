@@ -13,6 +13,7 @@ from torch.optim.adamw import adamw
 from triton.language.extra.cuda import libdevice
 
 from pllm.contracts.tensor_layout import LayoutFieldId
+from pllm.kernels.page_copy import no_allocation
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,25 +62,34 @@ def apply_adamw(
     config: AdamWConfig,
     gradients: tuple[torch.Tensor, ...],
 ) -> None:
-    ids = (fields.parameter, fields.gradient, fields.step, fields.exp_avg, fields.exp_avg_sq)
-    if len(roots) != len(gradients) or not roots:
-        raise ValueError("AdamW gradients must align with private roots")
-    for root, gradient in zip(roots, gradients, strict=True):
-        if any(field >= len(root) for field in ids):
-            raise ValueError("AdamW field is outside the signed layout")
-        parameter = root[fields.parameter]
-        if (
-            any(
-                root[field].shape != parameter.shape or root[field].dtype != parameter.dtype
-                for field in (fields.gradient, fields.exp_avg, fields.exp_avg_sq)
-            )
-            or root[fields.step].shape != ()
-            or root[fields.step].dtype != torch.float32
-            or gradient.shape != parameter.shape
-            or gradient.dtype != parameter.dtype
-            or gradient.device != parameter.device
-        ):
-            raise ValueError("AdamW fields or gradient differ from the signed layout")
+    """Apply the bound optimizer to validated page views and matching gradients."""
+    if roots and roots[0][0].is_meta:
+        # Torch's capturable implementation requires a CUDA tag; its storage stays meta.
+        from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+
+        from pllm.execution.memory import MemoryTrace, measure
+
+        with FakeTensorMode() as mode:
+
+            def operand(value: torch.Tensor) -> torch.Tensor:
+                return FakeTensor(mode, value, torch.device("cuda:0"))
+
+            pages = tuple(tuple(operand(value) for value in root) for root in roots)
+            values = tuple(operand(value) for value in gradients)
+            scratch = measure(lambda: apply_adamw(pages, fields, config, values))
+        MemoryTrace.reserve(scratch.workspace)
+        return
+    # PTTS and region input binding already validate page fields; gradients enter here from math.
+    if (
+        not roots
+        or len(roots) != len(gradients)
+        or any(
+            (gradient.shape, gradient.dtype, gradient.device)
+            != (root[fields.parameter].shape, root[fields.parameter].dtype, root[fields.parameter].device)
+            for root, gradient in zip(roots, gradients, strict=True)
+        )
+    ):
+        raise ValueError("AdamW gradients must match the parameter pages")
     with torch.no_grad():
         for root, gradient in zip(roots, gradients, strict=True):
             root[fields.gradient].copy_(gradient)
@@ -150,8 +160,8 @@ def _paged_adamw(
     eps: float,
     decay: float,
 ) -> None:
-    state = tl.program_id(0)
-    column = tl.program_id(1) * 256 + tl.arange(0, 256)
+    state = tl.program_id(0) // tl.cdiv(width, 256)
+    column = (tl.program_id(0) % tl.cdiv(width, 256)) * 256 + tl.arange(0, 256)
     p = tl.load(slots + state)
     g = tl.load(slots + count + state)
     m = tl.load(slots + 3 * count + state)
@@ -185,34 +195,35 @@ def paged_adamw(
 ) -> None:
     """Five original FP32 fields, authorized slot prefixes, no field packing."""
     if (
-        len(pools) != 5
-        or slots.ndim != 2
-        or slots.shape[0] != 5
-        or slots.dtype != torch.long
-        or not slots.is_contiguous()
-    ):
-        raise ValueError("paged AdamW requires five original field-slot rows")
-    parameter, gradient, step, first, second = pools
-    if (
-        parameter.ndim < 2
-        or any(pool.dtype != torch.float32 or pool.device != slots.device for pool in pools)
-        or any(pool.shape != parameter.shape for pool in (gradient, first, second))
-        or step.shape != parameter.shape[:1]
-        or gradients.shape != (slots.shape[1], parameter[0].numel())
+        gradients.shape != (slots.shape[1], pools[0][0].numel())
         or gradients.dtype != torch.float32
         or gradients.device != slots.device
         or not gradients.is_contiguous()
         or gradients.requires_grad
     ):
-        raise ValueError("paged AdamW fields or gradients differ from the signed layout")
+        raise ValueError("paged AdamW gradients must match the selected parameter pages")
     sources = slots if sources is None else sources
-    count, width = gradients.shape
-    corrections = gradients.new_empty((count, 2))
-    # Increment in a separate launch: no tile may observe another tile's step write.
-    _advance_steps[(count,)](
-        step, slots, sources, corrections, count, step.stride(0), config.lr, config.betas[0], config.betas[1]
+    corrections = gradients.new_empty((len(gradients), 2))
+    _paged_update(
+        list(pools), slots, gradients, sources, corrections, [config.lr, *config.betas, config.eps, config.weight_decay]
     )
-    _paged_adamw[(count, (width + 255) // 256)](
+
+
+@torch.library.custom_op("pllm::paged_adamw", mutates_args={"pools", "corrections"})
+def _paged_update(
+    pools: list[torch.Tensor],
+    slots: torch.Tensor,
+    gradients: torch.Tensor,
+    sources: torch.Tensor,
+    corrections: torch.Tensor,
+    hyperparameters: list[float],
+) -> None:
+    parameter, gradient, step, first, second = pools
+    lr, beta1, beta2, eps, decay = hyperparameters
+    count, width = gradients.shape
+    # Increment in a separate launch: no tile may observe another tile's step write.
+    _advance_steps[(count,)](step, slots, sources, corrections, count, step.stride(0), lr, beta1, beta2)
+    _paged_adamw[(count * ((width + 255) // 256),)](
         parameter,
         gradient,
         first,
@@ -227,9 +238,12 @@ def paged_adamw(
         gradient.stride(0),
         first.stride(0),
         second.stride(0),
-        config.betas[1],
-        1 - config.betas[0],
-        1 - config.betas[1],
-        config.eps,
-        1 - config.lr * config.weight_decay,
+        beta2,
+        1 - beta1,
+        1 - beta2,
+        eps,
+        1 - lr * decay,
     )
+
+
+_paged_update.register_fake(no_allocation)  # pyright: ignore[reportUnknownMemberType]

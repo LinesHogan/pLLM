@@ -20,7 +20,7 @@ def upload(
     the stream. Staging through pinned memory lets the copy queue behind the GPU work instead.
     """
     host = torch.tensor(values, dtype=dtype)
-    return host.pin_memory().to(device, non_blocking=True) if device.type == "cuda" else host
+    return host.pin_memory().to(device, non_blocking=True) if device.type == "cuda" else host.to(device)
 
 
 class PinnedStaging:

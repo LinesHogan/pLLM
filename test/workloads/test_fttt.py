@@ -49,9 +49,13 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry(monkeypatch: pytest.Mo
     coordinator = make_llm(workload=workload, config=facts)
     peak = coordinator.execution.schedule_bundle.schedule_decision.peak_memory_bytes
     with monkeypatch.context() as guarded:
+        initialize = tasks.initialize_edit_state
 
         def allocate(*args):
-            raise AssertionError("state allocation before finite admission")
+            from torch._guards import detect_fake_mode
+
+            assert detect_fake_mode() is not None, "state allocation before finite admission"
+            return initialize(*args)
 
         guarded.setattr(tasks, "initialize_edit_state", allocate)
         with pytest.raises(ValueError):

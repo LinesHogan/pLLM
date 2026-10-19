@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Generic, Literal, TypeVar, cast
+from typing import Generic, Literal, Protocol, TypeVar
 
 import torch
 
@@ -16,18 +16,14 @@ from pllm.contracts.semantic_graph import ImplementationId, SemanticOutputKind, 
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.cuda_stream import CudaStreamReadiness, upload
+from pllm.execution.memory import MemoryUsage, measure
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot, borrowed_root
-from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin, PagePublication, PageWrite, Slots
+from pllm.execution.ptts.page_bundle import PagePin, PagePublication, PageWrite, Slots
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.state_execution import StateTaskContext
 from pllm.execution.trace import TracePhase
 from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw, paged_adamw
-
-if TYPE_CHECKING:
-    from pllm.execution.step_capture import StepCapture
-    from pllm.execution.tensor_frame import TensorFrame
-
 
 I = TypeVar("I")
 D = TypeVar("D")
@@ -218,35 +214,66 @@ class FunctionMath(Generic[I, D, R]):
         )
 
 
+FieldSlots = Callable[[int], tuple[torch.Tensor, tuple[int, ...]]]
+
+
+class Optimizer(Protocol):
+    @property
+    def groups(self) -> int: ...
+
+    def update(
+        self, roots: Sequence[tuple[torch.Tensor, ...]], slots: FieldSlots, gradients: tuple[torch.Tensor, ...]
+    ) -> None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class PoolAdamW:
-    """AdamW over a state's optimizer fields, five fields per parameter group.
-
-    On CUDA with one fp32 group it updates the page pools in place through the write's slots,
-    so the cost does not grow with a Python loop over states; otherwise it updates per-state views.
-    """
+    """One update entry point for grouped tensor views and FP32 CUDA page pools."""
 
     config: AdamWConfig
     groups: int
 
-    def __call__(self, roots: Sequence[tuple[torch.Tensor, ...]], gradients: tuple[torch.Tensor, ...]) -> None:
-        apply_adamw(
-            tuple(root[5 * group : 5 * group + 5] for root in roots for group in range(self.groups)),
-            AdamWFields(*(LayoutFieldId(i) for i in range(5))),
-            self.config,
-            gradients,
-        )
-
-    def update_pages(self, arena: PageBundleArena, write: PageWrite, gradients: tuple[torch.Tensor, ...]) -> bool:
-        """Update in the pools when possible; False means the caller must use per-state views."""
-        if self.groups != 1 or arena.device.type != "cuda" or gradients[0].dtype != torch.float32:
-            return False
-        roots = arena.lazy_roots((write,) * len(write.after_refs), write.after_refs)
-        fields = tuple(roots.field_slots(i) for i in range(5))
+    def update(
+        self, roots: Sequence[tuple[torch.Tensor, ...]], slots: FieldSlots, gradients: tuple[torch.Tensor, ...]
+    ) -> None:
+        """Update the borrowed parameter views; meta executes the same paged tensor path."""
+        parameter = roots[0][0]
+        if self.groups != 1 or parameter.device.type == "cpu" or parameter.dtype != torch.float32:
+            apply_adamw(
+                tuple(root[5 * group : 5 * group + 5] for root in roots for group in range(self.groups)),
+                AdamWFields(*(LayoutFieldId(i) for i in range(5))),
+                self.config,
+                gradients,
+            )
+            return
+        fields = tuple(slots(i) for i in range(5))
         pools = tuple(pool.reshape(len(pool), -1) if index != 2 else pool for index, (pool, _) in enumerate(fields))
-        slots = upload([slots for _, slots in fields], arena.device)
-        paged_adamw(pools, slots, torch.stack(gradients).reshape(len(gradients), -1), self.config)
-        return True
+        table = upload([rows for _, rows in fields], parameter.device)
+        paged_adamw(pools, table, torch.stack(gradients).reshape(len(gradients), -1), self.config)
+
+
+MemoryDataT = TypeVar("MemoryDataT", contravariant=True)
+
+
+class MemoryOperation(Protocol[MemoryDataT]):
+    """Resource projection of a bound executable operation."""
+
+    def memory(self, data: MemoryDataT, batch: TensorBatch) -> MemoryUsage: ...
+    def input_shapes(
+        self, rows: int, hidden: int, training_shapes: tuple[tuple[int, ...], ...]
+    ) -> tuple[tuple[int, ...], ...]: ...
+    def resident(self, capture_bytes: int) -> int: ...
+
+
+class TensorStep(Protocol[D]):
+    @property
+    def symbol(self) -> TaskSymbol: ...
+    @property
+    def training(self) -> bool: ...
+    def execute(self, context: StateTaskContext[D], batch: TensorBatch) -> TaskOutput: ...
+    def memory(
+        self, data: D, batch: TensorBatch, continuation: Callable[[D, TensorBatch], TaskOutput]
+    ) -> MemoryUsage: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,12 +282,32 @@ class TensorOperation(Generic[D]):
     function: Callable[[D, TensorBatch], TaskOutput]
     mode: Literal["read", "transition", "update", "gradient"] = "read"
     select: Callable[[D, RequestStateSelection], tuple[int, ...]] | None = None
-    optimizer: Callable[[Roots, tuple[torch.Tensor, ...]], None] | None = None
+    optimizer: Optimizer | None = None
     publish: bool = False
-    gradient_fields: int = 1
     version: Literal["input", "private", "published"] = "input"
     copy_fields: tuple[LayoutFieldId, ...] | None = None
-    step: StepCapture | None = None
+    step: TensorStep[D] | None = None
+
+    def input_shapes(
+        self, rows: int, hidden: int, training_shapes: tuple[tuple[int, ...], ...]
+    ) -> tuple[tuple[int, ...], ...]:
+        return ((rows, hidden),)
+
+    def resident(self, capture_bytes: int) -> int:
+        return capture_bytes if self.step is not None else 0
+
+    def memory(self, data: D, batch: TensorBatch) -> MemoryUsage:
+        """Execute this operation's tensor path, excluding the already-funded pages."""
+        if self.step is not None:
+            return self.step.memory(data, batch, self.function)
+
+        def run() -> TaskOutput:
+            output = self.function(data, batch)
+            if self.optimizer is not None and output.gradients:
+                self.optimizer.update(batch.roots, batch.field_slots, output.gradients)
+            return output
+
+        return measure(run)
 
     def execute(self, context: StateTaskContext[D]) -> None:
         data, stream = context.data(), context.pin.stream
@@ -277,9 +324,9 @@ class TensorOperation(Generic[D]):
             if self.step is None:
                 output = self.function(data, batch)
             else:
-                output = self.step.execute(cast("StateTaskContext[TensorFrame]", context), batch)
-                if self.step.optimizer is None:
-                    output = self.function(data, replace(batch, completed=frozenset((self.step.task.symbol,))))
+                output = self.step.execute(context, batch)
+                if not self.step.training:
+                    output = self.function(data, replace(batch, completed=frozenset((self.step.symbol,))))
             if output.gradient_indices:
                 if (
                     not output.gradients
@@ -292,17 +339,14 @@ class TensorOperation(Generic[D]):
                 if (
                     self.mode not in ("update", "gradient")
                     or self.optimizer is None
-                    or len(output.gradients) != len(selected) * self.gradient_fields
+                    or len(output.gradients) != len(selected) * self.optimizer.groups
                 ):
                     raise ValueError("gradients require an explicit matching optimizer update")
                 context.write = context.arena.prepare_transition(
                     context.pin.refs.take(selected), stream, copy_fields=self.copy_fields
                 )
-                if not (
-                    isinstance(self.optimizer, PoolAdamW)
-                    and self.optimizer.update_pages(context.arena, context.write, output.gradients)
-                ):
-                    self.optimizer(context.arena.writable_roots(context.write), output.gradients)
+                roots = context.arena.lazy_roots((context.write,) * len(selected), context.write.after_refs)
+                self.optimizer.update(roots, roots.field_slots, output.gradients)
             if output.field_writes:
                 if context.write is None:
                     raise ValueError("memory writes require the invocation's private transition")
@@ -361,3 +405,37 @@ class TensorOperation(Generic[D]):
                         step_id=observation.step_id,
                         gradient=observation.gradient,
                     )
+
+
+class BatchOperation(TensorOperation[D]):
+    """A tensor operation whose admitted rows come from the external training batch."""
+
+    def input_shapes(
+        self, rows: int, hidden: int, training_shapes: tuple[tuple[int, ...], ...]
+    ) -> tuple[tuple[int, ...], ...]:
+        return (training_shapes[0],)
+
+
+class BatchPreparation(BatchOperation[D]):
+    """Validate both hidden and logit input capacities before training."""
+
+    def input_shapes(
+        self, rows: int, hidden: int, training_shapes: tuple[tuple[int, ...], ...]
+    ) -> tuple[tuple[int, ...], ...]:
+        return training_shapes
+
+
+@dataclass(frozen=True)
+class TensorComputation:
+    """A producer's tensor program and homogeneous input shapes, runnable outside the worker."""
+
+    function: Callable[..., tuple[torch.Tensor, ...]]
+    shapes: tuple[tuple[int, ...], ...]
+    dtype: torch.dtype
+
+    def __call__(self, *inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return self.function(*inputs)
+
+    def memory(self) -> MemoryUsage:
+        inputs = tuple(torch.empty(shape, device="meta", dtype=self.dtype) for shape in self.shapes)
+        return measure(lambda: self(*inputs))

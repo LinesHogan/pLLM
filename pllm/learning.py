@@ -27,12 +27,21 @@ from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding, ParameterOverlayOperator
 from pllm.contracts.region_program import TensorType
-from pllm.contracts.semantic_graph import AnchorSymbol, MathContract, SchedulerTimeline, SemanticGraph, StateEffectKind
+from pllm.contracts.semantic_graph import (
+    AnchorSymbol,
+    MathContract,
+    SchedulerTimeline,
+    SemanticGraph,
+    StateEffectKind,
+    TaskResourceFact,
+    TaskSymbol,
+    ValueResourceFact,
+)
 from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
 from pllm.execution.codec import boundary_digest
 from pllm.execution.declaration import Builder, Dimensions, Field, Shape, When, native
 from pllm.execution.freeze import fingerprint, freeze, owner_snapshot, owner_values
-from pllm.execution.host_memory import completion_example, completion_resources, transaction_resources
+from pllm.execution.host_memory import transaction_resources
 from pllm.execution.host_runtime import (
     CompletionInput,
     HostRuntimeFacts,
@@ -42,6 +51,7 @@ from pllm.execution.host_runtime import (
     TensorHostBinding,
     TransactionHostBinding,
 )
+from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.region_adamw import AdamWRegion
 from pllm.execution.replay import Recurrence
 from pllm.execution.shared_tensor import tensor_dtype
@@ -107,7 +117,7 @@ def transaction(
         implementations=(native(f"{name}:publish@1", "host/service@1", host=True),),
     )
     if example is not None:
-        timeline = transaction_resources(facts, example, (update, query, publish))
+        timeline = transaction_resources(facts, example, tuple(b.host_operations.values()))
     return TransactionHostBinding(b.graph, state_factory, b.bind_host(), service, facts, timeline)
 
 
@@ -139,19 +149,7 @@ class CompletionWorkload(
 
     def training_example(self, facts: HostRuntimeFacts) -> ContextT:
         """Maximum-shape host input; override when host metadata selects training rows."""
-        return self.prepare(completion_example(facts))
-
-    def resource_facts(self, facts: HostRuntimeFacts) -> SchedulerTimeline:
-        """Trace the declared loss and its backward using shape-only host operands."""
-        definition = self.parameters
-        return completion_resources(
-            facts,
-            cast(Mapping[str, Shape], definition.fields),
-            definition.dtype,
-            cast(AdamWConfig, definition.optimizer),
-            self.training_example,
-            self.loss,
-        )
+        return self.prepare(CompletionInput.example(facts))
 
     def declare_host(self, facts: HostRuntimeFacts) -> TensorHostBinding[CompletionInput, ContextT, ResultT]:
         if facts.hidden_size < 1:
@@ -204,7 +202,7 @@ class CompletionWorkload(
                     + boundary_digest(identity, optimizer.program, optimizer.capacity, optimizer.copy_workspace_bytes)
                 ),
             ),
-            optimizer=optimizer.writeback,
+            optimizer=optimizer,
             math=MathContract(
                 parameter_gradients=(state.declaration.resource,),
                 detached_inputs=("batch",),
@@ -243,16 +241,29 @@ class CompletionWorkload(
                 value.hidden.record_stream(batch.stream)
             return prepare_data(value)
 
-        timeline = owner.resource_facts(facts)
-        timeline = replace(
-            timeline,
-            task_resources=tuple(
-                replace(fact, workspace_bytes=fact.workspace_bytes + optimizer.copy_workspace_bytes)
-                if fact.task == update.symbol
-                else fact
-                for fact in timeline.task_resources
-            ),
-        )
+        timeline = facts.timeline()
+        if facts.memory_budget_bytes is not None:
+            if facts.max_input_rows is None:
+                raise ValueError("finite completion costs require max_input_rows")
+            data = owner.training_example(facts)
+            root = tuple(
+                torch.empty(field.shape, dtype=tensor_dtype(field.dtype), device="meta")
+                for field in layout.layout.fields
+            )
+            batch = TensorBatch(RequestStateSelection((), ()), (root,), (), None)
+            usage = b.operations[update.symbol].memory(data, batch)
+            timeline = replace(
+                timeline,
+                reserved_bytes=(facts.max_input_rows * facts.hidden_size * 4,) * len(timeline.anchors),
+                task_resources=(
+                    TaskResourceFact(TaskSymbol("publish"), 0),
+                    TaskResourceFact(update.symbol, usage.workspace),
+                ),
+                value_resources=(
+                    ValueResourceFact(TaskSymbol("publish"), "control", 0),
+                    ValueResourceFact(update.symbol, "control", usage.output),
+                ),
+            )
         return TensorHostBinding(
             b.graph,
             b.layouts,

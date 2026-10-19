@@ -9,6 +9,7 @@ from types import FunctionType, MethodType
 from typing import Annotated, ClassVar, TypeVar, cast, get_args, get_origin
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from pllm.authoring import BackendCompileFacts, BackendRequirements, BackendWorkload, TensorStepInput
 from pllm.config import ExecutionOptions
@@ -53,7 +54,6 @@ from pllm.execution.host_runtime import (
 )
 from pllm.execution.replay import Recurrence as Recurrence
 from pllm.execution.state_execution import MathBinding, StateExecution
-from pllm.execution.step_capture import StepCapture, reads_rows
 from pllm.execution.task_memory import derive_resources
 from pllm.execution.tensor_binding import SGD as SGD
 from pllm.execution.tensor_binding import Buffer as Buffer
@@ -61,18 +61,11 @@ from pllm.execution.tensor_binding import TensorBinding
 from pllm.execution.tensor_binding import TensorOutput as TensorOutput
 from pllm.execution.tensor_frame import TensorFrame, TensorPort, Tensors
 from pllm.execution.tensor_frame import TensorUpdate as TensorUpdate
-from pllm.execution.tensor_program import FunctionMath, InvocationOutput, PoolAdamW, Roots
+from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots, TensorComputation
 from pllm.kernels.adamw import AdamWConfig
 
 F = TypeVar("F", bound=Callable[..., torch.Tensor | TensorUpdate])
-G = TypeVar("G", bound=Callable[..., object])
 C = TypeVar("C")
-RequestT = TypeVar("RequestT")
-TransactionT = TypeVar("TransactionT")
-ContextT = TypeVar("ContextT")
-SnapshotT = TypeVar("SnapshotT")
-ResultT = TypeVar("ResultT")
-InputT = TypeVar("InputT")
 
 
 class Phase(Enum):
@@ -461,6 +454,11 @@ class Workload(
     """Python methods and effects compiled once, not runtime hooks or a second IR."""
 
     name: ClassVar[str] = "python.workload"
+
+    @property
+    def producers(self) -> tuple[TensorComputation, ...]:
+        """Concurrent tensor producers whose storage can overlap every worker anchor."""
+        return ()
 
     def _build(self, b: TensorBinding) -> None:
         owner = _snapshot(self)
@@ -1065,7 +1063,20 @@ class Workload(
         """Reserve ordinary tensor scratch and each requested graph's private pool."""
         if options.explicit_math:
             raise ValueError("this workload has no explicit tensor implementation")
-        return derive_resources(self.declaration(facts), facts, options)
+        with FakeTensorMode():
+            binding = self.declaration(facts)
+        timeline = derive_resources(binding, facts, options)
+        concurrent = sum(producer.memory().workspace for producer in self.producers)
+        return (
+            replace(
+                timeline,
+                reserved_bytes=tuple(
+                    value + concurrent for value in (timeline.reserved_bytes or (0,) * len(timeline.anchors))
+                ),
+            )
+            if concurrent
+            else timeline
+        )
 
     def implementations(
         self, operation: str, resources: tuple[TaskResourceFact, ...], *, explicit_math: bool = False
@@ -1079,29 +1090,8 @@ class Workload(
     def operations(
         self, facts: BackendCompileFacts, plan: PlanBundle, b: TensorBinding
     ) -> MathBinding[TensorStepInput, TensorFrame, TensorOutput]:
-        captured = {symbol: task for symbol, task in b.tensor_tasks.items() if reads_rows(task, b.tensor_tasks)}
-        if plan.timeline.task_resources and captured and type(self).operations is Workload.operations:
-            capture = "compute/cuda_graph@1" in plan.timeline.capabilities
-            limits = {fact.task: fact for fact in plan.timeline.task_resources}
-            states = (
-                facts.max_admitted_lineages if any(state.scope is StateScope.REQUEST for state in b.graph.states) else 1
-            )
-            conditional = any(
-                task.policy.update_states in task.domains
-                or (b.operations[symbol].optimizer and task.policy.forward_rows)
-                for symbol, task in captured.items()
-            )
-            if conditional and capture:
-                raise ValueError("step capture needs row-wise independent training without dynamic update selection")
-            if not conditional:
-                for symbol, task in captured.items():
-                    operation = b.operations[symbol]
-                    optimizer = operation.optimizer
-                    assert optimizer is None or isinstance(optimizer, PoolAdamW)
-                    b.operations[symbol] = replace(
-                        operation,
-                        step=StepCapture(task, b.tensor_tasks, limits[symbol], states, optimizer, enabled=capture),
-                    )
+        if plan.timeline.task_resources and type(self).operations is Workload.operations:
+            b.configure_steps(facts, "compute/cuda_graph@1" in plan.timeline.capabilities)
         return MathBinding(
             self._functions(b, facts.device, facts.initialization_seed), b.bind_all(plan, model_probe=facts.probe)
         )

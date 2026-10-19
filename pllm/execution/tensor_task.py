@@ -28,6 +28,7 @@ from pllm.execution.tensor_frame import (
     TensorPort,
     gradient_rows,
     select_rows,
+    selected_rows,
     state_leaf,
     state_means,
     training_observations,
@@ -47,6 +48,15 @@ class TensorTask:
     output: str
     # Memory fields written from inputs at publication; only training tasks have them.
     captures: Mapping[str, LayoutFieldId]
+
+    def dependencies(self, tasks: Mapping[TaskSymbol, TensorTask]) -> tuple[TensorTask, ...]:
+        """This task's tensor DAG in dependency order, ending with the task itself."""
+        ordered: dict[TaskSymbol, TensorTask] = {}
+        for source in self.sources.values():
+            if isinstance(source, TaskResultInputSource):
+                ordered.update((task.symbol, task) for task in tasks[source.task].dependencies(tasks))
+        ordered[self.symbol] = self
+        return tuple(ordered.values())
 
     @property
     def domains(self) -> tuple[str, ...]:
@@ -79,11 +89,7 @@ class TensorTask:
             if mask.dtype != torch.bool or mask.shape != (len(data.rows),):
                 raise ValueError("row domain must be a boolean mask over the operation rows")
         compacted = bool(policy.forward_rows) and compact
-        rows = (
-            tuple(int(index.item()) for index in inputs[policy.forward_rows].nonzero().flatten().cpu())
-            if compacted
-            else tuple(range(len(data.rows)))
-        )
+        rows = selected_rows(inputs[policy.forward_rows]) if compacted else tuple(range(len(data.rows)))
         selected = replace(data, rows=tuple(data.rows[index] for index in rows), index=None) if compacted else data
         for key in self.ports:
             inputs[key] = self._input(key, inputs, data, selected, batch, rows, compacted)
@@ -171,9 +177,7 @@ class TensorTask:
             inputs, rows = self.read(data, batch)
             selected = rows
             if self.policy.update_states in self.domains:
-                selected = tuple(
-                    int(index.item()) for index in inputs[self.policy.update_states].nonzero().flatten().cpu()
-                )
+                selected = selected_rows(inputs[self.policy.update_states])
             indices = batch.selection.row_states
             active = tuple(sorted({indices[data.rows[row].identity] for row in selected}))
             if rows:

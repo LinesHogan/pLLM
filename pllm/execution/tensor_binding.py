@@ -44,13 +44,12 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 from pllm.execution.declaration import Builder, Call, Dimensions, Field, Shape, State, When, native
-from pllm.execution.memory import MemoryUsage
 from pllm.execution.ptts.page_borrow import borrowed_root
 from pllm.execution.ptts.page_bundle import PagePublication
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION, Recurrence
 from pllm.execution.shared_tensor import tensor_dtype
-from pllm.execution.task_memory import weighted_memory
+from pllm.execution.step_capture import StepCapture, reads_rows
 from pllm.execution.tensor_frame import (
     OverlayEntry,
     OverlayTargetResult,
@@ -59,21 +58,30 @@ from pllm.execution.tensor_frame import (
     TensorPort,
     Tensors,
     TensorUpdate,
+    export_tensor,
     feedback_port,
     field_rows,
+    finite,
     flat_gradient,
     input_port,
     row_index,
     take_rows,
 )
-from pllm.execution.tensor_program import InvocationOutput, Observation, TaskOutput, TensorBatch
+from pllm.execution.tensor_program import (
+    BatchOperation,
+    BatchPreparation,
+    InvocationOutput,
+    Observation,
+    PoolAdamW,
+    TaskOutput,
+    TensorBatch,
+)
 from pllm.execution.tensor_task import TensorTask
 from pllm.execution.trace import MAX_SNAPSHOT_BYTES
 from pllm.kernels.adamw import AdamWConfig
 
 if TYPE_CHECKING:
     from pllm.authoring import BackendCompileFacts, TensorStepInput
-    from pllm.config import ExecutionOptions
 
 
 def _check_overlay_fields(
@@ -296,10 +304,6 @@ class TensorBinding(Builder[TensorFrame]):
         super().__init__(name, digest, dimensions)
         self.host = host
         self.exports: dict[TaskSymbol, tuple[int, int, bool]] = {}
-        self.memory_probes: dict[
-            TaskSymbol,
-            Callable[[BackendCompileFacts, ExecutionOptions], tuple[MemoryUsage, tuple[tuple[int, ...], ...]]],
-        ] = {}
         self.tensor_tasks: dict[TaskSymbol, TensorTask] = {}
         self.initializers: dict[str, Callable[[tuple[torch.Tensor, ...], torch.Generator], None]] = {}
         self.weighted_training = False
@@ -307,6 +311,37 @@ class TensorBinding(Builder[TensorFrame]):
         self.sample_limit: int | None = None
         self.overlay_targets: tuple[ParameterTarget, ...] = ()
         self.overlay_import = False
+
+    def configure_steps(self, facts: BackendCompileFacts, capture: bool) -> None:
+        """Select the same tensor step for planning and execution."""
+        captured = {
+            symbol: task
+            for symbol, task in self.tensor_tasks.items()
+            if reads_rows(task, self.tensor_tasks) and symbol not in self.exports
+        }
+        conditional = any(
+            task.policy.update_states in task.domains
+            or (self.operations[symbol].optimizer and task.policy.forward_rows)
+            for symbol, task in captured.items()
+        )
+        if conditional:
+            if capture:
+                raise ValueError("step capture needs row-wise independent training without dynamic update selection")
+            return
+        limits = {fact.task: fact for fact in self.resources}
+        states = (
+            facts.max_admitted_lineages if any(state.scope is StateScope.REQUEST for state in self.graph.states) else 1
+        )
+        for symbol, task in captured.items():
+            operation = self.operations[symbol]
+            optimizer = operation.optimizer
+            assert optimizer is None or isinstance(optimizer, PoolAdamW)
+            self.operations[symbol] = replace(
+                operation,
+                step=StepCapture(
+                    task, self.tensor_tasks, limits[symbol], states, facts.device, optimizer, enabled=capture
+                ),
+            )
 
     def recurrence(self, effect: Recurrence) -> None:
         activation = self.attachment is not None and self.attachment.kind is AttachmentKind.ACTIVATION_PATCH
@@ -433,7 +468,7 @@ class TensorBinding(Builder[TensorFrame]):
 
         def execute(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
             with torch.no_grad():
-                if any(not torch.isfinite(source).all() for _, values in data.replacements for source in values):
+                if any(not finite(source) for _, values in data.replacements for source in values):
                     raise ValueError("replacement tensors differ from the signed layout or finite-value contract")
                 for index, values in data.replacements:
                     for target, source in zip(batch.roots[index], values, strict=True):
@@ -718,28 +753,6 @@ class TensorBinding(Builder[TensorFrame]):
         if steps < 1 or self.weighted_training or self.host:
             raise ValueError("weighted training requires one model training sink and positive steps")
         self.weighted_training = True
-        self.memory_probes[TaskSymbol(name)] = lambda facts, options: weighted_memory(
-            self,
-            function,
-            arguments,
-            tuple(field.name for field in state.fields),
-            steps,
-            optimizer.lr,
-            facts,
-            options,
-            prepare=False,
-        )
-        self.memory_probes[TaskSymbol(f"__{name}_prepare")] = lambda facts, options: weighted_memory(
-            self,
-            function,
-            arguments,
-            tuple(field.name for field in state.fields),
-            steps,
-            optimizer.lr,
-            facts,
-            options,
-            prepare=True,
-        )
         fields = tuple(field.name for field in state.fields)
         dimensions = self.dimensions
         prepare_function: Callable[[TensorFrame, TensorBatch], TaskOutput] | None = None
@@ -803,17 +816,15 @@ class TensorBinding(Builder[TensorFrame]):
                     and any(actual > bound for actual, bound in zip(hidden.shape, shape, strict=True))
                 ):
                     raise ValueError("weighted-CE batch differs from signed parameters or input bounds")
-                if not torch.isfinite(weights).all():
+                if not finite(weights):
                     raise ValueError("weighted CE weights must be finite")
                 valid = (labels >= 0) & (labels < dimensions.vocab_size) & (weights > 0)
-                counts = valid.sum(-1).cpu()
-                if not counts.all():
-                    raise ValueError("weighted CE requires at least one valid weighted label per state")
-                data.selected, data.trained_rows = selected, int(counts.sum().item())
-                if data.trained_rows != valid.numel():
+                data.selected = selected
+                data.trained_rows, incomplete = weighted_rows(valid)
+                if incomplete:
                     hidden, logits = (tensor.masked_fill(~valid.unsqueeze(-1), 0) for tensor in (hidden, logits))
                     labels, weights = (tensor.masked_fill(~valid, 0) for tensor in (labels, weights))
-                if not torch.isfinite(hidden).all() or not torch.isfinite(logits).all():
+                if not finite(hidden) or not finite(logits):
                     raise ValueError("weighted-CE active rows must be finite")
                 data.batch_inputs = tuple(
                     tensor.clone() if torch.is_inference(tensor) else tensor
@@ -821,7 +832,10 @@ class TensorBinding(Builder[TensorFrame]):
                 )
                 data.parameters = tuple(tensor.new_empty((len(selected), *tensor.shape)) for tensor in root)
                 with torch.no_grad():
-                    reset(dict(zip(fields, data.parameters, strict=True)), torch.Generator(device=root[0].device))
+                    reset(
+                        dict(zip(fields, data.parameters, strict=True)),
+                        torch.Generator(device="cpu" if root[0].is_meta else root[0].device),
+                    )
                 return TaskOutput()
 
             prepare_function = prepare
@@ -831,6 +845,7 @@ class TensorBinding(Builder[TensorFrame]):
             outputs=("batch",),
             when=When.BEFORE_SAMPLE,
             function=prepare_function,
+            operation_type=BatchPreparation,
             implementations=(native("canonical.weighted_batch:prepare@1"),),
         )
 
@@ -884,6 +899,7 @@ class TensorBinding(Builder[TensorFrame]):
                 reduction="weighted_state_mean_then_mean",
             ),
             function=execute,
+            operation_type=BatchOperation,
             select=lambda data, selection: data.selected,
             implementations=(native(identity),),
         )
@@ -1162,11 +1178,7 @@ class TensorBinding(Builder[TensorFrame]):
                     return TaskOutput()
                 selected = replace(data, rows=data.rows[:max_rows], columns=max_cols)
                 operation.function(selected, batch)
-                value = (
-                    batch.results[call.symbol, call.outputs[0]][:max_rows, :max_cols]
-                    .detach()
-                    .to(device="cpu", copy=True)
-                )
+                value = export_tensor(batch.results[call.symbol, call.outputs[0]][:max_rows, :max_cols])
                 batch.results[call.symbol, call.outputs[0]] = value
                 return TaskOutput(
                     observations=(
@@ -1387,3 +1399,14 @@ class TensorBinding(Builder[TensorFrame]):
         return TensorResult(
             invocation.value, invocation, tuple(data.entries), data.input_gradients, data.parameter_gradient_fields
         )
+
+
+def weighted_rows(valid: torch.Tensor) -> tuple[int, bool]:
+    """Resolve host validation and masking; meta uses the allocation-heavy partial-batch path."""
+    counts = valid.sum(-1)
+    if valid.is_meta:
+        return valid.numel(), True
+    if not counts.all():
+        raise ValueError("weighted CE requires at least one valid weighted label per state")
+    count = int(counts.sum().item())
+    return count, count != valid.numel()

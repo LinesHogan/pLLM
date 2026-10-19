@@ -31,7 +31,7 @@ from pllm.execution.scheduler import validate_plan_bundle
 from pllm.execution.state_execution import StateExecution
 from pllm.execution.tensor_binding import TensorOutput
 from pllm.execution.tensor_frame import TensorFrame
-from pllm.workloads.video import VideoWorkload, frame_features
+from pllm.workloads.video import VideoWorkload
 
 if TYPE_CHECKING:
     from pllm.backends.vllm.runtime import ReadonlyStepAbsent, ReadonlyStepEnd, ReadonlyStepInput
@@ -202,7 +202,7 @@ class VideoSession:
         self.channels = tuple(tuple(pair[0] for pair in row) for row in pipes)
         child_channels = tuple(tuple(pair[1] for pair in row) for row in pipes)
         self.process = context.Process(target=worker, args=(child_control, child_channels, workload, config))
-        self.timeout, self.workload = timeout, workload
+        self.timeout, self.producer = timeout, workload.producers[0]
         self.steps = steps
         self.pending: deque[Pending] = deque()
         self._reports: deque[tuple[int, StateRef | None, str | None]] = deque()
@@ -258,9 +258,7 @@ class VideoSession:
             try:
                 with torch.cuda.stream(self.stream):
                     current = frame.to(self.arena.device)
-                    values = frame_features(
-                        current, current if self._previous is None else self._previous, self.workload.grid_size
-                    )
+                    values = self.producer(current, current if self._previous is None else self._previous)
                     for index, value in enumerate(values):
                         self.arena.write_field(write, 0, LayoutFieldId(index)).copy_(value)
                     self._previous = current

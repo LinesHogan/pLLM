@@ -355,17 +355,11 @@ loss；绑定在每个 SGD 步微分它们的**均值**。这不是 ESamp 的独
 检查。reset 训练与激活导入完全覆盖其私有字段，所以它们的绑定用
 `copy_fields=()` 跳过把旧字段拷进新页。默认 `copy_fields=None` 拷贝全部私有
 字段；显式有序子集只拷那些字段。内置 Adam 绑定保留参数、步数与动量，但不保留
-旧梯度 —— 更新会完全覆盖梯度（包括每个 TLM 因子组）。没有单独的 `replace`
-执行模式。这里使用同一 arena、pin 与 receipt；调用方必须在发布前完全覆盖被省略
-的私有字段，且不得读取其未初始化内容。私有页容量不变。这个入口目前支持 reset
-SGD 与加权批次，不支持持久动量、任意外部 DTO、推理行选择器或跨步 autograd。
-`SamplerWorkload` 与 `LoRAData` 已移除；没有平行的原生创作路径。
+旧梯度（包括每个 TLM 因子组）。发布前必须写满省略复制的字段，不得读未初始化值。
+此入口支持 reset SGD 与加权批次；私有页容量及 arena/pin/receipt 所有权不变。
 
-普通 `Workload` 还暴露带类型的 `implementations` 与 `operations` 钩子，用于对其
-原始签名任务做显式原生替换，不另建图或运行时。普通张量方法的成本随其数学重新
-推导，不再需要 `native_methods`/`require_native_methods` 锁或继承的手写字节公式。
-原生替换仍须实现签名的数学：In-Place-TTT 只对内置源方法选择块扫描；自定义方法
-走自己的普通张量路径。签名与绑定的数学一致性检查仍保留。
+`implementations` 与 `operations` 可为签名任务选择原生实现；实现仍须保持所声明的
+数学。修改普通方法会重新推导成本，不需要资源公式或方法锁。
 
 ## 高级数据流
 
@@ -463,16 +457,10 @@ prepare/output 辅助仍是显式原生宿主数学。标量配置在绑定时�
 之后的 monkey patch 只影响新绑定的执行。TTRL 是维护中的范例：多数投票、
 平局规则、采样限制与重试/栅栏构造仍是它的数学，原始 completion 对象保留。
 
-有界 TTRL 张量执行：把 `HostRuntimeFacts(device, hidden_size=...,
-max_input_rows=..., memory_budget_bytes=...)` 传给同一公共工厂。框架用最大形状的
-fake CPU 输入追踪 loss、反向与 Adam 工作区，并保留原始 hidden 缓冲及结果。
-TTRL 的 `training_example(facts)` 提供所有行可训练的奖励元数据；宿主选择条件
-不能只从张量形状推导。FTTT 通过 `transaction(..., example=...)` 提供上下文与回滚
-快照，由框架追踪 update/query/publish。它们不再覆盖 `resource_facts`。
-行上限在准备前检查；CUDA 输入记录其消费流。返回的 timeline 不能擦除用户限制。
-没有预算时普通行为不变。这不是对 completion 文本、Python 元数据/历史或
-外部库 scratch 的约束。宿主声明保留其原始 `HostRuntimeFacts`；高级调用方用
-`binding.compile()`，不是编译期另一套事实。
+有界宿主执行使用 `HostRuntimeFacts(max_input_rows=..., memory_budget_bytes=...)`。
+TTRL 的 `training_example` 给出可训练的最大形状元数据；FTTT 的 transaction
+`example` 给出上下文与回滚快照。框架执行实际 loss/update/query 路径来推导资源，
+不要求负载申报字节。使用 `binding.compile()` 保留同一组事实与用户预算。
 
 ## 因果适配器
 
@@ -604,87 +592,40 @@ loss 则从原始 arena 的稳定槽表推导设备映射，替换前有原始�
 反向算子，不构造 autograd 磁带；原始输入、均值与逆标准差仍是必要 scratch。
 普通用户函数保留正常 autograd 语义，不 gather 矩阵参数。
 
-### 分页 AdamW 与分页写
+### 张量步、分页更新与捕获
 
-`PagedRows.adamw(fields, gradients, config)` 接受参数/梯度/步数/一阶动量/二阶
-动量顺序的五个原始 FP32 字段和连续 `[states, parameters]` 梯度。只有原始私有槽
-可被更新；过滤计算行不改变写权限。ESamp 分页 eager 与 Adam 捕获共享一个
-步数/偏置内核和一个参数/梯度/动量内核。eager 仍构造启动槽表；其已知工作区按
-每状态 96 字节取整（80 槽表字节、4 状态末端字节、8 校正字节），不含分配器
-开销。捕获用其原始稳定槽表并计入图池预留。普通 eager AdamW 仍是原始 PyTorch
-实现；库融合开关没有保持既定的归一化 ESamp 容差，未被选用。共享/独立 LoRA 也
-支持分页写捕获：reset 与 SGD 通过 `write(values, selected, add=..., scale=...)`
-直接写原始私有字段。`selected` 是原始授权状态索引的一个去重子集；值保持该序。
-只读槽不可变。eager 与捕获训练共享同一数学与加权归约；捕获的缺席槽用 -1，永不
-写入。写内核直接读选中状态与原始槽（包括跨步选择），没有中间选中槽张量。
-缩放对替换写与加性写都适用。显式 LoRA 循环复用 log-softmax 存储做 CE 导数，
-并把固定行归一化提升到 SGD 迭代之外。LoRA 在其既有捕获行状态输入中排除零权重
-行；eager 过滤用已算出的有效行数，不全活跃批次不重组。
+框架用同一个 StepCapture body 执行普通张量步、形状追踪与 CUDA 图捕获。
+它读行/状态表、gather 字段、执行前后向，再更新授权的私有页。FP32 CUDA
+AdamW 直接更新页池；CPU 和其他 dtype 共享 PyTorch 优化器路径。缺席槽为 -1，
+永不写入；发布、跨流排序、回滚与页生命周期仍归 PTTS。
 
-### 捕获准入（KernelCapture）
-
-直接 `arena.capture_kernel` 在返回前恢复调用方自有私有字段。框架
-`KernelCapture.bind` 使用一次性准入页并在捕获后中止它们，不分配字段备份。
-KernelCapture 输入工厂接受设备；它们必须在 meta 与 CUDA 上产出相同的去重缓冲
-形状/dtype。所有捕获都在分配任何捕获输入缓冲前，对照原始签名驻留预算在 meta
-上量尺寸。真实输入存储与字段 scratch 在冷准入前再检查；图池预留在捕获后检查，
-被拒时回收冷页。真实 replay、跨流排序、发布与中止仍归原始 arena，无字段
-gather 缓冲。
+捕获使用固定输入上限和私有图池；绑定前检查表容量，捕获后核对真实池大小与
+`capture_memory_bytes`。负载不计算槽表、校正张量或优化器临时空间的字节公式。
 
 ### 资源事实与内存预算
 
-`resource_facts(facts, options)` 返回从
-`facts.timeline` 派生的 SchedulerTimeline，带原始任务/值资源事实，不是另一张
-成本图。`ExecutionOptions(memory_budget_bytes=...)` 约束该原始 AER 计划。原始
-timeline、返回的资源事实与用户限制三者求交：任何声明都不能放松或擦除既有限制。
-`None` 不加限制；零是零字节限制。有限规划要求每个任务与输出（包括零字节输出）
-都有显式成本。该限制覆盖声明的状态、驻留、预留、工作区与存活结果字节，不覆盖
-未声明的 vLLM 模型/KV、分配器或外部库成本。它区别于 arena 容量
-（`state_memory_bytes`）与每任务捕获容量。ESamp 还声明普通张量打包/保存的
-中间量、谓词、Adam 工作区与导出的 loss/梯度存储。
+框架的 `resource_facts(facts, options)` 在最大输入形状上执行已绑定的任务，
+不另写一套数学或字节公式。它追踪真实的 StepCapture/TensorTask、加权训练、
+原生 overlay 与区域扫描；Triton 内核使用 Torch 注册的 fake 实现。存储别名共享
+计数，autograd 保存值和返回后保留值持续计入；分配按 512 字节对齐，并计入大块不拆分余量。
+输入页另行计账，捕获池仍使用 `capture_memory_bytes`，规划不初始化 CUDA。
 
-默认 `Workload.resource_facts` 在最大输入形状上执行 meta 数学，按存储身份追踪
-活跃分配：视图共享底层存储，autograd 保存的张量和 Python 保留的结果持续计入。
-借用输入不计入任务工作区；gather、前后向和返回值计入，每次分配向上取整到
-512 字节。CUDA foreach Adam 的真实张量实现用 fake CUDA 输入追踪，规划过程不
-初始化 CUDA。`capture_memory_bytes` 仍单独预留捕获池。
+任务对象提供自己的资源投影，发布只改变已有页的所有权元数据。并发生产者声明
+可执行 `TensorComputation` 与输入形状，框架将其峰值保留到每个 worker anchor。
+In-Place-TTT 的区域源码留在负载，TensorScan 负责区域预算和恢复生命周期。
+宿主有限训练需要 `max_input_rows`；有宿主选择条件时提供最大形状样例。
 
-Dummy、OverRIDE、ESamp、LoRA、ReFT 与普通 tensor task 使用这些推导事实。
-原生 In-Place-TTT 还预留区域规划证明要求的恢复生命周期；块扫描及资源核算由框架
-实现。Video 编码同样追踪，另把生产者可与任意 worker anchor 重叠的工作区计入
-预留。原生模型 replay 保留已有的区域资源推导。修改普通数学不再要求复制手写
-成本公式；有限宿主训练仍须声明 `max_input_rows`，有数据依赖的宿主选择须提供
-最大形状样例。任意不透明外部库 scratch 或无法形状追踪的分支仍需显式资源契约，
-这些事实不是整个 GPU 进程的显存保证。
+`memory_budget_bytes` 约束 AER 中的状态、驻留、工作区和结果，不等于整个进程
+显存或 arena 的 `state_memory_bytes`。原时间轴与用户预算求交，不能放松限制；
+`None` 不加限制，零就是零字节。未声明的模型/KV、分配器及外部库内存仍不在此界内。
 
-原生源/目标打包在消费任务内进行；预测只打包
-合格采样行。训练结果是导出的图值，所以 AER 保留其存储到完成，不止到优化器消费。
-连续 hidden 行借用原始快照（包括跨步列）；不规则行仍打包。vLLM 为每个资源创建
-一个自持有的 FP32 快照，并跨原始 timeline 预留其最大容量；worker 重建保留该
-timeline 并拒绝更低的快照预留。就绪排序让生产先于消费，同时记录消费流防止
-分配器在读取完成前复用。既有后端需求从原始图投影采样阶段/反馈。vLLM 在采样
-锚点预留已知投影/转换/行运算缓冲，并自持反馈 logits/token 到完成。探针与附着
-安装用真实采样容量与填充头宽检查同样的最小值；安装从原始签名图读取需求。
-整行加法/重加权避免 gather/拷回；部分行保留精确索引与有限支撑语义。这些预留
-不覆盖上游采样器/GEMM scratch 或模型/KV 池。特化还从原始附着、字段形状与
-replay 任务推导效果缓冲预留。保守信封跨 timeline 保留稠密操作数快照、低秩/激活
-中间量、replay 进位/当前槽 KV 备份与正常输出；资金不足的重新签名计划在钩子前
-被安装拒绝。Qwen2 适配器直接更新其新鲜投影输出，从不写状态页或残差输入。
-连续低秩/replay 行借用视图；稠密训练捕获仍自持其输入。逐 token replay 跨层共享
-一个不可变序列张量，保留正常输出不克隆。其逐层 KV 备份仍在正常 token 之前；
-条件 replay 备份成功的正常 token。加权 CE 准备借用全部有效的普通输入；无效行
-需要掩码拷贝，推理模式张量需要自持普通存储供 autograd。普通请求参数读取在
-所有选中行使用同一原始状态时借用广播视图（包括单例/空选择）。混合状态仍打包；
-backward 把重复行贡献求和进同一原始导数叶。这些叶别名 pin 住的参数，不是第二份
-参数分配。连续采样反馈行同样借用其自持反馈缓冲；重排行打包。这些输入对用户
-数学只读。结算的上下文释放引导/反馈；返回的结果保留其原始张量，失败结算保留
-其重试数据。在唯一普通训练终点，导数叶与保留的结果图引用在成功后释放，包括
-无训练分支。导出的张量存储、计算的梯度与分阶段优化器更新被保留；这依赖既有
-要求：每条微分路径都到达该终点。这些保守已知张量信封不是库 scratch 保证，也不
-约束任意自定义 autograd。不支持的捕获在特化时被拒。
+输入与导出结果仍遵循原有生命周期：连续行可借用视图，不规则行会打包；
+输入对用户数学只读，结果与梯度保留到消费者完成。普通训练终点释放 autograd
+图及导数叶，无训练分支也一样；失败结算保留重试所需的数据。
 
-语义执行、直接分页访问与捕获/融合保持为彼此独立的能力声称。新优化原语以跨
-可复用场景的测量为准，改实现前先固定独立参考。
+vLLM 继续按真实容量预留 hidden 快照、采样反馈和效果/replay 缓冲；新推导不重复
+计入这些输入。就绪排序和消费流记录防止读完前复用。采样器、GEMM 与模型/KV 的
+外部工作区不因此获得新保证。直接分页访问、语义执行和捕获/融合仍是独立能力。
 
 ## 全负载覆盖
 

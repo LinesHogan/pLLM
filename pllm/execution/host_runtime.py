@@ -11,7 +11,7 @@ from typing import Generic, Protocol, TypeVar
 import torch
 
 from pllm.contracts.compilation import ScheduleBundle
-from pllm.contracts.feedback import CompletionBatch
+from pllm.contracts.feedback import Completion, CompletionBatch, FinishReason
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import (
     AnchorId,
@@ -128,6 +128,19 @@ class CompletionInput:
     readiness: CudaStreamReadiness | None = None
 
     @classmethod
+    def example(cls, facts: HostRuntimeFacts, device: torch.device = torch.device("meta")) -> CompletionInput:
+        """A shape-only input with domain-neutral completion metadata."""
+        if facts.max_input_rows is None:
+            raise ValueError("finite completion costs require max_input_rows")
+        entries = tuple(
+            Completion(RequestIdentity(str(i), i, 0), i, str(i), (), "", FinishReason.LENGTH)
+            for i in range(facts.max_input_rows)
+        )
+        return cls(
+            CompletionBatch(entries), torch.empty((len(entries), facts.hidden_size), dtype=torch.float32, device=device)
+        )
+
+    @classmethod
     def capture(
         cls, completions: CompletionBatch, hidden: torch.Tensor, stream: torch.cuda.Stream | None = None
     ) -> CompletionInput:
@@ -147,7 +160,7 @@ class CompletionInput:
             or self.hidden.shape[0] != len(self.completions.entries)
             or self.hidden.dtype != torch.float32
             or torch.is_inference(self.hidden)
-            or self.hidden.device.type not in ("cpu", "cuda")
+            or self.hidden.device.type not in ("cpu", "cuda", "meta")
             or (self.hidden.device.type == "cuda") != (self.readiness is not None)
         ):
             raise ValueError("completion input requires owned float32 rows aligned to completions")

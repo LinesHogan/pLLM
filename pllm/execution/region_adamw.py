@@ -1,5 +1,6 @@
 """Import the existing AdamW kernel without replacing its numerical path."""
 
+from collections.abc import Sequence
 from math import prod
 
 import torch
@@ -12,6 +13,7 @@ from pllm.execution.region_execution import RegionExecution
 from pllm.execution.region_native import NativePrimitive, PrimitiveResources
 from pllm.execution.region_storage import analyze_region_capacity
 from pllm.execution.region_values import Data, check_data
+from pllm.execution.tensor_program import FieldSlots
 from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw
 
 
@@ -72,6 +74,7 @@ class AdamWRegion:
         )
         self._names = tuple(v.name for v in inputs)
         self._parameters = parameters
+        self.groups = len(parameters)
         self.capacity = analyze_region_capacity(self.program, schedule, {signature.name: cell})
 
         # The native wrapper's copies are source-derived. This adapter also
@@ -108,7 +111,9 @@ class AdamWRegion:
             tensors.append(value)
         return tuple(tuple(tensors[i : i + 5]) for i in range(0, len(tensors), 5))
 
-    def writeback(self, roots: tuple[tuple[torch.Tensor, ...], ...], gradients: tuple[torch.Tensor, ...]) -> None:
+    def update(
+        self, roots: Sequence[tuple[torch.Tensor, ...]], slots: FieldSlots, gradients: tuple[torch.Tensor, ...]
+    ) -> None:
         """Copy one instance's mathematical results into its already-issued write."""
         if len(roots) != 1 or len(roots[0]) != 5 * len(self._parameters):
             raise ValueError("instance AdamW writeback requires its exact signed optimizer fields")

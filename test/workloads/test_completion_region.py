@@ -10,7 +10,6 @@ import pllm.execution.tensor_program as tensor_program
 from pllm import _core
 from pllm.contracts.feedback import Completion, CompletionBatch, FinishReason
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.contracts.semantic_graph import TaskResourceFact, TaskSymbol, ValueResourceFact
 from pllm.execution.host_runtime import CompletionInput, HostRuntimeFacts
 from pllm.execution.region_adamw import AdamWRegion
 from pllm.execution.tensor_program import InvocationOutput
@@ -45,16 +44,6 @@ class TwoGroups(pllm.CompletionWorkload[CompletionInput, InvocationOutput]):
     def output(self, data, result):
         return result
 
-    def resource_facts(self, facts):
-        return replace(
-            facts.timeline(),
-            task_resources=(TaskResourceFact(TaskSymbol("publish"), 0), TaskResourceFact(TaskSymbol("train"), 4096)),
-            value_resources=(
-                ValueResourceFact(TaskSymbol("publish"), "control", 0),
-                ValueResourceFact(TaskSymbol("train"), "control", 4),
-            ),
-        )
-
 
 @pytest.mark.parametrize("device", ("cpu", "cuda:0"))
 def test_default_completion_region_keeps_multigroup_adamw_and_publication(monkeypatch, device):
@@ -63,7 +52,12 @@ def test_default_completion_region_keeps_multigroup_adamw_and_publication(monkey
     device = torch.device(device)
     stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
     facts = HostRuntimeFacts(
-        device, hidden_size=2, initialization_seed=23, state_memory_budget_bytes=65536, memory_budget_bytes=1 << 20
+        device,
+        hidden_size=2,
+        initialization_seed=23,
+        state_memory_budget_bytes=65536,
+        memory_budget_bytes=1 << 20,
+        max_input_rows=4,
     )
     workload = TwoGroups()
     binding = workload.declare_host(facts)

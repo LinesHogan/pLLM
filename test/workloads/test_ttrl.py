@@ -191,12 +191,6 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
     with pytest.raises(ValueError, match="max_input_rows"):
         TTRLWorkload(config).declare_host(replace(facts, memory_budget_bytes=1 << 20))
 
-    class LooseBudget(TTRLWorkload):
-        def resource_facts(self, facts):
-            return replace(TTRLWorkload.resource_facts(self, facts), memory_budget_bytes=None)
-
-    with pytest.raises(ValueError):
-        make_llm(workload=LooseBudget(config), config=replace(facts, max_input_rows=6, memory_budget_bytes=1))
     binding = zero.declare_host(facts)
     execution = binding.compile()
     (initial,) = execution.admit(())

@@ -6,6 +6,7 @@ Fourier encoder demonstrates conditioning, not a trained vision-language model.
 """
 
 from dataclasses import dataclass, replace
+from functools import partial
 from math import isfinite, pi
 from typing import Annotated, ClassVar
 
@@ -16,29 +17,24 @@ import pllm
 from pllm.authoring import (
     BackendCompileFacts,
     BackendRequirements,
-    BackendWorkload,
     MathBinding,
     PlanBundle,
     TensorStepInput,
 )
 from pllm.config import ExecutionOptions
-from pllm.contracts.backend_attachment import ActivationPatchBinding, BackendAttachmentSpec
+from pllm.contracts.backend_attachment import ActivationPatchBinding
 from pllm.contracts.semantic_graph import (
-    SchedulerTimeline,
-    SemanticGraph,
     StateEffectKind,
     TaskResultInputSource,
     TaskSymbol,
     WorkloadId,
 )
-from pllm.contracts.tensor_layout import LayoutFieldId, TensorLayoutRequest
+from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.codec import boundary_digest
 from pllm.execution.declaration import Field, When, native
-from pllm.execution.memory import MemoryUsage, measure
-from pllm.execution.task_memory import derive_resources
 from pllm.execution.tensor_binding import TensorBinding, TensorOutput
-from pllm.execution.tensor_frame import TensorFrame
-from pllm.execution.tensor_program import TaskOutput, TensorBatch
+from pllm.execution.tensor_frame import TensorFrame, finite
+from pllm.execution.tensor_program import TaskOutput, TensorBatch, TensorComputation
 
 FEATURES = ("qp", "residual_energy", "motion_magnitude", "segmentation")
 _ENCODE = TaskSymbol("encode")
@@ -117,13 +113,13 @@ class _VideoEncoder(pllm.Workload):
 
 def _write_inject(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
     hidden = batch.results[_ENCODE, "value"]
-    if not torch.isfinite(hidden).all():
+    if not finite(hidden):
         raise ValueError("video encoder produced a non-finite injection")
     return TaskOutput(field_writes=((_DELTA, hidden.unsqueeze(0)),), changed=(0,), update_count=1)
 
 
 @dataclass(frozen=True)
-class VideoWorkload(BackendWorkload[TensorFrame, TensorOutput]):
+class VideoWorkload(pllm.Workload):
     """One borrowed feature root and one entirely local per-step injection root."""
 
     name: ClassVar[str] = "video.session"
@@ -150,6 +146,16 @@ class VideoWorkload(BackendWorkload[TensorFrame, TensorOutput]):
             on_missing=pllm.MissingPolicy.HOLD,
         )
 
+    @property
+    def producers(self) -> tuple[TensorComputation, ...]:
+        return (
+            TensorComputation(
+                partial(frame_features, grid_size=self.grid_size),
+                ((8 * self.grid_size, 8 * self.grid_size),) * 2,
+                torch.uint8,
+            ),
+        )
+
     def backend_requirements(self) -> BackendRequirements:
         return BackendRequirements(activation_layers=self.activation.layers)
 
@@ -163,19 +169,6 @@ class VideoWorkload(BackendWorkload[TensorFrame, TensorOutput]):
                 ),
             ),
             options,
-        )
-
-    def resource_facts(self, facts: BackendCompileFacts, options: ExecutionOptions) -> SchedulerTimeline:
-        timeline = derive_resources(self._binding(facts)[1], facts, options)
-        # Producer scratch can overlap every worker anchor; it is not a worker task.
-        frame = torch.empty((8 * self.grid_size, 8 * self.grid_size), dtype=torch.uint8, device="meta")
-        previous = torch.empty_like(frame)
-        producer = measure(lambda: frame_features(frame, previous, self.grid_size)).workspace
-        return replace(
-            timeline,
-            reserved_bytes=tuple(
-                value + producer for value in (timeline.reserved_bytes or (0,) * len(timeline.anchors))
-            ),
         )
 
     def _binding(self, facts: BackendCompileFacts) -> tuple[_VideoEncoder, TensorBinding]:
@@ -194,14 +187,6 @@ class VideoWorkload(BackendWorkload[TensorFrame, TensorOutput]):
             implementations=(native("video.inject:write@1", "transition/full_root@1"),),
         )
 
-        def write_memory(
-            facts: BackendCompileFacts, options: ExecutionOptions
-        ) -> tuple[MemoryUsage, tuple[tuple[int, ...], ...]]:
-            hidden = torch.empty(facts.probe.hidden_size, device="meta")
-            usage = measure(lambda: torch.isfinite(hidden).all())
-            return replace(usage, output=0), ()
-
-        b.memory_probes[update.symbol] = write_memory
         publication = b.publish(update, inject, when=When.BEFORE_MODEL)
         b.overlay(
             inject,
@@ -232,8 +217,9 @@ class VideoWorkload(BackendWorkload[TensorFrame, TensorOutput]):
         )
         return encoder, b
 
-    def declare(self, facts: BackendCompileFacts) -> tuple[SemanticGraph, TensorLayoutRequest, BackendAttachmentSpec]:
-        return self._binding(facts)[1].finish()
+    def declaration(self, facts: BackendCompileFacts | None = None) -> TensorBinding:
+        assert facts is not None
+        return self._binding(facts)[1]
 
     def bind_math(
         self, facts: BackendCompileFacts, plan: PlanBundle
