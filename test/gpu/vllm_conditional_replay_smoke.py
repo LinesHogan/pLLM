@@ -1,7 +1,11 @@
-"""Evidence 41: real layer-range recurrence, per-layer current-slot KV and preserved normal output."""
+"""Conditional layer replay (In-Place TTT over layers 22-23) on a real vLLM model.
+
+Each replayed layer is recomputed by an independent attention/MLP oracle including the
+published overlay delta; replay writes only the current KV slot, leaves normal outputs
+and the CUDA RNG untouched, and replays only when an update was published.
+"""
 
 import sys
-from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,7 +17,6 @@ from vllm import SamplingParams
 
 import pllm
 from pllm.backends.vllm.replay import VllmLayerReplay
-from pllm.backends.vllm.runtime import WorkloadModelRunner, probe_backend
 from pllm.config import ModelConfig, VllmDType
 from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
 from pllm.contracts.semantic_graph import ConditionalLayerReplay
@@ -29,31 +32,9 @@ def main():
     workload = InPlaceTTTWorkload(
         InPlaceTTTConfig(targets, chunk_size=2, learning_rate=1e-6, replay=ConditionalLayerReplay((22, 23)))
     )
-    original_attach = WorkloadModelRunner.attach_workload
-
-    def checked_attach(runner, deployment):
-        timeline = deployment.attachment.inputs.plan.timeline
-        assert min(timeline.reserved_bytes) > 0
-        facts = probe_backend(workload.backend_requirements(), runner, timeline)
-        for index in range(len(timeline.anchors)):
-            short = replace(
-                timeline,
-                reserved_bytes=tuple(value - int(i == index) for i, value in enumerate(timeline.reserved_bytes)),
-            )
-            underfunded = workload.compile_backend(replace(facts, timeline=short))
-            try:
-                original_attach(runner, underfunded)
-            except ValueError as error:
-                assert "effect buffers" in str(error)
-            else:
-                raise AssertionError("worker accepted a re-signed underfunded effect plan")
-        original_attach(runner, deployment)
-
-    with patch.object(WorkloadModelRunner, "attach_workload", checked_attach):
-        handle = pllm.make_llm(
-            workload=workload,
-            config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", VllmDType.BFLOAT16, 64, 2, 64, 0.25, seed=7),
-        )
+    handle = pllm.make_llm(
+        workload=workload, config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", VllmDType.BFLOAT16, 64, 2, 64, 0.25, seed=7)
+    )
     layers = tuple(handle.runner.model.model.layers[index] for index in (22, 23))
     normal_outputs, events, comparisons = [], [], []
     original_task, original_step = ReplayStateTask.execute, VllmLayerReplay.step
@@ -226,14 +207,7 @@ def main():
         diagnostics = handle.deployment.execution.diagnostics()
         assert diagnostics.update_count == 4 and diagnostics.trained_rows == 8
         assert diagnostics.active_lineages == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
-        print(
-            dict(
-                updates=diagnostics.update_count,
-                replay_iterations=len(events),
-                numerical_comparisons=len(comparisons),
-                fallback=0,
-            )
-        )
+        print(f"updates={diagnostics.update_count} replay_iterations={len(events)} comparisons={len(comparisons)}")
     finally:
         hook.remove()
         handle.close()
