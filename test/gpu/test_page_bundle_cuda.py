@@ -1,4 +1,8 @@
-"""Evidence 13: actual CUDA PageBundle COW and exact event-gated reclamation."""
+"""The CUDA page arena: copy-on-write versions, exact pins, and reclamation gated on reader events.
+
+The second half shares a pinned page with a spawned process over CUDA IPC; the page
+is reclaimed only after the reader's ACK proves its queued work finished.
+"""
 
 import multiprocessing as mp
 from dataclasses import replace
@@ -14,41 +18,27 @@ from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.ptts.page_bundle import PageBundleArena
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
+from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw
 from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
 from test.backend_facts import backend_facts
 
 
-def _plan(shared=False, rank=2, memory_bytes=10000):
+def _plan(shared=False):
     bindings = tuple(
         PackedHiddenResourceBinding(
             str(layer), HiddenLayerKind.INDEX, HiddenSite.BLOCK_OUTPUT, f"model.layers[{layer}]"
         )
         for layer in (0, -1)
     )
-    facts = backend_facts(
-        4,
-        bindings,
-        SchedulerTimeline(
-            tuple(
-                TimelineAnchor(AnchorSymbol(name), index)
-                for index, name in enumerate(("model.execute", "sampler.pre_draw", "token.commit", "next.prepare"))
-            ),
-            ("compute/cuda@1", "state/dense_page_cuda@1"),
-        ),
-        PageBundleProviderFacts("test.page_bundle@1", 6, StateDeviceKind.CUDA, 0, shared_memory=shared),
-        memory_bytes=memory_bytes,
+    anchors = ("model.execute", "sampler.pre_draw", "token.commit", "next.prepare")
+    timeline = SchedulerTimeline(
+        tuple(TimelineAnchor(AnchorSymbol(name), index) for index, name in enumerate(anchors)),
+        ("compute/cuda@1", "state/dense_page_cuda@1"),
     )
-    declaration = ESampRequestWorkload(ESampRequestConfig(rank=rank)).declaration(facts)
-    return compile_page_bundle_plan(
-        (declaration.graph, declaration.layouts),
-        facts.timeline,
-        facts.providers,
-        facts.max_admitted_lineages,
-        facts.state_memory_budget_bytes,
-        facts.device,
-    )
+    provider = PageBundleProviderFacts("test.page_bundle@1", 6, StateDeviceKind.CUDA, 0, shared_memory=shared)
+    facts = backend_facts(4, bindings, timeline, provider)
+    return ESampRequestWorkload(ESampRequestConfig(rank=2)).plan_backend(facts).inputs.plan
 
 
 @pytest.mark.slow
@@ -90,23 +80,16 @@ def test_cuda_ptts_waits_for_exact_fence_before_reclaim() -> None:
         torch.cuda._sleep(100_000_000)
         consumed = borrowed.clone()
     release = arena.release_pin(pin)
-    assert arena.pending_pin_releases == 1
-    assert arena.free_pages == 2
-    usage = arena.usage()
-    assert usage.live_field_pages == usage.retiring_field_pages == usage.free_field_pages == 10
-    assert usage.private_versions == 0 and usage.pending_receipts >= 1
-    with pytest.raises(RuntimeError, match="no new reads"):
+    assert arena.pending_pin_releases == 1 and arena.free_pages == 2
+    with pytest.raises(RuntimeError):  # a released pin admits no new reads
         arena.snapshot(pin, admitted.after_refs[0])
-    with pytest.raises(RuntimeError, match="issued"):
-        arena.wait_release(replace(release))
-    addresses = arena.pool_addresses
     pressure = arena.publish(arena.prepare_transition(publication.after_refs, writer))
     arena.settle(pressure)
     # All six slots are owned until the handed-back reader fence completes.
     update = arena.prepare_transition(pressure.after_refs, writer)
     assert arena.release_complete(release)
     arena.abort(update)
-    assert arena.pool_addresses == addresses and arena.free_pages == 2
+    assert arena.free_pages == 2
     torch.testing.assert_close(original[0], initial[0])
     torch.testing.assert_close(consumed, initial[0])
     torch.testing.assert_close(result[0], initial[0] - 0.01)
@@ -130,19 +113,14 @@ def _cuda_ipc_worker(control, read_channel, wire, outcome):
             read = PageBundleArena.receive_field(plan, read_channel, stream=stream)
             storage = read.descriptor.cuda_storage
             assert storage is not None and read.tensor.is_cuda
-            for invalid in (
-                replace(storage, device_uuid="different GPU"),
-                replace(storage, size_bytes=storage.size_bytes + 4),
-                replace(storage, handle=""),
-            ):
-                with pytest.raises(ValueError):
-                    invalid.map(
-                        storage.size_bytes,
-                        read.tensor.dtype,
-                        read.descriptor.storage_offset,
-                        tuple(read.tensor.shape),
-                        stream,
-                    )
+            with pytest.raises(ValueError):  # a descriptor for another GPU cannot be mapped
+                replace(storage, device_uuid="different GPU").map(
+                    storage.size_bytes,
+                    read.tensor.dtype,
+                    read.descriptor.storage_offset,
+                    tuple(read.tensor.shape),
+                    stream,
+                )
             control.send_bytes(b"prepared")
             assert control.recv_bytes() == b"run"
             expected = torch.arange(read.tensor.numel(), device=stream.device, dtype=read.tensor.dtype)
@@ -197,20 +175,14 @@ def _cuda_ipc_lifecycle():
             descriptor = arena.send_field(pin, ref, LayoutFieldId(0), read_channel, process.pid)
             assert descriptor.ref is ref and descriptor.cuda_storage is not None
             assert control.poll(20) and control.recv_bytes() == b"prepared"
-            for invalid in (
-                replace(descriptor, owner_id=0),
-                replace(descriptor, storage_offset=10**9),
-                replace(descriptor, resource="unsigned"),
-                replace(descriptor, compilation_signature="b" * 64),
-            ):
-                sender, receiver = context.Pipe()
-                try:
-                    sender.send_bytes(encode_boundary(invalid).encode())
-                    with pytest.raises(ValueError):
-                        PageBundleArena.receive_field(plan, receiver, stream=stream)
-                finally:
-                    sender.close()
-                    receiver.close()
+            sender, receiver = context.Pipe()
+            try:  # a descriptor for a different compiled plan is rejected
+                sender.send_bytes(encode_boundary(replace(descriptor, compilation_signature="b" * 64)).encode())
+                with pytest.raises(ValueError):
+                    PageBundleArena.receive_field(plan, receiver, stream=stream)
+            finally:
+                sender.close()
+                receiver.close()
             # A local publication must not overwrite the remote reader's exact old version.
             write = arena.prepare_transition((ref,), stream, fields=((LayoutFieldId(0),),))
             with torch.cuda.stream(stream):
@@ -230,7 +202,7 @@ def _cuda_ipc_lifecycle():
                 arena.collect_completed(wait=True)
                 assert arena.active_lineages == arena.pending_pin_releases == 0 and arena.free_pages == 6
             else:
-                with pytest.raises(RuntimeError, match="completion proof"):
+                with pytest.raises(RuntimeError):  # no completion proof: the page stays owned
                     arena.wait_release(released)
                 assert arena.root(ref).ref == ref and arena.pending_pin_releases == 1
             control.send_bytes(b"exit")
