@@ -85,9 +85,10 @@ def test_cuda_ptts_waits_for_exact_fence_before_reclaim() -> None:
         arena.snapshot(pin, admitted.after_refs[0])
     pressure = arena.publish(arena.prepare_transition(publication.after_refs, writer))
     arena.settle(pressure)
-    # All six slots are owned until the handed-back reader fence completes.
+    # Reusing the released reader's pages does not wait on the host: the writer's stream waits for the reader's
+    # fence on the GPU, so the reader still sees the old value (checked below).
     update = arena.prepare_transition(pressure.after_refs, writer)
-    assert arena.release_complete(release)
+    arena.wait_release(release)
     arena.abort(update)
     assert arena.free_pages == 2
     torch.testing.assert_close(original[0], initial[0])
