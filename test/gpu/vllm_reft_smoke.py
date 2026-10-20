@@ -1,4 +1,4 @@
-"""Evidence 34: actual Qwen2 activation patch with publish/skip and exact row math."""
+"""ReFT on a real Qwen2 layer: imported parameters patch exactly the first/last prompt rows."""
 
 import sys
 from pathlib import Path
@@ -12,20 +12,13 @@ import pllm
 from pllm.config import ModelConfig, VllmDType
 from pllm.workloads.reft import ActivationConfig, ActivationWorkload
 
+BUDGET = pllm.ExecutionOptions(memory_budget_bytes=1 << 30)
+
 
 def main() -> None:
     handle = pllm.make_llm(
         workload=ActivationWorkload(ActivationConfig((23,), 2, first_tokens=1, last_tokens=1)),
-        config=ModelConfig(
-            "Qwen/Qwen2.5-0.5B-Instruct",
-            VllmDType.BFLOAT16,
-            64,
-            2,
-            64,
-            0.25,
-            seed=7,
-            execution=pllm.ExecutionOptions(memory_budget_bytes=1 << 30),
-        ),
+        config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", VllmDType.BFLOAT16, 64, 2, 64, 0.25, seed=7, execution=BUDGET),
     )
     execution = handle.deployment.execution
     baseline = []
@@ -77,7 +70,7 @@ def main() -> None:
         diagnostics = execution.diagnostics()
         assert diagnostics.update_count == 1
         assert diagnostics.inference_pins == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
-        print(dict(publications=diagnostics.update_count, patched_prefill_rows=observed[0], fallback=0))
+        print(f"ReFT: publications={diagnostics.update_count} patched_prefill_rows={observed[0]}")
     finally:
         if hook is not None:
             hook.remove()
