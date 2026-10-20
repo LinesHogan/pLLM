@@ -173,7 +173,7 @@ def _cuda_ipc_lifecycle():
         child_read.close()
         try:
             descriptor = arena.send_field(pin, ref, LayoutFieldId(0), read_channel, process.pid)
-            assert descriptor.ref is ref and descriptor.cuda_storage is not None
+            assert descriptor.ref == ref and descriptor.cuda_storage is not None
             assert control.poll(20) and control.recv_bytes() == b"prepared"
             sender, receiver = context.Pipe()
             try:  # a descriptor for a different compiled plan is rejected
