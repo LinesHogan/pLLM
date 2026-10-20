@@ -107,7 +107,9 @@ class When(Enum):
     HOST_OUTPUT = ("host.compute.end", "host.output.publish")
     HOST_COMMIT = ("host.output.publish", "host.next")
     HOST = ("host.input.ready", "host.next")
-    OBSERVE = ("state.publish", "sampler.pre_draw")
+    # Observation and replay share one window (after publication, before sampling); an Enum makes
+    # equal values one member, so OBSERVE is REPLAY.
+    OBSERVE = REPLAY
 
 
 @dataclass(frozen=True, slots=True)
