@@ -146,7 +146,7 @@ def test_global_multifactor_adamw_matches_oracle_and_publishes_one_version() -> 
             execution.admit((second,))
             second_pin = execution.directory.inference_pin(second)
         assert execution.directory.inference_pin(first) is old_pin
-        assert old_pin.refs == (ref,)
+        assert tuple(old_pin.refs) == (ref,)
         actual = execution.snapshot(current)
         for index, parameter in enumerate(reference):
             fields = actual[index * 5 : (index + 1) * 5]

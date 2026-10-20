@@ -95,7 +95,7 @@ def test_weighted_ce_shared_update_matches_sgd_and_preserves_original_pins() -> 
         optimizer.step()
     result = execution.step(value)
     torch.testing.assert_close(result.loss[0], (losses[0] + 3 * losses[1]).detach() / 4)
-    assert result.publication.before_refs == (initial,)
+    assert tuple(result.publication.before_refs) == (initial,)
     for actual, expected in zip(execution.snapshot(result.publication.after_refs[0]), (a, b), strict=True):
         torch.testing.assert_close(actual, expected)
     # Another batch restarts from the initial factors; no input keeps the head and only guides sampling.
@@ -156,7 +156,7 @@ def test_independent_lora_bmm_preserves_keyed_mean_and_private_publication() -> 
                 sgd_reference(config, seed[i], hidden[i], logits[i], labels[i], weights[i], 2) for i in range(2)
             )
             publication = execution.step(value, stream).publication
-            assert publication.before_refs == (initial[1], initial[0])
+            assert tuple(publication.before_refs) == (initial[1], initial[0])
             for ref, expected in zip(publication.after_refs, references, strict=True):
                 for actual, target in zip(execution.snapshot(ref, stream), expected, strict=True):
                     torch.testing.assert_close(actual, target, rtol=1e-5, atol=1e-7)
@@ -204,7 +204,7 @@ def route_keyed_lineages_until_dormant_retirement() -> None:
     batch = pllm.WeightedCEBatch.for_prompts(hidden, logits, torch.tensor([[1, 3]]), torch.tensor([[1.0, 2.0]]), (1,))
     publication = execution.step(step_input((math_b, code), torch.ones((2, 4)), batch)).publication
     latest_math = execution.arena.latest(first.lineage_id)
-    assert publication.after_refs == (latest_math,)
+    assert tuple(publication.after_refs) == (latest_math,)
     # One request's update is visible to its whole route; the other route is untouched.
     for actual, initial in zip(execution.snapshot(latest_math), math_initial, strict=True):
         assert not torch.equal(actual, initial)

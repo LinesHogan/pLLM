@@ -403,7 +403,7 @@ def test_heterogeneous_resources_admit_publish_and_pin_in_one_invocation():
         torch.testing.assert_close(value, torch.full_like(value, expected), rtol=0, atol=0)
     # Request inference still owns the original global version after publication.
     pin = execution.directory.inference_pin(a)
-    assert pin.refs == (global_ref,)
+    assert tuple(pin.refs) == (global_ref,)
     torch.testing.assert_close(execution.arena.snapshot(pin, global_ref)[0], torch.full((2, 5), 100.0), rtol=0, atol=0)
     execution.retire((a, b))
     execution.retire(())
@@ -460,13 +460,13 @@ def test_retiring_a_request_cancels_its_invocation_and_releases_only_its_pins():
     execution.retire((a,))
     assert invocation.context.cancel_requested.is_set() and invocation.context.release is not None
     assert not execution.directory.has_inference_pin(a)
-    assert execution.directory.inference_pin(b).refs == (global_ref,)
+    assert tuple(execution.directory.inference_pin(b).refs) == (global_ref,)
     execution.cancel_step(execution.begin(rows_for(b)))
     execution.retire((b,))
     # An offline instance invocation has no request roots, even in a mixed directory.
     invocation = execution.begin(())
-    assert invocation.context.pin.refs == (global_ref,)
-    assert invocation.context.selection.for_resource(DENSE).refs == ()
+    assert tuple(invocation.context.pin.refs) == (global_ref,)
+    assert tuple(invocation.context.selection.for_resource(DENSE).refs) == ()
     execution.retire(())
     assert invocation.context.release is not None
     execution.retire_dormant()

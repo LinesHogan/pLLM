@@ -84,7 +84,7 @@ def main() -> None:
         )
         diagnostics = execution.diagnostics()
         assert checks[0] >= 2 * len(handle.runner.model.model.layers)
-        assert execution.directory.select(()).refs == (current,)
+        assert tuple(execution.directory.select(()).refs) == (current,)
         assert diagnostics.update_count == 1 and diagnostics.trained_rows > 0
         assert handle.runner.overlay_updated_apply_count > 0
         assert diagnostics.inference_pins == diagnostics.pending_state_releases == diagnostics.fallback_count == 0

@@ -138,7 +138,7 @@ def test_multi_resource_update_is_atomic_and_write_handles_are_single_use() -> N
     update = arena.prepare_transition(refs)
     arena.write_field(update, 0, F0).fill_(99)
     arena.abort(update)
-    assert tuple(arena.latest(ref.lineage_id) for ref in refs) == refs
+    assert tuple(arena.latest(ref.lineage_id) for ref in refs) == tuple(refs)
     for ref, expected in zip(refs, before, strict=True):
         for actual, value in zip(arena.snapshot(pin, ref), expected, strict=True):
             torch.testing.assert_close(actual, value)
@@ -149,7 +149,7 @@ def test_multi_resource_update_is_atomic_and_write_handles_are_single_use() -> N
         arena.write_field(update, index, F0).fill_(index + 5)
     published = arena.publish(update)
     arena.settle(published)
-    assert tuple(arena.latest(ref.lineage_id) for ref in refs) == published.after_refs
+    assert tuple(arena.latest(ref.lineage_id) for ref in refs) == tuple(published.after_refs)
     new_pin = arena.pin_exact(published.after_refs)
     for index, ref in enumerate(published.after_refs):
         actual = arena.snapshot(new_pin, ref)[0]

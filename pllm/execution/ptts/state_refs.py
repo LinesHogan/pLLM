@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from functools import cached_property
 from typing import overload
 
 import numpy as np
@@ -14,12 +15,7 @@ from pllm.contracts.state_ref import LayoutId, LineageId, StateRef, VersionId
 Indices = npt.NDArray[np.int64]
 
 
-@dataclass(slots=True)
-class _RefCache:
-    refs: tuple[StateRef, ...] | None = None
-
-
-@dataclass(frozen=True, slots=True, eq=False)
+@dataclass(frozen=True, eq=False)
 class StateRefs(Sequence[StateRef]):
     """Ordered identities, optionally resolved to arena rows; arrays never change after issue.
 
@@ -32,7 +28,6 @@ class StateRefs(Sequence[StateRef]):
     lineages: Indices
     versions: Indices
     rows: Indices | None = None
-    _cache: _RefCache = field(default_factory=_RefCache, repr=False)
 
     def __post_init__(self) -> None:
         for column in (self.layouts, self.lineages, self.versions, self.rows):
@@ -49,32 +44,25 @@ class StateRefs(Sequence[StateRef]):
     def __getitem__(self, index: slice) -> StateRefs: ...
 
     def __getitem__(self, index: int | slice) -> StateRef | StateRefs:
-        if isinstance(index, slice):
-            return self.take(index)
-        if self._cache.refs is None:
-            refs = tuple(
-                StateRef(LayoutId(layout), LineageId(lineage), VersionId(version))
-                for layout, lineage, version in zip(
-                    self.layouts.tolist(), self.lineages.tolist(), self.versions.tolist()
-                )
-            )
-            self._cache.refs = refs
-        assert self._cache.refs is not None
-        return self._cache.refs[index]
+        return self.take(index) if isinstance(index, slice) else self.refs[index]
+
+    @cached_property
+    def refs(self) -> tuple[StateRef, ...]:
+        """The individual identities, built once when a cold path first inspects them."""
+        return tuple(
+            StateRef(LayoutId(layout), LineageId(lineage), VersionId(version))
+            for layout, lineage, version in zip(self.layouts.tolist(), self.lineages.tolist(), self.versions.tolist())
+        )
 
     def __eq__(self, other: object) -> bool:
-        if self is other:
-            return True
-        if isinstance(other, StateRefs):
-            return all(
-                np.array_equal(left, right)
-                for left, right in zip(
-                    (self.layouts, self.lineages, self.versions), (other.layouts, other.lineages, other.versions)
-                )
+        if not isinstance(other, StateRefs):
+            return NotImplemented
+        return self is other or all(
+            np.array_equal(left, right)
+            for left, right in zip(
+                (self.layouts, self.lineages, self.versions), (other.layouts, other.lineages, other.versions)
             )
-        if isinstance(other, tuple):
-            return tuple(self) == other
-        return NotImplemented
+        )
 
     @classmethod
     def of(cls, refs: Sequence[StateRef]) -> StateRefs:
@@ -85,13 +73,11 @@ class StateRefs(Sequence[StateRef]):
             np.fromiter((getattr(ref, name) for ref in refs), np.int64, len(refs))
             for name in ("layout_id", "lineage_id", "version_id")
         )
-        batch = cls(layouts, lineages, versions)
-        batch._cache.refs = tuple(refs)
-        return batch
+        return cls(layouts, lineages, versions)
 
     def resolved(self, rows: Indices) -> StateRefs:
-        """Attach arena rows while preserving any identities already handed to callers."""
-        return StateRefs(self.layouts, self.lineages, self.versions, rows, self._cache)
+        """The same identities with their arena rows attached."""
+        return StateRefs(self.layouts, self.lineages, self.versions, rows)
 
     @classmethod
     def join(cls, groups: Sequence[StateRefs]) -> StateRefs:
@@ -115,17 +101,12 @@ class StateRefs(Sequence[StateRef]):
     def take(self, indices: Sequence[int] | Indices | slice) -> StateRefs:
         """Select a batch without materializing identities."""
         index = indices if isinstance(indices, (np.ndarray, slice)) else np.asarray(indices, dtype=np.int64)
-        batch = StateRefs(
+        return StateRefs(
             self.layouts[index],
             self.lineages[index],
             self.versions[index],
             None if self.rows is None else self.rows[index],
         )
-
-        if self._cache.refs is not None:
-            positions = range(*index.indices(len(self))) if isinstance(index, slice) else index.tolist()
-            batch._cache.refs = tuple(self._cache.refs[i] for i in positions)
-        return batch
 
     def positions(self, refs: StateRefs) -> Indices:
         """Positions of exact identities in this batch; -1 denotes an absent version."""

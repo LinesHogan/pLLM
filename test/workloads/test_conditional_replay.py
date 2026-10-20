@@ -127,7 +127,7 @@ def test_learning_publication_conditional_replay_matches_reference():
             assert context.write is None and context.publication is not None
             batch = _read(context, "private")
             versions = dict(zip(context.publication.before_refs, context.publication.after_refs, strict=True))
-            assert batch.after_refs == tuple(versions.get(ref, ref) for ref in context.pin.refs)
+            assert tuple(batch.after_refs) == tuple(versions.get(ref, ref) for ref in context.pin.refs)
             for ref, root in zip(batch.after_refs, batch.roots, strict=True):
                 for actual, expected in zip(root, execution.snapshot(ref), strict=True):
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -149,11 +149,11 @@ def test_learning_publication_conditional_replay_matches_reference():
     assert layer.calls == 2 and len(replay) == 2
     assert all(pin is context.published_pin for pin in layer.pins)
     (trained,) = (entry for entry in result.entries if entry.identity == identities[0])
-    assert context.published_pin.refs == (trained.after_ref,)
+    assert tuple(context.published_pin.refs) == (trained.after_ref,)
     assert context.published_release.pin is context.published_pin
     assert all(
         execution.arena.plan.semantic_graph.tasks[event.task_id] is execution.arena.plan.semantic_graph.tasks[1]
-        and event.refs == context.published_pin.refs
+        and event.refs == tuple(context.published_pin.refs)
         and event.pin_id == context.published_pin.pin_id
         and event.operation_id == context.publication.operation_id
         for event in replay
@@ -169,7 +169,8 @@ def test_learning_publication_conditional_replay_matches_reference():
         if event.invocation_id == context.invocation_id and event.phase is TracePhase.SETTLED
     )
     assert (
-        published.refs is context.publication.after_refs and published.sequence < replay[0].sequence < settled.sequence
+        published.refs == tuple(context.publication.after_refs)
+        and published.sequence < replay[0].sequence < settled.sequence
     )
     assert settled.release_id == context.release.release_id and settled.operation_id == published.operation_id
     # Independent scalar outer products and recurrence; no production math helper.

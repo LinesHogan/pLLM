@@ -92,7 +92,7 @@ def test_default_completion_region_keeps_multigroup_adamw_and_publication(device
         result = execution.step(batch, stream)
         if stream is not None:
             stream.synchronize()
-        assert result.publication.before_refs == (latest,)
+        assert tuple(result.publication.before_refs) == (latest,)
         (latest,) = result.publication.after_refs
         assert latest.version_id == round_
         actual = execution.snapshot(latest, stream)

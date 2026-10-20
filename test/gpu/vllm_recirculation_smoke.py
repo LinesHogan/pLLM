@@ -203,7 +203,7 @@ def main():
         torch.testing.assert_close(torch.cuda.get_rng_state(), rng, rtol=0, atol=0)
         expected = tuple(row for row in context.replay.rows if row.phase is HiddenPhase.PREFILL)
         assert tuple(replay_calls[before:]) == expected
-        assert context.publication is None and context.pin.refs == ()
+        assert context.publication is None and tuple(context.pin.refs) == ()
         events.extend(
             event
             for event in context.trace.snapshot().events

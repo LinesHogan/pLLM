@@ -89,7 +89,7 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
             result = execution.step(batch, stream)
             if stream is not None:
                 stream.synchronize()
-            assert result.publication is not None and result.publication.before_refs == (latest,)
+            assert result.publication is not None and tuple(result.publication.before_refs) == (latest,)
             (latest,) = result.publication.after_refs
             assert result.state_ref is latest
             assert [item.reward for item in result.reward_outcomes] == expected_rewards

@@ -66,7 +66,7 @@ class TraceEvent:
     invocation_id: int
     task_id: TaskId | None = None
     identities: tuple[RequestIdentity, ...] = ()
-    refs: Sequence[StateRef] = ()
+    refs: tuple[StateRef, ...] = ()
     operation_id: int | None = None
     pin_id: int | None = None
     release_id: int | None = None
@@ -407,7 +407,7 @@ class ExecutionTrace:
                         invocation_id,
                         task_id,
                         identities,
-                        refs,
+                        tuple(refs),
                         operation_id,
                         pin_id,
                         release_id,

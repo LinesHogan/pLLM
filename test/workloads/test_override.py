@@ -140,7 +140,7 @@ def test_override_matches_reweight_adam_and_final_noop() -> None:
         loss = F.cross_entropy(torch.stack(logits), TOKENS[[link.sampler_row_index for link in selected]])
         loss.backward()
         optimizer.step()
-        assert result.publication.before_refs == (latest,)
+        assert tuple(result.publication.before_refs) == (latest,)
         (latest,) = result.publication.after_refs
         torch.testing.assert_close(result.loss, loss.detach())
         assert_roots(execution.snapshot(latest), adam_roots(optimizer, down, up))
@@ -209,7 +209,7 @@ def _request_heads() -> None:
     untouched = requests.snapshot(initial[1])
     result = run(requests, value)
     # Only the eligible requests publish; the ineligible one keeps its exact version.
-    assert result.publication.before_refs == (initial[0], initial[2])
+    assert tuple(result.publication.before_refs) == (initial[0], initial[2])
     assert requests.arena.latest(initial[1].lineage_id) == initial[1]
     assert_roots(requests.snapshot(initial[1]), untouched, exact=True)
     weights = torch.nn.Parameter(torch.zeros((2, 4, 7)))
@@ -433,7 +433,7 @@ def _domains_oracle(device, request, identities) -> None:
             for ref, gradient in zip(latest, gradients, strict=True):
                 torch.testing.assert_close(result.parameter_gradients[ref].reshape(4, 7), gradient)
         if active:
-            assert result.publication.before_refs == tuple(latest[index] for index in active)
+            assert tuple(result.publication.before_refs) == tuple(latest[index] for index in active)
             for index, ref in zip(active, result.publication.after_refs, strict=True):
                 latest[index] = ref
                 assert_roots(execution.snapshot(ref, stream), adam_roots(optimizers[index], parameters[index]))
