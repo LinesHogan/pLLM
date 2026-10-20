@@ -29,6 +29,7 @@ from pllm.contracts.region_imports import (
     FunctionalKernelImport,
     NativeKernelImport,
     NativeTensorImport,
+    OrderedScanImport,
     RegionTensorImport,
 )
 from pllm.contracts.region_program import (
@@ -401,6 +402,7 @@ _tensor_import_tags = {
     FunctionalKernelImport: "functional_kernel",
     CompiledTensorImport: "compiled",
     BorrowedTensorImport: "borrowed",
+    OrderedScanImport: "ordered_scan",
 }
 configure_tagged_union(RegionTensorImport, _converter, tag_generator=_tensor_import_tags.__getitem__, tag_name="kind")
 # Imports cross the boundary as a heterogeneous tuple. Runtime tuple encoding
@@ -425,6 +427,11 @@ _converter.register_unstructure_hook(
 )
 
 
+_converter.register_unstructure_hook(
+    OrderedScanImport, lambda value: _converter.unstructure(value, unstructure_as=RegionTensorImport)
+)
+
+
 def _native_kernel_import(value: object, _target: object) -> NativeKernelImport:
     result = _converter.structure(value, cast(type[RegionTensorImport], RegionTensorImport))
     if not isinstance(result, NativeKernelImport):
@@ -443,6 +450,16 @@ def _functional_kernel_import(value: object, _target: object) -> FunctionalKerne
 
 
 _converter.register_structure_hook(FunctionalKernelImport, _functional_kernel_import)
+
+
+def _ordered_scan_import(value: object, _target: object) -> OrderedScanImport:
+    result = _converter.structure(value, cast(type[RegionTensorImport], RegionTensorImport))
+    if not isinstance(result, OrderedScanImport):
+        raise ValueError("additive scan needs its verified ordered kernel import")
+    return result
+
+
+_converter.register_structure_hook(OrderedScanImport, _ordered_scan_import)
 
 
 def _borrowed_tensor_import(value: object, _target: object) -> BorrowedTensorImport:

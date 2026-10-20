@@ -6,6 +6,7 @@ Training returns one loss per row. PTTS allocates and publishes versions outside
 
 from __future__ import annotations
 
+import gc
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field as dataclass_field, replace
@@ -319,8 +320,17 @@ class StepCapture:
                 self._body(data, batch)
         stream.synchronize()
         self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph, stream=stream, pool=torch.cuda.graph_pool_handle()):
-            self._body(data, batch)
+        collecting = gc.isenabled()
+        gc.disable()
+        try:
+            # Cyclic collection can release tensors from another CUDA stream
+            # and invalidate capture. Torch's context collects before starting;
+            # postpone automatic collection until capture has ended as well.
+            with torch.cuda.graph(self.graph, stream=stream, pool=torch.cuda.graph_pool_handle()):
+                self._body(data, batch)
+        finally:
+            if collecting:
+                gc.enable()
         current.wait_stream(stream)
         self.resident_bytes = self.table.untyped_storage().nbytes() + cuda_graph_pool_bytes(
             self.graph.pool(), self.table.device.index or 0

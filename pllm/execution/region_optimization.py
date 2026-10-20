@@ -52,6 +52,7 @@ from pllm.execution.region_compilation import (
 from pllm.execution.region_execution import RegionInstructionExecution
 from pllm.execution.region_native import (
     CompiledPrimitive,
+    OrderedScanPrimitive,
     RegionFunction,
     TensorSource,
     is_original_tensor_source,
@@ -398,6 +399,11 @@ def prepare_region_candidates(
         candidate = prepared if physical is None else prepared.arranged(physical)
         if all(candidate.candidate != p.candidate for p in proposals):
             proposals.append(candidate)
+    if options.allow_numerical_transforms and len(proposals) < max_candidates:
+        from pllm.execution.additive_scan import candidates
+
+        alternatives = tuple(candidates(program, sources, limits))
+        proposals.extend(alternatives[-(max_candidates - len(proposals)) :])
     request = RegionSelectionRequest(
         imports,
         tuple(p.candidate for p in proposals),
@@ -419,7 +425,8 @@ def warn_region_transforms(
     transforms = tuple(
         t
         for name, cell in execution.cells.items()
-        if name in assessment.changed_functions and isinstance(cell, (ExportedCell, CompiledPrimitive))
+        if name in assessment.changed_functions
+        and isinstance(cell, (ExportedCell, CompiledPrimitive, OrderedScanPrimitive))
         for t in cell.transformations
     )
     warn_numerical_transforms(identity, transforms)

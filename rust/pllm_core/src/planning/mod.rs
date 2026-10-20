@@ -21,6 +21,7 @@ mod region_selection;
 mod region_tiling;
 mod region_window;
 mod region_outlining;
+mod additive_scan;
 pub(crate) mod backend_attachment;
 pub(crate) mod scheduler;
 pub(crate) mod semantic_graph;
@@ -140,6 +141,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     region_tiling::register(module)?;
     region_window::register(module)?;
     region_outlining::register(module)?;
+    additive_scan::register(module)?;
     module.add_function(wrap_pyfunction!(compile_state_schedule, module)?)?;
     module.add_function(wrap_pyfunction!(validate_plan_bundle, module)?)?;
     Ok(())

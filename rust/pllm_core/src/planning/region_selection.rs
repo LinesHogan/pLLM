@@ -44,6 +44,8 @@ pub(super) struct Candidate {
     pub outlines: Vec<super::region_outlining::CallOutlineEvidence>,
     #[serde(default)]
     pub stream_plan: Option<super::region_streams::StreamPlan>,
+    #[serde(default)]
+    pub additive_scan: Option<super::additive_scan::Evidence>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

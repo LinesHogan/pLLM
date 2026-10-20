@@ -457,7 +457,13 @@ class TensorBinding(Builder[TensorFrame]):
     def configure_scans(self, facts: BackendCompileFacts) -> None:
         """Bind scan specialization to the plan's policy and row capacity."""
         for symbol, operation in self.operations.items():
-            scans = ScanContext(facts.timeline.region_policy, facts.probe.max_packed_rows, facts.device)
+            budget = facts.timeline.memory_budget_bytes
+            scans = ScanContext(
+                facts.timeline.region_policy,
+                facts.probe.max_packed_rows,
+                facts.device,
+                None if budget is None else budget // max(1, facts.max_admitted_lineages),
+            )
             self.operations[symbol] = replace(operation, function=scans.bind(operation.function))
 
     def configure_steps(self, facts: BackendCompileFacts, capture: bool) -> None:

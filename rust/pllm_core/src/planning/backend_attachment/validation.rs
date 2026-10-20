@@ -263,7 +263,7 @@ fn validate_probe(probe: &BackendPlacementProbe) -> Result<(), String> {
             return Err("backend source catalog requires distinct imports".into());
         }
         let declaration = match imported {
-            TensorImport::Compiled { .. } => return Err("compiled alternatives require numerical selection, not a source catalog".into()),
+            TensorImport::Compiled { .. } | TensorImport::OrderedScan { .. } => return Err("compiled alternatives require numerical selection, not a source catalog".into()),
             TensorImport::Native { declaration } | TensorImport::Borrowed { declaration, .. } => declaration,
             TensorImport::NativeKernel { declaration, device, .. }
                 | TensorImport::FunctionalKernel { declaration, device, .. } => {

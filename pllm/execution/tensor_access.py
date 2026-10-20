@@ -139,7 +139,16 @@ def import_tensor_access_graph(cell: ExportedCell) -> TensorAccessGraph:
                 if (operator in _DENSE or operator in _VIEWS) and not aliases
                 else TensorAccessKind.UNKNOWN
             )
-            operations.append(TensorAccess(node.name, operator, kind, arguments))
+            operations.append(
+                TensorAccess(
+                    node.name,
+                    operator,
+                    kind,
+                    arguments,
+                    tuple(_argument(value) for value in node.args),
+                    tuple((key, _argument(value)) for key, value in sorted(node.kwargs.items())),
+                )
+            )
         storage_ids[node.name] = storage_id
     raw_outputs = tensor_graph_result_nodes(graph)
     if len(cell.output_positions) != len(cell.output_signatures) or any(
@@ -159,6 +168,10 @@ def import_tensor_access_graph(cell: ExportedCell) -> TensorAccessGraph:
         tuple(raw_outputs[i].name for i in cell.output_positions),
         tuple(operations),
     )
+
+
+def _argument(value: object) -> str:
+    return "$" + value.name if isinstance(value, torch.fx.Node) else repr(value)
 
 
 def profile_tensor_memory(cell: ExportedCell) -> TensorMemoryProfile:

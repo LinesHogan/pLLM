@@ -77,6 +77,8 @@ class RegionValueFrame:
         inputs: Mapping[str, Data],
         sizes: Mapping[str, int],
         window: RegionWindow | None = None,
+        *,
+        borrow_inputs: bool = False,
     ) -> None:
         # The executor supplies its checked invocation-entry snapshot. This
         # frame consumes value routes and layouts, not the source Program.
@@ -91,14 +93,14 @@ class RegionValueFrame:
         arguments = tuple(bindings.values[i] for i in bindings.arguments)
         if set(inputs) != {site.name for site in arguments}:
             raise ValueError("region input bindings must be complete and exact")
-        # The caller retains ownership. Detached private inputs prevent an
-        # exported view result from exposing a borrowed caller or arena tensor.
+        # The caller retains ownership. Private inputs prevent exported views
+        # from exposing it. A verified owned-result kernel can borrow instead.
         # Validate all shapes before copying any payload: a wrong bank length
         # must not allocate outside the bound invocation's workspace envelope.
         for site in arguments:
             check_data(inputs[site.name], site.type, self._sizes)
         for site in arguments:
-            self.put(site.id, (), copy_data(inputs[site.name]))
+            self.put(site.id, (), inputs[site.name] if borrow_inputs else copy_data(inputs[site.name]))
 
     def advance(self, time: tuple[int, ...]) -> None:
         # Equal-time invocations may appear in either order. Keep their values

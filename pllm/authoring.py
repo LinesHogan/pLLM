@@ -253,6 +253,10 @@ class BackendAuthoring(ABC):
             facts,
             timeline=replace(
                 facts.timeline,
+                memory_budget_bytes=min(
+                    (n for n in (facts.timeline.memory_budget_bytes, options.memory_budget_bytes) if n is not None),
+                    default=None,
+                ),
                 region_policy=RegionSelectionPolicy(
                     options.allow_numerical_transforms, options.schedule_policy, options.tuning
                 ),

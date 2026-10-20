@@ -142,6 +142,12 @@ fn call_memory(import: &TensorImport, program: &Program) -> Result<CallMemory, S
     let mut devices = BTreeMap::<String, CallDeviceMemory>::new();
     match import {
         TensorImport::Borrowed { .. } => Ok(CallMemory { devices, unknown: false }),
+        TensorImport::OrderedScan { allocations, device, .. } => {
+            let mut scratch_bytes = 0;
+            for allocation in allocations { add(&mut scratch_bytes, allocation.bytes)?; }
+            devices.insert(device.clone(), CallDeviceMemory { scratch_bytes, ..Default::default() });
+            Ok(CallMemory { devices, unknown: true })
+        },
         TensorImport::FunctionalKernel { declaration, allocations, device, .. } => {
             let mut allocated = 0_u64;
             for allocation in allocations { add(&mut allocated, allocation.bytes)?; }
@@ -433,10 +439,24 @@ pub(super) fn assess_region_candidates(program: &Program, request: &RegionReques
     }
     let mut assessments = Vec::new();
     for (index, candidate) in request.candidates.iter().enumerate() {
-        if index == 0 && (!candidate.outlines.is_empty() || candidate.stream_plan.is_some()) {
+        if index == 0 && (!candidate.outlines.is_empty() || candidate.stream_plan.is_some() || candidate.additive_scan.is_some()) {
             return Err("first region candidate must be the original reference execution".into());
         }
-        let (derived, baseline) = super::region_outlining::apply_evidence(program, &request.source_imports, &candidate.outlines)?;
+        let (mut derived, baseline) = super::region_outlining::apply_evidence(program, &request.source_imports, &candidate.outlines)?;
+        let mut additive_name = None;
+        if let Some(evidence) = &candidate.additive_scan {
+            if !candidate.outlines.is_empty() || candidate.stream_plan.is_some() {
+                return Err("additive scan must derive directly from its source region".into());
+            }
+            let plan = super::additive_scan::derive(program, &request.source_imports, evidence)?
+                .ok_or("source does not prove the additive scan rewrite")?;
+            let mut expected = request.source_imports.clone();
+            additive_name = Some(plan.implementation.name().to_owned());
+            expected.push(plan.implementation);
+            expected.sort_by(|a, b| a.name().cmp(b.name()));
+            if candidate.imports != expected { return Err("additive scan imports differ from the derived kernel".into()); }
+            derived = plan.program;
+        }
         let payload = if let Some(plan) = &candidate.stream_plan {
             // Validation derives the source payload as part of the complete
             // stream plan. Reuse it only after that full comparison succeeds.
@@ -455,9 +475,10 @@ pub(super) fn assess_region_candidates(program: &Program, request: &RegionReques
         }
         let reachable = if candidate.outlines.is_empty() { source_reachable.clone() }
             else { reachable_region_functions(&derived, &analyze(&derived, false)?)? };
-        let changed_functions = candidate.imports.iter().zip(&baseline)
+        let mut changed_functions = candidate.imports.iter().zip(&baseline)
             .filter(|(a, b)| a != b && reachable.contains(a.name()))
             .map(|(import, _)| import.name().to_owned()).collect::<Vec<_>>();
+        if let Some(name) = additive_name { changed_functions = vec![name]; }
         let peak_bytes = if let Some(plan) = &candidate.stream_plan {
             plan.devices.iter().map(|d| super::region_selection::PayloadLimit {
                 device: d.device.clone(), bytes: d.peak_bytes_upper_bound }).collect::<Vec<_>>()

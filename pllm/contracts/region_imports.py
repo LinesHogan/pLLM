@@ -129,6 +129,19 @@ class CompiledTensorImport:
     # this compiler adapter's normalized-graph operator subset.
 
 
+@dataclass(frozen=True, slots=True)
+class OrderedScanImport:
+    """Verified additive scan kernel: borrowed inputs and owned result banks.
+
+    Allocations bound call-local scratch; independent result leaves are charged
+    by the region storage analysis. Only numerical selection can bind this ABI.
+    """
+
+    declaration: Function
+    device: str
+    allocations: tuple[KernelAllocation, ...]
+
+
 RegionTensorImport: TypeAlias = (
     ExportedTensorImport
     | NativeTensorImport
@@ -136,6 +149,7 @@ RegionTensorImport: TypeAlias = (
     | FunctionalKernelImport
     | CompiledTensorImport
     | BorrowedTensorImport
+    | OrderedScanImport
 )
 
 

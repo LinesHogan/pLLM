@@ -4,6 +4,7 @@ Each overlay must be applied to every row, update only its own request (or route
 and leave no lineage, pending release or fallback behind.
 """
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -11,10 +12,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Annotated
+from unittest.mock import patch
 
 import torch
-from vllm import SamplingParams
+from vllm import LLM, SamplingParams
 
 import pllm
 from pllm import TensorUpdate
@@ -112,7 +115,11 @@ def open_llm(workload, seqs=2, tokens=64, **execution) -> VllmLlm[object, object
         seed=7,
         **options,
     )
-    handle = pllm.make_llm(workload=workload, config=config)
+    # Separate engine starts profile different CUDA/library warmup overhead.
+    # A common public vLLM byte budget makes the strict/batched comparison
+    # about overlay execution rather than that profiling variation.
+    with patch("pllm.backends.vllm.runtime.LLM", partial(LLM, kv_cache_memory_bytes=4 << 30)):
+        handle = pllm.make_llm(workload=workload, config=config)
     if not isinstance(handle, VllmLlm):
         raise RuntimeError("public make_llm did not route the parameter overlay to vLLM")
     return handle
@@ -209,16 +216,46 @@ def main() -> int:
         InPlaceTTTConfig((TARGET,), chunk_size=1, learning_rate=1e-4, update_prefill=True, update_decode=False)
     )
     scenarios = (
+        (
+            "dense_strict",
+            lambda: open_llm(dense, memory_budget_bytes=1 << 30, allow_numerical_transforms=False),
+            lambda h: _check(h, "dense strict"),
+        ),
         ("dense", lambda: open_llm(dense, memory_budget_bytes=1 << 30), lambda h: _check(h, "dense")),
         ("low_rank", lambda: open_llm(RequestLowRankTTT()), lambda h: _check(h, "request low-rank")),
         ("imported", lambda: open_llm(ImportedLowRank(), memory_budget_bytes=1 << 30), _check_imported),
         ("routed", lambda: open_llm(RoutedLowRankTTT(), seqs=3, tokens=96), _check_routed),
     )
     results: dict[str, tuple[str, ...]] = {}
+    dense_cache = None
     for name, open_handle, check in scenarios:
         handle = open_handle()
         try:
+            cache = handle.runner.kv_cache_config
+            before = (cache.num_blocks, tuple(tensor.size for tensor in cache.kv_cache_tensors))
             results[name] = check(handle)
+            after = (cache.num_blocks, tuple(tensor.size for tensor in cache.kv_cache_tensors))
+            if before != after:
+                raise RuntimeError("overlay execution changed the vLLM KV allocation")
+            if name == "dense_strict":
+                dense_cache = before
+            if name == "dense" and before != dense_cache:
+                raise RuntimeError("additive scan changed vLLM KV-cache capacity")
+            if name in ("dense", "dense_strict"):
+                print(
+                    json.dumps(
+                        {
+                            "scenario": name,
+                            "kv_blocks": before[0],
+                            "kv_bytes": sum(before[1]),
+                            "task_workspace": [
+                                (str(f.task), f.workspace_bytes)
+                                for f in handle.attachment.inputs.plan.timeline.task_resources
+                            ],
+                        }
+                    ),
+                    flush=True,
+                )
         finally:
             handle.close()
     print(results)

@@ -1,4 +1,4 @@
-"""Imported tensor storage and access facts, separate from algorithm semantics.
+"""Exported tensor operations, literal arguments and storage facts for region planning.
 
 These describe the unfused exported graph. They are not device allocator sizes,
 backend scratch bounds, cache misses, or measured HBM traffic.
@@ -37,6 +37,10 @@ class TensorAccess:
     operator: str
     kind: TensorAccessKind
     inputs: tuple[str, ...]
+    # Literal arguments accompany storage facts when an algebraic rule needs
+    # to distinguish, for example, addition from addition with alpha != 1.
+    arguments: tuple[str, ...] = ()
+    keywords: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

@@ -12,7 +12,7 @@ import torch
 
 from pllm.contracts.region_bindings import RegionBindings
 from pllm.contracts.region_imports import RegionTensorImport
-from pllm.contracts.region_program import Program, bind_sizes
+from pllm.contracts.region_program import Call, Program, bind_sizes
 from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.region_schedule import ScheduleInstance, Statement
 from pllm.contracts.region_selection import RegionPayloadLimit
@@ -28,6 +28,7 @@ from pllm.execution.region_native import (
     CompiledPrimitive,
     FunctionalKernelPrimitive,
     NativePrimitive,
+    OrderedScanPrimitive,
     RegionFunction,
 )
 from pllm.execution.region_resources import RegionResources
@@ -95,7 +96,9 @@ class RegionExecutionPlan:
 
     def bind(self, cells: Mapping[str, RegionFunction]) -> "RegionInstructionExecution":
         if any(
-            isinstance(cell, CompiledPrimitive) or isinstance(cell, ExportedCell) and cell.transformations
+            isinstance(cell, (CompiledPrimitive, OrderedScanPrimitive))
+            or isinstance(cell, ExportedCell)
+            and cell.transformations
             for cell in cells.values()
         ):
             raise ValueError("transformed cells require a numerical selection decision")
@@ -145,6 +148,7 @@ class RegionInstructionExecution:
                 FunctionalKernelPrimitive,
                 CompiledPrimitive,
                 BorrowedTensorPrimitive,
+                OrderedScanPrimitive,
             ):
                 raise ValueError("region calls require an exported cell or explicit native import")
             if cell.declaration != declaration:
@@ -154,6 +158,12 @@ class RegionInstructionExecution:
         self._lowered = lowered
         self._bindings = bindings
         self._cells = dict(cells)
+        operations = program.entry.block.operations
+        self._borrow_inputs = (
+            len(operations) == 1
+            and isinstance(operations[0], Call)
+            and isinstance(cells[operations[0].function], OrderedScanPrimitive)
+        )
         self._state_windows = stream_plan.state_windows if stream_plan is not None else state_windows
         self._actions = RegionActions(program, cells)
         self._stream_plan = stream_plan
@@ -258,7 +268,7 @@ class RegionInstructionExecution:
             if streams is not None:
                 for value in inputs.values():
                     record_stream(value, streams.owner)
-            frame = RegionValueFrame(layout, inputs, sizes, self._window)
+            frame = RegionValueFrame(layout, inputs, sizes, self._window, borrow_inputs=self._borrow_inputs)
             count = 0
             concurrent: RegionStreamFrame | None = None
             try:
@@ -317,7 +327,9 @@ class RegionExecution(RegionInstructionExecution):
         self, program: Program, lowered: LoweredSchedule, bindings: RegionBindings, cells: Mapping[str, RegionFunction]
     ) -> None:
         if any(
-            isinstance(cell, CompiledPrimitive) or isinstance(cell, ExportedCell) and cell.transformations
+            isinstance(cell, (CompiledPrimitive, OrderedScanPrimitive))
+            or isinstance(cell, ExportedCell)
+            and cell.transformations
             for cell in cells.values()
         ):
             raise ValueError("transformed cells require a numerical selection decision")

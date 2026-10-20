@@ -246,6 +246,7 @@ class TensorScan:
         )
         result = copy(self)
         result._execution = execution.execution
+        result.payload_limits = payload_limits
         return result, execution
 
     def prepared(
@@ -258,6 +259,7 @@ class TensorScan:
         """Static preparation needs no example invocation or measurement."""
         payload_limits = payload_limits or self.payload_limits
         result = copy(self)
+        result.payload_limits = payload_limits
         result._execution = prepare_region_execution(
             self.program, self._cells, payload_limits=payload_limits, options=options, parallel=parallel
         )

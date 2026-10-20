@@ -26,8 +26,11 @@ class ScanContext:
 
     active: ContextVar["ScanContext | None"] = ContextVar("scan_context", default=None)
 
-    def __init__(self, policy: RegionSelectionPolicy, max_rows: int, device: torch.device) -> None:
+    def __init__(
+        self, policy: RegionSelectionPolicy, max_rows: int, device: torch.device, payload_bytes: int | None = None
+    ) -> None:
         self.policy, self.max_rows, self.device = policy, max_rows, device
+        self.payload_bytes = payload_bytes
 
     def bind(self, function: Callable[..., R]) -> Callable[..., R]:
         """Use the same scope for memory tracing and execution."""
@@ -52,6 +55,7 @@ class ScanContext:
         specs: tuple[tuple[torch.Size, tuple[int, ...], torch.dtype, torch.device], ...],
         invariants: int,
         chunk: int,
+        count: int,
     ) -> TensorScan:
         """Export once per callable and guarded layout; all other calls are cache lookups."""
 
@@ -61,7 +65,8 @@ class ScanContext:
         # Closure/owner constants belong to the callable: changing them requires a new step object.
         with _disable_current_modes(), FakeTensorMode():
             samples = tuple(
-                torch.empty_strided(shape, stride, dtype=dtype, device=device) for shape, stride, dtype, device in specs
+                torch.empty_strided(shape, stride, dtype=dtype, device=self.device if device.type == "meta" else device)
+                for shape, stride, dtype, device in specs
             )
             region = import_exported_region(
                 torch.export.export(TensorCellModule(ordered), samples, strict=False), carry=1
@@ -73,10 +78,18 @@ class ScanContext:
                 invariants=invariants,
                 functions=region.functions,
             )
-        if samples[0].is_meta:
+        limits = scan.payload_limits
+        if self.policy.allow_numerical_transforms:
+            from pllm.execution.additive_scan import payload_budget
+
+            limits = payload_budget(scan.program, region.functions, limits, self.payload_bytes)
+        if specs[0][3].type == "meta":
+            # Tracing needs the admitted envelope, not an executable or CUDA
+            # lanes. Every runtime candidate must fit this same envelope.
+            scan.payload_limits = limits
             return scan
         if self.policy.tuning == "heuristic":
-            return scan.prepared(options=self.policy, parallel=True)
+            return scan.prepared(options=self.policy, parallel=True, payload_limits=limits)
         samples = tuple(
             torch.empty_strided(shape, stride, dtype=dtype, device=device).zero_()
             for shape, stride, dtype, device in specs
@@ -84,8 +97,9 @@ class ScanContext:
         return scan.optimized(
             samples[:1],
             samples[1 : 1 + invariants],
-            tuple((s,) * min(3, (self.max_rows + chunk - 1) // chunk) for s in samples[1 + invariants :]),
+            tuple((s,) * count for s in samples[1 + invariants :]),
             options=self.policy,
+            payload_limits=limits,
             streams=RegionStreamBindings(torch.cuda.current_stream(self.device), self.streams),
         )[0]
 
@@ -123,6 +137,7 @@ def scan(
         and over[0].shape[0]
         and over[0].shape[0] % chunk == 0
         and not (torch.is_grad_enabled() and any(t.requires_grad for t in (carry, *over, *invariants)))
+        and len({t.untyped_storage() for t in (carry, *over, *invariants)}) == 1 + len(over) + len(invariants)
     ):
         columns = tuple(tuple(torch.ops.aten.split.Tensor(t, chunk)) for t in over)
         compiled = context.specialize(
@@ -130,6 +145,9 @@ def scan(
             tuple((t.shape, t.stride(), t.dtype, t.device) for t in (carry, *invariants, *(c[0] for c in columns))),
             len(invariants),
             chunk,
+            # Heuristic plans cover the whole declared count domain. Only
+            # measured tuning needs separate examples for the actual count.
+            over[0].shape[0] // chunk if context.policy.tuning == "measured" else 0,
         )
         if carry.is_meta:
             MemoryTrace.reserve(sum(limit.bytes for limit in compiled.payload_limits))

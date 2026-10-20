@@ -12,6 +12,7 @@ from dataclasses import replace
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import CausalModelDomain
@@ -29,6 +30,7 @@ from pllm.contracts.region_selection import (
     RegionSelectionRequest,
     RegionTuningSize,
 )
+from pllm.execution.additive_scan import candidates as additive_candidates
 from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
 from pllm.execution.region_compilation import (
     analyze_region_program,
@@ -38,11 +40,13 @@ from pllm.execution.region_compilation import (
 )
 from pllm.execution.region_optimization import (
     assess_region_candidates,
+    bind_region_candidate,
     optimize_region,
     select_region_candidate,
 )
 from pllm.execution.region_schedule import RegionScheduleExecution
 from pllm.execution.region_storage import analyze_region_payload, import_region_functions
+from pllm.execution.region_values import Bank
 from pllm.execution.replay import Recurrence
 from pllm.execution.tensor_scan import TensorScan
 from pllm.execution.tokenwise_region import TokenwiseRegion
@@ -221,6 +225,61 @@ def test_tuned_tensor_scan_keeps_one_symbolic_plan_and_its_guards():
     with pytest.raises(ValueError):  # Beyond the declared maximum trip count.
         tuned((w,), (), (rows + rows[:1],))
     assert torch.equal(w, torch.ones_like(w))
+
+    # A claimed loop rewrite must replay against its source, even when the
+    # supplied timing makes it attractive. These checks need no GPU execution.
+    with FakeTensorMode():
+        operands = tuple(torch.empty(shape, device="cuda:0") for shape in ((3, 4), (3, 4), (2, 4), (2, 3)))
+        cell = ExportedCell.capture(
+            lambda w, base, x, y: (w + 0.013 * (y.T @ x), x @ (base + w).T),
+            ("w", "base", "x", "y"),
+            ("next", "out"),
+            operands,
+        )
+        scan = TensorScan(cell, SizeParameter("n", 0, 9), carry=1, invariants=1)
+    imports = import_region_functions(scan.program, {cell.digest: cell})
+    limits = (RegionPayloadLimit("cuda:0", 32 << 20),)
+    alternatives = tuple(additive_candidates(scan.program, {cell.digest: cell}, limits))
+    assert alternatives
+    candidate = replace(alternatives[0].candidate, elapsed_ns=(50,))
+    request = RegionSelectionRequest(
+        imports,
+        (RegionCandidate(analyze_region_program(scan.program).reference_schedule, imports, (100,)), candidate),
+        limits,
+        True,
+        "rewrite verification",
+        (RegionTuningSize("n", 5),),
+    )
+    assert select_region_candidate(scan.program, request).selected == 1
+    assert select_region_candidate(scan.program, replace(request, allow_numerical_transforms=False)).selected == 0
+    source_peak = assess_region_candidates(scan.program, request)[0].peak_bytes
+    assert select_region_candidate(scan.program, replace(request, payload_limits=source_peak)).selected == 0
+    assert candidate.additive_scan is not None
+    forged = replace(candidate, additive_scan=replace(candidate.additive_scan, window=3))
+    with pytest.raises(ValueError, match="additive scan imports differ"):
+        select_region_candidate(scan.program, replace(request, candidates=(request.candidates[0], forged)))
+    if torch.cuda.is_available():
+        # Separate allocations exercise the bank-packing path as well as a
+        # partial final window. Outputs must never expose caller-owned inputs.
+        w = torch.ones(3, 4, device="cuda:0")
+        base = torch.zeros_like(w)
+        xs = tuple(torch.full((2, 4), i / 10, device=w.device) for i in range(5))
+        ys = tuple(torch.full((2, 3), i / 20, device=w.device) for i in range(5))
+        expected, outputs = w, []
+        for x, y in zip(xs, ys, strict=True):
+            outputs.append(x @ (base + expected).T)
+            expected = expected + 0.013 * (y.T @ x)
+        execution = bind_region_candidate(alternatives[0], limits, assess_region_candidates(scan.program, request)[1])
+        arguments = dict(
+            zip((v.name for v in scan.program.entry.block.arguments), (w, base, Bank(xs), Bank(ys)), strict=True)
+        )
+        final, bank = execution.run(arguments, sizes={"n": 5}).values
+        assert isinstance(bank, Bank)
+        torch.testing.assert_close(final, expected)
+        torch.testing.assert_close(bank.elements, tuple(outputs))
+        torch.testing.assert_close(w, torch.ones_like(w))
+        for actual, value in zip(xs, range(5), strict=True):
+            torch.testing.assert_close(actual, torch.full_like(actual, value / 10))
 
 
 def test_tuner_without_numerical_permission_never_warns_or_offers_rewrites():

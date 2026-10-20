@@ -64,6 +64,10 @@ pub(super) struct Access {
     pub operator: String,
     pub kind: AccessKind,
     pub inputs: Vec<String>,
+    #[serde(default)]
+    pub arguments: Vec<String>,
+    #[serde(default)]
+    pub keywords: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

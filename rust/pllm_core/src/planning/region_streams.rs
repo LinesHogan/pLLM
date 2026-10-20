@@ -115,7 +115,7 @@ fn concurrent_action(action: &Action, program: &Program, imports: &[TensorImport
                     && declaration.resources.iter().all(|name|
                     program.resources.iter().any(|r| matches!(r, Resource::Borrowed { name: known, .. } if known == name))
                     && declaration.accesses.iter().any(|a| &a.resource == name)),
-                TensorImport::Native { .. } => false,
+                TensorImport::Native { .. } | TensorImport::OrderedScan { .. } => false,
             })
         },
         Action::Primitive { operation } => matches!(operation, Operation::Constant { .. } | Operation::Parameter { .. }

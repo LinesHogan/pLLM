@@ -4,10 +4,12 @@ Its outputs match the workload's own chunk transition bitwise on CPU and CUDA, a
 the measured region-tuning policy is signed into the backend facts.
 """
 
+import warnings
 from dataclasses import replace
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 import pllm
 from pllm.authoring import BackendCompileFacts, ParameterTargetShape
@@ -18,13 +20,17 @@ from pllm.contracts.parameter_overlay import (
     ParameterRole,
     ParameterTarget,
 )
-from pllm.contracts.region_selection import RegionSelectionPolicy
+from pllm.contracts.region_selection import RegionPayloadLimit, RegionSelectionPolicy
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
+from pllm.execution.additive_scan import candidates as additive_candidates
 from pllm.execution.codec import decode_boundary, encode_boundary
+from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.scan import ScanContext
+from pllm.execution.tensor_scan import TensorScan
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
 from test.backend_facts import backend_facts
 from test.workloads.test_inplace_ttt import _input
@@ -48,12 +54,16 @@ def facts_for(device, dtype):
 
 
 @pytest.mark.parametrize("device,dtype", (("cpu", torch.float32), ("cuda:0", torch.bfloat16)))
-def test_bound_scan_matches_original_chunk_math_bitwise(device, dtype):
+@pytest.mark.parametrize("numerics", (False, True))
+def test_bound_scan_matches_original_chunk_math_bitwise(device, dtype, numerics):
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("CUDA required")
     device = torch.device(device)
     workload = InPlaceTTTWorkload(InPlaceTTTConfig((TARGET,), chunk_size=3, learning_rate=0.017, update_decode=True))
-    execution = workload.compile_backend(facts_for(device, dtype)).execution
+    facts = facts_for(device, dtype)
+    facts = replace(facts, timeline=replace(facts.timeline, region_policy=RegionSelectionPolicy(numerics)))
+    execution = workload.compile_backend(facts).execution
+    reference_transition = ScanContext(RegionSelectionPolicy(False), 8, device).bind(workload.transition)
     stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
     identity = RequestIdentity("region", 0, 0)
     (ref,) = execution.admit((identity,), stream)
@@ -70,11 +80,12 @@ def test_bound_scan_matches_original_chunk_math_bitwise(device, dtype):
     ):
         hidden = torch.randn(rows, 7, dtype=dtype, device=device, generator=generator)
         desired = torch.randn(rows, 5, dtype=dtype, device=device, generator=generator)
-        expected = workload.transition(hidden, desired, base, *reference)
+        expected = reference_transition(hidden, desired, base, *reference)
         operand = CapturedParameterOperand(identity, TARGET, phase, hidden, desired, base)
         (result,) = execution.step(_input((operand,)), stream=stream).entries
         got = result.targets[0].update
-        torch.testing.assert_close(got.output, expected.output, rtol=0, atol=0)
+        tolerance = {"rtol": 0.02, "atol": 0.001} if numerics else {"rtol": 0, "atol": 0}
+        torch.testing.assert_close(got.output, expected.output, **tolerance)
         assert (got.changed, got.update_count, got.trained_rows, got.metrics) == (
             expected.changed,
             expected.update_count,
@@ -84,7 +95,7 @@ def test_bound_scan_matches_original_chunk_math_bitwise(device, dtype):
         assert result.before_ref == ref and result.after_ref.version_id == ref.version_id + 1
         ref = result.after_ref
         for a, b in zip(execution.snapshot(ref, stream), reference, strict=True):
-            torch.testing.assert_close(a, b, rtol=0, atol=0)
+            torch.testing.assert_close(a, b, **tolerance)
     execution.retire((identity,))
     assert execution.arena.active_lineages == 0
 
@@ -128,3 +139,72 @@ def test_scan_matches_the_serial_loop_including_carry_views(device):
             outputs.append(output)
         actual = pllm.scan(step, carry=carry, over=(over,), chunk=3)
         torch.testing.assert_close(actual, (expected, tuple(outputs)), rtol=0, atol=0)
+
+    if device == "cpu":
+        return
+    generator = torch.Generator(device=device).manual_seed(315)
+    carry = torch.randn(11, 13, device=device, generator=generator) * 0.01
+    base = torch.randn(13, 11, device=device, generator=generator).T
+    x = torch.randn(20, 13, device=device, generator=generator)
+    y = torch.randn(20, 11, device=device, generator=generator)
+    workload = InPlaceTTTWorkload(InPlaceTTTConfig((TARGET,), chunk_size=4, learning_rate=0.013))
+
+    for kind in ("additive", "nonlinear", "bilinear", "downcast", "random", "alpha"):
+
+        def transition(state, inputs, targets, weight):
+            result, output = workload.step(state, inputs, targets, weight)
+            if kind == "nonlinear":
+                result = result.tanh()
+            elif kind == "bilinear":
+                result = result * state
+            elif kind == "downcast":
+                result = result.to(torch.bfloat16).float()
+            elif kind == "random":
+                result = result + torch.rand_like(result)
+            elif kind == "alpha":
+                result = torch.add(state, result - state, alpha=2)
+            return result, output
+
+        if kind not in ("additive", "random"):
+            # Refusal is a source-proof property; compiling and timing an
+            # unrelated fallback for every counterexample adds no coverage.
+            with FakeTensorMode():
+                samples = tuple(torch.empty(shape, device=device) for shape in ((11, 13), (11, 13), (4, 13), (4, 11)))
+                cell = ExportedCell.capture(
+                    lambda state, weight, inputs, targets: transition(state, inputs, targets, weight),
+                    ("state", "weight", "inputs", "targets"),
+                    ("next", "output"),
+                    samples,
+                )
+                scan = TensorScan(cell, 5, carry=1, invariants=1)
+            assert not tuple(
+                additive_candidates(scan.program, {cell.digest: cell}, (RegionPayloadLimit(device, 1 << 30),))
+            )
+            continue
+        reference, outputs = carry, []
+        rng = torch.cuda.get_rng_state()
+        for xx, yy in zip(x.split(4), y.split(4), strict=True):
+            reference, output = transition(reference, xx, yy, base)
+            outputs.append(output)
+        for numerics in (False, True) if kind == "additive" else (True,):
+            torch.cuda.set_rng_state(rng)
+            context = ScanContext(RegionSelectionPolicy(numerics), 20, torch.device(device))
+            if kind == "random":
+                # RNG already needs an opaque backend binding; the affine
+                # optimizer must not silently turn it into a pure coefficient.
+                with pytest.raises(ValueError, match="opaque tensor fragments"):
+                    context.bind(pllm.scan)(transition, carry=carry, over=(x, y), chunk=4, invariants=(base,))
+                continue
+            with warnings.catch_warnings(record=True) as reported:
+                actual = context.bind(pllm.scan)(transition, carry=carry, over=(x, y), chunk=4, invariants=(base,))
+            tolerance = {"rtol": 1e-5, "atol": 1e-6} if numerics else {"rtol": 0, "atol": 0}
+            torch.testing.assert_close(actual, (reference, tuple(outputs)), **tolerance)
+            if kind != "additive" or not numerics:
+                assert not any("additive scan" in str(item.message) for item in reported)
+    # Alias guards are checked on each invocation, not inferred from fake samples.
+    reference, outputs = carry, []
+    for xx, yy in zip(x.split(4), y.split(4), strict=True):
+        reference, output = workload.step(reference, xx, yy, carry)
+        outputs.append(output)
+    actual = pllm.scan(workload.step, carry=carry, over=(x, y), chunk=4, invariants=(carry,))
+    torch.testing.assert_close(actual, (reference, tuple(outputs)), rtol=0, atol=0)
