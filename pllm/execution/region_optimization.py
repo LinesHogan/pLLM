@@ -51,8 +51,8 @@ from pllm.execution.region_compilation import (
 )
 from pllm.execution.region_execution import RegionInstructionExecution
 from pllm.execution.region_native import (
+    AdditiveScanPrimitive,
     CompiledPrimitive,
-    OrderedScanPrimitive,
     RegionFunction,
     TensorSource,
     is_original_tensor_source,
@@ -374,11 +374,19 @@ def prepare_region_candidates(
         proposals[min(1, len(proposals) - 1)].candidate,
     )
     order = base.schedule_map if base.stream_plan is None else base.stream_plan.schedule_map
+    alternatives: tuple[PreparedRegionCandidate, ...] = ()
+    if options.allow_numerical_transforms and len(proposals) < max_candidates:
+        from pllm.execution.additive_scan import candidates, preference
+
+        alternatives = tuple(sorted(candidates(program, sources, limits), key=preference))
+    # Keep both ordered and tree choices in the measured shortlist; tensor
+    # fusion alternatives must not consume every available slot first.
+    reserved = min(2, len(alternatives), max_candidates - len(proposals))
     for prepared in prepare_region_implementations(
         program,
         sources,
         options=options,
-        max_variants=min(4 if measured else 3, max(0, min(max_candidates, 8) - len(proposals))),
+        max_variants=min(4 if measured else 3, max(0, min(max_candidates, 8) - len(proposals) - reserved)),
         max_rewrite_depth=max_rewrite_depth,
         compiler=compiler,
     ):
@@ -399,10 +407,7 @@ def prepare_region_candidates(
         candidate = prepared if physical is None else prepared.arranged(physical)
         if all(candidate.candidate != p.candidate for p in proposals):
             proposals.append(candidate)
-    if options.allow_numerical_transforms and len(proposals) < max_candidates:
-        from pllm.execution.additive_scan import candidates
-
-        alternatives = tuple(candidates(program, sources, limits))
+    if alternatives and len(proposals) < max_candidates:
         proposals.extend(alternatives[-(max_candidates - len(proposals)) :])
     request = RegionSelectionRequest(
         imports,
@@ -426,7 +431,7 @@ def warn_region_transforms(
         t
         for name, cell in execution.cells.items()
         if name in assessment.changed_functions
-        and isinstance(cell, (ExportedCell, CompiledPrimitive, OrderedScanPrimitive))
+        and isinstance(cell, (ExportedCell, CompiledPrimitive, AdditiveScanPrimitive))
         for t in cell.transformations
     )
     warn_numerical_transforms(identity, transforms)

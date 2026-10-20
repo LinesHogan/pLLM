@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from pllm.contracts.region_imports import OrderedScanImport
+from pllm.contracts.region_imports import AdditiveScanImport, ScanForm
 from pllm.contracts.region_program import Program
 
 
@@ -12,6 +12,8 @@ class AdditiveScanEvidence:
 
     window: int
     workspace: int
+    form: ScanForm
+    offsets: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +21,9 @@ class AdditiveScanPlan:
     """One verified source rewrite, including its complete allocation bound."""
 
     program: Program
-    implementation: OrderedScanImport
+    implementation: AdditiveScanImport
     scale: float
     window: int
+    capacity: int
+    chunk: int
+    offsets: tuple[int, ...]

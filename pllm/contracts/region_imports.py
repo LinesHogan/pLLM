@@ -10,6 +10,7 @@ original resource owners and allocations retained across calls are separate.
 """
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import TypeAlias
 
 from pllm.contracts.region_program import AccessMode, AffineIndex, Function, IndexTerm, ScalarType, TensorType
@@ -129,8 +130,15 @@ class CompiledTensorImport:
     # this compiler adapter's normalized-graph operator subset.
 
 
+class ScanForm(StrEnum):
+    """Numerical algorithms admitted for an additive carry."""
+
+    ORDERED = "ordered"
+    HILLIS_STEELE = "hillis_steele"
+
+
 @dataclass(frozen=True, slots=True)
-class OrderedScanImport:
+class AdditiveScanImport:
     """Verified additive scan kernel: borrowed inputs and owned result banks.
 
     Allocations bound call-local scratch; independent result leaves are charged
@@ -140,6 +148,7 @@ class OrderedScanImport:
     declaration: Function
     device: str
     allocations: tuple[KernelAllocation, ...]
+    form: ScanForm
 
 
 RegionTensorImport: TypeAlias = (
@@ -149,7 +158,7 @@ RegionTensorImport: TypeAlias = (
     | FunctionalKernelImport
     | CompiledTensorImport
     | BorrowedTensorImport
-    | OrderedScanImport
+    | AdditiveScanImport
 )
 
 

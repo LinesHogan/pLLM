@@ -67,7 +67,7 @@ pub(super) fn backing_bounds(program: &Program, imports: &[TensorImport]) -> Res
             TensorImport::Exported { access } => access,
             TensorImport::Compiled { source_access, .. } => source_access,
             TensorImport::Native { .. } | TensorImport::NativeKernel { .. }
-                | TensorImport::FunctionalKernel { .. } | TensorImport::OrderedScan { .. } | TensorImport::Borrowed { .. } => continue,
+                | TensorImport::FunctionalKernel { .. } | TensorImport::AdditiveScan { .. } | TensorImport::Borrowed { .. } => continue,
         };
         for storage in &graph.storages { include(&storage.device, storage.bytes); }
     }
@@ -199,7 +199,7 @@ fn derive_provenance(program: &Program, imports: &[TensorImport]) -> Result<Prov
         };
         let import = functions.get(function.as_str()).ok_or("missing tensor access import")?;
         let graph = match import {
-            TensorImport::Native { .. } | TensorImport::NativeKernel { .. } | TensorImport::FunctionalKernel { .. } | TensorImport::OrderedScan { .. }
+            TensorImport::Native { .. } | TensorImport::NativeKernel { .. } | TensorImport::FunctionalKernel { .. } | TensorImport::AdditiveScan { .. }
                 | TensorImport::Compiled { .. } | TensorImport::Borrowed { .. } => {
                 // Native/compiled boundaries clone each result independently.
                 // Functional kernels return their own distinct dense backings.

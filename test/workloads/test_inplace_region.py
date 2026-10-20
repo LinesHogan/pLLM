@@ -6,6 +6,7 @@ the measured region-tuning policy is signed into the backend facts.
 
 import warnings
 from dataclasses import replace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -29,7 +30,7 @@ from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
-from pllm.execution.scan import ScanContext
+from pllm.execution.scan import ScanContext, ScanTemplate
 from pllm.execution.tensor_scan import TensorScan
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
 from test.backend_facts import backend_facts
@@ -208,3 +209,22 @@ def test_scan_matches_the_serial_loop_including_carry_views(device):
         outputs.append(output)
     actual = pllm.scan(workload.step, carry=carry, over=(x, y), chunk=4, invariants=(carry,))
     torch.testing.assert_close(actual, (reference, tuple(outputs)), rtol=0, atol=0)
+    # Prime bounded buckets with real C, then vary C within them without any
+    # warm export. The measured policy must not specialize on every count.
+    x, y = torch.cat((x, x[:12])), torch.cat((y, y[:12]))
+    context = ScanContext(RegionSelectionPolicy(True, tuning="measured"), 32, torch.device(device))
+    run = context.bind(pllm.scan)
+    run(workload.step, carry=carry, over=(x[:20], y[:20]), chunk=4, invariants=(base,))
+    with (
+        patch("torch.export.export", side_effect=AssertionError("warm C caused an export")),
+        patch.object(ScanTemplate, "_prepare", side_effect=AssertionError("warm C caused plan preparation")),
+    ):
+        for count in (0, 6, 5, 8, 7):
+            expected, outputs = carry, []
+            for xx, yy in zip(x[: 4 * count].split(4), y[: 4 * count].split(4), strict=True):
+                if not len(xx):
+                    continue
+                expected, output = workload.step(expected, xx, yy, base)
+                outputs.append(output)
+            actual = run(workload.step, carry=carry, over=(x[: 4 * count], y[: 4 * count]), chunk=4, invariants=(base,))
+            torch.testing.assert_close(actual, (expected, tuple(outputs)), rtol=1e-5, atol=1e-6)

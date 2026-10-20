@@ -12,13 +12,28 @@ from torch.utils._python_dispatch import _disable_current_modes  # pyright: igno
 from pllm.contracts.region_program import SizeParameter
 from pllm.contracts.region_selection import RegionSelectionPolicy
 from pllm.execution.exported_cell import TensorCellModule
-from pllm.execution.exported_region import import_exported_region
+from pllm.execution.exported_region import ExportedRegion, import_exported_region
 from pllm.execution.memory import MemoryTrace
 from pllm.execution.region_streams import RegionStreamBindings
 from pllm.execution.tensor_scan import TensorScan
 
 Step = Callable[..., tuple[torch.Tensor, torch.Tensor]]
 R = TypeVar("R")
+Specs = tuple[tuple[torch.Size, tuple[int, ...], torch.dtype, torch.device], ...]
+
+
+@lru_cache(maxsize=128)
+def _export_step(step: Step, specs: Specs, invariants: int) -> ExportedRegion:
+    """Export one source layout independently of policy and chunk-count buckets."""
+
+    def ordered(carry: torch.Tensor, *args: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return step(carry, *args[invariants:], *args[:invariants])
+
+    with _disable_current_modes(), FakeTensorMode():
+        samples = tuple(
+            torch.empty_strided(shape, stride, dtype=dtype, device=device) for shape, stride, dtype, device in specs
+        )
+        return import_exported_region(torch.export.export(TensorCellModule(ordered), samples, strict=False), carry=1)
 
 
 class ScanContext:
@@ -49,58 +64,85 @@ class ScanContext:
         return (torch.cuda.Stream(device=self.device),)
 
     @lru_cache(maxsize=128)
-    def specialize(
-        self,
-        step: Step,
-        specs: tuple[tuple[torch.Size, tuple[int, ...], torch.dtype, torch.device], ...],
-        invariants: int,
-        chunk: int,
-        count: int,
-    ) -> TensorScan:
-        """Export once per callable and guarded layout; all other calls are cache lookups."""
+    def _template(self, step: Step, specs: Specs, invariants: int, chunk: int) -> "ScanTemplate":
+        return ScanTemplate(self, _export_step(step, specs, invariants), specs, invariants, chunk)
 
-        def ordered(carry: torch.Tensor, *args: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            return step(carry, *args[invariants:], *args[:invariants])
+    def specialize(self, step: Step, specs: Specs, invariants: int, chunk: int, count: int) -> TensorScan:
+        """Reuse source export and one prepared plan per bounded count bucket."""
+        tracing = specs[0][3].type == "meta"
+        layouts = tuple(
+            (shape, stride, dtype, self.device if device.type == "meta" else device)
+            for shape, stride, dtype, device in specs
+        )
+        return self._template(step, layouts, invariants, chunk).for_count(count, tracing=tracing)
 
-        # Closure/owner constants belong to the callable: changing them requires a new step object.
-        with _disable_current_modes(), FakeTensorMode():
-            samples = tuple(
-                torch.empty_strided(shape, stride, dtype=dtype, device=self.device if device.type == "meta" else device)
-                for shape, stride, dtype, device in specs
-            )
-            region = import_exported_region(
-                torch.export.export(TensorCellModule(ordered), samples, strict=False), carry=1
-            )
-            scan = TensorScan(
-                region.program,
-                SizeParameter("chunks", 0, (self.max_rows + chunk - 1) // chunk),
-                carry=1,
-                invariants=invariants,
-                functions=region.functions,
-            )
-        limits = scan.payload_limits
-        if self.policy.allow_numerical_transforms:
+
+class ScanTemplate:
+    """Execution-owned preparation caches; no invocation tensors or carry state."""
+
+    def __init__(self, context: ScanContext, region: ExportedRegion, specs: Specs, invariants: int, chunk: int) -> None:
+        self.context, self.region, self.specs = context, region, specs
+        self.invariants = invariants
+        self.maximum = (context.max_rows + chunk - 1) // chunk
+        self.sources: dict[int, TensorScan] = {}
+        self.plans: dict[int, TensorScan] = {}
+
+    def for_count(self, count: int, *, tracing: bool) -> TensorScan:
+        """Tune at the first real C in a bucket, then reuse for the whole guarded domain."""
+        capacity = min(self.maximum, 1 << (max(1, count) - 1).bit_length())
+        if not self.context.policy.allow_numerical_transforms:
+            capacity = self.maximum
+        if capacity not in self.sources:
+            self.sources[capacity] = self._source(capacity)
+        scan = self.sources[capacity]
+        if tracing:
+            return scan
+        if capacity not in self.plans:
+            self.plans[capacity] = self._prepare(scan, count)
+        return self.plans[capacity]
+
+    def _source(self, capacity: int) -> TensorScan:
+        with _disable_current_modes():
+            return self._build_source(capacity)
+
+    def _build_source(self, capacity: int) -> TensorScan:
+        scan = TensorScan(
+            self.region.program,
+            SizeParameter("chunks", 0, capacity),
+            carry=1,
+            invariants=self.invariants,
+            functions=self.region.functions,
+        )
+        if self.context.policy.allow_numerical_transforms:
             from pllm.execution.additive_scan import payload_budget
 
-            limits = payload_budget(scan.program, region.functions, limits, self.payload_bytes)
-        if specs[0][3].type == "meta":
-            # Tracing needs the admitted envelope, not an executable or CUDA
-            # lanes. Every runtime candidate must fit this same envelope.
-            scan.payload_limits = limits
-            return scan
-        if self.policy.tuning == "heuristic":
-            return scan.prepared(options=self.policy, parallel=True, payload_limits=limits)
+            scan.payload_limits = payload_budget(
+                scan.program, self.region.functions, scan.payload_limits, self.context.payload_bytes
+            )
+        return scan
+
+    def _prepare(self, scan: TensorScan, count: int) -> TensorScan:
+        context = self.context
+        if context.policy.tuning == "heuristic":
+            return scan.prepared(options=context.policy, parallel=True)
         samples = tuple(
             torch.empty_strided(shape, stride, dtype=dtype, device=device).zero_()
-            for shape, stride, dtype, device in specs
+            for shape, stride, dtype, device in self.specs[: 1 + self.invariants]
+        )
+        columns = tuple(
+            tuple(
+                torch.empty_strided((count, *shape), (shape[0] * stride[0], *stride), dtype=dtype, device=device)
+                .zero_()
+                .unbind()
+            )
+            for shape, stride, dtype, device in self.specs[1 + self.invariants :]
         )
         return scan.optimized(
             samples[:1],
-            samples[1 : 1 + invariants],
-            tuple((s,) * count for s in samples[1 + invariants :]),
-            options=self.policy,
-            payload_limits=limits,
-            streams=RegionStreamBindings(torch.cuda.current_stream(self.device), self.streams),
+            samples[1 : 1 + self.invariants],
+            columns,
+            options=context.policy,
+            streams=RegionStreamBindings(torch.cuda.current_stream(context.device), context.streams),
         )[0]
 
 
@@ -145,9 +187,7 @@ def scan(
             tuple((t.shape, t.stride(), t.dtype, t.device) for t in (carry, *invariants, *(c[0] for c in columns))),
             len(invariants),
             chunk,
-            # Heuristic plans cover the whole declared count domain. Only
-            # measured tuning needs separate examples for the actual count.
-            over[0].shape[0] // chunk if context.policy.tuning == "measured" else 0,
+            over[0].shape[0] // chunk,
         )
         if carry.is_meta:
             MemoryTrace.reserve(sum(limit.bytes for limit in compiled.payload_limits))

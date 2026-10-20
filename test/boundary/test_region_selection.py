@@ -16,6 +16,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import CausalModelDomain
+from pllm.contracts.region_imports import ScanForm
 from pllm.contracts.region_program import (
     Call,
     Program,
@@ -50,6 +51,7 @@ from pllm.execution.region_values import Bank
 from pllm.execution.replay import Recurrence
 from pllm.execution.tensor_scan import TensorScan
 from pllm.execution.tokenwise_region import TokenwiseRegion
+from pllm.kernels.additive_scan import AdditiveBuffers, launch_window
 from test.region_fixtures import (
     StorageObserver,
     assert_grid_closed_form,
@@ -255,8 +257,18 @@ def test_tuned_tensor_scan_keeps_one_symbolic_plan_and_its_guards():
     source_peak = assess_region_candidates(scan.program, request)[0].peak_bytes
     assert select_region_candidate(scan.program, replace(request, payload_limits=source_peak)).selected == 0
     assert candidate.additive_scan is not None
-    forged = replace(candidate, additive_scan=replace(candidate.additive_scan, window=3))
+    forged = replace(candidate, additive_scan=replace(candidate.additive_scan, window=4))
     with pytest.raises(ValueError, match="additive scan imports differ"):
+        select_region_candidate(scan.program, replace(request, candidates=(request.candidates[0], forged)))
+    tree = next(
+        p
+        for p in alternatives
+        if p.candidate.additive_scan.form is ScanForm.HILLIS_STEELE and p.candidate.additive_scan.window == 8
+    )
+    evidence = tree.candidate.additive_scan
+    assert evidence is not None
+    forged = replace(tree.candidate, additive_scan=replace(evidence, offsets=evidence.offsets[1:]), elapsed_ns=(50,))
+    with pytest.raises(ValueError, match="prefix stages"):
         select_region_candidate(scan.program, replace(request, candidates=(request.candidates[0], forged)))
     if torch.cuda.is_available():
         # Separate allocations exercise the bank-packing path as well as a
@@ -280,6 +292,52 @@ def test_tuned_tensor_scan_keeps_one_symbolic_plan_and_its_guards():
         torch.testing.assert_close(w, torch.ones_like(w))
         for actual, value in zip(xs, range(5), strict=True):
             torch.testing.assert_close(actual, torch.full_like(actual, value / 10))
+        request = replace(request, candidates=(request.candidates[0], replace(tree.candidate, elapsed_ns=(50,))))
+        execution = bind_region_candidate(tree, limits, assess_region_candidates(scan.program, request)[1])
+        for count in (0, 1, 3, 5):
+            expected, outputs = w, []
+            for x, y in zip(xs[:count], ys[:count], strict=True):
+                outputs.append(x @ (base + expected).T)
+                expected = expected + 0.013 * (y.T @ x)
+            arguments = dict(
+                zip(
+                    (v.name for v in scan.program.entry.block.arguments),
+                    (w, base, Bank(xs[:count]), Bank(ys[:count])),
+                    strict=True,
+                )
+            )
+            final, bank = execution.run(arguments, sizes={"n": count}).values
+            assert isinstance(bank, Bank)
+            torch.testing.assert_close(final, expected)
+            torch.testing.assert_close(bank.elements, tuple(outputs))
+        # Replay changes only a device count. No recapture, storage replacement
+        # or C-specific kernel compilation is needed for the same window.
+        full_x = torch.arange(8 * 2 * 4, device=w.device, dtype=w.dtype).view(8, 2, 4) / 100
+        full_y = torch.arange(8 * 2 * 3, device=w.device, dtype=w.dtype).view(8, 2, 3) / 100
+        staged_x, staged_y = torch.zeros_like(full_x), torch.zeros_like(full_y)
+        active = torch.zeros((), device=w.device, dtype=torch.int32)
+        buffers = AdditiveBuffers(w, 8, 2)
+        launch_window(staged_x, staged_y, w, base, active, buffers, 0.013, ScanForm.HILLIS_STEELE, evidence.offsets)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch_window(staged_x, staged_y, w, base, active, buffers, 0.013, ScanForm.HILLIS_STEELE, evidence.offsets)
+        storage = (buffers.increments, buffers.weights, buffers.output, buffers.final, active)
+        pointers = tuple(t.data_ptr() for t in storage)
+        for count in (8, 0, 1, 5, 3, 8):
+            staged_x.zero_()
+            staged_y.zero_()
+            staged_x[:count].copy_(full_x[:count])
+            staged_y[:count].copy_(full_y[:count])
+            active.fill_(count)
+            graph.replay()
+            increments = 0.013 * torch.bmm(staged_y.transpose(1, 2), staged_x)
+            prefixes = torch.cat((w[None], w[None] + increments.double().cumsum(0).float()))
+            torch.testing.assert_close(buffers.final, prefixes[count])
+            torch.testing.assert_close(buffers.weights[:count], base[None] + prefixes[:count])
+            torch.testing.assert_close(
+                buffers.output[:count], torch.bmm(staged_x[:count], (base[None] + prefixes[:count]).transpose(1, 2))
+            )
+            assert pointers == tuple(t.data_ptr() for t in storage)
 
 
 def test_tuner_without_numerical_permission_never_warns_or_offers_rewrites():

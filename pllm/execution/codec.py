@@ -64,14 +64,13 @@ def functionalize_export(program: torch.export.ExportedProgram) -> torch.export.
     execution context. The same ATen check is applied again by the importer.
     """
     _check_export_metadata(program)
+    _normalize_transposes(program)
     try:
         for node in program.graph.nodes:
             if node.op == "call_function":
                 target: object = node.target
                 check_functional_aten(target)
-                # Composite ATen operators still need the existing canonical
-                # decomposition (for example numpy_T and matmul).
-                if torch.Tag.core not in cast(list[torch.Tag], getattr(target, "tags")):
+                if _needs_decomposition(node):
                     break
             elif node.op not in ("placeholder", "output"):
                 break
@@ -88,6 +87,41 @@ def functionalize_export(program: torch.export.ExportedProgram) -> torch.export.
     result = cast(_FunctionalExport, program).run_decompositions(decompositions)
     _check_export_metadata(result)
     return result
+
+
+def _normalize_transposes(program: torch.export.ExportedProgram) -> None:
+    """Lower NumPy's axis reversal as the exact view, without another AOT export."""
+    changed = False
+    for node in program.graph.nodes:
+        if node.op == "call_function" and node.target == torch.ops.aten.numpy_T.default:
+            operand = node.all_input_nodes[0]
+            tensor = tensor_node_metadata(operand)
+            if tensor is not None:
+                node.target = torch.ops.aten.permute.default
+                node.args, node.kwargs = (operand, list(reversed(range(tensor.ndim)))), {}
+                changed = True
+    if changed:
+        program.graph_module.recompile()
+
+
+def _needs_decomposition(node: torch.fx.Node) -> bool:
+    # These pure views expose their complete backing through fake metadata.
+    # Rank-two matmul is already a supported GEMM boundary. Other composites
+    # still decompose, so hidden temporary allocations are not erased.
+    operator = node.target
+    assert isinstance(operator, OpOverload)
+    if operator in (
+        torch.ops.aten.detach.default,
+        torch.ops.aten.t.default,
+        torch.ops.aten.transpose.int,
+        torch.ops.aten.permute.default,
+    ):
+        return False
+    if operator == torch.ops.aten.matmul.default:
+        operands = tuple(tensor_node_metadata(n) for n in node.all_input_nodes)
+        if len(operands) == 2 and all(t is not None and t.ndim == 2 for t in operands):
+            return False
+    return torch.Tag.core not in operator.tags
 
 
 def _check_export_metadata(program: torch.export.ExportedProgram) -> None:

@@ -14,13 +14,14 @@ from typing import TypeAlias
 import torch
 
 from pllm.contracts.region_imports import (
+    AdditiveScanImport,
     BorrowedTensorImport,
     CompiledTensorImport,
     ExportedTensorImport,
     FunctionalKernelImport,
     NativeKernelImport,
-    OrderedScanImport,
     RegionTensorImport,
+    ScanForm,
     region_import_name,
 )
 from pllm.contracts.region_program import AccessMode, Function, ScalarType, TensorType
@@ -96,10 +97,10 @@ NativeFunction: TypeAlias = Callable[[tuple[Data, ...], PrimitiveResources], tup
 
 
 @dataclass(frozen=True, slots=True)
-class OrderedScanPrimitive:
+class AdditiveScanPrimitive:
     """Bind a Rust-derived additive kernel with borrowed inputs and owned outputs."""
 
-    implementation: OrderedScanImport
+    implementation: AdditiveScanImport
     function: Callable[[tuple[Data, ...]], tuple[Data, ...]]
 
     @property
@@ -108,7 +109,9 @@ class OrderedScanPrimitive:
 
     @property
     def transformations(self) -> tuple[str, ...]:
-        return ("additive scan: batched GEMMs with ordered carry rounding",)
+        if self.implementation.form is ScanForm.ORDERED:
+            return ("additive scan: batched GEMMs with ordered carry rounding",)
+        return ("additive scan: batched GEMMs and Hillis–Steele fp32 prefix reassociation",)
 
     def invoke(
         self, inputs: tuple[Data, ...], pages: RegionResources | None, sizes: Mapping[str, int] = {}
@@ -287,7 +290,7 @@ RegionFunction: TypeAlias = (
     | FunctionalKernelPrimitive
     | CompiledPrimitive
     | BorrowedTensorPrimitive
-    | OrderedScanPrimitive
+    | AdditiveScanPrimitive
 )
 TensorSource: TypeAlias = ExportedCell | BorrowedTensorPrimitive | NativePrimitive | FunctionalKernelPrimitive
 
@@ -315,7 +318,7 @@ def is_original_region_source(cell: RegionFunction) -> bool:
 def original_region_sources(cells: Mapping[str, RegionFunction]) -> dict[str, TensorSource]:
     result: dict[str, TensorSource] = {}
     for name, cell in cells.items():
-        if isinstance(cell, (CompiledPrimitive, OrderedScanPrimitive)) or not is_original_region_source(cell):
+        if isinstance(cell, (CompiledPrimitive, AdditiveScanPrimitive)) or not is_original_region_source(cell):
             raise ValueError("region preparation requires original source implementations")
         result[name] = cell
     return result

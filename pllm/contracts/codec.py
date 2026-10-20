@@ -23,13 +23,13 @@ from pllm.contracts.control_instructions import (
     ControlWhile,
 )
 from pllm.contracts.region_imports import (
+    AdditiveScanImport,
     BorrowedTensorImport,
     CompiledTensorImport,
     ExportedTensorImport,
     FunctionalKernelImport,
     NativeKernelImport,
     NativeTensorImport,
-    OrderedScanImport,
     RegionTensorImport,
 )
 from pllm.contracts.region_program import (
@@ -402,7 +402,7 @@ _tensor_import_tags = {
     FunctionalKernelImport: "functional_kernel",
     CompiledTensorImport: "compiled",
     BorrowedTensorImport: "borrowed",
-    OrderedScanImport: "ordered_scan",
+    AdditiveScanImport: "additive_scan",
 }
 configure_tagged_union(RegionTensorImport, _converter, tag_generator=_tensor_import_tags.__getitem__, tag_name="kind")
 # Imports cross the boundary as a heterogeneous tuple. Runtime tuple encoding
@@ -428,7 +428,7 @@ _converter.register_unstructure_hook(
 
 
 _converter.register_unstructure_hook(
-    OrderedScanImport, lambda value: _converter.unstructure(value, unstructure_as=RegionTensorImport)
+    AdditiveScanImport, lambda value: _converter.unstructure(value, unstructure_as=RegionTensorImport)
 )
 
 
@@ -452,14 +452,14 @@ def _functional_kernel_import(value: object, _target: object) -> FunctionalKerne
 _converter.register_structure_hook(FunctionalKernelImport, _functional_kernel_import)
 
 
-def _ordered_scan_import(value: object, _target: object) -> OrderedScanImport:
+def _additive_scan_import(value: object, _target: object) -> AdditiveScanImport:
     result = _converter.structure(value, cast(type[RegionTensorImport], RegionTensorImport))
-    if not isinstance(result, OrderedScanImport):
-        raise ValueError("additive scan needs its verified ordered kernel import")
+    if not isinstance(result, AdditiveScanImport):
+        raise ValueError("additive scan needs its verified kernel import")
     return result
 
 
-_converter.register_structure_hook(OrderedScanImport, _ordered_scan_import)
+_converter.register_structure_hook(AdditiveScanImport, _additive_scan_import)
 
 
 def _borrowed_tensor_import(value: object, _target: object) -> BorrowedTensorImport:

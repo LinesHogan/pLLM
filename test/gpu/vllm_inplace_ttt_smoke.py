@@ -31,6 +31,7 @@ from pllm.contracts.parameter_overlay import (
 )
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
+from pllm.execution.additive_scan import AdditiveUpdate
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
 
 TARGET = ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT)
@@ -130,7 +131,8 @@ def texts(outputs) -> tuple[str, ...]:
 
 
 def _check(handle: VllmLlm[object, object], label: str) -> tuple[str, ...]:
-    outputs = texts(handle.generate(PROMPTS, SAMPLING))
+    prompts = ["The sky is blue. " * 5, "Water freezes when it is cold. " * 4] if label.startswith("dense") else PROMPTS
+    outputs = texts(handle.generate(prompts, SAMPLING))
     diagnostics = handle.deployment.execution.diagnostics()
     if (
         not all(outputs)
@@ -221,7 +223,16 @@ def main() -> int:
             lambda: open_llm(dense, memory_budget_bytes=1 << 30, allow_numerical_transforms=False),
             lambda h: _check(h, "dense strict"),
         ),
-        ("dense", lambda: open_llm(dense, memory_budget_bytes=1 << 30), lambda h: _check(h, "dense")),
+        (
+            "dense_256",
+            lambda: open_llm(dense, memory_budget_bytes=256 << 20),
+            lambda h: _check(h, "dense window"),
+        ),
+        (
+            "dense_1536",
+            lambda: open_llm(dense, memory_budget_bytes=1536 << 20),
+            lambda h: _check(h, "dense tree"),
+        ),
         ("low_rank", lambda: open_llm(RequestLowRankTTT()), lambda h: _check(h, "request low-rank")),
         ("imported", lambda: open_llm(ImportedLowRank(), memory_budget_bytes=1 << 30), _check_imported),
         ("routed", lambda: open_llm(RoutedLowRankTTT(), seqs=3, tokens=96), _check_routed),
@@ -233,19 +244,30 @@ def main() -> int:
         try:
             cache = handle.runner.kv_cache_config
             before = (cache.num_blocks, tuple(tensor.size for tensor in cache.kv_cache_tensors))
-            results[name] = check(handle)
+            forms: set[tuple[str, int]] = set()
+            execute = AdditiveUpdate.__call__
+
+            def record(update, inputs):
+                forms.add((update.plan.implementation.form.value, update.plan.window))
+                return execute(update, inputs)
+
+            with patch.object(AdditiveUpdate, "__call__", record):
+                results[name] = check(handle)
+            if name == "dense_1536" and not any(form == "hillis_steele" for form, _ in forms):
+                raise RuntimeError("large-budget dense overlay did not exercise a tree window")
             after = (cache.num_blocks, tuple(tensor.size for tensor in cache.kv_cache_tensors))
             if before != after:
                 raise RuntimeError("overlay execution changed the vLLM KV allocation")
             if name == "dense_strict":
                 dense_cache = before
-            if name == "dense" and before != dense_cache:
+            if name.startswith("dense_") and before != dense_cache:
                 raise RuntimeError("additive scan changed vLLM KV-cache capacity")
-            if name in ("dense", "dense_strict"):
+            if name.startswith("dense_"):
                 print(
                     json.dumps(
                         {
                             "scenario": name,
+                            "scan_forms": sorted(forms),
                             "kv_blocks": before[0],
                             "kv_bytes": sum(before[1]),
                             "task_workspace": [

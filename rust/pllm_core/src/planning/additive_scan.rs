@@ -1,4 +1,4 @@
-//! Prove an identity-carry matrix update and derive its ordered, windowed kernel.
+//! Prove an identity-carry update and its ordered or tree prefix windows.
 //! Region selection replays this rule from the source imports before admission.
 
 use std::collections::BTreeMap;
@@ -11,7 +11,16 @@ use super::tensor_access::{Access, AccessGraph};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Evidence { pub window: u64, pub workspace: u64 }
+pub(super) struct Evidence {
+    pub window: u64,
+    pub workspace: u64,
+    pub form: Form,
+    pub offsets: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum Form { Ordered, HillisSteele }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -20,6 +29,9 @@ pub(super) struct Plan {
     pub implementation: TensorImport,
     pub scale: f64,
     pub window: u64,
+    pub capacity: u64,
+    pub chunk: u64,
+    pub offsets: Vec<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -116,6 +128,34 @@ fn times(a: u64, b: u64) -> Result<u64, String> {
     a.checked_mul(b).ok_or("additive scan allocation overflows".into())
 }
 
+fn validate_prefix(evidence: &Evidence) -> Result<(), String> {
+    let width = evidence.window;
+    if width == 0 || width > 64 || !width.is_power_of_two() {
+        return Err("additive scan window must be a power of two between 1 and 64".into());
+    }
+    let expected: Vec<_> = match evidence.form {
+        Form::Ordered => vec![],
+        Form::HillisSteele => (0..width.trailing_zeros()).map(|level| 1_u64 << level).collect(),
+    };
+    if evidence.offsets != expected { return Err("prefix stages must cover each preceding increment once".into()); }
+    if evidence.form == Form::Ordered { return Ok(()); }
+    // After each stage, lane i owns the interval [starts[i], i]. Adjacent
+    // intervals compose in order, with neither duplication nor omission.
+    // Masked lanes are additive identities; outputs use the preceding prefix
+    // and the final carry uses the last active lane, including the C=0 identity.
+    let mut starts: Vec<_> = (0..width).collect();
+    for &offset in &evidence.offsets {
+        let mut next = starts.clone();
+        for i in offset..width {
+            if starts[i as usize] != i - offset + 1 { return Err("prefix intervals overlap or have a gap".into()); }
+            next[i as usize] = starts[(i - offset) as usize];
+        }
+        starts = next;
+    }
+    if starts.iter().any(|&start| start != 0) { return Err("prefix does not reach the first increment".into()); }
+    Ok(())
+}
+
 pub(super) fn derive(program: &Program, imports: &[TensorImport], evidence: &Evidence) -> Result<Option<Plan>, String> {
     let block = &program.entry.block;
     let Some(carry) = block.arguments.first() else { return Ok(None); };
@@ -123,7 +163,7 @@ pub(super) fn derive(program: &Program, imports: &[TensorImport], evidence: &Evi
     if shape.len() != 2 || !device.starts_with("cuda") || !matches!(dtype.as_str(), "torch.float32" | "torch.bfloat16")
         || shape.contains(&0) { return Ok(None); }
     region_program::verify(program)?;
-    if evidence.window < 2 || evidence.window > 64 { return Err("additive scan window must be between 2 and 64".into()); }
+    validate_prefix(evidence)?;
     for function in &program.functions {
         imports.iter().find(|i| i.name() == function.name).ok_or("missing additive source import")?.validate(function)?;
     }
@@ -137,28 +177,31 @@ pub(super) fn derive(program: &Program, imports: &[TensorImport], evidence: &Evi
     if sx.len() != 2 || sy != &vec![sx[0], shape[0]] || sx[1] != shape[1] || sx[0] == 0
         || xs != count || ys != count || dx != dtype || dy != dtype || vx != device || vy != device { return Ok(None); }
     let capacity = count.maximum(program);
-    if capacity < evidence.window { return Ok(None); }
+    // A padded window may reach the next power of two, without rounding a
+    // potentially unbounded declared capacity into an overflowing integer.
+    if capacity <= evidence.window / 2 { return Ok(None); }
     let window = evidence.window;
     let carry_bytes = tensor_bytes(&block.arguments[0].type_)?;
     let packed_inputs = times(window, total(&[tensor_bytes(x)?, tensor_bytes(y)?])?)?;
     // Outputs are independent bank leaves. Raw batched outputs live until each
     // leaf is copied; the frame separately charges the returned leaves.
     let packed_outputs = times(window, tensor_bytes(y)?)?;
-    let scratch = total(&[packed_inputs, times(2 * window + 2, carry_bytes)?, packed_outputs, evidence.workspace])?;
+    let scratch = total(&[packed_inputs, times(2 * window + 2, carry_bytes)?, packed_outputs, evidence.workspace, 512])?;
     let function = Function {
-        name: digest(&canonical_ascii_json(&("ordered-additive-scan@1", program, imports, evidence))?),
+        name: digest(&canonical_ascii_json(&("additive-prefix@2", program, imports, evidence))?),
         inputs: block.arguments.iter().map(|v| v.type_.clone()).collect(),
         outputs: outputs.iter().map(|v| v.type_.clone()).collect(), resources: vec![], accesses: vec![],
     };
-    let implementation = TensorImport::OrderedScan {
+    let implementation = TensorImport::AdditiveScan {
         declaration: function.clone(), device: device.clone(),
-        allocations: vec![KernelAllocation { name: "ordered-window".into(), device: device.clone(), bytes: scratch }],
+        allocations: vec![KernelAllocation { name: "prefix-window".into(), device: device.clone(), bytes: scratch }],
+        form: evidence.form.clone(),
     };
     let mut result = program.clone();
     result.entry.block.operations = vec![Operation::Call { inputs: inputs.clone(), outputs: outputs.clone(), function: function.name.clone() }];
     result.functions.push(function);
     region_program::verify(&result)?;
-    Ok(Some(Plan { program: result, implementation, scale, window }))
+    Ok(Some(Plan { program: result, implementation, scale, window, capacity, chunk: sx[0], offsets: evidence.offsets.clone() }))
 }
 
 #[pyfunction]

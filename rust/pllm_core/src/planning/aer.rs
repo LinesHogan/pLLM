@@ -142,7 +142,7 @@ fn call_memory(import: &TensorImport, program: &Program) -> Result<CallMemory, S
     let mut devices = BTreeMap::<String, CallDeviceMemory>::new();
     match import {
         TensorImport::Borrowed { .. } => Ok(CallMemory { devices, unknown: false }),
-        TensorImport::OrderedScan { allocations, device, .. } => {
+        TensorImport::AdditiveScan { allocations, device, .. } => {
             let mut scratch_bytes = 0;
             for allocation in allocations { add(&mut scratch_bytes, allocation.bytes)?; }
             devices.insert(device.clone(), CallDeviceMemory { scratch_bytes, ..Default::default() });
