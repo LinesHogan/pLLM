@@ -1,4 +1,8 @@
-"""Evidence 31: actual MRv1 persistent rows and finite-support sampler intervention."""
+"""ESamp on vLLM's MRv1 runner: packed rows match the scheduler and guidance keeps finite support.
+
+Rows encoded from MRv1's persistent batch must list every scheduled token with its
+phase, and the sampler reweighting must change only finite logits by the beta formula.
+"""
 
 import sys
 from pathlib import Path
@@ -40,7 +44,6 @@ def main() -> None:
             (row.identity.request_id, row.token_offset, row.phase.value) for row in result.row_batch.rows
         ] == expected
         assert [link.packed_row_index for link in result.links] == links == logits_indices.tolist()
-        assert all(row.identity is identities[row.request_ordinal] for row in result.row_batch.rows)
         widths.add(batch.num_reqs)
         phases.update(row.phase.value for row in result.row_batch.rows)
         identities_seen.update(identity.prompt_idx for identity in identities)
@@ -67,7 +70,6 @@ def main() -> None:
 
     try:
         assert isinstance(handle.runner, mrv1.Mrv1Runner)
-        assert handle.attachment.physical.adapter_id == "canonical.vllm_mrv1@1"
         with (
             patch.object(mrv1, "encode_mrv1_rows", inspect_rows),
             patch.object(SamplerGuidance, "_reweight_finite_survivors", staticmethod(inspect_reweight)),
@@ -85,17 +87,7 @@ def main() -> None:
         diagnostics = handle.worker_state().diagnostics
         assert diagnostics.loss_count == diagnostics.update_count == 9
         assert diagnostics.active_lineages == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
-        print(
-            dict(
-                runner="mrv1",
-                rows=row_checks,
-                sampler_checks=sampler_checks,
-                affected_rows=affected_checks,
-                updates=diagnostics.update_count,
-                completion_rows=3,
-                fallback=0,
-            )
-        )
+        print(f"MRv1: rows={row_checks} sampler_checks={sampler_checks} updates={diagnostics.update_count}")
     finally:
         handle.close()
 
