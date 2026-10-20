@@ -47,6 +47,7 @@ from pllm.authoring import (
 )
 from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.hidden_capture import HiddenTaps
+from pllm.backends.vllm.model_scan import VllmModelScan
 from pllm.backends.vllm.packed_rows import encode_mrv2_rows
 from pllm.backends.vllm.parameter_overlay import (
     VllmParameterOverlay,
@@ -65,6 +66,7 @@ from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
     AttachmentHiddenResource,
+    AttachmentKind,
     AttachmentTopology,
     BackendPlacementProbe,
     CausalModelDomain,
@@ -304,13 +306,25 @@ class VllmSession(Generic[DataT, ResultT]):
             raise ValueError("hidden inputs require taps installed when the model was loaded")
         self._taps = taps
         overlay_bindings = attachment.inputs.request.overlay_bindings
+        model_scan = attachment.inputs.request.attachment_kind is AttachmentKind.MODEL_SCAN
         self._overlay_import = bool(overlay_bindings) and (
             plan.semantic_graph.tasks[attachment.inputs.request.task_bindings[0].task_id].timing.after
             == "request.prepare"
         )
         self._overlay = (
             VllmParameterOverlay(model, overlay_bindings, capture=not self._overlay_import)
-            if overlay_bindings
+            if overlay_bindings and not model_scan
+            else None
+        )
+        self._model_scan = (
+            VllmModelScan(
+                model,
+                deployment.execution,
+                attachment.inputs.request.task_bindings[0].anchor_id,
+                overlay_bindings[0].scale,
+                attachment.inputs.request.model_scan_chunk_size,
+            )
+            if model_scan
             else None
         )
         tasks = tuple(task for task in attachment.inputs.plan.semantic_graph.tasks if task.replay is not None)
@@ -505,11 +519,11 @@ class VllmSession(Generic[DataT, ResultT]):
         self._require_input_live()
         if self._step is not None:
             raise RuntimeError("prior vLLM workload step is still active")
-        if self._decode_injection and (
+        if (self._decode_injection or self._model_scan is not None) and (
             scheduler_output.preempted_req_ids or scheduler_output.scheduled_cached_reqs.resumed_req_ids
         ):
             self._input_failed = True
-            raise RuntimeError("per-decode activation injection and vLLM preemption cannot be enabled together")
+            raise RuntimeError("activation injection and ModelScan need requests without vLLM preemption")
         execution = self._deployment.execution
         execution.arena.collect_completed()
         finished = tuple(
@@ -561,6 +575,15 @@ class VllmSession(Generic[DataT, ResultT]):
         self._next_step_id += 1
         step = _PackedStep[DataT](rows)
         self._step = step
+        if self._model_scan is not None:
+            execution = self._deployment.execution
+            invocation = execution.start_step(
+                TensorStepInput(rows.row_batch, rows), torch.cuda.current_stream(execution.device)
+            )
+            step.invocation = invocation
+            self._advance(invocation, "request.prepare")
+            self._model_scan.prepare(rows.row_batch, invocation)
+            return
         if isinstance(self._replay, VllmTokenwiseReplay) and self._activation is None:
             execution = self._deployment.execution
             invocation = execution.start_step(
@@ -645,17 +668,17 @@ class VllmSession(Generic[DataT, ResultT]):
 
     def _finish_effects(self) -> None:
         """End-of-forward lifecycle for every active optional primitive."""
-        for effect in (self._overlay, self._activation, self._replay):
+        for effect in (self._overlay, self._activation, self._replay, self._model_scan):
             if effect is not None:
                 effect.clear()
 
     def _abort_effects(self) -> None:
-        for effect in (self._overlay, self._activation):
+        for effect in (self._overlay, self._activation, self._model_scan):
             if effect is not None:
                 effect.clear()
 
     def _close_effects(self) -> None:
-        for effect in (self._overlay, self._activation, self._replay):
+        for effect in (self._overlay, self._activation, self._replay, self._model_scan):
             if effect is not None:
                 effect.close()
 
@@ -1825,7 +1848,7 @@ def probe_backend(
     )
     targets = inspect_parameter_targets(model, requirements.parameter_targets, runner.dtype)
     replay_capabilities = (
-        ("model/layer_replay@1", "model/tokenwise_replay@1", REGION_STREAMS_CAPABILITY)
+        ("model/chunk_scan@1", "model/layer_replay@1", "model/tokenwise_replay@1", REGION_STREAMS_CAPABILITY)
         if runner.runner_kind is RunnerKind.MRV2
         else ()
     )
@@ -1920,13 +1943,18 @@ def probe_backend(
     # may still read from the step before, because the host prepares a step while the GPU runs the last.
     # Each lagged step additionally retains its exact input root for readers. No host wait
     # is hidden in this capacity: current + private + GPU reader + publish_lag retained roots.
+    capacity = (3 + publish_lag) * runner.max_num_reqs + 2
+    if chunk := requirements.prefill_chunk_size:
+        # Every chunk may be queued before the GPU releases its first version.
+        roots = (probe.max_packed_rows + chunk - 1) // chunk + 2
+        capacity = max(capacity, roots * runner.max_num_reqs)
     return BackendCompileFacts(
         probe,
         timeline,
         (
             PageBundleProviderFacts(
                 "canonical.page_bundle_cuda@1",
-                (3 + publish_lag) * runner.max_num_reqs + 2,
+                capacity,
                 probe.device_kind,
                 probe.device_ordinal,
             ),

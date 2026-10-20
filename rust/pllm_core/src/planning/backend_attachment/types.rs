@@ -6,7 +6,7 @@ use super::super::state_representation::StateDeviceKind;
 use super::super::tensor_layout::TensorDType;
 use super::super::PlanBundle;
 
-pub(crate) const SCHEMA_VERSION: u64 = 8;
+pub(crate) const SCHEMA_VERSION: u64 = 9;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -20,6 +20,7 @@ pub(crate) enum AttachmentTopology {
 pub(crate) enum AttachmentKind {
     Observation,
     ModelReplay,
+    ModelScan,
     RequestTraining,
     ParameterOverlay,
     ActivationPatch,
@@ -251,6 +252,7 @@ pub(crate) struct BackendAttachmentRequest {
     pub(crate) state_resource: String,
     pub(crate) overlay_bindings: Vec<OverlayBinding>,
     pub(crate) activation_bindings: Vec<ActivationPatchBinding>,
+    pub(crate) model_scan_chunk_size: u64,
     pub(crate) schema_version: u64,
 }
 

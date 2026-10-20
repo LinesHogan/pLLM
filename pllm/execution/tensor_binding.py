@@ -14,27 +14,38 @@ from pllm.contracts.backend_attachment import (
     ActivationPatchBinding,
     ActivationPatchOperator,
     AttachmentKind,
+    AttachmentTaskRole,
+    BackendAttachmentSpec,
     BackendPlacementProbe,
     DecodeRefresh,
     DecodeWindow,
     MissingPolicy,
 )
+from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
-from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding, ParameterOverlayOperator, ParameterTarget
+from pllm.contracts.parameter_overlay import (
+    ModelScan,
+    ParameterOverlayFieldBinding,
+    ParameterOverlayOperator,
+    ParameterTarget,
+)
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
 from pllm.contracts.semantic_graph import (
+    AnchorSymbol,
     ConditionalLayerReplay,
     HiddenInputSource,
     HostPayloadSchemaId,
+    ImplementationId,
     MathContract,
     PackedSamplerRowsInputSource,
     SemanticEffect,
     SemanticInput,
     SemanticInputSource,
     SemanticOutputKind,
+    SemanticTask,
     StateEffectKind,
     StateScope,
     StateSelectionInputSource,
@@ -44,12 +55,15 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 from pllm.execution.declaration import Builder, Call, Dimensions, Field, Shape, State, When, native
+from pllm.execution.execution import TaskGraphImplementation
+from pllm.execution.model_scan import ChunkTraining, ModelScanTask
 from pllm.execution.ptts.page_borrow import borrowed_root
 from pllm.execution.ptts.page_bundle import PagePublication
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION, Recurrence
 from pllm.execution.scan import ScanContext
 from pllm.execution.shared_tensor import tensor_dtype
+from pllm.execution.state_execution import StateTaskContext
 from pllm.execution.step_capture import StepCapture, reads_rows
 from pllm.execution.tensor_frame import (
     OverlayEntry,
@@ -74,6 +88,7 @@ from pllm.execution.tensor_program import (
     InvocationOutput,
     Observation,
     PoolAdamW,
+    PoolSGD,
     TaskOutput,
     TensorBatch,
 )
@@ -312,6 +327,90 @@ class TensorBinding(Builder[TensorFrame]):
         self.sample_limit: int | None = None
         self.overlay_targets: tuple[ParameterTarget, ...] = ()
         self.overlay_import = False
+        self.model_scan: tuple[ModelScan, ChunkTraining] | None = None
+
+    def scan_model(
+        self,
+        name: str,
+        scan: ModelScan,
+        buffers: Mapping[str, Buffer],
+        namespace: str,
+        initialize: Callable[[Mapping[str, torch.Tensor], torch.Generator], None],
+        loss: TensorMath,
+        optimizer: AdamWConfig | SGD,
+    ) -> None:
+        """Declare one request-owned scan and its projection consumer."""
+        effect = scan.apply
+        _check_overlay_fields(buffers, effect.factors, effect.targets, effect.operator, effect.scale)
+        if self.graph.tasks or self.graph.states or self.host:
+            raise ValueError("ModelScan needs its own request state and model execution")
+        if self.dimensions is not None:
+            _check_overlay_shapes(buffers, effect.factors, self.dimensions, effect.operator)
+        self.overlay_targets = effect.targets
+        state = self.state(
+            effect.state,
+            tuple(_buffer_field(key, buffer, lambda model: model.target_shapes[0]) for key, buffer in buffers.items()),
+            namespace=namespace,
+            scope=StateScope.REQUEST,
+            keys=(RequestKeyField.REQUEST_ID,),
+            optimizer=optimizer if isinstance(optimizer, AdamWConfig) else None,
+        )
+        stride = 5 if state.optimizer is not None else 1
+        parameters = tuple(range(0, len(state.fields), stride))
+
+        def init(root: tuple[torch.Tensor, ...], generator: torch.Generator) -> None:
+            initialize(dict(zip(buffers, (root[i] for i in parameters), strict=True)), generator)
+
+        self.initializers[effect.state] = init
+        forward = self.compute(
+            name,
+            inputs={"rows": self.rows()},
+            changes=state,
+            when=When.MODEL_UPDATE,
+            implementations=(native("model.chunk_scan@1", "model/chunk_scan@1"),),
+        )
+        self.model_scan = (
+            scan,
+            ChunkTraining(
+                loss,
+                tuple(buffers),
+                parameters,
+                PoolAdamW(optimizer, len(buffers))
+                if isinstance(optimizer, AdamWConfig)
+                else PoolSGD(optimizer.lr, len(buffers)),
+            ),
+        )
+        self._attach(
+            BackendAttachmentSpec(
+                AttachmentKind.MODEL_SCAN,
+                ((AttachmentTaskRole.COMPUTE, forward.symbol),),
+                AnchorSymbol("sampler.pre_draw"),
+                state.declaration.resource,
+                (
+                    ParameterOverlayFieldBinding(
+                        effect.targets[0],
+                        effect.operator,
+                        tuple(LayoutFieldId(i) for i in parameters),
+                        effect.scale,
+                    ),
+                ),
+                model_scan_chunk_size=scan.chunk_size,
+            )
+        )
+
+    def bind_native(
+        self,
+        task: SemanticTask,
+        identity: ImplementationId,
+        plan: PlanBundle | None,
+        probe: BackendPlacementProbe | None,
+    ) -> TaskGraphImplementation[StateTaskContext[TensorFrame]] | None:
+        """Bind the model region using the same signed declaration as its backend."""
+        if self.model_scan is None:
+            return None
+        assert plan is not None and probe is not None
+        scan, training = self.model_scan
+        return ModelScanTask[TensorFrame].bind(task, identity, plan, probe, scan.chunk_size, training)
 
     def configure_scans(self, facts: BackendCompileFacts) -> None:
         """Bind scan specialization to the plan's policy and row capacity."""
@@ -753,6 +852,7 @@ class TensorBinding(Builder[TensorFrame]):
             raise ValueError("weighted training requires one model training sink and positive steps")
         self.weighted_training = True
         fields = tuple(field.name for field in state.fields)
+        application = PoolSGD(optimizer.lr, len(fields))
         dimensions = self.dimensions
         prepare_function: Callable[[TensorFrame, TensorBatch], TaskOutput] | None = None
         if dimensions is not None:
@@ -872,9 +972,7 @@ class TensorBinding(Builder[TensorFrame]):
                         if losses.requires_grad
                         else tuple(torch.zeros_like(parameter) for parameter in parameters.values())
                     )
-                    with torch.no_grad():
-                        for parameter, gradient in zip(parameters.values(), gradients, strict=True):
-                            parameter.add_(gradient, alpha=-optimizer.lr)
+                    application.update((tuple(parameters.values()),), batch.field_slots, gradients)
                     return losses.detach(), gradients
 
                 losses, gradients = step()
@@ -1222,7 +1320,7 @@ class TensorBinding(Builder[TensorFrame]):
             raise ValueError("tensor execution requires specialized model dimensions")
         if (
             self.attachment is not None
-            and self.attachment.kind is AttachmentKind.MODEL_REPLAY
+            and self.attachment.kind in (AttachmentKind.MODEL_REPLAY, AttachmentKind.MODEL_SCAN)
             and not self.attachment.activation_bindings
         ):
 

@@ -150,10 +150,13 @@ class BackendRequirements:
     sampler_stage: SamplerStage | None = None
     sampler_feedback: bool = False
     resident_bytes: int = 0
+    prefill_chunk_size: int = 0
 
     def __post_init__(self) -> None:
         if self.resident_bytes < 0:
             raise ValueError("frozen dependency residency must be nonnegative")
+        if self.prefill_chunk_size < 0:
+            raise ValueError("prefill chunk size must be nonnegative")
 
 
 @dataclass(frozen=True, slots=True)

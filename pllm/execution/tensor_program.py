@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, replace
 from typing import Generic, Literal, Protocol, TypeVar
 
 import torch
+from torch.optim.sgd import sgd
 
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.request_identity import RequestIdentity
@@ -224,6 +225,32 @@ class Optimizer(Protocol):
     def update(
         self, roots: Sequence[tuple[torch.Tensor, ...]], slots: FieldSlots, gradients: tuple[torch.Tensor, ...]
     ) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class PoolSGD:
+    """Apply ordinary SGD to private parameter views, shared by batch and region training."""
+
+    lr: float
+    groups: int
+
+    @torch.no_grad()
+    def update(
+        self, roots: Sequence[tuple[torch.Tensor, ...]], slots: FieldSlots, gradients: tuple[torch.Tensor, ...]
+    ) -> None:
+        """Use Torch's optimizer implementation without carrying momentum state."""
+        sgd(
+            [parameter for root in roots for parameter in root],
+            list(gradients),
+            [],
+            weight_decay=0,
+            momentum=0,
+            lr=self.lr,
+            dampening=0,
+            nesterov=False,
+            maximize=False,
+            foreach=False,
+        )
 
 
 @dataclass(frozen=True, slots=True)

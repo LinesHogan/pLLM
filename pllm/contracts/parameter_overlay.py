@@ -1,4 +1,4 @@
-"""Closed logical bindings for immutable parameter-overlay publications."""
+"""Parameter effects and model advancement declarations shared by authoring and backends."""
 
 from __future__ import annotations
 
@@ -57,7 +57,58 @@ class CapturedParameterOperand:
     base_weight: torch.Tensor
 
 
+@dataclass(frozen=True)
+class Exact:
+    """Each prefill chunk reads the preceding chunk's committed adapter."""
+
+
+class KVPolicy(StrEnum):
+    """Which parameter history the model's cached keys and values represent."""
+
+    CAUSAL_HISTORY = "causal_history"
+
+
+@dataclass(frozen=True)
+class ParameterEffect:
+    """Apply request state at original model projections."""
+
+    state: str
+    targets: tuple[ParameterTarget, ...]
+    weight: str = "value"
+    operator: ParameterOverlayOperator = ParameterOverlayOperator.DENSE_ADD
+    factors: tuple[str, str] = ("a", "b")
+    scale: float = 1.0
+
+    @property
+    def applied_fields(self) -> tuple[str, ...]:
+        """The fields consumed by the declared projection operator."""
+        return (self.weight,) if self.operator is ParameterOverlayOperator.DENSE_ADD else self.factors
+
+
+@dataclass(frozen=True)
+class ModelScan:
+    """Learn once per nonempty prefill chunk, including its tail; freeze for decode."""
+
+    chunk_size: int
+    apply: ParameterEffect
+    learn: str
+    algorithm: Exact = Exact()
+    kv: KVPolicy = KVPolicy.CAUSAL_HISTORY
+
+    def __post_init__(self) -> None:
+        if type(self.chunk_size) is not int or self.chunk_size < 1:
+            raise ValueError("ModelScan needs a positive chunk size")
+        if not self.learn:
+            raise ValueError("ModelScan needs a training method")
+        if type(self.algorithm) is not Exact or self.kv is not KVPolicy.CAUSAL_HISTORY:
+            raise ValueError("ModelScan currently supports Exact with CAUSAL_HISTORY")
+
+
 __all__ = [
+    "ModelScan",
+    "ParameterEffect",
+    "Exact",
+    "KVPolicy",
     "ParameterModuleKind",
     "ParameterOverlayFieldBinding",
     "ParameterOverlayOperator",

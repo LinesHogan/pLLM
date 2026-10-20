@@ -182,9 +182,13 @@ class ExecutionTrace:
             raise ValueError("trace capacity must be positive")
         self.plan = plan
         self._execution_id = uuid4().hex
-        self._events: deque[tuple[TraceEvent, tuple[torch.cuda.Event, torch.cuda.Event] | None]] = deque(
-            maxlen=capacity
-        )
+        self._events: deque[
+            tuple[
+                TraceEvent,
+                tuple[torch.cuda.Event, torch.cuda.Event] | None,
+                tuple[torch.Tensor, torch.cuda.Event | None] | None,
+            ]
+        ] = deque(maxlen=capacity)
         self._timed_tasks: frozenset[TaskId] = frozenset()
         self._selection: TraceSelection = TraceSelection()
         self._kernel_calls: int = 0
@@ -379,7 +383,8 @@ class ExecutionTrace:
         kernel_name: str | None = None,
         device_duration_ns: int | None = None,
     ) -> None:
-        dtype, shape, data = None, (), None
+        dtype, shape = None, ()
+        payload = None
         if tensor is not None:
             if (
                 phase not in (TracePhase.TENSOR, TracePhase.GRADIENT)
@@ -391,9 +396,13 @@ class ExecutionTrace:
                 raise ValueError("tensor trace requires an original task and a bounded explicit snapshot")
             dtype = TensorDType(str(tensor.dtype).removeprefix("torch."))
             shape = tuple(tensor.shape)
-            # Explicit diagnostics may synchronize; metadata-only snapshots never do.
-            raw = tensor.detach().to(device="cpu").contiguous().reshape(-1).view(torch.uint8)
-            data = b64encode(raw.numpy().tobytes()).decode("ascii")
+            # Own a bounded host copy; only an explicit snapshot may wait for it.
+            host = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=tensor.is_cuda)
+            host.copy_(tensor.detach(), non_blocking=True)
+            ready = torch.cuda.Event() if tensor.is_cuda else None
+            if ready is not None:
+                ready.record(torch.cuda.current_stream(tensor.device))
+            payload = host, ready
         with self._lock:
             if len(self._events) == self._events.maxlen:
                 self._dropped += 1
@@ -418,13 +427,13 @@ class ExecutionTrace:
                         tensor_name=tensor_name,
                         tensor_dtype=dtype,
                         tensor_shape=shape,
-                        tensor_data=data,
                         step_id=step_id,
                         source_shape=source_shape,
                         kernel_name=kernel_name,
                         device_duration_ns=device_duration_ns,
                     ),
                     timing,
+                    payload,
                 )
             )
 
@@ -432,7 +441,13 @@ class ExecutionTrace:
         with self._lock:
             events: list[TraceEvent] = []
             pending = 0
-            for event, timing in self._events:
+            for event, timing, payload in self._events:
+                if payload is not None:
+                    host, ready = payload
+                    if ready is not None and not ready.query():
+                        ready.synchronize()
+                    data = b64encode(host.reshape(-1).view(torch.uint8).numpy().tobytes()).decode("ascii")
+                    event = replace(event, tensor_data=data)
                 if timing is not None:
                     if timing[1].query():
                         event = replace(event, device_duration_ns=round(timing[0].elapsed_time(timing[1]) * 1_000_000))

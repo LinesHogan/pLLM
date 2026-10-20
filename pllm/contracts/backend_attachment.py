@@ -34,6 +34,7 @@ class AttachmentTopology(StrEnum):
 class AttachmentKind(StrEnum):
     OBSERVATION = "observation"
     MODEL_REPLAY = "model_replay"
+    MODEL_SCAN = "model_scan"
     REQUEST_TRAINING = "request_training"
     PARAMETER_OVERLAY = "parameter_overlay"
     ACTIVATION_PATCH = "activation_patch"
@@ -161,6 +162,7 @@ class BackendAttachmentSpec:
     overlay_bindings: tuple[ParameterOverlayFieldBinding, ...] = ()
     activation_bindings: tuple[ActivationPatchBinding, ...] = ()
     sampler_stage: SamplerStage = SamplerStage.PACKED_POST_FILTER_EXACT
+    model_scan_chunk_size: int = 0
 
     @property
     def guides_sampler(self) -> bool:
@@ -181,7 +183,8 @@ class BackendAttachmentRequest:
     state_resource: str
     overlay_bindings: tuple[ParameterOverlayFieldBinding, ...] = ()
     activation_bindings: tuple[ActivationPatchBinding, ...] = ()
-    schema_version: int = 8
+    model_scan_chunk_size: int = 0
+    schema_version: int = 9
 
     @property
     def guides_sampler(self) -> bool:
@@ -203,7 +206,7 @@ class BackendAttachmentCompilerInputs:
 class BackendAttachmentDecision:
     request_digest: str
     signature: str
-    schema_version: int = 8
+    schema_version: int = 9
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,7 +221,7 @@ class BackendAttachmentPhysicalPlan:
     topology: AttachmentTopology
     graph_mode: AttachmentGraphMode
     bundle_signature: str
-    schema_version: int = 8
+    schema_version: int = 9
 
 
 @dataclass(frozen=True, slots=True)

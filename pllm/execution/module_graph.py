@@ -447,6 +447,14 @@ class _ModuleCalls(torch.fx.Tracer):
         return bool(module_qualified_name)
 
 
+def capture_module_calls(module: torch.nn.Module, *, none_inputs: tuple[str, ...] = ()) -> torch.fx.GraphModule:
+    """Capture original child calls, retaining explicit None specializations."""
+    for child in module.modules():
+        ModuleCallBinding.bind(child)
+    graph = _ModuleCalls().trace(module, concrete_args={name: None for name in none_inputs} or None)
+    return torch.fx.GraphModule(module, graph)
+
+
 @dataclass(frozen=True, slots=True)
 class ModuleGraphPartition:
     prefix: torch.fx.GraphModule
@@ -478,9 +486,7 @@ def capture_module_partition(
     """
     if not stateful or set(stateful) & set(readonly):
         raise ValueError("module partition requires disjoint resource contracts")
-    for child in module.modules():
-        ModuleCallBinding.bind(child)
-    graph = _ModuleCalls().trace(module, concrete_args={name: None for name in none_inputs} or None)
+    graph = capture_module_calls(module, none_inputs=none_inputs).graph
     nodes = tuple(graph.nodes)
     cuts: list[int] = []
     for index, node in enumerate(nodes):

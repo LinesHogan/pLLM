@@ -289,6 +289,7 @@ def bind_backend_attachment(
         state_resource=spec.state_resource,
         overlay_bindings=spec.overlay_bindings,
         activation_bindings=spec.activation_bindings,
+        model_scan_chunk_size=spec.model_scan_chunk_size,
     )
     inputs = BackendAttachmentCompilerInputs(request, probe, plan)
     decision = compile_backend_attachment(inputs)

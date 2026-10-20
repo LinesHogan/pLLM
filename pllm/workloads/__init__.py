@@ -10,6 +10,7 @@ from pllm.workloads.gtta import GTTAConfig as GTTAConfig, GTTAWorkload as GTTAWo
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig as InPlaceTTTConfig, InPlaceTTTWorkload as InPlaceTTTWorkload
 from pllm.workloads.lora import OutputLoRAConfig as OutputLoRAConfig, OutputLoRAWorkload as OutputLoRAWorkload
 from pllm.workloads.override import OverRIDEConfig as OverRIDEConfig, OverRIDEWorkload as OverRIDEWorkload
+from pllm.workloads.prefill_adapters import PrefillAdapters as PrefillAdapters
 from pllm.workloads.recirculation import (
     RecirculationConfig as RecirculationConfig,
     RecirculationWorkload as RecirculationWorkload,

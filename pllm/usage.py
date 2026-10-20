@@ -25,7 +25,16 @@ from pllm.contracts.backend_attachment import (
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.packed_rows import PackedPhaseRow
-from pllm.contracts.parameter_overlay import ParameterOverlayOperator, ParameterTarget
+from pllm.contracts.parameter_overlay import (
+    Exact as Exact,
+    KVPolicy as KVPolicy,
+    ModelScan as ModelScan,
+    ParameterEffect as ParameterEffect,
+    ParameterModuleKind,
+    ParameterOverlayOperator,
+    ParameterRole,
+    ParameterTarget,
+)
 from pllm.contracts.request_identity import RequestKeyField, canonical_request_key_fields
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
@@ -59,6 +68,7 @@ from pllm.execution.host_runtime import (
     HostWorkload,
     TensorHostBinding,
 )
+from pllm.execution.model_scan import model_scan_workspace
 from pllm.execution.replay import Recurrence as Recurrence
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.task_memory import derive_resources
@@ -355,16 +365,9 @@ class Activation:
 
 
 @dataclass(frozen=True)
-class Overlay:
+class Overlay(ParameterEffect):
     """Externally produced parameter overlay: field values arrive as a StateTensorUpdate,
     are imported into private roots and published before the model runs."""
-
-    state: str
-    targets: tuple[ParameterTarget, ...]
-    weight: str = "value"
-    operator: ParameterOverlayOperator = ParameterOverlayOperator.DENSE_ADD
-    factors: tuple[str, str] = ("a", "b")
-    scale: float = 1.0
 
     def declare(self, context: _Declaration) -> None:
         """Import externally produced overlay buffers into private roots."""
@@ -373,7 +376,7 @@ class Overlay:
             self.state,
             _buffers(definition),
             targets=self.targets,
-            applied=(self.weight,) if self.operator is ParameterOverlayOperator.DENSE_ADD else self.factors,
+            applied=self.applied_fields,
             operator=self.operator,
             scale=self.scale,
             namespace=definition.namespace,
@@ -616,7 +619,10 @@ class _Overlay(_Effect):
             _setting(self.operator, context.owner, ParameterOverlayOperator),
             _setting(self.scale, context.owner, float),
         )
-        applied, replay = self.applied(context.owner, operator), Config.resolve(self.replay, context.owner)
+        effect = ParameterEffect(
+            self.state, targets, self.weight, operator, _setting(self.factors, context.owner, tuple), scale
+        )
+        applied, replay = effect.applied_fields, Config.resolve(self.replay, context.owner)
         if replay is not None and not isinstance(replay, ConditionalLayerReplay):
             raise TypeError("overlay replay requires a conditional layer replay")
         identity = fingerprint(operation.function)
@@ -640,14 +646,6 @@ class _Overlay(_Effect):
             function=_invoke(freeze(operation.function), bindings),
         )
         context.definitions.append((operation.name, boundary_digest(identity, bindings, operator, scale, applied)))
-
-    def applied(self, owner: object, operator: ParameterOverlayOperator) -> tuple[str, ...]:
-        """Resolve the field names applied to each overlay target."""
-        if operator is ParameterOverlayOperator.DENSE_ADD:
-            return (self.weight,)
-        factors = _setting(self.factors, owner, tuple)
-        _reject(len(factors) != 2, "low-rank overlays require two factor field names", TypeError)
-        return factors
 
 
 def overlay(
@@ -916,7 +914,7 @@ def _property(member: object) -> Callable[..., object] | None:
         if isinstance(member, property)
         and member.fget is not None
         and signature(member.fget, eval_str=False).return_annotation
-        in (InstanceState, RequestState, Activation, Overlay, Recurrence)
+        in (InstanceState, RequestState, Activation, Overlay, Recurrence, ModelScan)
         else None
     )
 
@@ -950,6 +948,8 @@ class _Declaration:
     parameters: dict[tuple[str, str], SemanticInputSource | TensorPort] = field(default_factory=lambda: {})
     prediction: tuple[Call, _Sampler] | None = None
     training: tuple[Call, State] | None = None
+    model_training: set[str] = field(default_factory=lambda: set[str]())
+    implicit_training: set[str] = field(default_factory=lambda: set[str]())
 
     @classmethod
     def read(cls, workload: Workload, binding: TensorBinding) -> _Declaration:
@@ -976,6 +976,9 @@ class _Declaration:
         for name, member in members.items():
             if _property(member):
                 values[name] = object.__getattribute__(owner, name)
+        for value in values.values():
+            if isinstance(value, ModelScan):
+                context.overlay_states.add(value.apply.state)
         return context
 
     def read_operation(
@@ -993,6 +996,9 @@ class _Declaration:
         seeds.extend(candidates[text] for text in texts if isinstance(text, str) and text in candidates)
         if (overlay := _typed(effect, _Overlay)) is not None:
             self.overlay_states.add(overlay.state)
+        if phase is None and isinstance(effect, _Train):
+            phase = Phase.MODEL_UPDATE
+            self.implicit_training.add(name)
         if phase is not None:
             if (function := _typed(member, FunctionType)) is not None:
                 seeds.append(function)
@@ -1038,12 +1044,87 @@ class _Declaration:
                 state.declare(name, self)
 
         for name, value in self.values.items():
+            if isinstance(value, ModelScan):
+                self.declare_model_scan(name, value)
             if isinstance(value, (Activation, Overlay, Recurrence)):
                 self.definitions.append((name, fingerprint(value)))
                 if isinstance(value, Recurrence):
                     self.binding.recurrence(value)
                 else:
                     value.declare(self)
+
+    def declare_model_scan(self, name: str, scan: ModelScan) -> None:
+        """Bind the training method once, under its model scan's advance owner."""
+        effect = scan.apply
+        definition = self.state_definition(effect.state, "ModelScan needs a declared RequestState")
+        target = ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT)
+        _reject(
+            definition.scope is not StateScope.REQUEST
+            or definition.request_keys != (RequestKeyField.REQUEST_ID,)
+            or effect.targets != (target,)
+            or effect.operator is not ParameterOverlayOperator.LOW_RANK_ADD,
+            "ModelScan currently needs request-local low-rank state on layer 0's down projection",
+        )
+        _reject(
+            definition.optimizer is None
+            or definition.initialize is None
+            or definition.memory
+            or tuple(definition.fields) != effect.factors
+            or definition.alignment != 16,
+            "ModelScan needs two ordered adapter fields, an initializer and an optimizer",
+        )
+        assert definition.optimizer is not None and definition.initialize is not None
+        _reject(
+            set(definition.fields) & {operand.value for operand in Operand},
+            "adapter field names must differ from the input, target and weight operand names",
+        )
+        dimensions = self.binding.dimensions
+        _reject(
+            dimensions is not None and str(definition.dtype) != "torch." + dimensions.dtype.value,
+            "ModelScan state dtype must match the model's projection dtype",
+        )
+        candidates = tuple(operation for operation in self.operations if operation.name == scan.learn)
+        _reject(len(candidates) != 1 or scan.learn in self.model_training, "ModelScan training needs one advance owner")
+        (operation,) = candidates
+        training = operation.effect
+        _reject(
+            not isinstance(training, _Train)
+            or training.state != effect.state
+            or training.steps != 1
+            or training.reset
+            or training.update
+            or training.reduction != "mean"
+            or operation.phase is not Phase.MODEL_UPDATE
+            or operation.rows
+            or operation.gradient is not None,
+            "ModelScan needs @train on its own state, with one local mean loss",
+        )
+        buffers: dict[str, Buffer] = {}
+        for key, value in definition.fields.items():
+            if isinstance(value, Buffer):
+                buffers[key] = value
+            elif callable(value):
+                raise TypeError("ModelScan operand-dependent shapes require Buffer(input_size, output_size)")
+            else:
+                buffers[key] = Buffer(value, definition.dtype)
+        bindings = {
+            key: source.overlay(effect.state, buffers) for key, source in _arguments(operation.function).items()
+        }
+        _reject(
+            set(bindings.values()) != {"input", "target", "weight", *effect.factors},
+            "ModelScan loss must consume input, target, base weight and both adapter factors",
+        )
+        self.definitions.append((name, fingerprint(scan)))
+        self.binding.scan_model(
+            name,
+            scan,
+            buffers,
+            definition.namespace,
+            freeze(definition.initialize),
+            _invoke(freeze(operation.function), bindings),
+            definition.optimizer,
+        )
+        self.model_training.add(scan.learn)
 
     def train(self, call: Call, state: str) -> None:
         _reject(self.training is not None, "tensor sampler attachment requires one training operation")
@@ -1115,7 +1196,16 @@ class Workload(
         context = _Declaration.read(self, b)
         context.declare_values()
         for operation in sorted(context.operations, key=lambda operation: operation.name):
-            operation.effect.declare(operation)
+            if operation.name not in context.model_training:
+                _reject(
+                    b.model_scan is not None,
+                    "ModelScan owns its state and training; remove other scheduled operations",
+                )
+                _reject(
+                    operation.name in context.implicit_training,
+                    "@train without @on must belong to a ModelScan",
+                )
+                operation.effect.declare(operation)
         context.attach_training()
         context.sign_composition()
 
@@ -1187,6 +1277,7 @@ class Workload(
             sampler_feedback=any(
                 isinstance(port.source, SamplerFeedbackInputSource) for task in b.graph.tasks for port in task.inputs
             ),
+            prefill_chunk_size=0 if b.model_scan is None else b.model_scan[0].chunk_size,
         )
 
     def declare(self, facts: BackendCompileFacts) -> tuple[SemanticGraph, TensorLayoutRequest, BackendAttachmentSpec]:
@@ -1255,6 +1346,25 @@ class Workload(
         _reject(options.explicit_math, "this workload has no explicit tensor implementation")
         with FakeTensorMode():
             binding = self.declaration(facts)
+        if binding.model_scan is not None:
+            _reject(options.capture, "ModelScan currently needs eager execution")
+            scan, training = binding.model_scan
+            (layout,) = binding.layouts.layouts
+            (task,) = binding.graph.tasks
+            return replace(
+                facts.timeline,
+                task_resources=(
+                    TaskResourceFact(
+                        task.symbol,
+                        model_scan_workspace(
+                            facts.probe,
+                            scan.chunk_size,
+                            tuple(layout.layout.fields[i].shape for i in training.parameters),
+                        ),
+                        0,
+                    ),
+                ),
+            )
         timeline = derive_resources(binding, facts, options)
         concurrent = sum(producer.memory().workspace for producer in self.producers)
         return (
@@ -1330,6 +1440,10 @@ __all__ = [
     "Activation",
     "Overlay",
     "Recurrence",
+    "ModelScan",
+    "ParameterEffect",
+    "Exact",
+    "KVPolicy",
     "SGD",
     "Batch",
 ]

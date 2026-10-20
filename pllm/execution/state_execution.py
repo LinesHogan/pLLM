@@ -45,6 +45,7 @@ from pllm.execution.replay import LayerReplayPrimitive, TokenwiseReplayPrimitive
 from pllm.execution.trace import ExecutionTrace, TracePhase
 
 if TYPE_CHECKING:
+    from pllm.execution.model_scan import ModelScanPrimitive
     from pllm.execution.tensor_program import TensorBatch
 
 InputT = TypeVar("InputT", contravariant=True)
@@ -93,6 +94,7 @@ class StateTaskContext(Generic[DataT]):
     update_count: int = 0
     trained_rows: int = 0
     replay: LayerReplayPrimitive | TokenwiseReplayPrimitive | None = None
+    model_scan: ModelScanPrimitive | None = None
     updated_refs: Sequence[StateRef] = ()
     replay_started: bool = False
     cancel_requested: Event = field(default_factory=Event)
