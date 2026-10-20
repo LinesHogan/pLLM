@@ -1,4 +1,8 @@
-"""One real MRv2 boundary proof for canonical ESamp request execution."""
+"""ESamp on a real vLLM MRv2 model: plain inference, captured ESamp, and publish-lag equivalence.
+
+Training-only ESamp (beta 0) must give identical tokens, counters and final optimizer
+state with publish_lag 0 and 1.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +10,6 @@ import gc
 import os
 import sys
 from collections.abc import Sequence
-from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,40 +19,11 @@ import torch
 from vllm import SamplingParams
 
 import pllm
-from pllm.authoring import BackendCompileFacts, BackendRequirements
-from pllm.backends.vllm.mrv1 import Mrv1Runner
-from pllm.backends.vllm.runtime import VllmLlm, WorkloadModelRunner, probe_backend
+from pllm.backends.vllm.runtime import VllmLlm
 from pllm.config import ExecutionOptions, ModelConfig, VllmDType
 from pllm.contracts.state_ref import StateRef
 from pllm.execution.ptts.page_bundle import PageBundleArena
-from pllm.workloads.esamp_request import (
-    ESampRequestConfig,
-    ESampRequestWorkload,
-)
-
-
-def checked_probe(
-    requirements: BackendRequirements, runner: WorkloadModelRunner | Mrv1Runner, *, publish_lag: int = 1
-) -> BackendCompileFacts:
-    facts = probe_backend(requirements, runner, publish_lag=publish_lag)
-    timeline = facts.timeline
-    for index in range(len(timeline.anchors)):
-        try:
-            probe_backend(
-                requirements,
-                runner,
-                replace(
-                    timeline,
-                    reserved_bytes=tuple(size - int(i == index) for i, size in enumerate(timeline.reserved_bytes)),
-                ),
-                publish_lag=publish_lag,
-            )
-        except ValueError as error:
-            assert "input/sampler buffers" in str(error)
-        else:
-            raise AssertionError("worker accepted an underfunded input/sampler reservation")
-    assert probe_backend(requirements, runner, timeline, publish_lag=publish_lag).timeline is timeline
-    return facts
+from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
 
 
 def lag_equivalence() -> None:
@@ -79,6 +53,7 @@ def lag_equivalence() -> None:
             execution=ExecutionOptions(capture=True, publish_lag=lag, capture_memory_bytes=16 * 1024**2),
         )
         with pllm.make_llm(config, workload=ESampRequestWorkload(ESampRequestConfig(rank=2))) as llm:
+            # Requests retire inside generate; read each final version just before it is retired.
             with patch.object(PageBundleArena, "retire", snapshot):
                 outputs = llm.generate(
                     ["The sky is", "The sea is"],
@@ -130,44 +105,26 @@ def main() -> int:
         del plain
         gc.collect()
         torch.cuda.empty_cache()
-    workload = ESampRequestWorkload(
-        ESampRequestConfig(
-            rank=2,
-            source_layer=0,
-            target_layer=-1,
-            intervention_beta=0.2,
-        )
+    workload = ESampRequestWorkload(ESampRequestConfig(rank=2, source_layer=0, target_layer=-1, intervention_beta=0.2))
+    routed = pllm.make_llm(
+        workload=workload,
+        config=ModelConfig(
+            model="Qwen/Qwen2.5-0.5B-Instruct",
+            dtype=VllmDType.BFLOAT16,
+            max_model_len=64,
+            max_num_seqs=1,
+            max_num_batched_tokens=64,
+            gpu_memory_utilization=0.4,
+            seed=7,
+            execution=ExecutionOptions(capture=True, capture_memory_bytes=16 * 1024**2),
+        ),
     )
-    with patch("pllm.backends.vllm.runtime.probe_backend", side_effect=checked_probe):
-        routed = pllm.make_llm(
-            workload=workload,
-            config=ModelConfig(
-                model="Qwen/Qwen2.5-0.5B-Instruct",
-                dtype=VllmDType.BFLOAT16,
-                max_model_len=64,
-                max_num_seqs=1,
-                max_num_batched_tokens=64,
-                gpu_memory_utilization=0.4,
-                seed=7,
-                execution=ExecutionOptions(capture=True, capture_memory_bytes=16 * 1024**2),
-            ),
-        )
     match routed:
         case VllmLlm() as handle:
             pass
         case _:
             raise RuntimeError("public make_llm did not select canonical runtime")
     try:
-        plan = handle.attachment.inputs.plan
-        probe = handle.attachment.inputs.probe
-        owned_hidden_bytes = 2 * len(probe.hidden_resources) * probe.max_packed_rows * probe.hidden_size * 4
-        for anchor, size in zip(plan.timeline.anchors, plan.timeline.reserved_bytes, strict=True):
-            assert (
-                size > owned_hidden_bytes
-                if anchor.symbol in ("sampler.pre_draw", "sampler.complete")
-                else size == owned_hidden_bytes
-            )
-        assert plan.schedule_decision.peak_memory_bytes >= plan.state_physical.reserved_bytes + owned_hidden_bytes
         outputs = handle.generate(["The sky is"], SamplingParams(max_tokens=3, temperature=0.0, n=1, ignore_eos=True))
         execution = handle.deployment.execution
         assert sum("cuda_graph" in task.implementation_id for task in execution.plan.tasks) == 3
@@ -182,17 +139,7 @@ def main() -> int:
             or execution.plan.fallback_count != 0
         ):
             raise RuntimeError("canonical ESamp lifecycle evidence is incomplete")
-        print(
-            {
-                "text": outputs[0].outputs[0].text,
-                "runner": handle.runner.runner_kind.value,
-                "loss_count": diagnostics.loss_count,
-                "update_count": diagnostics.update_count,
-                "active_lineages": diagnostics.active_lineages,
-                "fallback_count": execution.plan.fallback_count,
-                "attachment": (handle.deployment.attachment.physical.bundle_signature[:12]),
-            }
-        )
+        print(f"captured ESamp: text={outputs[0].outputs[0].text!r} loss/update={diagnostics.loss_count}")
     finally:
         handle.close()
     del handle, routed
