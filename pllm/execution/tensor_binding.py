@@ -48,6 +48,7 @@ from pllm.execution.ptts.page_borrow import borrowed_root
 from pllm.execution.ptts.page_bundle import PagePublication
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION, Recurrence
+from pllm.execution.scan import ScanContext
 from pllm.execution.shared_tensor import tensor_dtype
 from pllm.execution.step_capture import StepCapture, reads_rows
 from pllm.execution.tensor_frame import (
@@ -312,6 +313,12 @@ class TensorBinding(Builder[TensorFrame]):
         self.overlay_targets: tuple[ParameterTarget, ...] = ()
         self.overlay_import = False
 
+    def configure_scans(self, facts: BackendCompileFacts) -> None:
+        """Bind scan specialization to the plan's policy and row capacity."""
+        for symbol, operation in self.operations.items():
+            scans = ScanContext(facts.timeline.region_policy, facts.probe.max_packed_rows, facts.device)
+            self.operations[symbol] = replace(operation, function=scans.bind(operation.function))
+
     def configure_steps(self, facts: BackendCompileFacts, capture: bool) -> None:
         """Select the same tensor step for planning and execution."""
         captured = {
@@ -454,14 +461,6 @@ class TensorBinding(Builder[TensorFrame]):
         )
         if replay is not None:
             self.replay(publication, state, replay)
-
-    def lower_overlay(self, name: str, function: Callable[[Tensors], TensorUpdate]) -> None:
-        """Bind explicit native math after its author has verified the source contract."""
-        symbol = TaskSymbol(name)
-        operation = self.operations[symbol]
-        if not isinstance(operation.function, OverlayTransition):
-            raise ValueError("overlay lowering requires an original overlay transition")
-        self.operations[symbol] = replace(operation, function=replace(operation.function, function=function))
 
     def _import_update(self, state: State, identity: str) -> Call:
         """One BEFORE_MODEL import of externally produced field values into private roots."""

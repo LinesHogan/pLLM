@@ -17,7 +17,13 @@ from torch.export.graph_signature import InputKind, TensorArgument
 from torch.fx import _symbolic_trace
 
 from pllm.contracts.region_imports import KernelAllocation
-from pllm.execution.codec import boundary_digest, check_functional_aten, tensor_graph_outputs, tensor_node_metadata
+from pllm.execution.codec import (
+    boundary_digest,
+    check_functional_aten,
+    tensor_graph_outputs,
+    tensor_graph_result_nodes,
+    tensor_node_metadata,
+)
 
 _ASSERT_IS_NONE: object = getattr(_symbolic_trace, "_assert_is_none")
 
@@ -231,13 +237,16 @@ class TensorGraphPartition:
     opaque: bool
 
 
-def partition_tensor_graph(graph: torch.fx.GraphModule) -> tuple[TensorGraphPartition, ...]:
+def partition_tensor_graph(graph: torch.fx.GraphModule, *, carry: int = 0) -> tuple[TensorGraphPartition, ...]:
     """Keep functional external calls and their tuple projections together.
 
     This preserves source order and copies FX nodes, not operator mathematics.
     The backend must authorize every opaque fragment before it can be bound.
+    Carry dependence separates runs; storage-aliasing views are rebuilt inside
+    consumers so only distinct storage roots cross fragment boundaries.
     """
-    groups: list[tuple[bool, list[torch.fx.Node]]] = []
+    dependent = {n: i < carry for i, n in enumerate(n for n in graph.graph.nodes if n.op == "placeholder")}
+    groups: list[tuple[tuple[bool, bool], list[torch.fx.Node]]] = []
     for node in graph.graph.nodes:
         if node.op in ("placeholder", "output"):
             continue
@@ -248,26 +257,58 @@ def partition_tensor_graph(graph: torch.fx.GraphModule) -> tuple[TensorGraphPart
             check_functional_aten(node.target)
         except ValueError:
             opaque = True
-        if not groups or groups[-1][0] != opaque:
-            groups.append((opaque, []))
+        dependent[node] = any(dependent[n] for n in node.all_input_nodes)
+        key = opaque, dependent[node]
+        if not groups or groups[-1][0] != key:
+            groups.append((key, []))
         groups[-1][1].append(node)
+    storages = {n: t.untyped_storage() for n in graph.graph.nodes if (t := tensor_node_metadata(n)) is not None}
+    views = {
+        n
+        for (opaque, _), nodes in groups
+        if not opaque
+        for n in nodes
+        if any(storages[n] == storages.get(arg) for arg in n.all_input_nodes)
+    }
+
+    def roots(node: torch.fx.Node) -> tuple[torch.fx.Node, ...]:
+        return tuple(root for arg in node.all_input_nodes for root in roots(arg)) if node in views else (node,)
+
+    # Opaque kernels retain their audited ABI; only tensor consumers rebuild views.
+    frontiers = [
+        tuple(
+            dict.fromkeys(
+                root
+                for n in nodes
+                for arg in n.all_input_nodes
+                for root in ((arg,) if opaque else roots(arg))
+                if root not in nodes
+            )
+        )
+        for (opaque, _), nodes in groups
+    ]
+    escaping = {n for inputs in frontiers for n in inputs} | set(tensor_graph_result_nodes(graph))
     result: list[TensorGraphPartition] = []
-    for opaque, nodes in groups:
-        inside = set(nodes)
-        inputs = tuple(dict.fromkeys(value for node in nodes for value in node.all_input_nodes if value not in inside))
-        outputs = tuple(node for node in nodes if any(user not in inside for user in node.users))
+    for ((opaque, _), nodes), inputs in zip(groups, frontiers, strict=True):
+        outputs = tuple(node for node in nodes if node in escaping)
         if any(tensor_node_metadata(node) is None for node in (*inputs, *outputs)):
             raise ValueError("tensor partition must retain tuple-valued calls with their projections")
         if not outputs:
-            raise ValueError("effect-only tensor fragments require an explicit resource contract")
+            if opaque:
+                raise ValueError("effect-only tensor fragments require an explicit resource contract")
+            continue
         fragment = torch.fx.Graph()
         mapped: dict[torch.fx.Node, torch.fx.Node] = {}
         for node in inputs:
             copied = fragment.placeholder(node.name)
             copied.meta = node.meta.copy()
             mapped[node] = copied
+
+        def read(node: torch.fx.Node) -> torch.fx.Node:
+            return mapped[node] if node in mapped else fragment.node_copy(node, read)
+
         for node in nodes:
-            mapped[node] = fragment.node_copy(node, mapped.__getitem__)
+            mapped[node] = fragment.node_copy(node, read)
         fragment.output(tuple(mapped[node] for node in outputs))
         result.append(
             TensorGraphPartition(

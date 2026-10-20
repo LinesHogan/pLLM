@@ -108,3 +108,23 @@ def test_production_tuning_policy_is_signed_into_worker_facts():
         workload.bind_backend(
             replace(facts, timeline=replace(facts.timeline, region_policy=RegionSelectionPolicy())), attachment
         )
+
+
+@pytest.mark.parametrize("device", ("cpu", "cuda:0"))
+def test_scan_matches_the_serial_loop_including_carry_views(device):
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    def step(carry, x):
+        # Views of the carry are rematerialized inside the cell that consumes them.
+        view = carry.view_as(carry).reshape(1, -1).permute(1, 0).transpose(0, 1).expand(2, -1)[1]
+        return carry + view + x.sum(0), x + carry
+
+    for rows in (0, 1, 6):
+        carry, over = torch.zeros(7, device=device), torch.ones(rows, 7, device=device)
+        expected, outputs = carry, []
+        for start in range(0, rows, 3):
+            expected, output = step(expected, over[start : start + 3])
+            outputs.append(output)
+        actual = pllm.scan(step, carry=carry, over=(over,), chunk=3)
+        torch.testing.assert_close(actual, (expected, tuple(outputs)), rtol=0, atol=0)

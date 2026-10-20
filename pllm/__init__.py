@@ -36,6 +36,7 @@ from pllm.execution.host_runtime import (
     TransactionHostBinding as TransactionHostBinding,
 )
 from pllm.execution.ptts.page_bundle import PagePublication as PagePublication
+from pllm.execution.scan import scan as scan
 from pllm.execution.tensor_binding import TensorResult as TensorResult
 from pllm.execution.tensor_frame import Tensors as Tensors
 from pllm.execution.tensor_program import InvocationOutput as InvocationOutput
@@ -148,6 +149,7 @@ def make_llm(
 
 __all__ = [
     "make_llm",
+    "scan",
     "ModelConfig",
     "ExecutionOptions",
     "HostRuntimeFacts",

@@ -51,7 +51,9 @@ def warn_numerical_transforms(signature: str, transformations: tuple[str, ...]) 
     )
 
 
-class _Cell(torch.nn.Module):
+class TensorCellModule(torch.nn.Module):
+    """Present a tensor function to Torch export."""
+
     def __init__(self, function: CellFunction) -> None:
         super().__init__()
         self.function = function
@@ -231,9 +233,9 @@ class ExportedCell:
             raise ValueError("exported cell ports must have unique names and complete tensor examples")
         _check_distinct_inputs(examples)
         # Export executes Python: use private examples, never arena borrows or user-owned inputs.
-        samples = tuple(t.detach().clone() for t in examples)
+        samples = tuple(t.new_empty_strided(t.shape, t.stride()).copy_(t.detach()) for t in examples)
         with torch.no_grad():
-            program = functionalize_export(torch.export.export(_Cell(function), samples, strict=False))
+            program = functionalize_export(torch.export.export(TensorCellModule(function), samples, strict=False))
         signature = program.graph_signature
         if any(spec.kind is not InputKind.USER_INPUT for spec in signature.input_specs):
             raise ValueError(

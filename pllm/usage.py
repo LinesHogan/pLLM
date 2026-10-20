@@ -1141,6 +1141,8 @@ class Workload(
         b.resources = () if facts is None else facts.timeline.task_resources
         b.probe = None if facts is None else facts.probe
         self._build(b)
+        if facts is not None:
+            b.configure_scans(facts)
         b.graph = replace(
             b.graph,
             tasks=tuple(

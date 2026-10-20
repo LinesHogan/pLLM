@@ -31,7 +31,8 @@ class ExportedRegion:
 def import_exported_region(
     program: torch.export.ExportedProgram,
     *,
-    bind_kernel: Callable[[TensorGraphPartition], NativePrimitive | FunctionalKernelPrimitive],
+    bind_kernel: Callable[[TensorGraphPartition], NativePrimitive | FunctionalKernelPrimitive] | None = None,
+    carry: int = 0,
 ) -> ExportedRegion:
     """Keep original ATen fragments and delegate opaque fragments to a backend.
 
@@ -80,8 +81,10 @@ def import_exported_region(
     operations: list[Call] = []
     functions: dict[str, TensorSource] = {}
     used = set(names.values())
-    for partition in partition_tensor_graph(graph):
+    for partition in partition_tensor_graph(graph, carry=carry):
         if partition.opaque:
+            if bind_kernel is None:
+                raise ValueError("opaque tensor fragments need a backend kernel binding")
             cell: TensorSource = bind_kernel(partition)
             if cell.implementation is None or cell.declaration.resources:
                 raise ValueError("opaque tensor fragments require a pure backend kernel contract")

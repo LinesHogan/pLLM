@@ -52,7 +52,7 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
             fingerprint(value.__kwdefaults__, seen),
         )
     if isinstance(value, ModuleType):
-        if not value.__name__.startswith(("torch", "math")):
+        if value.__name__ != "pllm" and not value.__name__.startswith(("torch", "math")):
             raise ValueError(f"{value.__name__}: module dependencies require an explicit native binding")
         return boundary_digest(value.__name__, torch.__version__)
     if isinstance(value, torch.dtype):

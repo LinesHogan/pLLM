@@ -63,6 +63,18 @@ def functionalize_export(program: torch.export.ExportedProgram) -> torch.export.
     for fake inputs. Pure source import must work in a driver without a device
     execution context. The same ATen check is applied again by the importer.
     """
+    # Export inserts metadata assertions for tensor-to-tensor conversions.
+    # Prove them on the guarded static metadata before importing tensor math.
+    for node in tuple(program.graph.nodes):
+        if node.op == "call_function" and node.target == torch.ops.aten._assert_tensor_metadata.default:
+            sample = tensor_node_metadata(node.all_input_nodes[0])
+            assert sample is not None
+            with sample.fake_mode:
+                torch.ops.aten._assert_tensor_metadata.default(
+                    *torch.fx.map_arg(node.args, tensor_node_metadata), **node.kwargs
+                )
+            program.graph.erase_node(node)
+    program.graph_module.recompile()
     try:
         for node in program.graph.nodes:
             if node.op == "call_function":
