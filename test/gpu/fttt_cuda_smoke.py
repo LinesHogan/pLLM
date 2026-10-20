@@ -1,4 +1,4 @@
-"""One real-CUDA stream/receipt proof for the canonical FTTT graph."""
+"""FTTT on CUDA: a completion captured on one stream trains an edit consumed on another."""
 
 from __future__ import annotations
 
@@ -7,30 +7,13 @@ import torch
 from pllm import make_llm
 from pllm.contracts.feedback import Completion, CompletionBatch, FinishReason, RetryAction
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.execution.host_runtime import (
-    CompletionInput,
-    HostRuntimeFacts,
-)
-from pllm.workloads.fttt import (
-    FTTTConfig,
-    FTTTFeedbackService,
-    FTTTJudgeResult,
-    FTTTJudgeService,
-    FTTTWorkload,
-)
+from pllm.execution.host_runtime import CompletionInput, HostRuntimeFacts
+from pllm.workloads.fttt import FTTTConfig, FTTTFeedbackService, FTTTJudgeResult, FTTTJudgeService, FTTTWorkload
 
 
 class _CudaNegativeJudge(FTTTJudgeService):
     def judge(self, completion: Completion) -> FTTTJudgeResult:
-        return FTTTJudgeResult(
-            False,
-            0.0,
-            "wrong arithmetic carry",
-            (11, 12),
-            "incorrect",
-            "cuda_exact",
-            "",
-        )
+        return FTTTJudgeResult(False, 0.0, "wrong arithmetic carry", (11, 12), "incorrect", "cuda_exact", "")
 
 
 def main() -> int:
@@ -39,12 +22,7 @@ def main() -> int:
     device = torch.device("cuda", 0)
     producer_stream = torch.cuda.Stream(device=device)
     consumer_stream = torch.cuda.Stream(device=device)
-    config = FTTTConfig(
-        rank=2,
-        learning_rate=0.05,
-        feedback_feature_size=3,
-        max_retries=2,
-    )
+    config = FTTTConfig(rank=2, learning_rate=0.05, feedback_feature_size=3, max_retries=2)
     service = FTTTFeedbackService(config, _CudaNegativeJudge())
     coordinator = make_llm(
         workload=FTTTWorkload(service),
@@ -54,22 +32,9 @@ def main() -> int:
     )
     execution = coordinator.execution
     identity = RequestIdentity("cuda-feedback-0", 0, 0)
-    completion = Completion(
-        identity,
-        0,
-        "cuda-round-0",
-        (1, 2),
-        "wrong arithmetic",
-        FinishReason.STOP,
-    )
+    completion = Completion(identity, 0, "cuda-round-0", (1, 2), "wrong arithmetic", FinishReason.STOP)
     with torch.cuda.stream(producer_stream):
-        hidden_rows = torch.linspace(
-            -1.0,
-            1.0,
-            steps=4,
-            device=device,
-            dtype=torch.float32,
-        ).reshape(1, 4)
+        hidden_rows = torch.linspace(-1.0, 1.0, steps=4, device=device, dtype=torch.float32).reshape(1, 4)
     with torch.cuda.stream(consumer_stream):
         result = coordinator.run(CompletionInput.capture(CompletionBatch((completion,)), hidden_rows, producer_stream))
     if result is None:
@@ -89,15 +54,7 @@ def main() -> int:
         or diagnostics.fallback_count != 0
     ):
         raise RuntimeError("canonical FTTT CUDA lifecycle evidence is incomplete")
-    print(
-        {
-            "loss_count": len(result.losses),
-            "update_count": result.update_count,
-            "state_version": diagnostics.state_version,
-            "delta_max": float(result.edit_delta.abs().max().item()),
-            "fallback_count": diagnostics.fallback_count,
-        }
-    )
+    print(f"FTTT CUDA: update_count={result.update_count} state_version={diagnostics.state_version}")
     return 0
 
 
