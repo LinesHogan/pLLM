@@ -321,7 +321,7 @@ class VllmSession(Generic[DataT, ResultT]):
                 model,
                 deployment.execution,
                 attachment.inputs.request.task_bindings[0].anchor_id,
-                overlay_bindings[0].scale,
+                overlay_bindings,
                 attachment.inputs.request.model_scan_chunk_size,
             )
             if model_scan

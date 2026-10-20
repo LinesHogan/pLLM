@@ -27,6 +27,7 @@ pub(crate) struct ScheduleDecision {
     peak_memory_bytes: u64,
     fence_count: u64,
     state_plan_digest: Option<String>,
+    source_schedules: Vec<TaskRegionSchedule>,
 }
 
 impl ScheduleDecision {
@@ -60,6 +61,24 @@ pub(crate) struct PhysicalPlan {
     pub(crate) schema_version: u64,
     pub(crate) region_ends: Vec<u32>,
     pub(crate) materialized_values: Vec<u32>,
+    pub(crate) source_schedules: Vec<TaskRegionSchedule>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskRegionSchedule {
+    task: String,
+    name: String,
+    schedule_map: String,
+}
+
+fn source_schedules(graph: &SemanticGraph) -> Result<Vec<TaskRegionSchedule>, String> {
+    graph.source_regions.iter().map(|source| {
+        let analysis = super::region_dependence::analyze(&source.program, true)?;
+        let candidate = analysis.candidates.iter().find(|candidate| candidate.source == "isl-parallel")
+            .ok_or("source region has no verified ISL parallel candidate")?;
+        Ok(TaskRegionSchedule { task: source.task.clone(), name: source.name.clone(), schedule_map: candidate.schedule_map.clone() })
+    }).collect()
 }
 
 fn error(message: impl Into<String>) -> PyErr {
@@ -196,12 +215,13 @@ pub(super) fn compile(
     validate_graph(graph)?;
     validate_timeline(timeline)?;
     let index = graph_index(graph, timeline, state)?;
+    let sources = source_schedules(graph)?;
     fn choose<'a>(graph: &'a SemanticGraph, timeline: &Timeline, index: &GraphIndex,
                   state: Option<&StatePhysicalPlan>, selected: &mut Vec<&'a ImplementationCandidate>,
-                  best: &mut Option<ScheduleDecision>) -> Result<(), String> {
+                  sources: &[TaskRegionSchedule], best: &mut Option<ScheduleDecision>) -> Result<(), String> {
         if selected.len() == graph.tasks.len() {
             if let Ok(solution) = aer::solve(graph, timeline, index, selected, state) {
-                let decision = sign_solution(graph, timeline, state, selected, solution)?;
+                let decision = sign_solution(graph, timeline, state, selected, solution, sources)?;
                 if best.as_ref().is_none_or(|best| decision.score() < best.score()) {
                     *best = Some(decision);
                 }
@@ -210,7 +230,7 @@ pub(super) fn compile(
             for candidate in &graph.tasks[selected.len()].implementations {
                 if candidate.required_capabilities.iter().all(|cap| timeline.capabilities.binary_search(cap).is_ok()) {
                     selected.push(candidate);
-                    choose(graph, timeline, index, state, selected, best)?;
+                    choose(graph, timeline, index, state, selected, sources, best)?;
                     selected.pop();
                 }
             }
@@ -218,7 +238,7 @@ pub(super) fn compile(
         Ok(())
     }
     let mut best = None;
-    choose(graph, timeline, &index, state, &mut Vec::new(), &mut best)?;
+    choose(graph, timeline, &index, state, &mut Vec::new(), &sources, &mut best)?;
     best.ok_or_else(|| "no implementation, AER partition and placement fits the signed resource facts".into())
 }
 
@@ -228,6 +248,7 @@ fn sign_solution(
     state: Option<&StatePhysicalPlan>,
     implementations: &[&ImplementationCandidate],
     solution: aer::Solution,
+    sources: &[TaskRegionSchedule],
 ) -> Result<ScheduleDecision, String> {
     let mut plans = Vec::with_capacity(graph.tasks.len());
     let mut region_ends = Vec::new();
@@ -249,6 +270,7 @@ fn sign_solution(
         graph_digest: digest(&canonical_ascii_json(graph)?),
         timeline_digest: digest(&canonical_ascii_json(timeline)?),
         tasks: plans,
+        source_schedules: sources.to_vec(),
         fallback_count: 0,
         signature: String::new(),
         schema_version: SCHEMA_VERSION,
@@ -301,7 +323,7 @@ fn validate_decision(
     }).collect::<Result<Vec<_>, String>>()?;
     let solution = aer::check_placement(graph, timeline, &index, &implementations, state,
         &decision.tasks, &decision.region_ends)?;
-    let expected = sign_solution(graph, timeline, state, &implementations, solution)?;
+    let expected = sign_solution(graph, timeline, state, &implementations, solution, &source_schedules(graph)?)?;
     if decision != &expected {
         return Err("canonical schedule decision differs from its selected placement witness".to_owned());
     }
@@ -334,6 +356,7 @@ pub(super) fn project_physical(
         schema_version: SCHEMA_VERSION,
         region_ends: decision.region_ends.clone(),
         materialized_values: decision.materialized_values.clone(),
+        source_schedules: decision.source_schedules.clone(),
     })
 }
 
@@ -437,7 +460,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{aer, decision_signature, graph_index, sign_solution};
+    use super::{aer, decision_signature, graph_index, sign_solution, source_schedules};
     use super::{compile, lower_physical, validate_decision, validate_physical, ScheduleDecision};
     use crate::planning::semantic_graph::{decode_graph, decode_timeline};
     use serde_json::json;
@@ -604,7 +627,7 @@ mod tests {
         let implementations: Vec<_> = graph.tasks.iter().map(|task| &task.implementations[0]).collect();
         let witness = aer::check_placement(&graph, &roomy, &index, &implementations, None,
             &later, &decision.region_ends).unwrap();
-        let signed = sign_solution(&graph, &roomy, None, &implementations, witness).unwrap();
+        let signed = sign_solution(&graph, &roomy, None, &implementations, witness, &source_schedules(&graph).unwrap()).unwrap();
         assert_ne!(signed, compile(&graph, &roomy, None).unwrap());
         validate_decision(&graph, &roomy, &signed, None).unwrap();
         for mutation in 0..5 {

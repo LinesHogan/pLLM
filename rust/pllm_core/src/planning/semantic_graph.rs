@@ -230,7 +230,15 @@ pub(crate) struct ConditionalInputGroup {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum InputVersion { Input }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskSourceRegion {
+    pub(crate) task: String,
+    pub(crate) name: String,
+    pub(super) program: super::region_program::Program,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SemanticGraph {
     pub(crate) workload_id: String,
@@ -240,6 +248,8 @@ pub(crate) struct SemanticGraph {
     pub(crate) states: Vec<SemanticState>,
     pub(crate) schema_version: u64,
     pub(crate) input_groups: Vec<ConditionalInputGroup>,
+    #[serde(default)]
+    pub(crate) source_regions: Vec<TaskSourceRegion>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -467,6 +477,23 @@ fn validate_task(task: &SemanticTask) -> Result<(), String> {
 
 pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
     validate_input_groups(graph)?;
+    let mut sources = std::collections::BTreeSet::new();
+    for source in &graph.source_regions {
+        let task = graph.tasks.iter().find(|task| task.symbol == source.task)
+            .ok_or("source region names an unknown task")?;
+        if !sources.insert((&source.task, &source.name)) || source.name.is_empty() {
+            return Err("source regions need distinct nonempty task-local names".into());
+        }
+        for resource in &source.program.resources {
+            if let super::region_program::Resource::State { name, .. } = resource {
+                if !task.effects.iter().any(|effect| &effect.resource == name) {
+                    return Err("source region state is outside its task effects".into());
+                }
+            }
+        }
+        // The complete source is checked before AER chooses physical partitions.
+        super::region_dependence::analyze(&source.program, false)?;
+    }
     if graph.schema_version != SCHEMA_VERSION {
         return Err(format!(
             "unsupported SemanticGraph schema_version: {}",

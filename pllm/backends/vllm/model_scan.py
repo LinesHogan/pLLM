@@ -14,11 +14,14 @@ from pllm.authoring import DataT, ResultT, TensorStepInput
 from pllm.backends.vllm.region_attention import attention_metadata, validate_attention_resources
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
+from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding
+from pllm.contracts.region_program import BorrowedResource
 from pllm.contracts.semantic_graph import AnchorId, TaskId
 from pllm.execution.cuda_stream import upload
 from pllm.execution.execution import TaskGraphInvocation
-from pllm.execution.module_graph import ModuleCallBinding, capture_module_calls
+from pllm.execution.module_graph import ModuleCallBinding, capture_module_calls, capture_module_partition
 from pllm.execution.state_execution import StateExecution, StateTaskContext
+from pllm.execution.tensor_borrow import TensorResourceView
 
 
 def _adapter_mlp(layer: Qwen2DecoderLayer, scale: float) -> GraphModule:
@@ -56,8 +59,8 @@ def _adapter_mlp(layer: Qwen2DecoderLayer, scale: float) -> GraphModule:
     return GraphModule(source, graph)
 
 
-def _adapter_layer(layer: Qwen2DecoderLayer, scale: float) -> GraphModule:
-    source = capture_module_calls(layer, none_inputs=("residual",))
+def _adapter_layer(layer: Qwen2DecoderLayer, scale: float, *, entry: bool) -> GraphModule:
+    source = capture_module_calls(layer, none_inputs=("residual",) if entry else ())
     source.add_module("_adapter_mlp", _adapter_mlp(layer, scale))
     graph = torch.fx.Graph()
     mapped: dict[Node, Node] = {}
@@ -84,41 +87,34 @@ def _adapter_layer(layer: Qwen2DecoderLayer, scale: float) -> GraphModule:
 
 @dataclass(frozen=True)
 class ModelScanSource:
-    """The original complete model graph with one explicit projection effect."""
+    """Original layer calls, with explicit effects only at the declared projections."""
 
-    model: Qwen2Model
-    graph: GraphModule
+    graphs: tuple[GraphModule, ...]
+    suffix: GraphModule
     bindings: tuple[ModuleCallBinding, ...]
 
     @classmethod
-    def capture(cls, model: Qwen2Model, scale: float) -> "ModelScanSource":
-        """Retain original layer order, embedding and final normalization."""
-        bindings = tuple(ModuleCallBinding.bind(module) for module in tuple(model.modules())[1:])
-        source = capture_module_calls(model, none_inputs=("input_ids", "intermediate_tensors"))
-        source.add_module("_adapter_layer", _adapter_layer(model.layers[0], scale))
-        graph = torch.fx.Graph()
-        mapped: dict[Node, Node] = {}
-        a, b = graph.placeholder("adapter_a"), graph.placeholder("adapter_b")
-        operands: tuple[Node, Node] | None = None
-        for node in source.graph.nodes:
-            if node.op == "call_module" and node.target == "layers.0":
-                args = torch.fx.map_arg(node.args, mapped.__getitem__)
-                call = graph.call_module("_adapter_layer", (a, b, *args))
-                mapped[node] = call
-                operands = (
-                    graph.call_function(operator.getitem, (call, 2)),
-                    graph.call_function(operator.getitem, (call, 3)),
-                )
-            elif node.op == "output":
-                assert operands is not None
-                graph.output((torch.fx.map_arg(node.args[0], mapped.__getitem__), *operands))
-            else:
-                mapped[node] = graph.node_copy(node, mapped.__getitem__)
-        graph.lint()
-        return cls(model, GraphModule(source, graph), bindings)
+    def capture(cls, model: Qwen2Model, effects: tuple[ParameterOverlayFieldBinding, ...]) -> "ModelScanSource":
+        names = tuple(f"layers.{i}" for i in range(len(model.layers)))
+        partition = capture_module_partition(
+            model, stateful=names, readonly=("norm",), none_inputs=("input_ids", "intermediate_tensors")
+        )
+        calls = tuple(node.target for node in partition.prefix.graph.nodes if node.op == "call_module")
+        if calls != names or len(partition.frontier) != 1:
+            raise ValueError("ModelScan needs a complete layer chain and its original final normalization")
+        targets = {effect.target.layer: effect for effect in effects}
+        graphs = tuple(
+            _adapter_layer(layer, targets[i].scale, entry=i == 0)
+            if i in targets
+            else capture_module_calls(layer, none_inputs=("residual",) if i == 0 else ())
+            for i, layer in enumerate(model.layers)
+        )
+        return cls(
+            graphs, partition.suffix, tuple(ModuleCallBinding.bind(module) for module in tuple(model.modules())[1:])
+        )
 
     def validate(self) -> None:
-        """Check that the source still calls the same original modules."""
+        """Retain the source modules and their original forward bindings."""
         for binding in self.bindings:
             binding.validate(binding.module)
 
@@ -131,12 +127,12 @@ class VllmModelScan(Generic[DataT, ResultT]):
         model: Qwen2ForCausalLM,
         execution: StateExecution[TensorStepInput, DataT, ResultT],
         anchor: AnchorId,
-        scale: float,
+        effects: tuple[ParameterOverlayFieldBinding, ...],
         chunk_size: int,
     ) -> None:
         self.model, self.execution, self.anchor = model.model, execution, anchor
         self.chunk_size = chunk_size
-        self.source = ModelScanSource.capture(self.model, scale)
+        self.source = ModelScanSource.capture(self.model, effects)
         self.attentions = tuple(layer.self_attn.attn for layer in self.model.layers)
         validate_attention_resources(self.attentions, hidden_size=model.config.hidden_size)
         self.original = self.model.forward
@@ -158,10 +154,18 @@ class VllmModelScan(Generic[DataT, ResultT]):
         """Number of original scheduled token rows."""
         return len(self._rows)
 
-    @property
-    def weight(self) -> torch.Tensor:
-        """Borrow the original frozen projection for local reconstruction."""
-        return self.model.layers[0].mlp.down_proj.weight.detach()
+    def weight(self, layer: int) -> torch.Tensor:
+        """Borrow the selected original frozen projection."""
+        return self.model.layers[layer].mlp.down_proj.weight.detach()
+
+    def inputs(self, chunk: int) -> tuple[torch.Tensor, ...]:
+        """Pack the embedding frontier without including padding in any model call."""
+        assert self._hidden is not None
+        return tuple(_pad(self._hidden[start : start + chunk], chunk) for start in range(0, self.length, chunk))
+
+    def kv_view(self, resource: BorrowedResource) -> TensorResourceView:
+        """Borrow disjoint full layer caches; causal order is retained within each."""
+        return TensorResourceView(resource, tuple(attention.kv_cache for attention in self.attentions))
 
     def prepare(self, rows: PackedPhaseRowBatch, invocation: TaskGraphInvocation[StateTaskContext[DataT]]) -> None:
         """Reject unsupported lifecycle cases before running any model cell."""
@@ -202,15 +206,22 @@ class VllmModelScan(Generic[DataT, ResultT]):
         return self._output
 
     def forward(
-        self, start: int, stop: int, parameters: tuple[torch.Tensor, ...]
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self,
+        layer: int,
+        start: int,
+        rows: int,
+        hidden: torch.Tensor,
+        residual: torch.Tensor,
+        parameters: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, ...]:
         """Use genuine causal chunk metadata over the runner's original cache pages."""
         assert self._context is not None and self._positions is not None and self._hidden is not None
-        size, length = stop - start, self.row.token_offset + stop
+        stop = start + rows
+        size, length = rows, self.row.token_offset + stop
         sequence = upload([0, size, length], self._hidden.device, torch.int32)
         metadata, slots = {}, {}
         prefill = self.row.phase is HiddenPhase.PREFILL
-        for attention in self.attentions:
+        for attention in (self.attentions[layer],):
             base, _, mapping = attention_metadata(self._context, attention)
             slot = mapping[start:stop]
             metadata[attention.layer_name] = replace(
@@ -234,36 +245,38 @@ class VllmModelScan(Generic[DataT, ResultT]):
             self._context, attn_metadata=metadata, slot_mapping=slots, batch_descriptor=None, is_padding=None
         )
         with override_forward_context(context):
-            hidden, x, target = self.source.graph(
-                *parameters, None, self._positions[start:stop], None, self._hidden[start:stop]
+            outputs = self.source.graphs[layer](
+                *parameters, self._positions[start:stop], hidden[:rows], None if layer == 0 else residual[:rows]
             )
-        self.observe_kv(start, stop)
-        return hidden, x, target
+        self.observe_kv(layer, start, stop)
+        return tuple(_pad(value, hidden.shape[0]) for value in outputs)
 
-    def observe_kv(self, start: int, stop: int) -> None:
-        """Expose complete causal prefixes through the existing opt-in tensor trace."""
+    def observe_kv(self, layer: int, start: int, stop: int) -> None:
+        """Record each completed cell's causal prefix through asynchronous tracing."""
         assert self._invocation is not None and self._context is not None
         owner = self._invocation.context
-        if not owner.trace.observing:
-            return
-        length = self.row.token_offset + stop
-        for ordinal, attention in enumerate(self.attentions):
+        if owner.trace.observing:
+            attention = self.attentions[layer]
             metadata, cache, _ = attention_metadata(self._context, attention)
-            positions = torch.arange(length, device=cache.device)
+            positions = torch.arange(self.row.token_offset + stop, device=cache.device)
             blocks = metadata.block_table[self.row.request_ordinal, positions // cache.shape[2]].long()
-            values = cache[blocks, :, positions % cache.shape[2], :]
             owner.trace.observe(
                 owner.invocation_id,
                 TaskId(0),
-                f"kv.{ordinal}",
-                values,
+                f"{layer}.kv",
+                cache[blocks, :, positions % cache.shape[2], :],
                 row=self.row,
                 iteration=start // self.chunk_size,
             )
 
-    def finish(self, outputs: tuple[torch.Tensor, ...]) -> None:
-        """Return ordinary packed hidden states to the runner's unchanged sampler."""
-        self._output = torch.cat(outputs, dim=0)
+    def finish(self, outputs: tuple[torch.Tensor, ...], residuals: tuple[torch.Tensor, ...], chunk: int) -> None:
+        """Normalize each valid chunk with the original module, then return packed rows."""
+        self._output = torch.cat(
+            tuple(
+                self.source.suffix((h[: min(chunk, self.length - i * chunk)], r[: min(chunk, self.length - i * chunk)]))
+                for i, (h, r) in enumerate(zip(outputs, residuals, strict=True))
+            )
+        )
 
     def clear(self) -> None:
         """Release references to this invocation's inputs and outputs."""
@@ -274,3 +287,8 @@ class VllmModelScan(Generic[DataT, ResultT]):
         """Remove the model handoff and restore the original runner call."""
         self.clear()
         self.model.forward = self.original
+
+
+def _pad(value: torch.Tensor, rows: int) -> torch.Tensor:
+    """Extend only the region value layout; padded rows never reach model kernels."""
+    return torch.nn.functional.pad(value, (0, 0, 0, rows - value.shape[0]))

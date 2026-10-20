@@ -36,6 +36,7 @@ from pllm.contracts.parameter_overlay import (
     ParameterTarget,
 )
 from pllm.contracts.request_identity import RequestKeyField, canonical_request_key_fields
+from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
     ConditionalLayerReplay,
@@ -1057,13 +1058,15 @@ class _Declaration:
         """Bind the training method once, under its model scan's advance owner."""
         effect = scan.apply
         definition = self.state_definition(effect.state, "ModelScan needs a declared RequestState")
-        target = ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT)
         _reject(
             definition.scope is not StateScope.REQUEST
-            or definition.request_keys != (RequestKeyField.REQUEST_ID,)
-            or effect.targets != (target,)
+            or RequestKeyField.REQUEST_ID not in definition.request_keys
+            or any(
+                target.module is not ParameterModuleKind.MLP or target.role is not ParameterRole.DOWN_PROJECTION_WEIGHT
+                for target in effect.targets
+            )
             or effect.operator is not ParameterOverlayOperator.LOW_RANK_ADD,
-            "ModelScan currently needs request-local low-rank state on layer 0's down projection",
+            "ModelScan needs independent request-local low-rank down projections",
         )
         _reject(
             definition.optimizer is None
@@ -1123,6 +1126,7 @@ class _Declaration:
             freeze(definition.initialize),
             _invoke(freeze(operation.function), bindings),
             definition.optimizer,
+            definition.request_keys,
         )
         self.model_training.add(scan.learn)
 
@@ -1164,6 +1168,7 @@ class _Declaration:
         _reject(
             any(
                 name not in {state.resource for state in b.graph.states}
+                and (b.model_scan is None or name != b.model_scan[0].apply.state)
                 for name, value in self.values.items()
                 if _typed(value, InstanceState) is not None
             ),
@@ -1288,13 +1293,20 @@ class Workload(
     ) -> FunctionMath[TensorStepInput, TensorFrame, TensorOutput]:
         generator = torch.Generator(device=device).manual_seed(seed)
 
-        def initializer(resource: str) -> Callable[[Roots], None]:
+        def initializer(resource: str) -> Callable[[Roots, tuple[RequestStateKey | None, ...]], None]:
             init = b.initializers.get(resource)
 
-            def initialize(roots: Roots) -> None:
+            def initialize(roots: Roots, keys: tuple[RequestStateKey | None, ...]) -> None:
                 if init is not None:
-                    for root in roots:
-                        init(root, generator)
+                    for root, key in zip(roots, keys, strict=True):
+                        rng = (
+                            generator
+                            if b.model_scan is None
+                            else torch.Generator(device=device).manual_seed(
+                                int(boundary_digest(seed, resource, key)[:16], 16)
+                            )
+                        )
+                        init(root, rng)
 
             return initialize
 
@@ -1349,17 +1361,20 @@ class Workload(
         if binding.model_scan is not None:
             _reject(options.capture, "ModelScan currently needs eager execution")
             scan, training = binding.model_scan
-            (layout,) = binding.layouts.layouts
+            layouts = binding.layouts.layouts
             (task,) = binding.graph.tasks
             return replace(
                 facts.timeline,
                 task_resources=(
                     TaskResourceFact(
                         task.symbol,
-                        model_scan_workspace(
-                            facts.probe,
-                            scan.chunk_size,
-                            tuple(layout.layout.fields[i].shape for i in training.parameters),
+                        sum(
+                            model_scan_workspace(
+                                facts.probe,
+                                scan.chunk_size,
+                                tuple(layout.layout.fields[i].shape for i in training.parameters),
+                            )
+                            for layout in layouts
                         ),
                         0,
                     ),

@@ -27,6 +27,7 @@ from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding, ParameterOverlayOperator
 from pllm.contracts.region_program import TensorType
+from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.semantic_graph import (
     AnchorSymbol,
     MathContract,
@@ -224,7 +225,7 @@ class CompletionWorkload(
         initialize_parameters = None if definition.initialize is None else freeze(definition.initialize)
         prepare_data, output_data = freeze(owner.prepare), freeze(owner.output)
 
-        def initialize(roots: Roots) -> None:
+        def initialize(roots: Roots, keys: tuple[RequestStateKey | None, ...]) -> None:
             if initialize_parameters is not None:
                 (root,) = roots
                 initialize_parameters({name: root[5 * index] for index, name in enumerate(shapes)}, generator)
@@ -400,13 +401,14 @@ class CausalAdapterWorkload(
                     target.target,
                     ParameterOverlayOperator.LOW_RANK_ADD,
                     (state.field(f"factor_{2 * index}.parameters"), state.field(f"factor_{2 * index + 1}.parameters")),
+                    str(state.declaration.resource),
                     model.scale,
                 )
                 for index, target in enumerate(model.targets)
             ),
         )
 
-        def initialize(roots: Roots) -> None:
+        def initialize(roots: Roots, keys: tuple[RequestStateKey | None, ...]) -> None:
             (root,) = roots
             for index, factor in enumerate(model.initial_factors):
                 root[5 * index].copy_(factor)

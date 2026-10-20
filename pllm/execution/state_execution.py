@@ -39,7 +39,7 @@ from pllm.execution.ptts.page_bundle import (
     PageRelease,
     PageWrite,
 )
-from pllm.execution.ptts.request_state import RequestStateDirectory, RequestStateSelection
+from pllm.execution.ptts.request_state import RequestStateDirectory, RequestStateSelection, StateAddress
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.replay import LayerReplayPrimitive, TokenwiseReplayPrimitive
 from pllm.execution.trace import ExecutionTrace, TracePhase
@@ -234,7 +234,9 @@ class StateTaskContext(Generic[DataT]):
 class StateMath(Protocol[InputContra, DataT, ResultCo]):
     """Input validation and tensor mathematics, never invocation ownership."""
 
-    def initialize(self, roots: tuple[tuple[torch.Tensor, ...], ...], resources: tuple[str, ...], /) -> None: ...
+    def initialize(
+        self, roots: tuple[tuple[torch.Tensor, ...], ...], addresses: tuple[StateAddress, ...], /
+    ) -> None: ...
 
     def rows(self, value: InputContra, /) -> tuple[PackedPhaseRow, ...]: ...
 
@@ -488,9 +490,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             try:
                 if batch.write is not None:
                     with nullcontext() if stream is None else torch.cuda.stream(stream):
-                        self.math.initialize(
-                            self.arena.writable_roots(batch.write), tuple(str(key.resource) for key in batch.keys)
-                        )
+                        self.math.initialize(self.arena.writable_roots(batch.write), batch.keys)
                 receipt = self.directory.commit_admission(batch)
             except Exception:
                 self.directory.abort_admission(batch)

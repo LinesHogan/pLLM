@@ -141,3 +141,36 @@ def validate_readonly_views(
                 for write in original.plan.writes
             ):
                 raise ValueError("read-only resource aliases writable paged storage")
+
+
+@dataclass(frozen=True, slots=True)
+class TensorResourceView:
+    """Independent mutable tensor cells borrowed from a backend, without payload copies.
+
+    Each cell conservatively covers its entire tensor. This permits reordering
+    different layers while retaining all causal KV order within each layer.
+    """
+
+    resource: BorrowedResource
+    tensors: tuple[torch.Tensor, ...]
+
+    def validate(self, protected: tuple[tuple[str, int, int], ...]) -> tuple[tuple[str, int, int], ...]:
+        if self.resource.domain != (len(self.tensors),):
+            raise ValueError("tensor resources need one complete tensor per logical cell")
+        spans = list(protected)
+        for tensor in self.tensors:
+            if tensor.layout != torch.strided or tensor.device.type == "meta":
+                raise ValueError("mutable tensor borrowing requires real strided storage")
+            extent = 1
+            for stride, size in sorted(zip(tensor.stride(), tensor.shape, strict=True)):
+                if size > 1 and stride < extent:
+                    raise ValueError("mutable tensor cells must not overlap themselves")
+                extent += (size - 1) * stride
+            device, address, size = str(tensor.device), tensor.data_ptr(), extent * tensor.element_size()
+            if any(device == d and address < a + n and a < address + size for d, a, n in spans):
+                raise ValueError("mutable tensor cells overlap another borrowed cell or PTTS allocation")
+            spans.append((device, address, size))
+        return tuple(spans[len(protected) :])
+
+    def check(self, mode: AccessMode, ranges: tuple[tuple[int, int], ...]) -> None:
+        assert len(ranges) == 1 and 0 <= ranges[0][0] <= ranges[0][1] <= len(self.tensors)

@@ -32,7 +32,12 @@ from pllm.execution.host_borrow import HostResourceView, validate_host_views
 from pllm.execution.paged_access import PagedResourceView, validate_paged_views
 from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin, PagePublication, PageRelease, PageWrite
 from pllm.execution.region_values import Bank, Data, check_data
-from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView, validate_readonly_views
+from pllm.execution.tensor_borrow import (
+    ReadonlyTensorCell,
+    ReadonlyTensorView,
+    TensorResourceView,
+    validate_readonly_views,
+)
 
 
 class RegionPageOwner(Protocol):
@@ -74,6 +79,14 @@ class PagedResourceBinding:
 @dataclass(frozen=True, slots=True)
 class ReadonlyResourceBinding:
     view: ReadonlyTensorView
+    owner: RegionPageOwner
+
+
+@dataclass(frozen=True, slots=True)
+class TensorResourceBinding:
+    """An invocation borrows distinct mutable backend tensors."""
+
+    view: TensorResourceView
     owner: RegionPageOwner
 
 
@@ -237,7 +250,12 @@ class RegionResources:
         *,
         sizes: Mapping[str, int] = {},
         borrows: tuple[
-            PagedResourceBinding | ReadonlyResourceBinding | PinnedResourceBinding | HostResourceBinding, ...
+            PagedResourceBinding
+            | ReadonlyResourceBinding
+            | PinnedResourceBinding
+            | HostResourceBinding
+            | TensorResourceBinding,
+            ...,
         ] = (),
         tensor_borrows: tuple[BorrowedTensorImport, ...] = (),
     ) -> None:
@@ -295,12 +313,17 @@ class RegionResources:
             paged = tuple(binding.view for binding in borrows if isinstance(binding, PagedResourceBinding))
             readonly = tuple(binding.view for binding in borrows if isinstance(binding, ReadonlyResourceBinding))
             host = tuple(binding.view for binding in borrows if isinstance(binding, HostResourceBinding))
-            validate_paged_views(paged, owner.arena.allocation_ranges)
-            validate_readonly_views(readonly, paged, owner.arena.allocation_ranges)
+            mutable: tuple[tuple[str, int, int], ...] = ()
+            for binding in borrows:
+                if isinstance(binding, TensorResourceBinding):
+                    mutable += binding.view.validate((*owner.arena.allocation_ranges, *mutable))
+            validate_paged_views(paged, (*owner.arena.allocation_ranges, *mutable))
+            validate_readonly_views(readonly, paged, (*owner.arena.allocation_ranges, *mutable))
             validate_host_views(host)
             for binding in borrows:
                 if isinstance(binding, PinnedResourceBinding):
                     binding.validate(program, paged)
+                    validate_readonly_views((binding.view,), paged, mutable)
         self._borrows = views
         external_names = {r.name for r in program.resources if isinstance(r, (ExternalResource, BorrowedResource))}
         expected = {f.name: f for f in program.functions if external_names.intersection(f.resources)}

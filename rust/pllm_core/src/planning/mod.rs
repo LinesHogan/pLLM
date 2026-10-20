@@ -27,7 +27,7 @@ pub(crate) mod state_representation;
 pub(crate) mod tensor_layout;
 mod version_hazards;
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PlanBundle {
     pub(crate) semantic_graph: semantic_graph::SemanticGraph,

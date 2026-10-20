@@ -6,7 +6,7 @@ use super::super::state_representation::StateDeviceKind;
 use super::super::tensor_layout::TensorDType;
 use super::super::PlanBundle;
 
-pub(crate) const SCHEMA_VERSION: u64 = 9;
+pub(crate) const SCHEMA_VERSION: u64 = 10;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -194,6 +194,7 @@ pub(crate) struct OverlayBinding {
     pub(crate) target: ParameterTarget,
     pub(crate) operator: OverlayOperator,
     pub(crate) fields: Vec<u32>,
+    pub(crate) resource: String,
     pub(crate) scale: f64,
 }
 

@@ -71,15 +71,14 @@ fn validate_request(
         AttachmentKind::ModelScan => {
             if request.task_bindings.len() != 1
                 || request.task_bindings[0].role != AttachmentTaskRole::Compute
-                || request.overlay_bindings.len() != 1
+                || request.overlay_bindings.is_empty()
                 || request.overlay_bindings.iter().any(|binding|
-                    binding.target.layer != 0
-                    || binding.target.module != ParameterModuleKind::Mlp
+                    binding.target.module != ParameterModuleKind::Mlp
                     || binding.target.role != ParameterRole::DownProjectionWeight
                     || binding.operator != OverlayOperator::LowRankAdd)
                 || !probe.capabilities.iter().any(|value| value == "model/chunk_scan@1")
             {
-                return Err("model scan requires one compute task, one projection and its backend capability".into());
+                return Err("model scan requires a compute owner, down projections and the backend capability".into());
             }
         }
         AttachmentKind::ModelReplay if composed_replay => {
@@ -652,21 +651,33 @@ fn validate_cross_binding(
     match request.attachment_kind {
         AttachmentKind::ModelScan => {
             let task = task_for_dense_id(graph, &request.task_bindings[0])?;
-            if graph.tasks.len() != 1 || graph.states.len() != 1
-                || graph.states[0].resource != request.state_resource
-                || graph.states[0].scope != StateScope::Request
-                || graph.states[0].key_fields != vec![RequestKeyField::RequestId]
-                || task.inputs.len() != 1
-                || !matches!(task.inputs[0].source, InputSource::PackedRows)
-                || !task.outputs.is_empty()
-                || task.replay.is_some()
-                || task.effects.len() != 1
-                || task.effects[0].resource != request.state_resource
-                || task.effects[0].kind != StateEffectKind::UpdateMaybe
-                || task.effects[0].version.is_some()
+            let resources: std::collections::BTreeSet<_> = graph.states.iter().map(|state| &state.resource).collect();
+            if resources.len() != request.overlay_bindings.len()
+                || graph.states.iter().any(|state| state.scope != StateScope::Request
+                    || !state.key_fields.contains(&RequestKeyField::RequestId))
+                || !resources.contains(&request.state_resource)
+                || request.overlay_bindings.iter().map(|binding| &binding.resource).collect::<std::collections::BTreeSet<_>>() != resources
+                || task.inputs.len() != 1 || !matches!(task.inputs[0].source, InputSource::PackedRows)
+                || !task.outputs.is_empty() || task.replay.is_some()
+                || task.effects.iter().map(|effect| &effect.resource).collect::<std::collections::BTreeSet<_>>() != resources
+                || task.effects.iter().any(|effect| effect.kind != StateEffectKind::UpdateMaybe || effect.version.is_some())
                 || task.timing.after != "model.execute" || task.timing.before != "state.publish"
+                || !["prefill", "decode"].iter().all(|name| graph.source_regions.iter().any(|source| source.task == task.symbol && source.name == *name))
             {
-                return Err("model scan requires one request update region during model forward".into());
+                return Err("model scan needs independent request-target updates and complete prefill/decode sources".into());
+            }
+            for source in graph.source_regions.iter().filter(|source| source.task == task.symbol) {
+                let declared = source.program.resources.iter().filter_map(|resource| match resource {
+                    super::super::region_program::Resource::State { name, .. } => Some(name),
+                    _ => None,
+                }).collect::<std::collections::BTreeSet<_>>();
+                if declared != resources {
+                    return Err("model scan source must cover every independently published target".into());
+                }
+            }
+            if probe.causal_domain.as_ref().is_some_and(|domain|
+                request.overlay_bindings.iter().any(|binding| u64::from(binding.target.layer) >= domain.layers)) {
+                return Err("model scan target is outside the backend layer domain".into());
             }
             if state.representations.iter().any(|provider|
                 probe.max_packed_rows.div_ceil(request.model_scan_chunk_size).checked_add(2)
@@ -864,27 +875,19 @@ pub(crate) fn validate_inputs(inputs: &AttachmentCompilerInputs) -> Result<(), S
         .iter()
         .find(|layout| layout.resource == inputs.request.state_resource)
         .ok_or_else(|| "attachment state has no tensor layout".to_owned())?;
-    if inputs
-        .request
-        .overlay_bindings
-        .iter()
-        .flat_map(|binding| &binding.fields)
-        .chain(
-            inputs
-                .request
-                .activation_bindings
-                .iter()
-                .flat_map(|binding| &binding.fields),
-        )
-        .any(|field| {
-            !layout
-                .layout
-                .fields
-                .iter()
-                .any(|known| known.field_id == u64::from(*field))
-        })
-    {
-        return Err("overlay field is absent from the signed tensor layout".to_owned());
+    for binding in &inputs.request.overlay_bindings {
+        let target_layout = plan.tensor_layout_request.layouts.iter().find(|layout| layout.resource == binding.resource)
+            .ok_or("projection resource has no signed tensor layout")?;
+        if inputs.request.attachment_kind != AttachmentKind::ModelScan && binding.resource != inputs.request.state_resource {
+            return Err("projection resource differs from the attachment state".into());
+        }
+        if binding.fields.iter().any(|field| !target_layout.layout.fields.iter().any(|known| known.field_id == u64::from(*field))) {
+            return Err("projection field is absent from its target resource layout".into());
+        }
+    }
+    if inputs.request.activation_bindings.iter().flat_map(|binding| &binding.fields).any(|field|
+        !layout.layout.fields.iter().any(|known| known.field_id == u64::from(*field))) {
+        return Err("activation field is absent from its signed tensor layout".into());
     }
     }
     validate_cross_binding(

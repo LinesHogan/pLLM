@@ -162,12 +162,14 @@ class TraceSelection:
     names: tuple[str, ...] = ()
     tensors: bool = False
     gradients: bool = False
+    max_events: int = 0  # Zero keeps the recorder's current bounded capacity.
     max_tensor_bytes: int = MAX_SNAPSHOT_BYTES
     kernel_calls: int = 0
 
     def __post_init__(self) -> None:
         if (
-            not 8 <= self.max_tensor_bytes <= MAX_SNAPSHOT_BYTES
+            not 0 <= self.max_events <= 65536
+            or not 8 <= self.max_tensor_bytes <= MAX_SNAPSHOT_BYTES
             or not 0 <= self.kernel_calls <= 16
             or any(index < 0 for index in self.iterations)
         ):
@@ -200,6 +202,9 @@ class ExecutionTrace:
         if not set(selection.tasks).issubset(task.task_id for task in self.plan.tasks):
             raise ValueError("observation selection is outside the original physical plan")
         with self._lock:
+            if selection.max_events:
+                self._dropped += max(0, len(self._events) - selection.max_events)
+                self._events = deque(self._events, maxlen=selection.max_events)
             self._selection, self._kernel_calls = selection, selection.kernel_calls
 
     @contextmanager

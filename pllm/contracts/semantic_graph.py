@@ -7,6 +7,7 @@ from enum import StrEnum
 from typing import Literal, NewType
 
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from pllm.contracts.region_program import Program
 from pllm.contracts.region_selection import RegionSelectionPolicy
 from pllm.contracts.request_identity import RequestKeyField
 
@@ -242,6 +243,15 @@ class ConditionalInputGroup:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskSourceRegion:
+    """Complete task-owned source, available before physical partitioning."""
+
+    task: TaskSymbol
+    name: str
+    program: Program
+
+
+@dataclass(frozen=True, slots=True)
 class SemanticGraph:
     workload_id: WorkloadId
     tasks: tuple[SemanticTask, ...]
@@ -250,6 +260,7 @@ class SemanticGraph:
     edges: tuple[SemanticEdge, ...] = ()
     schema_version: int = 1
     input_groups: tuple[ConditionalInputGroup, ...] = ()
+    source_regions: tuple[TaskSourceRegion, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,6 +306,15 @@ class PhysicalTask:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskRegionSchedule:
+    """A source-derived instance order signed with the enclosing physical plan."""
+
+    task: TaskSymbol
+    name: str
+    schedule_map: str
+
+
+@dataclass(frozen=True, slots=True)
 class ScheduleDecision:
     graph_digest: str
     timeline_digest: str
@@ -307,6 +327,7 @@ class ScheduleDecision:
     peak_memory_bytes: int
     fence_count: int
     state_plan_digest: str | None
+    source_schedules: tuple[TaskRegionSchedule, ...] = ()
     schema_version: int = 1
 
 
@@ -318,6 +339,7 @@ class PhysicalPlan:
     fallback_count: int
     region_ends: tuple[int, ...]
     materialized_values: tuple[int, ...]
+    source_schedules: tuple[TaskRegionSchedule, ...] = ()
     schema_version: int = 1
 
 

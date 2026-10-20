@@ -1,4 +1,4 @@
-"""Qwen2.5 BF16 oracle and a synchronization audit of each production model call."""
+"""Real five-layer BF16 oracle, executed-grid trace and per-step synchronization audit."""
 
 import sys
 from pathlib import Path
@@ -15,10 +15,10 @@ from vllm import SamplingParams
 from vllm.forward_context import get_forward_context, override_forward_context
 
 import pllm
-from pllm.execution.trace import TraceSelection
-from test.workloads.test_model_scan import Adapters
+from pllm.execution.trace import TracePhase, TraceSelection
+from test.workloads.test_model_scan import Adapters, pad
 
-CHUNK, RANK = 3, 2  # A real one-row tail; parameter snapshots fit the 32 KiB trace bound.
+CHUNK, RANK = 3, 2
 
 
 def pages(model, context, length):
@@ -31,42 +31,65 @@ def pages(model, context, length):
 
 
 class Oracle:
-    """Original Qwen2 forward calls and a Torch optimizer, with independent KV history."""
+    """Original per-layer calls in chunk-major order, independent Torch optimizers and KV."""
 
-    def __init__(self, model, zero):
-        self.model, self.zero, self.offset, self.kv = model, zero, 0, ()
-        self.normal = type(model).forward.__get__(model, type(model))
-        self.mlp = model.layers[0].mlp
-        self.mlp_forward, self.down_forward = self.mlp.forward, self.mlp.down_proj.forward
-        weight = self.mlp.down_proj.weight
-        self.a = torch.empty(RANK, weight.shape[1], device=weight.device, dtype=weight.dtype)
-        self.a.normal_(std=0.02, generator=torch.Generator(device=weight.device).manual_seed(7))
-        if zero:
-            self.a.zero_()
-        self.b = torch.zeros(weight.shape[0], RANK, device=weight.device, dtype=weight.dtype)
-        self.a.requires_grad_(), self.b.requires_grad_()
-        self.optimizer = torch.optim.SGD((self.a, self.b), lr=1e-3, foreach=False)
-        self.records = {}
+    def __init__(self, handle, zero):
+        self.model, self.owner, self.zero = handle.runner.get_model().model, handle.deployment.execution, zero
+        self.offset, self.kv, self.records, self.params = 0, (), {}, {}
+        self.bindings = handle.deployment.attachment.inputs.request.overlay_bindings
+        self.optimizers = {}
 
-    def mlp_call(self, x):
-        self.target = x.clone()
-        return self.mlp_forward(x)
+    def layer(self, layer, positions, h, r):
+        module = self.model.layers[layer]
+        record = {"input": h.clone(), "residual_in": h.clone() if r is None else r.clone()}
+        params = self.params.get(layer)
+        if params is None:
+            h, r = module(positions, h, r)
+        else:
+            a, b = params
+            mlp, down = module.mlp.forward, module.mlp.down_proj.forward
 
-    def down_call(self, x):
-        self.x = x.clone()
-        value, bias = self.down_forward(x)
-        return (value if self.zero else value + (x @ self.a.T) @ self.b.T), bias
+            def mlp_call(x):
+                record["target"] = x.clone()
+                return mlp(x)
+
+            def down_call(x):
+                record["x"] = x.clone()
+                value, bias = down(x)
+                return (value if self.zero else value + (x @ a.T) @ b.T), bias
+
+            record.update(a_read=a.clone(), b_read=b.clone())
+            with (
+                patch.object(module.mlp, "forward", mlp_call),
+                patch.object(module.mlp.down_proj, "forward", down_call),
+            ):
+                h, r = module(positions, h, r)
+        record.update(hidden=h.clone(), residual=r.clone())
+        return h, r, record
 
     def run(self, ids, positions):
         context, prefill = get_forward_context(), self.offset == 0
+        if prefill:
+            refs = next(e.refs for e in reversed(self.owner.trace.snapshot().events) if e.phase is TracePhase.ADMIT)
+            with torch.inference_mode(False):
+                self.params = {
+                    binding.target.layer: tuple(
+                        self.owner.snapshot(ref, torch.cuda.current_stream())[i].clone().requires_grad_()
+                        for i in binding.fields
+                    )
+                    for ref, binding in zip(refs, self.bindings, strict=True)
+                }
+            self.optimizers = {
+                layer: torch.optim.SGD(params, lr=1e-3, foreach=False) for layer, params in self.params.items()
+            }
         saved = [(cache, index, cache[index].clone()) for cache, index in pages(self.model, context, self.offset)]
         for (cache, index, _), value in zip(saved, self.kv):
             cache[index] = value
-        self.mlp.forward, self.mlp.down_proj.forward = self.mlp_call, self.down_call
         outputs = []
         try:
-            for chunk, start in enumerate(range(0, len(positions), CHUNK)):
-                stop = min(start + CHUNK, len(positions))
+            chunk_size = CHUNK if prefill else 1
+            for chunk, start in enumerate(range(0, len(positions), chunk_size)):
+                stop = min(start + chunk_size, len(positions))
                 size, length = stop - start, self.offset + stop
                 metadata = {
                     name: replace(
@@ -92,30 +115,41 @@ class Oracle:
                         is_padding=None,
                     )
                 ):
-                    hidden = self.normal(ids[start:stop], positions[start:stop])
-                if prefill:
-                    with torch.inference_mode(False), torch.enable_grad():
-                        x, target = self.x.clone(), self.target.clone()
-                        prediction = x @ self.mlp.down_proj.weight.detach().T + (x @ self.a.T) @ self.b.T
-                        dtype = torch.promote_types(prediction.dtype, torch.float32)
-                        self.a.grad, self.b.grad = torch.autograd.grad(
-                            (prediction.to(dtype) - target.to(dtype)).square().mean(), (self.a, self.b)
+                    h, r = self.model.embed_input_ids(ids[start:stop]), None
+                    for layer in range(len(self.model.layers)):
+                        h, r, record = self.layer(layer, positions[start:stop], h, r)
+                        record = {
+                            name: value if name.endswith("read") else pad(value, chunk_size)
+                            for name, value in record.items()
+                        }
+                        if prefill and layer in self.params:
+                            a, b = self.params[layer]
+                            with torch.inference_mode(False), torch.enable_grad():
+                                x, target = record["x"][:size].clone(), record["target"][:size].clone()
+                                prediction = (
+                                    x @ self.model.layers[layer].mlp.down_proj.weight.detach().T + (x @ a.T) @ b.T
+                                )
+                                dtype = torch.promote_types(prediction.dtype, torch.float32)
+                                a.grad, b.grad = torch.autograd.grad(
+                                    (prediction.to(dtype) - target.to(dtype)).square().mean(), (a, b)
+                                )
+                            self.optimizers[layer].step()
+                            record.update(a=a.clone(), b=b.clone())
+                        cache, index = tuple(pages(self.model, context, length))[layer]
+                        record["kv"] = cache[index].clone()
+                        self.records.update(
+                            ((prefill, chunk, f"{layer}.{name}"), value) for name, value in record.items()
                         )
-                    self.optimizer.step()
+                    outputs.append(self.model.norm(h, r)[0])
                 self.kv = tuple(cache[index].clone() for cache, index in pages(self.model, context, length))
-                record = dict(zip(("hidden", "a", "b"), (hidden.clone(), self.a.clone(), self.b.clone())))
-                record.update((f"kv.{i}", value) for i, value in enumerate(self.kv))
-                self.records[prefill, chunk] = record
-                outputs.append(hidden)
             self.offset += len(positions)
             return torch.cat(outputs)
         finally:
-            self.mlp.forward, self.mlp.down_proj.forward = self.mlp_forward, self.down_forward
             for cache, index, value in saved:
                 cache[index] = value
 
 
-def scenario(zero):
+def scenario(zero, tolerance):
     counts = dict(sync_warnings=0, event_synchronize=0, model_calls=0)
     config = pllm.ModelConfig(
         "Qwen/Qwen2.5-0.5B-Instruct",
@@ -127,7 +161,7 @@ def scenario(zero):
     )
     with pllm.make_llm(config, workload=Adapters(chunk_size=CHUNK, rank=RANK, zero=zero)) as handle:
         causal = handle.runner.get_model()
-        model, oracle = causal.model, Oracle(causal.model, zero)
+        model, oracle = causal.model, Oracle(handle, zero)
         forward, synchronize = model.forward, torch.cuda.Event.synchronize
         tokens = []
 
@@ -151,37 +185,49 @@ def scenario(zero):
             counts["sync_warnings"] += len(sites)
             assert not sites, sites
             counts["model_calls"] += 1
-            torch.testing.assert_close(output, reference, atol=0, rtol=0)
+            torch.testing.assert_close(output, reference, atol=tolerance, rtol=tolerance)
             tokens.append(type(causal).compute_logits(causal, reference[-1:]).argmax())
             return output
 
         model.forward = observed
         try:
-            torch.cuda.set_sync_debug_mode("warn")  # Emit Torch's prototype notice outside the measured calls.
+            torch.cuda.set_sync_debug_mode("warn")
             torch.cuda.set_sync_debug_mode("default")
-            handle.observe(TraceSelection(tensors=True))
+            handle.observe(TraceSelection(tensors=True, max_events=4096))
             (result,) = handle.generate(
                 ["The quick brown fox jumps over the lazy dog. Explain why."],
                 SamplingParams(max_tokens=2, temperature=0, ignore_eos=True),
             )
         finally:
             model.forward = forward
-        events, compared = handle.trace_snapshot().events, 0
+        events, compared, maxima, trace = handle.trace_snapshot().events, 0, {}, []
         for event in events:
             if event.tensor_name:
-                reference = oracle.records[event.row.token_offset == 0, event.iteration][event.tensor_name]
-                torch.testing.assert_close(event.tensor(), reference.cpu(), atol=0, rtol=0)
+                reference = oracle.records[event.row.token_offset == 0, event.iteration, event.tensor_name].cpu()
+                actual = event.tensor()
+                torch.testing.assert_close(actual, reference, atol=tolerance, rtol=tolerance)
+                layer = int(event.tensor_name.split(".")[0])
+                maxima[layer] = max(maxima.get(layer, 0), float((actual - reference).abs().max()))
+                if event.row.token_offset == 0 and event.tensor_name.endswith(".input"):
+                    trace.append((event.iteration, layer))
+                if event.tensor_name.endswith("a_read"):
+                    assert event.refs[0].version_id == (
+                        event.iteration
+                        if event.row.token_offset == 0
+                        else (len(result.prompt_token_ids) + CHUNK - 1) // CHUNK
+                    )
                 compared += 1
         diagnostics = handle.deployment.execution.diagnostics()
-        updates = (len(result.prompt_token_ids) + CHUNK - 1) // CHUNK
-        assert len(result.prompt_token_ids) % CHUNK and diagnostics.update_count == updates
-        assert compared == updates * (len(model.layers) + 3) + len(model.layers)
+        chunks = (len(result.prompt_token_ids) + CHUNK - 1) // CHUNK
+        assert diagnostics.update_count == chunks * 5 and trace != sorted(trace)
+        assert len(trace) == chunks * len(model.layers)
         assert result.outputs[0].token_ids == [int(token) for token in tokens]
         assert diagnostics.active_lineages == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
         assert counts == dict(sync_warnings=0, event_synchronize=0, model_calls=2), counts
-        return dict(zero=zero, updates=updates, compared=compared, **counts)
+        return dict(zero=zero, updates=chunks * 5, compared=compared, maximum_errors=maxima, trace=trace, **counts)
 
 
 if __name__ == "__main__":
-    # Zero-adapter original-model identity fixes atol=rtol=0 before learning is exercised.
-    print(json.dumps([scenario(True), scenario(False)]))
+    baseline = scenario(True, 0)
+    # The no-update run fixes zero tolerance before the learned trajectory runs.
+    print(json.dumps([baseline, scenario(False, 0)]))

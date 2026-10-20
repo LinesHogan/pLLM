@@ -184,7 +184,7 @@ class BackendAttachmentRequest:
     overlay_bindings: tuple[ParameterOverlayFieldBinding, ...] = ()
     activation_bindings: tuple[ActivationPatchBinding, ...] = ()
     model_scan_chunk_size: int = 0
-    schema_version: int = 9
+    schema_version: int = 10
 
     @property
     def guides_sampler(self) -> bool:
@@ -206,7 +206,7 @@ class BackendAttachmentCompilerInputs:
 class BackendAttachmentDecision:
     request_digest: str
     signature: str
-    schema_version: int = 9
+    schema_version: int = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,7 +221,7 @@ class BackendAttachmentPhysicalPlan:
     topology: AttachmentTopology
     graph_mode: AttachmentGraphMode
     bundle_signature: str
-    schema_version: int = 9
+    schema_version: int = 10
 
 
 @dataclass(frozen=True, slots=True)

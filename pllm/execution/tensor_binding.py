@@ -50,13 +50,14 @@ from pllm.contracts.semantic_graph import (
     StateScope,
     StateSelectionInputSource,
     TaskResultInputSource,
+    TaskSourceRegion,
     TaskSymbol,
 )
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 from pllm.execution.declaration import Builder, Call, Dimensions, Field, Shape, State, When, native
 from pllm.execution.execution import TaskGraphImplementation
-from pllm.execution.model_scan import ChunkTraining, ModelScanTask
+from pllm.execution.model_scan import ChunkTraining, ModelScanTask, model_scan_source, target_resource
 from pllm.execution.ptts.page_borrow import borrowed_root
 from pllm.execution.ptts.page_bundle import PagePublication
 from pllm.execution.ptts.request_state import RequestStateSelection
@@ -338,6 +339,7 @@ class TensorBinding(Builder[TensorFrame]):
         initialize: Callable[[Mapping[str, torch.Tensor], torch.Generator], None],
         loss: TensorMath,
         optimizer: AdamWConfig | SGD,
+        keys: tuple[RequestKeyField, ...],
     ) -> None:
         """Declare one request-owned scan and its projection consumer."""
         effect = scan.apply
@@ -346,29 +348,54 @@ class TensorBinding(Builder[TensorFrame]):
             raise ValueError("ModelScan needs its own request state and model execution")
         if self.dimensions is not None:
             _check_overlay_shapes(buffers, effect.factors, self.dimensions, effect.operator)
+        if self.dimensions is not None and any(
+            target.layer >= self.dimensions.layer_count for target in effect.targets
+        ):
+            raise ValueError("ModelScan targets must be inside the backend's complete layer domain")
         self.overlay_targets = effect.targets
-        state = self.state(
-            effect.state,
-            tuple(_buffer_field(key, buffer, lambda model: model.target_shapes[0]) for key, buffer in buffers.items()),
-            namespace=namespace,
-            scope=StateScope.REQUEST,
-            keys=(RequestKeyField.REQUEST_ID,),
-            optimizer=optimizer if isinstance(optimizer, AdamWConfig) else None,
+        states = tuple(
+            self.state(
+                target_resource(effect.state, target.layer),
+                tuple(
+                    _buffer_field(key, buffer, lambda model, i=i: model.target_shapes[i])
+                    for key, buffer in buffers.items()
+                ),
+                namespace=namespace,
+                scope=StateScope.REQUEST,
+                keys=keys,
+                optimizer=optimizer if isinstance(optimizer, AdamWConfig) else None,
+            )
+            for i, target in enumerate(effect.targets)
         )
-        stride = 5 if state.optimizer is not None else 1
-        parameters = tuple(range(0, len(state.fields), stride))
+        stride = 5 if states[0].optimizer is not None else 1
+        parameters = tuple(range(0, len(states[0].fields), stride))
 
         def init(root: tuple[torch.Tensor, ...], generator: torch.Generator) -> None:
             initialize(dict(zip(buffers, (root[i] for i in parameters), strict=True)), generator)
 
-        self.initializers[effect.state] = init
+        self.initializers.update((str(state.declaration.resource), init) for state in states)
         forward = self.compute(
             name,
             inputs={"rows": self.rows()},
-            changes=state,
+            reads=tuple(SemanticEffect(state.declaration.resource, StateEffectKind.UPDATE_MAYBE) for state in states),
             when=When.MODEL_UPDATE,
             implementations=(native("model.chunk_scan@1", "model/chunk_scan@1"),),
         )
+        if self.probe is not None:
+            assert self.dimensions is not None
+            self.graph = replace(
+                self.graph,
+                source_regions=tuple(
+                    TaskSourceRegion(
+                        forward.symbol,
+                        phase,
+                        model_scan_source(
+                            scan, self.layouts, self.probe, self.dimensions.layer_count, parameters, learning=learning
+                        ),
+                    )
+                    for phase, learning in (("prefill", True), ("decode", False))
+                ),
+            )
         self.model_scan = (
             scan,
             ChunkTraining(
@@ -385,14 +412,16 @@ class TensorBinding(Builder[TensorFrame]):
                 AttachmentKind.MODEL_SCAN,
                 ((AttachmentTaskRole.COMPUTE, forward.symbol),),
                 AnchorSymbol("sampler.pre_draw"),
-                state.declaration.resource,
-                (
+                states[0].declaration.resource,
+                tuple(
                     ParameterOverlayFieldBinding(
-                        effect.targets[0],
+                        target,
                         effect.operator,
                         tuple(LayoutFieldId(i) for i in parameters),
+                        target_resource(effect.state, target.layer),
                         effect.scale,
-                    ),
+                    )
+                    for target in effect.targets
                 ),
                 model_scan_chunk_size=scan.chunk_size,
             )
@@ -410,7 +439,7 @@ class TensorBinding(Builder[TensorFrame]):
             return None
         assert plan is not None and probe is not None
         scan, training = self.model_scan
-        return ModelScanTask[TensorFrame].bind(task, identity, plan, probe, scan.chunk_size, training)
+        return ModelScanTask[TensorFrame].bind(task, identity, plan, scan, training)
 
     def configure_scans(self, facts: BackendCompileFacts) -> None:
         """Bind scan specialization to the plan's policy and row capacity."""
@@ -553,7 +582,11 @@ class TensorBinding(Builder[TensorFrame]):
             publication,
             tuple(
                 ParameterOverlayFieldBinding(
-                    target, operator, tuple(state.field(f"{key}_{i}") for key in applied), scale
+                    target,
+                    operator,
+                    tuple(state.field(f"{key}_{i}") for key in applied),
+                    str(state.declaration.resource),
+                    scale,
                 )
                 for i, target in enumerate(targets)
             ),
@@ -632,7 +665,11 @@ class TensorBinding(Builder[TensorFrame]):
             publication,
             tuple(
                 ParameterOverlayFieldBinding(
-                    target, operator, tuple(state.field(f"{key}_{i}") for key in applied), scale
+                    target,
+                    operator,
+                    tuple(state.field(f"{key}_{i}") for key in applied),
+                    str(state.declaration.resource),
+                    scale,
                 )
                 for i, target in enumerate(targets)
             ),

@@ -325,7 +325,7 @@ def multistate(*, route=False, instance=True, failing=()):
     arena = multistate_arena(route=route, instance=instance)
 
     def initializer(name, value):
-        def initialize(roots):
+        def initialize(roots, keys):
             if name in failing:
                 raise RuntimeError("injected admission failure")
             for root in roots:

@@ -44,6 +44,7 @@ class ParameterOverlayFieldBinding:
     target: ParameterTarget
     operator: ParameterOverlayOperator
     fields: tuple[LayoutFieldId, ...]
+    resource: str
     scale: float = 1.0
 
 

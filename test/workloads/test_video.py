@@ -97,7 +97,7 @@ def binding_case(*, alias=False, write_failure=False, runtime=False, missing=Non
         (b.graph, b.layouts), timeline, (PageBundleProviderFacts("video.binding@1", 3),), 1, 65536, torch.device("cpu")
     )
     math = FunctionMath(
-        {"inject": lambda roots: None},
+        {"inject": lambda roots, keys: None},
         lambda value: () if value is None else value.rows.request_rows,
         lambda value, batch: TensorFrame(value, () if value is None else value.rows.rows),
         lambda data, result: result.publication,

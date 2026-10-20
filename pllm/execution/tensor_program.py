@@ -12,6 +12,7 @@ from torch.optim.sgd import sgd
 
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.request_identity import RequestIdentity
+from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
 from pllm.contracts.semantic_graph import ImplementationId, SemanticOutputKind, StateResource, TaskSymbol
 from pllm.contracts.state_ref import StateRef
@@ -20,7 +21,7 @@ from pllm.execution.cuda_stream import CudaStreamReadiness, upload
 from pllm.execution.memory import MemoryUsage, measure
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot, borrowed_root
 from pllm.execution.ptts.page_bundle import PagePin, PagePublication, PageWrite, Slots
-from pllm.execution.ptts.request_state import RequestStateSelection
+from pllm.execution.ptts.request_state import RequestStateSelection, StateAddress
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.state_execution import StateTaskContext
 from pllm.execution.trace import TracePhase
@@ -171,18 +172,22 @@ def _read(context: StateTaskContext[D], version: Literal["input", "private", "pu
 
 @dataclass(frozen=True, slots=True)
 class FunctionMath(Generic[I, D, R]):
-    initializers: Mapping[str, Callable[[Roots], None]]
+    initializers: Mapping[str, Callable[[Roots, tuple[RequestStateKey | None, ...]], None]]
     rows: Callable[[I], tuple[PackedPhaseRow, ...]]
     prepare_data: Callable[[I, TensorBatch], D]
     output_data: Callable[[D, InvocationOutput], R]
 
-    def initialize(self, roots: Roots, resources: tuple[str, ...]) -> None:
-        if len(roots) != len(resources) or not set(resources) <= self.initializers.keys():
+    def initialize(self, roots: Roots, addresses: tuple[StateAddress, ...]) -> None:
+        resources = tuple(str(address.resource) for address in addresses)
+        if len(roots) != len(addresses) or not set(resources) <= self.initializers.keys():
             raise ValueError("state initialization requires a named initializer for every root")
         for resource in dict.fromkeys(resources):
-            self.initializers[resource](
-                tuple(root for root, name in zip(roots, resources, strict=True) if name == resource)
+            selected = tuple(
+                (root, address.key)
+                for root, address in zip(roots, addresses, strict=True)
+                if address.resource == resource
             )
+            self.initializers[resource](tuple(root for root, _ in selected), tuple(key for _, key in selected))
 
     def prepare(self, value: I, context: StateTaskContext[D]) -> D:
         with (
