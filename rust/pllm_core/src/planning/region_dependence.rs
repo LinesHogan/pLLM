@@ -54,8 +54,8 @@ pub(super) struct ScheduleCandidate {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ResourceDependencies {
-    reads: String,
-    writes: String,
+    pub reads: String,
+    pub writes: String,
     raw: String,
     war: String,
     waw: String,
@@ -76,7 +76,7 @@ pub(super) struct Analysis {
     pub(super) value_consumers: String,
     data_dependencies: String,
     effect_dependencies: String,
-    resource_dependencies: ResourceDependencies,
+    pub resource_dependencies: ResourceDependencies,
     pub(super) dependencies: String,
     pub reference_schedule: String,
     pub candidates: Vec<ScheduleCandidate>,

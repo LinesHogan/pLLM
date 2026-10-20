@@ -35,6 +35,7 @@ from vllm.v1.worker.gpu_worker import Worker
 
 from pllm.authoring import (
     AuxiliaryInput,
+    BackendAuthoring,
     BackendCompileFacts,
     BackendDeployment,
     BackendRequirements,
@@ -47,7 +48,7 @@ from pllm.authoring import (
 )
 from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.hidden_capture import HiddenTaps
-from pllm.backends.vllm.model_scan import VllmModelScan
+from pllm.backends.vllm.model_scan import ModelScanSource, VllmModelScan
 from pllm.backends.vllm.packed_rows import encode_mrv2_rows
 from pllm.backends.vllm.parameter_overlay import (
     VllmParameterOverlay,
@@ -61,6 +62,7 @@ from pllm.backends.vllm.sampler import (
     SignedSamplerGuidance,
     Vllm027Sampler,
 )
+from pllm.backends.vllm.window_scheduler import WINDOW_ARGUMENT, WindowSchedulerOutput, model_scan_admission
 from pllm.config import ModelConfig, RunnerKind, VllmDType
 from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import (
@@ -138,7 +140,7 @@ _BACKEND_ABI_FIELDS = (
     "attachments=request_training|parameter_overlay|activation_patch",
     "activation=phase_windows/exact_step_pins/source_readonly@2",
     "model=causal_indexed_layer@5",
-    "region=event_ordered_windows@3/explicit_native_host_reads",
+    "region=closed_engine_windows@4/captured_tensor_sources",
 )
 _REQUEST_CAPABILITIES = (
     "producer/packed_hidden@1",
@@ -323,7 +325,7 @@ class VllmSession(Generic[DataT, ResultT]):
                 deployment.execution,
                 attachment.inputs.request.task_bindings[0].anchor_id,
                 overlay_bindings,
-                attachment.inputs.request.model_scan_chunk_size,
+                model_scan_admission(attachment),
             )
             if model_scan
             else None
@@ -525,6 +527,10 @@ class VllmSession(Generic[DataT, ResultT]):
         ):
             self._input_failed = True
             raise RuntimeError("activation injection and ModelScan need requests without vLLM preemption")
+        if self._model_scan is not None:
+            if not isinstance(scheduler_output, WindowSchedulerOutput):
+                raise ValueError("ModelScan needs its closed-window scheduler and original allocation grants")
+            self._model_scan.accept(scheduler_output.window)
         execution = self._deployment.execution
         execution.arena.collect_completed()
         finished = tuple(
@@ -1125,6 +1131,7 @@ class BackendProbe:
 
     requirements: BackendRequirements
     publish_lag: int = 1
+    definition: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1566,6 +1573,13 @@ class VllmLlm(Generic[DataT, ResultT]):
                 raise ValueError("one prompt identity cannot name different input texts")
         validate_auxiliary(auxiliary, self.attachment.inputs.plan, SharedTensor.describe)
         llm = self._require_llm()
+        if self.attachment.inputs.request.attachment_kind is AttachmentKind.MODEL_SCAN:
+            sampling_params = sampling_params.clone()
+            extras = dict(sampling_params.extra_args or {})
+            if WINDOW_ARGUMENT in extras:
+                raise ValueError("closed-window admission is supplied by the installed workload plan")
+            extras[WINDOW_ARGUMENT] = encode_boundary(model_scan_admission(self.attachment))
+            sampling_params.extra_args = extras
         llm.sleep(level=0, mode="keep")
         request_ids: list[str] = []
         lifetime = ExitStack()
@@ -1678,6 +1692,10 @@ def create_vllm_llm(
     if _VLLM_VERSION != _SUPPORTED_VLLM_VERSION:
         raise RuntimeError("vLLM workload requires vLLM 0.27.1 exactly")
     requirements = workload.backend_requirements()
+    if requirements.prefill_chunk_size and (
+        config.runner is not RunnerKind.MRV2 or config.max_num_batched_tokens < requirements.prefill_chunk_size
+    ):
+        raise ValueError("ModelScan needs MRv2 and enough engine tokens for one complete learning chunk")
     if config.cuda_graphs and (requirements.parameter_targets or requirements.activation_layers):
         raise ValueError("parameter overlays and activation patches do not run under CUDA graphs yet")
     environment = {
@@ -1713,8 +1731,11 @@ def create_vllm_llm(
             seed=config.seed,
             trust_remote_code=config.trust_remote_code,
             enable_prefix_caching=config.enable_prefix_caching,
-            enable_chunked_prefill=False,
-            async_scheduling=False if config.runner is RunnerKind.MRV1 else None,
+            enable_chunked_prefill=bool(requirements.prefill_chunk_size),
+            scheduler_cls=(
+                "pllm.backends.vllm.window_scheduler.ClosedWindowScheduler" if requirements.prefill_chunk_size else None
+            ),
+            async_scheduling=False if config.runner is RunnerKind.MRV1 or requirements.prefill_chunk_size else None,
         )
     finally:
         for name, value in previous_environment.items():
@@ -1731,7 +1752,7 @@ def create_vllm_llm(
                 timeout=30.0,
                 args=(
                     BackendCommand.PROBE.value,
-                    encode_boundary(BackendProbe(requirements, config.execution.publish_lag)),
+                    encode_boundary(BackendProbe(requirements, config.execution.publish_lag, definition or "")),
                 ),
             )
             if len(replies) != 1:
@@ -1772,7 +1793,8 @@ def create_vllm_llm(
                 case _:
                     raise RuntimeError("vLLM workload did not construct its selected runner")
             facts = workload.specialize(
-                probe_backend(requirements, runner, publish_lag=config.execution.publish_lag), config.execution
+                probe_backend(requirements, runner, publish_lag=config.execution.publish_lag, source_workload=workload),
+                config.execution,
             )
             deployment = workload.compile_backend(facts)
             runner.attach_workload(deployment, config.execution.publish_lag)
@@ -1821,6 +1843,7 @@ def probe_backend(
     timeline: SchedulerTimeline | None = None,
     *,
     publish_lag: int = 1,
+    source_workload: BackendAuthoring | None = None,
 ) -> BackendCompileFacts:
     _require_runner(runner)
     match runner.model:
@@ -1945,11 +1968,9 @@ def probe_backend(
     # Each lagged step additionally retains its exact input root for readers. No host wait
     # is hidden in this capacity: current + private + GPU reader + publish_lag retained roots.
     capacity = (3 + publish_lag) * runner.max_num_reqs + 2
-    if chunk := requirements.prefill_chunk_size:
-        # Every chunk may be queued before the GPU releases its first version.
-        roots = (probe.max_packed_rows + chunk - 1) // chunk + 2
-        capacity = max(capacity, roots * runner.max_num_reqs)
-    return BackendCompileFacts(
+    if requirements.prefill_chunk_size:
+        capacity = 3 * runner.max_num_reqs
+    facts = BackendCompileFacts(
         probe,
         timeline,
         (
@@ -1967,6 +1988,13 @@ def probe_backend(
         model.config.vocab_size,
         layer_count,
     )
+    if requirements.prefill_chunk_size and source_workload is not None:
+        graph, _, attachment = source_workload.declare(facts)
+        source = ModelScanSource.capture(model.model, attachment.overlay_bindings)
+        kernels = source.imports(model.model, graph.source_regions, probe)
+        training = source_workload.source_imports(facts)
+        facts = replace(facts, probe=replace(probe, region_imports=(*probe.region_imports, *kernels, *training)))
+    return facts
 
 
 def _require_runner(runner: WorkloadModelRunner | Mrv1Runner) -> None:

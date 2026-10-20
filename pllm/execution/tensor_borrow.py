@@ -2,11 +2,21 @@
 
 from dataclasses import dataclass
 from math import prod
+from typing import Protocol
 
 import torch
 
 from pllm.contracts.region_program import AccessMode, BorrowedResource
 from pllm.execution.paged_access import PagedResourceView
+
+
+class MutableTensorView(Protocol):
+    """A backend's physical separation proof for indexed mutable resources."""
+
+    @property
+    def resource(self) -> BorrowedResource: ...
+    def validate(self, protected: tuple[tuple[str, int, int], ...]) -> tuple[tuple[str, int, int], ...]: ...
+    def check(self, mode: AccessMode, ranges: tuple[tuple[int, int], ...]) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,3 +184,38 @@ class TensorResourceView:
 
     def check(self, mode: AccessMode, ranges: tuple[tuple[int, int], ...]) -> None:
         assert len(ranges) == 1 and 0 <= ranges[0][0] <= ranges[0][1] <= len(self.tensors)
+
+
+@dataclass(frozen=True, slots=True)
+class PagedAllocationView:
+    """Request/layer KV cells backed by the original allocator's CPU block grants.
+
+    Prefix sharing is excluded: disjoint allocated blocks prove request
+    separation without reading device page tables. The backend must use the
+    same grants for its GPU table/slot producer and retain that producer's order.
+    This descriptor allocates, retires and remaps no pages.
+    """
+
+    resource: BorrowedResource
+    caches: tuple[torch.Tensor, ...]
+    blocks: tuple[tuple[int, ...], ...]
+
+    def validate(self, protected: tuple[tuple[str, int, int], ...]) -> tuple[tuple[str, int, int], ...]:
+        if len(self.resource.domain) != 2 or self.resource.domain[1] != len(self.caches):
+            raise ValueError("paged allocation proof needs request and layer domains")
+        if len(self.blocks) > self.resource.domain[0]:
+            raise ValueError("paged allocation grants exceed the declared request count")
+        flat = tuple(block for row in self.blocks for block in row)
+        if any(not row for row in self.blocks) or len(flat) != len(set(flat)):
+            raise ValueError("closed model windows require distinct nonshared request blocks")
+        if any(cache.ndim != 4 or any(not 0 <= block < cache.shape[0] for block in flat) for cache in self.caches):
+            raise ValueError("original KV allocation grants exceed the cache block domain")
+        storage = BorrowedResource(self.resource.name, (len(self.caches),))
+        return TensorResourceView(storage, self.caches).validate(protected)
+
+    def check(self, mode: AccessMode, ranges: tuple[tuple[int, int], ...]) -> None:
+        if len(ranges) != 2 or not (
+            0 <= ranges[0][0] <= ranges[0][1] <= len(self.blocks)
+            and 0 <= ranges[1][0] <= ranges[1][1] <= len(self.caches)
+        ):
+            raise ValueError("KV access is outside the original request/layer allocation grants")

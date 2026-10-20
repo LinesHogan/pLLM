@@ -19,6 +19,7 @@ mod region_imports;
 mod region_capacity;
 mod region_selection;
 mod region_tiling;
+mod region_window;
 mod region_outlining;
 pub(crate) mod backend_attachment;
 pub(crate) mod scheduler;
@@ -137,6 +138,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     region_capacity::register(module)?;
     region_selection::register(module)?;
     region_tiling::register(module)?;
+    region_window::register(module)?;
     region_outlining::register(module)?;
     module.add_function(wrap_pyfunction!(compile_state_schedule, module)?)?;
     module.add_function(wrap_pyfunction!(validate_plan_bundle, module)?)?;

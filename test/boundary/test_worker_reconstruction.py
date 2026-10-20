@@ -21,6 +21,7 @@ from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.workload_transport import decode_workload, encode_workload
 from pllm.workloads.dummy import DummyWorkload
 from pllm.workloads.override import OverRIDEWorkload
+from pllm.workloads.prefill_adapters import PrefillAdapters
 from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload
 
 
@@ -65,7 +66,12 @@ class TransportHolder(DummyWorkload):
 def test_workload_transport_round_trips_frozen_workloads_and_rejects_what_the_worker_cannot_import() -> None:
     # Built-ins and user workloads travel identically: class coordinates plus frozen fields;
     # module-level function replacements are imported by the worker.
-    for workload in (DummyWorkload(), replace(OverRIDEWorkload(), objective=doubled_cross_entropy), HuberWorkload(3)):
+    for workload in (
+        DummyWorkload(),
+        replace(OverRIDEWorkload(), objective=doubled_cross_entropy),
+        HuberWorkload(3),
+        PrefillAdapters(dtype=torch.float64),
+    ):
         assert decode_workload(encode_workload(workload), device=torch.device("cpu"), seed=0) == workload
     holder = TransportHolder(extra=FakeTransport(FakeTransportConfig(2)))
     restored = decode_workload(encode_workload(holder), device=torch.device("cpu"), seed=0)

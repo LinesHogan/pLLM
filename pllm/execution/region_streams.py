@@ -9,16 +9,35 @@ import torch
 
 from pllm import _core
 from pllm.contracts.region_program import Program
-from pllm.contracts.region_proposal import RegionScheduleProposal
+from pllm.contracts.region_proposal import ClosedRegionWindow, RegionScheduleProposal
 from pllm.contracts.region_retention import RetainedAllocation
-from pllm.contracts.region_selection import RegionPayloadLimit
+from pllm.contracts.region_selection import RegionPayloadLimit, RegionSelectionPolicy
 from pllm.contracts.region_streams import RegionStreamExploration, RegionStreamPlan
+from pllm.contracts.semantic_graph import TaskSourceRegion
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.region_compilation import analyze_region_program
 from pllm.execution.region_frame import lookup
 from pllm.execution.region_storage import RegionImportSource, analyze_region_payload, import_region_functions
 from pllm.execution.region_values import Bank, Data
+
+
+def plan_closed_window(
+    source: TaskSourceRegion, policy: RegionSelectionPolicy, *, parallel: bool, budget: int | None = None
+) -> ClosedRegionWindow:
+    """Derive and sign an engine cut before the enclosing task is partitioned."""
+    assert source.window is not None
+    return decode_boundary(
+        _core.plan_closed_region_window(
+            encode_boundary(source.program),
+            encode_boundary(source.imports),
+            encode_boundary(source.window),
+            encode_boundary(policy),
+            parallel,
+            budget,
+        ),
+        ClosedRegionWindow,
+    )
 
 
 def lower_region_streams(

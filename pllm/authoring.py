@@ -22,6 +22,7 @@ from pllm.contracts.hidden_locator import HiddenPhase as HiddenPhase, HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenSnapshotBatch
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.contracts.parameter_overlay import CapturedParameterOperand, ParameterTarget
+from pllm.contracts.region_imports import RegionTensorImport
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage as SamplerStage
 from pllm.contracts.semantic_graph import (
     HiddenInputSource,
@@ -229,13 +230,24 @@ class BackendAuthoring(ABC):
     @abstractmethod
     def backend_requirements(self) -> BackendRequirements: ...
 
+    def source_imports(self, facts: BackendCompileFacts) -> tuple[RegionTensorImport, ...]:
+        """Capture local source contracts on the original execution device."""
+        return ()
+
     def resource_facts(self, facts: BackendCompileFacts, options: ExecutionOptions) -> SchedulerTimeline:
         if options.capture or options.explicit_math:
             raise ValueError("this workload has no explicit tensor/capture implementation")
         return facts.timeline
 
     def specialize(self, facts: BackendCompileFacts, options: ExecutionOptions) -> BackendCompileFacts:
+        from pllm.contracts.region_imports import region_import_name
         from pllm.contracts.region_selection import RegionSelectionPolicy
+
+        if facts.device.type == "cpu":
+            captured = self.source_imports(facts)
+            if captured:
+                imports = {region_import_name(item): item for item in (*facts.probe.region_imports, *captured)}
+                facts = replace(facts, probe=replace(facts.probe, region_imports=tuple(imports.values())))
 
         facts = replace(
             facts,

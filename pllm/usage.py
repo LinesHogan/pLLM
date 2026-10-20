@@ -35,6 +35,8 @@ from pllm.contracts.parameter_overlay import (
     ParameterRole,
     ParameterTarget,
 )
+from pllm.contracts.region_imports import RegionTensorImport
+from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY
 from pllm.contracts.request_identity import RequestKeyField, canonical_request_key_fields
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import SamplerStage
@@ -69,7 +71,7 @@ from pllm.execution.host_runtime import (
     HostWorkload,
     TensorHostBinding,
 )
-from pllm.execution.model_scan import model_scan_workspace
+from pllm.execution.region_streams import plan_closed_window
 from pllm.execution.replay import Recurrence as Recurrence
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.task_memory import derive_resources
@@ -1235,6 +1237,7 @@ class Workload(
         )
         b.resources = () if facts is None else facts.timeline.task_resources
         b.probe = None if facts is None else facts.probe
+        b.max_requests = 1 if facts is None else facts.max_admitted_lineages
         self._build(b)
         if facts is not None:
             b.configure_scans(facts)
@@ -1353,6 +1356,20 @@ class Workload(
         )
         return owner.operations(facts, plan, b)
 
+    def source_imports(self, facts: BackendCompileFacts) -> tuple[RegionTensorImport, ...]:
+        """Import the local derivatives and the actual shared optimizer implementation."""
+        with FakeTensorMode():
+            binding = self.declaration(facts)
+        if binding.model_scan is None:
+            return ()
+        _, training = binding.model_scan
+        return tuple(
+            training.capture(function).implementation
+            for source in binding.graph.source_regions
+            for function in source.program.functions
+            if function.name.startswith("train.")
+        )
+
     def resource_facts(self, facts: BackendCompileFacts, options: ExecutionOptions) -> SchedulerTimeline:
         """Reserve ordinary tensor scratch and each requested graph's private pool."""
         _reject(options.explicit_math, "this workload has no explicit tensor implementation")
@@ -1360,22 +1377,22 @@ class Workload(
             binding = self.declaration(facts)
         if binding.model_scan is not None:
             _reject(options.capture, "ModelScan currently needs eager execution")
-            scan, training = binding.model_scan
-            layouts = binding.layouts.layouts
             (task,) = binding.graph.tasks
+            windows = tuple(
+                plan_closed_window(
+                    source,
+                    facts.timeline.region_policy,
+                    parallel=REGION_STREAMS_CAPABILITY in facts.probe.capabilities,
+                    budget=options.memory_budget_bytes,
+                )
+                for source in binding.graph.source_regions
+            )
             return replace(
                 facts.timeline,
                 task_resources=(
                     TaskResourceFact(
                         task.symbol,
-                        sum(
-                            model_scan_workspace(
-                                facts.probe,
-                                scan.chunk_size,
-                                tuple(layout.layout.fields[i].shape for i in training.parameters),
-                            )
-                            for layout in layouts
-                        ),
+                        max(window.workspace_bytes for window in windows),
                         0,
                     ),
                 ),

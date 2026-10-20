@@ -43,6 +43,7 @@ from pllm.workloads.fttt import (
 )
 from pllm.workloads.fttt.types import FTTTResult
 from pllm.workloads.lora import OutputLoRAConfig, OutputLoRAWorkload
+from pllm.workloads.prefill_adapters import PrefillAdapters
 from pllm.workloads.recirculation import RecirculationConfig, RecirculationWorkload
 from pllm.workloads.reft import ActivationConfig, ActivationWorkload
 from pllm.workloads.tlm import HfQvConfig, HfQvModel, TLMConfig, TLMWorkload
@@ -150,6 +151,30 @@ def _user_reference_workload() -> None:
         print(f"user workload by reference: child={child} loss={finished.loss_count}")
     finally:
         handle.close()
+
+
+def _model_scan_reconstruction() -> None:
+    """A rebuilt worker starts fresh request identities and exact version-zero roots."""
+    processes, requests = [], []
+    for _ in range(2):
+        with pllm.make_llm(
+            workload=PrefillAdapters(chunk_size=3, rank=2), config=engine(tokens=6, memory=0.15)
+        ) as handle:
+            handle.observe(TraceSelection(max_events=4096))
+            outputs = handle.generate(["The quick brown fox jumps over the lazy dog.", "Hello there."], greedy(2))
+            state = handle.worker_state()
+            assert state.process_id != os.getpid()
+            assert state.diagnostics.update_count == 5 * sum(
+                (len(output.prompt_token_ids) + 2) // 3 for output in outputs
+            )
+            assert_clean(state.diagnostics)
+            admissions = [event for event in handle.trace_snapshot().events if event.phase is TracePhase.ADMIT]
+            assert admissions and all(ref.version_id == 0 for event in admissions for ref in event.refs)
+            processes.append(state.process_id)
+            requests.append({identity.request_id for event in admissions for identity in event.identities})
+            assert not torch.cuda.is_initialized()
+    assert processes[0] != processes[1] and requests[0].isdisjoint(requests[1])
+    print(f"ModelScan reconstructed workers={processes}; fresh requests={requests}; parent CUDA=off")
 
 
 def _dummy_export() -> None:
@@ -504,6 +529,7 @@ def main() -> int:
     _captured_esamp()
     _dummy_export()
     _user_reference_workload()
+    _model_scan_reconstruction()
     _gpu_shared_input()
     return 0
 
@@ -518,6 +544,7 @@ MODES = {
     "--recirculation-measured": lambda: _recirculation_schedules(measured=True),
     "--dummy-only": _dummy_export,
     "--user-only": _user_reference_workload,
+    "--model-scan-only": _model_scan_reconstruction,
     "--tlm-only": _tlm_shared_input,
 }
 

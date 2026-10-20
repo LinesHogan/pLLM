@@ -33,4 +33,5 @@ class RegionBindings:
     times: tuple[AccessTable, ...]
     last_uses: tuple[AccessTable, ...]
     retained: tuple[AccessTable, ...]
+    resource_uses: tuple[AccessTable, ...]
     signature: str

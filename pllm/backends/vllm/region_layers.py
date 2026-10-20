@@ -124,7 +124,8 @@ def decoder_partition_bodies(
     return tuple(result)
 
 
-def _original_layer(layer: Qwen2DecoderLayer) -> bool:
+def original_layer(layer: Qwen2DecoderLayer) -> bool:
+    """Check the Qwen2 implementation and hooks covered by the native endpoint contract."""
     if (
         type(layer) is not Qwen2DecoderLayer
         or type(layer.self_attn) is not Qwen2Attention
@@ -155,7 +156,7 @@ class VllmDecoderBodies:
     def inspect(
         cls, layers: tuple[Qwen2DecoderLayer, ...], tensor: TensorType, domain: CausalModelDomain, max_rows: int
     ) -> "VllmDecoderBodies | None":
-        if len(layers) != domain.layers or not all(_original_layer(layer) for layer in layers):
+        if len(layers) != domain.layers or not all(original_layer(layer) for layer in layers):
             return None
         # These are external resource facts, not an alternate layer forward.
         # FX reads the actual call order and frontier from the original method.
@@ -259,7 +260,7 @@ class VllmDecoderBodies:
 
     def validate(self, layers: tuple[Qwen2DecoderLayer, ...]) -> None:
         if len(layers) != len(self.layers) or any(
-            actual is not original or not _original_layer(actual)
+            actual is not original or not original_layer(actual)
             for actual, original in zip(layers, self.layers, strict=True)
         ):
             raise ValueError("model layer changed after binding its source definition")

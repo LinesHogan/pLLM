@@ -267,10 +267,9 @@ fn validate_probe(probe: &BackendPlacementProbe) -> Result<(), String> {
             TensorImport::Native { declaration } | TensorImport::Borrowed { declaration, .. } => declaration,
             TensorImport::NativeKernel { declaration, device, .. }
                 | TensorImport::FunctionalKernel { declaration, device, .. } => {
-                if probe.device_kind != StateDeviceKind::Cuda || probe.graph_mode != AttachmentGraphMode::Eager
-                    || device != &original_device
+                if probe.graph_mode != AttachmentGraphMode::Eager || device != &original_device
                 {
-                    return Err("backend kernel imports require original eager CUDA execution".into());
+                    return Err("backend kernel imports require the original eager execution device".into());
                 }
                 declaration
             },
@@ -662,7 +661,7 @@ fn validate_cross_binding(
                 || task.effects.iter().map(|effect| &effect.resource).collect::<std::collections::BTreeSet<_>>() != resources
                 || task.effects.iter().any(|effect| effect.kind != StateEffectKind::UpdateMaybe || effect.version.is_some())
                 || task.timing.after != "model.execute" || task.timing.before != "state.publish"
-                || !["prefill", "decode"].iter().all(|name| graph.source_regions.iter().any(|source| source.task == task.symbol && source.name == *name))
+                || graph.source_regions.iter().filter(|source| source.task == task.symbol && source.window.is_some()).count() != 1
             {
                 return Err("model scan needs independent request-target updates and complete prefill/decode sources".into());
             }
@@ -680,11 +679,10 @@ fn validate_cross_binding(
                 return Err("model scan target is outside the backend layer domain".into());
             }
             if state.representations.iter().any(|provider|
-                probe.max_packed_rows.div_ceil(request.model_scan_chunk_size).checked_add(2)
-                    .and_then(|roots| roots.checked_mul(provider.max_admitted_lineages))
+                3_u64.checked_mul(provider.max_admitted_lineages)
                     .is_none_or(|needed| provider.page_capacity < needed))
             {
-                return Err("increase model scan page capacity for the complete asynchronous chunk chain".into());
+                return Err("increase page capacity for the initial, current and private roots of each closed-window request".into());
             }
         }
         AttachmentKind::Observation => {

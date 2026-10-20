@@ -26,7 +26,7 @@ class RegionStorageAnalysis:
     roots: tuple[RegionStorageRoot, ...]
     input_storages: str
     borrowed_storages: str
-    live_storages: str
+    live_times: str
     allocation_times: str
     retained_storages: str
     value_storage: str

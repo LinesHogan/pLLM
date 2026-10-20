@@ -16,7 +16,7 @@ from pllm.contracts.region_program import Program, bind_sizes
 from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.region_schedule import Statement
 from pllm.contracts.region_selection import RegionPayloadLimit
-from pllm.contracts.region_streams import RegionStreamPlan
+from pllm.contracts.region_streams import RegionStateWindow, RegionStreamPlan
 from pllm.contracts.schedule_instructions import LoweredSchedule
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.exported_cell import ExportedCell
@@ -68,6 +68,7 @@ class RegionExecutionPlan:
     imports: tuple[RegionTensorImport, ...]
     proposal: RegionScheduleProposal
     payload_limits: tuple[RegionPayloadLimit, ...]
+    state_windows: tuple[RegionStateWindow, ...] = ()
 
     def __post_init__(self) -> None:
         if import_region_functions(self.program, self.imports) != self.imports:
@@ -106,6 +107,7 @@ class RegionExecutionPlan:
             cells,
             stream_plan=self.stream_plan,
             payload_limits=self.payload_limits,
+            state_windows=self.state_windows,
         )
 
 
@@ -121,6 +123,7 @@ class RegionInstructionExecution:
         *,
         stream_plan: RegionStreamPlan | None = None,
         payload_limits: tuple[RegionPayloadLimit, ...] = (),
+        state_windows: tuple[RegionStateWindow, ...] = (),
     ) -> None:
         self._schedule = RegionScheduleExecution(program, lowered)
         if bindings.program_digest != lowered.program_digest or bindings.schedule_map != lowered.schedule_map:
@@ -148,6 +151,7 @@ class RegionInstructionExecution:
         self._lowered = lowered
         self._bindings = bindings
         self._cells = dict(cells)
+        self._state_windows = stream_plan.state_windows if stream_plan is not None else state_windows
         self._actions = RegionActions(program, cells)
         self._stream_plan = stream_plan
         self._window = None if stream_plan is None else RegionWindow(stream_plan.slots)
@@ -217,17 +221,14 @@ class RegionInstructionExecution:
             raise ValueError("resource programs require PTTS primitive bindings")
         if pages is not None:
             pages.validate(self._program, sizes)
+            pages.validate_cells(self._bindings.resource_uses)
             pages.validate_native_kernels(
                 {name: cell.implementation for name, cell in self._cells.items() if isinstance(cell, NativePrimitive)}
             )
             pages.validate_tensor_borrows(self._tensor_borrows)
         scope = pages.scope() if pages is not None else (nullcontext() if owner is None else torch.cuda.stream(owner))
         window_scope = nullcontext() if self._window is None else self._window.reserve()
-        page_window = (
-            nullcontext()
-            if pages is None or self._stream_plan is None
-            else pages.window(self._stream_plan.state_windows)
-        )
+        page_window = nullcontext() if pages is None or not self._state_windows else pages.window(self._state_windows)
         with torch.no_grad(), window_scope, page_window, scope:
             if streams is not None:
                 for value in inputs.values():

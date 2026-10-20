@@ -6,11 +6,11 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from itertools import product
-from math import prod
 from typing import Protocol
 
 import torch
 
+from pllm.contracts.region_bindings import AccessTable
 from pllm.contracts.region_imports import BorrowedTensorImport, NativeKernelImport
 from pllm.contracts.region_program import (
     AccessMode,
@@ -32,11 +32,12 @@ from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.host_borrow import HostResourceView, validate_host_views
 from pllm.execution.paged_access import PagedResourceView, validate_paged_views
 from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin, PagePublication, PageRelease, PageWrite
+from pllm.execution.region_frame import lookup
 from pllm.execution.region_values import Bank, Data, check_data
 from pllm.execution.tensor_borrow import (
+    MutableTensorView,
     ReadonlyTensorCell,
     ReadonlyTensorView,
-    TensorResourceView,
     validate_readonly_views,
 )
 
@@ -87,7 +88,7 @@ class ReadonlyResourceBinding:
 class TensorResourceBinding:
     """An invocation borrows distinct mutable backend tensors."""
 
-    view: TensorResourceView
+    view: MutableTensorView
     owner: RegionPageOwner
 
 
@@ -295,8 +296,6 @@ class RegionResources:
                 check_data(value, type_, self._sizes)
             mappings[key] = cell
             lineages.add(cell.original.lineage_id)
-        if len(mappings) != sum(prod(r.domain) for r in resources.values()):
-            raise ValueError("page bindings must cover every logical resource cell")
         self._resources = program.resources
         self._owner = owner
         self._cells = mappings
@@ -367,6 +366,17 @@ class RegionResources:
             tuple(bounds[cell.resource] for cell in cells),
             self._owner.pin.stream,
         )
+
+    def validate_cells(self, uses: tuple[AccessTable, ...]) -> None:
+        """Cover every cell reached at these sizes, before any statement issues."""
+        tables = {table.input_id: table for table in uses}
+        for ordinal, resource in enumerate(self._resources):
+            if not isinstance(resource, Resource):
+                continue
+            for indices in product(*(range(size) for size in resource.domain)):
+                if lookup(tables.get(ordinal), indices, self._sizes) is not None:
+                    if (resource.name, indices) not in self._cells:
+                        raise ValueError("bind every state cell reached by the admitted region sizes")
 
     def scope(self) -> AbstractContextManager[None]:
         stream = self._owner.pin.stream

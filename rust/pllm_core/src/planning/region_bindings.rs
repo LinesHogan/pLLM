@@ -42,6 +42,7 @@ struct RegionBindings {
     times: Vec<AccessTable>,
     last_uses: Vec<AccessTable>,
     retained: Vec<AccessTable>,
+    resource_uses: Vec<AccessTable>,
     signature: String,
 }
 
@@ -62,6 +63,8 @@ pub(super) fn tables(
     let maps = isl(map.get_map_list())?;
     let mut result = std::collections::BTreeMap::<usize, AccessTable>::new();
     for i in 0..isl(maps.n_map())? {
+        // Each accessor is an independent bounded compilation, like an AER root.
+        ctx.reset_operations();
         let map = isl(maps.get_at(i))?;
         if isl(map.is_empty())? {
             continue;
@@ -76,7 +79,7 @@ pub(super) fn tables(
             0
         };
         let rank = u32::try_from(isl(map.dim(DimType::In))?).map_err(|e| e.to_string())?;
-        let (condition, coordinates) = accessor(map, ctx)?;
+        let (condition, coordinates) = accessor(map, ctx).map_err(|e| format!("accessor {input_prefix}{input_id}: {e}"))?;
         let table = result.entry(input_id).or_insert_with(|| AccessTable {
             input_id,
             rank,
@@ -114,11 +117,13 @@ fn derive_lowering(program: &Program, schedule_map: &str) -> Result<RegionBindin
     let ctx = context()?;
     let domain = isl(UnionSet::read_from_str(&ctx, &analysis.domain))?;
     let dependencies = isl(UnionMap::read_from_str(&ctx, &analysis.dependencies))?;
-    let schedule = read_schedule(&ctx, schedule_map)?;
-    legal(&domain, &dependencies, &schedule)?;
+    let schedule = read_schedule(&ctx, schedule_map).map_err(|e| format!("bindings schedule: {e}"))?;
+    legal(&domain, &dependencies, &schedule).map_err(|e| format!("bindings legality: {e}"))?;
+    ctx.reset_operations();
     let sources = isl(UnionMap::read_from_str(&ctx, &analysis.value_sources))?;
     let consumers = isl(UnionMap::read_from_str(&ctx, &analysis.value_consumers))?;
     let last_uses = isl(isl(consumers.apply_range(isl(schedule.copy())?))?.lexmax())?;
+    ctx.reset_operations();
     let result_domains = analysis
         .results
         .iter()
@@ -140,8 +145,18 @@ fn derive_lowering(program: &Program, schedule_map: &str) -> Result<RegionBindin
     ))?;
     let retained = isl(isl(sources.copy())?.intersect_domain(result_domains))?;
     let retained = isl(isl(retained.range())?.identity())?;
+    ctx.reset_operations();
+    let reads = isl(UnionMap::read_from_str(&ctx, &analysis.resource_dependencies.reads))?;
+    let writes = isl(UnionMap::read_from_str(&ctx, &analysis.resource_dependencies.writes))?;
+    let state_domains = program.resources.iter().enumerate().filter_map(|(i, resource)| {
+        matches!(resource, super::region_program::Resource::State { .. }).then(|| {
+            format!("R{i}[{}]", (0..resource.domain().len()).map(|d| format!("r{d}")).collect::<Vec<_>>().join(","))
+        })
+    }).collect::<Vec<_>>().join(";");
+    let used = isl(isl(isl(isl(reads.union(writes))?.intersect_domain(isl(domain.copy())?))?.range())?.intersect(
+        isl(UnionSet::read_from_str(&ctx, &format!("{{ {state_domains} }}")))?))?;
     let mut bindings = RegionBindings {
-        version: 1,
+        version: 2,
         program_digest: analysis.program_digest,
         schedule_map: map_text(&schedule)?,
         sources: tables(sources, &ctx, 'V', true)?,
@@ -154,6 +169,7 @@ fn derive_lowering(program: &Program, schedule_map: &str) -> Result<RegionBindin
         times: tables(schedule, &ctx, 'S', false)?,
         last_uses: tables(last_uses, &ctx, 'V', false)?,
         retained: tables(retained, &ctx, 'V', true)?,
+        resource_uses: tables(isl(used.identity())?, &ctx, 'R', false)?,
         values: analysis.values,
         arguments: analysis.arguments,
         results: analysis.results,

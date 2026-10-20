@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, VecDeque};
-use isl_rs::{Context, DimType, MultiVal, Schedule, ScheduleNode, ScheduleNodeType, UnionMap, UnionSet, Val};
+use isl_rs::{Context, DimType, MultiUnionPwAff, MultiVal, Schedule, ScheduleNode, ScheduleNodeType, Set, UnionMap, UnionSet, Val};
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +17,78 @@ pub(super) struct Exploration {
     pub program_digest: String,
     pub candidates: Vec<ScheduleCandidate>,
     pub diagnostics: Vec<String>,
+}
+
+/// Physical windows have finite bounds. ISL computes their ready frontiers
+/// over the union of all admitted sizes; no model coordinates or wave formula
+/// enter the construction. Recheck the result against the full symbolic domain.
+pub(super) fn frontier(program: &Program, max_instances: u64) -> Result<ScheduleCandidate> {
+    let source = analyze(program, false)?;
+    let bound = source.statements.iter().try_fold(0_u64, |sum, statement| {
+        let count = statement.extents.iter().try_fold(1_u64, |n, extent|
+            n.checked_mul(extent.maximum(program))).ok_or("frontier domain overflows")?;
+        sum.checked_add(count).ok_or("frontier domain overflows")
+    })?;
+    if bound > max_instances { return Err("reduce the physical window for bounded frontier planning".into()); }
+    let ctx = context()?;
+    let domain = isl(UnionSet::read_from_str(&ctx, &source.domain))?;
+    let dependencies = isl(UnionMap::read_from_str(&ctx, &source.dependencies))?;
+    let mut remaining = isl(isl(domain.copy())?.project_out_all_params())?;
+    let mut edges = isl(isl(dependencies.copy())?.project_out_all_params())?;
+    let mut times = isl(UnionMap::read_from_str(&ctx, "{ }"))?;
+    let mut wave = 0_u64;
+    while !isl(remaining.is_empty())? {
+        let ready = isl(isl(remaining.copy())?.subtract(isl(isl(edges.copy())?.range())?))?;
+        if isl(ready.is_empty())? {
+            return Err("size-independent frontier would contain a dependence cycle".into());
+        }
+        times = isl(times.union(frontier_times(&ready, wave, &ctx)?))?;
+        remaining = isl(remaining.subtract(ready))?;
+        edges = isl(isl(edges.intersect_domain(isl(remaining.copy())?))?
+            .intersect_range(isl(remaining.copy())?))?;
+        wave += 1;
+    }
+    let times = isl(isl(times.coalesce())?.intersect_domain(isl(domain.copy())?))?;
+    legal(&domain, &dependencies, &times)?;
+    let tree = isl(isl(Schedule::from_domain(domain))?.insert_partial_schedule(
+        isl(MultiUnionPwAff::from_union_map(isl(times.copy())?))?))?;
+    Ok(ScheduleCandidate {
+        source: "isl-bounded-frontier".into(),
+        schedule_map: map_text(&times)?,
+        schedule_tree: schedule_text(&tree)?,
+    })
+}
+
+fn frontier_times(ready: &UnionSet, wave: u64, ctx: &Context) -> Result<UnionMap> {
+    let list = isl(ready.get_set_list())?;
+    let mut sets = (0..isl(list.n_set())?).map(|i| {
+        let set = isl(list.get_at(i))?;
+        Ok((isl(set.get_tuple_name())?.to_owned(), set))
+    }).collect::<Result<Vec<_>>>()?;
+    sets.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut result = isl(UnionMap::read_from_str(ctx, "{ }"))?;
+    let mut lane_order = 0_u64;
+    for (_, mut set) in sets {
+        while !isl(set.is_empty())? {
+            let point = isl(isl(isl(set.copy())?.lexmin())?.sample_point())?;
+            let cell = isl(Set::from_point(point))?;
+            set = isl(set.subtract(isl(cell.copy())?))?;
+            let range = isl(UnionSet::read_from_str(ctx, &format!("{{ [{wave}, {lane_order}] }}")))?;
+            result = isl(result.union(isl(UnionMap::from_domain_and_range(
+                isl(UnionSet::from_set(cell))?, range))?))?;
+            lane_order += 1;
+        }
+    }
+    Ok(result)
+}
+
+#[pyfunction]
+fn derive_region_frontier(program_json: &str, max_instances: u64) -> PyResult<String> {
+    let run = || -> Result<String> {
+        let program: Program = serde_json::from_str(program_json).map_err(|e| e.to_string())?;
+        canonical_ascii_json(&frontier(&program, max_instances)?)
+    };
+    run().map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
 fn bands(node: &ScheduleNode, path: &mut Vec<i32>, found: &mut Vec<Vec<i32>>) -> Result<()> {
@@ -324,6 +396,7 @@ fn explore_region_schedules(program_json: &str, max_candidates: u64) -> PyResult
 }
 
 pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(derive_region_frontier, module)?)?;
     module.add_function(wrap_pyfunction!(explore_region_tiling, module)?)?;
     module.add_function(wrap_pyfunction!(explore_region_windows, module)?)?;
     module.add_function(wrap_pyfunction!(explore_region_schedules, module)?)?;

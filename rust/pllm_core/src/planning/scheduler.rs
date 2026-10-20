@@ -12,7 +12,7 @@ use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ScheduleDecision {
     graph_digest: String,
@@ -51,7 +51,7 @@ pub(crate) struct PhysicalTask {
     pub(crate) release_values: Vec<u32>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PhysicalPlan {
     pub(crate) plan_epoch: u64,
@@ -64,20 +64,28 @@ pub(crate) struct PhysicalPlan {
     pub(crate) source_schedules: Vec<TaskRegionSchedule>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TaskRegionSchedule {
     task: String,
     name: String,
     schedule_map: String,
+    window: Option<super::region_window::ClosedWindow>,
 }
 
-fn source_schedules(graph: &SemanticGraph) -> Result<Vec<TaskRegionSchedule>, String> {
+fn source_schedules(graph: &SemanticGraph, timeline: &Timeline) -> Result<Vec<TaskRegionSchedule>, String> {
     graph.source_regions.iter().map(|source| {
+        if let Some(request) = &source.window {
+            let budget = timeline.task_resources.iter().find(|fact| fact.task == source.task).map(|fact| fact.workspace_bytes);
+            let window = super::region_window::derive(&source.program, &source.imports, request,
+                &timeline.region_policy, timeline.capabilities.iter().any(|c| c == "execution/region_streams@1"), budget)?;
+            return Ok(TaskRegionSchedule { task: source.task.clone(), name: source.name.clone(),
+                schedule_map: window.proposal.payload.capacity.schedule_map.clone(), window: Some(window) });
+        }
         let analysis = super::region_dependence::analyze(&source.program, true)?;
         let candidate = analysis.candidates.iter().find(|candidate| candidate.source == "isl-parallel")
             .ok_or("source region has no verified ISL parallel candidate")?;
-        Ok(TaskRegionSchedule { task: source.task.clone(), name: source.name.clone(), schedule_map: candidate.schedule_map.clone() })
+        Ok(TaskRegionSchedule { task: source.task.clone(), name: source.name.clone(), schedule_map: candidate.schedule_map.clone(), window: None })
     }).collect()
 }
 
@@ -215,7 +223,7 @@ pub(super) fn compile(
     validate_graph(graph)?;
     validate_timeline(timeline)?;
     let index = graph_index(graph, timeline, state)?;
-    let sources = source_schedules(graph)?;
+    let sources = source_schedules(graph, timeline)?;
     fn choose<'a>(graph: &'a SemanticGraph, timeline: &Timeline, index: &GraphIndex,
                   state: Option<&StatePhysicalPlan>, selected: &mut Vec<&'a ImplementationCandidate>,
                   sources: &[TaskRegionSchedule], best: &mut Option<ScheduleDecision>) -> Result<(), String> {
@@ -323,7 +331,7 @@ fn validate_decision(
     }).collect::<Result<Vec<_>, String>>()?;
     let solution = aer::check_placement(graph, timeline, &index, &implementations, state,
         &decision.tasks, &decision.region_ends)?;
-    let expected = sign_solution(graph, timeline, state, &implementations, solution, &source_schedules(graph)?)?;
+    let expected = sign_solution(graph, timeline, state, &implementations, solution, &source_schedules(graph, timeline)?)?;
     if decision != &expected {
         return Err("canonical schedule decision differs from its selected placement witness".to_owned());
     }
@@ -627,7 +635,7 @@ mod tests {
         let implementations: Vec<_> = graph.tasks.iter().map(|task| &task.implementations[0]).collect();
         let witness = aer::check_placement(&graph, &roomy, &index, &implementations, None,
             &later, &decision.region_ends).unwrap();
-        let signed = sign_solution(&graph, &roomy, None, &implementations, witness, &source_schedules(&graph).unwrap()).unwrap();
+        let signed = sign_solution(&graph, &roomy, None, &implementations, witness, &source_schedules(&graph, &roomy).unwrap()).unwrap();
         assert_ne!(signed, compile(&graph, &roomy, None).unwrap());
         validate_decision(&graph, &roomy, &signed, None).unwrap();
         for mutation in 0..5 {

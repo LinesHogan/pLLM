@@ -51,6 +51,12 @@ def _encode_field(
     workload: BackendAuthoring, field: dataclasses.Field[object], hint: type[object] | None
 ) -> WorkloadFieldTransport:
     value = getattr(workload, field.name)
+    if hint is torch.dtype:
+        if type(value) is not torch.dtype:
+            raise ValueError(f"workload field {field.name!r} must contain its declared torch.dtype")
+        return WorkloadFieldTransport(
+            field.name, WorkloadFieldKind.REFERENCE, "", "torch", str(value).removeprefix("torch.")
+        )
     if isinstance(value, WorkerTransportable):
         payload = encode_boundary(value.transport_payload())
         reference = type(value)

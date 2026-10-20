@@ -29,7 +29,7 @@ pub(super) struct StorageAnalysis {
     pub roots: Vec<StorageRoot>,
     pub input_storages: String,
     pub borrowed_storages: String,
-    pub live_storages: String,
+    pub live_times: String,
     pub allocation_times: String,
     pub retained_storages: String,
     value_storage: String,
@@ -284,12 +284,13 @@ fn derive_provenance(program: &Program, imports: &[TensorImport]) -> Result<Prov
 }
 
 fn derive_storage(program: &Program, schedule_map: &str, imports: &[TensorImport]) -> Result<StorageAnalysis> {
-    let provenance = provenance(program, imports)?;
+    let provenance = provenance(program, imports).map_err(|e| format!("storage provenance: {e}"))?;
     let ctx = context()?;
     let domain = isl(UnionSet::read_from_str(&ctx, &provenance.domain))?;
     let dependencies = isl(UnionMap::read_from_str(&ctx, &provenance.dependencies))?;
     let schedule = read_schedule(&ctx, schedule_map)?;
-    legal(&domain, &dependencies, &schedule)?;
+    legal(&domain, &dependencies, &schedule).map_err(|e| format!("storage schedule: {e}"))?;
+    ctx.reset_operations();
     let last_uses = isl(isl(isl(UnionMap::read_from_str(&ctx, &provenance.consumers))?
         .apply_range(isl(schedule.copy())?))?.lexmax())?;
     let retained = isl(UnionMap::read_from_str(&ctx, &provenance.retained))?;
@@ -307,15 +308,20 @@ fn derive_storage(program: &Program, schedule_map: &str, imports: &[TensorImport
         .union(isl(UnionMap::from_domain_and_range(isl(isl(retained.copy())?.domain())?, times))?))?;
     // Include even unused outputs during their producing call. Equal-time
     // calls share a conservative envelope, matching strict-< frame releases.
-    let live_t = isl(after_birth.intersect(before_release))?;
-    let live = isl(isl(live_t.apply_range(isl(isl(schedule.copy())?.reverse())?))?.union(
-        isl(isl(births.copy())?.apply_range(isl(isl(schedule.copy())?.reverse())?))?))?;
+    let live_t = isl(after_birth.intersect(before_release)).map_err(|e| format!("storage live times: {e}"))?;
+    ctx.reset_operations();
+    // Capacity counts roots at a time, not at every statement sharing that
+    // time. Birth/last-use intervals also cover gaps between real times;
+    // gaps introduce no new allocations and cannot increase peak liveness.
+    // Retained roots remain live after the final statement as before.
+    let live = isl(live_t.union(isl(births.copy())?))?;
+    ctx.reset_operations();
     let mut result = StorageAnalysis {
         program_digest: provenance.program_digest, schedule_map: map_text(&schedule)?,
         imports_digest: provenance.imports_digest, roots: provenance.roots,
         input_storages: provenance.input_storages,
         borrowed_storages: provenance.borrowed_storages,
-        live_storages: map_text(&live)?, allocation_times: map_text(&births)?,
+        live_times: map_text(&live)?, allocation_times: map_text(&births)?,
         retained_storages: provenance.retained_storages,
         value_storage: provenance.value_storage, storage_consumers: provenance.storage_consumers,
         routes: provenance.routes_tables, births: tables(births, &ctx, 'V', false)?,

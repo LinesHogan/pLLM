@@ -236,6 +236,8 @@ pub(crate) struct TaskSourceRegion {
     pub(crate) task: String,
     pub(crate) name: String,
     pub(super) program: super::region_program::Program,
+    pub(super) imports: Vec<super::region_imports::TensorImport>,
+    pub(super) window: Option<super::region_window::Request>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -491,7 +493,17 @@ pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
                 }
             }
         }
-        // The complete source is checked before AER chooses physical partitions.
+        // The complete source and endpoint contracts precede physical partitioning.
+        let mut imported = std::collections::BTreeSet::new();
+        for import in &source.imports {
+            if !imported.insert(import.name()) { return Err("source imports must be distinct".into()); }
+            let declaration = source.program.functions.iter().find(|f| f.name == import.name())
+                .ok_or("source import names an undeclared function")?;
+            import.validate(declaration)?;
+        }
+        if source.window.is_some() && imported.len() != source.program.functions.len() {
+            return Err("closed windows need complete original endpoint imports".into());
+        }
         super::region_dependence::analyze(&source.program, false)?;
     }
     if graph.schema_version != SCHEMA_VERSION {

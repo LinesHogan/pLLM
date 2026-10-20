@@ -190,11 +190,21 @@ fn call_memory(import: &TensorImport, program: &Program) -> Result<CallMemory, S
                 add(&mut facts.logical_read_bytes, bytes)?;
                 add(&mut facts.logical_write_bytes, bytes)?;
             }
-            if let TensorImport::NativeKernel { allocations, device, .. } = import {
+            if let TensorImport::NativeKernel { allocations, device, tensor_sources, .. } = import {
                 devices.entry(device.clone()).or_default();
                 for allocation in allocations {
                     add(&mut devices.entry(allocation.device.clone()).or_default().scratch_bytes, allocation.bytes)?;
                 }
+                // A host-indexed dispatch executes exactly one captured graph.
+                // Its private arguments are already counted above; all new
+                // storage, including raw results, lives through wrapper copies.
+                let mut peak = 0_u64;
+                for source in tensor_sources {
+                    for profile in tensor_memory(source)?.devices {
+                        peak = peak.max(profile.peak_new_tensor_bytes);
+                    }
+                }
+                add(&mut devices.entry(device.clone()).or_default().scratch_bytes, peak)?;
             }
             // Native kernel storage is explicit when supplied. Internal
             // logical traffic is still unknown, just as for compiled imports.
@@ -265,7 +275,7 @@ fn derive_region_tensor_memory(program: &Program, storage: &StorageAnalysis,
     let times = maps(isl(UnionMap::read_from_str(&ctx, &storage.allocation_times))?)?
         .into_iter().map(|map| Ok((id(&map, DimType::In, "V")?, map)))
         .collect::<Result<BTreeMap<_, _>, String>>()?;
-    let live = isl(isl(UnionMap::read_from_str(&ctx, &storage.live_storages))?.reverse())?;
+    let live = isl(isl(UnionMap::read_from_str(&ctx, &storage.live_times)).map_err(|e| format!("read storage liveness: {e}"))?.reverse())?;
     let retained = isl(isl(UnionMap::read_from_str(&ctx, &storage.retained_storages))?.domain())?;
     let partitions = [isl(live.copy())?, isl(isl(live.copy())?.intersect_range(isl(retained.copy())?))?,
         isl(live.subtract_range(retained))?];
@@ -282,7 +292,7 @@ fn derive_region_tensor_memory(program: &Program, storage: &StorageAnalysis,
                 // existing ISL quota per query rather than accumulating it
                 // across unrelated roots in a larger source program.
                 ctx.reset_operations();
-                let count = fiber_bound(&map, times.get(&root))?;
+                let count = fiber_bound(&map, times.get(&root)).map_err(|e| format!("root {root} fiber: {e}"))?;
                 fibers.insert(key, count);
                 count
             };
@@ -308,7 +318,7 @@ fn derive_region_tensor_memory(program: &Program, storage: &StorageAnalysis,
         let root = roots[&id(&map, DimType::In, "V")?];
         let set = isl(map.domain())?;
         let fiber = isl(Map::from_domain_and_range(isl(Set::read_from_str(&ctx, "{ [] }"))?, set))?;
-        let count = fiber_bound(&fiber, None)?;
+        let count = fiber_bound(&fiber, None).map_err(|e| format!("input or statement fiber: {e}"))?;
         let device = devices.get_mut(&root.device).unwrap();
         add(&mut device.entry_copy_bytes_upper_bound, count, root.bytes)?;
         add(&mut device.logical_read_bytes_upper_bound, count, root.bytes)?;
@@ -326,7 +336,7 @@ fn derive_region_tensor_memory(program: &Program, storage: &StorageAnalysis,
         let domain = isl(list.get_at(i))?;
         let fiber = isl(Map::from_domain_and_range(isl(Set::read_from_str(&ctx, "{ [] }"))?, domain))?;
         let statement = &source.statements[id(&fiber, DimType::Out, "S")?];
-        let count = fiber_bound(&fiber, None)?;
+        let count = fiber_bound(&fiber, None).map_err(|e| format!("input or statement fiber: {e}"))?;
         if count == 0 { continue; }
         let action = super::region_control::action(region_storage::operation(program, &statement.path)?)?;
         let profile = scratch.action(&action)?;

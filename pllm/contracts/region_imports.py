@@ -91,6 +91,7 @@ class NativeKernelImport:
     device: str
     allocations: tuple[KernelAllocation, ...]
     host_reads: bool
+    tensor_sources: tuple[TensorAccessGraph, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

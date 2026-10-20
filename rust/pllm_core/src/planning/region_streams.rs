@@ -69,7 +69,7 @@ struct WindowSlot { value_id: usize, shape: Vec<u64>, dtype: String, device: Str
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct StateWindow { resource: String, private_roots: u64 }
+pub(super) struct StateWindow { pub resource: String, pub private_roots: u64 }
 
 fn tensor_leaf(type_: &Type) -> Option<Type> {
     match type_ {
@@ -92,7 +92,7 @@ fn queue_only(action: &Action, program: &Program, imports: &[TensorImport]) -> b
     }
 }
 
-fn publishes(action: &Action, resource: &str) -> bool {
+pub(super) fn publishes(action: &Action, resource: &str) -> bool {
     match action {
         Action::Primitive { operation } => matches!(operation, Operation::Publish { resource: name, .. } if name == resource),
         Action::If { then_block, else_block } => then_block.steps.iter().chain(&else_block.steps).any(|step| publishes(&step.action, resource)),
@@ -110,7 +110,9 @@ fn concurrent_action(action: &Action, program: &Program, imports: &[TensorImport
             && imports.iter().any(|import| import.name() == function && match import {
                 TensorImport::Exported { access } => access.operations.iter().all(|op| op.kind != super::tensor_access::AccessKind::Unknown),
                 TensorImport::Compiled { .. } | TensorImport::FunctionalKernel { .. } | TensorImport::Borrowed { .. } => true,
-                TensorImport::NativeKernel { declaration, host_reads, .. } => !host_reads && declaration.resources.iter().all(|name|
+                TensorImport::NativeKernel { declaration, host_reads, tensor_sources, .. } => !host_reads
+                    && tensor_sources.iter().all(|graph| graph.operations.iter().all(|op| op.kind != super::tensor_access::AccessKind::Unknown))
+                    && declaration.resources.iter().all(|name|
                     program.resources.iter().any(|r| matches!(r, Resource::Borrowed { name: known, .. } if known == name))
                     && declaration.accesses.iter().any(|a| &a.resource == name)),
                 TensorImport::Native { .. } => false,
@@ -127,7 +129,7 @@ fn concurrent_action(action: &Action, program: &Program, imports: &[TensorImport
     }
 }
 
-fn derive(program: &Program, schedule: &str, axis: usize, lanes: u32, pipeline_depth: u32,
+pub(super) fn derive(program: &Program, schedule: &str, axis: usize, lanes: u32, pipeline_depth: u32,
           imports: &[TensorImport], retained: &[Allocation]) -> Result<StreamPlan> {
     thread_local! {
         static PLANS: RefCell<VecDeque<(String, StreamPlan)>> = const { RefCell::new(VecDeque::new()) };

@@ -30,6 +30,8 @@ from pllm.contracts.parameter_overlay import (
     ParameterOverlayOperator,
     ParameterTarget,
 )
+from pllm.contracts.region_imports import NativeTensorImport, region_import_name
+from pllm.contracts.region_proposal import ClosedWindowRequest
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
@@ -325,6 +327,7 @@ class TensorBinding(Builder[TensorFrame]):
         self.initializers: dict[str, Callable[[tuple[torch.Tensor, ...], torch.Generator], None]] = {}
         self.weighted_training = False
         self.probe: BackendPlacementProbe | None = None
+        self.max_requests = 1
         self.sample_limit: int | None = None
         self.overlay_targets: tuple[ParameterTarget, ...] = ()
         self.overlay_import = False
@@ -383,17 +386,27 @@ class TensorBinding(Builder[TensorFrame]):
         )
         if self.probe is not None:
             assert self.dimensions is not None
+            program = model_scan_source(
+                scan, self.layouts, self.probe, self.dimensions.layer_count, parameters, self.max_requests
+            )
+            catalog = {region_import_name(item): item for item in self.probe.region_imports}
             self.graph = replace(
                 self.graph,
-                source_regions=tuple(
+                source_regions=(
                     TaskSourceRegion(
                         forward.symbol,
-                        phase,
-                        model_scan_source(
-                            scan, self.layouts, self.probe, self.dimensions.layer_count, parameters, learning=learning
+                        "model",
+                        program,
+                        tuple(
+                            catalog.get(function.name, NativeTensorImport(function))
+                            for function in sorted(program.functions, key=lambda function: function.name)
                         ),
-                    )
-                    for phase, learning in (("prefill", True), ("decode", False))
+                        ClosedWindowRequest(
+                            tuple(f"prefill{i}" for i in range(self.max_requests)),
+                            scan.chunk_size,
+                            self.probe.max_packed_rows,
+                        ),
+                    ),
                 ),
             )
         self.model_scan = (

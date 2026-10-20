@@ -32,8 +32,8 @@ pub(super) struct Payload {
 }
 
 pub(super) fn derive(program: &Program, schedule: &str, tensors: &[TensorImport], retained: &[Allocation]) -> Result<Payload> {
-    let storage = region_storage::derive(program, schedule, tensors)?;
-    let capacity = aer::region_tensor_memory(program, &storage, tensors)?;
+    let storage = region_storage::derive(program, schedule, tensors).map_err(|e| format!("payload storage: {e}"))?;
+    let capacity = aer::region_tensor_memory(program, &storage, tensors).map_err(|e| format!("payload capacity: {e}"))?;
     let retention = if retained.is_empty() {
         // Storage/capacity already checked the source and schedule. With no
         // retained allocations there are no endpoint relations to derive.

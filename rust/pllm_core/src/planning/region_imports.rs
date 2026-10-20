@@ -15,7 +15,7 @@ pub(super) enum TensorImport {
     Exported { access: AccessGraph },
     Native { declaration: Function },
     Borrowed { declaration: Function, field: u64 },
-    NativeKernel { declaration: Function, implementation: String, device: String, allocations: Vec<KernelAllocation>, host_reads: bool },
+    NativeKernel { declaration: Function, implementation: String, device: String, allocations: Vec<KernelAllocation>, host_reads: bool, tensor_sources: Vec<AccessGraph> },
     FunctionalKernel { declaration: Function, implementation: String, device: String, allocations: Vec<KernelAllocation> },
     Compiled { source_access: AccessGraph, backend: String, code_digest: String,
         allocations: Vec<KernelAllocation> },
@@ -128,6 +128,23 @@ impl TensorImport {
                 }
                 for type_ in declaration.inputs.iter().chain(&declaration.outputs) {
                     validate_native_port(type_)?;
+                }
+                if let Self::NativeKernel { tensor_sources, .. } = self {
+                    for access in tensor_sources {
+                        let values = tensor_access::validate(access)?;
+                        // Captured alternatives may return intermediate gradients;
+                        // the native optimizer then writes the declared private roots.
+                        let tensor_call = Function {
+                            inputs: function.inputs.iter().filter(|t| matches!(t, Type::Tensor { .. })).cloned().collect(),
+                            outputs: access.outputs.iter().map(|name| {
+                                let view = values[name.as_str()];
+                                Type::Tensor { shape: view.shape.clone(), dtype: view.dtype.clone(),
+                                    device: access.storages[view.storage].device.clone() }
+                            }).collect(),
+                            resources: vec![], accesses: vec![], ..function.clone()
+                        };
+                        Self::Exported { access: access.clone() }.validate(&tensor_call)?;
+                    }
                 }
                 if let Self::NativeKernel { implementation, device, allocations, .. }
                     | Self::FunctionalKernel { implementation, device, allocations, .. } = self {
