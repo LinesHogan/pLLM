@@ -76,7 +76,6 @@ def launch_prefix(
     final: torch.Tensor,
     scale: float,
     form: ScanForm,
-    offsets: tuple[int, ...],
 ) -> None:
     """Launch into caller-owned, stable buffers; only the device count varies on replay."""
     block = 128 if form is ScanForm.HILLIS_STEELE else 256
@@ -95,7 +94,7 @@ def launch_prefix(
         base.stride(0),
         base.stride(1),
         scale,
-        len(offsets),
+        len(increments).bit_length() - 1,
         form is ScanForm.HILLIS_STEELE,
         block,
         enable_fp_fusion=False,  # pyright: ignore[reportCallIssue]
@@ -121,9 +120,8 @@ def launch_window(
     buffers: AdditiveBuffers,
     scale: float,
     form: ScanForm,
-    offsets: tuple[int, ...],
 ) -> None:
     """Run the whole window into stable buffers; staging and publication stay outside."""
     torch.bmm(targets.transpose(1, 2), inputs, out=buffers.increments)
-    launch_prefix(buffers.increments, carry, base, active, buffers.weights, buffers.final, scale, form, offsets)
+    launch_prefix(buffers.increments, carry, base, active, buffers.weights, buffers.final, scale, form)
     torch.bmm(inputs, buffers.weights.transpose(1, 2), out=buffers.output)

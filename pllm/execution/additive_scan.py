@@ -63,12 +63,12 @@ class AdditiveUpdate:
         state, plan = carry, self.plan
         outputs: list[torch.Tensor] = []
         buffers = AdditiveBuffers(carry, plan.window, plan.chunk)
-        for start in range(0, plan.capacity, plan.window):
-            size = min(max(0, len(x) - start), plan.window)
+        for start in range(0, len(x), plan.window):
+            size = min(len(x) - start, plan.window)
             xx = _pack(x[start : start + plan.window], plan.window, plan.chunk, carry.shape[1], carry)
             yy = _pack(y[start : start + plan.window], plan.window, plan.chunk, carry.shape[0], carry)
             active = torch.full((), size, dtype=torch.int32, device=carry.device)
-            launch_window(xx, yy, state, base, active, buffers, plan.scale, plan.implementation.form, plan.offsets)
+            launch_window(xx, yy, state, base, active, buffers, plan.scale, plan.implementation.form)
             state = buffers.final
             outputs.extend(row.clone() for row in buffers.output.unbind()[:size])
             # Outputs are independent leaves; the next window may reuse every
@@ -93,10 +93,7 @@ def candidates(
     workspace = torch.backends.cuda.cublas_workspace_size() + torch.backends.cuda.cublaslt_workspace_size()
     for window in (1, 2, 4, 8, 16, 32, 64):
         for form in (ScanForm.ORDERED, ScanForm.HILLIS_STEELE):
-            offsets = (
-                tuple(1 << level for level in range(window.bit_length() - 1)) if form is ScanForm.HILLIS_STEELE else ()
-            )
-            evidence = AdditiveScanEvidence(window, workspace, form, offsets)
+            evidence = AdditiveScanEvidence(window, workspace, form)
             encoded = _core.derive_additive_scan(
                 encode_boundary(program), encode_boundary(imports), encode_boundary(evidence)
             )
@@ -146,7 +143,7 @@ def payload_budget(
     return budget
 
 
-def preference(candidate: "PreparedRegionCandidate") -> tuple[int, int]:
+def preference(candidate: "PreparedRegionCandidate") -> tuple[int, bool]:
     """Amortize GEMM launches; use tree depth only for wide prefix windows.
 
     Measurements put small-window ordered and tree kernels within noise;
@@ -155,4 +152,6 @@ def preference(candidate: "PreparedRegionCandidate") -> tuple[int, int]:
     """
     evidence = candidate.candidate.additive_scan
     assert evidence is not None
-    return evidence.window, int((evidence.form is ScanForm.HILLIS_STEELE) == (evidence.window >= 16))
+    preferred = (evidence.form is ScanForm.HILLIS_STEELE) == (evidence.window >= 16)
+    # Ascending order: the shortlist keeps the tail, so the preferred form sorts last.
+    return evidence.window, preferred

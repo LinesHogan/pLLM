@@ -15,7 +15,6 @@ pub(super) struct Evidence {
     pub window: u64,
     pub workspace: u64,
     pub form: Form,
-    pub offsets: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -29,9 +28,7 @@ pub(super) struct Plan {
     pub implementation: TensorImport,
     pub scale: f64,
     pub window: u64,
-    pub capacity: u64,
     pub chunk: u64,
-    pub offsets: Vec<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -128,34 +125,6 @@ fn times(a: u64, b: u64) -> Result<u64, String> {
     a.checked_mul(b).ok_or("additive scan allocation overflows".into())
 }
 
-fn validate_prefix(evidence: &Evidence) -> Result<(), String> {
-    let width = evidence.window;
-    if width == 0 || width > 64 || !width.is_power_of_two() {
-        return Err("additive scan window must be a power of two between 1 and 64".into());
-    }
-    let expected: Vec<_> = match evidence.form {
-        Form::Ordered => vec![],
-        Form::HillisSteele => (0..width.trailing_zeros()).map(|level| 1_u64 << level).collect(),
-    };
-    if evidence.offsets != expected { return Err("prefix stages must cover each preceding increment once".into()); }
-    if evidence.form == Form::Ordered { return Ok(()); }
-    // After each stage, lane i owns the interval [starts[i], i]. Adjacent
-    // intervals compose in order, with neither duplication nor omission.
-    // Masked lanes are additive identities; outputs use the preceding prefix
-    // and the final carry uses the last active lane, including the C=0 identity.
-    let mut starts: Vec<_> = (0..width).collect();
-    for &offset in &evidence.offsets {
-        let mut next = starts.clone();
-        for i in offset..width {
-            if starts[i as usize] != i - offset + 1 { return Err("prefix intervals overlap or have a gap".into()); }
-            next[i as usize] = starts[(i - offset) as usize];
-        }
-        starts = next;
-    }
-    if starts.iter().any(|&start| start != 0) { return Err("prefix does not reach the first increment".into()); }
-    Ok(())
-}
-
 pub(super) fn derive(program: &Program, imports: &[TensorImport], evidence: &Evidence) -> Result<Option<Plan>, String> {
     let block = &program.entry.block;
     let Some(carry) = block.arguments.first() else { return Ok(None); };
@@ -163,7 +132,10 @@ pub(super) fn derive(program: &Program, imports: &[TensorImport], evidence: &Evi
     if shape.len() != 2 || !device.starts_with("cuda") || !matches!(dtype.as_str(), "torch.float32" | "torch.bfloat16")
         || shape.contains(&0) { return Ok(None); }
     region_program::verify(program)?;
-    validate_prefix(evidence)?;
+    // Each window size fixes one Hillis–Steele doubling schedule, or one ordered loop.
+    if evidence.window == 0 || evidence.window > 64 || !evidence.window.is_power_of_two() {
+        return Err("additive scan window must be a power of two between 1 and 64".into());
+    }
     for function in &program.functions {
         imports.iter().find(|i| i.name() == function.name).ok_or("missing additive source import")?.validate(function)?;
     }
@@ -186,7 +158,7 @@ pub(super) fn derive(program: &Program, imports: &[TensorImport], evidence: &Evi
     // Outputs are independent bank leaves. Raw batched outputs live until each
     // leaf is copied; the frame separately charges the returned leaves.
     let packed_outputs = times(window, tensor_bytes(y)?)?;
-    let scratch = total(&[packed_inputs, times(2 * window + 2, carry_bytes)?, packed_outputs, evidence.workspace, 512])?;
+    let scratch = total(&[packed_inputs, times(2 * window + 2, carry_bytes)?, packed_outputs, evidence.workspace, 512])?;  // 512: the device active-count scalar's allocator block
     let function = Function {
         name: digest(&canonical_ascii_json(&("additive-prefix@2", program, imports, evidence))?),
         inputs: block.arguments.iter().map(|v| v.type_.clone()).collect(),
@@ -201,7 +173,7 @@ pub(super) fn derive(program: &Program, imports: &[TensorImport], evidence: &Evi
     result.entry.block.operations = vec![Operation::Call { inputs: inputs.clone(), outputs: outputs.clone(), function: function.name.clone() }];
     result.functions.push(function);
     region_program::verify(&result)?;
-    Ok(Some(Plan { program: result, implementation, scale, window, capacity, chunk: sx[0], offsets: evidence.offsets.clone() }))
+    Ok(Some(Plan { program: result, implementation, scale, window, chunk: sx[0] }))
 }
 
 #[pyfunction]

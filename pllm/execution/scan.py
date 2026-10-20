@@ -91,9 +91,10 @@ class ScanTemplate:
         """Tune at the first real C in a bucket, then reuse for the whole guarded domain."""
         capacity = min(self.maximum, 1 << (max(1, count) - 1).bit_length())
         if not self.context.policy.allow_numerical_transforms:
-            capacity = self.maximum
+            capacity = self.maximum  # Only the reference exists; one plan covers every C.
         if capacity not in self.sources:
-            self.sources[capacity] = self._source(capacity)
+            with _disable_current_modes():
+                self.sources[capacity] = self._source(capacity)
         scan = self.sources[capacity]
         if tracing:
             return scan
@@ -102,10 +103,6 @@ class ScanTemplate:
         return self.plans[capacity]
 
     def _source(self, capacity: int) -> TensorScan:
-        with _disable_current_modes():
-            return self._build_source(capacity)
-
-    def _build_source(self, capacity: int) -> TensorScan:
         scan = TensorScan(
             self.region.program,
             SizeParameter("chunks", 0, capacity),

@@ -13,7 +13,6 @@ class AdditiveScanEvidence:
     window: int
     workspace: int
     form: ScanForm
-    offsets: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +23,4 @@ class AdditiveScanPlan:
     implementation: AdditiveScanImport
     scale: float
     window: int
-    capacity: int
     chunk: int
-    offsets: tuple[int, ...]

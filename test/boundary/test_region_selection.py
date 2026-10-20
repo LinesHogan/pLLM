@@ -267,8 +267,8 @@ def test_tuned_tensor_scan_keeps_one_symbolic_plan_and_its_guards():
     )
     evidence = tree.candidate.additive_scan
     assert evidence is not None
-    forged = replace(tree.candidate, additive_scan=replace(evidence, offsets=evidence.offsets[1:]), elapsed_ns=(50,))
-    with pytest.raises(ValueError, match="prefix stages"):
+    forged = replace(tree.candidate, additive_scan=replace(evidence, form=ScanForm.ORDERED), elapsed_ns=(50,))
+    with pytest.raises(ValueError, match="additive scan imports differ"):
         select_region_candidate(scan.program, replace(request, candidates=(request.candidates[0], forged)))
     if torch.cuda.is_available():
         # Separate allocations exercise the bank-packing path as well as a
@@ -317,10 +317,10 @@ def test_tuned_tensor_scan_keeps_one_symbolic_plan_and_its_guards():
         staged_x, staged_y = torch.zeros_like(full_x), torch.zeros_like(full_y)
         active = torch.zeros((), device=w.device, dtype=torch.int32)
         buffers = AdditiveBuffers(w, 8, 2)
-        launch_window(staged_x, staged_y, w, base, active, buffers, 0.013, ScanForm.HILLIS_STEELE, evidence.offsets)
+        launch_window(staged_x, staged_y, w, base, active, buffers, 0.013, ScanForm.HILLIS_STEELE)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            launch_window(staged_x, staged_y, w, base, active, buffers, 0.013, ScanForm.HILLIS_STEELE, evidence.offsets)
+            launch_window(staged_x, staged_y, w, base, active, buffers, 0.013, ScanForm.HILLIS_STEELE)
         storage = (buffers.increments, buffers.weights, buffers.output, buffers.final, active)
         pointers = tuple(t.data_ptr() for t in storage)
         for count in (8, 0, 1, 5, 3, 8):
