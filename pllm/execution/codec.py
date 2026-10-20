@@ -63,18 +63,7 @@ def functionalize_export(program: torch.export.ExportedProgram) -> torch.export.
     for fake inputs. Pure source import must work in a driver without a device
     execution context. The same ATen check is applied again by the importer.
     """
-    # Export inserts metadata assertions for tensor-to-tensor conversions.
-    # Prove them on the guarded static metadata before importing tensor math.
-    for node in tuple(program.graph.nodes):
-        if node.op == "call_function" and node.target == torch.ops.aten._assert_tensor_metadata.default:
-            sample = tensor_node_metadata(node.all_input_nodes[0])
-            assert sample is not None
-            with sample.fake_mode:
-                torch.ops.aten._assert_tensor_metadata.default(
-                    *torch.fx.map_arg(node.args, tensor_node_metadata), **node.kwargs
-                )
-            program.graph.erase_node(node)
-    program.graph_module.recompile()
+    _check_export_metadata(program)
     try:
         for node in program.graph.nodes:
             if node.op == "call_function":
@@ -96,7 +85,24 @@ def functionalize_export(program: torch.export.ExportedProgram) -> torch.export.
     # storage views. Do not admit arbitrary Python callables into the graph.
     splits = (torch.ops.aten.split.Tensor, torch.ops.aten.split_with_sizes.default)
     decompositions = cast(_TensorDecompositions, _decomp).get_decompositions(splits)
-    return cast(_FunctionalExport, program).run_decompositions(decompositions)
+    result = cast(_FunctionalExport, program).run_decompositions(decompositions)
+    _check_export_metadata(result)
+    return result
+
+
+def _check_export_metadata(program: torch.export.ExportedProgram) -> None:
+    # Export inserts metadata assertions for tensor-to-tensor conversions.
+    # Prove them on the guarded static metadata before importing tensor math.
+    for node in tuple(program.graph.nodes):
+        if node.op == "call_function" and node.target == torch.ops.aten._assert_tensor_metadata.default:
+            sample = tensor_node_metadata(node.all_input_nodes[0])
+            assert sample is not None
+            with sample.fake_mode:
+                torch.ops.aten._assert_tensor_metadata.default(
+                    *torch.fx.map_arg(node.args, tensor_node_metadata), **node.kwargs
+                )
+            program.graph.erase_node(node)
+    program.graph_module.recompile()
 
 
 def check_functional_aten(target: object) -> None:

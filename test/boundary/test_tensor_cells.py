@@ -13,6 +13,7 @@ import torch
 
 from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning, warn_numerical_transforms
 from pllm.execution.module_graph import capture_module_export
+from pllm.execution.tensor_program import PoolSGD
 
 
 def update_cell(hidden, weights):
@@ -21,15 +22,26 @@ def update_cell(hidden, weights):
     return output, weights
 
 
-def test_functionalized_export_repeats_the_update_and_preserves_all_input_versions():
+def differentiated_update(hidden, weights, optimizer=PoolSGD(0.01, 1)):
+    with torch.enable_grad():
+        parameter = weights.detach().clone().requires_grad_()
+        output = hidden @ parameter
+        error = output.to(torch.promote_types(output.dtype, torch.float32))
+        (gradient,) = torch.autograd.grad(error.square().mean(), (parameter,))
+    optimizer.update(((weights,),), lambda field: (weights.unsqueeze(0), (0,)), (gradient,))
+    return output.detach(), weights
+
+
+@pytest.mark.parametrize("update", (update_cell, differentiated_update))
+def test_functionalized_export_repeats_the_update_and_preserves_all_input_versions(update):
     torch.manual_seed(17)
     hidden, weights = torch.randn(2, 2, dtype=torch.float64), torch.randn(2, 2, dtype=torch.float64)
     saved_h, saved_w = hidden.clone(), weights.clone()
-    cell = ExportedCell.capture(update_cell, ("hidden", "weights"), ("output", "next_weights"), (hidden, weights))
+    cell = ExportedCell.capture(update, ("hidden", "weights"), ("output", "next_weights"), (hidden, weights))
     assert cell.mutations == (("weights", "next_weights"),)
     actual, expected = (hidden, weights), (hidden.clone(), weights.clone())
     for _ in range(4):
-        actual, expected = cell(*actual), update_cell(*expected)
+        actual, expected = cell(*actual), update(*expected)
     for value, reference in zip(actual, expected, strict=True):
         torch.testing.assert_close(value, reference, rtol=1e-12, atol=1e-12)
     assert torch.equal(hidden, saved_h) and torch.equal(weights, saved_w)
