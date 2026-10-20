@@ -24,7 +24,7 @@ from pllm.backends.vllm.window_scheduler import WindowAdmission, WindowBatch
 from pllm.contracts.backend_attachment import BackendPlacementProbe
 from pllm.contracts.packed_rows import PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding
-from pllm.contracts.region_imports import KernelAllocation, NativeKernelImport
+from pllm.contracts.region_imports import BorrowedTensorImport, KernelAllocation, NativeKernelImport
 from pllm.contracts.region_program import BorrowedResource, Function, TensorType
 from pllm.contracts.semantic_graph import AnchorId, TaskId, TaskSourceRegion
 from pllm.contracts.tensor_layout import TensorDType
@@ -165,16 +165,19 @@ class ModelScanSource:
         model: Qwen2Model,
         sources: tuple[TaskSourceRegion, ...],
         probe: BackendPlacementProbe,
-    ) -> tuple[NativeKernelImport, ...]:
+    ) -> tuple[NativeKernelImport | BorrowedTensorImport, ...]:
         """Audit actual Qwen calls and charge the native allocations absent from fake execution."""
         assert probe.causal_domain is not None
         validate_attention_resources(
             tuple(layer.self_attn.attn for layer in model.layers), hidden_size=probe.hidden_size
         )
-        result: list[NativeKernelImport] = []
+        result: list[NativeKernelImport | BorrowedTensorImport] = []
         for source in sources:
             for function in source.program.functions:
                 if function.name.startswith("train."):
+                    continue
+                if function.name.startswith("weight."):
+                    result.append(BorrowedTensorImport(function, 0))
                     continue
                 layer = int(function.name.split(".")[-1])
                 attention = model.layers[layer].self_attn.attn
@@ -274,6 +277,17 @@ class VllmModelScan(Generic[DataT, ResultT]):
         self.source = ModelScanSource.capture(self.model, effects)
         self.attentions = tuple(layer.self_attn.attn for layer in self.model.layers)
         validate_attention_resources(self.attentions, hidden_size=model.config.hidden_size)
+        self._weights = ReadonlyTensorView(
+            BorrowedResource("weights", (len(self.model.layers),)),
+            tuple(
+                ReadonlyTensorCell.bind(
+                    (i,),
+                    (layer.mlp.down_proj.weight, *layer.parameters())
+                    + tuple(tensor for tensor in layer.buffers() if tensor is not self.attentions[i].kv_cache),
+                )
+                for i, layer in enumerate(self.model.layers)
+            ),
+        )
         self.original = self.model.forward
         self._spans: tuple[ModelScanSpan, ...] = ()
         self._invocation: TaskGraphInvocation[StateTaskContext[DataT]] | None = None
@@ -282,6 +296,7 @@ class VllmModelScan(Generic[DataT, ResultT]):
         self._hidden: torch.Tensor | None = None
         self._output: torch.Tensor | None = None
         self._batch: WindowBatch | None = None
+        self._sequences: dict[tuple[int, int], torch.Tensor] = {}
         self.admissions: deque[WindowBatch] = deque(maxlen=256)
         self._auxiliary = (torch.cuda.Stream(device=execution.device),)
         for stream in self._auxiliary:
@@ -306,9 +321,6 @@ class VllmModelScan(Generic[DataT, ResultT]):
         assert owner.pin.stream is not None and lanes == 2
         return RegionStreamBindings(owner.pin.stream, self._auxiliary)
 
-    def weight(self, layer: int) -> torch.Tensor:
-        return self.model.layers[layer].mlp.down_proj.weight.detach()
-
     def inputs(self, request: int, chunk: int) -> tuple[torch.Tensor, ...]:
         assert self._hidden is not None
         span = self.spans[request]
@@ -319,17 +331,8 @@ class VllmModelScan(Generic[DataT, ResultT]):
         )
 
     def weights_view(self, resource: BorrowedResource) -> ReadonlyTensorView:
-        return ReadonlyTensorView(
-            resource,
-            tuple(
-                ReadonlyTensorCell.bind(
-                    (i,),
-                    tuple(layer.parameters())
-                    + tuple(tensor for tensor in layer.buffers() if tensor is not self.attentions[i].kv_cache),
-                )
-                for i, layer in enumerate(self.model.layers)
-            ),
-        )
+        assert resource == self._weights.resource
+        return self._weights
 
     def input_view(self, resource: BorrowedResource) -> ReadonlyTensorView:
         assert self._positions is not None and self._context is not None
@@ -345,6 +348,7 @@ class VllmModelScan(Generic[DataT, ResultT]):
                         self._positions[begin:end],
                         metadata.block_table[span.row.request_ordinal : span.row.request_ordinal + 1],
                         slots[begin:end],
+                        *(value for (r, _), value in self._sequences.items() if r == request),
                     )
                 cells.append(ReadonlyTensorCell.bind((request, layer), tensors))
         return ReadonlyTensorView(resource, tuple(cells))
@@ -422,6 +426,21 @@ class VllmModelScan(Generic[DataT, ResultT]):
             assert input_ids is not None
             inputs_embeds = self.model.embed_input_ids(input_ids)
         self._positions, self._hidden, self._context = positions, inputs_embeds, get_forward_context()
+        chunks = tuple(
+            (request, span.row.token_offset + start, min(chunk, span.length - start))
+            for request, span in enumerate(self.spans)
+            for chunk in (self.chunk_size if span.learning else 1,)
+            for start in range(0, span.length, chunk)
+        )
+        sequences = upload([[0, rows, start + rows] for _, start, rows in chunks], inputs_embeds.device, torch.int32)
+        self._sequences = {(request, start): sequences[i] for i, (request, start, _) in enumerate(chunks)}
+        for stream in self._auxiliary:
+            for tensor in (positions, sequences):
+                tensor.record_stream(stream)
+            for attention in self.attentions:
+                metadata, _, slots = attention_metadata(self._context, attention)
+                metadata.block_table.record_stream(stream)
+                slots.record_stream(stream)
         self.execution.execute_anchor(self._invocation, self.anchor)
         assert self._output is not None
         return self._output
@@ -440,7 +459,7 @@ class VllmModelScan(Generic[DataT, ResultT]):
         span = self.spans[request]
         begin = span.row.packed_row_index + start - span.row.token_offset
         stop, length = begin + rows, start + rows
-        sequence = upload([0, rows, length], self._hidden.device, torch.int32)
+        sequence = self._sequences[request, start]
         attention = self.attentions[layer]
         base, _, mapping = attention_metadata(self._context, attention)
         slot = mapping[begin:stop]
@@ -461,9 +480,6 @@ class VllmModelScan(Generic[DataT, ResultT]):
             scheduler_metadata=None,
             prefix_scheduler_metadata=None,
         )
-        stream = torch.cuda.current_stream(hidden.device)
-        for tensor in (self._positions, mapping, base.block_table, attention.kv_cache):
-            tensor.record_stream(stream)
         context = replace(
             self._context,
             attn_metadata={attention.layer_name: metadata},
@@ -511,6 +527,7 @@ class VllmModelScan(Generic[DataT, ResultT]):
     def clear(self) -> None:
         self._spans, self._invocation, self._context = (), None, None
         self._positions = self._hidden = self._output = None
+        self._sequences.clear()
 
     def close(self) -> None:
         self.clear()

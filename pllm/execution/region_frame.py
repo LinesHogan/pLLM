@@ -9,11 +9,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from heapq import heappop, heappush
+from itertools import product
 
 import torch
 
 from pllm.contracts.region_bindings import AccessTable, RegionBindings
-from pllm.contracts.region_program import BankType, DataType, resolve_extent
+from pllm.contracts.region_program import BankType, DataType, ResourceType, resolve_extent
 from pllm.execution.region_schedule import checked_schedule_integer, evaluate_schedule_expression
 from pllm.execution.region_values import Bank, Data, check_data, copy_data
 from pllm.execution.region_window import RegionWindow
@@ -24,15 +25,11 @@ ValuePoint = tuple[int, tuple[int, ...]]
 def lookup(table: AccessTable | None, point: tuple[int, ...], sizes: Mapping[str, int] = {}) -> ValuePoint | None:
     if table is None:
         return None
-    if len(point) != table.rank:
-        raise ValueError("value accessor coordinate rank mismatch")
     variables = {f"__size_{name}": value for name, value in sizes.items()}
     variables.update((f"p{i}", coordinate) for i, coordinate in enumerate(point))
     result: ValuePoint | None = None
     for case in table.cases:
         if evaluate_schedule_expression(case.condition, variables):
-            if result is not None:
-                raise RuntimeError("verified value accessor has overlapping source cases")
             result = (
                 case.target_id,
                 tuple(checked_schedule_integer(evaluate_schedule_expression(c, variables)) for c in case.coordinates),
@@ -40,12 +37,43 @@ def lookup(table: AccessTable | None, point: tuple[int, ...], sizes: Mapping[str
     return result
 
 
+Routes = dict[ValuePoint, ValuePoint]
+
+
+def expand_accesses(
+    tables: tuple[AccessTable, ...], domains: Mapping[int, tuple[int | str, ...]], sizes: Mapping[str, int]
+) -> Routes:
+    """Resolve a signed accessor over this window's concrete domain once."""
+    result: Routes = {}
+    for table in tables:
+        for point in product(*(range(resolve_extent(n, sizes)) for n in domains[table.input_id])):
+            target = lookup(table, point, sizes)
+            if target is not None:
+                result[table.input_id, point] = target
+    return result
+
+
+class RegionValueLayout:
+    """Concrete routes and lifetimes shared by fresh frames of a fixed window."""
+
+    def __init__(self, bindings: RegionBindings, sizes: Mapping[str, int], resources: tuple[ResourceType, ...]) -> None:
+        domains = {site.id: (*site.extents, *site.bank_shape) for site in bindings.values}
+        self.bindings = bindings
+        self.sources = expand_accesses(bindings.sources, domains, sizes)
+        self.scalars = expand_accesses(bindings.scalars, domains, sizes)
+        self.last_uses = expand_accesses(bindings.last_uses, domains, sizes)
+        self.retained = expand_accesses(bindings.retained, domains, sizes)
+        self.resource_uses = expand_accesses(
+            bindings.resource_uses, {i: r.domain for i, r in enumerate(resources)}, sizes
+        )
+
+
 class RegionValueFrame:
     """One execution's live SSA leaves, including exact old bank elements."""
 
     def __init__(
         self,
-        bindings: RegionBindings,
+        layout: RegionValueLayout,
         inputs: Mapping[str, Data],
         sizes: Mapping[str, int],
         window: RegionWindow | None = None,
@@ -54,15 +82,10 @@ class RegionValueFrame:
         # frame consumes value routes and layouts, not the source Program.
         self._window = window
         self._sizes = sizes
-        self._bindings = bindings
-        self._sources = {t.input_id: t for t in bindings.sources}
-        self._scalars = {t.input_id: t for t in bindings.scalars}
-        self._last_uses = {t.input_id: t for t in bindings.last_uses}
-        self._retained = {t.input_id: t for t in bindings.retained}
-        self._times = {t.input_id: t for t in bindings.times}
+        self._bindings = bindings = layout.bindings
+        self._layout = layout
         self._live: dict[ValuePoint, Data] = {}
         self._releases: list[tuple[tuple[int, ...], ValuePoint]] = []
-        self._time: tuple[int, ...] | None = None
         self.peak_live_values = 0
         self.released_values = 0
         arguments = tuple(bindings.values[i] for i in bindings.arguments)
@@ -77,17 +100,7 @@ class RegionValueFrame:
         for site in arguments:
             self.put(site.id, (), copy_data(inputs[site.name]))
 
-    def time_for(self, statement_id: int, coordinates: tuple[int, ...]) -> tuple[int, ...]:
-        mapped = lookup(self._times.get(statement_id), coordinates, self._sizes)
-        if mapped is None:
-            raise RuntimeError("invocation has no verified schedule time")
-        return mapped[1]
-
-    def advance(self, statement_id: int, coordinates: tuple[int, ...]) -> None:
-        time = self.time_for(statement_id, coordinates)
-        if self._time is not None and time < self._time:
-            raise RuntimeError("execution cursor moved backwards in schedule time")
-        self._time = time
+    def advance(self, time: tuple[int, ...]) -> None:
         # Equal-time invocations may appear in either order. Keep their values
         # until the next time, regardless of ISL's ordering of independent leaves.
         while self._releases and self._releases[0][0] < time:
@@ -98,19 +111,15 @@ class RegionValueFrame:
             self.released_values += 1
 
     def _read_leaf(self, value_id: int, coordinates: tuple[int, ...]) -> Data:
-        source = lookup(self._sources.get(value_id), coordinates, self._sizes)
-        if source is None:
-            raise RuntimeError("value has no verified original source")
-        source_id, source_coordinates = source
-        scalar = lookup(self._scalars.get(source_id), source_coordinates, self._sizes)
+        source = self._layout.sources.get((value_id, coordinates))
+        assert source is not None
+        scalar = self._layout.scalars.get(source)
         if scalar is not None:
             return scalar[1][0]
-        try:
-            if self._window is not None:
-                self._window.read(source, self._live[source])
-            return self._live[source]
-        except KeyError as error:
-            raise RuntimeError("source value was not produced or was released too early") from error
+        value = self._live[source]
+        if self._window is not None:
+            self._window.read(source, value)
+        return value
 
     def read(self, value_id: int, coordinates: tuple[int, ...]) -> Data:
         site = self._bindings.values[value_id]
@@ -130,9 +139,6 @@ class RegionValueFrame:
         return assemble(site.type, ())
 
     def put(self, value_id: int, coordinates: tuple[int, ...], value: Data) -> None:
-        site = self._bindings.values[value_id]
-        check_data(value, site.type, self._sizes)
-
         def insert(item: Data, indices: tuple[int, ...]) -> None:
             if isinstance(item, Bank):
                 for i, child in enumerate(item.elements):
@@ -140,12 +146,10 @@ class RegionValueFrame:
                 return
             point = (*coordinates, *indices)
             key = (value_id, point)
-            retained = lookup(self._retained.get(value_id), point, self._sizes) is not None
-            last = lookup(self._last_uses.get(value_id), point, self._sizes)
+            retained = key in self._layout.retained
+            last = self._layout.last_uses.get(key)
             if not retained and last is None:
                 return
-            if key in self._live:
-                raise RuntimeError("SSA leaf was produced more than once")
             if self._window is not None and isinstance(item, torch.Tensor):
                 item = self._window.store(key, item)
             self._live[key] = item

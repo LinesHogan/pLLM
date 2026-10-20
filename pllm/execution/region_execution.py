@@ -14,7 +14,7 @@ from pllm.contracts.region_bindings import RegionBindings
 from pllm.contracts.region_imports import RegionTensorImport
 from pllm.contracts.region_program import Program, bind_sizes
 from pllm.contracts.region_proposal import RegionScheduleProposal
-from pllm.contracts.region_schedule import Statement
+from pllm.contracts.region_schedule import ScheduleInstance, Statement
 from pllm.contracts.region_selection import RegionPayloadLimit
 from pllm.contracts.region_streams import RegionStateWindow, RegionStreamPlan
 from pllm.contracts.schedule_instructions import LoweredSchedule
@@ -22,7 +22,7 @@ from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_compilation import lower_region_bindings, lower_region_schedule
 from pllm.execution.region_control import RegionActions
-from pllm.execution.region_frame import RegionValueFrame
+from pllm.execution.region_frame import RegionValueFrame, RegionValueLayout, Routes, expand_accesses
 from pllm.execution.region_native import (
     BorrowedTensorPrimitive,
     CompiledPrimitive,
@@ -41,6 +41,8 @@ from pllm.execution.region_streams import (
 )
 from pllm.execution.region_values import Data, copy_data
 from pllm.execution.region_window import RegionWindow, WindowBackpressure
+
+PreparedWindow = tuple[tuple[ScheduleInstance, ...], RegionValueLayout, Routes, tuple[tuple[int, Routes], ...]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,7 +114,7 @@ class RegionExecutionPlan:
 
 
 class RegionInstructionExecution:
-    """Cold-bind imported cells and one fixed schedule, then execute fresh frames."""
+    """Prepare each concrete window once, then execute its table with fresh frames."""
 
     def __init__(
         self,
@@ -126,6 +128,7 @@ class RegionInstructionExecution:
         state_windows: tuple[RegionStateWindow, ...] = (),
     ) -> None:
         self._schedule = RegionScheduleExecution(program, lowered)
+        self._prepared: dict[tuple[tuple[str, int], ...], PreparedWindow] = {}
         if bindings.program_digest != lowered.program_digest or bindings.schedule_map != lowered.schedule_map:
             raise ValueError("tensor bindings and loop instructions must describe the same schedule")
         if stream_plan is not None:
@@ -158,6 +161,27 @@ class RegionInstructionExecution:
         self._tensor_borrows = {
             name: cell.implementation for name, cell in cells.items() if isinstance(cell, BorrowedTensorPrimitive)
         }
+
+    def _prepare(self, parameters: tuple[tuple[str, int], ...]) -> PreparedWindow:
+        if parameters in self._prepared:
+            return self._prepared[parameters]
+        sizes = dict(parameters)
+        domains = {statement.id: statement.extents for statement in self._lowered.statements}
+        times = expand_accesses(self._bindings.times, domains, sizes)
+        instances = tuple(
+            ScheduleInstance(item.statement_id, item.coordinates, times[item.statement_id, item.coordinates][1])
+            for item in self._schedule.invocations(sizes)
+        )
+        plan = self._stream_plan
+        self._prepared[parameters] = (
+            instances,
+            RegionValueLayout(self._bindings, sizes, self._program.resources),
+            {} if plan is None else expand_accesses(plan.placements, domains, sizes),
+            ()
+            if plan is None
+            else tuple((wait.lane, expand_accesses(wait.predecessors, domains, sizes)) for wait in plan.waits),
+        )
+        return self._prepared[parameters]
 
     @property
     def stream_plan(self) -> RegionStreamPlan | None:
@@ -203,6 +227,7 @@ class RegionInstructionExecution:
         sizes = bind_sizes(self._program, sizes)
         if streams is None and self._stream_plan is not None:
             raise ValueError("borrowed streams and a verified physical stream plan must be supplied together")
+        instances, layout, placements, waits = self._prepare(tuple(sorted(sizes.items())))
         owner = None if streams is None else streams.owner
         if streams is not None:
             if self._stream_plan is None:
@@ -221,7 +246,7 @@ class RegionInstructionExecution:
             raise ValueError("resource programs require PTTS primitive bindings")
         if pages is not None:
             pages.validate(self._program, sizes)
-            pages.validate_cells(self._bindings.resource_uses)
+            pages.validate_cells(layout.resource_uses)
             pages.validate_native_kernels(
                 {name: cell.implementation for name, cell in self._cells.items() if isinstance(cell, NativePrimitive)}
             )
@@ -233,26 +258,22 @@ class RegionInstructionExecution:
             if streams is not None:
                 for value in inputs.values():
                     record_stream(value, streams.owner)
-            frame = RegionValueFrame(self._bindings, inputs, sizes, self._window)
+            frame = RegionValueFrame(layout, inputs, sizes, self._window)
             count = 0
             concurrent: RegionStreamFrame | None = None
             try:
                 if streams is not None and self._stream_plan is not None:
-                    concurrent = RegionStreamFrame(self._stream_plan, streams, sizes)
-                for invocation in self._schedule.invocations(sizes):
-                    if pages is not None:
-                        pages.before_statement()
+                    concurrent = RegionStreamFrame(self._stream_plan, streams, placements, waits)
+                for invocation in instances:
                     statement = self._lowered.statements[invocation.statement_id]
                     stream = (
                         None
                         if concurrent is None
-                        else concurrent.enter(
-                            frame.time_for(statement.id, invocation.coordinates), statement.id, invocation.coordinates
-                        )
+                        else concurrent.enter(invocation.time, statement.id, invocation.coordinates)
                     )
                     # GPU credit waits and slot events protect physical reuse;
                     # logical lifetimes can advance without observing completion.
-                    frame.advance(statement.id, invocation.coordinates)
+                    frame.advance(invocation.time)
                     with nullcontext() if stream is None else torch.cuda.stream(stream):
                         self._invoke(frame, statement, invocation.coordinates, pages, sizes, stream)
                     count += 1

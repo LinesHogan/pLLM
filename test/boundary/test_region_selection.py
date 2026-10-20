@@ -164,7 +164,7 @@ def test_tuning_one_example_size_serves_every_declared_size():
         max_candidates=3,
         options=RegionSelectionPolicy(tuning="measured"),
     )
-    for chunks, layers in ((0, 0), (3, 0), (8, 5)):
+    for chunks, layers in ((0, 0), (3, 0), (8, 5), (2, 3), (8, 5), (0, 0)):
         result = selected.execution.run(inputs_for(chunks, layers), sizes={"chunks": chunks, "layers": layers})
         assert result.invocations == chunks * layers
         assert_grid_closed_form(result.values, chunks, layers)

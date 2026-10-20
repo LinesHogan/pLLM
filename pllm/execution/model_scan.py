@@ -53,7 +53,7 @@ from pllm.execution.codec import boundary_digest
 from pllm.execution.exported_cell import ExportedCell, TensorSignature
 from pllm.execution.memory import measure
 from pllm.execution.region_execution import RegionExecutionPlan, RegionInstructionExecution
-from pllm.execution.region_native import NativePrimitive, RegionFunction, external_primitive
+from pllm.execution.region_native import BorrowedTensorPrimitive, NativePrimitive, source_region_functions
 from pllm.execution.region_resources import (
     ExternalFunction,
     HostResourceBinding,
@@ -103,7 +103,7 @@ class ChunkTraining:
                 {
                     "input": x[:rows].detach().clone(),
                     "target": target[:rows].detach().clone(),
-                    "weight": weight.detach().clone(),
+                    "weight": weight.detach(),
                     **dict(zip(self.fields, values, strict=True)),
                 }
             )
@@ -211,7 +211,7 @@ def _layer_source(
     resource: Resource | None,
     parameters: tuple[int, ...],
     learning: bool,
-) -> tuple[tuple[Value, ...], tuple[Op, ...], tuple[Function, ...]]:
+) -> tuple[tuple[Op, ...], tuple[Function, ...]]:
     """One original layer, followed by its optional local update and publication."""
     index = ScalarType.INDEX
     phase = "prefill" if learning else "decode"
@@ -257,7 +257,7 @@ def _layer_source(
         ),
     )
     if resource is None or not learning:
-        return (), operations, (forward,)
+        return operations, (forward,)
     assert len(payload) == 2
     a, b = payload
     assert isinstance(a, TensorType) and isinstance(b, TensorType)
@@ -269,12 +269,19 @@ def _layer_source(
         ("invocation",),
         (ResourceAccess("invocation", AccessMode.READ, ()),),
     )
+    load = Function(
+        f"weight.{layer}",
+        (index,),
+        (weight.type,),
+        ("weights",),
+        (ResourceAccess("weights", AccessMode.READ, (cell,)),),
+    )
     new = tuple(Value(f"new{layer}_{i}", t) for i, t in enumerate(state))
     return (
-        (weight,),
         (
             *operations,
             Coordinate((), (Value(f"layer_id{layer}", index),), AffineIndex(layer)),
+            Call((f"layer_id{layer}",), (weight,), load.name),
             Call(
                 ("request", f"layer_id{layer}", "c", "rows", f"x{layer}", f"t{layer}", weight.name, *_names(old)),
                 new,
@@ -282,7 +289,7 @@ def _layer_source(
             ),
             Publish((*_names(new), "request"), (), resource.name),
         ),
-        (forward, train),
+        (forward, train, load),
     )
 
 
@@ -328,8 +335,7 @@ def _request_source(
         for target, layout in zip(scan.apply.targets, layouts.layouts, strict=True)
     }
     for layer in range(layers):
-        arguments, operations, declarations = _layer_source(layer, hidden, targets.get(layer), parameters, learning)
-        args += arguments
+        operations, declarations = _layer_source(layer, hidden, targets.get(layer), parameters, learning)
         ops += operations
         functions += declarations
     body = Region(Block((Value("c", ScalarType.INDEX), *args), ops, (f"h{layers}", f"r{layers - 1}")))
@@ -442,9 +448,11 @@ class ModelScanPrimitive(Protocol):
     @property
     def spans(self) -> tuple[ModelScanSpan, ...]: ...
     def inputs(self, request: int, chunk: int) -> tuple[torch.Tensor, ...]: ...
-    def weight(self, layer: int) -> torch.Tensor: ...
     def kv_view(self, resource: BorrowedResource) -> MutableTensorView: ...
-    def weights_view(self, resource: BorrowedResource) -> ReadonlyTensorView: ...
+    def weights_view(self, resource: BorrowedResource) -> ReadonlyTensorView:
+        """Original layer tensors, with the adapted projection weight in field zero."""
+        ...
+
     def input_view(self, resource: BorrowedResource) -> ReadonlyTensorView: ...
     def borrow_streams(self, owner: RegionPageOwner, lanes: int) -> RegionStreamBindings: ...
     def forward(
@@ -513,12 +521,7 @@ class ModelScanTask(Generic[D]):
         for name, cell in captured.items():
             if cell.implementation != imports[name]:
                 raise ValueError("local loss/optimizer capture differs from its signed source import")
-        functions: dict[str, RegionFunction] = {}
-        for function in window.program.functions:
-            imported = imports[function.name]
-            functions[function.name] = external_primitive(
-                function, imported if isinstance(imported, NativeKernelImport) else None
-            )
+        functions = source_region_functions(window.program.functions, {}, source.imports)
         execution = RegionExecutionPlan(
             window.program, source.imports, window.proposal, window.proposal.peak_bytes, window.state_windows
         ).bind(functions)
@@ -571,6 +574,11 @@ class ModelScanTask(Generic[D]):
             ),
             invocation.endpoints(),
             sizes=sizes,
+            tensor_borrows=tuple(
+                cell.implementation
+                for cell in self.execution.cells.values()
+                if isinstance(cell, BorrowedTensorPrimitive)
+            ),
             borrows=(
                 TensorResourceBinding(model.kv_view(resources["kv"]), context),
                 ReadonlyResourceBinding(model.weights_view(resources["weights"]), context),
@@ -622,15 +630,14 @@ class ModelScanInvocation(Generic[D]):
                     else Bank(())
                 )
                 arguments[f"{count}_offset"] = span.row.token_offset if span is not None else 0
-        arguments.update(
-            (f"weight{target.layer}", self.model.weight(target.layer)) for target in self.task.scan.apply.targets
-        )
         return arguments, sizes
 
     def endpoints(self) -> tuple[ExternalFunction, ...]:
         result: list[ExternalFunction] = []
         for function in self.task.window.program.functions:
             cell = self.task.execution.cells[function.name]
+            if isinstance(cell, BorrowedTensorPrimitive):
+                continue
             assert isinstance(cell, NativePrimitive)
             if function.name.startswith("train."):
                 callback = partial(self.train, function.name)

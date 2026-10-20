@@ -1,11 +1,12 @@
-"""Mechanical, lazy traversal of native-lowered schedule instructions.
+"""Cold traversal of native instructions for the shared executor's instance tables.
 
-This cursor only issues statement identities and coordinates. It neither owns
-state nor decides placement, batching, numerical transforms, or stream policy.
+This cursor only issues statement identities and coordinates during preparation.
+It neither owns state nor chooses placement, transforms or stream policy.
 """
 
 from __future__ import annotations
 
+import operator
 from collections.abc import Iterator, Mapping
 
 from pllm.contracts.region_program import Program, bind_sizes, resolve_extent
@@ -21,6 +22,19 @@ from pllm.contracts.schedule_instructions import (
     ScheduleSequence,
     StatementInvocation,
 )
+
+_ARITHMETIC = {
+    ScheduleOperator.ADD: operator.add,
+    ScheduleOperator.SUB: operator.sub,
+    ScheduleOperator.MUL: operator.mul,
+}
+_COMPARISONS = {
+    ScheduleOperator.EQ: operator.eq,
+    ScheduleOperator.LE: operator.le,
+    ScheduleOperator.LT: operator.lt,
+    ScheduleOperator.GE: operator.ge,
+    ScheduleOperator.GT: operator.gt,
+}
 
 
 def checked_schedule_integer(value: int | bool) -> int:
@@ -55,12 +69,10 @@ def evaluate_schedule_expression(expression: ScheduleExpression, variables: dict
     if op is ScheduleOperator.NEG:
         return checked_schedule_integer(-numbers[0])
     left, right = numbers
-    if op is ScheduleOperator.ADD:
-        return checked_schedule_integer(left + right)
-    if op is ScheduleOperator.SUB:
-        return checked_schedule_integer(left - right)
-    if op is ScheduleOperator.MUL:
-        return checked_schedule_integer(left * right)
+    if op in _ARITHMETIC:
+        return checked_schedule_integer(_ARITHMETIC[op](left, right))
+    if op in _COMPARISONS:
+        return _COMPARISONS[op](left, right)
     if op is ScheduleOperator.EXACT_DIV:
         if right == 0 or left % right:
             raise ValueError("schedule exact division precondition failed")
@@ -80,16 +92,6 @@ def evaluate_schedule_expression(expression: ScheduleExpression, variables: dict
         if (left < 0) != (right < 0):
             quotient = -quotient
         return checked_schedule_integer(left - quotient * right)
-    if op is ScheduleOperator.EQ:
-        return left == right
-    if op is ScheduleOperator.LE:
-        return left <= right
-    if op is ScheduleOperator.LT:
-        return left < right
-    if op is ScheduleOperator.GE:
-        return left >= right
-    if op is ScheduleOperator.GT:
-        return left > right
     raise ValueError("unknown schedule expression operator")
 
 

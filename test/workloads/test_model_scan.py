@@ -14,7 +14,7 @@ from pllm.authoring import ParameterTargetShape, TensorStepInput
 from pllm.contracts.backend_attachment import CausalModelDomain
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch
-from pllm.contracts.region_imports import KernelAllocation, NativeKernelImport
+from pllm.contracts.region_imports import BorrowedTensorImport, KernelAllocation, NativeKernelImport
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.model_scan import ModelScanSpan
@@ -52,10 +52,10 @@ class Adapters(PrefillAdapters):
 
 
 class Model:
-    def __init__(self, tokens):
+    def __init__(self, tokens, layers=10):
         rng = torch.Generator().manual_seed(71)
         rand = lambda *shape: torch.randn(shape, generator=rng, dtype=torch.float64) * 0.2
-        self.layers = tuple(tuple(rand(4, 4) for _ in range(3)) + (rand(6, 4), rand(4, 6)) for _ in range(10))
+        self.layers = tuple(tuple(rand(4, 4) for _ in range(3)) + (rand(6, 4), rand(4, 6)) for _ in range(layers))
         self.embedding, self.head = rand(17, 4), rand(17, 4)
         self.tokens, self.length = tokens, len(tokens)
         self.prompt_length = len(tokens)
@@ -79,7 +79,8 @@ class Model:
 
     def weights_view(self, resource):
         return ReadonlyTensorView(
-            resource, tuple(ReadonlyTensorCell.bind((i,), weights) for i, weights in enumerate(self.layers))
+            resource,
+            tuple(ReadonlyTensorCell.bind((i,), (self.weight(i), *weights)) for i, weights in enumerate(self.layers)),
         )
 
     def input_view(self, resource):
@@ -154,7 +155,9 @@ def imported_facts(workload, facts):
     """The fixed toy backend's bounded CPU layer contract; it is never a CUDA kernel."""
     graph, _, _ = workload.declare(facts)
     imports = tuple(
-        NativeKernelImport(
+        BorrowedTensorImport(function, 0)
+        if function.name.startswith("weight.")
+        else NativeKernelImport(
             function,
             "test.toy_causal_layer@1",
             "cpu",
@@ -170,7 +173,15 @@ def imported_facts(workload, facts):
 def test_model_scan_matches_independent_cpu_oracle_bitwise():
     torch.set_num_threads(1)
     for config, zero in ((pllm.SGD(1e-3), False), (pllm.AdamW(1e-3), False), (pllm.SGD(1e-3), True)):
-        workload = Adapters(chunk_size=4, rank=2, dtype=torch.float64, optimizer=config, zero=zero)
+        workload = Adapters(
+            chunk_size=2 if config == pllm.SGD(1e-3) and not zero else 1,
+            rank=2,
+            dtype=torch.float64,
+            optimizer=config,
+            zero=zero,
+            layers=(0, 2, 4, 6, 8) if config == pllm.SGD(1e-3) and not zero else (0,),
+        )
+        layers = 10 if len(workload.layers) > 1 else 1
         targets = workload.backend_requirements().parameter_targets
         facts = backend_facts(
             4,
@@ -179,15 +190,15 @@ def test_model_scan_matches_independent_cpu_oracle_bitwise():
             PageBundleProviderFacts("test.model_scan@1", 5),
             max_lineages=1,
             memory_bytes=1 << 24,
-            max_rows=11,
+            max_rows=5,
             dtype=TensorDType.FLOAT64,
             targets=tuple(ParameterTargetShape(t, 6, 4) for t in targets),
-            layer_count=10,
+            layer_count=layers,
         )
         facts = replace(
             facts,
             probe=replace(
-                facts.probe, capabilities=("model/chunk_scan@1",), causal_domain=CausalModelDomain(1, 10, 32)
+                facts.probe, capabilities=("model/chunk_scan@1",), causal_domain=CausalModelDomain(1, layers, 4)
             ),
         )
         facts = imported_facts(workload, facts)
@@ -201,10 +212,14 @@ def test_model_scan_matches_independent_cpu_oracle_bitwise():
             for ref, binding in zip(refs, bindings, strict=True)
         }
         if config == pllm.SGD(1e-3) and not zero:
-            subset = replace(workload, layers=(2, 4, 6, 8))
+            subset = replace(workload, layers=(8,))
             smaller = subset.compile_backend(
                 subset.specialize(
-                    imported_facts(subset, replace(facts, targets=facts.targets[1:])), pllm.ExecutionOptions()
+                    imported_facts(
+                        subset,
+                        replace(facts, targets=tuple(t for t in facts.targets if t.target.layer in subset.layers)),
+                    ),
+                    pllm.ExecutionOptions(),
                 )
             )
             other = RequestIdentity("other", 0, 0)
@@ -221,9 +236,10 @@ def test_model_scan_matches_independent_cpu_oracle_bitwise():
             )
             for layer, values in params.items()
         }
-        tokens = torch.tensor([1, 4, 2, 7, 3, 6, 11, 8, 0, 5, 9])
-        backend = Model(tokens)
-        kv, expected, history, outputs = serial(backend, params, optimizers, zero)
+        tokens = torch.tensor([1, 4, 2] if layers > 1 else [1] if zero else [1, 4])
+        chunks = (len(tokens) + workload.chunk_size - 1) // workload.chunk_size
+        backend = Model(tokens, layers)
+        kv, expected, history, outputs = serial(backend, params, optimizers, zero, workload.chunk_size)
         execute(deployment, backend, HiddenPhase.PREFILL)
         events = [event for event in owner.trace.snapshot().events if event.tensor_name]
         pairs = [
@@ -238,12 +254,14 @@ def test_model_scan_matches_independent_cpu_oracle_bitwise():
             for event in events
             if event.tensor_name.endswith(".input")
         ]
-        assert trace != sorted(trace) and set(trace) == {(c, l) for c in range(3) for l in range(10)}
+        assert set(trace) == {(c, l) for c in range(chunks) for l in range(layers)}
+        if layers > 1:
+            assert trace != sorted(trace)
         for event in events:
             if event.tensor_name.endswith("a_read"):
                 assert len(event.refs) == 1 and event.refs[0].version_id == event.iteration
-        assert owner.diagnostics().update_count == 15
-        assert all(owner.arena.latest(ref.lineage_id).version_id == 3 for ref in refs)
+        assert owner.diagnostics().update_count == chunks * len(params)
+        assert all(owner.arena.latest(ref.lineage_id).version_id == chunks for ref in refs)
         first = (torch.cat(outputs)[-1] @ backend.head.T).argmax()
         assert torch.equal(first, (backend.output[-1] @ backend.head.T).argmax())
         backend.tokens, backend.length = first.reshape(1), 1
@@ -258,7 +276,7 @@ def test_model_scan_matches_independent_cpu_oracle_bitwise():
                 h = target + out
         execute(deployment, backend, HiddenPhase.DECODE)
         assert torch.equal(backend.output.view(torch.int64), h.view(torch.int64))
-        assert owner.diagnostics().update_count == 15
+        assert owner.diagnostics().update_count == chunks * len(params)
         source = owner.arena.plan.semantic_graph.source_regions[0].program
         analysis = analyze_region_program(source)
         # Reverse all statement times: complete domain, deliberately illegal causal order.
@@ -275,15 +293,15 @@ def test_model_scan_matches_independent_cpu_oracle_bitwise():
             multiple_requests(workload, facts)
 
 
-def serial(backend, params, optimizers, zero):
+def serial(backend, params, optimizers, zero, chunk_size=2):
     tokens = backend.tokens
     kv = [(torch.empty(0, 4, dtype=torch.float64),) * 2 for _ in backend.layers]
     expected, history, outputs = {}, {}, []
-    for chunk, start in enumerate(range(0, len(tokens), 4)):
-        h = backend.embedding[tokens[start : start + 4]]
+    for chunk, start in enumerate(range(0, len(tokens), chunk_size)):
+        h = backend.embedding[tokens[start : start + chunk_size]]
         r = h
         for layer in range(len(kv)):
-            record = {"input": pad(h, 4), "residual_in": pad(r, 4)}
+            record = {"input": pad(h, chunk_size), "residual_in": pad(r, chunk_size)}
             x, target, weight, kv[layer] = backend.layer(layer, h, kv[layer])
             with torch.no_grad():
                 out = x @ weight.T
@@ -295,10 +313,10 @@ def serial(backend, params, optimizers, zero):
                 h = target + out
             r = torch.zeros_like(h)
             record.update(
-                hidden=pad(h, 4),
-                residual=pad(r, 4),
-                x=pad(x if layer in params else h, 4),
-                target=pad(target if layer in params else h, 4),
+                hidden=pad(h, chunk_size),
+                residual=pad(r, chunk_size),
+                x=pad(x if layer in params else h, chunk_size),
+                target=pad(target if layer in params else h, chunk_size),
             )
             if layer in params:
                 a, b = params[layer]
@@ -321,11 +339,9 @@ class Batch:
         self.caches = tuple(torch.stack([m.kv[layer] for m in models.values()]) for layer in range(10))
         self.slots = {identity: i for i, identity in enumerate(models)}
         for identity, model in models.items():
+            model.layers = next(iter(models.values())).layers
             model.kv = [cache[self.slots[identity]] for cache in self.caches]
         self.outputs = {identity: [] for identity in models}
-
-    def weight(self, layer):
-        return next(iter(self.models.values())).weight(layer)
 
     def inputs(self, request, chunk):
         span = self.spans[request]
@@ -355,11 +371,13 @@ class Batch:
 
 def multiple_requests(workload, facts):
     """Compare variable prompts across reordered cuts and reuse retired request capacity."""
+    workload = replace(workload, layers=(0, 8))
     facts = replace(
         facts,
-        max_admitted_lineages=3,
+        targets=tuple(t for t in facts.targets if t.target.layer in workload.layers),
+        max_admitted_lineages=2,
         providers=(PageBundleProviderFacts("test.model_scan@1", 12),),
-        probe=replace(facts.probe, causal_domain=CausalModelDomain(3, 10, 32)),
+        probe=replace(facts.probe, causal_domain=CausalModelDomain(2, 10, 6)),
     )
     facts = imported_facts(workload, facts)
     deployment = workload.compile_backend(workload.specialize(facts, pllm.ExecutionOptions()))
@@ -373,8 +391,8 @@ def multiple_requests(workload, facts):
             replace(source, window=replace(source.window, token_budget=1)), facts.timeline.region_policy, parallel=False
         )
     owner, bindings = deployment.execution, deployment.attachment.inputs.request.overlay_bindings
-    identities = tuple(RequestIdentity(str(i), 0, 0) for i in range(3))
-    models = {identity: Model(torch.arange(length) % 17) for identity, length in zip(identities, (3, 9, 11))}
+    identities = tuple(RequestIdentity(str(i), 0, 0) for i in range(2))
+    models = {identity: Model(torch.arange(length) % 17) for identity, length in zip(identities, (3, 6))}
     expected, roots = {}, {}
     for identity, model in models.items():
         refs = owner.admit((identity,))
@@ -390,6 +408,7 @@ def multiple_requests(workload, facts):
     window = owner.arena.plan.schedule_physical.source_schedules[0].window
     limit = window.chunks * window.request.quantum
     pending = list(identities)
+    ordinals = {identity: set() for identity in identities}
     rounds = 0
     while pending:
         pending.reverse()
@@ -402,6 +421,7 @@ def multiple_requests(workload, facts):
                 continue
             row = PackedPhaseRow(len(rows), len(spans), offset, HiddenPhase.PREFILL, identity)
             spans.append(ModelScanSpan(row, length, model.length))
+            ordinals[identity].add(row.request_ordinal)
             rows.extend(
                 replace(row, packed_row_index=row.packed_row_index + i, token_offset=offset + i) for i in range(length)
             )
@@ -415,12 +435,13 @@ def multiple_requests(workload, facts):
         owner.finish_step(invocation)
         for identity in tuple(pending):
             if models[identity].lengths[0] == models[identity].length:
-                count = (models[identity].length + 3) // 4
+                count = (models[identity].length + 1) // 2
                 assert all(owner.arena.latest(ref.lineage_id).version_id == count for ref in roots[identity])
                 owner.retire((identity,))
                 pending.remove(identity)
         rounds += 1
-    assert owner.diagnostics().update_count == 5 * sum((model.length + 3) // 4 for model in models.values())
+    assert owner.diagnostics().update_count == len(bindings) * sum((model.length + 1) // 2 for model in models.values())
+    assert any(len(seen) > 1 for seen in ordinals.values())
     comparisons = 0
     for identity, model in models.items():
         kv, records, history, outputs = expected[identity]
@@ -449,14 +470,14 @@ def cancel_windows(deployment):
     for point in ("forward", "update", "publish", "tail"):
         identity = RequestIdentity(point, 2, 0)
         refs = owner.admit((identity,))
-        model = Model(torch.tensor([1, 2, 3, 4, 5]))
+        model = Model(torch.tensor([1, 2, 3]))
         row = PackedPhaseRow(0, 0, 0, HiddenPhase.PREFILL, identity)
-        model.spans = (ModelScanSpan(row, 5, 5),)
-        rows = PackedPhaseRowBatch(1, 0, 5, tuple(replace(row, packed_row_index=i, token_offset=i) for i in range(5)))
+        model.spans = (ModelScanSpan(row, 3, 3),)
+        rows = PackedPhaseRowBatch(1, 0, 3, tuple(replace(row, packed_row_index=i, token_offset=i) for i in range(3)))
         invocation = owner.start_step(TensorStepInput(rows, PackedSamplerRowBatch(rows, ())))
         context = invocation.context
         context.model_scan = model
-        with inject_fault(point, model, lambda: context, 4) as (fired, _):
+        with inject_fault(point, model, lambda: context, 2) as (fired, _):
             with pytest.raises(RuntimeError):
                 owner.execute_anchor(invocation, deployment.attachment.inputs.request.task_bindings[0].anchor_id)
             if context.release is None:

@@ -45,10 +45,10 @@ PROBE = BackendPlacementProbe(
     1,
     TensorDType.FLOAT32,
     4,
-    8,
+    4,
     (),
     ("model/tokenwise_replay@1",),
-    causal_domain=CausalModelDomain(2, 3, 8),
+    causal_domain=CausalModelDomain(2, 3, 3),
 )
 FACTS = BackendCompileFacts(
     PROBE, RuntimeFacts(torch.device("cpu")).timeline(("model/tokenwise_replay@1",)), (), 2, 0, 0, layer_count=3

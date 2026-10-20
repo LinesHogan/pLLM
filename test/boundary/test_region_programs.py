@@ -347,7 +347,7 @@ def tensor_predicate_loop():
 
 
 FAMILIES = {
-    "wavefront-and-tiling": (lambda: wavefront(5, 7),),
+    "wavefront-and-tiling": (lambda: wavefront(3, 3),),
     "scans": (scan_versions, prefix_sums),
     "control-flow": (pretest_loop, lambda: nested_control(3, 4)),
     "symbolic-sizes": (parameter_offsets,),

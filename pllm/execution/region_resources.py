@@ -10,7 +10,6 @@ from typing import Protocol
 
 import torch
 
-from pllm.contracts.region_bindings import AccessTable
 from pllm.contracts.region_imports import BorrowedTensorImport, NativeKernelImport
 from pllm.contracts.region_program import (
     AccessMode,
@@ -32,7 +31,7 @@ from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.host_borrow import HostResourceView, validate_host_views
 from pllm.execution.paged_access import PagedResourceView, validate_paged_views
 from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin, PagePublication, PageRelease, PageWrite
-from pllm.execution.region_frame import lookup
+from pllm.execution.region_frame import Routes
 from pllm.execution.region_values import Bank, Data, check_data
 from pllm.execution.tensor_borrow import (
     MutableTensorView,
@@ -105,9 +104,9 @@ class _PinnedTensorView(ReadonlyTensorView):
     owner: RegionPageOwner
     proofs: tuple[PinnedResourceCell, ...]
 
-    def check(self, mode: AccessMode, ranges: tuple[tuple[int, int], ...]) -> None:
+    def validate(self) -> None:
         self.owner.check_page_execution()
-        ReadonlyTensorView.check(self, mode, ranges)
+        ReadonlyTensorView.validate(self)
         proofs = {cell.indices: cell for cell in self.proofs}
         if len(proofs) != len(self.proofs) or set(proofs) != {cell.indices for cell in self.cells if cell.identities}:
             raise ValueError("pinned view requires exact nonempty cell proofs")
@@ -129,9 +128,7 @@ class _PinnedTensorView(ReadonlyTensorView):
             )
 
         for cell in self.cells:
-            if not cell.identities or not all(
-                lo <= coordinate < hi for coordinate, (lo, hi) in zip(cell.indices, ranges, strict=True)
-            ):
+            if not cell.identities:
                 continue
             proof = proofs[cell.indices]
             # Published/admission versions use original invocation-held exact pins;
@@ -173,7 +170,7 @@ class PinnedResourceBinding:
             )
             views.append(ReadonlyTensorCell.bind(indices, tensors))
         view = _PinnedTensorView(resource, tuple(views), owner, cells)
-        view.check(AccessMode.READ, tuple((0, size) for size in resource.domain))
+        view.validate()
         return cls(view, owner)
 
     def validate(self, program: Program, paged: tuple[PagedResourceView, ...]) -> None:
@@ -237,10 +234,11 @@ class BoundResourceAccess:
 
 
 class RegionResources:
-    """Immutable page mappings and external endpoints, without resource ownership.
+    """Invocation-bound page mappings, checked borrows and external endpoints.
 
     Binding names cannot prove independence: different logical cells must have
     distinct physical lineages. Multiple fields in one cell publish atomically.
+    Access and tensor bindings are cached here for this owner's invocation only.
     """
 
     def __init__(
@@ -297,6 +295,7 @@ class RegionResources:
             mappings[key] = cell
             lineages.add(cell.original.lineage_id)
         self._resources = program.resources
+        self._domains = {resource.name: resource.domain for resource in program.resources}
         self._owner = owner
         self._cells = mappings
         self._types = {r.name: r.payload for r in resources.values()}
@@ -325,6 +324,7 @@ class RegionResources:
                     binding.validate(program, paged)
                     validate_readonly_views((binding.view,), paged, mutable)
         self._borrows = views
+        self._readonly = tuple(view for view in views.values() if isinstance(view, ReadonlyTensorView))
         external_names = {r.name for r in program.resources if isinstance(r, (ExternalResource, BorrowedResource))}
         expected = {f.name: f for f in program.functions if external_names.intersection(f.resources)}
         self._external_declarations = expected
@@ -345,6 +345,22 @@ class RegionResources:
             if function.declaration != expected[name]:
                 raise ValueError("external function differs from its source declaration")
         self._externals = functions
+        self._access_arguments = {
+            function.name: tuple(
+                sorted(
+                    {
+                        term.argument
+                        for access in function.accesses
+                        for interval in access.ranges
+                        for expression in (interval.lower, interval.upper)
+                        for term in expression.terms
+                    }
+                )
+            )
+            for function in program.functions
+        }
+        self._accesses: dict[tuple[str, tuple[Data, ...]], tuple[BoundResourceAccess, ...]] = {}
+        self._tensors: dict[tuple[str, tuple[Data, ...]], torch.Tensor] = {}
 
     def validate(self, program: Program, sizes: Mapping[str, int] = {}) -> None:
         if self._sizes != bind_sizes(program, sizes):
@@ -355,6 +371,8 @@ class RegionResources:
         if self._external_declarations != {f.name: f for f in program.functions if names.intersection(f.resources)}:
             raise ValueError("external bindings belong to different source declarations")
         self._owner.check_page_execution()
+        for view in self._readonly:
+            view.validate()
 
     def window(self, facts: tuple[RegionStateWindow, ...]) -> AbstractContextManager[None]:
         """Reserve original-owner COW capacity for the compiler's whole window."""
@@ -367,16 +385,12 @@ class RegionResources:
             self._owner.pin.stream,
         )
 
-    def validate_cells(self, uses: tuple[AccessTable, ...]) -> None:
+    def validate_cells(self, uses: Routes) -> None:
         """Cover every cell reached at these sizes, before any statement issues."""
-        tables = {table.input_id: table for table in uses}
-        for ordinal, resource in enumerate(self._resources):
-            if not isinstance(resource, Resource):
-                continue
-            for indices in product(*(range(size) for size in resource.domain)):
-                if lookup(tables.get(ordinal), indices, self._sizes) is not None:
-                    if (resource.name, indices) not in self._cells:
-                        raise ValueError("bind every state cell reached by the admitted region sizes")
+        for ordinal, indices in uses:
+            resource = self._resources[ordinal]
+            if isinstance(resource, Resource) and (resource.name, indices) not in self._cells:
+                raise ValueError("bind every state cell reached by the admitted region sizes")
 
     def scope(self) -> AbstractContextManager[None]:
         stream = self._owner.pin.stream
@@ -404,22 +418,21 @@ class RegionResources:
     def borrow_tensor(self, implementation: BorrowedTensorImport, inputs: tuple[Data, ...]) -> torch.Tensor:
         self.before_statement()
         function = implementation.declaration
-        if self._tensor_borrows.get(function.name) != implementation:
-            raise ValueError("tensor borrow has no matching original source binding")
+        key = function.name, inputs
+        if key in self._tensors:
+            return self._tensors[key]
         indices: list[int] = []
-        for value, type_ in zip(inputs, function.inputs, strict=True):
-            check_data(value, type_, self._sizes)
-            if type(value) is not int:
-                raise ValueError("tensor borrowing requires integer resource coordinates")
+        for value in inputs:
+            assert type(value) is int
             indices.append(value)
         self.bind_accesses(function, inputs)
         view = self._borrows[function.resources[0]]
-        if not isinstance(view, ReadonlyTensorView):
-            raise ValueError("tensor borrowing requires original read-only tensor storage")
+        assert isinstance(view, ReadonlyTensorView)
         value = view.tensor(tuple(indices), implementation.field)
         check_data(value, function.outputs[0], self._sizes)
         if not value.is_contiguous():
             raise ValueError("tensor borrow requires the declared contiguous layout")
+        self._tensors[key] = value
         return value
 
     def before_statement(self) -> None:
@@ -428,6 +441,9 @@ class RegionResources:
     def bind_accesses(self, declaration: Function, inputs: tuple[Data, ...]) -> tuple[BoundResourceAccess, ...]:
         if not declaration.accesses:
             return ()
+        key = declaration.name, tuple(inputs[i] for i in self._access_arguments[declaration.name])
+        if key in self._accesses:
+            return self._accesses[key]
 
         def index(expression: AffineIndex) -> int:
             value = expression.constant
@@ -441,36 +457,25 @@ class RegionResources:
                     raise ValueError("resource access arithmetic exceeds the signed index range")
             return value
 
-        resources = {resource.name: resource for resource in self._resources}
         result: list[BoundResourceAccess] = []
         for access in declaration.accesses:
             ranges = tuple((index(interval.lower), index(interval.upper)) for interval in access.ranges)
-            domain = resources[access.resource].domain
+            domain = self._domains[access.resource]
             if any(not 0 <= lower <= upper <= size for (lower, upper), size in zip(ranges, domain, strict=True)):
                 raise ValueError("native resource access lies outside its declared logical domain")
             view = self._borrows.get(access.resource)
             if view is not None:
                 view.check(access.mode, ranges)
             result.append(BoundResourceAccess(access.resource, access.mode, ranges))
-        return tuple(result)
+        self._accesses[key] = tuple(result)
+        return self._accesses[key]
 
-    def external(
-        self, declaration: Function, inputs: tuple[Data, ...], implementation: NativeKernelImport | None = None
-    ) -> tuple[Data, ...]:
+    def external(self, declaration: Function, inputs: tuple[Data, ...]) -> tuple[Data, ...]:
         self.before_statement()
-        function = self._externals.get(declaration.name)
-        if function is None or function.declaration != declaration:
-            raise ValueError("call has no matching external resource binding")
-        if function.implementation != implementation:
-            raise ValueError("external endpoint differs from the imported native kernel execution contract")
-        for value, type_ in zip(inputs, declaration.inputs, strict=True):
-            check_data(value, type_, self._sizes)
-        self.bind_accesses(declaration, inputs)
+        function = self._externals[declaration.name]
         return function.function(inputs)
 
     def _cell(self, resource: str, indices: tuple[int, ...]) -> ResourcePageCell:
-        if any(type(index) is not int for index in indices):
-            raise ValueError("logical resource indices must be integers")
         try:
             return self._cells[(resource, indices)]
         except KeyError as error:

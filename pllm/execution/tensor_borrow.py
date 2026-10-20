@@ -106,10 +106,12 @@ class ReadonlyTensorView:
             not 0 <= lo <= hi <= size for (lo, hi), size in zip(ranges, self.resource.domain, strict=True)
         ):
             raise ValueError("read-only tensor access exceeds its declared domain")
+
+    def validate(self) -> None:
+        """Check physical identities once at the invocation binding boundary."""
         for cell in self.cells:
-            if all(lo <= coordinate < hi for coordinate, (lo, hi) in zip(cell.indices, ranges, strict=True)):
-                for identity in cell.identities:
-                    identity.check()
+            for identity in cell.identities:
+                identity.check()
 
     def tensor(self, indices: tuple[int, ...], field: int) -> torch.Tensor:
         self.check(AccessMode.READ, tuple((coordinate, coordinate + 1) for coordinate in indices))
@@ -138,7 +140,7 @@ def validate_readonly_views(
     protected: tuple[tuple[str, int, int], ...],
 ) -> None:
     for view in views:
-        view.check(AccessMode.READ, tuple((0, size) for size in view.resource.domain))
+        view.validate()
         for device, address, size in view.allocation_ranges:
             if any(
                 device == other and address < start + count and start < address + size

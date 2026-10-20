@@ -1,7 +1,6 @@
 """Borrow invocation streams and consume native phase/placement accessors."""
 
 from collections import deque
-from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -17,7 +16,7 @@ from pllm.contracts.semantic_graph import TaskSourceRegion
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.region_compilation import analyze_region_program
-from pllm.execution.region_frame import lookup
+from pllm.execution.region_frame import Routes
 from pllm.execution.region_storage import RegionImportSource, analyze_region_payload, import_region_functions
 from pllm.execution.region_values import Bank, Data
 
@@ -193,10 +192,16 @@ class RegionStreamBindings:
 class RegionStreamFrame:
     """Device dependency and window-credit events; no host completion waits."""
 
-    def __init__(self, plan: RegionStreamPlan, bindings: RegionStreamBindings, sizes: Mapping[str, int]) -> None:
+    def __init__(
+        self,
+        plan: RegionStreamPlan,
+        bindings: RegionStreamBindings,
+        placements: Routes,
+        waits: tuple[tuple[int, Routes], ...],
+    ) -> None:
         self._streams = (bindings.owner, *bindings.auxiliary)
-        self._placements = {table.input_id: table for table in plan.placements}
-        self._waits = tuple((wait.lane, {table.input_id: table for table in wait.predecessors}) for wait in plan.waits)
+        self._placements = placements
+        self._waits = waits
         self._depth = plan.pipeline_depth
         self._pending: deque[tuple[tuple[int, ...], dict[int, torch.cuda.Event]]] = deque()
         self._events: dict[tuple[int, ...], dict[int, torch.cuda.Event]] = {}
@@ -204,7 +209,6 @@ class RegionStreamFrame:
             {lane: torch.cuda.Event() for lane in range(len(self._streams))} for _ in range(plan.pipeline_depth + 1)
         )
         self._waited: dict[tuple[int, int], tuple[int, ...]] = {}
-        self._sizes = sizes
         self._phase: tuple[int, ...] | None = None
         self._active: set[int] = {0}
         self._ordered_through: tuple[int, ...] | None = None
@@ -226,14 +230,14 @@ class RegionStreamFrame:
                 self._event_pool.append(credit)
                 self._ordered_through = retired
             self._phase = phase
-        placement = lookup(self._placements.get(statement_id), coordinates, self._sizes)
+        placement = self._placements.get((statement_id, coordinates))
         assert placement is not None and len(placement[1]) == 1
         (lane,) = placement[1]
         stream = self._streams[lane]
         for producer, tables in self._waits:
             if producer == lane:
                 continue
-            predecessor = lookup(tables.get(statement_id), coordinates, self._sizes)
+            predecessor = tables.get((statement_id, coordinates))
             if predecessor is None:
                 continue
             required = predecessor[1]

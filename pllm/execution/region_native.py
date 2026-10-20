@@ -44,12 +44,10 @@ class PrimitiveResources:
         declaration: Function,
         pages: RegionResources | None,
         inputs: tuple[Data, ...],
-        implementation: NativeKernelImport | None = None,
     ) -> None:
         if (declaration.resources or declaration.accesses) and pages is None:
             raise ValueError("effectful native import requires original resource bindings")
         self._declaration = declaration
-        self._implementation = implementation
         self._pages = pages
         self._active = True
         self._accesses = () if pages is None else pages.bind_accesses(declaration, inputs)
@@ -59,7 +57,6 @@ class PrimitiveResources:
             raise RuntimeError("native resource view has expired")
         if resource not in self._declaration.resources or self._pages is None:
             raise ValueError("native import accessed an undeclared resource")
-        self._pages.before_statement()
         return self._pages
 
     def snapshot(self, resource: str, indices: tuple[int, ...] = ()) -> tuple[Data, ...]:
@@ -87,7 +84,7 @@ class PrimitiveResources:
             raise ValueError("external call requires original resource bindings")
         if self._pages.bind_accesses(self._declaration, inputs) != self._accesses:
             raise ValueError("external invocation changes its original indexed access")
-        return self._pages.external(self._declaration, inputs, self._implementation)
+        return self._pages.external(self._declaration, inputs)
 
     def close(self) -> None:
         self._active = False
@@ -117,7 +114,7 @@ class NativePrimitive:
         # Native tensor kernels may update their arguments. Private mathematical
         # inputs preserve all SSA versions, independently of physical COW pages.
         arguments = tuple(copy_data(value) for value in inputs)
-        resources = PrimitiveResources(self.declaration, pages, inputs, self.implementation)
+        resources = PrimitiveResources(self.declaration, pages, inputs)
         try:
             result = self.function(arguments, resources)
             if pages is not None:

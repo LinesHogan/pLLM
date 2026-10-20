@@ -104,7 +104,7 @@ def test_external_endpoints_run_in_order_and_expire_with_the_invocation():
     assert interpret(program, {}, functions={f.name: call for f in program.functions}).values == result.values
     execution.cancel_step(invocation)
     with pytest.raises(RuntimeError):
-        resources.external(program.functions[0], ())
+        external_primitive(program.functions[0]).invoke((), resources)
     execution.retire(tuple(row.identity for row in rows))
 
 
@@ -210,7 +210,7 @@ def test_paged_borrows_use_original_kv_storage_and_reject_unproved_accesses():
         program, invocation.context, (), endpoints, borrows=(PagedResourceBinding(view, invocation.context),)
     )
     with pytest.raises(ValueError):
-        pages.external(program.functions[1], (0, 0, 0))
+        external_primitive(program.functions[1]).invoke((0, 0, 0), pages)
     assert not calls
     # Request 1's write is proven disjoint from request 0's accesses, so it may move first.
     cells = {f.name: external_primitive(f) for f in program.functions}
