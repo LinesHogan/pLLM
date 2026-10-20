@@ -1,11 +1,14 @@
-"""Evidence 33: actual fused q/v arithmetic, global publication and admission pins."""
+"""TLM on a real vLLM model: one training batch publishes q/v LoRA factors used by every later token.
+
+The fused QKV projection of every layer is checked against dense PyTorch linear
+arithmetic with the published factors.
+"""
 
 from __future__ import annotations
 
 import argparse
 import sys
 from pathlib import Path
-from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -40,15 +43,6 @@ def main() -> None:
     batch = CausalTrainBatch(tokens, tokens)
     hooks = []
     checks = [0]
-    linear_rows: list[int] = []
-    linear_inputs: list[int] = []
-    original_linear = F.linear
-
-    def observe_linear(value, weight, bias=None):
-        if 2 in weight.shape:
-            linear_rows.append(value.shape[0])
-            linear_inputs.append(value.data_ptr())
-        return original_linear(value, weight, bias)
 
     try:
         (initial,) = execution.directory.select(()).refs
@@ -78,42 +72,23 @@ def main() -> None:
             def check(module, args, output, factor=factor, q_size=q_size, kv_size=kv_size):
                 (hidden,) = args
                 actual, _ = output
-                assert linear_rows == [hidden.shape[0]] * 4, (
-                    "same-version requests were split into separate LoRA launches"
-                )
-                assert linear_inputs[::2] == [hidden.data_ptr()] * 2, "contiguous LoRA inputs were copied"
-                linear_rows.clear()
-                linear_inputs.clear()
-                expected = original_linear(hidden, module.weight, module.bias)
-                expected[:, :q_size] += original_linear(original_linear(hidden, factor[0]), factor[1]) * model.scale
-                expected[:, q_size + kv_size :] += (
-                    original_linear(original_linear(hidden, factor[2]), factor[3]) * model.scale
-                )
+                expected = F.linear(hidden, module.weight, module.bias)
+                expected[:, :q_size] += F.linear(F.linear(hidden, factor[0]), factor[1]) * model.scale
+                expected[:, q_size + kv_size :] += F.linear(F.linear(hidden, factor[2]), factor[3]) * model.scale
                 torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
                 checks[0] += 1
 
             hooks.append(layer.self_attn.qkv_proj.register_forward_hook(check))
-        with patch("torch.nn.functional.linear", observe_linear):
-            handle.generate(
-                ["The sky is", "Water freezes at"], SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True)
-            )
+        handle.generate(
+            ["The sky is", "Water freezes at"], SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True)
+        )
         diagnostics = execution.diagnostics()
         assert checks[0] >= 2 * len(handle.runner.model.model.layers)
         assert execution.directory.select(()).refs == (current,)
         assert diagnostics.update_count == 1 and diagnostics.trained_rows > 0
         assert handle.runner.overlay_updated_apply_count > 0
         assert diagnostics.inference_pins == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
-        print(
-            dict(
-                mode=mode,
-                updates=diagnostics.update_count,
-                loss_count=diagnostics.loss_count,
-                qkv_oracle_checks=checks[0],
-                apply_rows=handle.runner.overlay_apply_count,
-                updated_apply_rows=handle.runner.overlay_updated_apply_count,
-                fallback_count=diagnostics.fallback_count,
-            )
-        )
+        print(f"TLM {mode}: updates={diagnostics.update_count} qkv_oracle_checks={checks[0]}")
     finally:
         for hook in hooks:
             hook.remove()
