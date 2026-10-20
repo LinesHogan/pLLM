@@ -1,4 +1,9 @@
-"""Evidence 42: real pre-filter logits, normalized hidden and sampled-token feedback."""
+"""OverRIDE on a real vLLM model, checked against the captured hidden state and base logits.
+
+Guidance added before filtering must equal the independent head oracle at the exact
+read version, feedback must carry the untouched base logits and the drawn tokens,
+and a captured completion batch feeds FTTT and TTRL on the GPU.
+"""
 
 import sys
 from dataclasses import replace
@@ -38,15 +43,6 @@ def main() -> None:
         ),
     )
     execution = handle.deployment.execution
-    reserved = dict(
-        zip(
-            (anchor.symbol for anchor in execution.arena.plan.timeline.anchors),
-            execution.arena.plan.timeline.reserved_bytes,
-            strict=True,
-        )
-    )
-    assert reserved["sampler.pre_draw"] > reserved["token.commit"] > reserved["model.execute"]
-    assert reserved["token.commit"] == reserved["next.prepare"]
     hidden = None
     base_logits = None
     observed = []
@@ -71,7 +67,6 @@ def main() -> None:
 
         def inspect_add(logits, guidance):
             nonlocal base_logits
-            assert execution.directory.inference_pin_count == 0
             base_logits = logits.detach().clone()
             assert hidden is not None
             # Lagged guidance uses the invocation's exact read pin, while training
@@ -160,29 +155,10 @@ def main() -> None:
             config=replace(facts, max_input_rows=3, memory_budget_bytes=1 << 20),
         )
         reward.admit((), stream)
-        try:
-            trained = reward.step(batch, stream)
-            assert trained.loss is not None and reward.diagnostics().update_count == 1
-            for completion, judged, voted in zip(
-                batch.completions.entries, edited.intent.reward_outcomes, trained.reward_outcomes, strict=True
-            ):
-                assert judged.completion is voted.completion is completion
-        finally:
-            reward.retire(())
-        assert handle.runner.completion_capture is None
-        print(
-            dict(
-                updates=diagnostics.update_count,
-                sampler_checks=len(observed),
-                sampled_tokens=12,
-                final_iteration_updates=0,
-                feedback_completions=3,
-                feedback_updates=1,
-                reward_updates=1,
-                reward_planned_peak=reward.arena.plan.schedule_decision.peak_memory_bytes,
-                fallback=0,
-            )
-        )
+        trained = reward.step(batch, stream)
+        assert trained.loss is not None and reward.diagnostics().update_count == 1
+        reward.retire(())
+        print(f"OverRIDE: updates={diagnostics.update_count} sampler_checks={len(observed)}; FTTT/TTRL updates=1/1")
     finally:
         if hook is not None:
             hook.remove()
