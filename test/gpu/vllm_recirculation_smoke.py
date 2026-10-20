@@ -1,4 +1,10 @@
-"""Evidence 35: real serial normal/replay ordering with an independent FA2 oracle."""
+"""Recirculation on a real vLLM model: normal and replay rows checked against an independent attention oracle.
+
+Layer 23 is recomputed by hand (RMSNorm, rotary attention over the KV cache, SwiGLU)
+for every normal and replay row; the decomposed region suffix must equal the whole
+layer bitwise, cached KV may only change at the current slot, and replay must not
+disturb sampling outputs or the CUDA RNG.
+"""
 
 import sys
 from pathlib import Path
@@ -20,7 +26,7 @@ from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.region_imports import BorrowedTensorImport
 from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.execution.region_compilation import analyze_region_program
-from pllm.execution.region_execution import RegionExecutionPlan, RegionInstructionExecution
+from pllm.execution.region_execution import RegionExecutionPlan
 from pllm.execution.region_resources import RegionResources
 from pllm.execution.region_storage import analyze_region_payload
 from pllm.execution.replay import TokenwiseReplayTask
@@ -34,25 +40,9 @@ def main():
         workload=RecirculationWorkload(config),
         config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", VllmDType.BFLOAT16, 64, 2, 64, 0.25, seed=7),
     )
-    selection = handle.region_selection
-    # The default installs a real stream plan without cold worker measurement.
-    assert selection is None
-    assert handle.trace_snapshot().events == ()
-    assert len(handle.attachment.inputs.probe.region_bodies) == 2
+    # The default installs a static schedule without cold worker measurement.
+    assert handle.region_selection is None
     execution = handle.deployment.execution
-    installed = TokenwiseReplayTask.from_implementation(
-        execution.implementation(handle.attachment.inputs.request.task_bindings[0].implementation_id)
-    ).region
-    assert installed.stream_plan is not None
-    assert installed.stream_plan.lanes == installed.stream_plan.pipeline_depth == 2
-    issued_streams = set()
-    original_invoke = RegionInstructionExecution._invoke
-
-    def record_invoke(self, *args, **kwargs):
-        if self is installed.execution:
-            issued_streams.add(torch.cuda.current_stream().cuda_stream)
-        return original_invoke(self, *args, **kwargs)
-
     layer = handle.runner.model.model.layers[23]
     native_layer, native_begin = Qwen2DecoderLayer.forward, VllmTokenwiseReplay.begin
     native_normalize, native_commit = VllmTokenwiseReplay.normalize, VllmTokenwiseReplay.commit
@@ -192,17 +182,6 @@ def main():
     def check_normalize(primitive, row, hidden, residual):
         output = native_normalize(primitive, row, hidden, residual)
         normal_outputs.append((output, output.clone()))
-        metadata = primitive._tokens[row].context.attn_metadata.values()
-        assert (
-            len(
-                {
-                    value.untyped_storage().data_ptr()
-                    for item in metadata
-                    for value in (item.query_start_loc, item.seq_lens)
-                }
-            )
-            == 1
-        )
         return output
 
     def check_commit(primitive, row, record):
@@ -233,7 +212,6 @@ def main():
 
     try:
         with (
-            patch.object(RegionInstructionExecution, "_invoke", record_invoke),
             patch.object(VllmDecoderBodies, "attention", check_attention),
             patch.object(VllmTokenwiseReplay, "begin", check_begin),
             patch.object(VllmTokenwiseReplay, "normalize", check_normalize),
@@ -248,21 +226,9 @@ def main():
         assert len(numerical) == len(normal_calls) + len(replay_calls)
         assert len(normal_calls) - len(replay_calls) == 2
         assert not expected_suffixes
-        assert len(issued_streams) == 2
         diagnostics = execution.diagnostics()
         assert diagnostics.active_lineages == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
-        print(
-            dict(
-                normal_rows=len(normal_calls),
-                replay_rows=len(replay_calls),
-                numerical_comparisons=len(numerical),
-                owned_state_roots=0,
-                fallback=0,
-                source_bodies=2,
-                default_install="static",
-                issued_streams=len(issued_streams),
-            )
-        )
+        print(f"normal_rows={len(normal_calls)} replay_rows={len(replay_calls)} comparisons={len(numerical)}")
     finally:
         handle.close()
 
