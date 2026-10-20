@@ -108,7 +108,9 @@ class VllmRmsNormKernel:
         # CUDA op: no raw output backing or global library scratch is allocated.
         # The NativePrimitive wrapper separately funds two private inputs and
         # its independent result copy; model weights stay borrowed upstream.
-        implementation = NativeKernelImport(declaration, "vllm.fused_add_rms_norm@1:" + identity, tensor.device, ())
+        implementation = NativeKernelImport(
+            declaration, "vllm.fused_add_rms_norm@1:" + identity, tensor.device, (), host_reads=False
+        )
         return cls(norm, implementation, epsilon, norm.weight)
 
     def run(self, hidden: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:

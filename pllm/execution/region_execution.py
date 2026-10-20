@@ -18,6 +18,7 @@ from pllm.contracts.region_schedule import Statement
 from pllm.contracts.region_selection import RegionPayloadLimit
 from pllm.contracts.region_streams import RegionStreamPlan
 from pllm.contracts.schedule_instructions import LoweredSchedule
+from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_compilation import lower_region_bindings, lower_region_schedule
 from pllm.execution.region_control import RegionActions
@@ -39,15 +40,20 @@ from pllm.execution.region_streams import (
     validate_stream_budget,
 )
 from pllm.execution.region_values import Data, copy_data
+from pllm.execution.region_window import RegionWindow, WindowBackpressure
 
 
 @dataclass(frozen=True, slots=True)
 class RegionExecutionResult:
+    """Owned results, ordered on the invocation stream; completion can order other consumers."""
+
     values: tuple[Data, ...]
     invocations: int
     # Outer scheduled frame only; not a GPU memory budget or nested-slot count.
     peak_live_values: int
     released_values: int
+    window_reuses: int = 0
+    completion: CudaStreamReadiness | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +150,7 @@ class RegionInstructionExecution:
         self._cells = dict(cells)
         self._actions = RegionActions(program, cells)
         self._stream_plan = stream_plan
+        self._window = None if stream_plan is None else RegionWindow(stream_plan.slots)
         self._tensor_borrows = {
             name: cell.implementation for name, cell in cells.items() if isinstance(cell, BorrowedTensorPrimitive)
         }
@@ -170,12 +177,16 @@ class RegionInstructionExecution:
         # Python's loop locals can retain the previous result through the next
         # kernel, after the native last-use plan has released its frame slot.
         ins = tuple(frame.read(i, coordinates) for i in statement.inputs)
-        if stream is not None:
+        if stream is not None and self._window is None:
             for value in ins:
                 record_stream(value, stream)
-        result = self._actions.execute(self._lowered.actions[statement.id], ins, pages, sizes)
-        for output, value in zip(statement.outputs, result, strict=True):
-            frame.put(output, coordinates, value)
+        try:
+            result = self._actions.execute(self._lowered.actions[statement.id], ins, pages, sizes)
+            for output, value in zip(statement.outputs, result, strict=True):
+                frame.put(output, coordinates, value)
+        finally:
+            if self._window is not None:
+                self._window.finish_reads()
 
     def run(
         self,
@@ -190,15 +201,18 @@ class RegionInstructionExecution:
             raise ValueError("borrowed streams and a verified physical stream plan must be supplied together")
         owner = None if streams is None else streams.owner
         if streams is not None:
-            streams.validate_available()
+            if self._stream_plan is None:
+                streams.validate_available()
+            else:
+                streams.validate(self._stream_plan)
+                if torch.cuda.is_current_stream_capturing():
+                    raise ValueError(
+                        "run region windows eagerly; graph replay needs device-side version and completion state"
+                    )
             if pages is not None:
                 pages.validate_stream(streams.owner)
             if self._stream_plan is None:
                 streams = None  # Available lanes can be unused by the installed plan.
-        if streams is not None and self._stream_plan is not None:
-            streams.validate(self._stream_plan)
-            if pages is not None:
-                pages.validate_stream(streams.owner)
         if self._program.resources and pages is None:
             raise ValueError("resource programs require PTTS primitive bindings")
         if pages is not None:
@@ -208,13 +222,22 @@ class RegionInstructionExecution:
             )
             pages.validate_tensor_borrows(self._tensor_borrows)
         scope = pages.scope() if pages is not None else (nullcontext() if owner is None else torch.cuda.stream(owner))
-        with torch.no_grad(), scope:
-            frame = RegionValueFrame(self._bindings, inputs, sizes)
+        window_scope = nullcontext() if self._window is None else self._window.reserve()
+        page_window = (
+            nullcontext()
+            if pages is None or self._stream_plan is None
+            else pages.window(self._stream_plan.state_windows)
+        )
+        with torch.no_grad(), window_scope, page_window, scope:
+            if streams is not None:
+                for value in inputs.values():
+                    record_stream(value, streams.owner)
+            frame = RegionValueFrame(self._bindings, inputs, sizes, self._window)
             count = 0
             concurrent: RegionStreamFrame | None = None
             try:
                 if streams is not None and self._stream_plan is not None:
-                    concurrent = RegionStreamFrame(self._stream_plan, streams, sizes, frame.hold_live_values)
+                    concurrent = RegionStreamFrame(self._stream_plan, streams, sizes)
                 for invocation in self._schedule.invocations(sizes):
                     if pages is not None:
                         pages.before_statement()
@@ -226,24 +249,37 @@ class RegionInstructionExecution:
                             frame.time_for(statement.id, invocation.coordinates), statement.id, invocation.coordinates
                         )
                     )
-                    # The completion window either finishes the previous phase
-                    # or holds its references under the signed pipeline budget.
+                    # GPU credit waits and slot events protect physical reuse;
+                    # logical lifetimes can advance without observing completion.
                     frame.advance(statement.id, invocation.coordinates)
                     with nullcontext() if stream is None else torch.cuda.stream(stream):
                         self._invoke(frame, statement, invocation.coordinates, pages, sizes, stream)
                     count += 1
+                if concurrent is not None:
+                    concurrent.order_results()
                 values = frame.results()
-                if self._tensor_borrows:
+                if self._tensor_borrows or self._window is not None:
                     # An exported result (including a nested bank/control
                     # result) can alias a borrowed model parameter. Materialize
                     # the complete public result tuple; AER charges this ABI.
-                    if concurrent is not None:
-                        concurrent.order_results()
-                    values = tuple(copy_data(value) for value in values)
+                    try:
+                        values = tuple(copy_data(value) for value in values)
+                    finally:
+                        if self._window is not None:
+                            self._window.finish_reads()
                 if streams is not None:
                     for value in values:
                         record_stream(value, streams.owner)
-                return RegionExecutionResult(values, count, frame.peak_live_values, frame.released_values)
+                return RegionExecutionResult(
+                    values,
+                    count,
+                    frame.peak_live_values,
+                    frame.released_values,
+                    0 if self._window is None else self._window.reuses,
+                    None if streams is None else CudaStreamReadiness(streams.owner),
+                )
+            except WindowBackpressure as exc:
+                raise RuntimeError("an executing cell requested backpressure after window admission") from exc
             finally:
                 try:
                     if concurrent is not None:

@@ -23,9 +23,10 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import PhysicalPlan, TaskId
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import TensorDType
+from pllm.execution.region_window import WindowBackpressure
 from pllm.execution.shared_tensor import tensor_dtype
 
-TRACE_SCHEMA_VERSION = 5
+TRACE_SCHEMA_VERSION = 6
 MAX_SNAPSHOT_BYTES = 32768
 
 
@@ -47,6 +48,7 @@ class TracePhase(StrEnum):
     TASK_BEGIN = "task_begin"
     TASK_END = "task_end"
     TASK_FAILED = "task_failed"
+    BACKPRESSURE = "backpressure"
     REPLAY = "replay"
     PUBLISH = "publish"
     SAMPLER_COMPLETE = "sampler_complete"
@@ -342,6 +344,9 @@ class ExecutionTrace:
                 yield
             if timing is not None:
                 timing[1].record(stream)
+        except WindowBackpressure:
+            self.record(TracePhase.BACKPRESSURE, invocation_id, task_id=task_id)
+            raise
         except Exception:
             self.record(TracePhase.TASK_FAILED, invocation_id, task_id=task_id)
             raise

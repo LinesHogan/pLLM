@@ -302,7 +302,6 @@ def recovery_region():
         8,
         CausalModelDomain(1, 3, 8),
         Recurrence().effect(3),
-        lambda a, b, i: a + b,
     )
 
 

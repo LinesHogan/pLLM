@@ -1,7 +1,7 @@
 """Borrow invocation streams and consume native phase/placement accessors."""
 
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -171,44 +171,24 @@ class RegionStreamBindings:
             raise ValueError("stream plan belongs to another tensor or retention device")
 
 
-@dataclass(frozen=True, slots=True)
-class _PendingPhase:
-    phase: tuple[int, ...]
-    completions: Mapping[int, CudaStreamReadiness]
-    values: tuple[Data, ...]
-
-
 class RegionStreamFrame:
-    """A bounded completion window for one fixed plan, under the original owner.
+    """Device dependency and window-credit events; no host completion waits."""
 
-    GPU waits follow the native per-lane dependency frontier. References survive
-    logical last use until their phase finishes; a full window applies host
-    backpressure before another phase can allocate. Opaque host/page operations
-    drain prior work. This object neither owns pages nor chooses a schedule.
-    """
-
-    def __init__(
-        self,
-        plan: RegionStreamPlan,
-        bindings: RegionStreamBindings,
-        sizes: Mapping[str, int],
-        hold_values: Callable[[], tuple[Data, ...]],
-    ) -> None:
+    def __init__(self, plan: RegionStreamPlan, bindings: RegionStreamBindings, sizes: Mapping[str, int]) -> None:
         self._streams = (bindings.owner, *bindings.auxiliary)
         self._placements = {table.input_id: table for table in plan.placements}
         self._waits = tuple((wait.lane, {table.input_id: table for table in wait.predecessors}) for wait in plan.waits)
-        self._host_fences = frozenset(plan.host_fences)
         self._depth = plan.pipeline_depth
-        self._hold_values = hold_values
-        self._pending: deque[_PendingPhase] = deque()
-        self._events: dict[tuple[int, ...], Mapping[int, CudaStreamReadiness]] = {}
-        self._completed: tuple[int, ...] | None = None
+        self._pending: deque[tuple[tuple[int, ...], dict[int, torch.cuda.Event]]] = deque()
+        self._events: dict[tuple[int, ...], dict[int, torch.cuda.Event]] = {}
+        self._event_pool = deque(
+            {lane: torch.cuda.Event() for lane in range(len(self._streams))} for _ in range(plan.pipeline_depth + 1)
+        )
         self._waited: dict[tuple[int, int], tuple[int, ...]] = {}
         self._sizes = sizes
         self._phase: tuple[int, ...] | None = None
         self._active: set[int] = {0}
-        # Called after the owner has copied the entry values. No auxiliary
-        # stream may read those copies (or prior owner work) before this event.
+        self._ordered_through: tuple[int, ...] | None = None
         ready = CudaStreamReadiness(bindings.owner)
         for stream in bindings.auxiliary:
             ready.order_on(stream)
@@ -216,89 +196,56 @@ class RegionStreamFrame:
     def enter(self, phase: tuple[int, ...], statement_id: int, coordinates: tuple[int, ...]) -> torch.cuda.Stream:
         if self._phase != phase:
             if self._phase is not None:
-                if phase < self._phase:
-                    raise RuntimeError("stream cursor moved backwards in phase time")
+                assert phase > self._phase
                 self._seal()
-                while len(self._pending) >= self._depth:
-                    self._retire()
+            if len(self._pending) >= self._depth:
+                retired, credit = self._pending.popleft()
+                for stream in self._streams:
+                    for event in self._events[retired].values():
+                        stream.wait_event(event)
+                del self._events[retired]
+                self._event_pool.append(credit)
+                self._ordered_through = retired
             self._phase = phase
         placement = lookup(self._placements.get(statement_id), coordinates, self._sizes)
-        if placement is None or len(placement[1]) != 1:
-            raise RuntimeError("statement has no verified physical stream")
+        assert placement is not None and len(placement[1]) == 1
         (lane,) = placement[1]
-        if not 0 <= lane < len(self._streams):
-            raise RuntimeError("physical stream is outside the borrowed lanes")
-        if statement_id in self._host_fences:
-            # A CPU callback or page operation can inspect state immediately;
-            # queued CUDA waits alone do not order those host observations.
-            self._drain()
-            self._join(self._record())
+        stream = self._streams[lane]
         for producer, tables in self._waits:
             if producer == lane:
-                continue  # Stream issue order already covers this frontier.
+                continue
             predecessor = lookup(tables.get(statement_id), coordinates, self._sizes)
             if predecessor is None:
                 continue
             required = predecessor[1]
-            if required >= phase:
-                raise RuntimeError("pipeline predecessor does not precede its consumer phase")
-            if self._completed is not None and required <= self._completed:
-                continue
+            assert required < phase
+            if self._ordered_through is not None and required <= self._ordered_through:
+                continue  # Every lane already carries that retired phase's device wait.
             previous = self._waited.get((lane, producer))
-            if previous is not None and required <= previous:
-                continue
-            events = self._events.get(required)
-            if events is None or producer not in events:
-                raise RuntimeError("pipeline consumer has no issued producer completion")
-            events[producer].order_on(self._streams[lane])
-            self._waited[(lane, producer)] = required
+            if previous is None or required > previous:
+                stream.wait_event(self._events[required][producer])
+                self._waited[(lane, producer)] = required
         self._active.add(lane)
-        return self._streams[lane]
-
-    def _record(self) -> dict[int, CudaStreamReadiness]:
-        return {lane: CudaStreamReadiness(self._streams[lane]) for lane in sorted(self._active)}
-
-    def _join(self, completions: Mapping[int, CudaStreamReadiness]) -> None:
-        # Record all producers before inserting owner waits, avoiding an event
-        # that accidentally includes a later join to another producer.
-        for readiness in completions.values():
-            readiness.order_on(self._streams[0])
-        for readiness in completions.values():
-            readiness.synchronize()
+        return stream
 
     def _seal(self) -> None:
-        if self._phase is None:
-            return
-        events = self._record()
-        values = self._hold_values() if self._depth > 1 else ()
-        self._pending.append(_PendingPhase(self._phase, events, values))
-        self._events[self._phase] = events
+        assert self._phase is not None
+        events = self._event_pool.popleft()
+        for lane in sorted(self._active):
+            events[lane].record(self._streams[lane])
+        self._pending.append((self._phase, events))
+        self._events[self._phase] = {lane: events[lane] for lane in self._active}
         self._active.clear()
 
-    def _retire(self) -> None:
-        pending = self._pending[0]
-        self._join(pending.completions)
-        self._completed = pending.phase
-        del self._events[pending.phase]
-        self._pending.popleft()
-
-    def _drain(self) -> None:
-        while self._pending:
-            self._retire()
-
     def order_results(self) -> None:
-        """Order final owner-side copies after every borrowed producer lane."""
-        ready = tuple(CudaStreamReadiness(stream) for stream in self._streams[1:])
-        for completion in ready:
+        """Join every issued lane before owner-side materialization or settlement."""
+        completions = tuple(CudaStreamReadiness(stream) for stream in self._streams[1:])
+        for completion in completions:
             completion.order_on(self._streams[0])
-        # Final completion must include these copies, even when the last
-        # scheduled statement ran solely on an auxiliary lane.
-        self._active.add(0)
 
     def complete(self) -> None:
-        if self._phase is None:
-            self._join(self._record())
-        else:
-            self._seal()
-            self._drain()
+        """Cancellation and normal return both enqueue the same owner join."""
+        self.order_results()
+        self._events.clear()
+        self._pending.clear()
         self._active.clear()

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Sequence
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Generator, Sequence
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field as dataclass_field
 from math import prod
 from multiprocessing.connection import Connection
@@ -25,6 +25,7 @@ from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.cuda_stream import upload
 from pllm.execution.ptts.page_bundle_planning import DTYPE_BYTES, page_stride_bytes
 from pllm.execution.ptts.state_refs import StateRefs
+from pllm.execution.region_window import WindowBackpressure
 from pllm.execution.scheduler import validate_plan_bundle
 from pllm.execution.shared_tensor import CudaIpcStorage, RemoteCompletion, tensor_dtype
 
@@ -191,8 +192,8 @@ class _Pages:
         self.table.pools.hold(self.slots)
         self.table.owners += np.bincount(self.rows, minlength=len(self.table.owners))
 
-    def release(self) -> None:
-        self.table.pools.release(self.slots)
+    def release(self, completion: torch.cuda.Event | None = None) -> None:
+        self.table.pools.release(self.slots, completion)
         self.table.owners -= np.bincount(self.rows, minlength=len(self.table.owners))
         self.table.reclaim()
 
@@ -279,17 +280,22 @@ class _Pools:
         self.holders = np.zeros((len(layout.fields), capacity), dtype=np.int32)
         self.generations = np.zeros((len(layout.fields), capacity), dtype=np.int64)
         self._field_offsets = np.arange(len(layout.fields), dtype=np.int64) * capacity
+        self._readiness: dict[tuple[int, int], set[torch.cuda.Event]] = {}
         if allocated_bytes != selected.reserved_bytes:
             raise ValueError("PageBundle pool allocation differs from signed capacity")
 
     def free_count(self, field: int) -> int:
         return int(np.count_nonzero(self.holders[field] == 0))
 
-    def allocate(self, field: int, count: int) -> tuple[Slots, Slots]:
+    def allocate(self, field: int, count: int, stream: torch.cuda.Stream | None) -> tuple[Slots, Slots]:
         """`count` free pages of one field, smallest slots first, with their generations."""
         slots = np.flatnonzero(self.holders[field] == 0)[:count]
         if len(slots) < count:
             raise RuntimeError("PageBundle capacity is exhausted")
+        for slot in slots:
+            for event in self._readiness.pop((field, int(slot)), ()):
+                assert stream is not None
+                stream.wait_event(event)
         self.holders[field, slots] = 1
         return slots, self.generations[field, slots]
 
@@ -318,8 +324,14 @@ class _Pools:
         """Add a batch of exact-version holders, including repeated shared pages."""
         self.holders += self._counts(slots).astype(np.int32)
 
-    def release(self, slots: Slots) -> None:
+    def release(self, slots: Slots, completion: torch.cuda.Event | None = None) -> None:
         """Drop a batch of holders; only the last holder advances the allocation generation."""
+        if completion is not None:
+            for field in range(slots.shape[1]):
+                for slot in np.unique(slots[:, field]):
+                    key = field, int(slot)
+                    self._readiness[key] = {event for event in self._readiness.get(key, ()) if not event.query()}
+                    self._readiness[key].add(completion)
         counts = self._counts(slots).astype(np.int32)
         self.holders -= counts
         self.generations += (counts != 0) & (self.holders == 0)
@@ -390,6 +402,11 @@ class PageBundleArena:
         self._pins: dict[PagePin, _Pin] = {}
         self._publications: dict[PagePublication, _Publication] = {}
         self._releases: dict[PageRelease, _Pin] = {}
+        self._recycled: set[PagePublication | PageRelease] = set()
+        self._aborted: dict[torch.cuda.Event, _Write] = {}
+        self._window_active = False
+        self._window_completion: torch.cuda.Event | None = None
+        self._storage_streams: set[int] = set()
         self._issued_releases: WeakSet[PageRelease] = WeakSet()
         self._pending_events: dict[torch.cuda.Stream, deque[PagePublication | PageRelease]] = {}
         self._ready_receipts: dict[PagePublication | PageRelease, None] = {}
@@ -500,16 +517,20 @@ class PageBundleArena:
                 len(private),
                 len(retiring),
                 len(held),
-                len(self._publications) + len(self._releases),
+                len(self._publications) + len(self._releases) + len(self._aborted),
                 self._admission_capacity_failures,
             )
 
     def _held_pages(self) -> Sequence[_Pages]:
         return (
-            tuple(group for pin in (*self._pins.values(), *self._releases.values()) for group in pin.pages)
+            tuple(group for pin in self._pins.values() for group in pin.pages)
+            + tuple(
+                group for receipt, pin in self._releases.items() if receipt not in self._recycled for group in pin.pages
+            )
             + tuple(
                 group
-                for publication in self._publications.values()
+                for receipt, publication in self._publications.items()
+                if receipt not in self._recycled
                 for group in (*publication.write.sources, *publication.write.targets)
             )
             + tuple(group for write in self._writes.values() for group in write.sources)
@@ -658,7 +679,7 @@ class PageBundleArena:
                 slots = np.empty((len(rows), len(table.pools.tensors)), dtype=np.int64)
                 generations = np.empty_like(slots)
                 for field in range(slots.shape[1]):
-                    slots[:, field], generations[:, field] = table.pools.allocate(field, len(rows))
+                    slots[:, field], generations[:, field] = table.pools.allocate(field, len(rows), stream)
                 table.owners[rows] += 1
                 targets.append(
                     _Pages(table, selected, rows, slots, generations, written=np.ones(slots.shape, dtype=np.bool_))
@@ -696,7 +717,8 @@ class PageBundleArena:
             if any(self._pools[resource].free_count(field) < count for field, count in enumerate(counts))
         }
         if exhausted:
-            self.collect_completed(wait=True, resources=exhausted)
+            self.collect_completed(resources=exhausted)
+            self._recycle_pending()
         if any(
             self._pools[resource].free_count(field) < count
             for resource, counts in demand.items()
@@ -704,7 +726,9 @@ class PageBundleArena:
         ):
             if not sources:
                 self._admission_capacity_failures += 1
-            raise RuntimeError("PageBundle capacity is exhausted by live owners")
+                raise WindowBackpressure("page capacity is held by live owners; retry admission asynchronously")
+            assert not self._window_active, "admitted window exceeded its COW reservation"
+            raise RuntimeError("page capacity is unavailable without waiting; reserve an execution window")
 
     def prepare_transition(
         self,
@@ -730,7 +754,7 @@ class PageBundleArena:
                 slots, generations = group.slots.copy(), group.generations.copy()
                 for field in range(slots.shape[1]):
                     rows = mask[:, field]
-                    slots[rows, field], generations[rows, field] = table.pools.allocate(field, int(rows.sum()))
+                    slots[rows, field], generations[rows, field] = table.pools.allocate(field, int(rows.sum()), stream)
                     table.pools.share(field, slots[~rows, field])
                 refs = targets if len(groups) == 1 else group.refs.next_versions()
                 allocated.append(_Pages(table, refs, group.rows, slots, generations, written=mask))
@@ -837,19 +861,79 @@ class PageBundleArena:
             publication.settled = True
 
     def abort(self, token: PageWrite) -> None:
+        """End logical ownership now; future physical reuse waits for the queued writes."""
         with self._lock:
             write = self._issued_write(token)
-            try:
-                completion = self._record(token.stream)
-                if completion is not None:
-                    completion.synchronize()
-            except Exception:
-                self._poisoned = True
-                raise
+            completion = self._record(token.stream)
             for group in (*write.targets, *write.sources):
                 group.table.writing[group.rows] = False
-                group.release()
+                group.release(completion)
             self._writes.pop(token)
+            if completion is not None:
+                self._aborted[completion] = write
+
+    @contextmanager
+    def reserve_window(
+        self,
+        refs: tuple[StateRef, ...],
+        fields: tuple[tuple[LayoutFieldId, ...], ...],
+        roots: tuple[int, ...],
+        stream: torch.cuda.Stream | None,
+    ) -> Generator[None, None, None]:
+        """Reserve COW headroom atomically, before any source cell or input copy issues."""
+        if not self._lock.acquire(blocking=False):
+            raise WindowBackpressure("page owner is reserving another window; retry admission asynchronously")
+        try:
+            if self._window_active:
+                raise WindowBackpressure("page window is already reserved; retry admission asynchronously")
+            if self._window_completion is not None and not self._window_completion.query():
+                raise WindowBackpressure("previous page window is still pending; retry admission asynchronously")
+            self.collect_completed()
+            self._recycle_pending()
+            demand: dict[tuple[str, int], int] = {}
+            for ref, selected, bound in zip(refs, fields, roots, strict=True):
+                root = self.root(ref)
+                table = self._tables[root.resource]
+                if bound:
+                    if self.latest(ref.lineage_id) != ref:
+                        raise ValueError("refresh the owned state selection before reserving a writable window")
+                    if table.writing[table.row_of[ref.lineage_id]]:
+                        raise WindowBackpressure("window target has a pending writer; retry after settlement")
+                pools = table.pools
+                for field in selected:
+                    slot = root.slots[field]
+                    needed = max(0, bound - int(pools.holders[field, slot] == 1))
+                    key = root.resource, int(field)
+                    demand[key] = demand.get(key, 0) + needed
+            if any(self._pools[resource].free_count(field) < needed for (resource, field), needed in demand.items()):
+                raise WindowBackpressure("page capacity cannot reserve the complete window before execution")
+            self._require_stream(stream)
+            self._window_active = True
+            try:
+                yield
+            finally:
+                # One in-flight page window bounds receipt metadata by the
+                # signed source domain as well as bounding physical COW pages.
+                self._window_completion = self._record(stream)
+                self._window_active = False
+        finally:
+            self._lock.release()
+
+    def _recycle_pending(self) -> None:
+        # Closed local readers and settled publications can transfer their
+        # physical lifetime to the next writer's device wait. Remote leases
+        # keep their holders until their own completion proofs are available.
+        for receipt in (*self._publications, *self._releases):
+            if receipt in self._recycled:
+                continue
+            if isinstance(receipt, PagePublication):
+                if not self._publications[receipt].settled:
+                    continue
+            elif not all(read.query() for read in receipt.remote_reads):
+                continue
+            for group in self._receipt_pages(receipt):
+                group.release(receipt.completion)
+            self._recycled.add(receipt)
 
     def pin_exact(self, refs: Sequence[StateRef], stream: torch.cuda.Stream | None = None) -> PagePin:
         with self._lock:
@@ -1145,6 +1229,11 @@ class PageBundleArena:
         with self._lock:
             self._require_live()
             self._poll_completions(wait, resources)
+            for completion in tuple(self._aborted):
+                if wait:
+                    completion.synchronize()
+                if completion.query():
+                    del self._aborted[completion]
             completed: list[_Pages] = []
             receipts: list[PagePublication | PageRelease] = []
             for receipt in self._ready_receipts:
@@ -1159,7 +1248,8 @@ class PageBundleArena:
                             read.synchronize()
                     if not all(read.query() for read in receipt.remote_reads):
                         continue
-                completed.extend(self._receipt_pages(receipt))
+                if receipt not in self._recycled:
+                    completed.extend(self._receipt_pages(receipt))
                 receipts.append(receipt)
             # A failed remote proof leaves every owner recorded, including locally ready receipts.
             for table in self._tables.values():
@@ -1171,6 +1261,7 @@ class PageBundleArena:
                     )
                     table.reclaim()
             for receipt in receipts:
+                self._recycled.discard(receipt)
                 del self._ready_receipts[receipt]
                 if isinstance(receipt, PagePublication):
                     del self._publications[receipt]
@@ -1210,6 +1301,13 @@ class PageBundleArena:
         ):
             raise RuntimeError("PageBundle stream differs from its signed device")
         self._order(self._initialization, stream)
+        if stream is not None and stream.cuda_stream not in self._storage_streams:
+            # The arena may be destroyed after asynchronous cancellation. CUDA's
+            # allocator must retain its backing on every declared reader/writer lane.
+            for pools in self._pools.values():
+                for tensor in pools.tensors:
+                    tensor.record_stream(stream)
+            self._storage_streams.add(stream.cuda_stream)
 
     def _record(self, stream: torch.cuda.Stream | None) -> torch.cuda.Event | None:
         if stream is None:

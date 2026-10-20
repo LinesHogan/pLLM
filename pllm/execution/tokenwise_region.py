@@ -12,7 +12,7 @@ import torch
 
 from pllm.contracts.backend_attachment import CausalModelDomain
 from pllm.contracts.region_composition import RegionFunctionBody, inline_function_bodies, inline_region
-from pllm.contracts.region_imports import BorrowedTensorImport, NativeKernelImport, RegionTensorImport
+from pllm.contracts.region_imports import BorrowedTensorImport, KernelAllocation, NativeKernelImport, RegionTensorImport
 from pllm.contracts.region_program import (
     AccessMode,
     AccessRange,
@@ -74,7 +74,6 @@ from pllm.execution.region_storage import analyze_region_payload, import_region_
 from pllm.execution.region_streams import RegionStreamBindings, arrange_region_schedule, plan_region_schedule
 from pllm.execution.region_values import Bank, Data
 
-Mix = Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor]
 Begin = Callable[[int], tuple[torch.Tensor, torch.Tensor]]
 Normalize = Callable[[int, torch.Tensor, torch.Tensor], torch.Tensor]
 Observe = Callable[[int, torch.Tensor], None]
@@ -108,7 +107,6 @@ class TokenwiseRegion:
         max_rows: int,
         domain: CausalModelDomain,
         effect: TokenwiseLayerReplay,
-        mix: Mix,
         *,
         source_imports: tuple[RegionTensorImport, ...] = (),
         function_bodies: tuple[RegionFunctionBody, ...] = (),
@@ -184,7 +182,7 @@ class TokenwiseRegion:
                 or type(position) is not int
             ):
                 raise ValueError("token mixture requires hidden tensors and the original token offset")
-            return (mix(source, destination, position),)
+            return (mix_layer_outputs(effect, source, destination, position),)
 
         args = (
             Value("row", index),
@@ -325,7 +323,18 @@ class TokenwiseRegion:
             declarations[declaration.name] = declaration
         cells: dict[str, RegionFunction] = dict(self.normal.functions)
         cells.update(self.replay.functions)
-        cells[blend.name] = NativePrimitive(blend, blend_)
+        width = 8 if tensor.dtype == "torch.float64" else 4
+        cells[blend.name] = NativePrimitive(
+            blend,
+            blend_,
+            NativeKernelImport(
+                blend,
+                "tokenwise.mix@1",
+                tensor.device,
+                (KernelAllocation("mixture", tensor.device, 16 * tensor.shape[1] * width),),
+                host_reads=False,
+            ),
+        )
         self.program = Program(
             Region(Block(tuple(arguments), tuple(operations), tuple(rows))),
             tuple(declarations.values()),
@@ -686,15 +695,11 @@ def compile_tokenwise_source(
 ) -> TokenwiseRegion:
     """Reconstruct source and reference lifetimes without optimization search."""
 
-    def mix(source: torch.Tensor, destination: torch.Tensor, position: int) -> torch.Tensor:
-        return mix_layer_outputs(effect, source, destination, position)
-
     return TokenwiseRegion(
         tensor,
         max_rows,
         domain,
         effect,
-        mix,
         source_imports=source_imports,
         function_bodies=function_bodies,
         activations=activations,
@@ -734,9 +739,7 @@ def tokenwise_attachment_bytes(hidden: int, width: int, max_rows: int) -> int:
     """Original adapter allocations outside the source region workspace.
 
     Embeddings and final concatenation remain in the original model adapter.
-    The native mixture's internal temporaries retain their existing conservative
-    allowance. Model/layer/attention library workspace remains separately owned.
+    The mixture is accounted by its region kernel import. Model/layer/attention
+    library workspace remains separately owned.
     """
-    outside = 2 * max_rows * hidden * width
-    mixture = 16 * hidden * width
-    return outside + mixture
+    return 2 * max_rows * hidden * width

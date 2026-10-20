@@ -18,7 +18,7 @@ type Result<T> = std::result::Result<T, String>;
 pub(super) struct Device {
     pub device: String,
     tensor_bytes_upper_bound: u64,
-    retained_bytes_upper_bound: u64,
+    pub retained_bytes_upper_bound: u64,
     pub peak_bytes_upper_bound: u64,
 }
 

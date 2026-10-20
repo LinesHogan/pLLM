@@ -80,15 +80,17 @@ class NativeKernelImport:
     allocations, including raw outputs and library workspace. Wrapper input/
     output copies are accounted separately. Persistent resources remain with
     their original owners; all accesses must appear in the source declaration.
-    Device reads/writes must respect waits queued on that issuing stream. Any
-    host observation of device data must await its stream before inspecting it.
-    Ordinary NativeTensorImport makes none of these execution guarantees.
+    Device reads/writes must respect waits queued on that issuing stream.
+    host_reads explicitly identifies kernels that inspect device data on the
+    host; they cannot participate in asynchronous windows. Ordinary
+    NativeTensorImport makes none of these execution guarantees.
     """
 
     declaration: Function
     implementation: str
     device: str
     allocations: tuple[KernelAllocation, ...]
+    host_reads: bool
 
 
 @dataclass(frozen=True, slots=True)

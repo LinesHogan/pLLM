@@ -16,7 +16,7 @@ from pllm.execution.host_runtime import (
     HostRuntimeFacts,
     HostSettlementError,
 )
-from pllm.execution.trace import TracePhase, TraceSnapshot
+from pllm.execution.trace import TRACE_SCHEMA_VERSION, TracePhase, TraceSnapshot
 from pllm.workloads.gtta import state as gtta_math
 from pllm.workloads.gtta.environment import GTTAEnvironmentService
 from pllm.workloads.gtta.state import GTTADynamicsSnapshot, GTTADynamicsState, GTTAStepContext
@@ -124,7 +124,7 @@ def test_typed_host_transaction_abort_requeue_and_postpublish_settlement(monkeyp
     assert execution.diagnostics().transaction_count == 2
     assert execution.diagnostics().fallback_count == 0
     before = execution.trace.snapshot()
-    assert before.schema_version == 5 and before.dropped == 0
+    assert before.schema_version == TRACE_SCHEMA_VERSION and before.dropped == 0
     assert before.pending_device_timings == 0 and not before.device_task_times()
     assert any(event.phase is TracePhase.ABORT for event in before.events)
     assert sum(event.phase is TracePhase.SETTLED for event in before.events) == 2

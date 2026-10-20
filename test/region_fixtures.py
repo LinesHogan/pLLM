@@ -48,9 +48,10 @@ from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.region_compilation import analyze_region_program, lower_region_bindings, lower_region_schedule
-from pllm.execution.region_execution import RegionExecution, RegionExecutionPlan
+from pllm.execution.region_execution import RegionExecution, RegionExecutionPlan, RegionInstructionExecution
 from pllm.execution.region_resources import RegionResources, ResourcePageCell
 from pllm.execution.region_storage import import_region_functions
+from pllm.execution.region_streams import RegionStreamBindings
 from pllm.execution.region_values import Bank
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.scheduler import compile_state_schedule, intern_tensor_layouts
@@ -333,7 +334,8 @@ class PageTask:
     """Runs ``region`` over the invocation's two request pages."""
 
     implementation_id: int
-    region: RegionExecution | None = None
+    region: RegionInstructionExecution | None = None
+    streams: RegionStreamBindings | None = None
     program: Program | None = None
     result = None
     context = None
@@ -342,7 +344,9 @@ class PageTask:
     def execute(self, context):
         if self.region is not None:
             self.context = context
-            self.result = self.region.run({} if self.inputs is None else self.inputs, pages=self.pages(context))
+            self.result = self.region.run(
+                {} if self.inputs is None else self.inputs, pages=self.pages(context), streams=self.streams
+            )
 
     def pages(self, context, refs=None) -> RegionResources:
         refs = context.pin.refs if refs is None else refs

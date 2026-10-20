@@ -370,5 +370,7 @@ def tensor_item(type_: TensorType) -> NativePrimitive:
 
     # The only device allocation is the native wrapper's private scalar copy.
     # Tensor.item completes that copy/read on the issuing stream before return.
-    implementation = NativeKernelImport(declaration, "native.scalar_read.current_stream@1", type_.device, ())
+    implementation = NativeKernelImport(
+        declaration, "native.scalar_read.current_stream@1", type_.device, (), host_reads=True
+    )
     return NativePrimitive(declaration, read, implementation)

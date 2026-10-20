@@ -10,10 +10,13 @@ from __future__ import annotations
 from collections.abc import Mapping
 from heapq import heappop, heappush
 
+import torch
+
 from pllm.contracts.region_bindings import AccessTable, RegionBindings
 from pllm.contracts.region_program import BankType, DataType, resolve_extent
 from pllm.execution.region_schedule import checked_schedule_integer, evaluate_schedule_expression
 from pllm.execution.region_values import Bank, Data, check_data, copy_data
+from pllm.execution.region_window import RegionWindow
 
 ValuePoint = tuple[int, tuple[int, ...]]
 
@@ -40,9 +43,16 @@ def lookup(table: AccessTable | None, point: tuple[int, ...], sizes: Mapping[str
 class RegionValueFrame:
     """One execution's live SSA leaves, including exact old bank elements."""
 
-    def __init__(self, bindings: RegionBindings, inputs: Mapping[str, Data], sizes: Mapping[str, int]) -> None:
+    def __init__(
+        self,
+        bindings: RegionBindings,
+        inputs: Mapping[str, Data],
+        sizes: Mapping[str, int],
+        window: RegionWindow | None = None,
+    ) -> None:
         # The executor supplies its checked invocation-entry snapshot. This
         # frame consumes value routes and layouts, not the source Program.
+        self._window = window
         self._sizes = sizes
         self._bindings = bindings
         self._sources = {t.input_id: t for t in bindings.sources}
@@ -82,6 +92,8 @@ class RegionValueFrame:
         # until the next time, regardless of ISL's ordering of independent leaves.
         while self._releases and self._releases[0][0] < time:
             _, point = heappop(self._releases)
+            if self._window is not None:
+                self._window.release(point)
             del self._live[point]
             self.released_values += 1
 
@@ -94,6 +106,8 @@ class RegionValueFrame:
         if scalar is not None:
             return scalar[1][0]
         try:
+            if self._window is not None:
+                self._window.read(source, self._live[source])
             return self._live[source]
         except KeyError as error:
             raise RuntimeError("source value was not produced or was released too early") from error
@@ -132,6 +146,8 @@ class RegionValueFrame:
                 return
             if key in self._live:
                 raise RuntimeError("SSA leaf was produced more than once")
+            if self._window is not None and isinstance(item, torch.Tensor):
+                item = self._window.store(key, item)
             self._live[key] = item
             if not retained and last is not None:
                 heappush(self._releases, (last[1], key))

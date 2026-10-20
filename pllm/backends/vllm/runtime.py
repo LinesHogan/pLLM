@@ -138,6 +138,7 @@ _BACKEND_ABI_FIELDS = (
     "attachments=request_training|parameter_overlay|activation_patch",
     "activation=phase_windows/exact_step_pins/source_readonly@2",
     "model=causal_indexed_layer@5",
+    "region=event_ordered_windows@3/explicit_native_host_reads",
 )
 _REQUEST_CAPABILITIES = (
     "producer/packed_hidden@1",
@@ -774,12 +775,12 @@ class VllmSession(Generic[DataT, ResultT]):
         if held:
             # Released pages remain fenced in the arena. Finishing a subset of the
             # requests must not make the host wait for unrelated side-stream work.
-            execution.retire(held, wait=self._post_sample is None)
+            execution.retire(held)
         for identity in identities:
             self._identities.pop(identity.request_id)
             self._token_frontiers.pop(identity, None)
 
-    def retire_all(self) -> None:
+    def retire_all(self, *, wait: bool = False) -> None:
         if self._step is not None:
             raise RuntimeError("canonical requests cannot retire during a step")
         if self._auxiliary is not None:
@@ -788,17 +789,17 @@ class VllmSession(Generic[DataT, ResultT]):
             self._post_sample.clear()
         self._retire(tuple(self._identities[request_id] for request_id in sorted(self._identities)))
         self._pending_identities.clear()
-        self._deployment.execution.arena.collect_completed(wait=True)
+        self._deployment.execution.arena.collect_completed(wait=wait)
 
     def close(self) -> None:
         self.abort_active()
-        self.retire_all()
+        self.retire_all(wait=True)
         self.abort_tuning()
         execution = self._deployment.execution
         if execution.directory.scope is StateScope.INSTANCE:
-            execution.retire(())
+            execution.retire((), wait=True)
         else:
-            execution.retire_dormant()
+            execution.retire_dormant(wait=True)
         self._close_effects()
 
     def _invocation(self) -> TaskGraphInvocation[StateTaskContext[DataT]]:

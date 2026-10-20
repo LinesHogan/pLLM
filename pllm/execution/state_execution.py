@@ -41,6 +41,7 @@ from pllm.execution.ptts.page_bundle import (
 )
 from pllm.execution.ptts.request_state import RequestStateDirectory, RequestStateSelection, StateAddress
 from pllm.execution.ptts.state_refs import StateRefs
+from pllm.execution.region_window import WindowBackpressure
 from pllm.execution.replay import LayerReplayPrimitive, TokenwiseReplayPrimitive
 from pllm.execution.trace import ExecutionTrace, TracePhase
 
@@ -593,11 +594,16 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         """Run without an external sampler borrower using the same staged lifecycle."""
         with self._lock:
             invocation = self.start_step(value, stream)
-            for anchor in self.arena.plan.timeline.anchors:
-                self.execute_anchor(invocation, AnchorId(anchor.ordinal))
-                if anchor.ordinal == self.sampler_anchor_id:
-                    self.complete_sampler(invocation, stream)
-            return self.finish_step(invocation)
+            try:
+                for anchor in self.arena.plan.timeline.anchors:
+                    self.execute_anchor(invocation, AnchorId(anchor.ordinal))
+                    if anchor.ordinal == self.sampler_anchor_id:
+                        self.complete_sampler(invocation, stream)
+                return self.finish_step(invocation)
+            except WindowBackpressure:
+                # The convenience call exposes no cursor; staged callers keep it through execute_anchor.
+                self.cancel_step(invocation)
+                raise
 
     def submit_input(
         self,
@@ -636,6 +642,9 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             try:
                 context.check_page_execution()
                 invocation.execute_anchor(anchor_id, context.pin.stream)
+            except WindowBackpressure:
+                # No cell of the pending task issued; its original cursor and pins remain usable.
+                raise
             except Exception as exc:
                 self._failed(invocation, context, exc)
 
@@ -822,7 +831,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             raise RuntimeError("state invocation is not registered as active")
         return invocation.context
 
-    def retire(self, identities: tuple[RequestIdentity, ...], *, wait: bool = True) -> tuple[StateRef, ...]:
+    def retire(self, identities: tuple[RequestIdentity, ...], *, wait: bool = False) -> tuple[StateRef, ...]:
         with self._lock:
             for identity in identities:
                 self._successful_inputs.pop(identity, None)
@@ -851,11 +860,11 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             self.trace.record(TracePhase.RETIRE, 0, identities=identities, refs=refs)
             return refs
 
-    def retire_dormant(self) -> tuple[StateRef, ...]:
+    def retire_dormant(self, *, wait: bool = False) -> tuple[StateRef, ...]:
         with self._lock:
             if self._active:
                 raise RuntimeError("dormant retirement requires no active invocation")
-            self.arena.collect_completed(wait=True)
+            self.arena.collect_completed(wait=wait)
             refs = self.directory.retire_dormant()
             self.trace.record(TracePhase.RETIRE, 0, identities=(), refs=refs)
             return refs

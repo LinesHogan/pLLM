@@ -10,9 +10,9 @@ use std::collections::VecDeque;
 use super::region_bindings::{tables, AccessTable};
 use super::region_control::{self, Action};
 use super::region_dependence::{analyze, canonical_schedule, context, isl, legal, map_text, read_schedule, Result};
-use super::region_imports::TensorImport;
+use super::region_imports::{TensorImport, native_copy_bytes, tensor_bytes};
 use super::region_payload::{self, Payload};
-use super::region_program::{Operation, Program, Resource};
+use super::region_program::{Operation, Program, Resource, Type};
 use super::region_retention::Allocation;
 use super::semantic_graph::{canonical_ascii_json, digest};
 
@@ -21,7 +21,9 @@ use super::semantic_graph::{canonical_ascii_json, digest};
 pub(super) struct StreamDevice {
     pub device: String,
     concurrent_scratch_bytes_upper_bound: u64,
-    pending_phase_bytes_upper_bound: u64,
+    window_storage_bytes_upper_bound: u64,
+    entry_copy_bytes_upper_bound: u64,
+    result_copy_bytes_upper_bound: u64,
     pub peak_bytes_upper_bound: u64,
 }
 
@@ -44,7 +46,8 @@ pub(super) struct StreamPlan {
     pub phase_schedule: String,
     placements: Vec<AccessTable>,
     waits: Vec<StreamWaits>,
-    host_fences: Vec<usize>,
+    slots: Vec<WindowSlot>,
+    state_windows: Vec<StateWindow>,
     // The phase payload covers live values and backend retention. Its ordinary
     // per-call scratch bound is multiplied below for concurrently active lanes.
     pub payload: Payload,
@@ -60,6 +63,44 @@ struct Exploration {
     diagnostics: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct WindowSlot { value_id: usize, shape: Vec<u64>, dtype: String, device: String, count: u64, bytes: u64, stride_bytes: u64 }
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct StateWindow { resource: String, private_roots: u64 }
+
+fn tensor_leaf(type_: &Type) -> Option<Type> {
+    match type_ {
+        Type::Tensor { .. } => Some(type_.clone()),
+        Type::Bank { element, .. } => tensor_leaf(element),
+        _ => None,
+    }
+}
+
+fn queue_only(action: &Action, program: &Program, imports: &[TensorImport]) -> bool {
+    // Retention endpoints remain on the owner, but an audited device-only
+    // implementation can acquire/release ownership without observing the GPU.
+    if concurrent_action(action, program, imports, &[]) { return true; }
+    match action {
+        Action::Primitive { operation } => matches!(operation, Operation::Snapshot { .. } | Operation::Publish { .. }),
+        Action::If { then_block, else_block } => then_block.steps.iter().chain(&else_block.steps)
+            .all(|step| queue_only(&step.action, program, imports)),
+        Action::Scan { body, .. } | Action::Map { body, .. } => body.steps.iter().all(|step| queue_only(&step.action, program, imports)),
+        Action::While { condition, body, .. } => condition.steps.iter().chain(&body.steps).all(|step| queue_only(&step.action, program, imports)),
+    }
+}
+
+fn publishes(action: &Action, resource: &str) -> bool {
+    match action {
+        Action::Primitive { operation } => matches!(operation, Operation::Publish { resource: name, .. } if name == resource),
+        Action::If { then_block, else_block } => then_block.steps.iter().chain(&else_block.steps).any(|step| publishes(&step.action, resource)),
+        Action::While { condition, body, .. } => condition.steps.iter().chain(&body.steps).any(|step| publishes(&step.action, resource)),
+        Action::Scan { body, .. } | Action::Map { body, .. } => body.steps.iter().any(|step| publishes(&step.action, resource)),
+    }
+}
+
 fn concurrent_action(action: &Action, program: &Program, imports: &[TensorImport], retained: &[Allocation]) -> bool {
     match action {
         Action::Primitive { operation: Operation::Call { function, .. } } => {
@@ -67,9 +108,9 @@ fn concurrent_action(action: &Action, program: &Program, imports: &[TensorImport
             // even when the endpoint also has a device-kernel implementation.
             !retained.iter().any(|allocation| allocation.is_endpoint(function))
             && imports.iter().any(|import| import.name() == function && match import {
-                TensorImport::Exported { .. } | TensorImport::Compiled { .. }
-                    | TensorImport::FunctionalKernel { .. } | TensorImport::Borrowed { .. } => true,
-                TensorImport::NativeKernel { declaration, .. } => declaration.resources.iter().all(|name|
+                TensorImport::Exported { access } => access.operations.iter().all(|op| op.kind != super::tensor_access::AccessKind::Unknown),
+                TensorImport::Compiled { .. } | TensorImport::FunctionalKernel { .. } | TensorImport::Borrowed { .. } => true,
+                TensorImport::NativeKernel { declaration, host_reads, .. } => !host_reads && declaration.resources.iter().all(|name|
                     program.resources.iter().any(|r| matches!(r, Resource::Borrowed { name: known, .. } if known == name))
                     && declaration.accesses.iter().any(|a| &a.resource == name)),
                 TensorImport::Native { .. } => false,
@@ -123,6 +164,9 @@ fn derive_plan(program: &Program, schedule: &str, axis: usize, lanes: u32, pipel
     // order tokens, and opaque effects. A serially legal input is insufficient.
     legal(&domain, &dependencies, &phase)?;
     let actions = region_control::statements(program, &source.statements)?;
+    if actions.iter().any(|action| !queue_only(action, program, imports)) {
+        return Err("asynchronous windows require imported device-only endpoints and queue-only page actions".into());
+    }
     let eligible = actions.iter().map(|action| concurrent_action(action, program, imports, retained)).collect::<Vec<_>>();
     let mut placements = Vec::new();
     let mut routing = isl(UnionMap::read_from_str(&ctx, "{ }"))?;
@@ -144,7 +188,7 @@ fn derive_plan(program: &Program, schedule: &str, axis: usize, lanes: u32, pipel
         return Err("physical phases expose no independent work on distinct streams".into());
     }
     let mut waits = Vec::new();
-    if pipeline_depth > 1 {
+    {
         for lane in 0..lanes {
             let lane_domain = isl(isl(isl(routing.copy())?.intersect_range(
                 isl(UnionSet::read_from_str(&ctx, &format!("{{ [{lane}] }}")))?))?.domain())?;
@@ -161,26 +205,103 @@ fn derive_plan(program: &Program, schedule: &str, axis: usize, lanes: u32, pipel
     placements.sort_by_key(|table| table.input_id);
     let phase_schedule = map_text(&phase)?;
     let payload = region_payload::derive(program, &phase_schedule, imports, retained)?;
+    // Private materialization removes output aliases at the physical window
+    // boundary. Keep actual imports for native scratch; use the copy ABI only
+    // to derive the independent value lifetimes and slot counts.
+    let mut owned_imports = program.functions.iter().map(|function| {
+        imports.iter().find(|import| import.name() == function.name && matches!(import, TensorImport::Borrowed { .. }))
+            .cloned().unwrap_or(TensorImport::Native { declaration: function.clone() })
+    }).collect::<Vec<_>>();
+    owned_imports.sort_by(|a, b| a.name().cmp(b.name()));
+    let storage = super::region_storage::derive(program, &phase_schedule, &owned_imports)?;
+    let backing = super::region_storage::derive(program, &phase_schedule, imports)?;
+    let capacity = super::aer::region_tensor_memory(program, &storage, &owned_imports)?;
+    let mut borrowed = std::collections::BTreeSet::new();
+    for statement in &source.statements {
+        if let Operation::Call { function, .. } = super::region_storage::operation(program, &statement.path)? {
+            if imports.iter().any(|import| import.name() == function && matches!(import, TensorImport::Borrowed { .. })) {
+                borrowed.extend(statement.outputs.iter().copied());
+            }
+        }
+    }
+    let mut footprints = std::collections::BTreeMap::new();
+    for statement in &source.statements {
+        if let Operation::Call { function, .. } = super::region_storage::operation(program, &statement.path)? {
+            let graph = imports.iter().find_map(|import| match import {
+                TensorImport::Exported { access } if import.name() == function => Some(access),
+                TensorImport::Compiled { source_access, .. } if import.name() == function => Some(source_access),
+                _ => None,
+            });
+            if let Some(graph) = graph {
+                let values = super::tensor_access::validate(graph)?;
+                for (name, &id) in graph.outputs.iter().zip(&statement.outputs) {
+                    let view = values[name.as_str()];
+                    let width = tensor_bytes(&Type::Tensor { shape: vec![1], dtype: view.dtype.clone(), device: String::new() })?;
+                    let span = if view.shape.contains(&0) { 0 } else { view.shape.iter().zip(&view.stride)
+                        .try_fold(1_u64, |n, (&size, &stride)| n.checked_add((size - 1).checked_mul(stride)?))
+                        .ok_or("window view span overflows")? };
+                    footprints.insert(id, span.checked_mul(width).ok_or("window view bytes overflow")?);
+                }
+            }
+        }
+    }
+    let slots = capacity.roots.iter().filter(|root| !borrowed.contains(&root.value_id) && root.live_instances_upper_bound > 0)
+        .map(|root| {
+            let Type::Tensor { shape, dtype, device } = tensor_leaf(&source.values[root.value_id].type_).ok_or("window root must be a tensor")? else { unreachable!() };
+            let bytes = footprints.get(&root.value_id).copied().or_else(|| backing.roots.iter().find(|r| r.value_id == root.value_id).map(|r| r.bytes))
+                .unwrap_or(tensor_bytes(&Type::Tensor { shape: shape.clone(), dtype: dtype.clone(), device: device.clone() })?);
+            let width = tensor_bytes(&Type::Tensor { shape: vec![1], dtype: dtype.clone(), device: device.clone() })?;
+            let bytes = bytes.checked_add(width - 1).ok_or("window element alignment overflows")? / width * width;
+            let alignment = if device.starts_with("cuda:") { 512 } else { 64 };
+            let stride_bytes = bytes.checked_add(alignment - 1).ok_or("window slot alignment overflows")? / alignment * alignment;
+            Ok(WindowSlot { value_id: root.value_id, shape, dtype, device, bytes, stride_bytes,
+                count: root.live_instances_upper_bound.checked_mul(u64::from(pipeline_depth)).ok_or("window slot count overflows")? })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut materialization = std::collections::BTreeMap::<String, u64>::new();
+    for statement in &source.statements {
+        let mut raw = std::collections::BTreeMap::<String, u64>::new();
+        for &id in &statement.outputs {
+            if let Some(root) = backing.roots.iter().find(|root| root.value_id == id && !borrowed.contains(&id)) {
+                let mut leaves = 1_u64;
+                let mut type_ = &source.values[id].type_;
+                while let Type::Bank { element, size } = type_ {
+                    leaves = leaves.checked_mul(size.maximum(program)).ok_or("window result count overflows")?;
+                    type_ = element;
+                }
+                let n = raw.entry(root.device.clone()).or_default();
+                *n = n.checked_add(root.bytes.checked_mul(leaves).ok_or("raw window output overflows")?).ok_or("raw window output sum overflows")?;
+            }
+        }
+        for (device, bytes) in raw { let n = materialization.entry(device).or_default(); *n = (*n).max(bytes); }
+    }
     let mut devices = Vec::new();
     for device in &payload.devices {
-        let scratch = payload.capacity.devices.iter().find(|d| d.device == device.device)
-            .map_or(0, |d| d.call_scratch_bytes_upper_bound);
-        let concurrent = scratch.checked_mul(u64::from(lanes)).ok_or("concurrent scratch overflows u64")?;
-        let phase_peak = device.peak_bytes_upper_bound.checked_add(concurrent - scratch)
-            .ok_or("concurrent payload overflows u64")?;
-        // Keep the existing phase proof intact. At most depth-1 completed-in-
-        // issue-order phases retain their references while the active phase
-        // executes. Charge their entire envelopes, including scratch/retention.
-        let pending = phase_peak.checked_mul(u64::from(pipeline_depth - 1))
-            .ok_or("pending phase payload overflows u64")?;
-        let peak = phase_peak.checked_add(pending).ok_or("pipeline payload overflows u64")?;
+        let owned = capacity.devices.iter().find(|d| d.device == device.device).ok_or("missing window device capacity")?;
+        let scratch = payload.capacity.devices.iter().find(|d| d.device == device.device).map_or(0, |d| d.call_scratch_bytes_upper_bound);
+        let concurrent = scratch.checked_add(materialization.get(&device.device).copied().unwrap_or(0))
+            .and_then(|n| n.checked_mul(u64::from(lanes))).ok_or("window scratch overflows")?;
+        let resident = slots.iter().filter(|slot| slot.device == device.device)
+            .try_fold(0_u64, |n, slot| n.checked_add(slot.stride_bytes.checked_mul(slot.count)?)).ok_or("window residency overflows")?;
+        let mut result_bytes = 0_u64;
+        for type_ in super::region_program::verify(program)? {
+            if let Some((name, bytes)) = native_copy_bytes(&type_, &program.parameters)? {
+                if name == device.device { result_bytes = result_bytes.checked_add(bytes).ok_or("window results overflow")?; }
+            }
+        }
+        let peak = resident.checked_add(concurrent).and_then(|n| n.checked_add(result_bytes))
+            .and_then(|n| n.checked_add(owned.entry_copy_bytes_upper_bound))
+            .and_then(|n| n.checked_add(device.retained_bytes_upper_bound)).ok_or("window peak overflows")?;
         devices.push(StreamDevice { device: device.device.clone(), concurrent_scratch_bytes_upper_bound: concurrent,
-            pending_phase_bytes_upper_bound: pending, peak_bytes_upper_bound: peak });
+            window_storage_bytes_upper_bound: resident, entry_copy_bytes_upper_bound: owned.entry_copy_bytes_upper_bound, result_copy_bytes_upper_bound: result_bytes, peak_bytes_upper_bound: peak });
     }
-    let mut result = StreamPlan { version: 2, program_digest: source.program_digest,
+    let state_windows = program.resources.iter().filter_map(|resource| match resource {
+        Resource::State { name, .. } => Some(StateWindow { resource: name.clone(), private_roots: if actions.iter().any(|action| publishes(action, name)) { 2 } else { 0 } }),
+        _ => None,
+    }).collect();
+    let mut result = StreamPlan { version: 3, program_digest: source.program_digest,
         schedule_map: map_text(&schedule)?, axis, lanes, pipeline_depth, phase_schedule, placements, waits,
-        host_fences: eligible.iter().enumerate().filter_map(|(id, eligible)| (!eligible).then_some(id)).collect(), payload, devices,
-        signature: String::new() };
+        slots, state_windows, payload, devices, signature: String::new() };
     result.signature = digest(&canonical_ascii_json(&result)?);
     Ok(result)
 }

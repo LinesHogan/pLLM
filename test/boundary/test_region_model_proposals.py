@@ -19,6 +19,7 @@ from pllm.contracts.backend_attachment import (
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
 from pllm.contracts.region_composition import RegionFunctionBody, inline_region
+from pllm.contracts.region_imports import KernelAllocation, NativeKernelImport
 from pllm.contracts.region_program import (
     AffineIndex,
     Block,
@@ -37,7 +38,8 @@ from pllm.contracts.semantic_graph import AnchorId
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.codec import decode_boundary, encode_boundary
-from pllm.execution.decoder_region import decoder_normalize_function
+from pllm.execution.cuda_stream import upload
+from pllm.execution.decoder_region import decoder_layer_function, decoder_normalize_function
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.exported_resources import borrow_exported_inputs
 from pllm.execution.paged_access import PagedLayer, PagedResourceView, bind_paged_access
@@ -91,6 +93,28 @@ def test_tuning_installs_a_parallel_model_proposal_with_the_original_owner():
     )
     body.validate()
     imports = import_region_functions(borrowed.program, local_sources)
+    workload = RecirculationWorkload()
+    domain = CausalModelDomain(1, 3, 4)
+    source = compile_tokenwise_region(tensor, 4, domain, workload.config.effect(3))
+    # These fixture endpoints use fixed four-element eager operations. Their
+    # temporary tensors fit 512 bytes; saved KV belongs to declared retention.
+    kernels = tuple(
+        NativeKernelImport(
+            declaration,
+            "test.decoder@1",
+            "cuda:0",
+            (KernelAllocation("temporaries", "cuda:0", 512),),
+            host_reads=False,
+        )
+        for declaration in (
+            source.begin,
+            source.observe,
+            source.complete,
+            decoder_layer_function(tensor, domain, residual=False),
+            decoder_layer_function(tensor, domain, residual=True),
+        )
+    )
+    imports = (*imports, *kernels)
     capabilities = (REGION_STREAMS_CAPABILITY, "model/tokenwise_replay@1")
     probe = BackendPlacementProbe(
         "test.model.proposals@1",
@@ -108,12 +132,11 @@ def test_tuning_installs_a_parallel_model_proposal_with_the_original_owner():
         4,
         (),
         capabilities,
-        causal_domain=CausalModelDomain(1, 3, 4),
+        causal_domain=domain,
         region_imports=imports,
         region_bodies=(body,),
     )
     facts = BackendCompileFacts(probe, RuntimeFacts(device).timeline(capabilities), (), 1, 0, 0, layer_count=3)
-    workload = RecirculationWorkload()
     # The measured tuning protocol below is the explicit opt-in: specialize so
     # the arena reservation funds every measured candidate, not the reference only.
     facts = workload.specialize(facts, ExecutionOptions(tuning="measured"))
@@ -171,6 +194,27 @@ print(encode_boundary(planned))
     rows = PackedPhaseRowBatch(1, 1, 3, tuple(PackedPhaseRow(i, 0, i, HiddenPhase.PREFILL, identity) for i in range(3)))
     sample = TensorStepInput(rows, PackedSamplerRowBatch(rows, (PackedSamplerRowLink(0, 2),)))
     inputs = torch.arange(12, device=device, dtype=torch.float32).reshape(3, 4) + 1
+    # Independent serial token recurrence, including the replayed cache writes.
+    expected_cache = torch.zeros((1, 3, 4, 4), device=device)
+    normal_outputs = []
+    for token in range(3):
+        hidden = inputs[token : token + 1]
+        taps = []
+        for ordinal in range(3):
+            previous = expected_cache[0, ordinal, token - 1] if token else torch.zeros_like(hidden)
+            expected_cache[0, ordinal, token].copy_(hidden[0])
+            hidden = hidden + previous + ordinal + 1
+            taps.append(hidden)
+        normal_outputs.append((hidden + torch.zeros_like(hidden)) * original_scale)
+        source, destination = taps[-1], taps[0]
+        normalized = source / source.square().sum(-1, keepdim=True).sqrt().clamp_min(torch.finfo(torch.float32).tiny)
+        normalized *= destination.square().sum(-1, keepdim=True).sqrt()
+        hidden = 0.85 * destination + 0.15 * normalized
+        for ordinal in (1, 2):
+            previous = expected_cache[0, ordinal, token - 1] if token else torch.zeros_like(hidden)
+            expected_cache[0, ordinal, token].copy_(hidden[0])
+            hidden = hidden + previous + ordinal + 1
+    expected_output = torch.cat(normal_outputs)
     owner.wait_stream(torch.cuda.current_stream(device))
     execution.admit((identity,), owner)
 
@@ -180,7 +224,6 @@ print(encode_boundary(planned))
             self.saved = {}
             self.output = None
             self.calls = []
-            self.expected = {}
             owner.wait_stream(torch.cuda.current_stream(device))
 
         @property
@@ -190,6 +233,10 @@ print(encode_boundary(planned))
         @property
         def function_bodies(self):
             return (body,)
+
+        @property
+        def kernel_imports(self):
+            return kernels
 
         def borrow_streams(self, context, lanes):
             return streams
@@ -229,9 +276,7 @@ print(encode_boundary(planned))
 
         def begin(self, row):
             self.saved[row] = self.cache[0, :, row.token_offset].clone()
-            return torch.tensor([row.token_offset], device=device), inputs[
-                row.packed_row_index : row.packed_row_index + 1
-            ]
+            return upload([row.token_offset], device), inputs[row.packed_row_index : row.packed_row_index + 1]
 
         def layer(self, row, ordinal, positions, hidden, residual):
             self.calls.append((row.token_offset, ordinal, torch.cuda.current_stream(device).cuda_stream))
@@ -239,9 +284,6 @@ print(encode_boundary(planned))
             previous = slot[row.token_offset - 1] if row.token_offset else torch.zeros_like(hidden)
             slot[row.token_offset].copy_(hidden[0])
             output = hidden + previous + ordinal + 1
-            if ordinal == 2 and row.token_offset not in self.expected:
-                with torch.no_grad():
-                    self.expected[row.token_offset] = norm(output, torch.zeros_like(output))
             return output, torch.zeros_like(output)
 
         def normalize(self, row, hidden, residual):
@@ -274,12 +316,9 @@ print(encode_boundary(planned))
             raise
         owner.synchronize()
         assert not decoder.saved
-        # The unaudited model callback must stay on the original stream even
-        # while eligible pure statements use a parallel physical plan.
-        assert {stream for _, _, stream in decoder.calls} == {owner.cuda_stream}
-        torch.testing.assert_close(
-            decoder.output, torch.cat(tuple(decoder.expected[i] for i in range(3))), rtol=0, atol=0
-        )
+        assert {stream for _, _, stream in decoder.calls} <= {owner.cuda_stream, streams.auxiliary[0].cuda_stream}
+        torch.testing.assert_close(decoder.output, expected_output, rtol=0, atol=0)
+        torch.testing.assert_close(decoder.cache, expected_cache, rtol=0, atol=0)
         torch.testing.assert_close(norm.scale, original_scale, rtol=0, atol=0)
         return decoder
 

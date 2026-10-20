@@ -26,6 +26,7 @@ from pllm.contracts.region_program import (
     bind_sizes,
     resolve_extent,
 )
+from pllm.contracts.region_streams import RegionStateWindow
 from pllm.contracts.state_ref import LineageId, StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.host_borrow import HostResourceView, validate_host_views
@@ -355,6 +356,17 @@ class RegionResources:
         if self._external_declarations != {f.name: f for f in program.functions if names.intersection(f.resources)}:
             raise ValueError("external bindings belong to different source declarations")
         self._owner.check_page_execution()
+
+    def window(self, facts: tuple[RegionStateWindow, ...]) -> AbstractContextManager[None]:
+        """Reserve original-owner COW capacity for the compiler's whole window."""
+        bounds = {fact.resource: fact.private_roots for fact in facts}
+        cells = tuple(self._cells.values())
+        return self._owner.arena.reserve_window(
+            tuple(self._owner.current_owned_ref(cell.original) for cell in cells),
+            tuple(cell.fields for cell in cells),
+            tuple(bounds[cell.resource] for cell in cells),
+            self._owner.pin.stream,
+        )
 
     def scope(self) -> AbstractContextManager[None]:
         stream = self._owner.pin.stream

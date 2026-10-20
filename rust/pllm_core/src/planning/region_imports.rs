@@ -15,7 +15,7 @@ pub(super) enum TensorImport {
     Exported { access: AccessGraph },
     Native { declaration: Function },
     Borrowed { declaration: Function, field: u64 },
-    NativeKernel { declaration: Function, implementation: String, device: String, allocations: Vec<KernelAllocation> },
+    NativeKernel { declaration: Function, implementation: String, device: String, allocations: Vec<KernelAllocation>, host_reads: bool },
     FunctionalKernel { declaration: Function, implementation: String, device: String, allocations: Vec<KernelAllocation> },
     Compiled { source_access: AccessGraph, backend: String, code_digest: String,
         allocations: Vec<KernelAllocation> },
