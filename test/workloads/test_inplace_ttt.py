@@ -263,7 +263,7 @@ def _check_headwise_math_and_tail():
                     for head in range(2):
                         key = row[head] / row[head].norm().clamp_min(1e-12)
                         gradient[head] += torch.outer(decayed[head] @ key - row[head], key)
-                state = decayed - 0.2 * gradient
+                state = decayed - 0.2 / 2 * gradient
         pending = joined[trained:]
         expected = hidden.double() @ base.double().T + torch.cat(outputs)[-len(hidden) :]
         actual = workload.transition(hidden, base, weights, tail, length)

@@ -1,7 +1,6 @@
 """Input reconstruction with per-request, gated delta-rule head weights."""
 
 from dataclasses import dataclass
-from math import isfinite
 from typing import Annotated
 
 import torch
@@ -36,11 +35,10 @@ class GatedDeltaConfig:
             or self.head_width < 1
             or self.chunk_size < 1
             or not 0 < self.alpha <= 1
-            or not isfinite(self.beta)
-            or self.beta <= 0
+            or not 0 < self.beta < 2
         ):
             raise ValueError(
-                "Gated delta needs unique targets, positive head/chunk sizes, 0 < alpha <= 1 and finite beta > 0"
+                "Gated delta needs unique targets, positive head/chunk sizes, 0 < alpha <= 1 and 0 < beta < 2"
             )
 
 
@@ -78,7 +76,8 @@ class GatedDeltaWorkload(pllm.Workload):
         values, keys = inputs.transpose(0, 1), keys.transpose(0, 1)
         decayed = state * self.config.alpha
         error = torch.bmm(keys, decayed.transpose(1, 2)) - values
-        updated = decayed - self.config.beta * torch.bmm(error.transpose(1, 2), keys)
+        # Averaging over the chunk's rows keeps alpha*(I - beta*mean(k kᵀ)) contractive for 0 < beta < 2.
+        updated = decayed - self.config.beta / self.config.chunk_size * torch.bmm(error.transpose(1, 2), keys)
         output = torch.bmm(values, state.transpose(1, 2)).transpose(0, 1)
         return updated, output
 

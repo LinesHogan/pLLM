@@ -415,7 +415,7 @@ def _check_right_matrix_rewrite():
                     )
                 )
                 final, outputs = execution.run(args, sizes={"c": count}).values
-                expected, expected_outputs = _right_oracle(initial, values[:count], keys[:count], 0.83, 0.17)
+                expected, expected_outputs = _right_oracle(initial, values[:count], keys[:count], 0.83, 0.17 / 4)
                 torch.testing.assert_close(final.double(), expected, rtol=2e-6, atol=2e-7)
                 torch.testing.assert_close(
                     tuple(v.double() for v in outputs.elements), expected_outputs, rtol=2e-6, atol=2e-7
