@@ -362,12 +362,12 @@ def _check_right_matrix_rewrite():
     from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
 
     target = ParameterTarget(0, ParameterModuleKind.ATTENTION, ParameterRole.QUERY_PROJECTION_WEIGHT)
-    workload = GatedDeltaWorkload(GatedDeltaConfig((target,), head_width=3, chunk_size=2, alpha=0.83, beta=0.17))
+    workload = GatedDeltaWorkload(GatedDeltaConfig((target,), head_width=3, chunk_size=4, alpha=0.83, beta=0.17))
     limits = (RegionPayloadLimit("cuda:0", 32 << 20),)
     for dtype in (torch.bfloat16, torch.float32):
         with FakeTensorMode():
             samples = tuple(
-                torch.empty(shape, dtype=dtype, device="cuda:0") for shape in ((2, 3, 3), (2, 2, 3), (2, 2, 3))
+                torch.empty(shape, dtype=dtype, device="cuda:0") for shape in ((2, 3, 3), (4, 2, 3), (4, 2, 3))
             )
             cell = ExportedCell.capture(workload.step, ("state", "values", "keys"), ("next", "output"), samples)
             scan = TensorScan(cell, SizeParameter("c", 0, 5), carry=1, invariants=0)
@@ -384,7 +384,7 @@ def _check_right_matrix_rewrite():
         )
         generator = torch.Generator(device="cuda:0").manual_seed(92)
         initial = torch.randn(2, 3, 3, device="cuda:0", generator=generator) * 0.2
-        values = torch.randn(5, 2, 2, 3, device="cuda:0", generator=generator)
+        values = torch.randn(5, 4, 2, 3, device="cuda:0", generator=generator)
         keys = torch.nn.functional.normalize(values, dim=-1)
         serial, serial_outputs = initial, []
         for x, k in zip(values, keys, strict=True):
@@ -422,8 +422,6 @@ def _check_right_matrix_rewrite():
                 )
         _check_right_matrix_graph(initial, values, keys)
     # Cost follows the source chunk work, not an absolute head-width threshold.
-    from pllm.execution.affine_scan import competitive_candidates
-
     for width, chunk, competitive in ((64, 64, True), (896, 64, False), (896, 896, True)):
         with FakeTensorMode():
             samples = tuple(
@@ -433,8 +431,7 @@ def _check_right_matrix_rewrite():
             cell = ExportedCell.capture(workload.step, ("state", "values", "keys"), ("next", "output"), samples)
             scan = TensorScan(cell, 8, carry=1, invariants=0)
         limits = (RegionPayloadLimit("cuda:0", 1 << 30),)
-        assert next(affine_candidates(scan.program, {cell.digest: cell}, limits), None) is not None
-        offered = tuple(competitive_candidates(scan.program, {cell.digest: cell}, limits))
+        offered = tuple(affine_candidates(scan.program, {cell.digest: cell}, limits))
         assert bool(offered) == competitive
         if competitive:
             forms = {(p.candidate.affine_scan.form, p.candidate.affine_scan.window) for p in offered}
@@ -446,10 +443,10 @@ def _check_right_matrix_graph(initial, values, keys):
     """Changing C reuses one captured window; reversed right actions fail the oracle."""
     from pllm.kernels.right_matrix_scan import RightMatrixBuffers, launch_window as launch_right_window
 
-    x = initial.new_zeros((8, 2, 2, 3))
+    x = initial.new_zeros((8, 2, 4, 3))
     k = torch.zeros_like(x)
     active = torch.zeros((), dtype=torch.int32, device=initial.device)
-    buffers = RightMatrixBuffers(initial, 8, 2)
+    buffers = RightMatrixBuffers(initial, 8, 4)
     launch_right_window(x, k, initial, active, buffers, 0.17, 0.83, ScanForm.HILLIS_STEELE)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

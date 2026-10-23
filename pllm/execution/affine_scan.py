@@ -128,6 +128,8 @@ def candidates(
             if encoded == "null":
                 return
             plan = decode_boundary(encoded, AffineScanPlan)
+            if not plan.competitive():
+                continue  # Eager host time can hide this GPU regression from measured tuning.
             if plan.implementation.action is ScanAction.RIGHT_MATRIX:
                 primitive = AffineScanPrimitive(plan.implementation, RightMatrixUpdate(plan))
             else:
@@ -146,24 +148,6 @@ def candidates(
             yield PreparedRegionCandidate(plan.program, candidate, (), functions)
 
 
-def competitive_candidates(
-    program: Program, cells: Mapping[str, RegionFunction], limits: tuple[RegionPayloadLimit, ...]
-) -> Iterator["PreparedRegionCandidate"]:
-    """Filter composition work and dependency depth using Rust-derived plans.
-
-    At d=896, eager host overhead can hide a large GPU-time regression. Both
-    policies retain the source there; the raw catalogue remains measurable.
-    """
-    for candidate in candidates(program, cells, limits):
-        primitive = candidate.cells[candidate.program.functions[-1].name]
-        assert isinstance(primitive, AffineScanPrimitive)
-        if primitive.implementation.action is ScanAction.RIGHT_MATRIX:
-            assert isinstance(primitive.function, RightMatrixUpdate)
-            if not primitive.function.plan.competitive():
-                continue
-        yield candidate
-
-
 def payload_budget(
     program: Program,
     cells: Mapping[str, RegionFunction],
@@ -177,7 +161,7 @@ def payload_budget(
     budget = (
         reference if ceiling is None else tuple(RegionPayloadLimit(r.device, min(r.bytes, ceiling)) for r in reference)
     )
-    for candidate in competitive_candidates(program, cells, available):
+    for candidate in candidates(program, cells, available):
         evidence = candidate.candidate.affine_scan
         assert evidence is not None
         primitive = candidate.cells[candidate.program.functions[-1].name]

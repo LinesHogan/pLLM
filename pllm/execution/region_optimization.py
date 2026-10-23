@@ -376,9 +376,9 @@ def prepare_region_candidates(
     order = base.schedule_map if base.stream_plan is None else base.stream_plan.schedule_map
     alternatives: tuple[PreparedRegionCandidate, ...] = ()
     if options.allow_numerical_transforms and len(proposals) < max_candidates:
-        from pllm.execution.affine_scan import competitive_candidates, preference
+        from pllm.execution.affine_scan import candidates, preference
 
-        alternatives = tuple(sorted(competitive_candidates(program, sources, limits), key=preference))
+        alternatives = tuple(sorted(candidates(program, sources, limits), key=preference))
     # Keep both ordered and tree choices in the measured shortlist; tensor
     # fusion alternatives must not consume every available slot first.
     reserved = min(2, len(alternatives), max_candidates - len(proposals))
