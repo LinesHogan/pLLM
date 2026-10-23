@@ -58,6 +58,7 @@ class RequestLowRankTTT(pllm.Workload):
 
     @pllm.on(pllm.Phase.MODEL_UPDATE)
     @pllm.overlay(
+        visibility=pllm.Visibility.forward_pinned(),
         state="factors",
         targets=(TARGET,),
         operator=ParameterOverlayOperator.LOW_RANK_ADD,

@@ -26,7 +26,6 @@ from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.parameter_overlay import (
-    Exact as Exact,
     KVPolicy as KVPolicy,
     ModelScan as ModelScan,
     ParameterEffect as ParameterEffect,
@@ -56,6 +55,7 @@ from pllm.contracts.semantic_graph import (
     TaskSymbol,
 )
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorLayoutRequest
+from pllm.contracts.visibility import Exact as Exact, Visibility as Visibility
 from pllm.execution.codec import boundary_digest
 from pllm.execution.declaration import Call, Dimensions, Shape, State, When, native
 from pllm.execution.freeze import (
@@ -598,6 +598,7 @@ class _Overlay(_Effect):
     prefill: bool | Config
     decode: bool | Config
     replay: ConditionalLayerReplay | Config | None
+    visibility: Visibility
 
     def declare(self, operation: _Operation) -> None:
         """Declare a request buffer transition and its parameter overlay attachment."""
@@ -647,8 +648,12 @@ class _Overlay(_Effect):
             operator=operator,
             scale=scale,
             function=_invoke(freeze(operation.function), bindings),
+            visibility=self.visibility,
+            equations_digest=boundary_digest(context.definitions, context.bindings),
         )
-        context.definitions.append((operation.name, boundary_digest(identity, bindings, operator, scale, applied)))
+        context.definitions.append(
+            (operation.name, boundary_digest(identity, bindings, operator, scale, applied, self.visibility))
+        )
 
 
 def overlay(
@@ -662,8 +667,14 @@ def overlay(
     prefill: bool | Config = True,
     decode: bool | Config = False,
     replay: ConditionalLayerReplay | Config | None = None,
+    visibility: Visibility = Visibility.forward_pinned(),
 ) -> Callable[[F], F]:
-    """Apply request state to projections; dense/head operators use `weight`, low-rank the factor pair."""
+    """Apply forward-pinned state; dense/head operators use `weight`, low-rank the factor pair."""
+
+    if visibility != Visibility.forward_pinned():
+        raise ValueError(
+            "Exact overlays need in-forward transitions; use Visibility.forward_pinned() until they are supported"
+        )
 
     return _mark(
         effect=_Overlay(
@@ -676,6 +687,7 @@ def overlay(
             prefill=prefill,
             decode=decode,
             replay=replay,
+            visibility=visibility,
         )
     )
 
@@ -1129,6 +1141,12 @@ class _Declaration:
             _invoke(freeze(operation.function), bindings),
             definition.optimizer,
             definition.request_keys,
+            boundary_digest(
+                self.definitions,
+                self.bindings,
+                fingerprint(definition.initialize),
+                definition.optimizer,
+            ),
         )
         self.model_training.add(scan.learn)
 
@@ -1475,6 +1493,7 @@ __all__ = [
     "ModelScan",
     "ParameterEffect",
     "Exact",
+    "Visibility",
     "KVPolicy",
     "SGD",
     "Batch",

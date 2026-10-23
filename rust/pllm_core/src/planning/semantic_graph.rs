@@ -205,6 +205,8 @@ pub(crate) struct SemanticTask {
     pub(crate) replay: Option<LayerReplay>,
     #[serde(default)]
     pub(crate) math: Option<MathContract>,
+    #[serde(default)]
+    pub(super) visibility: Option<super::visibility::StateVisibility>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -479,10 +481,30 @@ fn validate_task(task: &SemanticTask) -> Result<(), String> {
 
 pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
     validate_input_groups(graph)?;
+    for task in &graph.tasks {
+        if let Some(visibility) = &task.visibility {
+            super::visibility::validate(visibility)?;
+            if visibility.source.scope == super::visibility::Scope::Overlay
+                && visibility.source.policy.kind == super::visibility::Kind::Exact {
+                return Err("Exact overlays are planned only; use Visibility.forward_pinned() until in-forward transitions are supported".into());
+            }
+            if visibility.source.resources.iter().any(|resource|
+                !task.effects.iter().any(|effect| &effect.resource == resource)) {
+                return Err("state visibility resources must belong to the bound task".into());
+            }
+        }
+    }
     let mut sources = std::collections::BTreeSet::new();
     for source in &graph.source_regions {
         let task = graph.tasks.iter().find(|task| task.symbol == source.task)
             .ok_or("source region names an unknown task")?;
+        if let Some(window) = &source.window {
+            let visibility = task.visibility.as_ref().ok_or("model source needs a bound state visibility relation")?;
+            if visibility.source.scope != super::visibility::Scope::ModelScan
+                || visibility.source.chunk_size != window.quantum || visibility != &window.visibility {
+                return Err("model source chunk domain differs from its state visibility relation".into());
+            }
+        }
         if !sources.insert((&source.task, &source.name)) || source.name.is_empty() {
             return Err("source regions need distinct nonempty task-local names".into());
         }

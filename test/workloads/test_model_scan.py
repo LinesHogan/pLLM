@@ -10,19 +10,25 @@ import pytest
 import torch
 
 import pllm
+from pllm import _core
 from pllm.authoring import ParameterTargetShape, TensorStepInput
 from pllm.contracts.backend_attachment import CausalModelDomain
+from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.contracts.region_imports import BorrowedTensorImport, KernelAllocation, NativeKernelImport
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.tensor_layout import TensorDType
+from pllm.contracts.visibility import StateVisibility, VisibilitySource
+from pllm.execution.codec import boundary_digest, encode_boundary
 from pllm.execution.model_scan import ModelScanSpan
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.region_compilation import analyze_region_program, validate_region_schedule
+from pllm.execution.region_streams import plan_closed_window
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.tensor_borrow import PagedAllocationView, ReadonlyTensorCell, ReadonlyTensorView
 from pllm.execution.trace import TraceSelection
+from pllm.execution.visibility import bind_visibility
 from pllm.workloads.prefill_adapters import PrefillAdapters
 from test.backend_facts import backend_facts
 
@@ -170,7 +176,79 @@ def imported_facts(workload, facts):
     return replace(facts, probe=replace(facts.probe, region_imports=imports))
 
 
+def _check_visibility_relations() -> None:
+    """Reject forged logical writers before any source window is selected."""
+    assert type(pllm.Exact()) is pllm.Visibility
+    source = VisibilitySource(pllm.Exact(), "model_scan", "a" * 64, ("a", "b"), 2, "include")
+    exact = bind_visibility(source)
+    _core.validate_state_visibility(encode_boundary(exact))
+    assert "model[" in exact.explain() and "update[" in exact.explain() and "entry[" in exact.explain()
+    assert "-> update[r, t, -1 + c]" in exact.reads
+    pinned = bind_visibility(
+        replace(source, policy=pllm.Visibility.forward_pinned(), scope="overlay", chunk_size=0, tail="transition")
+    )
+    assert "C = 1" in pinned.reads and "-> update[" not in pinned.reads
+    planned = bind_visibility(replace(source, scope="overlay", tail="carry"))
+    assert "C <= N <= 1 + C" in planned.reads
+    assert "model[" in planned.explain() and "update[" in planned.explain()
+    assert "planned only" in planned.explain()
+    for changed in (replace(source, chunk_size=3), replace(source, equations_digest="b" * 64)):
+        assert boundary_digest(bind_visibility(changed)) != boundary_digest(exact)
+    forged = [
+        replace(exact, reads=exact.reads.replace("model[", "missing[")),
+        replace(exact, reads=exact.reads.replace("; update[", "; missing[")),
+        replace(exact, reads=exact.reads[:-1] + "; model[r,t,c] -> entry[r,t] : 0 < c < C }"),
+        replace(exact, dependencies="[C,N,R] -> { }"),
+    ]
+    for writer in ("update[r,t,c]", "update[r,t,c+1]", "update[r+1,t,c-1]", "update[r,t+1,c-1]", "entry[r,t]"):
+        forged.append(replace(exact, reads=exact.reads.replace("update[r, t, -1 + c]", writer)))
+    for value in forged:
+        assert value != exact
+        with pytest.raises(ValueError, match="state visibility"):
+            _core.validate_state_visibility(encode_boundary(value))
+    for changed in (replace(source, sweeps=2), replace(source, chunk_size=0), replace(source, tail="carry")):
+        with pytest.raises(ValueError, match="state visibility"):
+            bind_visibility(changed)
+    with pytest.raises(TypeError, match="reads"):
+        pllm.Visibility(reads="{ }")
+    scan = PrefillAdapters().prefill
+    with pytest.raises(TypeError, match="algorithm"):
+        pllm.ModelScan(scan.chunk_size, scan.apply, scan.learn, algorithm=pllm.Exact())
+    with pytest.raises(ValueError, match="visibility=Exact"):
+        replace(scan, visibility=pllm.Visibility.forward_pinned())
+
+
+def _check_visibility_source(plan: PlanBundle) -> None:
+    """A valid relation cannot be rebound to a different model chunk domain."""
+    task = plan.semantic_graph.tasks[0]
+    visibility = task.visibility
+    assert visibility is not None and visibility.source.policy == pllm.Exact()
+    assert tuple(visibility.source.resources) == tuple(str(effect.resource) for effect in task.effects)
+    window = plan.semantic_graph.source_regions[0].window
+    assert window is not None and visibility.source.chunk_size == window.quantum
+    assert window.visibility == visibility
+    source = plan.semantic_graph.source_regions[0]
+    with pytest.raises(ValueError, match="state visibility"):
+        plan_closed_window(
+            replace(source, window=replace(window, visibility=replace(visibility, reads="[C,N,R] -> { }"))),
+            plan.timeline.region_policy,
+            parallel=False,
+            budget=1,
+        )
+    changed: tuple[StateVisibility | None, ...] = (
+        None,
+        replace(visibility, reads=visibility.reads.replace("model[", "absent[")),
+        bind_visibility(replace(visibility.source, chunk_size=visibility.source.chunk_size + 1)),
+        bind_visibility(replace(visibility.source, scope="overlay", tail="carry")),
+    )
+    for value in changed:
+        graph = replace(plan.semantic_graph, tasks=(replace(task, visibility=value),))
+        with pytest.raises(ValueError, match="visibility|Exact overlays"):
+            _core.validate_plan_bundle(encode_boundary(replace(plan, semantic_graph=graph)))
+
+
 def test_model_scan_matches_independent_cpu_oracle_bitwise():
+    _check_visibility_relations()
     torch.set_num_threads(1)
     for config, zero in ((pllm.SGD(1e-3), False), (pllm.AdamW(1e-3), False), (pllm.SGD(1e-3), True)):
         workload = Adapters(
@@ -203,6 +281,8 @@ def test_model_scan_matches_independent_cpu_oracle_bitwise():
         )
         facts = imported_facts(workload, facts)
         deployment = workload.compile_backend(workload.specialize(facts, pllm.ExecutionOptions()))
+        if config == pllm.SGD(1e-3) and not zero:
+            _check_visibility_source(deployment.execution.arena.plan)
         owner = deployment.execution
         owner.trace.configure(TraceSelection(tensors=True, max_events=4096))
         refs = owner.admit((RequestIdentity("oracle", 0, 0),))

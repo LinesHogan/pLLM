@@ -49,7 +49,7 @@ class PrefillAdapters(pllm.Workload):
             self.chunk_size,
             pllm.ParameterEffect("adapters", _TARGETS, operator=pllm.ParameterOverlayOperator.LOW_RANK_ADD),
             learn="loss",
-            algorithm=pllm.Exact(),
+            visibility=pllm.Exact(),
             kv=pllm.KVPolicy.CAUSAL_HISTORY,
         )
 

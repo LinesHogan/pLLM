@@ -57,6 +57,7 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
+from pllm.contracts.visibility import StateVisibility, Visibility, VisibilitySource
 from pllm.execution.declaration import Builder, Call, Dimensions, Field, Shape, State, When, native
 from pllm.execution.execution import TaskGraphImplementation
 from pllm.execution.model_scan import ChunkTraining, ModelScanTask, model_scan_source, target_resource
@@ -97,6 +98,7 @@ from pllm.execution.tensor_program import (
 )
 from pllm.execution.tensor_task import TensorTask
 from pllm.execution.trace import MAX_SNAPSHOT_BYTES
+from pllm.execution.visibility import bind_visibility
 from pllm.kernels.adamw import AdamWConfig
 from pllm.kernels.head_overlay import head_correction
 
@@ -357,6 +359,7 @@ class TensorBinding(Builder[TensorFrame]):
         loss: TensorMath,
         optimizer: AdamWConfig | SGD,
         keys: tuple[RequestKeyField, ...],
+        equations_digest: str,
     ) -> None:
         """Declare one request-owned scan and its projection consumer."""
         effect = scan.apply
@@ -398,6 +401,17 @@ class TensorBinding(Builder[TensorFrame]):
             when=When.MODEL_UPDATE,
             implementations=(native("model.chunk_scan@1", "model/chunk_scan@1"),),
         )
+        visibility = self._bind_visibility(
+            forward,
+            VisibilitySource(
+                scan.visibility,
+                "model_scan",
+                equations_digest,
+                tuple(str(state.declaration.resource) for state in states),
+                scan.chunk_size,
+                "include",
+            ),
+        )
         if self.probe is not None:
             assert self.dimensions is not None
             program = model_scan_source(
@@ -419,6 +433,7 @@ class TensorBinding(Builder[TensorFrame]):
                             tuple(f"prefill{i}" for i in range(self.max_requests)),
                             scan.chunk_size,
                             self.probe.max_packed_rows,
+                            visibility,
                         ),
                     ),
                 ),
@@ -453,6 +468,18 @@ class TensorBinding(Builder[TensorFrame]):
                 model_scan_chunk_size=scan.chunk_size,
             )
         )
+
+    def _bind_visibility(self, call: Call, source: VisibilitySource) -> StateVisibility:
+        """Attach the native read-from proof before constructing or cutting model regions."""
+        visibility = bind_visibility(source)
+        self.graph = replace(
+            self.graph,
+            tasks=tuple(
+                replace(task, visibility=visibility) if task.symbol == call.symbol else task
+                for task in self.graph.tasks
+            ),
+        )
+        return visibility
 
     def bind_native(
         self,
@@ -541,6 +568,8 @@ class TensorBinding(Builder[TensorFrame]):
         operator: ParameterOverlayOperator,
         scale: float,
         function: Callable[[Tensors], TensorUpdate],
+        visibility: Visibility,
+        equations_digest: str,
     ) -> None:
         if self.graph.tasks or self.graph.states or self.host:
             raise ValueError("ordinary overlay requires a sole request state and model transition")
@@ -599,6 +628,17 @@ class TensorBinding(Builder[TensorFrame]):
             implementations=(
                 native(identity + ":cpu", "compute/cpu@1", "transition/full_root@1"),
                 native(identity + ":cuda", "compute/cuda@1", "state/fenced_reclaim@1", "transition/full_root@1"),
+            ),
+        )
+        self._bind_visibility(
+            transition,
+            VisibilitySource(
+                visibility,
+                "overlay",
+                equations_digest,
+                (str(state.declaration.resource),) * len(targets),
+                0,
+                "transition",
             ),
         )
         publication = self.publish(

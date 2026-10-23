@@ -12,6 +12,7 @@ from pllm.contracts.region_program import Program
 from pllm.contracts.region_proposal import ClosedRegionWindow, ClosedWindowRequest
 from pllm.contracts.region_selection import RegionSelectionPolicy
 from pllm.contracts.request_identity import RequestKeyField
+from pllm.contracts.visibility import StateVisibility
 
 WorkloadId = NewType("WorkloadId", str)
 TaskSymbol = NewType("TaskSymbol", str)
@@ -219,6 +220,7 @@ class SemanticTask:
     effects: tuple[SemanticEffect, ...] = ()
     replay: ConditionalLayerReplay | TokenwiseLayerReplay | None = None
     math: MathContract | None = None
+    visibility: StateVisibility | None = None
 
 
 @dataclass(frozen=True, slots=True)

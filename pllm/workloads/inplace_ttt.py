@@ -64,6 +64,7 @@ class InPlaceTTTWorkload(pllm.Workload):
 
     @pllm.on(pllm.Phase.MODEL_UPDATE)
     @pllm.overlay(
+        visibility=pllm.Visibility.forward_pinned(),
         state="dense_fast_weights",
         targets=pllm.Config("config.targets"),
         weight="delta",

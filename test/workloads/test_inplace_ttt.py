@@ -30,6 +30,16 @@ from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
 from test.backend_facts import assert_finite_resources, backend_facts
 
 
+class _ShiftedUpdate(InPlaceTTTWorkload):
+    """Change only a helper's mathematics to check the bound source identity."""
+
+    def step(
+        self, delta: torch.Tensor, inputs: torch.Tensor, targets: torch.Tensor, base: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Use a different increment without changing the transition method."""
+        return delta + self.config.learning_rate * torch.mm(targets.T, inputs) + 1, torch.mm(inputs, (base + delta).T)
+
+
 def _input(operands: tuple[CapturedParameterOperand, ...]) -> TensorStepInput:
     selected = tuple(dict.fromkeys((operand.identity, operand.phase) for operand in operands))
     rows = PackedPhaseRowBatch(
@@ -59,6 +69,22 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
         targets=tuple(ParameterTargetShape(target, 3, 2) for target in targets),
     )
     execution = workload.compile_backend(assert_finite_resources(workload, facts)).execution
+    visibility = next(
+        task.visibility for task in execution.arena.plan.semantic_graph.tasks if task.visibility is not None
+    )
+    assert visibility.source.policy == pllm.Visibility.forward_pinned()
+    assert visibility.source.tail == "transition" and visibility.source.chunk_size == 0
+    assert "model[" in visibility.explain() and "update[" in visibility.explain()
+    with pytest.raises(ValueError, match="use Visibility.forward_pinned"):
+        pllm.overlay(state="dense_fast_weights", targets=targets, visibility=pllm.Exact())
+    declaration = workload.declaration().graph
+    assert next(task.visibility for task in declaration.tasks if task.visibility is not None) == visibility
+    changed = InPlaceTTTWorkload(replace(config, chunk_size=3)).declaration().graph
+    changed_visibility = next(task.visibility for task in changed.tasks if task.visibility is not None)
+    assert changed_visibility.source.equations_digest != visibility.source.equations_digest
+    helper = _ShiftedUpdate(config).declaration().graph
+    helper_visibility = next(task.visibility for task in helper.tasks if task.visibility is not None)
+    assert helper_visibility.source.equations_digest != visibility.source.equations_digest
     identities = (RequestIdentity("same", 0, 0), RequestIdentity("same", 0, 1))
     refs = execution.admit(identities)
     bases = torch.tensor(
@@ -133,6 +159,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
 
         @pllm.on(pllm.Phase.MODEL_UPDATE)
         @pllm.overlay(
+            visibility=pllm.Visibility.forward_pinned(),
             state="factors",
             targets=(targets[0],),
             operator=pllm.ParameterOverlayOperator.LOW_RANK_ADD,

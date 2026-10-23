@@ -19,6 +19,7 @@ pub(super) struct Request {
     pub counts: Vec<String>,
     pub quantum: u64,
     pub token_budget: u64,
+    pub visibility: super::visibility::StateVisibility,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -84,6 +85,13 @@ fn check_closure(program: &Program, request: &Request) -> Result<String> {
 
 pub(super) fn derive(program: &Program, imports: &[TensorImport], request: &Request,
                      policy: &Policy, parallel: bool, budget: Option<u64>) -> Result<ClosedWindow> {
+    super::visibility::validate(&request.visibility)?;
+    if request.visibility.source.scope != super::visibility::Scope::ModelScan
+        || request.visibility.source.chunk_size != request.quantum
+        || request.visibility.source.resources.iter().any(|name| !program.resources.iter().any(|resource|
+            matches!(resource, Resource::State { name: declared, .. } if declared == name))) {
+        return Err("closed source visibility must match its target resources and chunk domain".into());
+    }
     let source_digest = check_closure(program, request).map_err(|e| format!("closed source: {e}"))?;
     let maximum = request.counts.iter().map(|name| program.parameters.iter()
         .find(|p| &p.name == name).map(|p| p.maximum).ok_or_else(|| "missing window count parameter".to_owned()))

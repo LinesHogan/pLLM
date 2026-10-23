@@ -83,6 +83,7 @@ class GatedDeltaWorkload(pllm.Workload):
 
     @pllm.on(pllm.Phase.MODEL_UPDATE)
     @pllm.overlay(
+        visibility=pllm.Visibility.forward_pinned(),
         state="fast_weights",
         targets=pllm.Config("config.targets"),
         weight="weights",
