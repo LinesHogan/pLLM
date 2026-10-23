@@ -186,7 +186,7 @@ def _check_visibility_relations() -> None:
         replace(source, policy=pllm.Visibility.forward_pinned(), scope="overlay", chunk_size=0, tail="transition")
     )
     assert "C = 1" in pinned and "-> update[" not in pinned
-    assert "C <= N <= 1 + C" in explain_visibility(replace(source, scope="overlay", tail="carry"))
+    assert "C <= N <= 1 + C" in explain_visibility(replace(source, scope="overlay", tail="carry", chunk_size=0))
     for changed in (replace(source, chunk_size=0), replace(source, tail="carry"), replace(source, scope="overlay")):
         with pytest.raises(ValueError, match="state visibility"):
             explain_visibility(changed)

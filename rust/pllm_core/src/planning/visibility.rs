@@ -38,7 +38,7 @@ fn relation(source: &Source, ctx: &Context) -> Result<UnionMap, String> {
     let extent = match (&source.scope, &source.policy.kind, &source.tail, source.chunk_size) {
         (Scope::Overlay, Kind::ForwardPinned, Tail::Transition, 0) => "C = 1 and N = 1",
         (Scope::ModelScan, Kind::Exact, Tail::Include, 1..) => "0 <= C and N = C",
-        (Scope::Overlay, Kind::Exact, Tail::Carry, 1..) => "0 <= C and C <= N <= C+1",
+        (Scope::Overlay, Kind::Exact, Tail::Carry, 0) => "0 <= C and C <= N <= C+1",
         _ => return Err("state visibility must use its declaration's chunk and tail domain".into()),
     };
     let domain = format!("{extent} and R >= 1 and 0 <= r < R and 0 <= t < {}", source.resources.len());

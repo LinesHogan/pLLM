@@ -25,9 +25,8 @@ def Exact() -> Visibility:
 class VisibilitySource:
     """Internal equation identity and read domain; Rust derives the read-from map.
 
-    A pinned overlay exposes one whole-forward transition. Its private chunk/tail
-    mathematics remain in the equation digest; chunk_size=0 means no model chunk
-    boundary is exposed. Exact sources instead expose the logical chunk domain.
+    Overlays keep their chunk/tail mathematics inside the transition's own scan
+    (chunk_size=0); ModelScan exposes its logical chunk domain to the planner.
     """
 
     policy: Visibility
@@ -36,3 +35,8 @@ class VisibilitySource:
     resources: tuple[str, ...]
     chunk_size: int
     tail: Literal["transition", "include", "carry"]
+
+    @property
+    def in_forward(self) -> bool:
+        """An Exact overlay runs its transition at the projection, inside the model forward."""
+        return self.scope == "overlay" and self.policy == Exact()

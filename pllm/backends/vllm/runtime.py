@@ -319,12 +319,10 @@ class VllmSession(Generic[DataT, ResultT]):
             plan.semantic_graph.tasks[attachment.inputs.request.task_bindings[0].task_id].timing.after
             == "request.prepare"
         )
-        if any(
-            task.visibility is not None
-            and task.visibility.scope == "overlay"
-            and task.visibility.policy.kind == "exact"
-            for task in plan.semantic_graph.tasks
-        ):
+        self._in_forward_overlay = any(
+            task.visibility is not None and task.visibility.in_forward for task in plan.semantic_graph.tasks
+        )
+        if self._in_forward_overlay:
             validate_projection_sources(model, tuple(binding.target for binding in overlay_bindings))
         self._overlay = (
             VllmParameterOverlay(model, overlay_bindings, capture=not self._overlay_import)
@@ -642,18 +640,8 @@ class VllmSession(Generic[DataT, ResultT]):
             invocation = execution.begin(rows.row_batch.request_rows, stream)
             step.invocation = invocation
         if adapter is not None:
-            transition = next(
-                (
-                    task
-                    for task in execution.arena.plan.semantic_graph.tasks
-                    if task.visibility is not None
-                    and task.visibility.scope == "overlay"
-                    and task.visibility.policy.kind == "exact"
-                ),
-                None,
-            )
             projection = None
-            if transition is not None:
+            if self._in_forward_overlay:
                 self._advance(invocation, "request.prepare")
                 binding = self.attachment.inputs.request.task_bindings[0]
                 projection = ProjectionTask(

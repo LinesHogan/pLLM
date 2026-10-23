@@ -57,7 +57,7 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
-from pllm.contracts.visibility import Visibility, VisibilitySource
+from pllm.contracts.visibility import Exact, Visibility, VisibilitySource
 from pllm.execution.declaration import Builder, Call, Dimensions, Field, Shape, State, When, native
 from pllm.execution.execution import TaskGraphImplementation
 from pllm.execution.model_scan import ChunkTraining, ModelScanTask, model_scan_source, target_resource
@@ -504,11 +504,7 @@ class TensorBinding(Builder[TensorFrame]):
             budget = facts.timeline.memory_budget_bytes
             task = next(task for task in self.graph.tasks if task.symbol == symbol)
             policy = facts.timeline.region_policy
-            if (
-                task.visibility is not None
-                and task.visibility.scope == "overlay"
-                and task.visibility.policy.kind == "exact"
-            ):
+            if task.visibility is not None and task.visibility.in_forward:
                 # The Qwen BF16 whole-model gate rejects prefix reassociation (natural-text KL > 1e-5).
                 policy = replace(policy, allow_numerical_transforms=False)
             scans = ScanContext(
@@ -582,7 +578,6 @@ class TensorBinding(Builder[TensorFrame]):
         function: Callable[[Tensors], TensorUpdate],
         visibility: Visibility,
         equations_digest: str,
-        chunk_size: int,
     ) -> None:
         if self.graph.tasks or self.graph.states or self.host:
             raise ValueError("ordinary overlay requires a sole request state and model transition")
@@ -650,11 +645,11 @@ class TensorBinding(Builder[TensorFrame]):
                 "overlay",
                 equations_digest,
                 (str(state.declaration.resource),) * len(targets),
-                chunk_size,
-                "carry" if chunk_size else "transition",
+                0,
+                "carry" if visibility == Exact() else "transition",
             ),
         )
-        if chunk_size:
+        if visibility == Exact():
             self.operations[transition.symbol] = replace(self.operations[transition.symbol], version="private")
         publication = self.publish(
             transition,
@@ -1534,9 +1529,7 @@ class TensorBinding(Builder[TensorFrame]):
             def prepare_overlay(value: TensorStepInput, batch: TensorBatch) -> TensorFrame:
                 expected = {(row.identity, target) for row in batch.selection.rows for target in self.overlay_targets}
                 actual = tuple((operand.identity, operand.target) for operand in value.operands)
-                if any(
-                    task.visibility is not None and task.visibility.policy.kind == "exact" for task in self.graph.tasks
-                ):
+                if any(task.visibility is not None and task.visibility.in_forward for task in self.graph.tasks):
                     targets = {operand.target for operand in value.operands}
                     expected = {(identity, target) for identity, target in expected if target in targets}
                 if len(actual) != len(expected) or set(actual) != expected:

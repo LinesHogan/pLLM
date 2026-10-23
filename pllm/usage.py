@@ -71,7 +71,6 @@ from pllm.execution.host_runtime import (
     HostWorkload,
     TensorHostBinding,
 )
-from pllm.execution.overlay_task import overlay_chunk
 from pllm.execution.region_streams import plan_closed_window
 from pllm.execution.replay import Recurrence as Recurrence
 from pllm.execution.state_execution import MathBinding, StateExecution
@@ -655,7 +654,6 @@ class _Overlay(_Effect):
             scale=scale,
             function=_invoke(freeze(operation.function), bindings),
             visibility=visibility,
-            chunk_size=overlay_chunk(operation.function) if visibility == Exact() else 0,
             equations_digest=boundary_digest(context.definitions, context.bindings),
         )
         context.definitions.append(
