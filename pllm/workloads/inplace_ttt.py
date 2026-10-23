@@ -7,7 +7,7 @@ import torch
 
 import pllm
 from pllm import ConditionalLayerReplay, ParameterTarget, TensorUpdate
-from pllm.kernels.page_copy import prepend_rows
+from pllm.workloads.chunk_tail import join_tail, save_tail
 
 Input = Annotated[torch.Tensor, pllm.Operand.INPUT]
 Target = Annotated[torch.Tensor, pllm.Operand.TARGET]
@@ -82,17 +82,13 @@ class InPlaceTTTWorkload(pllm.Workload):
         tail_length: TailLength,
     ) -> pllm.TensorUpdate:
         chunk = self.config.chunk_size
-        inputs, targets = prepend_rows([tail_input, tail_target], [hidden, target], tail_length, chunk - 1)
+        inputs, targets = join_tail((tail_input, tail_target), (hidden, target), tail_length, chunk)
         trained = len(inputs) // chunk * chunk
         updated, outputs = pllm.scan(
             self.step, carry=delta, over=(inputs[:trained], targets[:trained]), chunk=chunk, invariants=(base,)
         )
         delta.copy_(updated)
-        remaining = len(inputs) - trained
-        for tail, rows in ((tail_input, inputs), (tail_target, targets)):
-            tail.zero_()
-            tail[:remaining].copy_(rows[trained:])
-        tail_length.fill_(remaining)
+        remaining = save_tail((tail_input, tail_target), (inputs, targets), tail_length, trained)
         if remaining:
             outputs += (inputs[trained:] @ (base + delta).T,)
         return TensorUpdate(

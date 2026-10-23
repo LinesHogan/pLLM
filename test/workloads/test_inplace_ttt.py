@@ -42,6 +42,7 @@ def _input(operands: tuple[CapturedParameterOperand, ...]) -> TensorStepInput:
 
 
 def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
+    _check_headwise_math_and_tail()
     targets = tuple(
         ParameterTarget(layer, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT) for layer in (0, 1)
     )
@@ -234,3 +235,41 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     diagnostics = imported.diagnostics()
     assert diagnostics.update_count == 2
     assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
+
+
+def _check_headwise_math_and_tail():
+    """Head residuals, reconstruction and retained tails match independent FP64 math."""
+    from pllm.kernels.head_overlay import head_correction
+    from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
+
+    target = ParameterTarget(0, ParameterModuleKind.ATTENTION, ParameterRole.QUERY_PROJECTION_WEIGHT)
+    workload = GatedDeltaWorkload(GatedDeltaConfig((target,), head_width=3, chunk_size=2, alpha=0.9, beta=0.2))
+    generator = torch.Generator().manual_seed(123)
+    base = torch.randn(6, 6, generator=generator)
+    rows = torch.randn(5, 6, generator=generator)
+    weights, tail, length = torch.zeros(2, 3, 3), torch.zeros(1, 6), torch.zeros((), dtype=torch.int64)
+    state, pending = weights.double(), rows[:0].double()
+    for hidden in (rows[:1], rows[1:]):
+        joined = torch.cat((pending, hidden.double()))
+        trained = len(joined) // 2 * 2
+        outputs = []
+        for start in range(0, len(joined), 2):
+            x = joined[start : start + 2].reshape(-1, 2, 3)
+            outputs.append(torch.stack([x[:, h] @ state[h].T for h in range(2)], dim=1).reshape(-1, 6))
+            if start < trained:
+                decayed = 0.9 * state
+                gradient = torch.zeros_like(state)
+                for row in x:
+                    for head in range(2):
+                        key = row[head] / row[head].norm().clamp_min(1e-12)
+                        gradient[head] += torch.outer(decayed[head] @ key - row[head], key)
+                state = decayed - 0.2 * gradient
+        pending = joined[trained:]
+        expected = hidden.double() @ base.double().T + torch.cat(outputs)[-len(hidden) :]
+        actual = workload.transition(hidden, base, weights, tail, length)
+        torch.testing.assert_close(actual.output.double(), expected, rtol=2e-6, atol=5e-7)
+        torch.testing.assert_close(weights.double(), state, rtol=2e-6, atol=2e-7)
+        torch.testing.assert_close(tail[: len(pending)].double(), pending)
+        assert (actual.update_count, actual.trained_rows, int(length)) == (trained // 2, trained, len(pending))
+    correction = torch.stack([rows.reshape(-1, 2, 3)[:, h] @ weights[h].T for h in range(2)], dim=1).reshape(-1, 6)
+    torch.testing.assert_close(head_correction(rows, weights), correction, rtol=0, atol=0)

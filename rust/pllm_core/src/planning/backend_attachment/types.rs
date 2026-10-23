@@ -186,6 +186,7 @@ pub(crate) struct ParameterTarget {
 pub(crate) enum OverlayOperator {
     DenseAdd,
     LowRankAdd,
+    HeadAdd,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

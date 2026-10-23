@@ -138,6 +138,7 @@ _BACKEND_ABI_FIELDS = (
     "rows=one_logit_per_request",
     "attachment=shared_plan_v8",
     "attachments=request_training|parameter_overlay|activation_patch",
+    "parameter=head_add_fp32/input_reconstruction@1",
     "activation=phase_windows/exact_step_pins/source_readonly@2",
     "model=causal_indexed_layer@5",
     "region=closed_engine_windows@4/captured_tensor_sources",
@@ -151,6 +152,8 @@ _OVERLAY_CAPABILITIES = (
     "operand_capture/mlp_down_projection_pair@1",
     "overlay/dense_add@1",
     "overlay/low_rank_add@1",
+    "overlay/head_add_fp32@1",
+    "operand_capture/projection_input@1",
 )
 
 

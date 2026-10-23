@@ -14,13 +14,14 @@ from typing import TypeAlias
 import torch
 
 from pllm.contracts.region_imports import (
-    AdditiveScanImport,
+    AffineScanImport,
     BorrowedTensorImport,
     CompiledTensorImport,
     ExportedTensorImport,
     FunctionalKernelImport,
     NativeKernelImport,
     RegionTensorImport,
+    ScanAction,
     ScanForm,
     region_import_name,
 )
@@ -97,10 +98,10 @@ NativeFunction: TypeAlias = Callable[[tuple[Data, ...], PrimitiveResources], tup
 
 
 @dataclass(frozen=True, slots=True)
-class AdditiveScanPrimitive:
-    """Bind a Rust-derived additive kernel with borrowed inputs and owned outputs."""
+class AffineScanPrimitive:
+    """Bind a Rust-derived affine kernel with borrowed inputs and owned outputs."""
 
-    implementation: AdditiveScanImport
+    implementation: AffineScanImport
     function: Callable[[tuple[Data, ...]], tuple[Data, ...]]
 
     @property
@@ -109,6 +110,10 @@ class AdditiveScanPrimitive:
 
     @property
     def transformations(self) -> tuple[str, ...]:
+        if self.implementation.action is ScanAction.RIGHT_MATRIX:
+            return (
+                f"right-matrix affine scan: SGD distributivity, fp32 batched GEMMs and {self.implementation.form.value} composition",
+            )
         if self.implementation.form is ScanForm.ORDERED:
             return ("additive scan: batched GEMMs with ordered carry rounding",)
         return ("additive scan: batched GEMMs and Hillis–Steele fp32 prefix reassociation",)
@@ -290,7 +295,7 @@ RegionFunction: TypeAlias = (
     | FunctionalKernelPrimitive
     | CompiledPrimitive
     | BorrowedTensorPrimitive
-    | AdditiveScanPrimitive
+    | AffineScanPrimitive
 )
 TensorSource: TypeAlias = ExportedCell | BorrowedTensorPrimitive | NativePrimitive | FunctionalKernelPrimitive
 
@@ -318,7 +323,7 @@ def is_original_region_source(cell: RegionFunction) -> bool:
 def original_region_sources(cells: Mapping[str, RegionFunction]) -> dict[str, TensorSource]:
     result: dict[str, TensorSource] = {}
     for name, cell in cells.items():
-        if isinstance(cell, (CompiledPrimitive, AdditiveScanPrimitive)) or not is_original_region_source(cell):
+        if isinstance(cell, (CompiledPrimitive, AffineScanPrimitive)) or not is_original_region_source(cell):
             raise ValueError("region preparation requires original source implementations")
         result[name] = cell
     return result

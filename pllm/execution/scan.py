@@ -111,10 +111,13 @@ class ScanTemplate:
             functions=self.region.functions,
         )
         if self.context.policy.allow_numerical_transforms:
-            from pllm.execution.additive_scan import payload_budget
+            from pllm.execution.affine_scan import payload_budget
 
             scan.payload_limits = payload_budget(
-                scan.program, self.region.functions, scan.payload_limits, self.context.payload_bytes
+                scan.program,
+                self.region.functions,
+                scan.payload_limits,
+                self.context.payload_bytes,
             )
         return scan
 

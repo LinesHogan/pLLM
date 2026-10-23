@@ -1,4 +1,4 @@
-"""Bind Rust-proven additive scan candidates inside the shared region executor."""
+"""Bind Rust-proven affine scan candidates inside the shared region executor."""
 
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
@@ -7,16 +7,17 @@ from typing import TYPE_CHECKING
 import torch
 
 from pllm import _core
-from pllm.contracts.additive_scan import AdditiveScanEvidence, AdditiveScanPlan
-from pllm.contracts.region_imports import ScanForm
+from pllm.contracts.affine_scan import AffineScanEvidence, AffineScanPlan
+from pllm.contracts.region_imports import ScanAction, ScanForm
 from pllm.contracts.region_program import Program
 from pllm.contracts.region_selection import RegionCandidate, RegionPayloadLimit
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.region_compilation import analyze_region_program
-from pllm.execution.region_native import AdditiveScanPrimitive, RegionFunction
+from pllm.execution.region_native import AffineScanPrimitive, RegionFunction
 from pllm.execution.region_storage import analyze_region_payload, import_region_functions
 from pllm.execution.region_values import Bank, Data
 from pllm.kernels.additive_scan import AdditiveBuffers, launch_window
+from pllm.kernels.right_matrix_scan import RightMatrixBuffers, launch_window as launch_right_window
 
 if TYPE_CHECKING:
     from pllm.execution.region_optimization import PreparedRegionCandidate
@@ -53,7 +54,7 @@ def _pack(rows: tuple[torch.Tensor, ...], window: int, chunk: int, width: int, l
 class AdditiveUpdate:
     """Run the verified window size without retaining invocation state."""
 
-    plan: AdditiveScanPlan
+    plan: AffineScanPlan
 
     def __call__(self, inputs: tuple[Data, ...]) -> tuple[Data, ...]:
         carry, base, xs, ys = inputs
@@ -78,29 +79,59 @@ class AdditiveUpdate:
         return state.clone(), Bank(tuple(outputs))
 
 
+@dataclass(frozen=True, slots=True)
+class RightMatrixUpdate:
+    """Stage only real eager windows; the kernel itself also accepts padded graph slots."""
+
+    plan: AffineScanPlan
+
+    def __call__(self, inputs: tuple[Data, ...]) -> tuple[Data, ...]:
+        carry, xs, ks = inputs
+        assert isinstance(carry, torch.Tensor) and isinstance(xs, Bank) and isinstance(ks, Bank)
+        x, k, plan = _tensors(xs), _tensors(ks), self.plan
+        buffers = RightMatrixBuffers(carry, plan.window, plan.chunk)
+        xx = carry.new_empty((plan.window, carry.shape[0], plan.chunk, carry.shape[1]))
+        kk = torch.empty_like(xx)
+        outputs: list[torch.Tensor] = []
+        state = carry
+        active = torch.empty((), dtype=torch.int32, device=carry.device)
+        for start in range(0, len(x), plan.window):
+            size = min(len(x) - start, plan.window)
+            xx.zero_()
+            kk.zero_()
+            torch.stack(x[start : start + size], out=xx[:size].transpose(1, 2))
+            torch.stack(k[start : start + size], out=kk[:size].transpose(1, 2))
+            active.fill_(size)
+            launch_right_window(xx, kk, state, active, buffers, plan.scale, plan.decay, plan.implementation.form)
+            state = buffers.final
+            outputs.extend(row.transpose(0, 1).clone() for row in buffers.output[:size].unbind())
+        return state.clone(), Bank(tuple(outputs))
+
+
 def candidates(
-    program: Program, cells: Mapping[str, RegionFunction], limits: tuple[RegionPayloadLimit, ...]
+    program: Program,
+    cells: Mapping[str, RegionFunction],
+    limits: tuple[RegionPayloadLimit, ...],
 ) -> Iterator["PreparedRegionCandidate"]:
     """Offer budget-fitting windows; the normal selector chooses their execution."""
     from pllm.execution.region_optimization import PreparedRegionCandidate
 
-    # Enumerate only the port frontier this kernel can implement. The Rust
-    # derivation remains the authority for every source operation and shape.
-    if program.resources or len(program.entry.block.arguments) != 4 or len(program.entry.block.operations) != 1:
-        return
     imports = import_region_functions(program, cells)
     # These are backend workspace facts, not a claim about currently free VRAM.
     workspace = torch.backends.cuda.cublas_workspace_size() + torch.backends.cuda.cublaslt_workspace_size()
     for window in (1, 2, 4, 8, 16, 32, 64):
         for form in (ScanForm.ORDERED, ScanForm.HILLIS_STEELE):
-            evidence = AdditiveScanEvidence(window, workspace, form)
-            encoded = _core.derive_additive_scan(
+            evidence = AffineScanEvidence(window, workspace, form)
+            encoded = _core.derive_affine_scan(
                 encode_boundary(program), encode_boundary(imports), encode_boundary(evidence)
             )
             if encoded == "null":
                 return
-            plan = decode_boundary(encoded, AdditiveScanPlan)
-            primitive = AdditiveScanPrimitive(plan.implementation, AdditiveUpdate(plan))
+            plan = decode_boundary(encoded, AffineScanPlan)
+            if plan.implementation.action is ScanAction.RIGHT_MATRIX:
+                primitive = AffineScanPrimitive(plan.implementation, RightMatrixUpdate(plan))
+            else:
+                primitive = AffineScanPrimitive(plan.implementation, AdditiveUpdate(plan))
             functions: dict[str, RegionFunction] = {**cells, primitive.declaration.name: primitive}
             schedule = analyze_region_program(plan.program, optimize=False).reference_schedule
             payload = analyze_region_payload(plan.program, schedule, functions)
@@ -110,9 +141,27 @@ def candidates(
             ):
                 return  # Both forms have the same bound; larger windows only add scratch.
             candidate = RegionCandidate(
-                schedule, import_region_functions(plan.program, functions), (), additive_scan=evidence
+                schedule, import_region_functions(plan.program, functions), (), affine_scan=evidence
             )
             yield PreparedRegionCandidate(plan.program, candidate, (), functions)
+
+
+def competitive_candidates(
+    program: Program, cells: Mapping[str, RegionFunction], limits: tuple[RegionPayloadLimit, ...]
+) -> Iterator["PreparedRegionCandidate"]:
+    """Filter composition work and dependency depth using Rust-derived plans.
+
+    At d=896, eager host overhead can hide a large GPU-time regression. Both
+    policies retain the source there; the raw catalogue remains measurable.
+    """
+    for candidate in candidates(program, cells, limits):
+        primitive = candidate.cells[candidate.program.functions[-1].name]
+        assert isinstance(primitive, AffineScanPrimitive)
+        if primitive.implementation.action is ScanAction.RIGHT_MATRIX:
+            assert isinstance(primitive.function, RightMatrixUpdate)
+            if not primitive.function.plan.competitive():
+                continue
+        yield candidate
 
 
 def payload_budget(
@@ -128,10 +177,13 @@ def payload_budget(
     budget = (
         reference if ceiling is None else tuple(RegionPayloadLimit(r.device, min(r.bytes, ceiling)) for r in reference)
     )
-    for candidate in candidates(program, cells, available):
-        evidence = candidate.candidate.additive_scan
+    for candidate in competitive_candidates(program, cells, available):
+        evidence = candidate.candidate.affine_scan
         assert evidence is not None
-        if ceiling is None and evidence.window > 8:
+        primitive = candidate.cells[candidate.program.functions[-1].name]
+        assert isinstance(primitive, AffineScanPrimitive)
+        default_window = 64 if primitive.implementation.action is ScanAction.RIGHT_MATRIX else 8
+        if ceiling is None and evidence.window > default_window:
             break
         payload = analyze_region_payload(candidate.program, candidate.candidate.schedule_map, candidate.cells)
         budget = tuple(
@@ -150,7 +202,7 @@ def preference(candidate: "PreparedRegionCandidate") -> tuple[int, bool]:
     retain the smaller rounding change there. Measured selection overrides
     this cold ordering with completed execution costs at the real C.
     """
-    evidence = candidate.candidate.additive_scan
+    evidence = candidate.candidate.affine_scan
     assert evidence is not None
     preferred = (evidence.form is ScanForm.HILLIS_STEELE) == (evidence.window >= 16)
     # Ascending order: the shortlist keeps the tail, so the preferred form sorts last.

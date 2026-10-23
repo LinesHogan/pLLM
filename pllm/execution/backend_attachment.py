@@ -68,6 +68,10 @@ def attachment_buffer_bytes(
             outputs, inputs = first
             # Owned hidden/MLP snapshots survive forward; base weights are borrowed.
             buffers += rows * (width * (inputs + hidden + outputs) + 8)
+        elif binding.operator is ParameterOverlayOperator.HEAD_ADD:
+            heads, width_per_head, _ = first
+            # Owned capture, fp32 input/correction, layout copy, cast and addition.
+            buffers += rows * (6 * width * heads * width_per_head + 8)
         else:
             rank, inputs = first
             outputs = fields[binding.fields[1]].shape[0]

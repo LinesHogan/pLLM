@@ -98,6 +98,7 @@ from pllm.execution.tensor_program import (
 from pllm.execution.tensor_task import TensorTask
 from pllm.execution.trace import MAX_SNAPSHOT_BYTES
 from pllm.kernels.adamw import AdamWConfig
+from pllm.kernels.head_overlay import head_correction
 
 if TYPE_CHECKING:
     from pllm.authoring import BackendCompileFacts, TensorStepInput
@@ -110,7 +111,7 @@ def _check_overlay_fields(
     operator: ParameterOverlayOperator,
     scale: float,
 ) -> None:
-    arity = 1 if operator is ParameterOverlayOperator.DENSE_ADD else 2
+    arity = 2 if operator is ParameterOverlayOperator.LOW_RANK_ADD else 1
     if (
         not targets
         or tuple(sorted(set(targets))) != targets
@@ -132,12 +133,25 @@ def _check_overlay_shapes(
     for inputs, outputs in dimensions.target_shapes:
         if operator is ParameterOverlayOperator.DENSE_ADD:
             matched = shape_of(applied[0], inputs, outputs) == (outputs, inputs)
+        elif operator is ParameterOverlayOperator.HEAD_ADD:
+            shape = shape_of(applied[0], inputs, outputs)
+            matched = (
+                len(shape) == 3
+                and shape[0] > 0
+                and shape[1] == shape[2] > 0
+                and shape[0] * shape[1] == inputs == outputs
+            )
         else:
             down, up = (shape_of(key, inputs, outputs) for key in applied)
             matched = (
                 len(down) == 2 and len(up) == 2 and 1 <= down[0] == up[1] and down[1] == inputs and up[0] == outputs
             )
-        if not matched or any(buffers[key].dtype not in (None, tensor_dtype(dimensions.dtype)) for key in applied):
+        dtypes = (
+            (torch.float32,)
+            if operator is ParameterOverlayOperator.HEAD_ADD
+            else (None, tensor_dtype(dimensions.dtype))
+        )
+        if not matched or any(buffers[key].dtype not in dtypes for key in applied):
             raise ValueError("overlay fields must match their operator, target shape and dtype")
 
 
@@ -264,7 +278,7 @@ class OverlayTransition:
     buffers: tuple[str, ...]
     targets: tuple[ParameterTarget, ...]
     phases: tuple[HiddenPhase, ...]
-    effective: Callable[[Tensors], torch.Tensor]
+    apply: Callable[[torch.Tensor, torch.Tensor, Tensors], torch.Tensor]
     function: Callable[[Tensors], TensorUpdate]
 
     def __call__(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
@@ -294,7 +308,7 @@ class OverlayTransition:
                             }
                         )
                     else:
-                        result = TensorUpdate(operand.hidden @ (operand.base_weight + self.effective(values)).T)
+                        result = TensorUpdate(self.apply(operand.hidden, operand.base_weight, values))
                     if (
                         result.output.shape != operand.desired.shape
                         or result.output.dtype != operand.hidden.dtype
@@ -549,10 +563,15 @@ class TensorBinding(Builder[TensorFrame]):
             keys=keys,
         )
 
-        def effective(values: Mapping[str, torch.Tensor]) -> torch.Tensor:
-            if operator is ParameterOverlayOperator.DENSE_ADD:
-                return values[applied[0]] * scale
-            return values[applied[1]] @ values[applied[0]] * scale
+        def apply(hidden: torch.Tensor, base: torch.Tensor, values: Tensors) -> torch.Tensor:
+            if operator is ParameterOverlayOperator.HEAD_ADD:
+                return hidden @ base.T + (head_correction(hidden, values[applied[0]]) * scale).to(hidden.dtype)
+            delta = (
+                values[applied[0]]
+                if operator is ParameterOverlayOperator.DENSE_ADD
+                else values[applied[1]] @ values[applied[0]]
+            )
+            return hidden @ (base + delta * scale).T
 
         def select(data: TensorFrame, selection: RequestStateSelection) -> tuple[int, ...]:
             return tuple(
@@ -575,7 +594,7 @@ class TensorBinding(Builder[TensorFrame]):
             changes=state,
             effect=StateEffectKind.TRANSITION_MAYBE,
             when=When.MODEL_UPDATE,
-            function=OverlayTransition(tuple(buffers), targets, phases, effective, function),
+            function=OverlayTransition(tuple(buffers), targets, phases, apply, function),
             select=select,
             implementations=(
                 native(identity + ":cpu", "compute/cpu@1", "transition/full_root@1"),

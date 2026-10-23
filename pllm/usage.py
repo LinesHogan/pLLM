@@ -663,7 +663,7 @@ def overlay(
     decode: bool | Config = False,
     replay: ConditionalLayerReplay | Config | None = None,
 ) -> Callable[[F], F]:
-    """Apply request-state fields to model parameters; dense uses `weight`, low-rank the factor pair."""
+    """Apply request state to projections; dense/head operators use `weight`, low-rank the factor pair."""
 
     return _mark(
         effect=_Overlay(

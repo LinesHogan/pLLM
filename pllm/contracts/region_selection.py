@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import Literal
 
-from pllm.contracts.additive_scan import AdditiveScanEvidence
+from pllm.contracts.affine_scan import AffineScanEvidence
 from pllm.contracts.region_capacity import RegionCapacity
 from pllm.contracts.region_imports import RegionTensorImport
 from pllm.contracts.region_outlining import CallOutlineEvidence
@@ -36,7 +36,7 @@ class RegionCandidate:
     elapsed_ns: tuple[int, ...]
     outlines: tuple[CallOutlineEvidence, ...] = ()
     stream_plan: RegionStreamPlan | None = None
-    additive_scan: AdditiveScanEvidence | None = None
+    affine_scan: AffineScanEvidence | None = None
 
 
 @dataclass(frozen=True, slots=True)

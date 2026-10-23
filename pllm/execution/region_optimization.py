@@ -51,7 +51,7 @@ from pllm.execution.region_compilation import (
 )
 from pllm.execution.region_execution import RegionInstructionExecution
 from pllm.execution.region_native import (
-    AdditiveScanPrimitive,
+    AffineScanPrimitive,
     CompiledPrimitive,
     RegionFunction,
     TensorSource,
@@ -376,9 +376,9 @@ def prepare_region_candidates(
     order = base.schedule_map if base.stream_plan is None else base.stream_plan.schedule_map
     alternatives: tuple[PreparedRegionCandidate, ...] = ()
     if options.allow_numerical_transforms and len(proposals) < max_candidates:
-        from pllm.execution.additive_scan import candidates, preference
+        from pllm.execution.affine_scan import competitive_candidates, preference
 
-        alternatives = tuple(sorted(candidates(program, sources, limits), key=preference))
+        alternatives = tuple(sorted(competitive_candidates(program, sources, limits), key=preference))
     # Keep both ordered and tree choices in the measured shortlist; tensor
     # fusion alternatives must not consume every available slot first.
     reserved = min(2, len(alternatives), max_candidates - len(proposals))
@@ -431,7 +431,7 @@ def warn_region_transforms(
         t
         for name, cell in execution.cells.items()
         if name in assessment.changed_functions
-        and isinstance(cell, (ExportedCell, CompiledPrimitive, AdditiveScanPrimitive))
+        and isinstance(cell, (ExportedCell, CompiledPrimitive, AffineScanPrimitive))
         for t in cell.transformations
     )
     warn_numerical_transforms(identity, transforms)

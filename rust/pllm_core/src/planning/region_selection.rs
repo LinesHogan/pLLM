@@ -45,7 +45,7 @@ pub(super) struct Candidate {
     #[serde(default)]
     pub stream_plan: Option<super::region_streams::StreamPlan>,
     #[serde(default)]
-    pub additive_scan: Option<super::additive_scan::Evidence>,
+    pub affine_scan: Option<super::affine_scan::Evidence>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

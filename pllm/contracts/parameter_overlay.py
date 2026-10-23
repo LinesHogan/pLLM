@@ -26,6 +26,7 @@ class ParameterRole(StrEnum):
 class ParameterOverlayOperator(StrEnum):
     DENSE_ADD = "dense_add"
     LOW_RANK_ADD = "low_rank_add"
+    HEAD_ADD = "head_add"
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -83,7 +84,7 @@ class ParameterEffect:
     @property
     def applied_fields(self) -> tuple[str, ...]:
         """The fields consumed by the declared projection operator."""
-        return (self.weight,) if self.operator is ParameterOverlayOperator.DENSE_ADD else self.factors
+        return self.factors if self.operator is ParameterOverlayOperator.LOW_RANK_ADD else (self.weight,)
 
 
 @dataclass(frozen=True)

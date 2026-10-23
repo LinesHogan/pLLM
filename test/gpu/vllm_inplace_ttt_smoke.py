@@ -31,7 +31,8 @@ from pllm.contracts.parameter_overlay import (
 )
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
-from pllm.execution.additive_scan import AdditiveUpdate
+from pllm.execution.affine_scan import AdditiveUpdate, RightMatrixUpdate
+from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
 
 TARGET = ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT)
@@ -104,12 +105,12 @@ class ImportedLowRank(pllm.Workload):
         )
 
 
-def open_llm(workload, seqs=2, tokens=64, **execution) -> VllmLlm[object, object]:
+def open_llm(workload, seqs=2, tokens=64, model_length=64, **execution) -> VllmLlm[object, object]:
     options = {"execution": pllm.ExecutionOptions(**execution)} if execution else {}
     config = ModelConfig(
         model="Qwen/Qwen2.5-0.5B-Instruct",
         dtype=VllmDType.BFLOAT16,
-        max_model_len=64,
+        max_model_len=model_length,
         max_num_seqs=seqs,
         max_num_batched_tokens=tokens,
         gpu_memory_utilization=0.25,
@@ -131,7 +132,13 @@ def texts(outputs) -> tuple[str, ...]:
 
 
 def _check(handle: VllmLlm[object, object], label: str) -> tuple[str, ...]:
-    prompts = ["The sky is blue. " * 5, "Water freezes when it is cold. " * 4] if label.startswith("dense") else PROMPTS
+    prompts = (
+        ["The sky is blue. " * 5, "Water freezes when it is cold. " * 4]
+        if label.startswith(("dense", "gated"))
+        else PROMPTS
+    )
+    if label.startswith("gated"):
+        prompts = ["The sky is blue. " * 100, "Water freezes when it is cold. " * 80]
     outputs = texts(handle.generate(prompts, SAMPLING))
     diagnostics = handle.deployment.execution.diagnostics()
     if (
@@ -217,6 +224,11 @@ def main() -> int:
     dense = InPlaceTTTWorkload(
         InPlaceTTTConfig((TARGET,), chunk_size=1, learning_rate=1e-4, update_prefill=True, update_decode=False)
     )
+    headwise = GatedDeltaWorkload(
+        GatedDeltaConfig(
+            (ParameterTarget(0, ParameterModuleKind.ATTENTION, ParameterRole.QUERY_PROJECTION_WEIGHT),), chunk_size=64
+        )
+    )
     scenarios = (
         (
             "dense_strict",
@@ -232,6 +244,22 @@ def main() -> int:
             "dense_1536",
             lambda: open_llm(dense, memory_budget_bytes=1536 << 20),
             lambda h: _check(h, "dense tree"),
+        ),
+        (
+            "gated_strict",
+            lambda: open_llm(
+                headwise,
+                tokens=2048,
+                model_length=1024,
+                memory_budget_bytes=256 << 20,
+                allow_numerical_transforms=False,
+            ),
+            lambda h: _check(h, "gated strict"),
+        ),
+        (
+            "gated",
+            lambda: open_llm(headwise, tokens=2048, model_length=1024, memory_budget_bytes=256 << 20),
+            lambda h: _check(h, "gated tree"),
         ),
         ("low_rank", lambda: open_llm(RequestLowRankTTT()), lambda h: _check(h, "request low-rank")),
         ("imported", lambda: open_llm(ImportedLowRank(), memory_budget_bytes=1 << 30), _check_imported),
@@ -251,18 +279,29 @@ def main() -> int:
                 forms.add((update.plan.implementation.form.value, update.plan.window))
                 return execute(update, inputs)
 
-            with patch.object(AdditiveUpdate, "__call__", record):
+            execute_right = RightMatrixUpdate.__call__
+
+            def record_right(update, inputs):
+                forms.add(("right_matrix:" + update.plan.implementation.form.value, update.plan.window))
+                return execute_right(update, inputs)
+
+            with (
+                patch.object(AdditiveUpdate, "__call__", record),
+                patch.object(RightMatrixUpdate, "__call__", record_right),
+            ):
                 results[name] = check(handle)
             if name == "dense_1536" and not any(form == "hillis_steele" for form, _ in forms):
                 raise RuntimeError("large-budget dense overlay did not exercise a tree window")
+            if name == "gated" and not any(form.startswith("right_matrix:") for form, _ in forms):
+                raise RuntimeError("Gated delta overlay did not exercise a right-matrix scan")
             after = (cache.num_blocks, tuple(tensor.size for tensor in cache.kv_cache_tensors))
             if before != after:
                 raise RuntimeError("overlay execution changed the vLLM KV allocation")
             if name == "dense_strict":
                 dense_cache = before
-            if name.startswith("dense_") and before != dense_cache:
+            if name.startswith(("dense_", "gated")) and before != dense_cache:
                 raise RuntimeError("additive scan changed vLLM KV-cache capacity")
-            if name.startswith("dense_"):
+            if name.startswith(("dense_", "gated")):
                 print(
                     json.dumps(
                         {

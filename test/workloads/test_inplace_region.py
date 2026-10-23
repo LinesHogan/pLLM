@@ -25,7 +25,7 @@ from pllm.contracts.region_selection import RegionPayloadLimit, RegionSelectionP
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
-from pllm.execution.additive_scan import candidates as additive_candidates
+from pllm.execution.affine_scan import candidates as affine_candidates
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
@@ -179,7 +179,7 @@ def test_scan_matches_the_serial_loop_including_carry_views(device):
                 )
                 scan = TensorScan(cell, 5, carry=1, invariants=1)
             assert not tuple(
-                additive_candidates(scan.program, {cell.digest: cell}, (RegionPayloadLimit(device, 1 << 30),))
+                affine_candidates(scan.program, {cell.digest: cell}, (RegionPayloadLimit(device, 1 << 30),))
             )
             continue
         reference, outputs = carry, []

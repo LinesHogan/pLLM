@@ -13,7 +13,7 @@ pub(super) struct KernelAllocation { pub name: String, pub device: String, pub b
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum TensorImport {
     Exported { access: AccessGraph },
-    AdditiveScan { declaration: Function, device: String, allocations: Vec<KernelAllocation>, form: super::additive_scan::Form },
+    AffineScan { declaration: Function, device: String, allocations: Vec<KernelAllocation>, form: super::affine_scan::Form, action: super::affine_scan::Action },
     Native { declaration: Function },
     Borrowed { declaration: Function, field: u64 },
     NativeKernel { declaration: Function, implementation: String, device: String, allocations: Vec<KernelAllocation>, host_reads: bool, tensor_sources: Vec<AccessGraph> },
@@ -67,7 +67,7 @@ impl TensorImport {
         match self {
             Self::Exported { access } => &access.source_digest,
             Self::Native { declaration } | Self::NativeKernel { declaration, .. }
-                | Self::FunctionalKernel { declaration, .. } | Self::AdditiveScan { declaration, .. } | Self::Borrowed { declaration, .. } => &declaration.name,
+                | Self::FunctionalKernel { declaration, .. } | Self::AffineScan { declaration, .. } | Self::Borrowed { declaration, .. } => &declaration.name,
             Self::Compiled { source_access, .. } => &source_access.source_digest,
         }
     }
@@ -123,24 +123,24 @@ impl TensorImport {
                 }
             },
             Self::Native { declaration } | Self::NativeKernel { declaration, .. }
-                | Self::FunctionalKernel { declaration, .. } | Self::AdditiveScan { declaration, .. } => {
+                | Self::FunctionalKernel { declaration, .. } | Self::AffineScan { declaration, .. } => {
                 if declaration != function {
                     return Err("native storage import differs from its source declaration".into());
                 }
                 for type_ in declaration.inputs.iter().chain(&declaration.outputs) {
                     validate_native_port(type_)?;
                 }
-                if let Self::AdditiveScan { device, allocations, .. } = self {
+                if let Self::AffineScan { device, allocations, .. } = self {
                     let mut names = BTreeSet::new();
                     if !device.starts_with("cuda") || allocations.iter().any(|a|
                         a.name.is_empty() || a.device != *device || !names.insert(&a.name)) {
-                        return Err("additive scan needs unique CUDA allocation facts".into());
+                        return Err("affine scan needs unique CUDA allocation facts".into());
                     }
                     for type_ in declaration.inputs.iter().chain(&declaration.outputs) {
                         let Some(Type::Tensor { device: port, .. }) = super::region_storage::tensor_leaf(type_) else {
-                            return Err("additive scan ports must contain tensors".into());
+                            return Err("affine scan ports must contain tensors".into());
                         };
-                        if port != device { return Err("additive scan ports must use its execution device".into()); }
+                        if port != device { return Err("affine scan ports must use its execution device".into()); }
                     }
                 }
                 if let Self::NativeKernel { tensor_sources, .. } = self {

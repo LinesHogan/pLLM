@@ -219,7 +219,7 @@ fn validate_request(
                 || bindings.iter().any(|binding| {
                     !binding.scale.is_finite()
                         || match binding.operator {
-                            OverlayOperator::DenseAdd => binding.fields.len() != 1,
+                            OverlayOperator::DenseAdd | OverlayOperator::HeadAdd => binding.fields.len() != 1,
                             OverlayOperator::LowRankAdd => {
                                 binding.fields.len() != 2 || binding.fields[0] == binding.fields[1]
                             }
@@ -263,7 +263,7 @@ fn validate_probe(probe: &BackendPlacementProbe) -> Result<(), String> {
             return Err("backend source catalog requires distinct imports".into());
         }
         let declaration = match imported {
-            TensorImport::Compiled { .. } | TensorImport::AdditiveScan { .. } => return Err("compiled alternatives require numerical selection, not a source catalog".into()),
+            TensorImport::Compiled { .. } | TensorImport::AffineScan { .. } => return Err("compiled alternatives require numerical selection, not a source catalog".into()),
             TensorImport::Native { declaration } | TensorImport::Borrowed { declaration, .. } => declaration,
             TensorImport::NativeKernel { declaration, device, .. }
                 | TensorImport::FunctionalKernel { declaration, device, .. } => {

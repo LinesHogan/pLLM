@@ -31,7 +31,7 @@ from pllm.contracts.region_selection import (
     RegionSelectionRequest,
     RegionTuningSize,
 )
-from pllm.execution.additive_scan import candidates as additive_candidates
+from pllm.execution.affine_scan import candidates as affine_candidates
 from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
 from pllm.execution.region_compilation import (
     analyze_region_program,
@@ -241,7 +241,7 @@ def test_tuned_tensor_scan_keeps_one_symbolic_plan_and_its_guards():
         scan = TensorScan(cell, SizeParameter("n", 0, 9), carry=1, invariants=1)
     imports = import_region_functions(scan.program, {cell.digest: cell})
     limits = (RegionPayloadLimit("cuda:0", 32 << 20),)
-    alternatives = tuple(additive_candidates(scan.program, {cell.digest: cell}, limits))
+    alternatives = tuple(affine_candidates(scan.program, {cell.digest: cell}, limits))
     assert alternatives
     candidate = replace(alternatives[0].candidate, elapsed_ns=(50,))
     request = RegionSelectionRequest(
@@ -256,19 +256,19 @@ def test_tuned_tensor_scan_keeps_one_symbolic_plan_and_its_guards():
     assert select_region_candidate(scan.program, replace(request, allow_numerical_transforms=False)).selected == 0
     source_peak = assess_region_candidates(scan.program, request)[0].peak_bytes
     assert select_region_candidate(scan.program, replace(request, payload_limits=source_peak)).selected == 0
-    assert candidate.additive_scan is not None
-    forged = replace(candidate, additive_scan=replace(candidate.additive_scan, window=4))
-    with pytest.raises(ValueError, match="additive scan imports differ"):
+    assert candidate.affine_scan is not None
+    forged = replace(candidate, affine_scan=replace(candidate.affine_scan, window=4))
+    with pytest.raises(ValueError, match="affine scan imports differ"):
         select_region_candidate(scan.program, replace(request, candidates=(request.candidates[0], forged)))
     tree = next(
         p
         for p in alternatives
-        if p.candidate.additive_scan.form is ScanForm.HILLIS_STEELE and p.candidate.additive_scan.window == 8
+        if p.candidate.affine_scan.form is ScanForm.HILLIS_STEELE and p.candidate.affine_scan.window == 8
     )
-    evidence = tree.candidate.additive_scan
+    evidence = tree.candidate.affine_scan
     assert evidence is not None
-    forged = replace(tree.candidate, additive_scan=replace(evidence, form=ScanForm.ORDERED), elapsed_ns=(50,))
-    with pytest.raises(ValueError, match="additive scan imports differ"):
+    forged = replace(tree.candidate, affine_scan=replace(evidence, form=ScanForm.ORDERED), elapsed_ns=(50,))
+    with pytest.raises(ValueError, match="affine scan imports differ"):
         select_region_candidate(scan.program, replace(request, candidates=(request.candidates[0], forged)))
     if torch.cuda.is_available():
         # Separate allocations exercise the bank-packing path as well as a
@@ -338,6 +338,150 @@ def test_tuned_tensor_scan_keeps_one_symbolic_plan_and_its_guards():
                 buffers.output[:count], torch.bmm(staged_x[:count], (base[None] + prefixes[:count]).transpose(1, 2))
             )
             assert pointers == tuple(t.data_ptr() for t in storage)
+        _check_right_matrix_rewrite()
+
+
+def _right_oracle(initial, values, keys, alpha, beta):
+    """Independent row-wise FP64 SGD, not a coefficient or tree implementation."""
+    state, outputs = initial.double(), []
+    for x, k in zip(values.double(), keys.double(), strict=True):
+        outputs.append(torch.einsum("hij,thj->thi", state, x))
+        decayed = state * alpha
+        gradient = torch.zeros_like(state)
+        for row, key in zip(x, k, strict=True):
+            error = torch.einsum("hij,hj->hi", decayed, key) - row
+            gradient += torch.einsum("hi,hj->hij", error, key)
+        state = decayed - beta * gradient
+    return state, tuple(outputs)
+
+
+def _check_right_matrix_rewrite():
+    """Prove the head-batched source, reject bf16, and replay both numerical forms."""
+    from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
+    from pllm.contracts.region_imports import ScanAction
+    from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
+
+    target = ParameterTarget(0, ParameterModuleKind.ATTENTION, ParameterRole.QUERY_PROJECTION_WEIGHT)
+    workload = GatedDeltaWorkload(GatedDeltaConfig((target,), head_width=3, chunk_size=2, alpha=0.83, beta=0.17))
+    limits = (RegionPayloadLimit("cuda:0", 32 << 20),)
+    for dtype in (torch.bfloat16, torch.float32):
+        with FakeTensorMode():
+            samples = tuple(
+                torch.empty(shape, dtype=dtype, device="cuda:0") for shape in ((2, 3, 3), (2, 2, 3), (2, 2, 3))
+            )
+            cell = ExportedCell.capture(workload.step, ("state", "values", "keys"), ("next", "output"), samples)
+            scan = TensorScan(cell, SizeParameter("c", 0, 5), carry=1, invariants=0)
+        choices = tuple(affine_candidates(scan.program, {cell.digest: cell}, limits))
+        if dtype is torch.bfloat16:
+            assert not choices
+            continue
+        assert choices and all(
+            c.cells[c.program.functions[-1].name].implementation.action is ScanAction.RIGHT_MATRIX for c in choices
+        )
+        imports = import_region_functions(scan.program, {cell.digest: cell})
+        reference = RegionCandidate(
+            analyze_region_program(scan.program, optimize=False).reference_schedule, imports, (100,)
+        )
+        generator = torch.Generator(device="cuda:0").manual_seed(92)
+        initial = torch.randn(2, 3, 3, device="cuda:0", generator=generator) * 0.2
+        values = torch.randn(5, 2, 2, 3, device="cuda:0", generator=generator)
+        keys = torch.nn.functional.normalize(values, dim=-1)
+        serial, serial_outputs = initial, []
+        for x, k in zip(values, keys, strict=True):
+            serial, output = workload.step(serial, x, k)
+            serial_outputs.append(output)
+        strict = scan((initial,), (), (tuple(values), tuple(keys)))
+        assert torch.equal(strict.carry[0], serial)
+        assert all(torch.equal(a, b) for a, b in zip(strict.columns[0], serial_outputs, strict=True))
+        for choice in (p for p in choices if p.candidate.affine_scan.window == 4):
+            request = RegionSelectionRequest(
+                imports,
+                (reference, replace(choice.candidate, elapsed_ns=(50,))),
+                limits,
+                True,
+                "right action",
+                (RegionTuningSize("c", 5),),
+            )
+            assert (
+                select_region_candidate(scan.program, replace(request, allow_numerical_transforms=False)).selected == 0
+            )
+            execution = bind_region_candidate(choice, limits, assess_region_candidates(scan.program, request)[1])
+            for count in (0, 1, 3, 5):
+                args = dict(
+                    zip(
+                        (v.name for v in scan.program.entry.block.arguments),
+                        (initial, Bank(tuple(values[:count])), Bank(tuple(keys[:count]))),
+                        strict=True,
+                    )
+                )
+                final, outputs = execution.run(args, sizes={"c": count}).values
+                expected, expected_outputs = _right_oracle(initial, values[:count], keys[:count], 0.83, 0.17)
+                torch.testing.assert_close(final.double(), expected, rtol=2e-6, atol=2e-7)
+                torch.testing.assert_close(
+                    tuple(v.double() for v in outputs.elements), expected_outputs, rtol=2e-6, atol=2e-7
+                )
+        _check_right_matrix_graph(initial, values, keys)
+    # Cost follows the source chunk work, not an absolute head-width threshold.
+    from pllm.execution.affine_scan import competitive_candidates
+
+    for width, chunk, competitive in ((64, 64, True), (896, 64, False), (896, 896, True)):
+        with FakeTensorMode():
+            samples = tuple(
+                torch.empty(shape, device="cuda:0")
+                for shape in ((1, width, width), (chunk, 1, width), (chunk, 1, width))
+            )
+            cell = ExportedCell.capture(workload.step, ("state", "values", "keys"), ("next", "output"), samples)
+            scan = TensorScan(cell, 8, carry=1, invariants=0)
+        limits = (RegionPayloadLimit("cuda:0", 1 << 30),)
+        assert next(affine_candidates(scan.program, {cell.digest: cell}, limits), None) is not None
+        offered = tuple(competitive_candidates(scan.program, {cell.digest: cell}, limits))
+        assert bool(offered) == competitive
+        if competitive:
+            forms = {(p.candidate.affine_scan.form, p.candidate.affine_scan.window) for p in offered}
+            assert (ScanForm.HILLIS_STEELE, 8) in forms
+            assert (ScanForm.ORDERED, 2) in forms and (ScanForm.HILLIS_STEELE, 2) not in forms
+
+
+def _check_right_matrix_graph(initial, values, keys):
+    """Changing C reuses one captured window; reversed right actions fail the oracle."""
+    from pllm.kernels.right_matrix_scan import RightMatrixBuffers, launch_window as launch_right_window
+
+    x = initial.new_zeros((8, 2, 2, 3))
+    k = torch.zeros_like(x)
+    active = torch.zeros((), dtype=torch.int32, device=initial.device)
+    buffers = RightMatrixBuffers(initial, 8, 2)
+    launch_right_window(x, k, initial, active, buffers, 0.17, 0.83, ScanForm.HILLIS_STEELE)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch_right_window(x, k, initial, active, buffers, 0.17, 0.83, ScanForm.HILLIS_STEELE)
+    storage = (x, k, active, buffers.a, buffers.b, buffers.states, buffers.final, buffers.output)
+    addresses = tuple(t.data_ptr() for t in storage)
+    for count in (5, 0, 1, 3, 5):
+        x.zero_()
+        k.zero_()
+        x[:count].copy_(values[:count].transpose(1, 2))
+        k[:count].copy_(keys[:count].transpose(1, 2))
+        active.fill_(count)
+        graph.replay()
+        expected, outputs = _right_oracle(initial, values[:count], keys[:count], 0.83, 0.17)
+        torch.testing.assert_close(buffers.final.double(), expected, rtol=2e-6, atol=2e-7)
+        torch.testing.assert_close(
+            tuple(v.transpose(0, 1).double() for v in buffers.output[:count]), outputs, rtol=2e-6, atol=2e-7
+        )
+        assert addresses == tuple(t.data_ptr() for t in storage)
+    # Noncommuting symmetric per-chunk A matrices expose reversed composition;
+    # independent B and a nonsymmetric initial state also expose left action.
+    vv, kk = values.double().transpose(1, 2), keys.double().transpose(1, 2)
+    a = 0.83 * (torch.eye(3, device=initial.device) - 0.17 * (kk.transpose(-2, -1) @ kk))
+    b = 0.17 * (vv.transpose(-2, -1) @ kk)
+    wrong = initial.double()
+    for aa, bb in zip(a, b, strict=True):
+        wrong = aa @ wrong + bb
+    assert not torch.allclose(wrong, expected, rtol=1e-3, atol=1e-3)
+    prefix_a, prefix_b = a[0], b[0]
+    for aa, bb in zip(a[1:], b[1:], strict=True):
+        prefix_a, prefix_b = aa @ prefix_a, bb @ prefix_a + prefix_b
+    assert not torch.allclose(initial.double() @ prefix_a + prefix_b, expected, rtol=1e-3, atol=1e-3)
 
 
 def test_tuner_without_numerical_permission_never_warns_or_offers_rewrites():

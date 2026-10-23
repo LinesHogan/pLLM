@@ -24,7 +24,7 @@ from pllm.execution.region_compilation import lower_region_bindings, lower_regio
 from pllm.execution.region_control import RegionActions
 from pllm.execution.region_frame import RegionValueFrame, RegionValueLayout, Routes, expand_accesses
 from pllm.execution.region_native import (
-    AdditiveScanPrimitive,
+    AffineScanPrimitive,
     BorrowedTensorPrimitive,
     CompiledPrimitive,
     FunctionalKernelPrimitive,
@@ -96,7 +96,7 @@ class RegionExecutionPlan:
 
     def bind(self, cells: Mapping[str, RegionFunction]) -> "RegionInstructionExecution":
         if any(
-            isinstance(cell, (CompiledPrimitive, AdditiveScanPrimitive))
+            isinstance(cell, (CompiledPrimitive, AffineScanPrimitive))
             or isinstance(cell, ExportedCell)
             and cell.transformations
             for cell in cells.values()
@@ -148,7 +148,7 @@ class RegionInstructionExecution:
                 FunctionalKernelPrimitive,
                 CompiledPrimitive,
                 BorrowedTensorPrimitive,
-                AdditiveScanPrimitive,
+                AffineScanPrimitive,
             ):
                 raise ValueError("region calls require an exported cell or explicit native import")
             if cell.declaration != declaration:
@@ -162,7 +162,7 @@ class RegionInstructionExecution:
         self._borrow_inputs = (
             len(operations) == 1
             and isinstance(operations[0], Call)
-            and isinstance(cells[operations[0].function], AdditiveScanPrimitive)
+            and isinstance(cells[operations[0].function], AffineScanPrimitive)
         )
         self._state_windows = stream_plan.state_windows if stream_plan is not None else state_windows
         self._actions = RegionActions(program, cells)
@@ -327,7 +327,7 @@ class RegionExecution(RegionInstructionExecution):
         self, program: Program, lowered: LoweredSchedule, bindings: RegionBindings, cells: Mapping[str, RegionFunction]
     ) -> None:
         if any(
-            isinstance(cell, (CompiledPrimitive, AdditiveScanPrimitive))
+            isinstance(cell, (CompiledPrimitive, AffineScanPrimitive))
             or isinstance(cell, ExportedCell)
             and cell.transformations
             for cell in cells.values()

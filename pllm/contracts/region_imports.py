@@ -137,9 +137,16 @@ class ScanForm(StrEnum):
     HILLIS_STEELE = "hillis_steele"
 
 
+class ScanAction(StrEnum):
+    """Closed carry actions inferred from source mathematics."""
+
+    IDENTITY = "identity"
+    RIGHT_MATRIX = "right_matrix"
+
+
 @dataclass(frozen=True, slots=True)
-class AdditiveScanImport:
-    """Verified additive scan kernel: borrowed inputs and owned result banks.
+class AffineScanImport:
+    """Verified affine scan kernel: borrowed inputs and owned result banks.
 
     Allocations bound call-local scratch; independent result leaves are charged
     by the region storage analysis. Only numerical selection can bind this ABI.
@@ -149,6 +156,7 @@ class AdditiveScanImport:
     device: str
     allocations: tuple[KernelAllocation, ...]
     form: ScanForm
+    action: ScanAction
 
 
 RegionTensorImport: TypeAlias = (
@@ -158,7 +166,7 @@ RegionTensorImport: TypeAlias = (
     | FunctionalKernelImport
     | CompiledTensorImport
     | BorrowedTensorImport
-    | AdditiveScanImport
+    | AffineScanImport
 )
 
 
