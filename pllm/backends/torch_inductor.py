@@ -14,6 +14,7 @@ import operator
 from collections.abc import Generator
 from contextlib import AbstractContextManager
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Protocol, cast
 
 import torch
@@ -225,7 +226,9 @@ def _graph_allocations(graph: torch.fx.GraphModule) -> tuple[KernelAllocation, .
     return tuple(allocations)
 
 
-def compile_inductor_tensor_graph(source: torch.fx.GraphModule) -> CompiledTensorCode:
+def compile_inductor_tensor_graph(
+    source: torch.fx.GraphModule, *, autotune_at_compile_time: bool = True
+) -> CompiledTensorCode:
     """Pinned Inductor adapter: deterministic choice, graph-derived account.
 
     Dynamic library types and compiler hooks stay in this backend adapter. No
@@ -313,7 +316,7 @@ def compile_inductor_tensor_graph(source: torch.fx.GraphModule) -> CompiledTenso
         # CUDA graph pools are allocator state the graph account cannot name.
         "triton.cudagraphs": False,
         "triton.autotune_pointwise": False,
-        "triton.autotune_at_compile_time": True,
+        "triton.autotune_at_compile_time": autotune_at_compile_time,
         "post_grad_custom_pre_pass": None,
         "post_grad_custom_post_pass": None,
         "_pre_fusion_custom_pass": None,
@@ -389,11 +392,14 @@ def compile_inductor_tensor_graph(source: torch.fx.GraphModule) -> CompiledTenso
     )
 
 
+@dataclass(frozen=True, slots=True)
 class InductorTensorCompiler:
-    """Stateless provider; all compilation settings are scoped by Torch's lock."""
+    """Compiler settings are scoped by Torch's lock; the caller owns cold warmup."""
+
+    autotune_at_compile_time: bool = True
 
     def supports(self, source: torch.fx.GraphModule) -> bool:
         return supports_inductor_tensor_graph(source)
 
     def compile(self, source: torch.fx.GraphModule) -> CompiledTensorCode:
-        return compile_inductor_tensor_graph(source)
+        return compile_inductor_tensor_graph(source, autotune_at_compile_time=self.autotune_at_compile_time)

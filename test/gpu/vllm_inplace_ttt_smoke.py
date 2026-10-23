@@ -78,7 +78,12 @@ class RequestLowRankTTT(pllm.Workload):
         gradient_a = 2 * (error @ b).T @ hidden / hidden.shape[0]
         a.add_(-1e-3 * gradient_a)
         b.add_(-1e-3 * gradient_b)
-        return TensorUpdate(output, changed=True, update_count=1, trained_rows=hidden.shape[0])
+        return TensorUpdate(
+            output,
+            output.new_ones((), dtype=torch.bool),
+            output.new_ones((), dtype=torch.int64),
+            output.new_full((), hidden.shape[0], dtype=torch.int64),
+        )
 
 
 @dataclass(frozen=True)
@@ -158,28 +163,70 @@ def _check(handle: VllmLlm[object, object], label: str) -> tuple[str, ...]:
     return outputs
 
 
-def _check_graph_head(handle):
+def _check_cancelled_projection(handle):
+    """A captured real projection retains its pinned page through cancellation."""
+    from pllm.contracts.hidden_locator import HiddenPhase
+    from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
+    from pllm.contracts.request_identity import RequestIdentity
+
+    execution = handle.deployment.execution
+    overlay = handle.runner.require_session()._overlay
+    reader = overlay.readers[0]
+    identity = RequestIdentity("cancelled-projection", 41, 0)
+    stream = torch.cuda.current_stream()
+    (ref,) = execution.admit((identity,), stream)
+    rows = PackedPhaseRowBatch(
+        handle.attachment.physical.plan_epoch, 0, 1, (PackedPhaseRow(0, 0, 0, HiddenPhase.PREFILL, identity),)
+    )
+    invocation = execution.begin(rows.rows, stream)
+    overlay.reserve()
+    overlay.prepare(rows, invocation.context, execution.directory)
+    hidden = reader.captured.new_ones((1, reader.captured.shape[1]))
+    reader.forward(hidden)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = reader.forward(hidden)[0]
+    slot = execution.arena.field_slots((invocation.context.pin,), (ref,), reader.binding.fields[0])[1][0]
+    address = reader.pools[0][slot].data_ptr()
+    stream.synchronize()
+    with patch.object(torch.cuda.Event, "synchronize", side_effect=AssertionError("host cancellation wait")):
+        torch.cuda._sleep(100_000_000)
+        graph.replay()
+        execution.cancel_step(invocation)
+        overlay.clear()
+        execution.retire((identity,))
+        assert execution.arena.pending_pin_releases > 0
+        other = RequestIdentity("replacement-projection", 42, 0)
+        (replacement,) = execution.admit((other,), stream)
+        pin = execution.arena.pin_exact((replacement,), stream)
+        new_slot = execution.arena.field_slots((pin,), (replacement,), reader.binding.fields[0])[1][0]
+        assert reader.pools[0][new_slot].data_ptr() != address
+        execution.arena.release_pin(pin)
+    stream.synchronize()
+    assert torch.isfinite(output).all()
+    execution.retire((other,), wait=True)
+    execution.arena.collect_completed(wait=True)
+    assert execution.arena.pending_pin_releases == 0
+
+
+def _check_graph(handle):
     """Pinned graph operands reach training as row counts and request order change."""
-    from vllm.config import CUDAGraphMode
+    from pllm.backends.vllm.overlay_graph import PinnedParameterOverlay, _ProjectionReader
 
-    from pllm.backends.vllm.overlay_graph import CapacityGraphManager, PinnedGraphOverlay
-
-    runner = handle.runner
-    assert isinstance(runner.cudagraph_manager, CapacityGraphManager)
-    descriptors = runner.cudagraph_manager._capture_descs[CUDAGraphMode.PIECEWISE]
-    assert {d.num_reqs for d in descriptors if d.num_tokens == 128} == {1, 2}
-    overlay = runner.require_session()._overlay
-    assert isinstance(overlay, PinnedGraphOverlay)
-    assert all(program.borrows_inputs for program in overlay.programs.values())
-    pointers = (overlay.table.data_ptr(), overlay.captured.data_ptr(), overlay.pool.data_ptr())
+    overlay = handle.runner.require_session()._overlay
+    assert isinstance(overlay, PinnedParameterOverlay)
+    reader = overlay.readers[0]
+    assert all(program.borrows_inputs for program in reader.programs.values())
+    pointers = (reader.table.data_ptr(), reader.captured.data_ptr(), reader.pools[0].data_ptr())
     prompts = ["The sky is blue. " * 8, "Water freezes when it is cold. " * 2]
-    with patch.object(PinnedGraphOverlay, "emit", side_effect=AssertionError("warm replay called Python projection")):
+    with patch.object(_ProjectionReader, "emit", side_effect=AssertionError("warm replay called Python projection")):
         first = texts(handle.generate(prompts, SAMPLING))
         assert texts(handle.generate(list(reversed(prompts)), SAMPLING)) == first[::-1]
         assert texts(handle.generate(prompts[:1], SAMPLING)) == first[:1]
         assert all(texts(handle.generate(["The sky is blue. " * 5, "Water is cold. " * 2], SAMPLING)))
-    assert pointers == (overlay.table.data_ptr(), overlay.captured.data_ptr(), overlay.pool.data_ptr())
+    assert pointers == (reader.table.data_ptr(), reader.captured.data_ptr(), reader.pools[0].data_ptr())
     assert handle.diagnostics().update_count > 0 and handle.diagnostics().active_lineages == 0
+    _check_cancelled_projection(handle)
     return first
 
 
@@ -264,8 +311,8 @@ def main() -> int:
             lambda h: _check(h, "dense strict"),
         ),
         (
-            "dense_256",
-            lambda: open_llm(dense, memory_budget_bytes=256 << 20),
+            "dense_512",
+            lambda: open_llm(dense, memory_budget_bytes=512 << 20),
             lambda h: _check(h, "dense window"),
         ),
         (
@@ -307,10 +354,57 @@ def main() -> int:
                 capture_memory_bytes=256 << 20,
                 memory_budget_bytes=1 << 30,
             ),
-            lambda h: _check_graph_head(h),
+            lambda h: _check_graph(h),
+        ),
+        (
+            "graph_head_strict",
+            lambda: open_llm(
+                replace(
+                    headwise,
+                    config=replace(headwise.config, chunk_size=16, visibility=pllm.Visibility.forward_pinned()),
+                ),
+                tokens=128,
+                model_length=128,
+                cuda_graphs=True,
+                capture_memory_bytes=256 << 20,
+                memory_budget_bytes=1 << 30,
+                allow_numerical_transforms=False,
+            ),
+            _check_graph,
+        ),
+        (
+            "graph_dense",
+            lambda: open_llm(
+                dense,
+                tokens=128,
+                model_length=128,
+                cuda_graphs=True,
+                capture_memory_bytes=512 << 20,
+                memory_budget_bytes=2 << 30,
+            ),
+            _check_graph,
+        ),
+        (
+            "graph_low_rank",
+            lambda: open_llm(
+                RequestLowRankTTT(),
+                tokens=128,
+                model_length=128,
+                cuda_graphs=True,
+                capture_memory_bytes=256 << 20,
+                memory_budget_bytes=1 << 30,
+            ),
+            _check_graph,
         ),
         ("low_rank", lambda: open_llm(RequestLowRankTTT()), lambda h: _check(h, "request low-rank")),
         ("imported", lambda: open_llm(ImportedLowRank(), memory_budget_bytes=1 << 30), _check_imported),
+        (
+            "graph_imported",
+            lambda: open_llm(
+                ImportedLowRank(), cuda_graphs=True, capture_memory_bytes=256 << 20, memory_budget_bytes=1 << 30
+            ),
+            _check_imported,
+        ),
         ("routed", lambda: open_llm(RoutedLowRankTTT(), seqs=3, tokens=96), _check_routed),
     )
     results: dict[str, tuple[str, ...]] = {}

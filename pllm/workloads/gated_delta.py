@@ -7,7 +7,6 @@ import torch
 from torch.nn import functional as F
 
 import pllm
-from pllm.kernels.head_overlay import head_correction
 from pllm.workloads.chunk_tail import join_tail, save_tail
 
 Input = Annotated[torch.Tensor, pllm.Operand.INPUT]
@@ -88,15 +87,13 @@ class GatedDeltaWorkload(pllm.Workload):
     def transition(self, hidden: Input, weights: State, tail: Tail, length: Length) -> pllm.TensorUpdate:
         """Train complete chunks, retain the tail and return the training readouts."""
         chunk = self.config.chunk_size
-        (rows,) = join_tail((tail,), (hidden,), length, chunk)
-        trained = len(rows) // chunk * chunk
+        (rows,), valid = join_tail((tail,), (hidden,), length, chunk)
+        positions = torch.arange(len(hidden), device=hidden.device) + length
+        trained = valid // chunk * chunk
         inputs = rows.float().reshape(-1, *weights.shape[:2])
         keys = F.normalize(inputs, dim=-1)
-        updated, outputs = pllm.scan(self.step, carry=weights, over=(inputs[:trained], keys[:trained]), chunk=chunk)
+        updated, outputs = pllm.scan(self.step, carry=weights, over=(inputs, keys), chunk=chunk, valid_rows=trained)
         weights.copy_(updated)
-        remaining = save_tail((tail,), (rows,), length, trained)
-        corrections = tuple(output.reshape(-1, hidden.shape[1]) for output in outputs)
-        if remaining:
-            corrections += (head_correction(rows[trained:], weights),)
-        output = torch.cat(corrections)[-len(hidden) :]
+        remaining = save_tail((tail,), (rows,), length, valid, trained)
+        output = torch.cat(outputs).reshape(-1, hidden.shape[1]).index_select(0, positions)
         return pllm.TensorUpdate(output, trained > 0, trained // chunk, trained, {"tail_rows": remaining})

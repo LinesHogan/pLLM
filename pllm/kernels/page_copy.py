@@ -82,28 +82,19 @@ def gather_rows_meta(descriptor: torch.Tensor, rows: torch.Tensor, source: torch
     return source.new_empty((len(rows), *source.shape[1:]))
 
 
-@torch.library.custom_op("pllm::prepend_rows", mutates_args=())
-def _prepend_rows(
-    tails: list[torch.Tensor], rows: list[torch.Tensor], length: torch.Tensor, maximum: int
-) -> list[torch.Tensor]:
-    """Concatenate an active prefix to each aligned tensor column."""
-    count = int(length.item())
-    return [torch.cat((tail[:count], value)) for tail, value in zip(tails, rows, strict=True)]
-
-
-@_prepend_rows.register_fake  # pyright: ignore[reportUnknownMemberType]
-def prepend_rows_meta(
-    tails: list[torch.Tensor], rows: list[torch.Tensor], length: torch.Tensor, maximum: int
-) -> list[torch.Tensor]:
-    """Use the declared prefix bound without inspecting the device scalar."""
-    return [
-        value.new_empty((min(maximum, len(tail)) + len(value), *value.shape[1:]))
-        for tail, value in zip(tails, rows, strict=True)
-    ]
-
-
 def prepend_rows(
-    tails: list[torch.Tensor], rows: list[torch.Tensor], length: torch.Tensor, maximum: int
-) -> list[torch.Tensor]:
-    """Append rows to the active prefix, with a bounded shape-only implementation."""
-    return torch.ops.pllm.prepend_rows(tails, rows, length, maximum)
+    tails: tuple[torch.Tensor, ...],
+    rows: tuple[torch.Tensor, ...],
+    length: torch.Tensor,
+    chunk: int,
+) -> tuple[torch.Tensor, ...]:
+    """Join device-counted tails into a chunk-aligned capacity without reading the count."""
+    capacity = ((len(rows[0]) + chunk - 2) // chunk + 1) * chunk
+    indices = torch.arange(capacity, device=length.device)
+    joined: list[torch.Tensor] = []
+    for tail, value in zip(tails, rows, strict=True):
+        source = torch.cat((tail, value, value.new_zeros((1, *value.shape[1:]))))
+        offsets = torch.where(indices < length, indices, indices - length + len(tail))
+        offsets = torch.where(indices < length + len(value), offsets, len(source) - 1)
+        joined.append(source.index_select(0, offsets))
+    return tuple(joined)

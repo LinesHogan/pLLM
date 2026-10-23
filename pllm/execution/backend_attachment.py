@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from math import prod
 
 from pllm import _core
 from pllm.contracts.backend_attachment import (
     AttachmentCleanupStage,
-    AttachmentGraphMode,
     AttachmentKind,
     AttachmentTaskBinding,
     AttachmentTaskRole,
@@ -39,6 +39,7 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.decoder_region import decoder_activations, decoder_region_workspace_bytes
+from pllm.execution.parameter_projection import ROWS_PER_BLOCK, projection_blocks
 from pllm.execution.region_replay import replay_region_workspace_bytes
 from pllm.execution.tokenwise_region import (
     compile_tokenwise_region,
@@ -62,7 +63,7 @@ def attachment_buffer_bytes(
         if layout.resource == attachment.state_resource
         for field in layout.layout.fields
     }
-    buffers = 0
+    buffers = 1024 if attachment.overlay_bindings else 0
     for binding in attachment.overlay_bindings:
         first = fields[binding.fields[0]].shape
         if binding.operator is ParameterOverlayOperator.DENSE_ADD:
@@ -71,20 +72,20 @@ def attachment_buffer_bytes(
             buffers += rows * (width * (inputs + hidden + outputs) + 8)
         elif binding.operator is ParameterOverlayOperator.HEAD_ADD:
             heads, width_per_head, _ = first
+            inputs = outputs = heads * width_per_head
             # Owned capture, fp32 input/correction, layout copy, cast and addition.
             buffers += rows * (6 * width * heads * width_per_head + 8)
-            if probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH:
-                assert probe.causal_domain is not None
-                requests = probe.causal_domain.requests
-                # Bounded gather/read/scatter workspace, excluding the borrowed field pool.
-                buffers += 8 * (requests + requests * rows + rows)
-                buffers += requests * (
-                    8 * rows * heads * width_per_head * width + 2 * heads * width_per_head**2 * width
-                )
         else:
             rank, inputs = first
             outputs = fields[binding.fields[1]].shape[0]
             buffers += rows * (width * (inputs + rank + 2 * outputs) + 8)
+        if probe.causal_domain is not None and not any(
+            task.visibility is not None and task.visibility.in_forward for task in graph.tasks
+        ):
+            blocks = projection_blocks(rows, probe.causal_domain.requests)
+            buffers += 24 * (blocks * (ROWS_PER_BLOCK + len(binding.fields)) + rows)
+            buffers += 2 * blocks * sum(prod(fields[field].shape) * width for field in binding.fields)
+            buffers += blocks * ROWS_PER_BLOCK * 2 * width * (inputs + outputs)
     for binding in attachment.activation_bindings:
         shape = fields[binding.fields[0]].shape
         rank = shape[0] if len(shape) == 2 else 0

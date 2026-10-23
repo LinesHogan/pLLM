@@ -1,4 +1,4 @@
-"""Chunk-tail tensor bookkeeping shared by the causal fast-weight examples."""
+"""Counted chunk-tail tensor math shared by the causal fast-weight workloads."""
 
 import torch
 
@@ -6,19 +6,27 @@ from pllm.kernels.page_copy import prepend_rows
 
 
 def join_tail(
-    tails: tuple[torch.Tensor, ...], rows: tuple[torch.Tensor, ...], length: torch.Tensor, chunk: int
-) -> tuple[torch.Tensor, ...]:
-    """Prepend the unfinished chunk before processing newly captured rows."""
-    return tuple(prepend_rows(list(tails), list(rows), length, chunk - 1))
+    tails: tuple[torch.Tensor, ...],
+    rows: tuple[torch.Tensor, ...],
+    length: torch.Tensor,
+    chunk: int,
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    """Return bounded columns and their device-resident valid row count."""
+    return prepend_rows(tails, rows, length, chunk), length + len(rows[0])
 
 
 def save_tail(
-    tails: tuple[torch.Tensor, ...], rows: tuple[torch.Tensor, ...], length: torch.Tensor, trained: int
-) -> int:
-    """Keep only rows that have not participated in a complete update."""
-    remaining = len(rows[0]) - trained
+    tails: tuple[torch.Tensor, ...],
+    rows: tuple[torch.Tensor, ...],
+    length: torch.Tensor,
+    valid: torch.Tensor,
+    trained: torch.Tensor,
+) -> torch.Tensor:
+    """Save unfinished valid rows; capacity padding never becomes retained history."""
+    remaining = valid - trained
     for tail, values in zip(tails, rows, strict=True):
-        tail.zero_()
-        tail[:remaining].copy_(values[trained:])
-    length.fill_(remaining)
+        positions = torch.arange(len(tail), device=length.device)
+        selected = values.index_select(0, (positions + trained).clamp_max(len(values) - 1))
+        tail.copy_(selected.masked_fill((positions >= remaining).view(-1, *((1,) * (tail.ndim - 1))), 0))
+    length.copy_(remaining)
     return remaining

@@ -50,13 +50,13 @@ from pllm.backends.vllm.hidden_capture import HiddenTaps
 from pllm.backends.vllm.model_scan import ModelScanSource, VllmModelScan
 from pllm.backends.vllm.overlay_graph import (
     OverlayGraphRunner,
-    PinnedGraphOverlay,
+    PinnedParameterOverlay,
     graph_mode,
     graph_options,
 )
 from pllm.backends.vllm.packed_rows import encode_mrv2_rows
 from pllm.backends.vllm.parameter_overlay import (
-    VllmParameterOverlay,
+    ExactParameterOverlay,
     inspect_parameter_targets,
     validate_projection_sources,
 )
@@ -330,16 +330,18 @@ class VllmSession(Generic[DataT, ResultT]):
         if self._in_forward_overlay or probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH:
             validate_projection_sources(model, tuple(binding.target for binding in overlay_bindings))
         self._overlay = (
-            PinnedGraphOverlay(
+            ExactParameterOverlay(model, overlay_bindings)
+            if self._in_forward_overlay
+            else PinnedParameterOverlay(
                 model,
-                overlay_bindings[0],
+                overlay_bindings,
                 deployment.execution.arena,
                 probe.max_packed_rows,
                 max_sampler_rows,
-                attachment.inputs.plan.timeline.memory_budget_bytes or (1 << 30),
+                buffers,
+                plan.timeline.region_policy,
+                capture=not self._overlay_import,
             )
-            if probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH
-            else VllmParameterOverlay(model, overlay_bindings, capture=not self._overlay_import)
             if overlay_bindings and not model_scan
             else None
         )
@@ -378,7 +380,7 @@ class VllmSession(Generic[DataT, ResultT]):
             if probe.causal_domain is None or probe.causal_domain.layers != len(model.model.layers):
                 raise ValueError("backend replay requires its signed causal model domain")
             if isinstance(task.replay, ConditionalLayerReplay) and self._overlay is not None:
-                assert isinstance(self._overlay, VllmParameterOverlay)
+                assert isinstance(self._overlay, PinnedParameterOverlay)
                 self._replay = VllmLayerReplay(model, task.replay, self._overlay, probe.causal_domain)
             elif isinstance(task.replay, TokenwiseLayerReplay):
                 self._replay = VllmTokenwiseReplay(
@@ -629,6 +631,8 @@ class VllmSession(Generic[DataT, ResultT]):
         adapter = self._overlay
         if adapter is None and self._activation is None:
             return
+        if isinstance(adapter, PinnedParameterOverlay):
+            adapter.reserve()
         execution = self._deployment.execution
         identities = tuple(
             sorted(requests, key=lambda identity: (identity.request_id, identity.prompt_idx, identity.sample_idx))
@@ -1051,7 +1055,7 @@ class WorkloadModelRunner(Runner[Sampler | None], OverlayGraphRunner):
         self._install_hidden_taps()
 
     def _finish_model_binding(self) -> None:
-        self.finish_overlay_graphs()
+        self.finish_overlay_graphs(self.require_session().attachment)
 
     def _make_sampler(self, upstream: Sampler | None) -> Sampler:
         if upstream is None:

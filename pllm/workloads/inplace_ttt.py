@@ -87,15 +87,18 @@ class InPlaceTTTWorkload(pllm.Workload):
     ) -> pllm.TensorUpdate:
         """Return exclusive residuals, update complete chunks and retain unfinished rows."""
         chunk = self.config.chunk_size
-        inputs, targets = join_tail((tail_input, tail_target), (hidden, target), tail_length, chunk)
-        trained = len(inputs) // chunk * chunk
-        updated, outputs = pllm.scan(self.step, carry=delta, over=(inputs[:trained], targets[:trained]), chunk=chunk)
+        (inputs, targets), valid = join_tail((tail_input, tail_target), (hidden, target), tail_length, chunk)
+        positions = torch.arange(len(hidden), device=hidden.device) + tail_length
+        trained = valid // chunk * chunk
+        updated, outputs = pllm.scan(self.step, carry=delta, over=(inputs, targets), chunk=chunk, valid_rows=trained)
         delta.copy_(updated)
-        remaining = save_tail((tail_input, tail_target), (inputs, targets), tail_length, trained)
-        if remaining:
-            outputs += (inputs[trained:] @ delta.T,)
+        remaining = save_tail((tail_input, tail_target), (inputs, targets), tail_length, valid, trained)
         return TensorUpdate(
-            torch.cat(outputs)[-len(hidden) :], trained > 0, trained // chunk, trained, {"tail_rows": remaining}
+            torch.cat(outputs).index_select(0, positions),
+            trained > 0,
+            trained // chunk,
+            trained,
+            {"tail_rows": remaining},
         )
 
 

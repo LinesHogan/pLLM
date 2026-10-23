@@ -23,20 +23,11 @@ def _coefficients(
     index = tl.program_id(0) * block + tl.arange(0, block)
     mask = index < total
     eye = tl.cast(index % matrix // width == index % width, tl.float32)
-    live = index // elements < tl.load(active)
+    live = tl.load(active + index // elements, mask, 0)
     gram = tl.load(a + index, mask, 0)
     cross = tl.load(b + index, mask, 0)
     tl.store(a + index, tl.where(live, decay * (eye - scale * gram), eye), mask)
     tl.store(b + index, tl.where(live, scale * cross, 0), mask)
-
-
-@triton.jit
-def _final(
-    states: torch.Tensor, final: torch.Tensor, active: torch.Tensor, elements: tl.constexpr, block: tl.constexpr
-) -> None:
-    index = tl.program_id(0) * block + tl.arange(0, block)
-    value = tl.load(states + tl.load(active) * elements + index, index < elements, 0)
-    tl.store(final + index, value, index < elements)
 
 
 class RightMatrixBuffers:
@@ -74,7 +65,7 @@ def launch_window(
     decay: float,
     form: ScanForm,
 ) -> None:
-    """Consume staged [window, heads, rows, width] tensors and a device count."""
+    """Consume staged [window, heads, rows, width] tensors and device active masks."""
     x, k = inputs.flatten(0, 1), keys.flatten(0, 1)
     torch.bmm(k.transpose(1, 2), k, out=buffers.a.flatten(0, 1))
     torch.bmm(x.transpose(1, 2), k, out=buffers.b.flatten(0, 1))
@@ -101,5 +92,5 @@ def launch_window(
         for index in range(len(buffers.a)):
             torch.bmm(buffers.states[index], buffers.a[index], out=buffers.states[index + 1])
             buffers.states[index + 1].add_(buffers.b[index])
-    _final[((carry.numel() + 255) // 256,)](buffers.states, buffers.final, active, carry.numel(), 256)
+    buffers.final.copy_(torch.where(active.any(), buffers.states[-1], carry))
     torch.bmm(x, buffers.states[:-1].flatten(0, 1).transpose(1, 2), out=buffers.output.flatten(0, 1))

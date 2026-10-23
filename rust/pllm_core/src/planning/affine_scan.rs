@@ -34,6 +34,7 @@ pub(super) struct Plan {
 #[derive(Clone, Debug, PartialEq)]
 enum Expr {
     Input(usize),
+    Choose(Box<Expr>, Box<Expr>, Box<Expr>),
     Add(Box<Expr>, Box<Expr>),
     Sub(Box<Expr>, Box<Expr>),
     Permute(Box<Expr>, Vec<usize>),
@@ -46,6 +47,7 @@ fn expression(op: &Access, graph: &AccessGraph, values: &BTreeMap<String, Expr>)
     let operand = |i: usize| values.get(args.get(i)?.strip_prefix('$')?).cloned();
     if !op.keywords.is_empty() { return None; }
     match op.operator.as_str() {
+        "aten.where.self" if args.len() == 3 => Some(Expr::Choose(Box::new(operand(0)?), Box::new(operand(1)?), Box::new(operand(2)?))),
         "aten.add.Tensor" if args.len() == 2 => Some(Expr::Add(Box::new(operand(0)?), Box::new(operand(1)?))),
         "aten.sub.Tensor" if args.len() == 2 => Some(Expr::Sub(Box::new(operand(0)?), Box::new(operand(1)?))),
         "aten.mm.default" | "aten.bmm.default" | "aten.matmul.default" if args.len() == 2 => Some(Expr::Matmul(Box::new(operand(0)?), Box::new(operand(1)?))),
@@ -74,7 +76,7 @@ fn inline(access: &AccessGraph, inputs: &[String], outputs: &[super::region_prog
     // Walk every operation, including output-only branches: unknown effects,
     // RNG, detach and dtype changes cannot hide outside the carry slice.
     if access.inputs.len() != inputs.len() || access.outputs.len() != outputs.len()
-        || access.values.iter().any(|v| v.dtype != dtype) { return None; }
+        || access.values.iter().any(|v| v.dtype != dtype && v.dtype != "torch.bool") { return None; }
     let mut local = BTreeMap::new();
     for (port, name) in access.inputs.iter().zip(inputs) {
         if values.get(name)? == &Expr::Input(0) {
@@ -119,6 +121,11 @@ fn recognize(program: &Program, imports: &[TensorImport]) -> Option<(Action, f64
     }
     if body.block.yields.len() != 2 { return None; }
     let next = values.get(&body.block.yields[0])?;
+    let next = if block.arguments.len() == 4 {
+        let Expr::Choose(active, updated, previous) = next else { return None; };
+        if active.as_ref() != &Expr::Input(3) || previous.as_ref() != &Expr::Input(0) { return None; }
+        updated.as_ref()
+    } else { next };
     let output = values.get(&body.block.yields[1])?;
     let input = |i| Box::new(Expr::Input(i));
     let transpose = |x| Box::new(Expr::Permute(x, vec![1, 0]));
@@ -126,7 +133,7 @@ fn recognize(program: &Program, imports: &[TensorImport]) -> Option<(Action, f64
         let Expr::Scale(product, scale) = increment.as_ref() else { return None; };
         let expected = Expr::Matmul(transpose(input(2)), input(1));
         let read = Expr::Matmul(input(1), transpose(input(0)));
-        return (block.arguments.len() == 3 && carry.as_ref() == &Expr::Input(0) && product.as_ref() == &expected && output == &read)
+        return (matches!(block.arguments.len(), 3 | 4) && carry.as_ref() == &Expr::Input(0) && product.as_ref() == &expected && output == &read)
             .then_some((Action::Identity, *scale, 1.0));
     }
     let Expr::Sub(decayed, gradient) = next else { return None; };
@@ -144,7 +151,7 @@ fn recognize(program: &Program, imports: &[TensorImport]) -> Option<(Action, f64
     // Distribute (alpha*S - beta*(K*(alpha*S)^T-V)^T*K):
     // S*A+B, A=alpha*(I-beta*K^T*K), B=beta*V^T*K.
     // Chronological right actions compose as (A1*A2, B1*A2+B2).
-    (block.arguments.len() == 3 && product.as_ref() == &expected && output == read.as_ref())
+    (matches!(block.arguments.len(), 3 | 4) && product.as_ref() == &expected && output == read.as_ref())
         .then_some((Action::RightMatrix, *scale, decay))
 }
 
@@ -157,7 +164,7 @@ fn times(a: u64, b: u64) -> Result<u64, String> {
 
 pub(super) fn derive(program: &Program, imports: &[TensorImport], evidence: &Evidence) -> Result<Option<Plan>, String> {
     let block = &program.entry.block;
-    if block.arguments.len() != 3 || block.operations.len() != 1 || !program.resources.is_empty() { return Ok(None); }
+    if !matches!(block.arguments.len(), 3 | 4) || block.operations.len() != 1 || !program.resources.is_empty() { return Ok(None); }
     let Some(carry) = block.arguments.first() else { return Ok(None); };
     let Type::Tensor { shape, dtype, device } = &carry.type_ else { return Ok(None); };
     if !matches!(shape.len(), 2 | 3) || !device.starts_with("cuda") || !matches!(dtype.as_str(), "torch.float32" | "torch.bfloat16") || shape.contains(&0) { return Ok(None); }
@@ -168,6 +175,11 @@ pub(super) fn derive(program: &Program, imports: &[TensorImport], evidence: &Evi
     for function in &program.functions { imports.iter().find(|i| i.name() == function.name).ok_or("missing affine source import")?.validate(function)?; }
     let Some((action, scale, decay)) = recognize(program, imports) else { return Ok(None); };
     let Operation::Scan { inputs, outputs, count, .. } = &block.operations[0] else { unreachable!() };
+    if block.arguments.len() == 4 {
+        let Type::Bank { element, size } = &block.arguments[3].type_ else { return Ok(None); };
+        let Type::Tensor { shape, dtype, device: mask_device } = element.as_ref() else { return Ok(None); };
+        if !shape.is_empty() || dtype != "torch.bool" || mask_device != device || size != count { return Ok(None); }
+    }
     let first = 1;
     let Type::Bank { element: x, size: xs } = &block.arguments[first].type_ else { return Ok(None); };
     let Type::Bank { element: y, size: ys } = &block.arguments[first + 1].type_ else { return Ok(None); };
@@ -183,7 +195,7 @@ pub(super) fn derive(program: &Program, imports: &[TensorImport], evidence: &Evi
     // Both forms use the same conservative bound: inputs, pair ping-pong,
     // exclusive states, broadcast initial state, owned output and BLAS scratch.
     let scratch = total(&[times(window, total(&[tensor_bytes(x)?, tensor_bytes(y)?, tensor_bytes(y)?])?)?,
-        times(matrices, tensor_bytes(&carry.type_)?)?, evidence.workspace, 512])?;
+        times(matrices, tensor_bytes(&carry.type_)?)?, evidence.workspace, count.maximum(program), 512])?;
     let function = Function {
         name: digest(&canonical_ascii_json(&("affine-prefix@4", program, imports, evidence))?),
         inputs: block.arguments.iter().map(|v| v.type_.clone()).collect(), outputs: outputs.iter().map(|v| v.type_.clone()).collect(), resources: vec![], accesses: vec![],

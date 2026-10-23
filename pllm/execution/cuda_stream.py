@@ -10,6 +10,8 @@ from collections.abc import Sequence
 
 import torch
 
+from pllm.execution.region_window import WindowBackpressure
+
 
 def upload(
     values: Sequence[int] | Sequence[Sequence[int]], device: torch.device, dtype: torch.dtype = torch.long
@@ -31,14 +33,20 @@ class PinnedStaging:
     and while every buffer is still in flight a new one is added instead of waiting.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, capacity: int = 0, slots: int = 0) -> None:
+        self._bounded = slots > 0
         self._buffers: list[tuple[torch.Tensor, torch.cuda.Event]] = []
+        self._buffers.extend(
+            (torch.empty(capacity, dtype=torch.long, pin_memory=True), torch.cuda.Event()) for _ in range(slots)
+        )
         self._current: tuple[torch.Tensor, torch.cuda.Event] | None = None
 
     def take(self, size: int) -> torch.Tensor:
         """A zeroed int64 pinned host buffer of `size` elements, valid until the next `take`."""
         self._current = next((item for item in self._buffers if item[0].numel() >= size and item[1].query()), None)
         if self._current is None:
+            if self._bounded:
+                raise WindowBackpressure("pinned staging is still in flight; retry admission after completion")
             # Idle buffers that are too small are dropped; capacities grow in powers of two.
             self._buffers = [item for item in self._buffers if item[0].numel() >= size or not item[1].query()]
             capacity = 1 << max(size - 1, 0).bit_length()
@@ -81,3 +89,35 @@ class CudaStreamReadiness:
 
 
 __all__ = ["CudaStreamReadiness", "PinnedStaging", "upload"]
+
+
+class DeviceCounters:
+    """Two cumulative diagnostics with one ordered asynchronous host snapshot."""
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = torch.zeros(2, dtype=torch.int64, device=device)
+        self.host = torch.zeros(2, dtype=torch.int64, pin_memory=device.type == "cuda")
+        self.ready: torch.cuda.Event | None = None
+        self.values = (0, 0)
+
+    def add(self, values: torch.Tensor, stream: torch.cuda.Stream | None) -> None:
+        """Order GPU writes to the snapshot; CPU reads only after the latest event."""
+        if stream is None:
+            self.device.add_(values)
+            self.host.copy_(self.device)
+        else:
+            with torch.cuda.stream(stream):
+                self.device.record_stream(stream)
+                if self.ready is not None:
+                    stream.wait_event(self.ready)
+                self.device.add_(values)
+                self.host.copy_(self.device, non_blocking=True)
+                if self.ready is None:
+                    self.ready = torch.cuda.Event()
+                self.ready.record(stream)
+
+    def read(self) -> tuple[int, int]:
+        """Return the last complete snapshot without waiting for GPU work."""
+        if self.ready is None or self.ready.query():
+            self.values = (int(self.host[0]), int(self.host[1]))
+        return self.values

@@ -29,13 +29,12 @@ def _weights(
     mask = index < width
     row, column = index // columns, index % columns
     initial = tl.load(carry + row * carry_row + column * carry_column, mask, 0).to(tl.float32)
-    count = tl.load(active)
     if tree:
         lane = tl.arange(0, capacity)
         increment = (
-            tl.load(increments + lane[:, None] * width + index[None, :], (lane[:, None] < count) & mask[None, :], 0).to(
-                tl.float32
-            )
+            tl.load(
+                increments + lane[:, None] * width + index[None, :], tl.load(active + lane)[:, None] & mask[None, :], 0
+            ).to(tl.float32)
             * scale
         )
         prefix = increment.to(weights.dtype.element_ty).to(tl.float32)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType, reportAttributeAccessIssue]
@@ -50,16 +49,18 @@ def _weights(
             prefix,
             (lane[:, None] + 1 < capacity) & mask[None, :],
         )
-        last = tl.gather(prefix, tl.zeros((1, block), tl.int32) + tl.maximum(count - 1, 0), 0)
-        state = tl.where(count > 0, tl.sum(last, 0), initial)
+        last = tl.gather(prefix, tl.zeros((1, block), tl.int32) + capacity - 1, 0)
+        state = tl.where(tl.sum(tl.load(active + lane).to(tl.int32), 0) > 0, tl.sum(last, 0), initial)
     else:
         state = initial
         for chunk in range(capacity):
             tl.store(weights + chunk * width + index, state, mask)
-            increment = tl.load(increments + chunk * width + index, mask & (chunk < count), 0).to(tl.float32) * scale
+            increment = (
+                tl.load(increments + chunk * width + index, mask & tl.load(active + chunk), 0).to(tl.float32) * scale
+            )
             increment = increment.to(weights.dtype.element_ty).to(tl.float32)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType, reportAttributeAccessIssue]
             updated = (state + increment).to(weights.dtype.element_ty).to(tl.float32)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType, reportAttributeAccessIssue]
-            state = tl.where(chunk < count, updated, state)
+            state = tl.where(tl.load(active + chunk), updated, state)
     tl.store(final + index, state, mask)
 
 

@@ -1,4 +1,4 @@
-"""Qwen2 projection bindings consuming pinned fields or explicit projection-task residuals."""
+"""Qwen2 target inspection for both readers, and the eager Exact projection-task driver."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 import torch
-from torch.nn import Parameter, functional as F
+from torch.nn import Parameter
 from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
 
 from pllm.authoring import ParameterTargetShape
@@ -22,16 +22,12 @@ from pllm.contracts.parameter_overlay import (
     ParameterRole,
     ParameterTarget,
 )
-from pllm.contracts.request_identity import RequestIdentity
-from pllm.contracts.semantic_graph import StateScope
 from pllm.contracts.state_ref import StateRef
 from pllm.execution.cuda_stream import upload
 from pllm.execution.module_graph import capture_module_calls
 from pllm.execution.overlay_task import ProjectionTransition
-from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.state_execution import DataT, StateTaskContext
-from pllm.kernels.head_overlay import head_correction
 
 _LinearOutput = torch.Tensor | tuple[torch.Tensor, Parameter | None]
 _LinearForward = Callable[[torch.Tensor], _LinearOutput]
@@ -127,15 +123,14 @@ def inspect_parameter_targets(
 @dataclass(frozen=True, slots=True)
 class _PreparedRows:
     source: PackedPhaseRow
-    pin: PagePin
-    rows: torch.Tensor | slice
-    fields: tuple[torch.Tensor, ...]
+    ref: StateRef
+    rows: torch.Tensor
     binding: ParameterOverlayFieldBinding
     offset: int
     size: int
 
 
-class _ParameterModule:
+class _ExactProjection:
     def __init__(self, module: _Linear, mlp: _Mlp | None) -> None:
         self.module, self.mlp = module, mlp
         self.bindings: list[tuple[ParameterOverlayFieldBinding, int, int]] = []
@@ -146,13 +141,10 @@ class _ParameterModule:
         self.mlp_input: torch.Tensor | None = None
         self.total_rows = 0
         self.apply_count = self.updated_apply_count = 0
-        self.capture_operands = True
         self.transition: ProjectionTransition | None = None
 
     def captures_binding(self, binding: ParameterOverlayFieldBinding) -> bool:
-        return self.capture_operands and (
-            self.original_mlp_forward is not None or binding.operator is ParameterOverlayOperator.HEAD_ADD
-        )
+        return self.original_mlp_forward is not None or binding.operator is ParameterOverlayOperator.HEAD_ADD
 
     def forward_mlp(self, value: torch.Tensor) -> torch.Tensor:
         if self.original_mlp_forward is None:
@@ -171,33 +163,20 @@ class _ParameterModule:
             raise RuntimeError("parameter application differs from the prepared model step")
         # The unquantized TP1 projection owns this fresh output, not an input or state page.
         output = base[0] if isinstance(base, tuple) else base
-        inputs = tuple(
-            hidden[item.rows] if isinstance(item.rows, slice) else hidden.index_select(0, item.rows)
-            for item in self.prepared
-        )
+        inputs = tuple(hidden.index_select(0, item.rows) for item in self.prepared)
         captures = tuple(
             self.capture(item, selected)
             for item, selected in zip(self.prepared, inputs, strict=True)
             if self.captures_binding(item.binding)
         )
-        residuals = None if self.transition is None else self.transition.run(captures)
+        assert self.transition is not None
+        residuals = self.transition.run(captures)
         for item, selected in zip(self.prepared, inputs, strict=True):
-            if residuals is not None:
-                delta = (residuals[item.source.identity, item.binding.target] * item.binding.scale).to(output.dtype)
-            elif item.binding.operator is ParameterOverlayOperator.DENSE_ADD:
-                delta = F.linear(selected, item.fields[0]) * item.binding.scale
-            elif item.binding.operator is ParameterOverlayOperator.HEAD_ADD:
-                delta = (head_correction(selected, item.fields[0]) * item.binding.scale).to(hidden.dtype)
-            else:
-                a, b = item.fields
-                delta = F.linear(F.linear(selected, a), b) * item.binding.scale
+            delta = (residuals[item.source.identity, item.binding.target] * item.binding.scale).to(output.dtype)
             columns = output[:, item.offset : item.offset + item.size]
-            if isinstance(item.rows, slice):
-                columns[item.rows].add_(delta)
-            else:
-                columns.index_add_(0, item.rows, delta)
+            columns.index_add_(0, item.rows, delta)
             self.apply_count += selected.shape[0]
-            if any(ref.version_id > 0 for ref in item.pin.refs):
+            if item.ref.version_id > 0:
                 self.updated_apply_count += selected.shape[0]
         self.captures = captures
         return base
@@ -207,7 +186,6 @@ class _ParameterModule:
             desired = selected
         else:
             assert self.mlp_input is not None and self.mlp_input.shape[0] == self.total_rows
-            assert isinstance(item.rows, torch.Tensor)
             desired = self.mlp_input.index_select(0, item.rows)
         return CapturedParameterOperand(
             item.source.identity,
@@ -222,25 +200,21 @@ class _ParameterModule:
         self.prepared, self.captures = (), ()
         self.mlp_input = None
         self.total_rows = 0
-        self.capture_operands = True
         self.transition = None
 
 
-class VllmParameterOverlay:
-    """One hook per physical module, including fused q/v; no version selection."""
+class ExactParameterOverlay:
+    """Eager Exact projection-task driver; pinned reads use the shared tensor op."""
 
-    def __init__(
-        self, model: Qwen2ForCausalLM, bindings: tuple[ParameterOverlayFieldBinding, ...], *, capture: bool = True
-    ) -> None:
-        modules: dict[int, _ParameterModule] = {}
+    def __init__(self, model: Qwen2ForCausalLM, bindings: tuple[ParameterOverlayFieldBinding, ...]) -> None:
+        modules: dict[int, _ExactProjection] = {}
         for binding in bindings:
             module, offset, size, mlp = locate_parameter(model, binding.target)
             if id(module) not in modules:
-                modules[id(module)] = _ParameterModule(module, mlp)
+                modules[id(module)] = _ExactProjection(module, mlp)
             modules[id(module)].bindings.append((binding, offset, size))
         self._modules = tuple(modules.values())
         for handle in self._modules:
-            handle.capture_operands = capture
             handle.module.forward = handle.forward
             if handle.mlp is not None:
                 handle.mlp.forward = handle.forward_mlp
@@ -260,91 +234,27 @@ class VllmParameterOverlay:
         directory: RequestStateDirectory,
         transition: ProjectionTransition | None = None,
     ) -> None:
+        assert transition is not None
         identities = tuple(dict.fromkeys(row.identity for row in rows.rows))
-        resolved: list[tuple[tuple[PackedPhaseRow, ...], PagePin, StateRef]] = []
-        for identity in identities:
-            source = tuple(row for row in rows.rows if row.identity == identity)
-            if len({row.phase for row in source}) != 1:
-                raise ValueError("parameter application requires one phase per request")
-            if directory.scope is StateScope.INSTANCE:
-                pin = directory.inference_pin(identity, context.pin.stream)
-                (ref,) = pin.refs
-            else:
-                pin = context.pin
-                ref = context.selection.ref_for(identity)
-            resolved.append((source, pin, ref))
         for handle in self._modules:
-            handle.transition = transition
             prepared: list[_PreparedRows] = []
-            # Operand capture owns per-request rows on MLP targets; shared launches
-            # group only rows reading the exact same admitted root without capture.
-            groups: dict[
-                tuple[ParameterOverlayFieldBinding, StateRef, RequestIdentity | None],
-                tuple[PagePin, list[PackedPhaseRow], int, int],
-            ] = {}
-            for source, pin, ref in resolved:
-                for binding, offset, size in handle.bindings:
-                    key = (binding, ref, source[0].identity if handle.captures_binding(binding) else None)
-                    if key not in groups:
-                        groups[key] = (pin, [], offset, size)
-                    groups[key][1].extend(source)
-            for (binding, ref, _), (pin, source, offset, size) in groups.items():
-                packed = tuple(row.packed_row_index for row in source)
-                indices = (
-                    upload(packed, handle.module.weight.device)
-                    if handle.captures_binding(binding) or packed != tuple(range(packed[0], packed[0] + len(packed)))
-                    else slice(packed[0], packed[0] + len(packed))
+            for identity in identities:
+                source = tuple(row for row in rows.rows if row.identity == identity)
+                ref = context.selection.ref_for(identity)
+                indices = upload(tuple(row.packed_row_index for row in source), handle.module.weight.device)
+                prepared.extend(
+                    _PreparedRows(source[0], ref, indices, binding, offset, size)
+                    for binding, offset, size in handle.bindings
                 )
-                fields = tuple(context.arena.borrow_field(pin, ref, field) for field in binding.fields)
-                headwise = binding.operator is ParameterOverlayOperator.HEAD_ADD
-                shapes = (
-                    [(fields[0].shape[0], size // fields[0].shape[0], size // fields[0].shape[0])]
-                    if headwise
-                    else [(size, handle.module.weight.shape[1])]
-                    if binding.operator is ParameterOverlayOperator.DENSE_ADD
-                    else [(fields[0].shape[0], handle.module.weight.shape[1]), (size, fields[0].shape[0])]
-                )
-                if len(fields) != len(shapes) or any(
-                    value.shape != shape
-                    or value.dtype != (torch.float32 if headwise else handle.module.weight.dtype)
-                    or value.device != handle.module.weight.device
-                    for value, shape in zip(fields, shapes, strict=True)
-                ):
-                    raise ValueError("signed parameter fields differ from the physical projection")
-                prepared.append(_PreparedRows(source[0], pin, indices, fields, binding, offset, size))
+            handle.transition = transition
             handle.prepared, handle.total_rows = tuple(prepared), rows.total_rows
 
     def take_captures(self) -> tuple[CapturedParameterOperand, ...]:
-        captures: list[CapturedParameterOperand] = []
         for handle in self._modules:
             expected = sum(handle.captures_binding(item.binding) for item in handle.prepared)
-            if len(handle.captures) != expected:
-                raise RuntimeError("parameter target did not capture every signed operand")
-            if handle.transition is None:
-                captures.extend(handle.captures)
+            assert len(handle.captures) == expected
             handle.captures = ()
-        return tuple(captures)
-
-    def prepare_replay(
-        self, row: PackedPhaseRow, layer: int, arena: PageBundleArena, pin: PagePin, ref: StateRef
-    ) -> None:
-        self.clear()
-        for handle in self._modules:
-            handle.capture_operands = False
-            handle.total_rows = 1
-            handle.prepared = tuple(
-                _PreparedRows(
-                    row,
-                    pin,
-                    slice(0, 1),
-                    tuple(arena.borrow_field(pin, ref, field) for field in binding.fields),
-                    binding,
-                    offset,
-                    size,
-                )
-                for binding, offset, size in handle.bindings
-                if binding.target.layer == layer
-            )
+        return ()
 
     def clear(self) -> None:
         for handle in self._modules:

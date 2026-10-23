@@ -42,6 +42,7 @@ from pllm.execution.region_streams import (
 )
 from pllm.execution.region_values import Data, copy_data
 from pllm.execution.region_window import RegionWindow, WindowBackpressure
+from pllm.execution.tensor_access import import_tensor_access_graph
 
 PreparedWindow = tuple[tuple[ScheduleInstance, ...], RegionValueLayout, Routes, tuple[tuple[int, Routes], ...]]
 
@@ -116,6 +117,17 @@ class RegionExecutionPlan:
         )
 
 
+def _owns_results(cell: RegionFunction) -> bool:
+    """Functional source imports may borrow when no result aliases an entry backing."""
+    if isinstance(cell, (AffineScanPrimitive, CompiledPrimitive)):
+        return True
+    if isinstance(cell, ExportedCell):
+        access = import_tensor_access_graph(cell)
+        storage = {value.name: value.storage for value in access.values}
+        return not ({storage[name] for name in access.inputs} & {storage[name] for name in access.outputs})
+    return False
+
+
 class RegionInstructionExecution:
     """Prepare each concrete window once, then execute its table with fresh frames."""
 
@@ -160,9 +172,7 @@ class RegionInstructionExecution:
         self._cells = dict(cells)
         operations = program.entry.block.operations
         self._borrow_inputs = (
-            len(operations) == 1
-            and isinstance(operations[0], Call)
-            and isinstance(cells[operations[0].function], (AffineScanPrimitive, CompiledPrimitive))
+            len(operations) == 1 and isinstance(operations[0], Call) and _owns_results(cells[operations[0].function])
         )
         self._state_windows = stream_plan.state_windows if stream_plan is not None else state_windows
         self._actions = RegionActions(program, cells)

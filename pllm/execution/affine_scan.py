@@ -31,6 +31,14 @@ def _tensors(bank: Bank) -> tuple[torch.Tensor, ...]:
     return tuple(tensors)
 
 
+def _active_rows(masks: list[Data], count: int, carry: torch.Tensor) -> torch.Tensor:
+    if not masks:
+        return torch.ones(count, dtype=torch.bool, device=carry.device)
+    (mask,) = masks
+    assert isinstance(mask, Bank)
+    return torch.stack(_tensors(mask))
+
+
 def _pack(rows: tuple[torch.Tensor, ...], window: int, chunk: int, width: int, like: torch.Tensor) -> torch.Tensor:
     """Keep a fixed window shape; inactive slices are additive identities."""
     if len(rows) == window:
@@ -57,10 +65,11 @@ class AdditiveUpdate:
     plan: AffineScanPlan
 
     def __call__(self, inputs: tuple[Data, ...]) -> tuple[Data, ...]:
-        carry, xs, ys = inputs
+        carry, xs, ys, *masks = inputs
         assert isinstance(carry, torch.Tensor)
         assert isinstance(xs, Bank) and isinstance(ys, Bank)
         x, y = _tensors(xs), _tensors(ys)
+        active_rows = _active_rows(masks, len(x), carry)
         state, plan = carry, self.plan
         outputs: list[torch.Tensor] = []
         buffers = AdditiveBuffers(carry, plan.window, plan.chunk)
@@ -68,7 +77,7 @@ class AdditiveUpdate:
             size = min(len(x) - start, plan.window)
             xx = _pack(x[start : start + plan.window], plan.window, plan.chunk, carry.shape[1], carry)
             yy = _pack(y[start : start + plan.window], plan.window, plan.chunk, carry.shape[0], carry)
-            active = torch.full((), size, dtype=torch.int32, device=carry.device)
+            active = torch.nn.functional.pad(active_rows[start : start + size], (0, plan.window - size))
             launch_window(xx, yy, state, active, buffers, plan.scale, plan.implementation.form)
             state = buffers.final
             outputs.extend(row.clone() for row in buffers.output.unbind()[:size])
@@ -86,22 +95,22 @@ class RightMatrixUpdate:
     plan: AffineScanPlan
 
     def __call__(self, inputs: tuple[Data, ...]) -> tuple[Data, ...]:
-        carry, xs, ks = inputs
+        carry, xs, ks, *masks = inputs
         assert isinstance(carry, torch.Tensor) and isinstance(xs, Bank) and isinstance(ks, Bank)
         x, k, plan = _tensors(xs), _tensors(ks), self.plan
+        active_rows = _active_rows(masks, len(x), carry)
         buffers = RightMatrixBuffers(carry, plan.window, plan.chunk)
         xx = carry.new_empty((plan.window, carry.shape[0], plan.chunk, carry.shape[1]))
         kk = torch.empty_like(xx)
         outputs: list[torch.Tensor] = []
         state = carry
-        active = torch.empty((), dtype=torch.int32, device=carry.device)
         for start in range(0, len(x), plan.window):
             size = min(len(x) - start, plan.window)
             xx.zero_()
             kk.zero_()
             torch.stack(x[start : start + size], out=xx[:size].transpose(1, 2))
             torch.stack(k[start : start + size], out=kk[:size].transpose(1, 2))
-            active.fill_(size)
+            active = torch.nn.functional.pad(active_rows[start : start + size], (0, plan.window - size))
             launch_right_window(xx, kk, state, active, buffers, plan.scale, plan.decay, plan.implementation.form)
             state = buffers.final
             outputs.extend(row.transpose(0, 1).clone() for row in buffers.output[:size].unbind())

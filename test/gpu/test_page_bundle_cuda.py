@@ -216,3 +216,36 @@ def _cuda_ipc_lifecycle():
                 process.terminate()
                 process.join(10)
             process.close()
+
+
+def test_bounded_staging_and_diagnostics_wait_for_completion_without_host_waits():
+    """Busy host storage backpressures admission; a device snapshot never exposes partial counters."""
+    from unittest.mock import patch
+
+    from pllm.execution.cuda_stream import DeviceCounters, PinnedStaging
+    from pllm.execution.region_window import WindowBackpressure
+
+    stream = torch.cuda.Stream()
+    staging = PinnedStaging(capacity=8, slots=1)
+    destination = torch.empty(8, dtype=torch.int64, device="cuda")
+    counters = DeviceCounters(destination.device)
+    increments = torch.tensor([3, 17], device="cuda")
+    torch.cuda.synchronize()
+    with torch.cuda.stream(stream):
+        host = staging.take(8)
+        address = host.data_ptr()
+        host.fill_(23)
+        torch.cuda._sleep(100_000_000)
+        staging.copy_to(destination)
+        counters.add(increments, stream)
+    with (
+        patch.object(torch.cuda.Event, "synchronize", side_effect=AssertionError("host wait")),
+        patch.object(torch.cuda.Stream, "synchronize", side_effect=AssertionError("host wait")),
+    ):
+        with pytest.raises(WindowBackpressure):
+            staging.take(8)
+        assert counters.read() == (0, 0)
+    stream.synchronize()
+    torch.testing.assert_close(destination, torch.full_like(destination, 23))
+    assert staging.take(8).data_ptr() == address
+    assert counters.read() == (3, 17)

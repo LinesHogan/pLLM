@@ -25,6 +25,7 @@ from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.parameter_overlay import (
+    CapturedParameterOperand,
     ModelScan,
     ParameterOverlayFieldBinding,
     ParameterOverlayOperator,
@@ -285,7 +286,7 @@ class OverlayTransition:
     def __call__(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
         start = len(data.entries)
         operands = {(operand.identity, operand.target): operand for operand in data.step.operands}
-        changed: set[int] = set()
+        changed: dict[int, torch.Tensor] = {}
         with torch.no_grad():
             for row, index in zip(batch.selection.rows, batch.selection.state_indices, strict=True):
                 results: list[OverlayTargetResult] = []
@@ -302,28 +303,9 @@ class OverlayTransition:
                             strict=True,
                         )
                     )
-                    if operand.phase in self.phases:
-                        result = self.function(
-                            {
-                                **values,
-                                "input": operand.hidden,
-                                "target": operand.desired,
-                                "weight": operand.base_weight,
-                            }
-                        )
-                    else:
-                        result = TensorUpdate(self.apply(operand.hidden, values))
-                    if (
-                        result.output.shape != operand.desired.shape
-                        or result.output.dtype not in (operand.hidden.dtype, torch.float32)
-                        or result.output.device != operand.hidden.device
-                    ):
-                        raise ValueError("overlay output differs from its target shape, dtype or device")
-                    if min(result.update_count, result.trained_rows) < 0:
-                        raise ValueError("overlay update counters must be nonnegative")
+                    result = self.result(operand, values)
                     results.append(OverlayTargetResult(target, result))
-                    if result.changed:
-                        changed.add(index)
+                    changed[index] = result.changed if index not in changed else changed[index] | result.changed
                 data.entries.append(
                     OverlayEntry(row.identity, batch.selection.refs[index], batch.after_refs[index], tuple(results))
                 )
@@ -333,10 +315,40 @@ class OverlayTransition:
                 for entry in data.entries[start:]
                 for target in entry.targets
             },
-            changed=tuple(sorted(changed)),
-            update_count=sum(target.update.update_count for entry in data.entries[start:] for target in entry.targets),
-            trained_rows=sum(target.update.trained_rows for entry in data.entries[start:] for target in entry.targets),
+            changed=tuple(changed),
+            update_mask=torch.stack(tuple(changed.values())),
+            counters=torch.stack(
+                tuple(
+                    torch.stack((target.update.update_count, target.update.trained_rows))
+                    for entry in data.entries[start:]
+                    for target in entry.targets
+                )
+            ).sum(0),
         )
+
+    def result(self, operand: CapturedParameterOperand, values: Tensors) -> TensorUpdate:
+        """Validate the author's result at its tensor boundary without observing CUDA values."""
+        result = (
+            self.function({**values, "input": operand.hidden, "target": operand.desired, "weight": operand.base_weight})
+            if operand.phase in self.phases
+            else TensorUpdate.unchanged(self.apply(operand.hidden, values))
+        )
+        if (
+            result.output.shape != operand.desired.shape
+            or result.output.dtype not in (operand.hidden.dtype, torch.float32)
+            or result.output.device != operand.hidden.device
+        ):
+            raise ValueError("overlay output differs from its target shape, dtype or device")
+        if any(
+            value.shape != () or value.device != operand.hidden.device or value.dtype != dtype
+            for value, dtype in (
+                (result.changed, torch.bool),
+                (result.update_count, torch.int64),
+                (result.trained_rows, torch.int64),
+            )
+        ):
+            raise ValueError("overlay counters need a bool changed flag and int64 counts on the operand device")
+        return result
 
 
 class TensorBinding(Builder[TensorFrame]):

@@ -228,3 +228,51 @@ def test_scan_matches_the_serial_loop_including_carry_views(device):
                 outputs.append(output)
             actual = run(workload.step, carry=carry, over=(x[: 4 * count], y[: 4 * count]), chunk=4)
             torch.testing.assert_close(actual, (expected, tuple(outputs)), rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("numerics", (False, True))
+def test_counted_gated_tail_keeps_inactive_chunks_and_never_reads_device_counts(numerics):
+    """An independent chunk oracle covers C=0, carried tails and inactive capacity."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from pllm.kernels.head_overlay import head_correction
+    from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
+
+    target = ParameterTarget(0, ParameterModuleKind.ATTENTION, ParameterRole.QUERY_PROJECTION_WEIGHT)
+    workload = GatedDeltaWorkload(GatedDeltaConfig((target,), head_width=4, chunk_size=4))
+    context = ScanContext(RegionSelectionPolicy(numerics), 32, torch.device("cuda:0"), 64 << 20)
+    run = context.bind(workload.transition)
+    generator = torch.Generator(device="cuda").manual_seed(512)
+    weights = torch.randn(2, 4, 4, device="cuda", generator=generator) * 0.1
+    tail = torch.zeros(3, 8, device="cuda")
+    length = torch.zeros((), dtype=torch.int64, device="cuda")
+    state, retained = weights.clone(), tail[:0].clone()
+    for count in (1, 1, 9, 2, 17, 3):
+        hidden = torch.randn(count, 8, device="cuda", generator=generator)
+        joined = torch.cat((retained, hidden))
+        complete = len(joined) // 4 * 4
+        expected = []
+        for start in range(0, complete, 4):
+            x = joined[start : start + 4].view(4, 2, 4).transpose(0, 1)
+            k = torch.nn.functional.normalize(x, dim=-1)
+            expected.append((x @ state.transpose(1, 2)).transpose(0, 1).reshape(4, 8))
+            decayed = state * workload.config.alpha
+            error = k @ decayed.transpose(1, 2) - x
+            state = decayed - workload.config.beta / 4 * (error.transpose(1, 2) @ k)
+        retained = joined[complete:]
+        expected.append(head_correction(retained, state))
+        with patch.object(torch.Tensor, "item", side_effect=AssertionError("device count read")):
+            result = run(hidden, weights, tail, length)
+        torch.testing.assert_close(result.output, torch.cat(expected)[-count:], rtol=2e-5, atol=1e-6)
+        torch.testing.assert_close(weights, state, rtol=2e-5, atol=1e-6)
+        torch.testing.assert_close(tail[: len(retained)], retained, rtol=0, atol=0)
+        assert int(length) == len(retained) and int(result.trained_rows) == complete
+        assert bool(result.changed) == (complete > 0)
+    # Warm the same source/layout, then forbid every host CUDA synchronization.
+    torch.cuda.synchronize()
+    with (
+        patch.object(torch.Tensor, "item", side_effect=AssertionError("scalar read")),
+        patch.object(torch.cuda.Event, "synchronize", side_effect=AssertionError("host event wait")),
+        patch.object(torch.cuda.Stream, "synchronize", side_effect=AssertionError("host stream wait")),
+    ):
+        run(hidden, weights, tail, length)

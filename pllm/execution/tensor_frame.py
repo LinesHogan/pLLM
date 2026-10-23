@@ -64,10 +64,20 @@ class TensorUpdate:
     """Private overlay updates and their unscaled residual, excluding the base projection."""
 
     output: torch.Tensor
-    changed: bool = False
-    update_count: int = 0
-    trained_rows: int = 0
-    metrics: Mapping[str, int] = field(default_factory=lambda: dict[str, int]())
+    changed: torch.Tensor
+    update_count: torch.Tensor
+    trained_rows: torch.Tensor
+    metrics: Mapping[str, torch.Tensor] = field(default_factory=lambda: dict[str, torch.Tensor]())
+
+    @classmethod
+    def unchanged(cls, output: torch.Tensor) -> "TensorUpdate":
+        """A residual-only result with device-valued zero counters."""
+        return cls(
+            output,
+            output.new_zeros((), dtype=torch.bool),
+            output.new_zeros((), dtype=torch.int64),
+            output.new_zeros((), dtype=torch.int64),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,8 +94,8 @@ class OverlayEntry:
     targets: tuple[OverlayTargetResult, ...]
 
     @property
-    def changed(self) -> bool:
-        return any(target.update.changed for target in self.targets)
+    def changed(self) -> torch.Tensor:
+        return torch.stack(tuple(target.update.changed for target in self.targets)).any()
 
 
 @dataclass(frozen=True, slots=True)

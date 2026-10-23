@@ -29,7 +29,7 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
-from pllm.execution.cuda_stream import CudaStreamReadiness
+from pllm.execution.cuda_stream import CudaStreamReadiness, DeviceCounters
 from pllm.execution.execution import TaskGraphExecution, TaskGraphImplementation, TaskGraphInvocation
 from pllm.execution.memory import MemoryUsage
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
@@ -99,6 +99,8 @@ class StateTaskContext(Generic[DataT]):
     replay: LayerReplayPrimitive | TokenwiseReplayPrimitive | None = None
     model_scan: ModelScanPrimitive | None = None
     updated_refs: Sequence[StateRef] = ()
+    updated_mask: torch.Tensor | None = None
+    overlay_counters: torch.Tensor | None = None
     replay_started: bool = False
     cancel_requested: Event = field(default_factory=Event)
     borrowed_roots: tuple[BorrowedStateRoot, ...] = ()
@@ -385,6 +387,14 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         self._active: dict[int, TaskGraphInvocation[StateTaskContext[DataT]]] = {}
         self._next_invocation = 1
         self._loss_count = self._update_count = self._trained_rows = self._sampler_count = 0
+        self._overlay_counters = (
+            DeviceCounters(self.device)
+            if any(
+                task.visibility is not None and task.visibility.scope == "overlay"
+                for task in arena.plan.semantic_graph.tasks
+            )
+            else None
+        )
         self._lock = RLock()
         self._borrowed_resources = _borrowed_resources
         self._pending_borrows: tuple[BorrowedStateRoot, ...] | None = None
@@ -834,6 +844,9 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             self._loss_count += context.loss_count
             self._update_count += context.update_count
             self._trained_rows += context.trained_rows
+            if context.overlay_counters is not None:
+                assert self._overlay_counters is not None
+                self._overlay_counters.add(context.overlay_counters, context.pin.stream)
         if invocation.finished and self.arena.plan.semantic_graph.input_groups and context.held_input is None:
             for identity, refs in context.injected_refs.items():
                 self._successful_inputs[identity] = tuple(sorted(refs)), context.input_step_id
@@ -904,12 +917,13 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     def diagnostics(self) -> StateDiagnostics:
         with self._lock:
             self.arena.collect_completed()
+            updates, rows = (0, 0) if self._overlay_counters is None else self._overlay_counters.read()
             return StateDiagnostics(
                 self.directory.active_count,
                 self.directory.inference_pin_count,
                 self._loss_count,
-                self._update_count,
-                self._trained_rows,
+                self._update_count + updates,
+                self._trained_rows + rows,
                 self._sampler_count,
                 self.arena.pending_pin_releases,
                 self.plan.fallback_count,

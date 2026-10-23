@@ -293,6 +293,12 @@ class ReplayStateTask(Generic[DataT]):
     implementation_id: ImplementationId = REPLAY_IMPLEMENTATION
 
     def execute(self, context: StateTaskContext[DataT]) -> None:
+        # Conditional replay is explicitly eager and already observes GPU convergence.
+        if context.updated_mask is not None:
+            selected = tuple(bool(value) for value in context.updated_mask.cpu().unbind())
+            context.updated_refs = tuple(
+                ref for ref, active in zip(context.updated_refs, selected, strict=True) if active
+            )
         publication = context.publication
         if publication is None or not context.updated_refs:
             return

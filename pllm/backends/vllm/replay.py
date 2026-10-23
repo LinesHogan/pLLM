@@ -14,7 +14,7 @@ from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 
 from pllm.authoring import DataT, ResultT, TensorStepInput
 from pllm.backends.vllm.activation import VllmActivationPatch
-from pllm.backends.vllm.parameter_overlay import VllmParameterOverlay
+from pllm.backends.vllm.overlay_graph import PinnedParameterOverlay
 from pllm.backends.vllm.region_attention import (
     attention_paged_access,
     select_attention_metadata,
@@ -74,7 +74,7 @@ class VllmLayerReplay:
         self,
         model: Qwen2ForCausalLM,
         effect: ConditionalLayerReplay,
-        overlay: VllmParameterOverlay,
+        overlay: PinnedParameterOverlay,
         domain: CausalModelDomain,
     ) -> None:
         layers = model.model.layers

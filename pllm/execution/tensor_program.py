@@ -100,6 +100,8 @@ class TaskOutput:
     update_count: int = 0
     trained_rows: int = 0
     changed: tuple[int, ...] = ()
+    update_mask: torch.Tensor | None = None
+    counters: torch.Tensor | None = None
     observations: tuple[Observation, ...] = ()
     gradient_indices: tuple[int, ...] = ()
     loss: torch.Tensor | None = None
@@ -406,6 +408,11 @@ class TensorOperation(Generic[D]):
                 if transition is not None:
                     refs = refs.replace_versions(transition.before_refs, transition.after_refs)
                 context.updated_refs = refs.take(changed) if changed else ()
+                context.updated_mask = output.update_mask
+            if output.counters is not None:
+                context.overlay_counters = (
+                    output.counters if context.overlay_counters is None else context.overlay_counters + output.counters
+                )
             context.projection_outputs = output.residuals
             if output.guidance is not None:
                 context.guidance = output.guidance

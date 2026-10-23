@@ -200,6 +200,31 @@ def _dummy_export() -> None:
         handle.close()
 
 
+def _pinned_graph_overlay() -> None:
+    """Bind and replay a multi-target pinned overlay without initializing driver CUDA."""
+    from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
+
+    assert not torch.cuda.is_initialized()
+    targets = tuple(
+        pllm.ParameterTarget(layer, pllm.ParameterModuleKind.ATTENTION, pllm.ParameterRole.QUERY_PROJECTION_WEIGHT)
+        for layer in (0, 2)
+    )
+    workload = GatedDeltaWorkload(GatedDeltaConfig(targets, chunk_size=4, visibility=pllm.Visibility.forward_pinned()))
+    options = ExecutionOptions(
+        capture_memory_bytes=512 << 20, memory_budget_bytes=2 << 30, allow_numerical_transforms=False
+    )
+    with pllm.make_llm(workload=workload, config=engine(cuda_graphs=True, execution=options)) as handle:
+        prompts = ["The sky is blue and the sea is calm.", "Water freezes when it is very cold."]
+        first = handle.generate(prompts, greedy(3))
+        second = handle.generate(prompts[::-1], greedy(3))
+        assert [o.outputs[0].token_ids for o in first] == [o.outputs[0].token_ids for o in second][::-1]
+        state = handle.worker_state()
+        assert state.process_id != os.getpid() and state.diagnostics.update_count > 0
+        assert_clean(state.diagnostics)
+        assert not torch.cuda.is_initialized()
+    print("Pinned multi-target source graphs: EngineCore replay; parent CUDA=off")
+
+
 def _captured_esamp(runner: RunnerKind = RunnerKind.MRV2) -> None:
     assert not torch.cuda.is_initialized()
     options = ExecutionOptions(capture=True, capture_memory_bytes=16 * 1024**2)
@@ -530,12 +555,14 @@ def main() -> int:
     _dummy_export()
     _user_reference_workload()
     _model_scan_reconstruction()
+    _pinned_graph_overlay()
     _gpu_shared_input()
     return 0
 
 
 MODES = {
     "--captured-only": _captured_esamp,
+    "--pinned-graph-only": _pinned_graph_overlay,
     "--mrv1-captured": lambda: _captured_esamp(RunnerKind.MRV1),
     "--gpu-io-only": _gpu_shared_input,
     "--lora-only": lambda: (_output_lora_shared_input(), _independent_lora_input()),

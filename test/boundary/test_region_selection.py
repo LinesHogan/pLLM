@@ -314,7 +314,7 @@ def test_tuned_tensor_scan_keeps_one_symbolic_plan_and_its_guards():
         full_x = torch.arange(8 * 2 * 4, device=w.device, dtype=w.dtype).view(8, 2, 4) / 100
         full_y = torch.arange(8 * 2 * 3, device=w.device, dtype=w.dtype).view(8, 2, 3) / 100
         staged_x, staged_y = torch.zeros_like(full_x), torch.zeros_like(full_y)
-        active = torch.zeros((), device=w.device, dtype=torch.int32)
+        active = torch.zeros(8, device=w.device, dtype=torch.bool)
         buffers = AdditiveBuffers(w, 8, 2)
         launch_window(staged_x, staged_y, w, active, buffers, 0.013, ScanForm.HILLIS_STEELE)
         graph = torch.cuda.CUDAGraph()
@@ -327,7 +327,7 @@ def test_tuned_tensor_scan_keeps_one_symbolic_plan_and_its_guards():
             staged_y.zero_()
             staged_x[:count].copy_(full_x[:count])
             staged_y[:count].copy_(full_y[:count])
-            active.fill_(count)
+            active.copy_(torch.arange(8, device=active.device) < count)
             graph.replay()
             increments = 0.013 * torch.bmm(staged_y.transpose(1, 2), staged_x)
             prefixes = torch.cat((w[None], w[None] + increments.double().cumsum(0).float()))
@@ -445,7 +445,7 @@ def _check_right_matrix_graph(initial, values, keys):
 
     x = initial.new_zeros((8, 2, 4, 3))
     k = torch.zeros_like(x)
-    active = torch.zeros((), dtype=torch.int32, device=initial.device)
+    active = torch.zeros(8, dtype=torch.bool, device=initial.device)
     buffers = RightMatrixBuffers(initial, 8, 4)
     launch_right_window(x, k, initial, active, buffers, 0.17, 0.83, ScanForm.HILLIS_STEELE)
     graph = torch.cuda.CUDAGraph()
@@ -458,7 +458,7 @@ def _check_right_matrix_graph(initial, values, keys):
         k.zero_()
         x[:count].copy_(values[:count].transpose(1, 2))
         k[:count].copy_(keys[:count].transpose(1, 2))
-        active.fill_(count)
+        active.copy_(torch.arange(8, device=active.device) < count)
         graph.replay()
         expected, outputs = _right_oracle(initial, values[:count], keys[:count], 0.83, 0.17)
         torch.testing.assert_close(buffers.final.double(), expected, rtol=2e-6, atol=2e-7)
@@ -466,6 +466,14 @@ def _check_right_matrix_graph(initial, values, keys):
             tuple(v.transpose(0, 1).double() for v in buffers.output[:count]), outputs, rtol=2e-6, atol=2e-7
         )
         assert addresses == tuple(t.data_ptr() for t in storage)
+    # The counted source's mask bank need not be a prefix: inactive actions are identities.
+    active.copy_(torch.tensor([False, True, False, True, True, False, False, False], device=initial.device))
+    graph.replay()
+    expected = initial.double()
+    for index in (1, 3, 4):
+        expected, _ = _right_oracle(expected, values[index : index + 1], keys[index : index + 1], 0.83, 0.17)
+    torch.testing.assert_close(buffers.final.double(), expected, rtol=2e-6, atol=2e-7)
+    expected, _ = _right_oracle(initial, values[:5], keys[:5], 0.83, 0.17)
     # Noncommuting symmetric per-chunk A matrices expose reversed composition;
     # independent B and a nonsymmetric initial state also expose left action.
     vv, kk = values.double().transpose(1, 2), keys.double().transpose(1, 2)
@@ -604,24 +612,25 @@ def test_bounded_window_is_selected_when_the_faster_candidate_exceeds_the_budget
 
 def _check_pinned_projection_borrows():
     """Index tables vary under replay without materializing the field pool."""
-    from pllm.execution.parameter_projection import head_read, prepare_head_read
+    from pllm.contracts.parameter_overlay import ParameterOverlayOperator
+    from pllm.execution.parameter_projection import prepare_projection_read, projection_read
 
     generator = torch.Generator(device="cuda").manual_seed(109)
     hidden = torch.randn(8, 8, device="cuda", generator=generator)
     pool = torch.randn(32, 2, 4, 4, device="cuda", generator=generator)
-    slots = torch.tensor([1, 3], device="cuda")
+    slots = torch.tensor([[1], [3]], device="cuda")
     rows = torch.tensor([[0, 1, 2, 0], [3, 4, 5, 6]], device="cuda")
     owners = torch.tensor([0, 1, 2, 4, 5, 6, 7, -1], device="cuda")
-    values = (hidden, pool, slots, rows, owners)
-    execution = prepare_head_read(values, 128 << 20)
+    values = (hidden, slots, rows, owners, pool)
+    execution = prepare_projection_read(values, ParameterOverlayOperator.HEAD_ADD, 128 << 20, RegionSelectionPolicy())
     assert execution.borrows_inputs
-    arguments = dict(zip(("hidden", "pool", "slots", "rows", "owners"), values, strict=True))
+    arguments = dict(zip(("hidden", "slots", "rows", "owners", "pool0"), values, strict=True))
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU], record_shapes=True) as profile:
         result = execution.run(arguments).values[0]
     assert not any(
         event.name == "aten::clone" and event.input_shapes[0] == list(pool.shape) for event in profile.events()
     )
-    torch.testing.assert_close(result, head_read(*values)[0])
+    torch.testing.assert_close(result, projection_read(*values, operator=ParameterOverlayOperator.HEAD_ADD)[0])
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -631,9 +640,9 @@ def _check_pinned_projection_borrows():
     with torch.cuda.graph(graph, stream=stream):
         captured = execution.run(arguments).values[0]
     pointers = tuple(value.data_ptr() for value in values)
-    for state_slots in ((3, 1), (7, -1), (1, 3)):
-        slots.copy_(torch.tensor(state_slots, device="cuda"))
+    for state_slots in ((3, 1), (7, 2), (1, 3)):
+        slots.copy_(torch.tensor(state_slots, device="cuda")[:, None])
         graph.replay()
-        torch.testing.assert_close(captured, head_read(*values)[0])
+        torch.testing.assert_close(captured, projection_read(*values, operator=ParameterOverlayOperator.HEAD_ADD)[0])
         assert pointers == tuple(value.data_ptr() for value in values)
     assert not captured[-1].any()

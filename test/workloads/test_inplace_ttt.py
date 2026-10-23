@@ -177,7 +177,12 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
             output = x @ (b @ a).T
             a.add_(0.1 * y.T @ x)
             b.add_(0.2 * y.T @ y)
-            return TensorUpdate(output, changed=True, update_count=1, trained_rows=x.shape[0])
+            return TensorUpdate(
+                output,
+                output.new_ones((), dtype=torch.bool),
+                output.new_ones((), dtype=torch.int64),
+                output.new_full((), x.shape[0], dtype=torch.int64),
+            )
 
     low_rank = LowRankOverlay().compile_backend(replace(facts, targets=facts.targets[:1])).execution
     requests = (RequestIdentity("first", 0, 0), RequestIdentity("second", 0, 0))

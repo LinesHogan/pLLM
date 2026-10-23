@@ -23,11 +23,13 @@ Specs = tuple[tuple[torch.Size, tuple[int, ...], torch.dtype, torch.device], ...
 
 
 @lru_cache(maxsize=128)
-def _export_step(step: Step, specs: Specs, invariants: int) -> ExportedRegion:
+def _export_step(step: Step, specs: Specs, invariants: int, counted: bool) -> ExportedRegion:
     """Export one source layout independently of policy and chunk-count buckets."""
 
     def ordered(carry: torch.Tensor, *args: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return step(carry, *args[invariants:], *args[:invariants])
+        sequences = args[invariants:-1] if counted else args[invariants:]
+        updated, output = step(carry, *sequences, *args[:invariants])
+        return (torch.where(args[-1], updated, carry) if counted else updated), output
 
     with _disable_current_modes(), FakeTensorMode():
         samples = tuple(
@@ -64,17 +66,19 @@ class ScanContext:
         return (torch.cuda.Stream(device=self.device),)
 
     @lru_cache(maxsize=128)
-    def _template(self, step: Step, specs: Specs, invariants: int, chunk: int) -> "ScanTemplate":
-        return ScanTemplate(self, _export_step(step, specs, invariants), specs, invariants, chunk)
+    def _template(self, step: Step, specs: Specs, invariants: int, chunk: int, counted: bool) -> "ScanTemplate":
+        return ScanTemplate(self, _export_step(step, specs, invariants, counted), specs, invariants, chunk)
 
-    def specialize(self, step: Step, specs: Specs, invariants: int, chunk: int, count: int) -> TensorScan:
+    def specialize(
+        self, step: Step, specs: Specs, invariants: int, chunk: int, count: int, counted: bool = False
+    ) -> TensorScan:
         """Reuse source export and one prepared plan per bounded count bucket."""
         tracing = specs[0][3].type == "meta"
         layouts = tuple(
             (shape, stride, dtype, self.device if device.type == "meta" else device)
             for shape, stride, dtype, device in specs
         )
-        return self._template(step, layouts, invariants, chunk).for_count(count, tracing=tracing)
+        return self._template(step, layouts, invariants, chunk, counted).for_count(count, tracing=tracing)
 
 
 class ScanTemplate:
@@ -83,7 +87,7 @@ class ScanTemplate:
     def __init__(self, context: ScanContext, region: ExportedRegion, specs: Specs, invariants: int, chunk: int) -> None:
         self.context, self.region, self.specs = context, region, specs
         self.invariants = invariants
-        self.maximum = (context.max_rows + chunk - 1) // chunk
+        self.maximum = (context.max_rows + chunk - 1) // chunk + 1
         self.sources: dict[int, TensorScan] = {}
         self.plans: dict[int, TensorScan] = {}
 
@@ -131,7 +135,9 @@ class ScanTemplate:
         )
         columns = tuple(
             tuple(
-                torch.empty_strided((count, *shape), (shape[0] * stride[0], *stride), dtype=dtype, device=device)
+                torch.empty_strided(
+                    (count, *shape), (shape[0] * stride[0] if shape else 1, *stride), dtype=dtype, device=device
+                )
                 .zero_()
                 .unbind()
             )
@@ -156,10 +162,14 @@ def scan(
     over: tuple[torch.Tensor, ...],
     chunk: int,
     invariants: tuple[torch.Tensor, ...] = (),
+    valid_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
     """Run ``step(carry, *slices, *invariants) -> (next_carry, output)`` in chunk order.
 
     Return the final carry and an ordered tuple of outputs (empty for zero rows).
+    With ``valid_rows``, shapes describe capacity: only complete chunks within
+    the device count advance carry. Padded chunks still return their readouts
+    from the unchanged carry; callers select their actual output rows.
     Inputs are immutable; carry retains its shape, stride, dtype and device.
     Reuse the same callable with immutable closure/owner constants to reuse its
     specialization; pass varying tensors through invariants. CPU, partial chunks
@@ -173,6 +183,10 @@ def scan(
     """
     if chunk < 1 or not over or any(t.ndim == 0 or t.shape[0] != over[0].shape[0] for t in over):
         raise ValueError("scan needs a positive chunk and aligned row tensors")
+    if valid_rows is not None and (
+        valid_rows.shape != () or valid_rows.dtype != torch.int64 or valid_rows.device != carry.device
+    ):
+        raise ValueError("scan valid_rows needs an int64 scalar on the carry device")
     context = ScanContext.active.get() or _context(RegionSelectionPolicy(), over[0].shape[0], carry.device)
     if (
         context.device.type == "cuda"
@@ -182,12 +196,16 @@ def scan(
         and len({t.untyped_storage() for t in (carry, *over, *invariants)}) == 1 + len(over) + len(invariants)
     ):
         columns = tuple(tuple(torch.ops.aten.split.Tensor(t, chunk)) for t in over)
+        if valid_rows is not None:
+            active = (torch.arange(len(columns[0]), device=carry.device) + 1) * chunk <= valid_rows
+            columns += (tuple(active.unbind()),)
         compiled = context.specialize(
             step,
             tuple((t.shape, t.stride(), t.dtype, t.device) for t in (carry, *invariants, *(c[0] for c in columns))),
             len(invariants),
             chunk,
             over[0].shape[0] // chunk,
+            valid_rows is not None,
         )
         if carry.is_meta:
             MemoryTrace.reserve(sum(limit.bytes for limit in compiled.payload_limits))
@@ -203,6 +221,7 @@ def scan(
             return result.carry[0], result.columns[0]
     outputs: list[torch.Tensor] = []
     for start in range(0, over[0].shape[0], chunk):
-        carry, output = step(carry, *(t[start : start + chunk] for t in over), *invariants)
+        updated, output = step(carry, *(t[start : start + chunk] for t in over), *invariants)
+        carry = updated if valid_rows is None else torch.where(start + chunk <= valid_rows, updated, carry)
         outputs.append(output)
     return carry, tuple(outputs)
