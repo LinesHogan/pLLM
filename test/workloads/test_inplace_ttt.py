@@ -26,6 +26,7 @@ from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.visibility import explain_visibility
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
 from test.backend_facts import assert_finite_resources, backend_facts
 
@@ -72,19 +73,19 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     visibility = next(
         task.visibility for task in execution.arena.plan.semantic_graph.tasks if task.visibility is not None
     )
-    assert visibility.source.policy == pllm.Visibility.forward_pinned()
-    assert visibility.source.tail == "transition" and visibility.source.chunk_size == 0
-    assert "model[" in visibility.explain() and "update[" in visibility.explain()
+    assert visibility.policy == pllm.Visibility.forward_pinned()
+    assert visibility.tail == "transition" and visibility.chunk_size == 0
+    assert "model[" in explain_visibility(visibility) and "update[" in explain_visibility(visibility)
     with pytest.raises(ValueError, match="use Visibility.forward_pinned"):
         pllm.overlay(state="dense_fast_weights", targets=targets, visibility=pllm.Exact())
     declaration = workload.declaration().graph
     assert next(task.visibility for task in declaration.tasks if task.visibility is not None) == visibility
     changed = InPlaceTTTWorkload(replace(config, chunk_size=3)).declaration().graph
     changed_visibility = next(task.visibility for task in changed.tasks if task.visibility is not None)
-    assert changed_visibility.source.equations_digest != visibility.source.equations_digest
+    assert changed_visibility.equations_digest != visibility.equations_digest
     helper = _ShiftedUpdate(config).declaration().graph
     helper_visibility = next(task.visibility for task in helper.tasks if task.visibility is not None)
-    assert helper_visibility.source.equations_digest != visibility.source.equations_digest
+    assert helper_visibility.equations_digest != visibility.equations_digest
     identities = (RequestIdentity("same", 0, 0), RequestIdentity("same", 0, 1))
     refs = execution.admit(identities)
     bases = torch.tensor(

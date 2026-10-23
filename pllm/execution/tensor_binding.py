@@ -57,7 +57,7 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
-from pllm.contracts.visibility import StateVisibility, Visibility, VisibilitySource
+from pllm.contracts.visibility import Visibility, VisibilitySource
 from pllm.execution.declaration import Builder, Call, Dimensions, Field, Shape, State, When, native
 from pllm.execution.execution import TaskGraphImplementation
 from pllm.execution.model_scan import ChunkTraining, ModelScanTask, model_scan_source, target_resource
@@ -98,7 +98,6 @@ from pllm.execution.tensor_program import (
 )
 from pllm.execution.tensor_task import TensorTask
 from pllm.execution.trace import MAX_SNAPSHOT_BYTES
-from pllm.execution.visibility import bind_visibility
 from pllm.kernels.adamw import AdamWConfig
 from pllm.kernels.head_overlay import head_correction
 
@@ -401,7 +400,7 @@ class TensorBinding(Builder[TensorFrame]):
             when=When.MODEL_UPDATE,
             implementations=(native("model.chunk_scan@1", "model/chunk_scan@1"),),
         )
-        visibility = self._bind_visibility(
+        self._bind_visibility(
             forward,
             VisibilitySource(
                 scan.visibility,
@@ -433,7 +432,6 @@ class TensorBinding(Builder[TensorFrame]):
                             tuple(f"prefill{i}" for i in range(self.max_requests)),
                             scan.chunk_size,
                             self.probe.max_packed_rows,
-                            visibility,
                         ),
                     ),
                 ),
@@ -469,17 +467,14 @@ class TensorBinding(Builder[TensorFrame]):
             )
         )
 
-    def _bind_visibility(self, call: Call, source: VisibilitySource) -> StateVisibility:
-        """Attach the native read-from proof before constructing or cutting model regions."""
-        visibility = bind_visibility(source)
+    def _bind_visibility(self, call: Call, source: VisibilitySource) -> None:
+        """Attach the read domain; plan validation derives and checks its relation once."""
         self.graph = replace(
             self.graph,
             tasks=tuple(
-                replace(task, visibility=visibility) if task.symbol == call.symbol else task
-                for task in self.graph.tasks
+                replace(task, visibility=source) if task.symbol == call.symbol else task for task in self.graph.tasks
             ),
         )
-        return visibility
 
     def bind_native(
         self,

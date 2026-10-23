@@ -19,8 +19,8 @@ from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, Pack
 from pllm.contracts.region_imports import BorrowedTensorImport, KernelAllocation, NativeKernelImport
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.tensor_layout import TensorDType
-from pllm.contracts.visibility import StateVisibility, VisibilitySource
-from pllm.execution.codec import boundary_digest, encode_boundary
+from pllm.contracts.visibility import VisibilitySource
+from pllm.execution.codec import encode_boundary
 from pllm.execution.model_scan import ModelScanSpan
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.region_compilation import analyze_region_program, validate_region_schedule
@@ -28,7 +28,7 @@ from pllm.execution.region_streams import plan_closed_window
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.tensor_borrow import PagedAllocationView, ReadonlyTensorCell, ReadonlyTensorView
 from pllm.execution.trace import TraceSelection
-from pllm.execution.visibility import bind_visibility
+from pllm.execution.visibility import explain_visibility
 from pllm.workloads.prefill_adapters import PrefillAdapters
 from test.backend_facts import backend_facts
 
@@ -177,38 +177,19 @@ def imported_facts(workload, facts):
 
 
 def _check_visibility_relations() -> None:
-    """Reject forged logical writers before any source window is selected."""
+    """Each declaration domain derives one writer per reader; mismatched domains are rejected."""
     assert type(pllm.Exact()) is pllm.Visibility
     source = VisibilitySource(pllm.Exact(), "model_scan", "a" * 64, ("a", "b"), 2, "include")
-    exact = bind_visibility(source)
-    _core.validate_state_visibility(encode_boundary(exact))
-    assert "model[" in exact.explain() and "update[" in exact.explain() and "entry[" in exact.explain()
-    assert "-> update[r, t, -1 + c]" in exact.reads
-    pinned = bind_visibility(
+    exact = explain_visibility(source)
+    assert "model[r, t, c] -> update[r, t, -1 + c]" in exact and "decode[" in exact and "entry[" in exact
+    pinned = explain_visibility(
         replace(source, policy=pllm.Visibility.forward_pinned(), scope="overlay", chunk_size=0, tail="transition")
     )
-    assert "C = 1" in pinned.reads and "-> update[" not in pinned.reads
-    planned = bind_visibility(replace(source, scope="overlay", tail="carry"))
-    assert "C <= N <= 1 + C" in planned.reads
-    assert "model[" in planned.explain() and "update[" in planned.explain()
-    assert "planned only" in planned.explain()
-    for changed in (replace(source, chunk_size=3), replace(source, equations_digest="b" * 64)):
-        assert boundary_digest(bind_visibility(changed)) != boundary_digest(exact)
-    forged = [
-        replace(exact, reads=exact.reads.replace("model[", "missing[")),
-        replace(exact, reads=exact.reads.replace("; update[", "; missing[")),
-        replace(exact, reads=exact.reads[:-1] + "; model[r,t,c] -> entry[r,t] : 0 < c < C }"),
-        replace(exact, dependencies="[C,N,R] -> { }"),
-    ]
-    for writer in ("update[r,t,c]", "update[r,t,c+1]", "update[r+1,t,c-1]", "update[r,t+1,c-1]", "entry[r,t]"):
-        forged.append(replace(exact, reads=exact.reads.replace("update[r, t, -1 + c]", writer)))
-    for value in forged:
-        assert value != exact
+    assert "C = 1" in pinned and "-> update[" not in pinned
+    assert "C <= N <= 1 + C" in explain_visibility(replace(source, scope="overlay", tail="carry"))
+    for changed in (replace(source, chunk_size=0), replace(source, tail="carry"), replace(source, scope="overlay")):
         with pytest.raises(ValueError, match="state visibility"):
-            _core.validate_state_visibility(encode_boundary(value))
-    for changed in (replace(source, sweeps=2), replace(source, chunk_size=0), replace(source, tail="carry")):
-        with pytest.raises(ValueError, match="state visibility"):
-            bind_visibility(changed)
+            explain_visibility(changed)
     with pytest.raises(TypeError, match="reads"):
         pllm.Visibility(reads="{ }")
     scan = PrefillAdapters().prefill
@@ -219,31 +200,16 @@ def _check_visibility_relations() -> None:
 
 
 def _check_visibility_source(plan: PlanBundle) -> None:
-    """A valid relation cannot be rebound to a different model chunk domain."""
+    """Plan validation derives the relation once and binds it to the task's own state."""
     task = plan.semantic_graph.tasks[0]
     visibility = task.visibility
-    assert visibility is not None and visibility.source.policy == pllm.Exact()
-    assert tuple(visibility.source.resources) == tuple(str(effect.resource) for effect in task.effects)
+    assert visibility is not None and visibility.policy == pllm.Exact()
+    assert visibility.resources == tuple(str(effect.resource) for effect in task.effects)
     window = plan.semantic_graph.source_regions[0].window
-    assert window is not None and visibility.source.chunk_size == window.quantum
-    assert window.visibility == visibility
-    source = plan.semantic_graph.source_regions[0]
-    with pytest.raises(ValueError, match="state visibility"):
-        plan_closed_window(
-            replace(source, window=replace(window, visibility=replace(visibility, reads="[C,N,R] -> { }"))),
-            plan.timeline.region_policy,
-            parallel=False,
-            budget=1,
-        )
-    changed: tuple[StateVisibility | None, ...] = (
-        None,
-        replace(visibility, reads=visibility.reads.replace("model[", "absent[")),
-        bind_visibility(replace(visibility.source, chunk_size=visibility.source.chunk_size + 1)),
-        bind_visibility(replace(visibility.source, scope="overlay", tail="carry")),
-    )
-    for value in changed:
+    assert window is not None and visibility.chunk_size == window.quantum
+    for value in (replace(visibility, resources=("absent",)), replace(visibility, chunk_size=0)):
         graph = replace(plan.semantic_graph, tasks=(replace(task, visibility=value),))
-        with pytest.raises(ValueError, match="visibility|Exact overlays"):
+        with pytest.raises(ValueError, match="state visibility"):
             _core.validate_plan_bundle(encode_boundary(replace(plan, semantic_graph=graph)))
 
 
@@ -461,7 +427,6 @@ def multiple_requests(workload, facts):
     )
     facts = imported_facts(workload, facts)
     deployment = workload.compile_backend(workload.specialize(facts, pllm.ExecutionOptions()))
-    from pllm.execution.region_streams import plan_closed_window
 
     source = deployment.attachment.inputs.plan.semantic_graph.source_regions[0]
     with pytest.raises(ValueError, match="increase the memory budget"):

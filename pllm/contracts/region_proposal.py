@@ -6,7 +6,6 @@ from pllm.contracts.region_payload import RegionPayload
 from pllm.contracts.region_program import Program
 from pllm.contracts.region_selection import RegionPayloadLimit
 from pllm.contracts.region_streams import RegionStateWindow, RegionStreamPlan
-from pllm.contracts.visibility import StateVisibility
 
 REGION_STREAMS_CAPABILITY = "execution/region_streams@1"
 
@@ -29,7 +28,6 @@ class ClosedWindowRequest:
     counts: tuple[str, ...]
     quantum: int
     token_budget: int
-    visibility: StateVisibility
 
 
 @dataclass(frozen=True, slots=True)

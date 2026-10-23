@@ -515,13 +515,6 @@ fn validate_parameter_overlay_graph(
         .binary_search_by(|state| state.resource.cmp(&request.state_resource))
         .map_err(|_| "parameter overlay state resource is absent from the semantic graph".to_owned())?;
     let transition = task_for_dense_id(graph, &bindings[0])?;
-    if request.attachment_kind == AttachmentKind::ParameterOverlay && transition.timing.after == "model.execute" {
-        let visibility = transition.visibility.as_ref().ok_or("parameter transition needs forward-pinned visibility")?;
-        if visibility.source.scope != super::super::visibility::Scope::Overlay
-            || visibility.source.resources != request.overlay_bindings.iter().map(|binding| binding.resource.clone()).collect::<Vec<_>>() {
-            return Err("parameter visibility targets differ from its model read bindings".into());
-        }
-    }
     if !transition.effects.iter().any(|effect| {
         effect.resource == request.state_resource
             && effect.version.is_none()
@@ -657,12 +650,6 @@ fn validate_cross_binding(
     match request.attachment_kind {
         AttachmentKind::ModelScan => {
             let task = task_for_dense_id(graph, &request.task_bindings[0])?;
-            let visibility = task.visibility.as_ref().ok_or("ModelScan needs Exact visibility")?;
-            if visibility.source.scope != super::super::visibility::Scope::ModelScan
-                || visibility.source.resources != request.overlay_bindings.iter().map(|binding| binding.resource.clone()).collect::<Vec<_>>()
-                || visibility.source.chunk_size != request.model_scan_chunk_size {
-                return Err("ModelScan visibility differs from its target and chunk read bindings".into());
-            }
             let resources: std::collections::BTreeSet<_> = graph.states.iter().map(|state| &state.resource).collect();
             if resources.len() != request.overlay_bindings.len()
                 || graph.states.iter().any(|state| state.scope != StateScope::Request
