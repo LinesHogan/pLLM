@@ -30,6 +30,7 @@ pub(crate) enum AttachmentKind {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AttachmentGraphMode {
     Eager,
+    CudaGraph,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

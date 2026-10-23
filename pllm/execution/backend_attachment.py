@@ -7,6 +7,7 @@ from dataclasses import replace
 from pllm import _core
 from pllm.contracts.backend_attachment import (
     AttachmentCleanupStage,
+    AttachmentGraphMode,
     AttachmentKind,
     AttachmentTaskBinding,
     AttachmentTaskRole,
@@ -72,6 +73,14 @@ def attachment_buffer_bytes(
             heads, width_per_head, _ = first
             # Owned capture, fp32 input/correction, layout copy, cast and addition.
             buffers += rows * (6 * width * heads * width_per_head + 8)
+            if probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH:
+                assert probe.causal_domain is not None
+                requests = probe.causal_domain.requests
+                # Bounded gather/read/scatter workspace, excluding the borrowed field pool.
+                buffers += 8 * (requests + requests * rows + rows)
+                buffers += requests * (
+                    8 * rows * heads * width_per_head * width + 2 * heads * width_per_head**2 * width
+                )
         else:
             rank, inputs = first
             outputs = fields[binding.fields[1]].shape[0]

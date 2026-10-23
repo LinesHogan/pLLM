@@ -42,6 +42,7 @@ class Qwen2DecoderLayer(Module):
 
 
 class Qwen2Model(Module):
+    do_not_compile: bool
     layers: Sequence[Qwen2DecoderLayer]
     norm: RMSNorm
     forward: Callable[[torch.Tensor | None, torch.Tensor, IntermediateTensors | None, torch.Tensor | None], torch.Tensor | IntermediateTensors]

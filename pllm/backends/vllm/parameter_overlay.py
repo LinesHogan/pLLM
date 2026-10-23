@@ -50,7 +50,8 @@ class _Mlp(Protocol):
     forward: _MlpForward
 
 
-def _locate(model: Qwen2ForCausalLM, target: ParameterTarget) -> tuple[_Linear, int, int, _Mlp | None]:
+def locate_parameter(model: Qwen2ForCausalLM, target: ParameterTarget) -> tuple[_Linear, int, int, _Mlp | None]:
+    """Resolve the supported projection and its disjoint output slice."""
     layer = model.model.layers[target.layer]
     if target.module is ParameterModuleKind.MLP and target.role is ParameterRole.DOWN_PROJECTION_WEIGHT:
         module = layer.mlp.down_proj
@@ -111,7 +112,7 @@ def inspect_parameter_targets(
     if len(set(targets)) != len(targets):
         raise ValueError("parameter targets must be unique")
     for target in targets:
-        module, offset, size, _ = _locate(model, target)
+        module, offset, size, _ = locate_parameter(model, target)
         if (
             module.tp_size != 1
             or not module.return_bias
@@ -233,7 +234,7 @@ class VllmParameterOverlay:
     ) -> None:
         modules: dict[int, _ParameterModule] = {}
         for binding in bindings:
-            module, offset, size, mlp = _locate(model, binding.target)
+            module, offset, size, mlp = locate_parameter(model, binding.target)
             if id(module) not in modules:
                 modules[id(module)] = _ParameterModule(module, mlp)
             modules[id(module)].bindings.append((binding, offset, size))

@@ -42,6 +42,7 @@ class AttachmentKind(StrEnum):
 
 class AttachmentGraphMode(StrEnum):
     EAGER = "eager"
+    CUDA_GRAPH = "cuda_graph"
 
 
 class AttachmentCleanupStage(StrEnum):

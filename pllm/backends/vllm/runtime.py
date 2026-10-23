@@ -28,7 +28,6 @@ from vllm.v1.sample.sampler import Sampler as Mrv1Sampler
 from vllm.v1.worker.gpu.async_utils import AsyncOutput
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.model_runner import GPUModelRunner as UpstreamModelRunner
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu_worker import Worker
@@ -49,6 +48,12 @@ from pllm.authoring import (
 from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.hidden_capture import HiddenTaps
 from pllm.backends.vllm.model_scan import ModelScanSource, VllmModelScan
+from pllm.backends.vllm.overlay_graph import (
+    OverlayGraphRunner,
+    PinnedGraphOverlay,
+    graph_mode,
+    graph_options,
+)
 from pllm.backends.vllm.packed_rows import encode_mrv2_rows
 from pllm.backends.vllm.parameter_overlay import (
     VllmParameterOverlay,
@@ -322,10 +327,19 @@ class VllmSession(Generic[DataT, ResultT]):
         self._in_forward_overlay = any(
             task.visibility is not None and task.visibility.in_forward for task in plan.semantic_graph.tasks
         )
-        if self._in_forward_overlay:
+        if self._in_forward_overlay or probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH:
             validate_projection_sources(model, tuple(binding.target for binding in overlay_bindings))
         self._overlay = (
-            VllmParameterOverlay(model, overlay_bindings, capture=not self._overlay_import)
+            PinnedGraphOverlay(
+                model,
+                overlay_bindings[0],
+                deployment.execution.arena,
+                probe.max_packed_rows,
+                max_sampler_rows,
+                attachment.inputs.plan.timeline.memory_budget_bytes or (1 << 30),
+            )
+            if probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH
+            else VllmParameterOverlay(model, overlay_bindings, capture=not self._overlay_import)
             if overlay_bindings and not model_scan
             else None
         )
@@ -364,6 +378,7 @@ class VllmSession(Generic[DataT, ResultT]):
             if probe.causal_domain is None or probe.causal_domain.layers != len(model.model.layers):
                 raise ValueError("backend replay requires its signed causal model domain")
             if isinstance(task.replay, ConditionalLayerReplay) and self._overlay is not None:
+                assert isinstance(self._overlay, VllmParameterOverlay)
                 self._replay = VllmLayerReplay(model, task.replay, self._overlay, probe.causal_domain)
             elif isinstance(task.replay, TokenwiseLayerReplay):
                 self._replay = VllmTokenwiseReplay(
@@ -879,6 +894,8 @@ class Runner(Generic[SamplerT]):
         hidden_size = model.lm_head.weight.shape[1]
         self.hidden_taps = HiddenTaps(model, paths, self.max_num_tokens, hidden_size, self.device)
 
+    overlay_graph_bytes: int = 0
+
     def _initialize_workload(self, topology: AttachmentTopology) -> None:
         self.workload_topology = topology
         self._workload_session: _RunnerSession | None = None
@@ -914,7 +931,11 @@ class Runner(Generic[SamplerT]):
             or request.activation_bindings
             or any(task.replay is not None for task in deployment.attachment.inputs.plan.semantic_graph.tasks)
         )
-        if in_model and not self.model_config.enforce_eager:
+        if (
+            in_model
+            and not self.model_config.enforce_eager
+            and deployment.attachment.inputs.probe.graph_mode is not AttachmentGraphMode.CUDA_GRAPH
+        ):
             raise ValueError("parameter overlays, activation patches and layer replay do not run under CUDA graphs yet")
         match self.model:
             case Qwen2ForCausalLM() as model:
@@ -930,10 +951,19 @@ class Runner(Generic[SamplerT]):
         session = VllmSession(deployment, model, adapter, self.max_num_reqs, self.hidden_taps, publish_lag)
         self._workload_upstream_sampler = upstream
         self._workload_session = session
+        try:
+            self._finish_model_binding()
+        except Exception:
+            session.close()
+            self._workload_session = None
+            raise
         if adapter is not None:
             self.sampler = adapter
             # Both runner ABIs call model.compute_logits; guidance shares that LM-head read.
             setattr(model, "compute_logits", partial(session.compute_logits, model))
+
+    def _finish_model_binding(self) -> None:
+        """Finish backend model preparation after the session has installed its effects."""
 
     def detach_workload(self) -> None:
         session = self._workload_session
@@ -1004,7 +1034,7 @@ class Runner(Generic[SamplerT]):
         raise NotImplementedError
 
 
-class WorkloadModelRunner(Runner[Sampler | None], UpstreamModelRunner):
+class WorkloadModelRunner(Runner[Sampler | None], OverlayGraphRunner):
     runner_kind = RunnerKind.MRV2
 
     def __init__(
@@ -1019,6 +1049,9 @@ class WorkloadModelRunner(Runner[Sampler | None], UpstreamModelRunner):
     def load_model(self, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights)  # pyright: ignore[reportUnknownMemberType]
         self._install_hidden_taps()
+
+    def _finish_model_binding(self) -> None:
+        self.finish_overlay_graphs()
 
     def _make_sampler(self, upstream: Sampler | None) -> Sampler:
         if upstream is None:
@@ -1717,7 +1750,7 @@ def create_vllm_llm(
         config.runner is not RunnerKind.MRV2 or config.max_num_batched_tokens < requirements.prefill_chunk_size
     ):
         raise ValueError("ModelScan needs MRv2 and enough engine tokens for one complete learning chunk")
-    if config.cuda_graphs and (requirements.parameter_targets or requirements.activation_layers):
+    if config.cuda_graphs and requirements.activation_layers:
         raise ValueError("parameter overlays and activation patches do not run under CUDA graphs yet")
     environment = {
         _MP_ENV: "1" if config.multiprocessing else "0",
@@ -1736,6 +1769,7 @@ def create_vllm_llm(
     os.environ.update(environment)
     try:
         llm = LLM(
+            **graph_options(config, requirements),
             model=config.model,
             revision=config.revision,
             dtype=_model_dtype(config.dtype),
@@ -1894,7 +1928,7 @@ def probe_backend(
     targets = inspect_parameter_targets(model, requirements.parameter_targets, runner.dtype)
     replay_capabilities = (
         ("model/chunk_scan@1", "model/layer_replay@1", "model/tokenwise_replay@1", REGION_STREAMS_CAPABILITY)
-        if runner.runner_kind is RunnerKind.MRV2
+        if runner.runner_kind is RunnerKind.MRV2 and graph_mode(runner.overlay_graph_bytes) is AttachmentGraphMode.EAGER
         else ()
     )
     probe = _base_probe(
@@ -1928,7 +1962,7 @@ def probe_backend(
             )
         ),
     )
-    if runner.runner_kind is RunnerKind.MRV2:
+    if runner.runner_kind is RunnerKind.MRV2 and graph_mode(runner.overlay_graph_bytes) is AttachmentGraphMode.EAGER:
         probe = replace(
             probe,
             region_imports=qwen_region_kernels(
@@ -1969,7 +2003,7 @@ def probe_backend(
         requirements.sampler_feedback,
         publish_lag,
     )
-    required = tuple(value + requirements.resident_bytes for value in required)
+    required = tuple(value + requirements.resident_bytes + runner.overlay_graph_bytes for value in required)
     observed = replace(observed, reserved_bytes=required)
     if timeline is None:
         timeline = observed
@@ -2067,7 +2101,7 @@ def _base_probe(
         ),
         model_fingerprint=model_fingerprint,
         topology=runner.workload_topology,
-        graph_mode=AttachmentGraphMode.EAGER,
+        graph_mode=graph_mode(runner.overlay_graph_bytes),
         device_kind=StateDeviceKind.CUDA,
         device_ordinal=device_ordinal,
         tensor_parallel_size=1,

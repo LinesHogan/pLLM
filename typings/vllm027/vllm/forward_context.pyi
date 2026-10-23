@@ -3,6 +3,14 @@ from dataclasses import dataclass
 import torch
 from vllm.config import CUDAGraphMode
 
+@dataclass(frozen=True)
+class BatchDescriptor:
+    num_tokens: int
+    num_reqs: int | None = None
+    uniform: bool = False
+    has_lora: bool = False
+    num_active_loras: int = 0
+
 @dataclass
 class ForwardContext:
     no_compile_layers: dict[str, object]
@@ -10,7 +18,7 @@ class ForwardContext:
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]]
     dp_metadata: object | None = ...
     cudagraph_runtime_mode: CUDAGraphMode = ...
-    batch_descriptor: object | None = ...
+    batch_descriptor: BatchDescriptor | None = ...
     ubatch_slices: object | None = ...
     is_padding: torch.Tensor | None = ...
 

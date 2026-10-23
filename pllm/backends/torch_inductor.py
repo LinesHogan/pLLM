@@ -96,6 +96,9 @@ _ALLOWED_PACKETS = frozenset(
             "tanh",
             "erf",
             "clamp",
+            "clamp_min",
+            "masked_fill",
+            "scalar_tensor",
             "floor",
             "ceil",
             "round",
@@ -123,6 +126,8 @@ _ALLOWED_PACKETS = frozenset(
             "broadcast_to",
             "slice",
             "select",
+            "index_select",
+            "index",
             "squeeze",
             "unsqueeze",
             "narrow",
@@ -156,7 +161,8 @@ def supports_inductor_tensor_graph(source: torch.fx.GraphModule) -> bool:
         if (
             tensor is None
             or tensor.device.type not in ("cpu", "cuda")
-            or tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+            or tensor.dtype
+            not in (torch.float16, torch.bfloat16, torch.float32, torch.float64, torch.int32, torch.int64, torch.bool)
         ):
             return False
     operations = tuple(node for node in source.graph.nodes if node.op == "call_function")

@@ -105,7 +105,9 @@ class ImportedLowRank(pllm.Workload):
         )
 
 
-def open_llm(workload, seqs=2, tokens=64, model_length=64, **execution) -> VllmLlm[object, object]:
+def open_llm(
+    workload, seqs=2, tokens=64, model_length=64, *, cuda_graphs=False, **execution
+) -> VllmLlm[object, object]:
     options = {"execution": pllm.ExecutionOptions(**execution)} if execution else {}
     config = ModelConfig(
         model="Qwen/Qwen2.5-0.5B-Instruct",
@@ -114,6 +116,7 @@ def open_llm(workload, seqs=2, tokens=64, model_length=64, **execution) -> VllmL
         max_num_seqs=seqs,
         max_num_batched_tokens=tokens,
         gpu_memory_utilization=0.25,
+        cuda_graphs=cuda_graphs,
         seed=7,
         **options,
     )
@@ -153,6 +156,31 @@ def _check(handle: VllmLlm[object, object], label: str) -> tuple[str, ...]:
     ):
         raise RuntimeError(f"{label} MRv2 parameter-overlay lifecycle evidence is incomplete")
     return outputs
+
+
+def _check_graph_head(handle):
+    """Pinned graph operands reach training as row counts and request order change."""
+    from vllm.config import CUDAGraphMode
+
+    from pllm.backends.vllm.overlay_graph import CapacityGraphManager, PinnedGraphOverlay
+
+    runner = handle.runner
+    assert isinstance(runner.cudagraph_manager, CapacityGraphManager)
+    descriptors = runner.cudagraph_manager._capture_descs[CUDAGraphMode.PIECEWISE]
+    assert {d.num_reqs for d in descriptors if d.num_tokens == 128} == {1, 2}
+    overlay = runner.require_session()._overlay
+    assert isinstance(overlay, PinnedGraphOverlay)
+    assert all(program.borrows_inputs for program in overlay.programs.values())
+    pointers = (overlay.table.data_ptr(), overlay.captured.data_ptr(), overlay.pool.data_ptr())
+    prompts = ["The sky is blue. " * 8, "Water freezes when it is cold. " * 2]
+    with patch.object(PinnedGraphOverlay, "emit", side_effect=AssertionError("warm replay called Python projection")):
+        first = texts(handle.generate(prompts, SAMPLING))
+        assert texts(handle.generate(list(reversed(prompts)), SAMPLING)) == first[::-1]
+        assert texts(handle.generate(prompts[:1], SAMPLING)) == first[:1]
+        assert all(texts(handle.generate(["The sky is blue. " * 5, "Water is cold. " * 2], SAMPLING)))
+    assert pointers == (overlay.table.data_ptr(), overlay.captured.data_ptr(), overlay.pool.data_ptr())
+    assert handle.diagnostics().update_count > 0 and handle.diagnostics().active_lineages == 0
+    return first
 
 
 def _key(prompt_index: int) -> RequestStateKey:
@@ -265,6 +293,21 @@ def main() -> int:
                 memory_budget_bytes=256 << 20,
             ),
             lambda h: _check(h, "gated tree"),
+        ),
+        (
+            "graph_head",
+            lambda: open_llm(
+                replace(
+                    headwise,
+                    config=replace(headwise.config, chunk_size=16, visibility=pllm.Visibility.forward_pinned()),
+                ),
+                tokens=128,
+                model_length=128,
+                cuda_graphs=True,
+                capture_memory_bytes=256 << 20,
+                memory_budget_bytes=1 << 30,
+            ),
+            lambda h: _check_graph_head(h),
         ),
         ("low_rank", lambda: open_llm(RequestLowRankTTT()), lambda h: _check(h, "request low-rank")),
         ("imported", lambda: open_llm(ImportedLowRank(), memory_budget_bytes=1 << 30), _check_imported),

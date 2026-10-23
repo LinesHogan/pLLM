@@ -1022,6 +1022,10 @@ class PageBundleArena:
             self._require_live()
             return tuple(self._root_views(root, writable) for root, writable in self._held_roots(access, refs))
 
+    def field_pool(self, resource: str, field: LayoutFieldId) -> torch.Tensor:
+        """Bind stable graph storage; each invocation still supplies pin-authorized read slots."""
+        return self._pools[resource].tensors[field].detach()
+
     def field_slots(
         self, access: tuple[PagePin | PageWrite, ...], refs: Sequence[StateRef], field: LayoutFieldId
     ) -> tuple[torch.Tensor, tuple[int, ...]]:

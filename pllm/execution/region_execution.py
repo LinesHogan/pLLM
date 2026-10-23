@@ -162,7 +162,7 @@ class RegionInstructionExecution:
         self._borrow_inputs = (
             len(operations) == 1
             and isinstance(operations[0], Call)
-            and isinstance(cells[operations[0].function], AffineScanPrimitive)
+            and isinstance(cells[operations[0].function], (AffineScanPrimitive, CompiledPrimitive))
         )
         self._state_windows = stream_plan.state_windows if stream_plan is not None else state_windows
         self._actions = RegionActions(program, cells)
@@ -192,6 +192,11 @@ class RegionInstructionExecution:
             else tuple((wait.lane, expand_accesses(wait.predecessors, domains, sizes)) for wait in plan.waits),
         )
         return self._prepared[parameters]
+
+    @property
+    def borrows_inputs(self) -> bool:
+        """Whether the selected single-call ABI retains readonly entry storage without copies."""
+        return self._borrow_inputs
 
     @property
     def stream_plan(self) -> RegionStreamPlan | None:

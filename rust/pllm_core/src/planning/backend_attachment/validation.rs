@@ -864,6 +864,22 @@ fn validate_cross_binding(
 pub(crate) fn validate_inputs(inputs: &AttachmentCompilerInputs) -> Result<(), String> {
     let plan = &inputs.plan;
     plan.validate()?;
+    if inputs.probe.graph_mode == AttachmentGraphMode::CudaGraph {
+        let request = &inputs.request;
+        if inputs.probe.device_kind != StateDeviceKind::Cuda
+            || !inputs.probe.capabilities.iter().any(|value| value == "backend/vllm_mrv2@1")
+            || request.attachment_kind != AttachmentKind::ParameterOverlay
+            || request.overlay_bindings.len() != 1
+            || request.overlay_bindings[0].operator != OverlayOperator::HeadAdd
+            || plan.semantic_graph.states.iter().any(|state| state.scope != StateScope::Request)
+            || !plan.semantic_graph.tasks.iter().any(|task| task.visibility.as_ref().is_some_and(|source|
+                source.policy.kind == super::super::visibility::Kind::ForwardPinned))
+            || plan.semantic_graph.tasks.iter().any(|task| task.replay.is_some()
+                || task.visibility.as_ref().is_some_and(|source| source.policy.kind == super::super::visibility::Kind::Exact))
+        {
+            return Err("Graph checkpoint needs one forward-pinned head overlay without replay".into());
+        }
+    }
     if !inputs.request.activation_bindings.is_empty()
         || !matches!(inputs.request.attachment_kind, AttachmentKind::ModelReplay | AttachmentKind::Observation)
     {
