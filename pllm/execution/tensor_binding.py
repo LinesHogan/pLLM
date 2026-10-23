@@ -1538,11 +1538,9 @@ class TensorBinding(Builder[TensorFrame]):
             return prepare_replacement
         if self.overlay_targets:
             shapes = dict(zip(self.overlay_targets, dimensions.target_shapes, strict=True))
+            in_forward = any(task.visibility is not None and task.visibility.in_forward for task in self.graph.tasks)
 
             def prepare_overlay(value: TensorStepInput, batch: TensorBatch) -> TensorFrame:
-                in_forward = any(
-                    task.visibility is not None and task.visibility.in_forward for task in self.graph.tasks
-                )
                 expected = {
                     (row.identity, target)
                     for row in batch.selection.rows
