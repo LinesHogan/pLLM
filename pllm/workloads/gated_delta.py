@@ -11,7 +11,6 @@ from pllm.kernels.head_overlay import head_correction
 from pllm.workloads.chunk_tail import join_tail, save_tail
 
 Input = Annotated[torch.Tensor, pllm.Operand.INPUT]
-Weight = Annotated[torch.Tensor, pllm.Operand.WEIGHT]
 State = Annotated[torch.Tensor, pllm.Parameter("fast_weights", "weights")]
 Tail = Annotated[torch.Tensor, pllm.Parameter("fast_weights", "tail")]
 Length = Annotated[torch.Tensor, pllm.Parameter("fast_weights", "length")]
@@ -27,6 +26,7 @@ class GatedDeltaConfig:
     alpha: float = 0.99
     beta: float = 0.1
     update_decode: bool = False
+    visibility: pllm.Visibility = pllm.Exact()
 
     def __post_init__(self) -> None:
         if (
@@ -44,11 +44,7 @@ class GatedDeltaConfig:
 
 @dataclass(frozen=True)
 class GatedDeltaWorkload(pllm.Workload):
-    """Learn a chunk-level gated delta-rule residual after each model forward.
-
-    Queries read the state pinned at forward start. Training returns exclusive
-    chunk reads; visibility of those reads inside the model arrives with δ4.
-    """
+    """Learn per-request head residuals with exclusive chunk reads by default."""
 
     config: GatedDeltaConfig
 
@@ -81,16 +77,15 @@ class GatedDeltaWorkload(pllm.Workload):
         output = torch.bmm(values, state.transpose(1, 2)).transpose(0, 1)
         return updated, output
 
-    @pllm.on(pllm.Phase.MODEL_UPDATE)
     @pllm.overlay(
-        visibility=pllm.Visibility.forward_pinned(),
+        visibility=pllm.Config("config.visibility"),
         state="fast_weights",
         targets=pllm.Config("config.targets"),
         weight="weights",
         operator=pllm.ParameterOverlayOperator.HEAD_ADD,
         decode=pllm.Config("config.update_decode"),
     )
-    def transition(self, hidden: Input, base: Weight, weights: State, tail: Tail, length: Length) -> pllm.TensorUpdate:
+    def transition(self, hidden: Input, weights: State, tail: Tail, length: Length) -> pllm.TensorUpdate:
         """Train complete chunks, retain the tail and return the training readouts."""
         chunk = self.config.chunk_size
         (rows,) = join_tail((tail,), (hidden,), length, chunk)
@@ -103,5 +98,5 @@ class GatedDeltaWorkload(pllm.Workload):
         corrections = tuple(output.reshape(-1, hidden.shape[1]) for output in outputs)
         if remaining:
             corrections += (head_correction(rows[trained:], weights),)
-        output = hidden @ base.T + torch.cat(corrections)[-len(hidden) :].to(hidden.dtype)
+        output = torch.cat(corrections)[-len(hidden) :]
         return pllm.TensorUpdate(output, trained > 0, trained // chunk, trained, {"tail_rows": remaining})

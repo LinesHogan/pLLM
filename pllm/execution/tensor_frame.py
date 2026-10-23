@@ -61,6 +61,8 @@ def gradient_rows(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 @dataclass(frozen=True)
 class TensorUpdate:
+    """Private overlay updates and their unscaled residual, excluding the base projection."""
+
     output: torch.Tensor
     changed: bool = False
     update_count: int = 0

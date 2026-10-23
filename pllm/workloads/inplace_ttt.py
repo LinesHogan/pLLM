@@ -11,7 +11,6 @@ from pllm.workloads.chunk_tail import join_tail, save_tail
 
 Input = Annotated[torch.Tensor, pllm.Operand.INPUT]
 Target = Annotated[torch.Tensor, pllm.Operand.TARGET]
-Weight = Annotated[torch.Tensor, pllm.Operand.WEIGHT]
 Delta = Annotated[torch.Tensor, pllm.Parameter("dense_fast_weights", "delta")]
 TailInput = Annotated[torch.Tensor, pllm.Parameter("dense_fast_weights", "tail_input")]
 TailTarget = Annotated[torch.Tensor, pllm.Parameter("dense_fast_weights", "tail_target")]
@@ -20,11 +19,14 @@ TailLength = Annotated[torch.Tensor, pllm.Parameter("dense_fast_weights", "tail_
 
 @dataclass(frozen=True, slots=True)
 class InPlaceTTTConfig:
+    """Chunk mathematics and state visibility for a request-owned dense residual."""
+
     targets: tuple[ParameterTarget, ...]
     chunk_size: int = 4096
     learning_rate: float = 1e-3
     update_prefill: bool = True
     update_decode: bool = False
+    visibility: pllm.Visibility = pllm.Visibility.forward_pinned()
     replay: ConditionalLayerReplay | None = None
 
     def __post_init__(self) -> None:
@@ -39,6 +41,8 @@ class InPlaceTTTConfig:
 
 @dataclass(frozen=True)
 class InPlaceTTTWorkload(pllm.Workload):
+    """Train dense residuals at the declared projections using carried input/target chunks."""
+
     name = "inplace_ttt.dense_fast_weight"
     config: InPlaceTTTConfig
 
@@ -57,14 +61,14 @@ class InPlaceTTTWorkload(pllm.Workload):
         )
 
     def step(
-        self, delta: torch.Tensor, inputs: torch.Tensor, targets: torch.Tensor, base: torch.Tensor
+        self, delta: torch.Tensor, inputs: torch.Tensor, targets: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        output = torch.mm(inputs, (base + delta).T)
+        """Read the incoming residual and advance one additive chunk."""
+        output = torch.mm(inputs, delta.T)
         return delta + (self.config.learning_rate * torch.mm(targets.T, inputs)).to(delta), output
 
-    @pllm.on(pllm.Phase.MODEL_UPDATE)
     @pllm.overlay(
-        visibility=pllm.Visibility.forward_pinned(),
+        visibility=pllm.Config("config.visibility"),
         state="dense_fast_weights",
         targets=pllm.Config("config.targets"),
         weight="delta",
@@ -76,22 +80,20 @@ class InPlaceTTTWorkload(pllm.Workload):
         self,
         hidden: Input,
         target: Target,
-        base: Weight,
         delta: Delta,
         tail_input: TailInput,
         tail_target: TailTarget,
         tail_length: TailLength,
     ) -> pllm.TensorUpdate:
+        """Return exclusive residuals, update complete chunks and retain unfinished rows."""
         chunk = self.config.chunk_size
         inputs, targets = join_tail((tail_input, tail_target), (hidden, target), tail_length, chunk)
         trained = len(inputs) // chunk * chunk
-        updated, outputs = pllm.scan(
-            self.step, carry=delta, over=(inputs[:trained], targets[:trained]), chunk=chunk, invariants=(base,)
-        )
+        updated, outputs = pllm.scan(self.step, carry=delta, over=(inputs[:trained], targets[:trained]), chunk=chunk)
         delta.copy_(updated)
         remaining = save_tail((tail_input, tail_target), (inputs, targets), tail_length, trained)
         if remaining:
-            outputs += (inputs[trained:] @ (base + delta).T,)
+            outputs += (inputs[trained:] @ delta.T,)
         return TensorUpdate(
             torch.cat(outputs)[-len(hidden) :], trained > 0, trained // chunk, trained, {"tail_rows": remaining}
         )

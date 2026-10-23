@@ -8,7 +8,7 @@ from typing import Generic, Protocol, TypeVar
 
 import torch
 
-from pllm.contracts.semantic_graph import AnchorId, ImplementationId, PhysicalPlan
+from pllm.contracts.semantic_graph import AnchorId, ImplementationId, PhysicalPlan, TaskId
 from pllm.execution.trace import ExecutionTrace
 
 ExecutionContextT = TypeVar("ExecutionContextT")
@@ -92,6 +92,20 @@ class TaskGraphInvocation(Generic[ExecutionContextT]):
             raise RuntimeError("task invocation has unfinished signed tasks")
         self.finished = True
         return self.context
+
+    def execute_part(self, task_id: TaskId, *, complete: bool, stream: torch.cuda.Stream | None) -> None:
+        """Run a projection segment of the current task, retaining its cursor until completion."""
+        plan, trace = self.execution.plan, self.execution.trace
+        assert not self.finished and self._next_task_index < len(plan.tasks)
+        task = plan.tasks[self._next_task_index]
+        assert task.task_id == task_id and task.anchor_id >= self.last_anchor_id
+        with trace.task(self.invocation_id, task_id, stream):
+            self.execution.implementations[int(task_id)].execute(self.context)
+        self.last_anchor_id = int(task.anchor_id)
+        if complete:
+            if task.release_values and self.execution.release_values is not None:
+                self.execution.release_values(self.context, task.release_values)
+            self._next_task_index += 1
 
 
 __all__ = [

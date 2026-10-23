@@ -81,7 +81,7 @@ def test_bound_scan_matches_original_chunk_math_bitwise(device, dtype, numerics)
     ):
         hidden = torch.randn(rows, 7, dtype=dtype, device=device, generator=generator)
         desired = torch.randn(rows, 5, dtype=dtype, device=device, generator=generator)
-        expected = reference_transition(hidden, desired, base, *reference)
+        expected = reference_transition(hidden, desired, *reference)
         operand = CapturedParameterOperand(identity, TARGET, phase, hidden, desired, base)
         (result,) = execution.step(_input((operand,)), stream=stream).entries
         got = result.targets[0].update
@@ -145,15 +145,14 @@ def test_scan_matches_the_serial_loop_including_carry_views(device):
         return
     generator = torch.Generator(device=device).manual_seed(315)
     carry = torch.randn(11, 13, device=device, generator=generator) * 0.01
-    base = torch.randn(13, 11, device=device, generator=generator).T
     x = torch.randn(20, 13, device=device, generator=generator)
     y = torch.randn(20, 11, device=device, generator=generator)
     workload = InPlaceTTTWorkload(InPlaceTTTConfig((TARGET,), chunk_size=4, learning_rate=0.013))
 
     for kind in ("additive", "nonlinear", "bilinear", "downcast", "random", "alpha"):
 
-        def transition(state, inputs, targets, weight):
-            result, output = workload.step(state, inputs, targets, weight)
+        def transition(state, inputs, targets):
+            result, output = workload.step(state, inputs, targets)
             if kind == "nonlinear":
                 result = result.tanh()
             elif kind == "bilinear":
@@ -170,14 +169,14 @@ def test_scan_matches_the_serial_loop_including_carry_views(device):
             # Refusal is a source-proof property; compiling and timing an
             # unrelated fallback for every counterexample adds no coverage.
             with FakeTensorMode():
-                samples = tuple(torch.empty(shape, device=device) for shape in ((11, 13), (11, 13), (4, 13), (4, 11)))
+                samples = tuple(torch.empty(shape, device=device) for shape in ((11, 13), (4, 13), (4, 11)))
                 cell = ExportedCell.capture(
-                    lambda state, weight, inputs, targets: transition(state, inputs, targets, weight),
-                    ("state", "weight", "inputs", "targets"),
+                    transition,
+                    ("state", "inputs", "targets"),
                     ("next", "output"),
                     samples,
                 )
-                scan = TensorScan(cell, 5, carry=1, invariants=1)
+                scan = TensorScan(cell, 5, carry=1, invariants=0)
             assert not tuple(
                 affine_candidates(scan.program, {cell.digest: cell}, (RegionPayloadLimit(device, 1 << 30),))
             )
@@ -185,7 +184,7 @@ def test_scan_matches_the_serial_loop_including_carry_views(device):
         reference, outputs = carry, []
         rng = torch.cuda.get_rng_state()
         for xx, yy in zip(x.split(4), y.split(4), strict=True):
-            reference, output = transition(reference, xx, yy, base)
+            reference, output = transition(reference, xx, yy)
             outputs.append(output)
         for numerics in (False, True) if kind == "additive" else (True,):
             torch.cuda.set_rng_state(rng)
@@ -194,27 +193,28 @@ def test_scan_matches_the_serial_loop_including_carry_views(device):
                 # RNG already needs an opaque backend binding; the affine
                 # optimizer must not silently turn it into a pure coefficient.
                 with pytest.raises(ValueError, match="opaque tensor fragments"):
-                    context.bind(pllm.scan)(transition, carry=carry, over=(x, y), chunk=4, invariants=(base,))
+                    context.bind(pllm.scan)(transition, carry=carry, over=(x, y), chunk=4)
                 continue
             with warnings.catch_warnings(record=True) as reported:
-                actual = context.bind(pllm.scan)(transition, carry=carry, over=(x, y), chunk=4, invariants=(base,))
+                actual = context.bind(pllm.scan)(transition, carry=carry, over=(x, y), chunk=4)
             tolerance = {"rtol": 1e-5, "atol": 1e-6} if numerics else {"rtol": 0, "atol": 0}
             torch.testing.assert_close(actual, (reference, tuple(outputs)), **tolerance)
             if kind != "additive" or not numerics:
                 assert not any("additive scan" in str(item.message) for item in reported)
     # Alias guards are checked on each invocation, not inferred from fake samples.
+    alias_y = x[:, :11]
     reference, outputs = carry, []
-    for xx, yy in zip(x.split(4), y.split(4), strict=True):
-        reference, output = workload.step(reference, xx, yy, carry)
+    for xx, yy in zip(x.split(4), alias_y.split(4), strict=True):
+        reference, output = workload.step(reference, xx, yy)
         outputs.append(output)
-    actual = pllm.scan(workload.step, carry=carry, over=(x, y), chunk=4, invariants=(carry,))
+    actual = pllm.scan(workload.step, carry=carry, over=(x, alias_y), chunk=4)
     torch.testing.assert_close(actual, (reference, tuple(outputs)), rtol=0, atol=0)
     # Prime bounded buckets with real C, then vary C within them without any
     # warm export. The measured policy must not specialize on every count.
     x, y = torch.cat((x, x[:12])), torch.cat((y, y[:12]))
     context = ScanContext(RegionSelectionPolicy(True, tuning="measured"), 32, torch.device(device))
     run = context.bind(pllm.scan)
-    run(workload.step, carry=carry, over=(x[:20], y[:20]), chunk=4, invariants=(base,))
+    run(workload.step, carry=carry, over=(x[:20], y[:20]), chunk=4)
     with (
         patch("torch.export.export", side_effect=AssertionError("warm C caused an export")),
         patch.object(ScanTemplate, "_prepare", side_effect=AssertionError("warm C caused plan preparation")),
@@ -224,7 +224,7 @@ def test_scan_matches_the_serial_loop_including_carry_views(device):
             for xx, yy in zip(x[: 4 * count].split(4), y[: 4 * count].split(4), strict=True):
                 if not len(xx):
                     continue
-                expected, output = workload.step(expected, xx, yy, base)
+                expected, output = workload.step(expected, xx, yy)
                 outputs.append(output)
-            actual = run(workload.step, carry=carry, over=(x[: 4 * count], y[: 4 * count]), chunk=4, invariants=(base,))
+            actual = run(workload.step, carry=carry, over=(x[: 4 * count], y[: 4 * count]), chunk=4)
             torch.testing.assert_close(actual, (expected, tuple(outputs)), rtol=1e-5, atol=1e-6)

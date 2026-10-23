@@ -11,6 +11,7 @@ import torch
 from torch.optim.sgd import sgd
 
 from pllm.contracts.packed_rows import PackedPhaseRow
+from pllm.contracts.parameter_overlay import ParameterTarget
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
@@ -90,6 +91,9 @@ class Observation:
 
 @dataclass(frozen=True, slots=True)
 class TaskOutput:
+    residuals: Mapping[tuple[RequestIdentity, ParameterTarget], torch.Tensor] = field(
+        default_factory=lambda: dict[tuple[RequestIdentity, ParameterTarget], torch.Tensor]()
+    )
     guidance: PackedSamplerGuidanceBatch | None = None
     gradients: tuple[torch.Tensor, ...] = ()
     loss_count: int = 0
@@ -176,6 +180,7 @@ class FunctionMath(Generic[I, D, R]):
     rows: Callable[[I], tuple[PackedPhaseRow, ...]]
     prepare_data: Callable[[I, TensorBatch], D]
     output_data: Callable[[D, InvocationOutput], R]
+    resume_data: Callable[[D, D], D] | None = None
 
     def initialize(self, roots: Roots, addresses: tuple[StateAddress, ...]) -> None:
         resources = tuple(str(address.resource) for address in addresses)
@@ -194,7 +199,8 @@ class FunctionMath(Generic[I, D, R]):
             nullcontext() if context.pin.stream is None else torch.cuda.stream(context.pin.stream),
             torch.inference_mode(False),
         ):
-            return self.prepare_data(value, _read(context))
+            data = self.prepare_data(value, _read(context))
+            return data if context.value is None or self.resume_data is None else self.resume_data(context.value, data)
 
     def output(self, context: StateTaskContext[D]) -> R:
         graph = context.arena.plan.semantic_graph
@@ -349,9 +355,10 @@ class TensorOperation(Generic[D]):
             if len(set(selected)) != len(selected) or any(i < 0 or i >= len(batch.roots) for i in selected):
                 raise ValueError("update selection is outside the original state batch")
             if self.mode == "transition" and selected:
-                context.write = context.arena.prepare_transition(
-                    context.pin.refs.take(selected), stream, copy_fields=self.copy_fields
-                )
+                if self.version == "input" or context.write is None:
+                    context.write = context.arena.prepare_transition(
+                        context.pin.refs.take(selected), stream, copy_fields=self.copy_fields
+                    )
                 batch = _read(context, "private")
             if self.step is None:
                 output = self.function(data, batch)
@@ -399,6 +406,7 @@ class TensorOperation(Generic[D]):
                 if transition is not None:
                     refs = refs.replace_versions(transition.before_refs, transition.after_refs)
                 context.updated_refs = refs.take(changed) if changed else ()
+            context.projection_outputs = output.residuals
             if output.guidance is not None:
                 context.guidance = output.guidance
                 context.guidance_ready = CudaStreamReadiness(stream) if stream is not None else None

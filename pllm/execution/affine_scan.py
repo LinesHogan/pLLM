@@ -57,8 +57,8 @@ class AdditiveUpdate:
     plan: AffineScanPlan
 
     def __call__(self, inputs: tuple[Data, ...]) -> tuple[Data, ...]:
-        carry, base, xs, ys = inputs
-        assert isinstance(carry, torch.Tensor) and isinstance(base, torch.Tensor)
+        carry, xs, ys = inputs
+        assert isinstance(carry, torch.Tensor)
         assert isinstance(xs, Bank) and isinstance(ys, Bank)
         x, y = _tensors(xs), _tensors(ys)
         state, plan = carry, self.plan
@@ -69,7 +69,7 @@ class AdditiveUpdate:
             xx = _pack(x[start : start + plan.window], plan.window, plan.chunk, carry.shape[1], carry)
             yy = _pack(y[start : start + plan.window], plan.window, plan.chunk, carry.shape[0], carry)
             active = torch.full((), size, dtype=torch.int32, device=carry.device)
-            launch_window(xx, yy, state, base, active, buffers, plan.scale, plan.implementation.form)
+            launch_window(xx, yy, state, active, buffers, plan.scale, plan.implementation.form)
             state = buffers.final
             outputs.extend(row.clone() for row in buffers.output.unbind()[:size])
             # Outputs are independent leaves; the next window may reuse every

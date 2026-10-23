@@ -11,7 +11,6 @@ from pllm.contracts.region_imports import ScanForm
 def _weights(
     increments: torch.Tensor,
     carry: torch.Tensor,
-    base: torch.Tensor,
     weights: torch.Tensor,
     final: torch.Tensor,
     active: torch.Tensor,
@@ -20,8 +19,6 @@ def _weights(
     capacity: tl.constexpr,
     carry_row: tl.constexpr,
     carry_column: tl.constexpr,
-    base_row: tl.constexpr,
-    base_column: tl.constexpr,
     scale: tl.constexpr,
     levels: tl.constexpr,
     tree: tl.constexpr,
@@ -32,7 +29,6 @@ def _weights(
     mask = index < width
     row, column = index // columns, index % columns
     initial = tl.load(carry + row * carry_row + column * carry_column, mask, 0).to(tl.float32)
-    fixed = tl.load(base + row * base_row + column * base_column, mask, 0).to(tl.float32)
     count = tl.load(active)
     if tree:
         lane = tl.arange(0, capacity)
@@ -48,10 +44,10 @@ def _weights(
             previous = tl.gather(prefix, tl.maximum(lane - offset, 0)[:, None] + tl.zeros((1, block), tl.int32), 0)
             prefix = tl.where(lane[:, None] >= offset, previous + prefix, prefix)
         prefix = (prefix + initial[None, :]).to(weights.dtype.element_ty).to(tl.float32)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType, reportAttributeAccessIssue]
-        tl.store(weights + index, fixed + initial, mask)
+        tl.store(weights + index, initial, mask)
         tl.store(
             weights + (lane[:, None] + 1) * width + index[None, :],
-            fixed[None, :] + prefix,
+            prefix,
             (lane[:, None] + 1 < capacity) & mask[None, :],
         )
         last = tl.gather(prefix, tl.zeros((1, block), tl.int32) + tl.maximum(count - 1, 0), 0)
@@ -59,7 +55,7 @@ def _weights(
     else:
         state = initial
         for chunk in range(capacity):
-            tl.store(weights + chunk * width + index, fixed + state, mask)
+            tl.store(weights + chunk * width + index, state, mask)
             increment = tl.load(increments + chunk * width + index, mask & (chunk < count), 0).to(tl.float32) * scale
             increment = increment.to(weights.dtype.element_ty).to(tl.float32)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType, reportAttributeAccessIssue]
             updated = (state + increment).to(weights.dtype.element_ty).to(tl.float32)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType, reportAttributeAccessIssue]
@@ -70,7 +66,6 @@ def _weights(
 def launch_prefix(
     increments: torch.Tensor,
     carry: torch.Tensor,
-    base: torch.Tensor,
     active: torch.Tensor,
     weights: torch.Tensor,
     final: torch.Tensor,
@@ -82,7 +77,6 @@ def launch_prefix(
     _weights[((carry.numel() + block - 1) // block,)](
         increments,
         carry,
-        base,
         weights,
         final,
         active,
@@ -91,8 +85,6 @@ def launch_prefix(
         len(increments),
         carry.stride(0),
         carry.stride(1),
-        base.stride(0),
-        base.stride(1),
         scale,
         len(increments).bit_length() - 1,
         form is ScanForm.HILLIS_STEELE,
@@ -115,7 +107,6 @@ def launch_window(
     inputs: torch.Tensor,
     targets: torch.Tensor,
     carry: torch.Tensor,
-    base: torch.Tensor,
     active: torch.Tensor,
     buffers: AdditiveBuffers,
     scale: float,
@@ -123,5 +114,5 @@ def launch_window(
 ) -> None:
     """Run the whole window into stable buffers; staging and publication stay outside."""
     torch.bmm(targets.transpose(1, 2), inputs, out=buffers.increments)
-    launch_prefix(buffers.increments, carry, base, active, buffers.weights, buffers.final, scale, form)
+    launch_prefix(buffers.increments, carry, active, buffers.weights, buffers.final, scale, form)
     torch.bmm(inputs, buffers.weights.transpose(1, 2), out=buffers.output)

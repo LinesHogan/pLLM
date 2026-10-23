@@ -231,14 +231,14 @@ def test_tuned_tensor_scan_keeps_one_symbolic_plan_and_its_guards():
     # A claimed loop rewrite must replay against its source, even when the
     # supplied timing makes it attractive. These checks need no GPU execution.
     with FakeTensorMode():
-        operands = tuple(torch.empty(shape, device="cuda:0") for shape in ((3, 4), (3, 4), (2, 4), (2, 3)))
+        operands = tuple(torch.empty(shape, device="cuda:0") for shape in ((3, 4), (2, 4), (2, 3)))
         cell = ExportedCell.capture(
-            lambda w, base, x, y: (w + 0.013 * (y.T @ x), x @ (base + w).T),
-            ("w", "base", "x", "y"),
+            lambda w, x, y: (w + 0.013 * (y.T @ x), x @ w.T),
+            ("w", "x", "y"),
             ("next", "out"),
             operands,
         )
-        scan = TensorScan(cell, SizeParameter("n", 0, 9), carry=1, invariants=1)
+        scan = TensorScan(cell, SizeParameter("n", 0, 9), carry=1, invariants=0)
     imports = import_region_functions(scan.program, {cell.digest: cell})
     limits = (RegionPayloadLimit("cuda:0", 32 << 20),)
     alternatives = tuple(affine_candidates(scan.program, {cell.digest: cell}, limits))
@@ -274,16 +274,15 @@ def test_tuned_tensor_scan_keeps_one_symbolic_plan_and_its_guards():
         # Separate allocations exercise the bank-packing path as well as a
         # partial final window. Outputs must never expose caller-owned inputs.
         w = torch.ones(3, 4, device="cuda:0")
-        base = torch.zeros_like(w)
         xs = tuple(torch.full((2, 4), i / 10, device=w.device) for i in range(5))
         ys = tuple(torch.full((2, 3), i / 20, device=w.device) for i in range(5))
         expected, outputs = w, []
         for x, y in zip(xs, ys, strict=True):
-            outputs.append(x @ (base + expected).T)
+            outputs.append(x @ expected.T)
             expected = expected + 0.013 * (y.T @ x)
         execution = bind_region_candidate(alternatives[0], limits, assess_region_candidates(scan.program, request)[1])
         arguments = dict(
-            zip((v.name for v in scan.program.entry.block.arguments), (w, base, Bank(xs), Bank(ys)), strict=True)
+            zip((v.name for v in scan.program.entry.block.arguments), (w, Bank(xs), Bank(ys)), strict=True)
         )
         final, bank = execution.run(arguments, sizes={"n": 5}).values
         assert isinstance(bank, Bank)
@@ -297,12 +296,12 @@ def test_tuned_tensor_scan_keeps_one_symbolic_plan_and_its_guards():
         for count in (0, 1, 3, 5):
             expected, outputs = w, []
             for x, y in zip(xs[:count], ys[:count], strict=True):
-                outputs.append(x @ (base + expected).T)
+                outputs.append(x @ expected.T)
                 expected = expected + 0.013 * (y.T @ x)
             arguments = dict(
                 zip(
                     (v.name for v in scan.program.entry.block.arguments),
-                    (w, base, Bank(xs[:count]), Bank(ys[:count])),
+                    (w, Bank(xs[:count]), Bank(ys[:count])),
                     strict=True,
                 )
             )
@@ -317,10 +316,10 @@ def test_tuned_tensor_scan_keeps_one_symbolic_plan_and_its_guards():
         staged_x, staged_y = torch.zeros_like(full_x), torch.zeros_like(full_y)
         active = torch.zeros((), device=w.device, dtype=torch.int32)
         buffers = AdditiveBuffers(w, 8, 2)
-        launch_window(staged_x, staged_y, w, base, active, buffers, 0.013, ScanForm.HILLIS_STEELE)
+        launch_window(staged_x, staged_y, w, active, buffers, 0.013, ScanForm.HILLIS_STEELE)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            launch_window(staged_x, staged_y, w, base, active, buffers, 0.013, ScanForm.HILLIS_STEELE)
+            launch_window(staged_x, staged_y, w, active, buffers, 0.013, ScanForm.HILLIS_STEELE)
         storage = (buffers.increments, buffers.weights, buffers.output, buffers.final, active)
         pointers = tuple(t.data_ptr() for t in storage)
         for count in (8, 0, 1, 5, 3, 8):
@@ -333,9 +332,9 @@ def test_tuned_tensor_scan_keeps_one_symbolic_plan_and_its_guards():
             increments = 0.013 * torch.bmm(staged_y.transpose(1, 2), staged_x)
             prefixes = torch.cat((w[None], w[None] + increments.double().cumsum(0).float()))
             torch.testing.assert_close(buffers.final, prefixes[count])
-            torch.testing.assert_close(buffers.weights[:count], base[None] + prefixes[:count])
+            torch.testing.assert_close(buffers.weights[:count], prefixes[:count])
             torch.testing.assert_close(
-                buffers.output[:count], torch.bmm(staged_x[:count], (base[None] + prefixes[:count]).transpose(1, 2))
+                buffers.output[:count], torch.bmm(staged_x[:count], (prefixes[:count]).transpose(1, 2))
             )
             assert pointers == tuple(t.data_ptr() for t in storage)
         _check_right_matrix_rewrite()

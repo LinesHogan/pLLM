@@ -71,6 +71,7 @@ from pllm.execution.host_runtime import (
     HostWorkload,
     TensorHostBinding,
 )
+from pllm.execution.overlay_task import overlay_chunk
 from pllm.execution.region_streams import plan_closed_window
 from pllm.execution.replay import Recurrence as Recurrence
 from pllm.execution.state_execution import MathBinding, StateExecution
@@ -598,7 +599,7 @@ class _Overlay(_Effect):
     prefill: bool | Config
     decode: bool | Config
     replay: ConditionalLayerReplay | Config | None
-    visibility: Visibility
+    visibility: Visibility | Config
 
     def declare(self, operation: _Operation) -> None:
         """Declare a request buffer transition and its parameter overlay attachment."""
@@ -629,6 +630,11 @@ class _Overlay(_Effect):
         applied, replay = effect.applied_fields, Config.resolve(self.replay, context.owner)
         if replay is not None and not isinstance(replay, ConditionalLayerReplay):
             raise TypeError("overlay replay requires a conditional layer replay")
+        visibility = _setting(self.visibility, context.owner, Visibility)
+        _reject(
+            replay is not None and visibility == Exact(),
+            "Exact overlays use causal-history KV; remove post-forward layer replay",
+        )
         identity = fingerprint(operation.function)
         context.binding.parameter_overlay(
             operation.name,
@@ -648,7 +654,8 @@ class _Overlay(_Effect):
             operator=operator,
             scale=scale,
             function=_invoke(freeze(operation.function), bindings),
-            visibility=self.visibility,
+            visibility=visibility,
+            chunk_size=overlay_chunk(operation.function) if visibility == Exact() else 0,
             equations_digest=boundary_digest(context.definitions, context.bindings),
         )
         context.definitions.append(
@@ -667,14 +674,9 @@ def overlay(
     prefill: bool | Config = True,
     decode: bool | Config = False,
     replay: ConditionalLayerReplay | Config | None = None,
-    visibility: Visibility = Visibility.forward_pinned(),
+    visibility: Visibility | Config = Visibility.forward_pinned(),
 ) -> Callable[[F], F]:
-    """Apply forward-pinned state; dense/head operators use `weight`, low-rank the factor pair."""
-
-    if visibility != Visibility.forward_pinned():
-        raise ValueError(
-            "Exact overlays need in-forward transitions; use Visibility.forward_pinned() until they are supported"
-        )
+    """Apply residuals using the declared state visibility at each target projection."""
 
     return _mark(
         effect=_Overlay(
@@ -1011,6 +1013,8 @@ class _Declaration:
         seeds.extend(candidates[text] for text in texts if isinstance(text, str) and text in candidates)
         if (overlay := _typed(effect, _Overlay)) is not None:
             self.overlay_states.add(overlay.state)
+            if phase is None:
+                phase = Phase.MODEL_UPDATE
         if phase is None and isinstance(effect, _Train):
             phase = Phase.MODEL_UPDATE
             self.implicit_training.add(name)
@@ -1361,6 +1365,7 @@ class Workload(
             rows,
             b.bind_prepare(),
             output,
+            lambda previous, incoming: replace(incoming, entries=previous.entries),
         )
 
     def bind_math(

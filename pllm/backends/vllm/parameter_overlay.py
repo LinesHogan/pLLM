@@ -1,7 +1,8 @@
-"""Qwen2 parameter primitives borrowing the original signed arena fields and pins."""
+"""Qwen2 projection bindings consuming pinned fields or explicit projection-task residuals."""
 
 from __future__ import annotations
 
+import operator
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
@@ -11,6 +12,7 @@ from torch.nn import Parameter, functional as F
 from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
 
 from pllm.authoring import ParameterTargetShape
+from pllm.backends.vllm.region_layers import original_layer
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import (
     CapturedParameterOperand,
@@ -24,6 +26,8 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import StateScope
 from pllm.contracts.state_ref import StateRef
 from pllm.execution.cuda_stream import upload
+from pllm.execution.module_graph import capture_module_calls
+from pllm.execution.overlay_task import ProjectionTransition
 from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.state_execution import DataT, StateTaskContext
@@ -50,8 +54,6 @@ def _locate(model: Qwen2ForCausalLM, target: ParameterTarget) -> tuple[_Linear, 
     layer = model.model.layers[target.layer]
     if target.module is ParameterModuleKind.MLP and target.role is ParameterRole.DOWN_PROJECTION_WEIGHT:
         module = layer.mlp.down_proj
-        if module.bias is not None:
-            raise ValueError("dense operand capture requires a bias-free down projection")
         return module, 0, int(module.weight.shape[0]), layer.mlp
     if target.module is ParameterModuleKind.ATTENTION:
         attention = layer.self_attn
@@ -60,6 +62,46 @@ def _locate(model: Qwen2ForCausalLM, target: ParameterTarget) -> tuple[_Linear, 
         if target.role is ParameterRole.VALUE_PROJECTION_WEIGHT:
             return attention.qkv_proj, attention.q_size + attention.kv_size, attention.kv_size, None
     raise ValueError("Qwen2 overlay requires an MLP down or attention q/v projection")
+
+
+def validate_projection_sources(model: Qwen2ForCausalLM, targets: tuple[ParameterTarget, ...]) -> None:
+    """Bind Exact to original Qwen projections; the query slice cannot write same-layer K/V."""
+    for layer_index in dict.fromkeys(target.layer for target in targets):
+        layer = model.model.layers[layer_index]
+        if not original_layer(layer):
+            raise ValueError("Exact overlays need the original Qwen2 layer source without implicit hooks")
+        source = capture_module_calls(layer.self_attn)
+        nodes = tuple(source.graph.nodes)
+        projection = next(node for node in nodes if node.op == "call_module" and node.target == "qkv_proj")
+        packed = next(node for node in nodes if node.target is operator.getitem and node.args == (projection, 0))
+        split = next(node for node in nodes if node.op == "call_method" and node.target == "split")
+        attention = layer.self_attn
+        if split.args != (packed, [attention.q_size, attention.kv_size, attention.kv_size]) or split.kwargs != {
+            "dim": -1
+        }:
+            raise ValueError("Exact query overlays need disjoint query, key and value slices from the fused projection")
+        # Original Qwen2 independently normalizes Q/K and rotates each with the same positions.
+        # Only qkv[:q_size] is changed; K/V here retain history, while higher layers see corrected hidden.
+        slices = tuple(node.args[1] for node in split.users if node.target is operator.getitem)
+        if slices != (0, 1, 2) or tuple(packed.users) != (split,):
+            raise ValueError("Exact overlays need the original Qwen2 Q/K/V consumers")
+        query = next(node for node in split.users if node.args[1] == 0)
+        rotary = next(node for node in nodes if node.op == "call_module" and node.target == "rotary_emb")
+        consumer = next(node for node in nodes if node.op == "call_module" and node.target == "attn")
+        dependent: set[torch.fx.Node] = {query}
+        for node in nodes:
+            parents = node.all_input_nodes
+            if node.target is operator.getitem and node.args[0] is rotary:
+                # The original RoPE endpoint rotates Q and K independently with shared positions.
+                output = node.args[1]
+                assert isinstance(output, int)
+                parent = rotary.args[1 + output]
+                assert isinstance(parent, torch.fx.Node)
+                parents = [parent]
+            if any(parent in dependent for parent in parents):
+                dependent.add(node)
+        if consumer.args[1] in dependent or consumer.args[2] in dependent:
+            raise ValueError("Exact query overlays need a Qwen2 source where the query correction cannot feed K/V")
 
 
 def inspect_parameter_targets(
@@ -104,6 +146,7 @@ class _ParameterModule:
         self.total_rows = 0
         self.apply_count = self.updated_apply_count = 0
         self.capture_operands = True
+        self.transition: ProjectionTransition | None = None
 
     def captures_binding(self, binding: ParameterOverlayFieldBinding) -> bool:
         return self.capture_operands and (
@@ -127,18 +170,26 @@ class _ParameterModule:
             raise RuntimeError("parameter application differs from the prepared model step")
         # The unquantized TP1 projection owns this fresh output, not an input or state page.
         output = base[0] if isinstance(base, tuple) else base
-        captures: list[CapturedParameterOperand] = []
-        for item in self.prepared:
-            selected = hidden[item.rows] if isinstance(item.rows, slice) else hidden.index_select(0, item.rows)
-            if item.binding.operator is ParameterOverlayOperator.DENSE_ADD:
+        inputs = tuple(
+            hidden[item.rows] if isinstance(item.rows, slice) else hidden.index_select(0, item.rows)
+            for item in self.prepared
+        )
+        captures = tuple(
+            self.capture(item, selected)
+            for item, selected in zip(self.prepared, inputs, strict=True)
+            if self.captures_binding(item.binding)
+        )
+        residuals = None if self.transition is None else self.transition.run(captures)
+        for item, selected in zip(self.prepared, inputs, strict=True):
+            if residuals is not None:
+                delta = (residuals[item.source.identity, item.binding.target] * item.binding.scale).to(output.dtype)
+            elif item.binding.operator is ParameterOverlayOperator.DENSE_ADD:
                 delta = F.linear(selected, item.fields[0]) * item.binding.scale
             elif item.binding.operator is ParameterOverlayOperator.HEAD_ADD:
                 delta = (head_correction(selected, item.fields[0]) * item.binding.scale).to(hidden.dtype)
             else:
                 a, b = item.fields
                 delta = F.linear(F.linear(selected, a), b) * item.binding.scale
-            if self.captures_binding(item.binding):
-                captures.append(self.capture(item, selected))
             columns = output[:, item.offset : item.offset + item.size]
             if isinstance(item.rows, slice):
                 columns[item.rows].add_(delta)
@@ -147,7 +198,7 @@ class _ParameterModule:
             self.apply_count += selected.shape[0]
             if any(ref.version_id > 0 for ref in item.pin.refs):
                 self.updated_apply_count += selected.shape[0]
-        self.captures = tuple(captures)
+        self.captures = captures
         return base
 
     def capture(self, item: _PreparedRows, selected: torch.Tensor) -> CapturedParameterOperand:
@@ -171,6 +222,7 @@ class _ParameterModule:
         self.mlp_input = None
         self.total_rows = 0
         self.capture_operands = True
+        self.transition = None
 
 
 class VllmParameterOverlay:
@@ -201,7 +253,11 @@ class VllmParameterOverlay:
         return sum(handle.updated_apply_count for handle in self._modules)
 
     def prepare(
-        self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT], directory: RequestStateDirectory
+        self,
+        rows: PackedPhaseRowBatch,
+        context: StateTaskContext[DataT],
+        directory: RequestStateDirectory,
+        transition: ProjectionTransition | None = None,
     ) -> None:
         identities = tuple(dict.fromkeys(row.identity for row in rows.rows))
         resolved: list[tuple[tuple[PackedPhaseRow, ...], PagePin, StateRef]] = []
@@ -217,6 +273,7 @@ class VllmParameterOverlay:
                 ref = context.selection.ref_for(identity)
             resolved.append((source, pin, ref))
         for handle in self._modules:
+            handle.transition = transition
             prepared: list[_PreparedRows] = []
             # Operand capture owns per-request rows on MLP targets; shared launches
             # group only rows reading the exact same admitted root without capture.
@@ -262,7 +319,8 @@ class VllmParameterOverlay:
             expected = sum(handle.captures_binding(item.binding) for item in handle.prepared)
             if len(handle.captures) != expected:
                 raise RuntimeError("parameter target did not capture every signed operand")
-            captures.extend(handle.captures)
+            if handle.transition is None:
+                captures.extend(handle.captures)
             handle.captures = ()
         return tuple(captures)
 

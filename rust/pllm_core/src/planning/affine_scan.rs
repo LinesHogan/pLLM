@@ -124,9 +124,9 @@ fn recognize(program: &Program, imports: &[TensorImport]) -> Option<(Action, f64
     let transpose = |x| Box::new(Expr::Permute(x, vec![1, 0]));
     if let Expr::Add(carry, increment) = next {
         let Expr::Scale(product, scale) = increment.as_ref() else { return None; };
-        let expected = Expr::Matmul(transpose(input(3)), input(2));
-        let read = Expr::Matmul(input(2), transpose(Box::new(Expr::Add(input(1), input(0)))));
-        return (block.arguments.len() == 4 && carry.as_ref() == &Expr::Input(0) && product.as_ref() == &expected && output == &read)
+        let expected = Expr::Matmul(transpose(input(2)), input(1));
+        let read = Expr::Matmul(input(1), transpose(input(0)));
+        return (block.arguments.len() == 3 && carry.as_ref() == &Expr::Input(0) && product.as_ref() == &expected && output == &read)
             .then_some((Action::Identity, *scale, 1.0));
     }
     let Expr::Sub(decayed, gradient) = next else { return None; };
@@ -157,7 +157,7 @@ fn times(a: u64, b: u64) -> Result<u64, String> {
 
 pub(super) fn derive(program: &Program, imports: &[TensorImport], evidence: &Evidence) -> Result<Option<Plan>, String> {
     let block = &program.entry.block;
-    if !matches!(block.arguments.len(), 3 | 4) || block.operations.len() != 1 || !program.resources.is_empty() { return Ok(None); }
+    if block.arguments.len() != 3 || block.operations.len() != 1 || !program.resources.is_empty() { return Ok(None); }
     let Some(carry) = block.arguments.first() else { return Ok(None); };
     let Type::Tensor { shape, dtype, device } = &carry.type_ else { return Ok(None); };
     if !matches!(shape.len(), 2 | 3) || !device.starts_with("cuda") || !matches!(dtype.as_str(), "torch.float32" | "torch.bfloat16") || shape.contains(&0) { return Ok(None); }
@@ -168,13 +168,13 @@ pub(super) fn derive(program: &Program, imports: &[TensorImport], evidence: &Evi
     for function in &program.functions { imports.iter().find(|i| i.name() == function.name).ok_or("missing affine source import")?.validate(function)?; }
     let Some((action, scale, decay)) = recognize(program, imports) else { return Ok(None); };
     let Operation::Scan { inputs, outputs, count, .. } = &block.operations[0] else { unreachable!() };
-    let first = if action == Action::Identity { 2 } else { 1 };
+    let first = 1;
     let Type::Bank { element: x, size: xs } = &block.arguments[first].type_ else { return Ok(None); };
     let Type::Bank { element: y, size: ys } = &block.arguments[first + 1].type_ else { return Ok(None); };
     let (Type::Tensor { shape: sx, dtype: dx, device: vx }, Type::Tensor { shape: sy, dtype: dy, device: vy }) = (x.as_ref(), y.as_ref()) else { return Ok(None); };
     if xs != count || ys != count || dx != dtype || dy != dtype || vx != device || vy != device || sx.is_empty() || sx[0] == 0 || count.maximum(program) <= evidence.window / 2 { return Ok(None); }
     match action {
-        Action::Identity => if shape.len() != 2 || sx != &vec![sx[0], shape[1]] || sy != &vec![sx[0], shape[0]] || block.arguments[1].type_ != carry.type_ { return Ok(None); },
+        Action::Identity => if shape.len() != 2 || sx != &vec![sx[0], shape[1]] || sy != &vec![sx[0], shape[0]] { return Ok(None); },
         Action::RightMatrix => if dtype != "torch.float32" || shape.len() != 3 || shape[1] != shape[2] || sx != &vec![sx[0], shape[0], shape[1]] || sy != sx { return Ok(None); },
     }
     if outputs[0].type_ != carry.type_ || outputs[1].type_ != block.arguments[first + 1].type_ { return Ok(None); }
@@ -185,7 +185,7 @@ pub(super) fn derive(program: &Program, imports: &[TensorImport], evidence: &Evi
     let scratch = total(&[times(window, total(&[tensor_bytes(x)?, tensor_bytes(y)?, tensor_bytes(y)?])?)?,
         times(matrices, tensor_bytes(&carry.type_)?)?, evidence.workspace, 512])?;
     let function = Function {
-        name: digest(&canonical_ascii_json(&("affine-prefix@3", program, imports, evidence))?),
+        name: digest(&canonical_ascii_json(&("affine-prefix@4", program, imports, evidence))?),
         inputs: block.arguments.iter().map(|v| v.type_.clone()).collect(), outputs: outputs.iter().map(|v| v.type_.clone()).collect(), resources: vec![], accesses: vec![],
     };
     let implementation = TensorImport::AffineScan { declaration: function.clone(), device: device.clone(),

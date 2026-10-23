@@ -53,6 +53,7 @@ from pllm.backends.vllm.packed_rows import encode_mrv2_rows
 from pllm.backends.vllm.parameter_overlay import (
     VllmParameterOverlay,
     inspect_parameter_targets,
+    validate_projection_sources,
 )
 from pllm.backends.vllm.region_kernels import qwen_region_kernels
 from pllm.backends.vllm.region_layers import VllmDecoderBodies
@@ -111,6 +112,7 @@ from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.decoder_region import decoder_activations
 from pllm.execution.execution import TaskGraphInvocation
 from pllm.execution.host_runtime import CompletionCapture, CompletionInput
+from pllm.execution.overlay_task import ProjectionTask
 from pllm.execution.post_sample import PostSampleOverlap
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
@@ -317,6 +319,13 @@ class VllmSession(Generic[DataT, ResultT]):
             plan.semantic_graph.tasks[attachment.inputs.request.task_bindings[0].task_id].timing.after
             == "request.prepare"
         )
+        if any(
+            task.visibility is not None
+            and task.visibility.scope == "overlay"
+            and task.visibility.policy.kind == "exact"
+            for task in plan.semantic_graph.tasks
+        ):
+            validate_projection_sources(model, tuple(binding.target for binding in overlay_bindings))
         self._overlay = (
             VllmParameterOverlay(model, overlay_bindings, capture=not self._overlay_import)
             if overlay_bindings and not model_scan
@@ -633,7 +642,28 @@ class VllmSession(Generic[DataT, ResultT]):
             invocation = execution.begin(rows.row_batch.request_rows, stream)
             step.invocation = invocation
         if adapter is not None:
-            adapter.prepare(rows.row_batch, invocation.context, execution.directory)
+            transition = next(
+                (
+                    task
+                    for task in execution.arena.plan.semantic_graph.tasks
+                    if task.visibility is not None
+                    and task.visibility.scope == "overlay"
+                    and task.visibility.policy.kind == "exact"
+                ),
+                None,
+            )
+            projection = None
+            if transition is not None:
+                self._advance(invocation, "request.prepare")
+                binding = self.attachment.inputs.request.task_bindings[0]
+                projection = ProjectionTask(
+                    execution,
+                    invocation,
+                    rows,
+                    binding.task_id,
+                    tuple(item.target for item in self.attachment.inputs.request.overlay_bindings),
+                )
+            adapter.prepare(rows.row_batch, invocation.context, execution.directory, projection)
         if self._activation is not None:
             self._activation.prepare(rows.row_batch, invocation.context, execution.directory)
         if isinstance(self._replay, VllmTokenwiseReplay):

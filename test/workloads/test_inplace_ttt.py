@@ -1,7 +1,7 @@
 """In-Place TTT and ordinary overlay workloads against independent outer-product oracles.
 
 Multi-target chunk updates publish one version per request, other requests keep
-their exact base weights, and retirement releases every version.
+their entry state, and retirement releases every version.
 """
 
 from dataclasses import replace
@@ -35,10 +35,10 @@ class _ShiftedUpdate(InPlaceTTTWorkload):
     """Change only a helper's mathematics to check the bound source identity."""
 
     def step(
-        self, delta: torch.Tensor, inputs: torch.Tensor, targets: torch.Tensor, base: torch.Tensor
+        self, delta: torch.Tensor, inputs: torch.Tensor, targets: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Use a different increment without changing the transition method."""
-        return delta + self.config.learning_rate * torch.mm(targets.T, inputs) + 1, torch.mm(inputs, (base + delta).T)
+        return delta + self.config.learning_rate * torch.mm(targets.T, inputs) + 1, torch.mm(inputs, delta.T)
 
 
 def _input(operands: tuple[CapturedParameterOperand, ...]) -> TensorStepInput:
@@ -54,6 +54,8 @@ def _input(operands: tuple[CapturedParameterOperand, ...]) -> TensorStepInput:
 
 def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     _check_headwise_math_and_tail()
+    _check_exact_projection_lifecycle()
+    _check_exact_additive_projection()
     targets = tuple(
         ParameterTarget(layer, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT) for layer in (0, 1)
     )
@@ -76,8 +78,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     assert visibility.policy == pllm.Visibility.forward_pinned()
     assert visibility.tail == "transition" and visibility.chunk_size == 0
     assert "model[" in explain_visibility(visibility) and "update[" in explain_visibility(visibility)
-    with pytest.raises(ValueError, match="use Visibility.forward_pinned"):
-        pllm.overlay(state="dense_fast_weights", targets=targets, visibility=pllm.Exact())
+    pllm.overlay(state="dense_fast_weights", targets=targets, visibility=pllm.Exact())
     declaration = workload.declaration().graph
     assert next(task.visibility for task in declaration.tasks if task.visibility is not None) == visibility
     changed = InPlaceTTTWorkload(replace(config, chunk_size=3)).declaration().graph
@@ -120,7 +121,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
         latest = result.after_ref
         assert latest.version_id == row + 1 and result.changed == (row == 1)
         for index, target in enumerate(result.targets):
-            torch.testing.assert_close(target.update.output, hidden[row : row + 1] @ bases[index].T)
+            torch.testing.assert_close(target.update.output, torch.zeros_like(desired[index, row : row + 1]))
             assert (target.update.update_count, target.update.trained_rows) == ((0, 0) if row == 0 else (1, 2))
 
     # The independent outer-product oracle must be visible only to the trained request.
@@ -140,7 +141,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
         assert not result.changed
         for index, target in enumerate(result.targets):
             target_result = target.update
-            weight = bases[index] + deltas[index] if request_index == 0 else bases[index]
+            weight = deltas[index] if request_index == 0 else torch.zeros_like(bases[index])
             torch.testing.assert_close(target_result.output, hidden[:1] @ weight.T)
             assert target_result.update_count == 0
     assert execution.retire(identities) == (latest, refs[1])
@@ -158,7 +159,6 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
             dtype=torch.float64,
         )
 
-        @pllm.on(pllm.Phase.MODEL_UPDATE)
         @pllm.overlay(
             visibility=pllm.Visibility.forward_pinned(),
             state="factors",
@@ -171,11 +171,10 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
             self,
             x: Annotated[torch.Tensor, pllm.Operand.INPUT],
             y: Annotated[torch.Tensor, pllm.Operand.TARGET],
-            base: Annotated[torch.Tensor, pllm.Operand.WEIGHT],
             a: Annotated[torch.Tensor, pllm.Parameter("factors", "a")],
             b: Annotated[torch.Tensor, pllm.Parameter("factors", "b")],
         ) -> TensorUpdate:
-            output = x @ (base + 0.5 * b @ a).T
+            output = x @ (b @ a).T
             a.add_(0.1 * y.T @ x)
             b.add_(0.2 * y.T @ y)
             return TensorUpdate(output, changed=True, update_count=1, trained_rows=x.shape[0])
@@ -187,7 +186,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
         _input((CapturedParameterOperand(requests[0], targets[0], HiddenPhase.PREFILL, hidden, desired[0], bases[0]),))
     )
     (updated,) = result.entries
-    torch.testing.assert_close(updated.targets[0].update.output, hidden @ bases[0].T)
+    torch.testing.assert_close(updated.targets[0].update.output, torch.zeros_like(desired[0]))
     down, up = low_rank.snapshot(updated.after_ref)
     torch.testing.assert_close(down, 0.1 * desired[0].T @ hidden)
     torch.testing.assert_close(up, 0.2 * desired[0].T @ desired[0])
@@ -198,7 +197,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
             _input((CapturedParameterOperand(identity, targets[0], HiddenPhase.DECODE, hidden, desired[0], bases[0]),))
         ).entries
         assert not applied.changed and applied.targets[0].update.update_count == 0
-        weight = bases[0] + 0.5 * up @ down if request_index == 0 else bases[0]
+        weight = up @ down if request_index == 0 else torch.zeros_like(bases[0])
         torch.testing.assert_close(applied.targets[0].update.output, hidden @ weight.T)
     low_rank.retire(requests)
 
@@ -273,9 +272,9 @@ def _check_headwise_math_and_tail():
     target = ParameterTarget(0, ParameterModuleKind.ATTENTION, ParameterRole.QUERY_PROJECTION_WEIGHT)
     workload = GatedDeltaWorkload(GatedDeltaConfig((target,), head_width=3, chunk_size=2, alpha=0.9, beta=0.2))
     generator = torch.Generator().manual_seed(123)
-    base = torch.randn(6, 6, generator=generator)
     rows = torch.randn(5, 6, generator=generator)
-    weights, tail, length = torch.zeros(2, 3, 3), torch.zeros(1, 6), torch.zeros((), dtype=torch.int64)
+    weights = torch.randn(2, 3, 3, generator=generator) * 0.05
+    tail, length = torch.zeros(1, 6), torch.zeros((), dtype=torch.int64)
     state, pending = weights.double(), rows[:0].double()
     for hidden in (rows[:1], rows[1:]):
         joined = torch.cat((pending, hidden.double()))
@@ -293,11 +292,211 @@ def _check_headwise_math_and_tail():
                         gradient[head] += torch.outer(decayed[head] @ key - row[head], key)
                 state = decayed - 0.2 / 2 * gradient
         pending = joined[trained:]
-        expected = hidden.double() @ base.double().T + torch.cat(outputs)[-len(hidden) :]
-        actual = workload.transition(hidden, base, weights, tail, length)
+        expected = torch.cat(outputs)[-len(hidden) :]
+        actual = workload.transition(hidden, weights, tail, length)
         torch.testing.assert_close(actual.output.double(), expected, rtol=2e-6, atol=5e-7)
         torch.testing.assert_close(weights.double(), state, rtol=2e-6, atol=2e-7)
         torch.testing.assert_close(tail[: len(pending)].double(), pending)
         assert (actual.update_count, actual.trained_rows, int(length)) == (trained // 2, trained, len(pending))
     correction = torch.stack([rows.reshape(-1, 2, 3)[:, h] @ weights[h].T for h in range(2)], dim=1).reshape(-1, 6)
     torch.testing.assert_close(head_correction(rows, weights), correction, rtol=0, atol=0)
+
+
+def _check_exact_projection_lifecycle():
+    """Projection segments isolate requests/targets, retain tails and abort before publication."""
+    from pllm.contracts.semantic_graph import AnchorId
+    from pllm.execution.overlay_task import ProjectionTask
+    from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
+
+    targets = tuple(
+        ParameterTarget(layer, ParameterModuleKind.ATTENTION, ParameterRole.QUERY_PROJECTION_WEIGHT) for layer in (0, 2)
+    )
+    workload = GatedDeltaWorkload(GatedDeltaConfig(targets, head_width=1, chunk_size=2, alpha=1, beta=0.1))
+    facts = backend_facts(
+        1,
+        (),
+        RuntimeFacts(torch.device("cpu")).timeline(("transition/full_root@1",)),
+        PageBundleProviderFacts("test.cpu.full_root@1", 4),
+        memory_bytes=4096,
+        max_rows=16,
+        targets=tuple(ParameterTargetShape(target, 1, 1) for target in targets),
+    )
+    deployment = workload.compile_backend(workload.specialize(facts, pllm.ExecutionOptions()))
+    execution = deployment.execution
+    requests = (RequestIdentity("exact-a", 0, 0), RequestIdentity("exact-b", 0, 1))
+    refs = execution.admit(requests)
+    states = {(identity, target): (0.0, []) for identity in requests for target in targets}
+    binding = deployment.attachment.inputs.request.task_bindings[0]
+    # First C=0, then one complete chunk, then a non-power-of-two count with a tail.
+    for count in (1, 1, 7):
+        operands = tuple(
+            CapturedParameterOperand(
+                identity,
+                target,
+                HiddenPhase.PREFILL,
+                torch.full((count, 1), float(i + 1)),
+                torch.full((count, 1), float(i + 1)),
+                torch.zeros(1, 1),
+            )
+            for i, identity in enumerate(requests)
+            for target in targets
+        )
+        value = _input(operands)
+        invocation = execution.begin(value.rows.request_rows)
+        execution.execute_anchor(invocation, AnchorId(0))
+        task = ProjectionTask(execution, invocation, value.sampler_rows, binding.task_id, targets)
+        _check_projection_reads(task, operands, states, refs, count)
+        _publish_projection(execution, invocation)
+        result = execution.finish_step(invocation)
+        refs = result.publication.after_refs
+        for identity, ref in zip(requests, refs, strict=True):
+            fields = execution.snapshot(ref)
+            for index, target in enumerate(targets):
+                state, tail = states[identity, target]
+                torch.testing.assert_close(fields[index * 3], torch.tensor([[[state]]]))
+                assert fields[index * 3 + 2].item() == len(tail)
+    _check_projection_abort(execution, value, targets, binding, refs, operands, requests)
+    _check_causality_witness(workload, facts, requests, targets)
+
+
+def _check_projection_reads(task, operands, states, refs, count):
+    """Independent scalar recurrence identifies each exclusive chunk read."""
+    invocation = task.invocation
+    targets = tuple(dict.fromkeys(operand.target for operand in operands))
+    for target in targets:
+        selected = tuple(operand for operand in operands if operand.target == target)
+        outputs = task.run(selected)
+        for operand in selected:
+            state, tail = states[operand.identity, target]
+            rows = tail + operand.hidden[:, 0].tolist()
+            expected = []
+            for start in range(0, len(rows), 2):
+                chunk = rows[start : start + 2]
+                expected.extend(x * state for x in chunk)
+                if len(chunk) == 2:
+                    state -= 0.1 * sum(state - x for x in chunk) / 2
+            states[operand.identity, target] = state, rows[len(rows) // 2 * 2 :]
+            torch.testing.assert_close(outputs[operand.identity, target], torch.tensor(expected[-count:]).view(-1, 1))
+        assert invocation.context.publication is None
+        assert all(
+            ref.version_id == before.version_id for ref, before in zip(invocation.context.pin.refs, refs, strict=True)
+        )
+
+
+def _publish_projection(execution, invocation):
+    """Advance the normal completion anchors after all target segments have issued."""
+    from pllm.contracts.semantic_graph import AnchorId
+
+    for anchor in execution.arena.plan.timeline.anchors[2:]:
+        execution.execute_anchor(invocation, AnchorId(anchor.ordinal))
+        if anchor.ordinal == execution.sampler_anchor_id:
+            execution.complete_sampler(invocation)
+
+
+def _check_projection_abort(execution, value, targets, binding, refs, operands, requests):
+    """Discard a partial forward without publishing either target's private state."""
+    from pllm.contracts.semantic_graph import AnchorId
+    from pllm.execution.overlay_task import ProjectionTask
+
+    # A completed projection is still private until the forward's publish anchor.
+    before = tuple(execution.snapshot(ref) for ref in refs)
+    invocation = execution.begin(value.rows.request_rows)
+    execution.execute_anchor(invocation, AnchorId(0))
+    task = ProjectionTask(execution, invocation, value.sampler_rows, binding.task_id, targets)
+    task.run(tuple(operand for operand in operands if operand.target == targets[0]))
+    assert invocation.context.write is not None
+    execution.cancel_step(invocation)
+    for ref, expected in zip(refs, before, strict=True):
+        torch.testing.assert_close(execution.snapshot(ref), expected)
+    execution.retire(requests)
+    assert execution.diagnostics().active_lineages == 0
+
+
+def _check_causality_witness(workload, facts, requests, targets):
+    """The bound A3 model read observes zero, then the first chunk's update."""
+    from pllm.contracts.semantic_graph import AnchorId
+    from pllm.execution.overlay_task import ProjectionTask
+
+    witness = replace(workload, config=replace(workload.config, chunk_size=1))
+    deployment = witness.compile_backend(facts)
+    execution = deployment.execution
+    execution.admit(requests[:1])
+    operands = tuple(
+        CapturedParameterOperand(
+            requests[0], target, HiddenPhase.PREFILL, torch.ones(2, 1), torch.ones(2, 1), torch.zeros(1, 1)
+        )
+        for target in targets
+    )
+    value = _input(operands)
+    invocation = execution.begin(value.rows.request_rows)
+    execution.execute_anchor(invocation, AnchorId(0))
+    task = ProjectionTask(
+        execution,
+        invocation,
+        value.sampler_rows,
+        deployment.attachment.inputs.request.task_bindings[0].task_id,
+        targets,
+    )
+    for output in task.run(operands).values():
+        torch.testing.assert_close(output[:, 0], torch.tensor([0.0, 0.1]))
+    execution.cancel_step(invocation)
+    execution.retire(requests[:1])
+
+
+def _check_exact_additive_projection():
+    """Dense Exact uses residual arithmetic with distinct target updates and an unfinished chunk."""
+    from pllm.contracts.semantic_graph import AnchorId
+    from pllm.execution.overlay_task import ProjectionTask
+
+    targets = tuple(
+        ParameterTarget(layer, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT) for layer in (0, 1)
+    )
+    workload = InPlaceTTTWorkload(InPlaceTTTConfig(targets, chunk_size=2, learning_rate=0.01, visibility=pllm.Exact()))
+    facts = backend_facts(
+        1,
+        (),
+        RuntimeFacts(torch.device("cpu")).timeline(("transition/full_root@1",)),
+        PageBundleProviderFacts("test.cpu.full_root@1", 4),
+        memory_bytes=4096,
+        max_rows=8,
+        targets=tuple(ParameterTargetShape(target, 1, 1) for target in targets),
+    )
+    deployment = workload.compile_backend(facts)
+    execution = deployment.execution
+    identity = RequestIdentity("additive-exact", 0, 0)
+    execution.admit((identity,))
+    hidden = torch.arange(1.0, 8).view(-1, 1)
+    operands = tuple(
+        CapturedParameterOperand(
+            identity, target, HiddenPhase.PREFILL, hidden, hidden * (index + 1), torch.full((1, 1), 17.0)
+        )
+        for index, target in enumerate(targets)
+    )
+    value = _input(operands)
+    invocation = execution.begin(value.rows.request_rows)
+    execution.execute_anchor(invocation, AnchorId(0))
+    task = ProjectionTask(
+        execution,
+        invocation,
+        value.sampler_rows,
+        deployment.attachment.inputs.request.task_bindings[0].task_id,
+        targets,
+    )
+    expected_states = []
+    for operand in operands:
+        delta, outputs = torch.zeros(1, 1), []
+        for start in range(0, len(hidden), 2):
+            x, y = hidden[start : start + 2], operand.desired[start : start + 2]
+            outputs.append(x @ delta.T)
+            if len(x) == 2:
+                delta = delta + 0.01 * y.T @ x
+        expected_states.append(delta)
+        torch.testing.assert_close(task.run((operand,))[identity, operand.target], torch.cat(outputs))
+    _publish_projection(execution, invocation)
+    result = execution.finish_step(invocation)
+    assert len(result.entries) == 2
+    fields = execution.snapshot(result.publication.after_refs[0])
+    for index, expected in enumerate(expected_states):
+        torch.testing.assert_close(fields[4 * index], expected)
+        assert fields[4 * index + 3].item() == 1
+    execution.retire((identity,))

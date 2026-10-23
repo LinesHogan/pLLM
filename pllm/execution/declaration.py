@@ -380,7 +380,7 @@ class Builder(Generic[D]):
                 for effect in task.effects
                 if effect.kind is StateEffectKind.READ and effect.version is not None
             )
-            version = "input"
+            version = self.operations[task.symbol].version
             if versions:
                 producer = next(item for item in graph.tasks if item.symbol == versions[0])
                 version = (

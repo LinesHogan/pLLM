@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Annotated
 from unittest.mock import patch
@@ -56,7 +56,6 @@ class RequestLowRankTTT(pllm.Workload):
     def factors(self) -> pllm.RequestState:
         return low_rank_factors()
 
-    @pllm.on(pllm.Phase.MODEL_UPDATE)
     @pllm.overlay(
         visibility=pllm.Visibility.forward_pinned(),
         state="factors",
@@ -73,8 +72,8 @@ class RequestLowRankTTT(pllm.Workload):
         a: Annotated[torch.Tensor, pllm.Parameter("factors", "a")],
         b: Annotated[torch.Tensor, pllm.Parameter("factors", "b")],
     ) -> TensorUpdate:
-        output = hidden @ (base + 0.5 * b @ a).T
-        error = output - desired
+        output = hidden @ (b @ a).T
+        error = hidden @ base.T + 0.5 * output - desired
         gradient_b = 2 * error.T @ (hidden @ a.T) / hidden.shape[0]
         gradient_a = 2 * (error @ b).T @ hidden / hidden.shape[0]
         a.add_(-1e-3 * gradient_a)
@@ -247,19 +246,24 @@ def main() -> int:
             lambda h: _check(h, "dense tree"),
         ),
         (
-            "gated_strict",
+            "gated_exact",
             lambda: open_llm(
                 headwise,
                 tokens=2048,
                 model_length=1024,
                 memory_budget_bytes=256 << 20,
-                allow_numerical_transforms=False,
+                allow_numerical_transforms=True,
             ),
             lambda h: _check(h, "gated strict"),
         ),
         (
             "gated",
-            lambda: open_llm(headwise, tokens=2048, model_length=1024, memory_budget_bytes=256 << 20),
+            lambda: open_llm(
+                replace(headwise, config=replace(headwise.config, visibility=pllm.Visibility.forward_pinned())),
+                tokens=2048,
+                model_length=1024,
+                memory_budget_bytes=256 << 20,
+            ),
             lambda h: _check(h, "gated tree"),
         ),
         ("low_rank", lambda: open_llm(RequestLowRankTTT()), lambda h: _check(h, "request low-rank")),
@@ -295,6 +299,8 @@ def main() -> int:
                 raise RuntimeError("large-budget dense overlay did not exercise a tree window")
             if name == "gated" and not any(form.startswith("right_matrix:") for form, _ in forms):
                 raise RuntimeError("Gated delta overlay did not exercise a right-matrix scan")
+            if name == "gated_exact" and forms:
+                raise RuntimeError("Exact overlay selected a prefix that failed the whole-model gate")
             after = (cache.num_blocks, tuple(tensor.size for tensor in cache.kv_cache_tensors))
             if before != after:
                 raise RuntimeError("overlay execution changed the vLLM KV allocation")

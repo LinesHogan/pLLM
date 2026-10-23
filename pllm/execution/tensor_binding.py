@@ -279,16 +279,19 @@ class OverlayTransition:
     buffers: tuple[str, ...]
     targets: tuple[ParameterTarget, ...]
     phases: tuple[HiddenPhase, ...]
-    apply: Callable[[torch.Tensor, torch.Tensor, Tensors], torch.Tensor]
+    apply: Callable[[torch.Tensor, Tensors], torch.Tensor]
     function: Callable[[Tensors], TensorUpdate]
 
     def __call__(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
+        start = len(data.entries)
         operands = {(operand.identity, operand.target): operand for operand in data.step.operands}
         changed: set[int] = set()
         with torch.no_grad():
             for row, index in zip(batch.selection.rows, batch.selection.state_indices, strict=True):
                 results: list[OverlayTargetResult] = []
                 for target_index, target in enumerate(self.targets):
+                    if (row.identity, target) not in operands:
+                        continue
                     operand = operands[row.identity, target]
                     values = dict(
                         zip(
@@ -309,10 +312,10 @@ class OverlayTransition:
                             }
                         )
                     else:
-                        result = TensorUpdate(self.apply(operand.hidden, operand.base_weight, values))
+                        result = TensorUpdate(self.apply(operand.hidden, values))
                     if (
                         result.output.shape != operand.desired.shape
-                        or result.output.dtype != operand.hidden.dtype
+                        or result.output.dtype not in (operand.hidden.dtype, torch.float32)
                         or result.output.device != operand.hidden.device
                     ):
                         raise ValueError("overlay output differs from its target shape, dtype or device")
@@ -325,9 +328,14 @@ class OverlayTransition:
                     OverlayEntry(row.identity, batch.selection.refs[index], batch.after_refs[index], tuple(results))
                 )
         return TaskOutput(
+            residuals={
+                (entry.identity, target.target): target.update.output
+                for entry in data.entries[start:]
+                for target in entry.targets
+            },
             changed=tuple(sorted(changed)),
-            update_count=sum(target.update.update_count for entry in data.entries for target in entry.targets),
-            trained_rows=sum(target.update.trained_rows for entry in data.entries for target in entry.targets),
+            update_count=sum(target.update.update_count for entry in data.entries[start:] for target in entry.targets),
+            trained_rows=sum(target.update.trained_rows for entry in data.entries[start:] for target in entry.targets),
         )
 
 
@@ -494,8 +502,17 @@ class TensorBinding(Builder[TensorFrame]):
         """Bind scan specialization to the plan's policy and row capacity."""
         for symbol, operation in self.operations.items():
             budget = facts.timeline.memory_budget_bytes
+            task = next(task for task in self.graph.tasks if task.symbol == symbol)
+            policy = facts.timeline.region_policy
+            if (
+                task.visibility is not None
+                and task.visibility.scope == "overlay"
+                and task.visibility.policy.kind == "exact"
+            ):
+                # The Qwen BF16 whole-model gate rejects prefix reassociation (natural-text KL > 1e-5).
+                policy = replace(policy, allow_numerical_transforms=False)
             scans = ScanContext(
-                facts.timeline.region_policy,
+                policy,
                 facts.probe.max_packed_rows,
                 facts.device,
                 None if budget is None else budget // max(1, facts.max_admitted_lineages),
@@ -565,6 +582,7 @@ class TensorBinding(Builder[TensorFrame]):
         function: Callable[[Tensors], TensorUpdate],
         visibility: Visibility,
         equations_digest: str,
+        chunk_size: int,
     ) -> None:
         if self.graph.tasks or self.graph.states or self.host:
             raise ValueError("ordinary overlay requires a sole request state and model transition")
@@ -587,15 +605,15 @@ class TensorBinding(Builder[TensorFrame]):
             keys=keys,
         )
 
-        def apply(hidden: torch.Tensor, base: torch.Tensor, values: Tensors) -> torch.Tensor:
+        def apply(hidden: torch.Tensor, values: Tensors) -> torch.Tensor:
             if operator is ParameterOverlayOperator.HEAD_ADD:
-                return hidden @ base.T + (head_correction(hidden, values[applied[0]]) * scale).to(hidden.dtype)
+                return head_correction(hidden, values[applied[0]])
             delta = (
                 values[applied[0]]
                 if operator is ParameterOverlayOperator.DENSE_ADD
                 else values[applied[1]] @ values[applied[0]]
             )
-            return hidden @ (base + delta * scale).T
+            return hidden @ delta.T
 
         def select(data: TensorFrame, selection: RequestStateSelection) -> tuple[int, ...]:
             return tuple(
@@ -632,10 +650,12 @@ class TensorBinding(Builder[TensorFrame]):
                 "overlay",
                 equations_digest,
                 (str(state.declaration.resource),) * len(targets),
-                0,
-                "transition",
+                chunk_size,
+                "carry" if chunk_size else "transition",
             ),
         )
+        if chunk_size:
+            self.operations[transition.symbol] = replace(self.operations[transition.symbol], version="private")
         publication = self.publish(
             transition,
             state,
@@ -1514,6 +1534,11 @@ class TensorBinding(Builder[TensorFrame]):
             def prepare_overlay(value: TensorStepInput, batch: TensorBatch) -> TensorFrame:
                 expected = {(row.identity, target) for row in batch.selection.rows for target in self.overlay_targets}
                 actual = tuple((operand.identity, operand.target) for operand in value.operands)
+                if any(
+                    task.visibility is not None and task.visibility.policy.kind == "exact" for task in self.graph.tasks
+                ):
+                    targets = {operand.target for operand in value.operands}
+                    expected = {(identity, target) for identity, target in expected if target in targets}
                 if len(actual) != len(expected) or set(actual) != expected:
                     raise ValueError("captured operands must cover each selected request and target exactly once")
                 if value.rows.plan_epoch != batch.epoch or value.auxiliary is not None or value.hidden is not None:

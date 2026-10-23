@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -14,6 +14,7 @@ import torch
 
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.packed_rows import PackedPhaseRow
+from pllm.contracts.parameter_overlay import ParameterTarget
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
 from pllm.contracts.semantic_graph import (
@@ -23,6 +24,7 @@ from pllm.contracts.semantic_graph import (
     SamplerFeedbackInputSource,
     StateEffectKind,
     StateScope,
+    TaskId,
     TaskSymbol,
 )
 from pllm.contracts.state_ref import StateRef
@@ -105,6 +107,9 @@ class StateTaskContext(Generic[DataT]):
         default_factory=lambda: dict[RequestIdentity, set[StateRef]]()
     )
     input_step_id: int = -1
+    projection_outputs: Mapping[tuple[RequestIdentity, ParameterTarget], torch.Tensor] = field(
+        default_factory=lambda: dict[tuple[RequestIdentity, ParameterTarget], torch.Tensor]()
+    )
 
     def data(self) -> DataT:
         if self.value is None:
@@ -645,6 +650,25 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             except WindowBackpressure:
                 # No cell of the pending task issued; its original cursor and pins remain usable.
                 raise
+            except Exception as exc:
+                self._failed(invocation, context, exc)
+
+    def execute_part(
+        self,
+        invocation: TaskGraphInvocation[StateTaskContext[DataT]],
+        value: InputT,
+        task_id: TaskId,
+        *,
+        complete: bool,
+    ) -> None:
+        """Supply actual projection operands to one segment of a bound in-forward task."""
+        with self._lock:
+            context = self._context(invocation)
+            try:
+                context.check_page_execution()
+                assert self.math.rows(value) == context.selection.rows
+                context.value = self.math.prepare(value, context)
+                invocation.execute_part(task_id, complete=complete, stream=context.pin.stream)
             except Exception as exc:
                 self._failed(invocation, context, exc)
 
