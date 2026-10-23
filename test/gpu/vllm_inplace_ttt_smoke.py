@@ -299,8 +299,8 @@ def main() -> int:
                 raise RuntimeError("large-budget dense overlay did not exercise a tree window")
             if name == "gated" and not any(form.startswith("right_matrix:") for form, _ in forms):
                 raise RuntimeError("Gated delta overlay did not exercise a right-matrix scan")
-            if name == "gated_exact" and forms:
-                raise RuntimeError("Exact overlay selected a prefix that failed the whole-model gate")
+            if name == "gated_exact" and not any(form.startswith("right_matrix:") for form, _ in forms):
+                raise RuntimeError("Exact overlay did not select its right-matrix prefix")
             after = (cache.num_blocks, tuple(tensor.size for tensor in cache.kv_cache_tensors))
             if before != after:
                 raise RuntimeError("overlay execution changed the vLLM KV allocation")

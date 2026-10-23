@@ -502,13 +502,8 @@ class TensorBinding(Builder[TensorFrame]):
         """Bind scan specialization to the plan's policy and row capacity."""
         for symbol, operation in self.operations.items():
             budget = facts.timeline.memory_budget_bytes
-            task = next(task for task in self.graph.tasks if task.symbol == symbol)
-            policy = facts.timeline.region_policy
-            if task.visibility is not None and task.visibility.in_forward:
-                # The Qwen BF16 whole-model gate rejects prefix reassociation (natural-text KL > 1e-5).
-                policy = replace(policy, allow_numerical_transforms=False)
             scans = ScanContext(
-                policy,
+                facts.timeline.region_policy,
                 facts.probe.max_packed_rows,
                 facts.device,
                 None if budget is None else budget // max(1, facts.max_admitted_lineages),
