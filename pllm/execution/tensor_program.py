@@ -10,6 +10,7 @@ from typing import Generic, Literal, Protocol, TypeVar
 import torch
 from torch.optim.sgd import sgd
 
+from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.parameter_overlay import ParameterTarget
 from pllm.contracts.request_identity import RequestIdentity
@@ -183,6 +184,7 @@ class FunctionMath(Generic[I, D, R]):
     prepare_data: Callable[[I, TensorBatch], D]
     output_data: Callable[[D, InvocationOutput], R]
     resume_data: Callable[[D, D], D] | None = None
+    parameter_phases: tuple[HiddenPhase, ...] = ()
 
     def initialize(self, roots: Roots, addresses: tuple[StateAddress, ...]) -> None:
         resources = tuple(str(address.resource) for address in addresses)

@@ -6,6 +6,7 @@ their entry state, and retirement releases every version.
 
 from dataclasses import replace
 from typing import Annotated
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -127,23 +128,25 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     # The independent outer-product oracle must be visible only to the trained request.
     deltas = 0.3 * desired.transpose(1, 2) @ hidden
     for request_index, identity in enumerate(identities):
-        (result,) = execution.step(
-            _input(
-                tuple(
-                    CapturedParameterOperand(
-                        identity, target, HiddenPhase.DECODE, hidden[:1], desired[index, :1], bases[index]
-                    )
-                    for index, target in enumerate(targets)
+        value = _input(
+            tuple(
+                CapturedParameterOperand(
+                    identity, target, HiddenPhase.DECODE, hidden[:1], desired[index, :1], bases[index]
                 )
+                for index, target in enumerate(targets)
             )
-        ).entries
-        assert result.before_ref == result.after_ref == (latest if request_index == 0 else refs[1])
-        assert not result.changed
-        for index, target in enumerate(result.targets):
-            target_result = target.update
+        )
+        with patch.object(
+            execution.arena, "borrow_roots", side_effect=AssertionError("inactive transition read roots")
+        ):
+            result = execution.step(replace(value, operands=()))
+        assert not result.entries
+        ref = latest if request_index == 0 else refs[1]
+        assert execution.arena.latest(ref.lineage_id) == ref
+        fields = execution.snapshot(ref)
+        for index in range(len(targets)):
             weight = deltas[index] if request_index == 0 else torch.zeros_like(bases[index])
-            torch.testing.assert_close(target_result.output, hidden[:1] @ weight.T)
-            assert target_result.update_count == 0
+            torch.testing.assert_close(fields[4 * index], weight)
     assert execution.retire(identities) == (latest, refs[1])
     diagnostics = execution.diagnostics()
     assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
@@ -196,14 +199,16 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     torch.testing.assert_close(down, 0.1 * desired[0].T @ hidden)
     torch.testing.assert_close(up, 0.2 * desired[0].T @ desired[0])
     assert all(not tensor.any() for tensor in low_rank.snapshot(initial[1]))
-    # A phase outside update eligibility applies the exact pinned factors without changing them.
+    # A phase outside update eligibility leaves its pinned factors unchanged.
     for request_index, identity in enumerate(requests):
-        (applied,) = low_rank.step(
-            _input((CapturedParameterOperand(identity, targets[0], HiddenPhase.DECODE, hidden, desired[0], bases[0]),))
-        ).entries
-        assert not applied.changed and applied.targets[0].update.update_count == 0
-        weight = up @ down if request_index == 0 else torch.zeros_like(bases[0])
-        torch.testing.assert_close(applied.targets[0].update.output, hidden @ weight.T)
+        ref = updated.after_ref if request_index == 0 else initial[1]
+        before = low_rank.snapshot(ref)
+        value = _input(
+            (CapturedParameterOperand(identity, targets[0], HiddenPhase.DECODE, hidden, desired[0], bases[0]),)
+        )
+        result = low_rank.step(replace(value, operands=()))
+        assert not result.entries and low_rank.arena.latest(ref.lineage_id) == ref
+        torch.testing.assert_close(low_rank.snapshot(ref), before, rtol=0, atol=0)
     low_rank.retire(requests)
 
     # External factors share the optimizer's publication, isolation and retirement rules.
@@ -504,4 +509,24 @@ def _check_exact_additive_projection():
     for index, expected in enumerate(expected_states):
         torch.testing.assert_close(fields[4 * index], expected)
         assert fields[4 * index + 3].item() == 1
+    # Exact still needs decode residuals at the projection even when it does not train.
+    decode = tuple(
+        replace(operand, phase=HiddenPhase.DECODE, hidden=hidden[:1], desired=operand.desired[:1])
+        for operand in operands
+    )
+    value = _input(decode)
+    invocation = execution.begin(value.rows.request_rows)
+    execution.execute_anchor(invocation, AnchorId(0))
+    task = ProjectionTask(
+        execution,
+        invocation,
+        value.sampler_rows,
+        deployment.attachment.inputs.request.task_bindings[0].task_id,
+        targets,
+    )
+    for operand, state in zip(decode, expected_states, strict=True):
+        torch.testing.assert_close(task.run((operand,))[identity, operand.target], hidden[:1] @ state.T)
+    assert invocation.context.write is None
+    _publish_projection(execution, invocation)
+    assert execution.finish_step(invocation).publication is None
     execution.retire((identity,))

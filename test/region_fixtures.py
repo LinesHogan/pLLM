@@ -313,6 +313,8 @@ def page_program(cell: ExportedCell, rounds=8) -> Program:
 class PageMath:
     """Initialize request i's first field to i+1 and report owned refs."""
 
+    parameter_phases = ()
+
     def initialize(self, roots, resources):
         for i, root in enumerate(roots):
             for field in root:

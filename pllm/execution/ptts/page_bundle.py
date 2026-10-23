@@ -979,17 +979,24 @@ class PageBundleArena:
                 raise RuntimeError("PageBundle root is not held or written by this transaction")
         return tuple(result)
 
+    def slot_matrix(self, access: PagePin | PageWrite, refs: StateRefs) -> tuple[str, Slots]:
+        """Resolve a homogeneous array selection under its issued pin or private write."""
+        with self._lock:
+            for group in self._access_pages(access):
+                if refs is group.refs or refs == group.refs:
+                    return group.table.resource, group.slots
+                if len(refs) and np.all(refs.layouts == group.refs.layouts[0]):
+                    positions = group.refs.positions(refs)
+                    if np.all(positions >= 0):
+                        return group.table.resource, group.slots[positions]
+            raise RuntimeError("PageBundle slots require exact refs held by the issued token")
+
     def slots(self, access: tuple[PagePin | PageWrite, ...], refs: Sequence[StateRef]) -> tuple[str, Slots]:
         """Resolve all field slots once for a homogeneous resource selection."""
         with self._lock:
             tokens = tuple(dict.fromkeys(access))
             if len(tokens) == 1:
-                groups = self._access_pages(tokens[0])
-                for group in groups:
-                    if refs is group.refs or refs == group.refs:
-                        return group.table.resource, group.slots
-                positions = {ref: (group, i) for group in groups for i, ref in enumerate(group.refs)}
-                selected = [positions[ref] for ref in refs]
+                return self.slot_matrix(tokens[0], StateRefs.of(refs))
             else:
                 positions = {
                     token: {ref: (group, i) for group in self._access_pages(token) for i, ref in enumerate(group.refs)}

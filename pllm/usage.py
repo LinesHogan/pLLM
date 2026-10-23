@@ -1364,6 +1364,7 @@ class Workload(
             b.bind_prepare(),
             output,
             lambda previous, incoming: replace(incoming, entries=previous.entries),
+            parameter_phases=b.parameter_phases,
         )
 
     def bind_math(

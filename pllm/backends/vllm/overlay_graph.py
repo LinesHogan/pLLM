@@ -8,7 +8,6 @@ EagerAdaptor.compile for source FX bodies inside the upstream CUDA graph wrapper
 The upstream manager owns all capture/replay loops; PTTS owns every request version.
 """
 
-from collections.abc import Sequence
 from typing import Protocol
 
 import numpy as np
@@ -24,6 +23,7 @@ from pllm.authoring import BackendRequirements
 from pllm.backends.torch_inductor import InductorTensorCompiler
 from pllm.config import ModelConfig, RunnerKind
 from pllm.contracts.backend_attachment import AttachmentGraphMode, SignedBackendAttachment
+from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import CapturedParameterOperand, ParameterOverlayFieldBinding
 from pllm.contracts.region_selection import RegionSelectionPolicy
@@ -38,8 +38,9 @@ from pllm.execution.parameter_projection import (
     projection_block_rows,
     projection_blocks,
 )
-from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin
+from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin, Slots
 from pllm.execution.ptts.request_state import RequestStateDirectory
+from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.region_execution import RegionInstructionExecution
 from pllm.execution.state_execution import DataT, StateTaskContext
 
@@ -258,28 +259,26 @@ class _ProjectionReader:
         assert isinstance(result, torch.Tensor)
         return result
 
-    def prepare(
-        self, sources: Sequence[tuple[tuple[PackedPhaseRow, ...], PagePin, StateRef]], arena: PageBundleArena
-    ) -> None:
+    def prepare(self, field_slots: Slots, starts: Slots, total: int) -> None:
         host = self.host.numpy()
         maximum = projection_blocks(self.rows, self.requests)
         slots = host[: maximum * len(self.pools)].reshape(maximum, len(self.pools))
         positions = host[maximum * len(self.pools) : -self.rows].reshape(maximum, ROWS_PER_BLOCK)
         owners = host[-self.rows :]
         owners.fill(-1)
-        count = next(size for size in capacities(self.rows) if size >= sum(len(rows) for rows, _, _ in sources))
+        count = next(size for size in capacities(self.rows) if size >= total)
         width = projection_block_rows(count, self.requests)
-        block = 0
-        for rows, pin, ref in sources:
-            selected = tuple(arena.field_slots((pin,), (ref,), field)[1][0] for field in self.binding.fields)
-            if block == 0:
-                slots[:] = selected
-            for start in range(0, len(rows), width):
-                packed = tuple(row.packed_row_index for row in rows[start : start + width])
-                slots[block] = selected
-                positions[block, : len(packed)] = packed
-                owners[list(packed)] = block * width + np.arange(len(packed))
-                block += 1
+        lengths = np.diff(np.append(starts, total))
+        blocks = (lengths + width - 1) // width
+        first_blocks = np.cumsum(blocks) - blocks
+        requests = np.repeat(np.arange(len(starts)), lengths)
+        offsets = np.arange(total) - starts[requests]
+        block_rows = first_blocks[requests] + offsets // width
+        selected = field_slots[:, self.binding.fields]
+        slots[:] = selected[0]
+        slots[: int(blocks.sum())] = np.repeat(selected, blocks, axis=0)
+        positions[block_rows, offsets % width] = np.arange(total)
+        owners[:total] = block_rows * width + offsets % width
         self.staging.copy_to(self.table)
 
     def close(self) -> None:
@@ -302,13 +301,15 @@ class PinnedParameterOverlay:
         budget: int,
         policy: RegionSelectionPolicy,
         *,
-        capture: bool = True,
+        phases: tuple[HiddenPhase, ...],
     ) -> None:
         self.readers = tuple(
             _ProjectionReader(model, binding, arena, rows, requests, budget, policy) for binding in bindings
         )
-        self.capture = capture
-        self.sources: tuple[tuple[PackedPhaseRow, ...], ...] = ()
+        self.phases = phases
+        self.sources: tuple[PackedPhaseRow, ...] = ()
+        self.starts: Slots = np.empty(0, dtype=np.int64)
+        self.total_rows = 0
         self.stream: torch.cuda.Stream | None = None
         self.readiness: CudaStreamReadiness | None = None
         self.apply_count = self.updated_apply_count = 0
@@ -330,47 +331,54 @@ class PinnedParameterOverlay:
         assert self.stream is not None
         if self.readiness is not None:
             self.readiness.order_on(self.stream)
-        self.sources = tuple(
-            tuple(row for row in rows.rows if row.identity == identity)
-            for identity in dict.fromkeys(row.identity for row in rows.rows)
+        ordinals = np.fromiter((row.request_ordinal for row in rows.rows), np.int64, rows.total_rows)
+        self.starts = np.flatnonzero(np.append(True, ordinals[1:] != ordinals[:-1]))
+        self.sources = tuple(rows.rows[int(index)] for index in self.starts)
+        self.total_rows = rows.total_rows
+        if directory.scope is StateScope.INSTANCE:
+            pins = tuple(directory.inference_pin(row.identity, self.stream) for row in self.sources)
+            refs = StateRefs.join(tuple(pin.refs for pin in pins))
+            _, slots = context.arena.slots(pins, refs)
+            versions = refs.versions
+        else:
+            indices = np.fromiter(
+                (context.selection.row_states[row.identity] for row in self.sources), np.int64, len(self.sources)
+            )
+            _, fields = context.arena.slot_matrix(context.pin, context.pin.refs)
+            slots = fields[indices]
+            versions = context.pin.refs.versions[indices]
+        self.updated_apply_count += int(np.diff(np.append(self.starts, rows.total_rows)) @ (versions > 0)) * len(
+            self.readers
         )
-        sources: list[tuple[tuple[PackedPhaseRow, ...], PagePin, StateRef]] = []
-        for selected in self.sources:
-            pin = (
-                directory.inference_pin(selected[0].identity, self.stream)
-                if directory.scope is StateScope.INSTANCE
-                else context.pin
-            )
-            ref = (
-                pin.refs[0]
-                if directory.scope is StateScope.INSTANCE
-                else context.selection.ref_for(selected[0].identity)
-            )
-            sources.append((selected, pin, ref))
-            self.updated_apply_count += len(selected) * len(self.readers) if ref.version_id else 0
         for reader in self.readers:
             for value in (*reader.pools, reader.table, reader.captured, reader.desired):
                 value.record_stream(self.stream)
-            reader.prepare(sources, context.arena)
+            reader.prepare(slots, self.starts, rows.total_rows)
         self.apply_count += len(rows.rows) * len(self.readers)
 
     def take_captures(self) -> tuple[CapturedParameterOperand, ...]:
-        if not self.capture:
+        if not self.sources or not self.phases:
             return ()
+        spans = tuple(
+            (row, first, last)
+            for row, first, last in zip(
+                self.sources, self.starts.tolist(), np.append(self.starts[1:], self.total_rows).tolist(), strict=True
+            )
+            if row.phase in self.phases
+        )
         results: list[CapturedParameterOperand] = []
-        for reader in self.readers:
-            for rows in self.sources:
-                first, last = rows[0].packed_row_index, rows[-1].packed_row_index + 1
-                assert last - first == len(rows)
+        for reader in self.readers if spans else ():
+            weight = reader.module.weight[reader.offset : reader.offset + reader.width].detach()
+            for row, first, last in spans:
                 hidden = reader.captured[first:last].clone()
                 results.append(
                     CapturedParameterOperand(
-                        rows[0].identity,
+                        row.identity,
                         reader.binding.target,
-                        rows[0].phase,
+                        row.phase,
                         hidden,
                         hidden if reader.mlp is None else reader.desired[first:last].clone(),
-                        reader.module.weight[reader.offset : reader.offset + reader.width].detach(),
+                        weight,
                     )
                 )
         return tuple(results)

@@ -340,7 +340,7 @@ class VllmSession(Generic[DataT, ResultT]):
                 max_sampler_rows,
                 buffers,
                 plan.timeline.region_policy,
-                capture=not self._overlay_import,
+                phases=deployment.execution.math.parameter_phases,
             )
             if overlay_bindings and not model_scan
             else None

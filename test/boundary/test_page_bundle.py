@@ -1,5 +1,6 @@
 """PTTS evidence 9/10/12: copy-on-write versions, exact pins, atomic failure and reclamation."""
 
+import numpy as np
 import pytest
 import torch
 
@@ -33,6 +34,17 @@ def test_copy_on_write_transition_keeps_the_pinned_version_unchanged() -> None:
     assert new_a.version_id == 1
     assert arena.latest(a.lineage_id) == new_a and arena.latest(b.lineage_id) == b
     new_pin = arena.pin_exact((new_a,))
+    resource, slots = arena.slot_matrix(pin, pin.refs)
+    assert resource == "dense_fast_weights"
+    selected = pin.refs.take(np.array([1, 0, 1]))
+    np.testing.assert_array_equal(arena.slot_matrix(pin, selected)[1], slots[[1, 0, 1]])
+    with pytest.raises(RuntimeError):
+        arena.slot_matrix(pin, new_pin.refs)
+    both = arena.pin_exact((a, new_a))
+    _, versions = arena.slot_matrix(both, both.refs.take(np.array([1, 0])))
+    assert versions[0, 0] != versions[1, 0]
+    arena.wait_release(arena.release_pin(both))
+
     # Unwritten fields share storage; the written field got fresh pages.
     assert (
         arena.borrow_field(new_pin, new_a, LayoutFieldId(1)).data_ptr()

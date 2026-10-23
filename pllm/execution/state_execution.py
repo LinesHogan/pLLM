@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from pllm.contracts.compilation import PlanBundle
+from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.parameter_overlay import ParameterTarget
 from pllm.contracts.request_identity import RequestIdentity
@@ -241,6 +242,11 @@ class StateTaskContext(Generic[DataT]):
 
 class StateMath(Protocol[InputContra, DataT, ResultCo]):
     """Input validation and tensor mathematics, never invocation ownership."""
+
+    @property
+    def parameter_phases(self) -> tuple[HiddenPhase, ...]:
+        """Authored training phases used to select pinned projection captures."""
+        ...
 
     def initialize(
         self, roots: tuple[tuple[torch.Tensor, ...], ...], addresses: tuple[StateAddress, ...], /

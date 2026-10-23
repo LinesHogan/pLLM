@@ -282,10 +282,17 @@ class OverlayTransition:
     phases: tuple[HiddenPhase, ...]
     apply: Callable[[torch.Tensor, Tensors], torch.Tensor]
     function: Callable[[Tensors], TensorUpdate]
+    visibility: VisibilitySource
 
     def __call__(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
+        operands = {
+            (operand.identity, operand.target): operand
+            for operand in data.step.operands
+            if self.visibility.in_forward or operand.phase in self.phases
+        }
+        if not operands:
+            return TaskOutput()
         start = len(data.entries)
-        operands = {(operand.identity, operand.target): operand for operand in data.step.operands}
         changed: dict[int, torch.Tensor] = {}
         with torch.no_grad():
             for row, index in zip(batch.selection.rows, batch.selection.state_indices, strict=True):
@@ -306,9 +313,10 @@ class OverlayTransition:
                     result = self.result(operand, values)
                     results.append(OverlayTargetResult(target, result))
                     changed[index] = result.changed if index not in changed else changed[index] | result.changed
-                data.entries.append(
-                    OverlayEntry(row.identity, batch.selection.refs[index], batch.after_refs[index], tuple(results))
-                )
+                if results:
+                    data.entries.append(
+                        OverlayEntry(row.identity, batch.selection.refs[index], batch.after_refs[index], tuple(results))
+                    )
         return TaskOutput(
             residuals={
                 (entry.identity, target.target): target.update.output
@@ -365,6 +373,7 @@ class TensorBinding(Builder[TensorFrame]):
         self.max_requests = 1
         self.sample_limit: int | None = None
         self.overlay_targets: tuple[ParameterTarget, ...] = ()
+        self.parameter_phases: tuple[HiddenPhase, ...] = ()
         self.overlay_import = False
         self.model_scan: tuple[ModelScan, ChunkTraining] | None = None
 
@@ -595,6 +604,7 @@ class TensorBinding(Builder[TensorFrame]):
                 raise ValueError("overlay targets differ from backend specialization")
             _check_overlay_shapes(buffers, applied, dimensions, operator)
         self.overlay_targets = targets
+        self.parameter_phases = phases
         state = self.state(
             state_name,
             tuple(
@@ -618,19 +628,25 @@ class TensorBinding(Builder[TensorFrame]):
             return hidden @ delta.T
 
         def select(data: TensorFrame, selection: RequestStateSelection) -> tuple[int, ...]:
+            active = {operand.identity for operand in data.step.operands if operand.phase in phases}
             return tuple(
                 sorted(
                     {
                         index
                         for row, index in zip(selection.rows, selection.state_indices, strict=True)
-                        if any(
-                            operand.identity == row.identity and operand.phase in phases
-                            for operand in data.step.operands
-                        )
+                        if row.identity in active
                     }
                 )
             )
 
+        source = VisibilitySource(
+            visibility,
+            "overlay",
+            equations_digest,
+            (str(state.declaration.resource),) * len(targets),
+            0,
+            "carry" if visibility == Exact() else "transition",
+        )
         transition = self.compute(
             name,
             inputs={"operands": self.input("parameter.operands", "dense_pairs", "canonical.dense_operand_pairs@1")},
@@ -638,24 +654,14 @@ class TensorBinding(Builder[TensorFrame]):
             changes=state,
             effect=StateEffectKind.TRANSITION_MAYBE,
             when=When.MODEL_UPDATE,
-            function=OverlayTransition(tuple(buffers), targets, phases, apply, function),
+            function=OverlayTransition(tuple(buffers), targets, phases, apply, function, source),
             select=select,
             implementations=(
                 native(identity + ":cpu", "compute/cpu@1", "transition/full_root@1"),
                 native(identity + ":cuda", "compute/cuda@1", "state/fenced_reclaim@1", "transition/full_root@1"),
             ),
         )
-        self._bind_visibility(
-            transition,
-            VisibilitySource(
-                visibility,
-                "overlay",
-                equations_digest,
-                (str(state.declaration.resource),) * len(targets),
-                0,
-                "carry" if visibility == Exact() else "transition",
-            ),
-        )
+        self._bind_visibility(transition, source)
         if visibility == Exact():
             self.operations[transition.symbol] = replace(self.operations[transition.symbol], version="private")
         publication = self.publish(
@@ -1534,9 +1540,17 @@ class TensorBinding(Builder[TensorFrame]):
             shapes = dict(zip(self.overlay_targets, dimensions.target_shapes, strict=True))
 
             def prepare_overlay(value: TensorStepInput, batch: TensorBatch) -> TensorFrame:
-                expected = {(row.identity, target) for row in batch.selection.rows for target in self.overlay_targets}
+                in_forward = any(
+                    task.visibility is not None and task.visibility.in_forward for task in self.graph.tasks
+                )
+                expected = {
+                    (row.identity, target)
+                    for row in batch.selection.rows
+                    if in_forward or row.phase in self.parameter_phases
+                    for target in self.overlay_targets
+                }
                 actual = tuple((operand.identity, operand.target) for operand in value.operands)
-                if any(task.visibility is not None and task.visibility.in_forward for task in self.graph.tasks):
+                if in_forward:
                     targets = {operand.target for operand in value.operands}
                     expected = {(identity, target) for identity, target in expected if target in targets}
                 if len(actual) != len(expected) or set(actual) != expected:

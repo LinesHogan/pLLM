@@ -80,7 +80,9 @@ def test_learning_publication_conditional_replay_matches_reference():
     value = TensorStepInput(
         rows,
         PackedSamplerRowBatch(rows, ()),
-        operands=tuple(CapturedParameterOperand(row.identity, target, row.phase, x, y, base) for row in rows.rows),
+        operands=tuple(
+            CapturedParameterOperand(row.identity, target, row.phase, x, y, base) for row in rows.prefill_rows
+        ),
     )
 
     class ToyLayer:
