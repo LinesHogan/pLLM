@@ -4,14 +4,13 @@ import pytest
 import torch
 
 from examples.huber import HuberWorkload
-from pllm.authoring import TensorResult, TensorStepInput
-from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
-from pllm.contracts.packed_hidden import PackedHiddenResourceBinding, PackedHiddenSnapshot, PackedHiddenSnapshotBatch
-from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
+from pllm import testing
+from pllm.authoring import TensorResult
+from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
+from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId
 from pllm.contracts.state_representation import StateDeviceKind
-from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
 from test import reference_huber as oracle
@@ -69,30 +68,13 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
         count = len(owners)
         source = torch.linspace(-0.8 + step_id * 0.1, 0.9, count * hidden, device=device).reshape(count, hidden)
         target = source.flip(1) * -0.6 + 0.13
-        rows = PackedPhaseRowBatch(
-            1,
-            step_id,
-            count,
-            tuple(
-                PackedPhaseRow(i, i, step_id, HiddenPhase.DECODE, identities[owner]) for i, owner in enumerate(owners)
-            ),
-        )
-        sampler = PackedSamplerRowBatch(
-            rows, tuple(PackedSamplerRowLink(i, row) for i, row in enumerate(reversed(range(count))))
-        )
-        step = TensorStepInput(
-            rows,
-            sampler,
-            PackedHiddenSnapshotBatch(
-                rows,
-                tuple(
-                    sorted(
-                        (PackedHiddenSnapshot(bindings[0], source), PackedHiddenSnapshot(bindings[1], target)),
-                        key=lambda item: item.resource.locator_key,
-                    )
-                ),
-            ),
-            hidden_readiness=None if stream is None else CudaStreamReadiness(stream),
+        step = testing.step_input(
+            tuple(identities[owner] for owner in owners),
+            {bindings[0]: source, bindings[1]: target},
+            step_id=step_id,
+            token_offset=step_id,
+            sampler_order=tuple(reversed(range(count))),
+            stream=stream,
         )
         before = tuple(execution.snapshot(ref, stream) for ref in latest)
         for last_anchor in (0, execution.sampler_anchor_id):
@@ -106,7 +88,7 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
                 for actual, expected in zip(execution.snapshot(ref, stream), snapshot, strict=True):
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
-        active = tuple(link for link in sampler.links if latest[owners[link.packed_row_index]].version_id > 0)
+        active = tuple(link for link in step.sampler_rows.links if latest[owners[link.packed_row_index]].version_id > 0)
         predicted = (
             torch.cat(
                 [

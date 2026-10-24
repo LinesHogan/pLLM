@@ -81,3 +81,17 @@ __all__ = [
     "PackedHiddenSnapshot",
     "PackedHiddenSnapshotBatch",
 ]
+
+
+def hidden_binding(layer: int, site: HiddenSite, layer_count: int) -> PackedHiddenResourceBinding:
+    """The binding a Qwen2-style decoder exposes: block outputs by layer index, the final output as `model.norm`."""
+    if site is HiddenSite.MODEL_OUTPUT and layer == -1:
+        return PackedHiddenResourceBinding(str(layer), HiddenLayerKind.INDEX, site, "model.norm")
+    if site is not HiddenSite.BLOCK_OUTPUT:
+        raise ValueError("Qwen2 hidden input requires a block or final model output")
+    module_index = layer if layer >= 0 else layer_count + layer
+    if module_index < 0 or module_index >= layer_count:
+        raise ValueError("hidden layer does not identify a Qwen2 block")
+    return PackedHiddenResourceBinding(
+        str(layer), HiddenLayerKind.INDEX, HiddenSite.BLOCK_OUTPUT, f"model.layers.{module_index}"
+    )

@@ -46,15 +46,12 @@ from pllm.contracts.backend_attachment import (
     AttachmentTopology,
     SignedBackendAttachment,
 )
-from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
-from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
+from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from pllm.contracts.packed_hidden import hidden_binding
 from pllm.contracts.packed_rows import PackedSamplerRowBatch
 from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.region_selection import RegionSelection
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.contracts.semantic_graph import (
-    HiddenInputSource,
-)
 from pllm.execution.host_runtime import CompletionCapture
 from pllm.execution.state_execution import StateDiagnostics
 from pllm.execution.trace import ExecutionTrace
@@ -133,10 +130,7 @@ class Runner(Generic[SamplerT]):
             case _:
                 raise RuntimeError("hidden taps currently require Qwen2")
         layers = len(model.model.layers)
-        paths = (
-            hidden_binding(HiddenInputSource(layer, HiddenSite(site), HiddenPhase.DECODE), layers).module_path
-            for layer, site in requested
-        )
+        paths = (hidden_binding(layer, HiddenSite(site), layers).module_path for layer, site in requested)
         hidden_size = model.lm_head.weight.shape[1]
         self.hidden_taps = HiddenTaps(model, paths, self.max_num_tokens, hidden_size, self.device)
 
@@ -411,20 +405,3 @@ class WorkloadModelRunner(Runner[Sampler | None], OverlayGraphRunner):
 class BackendWorkerState:
     process_id: int
     diagnostics: StateDiagnostics
-
-
-def hidden_binding(source: HiddenInputSource, layer_count: int) -> PackedHiddenResourceBinding:
-    layer = source.layer
-    if source.site is HiddenSite.MODEL_OUTPUT and layer == -1:
-        return PackedHiddenResourceBinding(str(layer), HiddenLayerKind.INDEX, source.site, "model.norm")
-    if source.site is not HiddenSite.BLOCK_OUTPUT:
-        raise ValueError("Qwen2 hidden input requires a block or final model output")
-    module_index = layer if layer >= 0 else layer_count + layer
-    if module_index < 0 or module_index >= layer_count:
-        raise ValueError("hidden layer does not identify a Qwen2 block")
-    return PackedHiddenResourceBinding(
-        str(layer),
-        HiddenLayerKind.INDEX,
-        HiddenSite.BLOCK_OUTPUT,
-        f"model.layers.{module_index}",
-    )

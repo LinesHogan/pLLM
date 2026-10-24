@@ -15,11 +15,10 @@ import torch
 import torch.nn.functional as F
 
 import pllm
-from pllm.authoring import TensorStepInput
+from pllm import testing
 from pllm.config import ExecutionOptions
-from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
-from pllm.contracts.packed_hidden import PackedHiddenResourceBinding, PackedHiddenSnapshot, PackedHiddenSnapshotBatch
-from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
+from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
+from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import AnchorId, TaskSymbol
@@ -27,7 +26,6 @@ from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.visibility import VisibilitySource
 from pllm.execution import row_task_binding
 from pllm.execution.backend_attachment import lower_backend_attachment
-from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.declaration import Call
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
@@ -56,17 +54,9 @@ def facts_for(device, hidden_size, pages, lineages=2, memory_bytes=10000):
 def step_input(identities, source, target, step_id, order=None, stream=None):
     """Packed decode rows with the source (layer 0) and target (layer -1) hidden states."""
     count = len(identities)
-    rows = PackedPhaseRowBatch(
-        1, step_id, count, tuple(PackedPhaseRow(i, i, step_id, HiddenPhase.DECODE, x) for i, x in enumerate(identities))
-    )
-    links = tuple(PackedSamplerRowLink(i, row) for i, row in enumerate(order or range(count)))
-    tensors = {BINDINGS[0]: source[:count], BINDINGS[1]: target[:count]}
-    snapshots = tuple(PackedHiddenSnapshot(b, tensors[b]) for b in sorted(BINDINGS, key=lambda b: b.locator_key))
-    return TensorStepInput(
-        rows,
-        PackedSamplerRowBatch(rows, links),
-        PackedHiddenSnapshotBatch(rows, snapshots),
-        hidden_readiness=None if stream is None else CudaStreamReadiness(stream),
+    hidden = {BINDINGS[0]: source[:count], BINDINGS[1]: target[:count]}
+    return testing.step_input(
+        identities, hidden, step_id=step_id, token_offset=step_id, sampler_order=order, stream=stream
     )
 
 

@@ -13,21 +13,18 @@ import torch
 from torch.nn import functional as F
 
 import pllm
-from pllm.authoring import TensorStepInput
-from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
-from pllm.contracts.packed_hidden import PackedHiddenResourceBinding, PackedHiddenSnapshot, PackedHiddenSnapshotBatch
-from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
+from pllm import testing
+from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import SamplerFeedback
 from pllm.contracts.semantic_graph import AnchorId
 from pllm.contracts.state_representation import StateDeviceKind
-from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.workloads.override import OverRIDEConfig, OverRIDEWorkload
 from test.backend_facts import assert_finite_resources, backend_facts
 
-BINDING = PackedHiddenResourceBinding("-1", HiddenLayerKind.INDEX, HiddenSite.MODEL_OUTPUT, "model.norm")
+BINDING = testing.hidden_binding(-1, HiddenSite.MODEL_OUTPUT, 1)
 HIDDEN = torch.tensor([[0.2, -0.1, 0.4, 0.3], [-0.5, 0.7, 0.1, -0.2], [0.1, 0.3, -0.2, 0.8]])
 BASE = torch.linspace(-1, 1, 21).reshape(3, 7)
 TOKENS = torch.tensor([2, 4, 1])
@@ -43,18 +40,14 @@ def facts_for(device, lineages=3, pages=3):
 
 def step_input(identities, hidden, step_id, order=None, prefill=False, stream=None):
     phases = tuple(HiddenPhase.PREFILL if prefill and i == 0 else HiddenPhase.DECODE for i in range(len(identities)))
-    rows = PackedPhaseRowBatch(
-        1,
-        step_id,
-        len(identities),
-        tuple(PackedPhaseRow(i, i, step_id, phases[i], x) for i, x in enumerate(identities)),
-    )
-    links = tuple(PackedSamplerRowLink(i, row) for i, row in enumerate(order or range(len(identities))))
-    return TensorStepInput(
-        rows,
-        PackedSamplerRowBatch(rows, links),
-        PackedHiddenSnapshotBatch(rows, (PackedHiddenSnapshot(BINDING, hidden[: len(identities)]),)),
-        hidden_readiness=None if stream is None else CudaStreamReadiness(stream),
+    return testing.step_input(
+        identities,
+        {BINDING: hidden[: len(identities)]},
+        step_id=step_id,
+        token_offset=step_id,
+        phases=phases,
+        sampler_order=order,
+        stream=stream,
     )
 
 
@@ -65,13 +58,7 @@ def samples(indices, step_id, **kwargs):
 
 def run(execution, value, base=BASE, tokens=TOKENS, stream=None):
     """One step that delivers sampler feedback at the sampler anchor."""
-    invocation = execution.start_step(value, stream)
-    for anchor in execution.arena.plan.timeline.anchors:
-        execution.execute_anchor(invocation, AnchorId(anchor.ordinal))
-        if anchor.ordinal == execution.sampler_anchor_id:
-            feedback = SamplerFeedback(value.sampler_rows, base, tokens)
-            execution.complete_sampler(invocation, stream, feedback=feedback)
-    return execution.finish_step(invocation)
+    return testing.run_step(execution, value, feedback=SamplerFeedback(value.sampler_rows, base, tokens), stream=stream)
 
 
 def adam_roots(optimizer, *parameters):

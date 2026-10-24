@@ -8,22 +8,20 @@ import torch
 from torch.nn import functional as F
 
 import pllm
-from pllm.authoring import TensorStepInput, WeightedCEBatch
+from pllm import testing
+from pllm.authoring import WeightedCEBatch
 from pllm.config import ExecutionOptions
-from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
-from pllm.contracts.packed_hidden import PackedHiddenResourceBinding, PackedHiddenSnapshot, PackedHiddenSnapshotBatch
-from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
+from pllm.contracts.hidden_locator import HiddenSite
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
-from pllm.contracts.semantic_graph import AnchorId, StateScope
+from pllm.contracts.semantic_graph import StateScope
 from pllm.contracts.state_representation import StateDeviceKind
-from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.workloads.lora import OutputLoRAConfig, OutputLoRAWorkload
 from test.backend_facts import backend_facts
 
-BINDING = PackedHiddenResourceBinding("-1", HiddenLayerKind.INDEX, HiddenSite.MODEL_OUTPUT, "model.norm")
+BINDING = testing.hidden_binding(-1, HiddenSite.MODEL_OUTPUT, 1)
 
 
 def compile_lora(config, device=torch.device("cpu"), *, lineages=3, pages=3):
@@ -43,31 +41,8 @@ def compile_lora(config, device=torch.device("cpu"), *, lineages=3, pages=3):
     ).execution
 
 
-def step_input(identities, hidden, auxiliary, readiness=None):
-    rows = PackedPhaseRowBatch(
-        1,
-        0,
-        len(identities),
-        tuple(PackedPhaseRow(i, i, 0, HiddenPhase.DECODE, identity) for i, identity in enumerate(identities)),
-    )
-    return TensorStepInput(
-        rows,
-        PackedSamplerRowBatch(rows, tuple(PackedSamplerRowLink(i, i) for i in range(len(identities)))),
-        PackedHiddenSnapshotBatch(rows, (PackedHiddenSnapshot(BINDING, hidden),)),
-        auxiliary=auxiliary,
-        hidden_readiness=readiness,
-    )
-
-
-def run_with_guidance(execution, value, stream=None):
-    """Run one step and return the sampler guidance it exposed."""
-    invocation = execution.start_step(value, stream)
-    for anchor in execution.arena.plan.timeline.anchors:
-        execution.execute_anchor(invocation, AnchorId(anchor.ordinal))
-        if anchor.ordinal == execution.sampler_anchor_id:
-            guidance = execution.sampler_guidance(invocation, stream)
-            execution.complete_sampler(invocation, stream)
-    return guidance, execution.finish_step(invocation)
+def step_input(identities, hidden, auxiliary, stream=None):
+    return testing.step_input(identities, {BINDING: hidden}, auxiliary=auxiliary, stream=stream)
 
 
 def test_weighted_ce_shared_update_matches_sgd_and_preserves_original_pins() -> None:
@@ -102,7 +77,7 @@ def test_weighted_ce_shared_update_matches_sgd_and_preserves_original_pins() -> 
     (latest,) = execution.step(value).publication.after_refs
     for actual, expected in zip(execution.snapshot(latest), (a, b), strict=True):
         torch.testing.assert_close(actual, expected)
-    guidance, idle = run_with_guidance(execution, replace(value, auxiliary=None))
+    guidance, idle = testing.run_guided_step(execution, replace(value, auxiliary=None))
     torch.testing.assert_close(guidance.values, hidden @ a @ b * 1.5)
     assert idle.publication is None and idle.loss is None
     with pytest.raises(ValueError):  # At least one row must carry weight.
@@ -148,8 +123,7 @@ def test_independent_lora_bmm_preserves_keyed_mean_and_private_publication() -> 
             hidden[0, 2].fill_(float("nan"))
             batch = pllm.host.WeightedCEBatch.for_prompts(hidden, logits, labels, weights, (1, 0))
             assert batch.keys == (keys[1], keys[0])
-            readiness = CudaStreamReadiness(stream) if stream is not None else None
-            value = step_input(identities, torch.ones((3, 4), device=device), batch, readiness)
+            value = step_input(identities, torch.ones((3, 4), device=device), batch, stream)
             generator = torch.Generator(device=device).manual_seed(config.seed)
             seed = torch.randn((2, 4, 2), device=device, generator=generator) * 0.01
             references = tuple(
@@ -162,7 +136,7 @@ def test_independent_lora_bmm_preserves_keyed_mean_and_private_publication() -> 
                     torch.testing.assert_close(actual, target, rtol=1e-5, atol=1e-7)
             assert execution.arena.latest(initial[2].lineage_id) == initial[2]
             # Each row is guided by its own adapter; the untrained request keeps its initial factors.
-            guidance, _ = run_with_guidance(execution, replace(value, auxiliary=None), stream)
+            guidance, _ = testing.run_guided_step(execution, replace(value, auxiliary=None), stream=stream)
             expected = torch.cat(
                 [
                     torch.ones(1, 4, device=device) @ factors[0] @ factors[1] * 1.5

@@ -94,8 +94,9 @@ if TYPE_CHECKING:
     from pllm.backends.vllm.mrv1 import Mrv1Runner
 
 
-from pllm.backends.vllm.runner import TAPS_ENV, BackendWorkerState, WorkloadModelRunner, hidden_binding
+from pllm.backends.vllm.runner import TAPS_ENV, BackendWorkerState, WorkloadModelRunner
 from pllm.backends.vllm.session import input_reservations
+from pllm.contracts.packed_hidden import hidden_binding
 
 _MP_ENV = "VLLM_ENABLE_V1_MULTIPROCESSING"
 
@@ -881,7 +882,7 @@ def probe_backend(
     hidden_resources = tuple(
         sorted(
             (
-                AttachmentHiddenResource(hidden_binding(source, layer_count), source.phase)
+                AttachmentHiddenResource(hidden_binding(source.layer, source.site, layer_count), source.phase)
                 for source in requirements.hidden_inputs
             ),
             key=lambda resource: resource.resource_key,

@@ -14,12 +14,10 @@ import torch
 
 import pllm
 from examples.centered_hidden import centered_hidden
-from pllm import make_llm
-from pllm.authoring import TensorStepInput
+from pllm import make_llm, testing
 from pllm.contracts.backend_attachment import AttachmentHiddenResource
-from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
-from pllm.contracts.packed_hidden import PackedHiddenResourceBinding, PackedHiddenSnapshot, PackedHiddenSnapshotBatch
-from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
+from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.codec import decode_boundary, encode_boundary
@@ -31,28 +29,15 @@ from pllm.execution.trace import ExecutionTrace, TracePhase, TraceSelection, Tra
 from pllm.workloads.dummy import DummyConfig, DummyWorkload
 from test.backend_facts import assert_finite_resources, backend_facts
 
-BINDING = PackedHiddenResourceBinding("0", HiddenLayerKind.INDEX, HiddenSite.BLOCK_OUTPUT, "model.layers.0")
+BINDING = testing.hidden_binding(0, HiddenSite.BLOCK_OUTPUT, 1)
 CPU = HostRuntimeFacts(torch.device("cpu"))
 
 
 def step_input(step, hidden, count=3):
     """Row 0 is a prefill row; the rest decode, one request each."""
-    rows = PackedPhaseRowBatch(
-        1,
-        step,
-        count,
-        tuple(
-            PackedPhaseRow(
-                i, i, 0, HiddenPhase.PREFILL if i == 0 else HiddenPhase.DECODE, RequestIdentity(str(i), i, 0)
-            )
-            for i in range(count)
-        ),
-    )
-    return TensorStepInput(
-        rows,
-        PackedSamplerRowBatch(rows, tuple(PackedSamplerRowLink(i, i) for i in range(count))),
-        PackedHiddenSnapshotBatch(rows, (PackedHiddenSnapshot(BINDING, hidden[:count]),)),
-    )
+    phases = (HiddenPhase.PREFILL,) + (HiddenPhase.DECODE,) * (count - 1)
+    identities = tuple(RequestIdentity(str(i), i, 0) for i in range(count))
+    return testing.step_input(identities, {BINDING: hidden[:count]}, step_id=step, phases=phases)
 
 
 def test_dummy_runs_graph_sign_plan_execute() -> None:
@@ -103,12 +88,7 @@ def test_dummy_runs_graph_sign_plan_execute() -> None:
     with pytest.raises(ValueError):
         attached.start_step(step_input(2, torch.cat((hidden, hidden[:1])), count=4))
     with pytest.raises(ValueError):  # hidden width differs from the specialized model
-        attached.step(
-            replace(
-                value(2),
-                hidden=PackedHiddenSnapshotBatch(value(2).rows, (PackedHiddenSnapshot(BINDING, torch.zeros(3, 6)),)),
-            )
-        )
+        attached.step(step_input(2, torch.zeros(3, 6)))
     torch.testing.assert_close(attached.step(value(2)), expected)
     with pytest.raises(ValueError):  # a changed declaration cannot reuse the signed attachment
         DummyWorkload(replace(workload.config, export_every_n_steps=1)).bind_backend(bounded, deployment.attachment)
@@ -223,10 +203,8 @@ def _frozen_state_is_readable_by_an_observation() -> None:
     identity = RequestIdentity("req", 0, 0)
     execution.admit(())
     execution.admit((identity,))
-    rows = PackedPhaseRowBatch(1, 0, 1, (PackedPhaseRow(0, 0, 0, HiddenPhase.DECODE, identity),))
     source = (torch.arange(4, dtype=torch.float32) + 1).unsqueeze(0)
-    hidden = PackedHiddenSnapshotBatch(rows, (PackedHiddenSnapshot(BINDING, source),))
-    execution.step(TensorStepInput(rows, PackedSamplerRowBatch(rows, ()), hidden))
+    execution.step(testing.step_input((identity,), {BINDING: source}, sampler_order=()))
     events = [event.tensor() for event in execution.trace.snapshot().events if event.tensor_name == "features"]
     assert len(events) == 1 and torch.equal(events[0][0], source[0])
     execution.retire((identity,))

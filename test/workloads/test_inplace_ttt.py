@@ -12,10 +12,9 @@ import pytest
 import torch
 
 import pllm
-from pllm import TensorUpdate
+from pllm import TensorUpdate, testing
 from pllm.authoring import ParameterTargetShape, StateTensorUpdate, TensorStepInput
 from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.contracts.parameter_overlay import (
     CapturedParameterOperand,
     ParameterModuleKind,
@@ -44,13 +43,8 @@ class _ShiftedUpdate(InPlaceTTTWorkload):
 
 def _input(operands: tuple[CapturedParameterOperand, ...]) -> TensorStepInput:
     selected = tuple(dict.fromkeys((operand.identity, operand.phase) for operand in operands))
-    rows = PackedPhaseRowBatch(
-        1,
-        0,
-        len(selected),
-        tuple(PackedPhaseRow(index, index, 0, phase, identity) for index, (identity, phase) in enumerate(selected)),
-    )
-    return TensorStepInput(rows, PackedSamplerRowBatch(rows, ()), operands=operands)
+    identities, phases = zip(*selected, strict=True) if selected else ((), ())
+    return testing.step_input(identities, phases=phases, sampler_order=(), operands=operands)
 
 
 def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
@@ -243,19 +237,13 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     )
     prompts = (RequestIdentity("first", 0, 0), RequestIdentity("second", 1, 0))
     initial = imported.admit(prompts)
-    rows = PackedPhaseRowBatch(
-        1,
-        0,
-        2,
-        tuple(PackedPhaseRow(index, index, 0, HiddenPhase.PREFILL, identity) for index, identity in enumerate(prompts)),
-    )
     keys = tuple(RequestStateKey.project(identity, (RequestKeyField.PROMPT_IDX,)) for identity in prompts)
     # Each prompt imports its externally produced factors on its own, at its own version.
     published = []
     for index, key in enumerate(keys):
         update = StateTensorUpdate(tuple(tensor.unsqueeze(0) for tensor in generated), (key,))
         publication = imported.step(
-            TensorStepInput(rows, PackedSamplerRowBatch(rows, ()), auxiliary=update)
+            testing.step_input(prompts, phases=(HiddenPhase.PREFILL,) * 2, sampler_order=(), auxiliary=update)
         ).publication
         (ref,) = publication.after_refs
         assert ref.lineage_id == initial[index].lineage_id and ref.version_id == 1
@@ -265,7 +253,9 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
             assert imported.arena.latest(initial[1].lineage_id) == initial[1]
             assert all(not tensor.any() for tensor in imported.snapshot(initial[1]))
             # A staged batch does not import twice: the published version no longer matches.
-            again = imported.step(TensorStepInput(rows, PackedSamplerRowBatch(rows, ()), auxiliary=update))
+            again = imported.step(
+                testing.step_input(prompts, phases=(HiddenPhase.PREFILL,) * 2, sampler_order=(), auxiliary=update)
+            )
             assert again.publication is None
         published.append(ref)
     assert imported.retire(prompts) == tuple(published)
