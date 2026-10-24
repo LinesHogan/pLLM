@@ -70,8 +70,10 @@ from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION, Recurrence
 from pllm.execution.scan import ScanContext
 from pllm.execution.shared_tensor import tensor_dtype
 from pllm.execution.state_execution import StateTaskContext
-from pllm.execution.step_capture import StepCapture, reads_rows
+from pllm.execution.step_capture import StepCapture
+from pllm.execution.tensor_executor import TensorExecutor, reads_rows
 from pllm.execution.tensor_frame import (
+    MaskedRows,
     OverlayEntry,
     OverlayTargetResult,
     TensorFrame,
@@ -93,7 +95,7 @@ from pllm.execution.tensor_program import (
     BatchPreparation,
     InvocationOutput,
     Observation,
-    PoolAdamW,
+    PageUpdate,
     PoolSGD,
     TaskOutput,
     TensorBatch,
@@ -524,7 +526,7 @@ class TensorBinding(Builder[TensorFrame]):
                 loss,
                 tuple(buffers),
                 parameters,
-                PoolAdamW(optimizer, len(buffers))
+                PageUpdate(optimizer, len(buffers))
                 if isinstance(optimizer, AdamWConfig)
                 else PoolSGD(optimizer.lr, len(buffers)),
             ),
@@ -582,7 +584,7 @@ class TensorBinding(Builder[TensorFrame]):
                 facts.device,
                 None if budget is None else budget // max(1, facts.max_admitted_lineages),
             )
-            self.operations[symbol] = replace(operation, function=scans.bind(operation.function))
+            self.operations[symbol] = replace(operation, body=scans.bind(operation.body))
 
     def configure_steps(self, facts: BackendCompileFacts, capture: bool) -> None:
         """Select the same tensor step for planning and execution."""
@@ -607,13 +609,16 @@ class TensorBinding(Builder[TensorFrame]):
         for symbol, task in captured.items():
             operation = self.operations[symbol]
             optimizer = operation.optimizer
-            assert optimizer is None or isinstance(optimizer, PoolAdamW)
-            self.operations[symbol] = replace(
-                operation,
-                step=StepCapture(
-                    task, self.tensor_tasks, limits[symbol], states, facts.device, optimizer, enabled=capture
-                ),
+            assert optimizer is None or isinstance(optimizer, PageUpdate)
+            executor = TensorExecutor(
+                task,
+                self.tensor_tasks,
+                optimizer,
+                MaskedRows,
+                StepCapture(limits[symbol], states) if capture else None,
+                facts.device,
             )
+            self.operations[symbol] = replace(operation, body=executor, capture_resident=executor.resident)
 
     def recurrence(self, effect: Recurrence) -> None:
         activation = self.attachment is not None and self.attachment.kind is AttachmentKind.ACTIVATION_PATCH
@@ -1016,7 +1021,7 @@ class TensorBinding(Builder[TensorFrame]):
                     size = prod(shape)
                     if field_index == 0 and data.leaf is not None:
                         leaf = data.leaf.narrow(1, start or 0, size)
-                        rows = row_index(data, batch, leaf.device).take(leaf, "states")
+                        rows = row_index(data, batch, leaf.device).states.take(leaf)
                     else:
                         rows = field_rows(data, batch, field_index, start or 0, size)
                     return rows.view(len(rows), *shape)
@@ -1223,7 +1228,7 @@ class TensorBinding(Builder[TensorFrame]):
                     dtype=torch.long,
                 )
             index = row_index(data, batch, batch.roots[0][0].device)
-            return index.column("versions" if version else "states")
+            return index.versions.device if version else index.states.device
 
         return TensorPort(state.read(), read)
 
@@ -1281,8 +1286,8 @@ class TensorBinding(Builder[TensorFrame]):
                     )
                 task = TensorTask(symbol, function, ports, sources, policy, output, captures)
                 self.tensor_tasks[symbol] = task
-                execute = task.evaluate if update is None else task.train
-            return self.compute(
+                execute = task.evaluate
+            call = self.compute(
                 name,
                 inputs=sources,
                 outputs=(output,),
@@ -1294,6 +1299,14 @@ class TensorBinding(Builder[TensorFrame]):
                 function=execute,
                 implementations=(native(identity or f"{self.graph.workload_id}:{name}@1"),),
             )
+
+            if self.dimensions is not None:
+                operation = self.operations[symbol]
+                optimizer = operation.optimizer
+                assert optimizer is None or isinstance(optimizer, PageUpdate)
+                executor = TensorExecutor(self.tensor_tasks[symbol], self.tensor_tasks, optimizer)
+                self.operations[symbol] = replace(operation, body=executor, capture_resident=executor.resident)
+            return call
 
         return decorate
 
@@ -1423,7 +1436,7 @@ class TensorBinding(Builder[TensorFrame]):
             def prepare(data: TensorFrame) -> TensorFrame | None:
                 if not enabled or data.step.rows.step_id % every or not data.rows:
                     return None
-                return replace(data, rows=data.rows[:max_rows], columns=max_cols)
+                return replace(data, rows=data.rows[:max_rows], columns=max_cols, index=None, plan=None)
 
             def output(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
                 value = export_tensor(batch.results[call.symbol, call.outputs[0]][:max_rows, :max_cols])

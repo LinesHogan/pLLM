@@ -13,7 +13,6 @@ from dataclasses import dataclass, replace
 import torch
 
 from pllm.contracts.semantic_graph import (
-    HiddenInputSource,
     MathContract,
     SemanticInputSource,
     StateSelectionInputSource,
@@ -23,7 +22,6 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.tensor_frame import (
     LeafRoots,
-    RowPlan,
     TensorFrame,
     TensorMath,
     TensorPort,
@@ -33,7 +31,6 @@ from pllm.execution.tensor_frame import (
     selected_rows,
     state_leaf,
     state_means,
-    training_observations,
 )
 from pllm.execution.tensor_program import TaskOutput, TensorBatch
 
@@ -97,6 +94,7 @@ class TensorTask:
                 data,
                 rows=tuple(data.rows[index] for index in rows),
                 index=row_index(data, batch, inputs[policy.forward_rows].device).select(rows),
+                plan=None if data.plan is None else data.plan.select(rows),
             )
             if compacted
             else data
@@ -179,61 +177,6 @@ class TensorTask:
             return result
         return result.new_zeros((len(data.rows), *result.shape[1:])).index_copy_(0, mask.nonzero().flatten(), result)
 
-    def train(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
-        """Differentiate the loss and hand each selected state's gradient to the optimizer."""
-        with torch.enable_grad():
-            inputs, rows = self.read(data, batch)
-            selected = rows
-            if self.policy.update_states in self.domains:
-                selected = selected_rows(inputs[self.policy.update_states])
-            plan = row_index(data, batch, state_leaf(data, batch).device).plan
-            assert plan is not None
-            active = tuple(sorted(plan.select(selected).last))
-            if rows:
-                outcome = self._step(inputs, rows, active, plan.select(rows), data, batch)
-            else:
-                outcome = TaskOutput(
-                    gradients=tuple(torch.zeros_like(state_leaf(data, batch)[index]) for index in active),
-                    gradient_indices=active,
-                    update_count=len(active),
-                )
-        # validate_gradients binds every derivative path to this sole sink.
-        data.derivative_sources.clear()
-        data.leaf = None
-        for key, value in batch.results.items():
-            batch.results[key] = value.detach()
-        return outcome
-
-    def _step(
-        self,
-        inputs: dict[str, torch.Tensor],
-        rows: tuple[int, ...],
-        active: tuple[int, ...],
-        plan: RowPlan,
-        data: TensorFrame,
-        batch: TensorBatch,
-    ) -> TaskOutput:
-        loss, derivatives = self.differentiate(inputs, rows, data, batch)
-        state_gradients = derivatives[0].detach()
-        data.parameter_gradient_fields.update(
-            (ref, (value,)) for ref, value in zip(batch.selection.refs, state_gradients.unbind(), strict=True)
-        )
-        data.input_gradients.update(
-            (key, value.detach()) for key, value in zip(data.derivative_sources, derivatives[1:], strict=True)
-        )
-        batch.results[self.symbol, self.output] = loss = loss.detach()
-        hidden = {key: inputs[key] for key in inputs if isinstance(self.sources[key], HiddenInputSource)}
-        return TaskOutput(
-            loss=loss,
-            gradients=tuple(state_gradients[index] for index in active),
-            gradient_indices=active,
-            loss_count=len(plan.last) if self.policy.reduction == "state_mean" else 1,
-            update_count=len(active),
-            trained_rows=len(rows),
-            observations=training_observations(data, batch, loss, hidden, rows),
-            field_writes=self._memory_writes(inputs, plan, active, batch),
-        )
-
     def differentiate(
         self, inputs: dict[str, torch.Tensor], rows: tuple[int, ...], data: TensorFrame, batch: TensorBatch
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
@@ -258,12 +201,11 @@ class TensorTask:
             if data.weights is not None:
                 assert data.index is not None and data.counts is not None
                 loss = loss.new_zeros(len(data.counts)).index_add(
-                    0, data.index.column("states"), loss * data.weights
+                    0, data.index.states.device, loss * data.weights
                 ) / data.counts.clamp_min(1)
             else:
-                plan = row_index(data, batch, loss.device).plan
-                assert plan is not None
-                loss = state_means(loss, plan.select(rows))
+                assert data.plan is not None
+                loss = state_means(loss, data.plan.select(rows))
             return loss, loss.sum()
         if loss.ndim == 1:
             loss = (
@@ -274,30 +216,6 @@ class TensorTask:
         if loss.ndim != 0:
             raise ValueError("optimizer functions must return a scalar or one loss per row")
         return loss, loss
-
-    def _memory_writes(
-        self,
-        inputs: dict[str, torch.Tensor],
-        plan: RowPlan,
-        active: tuple[int, ...],
-        batch: TensorBatch,
-    ) -> tuple[tuple[LayoutFieldId, torch.Tensor], ...]:
-        """Capture the last compact input, retaining memory for updates without forward rows."""
-        if not active:
-            return ()
-        last = plan.last
-        return tuple(
-            (
-                field_id,
-                torch.stack(
-                    tuple(
-                        inputs[key][last[index]].detach() if index in last else batch.roots[index][field_id]
-                        for index in active
-                    )
-                ),
-            )
-            for key, field_id in self.captures.items()
-        )
 
 
 __all__ = ["TensorTask"]

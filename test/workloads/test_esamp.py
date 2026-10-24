@@ -30,7 +30,7 @@ from pllm.execution.declaration import Call
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
-from pllm.execution.tensor_frame import RowIndex, RowPlan, TensorFrame, TensorPort, state_means
+from pllm.execution.tensor_frame import CompactRows, RowIndex, RowPlan, TensorFrame, TensorPort, state_means
 from pllm.execution.tensor_program import TaskOutput, TensorBatch
 from pllm.execution.tensor_task import TensorTask
 from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
@@ -104,15 +104,17 @@ def reject_publication(arena, write):
 def test_esamp_predicts_before_training_and_isolates_request_versions(monkeypatch: pytest.MonkeyPatch) -> None:
     # Compact positions 0/1 came from operation rows 1/3 of one lineage.
     positions = (0, 1, 2, 3)
-    plan = RowPlan((positions, positions, positions, (0, 1, 0, 1), (0,) * 4), np.zeros((3, 1), dtype=np.int64))
+    plan = RowPlan(positions, positions, positions, (0, 1, 0, 1), (0,) * 4, np.zeros((3, 1), dtype=np.int64))
     losses = torch.tensor([2.0, 4.0], requires_grad=True)
     means = state_means(losses, plan.select((1, 3)))
     torch.testing.assert_close(means, torch.tensor([0.0, 3.0, 0.0]))
     torch.testing.assert_close(torch.autograd.grad(means.sum(), losses)[0], torch.tensor([0.5, 0.5]))
-    index = RowIndex(torch.tensor(plan.columns), plan)
+    index = RowIndex(
+        *(CompactRows(column, rows) for column, rows in zip(torch.tensor(plan.columns), plan.columns, strict=True))
+    )
     values = torch.arange(12).view(4, 3)
-    assert index.select((1, 2)).take(values, "packed").data_ptr() == values[1].data_ptr()
-    assert index.select((2, 2)).take(values, "packed").stride(0) == 0
+    assert index.select((1, 2)).packed.take(values).data_ptr() == values[1].data_ptr()
+    assert index.select((2, 2)).packed.take(values).stride(0) == 0
     with pytest.raises(ValueError):
         ExecutionOptions(publish_lag=-1)
     with pytest.raises(ValueError):
@@ -351,9 +353,10 @@ def test_sampler_adapts_step_results_in_memory_trace_and_runtime(monkeypatch: py
     evaluate = TensorTask.evaluate
     adapt = tensor_binding.sampler_output
     devices: list[str] = []
+    calls: list[TaskSymbol] = []
 
     def dependency(task: TensorTask, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
-        assert task.symbol != "predict", "prediction body re-entered after the fixed step"
+        calls.append(task.symbol)
         return evaluate(task, data, batch)
 
     def output(
@@ -382,6 +385,7 @@ def test_sampler_adapts_step_results_in_memory_trace_and_runtime(monkeypatch: py
     latest = execution.admit(identities)
     source = torch.linspace(-0.3, 0.7, 8).reshape(2, 4)
     devices.clear()
+    calls.clear()
     for step in range(2):
         expected = reference(source, torch.stack([execution.snapshot(ref)[0] for ref in latest]))
         result = execution.step(step_input(identities, source, source.flip(1), step, (1, 0)))
@@ -389,5 +393,5 @@ def test_sampler_adapts_step_results_in_memory_trace_and_runtime(monkeypatch: py
         assert result.guidance.affected_row_ids == (0, 1)
         torch.testing.assert_close(result.guidance.row_weights, torch.full((2,), float(step)))
         torch.testing.assert_close(result.guidance.values, expected.flip(0) if step else torch.zeros_like(expected))
-    assert devices == ["cpu", "cpu"]
+    assert devices == ["cpu", "cpu"] and calls.count(TaskSymbol("predict")) == 2
     execution.retire(identities)

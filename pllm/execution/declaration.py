@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
+from functools import partial
 from typing import Generic, TypeVar
 
 from pllm.contracts.backend_attachment import (
@@ -74,10 +75,11 @@ from pllm.execution.replay import REPLAY_IMPLEMENTATION, ReplayStateTask, Tokenw
 from pllm.execution.state_execution import ConditionalProducerTask, PublishStateTask, StateTaskContext
 from pllm.execution.tensor_program import (
     Optimizer,
-    PoolAdamW,
+    PageUpdate,
     TaskOutput,
     TensorBatch,
     TensorOperation,
+    native_body,
 )
 from pllm.kernels.adamw import AdamWConfig
 
@@ -336,10 +338,10 @@ class Builder(Generic[D]):
                 copy_fields = tuple(
                     LayoutFieldId(i) for i in range(len(changes.fields)) if i >= changes.optimizer_fields or i % 5 != 1
                 )
-                optimizer = PoolAdamW(config, groups)
+                optimizer = PageUpdate(config, groups)
             self.operations[task.symbol] = operation_type(
                 implementations[0].implementation_id,
-                function,
+                partial(native_body, function),
                 "read"
                 if changes is None
                 else ("gradient" if optimizer is not None else "transition")

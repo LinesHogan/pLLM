@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Literal, overload
+from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, overload
 
 import numpy as np
 import torch
@@ -120,19 +120,20 @@ def take_rows(values: torch.Tensor, rows: Sequence[int], device_rows: torch.Tens
     return values.index_select(0, device_rows)
 
 
-_COLUMNS = ("packed", "sampler", "samples", "states", "versions")
-
-
 @dataclass(frozen=True, slots=True)
 class RowPlan:
     """Host row facts and authorized slots shared by eager views and fixed tables.
 
-    Columns follow `_COLUMNS`; sources are [state, field] slots. Writes pair the
+    Columns serialize in packed/sampler/samples/states/versions order; sources are [state, field] slots. Writes pair the
     update-state positions with their issued destination slots. Selecting rows
     changes only columns; page access stays in the invocation's state order.
     """
 
-    columns: tuple[tuple[int, ...], ...]
+    packed: tuple[int, ...]
+    sampler: tuple[int, ...]
+    samples: tuple[int, ...]
+    states: tuple[int, ...]
+    versions: tuple[int, ...]
     sources: Slots
     writes: tuple[tuple[int, ...], Slots] | None = None
 
@@ -143,74 +144,109 @@ class RowPlan:
         selection = batch.selection
         states = selection.indices(data.rows) if selection.groups else (0,) * len(data.rows)
         return cls(
-            (
-                tuple(row.packed_row_index for row in data.rows),
-                tuple(links.get(row.packed_row_index, -1) for row in data.rows),
-                tuple(row.identity.sample_idx for row in data.rows),
-                states,
-                tuple(selection.refs.versions[list(states)].tolist()) if selection.groups else states,
-            ),
+            tuple(row.packed_row_index for row in data.rows),
+            tuple(links.get(row.packed_row_index, -1) for row in data.rows),
+            tuple(row.identity.sample_idx for row in data.rows),
+            states,
+            tuple(selection.refs.versions[list(states)].tolist()) if selection.groups else states,
             batch.slot_matrix()[1] if batch.roots else np.empty((0, 0), dtype=np.int64),
         )
 
     def select(self, rows: tuple[int, ...]) -> "RowPlan":
         """Keep operation-row order; capture positions refer to the compact inputs."""
-        return replace(self, columns=tuple(tuple(column[row] for row in rows) for column in self.columns))
+        return replace(
+            self,
+            packed=tuple(self.packed[row] for row in rows),
+            sampler=tuple(self.sampler[row] for row in rows),
+            samples=tuple(self.samples[row] for row in rows),
+            states=tuple(self.states[row] for row in rows),
+            versions=tuple(self.versions[row] for row in rows),
+        )
+
+    @property
+    def columns(self) -> tuple[tuple[int, ...], ...]:
+        """Serialize named fields only at the device-table boundary."""
+        return self.packed, self.sampler, self.samples, self.states, self.versions
 
     @property
     def counts(self) -> Slots:
         """Per-state row counts, followed by the padding sink."""
-        return np.bincount(self.columns[3], minlength=len(self.sources) + 1).astype(np.int64, copy=False)
+        return np.bincount(self.states, minlength=len(self.sources) + 1).astype(np.int64, copy=False)
 
     @property
     def last(self) -> dict[int, int]:
         """Last input position of every state with forward rows."""
-        return {state: position for position, state in enumerate(self.columns[3])}
+        return {state: position for position, state in enumerate(self.states)}
 
 
 @dataclass(frozen=True, slots=True)
-class RowIndex:
-    """Device columns with an eager RowPlan, or fixed columns supplied by graph staging."""
+class MaskedRows:
+    """A fixed device row selection, used inside masked tensor bodies."""
 
     device: torch.Tensor
-    plan: RowPlan | None = None
+    compact: ClassVar[bool] = False
 
-    def column(self, name: str) -> torch.Tensor:
-        return self.device[_COLUMNS.index(name)]
+    def take(self, values: torch.Tensor) -> torch.Tensor:
+        """Gather through fixed device indices."""
+        return values.index_select(0, self.device)
 
-    def take(self, values: torch.Tensor, name: str) -> torch.Tensor:
-        """Borrow contiguous/repeated eager rows, or gather from fixed device columns."""
-        if self.plan is None:
-            return values.index_select(0, self.column(name))
-        rows = self.plan.columns[_COLUMNS.index(name)]
-        if -1 in rows:
-            raise ValueError(f"some rows have no {name} row")
-        return take_rows(values, rows, self.column(name))
+    def select(self, rows: tuple[int, ...]) -> "MaskedRows":
+        """Keep a selected device view."""
+        return MaskedRows(select_rows(self.device, rows))
+
+
+@dataclass(frozen=True, slots=True)
+class CompactRows(MaskedRows):
+    """Host-selected rows preserve consecutive and repeated eager views."""
+
+    rows: tuple[int, ...]
+    compact: ClassVar[bool] = True
+
+    def take(self, values: torch.Tensor) -> torch.Tensor:
+        """Borrow eager views where row order permits them."""
+        if -1 in self.rows:
+            raise ValueError("some operation rows have no corresponding input row")
+        return take_rows(values, self.rows, self.device)
+
+    def select(self, rows: tuple[int, ...]) -> "CompactRows":
+        """Keep matching host indices and device columns."""
+        return CompactRows(select_rows(self.device, rows), tuple(self.rows[row] for row in rows))
+
+
+class RowIndex(NamedTuple):
+    """Named read strategies for an invocation's five index columns."""
+
+    packed: MaskedRows
+    sampler: MaskedRows
+    samples: MaskedRows
+    states: MaskedRows
+    versions: MaskedRows
 
     def select(self, rows: tuple[int, ...]) -> "RowIndex":
-        """Select compact inputs without resolving their host facts again."""
-        return RowIndex(select_rows(self.device.T, rows).T, None if self.plan is None else self.plan.select(rows))
+        """Select each column using its bound row strategy."""
+        return RowIndex(*(column.select(rows) for column in self))
 
 
 def row_index(data: "TensorFrame", batch: TensorBatch, device: torch.device) -> RowIndex:
     """The invocation's row tables, built on first use."""
     if data.index is None:
-        plan = RowPlan.build(data, batch)
-        data.index = RowIndex(upload(plan.columns, device), plan)
+        plan = RowPlan.build(data, batch) if data.plan is None else data.plan
+        data.plan = plan
+        data.index = RowIndex(
+            *(CompactRows(value, rows) for value, rows in zip(upload(plan.columns, device), plan.columns, strict=True))
+        )
     return data.index
 
 
 def field_rows(data: "TensorFrame", batch: TensorBatch, field: int, start: int, size: int) -> torch.Tensor:
     """`field[start:start+size]` of each row's state, `[rows, size]`; copies only that slice."""
-    if data.fields:
-        value = data.fields[field].reshape(len(data.fields[field]), -1).narrow(1, start, size)
-        return row_index(data, batch, value.device).take(value, "states")
-    pool, _ = batch.field_slots(field)
+    pool = data.fields[field] if data.fields else batch.field_slots(field)[0]
     view = pool.reshape(len(pool), -1).narrow(1, start, size)
-    plan = row_index(data, batch, pool.device).plan
-    assert plan is not None
-    rows = tuple(int(plan.sources[state, field]) for state in plan.columns[3])
-    return take_rows(view, rows)
+    index = row_index(data, batch, pool.device)
+    if data.fields:
+        return index.states.take(view)
+    assert data.plan is not None
+    return take_rows(view, tuple(int(data.plan.sources[state, field]) for state in data.plan.states))
 
 
 class FieldRoots(Sequence[tuple[torch.Tensor, ...]]):
@@ -259,7 +295,7 @@ class LeafRoots(Sequence[tuple[torch.Tensor, ...]]):
 
 def state_means(losses: torch.Tensor, plan: RowPlan) -> torch.Tensor:
     """Average compact row losses using the same host counts as fixed table staging."""
-    totals = losses.new_zeros(len(plan.sources)).index_add(0, upload(plan.columns[3], losses.device), losses)
+    totals = losses.new_zeros(len(plan.sources)).index_add(0, upload(plan.states, losses.device), losses)
     return totals / upload([max(int(count), 1) for count in plan.counts[:-1]], losses.device, losses.dtype)
 
 
@@ -330,6 +366,7 @@ class TensorFrame:
     trained_rows: int = 0
     replacements: tuple[tuple[int, tuple[torch.Tensor, ...]], ...] = ()
     index: RowIndex | None = None
+    plan: RowPlan | None = None
     # Differentiable [states, parameters] copy of the flat optimizer field, shared by the
     # invocation's differentiable tasks and cleared by the training task that consumes it.
     leaf: torch.Tensor | None = None
@@ -348,7 +385,7 @@ def feedback_port(name: Literal["base_logits", "sampled_tokens"]) -> TensorPort:
         if feedback is None:
             raise RuntimeError("tensor function requires completed sampler feedback")
         values = feedback.base_logits if name == "base_logits" else feedback.sampled_tokens
-        return row_index(data, batch, values.device).take(values, "sampler")
+        return row_index(data, batch, values.device).sampler.take(values)
 
     return TensorPort(SamplerFeedbackInputSource(), resolve, feedback=name)
 
@@ -380,23 +417,23 @@ def input_port(source: SemanticInputSource | TensorPort) -> TensorPort:
             def hidden(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
                 if data.hidden_inputs is not None:
                     value = data.hidden_inputs[str(layer), "index", site.value]
-                    return row_index(data, batch, value.device).take(value, "packed")[:, : data.columns]
+                    return row_index(data, batch, value.device).packed.take(value)[:, : data.columns]
                 (snapshot,) = (
                     item
                     for item in data.step.hidden_batch(batch.stream).snapshots
                     if item.resource.locator_key == (str(layer), "index", site.value)
                 )
                 index = row_index(data, batch, snapshot.hidden.device)
-                return index.take(snapshot.hidden, "packed")[:, : data.columns]
+                return index.packed.take(snapshot.hidden)[:, : data.columns]
 
             return TensorPort(source, hidden)
         case PackedSamplerRowsInputSource():
 
             def samples(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
                 if data.index is not None:
-                    return data.index.column("samples")
+                    return data.index.samples.device
                 device = data.step.hidden_batch(batch.stream).snapshots[0].hidden.device
-                return row_index(data, batch, device).column("samples")
+                return row_index(data, batch, device).samples.device
 
             return TensorPort(source, samples)
         case SamplerFeedbackInputSource():

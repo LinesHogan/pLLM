@@ -28,6 +28,7 @@ from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.state_execution import StateTaskContext
 from pllm.execution.trace import TracePhase
 from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw, paged_adamw
+from pllm.kernels.page_copy import copy_pages
 
 I = TypeVar("I")
 D = TypeVar("D")
@@ -268,7 +269,7 @@ class PoolSGD:
 
 
 @dataclass(frozen=True, slots=True)
-class PoolAdamW:
+class PageUpdate:
     """One update entry point for grouped tensor views and FP32 CUDA page pools."""
 
     config: AdamWConfig
@@ -280,17 +281,52 @@ class PoolAdamW:
         """Update the borrowed parameter views; meta executes the same paged tensor path."""
         parameter = roots[0][0]
         if self.groups != 1 or parameter.device.type == "cpu" or parameter.dtype != torch.float32:
-            apply_adamw(
-                tuple(root[5 * group : 5 * group + 5] for root in roots for group in range(self.groups)),
-                AdamWFields(*(LayoutFieldId(i) for i in range(5))),
-                self.config,
-                gradients,
-            )
+            self.tensors(roots, gradients)
             return
         fields = tuple(slots(i) for i in range(5))
         pools = tuple(pool.reshape(len(pool), -1) if index != 2 else pool for index, (pool, _) in enumerate(fields))
         table = upload([rows for _, rows in fields], parameter.device)
         paged_adamw(pools, table, torch.stack(gradients).reshape(len(gradients), -1), self.config)
+
+    def tensors(self, roots: Sequence[tuple[torch.Tensor, ...]], gradients: tuple[torch.Tensor, ...]) -> None:
+        """Apply the same grouped Torch update to ordinary or gathered private fields."""
+        apply_adamw(
+            tuple(root[5 * group : 5 * group + 5] for root in roots for group in range(self.groups)),
+            AdamWFields(*(LayoutFieldId(i) for i in range(5))),
+            self.config,
+            gradients,
+        )
+
+    @torch.no_grad()
+    def staged(
+        self,
+        pools: tuple[torch.Tensor, ...],
+        fields: tuple[torch.Tensor, ...],
+        sources: torch.Tensor,
+        destinations: torch.Tensor,
+        gradients: torch.Tensor,
+        captures: Mapping[LayoutFieldId, torch.Tensor],
+        last: torch.Tensor,
+        *,
+        paged: bool,
+    ) -> None:
+        """Update issued destinations and carry fields inside the shared tensor body."""
+        count = gradients.shape[0]
+        if paged:
+            paged_adamw(pools[:5], destinations[:5], gradients, self.config, sources[:5, :count].contiguous())
+        else:
+            self.tensors(
+                tuple(tuple(value[row] for value in fields[:5]) for row in range(count)), tuple(gradients.unbind())
+            )
+            rows = torch.arange(count, device=destinations.device)
+            for field in range(5):
+                copy_pages(fields[field], pools[field], rows, destinations[field])
+        for field in set(range(5, len(pools))) - captures.keys():
+            copy_pages(pools[field], pools[field], sources[field, :count], destinations[field])
+        for field, value in captures.items():
+            if value.shape[1:] != pools[field].shape[1:] or value.dtype != pools[field].dtype:
+                raise ValueError("memory capture must match its declared field shape and dtype")
+            copy_pages(value.detach(), pools[field], last, destinations[field])
 
 
 MemoryDataT = TypeVar("MemoryDataT", contravariant=True)
@@ -306,12 +342,15 @@ class MemoryOperation(Protocol[MemoryDataT]):
     def resident(self, capture_bytes: int) -> int: ...
 
 
-class TensorStep(Protocol[D]):
-    """A tensor body with fixed-shape preparation for runtime and memory tracing."""
+def native_body(
+    function: Callable[[D, TensorBatch], TaskOutput], data: D, batch: TensorBatch, context: StateTaskContext[D] | None
+) -> TaskOutput:
+    """Adapt native mathematical functions to the operation's single body interface."""
+    return function(data, batch)
 
-    def execute(self, context: StateTaskContext[D], batch: TensorBatch) -> TaskOutput: ...
-    def prepare_memory(self, data: D, batch: TensorBatch) -> None: ...
-    def run(self, data: D, batch: TensorBatch) -> TaskOutput: ...
+
+def _no_resident(capture_bytes: int) -> int:
+    return 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,14 +358,14 @@ class TensorOperation(Generic[D]):
     """Run one mathematical body, then adapt its result and settle declared effects."""
 
     implementation_id: ImplementationId
-    function: Callable[[D, TensorBatch], TaskOutput]
+    body: Callable[[D, TensorBatch, StateTaskContext[D] | None], TaskOutput]
     mode: Literal["read", "transition", "update", "gradient"] = "read"
     select: Callable[[D, RequestStateSelection], tuple[int, ...]] | None = None
     optimizer: Optimizer | None = None
     publish: bool = False
     version: Literal["input", "private", "published"] = "input"
     copy_fields: tuple[LayoutFieldId, ...] | None = None
-    step: TensorStep[D] | None = None
+    capture_resident: Callable[[int], int] = _no_resident
     prepare: Callable[[D], D | None] | None = None
     output: Callable[[D, TensorBatch], TaskOutput] | None = None
 
@@ -340,7 +379,7 @@ class TensorOperation(Generic[D]):
         return ((rows, hidden),)
 
     def resident(self, capture_bytes: int) -> int:
-        return capture_bytes if self.step is not None else 0
+        return self.capture_resident(capture_bytes)
 
     def memory(self, data: D, batch: TensorBatch) -> MemoryUsage:
         """Execute this operation's tensor path, excluding the already-funded pages."""
@@ -349,11 +388,7 @@ class TensorOperation(Generic[D]):
             inputs = data if self.prepare is None else self.prepare(data)
             if inputs is None:
                 return TaskOutput()
-            if self.step is None:
-                output = self.function(inputs, batch)
-            else:
-                self.step.prepare_memory(inputs, batch)
-                output = self.step.run(inputs, batch)
+            output = self.body(inputs, batch, None)
             if self.optimizer is not None and output.gradients:
                 self.optimizer.update(batch.roots, batch.field_slots, output.gradients)
             return output if self.output is None else self.output(inputs, batch)
@@ -376,10 +411,7 @@ class TensorOperation(Generic[D]):
                         context.pin.refs.take(selected), stream, copy_fields=self.copy_fields
                     )
                 batch = _read(context, "private")
-            if self.step is None:
-                output = self.function(data, batch)
-            else:
-                output = self.step.execute(context, batch)
+            output = self.body(data, batch, context)
             if self.output is not None:
                 output = self.output(data, batch)
             if output.gradient_indices:

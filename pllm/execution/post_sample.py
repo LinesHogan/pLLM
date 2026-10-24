@@ -70,7 +70,7 @@ class PostSampleOverlap:
                 result.record_stream(self.stream)
             main.wait_stream(self.stream)
             # Cached row versions and parameter leaves belong to the reader's selection.
-            context.value = replace(data, step=value, index=None, leaf=None, fields=(), hidden_inputs=None)
+            context.value = replace(data, step=value, index=None, plan=None, leaf=None, fields=(), hidden_inputs=None)
 
     def _copy_hidden(self, batch: PackedHiddenSnapshotBatch) -> PackedHiddenSnapshotBatch:
         snapshots: list[PackedHiddenSnapshot] = []
