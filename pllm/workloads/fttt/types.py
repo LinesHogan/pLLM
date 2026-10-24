@@ -8,10 +8,9 @@ from math import isfinite
 import torch
 
 from pllm.authoring import AdamW, StateTensorUpdate
-from pllm.contracts.feedback import Completion, RetryControl, RewardOutcome, UpdateBarrier
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
-from pllm.execution.host_runtime import CompletionInput
+from pllm.host import Completion, CompletionInput, RetryControl, RewardOutcome, UpdateBarrier
 
 
 @dataclass(frozen=True, slots=True)

@@ -12,14 +12,7 @@ import torch
 from torch.nn import functional as F
 
 import pllm
-from pllm.contracts.feedback import (
-    BarrierState,
-    ControlReason,
-    RetryAction,
-    RetryControl,
-    RewardOutcome,
-    UpdateBarrier,
-)
+from pllm.host import BarrierState, ControlReason, RetryAction, RetryControl, RewardOutcome, UpdateBarrier
 
 
 def boxed_label(text: str) -> str:

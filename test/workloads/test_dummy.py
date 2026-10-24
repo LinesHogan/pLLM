@@ -21,11 +21,11 @@ from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.codec import decode_boundary, encode_boundary
-from pllm.execution.host_runtime import HostRuntimeFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.tensor_task import TensorTask
 from pllm.execution.trace import ExecutionTrace, TracePhase, TraceSelection, TraceSnapshot
+from pllm.host import HostRuntimeFacts
 from pllm.workloads.dummy import DummyConfig, DummyWorkload
 from test.backend_facts import assert_finite_resources, backend_facts
 

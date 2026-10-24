@@ -9,11 +9,11 @@ import pytest
 import torch
 
 from pllm.authoring import CausalTrainBatch, StateTensorUpdate
-from pllm.contracts.feedback import Completion, CompletionBatch, FinishReason
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.host_runtime import CompletionCapture
 from pllm.execution.shared_tensor import SharedTensor
+from pllm.host import Completion, CompletionBatch, FinishReason
 
 IDENTITIES = (RequestIdentity("a", 9, 0), RequestIdentity("b", 7, 0), RequestIdentity("c", 11, 0))
 BATCH = CompletionBatch(

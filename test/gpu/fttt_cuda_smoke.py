@@ -5,9 +5,8 @@ from __future__ import annotations
 import torch
 
 from pllm import make_llm
-from pllm.contracts.feedback import Completion, CompletionBatch, FinishReason, RetryAction
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.execution.host_runtime import CompletionInput, HostRuntimeFacts
+from pllm.host import Completion, CompletionBatch, CompletionInput, FinishReason, HostRuntimeFacts, RetryAction
 from pllm.workloads.fttt import FTTTConfig, FTTTFeedbackService, FTTTJudgeResult, FTTTJudgeService, FTTTWorkload
 
 

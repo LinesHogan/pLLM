@@ -13,11 +13,18 @@ import torch
 import pllm
 from pllm import make_llm
 from pllm.authoring import FunctionMath
-from pllm.contracts.feedback import BarrierState, Completion, CompletionBatch, FinishReason, RetryAction
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId
-from pllm.execution.host_runtime import CompletionInput, HostRuntimeFacts
 from pllm.execution.state_execution import StateSettlementError
+from pllm.host import (
+    BarrierState,
+    Completion,
+    CompletionBatch,
+    CompletionInput,
+    FinishReason,
+    HostRuntimeFacts,
+    RetryAction,
+)
 from pllm.workloads.ttrl import TTRLConfig, TTRLData, TTRLWorkload, boxed_label
 
 

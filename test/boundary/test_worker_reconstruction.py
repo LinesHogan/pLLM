@@ -15,9 +15,9 @@ from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.contracts.workload_reference import WorkloadReference
 from pllm.execution.codec import decode_boundary, encode_boundary
-from pllm.execution.host_runtime import HostRuntimeFacts
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
+from pllm.host import HostRuntimeFacts
 from pllm.workload_transport import decode_workload, encode_workload
 from pllm.workloads.dummy import DummyWorkload
 from pllm.workloads.override import OverRIDEWorkload

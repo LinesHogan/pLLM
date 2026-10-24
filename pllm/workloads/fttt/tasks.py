@@ -8,7 +8,7 @@ from math import sqrt
 import torch
 from torch.nn import functional as F
 
-from pllm.execution.host_runtime import CompletionInput, HostRuntimeFacts
+from pllm.host import CompletionInput, HostRuntimeFacts
 from pllm.workloads.fttt.math import edit_training_tensors
 from pllm.workloads.fttt.types import (
     FTTTClosedLoopIntent,

@@ -20,8 +20,8 @@ import pllm
 from pllm.backends.vllm.runner import WorkloadModelRunner
 from pllm.backends.vllm.sampler import Vllm027Sampler
 from pllm.config import ModelConfig, VllmDType
-from pllm.execution.host_runtime import HostRuntimeFacts
 from pllm.execution.state_execution import StateExecution
+from pllm.host import HostRuntimeFacts
 from pllm.workloads.fttt import FTTTWorkload
 from pllm.workloads.override import OverRIDEConfig, OverRIDEWorkload
 from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload

@@ -6,7 +6,7 @@ from dataclasses import replace
 import torch
 
 from pllm import make_llm
-from pllm.execution.host_runtime import HostRuntimeFacts
+from pllm.host import HostRuntimeFacts
 from pllm.workloads.gtta import (
     GTTAConfig,
     GTTAHostRequest,

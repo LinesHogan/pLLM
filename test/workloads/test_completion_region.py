@@ -6,10 +6,9 @@ import pytest
 import torch
 
 import pllm
-from pllm.contracts.feedback import Completion, CompletionBatch, FinishReason
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.execution.host_runtime import CompletionInput, HostRuntimeFacts
 from pllm.execution.tensor_program import InvocationOutput
+from pllm.host import Completion, CompletionBatch, CompletionInput, FinishReason, HostRuntimeFacts
 
 
 class TwoGroups(pllm.host.CompletionWorkload[CompletionInput, InvocationOutput]):

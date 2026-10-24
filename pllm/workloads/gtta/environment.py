@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 
-from pllm.execution.host_runtime import HostReceipt
+from pllm.host import HostReceipt
 from pllm.workloads.gtta.types import (
     DynamicsEvent,
     GTTAConfig,

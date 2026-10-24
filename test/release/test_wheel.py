@@ -96,7 +96,7 @@ for workload in ('dummy', 'esamp_request', 'fttt', 'gtta', 'inplace_ttt', 'tlm',
                  'reft', 'recirculation', 'override', 'ttrl', 'lora'):
     module = importlib.import_module('pllm.workloads.' + workload)
     assert Path(module.__file__).resolve().is_relative_to(installed)
-from pllm.execution.host_runtime import HostRuntimeFacts
+from pllm.host import HostRuntimeFacts
 from pllm.workloads.dummy import DummyWorkload
 execution = pllm.make_llm(workload=DummyWorkload(),
     config=HostRuntimeFacts(torch.device('cpu')))

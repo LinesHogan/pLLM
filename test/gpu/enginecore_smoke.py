@@ -30,8 +30,8 @@ from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.semantic_graph import StateScope
 from pllm.contracts.tensor_layout import TensorDType
-from pllm.execution.host_runtime import HostRuntimeFacts
 from pllm.execution.trace import TracePhase, TraceSelection
+from pllm.host import HostRuntimeFacts
 from pllm.workloads.dummy import DummyConfig, DummyWorkload
 from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
 from pllm.workloads.fttt import (

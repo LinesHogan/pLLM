@@ -7,8 +7,17 @@ from collections import deque
 from dataclasses import dataclass, replace
 from hashlib import blake2b
 
-from pllm.contracts.feedback import BarrierState, ControlReason, RetryAction, RetryControl, RewardOutcome, UpdateBarrier
-from pllm.execution.host_runtime import CompletionInput, HostReceipt, NoHostRequest
+from pllm.host import (
+    BarrierState,
+    CompletionInput,
+    ControlReason,
+    HostReceipt,
+    NoHostRequest,
+    RetryAction,
+    RetryControl,
+    RewardOutcome,
+    UpdateBarrier,
+)
 from pllm.workloads.fttt.judge import FTTTJudgeService
 from pllm.workloads.fttt.types import (
     FTTTClosedLoopIntent,

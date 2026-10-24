@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from pllm.contracts.feedback import Completion, ControlReason
+from pllm.host import Completion, ControlReason
 from pllm.workloads.fttt.types import (
     FTTTJudgeResult,
 )
