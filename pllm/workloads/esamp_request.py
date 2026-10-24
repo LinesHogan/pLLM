@@ -21,7 +21,7 @@ class ESampRequestConfig:
     betas: tuple[float, float] = (0.9, 0.999)
     eps: float = 1e-8
     weight_decay: float = 0.0
-    key_fields: tuple[pllm.RequestKeyField, ...] = (pllm.RequestKeyField.REQUEST_ID,)
+    key_fields: tuple[pllm.state.RequestKeyField, ...] = (pllm.state.RequestKeyField.REQUEST_ID,)
 
     def __post_init__(self) -> None:
         a.AdamW(self.learning_rate, self.betas, self.eps, self.weight_decay)
@@ -29,7 +29,7 @@ class ESampRequestConfig:
             raise ValueError("ESamp request configuration is invalid")
 
 
-def initialize(parameters: pllm.Tensors, generator: torch.Generator) -> None:
+def initialize(parameters: pllm.state.Tensors, generator: torch.Generator) -> None:
     for name in ("up", "gate", "down"):
         parameters[name].normal_(0.0, 0.02, generator=generator)
     parameters["bias"].fill_(1.0)
@@ -123,7 +123,7 @@ class ESampRequestWorkload(pllm.Workload):
     def declare(
         self, facts: a.BackendCompileFacts
     ) -> tuple[a.SemanticGraph, a.TensorLayoutRequest, a.BackendAttachmentSpec]:
-        if self.config.key_fields != (pllm.RequestKeyField.REQUEST_ID,):
+        if self.config.key_fields != (pllm.state.RequestKeyField.REQUEST_ID,):
             raise ValueError("attached ESamp requires request-id state keys")
         return super().declare(facts)
 

@@ -92,7 +92,7 @@ class RoutedLowRankTTT(RequestLowRankTTT):
 
     @property
     def factors(self) -> pllm.RequestState:
-        return low_rank_factors((pllm.RequestKeyField.ROUTE,))
+        return low_rank_factors((pllm.state.RequestKeyField.ROUTE,))
 
 
 @dataclass(frozen=True)
@@ -104,8 +104,8 @@ class ImportedLowRank(pllm.Workload):
         return low_rank_factors()
 
     @property
-    def adapter(self) -> pllm.Overlay:
-        return pllm.Overlay(
+    def adapter(self) -> pllm.model.Overlay:
+        return pllm.model.Overlay(
             "factors", (TARGET,), operator=ParameterOverlayOperator.LOW_RANK_ADD, factors=("a", "b"), scale=0.5
         )
 
@@ -290,7 +290,7 @@ def _check_imported(handle: VllmLlm[object, object]) -> tuple[str, ...]:
     generator = torch.Generator().manual_seed(11)
     down = torch.randn(down_shape, generator=generator).to(device=device, dtype=torch.bfloat16)
     up = torch.randn(up_shape, generator=generator).to(device=device, dtype=torch.bfloat16)
-    update = pllm.StateTensorUpdate((down.unsqueeze(0), up.unsqueeze(0)), (_key(2),))
+    update = pllm.state.StateTensorUpdate((down.unsqueeze(0), up.unsqueeze(0)), (_key(2),))
     mixed = texts(handle.generate(PROMPTS, SAMPLING, prompt_indices=(2, 3), auxiliary=update))
     if mixed[0] == baseline[0] or mixed[1] != baseline[1]:
         raise RuntimeError("imported factors must move exactly their own request's outputs")
@@ -299,7 +299,7 @@ def _check_imported(handle: VllmLlm[object, object]) -> tuple[str, ...]:
         torch.zeros((2, *down_shape), device=device, dtype=torch.bfloat16),
         torch.zeros((2, *up_shape), device=device, dtype=torch.bfloat16),
     )
-    update = pllm.StateTensorUpdate(zeros, (_key(4), _key(5)))
+    update = pllm.state.StateTensorUpdate(zeros, (_key(4), _key(5)))
     if texts(handle.generate(PROMPTS, SAMPLING, prompt_indices=(4, 5), auxiliary=update)) != baseline:
         raise RuntimeError("imported zero factors must reproduce the base model exactly")
     diagnostics = handle.deployment.execution.diagnostics()

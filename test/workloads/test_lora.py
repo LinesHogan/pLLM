@@ -146,7 +146,7 @@ def test_independent_lora_bmm_preserves_keyed_mean_and_private_publication() -> 
             labels = torch.tensor([[2, 4, -100, 1], [0, 6, 3, 2]], device=device)
             weights = torch.tensor([[1.0, 3.0, 1.0, 0.0], [2.0, 1.0, 0.0, 4.0]], device=device)
             hidden[0, 2].fill_(float("nan"))
-            batch = pllm.WeightedCEBatch.for_prompts(hidden, logits, labels, weights, (1, 0))
+            batch = pllm.host.WeightedCEBatch.for_prompts(hidden, logits, labels, weights, (1, 0))
             assert batch.keys == (keys[1], keys[0])
             readiness = CudaStreamReadiness(stream) if stream is not None else None
             value = step_input(identities, torch.ones((3, 4), device=device), batch, readiness)
@@ -201,7 +201,9 @@ def route_keyed_lineages_until_dormant_retirement() -> None:
     math_initial, code_initial = execution.snapshot(first), execution.snapshot(joined_code)
     hidden = torch.linspace(-0.4, 0.6, 8).reshape(1, 2, 4)
     logits = torch.linspace(-1, 1, 14).reshape(1, 2, 7)
-    batch = pllm.WeightedCEBatch.for_prompts(hidden, logits, torch.tensor([[1, 3]]), torch.tensor([[1.0, 2.0]]), (1,))
+    batch = pllm.host.WeightedCEBatch.for_prompts(
+        hidden, logits, torch.tensor([[1, 3]]), torch.tensor([[1.0, 2.0]]), (1,)
+    )
     publication = execution.step(step_input((math_b, code), torch.ones((2, 4)), batch)).publication
     latest_math = execution.arena.latest(first.lineage_id)
     assert tuple(publication.after_refs) == (latest_math,)

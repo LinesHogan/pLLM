@@ -166,7 +166,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
             visibility=pllm.Visibility.forward_pinned(),
             state="factors",
             targets=(targets[0],),
-            operator=pllm.ParameterOverlayOperator.LOW_RANK_ADD,
+            operator=pllm.model.ParameterOverlayOperator.LOW_RANK_ADD,
             factors=("a", "b"),
             scale=0.5,
         )
@@ -223,11 +223,11 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
         )
 
         @property
-        def adapter(self) -> pllm.Overlay:
-            return pllm.Overlay(
+        def adapter(self) -> pllm.model.Overlay:
+            return pllm.model.Overlay(
                 "factors",
                 (targets[0],),
-                operator=pllm.ParameterOverlayOperator.LOW_RANK_ADD,
+                operator=pllm.model.ParameterOverlayOperator.LOW_RANK_ADD,
                 factors=("a", "b"),
                 scale=0.5,
             )

@@ -127,23 +127,23 @@ class VideoWorkload(pllm.Workload):
     layer: int = 0
     gain: float = 0.1
     page_capacity: int = 3
-    recurrence: pllm.Recurrence | None = None
+    recurrence: pllm.model.Recurrence | None = None
 
     def __post_init__(self) -> None:
         if self.grid_size < 1 or self.layer < 0 or self.page_capacity < 2 or not isfinite(self.gain) or self.gain <= 0:
             raise ValueError("video session requires a positive grid/gain, a layer and current/private page capacity")
 
     @property
-    def activation(self) -> pllm.Activation:
-        return pllm.Activation(
+    def activation(self) -> pllm.model.Activation:
+        return pllm.model.Activation(
             "inject",
             (self.layer,),
             first_tokens=1,
             last_tokens=1,
-            operator=pllm.ActivationPatchOperator.ADD,
-            decode=pllm.DecodeWindow.ALL,
-            decode_refresh=pllm.DecodeRefresh.STEP,
-            on_missing=pllm.MissingPolicy.HOLD,
+            operator=pllm.model.ActivationPatchOperator.ADD,
+            decode=pllm.model.DecodeWindow.ALL,
+            decode_refresh=pllm.model.DecodeRefresh.STEP,
+            on_missing=pllm.model.MissingPolicy.HOLD,
         )
 
     @property

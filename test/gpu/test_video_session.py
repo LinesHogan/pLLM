@@ -386,7 +386,9 @@ def test_video_session_zero_copy_backpressure_and_ack_lifetime():
     # absent/end evidence through the same tokenwise replay worker.
     config = replace(model_config(), execution=ExecutionOptions(allow_numerical_transforms=False))
     workload = VideoWorkload(
-        grid_size=2, layer=1, recurrence=pllm.Recurrence(source_layer=-1, destination_layer=0, alpha=0.6, beta=None)
+        grid_size=2,
+        layer=1,
+        recurrence=pllm.model.Recurrence(source_layer=-1, destination_layer=0, alpha=0.6, beta=None),
     )
     probe, child_probe = context.Pipe()
     try:

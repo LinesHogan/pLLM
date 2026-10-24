@@ -177,7 +177,7 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
     assert all(item.state is BarrierState.BLOCKED for item in result.update_barriers)
     disabled.retire(())
 
-    facts = pllm.HostRuntimeFacts(torch.device("cpu"), hidden_size=4, initialization_seed=11)
+    facts = pllm.host.HostRuntimeFacts(torch.device("cpu"), hidden_size=4, initialization_seed=11)
     execution = ZeroLoss(config).declare_host(facts).compile()
     (initial,) = execution.admit(())
     before = execution.snapshot(initial)

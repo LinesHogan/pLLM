@@ -12,7 +12,7 @@ from pllm.execution.host_runtime import CompletionInput, HostRuntimeFacts
 from pllm.execution.tensor_program import InvocationOutput
 
 
-class TwoGroups(pllm.CompletionWorkload[CompletionInput, InvocationOutput]):
+class TwoGroups(pllm.host.CompletionWorkload[CompletionInput, InvocationOutput]):
     name = "test.completion.two_groups"
 
     @property

@@ -9,7 +9,9 @@ import torch
 import pllm
 
 _TARGETS = tuple(
-    pllm.ParameterTarget(layer, pllm.ParameterModuleKind.MLP, pllm.ParameterRole.DOWN_PROJECTION_WEIGHT)
+    pllm.model.ParameterTarget(
+        layer, pllm.model.ParameterModuleKind.MLP, pllm.model.ParameterRole.DOWN_PROJECTION_WEIGHT
+    )
     for layer in (0, 2, 4, 6, 8)
 )
 
@@ -44,13 +46,13 @@ class PrefillAdapters(pllm.Workload):
         )
 
     @property
-    def prefill(self) -> pllm.ModelScan:
-        return pllm.ModelScan(
+    def prefill(self) -> pllm.model.ModelScan:
+        return pllm.model.ModelScan(
             self.chunk_size,
-            pllm.ParameterEffect("adapters", _TARGETS, operator=pllm.ParameterOverlayOperator.LOW_RANK_ADD),
+            pllm.model.ParameterEffect("adapters", _TARGETS, operator=pllm.model.ParameterOverlayOperator.LOW_RANK_ADD),
             learn="loss",
             visibility=pllm.Exact(),
-            kv=pllm.KVPolicy.CAUSAL_HISTORY,
+            kv=pllm.model.KVPolicy.CAUSAL_HISTORY,
         )
 
     @pllm.train(state="adapters")

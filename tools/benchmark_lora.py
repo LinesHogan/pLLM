@@ -33,28 +33,28 @@ def main() -> None:
     if not 1 <= groups <= options.batch:
         parser.error("state groups must be between one and the request batch size")
     active = ceil(args.training_rows * args.training_fraction)
-    for scope in (pllm.StateScope.INSTANCE, pllm.StateScope.REQUEST):
+    for scope in (pllm.state.StateScope.INSTANCE, pllm.state.StateScope.REQUEST):
         if args.scope not in ("both", scope.value):
             continue
-        states = groups if scope is pllm.StateScope.REQUEST else 1
+        states = groups if scope is pllm.state.StateScope.REQUEST else 1
         indices = (
             tuple(index % states for index in range(options.batch))
-            if scope is pllm.StateScope.REQUEST
+            if scope is pllm.state.StateScope.REQUEST
             else tuple(range(options.batch))
         )
         print(f"Output LoRA scope: {scope.value}")
 
-        def prepare(hidden_size: int, vocab_size: int, device: torch.device) -> pllm.WeightedCEBatch[torch.Tensor]:
-            shape = (states, args.training_rows) if scope is pllm.StateScope.REQUEST else (args.training_rows,)
+        def prepare(hidden_size: int, vocab_size: int, device: torch.device) -> pllm.host.WeightedCEBatch[torch.Tensor]:
+            shape = (states, args.training_rows) if scope is pllm.state.StateScope.REQUEST else (args.training_rows,)
             generator = torch.Generator(device=device).manual_seed(7)
             hidden = torch.randn((*shape, hidden_size), device=device, generator=generator)
             logits = torch.zeros((*shape, vocab_size), device=device)
             labels = torch.zeros(shape, device=device, dtype=torch.long)
             weights = (torch.arange(args.training_rows, device=device) < active).float().expand(shape)
             return (
-                pllm.WeightedCEBatch.for_prompts(hidden, logits, labels, weights, tuple(range(states)))
-                if scope is pllm.StateScope.REQUEST
-                else pllm.WeightedCEBatch(hidden, logits, labels, weights)
+                pllm.host.WeightedCEBatch.for_prompts(hidden, logits, labels, weights, tuple(range(states)))
+                if scope is pllm.state.StateScope.REQUEST
+                else pllm.host.WeightedCEBatch(hidden, logits, labels, weights)
             )
 
         config = OutputLoRAConfig(rank=args.rank, steps=2, scope=scope)

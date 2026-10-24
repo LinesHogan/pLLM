@@ -11,7 +11,7 @@ import pllm
 
 def load_loreft_interventions(
     directory: str | Path, layers: tuple[int, ...], device: torch.device, dtype: torch.dtype
-) -> pllm.StateTensorUpdate[torch.Tensor]:
+) -> pllm.state.StateTensorUpdate[torch.Tensor]:
     """Read pyreft checkpoints once into the original shared publication input."""
     loaded: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
     for path in sorted(Path(directory).glob("intkey_*.bin")):
@@ -21,7 +21,7 @@ def load_loreft_interventions(
         layer = int(match[1])
         if layer in loaded:
             raise ValueError(f"multiple intervention checkpoints for layer {layer}")
-        weight, bias, rotation = pllm.load_tensor_fields(path, ("weight", "bias", "rotate_layer"))
+        weight, bias, rotation = pllm.state.load_tensor_fields(path, ("weight", "bias", "rotate_layer"))
         loaded[layer] = (
             weight.to(device=device, dtype=dtype),
             bias.to(device=device, dtype=dtype),
@@ -29,7 +29,7 @@ def load_loreft_interventions(
         )
     if set(loaded) != set(layers):
         raise FileNotFoundError("missing requested LoReFT layer checkpoints")
-    return pllm.StateTensorUpdate(tuple(value for layer in layers for value in loaded[layer]))
+    return pllm.state.StateTensorUpdate(tuple(value for layer in layers for value in loaded[layer]))
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,8 +38,8 @@ class ActivationConfig:
     rank: int = 4
     first_tokens: int = 0
     last_tokens: int = 2
-    operator: pllm.ActivationPatchOperator = pllm.ActivationPatchOperator.LOW_RANK_AFFINE
-    scope: pllm.StateScope = pllm.StateScope.INSTANCE
+    operator: pllm.model.ActivationPatchOperator = pllm.model.ActivationPatchOperator.LOW_RANK_AFFINE
+    scope: pllm.state.StateScope = pllm.state.StateScope.INSTANCE
 
     def __post_init__(self) -> None:
         if (
@@ -65,16 +65,16 @@ class ActivationWorkload(pllm.Workload):
             pllm.Buffer((rank,)),
             pllm.Buffer(lambda inputs, outputs: (outputs, rank)),
         )
-        if self.config.operator is pllm.ActivationPatchOperator.ADD:
+        if self.config.operator is pllm.model.ActivationPatchOperator.ADD:
             fields = (pllm.Buffer(lambda inputs, outputs: (inputs,), dtype=torch.float32),)
-        state = pllm.RequestState if self.config.scope is pllm.StateScope.REQUEST else pllm.InstanceState
+        state = pllm.RequestState if self.config.scope is pllm.state.StateScope.REQUEST else pllm.InstanceState
         return state(
             {f"layer_{layer}_{offset}": buffer for layer in self.config.layers for offset, buffer in enumerate(fields)},
             namespace="canonical.activation@1",
         )
 
     @property
-    def patch(self) -> pllm.Activation:
-        return pllm.Activation(
+    def patch(self) -> pllm.model.Activation:
+        return pllm.model.Activation(
             "intervention", self.config.layers, self.config.first_tokens, self.config.last_tokens, self.config.operator
         )

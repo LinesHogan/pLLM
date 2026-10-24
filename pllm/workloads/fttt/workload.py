@@ -14,9 +14,9 @@ from pllm.workloads.fttt.types import FTTTConfig, FTTTHostTransaction, FTTTResul
 
 @dataclass(frozen=True, slots=True)
 class FTTTWorkload(
-    pllm.HostWorkload[
-        pllm.HostTransactionCoordinator[
-            pllm.CompletionInput | pllm.NoHostRequest,
+    pllm.host.HostWorkload[
+        pllm.host.HostTransactionCoordinator[
+            pllm.host.CompletionInput | pllm.host.NoHostRequest,
             FTTTHostTransaction,
             FTTTResult,
         ]
@@ -29,9 +29,9 @@ class FTTTWorkload(
         return self.feedback.config
 
     def declare_host(
-        self, facts: pllm.HostRuntimeFacts
-    ) -> pllm.TransactionHostBinding[
-        pllm.CompletionInput | pllm.NoHostRequest,
+        self, facts: pllm.host.HostRuntimeFacts
+    ) -> pllm.host.TransactionHostBinding[
+        pllm.host.CompletionInput | pllm.host.NoHostRequest,
         FTTTHostTransaction,
         tasks.FTTTStepContext,
         tasks.FTTTEditState,
@@ -39,7 +39,7 @@ class FTTTWorkload(
     ]:
         if not 0 < self.config.rank <= facts.hidden_size:
             raise ValueError("FTTT rank exceeds the specialized hidden size")
-        return pllm.transaction(
+        return pllm.host.transaction(
             "fttt.feedback",
             facts,
             config=self.config,

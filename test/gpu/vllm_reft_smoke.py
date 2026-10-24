@@ -65,7 +65,7 @@ def main() -> None:
             observed.append(selected.numel())
 
         hook = layer.register_forward_hook(check)
-        handle.generate(prompts, sampling, auxiliary=pllm.StateTensorUpdate(parameters))
+        handle.generate(prompts, sampling, auxiliary=pllm.state.StateTensorUpdate(parameters))
         assert observed == [4]
         diagnostics = execution.diagnostics()
         assert diagnostics.update_count == 1

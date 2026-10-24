@@ -4,66 +4,29 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, TypeVar, overload
 
-from pllm.authoring import AdamW as AdamW, CausalModel as CausalModel, HiddenSite as HiddenSite
-from pllm.config import ExecutionOptions as ExecutionOptions, ModelConfig as ModelConfig
-from pllm.contracts.auxiliary import (
-    CausalTrainBatch as CausalTrainBatch,
-    StateTensorUpdate as StateTensorUpdate,
-    WeightedCEBatch as WeightedCEBatch,
+from pllm import host as host, model as model, state as state  # noqa: E402
+from pllm.authoring import AdamW as AdamW
+from pllm.config import (
+    ExecutionOptions as ExecutionOptions,
+    ModelConfig as ModelConfig,
 )
-from pllm.contracts.backend_attachment import (
-    ActivationPatchOperator as ActivationPatchOperator,
-    DecodeRefresh as DecodeRefresh,
-    DecodeWindow as DecodeWindow,
-    MissingPolicy as MissingPolicy,
-)
-from pllm.contracts.parameter_overlay import (
-    ParameterModuleKind as ParameterModuleKind,
-    ParameterOverlayOperator as ParameterOverlayOperator,
-    ParameterRole as ParameterRole,
-    ParameterTarget as ParameterTarget,
-)
-from pllm.contracts.request_identity import RequestKeyField as RequestKeyField
-from pllm.contracts.semantic_graph import ConditionalLayerReplay as ConditionalLayerReplay, StateScope as StateScope
-from pllm.contracts.state_ref import StateRef as StateRef
-from pllm.execution.codec import load_tensor_fields as load_tensor_fields
 from pllm.execution.host_runtime import (
-    CompletionInput as CompletionInput,
-    HostRuntimeFacts as HostRuntimeFacts,
-    HostTransactionCoordinator as HostTransactionCoordinator,
-    HostWorkload as HostWorkload,
-    NoHostRequest as NoHostRequest,
-    TransactionHostBinding as TransactionHostBinding,
+    HostRuntimeFacts,
+    HostWorkload,
 )
-from pllm.execution.ptts.page_bundle import PagePublication as PagePublication
 from pllm.execution.scan import scan as scan
-from pllm.execution.tensor_binding import TensorResult as TensorResult
-from pllm.execution.tensor_frame import Tensors as Tensors
-from pllm.execution.tensor_program import InvocationOutput as InvocationOutput
-from pllm.learning import (
-    CausalAdapterWorkload as CausalAdapterWorkload,
-    CompletionWorkload as CompletionWorkload,
-    transaction as transaction,
-)
 from pllm.usage import (
     SGD as SGD,
-    Activation as Activation,
     BaseLogits as BaseLogits,
-    Batch as Batch,
     Buffer as Buffer,
     Capture as Capture,
     Config as Config,
     Exact as Exact,
     Hidden as Hidden,
     InstanceState as InstanceState,
-    KVPolicy as KVPolicy,
-    ModelScan as ModelScan,
     Operand as Operand,
-    Overlay as Overlay,
     Parameter as Parameter,
-    ParameterEffect as ParameterEffect,
     Phase as Phase,
-    Recurrence as Recurrence,
     RequestState as RequestState,
     Result as Result,
     SampledTokens as SampledTokens,
@@ -155,14 +118,10 @@ def make_llm(
 __all__ = [
     "make_llm",
     "scan",
-    "ModelScan",
-    "ParameterEffect",
     "Exact",
     "Visibility",
-    "KVPolicy",
     "ModelConfig",
     "ExecutionOptions",
-    "HostRuntimeFacts",
     "Workload",
     "Phase",
     "on",
@@ -184,44 +143,13 @@ __all__ = [
     "BaseLogits",
     "SampledTokens",
     "AdamW",
-    "HiddenSite",
     "overlay",
     "Operand",
     "Buffer",
     "TensorUpdate",
-    "ParameterOverlayOperator",
-    "ParameterTarget",
-    "RequestKeyField",
-    "ConditionalLayerReplay",
     "differentiate",
-    "Activation",
-    "Overlay",
-    "ActivationPatchOperator",
-    "DecodeWindow",
-    "DecodeRefresh",
-    "MissingPolicy",
-    "StateScope",
-    "ParameterModuleKind",
-    "ParameterRole",
-    "Tensors",
-    "StateTensorUpdate",
-    "load_tensor_fields",
-    "Recurrence",
-    "transaction",
-    "HostWorkload",
-    "HostTransactionCoordinator",
-    "TransactionHostBinding",
-    "CompletionInput",
-    "NoHostRequest",
-    "CompletionWorkload",
-    "InvocationOutput",
-    "PagePublication",
-    "StateRef",
-    "CausalAdapterWorkload",
-    "CausalModel",
-    "CausalTrainBatch",
     "SGD",
-    "Batch",
-    "WeightedCEBatch",
-    "TensorResult",
+    "host",
+    "model",
+    "state",
 ]

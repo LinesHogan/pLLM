@@ -62,7 +62,7 @@ class TTRLConfig:
 
 @dataclass(slots=True)
 class TTRLData:
-    batch: pllm.CompletionInput
+    batch: pllm.host.CompletionInput
     reward_outcomes: tuple[RewardOutcome, ...]
     retry_controls: tuple[RetryControl, ...]
     update_barriers: tuple[UpdateBarrier, ...]
@@ -76,8 +76,8 @@ class TTRLResult:
     retry_controls: tuple[RetryControl, ...]
     update_barriers: tuple[UpdateBarrier, ...]
     loss: torch.Tensor | None
-    state_ref: pllm.StateRef
-    publication: pllm.PagePublication | None
+    state_ref: pllm.state.StateRef
+    publication: pllm.state.PagePublication | None
 
     @property
     def update_count(self) -> int:
@@ -85,14 +85,14 @@ class TTRLResult:
 
 
 @dataclass(frozen=True, slots=True)
-class TTRLWorkload(pllm.CompletionWorkload[TTRLData, TTRLResult]):
+class TTRLWorkload(pllm.host.CompletionWorkload[TTRLData, TTRLResult]):
     name = "ttrl"
     config: TTRLConfig = TTRLConfig()
 
-    def training_example(self, facts: pllm.HostRuntimeFacts) -> TTRLData:
+    def training_example(self, facts: pllm.host.HostRuntimeFacts) -> TTRLData:
         # Reward metadata cannot be inferred from tensor shapes. Select every admitted row
         # so the loss trace covers the maximum training batch, including partial vote groups.
-        batch = pllm.CompletionInput.example(facts)
+        batch = pllm.host.CompletionInput.example(facts)
         rewards = tuple(RewardOutcome(entry, 1.0, True, "", "shape", "0", "") for entry in batch.completions.entries)
         return TTRLData(batch, rewards, (), (), tuple(range(len(batch.hidden))))
 
@@ -130,7 +130,7 @@ class TTRLWorkload(pllm.CompletionWorkload[TTRLData, TTRLResult]):
         data.loss = loss.detach()
         return loss
 
-    def prepare(self, value: pllm.CompletionInput) -> TTRLData:
+    def prepare(self, value: pllm.host.CompletionInput) -> TTRLData:
         entries = value.completions.entries
         groups: dict[int, list[int]] = {}
         for index, completion in enumerate(entries):
@@ -191,7 +191,7 @@ class TTRLWorkload(pllm.CompletionWorkload[TTRLData, TTRLResult]):
             )
         return TTRLData(value, tuple(rewards), tuple(controls), tuple(barriers), tuple(selected))
 
-    def output(self, data: TTRLData, result: pllm.InvocationOutput) -> TTRLResult:
+    def output(self, data: TTRLData, result: pllm.state.InvocationOutput) -> TTRLResult:
         refs = result.publication.after_refs if result.publication is not None else result.selection.refs
         return TTRLResult(
             data.reward_outcomes, data.retry_controls, data.update_barriers, data.loss, refs[0], result.publication

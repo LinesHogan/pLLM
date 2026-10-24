@@ -260,8 +260,8 @@ class ShineStyleLoRA(pllm.Workload):
         })
 
     @property
-    def adapter(self) -> pllm.Overlay:
-        return pllm.Overlay("factors", targets, operator=ParameterOverlayOperator.LOW_RANK_ADD,
+    def adapter(self) -> pllm.model.Overlay:
+        return pllm.model.Overlay("factors", targets, operator=ParameterOverlayOperator.LOW_RANK_ADD,
                             factors=("a", "b"), scale=0.5)
 ```
 
@@ -300,7 +300,7 @@ lineage。缺少 route 值的请求在准入时被拒。辅助批输入（`Weigh
 声明普通的 `InstanceState` 或 `RequestState` buffer 和一个 `Activation`
 property，命名状态、层、首个/末个 prefill token 与支持的算子。
 `LOW_RANK_AFFINE` 每层使用 weight/bias/rotation 字段；`ADD` 使用一个 FP32 向量。
-Buffer 形状回调收到激活的输入/输出宽度。以原始 `pllm.StateTensorUpdate` 作为
+Buffer 形状回调收到激活的输入/输出宽度。以原始 `pllm.state.StateTensorUpdate` 作为
 `auxiliary=` 提供。共享绑定校验检查点、选择根、拷贝私有字段并在模型执行前发布。
 实例替换可重复；请求替换使用原始 prompt 键，只导入到版本零的请求状态。
 缺失的更新不发布，既有推理 pin 继续看到它们精确的旧版本。见维护中的 ReFT
@@ -313,7 +313,7 @@ Buffer 形状回调收到激活的输入/输出宽度。以原始 `pllm.StateTen
 代价是不能与普通训练/激活操作混合（绑定时失败），纯宿主执行没有模型
 replay 能力。
 
-在 `pllm.Workload` 上声明 `pllm.Recurrence(source_layer=..., destination_layer=...,
+在 `pllm.Workload` 上声明 `pllm.model.Recurrence(source_layer=..., destination_layer=...,
 alpha=..., beta=..., ramp_tokens=..., enabled=...)` 作为类/实例属性或带类型的
 property。负层索引对真实模型解析。`beta=None` 使用互补的目标权重；源在混合前
 做范数匹配。这是既有的独立逐 token prefill 效果：正常 logits 保留，replay 更新
@@ -338,8 +338,8 @@ reduction="weighted_state_mean_then_mean")`）。reset 方法接收具名局部�
 
 训练输入用 `Annotated[Tensor, Batch("hidden"|"base_logits"|"labels"|"weights")]`
 和 `Parameter(state, field)`。它们消费原始 `WeightedCEBatch`，不是新的 DTO。
-共享输入用 `pllm.WeightedCEBatch(hidden, logits, labels, weights)`；独立输入用
-`pllm.WeightedCEBatch.for_prompts(hidden, logits, labels, weights, prompt_indices)`，
+共享输入用 `pllm.host.WeightedCEBatch(hidden, logits, labels, weights)`；独立输入用
+`pllm.host.WeightedCEBatch.for_prompts(hidden, logits, labels, weights, prompt_indices)`，
 同样的索引传给 `generate`，可选 `sample_idx=0`。两者都借用所供张量，不拷贝。
 绑定对齐原始键，拒绝出界输入，掩码非正权重/词表外标签。每个选中状态必须有
 有效行。训练张量有领先的选中状态轴，共享状态时是单例。每个状态返回一个归一化
@@ -385,7 +385,7 @@ Hidden 需求从声明推导。形状/dtype 回调只在模型事实可用后运
 ## 编写原生数学
 
 本节约束原生数学绑定（`bind_math` / `FunctionMath` / `TaskOutput`）与结构化
-宿主事务（`pllm.transaction`）。这是负载数学与执行层的接缝：流排序、捕获、
+宿主事务（`pllm.host.transaction`）。这是负载数学与执行层的接缝：流排序、捕获、
 私有分配、回滚与发布仍留在原始执行层，原生函数只拿到借来的操作数与显式
 授权的迁移根。空梯度与零梯度的区别、预算与成本声明的失败模式都在这里。
 给 FTTT / GTTA 这类宿主事务、或 ESamp / LoRA 的捕获内核写数学时读本节。
@@ -411,7 +411,7 @@ Hidden 需求从声明推导。形状/dtype 回调只在模型事实可用后运
 宿主事务继续使用既有宿主服务与 receipt 协议，不是第二个状态数据库或模型推理
 回调。
 
-结构化宿主事务用 `pllm.transaction(name, facts, config=config,
+结构化宿主事务用 `pllm.host.transaction(name, facts, config=config,
 state_factory=make_state, service=service, update=update, query=query,
 publish=publish)`。三个普通带类型函数接收同一原始上下文。共享绑定声明
 update-before-query-before-result 依赖与宿主时机窗口；调度仍由 Rust 完成。
@@ -441,7 +441,7 @@ prepare/loss/output 三个函数；代价是没有请求状态、没有跨调用
 没有自动捕获。注意标量配置在绑定时快照——之后 monkey patch 只影响
 新绑定的执行。
 
-继承 `pllm.CompletionWorkload[Data, Result]`，从原始 `CompletionInput` 做实例
+继承 `pllm.host.CompletionWorkload[Data, Result]`，从原始 `CompletionInput` 做实例
 作用域学习。`parameters` 声明为带具名形状、优化器与可选初始化的
 `InstanceState`。`prepare` 计算算法的结构化上下文；`loss(data, parameters)`
 接收具名张量视图并返回标量，或返回 `None` 跳过整个优化器更新。
@@ -470,7 +470,7 @@ TTRL 的 `training_example` 给出可训练的最大形状元数据；FTTT 的 t
 `resident_bytes` 与 `update.input_shapes` 决定有限计划能否准入。
 模型句柄的关闭语义也在本节末尾。
 
-继承 `pllm.CausalAdapterWorkload[Data, Result]`，带冻结的 `pllm.CausalModel`、
+继承 `pllm.host.CausalAdapterWorkload[Data, Result]`，带冻结的 `pllm.host.CausalModel`、
 优化器和设为 `BEFORE_MODEL` 或 `AFTER_SAMPLE` 的 `phase`。它使用与 completion
 学习相同的 prepare/loss/trained_rows/output 数学契约。`prepare` 接收原始
 `CausalTrainBatch`，未提供训练输入时为 `None`。具名 loss 参数按模型的有序

@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 
 import pllm
-from pllm import Recurrence as RecirculationConfig
+from pllm.model import Recurrence as RecirculationConfig
 
 
 @dataclass(frozen=True, slots=True)

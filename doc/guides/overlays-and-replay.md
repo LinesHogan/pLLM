@@ -18,7 +18,7 @@
 应用有效权重"的完整循环：
 
 ```python
-targets = (pllm.ParameterTarget(9, ParameterModuleKind.MLP,
+targets = (pllm.model.ParameterTarget(9, ParameterModuleKind.MLP,
                                 ParameterRole.DOWN_PROJECTION_WEIGHT),)
 
 class MyLoRA(pllm.Workload):
@@ -29,7 +29,7 @@ class MyLoRA(pllm.Workload):
 
     @pllm.on(pllm.Phase.MODEL_UPDATE)
     @pllm.overlay(state="factors", targets=targets,
-                  operator=pllm.ParameterOverlayOperator.LOW_RANK_ADD,
+                  operator=pllm.model.ParameterOverlayOperator.LOW_RANK_ADD,
                   factors=("a", "b"), scale=1.0, decode=True)
     def update(self, x: Annotated[torch.Tensor, pllm.Operand.INPUT],
                y: Annotated[torch.Tensor, pllm.Operand.TARGET],
@@ -69,7 +69,7 @@ class MyLoRA(pllm.Workload):
 **要解决的问题**：默认情况下，decode 步的更新要等下一步才可见。如果算法
 （比如 In-Place-TTT）要求更新**当步**生效，就需要重放。
 
-`replay=pllm.ConditionalLayerReplay((5, 8))` 声明一组升序层：对选中 token，
+`replay=pllm.model.ConditionalLayerReplay((5, 8))` 声明一组升序层：对选中 token，
 用发布后的状态按序重跑这些层。每个被重放的层覆盖自己的当前 KV 槽，集合外
 的层保留正常前向的 KV——混合 KV 是一种**声明过的近似**：它写进了签名，不是
 静默发生的。
@@ -84,7 +84,7 @@ class MyLoRA(pllm.Workload):
 重放。教程 04 的"层循环"一节有"重放 vs 不重放"的并排对照，可以直观看差别。
 
 **只想逐 token 循环 hidden，不想动权重呢？** 那是另一条路：在负载上声明一个
-独立的 `pllm.Recurrence(source_layer=-1, destination_layer=0, alpha=1.0,
+独立的 `pllm.model.Recurrence(source_layer=-1, destination_layer=0, alpha=1.0,
 beta=None, ramp_tokens=0)` 属性即可，无需任何状态（教程 04 的"步循环"一节）。
 代价是它必须独占负载：与普通训练/激活操作混用会在绑定时报错。
 
@@ -95,14 +95,14 @@ checkpoint，或任何一段宿主计算。
 
 做法和引擎内训练几乎一样：声明同样的 buffer，再声明一个 `Overlay` property
 命名状态、targets、算子、因子与 scale；把产出的张量经
-`generate(..., auxiliary=pllm.StateTensorUpdate(values, keys), prompt_indices=...)`
+`generate(..., auxiliary=pllm.state.StateTensorUpdate(values, keys), prompt_indices=...)`
 送入：
 
 ```python
 @property
-def adapter(self) -> pllm.Overlay:
-    return pllm.Overlay("factors", targets,
-                        operator=pllm.ParameterOverlayOperator.LOW_RANK_ADD,
+def adapter(self) -> pllm.model.Overlay:
+    return pllm.model.Overlay("factors", targets,
+                        operator=pllm.model.ParameterOverlayOperator.LOW_RANK_ADD,
                         factors=("a", "b"), scale=0.5)
 ```
 
@@ -116,14 +116,14 @@ def adapter(self) -> pllm.Overlay:
 
 **要解决的问题**：要改的不是权重，而是激活。
 
-声明 buffer 加一个 `pllm.Activation` property（命名状态、层、首/末 prefill
+声明 buffer 加一个 `pllm.model.Activation` property（命名状态、层、首/末 prefill
 token、算子），同样经 `auxiliary=` 送入。`LOW_RANK_AFFINE` 每层用
 weight/bias/rotation 字段，`ADD` 用一个 FP32 向量。见维护中的
 [ReFT](../../pllm/workloads/reft.py)。
 
 `first_tokens/last_tokens` 仍只选择 prefill 行。逐 decode 通过三个 keyword-only
-字段声明：`decode=pllm.DecodeWindow.ALL`、
-`decode_refresh=pllm.DecodeRefresh.STEP`、`on_missing=pllm.MissingPolicy.HOLD`
+字段声明：`decode=pllm.model.DecodeWindow.ALL`、
+`decode_refresh=pllm.model.DecodeRefresh.STEP`、`on_missing=pllm.model.MissingPolicy.HOLD`
 （默认分别为 NONE/INHERIT/STOP）。NONE 携带非默认刷新/缺席策略会在声明期拒绝。
 INHERIT 保留原作用域的版本选择，STEP 每步读取本 invocation 新发布的 exact ref；
 只有签署且成功验证的 HOLD 分支可以在没有新 publication 时读已成功的输入版本。

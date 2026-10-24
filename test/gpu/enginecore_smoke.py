@@ -206,7 +206,9 @@ def _graph_overlay(*, exact: bool = False) -> None:
 
     assert not torch.cuda.is_initialized()
     targets = tuple(
-        pllm.ParameterTarget(layer, pllm.ParameterModuleKind.ATTENTION, pllm.ParameterRole.QUERY_PROJECTION_WEIGHT)
+        pllm.model.ParameterTarget(
+            layer, pllm.model.ParameterModuleKind.ATTENTION, pllm.model.ParameterRole.QUERY_PROJECTION_WEIGHT
+        )
         for layer in (0, 2)
     )
     workload = GatedDeltaWorkload(

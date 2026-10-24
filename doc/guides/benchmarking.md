@@ -128,10 +128,10 @@ memcpy 字节。解读时注意四条边界：API 时间含同步，不是纯 CP
 
 ## 我要用独立训练输入或自定义实现臂
 
-独立输入用 `pllm.WeightedCEBatch.for_prompts(hidden, logits, labels,
+独立输入用 `pllm.host.WeightedCEBatch.for_prompts(hidden, logits, labels,
 weights, prompt_indices)`。它构造原始辅助对象及其 prompt/样本键，不拷贝
 张量。`prompt_indices` 必须与传给 `generate` 的一致；共享输入仍用无键的
-`pllm.WeightedCEBatch(...)`。场景不导入执行帧，不构造请求身份对象。例如
+`pllm.host.WeightedCEBatch(...)`。场景不导入执行帧，不构造请求身份对象。例如
 `--batch 8 --scope request --state-groups 2` 在八个请求间共享两个状态。
 `compare(..., prompt_indices=...)` 把这些键传给每次公开生成，包括预热与
 分析；设置会记录它们以便复现。

@@ -53,7 +53,7 @@ class Probe(pllm.Workload):
 ```python
 session = pllm.RequestState({"proj": lambda m: (m.hidden_size, m.hidden_size)},
                             optimizer=pllm.AdamW(lr=1e-3),
-                            keys=(pllm.RequestKeyField.ROUTE,))
+                            keys=(pllm.state.RequestKeyField.ROUTE,))
 
 llm.generate(prompts, params, routes=(route_of(p) for p in prompts))
 ```

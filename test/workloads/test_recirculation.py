@@ -210,7 +210,7 @@ def run_step(execution, value, decoder):
 def test_recirculation_declaration_fits_reference_budget_and_crosses_the_wire() -> None:
     class PlainRecurrence(pllm.Workload):
         @property
-        def recurrence(self) -> pllm.Recurrence:
+        def recurrence(self) -> pllm.model.Recurrence:
             return CONFIG
 
     workload = RecirculationWorkload(CONFIG)

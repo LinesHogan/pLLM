@@ -6,7 +6,8 @@ from typing import Annotated
 import torch
 
 import pllm
-from pllm import ConditionalLayerReplay, ParameterTarget, TensorUpdate
+from pllm import TensorUpdate
+from pllm.model import ConditionalLayerReplay, ParameterTarget
 from pllm.workloads.chunk_tail import join_tail, save_tail
 
 Input = Annotated[torch.Tensor, pllm.Operand.INPUT]
@@ -57,7 +58,11 @@ class InPlaceTTTWorkload(pllm.Workload):
                 "tail_length": pllm.Buffer((), dtype=torch.int64),
             },
             namespace="canonical.dense_fast_weight.state@1",
-            keys=(pllm.RequestKeyField.REQUEST_ID, pllm.RequestKeyField.PROMPT_IDX, pllm.RequestKeyField.SAMPLE_IDX),
+            keys=(
+                pllm.state.RequestKeyField.REQUEST_ID,
+                pllm.state.RequestKeyField.PROMPT_IDX,
+                pllm.state.RequestKeyField.SAMPLE_IDX,
+            ),
         )
 
     def step(

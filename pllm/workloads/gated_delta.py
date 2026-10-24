@@ -19,7 +19,7 @@ Length = Annotated[torch.Tensor, pllm.Parameter("fast_weights", "length")]
 class GatedDeltaConfig:
     """Chunk-level gated delta rule with constant, untrained gates."""
 
-    targets: tuple[pllm.ParameterTarget, ...]
+    targets: tuple[pllm.model.ParameterTarget, ...]
     head_width: int = 64
     chunk_size: int = 64
     alpha: float = 0.99
@@ -81,7 +81,7 @@ class GatedDeltaWorkload(pllm.Workload):
         state="fast_weights",
         targets=pllm.Config("config.targets"),
         weight="weights",
-        operator=pllm.ParameterOverlayOperator.HEAD_ADD,
+        operator=pllm.model.ParameterOverlayOperator.HEAD_ADD,
         decode=pllm.Config("config.update_decode"),
     )
     def transition(self, hidden: Input, weights: State, tail: Tail, length: Length) -> pllm.TensorUpdate:

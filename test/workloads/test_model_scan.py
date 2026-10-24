@@ -50,7 +50,7 @@ class Adapters(PrefillAdapters):
         return replace(state, optimizer=self.optimizer, initialize=zeros if self.zero else state.initialize)
 
     @property
-    def prefill(self) -> pllm.ModelScan:
+    def prefill(self) -> pllm.model.ModelScan:
         scan = super().prefill
         return replace(
             scan, apply=replace(scan.apply, targets=tuple(t for t in scan.apply.targets if t.layer in self.layers))
@@ -201,7 +201,7 @@ def _check_visibility_relations() -> None:
         pllm.Visibility(reads="{ }")
     scan = PrefillAdapters().prefill
     with pytest.raises(TypeError, match="algorithm"):
-        pllm.ModelScan(scan.chunk_size, scan.apply, scan.learn, algorithm=pllm.Exact())
+        pllm.model.ModelScan(scan.chunk_size, scan.apply, scan.learn, algorithm=pllm.Exact())
     with pytest.raises(ValueError, match="visibility=Exact"):
         replace(scan, visibility=pllm.Visibility.forward_pinned())
 

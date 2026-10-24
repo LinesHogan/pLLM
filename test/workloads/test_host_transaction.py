@@ -49,8 +49,8 @@ def test_typed_host_transaction_abort_requeue_and_postpublish_settlement(monkeyp
         assert context.dynamics is original_state and original_state.version == 1
         raise RuntimeError("query interrupted after update")
 
-    facts = pllm.HostRuntimeFacts(torch.device("cpu"))
-    binding = pllm.transaction(
+    facts = pllm.host.HostRuntimeFacts(torch.device("cpu"))
+    binding = pllm.host.transaction(
         "local.dynamics",
         facts,
         config=service.config,

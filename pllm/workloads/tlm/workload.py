@@ -47,28 +47,28 @@ class TLMConfig:
 class TLMResult:
     loss: torch.Tensor
     selected_count: int
-    publication: pllm.PagePublication | None
+    publication: pllm.state.PagePublication | None
 
 
 @dataclass(slots=True)
 class TLMData:
-    batch: pllm.CausalTrainBatch[torch.Tensor] | None
+    batch: pllm.host.CausalTrainBatch[torch.Tensor] | None
     loss: torch.Tensor
     selected_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
-class TLMWorkload(pllm.CausalAdapterWorkload[TLMData, TLMResult]):
+class TLMWorkload(pllm.host.CausalAdapterWorkload[TLMData, TLMResult]):
     name = "tlm.qv_lora"
     namespace = "canonical.qv_adamw@1"
     config: TLMConfig
-    model: pllm.CausalModel
+    model: pllm.host.CausalModel
 
     def __post_init__(self) -> None:
         if any(
-            item.target.module is not pllm.ParameterModuleKind.ATTENTION
+            item.target.module is not pllm.model.ParameterModuleKind.ATTENTION
             or item.target.role
-            not in (pllm.ParameterRole.QUERY_PROJECTION_WEIGHT, pllm.ParameterRole.VALUE_PROJECTION_WEIGHT)
+            not in (pllm.model.ParameterRole.QUERY_PROJECTION_WEIGHT, pllm.model.ParameterRole.VALUE_PROJECTION_WEIGHT)
             for item in self.model.targets
         ):
             raise ValueError("TLM factor topology must name q/v targets")
@@ -81,13 +81,13 @@ class TLMWorkload(pllm.CausalAdapterWorkload[TLMData, TLMResult]):
     def phase(self) -> pllm.Phase:
         return pllm.Phase.BEFORE_MODEL if self.config.mode is TLMMode.OFFLINE else pllm.Phase.AFTER_SAMPLE
 
-    def prepare(self, value: pllm.CausalTrainBatch[torch.Tensor] | None) -> TLMData:
+    def prepare(self, value: pllm.host.CausalTrainBatch[torch.Tensor] | None) -> TLMData:
         return TLMData(value, torch.zeros((), device=self.model.device))
 
     def trained_rows(self, data: TLMData) -> int:
         return data.selected_count
 
-    def output(self, data: TLMData, result: pllm.InvocationOutput) -> TLMResult:
+    def output(self, data: TLMData, result: pllm.state.InvocationOutput) -> TLMResult:
         return TLMResult(data.loss, data.selected_count, result.publication)
 
     def loss(self, data: TLMData, parameters: Mapping[str, torch.Tensor]) -> torch.Tensor | None:

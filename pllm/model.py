@@ -1,0 +1,46 @@
+"""In-model interventions and their targets: ModelScan, parameter overlays, activation patches, replay.
+
+Workloads use these together with `pllm.overlay`, `pllm.on` and the Visibility presets.
+"""
+
+from pllm.authoring import HiddenSite as HiddenSite
+from pllm.contracts.backend_attachment import (
+    ActivationPatchOperator as ActivationPatchOperator,
+    DecodeRefresh as DecodeRefresh,
+    DecodeWindow as DecodeWindow,
+    MissingPolicy as MissingPolicy,
+)
+from pllm.contracts.parameter_overlay import (
+    ParameterModuleKind as ParameterModuleKind,
+    ParameterOverlayOperator as ParameterOverlayOperator,
+    ParameterRole as ParameterRole,
+    ParameterTarget as ParameterTarget,
+)
+from pllm.contracts.semantic_graph import ConditionalLayerReplay as ConditionalLayerReplay
+from pllm.usage import (
+    Activation as Activation,
+    KVPolicy as KVPolicy,
+    ModelScan as ModelScan,
+    Overlay as Overlay,
+    ParameterEffect as ParameterEffect,
+    Recurrence as Recurrence,
+)
+
+__all__ = [
+    "ModelScan",
+    "ParameterEffect",
+    "KVPolicy",
+    "ParameterTarget",
+    "ParameterModuleKind",
+    "ParameterRole",
+    "ParameterOverlayOperator",
+    "HiddenSite",
+    "Activation",
+    "Overlay",
+    "ActivationPatchOperator",
+    "DecodeWindow",
+    "DecodeRefresh",
+    "MissingPolicy",
+    "ConditionalLayerReplay",
+    "Recurrence",
+]

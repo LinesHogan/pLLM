@@ -1,7 +1,7 @@
 """Output LoRA: low-rank logits added before sampling, trained by SGD on weighted cross-entropy batches.
 
 The state is shared by all requests (instance scope) or kept per request key (request scope). Training
-batches arrive as `pllm.WeightedCEBatch` inputs; pllm runs the SGD steps and publishes the new factors.
+batches arrive as `pllm.host.WeightedCEBatch` inputs; pllm runs the SGD steps and publishes the new factors.
 """
 
 from collections.abc import Callable
@@ -23,8 +23,11 @@ class OutputLoRAConfig:
     learning_rate: float = 1e-3
     steps: int = 1
     seed: int = 0
-    scope: pllm.StateScope = pllm.StateScope.INSTANCE
-    key_fields: tuple[pllm.RequestKeyField, ...] = (pllm.RequestKeyField.PROMPT_IDX, pllm.RequestKeyField.SAMPLE_IDX)
+    scope: pllm.state.StateScope = pllm.state.StateScope.INSTANCE
+    key_fields: tuple[pllm.state.RequestKeyField, ...] = (
+        pllm.state.RequestKeyField.PROMPT_IDX,
+        pllm.state.RequestKeyField.SAMPLE_IDX,
+    )
 
     def __post_init__(self) -> None:
         if (
@@ -36,7 +39,7 @@ class OutputLoRAConfig:
             or not 0 <= self.seed < 2**63
         ):
             raise ValueError("output LoRA requires positive rank/steps/scale/rate and a nonnegative seed")
-        if self.scope not in (pllm.StateScope.INSTANCE, pllm.StateScope.REQUEST):
+        if self.scope not in (pllm.state.StateScope.INSTANCE, pllm.state.StateScope.REQUEST):
             raise ValueError("output LoRA supports instance or independent request state")
 
 
@@ -49,7 +52,7 @@ class OutputLoRAWorkload(pllm.Workload):
     def output_factors(self) -> pllm.InstanceState:
         rank, seed = self.config.rank, self.config.seed
 
-        def initialize(parameters: pllm.Tensors, generator: torch.Generator) -> None:
+        def initialize(parameters: pllm.state.Tensors, generator: torch.Generator) -> None:
             parameters["a"].normal_(std=0.01, generator=generator.manual_seed(seed))
             parameters["b"].zero_()
 
@@ -57,7 +60,7 @@ class OutputLoRAWorkload(pllm.Workload):
             "a": lambda m: (m.hidden_size, rank),
             "b": lambda m: (rank, m.vocab_size),
         }
-        if self.config.scope is pllm.StateScope.REQUEST:
+        if self.config.scope is pllm.state.StateScope.REQUEST:
             return pllm.RequestState(
                 fields,
                 optimizer=pllm.SGD(self.config.learning_rate),
@@ -72,7 +75,7 @@ class OutputLoRAWorkload(pllm.Workload):
             namespace="canonical.output_lora@1",
         )
 
-    def reset(self, parameters: pllm.Tensors, generator: torch.Generator) -> None:
+    def reset(self, parameters: pllm.state.Tensors, generator: torch.Generator) -> None:
         down = parameters["a"]
         down.copy_(
             torch.randn(
@@ -86,7 +89,7 @@ class OutputLoRAWorkload(pllm.Workload):
     @pllm.add_logits
     def predict(
         self,
-        hidden: Annotated[torch.Tensor, pllm.Hidden(-1, pllm.HiddenSite.MODEL_OUTPUT)],
+        hidden: Annotated[torch.Tensor, pllm.Hidden(-1, pllm.model.HiddenSite.MODEL_OUTPUT)],
         down: Annotated[torch.Tensor, pllm.Parameter("output_factors", "a")],
         up: Annotated[torch.Tensor, pllm.Parameter("output_factors", "b")],
     ) -> torch.Tensor:
@@ -103,10 +106,10 @@ class OutputLoRAWorkload(pllm.Workload):
     )
     def train(
         self,
-        hidden: Annotated[torch.Tensor, pllm.Batch("hidden")],
-        logits: Annotated[torch.Tensor, pllm.Batch("base_logits")],
-        labels: Annotated[torch.Tensor, pllm.Batch("labels")],
-        weights: Annotated[torch.Tensor, pllm.Batch("weights")],
+        hidden: Annotated[torch.Tensor, pllm.host.Batch("hidden")],
+        logits: Annotated[torch.Tensor, pllm.host.Batch("base_logits")],
+        labels: Annotated[torch.Tensor, pllm.host.Batch("labels")],
+        weights: Annotated[torch.Tensor, pllm.host.Batch("weights")],
         down: Annotated[torch.Tensor, pllm.Parameter("output_factors", "a")],
         up: Annotated[torch.Tensor, pllm.Parameter("output_factors", "b")],
     ) -> torch.Tensor:
