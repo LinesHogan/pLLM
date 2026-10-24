@@ -209,7 +209,9 @@ class Builder(Generic[D]):
             if optimizer is not None or memory:
                 raise ValueError("an optimizer requires declared parameter fields")
             declaration = SemanticState(StateResource(name), scope, keys)
-            self.graph = replace(self.graph, states=(*self.graph.states, declaration))
+            self.graph = replace(
+                self.graph, states=tuple(sorted((*self.graph.states, declaration), key=lambda state: state.resource))
+            )
             return State(declaration, ())
         if memory and any(part.name in {field.name for field in fields} for part in memory):
             raise ValueError(f"{name}: memory fields duplicate a parameter field")
@@ -229,7 +231,9 @@ class Builder(Generic[D]):
         if len({field.name for field in fields}) != len(fields):
             raise ValueError(f"{name}: duplicate field name")
         declaration = SemanticState(StateResource(name), scope, keys)
-        self.graph = replace(self.graph, states=(*self.graph.states, declaration))
+        self.graph = replace(
+            self.graph, states=tuple(sorted((*self.graph.states, declaration), key=lambda state: state.resource))
+        )
         if self.dimensions is not None or all(
             not callable(field.shape) and not callable(field.dtype) for field in fields
         ):
@@ -256,7 +260,11 @@ class Builder(Generic[D]):
                     for i, (field, shape) in enumerate(zip(fields, shapes, strict=True))
                 ),
             )
-            self.layouts = TensorLayoutRequest((*self.layouts.layouts, StateTensorLayout(name, layout)))
+            self.layouts = TensorLayoutRequest(
+                tuple(
+                    sorted((*self.layouts.layouts, StateTensorLayout(name, layout)), key=lambda entry: entry.resource)
+                )
+            )
         return State(declaration, fields, optimizer, optimizer_fields)
 
     @staticmethod

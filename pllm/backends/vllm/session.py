@@ -69,6 +69,7 @@ from pllm.execution.post_sample import PostSampleOverlap
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.state_execution import StateDiagnostics, StateTaskContext
+from pllm.execution.state_feed import Feed, FeedReceiver
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tokenwise_tuning import TokenwiseTuning
 
@@ -205,6 +206,7 @@ class VllmSession(Generic[DataT, ResultT]):
             binding.decode is DecodeWindow.ALL for binding in attachment.inputs.request.activation_bindings
         )
         self._token_frontiers: dict[RequestIdentity, int] = {}
+        self._feed: FeedReceiver | None = None
         self._readonly_receiver: ReadonlyStepReceiver | None = None
         self._received_readonly: ReadonlyStepInput | ReadonlyStepAbsent | ReadonlyStepEnd | None = None
         self._input_failed = False
@@ -247,6 +249,10 @@ class VllmSession(Generic[DataT, ResultT]):
             )
         if execution.directory.scope is StateScope.INSTANCE:
             execution.admit((), torch.cuda.current_stream(execution.device))
+        if execution.feeds:
+            (binding,) = execution.feeds
+            self._feed = FeedReceiver(execution.arena.plan, binding)
+            self.bind_readonly_input(self._feed)
 
     @property
     def parameter_phases(self) -> tuple[HiddenPhase, ...]:
@@ -263,8 +269,14 @@ class VllmSession(Generic[DataT, ResultT]):
         self._auxiliary = batch
         self._pending_identities = {identity.request_id: identity for identity in identities}
 
+    def feed(self, name: str) -> Feed:
+        """Obtain the declared writer while the consumer is idle."""
+        if self._feed is None or self._next_step_id or self._step is not None:
+            raise RuntimeError("declare a fed state and obtain its writer before generate")
+        return self._feed.take(name)
+
     def bind_readonly_input(self, receiver: ReadonlyStepReceiver) -> None:
-        """Install example-owned transport before requests; it supplies no model mathematics."""
+        """Install the framework transport before requests; it supplies no model mathematics."""
         self._require_input_live()
         if (
             self._readonly_receiver is not None
@@ -674,15 +686,21 @@ class VllmSession(Generic[DataT, ResultT]):
         self._deployment.execution.arena.collect_completed(wait=wait)
 
     def close(self) -> None:
-        self.abort_active()
-        self.retire_all(wait=True)
-        self.abort_tuning()
-        execution = self._deployment.execution
-        if execution.directory.scope is StateScope.INSTANCE:
-            execution.retire((), wait=True)
-        else:
-            execution.retire_dormant(wait=True)
-        self._close_effects()
+        try:
+            self.abort_active()
+            self.retire_all(wait=True)
+            self.abort_tuning()
+            execution = self._deployment.execution
+            if execution.directory.scope is StateScope.INSTANCE:
+                execution.retire((), wait=True)
+            else:
+                execution.retire_dormant(wait=True)
+            self._close_effects()
+        finally:
+            if self._feed is not None:
+                self._input_failed = True
+                self._deployment.execution.discard_borrows()
+                self._feed.close()
 
     def _invocation(self) -> TaskGraphInvocation[StateTaskContext[DataT]]:
         if self._step is None or self._step.invocation is None:

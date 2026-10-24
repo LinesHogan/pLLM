@@ -54,6 +54,7 @@ from pllm.contracts.semantic_graph import (
     TaskResultInputSource,
     TaskSymbol,
 )
+from pllm.contracts.state_feed import FeedBinding, FeedOrder
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorLayoutRequest
 from pllm.contracts.visibility import Exact as Exact, Visibility as Visibility
 from pllm.execution.binding_base import SGD as SGD, Buffer as Buffer
@@ -258,10 +259,26 @@ class InstanceState:
     shape: Shape | None = None
     dtype: torch.dtype = torch.float32
     alignment: int = field(default=16, kw_only=True)
+    feed: FeedOrder | None = field(default=None, kw_only=True)
     # Plain per-lineage tensors carried across steps; never optimizer-managed.
     memory: Mapping[str, Shape] = field(default_factory=lambda: dict[str, Shape](), kw_only=True)
 
     def __post_init__(self) -> None:
+        _reject(
+            self.feed is not None and type(self.feed) is not FeedOrder,
+            "feed needs FeedOrder.ORDERED or FeedOrder.LATEST",
+            TypeError,
+        )
+        _reject(
+            self.feed is not None
+            and (
+                self.scope is not StateScope.INSTANCE
+                or self.optimizer is not None
+                or self.initialize is not None
+                or self.memory
+            ),
+            "fed state needs InstanceState without an optimizer, initializer or memory fields",
+        )
         _reject(
             self.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64),
             "optimizer state requires a supported floating dtype",
@@ -289,14 +306,18 @@ class InstanceState:
 
     def declare(self, name: str, context: _Declaration) -> None:
         """Allocate tensor parameters; buffer layouts belong to their effects."""
-        context.definitions.append((name, fingerprint(self)))
-        if name in context.overlay_states:
+        context.definitions.append((name, boundary_digest(fingerprint(self), tuple(self.fields))))
+        if name in context.overlay_states or name in context.states:
             return
+        if self.feed is not None:
+            _reject(context.binding.feeds, "declare one fed state per workload")
+            context.binding.feeds = (FeedBinding(name, self.feed, tuple(self.fields)),)
         shapes = {key: shape for key, shape in self.fields.items() if not isinstance(shape, Buffer)}
         if len(shapes) != len(self.fields):
             _reject(
                 self.optimizer is not None, "optimizer parameters require tensor shapes, not overlay buffers", TypeError
             )
+            context.allocate_buffers(name, self)
             return
         context.states[name], ports = context.binding.parameters(
             name,
@@ -349,22 +370,29 @@ class Activation:
             "decode window is off; refresh and missing policies require decode rows",
         )
 
+    def allocate(self, context: _Declaration) -> None:
+        """Make activation fields readable before tensor operations are declared."""
+        definition = context.state_definition(self.state, "Activation needs a declared state")
+        _reject(definition.feed is not None, "Activation needs local state written from fed inputs")
+        context.allocate_buffers(self.state, definition)
+
     def declare(self, context: _Declaration) -> None:
-        """Build activation buffers and their model attachment."""
-        definition = context.state_definition(self.state, "activation replacement requires a declared state")
+        """Attach either a computed or an imported update to the activation."""
+        state = context.states[self.state]
+        producer = context.writes.get(self.state)
+        if producer is None:
+            update = context.binding.import_update(state, "canonical.activation:import@1")
+            producer = update, context.binding.publish(update, state, when=When.BEFORE_MODEL)
         context.binding.activation_patch(
-            self.state,
-            _buffers(definition),
+            state,
+            *producer,
             layers=self.layers,
             operator=self.operator,
             first_tokens=self.first_tokens,
             last_tokens=self.last_tokens,
-            namespace=definition.namespace,
             decode=self.decode,
             decode_refresh=self.decode_refresh,
             on_missing=self.on_missing,
-            scope=definition.scope,
-            keys=definition.request_keys,
         )
 
 
@@ -419,6 +447,45 @@ class _Effect:
 
     def declare(self, operation: _Operation) -> None:
         operation.tensor()
+
+
+@dataclass(frozen=True, kw_only=True)
+class _Write(_Effect):
+    state: str
+    field: str
+
+    def declare(self, operation: _Operation) -> None:
+        context = operation.context
+        definition = context.state_definition(self.state, "write needs a declared state")
+        _reject(
+            definition.feed is not None
+            or definition.optimizer is not None
+            or definition.scope is not StateScope.INSTANCE
+            or self.state in context.writes
+            or self.field not in definition.fields
+            or operation.phase is not Phase.BEFORE_MODEL
+            or operation.gradient is not None
+            or operation.rows,
+            "write needs one BEFORE_MODEL writer for a local InstanceState field without an optimizer",
+        )
+        context.definitions.append((operation.name, fingerprint(self)))
+        call = operation.tensor()
+        state = context.states[self.state]
+        update = context.binding.write_result(call, state, self.field)
+        context.writes[self.state] = (
+            update,
+            context.binding.publish(
+                update,
+                state,
+                when=When.BEFORE_MODEL,
+                name=f"{self.state}.publish",
+            ),
+        )
+
+
+def write(*, state: str, field: str) -> Callable[[F], F]:
+    """Publish a computed tensor into a local state field before the model runs."""
+    return _mark(effect=_Write(state=state, field=field))
 
 
 @dataclass(frozen=True)
@@ -962,6 +1029,7 @@ class _Declaration:
     overlay_states: set[str] = field(default_factory=lambda: set[str]())
     states: dict[str, State] = field(default_factory=lambda: {})
     parameters: dict[tuple[str, str], SemanticInputSource | TensorPort] = field(default_factory=lambda: {})
+    writes: dict[str, tuple[Call, Call]] = field(default_factory=lambda: {})
     prediction: tuple[Call, _Sampler] | None = None
     training: tuple[Call, State] | None = None
     model_training: set[str] = field(default_factory=lambda: set[str]())
@@ -995,6 +1063,8 @@ class _Declaration:
         for value in values.values():
             if isinstance(value, ModelScan):
                 context.overlay_states.add(value.apply.state)
+            if isinstance(value, Overlay):
+                context.overlay_states.add(value.state)
         return context
 
     def read_operation(
@@ -1055,8 +1125,24 @@ class _Declaration:
             raise ValueError(error)
         return definition
 
+    def allocate_buffers(self, name: str, definition: InstanceState) -> None:
+        """Register buffer fields as ordinary readable state ports."""
+        state = self.binding.buffer_state(
+            name,
+            _buffers(definition),
+            namespace=definition.namespace,
+            scope=definition.scope,
+            keys=definition.request_keys,
+        )
+        self.states[name] = state
+        ports = self.binding.parameter_ports(state, {field.name: field.shape for field in state.fields})
+        self.parameters.update({(name, field): port for field, port in ports.items()})
+
     def declare_values(self) -> None:
         """Allocate ordinary state before effects and operations consume its ports."""
+        for value in self.values.values():
+            if isinstance(value, Activation):
+                value.allocate(self)
         for name, value in self.values.items():
             if (state := _typed(value, InstanceState)) is not None:
                 state.declare(name, self)
@@ -1066,10 +1152,19 @@ class _Declaration:
                 self.declare_model_scan(name, value)
             if isinstance(value, (Activation, Overlay, Recurrence)):
                 self.definitions.append((name, fingerprint(value)))
-                if isinstance(value, Recurrence):
-                    self.binding.recurrence(value)
-                else:
+                if isinstance(value, Overlay):
                     value.declare(self)
+
+    def attach_effects(self) -> None:
+        """Connect publications before replay and missing-input branches."""
+        for value in self.values.values():
+            if isinstance(value, Activation):
+                value.declare(self)
+        for value in self.values.values():
+            if isinstance(value, Recurrence):
+                self.binding.recurrence(value)
+        if self.binding.feeds:
+            self.binding.conditional_input(tuple(feed.resource for feed in self.binding.feeds))
 
     def declare_model_scan(self, name: str, scan: ModelScan) -> None:
         """Bind the training method once, under its model scan's advance owner."""
@@ -1178,12 +1273,7 @@ class _Declaration:
         b = self.binding
         if any(isinstance(value, Recurrence) for value in self.values.values()):
             attachment = b.attachment
-            composed = (
-                attachment is not None
-                and attachment.activation_bindings
-                and {state.resource for state in b.graph.states} == {attachment.state_resource}
-                and {task.symbol for task in b.graph.tasks} == {symbol for _, symbol in attachment.tasks}
-            )
+            composed = attachment is not None and attachment.activation_bindings
             _reject(
                 not composed and (len(b.graph.tasks) != 1 or b.graph.states),
                 "tokenwise recurrence requires a standalone model effect",
@@ -1234,6 +1324,7 @@ class Workload(
                     "@train without @on must belong to a ModelScan",
                 )
                 operation.effect.declare(operation)
+        context.attach_effects()
         context.attach_training()
         context.sign_composition()
 
@@ -1393,6 +1484,15 @@ class Workload(
             if function.name.startswith("train.")
         )
 
+    def specialize(self, facts: BackendCompileFacts, options: ExecutionOptions) -> BackendCompileFacts:
+        """Fund shared page storage for declared feeds before compiling the plan."""
+        if self.declaration(facts).feeds:
+            facts = replace(
+                facts,
+                providers=tuple(replace(provider, page_capacity=3, shared_memory=True) for provider in facts.providers),
+            )
+        return super().specialize(facts, options)
+
     def resource_facts(self, facts: BackendCompileFacts, options: ExecutionOptions) -> SchedulerTimeline:
         """Reserve ordinary tensor scratch and each requested graph's private pool."""
         _reject(options.explicit_math, "this workload has no explicit tensor implementation")
@@ -1447,7 +1547,10 @@ class Workload(
         if plan.timeline.task_resources and type(self).operations is Workload.operations:
             b.configure_steps(facts, "compute/cuda_graph@1" in plan.timeline.capabilities)
         return MathBinding(
-            self._functions(b, facts.device, facts.initialization_seed), b.bind_all(plan, model_probe=facts.probe)
+            self._functions(b, facts.device, facts.initialization_seed),
+            b.bind_all(plan, model_probe=facts.probe),
+            borrowed_resources=tuple(feed.resource for feed in b.feeds),
+            feeds=b.feeds,
         )
 
     def declare_host(self, facts: HostRuntimeFacts) -> TensorHostBinding[TensorStepInput, TensorFrame, TensorOutput]:
@@ -1471,6 +1574,7 @@ __all__ = [
     "Workload",
     "Phase",
     "on",
+    "write",
     "hook",
     "export",
     "add_logits",

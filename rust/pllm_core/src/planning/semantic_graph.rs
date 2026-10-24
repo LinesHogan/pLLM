@@ -705,7 +705,8 @@ fn validate_input_groups(graph: &SemanticGraph) -> Result<(), String> {
             return Err("conditional input requires its exact owned publication".into());
         }
         let writes: Vec<_> = graph.tasks.iter().filter(|task| producer(&task.symbol) && task.symbol != group.publication)
-            .flat_map(|task| &task.effects).filter(|effect| effect.resource == group.resource).collect();
+            .flat_map(|task| &task.effects).filter(|effect| effect.resource == group.resource
+                && effect.kind != StateEffectKind::Read).collect();
         if writes.len() != 1 || !matches!(writes[0].kind, StateEffectKind::Transition | StateEffectKind::TransitionMaybe)
             || writes[0].version.is_some()
         {

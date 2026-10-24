@@ -114,6 +114,12 @@ class BorrowedPage:
             raise RuntimeError("remote CUDA page access requires its original receiving stream")
         return self._tensor
 
+    def discard(self) -> None:
+        """Drop an import after consumer teardown, without fabricating a read ACK."""
+        if self.stream is not None:
+            self.stream.synchronize()
+        self._tensor = None
+
     def close(self) -> None:
         if self._tensor is None:
             raise RuntimeError("remote page borrow is already closed")

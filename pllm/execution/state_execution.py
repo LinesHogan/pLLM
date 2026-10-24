@@ -28,6 +28,7 @@ from pllm.contracts.semantic_graph import (
     TaskId,
     TaskSymbol,
 )
+from pllm.contracts.state_feed import FeedBinding
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.cuda_stream import CudaStreamReadiness, DeviceCounters
@@ -266,6 +267,7 @@ class MathBinding(Generic[InputT, DataT, ResultT]):
     math: StateMath[InputT, DataT, ResultT]
     tasks: tuple[TaskGraphImplementation[StateTaskContext[DataT]], ...]
     borrowed_resources: tuple[str, ...] = ()
+    feeds: tuple[FeedBinding, ...] = ()
 
     def local_resources(self, plan: PlanBundle) -> tuple[str, ...]:
         states = plan.semantic_graph.states
@@ -308,6 +310,7 @@ class MathBinding(Generic[InputT, DataT, ResultT]):
             self.tasks,
             sampler_anchor_id,
             _borrowed_resources=self.borrowed_resources,
+            feeds=self.feeds,
         )
         return execution
 
@@ -380,6 +383,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         sampler_anchor_id: AnchorId,
         *,
         _borrowed_resources: tuple[str, ...] = (),
+        feeds: tuple[FeedBinding, ...] = (),
     ) -> None:
         self.arena, self.directory, self.math = arena, directory, math
         self.sampler_anchor_id = sampler_anchor_id
@@ -403,12 +407,27 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         )
         self._lock = RLock()
         self._borrowed_resources = _borrowed_resources
+        self.feeds = feeds
         self._pending_borrows: tuple[BorrowedStateRoot, ...] | None = None
         self._borrow_failed = False
         self._pending_hold: HeldInput | None = None
         self._successful_inputs: dict[RequestIdentity, tuple[tuple[StateRef, ...], int]] = {}
         self._hold_count = 0
         self._last_hold: HeldInput | None = None
+
+    def discard_borrows(self) -> None:
+        """Retain failed grants until all GPU work ends, then discard their aliases."""
+        roots = list(self._pending_borrows or ())
+        for invocation in self._active.values():
+            roots.extend(invocation.context.borrowed_roots)
+            invocation.context.value = None
+            invocation.context.results.clear()
+        if roots and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        for root in roots:
+            root.discard()
+        self._pending_borrows = None
+        self._borrow_failed = True
 
     def _require_borrow_live(self) -> None:
         if self._borrow_failed:

@@ -24,6 +24,7 @@ from pllm.contracts.parameter_overlay import (
 from pllm.contracts.semantic_graph import (
     TaskSymbol,
 )
+from pllm.contracts.state_feed import FeedBinding
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.declaration import Builder, Dimensions, Field
 from pllm.execution.model_scan import ChunkTraining
@@ -71,6 +72,7 @@ class TensorBindingBase(Builder[TensorFrame]):
     def __init__(self, name: str, digest: str, dimensions: Dimensions | None = None, *, host: bool = False) -> None:
         super().__init__(name, digest, dimensions)
         self.host = host
+        self.feeds: tuple[FeedBinding, ...] = ()
         self.exports: dict[TaskSymbol, tuple[int, int, bool]] = {}
         self.tensor_tasks: dict[TaskSymbol, TensorTask] = {}
         self.initializers: dict[str, Callable[[tuple[torch.Tensor, ...], torch.Generator], None]] = {}

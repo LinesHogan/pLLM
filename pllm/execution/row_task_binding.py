@@ -203,8 +203,6 @@ class RowTaskBinding(TensorBindingBase):
         keys: tuple[RequestKeyField, ...] = (RequestKeyField.REQUEST_ID,),
         memory: Mapping[str, Shape] = {},
     ) -> tuple[State, dict[str, SemanticInputSource | TensorPort]]:
-        if self.graph.states:
-            raise ValueError("ordinary parameters use one instance state with named tensor views")
         if set(memory) & set(shapes):
             raise ValueError("memory fields duplicate a parameter field")
         if memory and optimizer is None:
@@ -227,14 +225,27 @@ class RowTaskBinding(TensorBindingBase):
             keys=keys if scope is StateScope.REQUEST else (),
             memory=memory_fields,
         )
+        return state, self.parameter_ports(state, shapes, initialize=initialize, memory=memory)
+
+    def parameter_ports(
+        self,
+        state: State,
+        shapes: Mapping[str, Shape],
+        *,
+        initialize: Callable[[Tensors, torch.Generator], None] | None = None,
+        memory: Mapping[str, Shape] = {},
+    ) -> dict[str, SemanticInputSource | TensorPort]:
+        """Bind named views of an allocated state without creating another root."""
         dimensions = self.dimensions
+        raw = state.optimizer is None
         if dimensions is None:
-            return state, {key: state.read() for key in (*shapes, *memory)}
+            return {key: state.read() for key in (*shapes, *memory)}
+        sizes = tuple(shape(dimensions) if callable(shape) else shape for shape in shapes.values())
         views: dict[str, Callable[[tuple[torch.Tensor, ...]], torch.Tensor]] = {}
         # Where each named view lives: (field index, start, size, shape); start is None for whole fields.
         locations: dict[str, tuple[int, int | None, tuple[int, ...]]] = {}
         offset = 0
-        for index, (key, shape) in enumerate(zip(shapes, sizes(dimensions), strict=True)):
+        for index, (key, shape) in enumerate(zip(shapes, sizes, strict=True)):
             size = prod(shape)
 
             def view(
@@ -279,7 +290,7 @@ class RowTaskBinding(TensorBindingBase):
                 field=locations[key][0],
             )
 
-        if scope is StateScope.REQUEST:
+        if state.declaration.scope is StateScope.REQUEST:
 
             def request_port(key: str) -> TensorPort:
                 field_index, start, shape = locations[key]
@@ -295,9 +306,9 @@ class RowTaskBinding(TensorBindingBase):
 
                 return TensorPort(state.read(), read, field=field_index)
 
-            return state, {key: request_port(key) for key in views}
+            return {key: request_port(key) for key in views}
 
-        return state, {key: port(key) for key in views}
+        return {key: port(key) for key in views}
 
     def weighted_train(
         self,

@@ -40,6 +40,7 @@ from pllm.contracts.semantic_graph import (
     ConditionalLayerReplay,
     SemanticEffect,
     StateEffectKind,
+    StateResource,
     StateScope,
     TaskSourceRegion,
 )
@@ -73,6 +74,31 @@ if TYPE_CHECKING:
 
 
 from pllm.execution.binding_base import SGD, Buffer, TensorBindingBase, buffer_field
+
+
+@dataclass(frozen=True)
+class FieldWriter:
+    """Write a task result into its declared field; used by the write lowering."""
+
+    source: Call
+    field: LayoutFieldId
+    resource: StateResource
+
+    def __call__(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
+        value = batch.results[self.source.symbol, "value"]
+        if value.is_meta:
+            target = batch.parameter_root(self.resource)[self.field]
+            if value.shape != target.shape or value.dtype != target.dtype:
+                raise ValueError(f"write to {self.resource} needs shape {tuple(target.shape)} and dtype {target.dtype}")
+        if not finite(value):
+            raise ValueError("write needs a finite tensor result")
+        return TaskOutput(
+            field_writes=((self.field, value.unsqueeze(0)),), changed=self.select(data, batch.selection), update_count=1
+        )
+
+    def select(self, data: TensorFrame, selection: RequestStateSelection) -> tuple[int, ...]:
+        """Select the target resource without updating other local states."""
+        return tuple(selection.refs.index(ref) for ref in selection.for_resource(self.resource).refs)
 
 
 def _check_overlay_fields(
@@ -466,7 +492,22 @@ class ModelEffectBinding(TensorBindingBase):
         if replay is not None:
             self.replay(publication, state, replay)
 
-    def _import_update(self, state: State, identity: str) -> Call:
+    def write_result(self, source: Call, state: State, field: str) -> Call:
+        """Lower one computed tensor to a private field update."""
+        writer = FieldWriter(source, state.field(field), state.declaration.resource)
+        return self.compute(
+            f"{source.symbol}.write",
+            inputs={"value": source["value"]},
+            outputs=("updated",),
+            changes=state,
+            effect=StateEffectKind.TRANSITION,
+            when=When.BEFORE_MODEL,
+            function=writer,
+            select=writer.select,
+            implementations=(native(f"tensor.write:{source.symbol}:{field}@1", "transition/full_root@1"),),
+        )
+
+    def import_update(self, state: State, identity: str) -> Call:
         """One BEFORE_MODEL import of externally produced field values into private roots."""
 
         def execute(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
@@ -529,7 +570,7 @@ class ModelEffectBinding(TensorBindingBase):
             scope=scope,
             keys=keys,
         )
-        update = self._import_update(state, "canonical.overlay:import@1")
+        update = self.import_update(state, "canonical.overlay:import@1")
         publication = self.publish(update, state, when=When.BEFORE_MODEL)
         self.overlay(
             state,
@@ -547,41 +588,17 @@ class ModelEffectBinding(TensorBindingBase):
             ),
         )
 
-    def activation_patch(
+    def buffer_state(
         self,
         name: str,
         buffers: Mapping[str, Buffer],
         *,
-        layers: tuple[int, ...],
-        operator: ActivationPatchOperator,
-        first_tokens: int,
-        last_tokens: int,
+        namespace: str,
         scope: StateScope,
         keys: tuple[RequestKeyField, ...],
-        namespace: str,
-        decode: DecodeWindow = DecodeWindow.NONE,
-        decode_refresh: DecodeRefresh = DecodeRefresh.INHERIT,
-        on_missing: MissingPolicy = MissingPolicy.STOP,
-    ) -> None:
-        replay = (
-            self.attachment is not None
-            and self.attachment.kind is AttachmentKind.MODEL_REPLAY
-            and not self.attachment.activation_bindings
-            and len(self.graph.tasks) == 1
-            and not self.graph.states
-        )
-        if self.host or (not replay and (self.graph.tasks or self.graph.states)):
-            raise ValueError("activation replacement requires a sole model state and effect")
-        width = 1 if operator is ActivationPatchOperator.ADD else 3
-        if (
-            not layers
-            or tuple(sorted(set(layers))) != layers
-            or layers[0] < 0
-            or min(first_tokens, last_tokens) < 0
-            or len(buffers) != len(layers) * width
-        ):
-            raise ValueError("activation fields must cover each ordered layer and operator")
-        state = self.state(
+    ) -> State:
+        """Allocate named model-width fields independently of their effect."""
+        return self.state(
             name,
             tuple(
                 buffer_field(key, buffer, lambda m: (m.hidden_size, m.hidden_size)) for key, buffer in buffers.items()
@@ -590,9 +607,35 @@ class ModelEffectBinding(TensorBindingBase):
             scope=scope,
             keys=keys,
         )
+
+    def activation_patch(
+        self,
+        state: State,
+        update: Call,
+        publication: Call,
+        *,
+        layers: tuple[int, ...],
+        operator: ActivationPatchOperator,
+        first_tokens: int,
+        last_tokens: int,
+        decode: DecodeWindow = DecodeWindow.NONE,
+        decode_refresh: DecodeRefresh = DecodeRefresh.INHERIT,
+        on_missing: MissingPolicy = MissingPolicy.STOP,
+    ) -> None:
+        """Attach an activation to a declared transition and its publication."""
+        width = 1 if operator is ActivationPatchOperator.ADD else 3
+        if (
+            self.host
+            or not layers
+            or tuple(sorted(set(layers))) != layers
+            or layers[0] < 0
+            or min(first_tokens, last_tokens) < 0
+            or len(state.fields) != len(layers) * width
+        ):
+            raise ValueError("activation fields must cover each ordered layer and operator")
         if self.dimensions is not None:
             hidden = self.dimensions.hidden_size
-            layout = self.layouts.layouts[0].layout
+            (layout,) = (entry.layout for entry in self.layouts.layouts if entry.resource == state.declaration.resource)
             for index in range(len(layers)):
                 fields = layout.fields[index * width : (index + 1) * width]
                 shapes = tuple(field.shape for field in fields)
@@ -610,8 +653,6 @@ class ModelEffectBinding(TensorBindingBase):
                         raise ValueError("activation fields differ from the operator's rank and hidden dimensions")
                 if any(field.dtype is not dtype for field in fields):
                     raise ValueError("activation fields differ from the operator's dtype")
-        update = self._import_update(state, "canonical.activation:import@1")
-        publication = self.publish(update, state, when=When.BEFORE_MODEL)
         self.overlay(
             state,
             update,

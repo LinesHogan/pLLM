@@ -69,6 +69,12 @@ class BorrowedStateRoot:
         storage = tensor.untyped_storage()
         validate_readonly_views((self._view,), (), ((str(tensor.device), storage.data_ptr(), storage.nbytes()),))
 
+    def discard(self) -> None:
+        """End all aliases during terminal consumer cleanup without acknowledging success."""
+        self._view = None
+        for page in self.pages:
+            page.discard()
+
     def close(self) -> None:
         if self._view is None:
             raise RuntimeError("borrowed root is already closed")

@@ -87,6 +87,7 @@ from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.state_execution import StateDiagnostics
+from pllm.execution.state_feed import Feed
 from pllm.execution.tokenwise_region import compile_tokenwise_region
 from pllm.execution.trace import TRACE_SCHEMA_VERSION, TraceSelection, TraceSnapshot
 
@@ -341,6 +342,13 @@ class VllmLlm(Generic[DataT, ResultT]):
             if exc is None:
                 raise
             exc.add_note(f"model cleanup also failed: {cleanup}")
+
+    def feed(self, name: str) -> Feed:
+        """Return the producer handle for a declared externally fed state."""
+        self._require_llm()
+        if self._runner is None:
+            raise ValueError("state feeds need multiprocessing=False; pass the writer to a spawned producer")
+        return self.runner.require_session().feed(name)
 
     def diagnostics(self) -> StateDiagnostics:
         if self._closed:

@@ -65,9 +65,6 @@ class TensorBatch:
     local_pin: PagePin | None = None
 
     def parameter_root(self, resource: str) -> tuple[torch.Tensor, ...]:
-        # No borrowed state: preserve the original sole-root reader (existing workload suite).
-        if not self.borrowed_roots:
-            return self.roots[0]
         borrowed = borrowed_root(self.borrowed_roots, resource)
         if borrowed is not None:
             assert self.local_pin is not None
@@ -145,8 +142,8 @@ class InvocationOutput:
 
 
 def _read(context: StateTaskContext[D], version: Literal["input", "private", "published"] = "input") -> TensorBatch:
-    if version != "input" and (len(context.selection.groups) > 1 or len(context.page_publications) > 1):
-        raise ValueError("multiple resources or publications require explicit Region snapshot sources")
+    if version != "input" and len(context.page_publications) > 1:
+        raise ValueError("multiple publications require explicit Region snapshot sources")
     refs = context.pin.refs
     access: tuple[PagePin | PageWrite, ...] = (context.pin,) * len(refs)
     if version == "private" and context.write is not None:
@@ -439,7 +436,7 @@ class TensorOperation(Generic[D]):
                     raise ValueError("memory writes require the invocation's private transition")
                 roots = context.arena.writable_roots(context.write)
                 for field_id, values in output.field_writes:
-                    if values.shape[0] != len(selected) or values.ndim < 2:
+                    if values.ndim < 1 or values.shape[0] != len(selected):
                         raise ValueError("memory writes require one row per selected lineage")
                     for root, value in zip(roots, values.unbind(), strict=True):
                         if root[int(field_id)].shape != value.shape or root[int(field_id)].dtype != value.dtype:

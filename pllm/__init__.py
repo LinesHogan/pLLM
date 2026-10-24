@@ -44,6 +44,7 @@ from pllm.usage import (
     on as on,
     overlay as overlay,
     train as train,
+    write as write,
 )
 
 if TYPE_CHECKING:
@@ -125,6 +126,7 @@ __all__ = [
     "Workload",
     "Phase",
     "on",
+    "write",
     "hook",
     "export",
     "add_logits",

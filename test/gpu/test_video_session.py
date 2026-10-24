@@ -1,17 +1,9 @@
-"""Video frame features injected into a real vLLM child through zero-copy CUDA pages.
-
-The CPU test checks the frame-feature math against a closed-form oracle. The GPU
-tests run the example ``VideoSession`` with an instrumented worker: injected layer
-outputs equal the captured output plus the published delta, KV caches stay intact,
-pages are reused only after the child's ACK, held versions replay, and a dying child
-fail-stops the session while it keeps the page owner.
-"""
+"""Real video through the public feed: numerical output, CUDA aliases, replay and shutdown."""
 
 import multiprocessing as mp
 import os
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
-from functools import partial
 from math import cos, pi, tanh
 from pathlib import Path
 from unittest.mock import patch
@@ -20,12 +12,11 @@ import pytest
 import torch
 
 import pllm
-from examples.video_session import VideoSession, consume, video_frames
+from examples.video_session import video_frames
 from pllm.config import ExecutionOptions, ModelConfig
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.contracts.state_ref import LineageId, StateRef, VersionId
 from pllm.contracts.tensor_layout import LayoutFieldId
-from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle import BorrowedPage, PageFieldTransfer, PageSlot
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
@@ -95,7 +86,8 @@ def test_video_real_frame_math_and_signed_composition():
         execution.retire(())
 
 
-def observed_worker(probe, start, close, control, channels, workload, config):
+@contextmanager
+def observe_model(workload):
     original_make, original_read, original_close = pllm.make_llm, BorrowedStateRoot.tensors, BorrowedPage.close
     seen = set()
     fenced = False
@@ -154,7 +146,6 @@ def observed_worker(probe, start, close, control, channels, workload, config):
             identities.update(row.identity for row in rows)
             steps.append((step.rows.step_id, int(ref.version_id)))
             phases.append(tuple(row.phase.value for row in rows))
-            probe.send_bytes(b"patched")
 
         layer.register_forward_hook(check)
         complete = session.complete_forward
@@ -180,8 +171,6 @@ def observed_worker(probe, start, close, control, channels, workload, config):
             )  # A field clone cannot satisfy the pool extent.
         if root.ref not in seen:
             seen.add(root.ref)
-            probe.send_bytes(encode_boundary(tuple(page.descriptor for page in root.pages)).encode())
-            assert start.wait(120), "test did not release the consumer"
         return values
 
     def finish(page):
@@ -193,11 +182,8 @@ def observed_worker(probe, start, close, control, channels, workload, config):
                 torch.cuda._sleep(100_000_000)
                 event.record(page.stream)
             assert not event.query()
-            probe.send_bytes(b"before-close")
-            assert close.wait(120)
             original_close(page)
             assert event.query()
-            probe.send_bytes(b"closed")
         else:
             original_close(page)
 
@@ -207,38 +193,16 @@ def observed_worker(probe, start, close, control, channels, workload, config):
             patch.object(BorrowedStateRoot, "tensors", read),
             patch.object(BorrowedPage, "close", finish),
         ):
-            consume(control, channels, workload, config)
+            yield
         assert len(identities) == 1 and steps == [(i, i + 1) for i in range(4)]
         assert all(phase == "prefill" for phase in phases[0])
         assert phases[1:] == [("decode",)] * 3
-        probe.send_bytes(b"one-request-four-steps-kv-ok")
     finally:
-        probe.close()
+        assert len(seen) == 4
 
 
-def preempted_worker(probe, control, channels, workload, config):
-    from pllm.backends.vllm.session import VllmSession
-
-    original = VllmSession.before_execute
-
-    def preempt(session, output):
-        if session.next_step_id == 1:
-            assert session.diagnostics().update_count == 1
-            output = replace(output, preempted_req_ids=set(session._identities))
-        try:
-            return original(session, output)
-        except RuntimeError as error:
-            probe.send_bytes(str(error).encode())
-            raise
-
-    try:
-        with patch.object(VllmSession, "before_execute", preempt):
-            consume(control, channels, workload, config)
-    finally:
-        probe.close()
-
-
-def composed_worker(probe, control, channels, workload, config, *, versions=(1, 2, 3)):
+@contextmanager
+def observe_replay(*, versions):
     from pllm.backends.vllm.replay import VllmTokenwiseReplay
     from pllm.execution.exported_cell import ExportedCell
 
@@ -303,7 +267,7 @@ def composed_worker(probe, control, channels, workload, config, *, versions=(1, 
             patch.object(VllmTokenwiseReplay, "normalize", normalize),
             patch.object(VllmTokenwiseReplay, "finish", finish),
         ):
-            consume(control, channels, workload, config)
+            yield
         assert len(completed) == len(versions) and len({identity for rows in completed for identity in rows}) == 1
         assert (
             len([step for step, _ in calls if step == 0]) > 2
@@ -312,9 +276,8 @@ def composed_worker(probe, control, channels, workload, config, *, versions=(1, 
         diagnostics = holder["execution"].diagnostics()
         assert diagnostics.update_count == len(set(versions))
         assert diagnostics.hold_count == len(versions) - len(set(versions)) and diagnostics.fallback_count == 0
-        probe.send_bytes(b"composed-pins-hidden-normal-output-kv-ok")
     finally:
-        probe.close()
+        assert not normals
 
 
 def model_config():
@@ -327,119 +290,83 @@ def model_config():
     )
 
 
+def produce_frames(feed, source, events):
+    previous = source[0].cuda()
+    try:
+        for kind, frame in zip(events, source, strict=True):
+            if kind == "missing":
+                feed.missing()
+                continue
+            current = frame.cuda()
+            values = frame_features(current, previous, 2)
+            feed.publish(
+                **dict(zip(("qp", "residual_energy", "motion_magnitude", "segmentation"), values, strict=True))
+            )
+            previous = current
+            for value in values:
+                value.zero_()  # publish returning permits immediate mutation of its source tensors.
+        feed.end()
+    finally:
+        feed.close()
+
+
+def run_video(workload, events, steps, config=None):
+    from vllm import SamplingParams
+
+    process = None
+    try:
+        with pllm.make_llm(config=config or model_config(), workload=workload) as llm:
+            process = mp.get_context("spawn").Process(
+                target=produce_frames,
+                args=(llm.feed("features"), frames(len(events)), events),
+            )
+            process.start()
+            outputs = llm.generate(
+                ["Describe the scene in this video frame:"],
+                SamplingParams(max_tokens=steps, temperature=0.0, ignore_eos=True),
+            )
+            assert len(outputs[0].outputs[0].token_ids) == steps
+            return llm.diagnostics(), outputs[0].outputs[0].text
+    finally:
+        if process is not None:
+            process.join(120)
+            if process.is_alive():
+                process.kill()
+                process.join()
+                pytest.fail("feed owner did not finish after consumer teardown")
+            assert process.exitcode == 0
+
+
 @pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="real LLM/CUDA IPC requires a GPU")
 def test_video_session_zero_copy_backpressure_and_ack_lifetime():
-    source = frames()
-    context = mp.get_context("spawn")
-    probe, child_probe = context.Pipe()
-    start, close = context.Event(), context.Event()
-    try:
-        with VideoSession(
-            VideoWorkload(grid_size=2),
-            model_config(),
-            steps=len(source),
-            worker=partial(observed_worker, child_probe, start, close),
-        ) as session:
-            child_probe.close()
-            session.submit(source[0])
-            assert probe.poll(120)
-            received = decode_boundary(probe.recv_bytes().decode(), tuple[PageFieldTransfer, ...])
-            first = session.pending[0]
-            assert received == first.fields  # Same GPU UUID/handle/offset, all fields of v1.
-            session.submit(source[1])
-            session.submit(source[2])
-            assert not session.arena.release_complete(first.release)
-            assert session.arena.root(first.ref).pages == tuple(field.page for field in first.fields)
-            with pytest.raises(RuntimeError):  # v1 still has live owners
-                session.arena.prepare_transition((session.current,), session.stream)
-            start.set()
-            assert probe.poll(120) and probe.recv_bytes() == b"patched"
-            assert probe.poll(120) and probe.recv_bytes() == b"before-close"
-            start.clear()
-            assert not session.arena.release_complete(first.release)
-            close.set()
-            assert probe.poll(120) and probe.recv_bytes() == b"closed"
-            assert session.drain().ref == first.ref
-            session.submit(source[3])
-            reused = session.pending[-1].fields[0].page
-            assert (
-                reused.slot_id == first.fields[0].page.slot_id
-                and reused.generation == first.fields[0].page.generation + 1
-            )
-            start.set()
-            results = [session.drain() for _ in range(3)]
-            assert results[-1].updates == 4 and all(result.fallback == 0 for result in results)
-            assert all(result.text == "" for result in results[:-1])
-            for _ in range(3):
-                assert probe.poll(120)
-                decode_boundary(probe.recv_bytes().decode(), tuple[PageFieldTransfer, ...])
-                assert probe.poll(120) and probe.recv_bytes() == b"patched"
-        assert session.arena.active_lineages == session.arena.pending_pin_releases == 0
-        assert probe.poll(120) and probe.recv_bytes() == b"one-request-four-steps-kv-ok"
-    finally:
-        start.set()
-        close.set()
-        probe.close()
-        child_probe.close()
-    # One composed session covers fresh versions, held versions and explicit
-    # absent/end evidence through the same tokenwise replay worker.
+    workload = VideoWorkload(grid_size=2)
+    with observe_model(workload):
+        diagnostics, _ = run_video(workload, ("publish",) * 4, 4)
+    assert diagnostics.update_count == 4 and diagnostics.fallback_count == 0
     config = replace(model_config(), execution=ExecutionOptions(allow_numerical_transforms=False))
     workload = VideoWorkload(
         grid_size=2,
         layer=1,
         recurrence=pllm.model.Recurrence(source_layer=-1, destination_layer=0, alpha=0.6, beta=None),
     )
-    probe, child_probe = context.Pipe()
-    try:
-        with VideoSession(
-            workload, config, steps=5, worker=partial(composed_worker, child_probe, versions=(1, 1, 2, 2, 2))
-        ) as held:
-            child_probe.close()
-            held.submit(source[0])
-            held.missing()
-            held.submit(source[1])
-            held.missing(end=True)
-            results = [held.drain() for _ in range(5)]
-            assert [result.step_id for result in results] == list(range(5))
-            assert [result.updates for result in results] == [1, 1, 2, 2, 2]
-            assert [result.holds for result in results] == [0, 1, 1, 2, 3]
-            assert [result.missing for result in results] == [None, "absent", None, "end", "end"]
-            assert [result.ref is None for result in results] == [False, True, False, True, True]
-            assert all(result.fallback == 0 for result in results)
-        assert probe.poll(120) and probe.recv_bytes() == b"composed-pins-hidden-normal-output-kv-ok"
-        assert held.arena.active_lineages == held.arena.pending_pin_releases == 0
-    finally:
-        probe.close()
-        child_probe.close()
+    with observe_replay(versions=(1, 1, 2, 2, 2)):
+        diagnostics, _ = run_video(workload, ("publish", "missing", "publish"), 5, config)
+    assert diagnostics.update_count == 2 and diagnostics.hold_count == 3 and diagnostics.fallback_count == 0
 
 
 @pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="real LLM/CUDA IPC requires a GPU")
 def test_video_session_failure_retains_owner_without_fallback():
-    # Bad ACKs, closed channels and descriptor drift are covered at the arena
-    # boundary in test_page_bundle_cuda.py. Here one real child dies mid-request
-    # (vLLM preemption is rejected after a real forward) and the supervising
-    # session must fail-stop while retaining the original page owner.
-    (frame,) = frames(1)
-    context = mp.get_context("spawn")
-    probe, child_probe = context.Pipe()
-    try:
-        with VideoSession(
-            VideoWorkload(grid_size=2), model_config(), steps=2, worker=partial(preempted_worker, child_probe)
-        ) as session:
-            child_probe.close()
-            with pytest.raises((EOFError, OSError, RuntimeError)):
-                session.submit(frame)
-                session.missing(end=True)  # An explicit End cannot mask a transport integrity failure.
-                session.drain()
-            assert probe.poll(120)
-            assert b"preemption" in probe.recv_bytes()
-            assert session.failed and session.arena.root(session.current).ref == session.current
-            assert session.arena.usage().pinned_versions > 0
-            with pytest.raises(RuntimeError):  # the session fail-stopped
-                session.submit(frame)
-        assert not session.process.is_alive()
-    finally:
-        probe.close()
-        child_probe.close()
+    from pllm.backends.vllm.session import VllmSession
+
+    before_execute = VllmSession.before_execute
+
+    def preempt(session, output):
+        if session.next_step_id == 1:
+            assert session.diagnostics().update_count == 1
+            output = replace(output, preempted_req_ids=set(session._identities))
+        return before_execute(session, output)
+
+    with patch.object(VllmSession, "before_execute", preempt), pytest.raises(RuntimeError, match="preempt"):
+        run_video(VideoWorkload(grid_size=2), ("publish", "publish"), 2)

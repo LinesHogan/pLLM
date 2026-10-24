@@ -1,0 +1,234 @@
+"""Public feed declarations and computed writes, independent of the video example."""
+
+from collections import deque
+from dataclasses import dataclass, replace
+from typing import Annotated
+
+import pytest
+import torch
+
+import pllm
+from pllm.contracts.semantic_graph import SemanticEffect, StateEffectKind, StateResource
+from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
+from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.state_feed import FeedRecord, select_publications
+from test.backend_facts import backend_facts
+
+Source = Annotated[torch.Tensor, pllm.Parameter("source", "value")]
+Target = Annotated[torch.Tensor, pllm.Parameter("target", "value")]
+
+
+@dataclass(frozen=True)
+class FeedWorkload(pllm.Workload):
+    """A general tensor feed transformed into a local activation field."""
+
+    order: pllm.state.FeedOrder = pllm.state.FeedOrder.ORDERED
+    missing: pllm.model.MissingPolicy = pllm.model.MissingPolicy.HOLD
+
+    @property
+    def source(self) -> pllm.InstanceState:
+        return pllm.InstanceState({"value": (2,)}, feed=self.order)
+
+    @property
+    def target(self) -> pllm.InstanceState:
+        return pllm.InstanceState({"value": (2,)})
+
+    @property
+    def activation(self) -> pllm.model.Activation:
+        return pllm.model.Activation(
+            "target",
+            (0,),
+            operator=pllm.model.ActivationPatchOperator.ADD,
+            decode=pllm.model.DecodeWindow.ALL,
+            decode_refresh=pllm.model.DecodeRefresh.STEP,
+            on_missing=self.missing,
+        )
+
+    @pllm.on(pllm.Phase.BEFORE_MODEL)
+    @pllm.write(state="target", field="value")
+    def transform(self, value: Source, previous: Target) -> torch.Tensor:
+        """Reading local state and fed state must not be mistaken for two writers."""
+        return value * 2 + previous * 0
+
+
+def facts_for(device=torch.device("cpu")):
+    from pllm.contracts.state_representation import StateDeviceKind
+
+    timeline = RuntimeFacts(device).timeline(("transition/full_root@1",))
+    provider = PageBundleProviderFacts("test.feed@1", 3, StateDeviceKind(device.type), device.index or 0, True)
+    return backend_facts(2, (), timeline, provider, layer_count=1, memory_bytes=65536)
+
+
+def test_feed_declaration_signs_order_and_derives_ownership():
+    signatures = []
+    for order in pllm.state.FeedOrder:
+        workload = FeedWorkload(order)
+        assert workload.backend_requirements().activation_layers == (0,)
+        facts = workload.specialize(facts_for(), pllm.ExecutionOptions())
+        deployment = workload.compile_backend(facts)
+        assert deployment.execution.arena.owned_resources == ("target",)
+        assert deployment.execution.feeds[0].fields == ("value",)
+        plan = deployment.execution.arena.plan
+        signatures.append(plan.schedule_decision.signature)
+        (group,) = plan.semantic_graph.input_groups
+        assert group.borrowed_resources == ("source",)
+        assert (
+            len(
+                [
+                    effect
+                    for task in plan.semantic_graph.tasks
+                    for effect in task.effects
+                    if effect.kind is StateEffectKind.TRANSITION
+                ]
+            )
+            == 1
+        )
+    assert len(set(signatures)) == 2
+
+
+def test_conditional_input_allows_local_reads_but_rejects_an_extra_writer():
+    workload = FeedWorkload()
+    facts = workload.specialize(facts_for(), pllm.ExecutionOptions())
+    binding = workload.declaration(facts)
+    binding.graph = replace(
+        binding.graph,
+        tasks=tuple(
+            replace(
+                task,
+                effects=tuple(
+                    SemanticEffect(StateResource("target"), StateEffectKind.TRANSITION)
+                    if effect.resource == "target" and effect.kind is StateEffectKind.READ
+                    else effect
+                    for effect in task.effects
+                ),
+            )
+            if task.symbol == "transform"
+            else task
+            for task in binding.graph.tasks
+        ),
+    )
+    from pllm.execution.ptts.page_bundle_planning import compile_page_bundle_plan
+
+    with pytest.raises(ValueError, match="one owned transition"):
+        compile_page_bundle_plan(
+            (binding.graph, binding.layouts), facts.timeline, facts.providers, 2, 65536, facts.device
+        )
+
+
+@pytest.mark.parametrize(
+    "order,expected", [(pllm.state.FeedOrder.ORDERED, (1,)), (pllm.state.FeedOrder.LATEST, (1, 2, 3))]
+)
+def test_selection_preserves_explicit_missing_and_end_barriers(order, expected):
+    queue = deque(
+        [
+            *(FeedRecord("publish", index) for index in (1, 2, 3)),
+            FeedRecord("missing"),
+            FeedRecord("publish", 4),
+            FeedRecord("end"),
+        ]
+    )
+    assert tuple(record.slot for record in select_publications(queue, order)) == expected
+    while queue[0].kind == "publish":
+        select_publications(queue, order)
+    assert select_publications(queue, order) == (FeedRecord("missing"),)
+    assert select_publications(queue, order) == (FeedRecord("publish", 4),)
+    assert select_publications(queue, order) == (FeedRecord("end"),)
+
+
+def test_feed_rejects_local_writers_and_request_scopes():
+    with pytest.raises(ValueError, match="InstanceState"):
+        pllm.RequestState(shape=(2,), feed=pllm.state.FeedOrder.ORDERED)
+    with pytest.raises(ValueError, match="optimizer"):
+        pllm.InstanceState(shape=(2,), feed=pllm.state.FeedOrder.ORDERED, optimizer=pllm.SGD(0.1))
+
+    @dataclass(frozen=True)
+    class WritesSource(FeedWorkload):
+        @pllm.on(pllm.Phase.BEFORE_MODEL)
+        @pllm.write(state="source", field="value")
+        def transform(self, value: Source, previous: Target) -> torch.Tensor:
+            return value + previous
+
+    with pytest.raises(ValueError, match="local InstanceState"):
+        WritesSource().declaration()
+
+
+def test_write_validates_result_shape_during_specialization():
+    @dataclass(frozen=True)
+    class WrongShape(FeedWorkload):
+        @pllm.on(pllm.Phase.BEFORE_MODEL)
+        @pllm.write(state="target", field="value")
+        def transform(self, value: Source, previous: Target) -> torch.Tensor:
+            return (value + previous).sum()
+
+    with pytest.raises(ValueError, match="write to target needs shape"):
+        WrongShape().specialize(facts_for(), pllm.ExecutionOptions())
+
+
+def test_ordinary_state_ports_and_write_do_not_depend_on_declaration_order():
+    from pllm.authoring import TensorStepInput
+    from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
+
+    @dataclass(frozen=True)
+    class LocalWorkload(FeedWorkload):
+        @property
+        def source(self) -> pllm.InstanceState:
+            return pllm.InstanceState({"value": (2,)})
+
+        @property
+        def unrelated(self) -> pllm.InstanceState:
+            return pllm.InstanceState({"value": (2,)})
+
+        @pllm.on(pllm.Phase.BEFORE_MODEL)
+        @pllm.write(state="target", field="value")
+        def transform(self, value: Source, previous: Target) -> torch.Tensor:
+            return torch.ones_like(value) + previous
+
+    workload = LocalWorkload()
+    facts = workload.specialize(facts_for(), pllm.ExecutionOptions())
+    execution = workload.compile_backend(facts).execution
+    execution.admit(())
+    rows = PackedPhaseRowBatch(1, 0, 0, ())
+    execution.step(TensorStepInput(rows, PackedSamplerRowBatch(rows, ())))
+    refs = execution.directory.latest_refs(())
+    assert [ref.version_id for ref in refs] == [0, 1, 0]
+    torch.testing.assert_close(execution.snapshot(refs[1])[0], torch.ones(2))
+    execution.retire(())
+
+
+def test_write_field_and_feed_field_order_are_signed():
+    @dataclass(frozen=True)
+    class Fields(FeedWorkload):
+        @property
+        def target(self) -> pllm.InstanceState:
+            return pllm.InstanceState({"value": (2,), "second": (2,)})
+
+        @property
+        def activation(self) -> pllm.model.Activation:
+            return pllm.model.Activation("target", (0, 1), operator=pllm.model.ActivationPatchOperator.ADD)
+
+        @pllm.on(pllm.Phase.BEFORE_MODEL)
+        @pllm.write(state="target", field="value")
+        def transform(self, value: Source, previous: Target) -> torch.Tensor:
+            return value + previous
+
+    first = Fields().declaration().graph.execution_parameters_digest
+    pllm.write(state="target", field="second")(Fields.transform)
+    assert Fields().declaration().graph.execution_parameters_digest != first
+    Fields.source = pllm.InstanceState({"value": (2,), "extra": (2,)}, feed=pllm.state.FeedOrder.ORDERED)
+    first = Fields().declaration().graph.execution_parameters_digest
+    Fields.source = pllm.InstanceState({"extra": (2,), "value": (2,)}, feed=pllm.state.FeedOrder.ORDERED)
+    assert Fields().declaration().graph.execution_parameters_digest != first
+
+
+def test_fed_buffer_fields_use_the_same_declared_ports():
+    @dataclass(frozen=True)
+    class BufferFeed(FeedWorkload):
+        @property
+        def source(self) -> pllm.InstanceState:
+            return pllm.InstanceState({"value": pllm.Buffer((2,), dtype=torch.float32)}, feed=self.order)
+
+    workload = BufferFeed()
+    facts = workload.specialize(facts_for(), pllm.ExecutionOptions())
+    execution = workload.compile_backend(facts).execution
+    assert execution.arena.owned_resources == ("target",)
+    assert execution.feeds[0].fields == ("value",)

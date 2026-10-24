@@ -1,12 +1,9 @@
-"""Video feature consumption through ordinary Parameter ports and Activation ADD.
+"""Video declarations and Fourier encoding used by the feed example.
 
-The producer's block statistics approximate codec-side signals from real frames;
-they are not parsed AV1 QP/segmentation or NVDEC motion vectors. The small fixed
-Fourier encoder demonstrates conditioning, not a trained vision-language model.
+Features arrive from a producer; the model consumes a local activation state.
 """
 
-from dataclasses import dataclass, replace
-from functools import partial
+from dataclasses import dataclass
 from math import isfinite, pi
 from typing import Annotated, ClassVar
 
@@ -14,35 +11,79 @@ import torch
 from torch.nn import functional as F
 
 import pllm
-from pllm.authoring import (
-    BackendCompileFacts,
-    BackendRequirements,
-    MathBinding,
-    PlanBundle,
-    TensorStepInput,
-)
-from pllm.config import ExecutionOptions
-from pllm.contracts.backend_attachment import ActivationPatchBinding
-from pllm.contracts.semantic_graph import (
-    StateEffectKind,
-    TaskResultInputSource,
-    TaskSymbol,
-    WorkloadId,
-)
-from pllm.contracts.tensor_layout import LayoutFieldId
-from pllm.execution.codec import boundary_digest
-from pllm.execution.declaration import Field, When, native
-from pllm.execution.tensor_binding import TensorBinding, TensorOutput
-from pllm.execution.tensor_frame import TensorFrame, finite
-from pllm.execution.tensor_program import TaskOutput, TensorBatch, TensorComputation
 
 FEATURES = ("qp", "residual_energy", "motion_magnitude", "segmentation")
-_ENCODE = TaskSymbol("encode")
-_DELTA = LayoutFieldId(0)
 QP = Annotated[torch.Tensor, pllm.Parameter("features", "qp")]
 Residual = Annotated[torch.Tensor, pllm.Parameter("features", "residual_energy")]
 Motion = Annotated[torch.Tensor, pllm.Parameter("features", "motion_magnitude")]
 Segments = Annotated[torch.Tensor, pllm.Parameter("features", "segmentation")]
+Injection = Annotated[torch.Tensor, pllm.Parameter("inject", "delta")]
+
+
+def injection_shape(inputs: int, outputs: int) -> tuple[int, ...]:
+    """Use the model's hidden width for its additive activation field."""
+    return (inputs,)
+
+
+@dataclass(frozen=True)
+class VideoWorkload(pllm.Workload):
+    """Encode fed feature maps into one local injection on each supplied step."""
+
+    name: ClassVar[str] = "video.session"
+    grid_size: int = 8
+    layer: int = 0
+    gain: float = 0.1
+    recurrence: pllm.model.Recurrence | None = None
+
+    def __post_init__(self) -> None:
+        if self.grid_size < 1 or self.layer < 0 or not isfinite(self.gain) or self.gain <= 0:
+            raise ValueError("VideoWorkload needs a positive grid/gain and a nonnegative layer")
+
+    @property
+    def features(self) -> pllm.InstanceState:
+        """Declare the four read-only feature fields supplied by the producer."""
+        return pllm.InstanceState(
+            {name: (self.grid_size, self.grid_size) for name in FEATURES},
+            namespace="video.features@1",
+            dtype=torch.float32,
+            feed=pllm.state.FeedOrder.ORDERED,
+        )
+
+    @property
+    def inject(self) -> pllm.InstanceState:
+        """Declare the local state written by the encoder and read by Activation."""
+        return pllm.InstanceState(
+            {"delta": pllm.Buffer(injection_shape, dtype=torch.float32)},
+            namespace="video.inject@1",
+        )
+
+    @property
+    def activation(self) -> pllm.model.Activation:
+        """Apply the latest settled injection to the selected prefill/decode rows."""
+        return pllm.model.Activation(
+            "inject",
+            (self.layer,),
+            first_tokens=1,
+            last_tokens=1,
+            operator=pllm.model.ActivationPatchOperator.ADD,
+            decode=pllm.model.DecodeWindow.ALL,
+            decode_refresh=pllm.model.DecodeRefresh.STEP,
+            on_missing=pllm.model.MissingPolicy.HOLD,
+        )
+
+    @pllm.on(pllm.Phase.BEFORE_MODEL)
+    @pllm.write(state="inject", field="delta")
+    def encode(
+        self, qp: QP, residual: Residual, motion: Motion, segmentation: Segments, template: Injection
+    ) -> torch.Tensor:
+        """Project block statistics onto a fixed Fourier basis at model hidden width."""
+        signal = torch.cat(
+            (qp.flatten() / 63, residual.flatten().sqrt(), motion.flatten() / (2**0.5), segmentation.flatten() / 3)
+        )
+        positions = torch.arange(signal.numel(), dtype=torch.float32, device=signal.device) + 0.5
+        frequencies = torch.arange(template.numel(), dtype=torch.float32, device=signal.device) + 1
+        basis = torch.cos((pi / signal.numel()) * frequencies[:, None] * positions[None, :])
+        return self.gain * torch.tanh((basis @ signal) / signal.numel() ** 0.5)
 
 
 def frame_features(frame: torch.Tensor, previous: torch.Tensor, grid_size: int) -> tuple[torch.Tensor, ...]:
@@ -83,148 +124,3 @@ def frame_features(frame: torch.Tensor, previous: torch.Tensor, grid_size: int) 
         magnitudes[choice],
         (variance > 0.02).float() + 2 * (energy > 0.01).float(),
     )
-
-
-@dataclass(frozen=True)
-class _VideoEncoder(pllm.Workload):
-    name = "video.encoder"
-    grid_size: int
-    hidden_size: int
-    gain: float
-
-    @property
-    def features(self) -> pllm.InstanceState:
-        return pllm.InstanceState(
-            {name: (self.grid_size, self.grid_size) for name in FEATURES},
-            namespace="video.features@1",
-            dtype=torch.float32,
-        )
-
-    @pllm.on(pllm.Phase.BEFORE_MODEL)
-    def encode(self, qp: QP, residual: Residual, motion: Motion, segmentation: Segments) -> torch.Tensor:
-        signal = torch.cat(
-            (qp.flatten() / 63, residual.flatten().sqrt(), motion.flatten() / (2**0.5), segmentation.flatten() / 3)
-        )
-        positions = torch.arange(signal.numel(), dtype=torch.float32, device=signal.device) + 0.5
-        frequencies = torch.arange(self.hidden_size, dtype=torch.float32, device=signal.device) + 1
-        basis = torch.cos((pi / signal.numel()) * frequencies[:, None] * positions[None, :])
-        return self.gain * torch.tanh((basis @ signal) / signal.numel() ** 0.5)
-
-
-def _write_inject(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
-    hidden = batch.results[_ENCODE, "value"]
-    if not finite(hidden):
-        raise ValueError("video encoder produced a non-finite injection")
-    return TaskOutput(field_writes=((_DELTA, hidden.unsqueeze(0)),), changed=(0,), update_count=1)
-
-
-@dataclass(frozen=True)
-class VideoWorkload(pllm.Workload):
-    """One borrowed feature root and one entirely local per-step injection root."""
-
-    name: ClassVar[str] = "video.session"
-    grid_size: int = 8
-    layer: int = 0
-    gain: float = 0.1
-    page_capacity: int = 3
-    recurrence: pllm.model.Recurrence | None = None
-
-    def __post_init__(self) -> None:
-        if self.grid_size < 1 or self.layer < 0 or self.page_capacity < 2 or not isfinite(self.gain) or self.gain <= 0:
-            raise ValueError("video session requires a positive grid/gain, a layer and current/private page capacity")
-
-    @property
-    def activation(self) -> pllm.model.Activation:
-        return pllm.model.Activation(
-            "inject",
-            (self.layer,),
-            first_tokens=1,
-            last_tokens=1,
-            operator=pllm.model.ActivationPatchOperator.ADD,
-            decode=pllm.model.DecodeWindow.ALL,
-            decode_refresh=pllm.model.DecodeRefresh.STEP,
-            on_missing=pllm.model.MissingPolicy.HOLD,
-        )
-
-    @property
-    def producers(self) -> tuple[TensorComputation, ...]:
-        return (
-            TensorComputation(
-                partial(frame_features, grid_size=self.grid_size),
-                ((8 * self.grid_size, 8 * self.grid_size),) * 2,
-                torch.uint8,
-            ),
-        )
-
-    def backend_requirements(self) -> BackendRequirements:
-        return BackendRequirements(activation_layers=self.activation.layers)
-
-    def specialize(self, facts: BackendCompileFacts, options: ExecutionOptions) -> BackendCompileFacts:
-        return super().specialize(
-            replace(
-                facts,
-                providers=tuple(
-                    replace(provider, page_capacity=self.page_capacity, shared_memory=True)
-                    for provider in facts.providers
-                ),
-            ),
-            options,
-        )
-
-    def _binding(self, facts: BackendCompileFacts) -> tuple[_VideoEncoder, TensorBinding]:
-        encoder = _VideoEncoder(self.grid_size, facts.probe.hidden_size, self.gain)
-        b = encoder.declaration(facts)
-        inject = b.state("inject", (Field("delta", (facts.probe.hidden_size,)),), namespace="video.inject@1")
-        activation = self.activation
-        update = b.compute(
-            "write_inject",
-            inputs={"hidden": TaskResultInputSource(_ENCODE, "value")},
-            outputs=("updated",),
-            changes=inject,
-            effect=StateEffectKind.TRANSITION,
-            when=When.BEFORE_MODEL,
-            function=_write_inject,
-            implementations=(native("video.inject:write@1", "transition/full_root@1"),),
-        )
-
-        publication = b.publish(update, inject, when=When.BEFORE_MODEL)
-        b.overlay(
-            inject,
-            update,
-            publication,
-            activations=(
-                ActivationPatchBinding(
-                    self.layer,
-                    (_DELTA,),
-                    activation.first_tokens,
-                    activation.last_tokens,
-                    activation.operator,
-                    activation.decode,
-                    activation.decode_refresh,
-                    activation.on_missing,
-                ),
-            ),
-        )
-        if self.recurrence is not None:
-            b.recurrence(self.recurrence)
-        b.conditional_input(("features",))
-        b.graph = replace(
-            b.graph,
-            workload_id=WorkloadId(self.name),
-            execution_parameters_digest=boundary_digest(
-                b.graph.execution_parameters_digest, self, activation, ("features",), "video.inject:write@1"
-            ),
-        )
-        return encoder, b
-
-    def declaration(self, facts: BackendCompileFacts | None = None) -> TensorBinding:
-        assert facts is not None
-        return self._binding(facts)[1]
-
-    def bind_math(
-        self, facts: BackendCompileFacts, plan: PlanBundle
-    ) -> MathBinding[TensorStepInput, TensorFrame, TensorOutput]:
-        encoder, b = self._binding(facts)
-        if b.graph != plan.semantic_graph or b.layouts != plan.tensor_layout_request:
-            raise ValueError("video binding differs from the original signed declaration")
-        return replace(encoder.operations(facts, plan, b), borrowed_resources=("features",))
