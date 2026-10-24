@@ -73,7 +73,6 @@ from pllm.execution.state_execution import StateTaskContext
 from pllm.execution.step_capture import StepCapture
 from pllm.execution.tensor_executor import TensorExecutor, reads_rows
 from pllm.execution.tensor_frame import (
-    MaskedRows,
     OverlayEntry,
     OverlayTargetResult,
     TensorFrame,
@@ -614,9 +613,9 @@ class TensorBinding(Builder[TensorFrame]):
                 task,
                 self.tensor_tasks,
                 optimizer,
-                MaskedRows,
-                StepCapture(limits[symbol], states) if capture else None,
-                facts.device,
+                compact=False,
+                capture=StepCapture(limits[symbol], states) if capture else None,
+                device=facts.device,
             )
             self.operations[symbol] = replace(operation, body=executor, capture_resident=executor.resident)
 

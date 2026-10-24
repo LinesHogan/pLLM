@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, overload
+from typing import TYPE_CHECKING, Literal, NamedTuple, overload
 
 import numpy as np
 import torch
@@ -184,7 +184,6 @@ class MaskedRows:
     """A fixed device row selection, used inside masked tensor bodies."""
 
     device: torch.Tensor
-    compact: ClassVar[bool] = False
 
     def take(self, values: torch.Tensor) -> torch.Tensor:
         """Gather through fixed device indices."""
@@ -196,11 +195,11 @@ class MaskedRows:
 
 
 @dataclass(frozen=True, slots=True)
-class CompactRows(MaskedRows):
+class CompactRows:
     """Host-selected rows preserve consecutive and repeated eager views."""
 
+    device: torch.Tensor
     rows: tuple[int, ...]
-    compact: ClassVar[bool] = True
 
     def take(self, values: torch.Tensor) -> torch.Tensor:
         """Borrow eager views where row order permits them."""
@@ -213,14 +212,18 @@ class CompactRows(MaskedRows):
         return CompactRows(select_rows(self.device, rows), tuple(self.rows[row] for row in rows))
 
 
+# Both strategies read rows through `take` and `select`; the binding chooses one per invocation.
+RowColumn = MaskedRows | CompactRows
+
+
 class RowIndex(NamedTuple):
     """Named read strategies for an invocation's five index columns."""
 
-    packed: MaskedRows
-    sampler: MaskedRows
-    samples: MaskedRows
-    states: MaskedRows
-    versions: MaskedRows
+    packed: RowColumn
+    sampler: RowColumn
+    samples: RowColumn
+    states: RowColumn
+    versions: RowColumn
 
     def select(self, rows: tuple[int, ...]) -> "RowIndex":
         """Select each column using its bound row strategy."""

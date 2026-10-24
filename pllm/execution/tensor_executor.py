@@ -16,7 +16,6 @@ from pllm.execution.cuda_stream import PinnedStaging
 from pllm.execution.state_execution import StateTaskContext
 from pllm.execution.step_capture import StepCapture
 from pllm.execution.tensor_frame import (
-    CompactRows,
     FieldRoots,
     MaskedRows,
     ParameterGradients,
@@ -76,19 +75,19 @@ class TableLayout:
 def reads_rows(task: TensorTask, tasks: Mapping[TaskSymbol, TensorTask]) -> bool:
     """Whether the task reads per-row inputs (hidden, feedback, request state), directly or upstream.
 
-    Only such tasks have a row table to capture; the rest stay on the plain TensorTask path.
+    Only such tasks have a fixed row table to capture; the rest evaluate compact rows.
     """
     return any(port.rowwise for item in task.dependencies(tasks) for port in item.ports.values())
 
 
 @dataclass
 class TensorExecutor:
-    """One body and one result settlement, with a bound compact or masked reader."""
+    """One body and one result settlement for compact (eager) or masked (fixed-table) evaluation."""
 
     task: TensorTask
     tasks: Mapping[TaskSymbol, TensorTask]
     optimizer: PageUpdate | None = None
-    strategy: type[MaskedRows] = CompactRows
+    compact: bool = True  # chosen at binding: compact host-selected rows, or masked fixed tables
     capture: StepCapture | None = None
     device: torch.device = torch.device("cpu")
     table: torch.Tensor | None = None
@@ -111,7 +110,7 @@ class TensorExecutor:
     staging: PinnedStaging = dataclass_field(default_factory=PinnedStaging)
 
     def __post_init__(self) -> None:
-        if self.strategy.compact:
+        if self.compact:
             return
         dependencies = self.task.dependencies(self.tasks)
         self.read_fields = frozenset(
@@ -213,11 +212,11 @@ class TensorExecutor:
         return capture_bytes if self.capture is not None else 0
 
     def _body(self, data: TensorFrame, batch: TensorBatch) -> None:
-        frame, operands = (data, batch) if self.strategy.compact else self._frame(data, batch)
+        frame, operands = (data, batch) if self.compact else self._frame(data, batch)
         self.evaluated_rows = tuple(range(len(frame.rows)))
         self.result = self.gradients = None
         self.input_gradients = {}
-        if not self.strategy.compact:
+        if not self.compact:
             for dependency in self.task.dependencies(self.tasks)[:-1]:
                 dependency.evaluate(frame, operands)
         if self.optimizer is None:
@@ -225,8 +224,8 @@ class TensorExecutor:
             self.result = operands.results[self.task.symbol, self.task.output]
             return
         with torch.enable_grad():
-            self.inputs, self.evaluated_rows = self.task.read(frame, operands, compact=self.strategy.compact)
-            if self.strategy.compact:
+            self.inputs, self.evaluated_rows = self.task.read(frame, operands, compact=self.compact)
+            if self.compact:
                 selected = (
                     selected_rows(self.inputs[self.task.policy.update_states])
                     if self.task.policy.update_states in self.task.domains
@@ -242,7 +241,7 @@ class TensorExecutor:
                 self.gradients = derivatives[0].detach()
             else:
                 self.gradients = torch.zeros_like(state_leaf(frame, operands))
-        if not self.strategy.compact:
+        if not self.compact:
             self.gradients = self.gradients[: self.state_count].contiguous()
             assert self.table is not None
             _, _, last, sources, destinations, _ = self.layout.split(self.table)
@@ -266,7 +265,7 @@ class TensorExecutor:
     ) -> TaskOutput:
         """Prepare operands, run the shared body or graph, then settle invocation outputs."""
         addresses: tuple[int, ...] = ()
-        if not self.strategy.compact:
+        if not self.compact:
             if not data.rows:
                 return TaskOutput()
             addresses = self._inputs(data, batch)
@@ -333,29 +332,29 @@ class TensorExecutor:
 
     def settle_rows(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
         """Record gradients, losses and observations once for both evaluation strategies."""
-        rows = self.evaluated_rows if self.strategy.compact else tuple(range(len(data.rows)))
+        rows = self.evaluated_rows if self.compact else tuple(range(len(data.rows)))
         count = (
             len(batch.roots)
             if self.optimizer is not None and self.task.policy.reduction == "state_mean"
             else len(data.rows)
         )
-        value = None if self.result is None else retain_rows(self.result, count, copy=not self.strategy.compact)
+        value = None if self.result is None else retain_rows(self.result, count, copy=not self.compact)
         if value is not None:
             batch.results[self.task.symbol, self.task.output] = value
         if self.optimizer is None:
             return TaskOutput()
         assert self.gradients is not None
-        gradients = retain_rows(self.gradients, len(batch.roots), copy=not self.strategy.compact)
+        gradients = retain_rows(self.gradients, len(batch.roots), copy=not self.compact)
         if value is not None:
             data.input_gradients.update(
-                (key, retain_rows(value, len(data.rows), copy=not self.strategy.compact))
+                (key, retain_rows(value, len(data.rows), copy=not self.compact))
                 for key, value in self.input_gradients.items()
             )
             data.parameter_gradient_fields = ParameterGradients(
                 batch.selection.refs, gradients, data.parameter_gradient_fields
             )
-        pending = tuple(gradients[index] for index in self.updated) if self.strategy.compact else ()
-        positions = self.updated if self.strategy.compact else ()
+        pending = tuple(gradients[index] for index in self.updated) if self.compact else ()
+        positions = self.updated if self.compact else ()
         plan = row_plan(data, batch).select(rows)
         last = plan.last
         writes = tuple(
@@ -369,11 +368,11 @@ class TensorExecutor:
                 ),
             )
             for key, field in self.task.captures.items()
-            if self.strategy.compact and self.updated and rows
+            if self.compact and self.updated and rows
         )
         observed = (
             {key: value for key, value in self.inputs.items() if isinstance(self.task.sources[key], HiddenInputSource)}
-            if self.strategy.compact
+            if self.compact
             else self.inputs
         )
         return TaskOutput(
