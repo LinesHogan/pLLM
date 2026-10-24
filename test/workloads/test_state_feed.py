@@ -11,7 +11,7 @@ import pllm
 from pllm.contracts.semantic_graph import SemanticEffect, StateEffectKind, StateResource
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
-from pllm.execution.state_feed import FeedRecord, select_publications
+from pllm.execution.state_feed import FeedEvent, FeedRecord, select_publications
 from test.backend_facts import backend_facts
 
 Source = Annotated[torch.Tensor, pllm.Parameter("source", "value")]
@@ -121,18 +121,18 @@ def test_conditional_input_allows_local_reads_but_rejects_an_extra_writer():
 def test_selection_preserves_explicit_missing_and_end_barriers(order, expected):
     queue = deque(
         [
-            *(FeedRecord("publish", index) for index in (1, 2, 3)),
-            FeedRecord("missing"),
-            FeedRecord("publish", 4),
-            FeedRecord("end"),
+            *(FeedRecord(FeedEvent.PUBLISH, index) for index in (1, 2, 3)),
+            FeedRecord(FeedEvent.MISSING),
+            FeedRecord(FeedEvent.PUBLISH, 4),
+            FeedRecord(FeedEvent.END),
         ]
     )
     assert tuple(record.slot for record in select_publications(queue, order)) == expected
-    while queue[0].kind == "publish":
+    while queue[0].kind is FeedEvent.PUBLISH:
         select_publications(queue, order)
-    assert select_publications(queue, order) == (FeedRecord("missing"),)
-    assert select_publications(queue, order) == (FeedRecord("publish", 4),)
-    assert select_publications(queue, order) == (FeedRecord("end"),)
+    assert select_publications(queue, order) == (FeedRecord(FeedEvent.MISSING),)
+    assert select_publications(queue, order) == (FeedRecord(FeedEvent.PUBLISH, 4),)
+    assert select_publications(queue, order) == (FeedRecord(FeedEvent.END),)
 
 
 def test_feed_rejects_local_writers_and_request_scopes():

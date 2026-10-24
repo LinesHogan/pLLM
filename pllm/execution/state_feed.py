@@ -7,6 +7,7 @@ import os
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from multiprocessing import get_context
 from multiprocessing.connection import Connection, wait
 from multiprocessing.resource_sharer import DupFd
@@ -29,11 +30,20 @@ if TYPE_CHECKING:
 Channels = tuple[tuple[Connection, ...], ...]
 
 
+class FeedEvent(StrEnum):
+    """What one control record tells the consumer."""
+
+    PUBLISH = "publish"
+    MISSING = "missing"
+    END = "end"
+    CANCEL = "cancel"
+
+
 @dataclass(frozen=True)
 class FeedRecord:
     """One complete root or explicit producer lifecycle event."""
 
-    kind: str
+    kind: FeedEvent
     slot: int = -1
     ref: StateRef | None = None
 
@@ -41,17 +51,20 @@ class FeedRecord:
 def select_publications(records: deque[FeedRecord], order: FeedOrder) -> tuple[FeedRecord, ...]:
     """Select a bounded prefix; missing/end remain barriers in either order."""
     selected = [records.popleft()]
-    if order is FeedOrder.LATEST and selected[0].kind == "publish":
-        while records and records[0].kind == "publish":
+    if order is FeedOrder.LATEST and selected[0].kind is FeedEvent.PUBLISH:
+        while records and records[0].kind is FeedEvent.PUBLISH:
             selected.append(records.popleft())
     return tuple(selected)
+
+
+_PIDFD_OPEN = 434  # x86-64 Linux syscall number
 
 
 def _process_exit(pid: int) -> Connection:
     # The bundled Python/libc omit pidfd_open; Linux still provides the lifetime fence.
     libc = ctypes.CDLL(None, use_errno=True)
     libc.syscall.restype = ctypes.c_long
-    descriptor = int(libc.syscall(ctypes.c_long(434), ctypes.c_int(pid), ctypes.c_uint(0)))
+    descriptor = int(libc.syscall(ctypes.c_long(_PIDFD_OPEN), ctypes.c_int(pid), ctypes.c_uint(0)))
     if descriptor < 0:
         raise OSError(ctypes.get_errno(), "state feeds need Linux process-exit descriptors")
     return Connection(descriptor)
@@ -208,7 +221,7 @@ class Feed:
             finally:
                 self._pending[slot] = arena.release_pin(pin)
             stream.synchronize()  # Returning transfers no source-tensor lifetime obligation to the caller.
-            self._send(FeedRecord("publish", slot, self._current))
+            self._send(FeedRecord(FeedEvent.PUBLISH, slot, self._current))
         except BaseException:
             self._failed = True
             raise
@@ -217,7 +230,7 @@ class Feed:
         """Submit one explicit absent-input step using the Activation missing policy."""
         self._require_live()
         try:
-            self._send(FeedRecord("missing"))
+            self._send(FeedRecord(FeedEvent.MISSING))
         except BaseException:
             self._failed = True
             raise
@@ -228,7 +241,7 @@ class Feed:
             return
         self._require_live()
         try:
-            self._send(FeedRecord("end"))
+            self._send(FeedRecord(FeedEvent.END))
             self._ended = True
         except BaseException:
             self._failed = True
@@ -250,7 +263,7 @@ class Feed:
             return
         try:
             if not self._ended or self._failed:
-                self._control.send_bytes(encode_boundary(FeedRecord("cancel")).encode())
+                self._control.send_bytes(encode_boundary(FeedRecord(FeedEvent.CANCEL)).encode())
                 self._await_shutdown()
             else:
                 for slot in tuple(self._pending):
@@ -267,7 +280,7 @@ class Feed:
         except (EOFError, OSError, RuntimeError):
             self._failed = True
             try:
-                self._control.send_bytes(encode_boundary(FeedRecord("cancel")).encode())
+                self._control.send_bytes(encode_boundary(FeedRecord(FeedEvent.CANCEL)).encode())
             except (EOFError, OSError):
                 pass
             self._await_shutdown()
@@ -307,9 +320,13 @@ class FeedReceiver:
     def _snapshot(self) -> None:
         if not self.records:
             self.records.append(decode_boundary(self.control.recv_bytes().decode(), FeedRecord))
-        while len(self.records) <= len(self.channels) and self.records[-1].kind != "end" and self.control.poll():
+        while (
+            len(self.records) <= len(self.channels)
+            and self.records[-1].kind is not FeedEvent.END
+            and self.control.poll()
+        ):
             self.records.append(decode_boundary(self.control.recv_bytes().decode(), FeedRecord))
-        if any(record.kind not in ("publish", "missing", "end") for record in self.records):
+        if any(record.kind is FeedEvent.CANCEL for record in self.records):
             raise RuntimeError("feed producer cancelled or sent an invalid record")
 
     def _receive(self, record: FeedRecord, stream: torch.cuda.Stream) -> BorrowedStateRoot:
@@ -338,11 +355,11 @@ class FeedReceiver:
                 self._receive(record, stream).close()
                 self.control.send_bytes(b"credit")
             record = selected[-1]
-            if record.kind == "publish":
+            if record.kind is FeedEvent.PUBLISH:
                 result = ReadonlyStepInput(rows.plan_epoch, rows.step_id, (self._receive(record, stream),))
-            elif record.kind == "missing":
+            elif record.kind is FeedEvent.MISSING:
                 result = ReadonlyStepAbsent(rows.plan_epoch, rows.step_id)
-            elif record.kind == "end":
+            elif record.kind is FeedEvent.END:
                 self.ended = True
                 result = ReadonlyStepEnd(rows.plan_epoch, rows.step_id)
             else:

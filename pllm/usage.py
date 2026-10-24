@@ -265,11 +265,6 @@ class InstanceState:
 
     def __post_init__(self) -> None:
         _reject(
-            self.feed is not None and type(self.feed) is not FeedOrder,
-            "feed needs FeedOrder.ORDERED or FeedOrder.LATEST",
-            TypeError,
-        )
-        _reject(
             self.feed is not None
             and (
                 self.scope is not StateScope.INSTANCE
