@@ -39,6 +39,7 @@ from pllm.contracts.semantic_graph import (
     ValueResourceFact,
 )
 from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
+from pllm.execution.binding_base import Buffer
 from pllm.execution.codec import boundary_digest
 from pllm.execution.declaration import Builder, Dimensions, Field, Shape, When, native
 from pllm.execution.freeze import fingerprint, freeze, owner_snapshot, owner_values
@@ -57,7 +58,6 @@ from pllm.execution.region_adamw import AdamWRegion
 from pllm.execution.replay import Recurrence
 from pllm.execution.shared_tensor import tensor_dtype
 from pllm.execution.state_execution import MathBinding, StateExecution
-from pllm.execution.tensor_binding import Buffer
 from pllm.execution.tensor_frame import Tensors
 from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots, TensorBatch, autograd_loss
 from pllm.kernels.adamw import AdamWConfig

@@ -56,6 +56,7 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorLayoutRequest
 from pllm.contracts.visibility import Exact as Exact, Visibility as Visibility
+from pllm.execution.binding_base import SGD as SGD, Buffer as Buffer
 from pllm.execution.codec import boundary_digest
 from pllm.execution.declaration import Call, Dimensions, Shape, State, When, native
 from pllm.execution.freeze import (
@@ -75,7 +76,7 @@ from pllm.execution.region_streams import plan_closed_window
 from pllm.execution.replay import Recurrence as Recurrence
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.task_memory import derive_resources
-from pllm.execution.tensor_binding import SGD as SGD, Buffer as Buffer, TensorBinding, TensorOutput as TensorOutput
+from pllm.execution.tensor_binding import TensorBinding, TensorOutput as TensorOutput
 from pllm.execution.tensor_frame import TensorFrame, TensorPort, Tensors, TensorUpdate as TensorUpdate
 from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots, TensorComputation
 from pllm.kernels.adamw import AdamWConfig

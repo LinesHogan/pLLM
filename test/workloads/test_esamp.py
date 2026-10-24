@@ -25,7 +25,7 @@ from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import AnchorId, TaskSymbol
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.visibility import VisibilitySource
-from pllm.execution import tensor_binding
+from pllm.execution import row_task_binding
 from pllm.execution.backend_attachment import lower_backend_attachment
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.declaration import Call
@@ -376,7 +376,7 @@ def _ordinary_request_distillation() -> None:
 def test_sampler_adapts_step_results_in_memory_trace_and_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     """Fixed steps never re-enter prediction evaluation, including the meta resource trace."""
     evaluate = TensorTask.evaluate
-    adapt = tensor_binding.sampler_output
+    adapt = row_task_binding.sampler_output
     devices: list[str] = []
     calls: list[TaskSymbol] = []
 
@@ -399,7 +399,7 @@ def test_sampler_adapts_step_results_in_memory_trace_and_runtime(monkeypatch: py
         return result
 
     monkeypatch.setattr(TensorTask, "evaluate", dependency)
-    monkeypatch.setattr(tensor_binding, "sampler_output", output)
+    monkeypatch.setattr(row_task_binding, "sampler_output", output)
     workload = ESampRequestWorkload(ESampRequestConfig(rank=2, intervention_beta=0.2))
     facts = workload.specialize(facts_for(torch.device("cpu"), 4, 8), ExecutionOptions())
     assert "meta" in devices

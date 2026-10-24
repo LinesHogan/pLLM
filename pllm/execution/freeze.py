@@ -59,7 +59,7 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
         return str(value)
     if isinstance(value, Enum):
         return boundary_digest(type(value).__qualname__, fingerprint(value.value, seen))
-    from pllm.execution.tensor_binding import TensorUpdate
+    from pllm.execution.tensor_frame import TensorUpdate
 
     if value is TensorUpdate:
         return TensorUpdate.__qualname__
