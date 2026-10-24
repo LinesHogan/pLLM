@@ -870,10 +870,9 @@ pub(crate) fn validate_inputs(inputs: &AttachmentCompilerInputs) -> Result<(), S
             || !inputs.probe.capabilities.iter().any(|value| value == "backend/vllm_mrv2@1")
             || request.attachment_kind != AttachmentKind::ParameterOverlay
             || plan.semantic_graph.states.iter().any(|state| state.scope != StateScope::Request)
-            || plan.semantic_graph.tasks.iter().any(|task| task.replay.is_some()
-                || task.visibility.as_ref().is_some_and(|source| source.policy.kind != super::super::visibility::Kind::ForwardPinned))
+            || plan.semantic_graph.tasks.iter().any(|task| task.replay.is_some())
         {
-            return Err("Graph overlays need forward-pinned parameter reads without replay".into());
+            return Err("Graph overlays need request-owned parameter reads without replay".into());
         }
     }
     if !inputs.request.activation_bindings.is_empty()

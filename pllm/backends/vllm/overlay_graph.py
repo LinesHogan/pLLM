@@ -1,10 +1,12 @@
-"""Pinned projection integration for vLLM 0.27.1's deferred graph startup.
+"""Parameter projection integration for vLLM 0.27.1's deferred graph startup.
 
 Depends on GPUModelRunner.load_model/profile_run/capture_model, the capture call
 from Worker.compile_or_warm_up_model, Qwen2Model.do_not_compile,
 ModelCudaGraphManager construction, VllmConfig.compute_hash and
 aot_compile_hash_factors at the first deferred Qwen2Model call, and
 EagerAdaptor.compile for source FX bodies inside the upstream CUDA graph wrappers.
+Hybrid dispatch uses GPUModelRunner.update_requests and ModelCudaGraphManager.dispatch
+before prepare_inputs, and Qwen2Model.do_not_compile to bypass compiled training bodies.
 The upstream manager owns all capture/replay loops; PTTS owns every request version.
 """
 
@@ -16,11 +18,13 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode, VllmConfig
 from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM, Qwen2Model
 from vllm.platforms import current_platform
-from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor, ModelCudaGraphManager
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from pllm.authoring import BackendRequirements
 from pllm.backends.torch_inductor import InductorTensorCompiler
+from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay
 from pllm.config import ModelConfig, RunnerKind
 from pllm.contracts.backend_attachment import AttachmentGraphMode, SignedBackendAttachment
 from pllm.contracts.hidden_locator import HiddenPhase
@@ -89,6 +93,30 @@ def graph_mode(budget: int) -> AttachmentGraphMode:
     return AttachmentGraphMode.CUDA_GRAPH if budget > 0 else AttachmentGraphMode.EAGER
 
 
+class _HybridGraphManager(ModelCudaGraphManager):
+    """Keep upstream replay ownership; training batches use the unpadded source model."""
+
+    def __init__(
+        self,
+        config: VllmConfig,
+        device: torch.device,
+        mode: CUDAGraphMode,
+        decode_query_len: int,
+        phases: tuple[HiddenPhase, ...],
+    ) -> None:
+        super().__init__(config, device, mode, decode_query_len)
+        self.phases = phases
+        self.eager = False
+
+    def dispatch(
+        self, num_reqs: int, num_tokens: int, uniform_token_count: int | None, num_active_loras: int
+    ) -> BatchExecutionDescriptor:
+        """Use an unpadded source batch whenever an authored phase trains."""
+        if self.eager:
+            return BatchExecutionDescriptor(CUDAGraphMode.NONE, num_tokens, num_reqs)
+        return super().dispatch(num_reqs, num_tokens, uniform_token_count, num_active_loras)
+
+
 class OverlayGraphRunner(GPUModelRunner):
     """Defer first compilation/capture until the ordinary workload installation completes."""
 
@@ -109,7 +137,23 @@ class OverlayGraphRunner(GPUModelRunner):
             return 0
         return super().capture_model()
 
-    def finish_overlay_graphs(self, attachment: SignedBackendAttachment) -> None:
+    def update_requests(self, scheduler_output: SchedulerOutput) -> None:
+        """Choose placement from CPU counters after upstream request updates."""
+        super().update_requests(scheduler_output)
+        manager = self.cudagraph_manager
+        if isinstance(manager, _HybridGraphManager) and scheduler_output.num_scheduled_tokens:
+            indices = np.fromiter(
+                (self.req_states.req_id_to_index[key] for key in scheduler_output.num_scheduled_tokens), np.int64
+            )
+            prefill = self.req_states.num_computed_tokens_np[indices] < self.req_states.prefill_len.np[indices]
+            manager.eager = bool(
+                (HiddenPhase.PREFILL in manager.phases and prefill.any())
+                or (HiddenPhase.DECODE in manager.phases and (~prefill).any())
+            )
+            assert self.projection_model is not None
+            self.projection_model.do_not_compile = manager.eager
+
+    def finish_overlay_graphs(self, attachment: SignedBackendAttachment, phases: tuple[HiddenPhase, ...]) -> None:
         """Capture only the bound model; dummy tables have no request ownership or live destinations."""
         if self.projection_model is None:
             return
@@ -120,11 +164,13 @@ class OverlayGraphRunner(GPUModelRunner):
         }
         manager = self.cudagraph_manager
         assert manager is not None
-        self.cudagraph_manager = ModelCudaGraphManager(
-            self.vllm_config,
-            self.device,
-            manager.cudagraph_mode,
-            manager.decode_query_len,
+        self.cudagraph_manager = (
+            _HybridGraphManager(self.vllm_config, self.device, manager.cudagraph_mode, manager.decode_query_len, phases)
+            if any(
+                task.visibility is not None and task.visibility.in_forward
+                for task in attachment.inputs.plan.semantic_graph.tasks
+            )
+            else ModelCudaGraphManager(self.vllm_config, self.device, manager.cudagraph_mode, manager.decode_query_len)
         )
         self.projection_model.do_not_compile = False
         self.capture_model()
@@ -177,6 +223,7 @@ class _ProjectionReader:
         self.forward_base = self.module.forward
         self.mlp_base = None if self.mlp is None else self.mlp.forward
         self.binding, self.rows, self.requests = binding, rows, requests
+        self.enabled = True
         self.pools = [arena.field_pool(binding.resource, field) for field in binding.fields]
         self.table = torch.zeros(
             projection_blocks(rows, requests) * (ROWS_PER_BLOCK + len(binding.fields)) + rows,
@@ -227,13 +274,15 @@ class _ProjectionReader:
 
     def forward_mlp(self, value: torch.Tensor) -> torch.Tensor:
         assert self.mlp_base is not None
-        self.desired[: value.shape[0]].copy_(value)
+        if self.enabled:
+            self.desired[: value.shape[0]].copy_(value)
         return self.mlp_base(value)
 
     def forward(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.nn.Parameter | None]:
         base = self.forward_base(hidden)
         assert isinstance(base, tuple)
-        pinned_projection(hidden, self.pools, self.table, base[0], self.captured)
+        if self.enabled:
+            pinned_projection(hidden, self.pools, self.table, base[0], self.captured)
         return base
 
     def emit(
@@ -406,3 +455,76 @@ class PinnedParameterOverlay:
     def close(self) -> None:
         for reader in reversed(self.readers):
             reader.close()
+
+
+class HybridParameterOverlay:
+    """Exact training uses its eager driver; inactive batches read through the pinned op."""
+
+    def __init__(
+        self, pinned: PinnedParameterOverlay, exact: ExactParameterOverlay, phases: tuple[HiddenPhase, ...]
+    ) -> None:
+        self.pinned, self.exact, self.phases = pinned, exact, phases
+
+    @property
+    def apply_count(self) -> int:
+        return self.pinned.apply_count + self.exact.apply_count
+
+    @property
+    def updated_apply_count(self) -> int:
+        return self.pinned.updated_apply_count + self.exact.updated_apply_count
+
+    def reserve(self) -> None:
+        """Reserve bounded staging before the invocation issues GPU work."""
+        self.pinned.reserve()
+
+    def prepare(
+        self,
+        rows: PackedPhaseRowBatch,
+        context: StateTaskContext[DataT],
+        directory: RequestStateDirectory,
+        transition: ProjectionTransition | None = None,
+    ) -> None:
+        """Select the same eligibility used by dispatch from Rust-planned row facts."""
+        training = any(row.phase in self.phases for row in rows.rows)
+        for reader in self.pinned.readers:
+            reader.enabled = not training
+        if training:
+            self.exact.prepare(rows, context, directory, transition)
+        else:
+            self.pinned.prepare(rows, context, directory)
+
+    def take_captures(self) -> tuple[CapturedParameterOperand, ...]:
+        """Exact consumed training operands in forward; inactive reads produce no task operands."""
+        return self.exact.take_captures()
+
+    def clear(self) -> None:
+        """Release invocation views through their existing owners."""
+        self.exact.clear()
+        self.pinned.clear()
+
+    def close(self) -> None:
+        """Unwind the stable wrappers in reverse installation order."""
+        self.exact.close()
+        self.pinned.close()
+
+
+def parameter_overlay(
+    model: Qwen2ForCausalLM,
+    bindings: tuple[ParameterOverlayFieldBinding, ...],
+    arena: PageBundleArena,
+    rows: int,
+    requests: int,
+    budget: int,
+    policy: RegionSelectionPolicy,
+    phases: tuple[HiddenPhase, ...],
+    *,
+    in_forward: bool,
+    graphs: bool,
+) -> PinnedParameterOverlay | ExactParameterOverlay | HybridParameterOverlay:
+    """Install each projection wrapper once, before compiling or capturing the model."""
+    if in_forward and not graphs:
+        return ExactParameterOverlay(model, bindings)
+    pinned = PinnedParameterOverlay(
+        model, bindings, arena, rows, requests, budget, policy, phases=() if in_forward else phases
+    )
+    return HybridParameterOverlay(pinned, ExactParameterOverlay(model, bindings), phases) if in_forward else pinned

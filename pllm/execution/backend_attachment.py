@@ -8,6 +8,7 @@ from math import prod
 from pllm import _core
 from pllm.contracts.backend_attachment import (
     AttachmentCleanupStage,
+    AttachmentGraphMode,
     AttachmentKind,
     AttachmentTaskBinding,
     AttachmentTaskRole,
@@ -79,8 +80,9 @@ def attachment_buffer_bytes(
             rank, inputs = first
             outputs = fields[binding.fields[1]].shape[0]
             buffers += rows * (width * (inputs + rank + 2 * outputs) + 8)
-        if probe.causal_domain is not None and not any(
-            task.visibility is not None and task.visibility.in_forward for task in graph.tasks
+        if probe.causal_domain is not None and (
+            probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH
+            or not any(task.visibility is not None and task.visibility.in_forward for task in graph.tasks)
         ):
             blocks = projection_blocks(rows, probe.causal_domain.requests)
             buffers += 24 * (blocks * (ROWS_PER_BLOCK + len(binding.fields)) + rows)

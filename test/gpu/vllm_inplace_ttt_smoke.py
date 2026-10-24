@@ -170,7 +170,11 @@ def _check_cancelled_projection(handle):
     from pllm.contracts.request_identity import RequestIdentity
 
     execution = handle.deployment.execution
+    from pllm.backends.vllm.overlay_graph import HybridParameterOverlay
+
     overlay = handle.runner.require_session()._overlay
+    if isinstance(overlay, HybridParameterOverlay):
+        overlay = overlay.pinned
     reader = overlay.readers[0]
     identity = RequestIdentity("cancelled-projection", 41, 0)
     stream = torch.cuda.current_stream()
@@ -228,6 +232,45 @@ def _check_graph(handle):
     assert pointers == (reader.table.data_ptr(), reader.captured.data_ptr(), reader.pools[0].data_ptr())
     assert handle.diagnostics().update_count > 0 and handle.diagnostics().active_lineages == 0
     _check_cancelled_projection(handle)
+    return first
+
+
+def _check_hybrid(handle):
+    """Exact eligibility selects source execution; inactive decode never calls Python projections."""
+    from vllm.config import CUDAGraphMode
+
+    from pllm.backends.vllm.overlay_graph import HybridParameterOverlay, _ProjectionReader
+    from pllm.contracts.hidden_locator import HiddenPhase
+
+    overlay = handle.runner.require_session()._overlay
+    assert isinstance(overlay, HybridParameterOverlay)
+    manager = handle.runner.cudagraph_manager
+    dispatch = manager.dispatch
+    modes = []
+
+    def record(num_reqs, num_tokens, uniform_token_count, num_active_loras):
+        result = dispatch(num_reqs, num_tokens, uniform_token_count, num_active_loras)
+        modes.append((manager.eager, result.cg_mode))
+        return result
+
+    prompts = ["The sky is blue. " * 18, "Water is cold. " * 8]
+    with (
+        patch.object(manager, "dispatch", record),
+        patch.object(_ProjectionReader, "emit", side_effect=AssertionError("warm hybrid called Python pinned reader")),
+    ):
+        first = texts(handle.generate(prompts, SAMPLING))
+        assert texts(handle.generate(list(reversed(prompts)), SAMPLING)) == first[::-1]
+        texts(handle.generate(["Hi"], SAMPLING))  # One-token prefill must also use Exact, even at C=0.
+    assert all(mode is CUDAGraphMode.NONE if training else mode is CUDAGraphMode.FULL for training, mode in modes)
+    assert any(training for training, _ in modes)
+    if HiddenPhase.DECODE in overlay.phases:
+        assert all(training for training, _ in modes)
+    else:
+        assert any(not training for training, _ in modes)
+        _check_cancelled_projection(handle)
+    diagnostics = handle.diagnostics()
+    assert diagnostics.update_count > 0 and diagnostics.active_lineages == diagnostics.pending_state_releases == 0
+    assert overlay.take_captures() == ()
     return first
 
 
@@ -386,13 +429,50 @@ def main() -> int:
             _check_graph,
         ),
         (
+            "hybrid_head",
+            lambda: open_llm(
+                replace(headwise, config=replace(headwise.config, chunk_size=16)),
+                tokens=128,
+                model_length=128,
+                cuda_graphs=True,
+                capture_memory_bytes=512 << 20,
+                memory_budget_bytes=2 << 30,
+            ),
+            _check_hybrid,
+        ),
+        (
+            "hybrid_decode_training",
+            lambda: open_llm(
+                replace(headwise, config=replace(headwise.config, chunk_size=16, update_decode=True)),
+                tokens=128,
+                model_length=128,
+                cuda_graphs=True,
+                capture_memory_bytes=512 << 20,
+                memory_budget_bytes=2 << 30,
+            ),
+            _check_hybrid,
+        ),
+        (
+            "hybrid_dense",
+            lambda: open_llm(
+                replace(dense, config=replace(dense.config, visibility=pllm.Exact())),
+                tokens=128,
+                model_length=128,
+                cuda_graphs=True,
+                capture_memory_bytes=512 << 20,
+                memory_budget_bytes=2 << 30,
+            ),
+            _check_hybrid,
+        ),
+        # The process-wide pool retains the larger hybrid captures above.
+        (
             "graph_low_rank",
             lambda: open_llm(
                 RequestLowRankTTT(),
                 tokens=128,
                 model_length=128,
                 cuda_graphs=True,
-                capture_memory_bytes=256 << 20,
+                capture_memory_bytes=512 << 20,
                 memory_budget_bytes=1 << 30,
             ),
             _check_graph,
@@ -402,7 +482,7 @@ def main() -> int:
         (
             "graph_imported",
             lambda: open_llm(
-                ImportedLowRank(), cuda_graphs=True, capture_memory_bytes=256 << 20, memory_budget_bytes=1 << 30
+                ImportedLowRank(), cuda_graphs=True, capture_memory_bytes=512 << 20, memory_budget_bytes=1 << 30
             ),
             _check_imported,
         ),

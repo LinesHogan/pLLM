@@ -49,14 +49,15 @@ from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.hidden_capture import HiddenTaps
 from pllm.backends.vllm.model_scan import ModelScanSource, VllmModelScan
 from pllm.backends.vllm.overlay_graph import (
+    HybridParameterOverlay,
     OverlayGraphRunner,
     PinnedParameterOverlay,
     graph_mode,
     graph_options,
+    parameter_overlay,
 )
 from pllm.backends.vllm.packed_rows import encode_mrv2_rows
 from pllm.backends.vllm.parameter_overlay import (
-    ExactParameterOverlay,
     inspect_parameter_targets,
     validate_projection_sources,
 )
@@ -222,6 +223,8 @@ class _RunnerSession(Protocol):
     def abort_tuning(self) -> None: ...
     @property
     def attachment(self) -> SignedBackendAttachment: ...
+    @property
+    def parameter_phases(self) -> tuple[HiddenPhase, ...]: ...
 
 
 @dataclass(slots=True)
@@ -330,9 +333,7 @@ class VllmSession(Generic[DataT, ResultT]):
         if self._in_forward_overlay or probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH:
             validate_projection_sources(model, tuple(binding.target for binding in overlay_bindings))
         self._overlay = (
-            ExactParameterOverlay(model, overlay_bindings)
-            if self._in_forward_overlay
-            else PinnedParameterOverlay(
+            parameter_overlay(
                 model,
                 overlay_bindings,
                 deployment.execution.arena,
@@ -341,6 +342,8 @@ class VllmSession(Generic[DataT, ResultT]):
                 buffers,
                 plan.timeline.region_policy,
                 phases=deployment.execution.math.parameter_phases,
+                in_forward=self._in_forward_overlay,
+                graphs=probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH,
             )
             if overlay_bindings and not model_scan
             else None
@@ -416,6 +419,11 @@ class VllmSession(Generic[DataT, ResultT]):
         )
         if execution.directory.scope is StateScope.INSTANCE:
             execution.admit((), torch.cuda.current_stream(execution.device))
+
+    @property
+    def parameter_phases(self) -> tuple[HiddenPhase, ...]:
+        """Authored update phases used by hybrid model dispatch."""
+        return self._deployment.execution.math.parameter_phases
 
     def stage_input(self, batch: AuxiliaryInput[torch.Tensor] | None, identities: tuple[RequestIdentity, ...]) -> None:
         self._require_input_live()
@@ -631,7 +639,7 @@ class VllmSession(Generic[DataT, ResultT]):
         adapter = self._overlay
         if adapter is None and self._activation is None:
             return
-        if isinstance(adapter, PinnedParameterOverlay):
+        if isinstance(adapter, (PinnedParameterOverlay, HybridParameterOverlay)):
             adapter.reserve()
         execution = self._deployment.execution
         identities = tuple(
@@ -1055,7 +1063,7 @@ class WorkloadModelRunner(Runner[Sampler | None], OverlayGraphRunner):
         self._install_hidden_taps()
 
     def _finish_model_binding(self) -> None:
-        self.finish_overlay_graphs(self.require_session().attachment)
+        self.finish_overlay_graphs(self.require_session().attachment, self.require_session().parameter_phases)
 
     def _make_sampler(self, upstream: Sampler | None) -> Sampler:
         if upstream is None:

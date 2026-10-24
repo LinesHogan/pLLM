@@ -200,8 +200,8 @@ def _dummy_export() -> None:
         handle.close()
 
 
-def _pinned_graph_overlay() -> None:
-    """Bind and replay a multi-target pinned overlay without initializing driver CUDA."""
+def _graph_overlay(*, exact: bool = False) -> None:
+    """Bind multi-target pinned/hybrid overlays without initializing driver CUDA."""
     from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
 
     assert not torch.cuda.is_initialized()
@@ -209,7 +209,9 @@ def _pinned_graph_overlay() -> None:
         pllm.ParameterTarget(layer, pllm.ParameterModuleKind.ATTENTION, pllm.ParameterRole.QUERY_PROJECTION_WEIGHT)
         for layer in (0, 2)
     )
-    workload = GatedDeltaWorkload(GatedDeltaConfig(targets, chunk_size=4, visibility=pllm.Visibility.forward_pinned()))
+    workload = GatedDeltaWorkload(
+        GatedDeltaConfig(targets, chunk_size=4, visibility=pllm.Exact() if exact else pllm.Visibility.forward_pinned())
+    )
     options = ExecutionOptions(
         capture_memory_bytes=512 << 20, memory_budget_bytes=2 << 30, allow_numerical_transforms=False
     )
@@ -222,7 +224,7 @@ def _pinned_graph_overlay() -> None:
         assert state.process_id != os.getpid() and state.diagnostics.update_count > 0
         assert_clean(state.diagnostics)
         assert not torch.cuda.is_initialized()
-    print("Pinned multi-target source graphs: EngineCore replay; parent CUDA=off")
+    print(f"Multi-target source graphs: exact={exact}; EngineCore replay; parent CUDA=off")
 
 
 def _captured_esamp(runner: RunnerKind = RunnerKind.MRV2) -> None:
@@ -555,14 +557,16 @@ def main() -> int:
     _dummy_export()
     _user_reference_workload()
     _model_scan_reconstruction()
-    _pinned_graph_overlay()
+    _graph_overlay()
+    _graph_overlay(exact=True)
     _gpu_shared_input()
     return 0
 
 
 MODES = {
     "--captured-only": _captured_esamp,
-    "--pinned-graph-only": _pinned_graph_overlay,
+    "--pinned-graph-only": _graph_overlay,
+    "--hybrid-graph-only": lambda: _graph_overlay(exact=True),
     "--mrv1-captured": lambda: _captured_esamp(RunnerKind.MRV1),
     "--gpu-io-only": _gpu_shared_input,
     "--lora-only": lambda: (_output_lora_shared_input(), _independent_lora_input()),
