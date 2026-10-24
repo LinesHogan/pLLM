@@ -20,12 +20,18 @@ from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSi
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding, PackedHiddenSnapshot, PackedHiddenSnapshotBatch
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
+from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import AnchorId
 from pllm.contracts.state_representation import StateDeviceKind
+from pllm.execution import tensor_binding
 from pllm.execution.cuda_stream import CudaStreamReadiness
+from pllm.execution.declaration import Call
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.tensor_frame import TensorFrame, TensorPort
+from pllm.execution.tensor_program import TaskOutput, TensorBatch
+from pllm.execution.tensor_task import TensorTask
 from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
 from test.backend_facts import backend_facts
 
@@ -326,3 +332,48 @@ def _ordinary_request_distillation() -> None:
         diagnostics = execution.diagnostics()
         assert diagnostics.loss_count == diagnostics.update_count == 4 and diagnostics.trained_rows == 6
         assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
+
+
+def test_sampler_adapts_step_results_in_memory_trace_and_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fixed steps never re-enter prediction evaluation, including the meta resource trace."""
+    evaluate = TensorTask.evaluate
+    adapt = tensor_binding.sampler_output
+    devices: list[str] = []
+
+    def dependency(task: TensorTask, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
+        assert task.symbol != "predict", "prediction body re-entered after the fixed step"
+        return evaluate(task, data, batch)
+
+    def output(
+        prediction: Call,
+        width: int,
+        stage: SamplerStage,
+        beta: float,
+        mask: TensorPort | None,
+        data: TensorFrame,
+        batch: TensorBatch,
+    ) -> TaskOutput:
+        result = adapt(prediction, width, stage, beta, mask, data, batch)
+        assert result.guidance is not None
+        devices.append(result.guidance.values.device.type)
+        return result
+
+    monkeypatch.setattr(TensorTask, "evaluate", dependency)
+    monkeypatch.setattr(tensor_binding, "sampler_output", output)
+    workload = ESampRequestWorkload(ESampRequestConfig(rank=2, intervention_beta=0.2))
+    facts = workload.specialize(facts_for(torch.device("cpu"), 4, 8), ExecutionOptions())
+    assert "meta" in devices
+    execution = workload.compile_backend(facts).execution
+    identities = (RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0))
+    latest = execution.admit(identities)
+    source = torch.linspace(-0.3, 0.7, 8).reshape(2, 4)
+    devices.clear()
+    for step in range(2):
+        expected = reference(source, torch.stack([execution.snapshot(ref)[0] for ref in latest]))
+        result = execution.step(step_input(identities, source, source.flip(1), step, (1, 0)))
+        latest = result.publication.after_refs
+        assert result.guidance.affected_row_ids == (0, 1)
+        torch.testing.assert_close(result.guidance.row_weights, torch.full((2,), float(step)))
+        torch.testing.assert_close(result.guidance.values, expected.flip(0) if step else torch.zeros_like(expected))
+    assert devices == ["cpu", "cpu"]
+    execution.retire(identities)

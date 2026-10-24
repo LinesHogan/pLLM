@@ -141,8 +141,6 @@ class TensorTask:
 
     def evaluate(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
         """Run a forward method and store its result for later tasks and the invocation output."""
-        if self.symbol in batch.completed:
-            return TaskOutput()
         differentiable = self.differentiable
         with torch.set_grad_enabled(differentiable):
             # Pure predictions run on every row and mask the result; differentiable forwards still

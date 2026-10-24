@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Generic, Literal, Protocol, TypeVar
 
 import torch
@@ -62,7 +62,6 @@ class TensorBatch:
     )
     borrowed_roots: tuple[BorrowedStateRoot, ...] = ()
     local_pin: PagePin | None = None
-    completed: frozenset[TaskSymbol] = frozenset()
 
     def parameter_root(self, resource: str) -> tuple[torch.Tensor, ...]:
         # No borrowed state: preserve the original sole-root reader (existing workload suite).
@@ -308,18 +307,17 @@ class MemoryOperation(Protocol[MemoryDataT]):
 
 
 class TensorStep(Protocol[D]):
-    @property
-    def symbol(self) -> TaskSymbol: ...
-    @property
-    def training(self) -> bool: ...
+    """A tensor body with fixed-shape preparation for runtime and memory tracing."""
+
     def execute(self, context: StateTaskContext[D], batch: TensorBatch) -> TaskOutput: ...
-    def memory(
-        self, data: D, batch: TensorBatch, continuation: Callable[[D, TensorBatch], TaskOutput]
-    ) -> MemoryUsage: ...
+    def prepare_memory(self, data: D, batch: TensorBatch) -> None: ...
+    def run(self, data: D, batch: TensorBatch) -> TaskOutput: ...
 
 
 @dataclass(frozen=True, slots=True)
 class TensorOperation(Generic[D]):
+    """Run one mathematical body, then adapt its result and settle declared effects."""
+
     implementation_id: ImplementationId
     function: Callable[[D, TensorBatch], TaskOutput]
     mode: Literal["read", "transition", "update", "gradient"] = "read"
@@ -329,6 +327,8 @@ class TensorOperation(Generic[D]):
     version: Literal["input", "private", "published"] = "input"
     copy_fields: tuple[LayoutFieldId, ...] | None = None
     step: TensorStep[D] | None = None
+    prepare: Callable[[D], D | None] | None = None
+    output: Callable[[D, TensorBatch], TaskOutput] | None = None
 
     def input_shapes(
         self, rows: int, hidden: int, training_shapes: tuple[tuple[int, ...], ...]
@@ -340,20 +340,28 @@ class TensorOperation(Generic[D]):
 
     def memory(self, data: D, batch: TensorBatch) -> MemoryUsage:
         """Execute this operation's tensor path, excluding the already-funded pages."""
-        if self.step is not None:
-            return self.step.memory(data, batch, self.function)
 
         def run() -> TaskOutput:
-            output = self.function(data, batch)
+            inputs = data if self.prepare is None else self.prepare(data)
+            if inputs is None:
+                return TaskOutput()
+            if self.step is None:
+                output = self.function(inputs, batch)
+            else:
+                self.step.prepare_memory(inputs, batch)
+                output = self.step.run(inputs, batch)
             if self.optimizer is not None and output.gradients:
                 self.optimizer.update(batch.roots, batch.field_slots, output.gradients)
-            return output
+            return output if self.output is None else self.output(inputs, batch)
 
         return measure(run)
 
     def execute(self, context: StateTaskContext[D]) -> None:
         data, stream = context.data(), context.pin.stream
         with nullcontext() if stream is None else torch.cuda.stream(stream), torch.inference_mode(False):
+            data = data if self.prepare is None else self.prepare(data)
+            if data is None:
+                return
             batch = _read(context, self.version)
             selected = tuple(range(len(batch.roots))) if self.select is None else self.select(data, context.selection)
             if len(set(selected)) != len(selected) or any(i < 0 or i >= len(batch.roots) for i in selected):
@@ -368,8 +376,8 @@ class TensorOperation(Generic[D]):
                 output = self.function(data, batch)
             else:
                 output = self.step.execute(context, batch)
-                if not self.step.training:
-                    output = self.function(data, replace(batch, completed=frozenset((self.step.symbol,))))
+            if self.output is not None:
+                output = self.output(data, batch)
             if output.gradient_indices:
                 if (
                     not output.gradients

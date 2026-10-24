@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import gc
 import math
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field as dataclass_field, replace
 from typing import TypeVar
 
@@ -20,7 +20,6 @@ from pllm.contracts.semantic_graph import TaskResourceFact, TaskSymbol
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.codec import cuda_graph_pool_bytes
 from pllm.execution.cuda_stream import PinnedStaging
-from pllm.execution.memory import MemoryUsage, measure
 from pllm.execution.state_execution import StateTaskContext
 from pllm.execution.tensor_frame import FieldRoots, ParameterGradients, RowIndex, TensorFrame, training_observations
 from pllm.execution.tensor_program import PoolAdamW, TaskOutput, TensorBatch
@@ -109,29 +108,11 @@ class StepCapture:
     stream: torch.cuda.Stream | None = None
     staging: PinnedStaging = dataclass_field(default_factory=PinnedStaging)
 
-    @property
-    def symbol(self) -> TaskSymbol:
-        return self.task.symbol
-
-    @property
-    def training(self) -> bool:
-        return self.optimizer is not None
-
-    def memory(
-        self, data: TensorFrame, batch: TensorBatch, continuation: Callable[[TensorFrame, TensorBatch], TaskOutput]
-    ) -> MemoryUsage:
-        """Run the step body and output path on borrowed meta operands."""
+    def prepare_memory(self, data: TensorFrame, batch: TensorBatch) -> None:
+        """Prepare meta operands for the operation's shared body and output trace."""
         self._inputs(data, batch)
         self.updated = tuple(range(len(batch.roots)))
-
-        def run() -> TaskOutput:
-            self.table = torch.empty(self.layout.size, device="meta", dtype=torch.long)
-            output = self.run(data, batch)
-            return (
-                continuation(data, replace(batch, completed=frozenset((self.symbol,)))) if not self.training else output
-            )
-
-        return measure(run)
+        self.table = torch.empty(self.layout.size, device="meta", dtype=torch.long)
 
     def __post_init__(self) -> None:
         dependencies = self.task.dependencies(self.tasks)

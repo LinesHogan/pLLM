@@ -7,6 +7,7 @@ signed declarations, chained results, values frozen at compile time and frozen s
 
 from dataclasses import replace
 from typing import Annotated
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -25,6 +26,7 @@ from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.host_runtime import HostRuntimeFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.tensor_task import TensorTask
 from pllm.execution.trace import ExecutionTrace, TracePhase, TraceSelection, TraceSnapshot
 from pllm.workloads.dummy import DummyConfig, DummyWorkload
 from test.backend_facts import assert_finite_resources, backend_facts
@@ -60,15 +62,21 @@ def test_dummy_runs_graph_sign_plan_execute() -> None:
     expected = hidden[1:3, :3].clone()
     value = lambda step: step_input(step, hidden)
     # Every second step exports the decode rows, bounded to 2 x 3, as an owned copy.
-    assert execution.step(value(1)) is None
-    exported = execution.step(value(2))
+    with patch.object(TensorTask, "read", autospec=True, side_effect=TensorTask.read) as reads:
+        assert execution.step(value(1)) is None
+        assert execution.step(step_input(2, hidden, count=1)) is None
+        reads.assert_not_called()
+        exported = execution.step(value(2))
+        reads.assert_called_once()
     hidden.fill_(-1)
     torch.testing.assert_close(exported, expected)
     hidden.copy_(torch.arange(15, dtype=torch.float32).reshape(3, 5))
     variant = make_llm(CPU, workload=centered_hidden(workload.config))
     torch.testing.assert_close(variant.step(value(2)), expected - expected.mean(dim=-1, keepdim=True))
     disabled = DummyWorkload(replace(workload.config, enabled=False)).compile_host(CPU)
-    assert disabled.step(value(2)) is None
+    with patch.object(TensorTask, "read", autospec=True, side_effect=TensorTask.read) as reads:
+        assert disabled.step(value(2)) is None
+        reads.assert_not_called()
 
     snapshot = execution.trace.snapshot()
     assert decode_boundary(encode_boundary(snapshot), TraceSnapshot) == snapshot

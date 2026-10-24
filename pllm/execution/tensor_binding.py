@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
+from functools import partial
 from math import isfinite, prod
 from typing import TYPE_CHECKING
 
@@ -265,6 +266,58 @@ def weighted_training_output(
         update_count=len(data.selected),
         trained_rows=data.trained_rows,
         changed=data.selected,
+        observations=observations,
+    )
+
+
+def sampler_output(
+    prediction: Call,
+    width: int,
+    stage: SamplerStage,
+    beta: float,
+    mask: TensorPort | None,
+    data: TensorFrame,
+    batch: TensorBatch,
+) -> TaskOutput:
+    """Adapt a computed prediction to sampler rows without executing its mathematics."""
+    result = batch.results[prediction.symbol, prediction.outputs[0]]
+    if result.shape != (len(data.rows), width):
+        raise ValueError("sampler output differs from its signed row and feature dimensions")
+    local = {row.packed_row_index: index for index, row in enumerate(data.rows)}
+    links = tuple(link for link in data.step.sampler_rows.links if link.packed_row_index in local)
+    weights = None
+    if stage is SamplerStage.PACKED_POST_FILTER_EXACT:
+        positions = tuple(local[link.packed_row_index] for link in links)
+        result = take_rows(result, positions)
+        # Unselected rows keep weight 0, so the sampler leaves their logits unchanged;
+        # selecting rows on the host would need a device-to-host read.
+        if mask is not None:
+            weights = take_rows(mask.read(data, batch), positions).to(result.dtype)
+    observations = (
+        tuple(
+            Observation(
+                "guidance",
+                result[index],
+                data.step.rows.rows[link.packed_row_index],
+                batch.selection.refs[0]
+                if batch.selection.keys == (None,)
+                else batch.selection.ref_for(data.step.rows.rows[link.packed_row_index].identity),
+                data.step.rows.step_id,
+            )
+            for index, link in enumerate(links)
+        )
+        if batch.observing
+        else ()
+    )
+    return TaskOutput(
+        guidance=PackedSamplerGuidanceBatch(
+            data.step.sampler_rows,
+            result.detach(),
+            tuple(link.sampler_row_index for link in links),
+            beta,
+            stage=stage,
+            row_weights=weights,
+        ),
         observations=observations,
     )
 
@@ -1353,50 +1406,9 @@ class TensorBinding(Builder[TensorFrame]):
                 else self.dimensions.vocab_size
             )
 
-            def execute(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
-                operation.function(data, batch)
-                result = batch.results[prediction.symbol, prediction.outputs[0]]
-                if result.shape != (len(data.rows), width):
-                    raise ValueError("sampler output differs from its signed row and feature dimensions")
-                local = {row.packed_row_index: index for index, row in enumerate(data.rows)}
-                links = tuple(link for link in data.step.sampler_rows.links if link.packed_row_index in local)
-                weights = None
-                if stage is SamplerStage.PACKED_POST_FILTER_EXACT:
-                    positions = tuple(local[link.packed_row_index] for link in links)
-                    result = take_rows(result, positions)
-                    # Unselected rows keep weight 0, so the sampler leaves their logits unchanged;
-                    # selecting rows on the host would need a device-to-host read.
-                    if mask is not None:
-                        weights = take_rows(mask.read(data, batch), positions).to(result.dtype)
-                observations = (
-                    tuple(
-                        Observation(
-                            "guidance",
-                            result[index],
-                            data.step.rows.rows[link.packed_row_index],
-                            batch.selection.refs[0]
-                            if batch.selection.keys == (None,)
-                            else batch.selection.ref_for(data.step.rows.rows[link.packed_row_index].identity),
-                            data.step.rows.step_id,
-                        )
-                        for index, link in enumerate(links)
-                    )
-                    if batch.observing
-                    else ()
-                )
-                return TaskOutput(
-                    guidance=PackedSamplerGuidanceBatch(
-                        data.step.sampler_rows,
-                        result.detach(),
-                        tuple(link.sampler_row_index for link in links),
-                        beta,
-                        stage=stage,
-                        row_weights=weights,
-                    ),
-                    observations=observations,
-                )
-
-            self.operations[prediction.symbol] = replace(operation, function=execute)
+            self.operations[prediction.symbol] = replace(
+                operation, output=partial(sampler_output, prediction, width, stage, beta, mask)
+            )
         self.sampler(prediction, training, state, output=prediction.outputs[0], stage=stage)
 
     def export(
@@ -1408,11 +1420,12 @@ class TensorBinding(Builder[TensorFrame]):
         if self.dimensions is not None:
             operation = self.operations[call.symbol]
 
-            def execute(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
-                if data.step.rows.step_id % every or not data.rows:
-                    return TaskOutput()
-                selected = replace(data, rows=data.rows[:max_rows], columns=max_cols)
-                operation.function(selected, batch)
+            def prepare(data: TensorFrame) -> TensorFrame | None:
+                if not enabled or data.step.rows.step_id % every or not data.rows:
+                    return None
+                return replace(data, rows=data.rows[:max_rows], columns=max_cols)
+
+            def output(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
                 value = export_tensor(batch.results[call.symbol, call.outputs[0]][:max_rows, :max_cols])
                 batch.results[call.symbol, call.outputs[0]] = value
                 return TaskOutput(
@@ -1421,18 +1434,13 @@ class TensorBinding(Builder[TensorFrame]):
                             name,
                             value,
                             step_id=data.step.rows.step_id,
-                            identities=tuple(row.identity for row in selected.rows),
+                            identities=tuple(row.identity for row in data.rows),
                             export=True,
                         ),
                     )
                 )
 
-            if not enabled:
-
-                def execute(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
-                    return TaskOutput()
-
-            self.operations[call.symbol] = replace(operation, function=execute)
+            self.operations[call.symbol] = replace(operation, prepare=prepare, output=output)
         self.graph = replace(
             self.graph,
             tasks=tuple(
