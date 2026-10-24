@@ -34,7 +34,7 @@ from pllm.execution.tensor_frame import TensorFrame
 from pllm.workloads.video import VideoWorkload
 
 if TYPE_CHECKING:
-    from pllm.backends.vllm.runtime import ReadonlyStepAbsent, ReadonlyStepEnd, ReadonlyStepInput
+    from pllm.backends.vllm.session import ReadonlyStepAbsent, ReadonlyStepEnd, ReadonlyStepInput
 
 Channels = tuple[tuple[Connection, ...], ...]
 
@@ -117,7 +117,7 @@ class _StepReceiver:
     def __call__(
         self, rows: PackedSamplerRowBatch, stream: torch.cuda.Stream
     ) -> "ReadonlyStepInput | ReadonlyStepAbsent | ReadonlyStepEnd":
-        from pllm.backends.vllm.runtime import ReadonlyStepAbsent, ReadonlyStepEnd, ReadonlyStepInput
+        from pllm.backends.vllm.session import ReadonlyStepAbsent, ReadonlyStepEnd, ReadonlyStepInput
 
         # The preceding step has settled before this next prepare boundary.
         self.report()

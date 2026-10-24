@@ -17,7 +17,7 @@ from vllm import SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
 
 import pllm
-from pllm.backends.vllm.runtime import WorkloadModelRunner
+from pllm.backends.vllm.runner import WorkloadModelRunner
 from pllm.backends.vllm.sampler import Vllm027Sampler
 from pllm.config import ModelConfig, VllmDType
 from pllm.execution.host_runtime import HostRuntimeFacts

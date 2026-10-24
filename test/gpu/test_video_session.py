@@ -217,7 +217,7 @@ def observed_worker(probe, start, close, control, channels, workload, config):
 
 
 def preempted_worker(probe, control, channels, workload, config):
-    from pllm.backends.vllm.runtime import VllmSession
+    from pllm.backends.vllm.session import VllmSession
 
     original = VllmSession.before_execute
 

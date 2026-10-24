@@ -10,12 +10,12 @@ from vllm.v1.worker.gpu_worker import Worker
 
 from pllm.authoring import BackendWorkload, DataT, ResultT, map_auxiliary
 from pllm.backends.vllm.mrv1 import Mrv1Runner
+from pllm.backends.vllm.runner import WorkloadModelRunner
 from pllm.backends.vllm.runtime import (
     BackendCommand,
     BackendInstall,
     BackendProbe,
     BackendStage,
-    WorkloadModelRunner,
     probe_backend,
 )
 from pllm.contracts.auxiliary import validate_auxiliary

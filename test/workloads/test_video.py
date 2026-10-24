@@ -177,7 +177,7 @@ class _Layer(torch.nn.Module):
 
 
 def _session(b, execution):
-    from pllm.backends.vllm.runtime import VllmSession
+    from pllm.backends.vllm.session import VllmSession
 
     plan = execution.arena.plan
     facts = backend_facts(2, (), plan.timeline, PageBundleProviderFacts("video.binding@1", 3))
@@ -231,7 +231,7 @@ def _step_rows(step, identities):
 
 
 def _decode_steps_keep_exact_publications_and_ack_order():
-    from pllm.backends.vllm.runtime import ReadonlyStepInput
+    from pllm.backends.vllm.session import ReadonlyStepInput
 
     identities = (RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0))
     # Only the stream adapter is replaced: all state tasks, pins and settlement are real CPU code.
@@ -280,7 +280,7 @@ def _decode_steps_keep_exact_publications_and_ack_order():
 
 
 def _hold_steps_reuse_the_settled_injection():
-    from pllm.backends.vllm.runtime import ReadonlyStepAbsent, ReadonlyStepEnd, ReadonlyStepInput
+    from pllm.backends.vllm.session import ReadonlyStepAbsent, ReadonlyStepEnd, ReadonlyStepInput
 
     identity = RequestIdentity("hold", 0, 0)
 

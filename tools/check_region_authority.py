@@ -79,6 +79,8 @@ AUTHORITY_FILES = (
     Path("pllm/execution/state_execution.py"),
     Path("pllm/authoring.py"),
     Path("pllm/backends/vllm/runtime.py"),
+    Path("pllm/backends/vllm/session.py"),
+    Path("pllm/backends/vllm/runner.py"),
     Path("pllm/execution/host_runtime.py"),
     Path("pllm/backends/vllm/sampler.py"),
 )

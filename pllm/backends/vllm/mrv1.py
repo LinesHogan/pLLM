@@ -13,7 +13,7 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from pllm.backends.vllm.packed_rows import encode_mrv1_rows
-from pllm.backends.vllm.runtime import Runner
+from pllm.backends.vllm.runner import Runner
 from pllm.backends.vllm.sampler import Mrv1Sampler
 from pllm.config import RunnerKind
 from pllm.contracts.backend_attachment import AttachmentTopology
