@@ -27,6 +27,7 @@ from pllm.execution.tensor_frame import (
     TensorPort,
     gradient_rows,
     row_index,
+    row_plan,
     select_rows,
     selected_rows,
     state_leaf,
@@ -204,8 +205,7 @@ class TensorTask:
                     0, data.index.states.device, loss * data.weights
                 ) / data.counts.clamp_min(1)
             else:
-                assert data.plan is not None
-                loss = state_means(loss, data.plan.select(rows))
+                loss = state_means(loss, row_plan(data, batch).select(rows))
             return loss, loss.sum()
         if loss.ndim == 1:
             loss = (

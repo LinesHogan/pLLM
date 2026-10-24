@@ -227,11 +227,17 @@ class RowIndex(NamedTuple):
         return RowIndex(*(column.select(rows) for column in self))
 
 
+def row_plan(data: "TensorFrame", batch: TensorBatch) -> RowPlan:
+    """The invocation's host row facts, built on first use; tasks without row inputs never need them."""
+    if data.plan is None:
+        data.plan = RowPlan.build(data, batch)
+    return data.plan
+
+
 def row_index(data: "TensorFrame", batch: TensorBatch, device: torch.device) -> RowIndex:
     """The invocation's row tables, built on first use."""
     if data.index is None:
-        plan = RowPlan.build(data, batch) if data.plan is None else data.plan
-        data.plan = plan
+        plan = row_plan(data, batch)
         data.index = RowIndex(
             *(CompactRows(value, rows) for value, rows in zip(upload(plan.columns, device), plan.columns, strict=True))
         )
@@ -245,8 +251,8 @@ def field_rows(data: "TensorFrame", batch: TensorBatch, field: int, start: int, 
     index = row_index(data, batch, pool.device)
     if data.fields:
         return index.states.take(view)
-    assert data.plan is not None
-    return take_rows(view, tuple(int(data.plan.sources[state, field]) for state in data.plan.states))
+    plan = row_plan(data, batch)
+    return take_rows(view, tuple(int(plan.sources[state, field]) for state in plan.states))
 
 
 class FieldRoots(Sequence[tuple[torch.Tensor, ...]]):

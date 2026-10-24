@@ -23,6 +23,7 @@ from pllm.execution.tensor_frame import (
     RowIndex,
     RowPlan,
     TensorFrame,
+    row_plan,
     selected_rows,
     state_leaf,
     training_observations,
@@ -226,13 +227,12 @@ class TensorExecutor:
         with torch.enable_grad():
             self.inputs, self.evaluated_rows = self.task.read(frame, operands, compact=self.strategy.compact)
             if self.strategy.compact:
-                assert data.plan is not None
                 selected = (
                     selected_rows(self.inputs[self.task.policy.update_states])
                     if self.task.policy.update_states in self.task.domains
                     else self.evaluated_rows
                 )
-                self.updated = tuple(sorted(data.plan.select(selected).last))
+                self.updated = tuple(sorted(row_plan(data, batch).select(selected).last))
             if self.evaluated_rows:
                 self.result, derivatives = self.task.differentiate(self.inputs, self.evaluated_rows, frame, operands)
                 self.result = self.result.detach()
@@ -266,12 +266,11 @@ class TensorExecutor:
     ) -> TaskOutput:
         """Prepare operands, run the shared body or graph, then settle invocation outputs."""
         addresses: tuple[int, ...] = ()
-        data.plan = RowPlan.build(data, batch)
         if not self.strategy.compact:
             if not data.rows:
                 return TaskOutput()
             addresses = self._inputs(data, batch)
-            plan = data.plan
+            plan = row_plan(data, batch)
             self.updated = tuple(sorted(plan.last)) if self.optimizer is not None else ()
             if context is not None and self.optimizer is not None:
                 context.write = context.arena.prepare_transition(
@@ -357,8 +356,7 @@ class TensorExecutor:
             )
         pending = tuple(gradients[index] for index in self.updated) if self.strategy.compact else ()
         positions = self.updated if self.strategy.compact else ()
-        assert data.plan is not None
-        plan = data.plan.select(rows)
+        plan = row_plan(data, batch).select(rows)
         last = plan.last
         writes = tuple(
             (
