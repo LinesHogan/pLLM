@@ -8,7 +8,7 @@ from typing import Literal
 class Visibility:
     """Choose which state a model read sees; use Exact or forward_pinned."""
 
-    kind: Literal["forward_pinned", "exact"]
+    kind: Literal["forward_pinned", "exact", "step_lag"]
 
     @staticmethod
     def forward_pinned() -> "Visibility":
@@ -30,11 +30,19 @@ class VisibilitySource:
     """
 
     policy: Visibility
-    scope: Literal["overlay", "model_scan"]
+    scope: Literal["overlay", "model_scan", "post_sampler"]
     equations_digest: str
     resources: tuple[str, ...]
     chunk_size: int
     tail: Literal["transition", "include", "carry"]
+    lag: int = 0
+
+    @staticmethod
+    def post_sampler(lag: int) -> "VisibilitySource":
+        """Declare the retained-input boundary for the optional serial writer lane."""
+        return VisibilitySource(
+            Visibility("step_lag"), "post_sampler", "retained-step-inputs@1", (), 0, "transition", lag
+        )
 
     @property
     def in_forward(self) -> bool:

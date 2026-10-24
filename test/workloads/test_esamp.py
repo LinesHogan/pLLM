@@ -24,11 +24,15 @@ from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import AnchorId, TaskSymbol
 from pllm.contracts.state_representation import StateDeviceKind
+from pllm.contracts.visibility import VisibilitySource
 from pllm.execution import tensor_binding
+from pllm.execution.backend_attachment import lower_backend_attachment
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.declaration import Call
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
+from pllm.execution.ptts.request_state import RequestStateDirectory
+from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.tensor_frame import CompactRows, RowIndex, RowPlan, TensorFrame, TensorPort, state_means
 from pllm.execution.tensor_program import TaskOutput, TensorBatch
@@ -115,6 +119,15 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(monkeypatc
     values = torch.arange(12).view(4, 3)
     assert index.select((1, 2)).packed.take(values).data_ptr() == values[1].data_ptr()
     assert index.select((2, 2)).packed.take(values).stride(0) == 0
+    refs = StateRefs(np.array([0, 0, 1]), np.array([1, 2, 3]), np.array([9, 5, 0]))
+    history = (
+        StateRefs(refs.layouts[:1], refs.lineages[:1], np.array([3])),
+        StateRefs(refs.layouts[:2], refs.lineages[:2], np.array([6, 5])),
+    )
+    for lag, expected in enumerate(([9, 5, 0], [6, 5, 0], [3, 5, 0])):
+        np.testing.assert_array_equal(
+            RequestStateDirectory._rewind(refs, history[-lag:] if lag else ()).versions, expected
+        )
     with pytest.raises(ValueError):
         ExecutionOptions(publish_lag=-1)
     with pytest.raises(ValueError):
@@ -216,7 +229,19 @@ def _esamp_native_oracle(device, normalized, captured):
     workload = ESampRequestWorkload(config)
     facts = facts_for(device, 8, 8, lineages=3, memory_bytes=100000)
     facts = workload.specialize(facts, ExecutionOptions(capture=captured, capture_memory_bytes=16 * 1024**2))
-    execution = workload.compile_backend(facts).execution
+    deployment = workload.compile_backend(facts)
+    execution = deployment.execution
+    plan = execution.arena.plan
+    assert plan.timeline.visibility == VisibilitySource.post_sampler(1)
+    assert deployment.attachment.physical.post_sampler == ("lagged" if stream is not None else "main")
+    if stream is not None and normalized and not captured:
+        for lag in (0, 1, 2):
+            attachment = workload.plan_backend(
+                replace(facts, timeline=replace(facts.timeline, visibility=VisibilitySource.post_sampler(lag)))
+            )
+            assert attachment.physical.post_sampler == ("lagged" if lag else "main")
+            with pytest.raises(ValueError):
+                lower_backend_attachment(attachment.inputs, replace(attachment.decision, post_sampler="writer"))
     identities = tuple(RequestIdentity(str(i), i, 0) for i in range(3))
     initial = execution.admit(identities, stream)
     held = execution.arena.pin_exact(initial, stream)

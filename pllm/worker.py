@@ -49,18 +49,17 @@ class GPUWorker(Worker):
             case _:
                 raise RuntimeError("canonical worker has not initialized its runner")
 
-    def _install(
-        self, workload: BackendWorkload[DataT, ResultT], attachment: SignedBackendAttachment, publish_lag: int
-    ) -> None:
+    def _install(self, workload: BackendWorkload[DataT, ResultT], attachment: SignedBackendAttachment) -> None:
         runner = self.workload_runner
+        visibility = attachment.inputs.plan.timeline.visibility
         facts = probe_backend(
             workload.backend_requirements(),
             runner,
             attachment.inputs.plan.timeline,
-            publish_lag=publish_lag,
+            publish_lag=0 if visibility is None else visibility.lag,
             source_workload=workload,
         )
-        runner.attach_workload(workload.bind_backend(facts, attachment), publish_lag)
+        runner.attach_workload(workload.bind_backend(facts, attachment))
 
     def workload_command(self, command: str, payload: str) -> str:
         runner = self.workload_runner
@@ -102,9 +101,7 @@ class GPUWorker(Worker):
                     authoring = decode_workload(install.definition, device=runner.device, seed=runner.model_config.seed)
                     if not isinstance(authoring, BackendWorkload):
                         raise ValueError("referenced workload is not a backend workload")
-                    self._install(
-                        cast(BackendWorkload[object, object], authoring), install.attachment, install.publish_lag
-                    )
+                    self._install(cast(BackendWorkload[object, object], authoring), install.attachment)
                     return encode_boundary(runner.worker_state())
                 case BackendCommand.STAGE:
                     stage = decode_boundary(payload, BackendStage)

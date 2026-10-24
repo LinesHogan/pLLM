@@ -298,6 +298,8 @@ pub(crate) struct Timeline {
     pub(crate) reserved_bytes: Vec<u64>,
     #[serde(default)]
     pub(crate) region_policy: super::region_selection::Policy,
+    #[serde(default)]
+    pub(super) visibility: Option<super::visibility::Source>,
 }
 
 pub(crate) fn decode_graph(payload: &str) -> Result<SemanticGraph, String> {
@@ -483,6 +485,7 @@ pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
     validate_input_groups(graph)?;
     for task in &graph.tasks {
         if let Some(visibility) = &task.visibility {
+            if visibility.scope == super::visibility::Scope::PostSampler { return Err("post-sampler visibility belongs to the timeline".into()); }
             super::visibility::validate(visibility)?;
             if visibility.resources.iter().any(|resource|
                 !task.effects.iter().any(|effect| &effect.resource == resource)) {
@@ -757,6 +760,10 @@ fn validate_input_groups(graph: &SemanticGraph) -> Result<(), String> {
 }
 
 pub(crate) fn validate_timeline(timeline: &Timeline) -> Result<(), String> {
+    if let Some(source) = &timeline.visibility {
+        if source.scope != super::visibility::Scope::PostSampler { return Err("timeline visibility needs a post-sampler domain".into()); }
+        super::visibility::validate(source)?;
+    }
     if timeline.schema_version != SCHEMA_VERSION {
         return Err(format!(
             "unsupported Timeline schema_version: {}",

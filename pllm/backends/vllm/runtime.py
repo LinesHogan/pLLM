@@ -82,7 +82,6 @@ from pllm.contracts.backend_attachment import (
     DecodeWindow,
     SignedBackendAttachment,
 )
-from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.feedback import (
     BarrierState,
     Completion,
@@ -105,7 +104,6 @@ from pllm.contracts.semantic_graph import (
     HiddenInputSource,
     SamplerFeedbackInputSource,
     SchedulerTimeline,
-    StateEffectKind,
     StateScope,
     TaskId,
     TokenwiseLayerReplay,
@@ -260,24 +258,6 @@ ReadonlyStepReceiver = Callable[
 ]
 
 
-def _post_sample_overlaps(plan: PlanBundle, sampler_anchor: AnchorId) -> bool:
-    """Whether post-sampler work can run on a side stream while readers see lagged versions.
-
-    Only a read-only, gradient-free prefix before the sampler can read a lagged version while
-    the post-sampler writer extends the latest one. Model mutations and borrowed activations
-    have their own strict admission and replay lifecycle and never qualify.
-    """
-    tasks = plan.schedule_physical.tasks
-    before = tuple(plan.semantic_graph.tasks[task.task_id] for task in tasks if task.anchor_id <= sampler_anchor)
-    return (
-        any(task.anchor_id > sampler_anchor for task in tasks)
-        and all(effect.kind is StateEffectKind.READ for task in before for effect in task.effects)
-        and all(
-            task.math is None or not (task.math.input_gradients or task.math.parameter_gradients) for task in before
-        )
-    )
-
-
 class VllmSession(Generic[DataT, ResultT]):
     """Model primitives over one original signed tensor-state invocation."""
 
@@ -288,7 +268,6 @@ class VllmSession(Generic[DataT, ResultT]):
         sampler: SamplerGuidance | None,
         max_sampler_rows: int,
         taps: HiddenTaps | None = None,
-        publish_lag: int = 1,
     ) -> None:
         attachment = deployment.attachment
         plan = attachment.inputs.plan
@@ -297,6 +276,7 @@ class VllmSession(Generic[DataT, ResultT]):
             for task in plan.semantic_graph.tasks
             for port in task.inputs
         )
+        visibility = plan.timeline.visibility
         required = _input_reservations(
             attachment.inputs.probe,
             plan.timeline,
@@ -304,7 +284,7 @@ class VllmSession(Generic[DataT, ResultT]):
             model.lm_head.weight.shape[0],
             attachment.inputs.request.sampler_stage if sampler is not None else None,
             self._capture_feedback,
-            publish_lag,
+            0 if visibility is None else visibility.lag,
         )
         buffers = attachment_buffer_bytes(
             attachment.inputs.probe, plan.semantic_graph, plan.tensor_layout_request, attachment.inputs.request
@@ -405,18 +385,15 @@ class VllmSession(Generic[DataT, ResultT]):
         self._auxiliary: AuxiliaryInput[torch.Tensor] | None = None
         self._tuning: TokenwiseTuning[TensorStepInput, DataT, ResultT] | None = None
         execution = deployment.execution
-        in_model = bool(overlay_bindings or attachment.inputs.request.activation_bindings or tasks)
-        self._post_sample = (
-            PostSampleOverlap(
+        self._post_sample = None
+        if attachment.physical.post_sampler != "main":
+            assert visibility is not None
+            self._post_sample = PostSampleOverlap(
                 execution.arena,
-                publish_lag,
+                visibility,
                 execution.device,
-                readers=self._capture_feedback
-                or any(task.anchor_id <= execution.sampler_anchor_id for task in plan.schedule_physical.tasks),
+                readers=attachment.physical.post_sampler == "lagged",
             )
-            if publish_lag > 0 and not in_model and _post_sample_overlaps(plan, execution.sampler_anchor_id)
-            else None
-        )
         if execution.directory.scope is StateScope.INSTANCE:
             execution.admit((), torch.cuda.current_stream(execution.device))
 
@@ -927,7 +904,6 @@ class Runner(Generic[SamplerT]):
     def attach_workload(
         self,
         deployment: BackendDeployment[DataT, ResultT],
-        publish_lag: int = 1,
     ) -> None:
         if self._workload_session is not None:
             raise RuntimeError("canonical runner already owns a workload session")
@@ -960,7 +936,7 @@ class Runner(Generic[SamplerT]):
         adapter = self._make_sampler(upstream) if deployment.attachment.inputs.request.guides_sampler else None
         if adapter is not None and not isinstance(adapter, SamplerGuidance):
             raise TypeError("backend sampler must share the original guidance lifecycle")
-        session = VllmSession(deployment, model, adapter, self.max_num_reqs, self.hidden_taps, publish_lag)
+        session = VllmSession(deployment, model, adapter, self.max_num_reqs, self.hidden_taps)
         self._workload_upstream_sampler = upstream
         self._workload_session = session
         try:
@@ -1204,7 +1180,6 @@ class BackendProbe:
 class BackendInstall:
     attachment: SignedBackendAttachment
     definition: str
-    publish_lag: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -1830,7 +1805,7 @@ def create_vllm_llm(
             installed = decode_boundary(
                 handle.command(
                     BackendCommand.INSTALL,
-                    encode_boundary(BackendInstall(attachment, definition or "", config.execution.publish_lag)),
+                    encode_boundary(BackendInstall(attachment, definition or "")),
                 ),
                 BackendWorkerState,
             )
@@ -1864,7 +1839,7 @@ def create_vllm_llm(
                 config.execution,
             )
             deployment = workload.compile_backend(facts)
-            runner.attach_workload(deployment, config.execution.publish_lag)
+            runner.attach_workload(deployment)
             handle = VllmLlm(llm, runner, deployment, deployment.attachment, facts)
         handle.tune_native_schedules()
         construction.pop_all()

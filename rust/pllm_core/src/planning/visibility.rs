@@ -8,7 +8,7 @@ use super::region_dependence::{isl, map_text};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum Kind { ForwardPinned, Exact }
+pub(super) enum Kind { ForwardPinned, Exact, StepLag }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -16,7 +16,7 @@ pub(super) struct Visibility { pub kind: Kind }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum Scope { Overlay, ModelScan }
+pub(super) enum Scope { Overlay, ModelScan, PostSampler }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -31,10 +31,25 @@ pub(super) struct Source {
     pub resources: Vec<String>,
     pub chunk_size: u64,
     pub tail: Tail,
+    #[serde(default)]
+    pub lag: u64,
 }
 
 /// The read-from map: every model/update reader names exactly one logical writer.
 fn relation(source: &Source, ctx: &Context) -> Result<UnionMap, String> {
+    if source.scope == Scope::PostSampler {
+        if source.policy.kind != Kind::StepLag || source.chunk_size != 0 || source.tail != Tail::Transition || !source.resources.is_empty() {
+            return Err("post-sampler visibility needs the step-input boundary domain".into());
+        }
+        let k = source.lag;
+        // boundary[b,q] is E's logical boundary, never a numerical version ID.
+        return isl(UnionMap::read_from_str(ctx, &format!("[side] -> {{
+            reader[t,q] -> latest[t,q] : side = 0 and t >= 0 and q >= 0;
+            reader[t,q] -> boundary[0,q] : side = 1 and 0 <= t < {k} and q >= 0;
+            reader[t,q] -> boundary[t-{k},q] : side = 1 and t >= {k} and q >= 0;
+            writer[t,q] -> latest[t,q] : 0 <= side <= 1 and t >= 0 and q >= 0 }}")));
+    }
+    if source.lag != 0 { return Err("step lag belongs to post-sampler visibility".into()); }
     let extent = match (&source.scope, &source.policy.kind, &source.tail, source.chunk_size) {
         (Scope::Overlay, Kind::ForwardPinned, Tail::Transition, 0) => "C = 1 and N = 1",
         (Scope::ModelScan, Kind::Exact, Tail::Include, 1..) => "0 <= C and N = C",
@@ -57,6 +72,15 @@ fn relation(source: &Source, ctx: &Context) -> Result<UnionMap, String> {
         parts.push(format!("decode[r,t] -> update[r,t,C-1] : {domain} and C > 0"));
     }
     isl(UnionMap::read_from_str(ctx, &format!("[C,N,R] -> {{ {} }}", parts.join("; "))))
+}
+
+pub(super) fn permits_overlap(source: &Source) -> Result<bool, String> {
+    let ctx = Context::alloc();
+    let allowed = isl(UnionMap::read_from_str(&ctx, "[side] -> {
+        reader[t,q] -> latest[t,q] : side = 0 and t >= 0 and q >= 0;
+        reader[t,q] -> boundary[b,q] : side = 1 and q >= 0 and ((t = 0 and b = 0) or (t > 0 and 0 <= b < t));
+        writer[t,q] -> latest[t,q] : 0 <= side <= 1 and t >= 0 and q >= 0 }"))?;
+    isl(relation(source, &ctx)?.is_subset(&allowed))
 }
 
 pub(super) fn validate(source: &Source) -> Result<(), String> {

@@ -12,6 +12,7 @@ import torch
 
 from pllm.contracts.auxiliary import map_auxiliary
 from pllm.contracts.packed_hidden import PackedHiddenSnapshot, PackedHiddenSnapshotBatch
+from pllm.contracts.visibility import VisibilitySource
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin
 from pllm.execution.ptts.state_refs import StateRefs
@@ -22,8 +23,10 @@ from pllm.execution.tensor_frame import TensorFrame
 class PostSampleOverlap:
     """One serial writer lane, fixed hidden storage and a bounded history of exact pins."""
 
-    def __init__(self, arena: PageBundleArena, lag: int, device: torch.device, *, readers: bool = True) -> None:
-        self.arena, self.lag = arena, lag
+    def __init__(
+        self, arena: PageBundleArena, visibility: VisibilitySource, device: torch.device, *, readers: bool = True
+    ) -> None:
+        self.arena, self.visibility = arena, visibility
         self.readers = readers
         self.stream = torch.cuda.Stream(device=device)
         self._history: deque[PagePin] = deque()
@@ -93,7 +96,7 @@ class PostSampleOverlap:
     def retain(self, pin: PagePin) -> None:
         """Retain this transition's input; release expired history on its owning stream."""
         self._history.append(pin)
-        while len(self._history) > self.lag:
+        while len(self._history) > self.visibility.lag:
             self.arena.release_pin(self._history.popleft())
 
     def clear(self) -> None:

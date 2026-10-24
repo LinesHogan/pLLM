@@ -262,6 +262,7 @@ pub(crate) struct BackendAttachmentRequest {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BackendAttachmentDecision {
+    pub(crate) post_sampler: PostSamplerPlacement,
     pub(crate) request_digest: String,
     pub(crate) signature: String,
     pub(crate) schema_version: u64,
@@ -270,6 +271,7 @@ pub(crate) struct BackendAttachmentDecision {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BackendAttachmentPhysicalPlan {
+    pub(crate) post_sampler: PostSamplerPlacement,
     pub(crate) plan_epoch: u64,
     pub(crate) adapter_id: String,
     pub(crate) attachment_signature: String,
@@ -282,3 +284,7 @@ pub(crate) struct BackendAttachmentPhysicalPlan {
     pub(crate) bundle_signature: String,
     pub(crate) schema_version: u64,
 }
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PostSamplerPlacement { Main, Lagged, Writer }

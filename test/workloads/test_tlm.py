@@ -10,6 +10,7 @@ import torch
 from torch.nn import functional as F
 
 from pllm.authoring import BackendCompileFacts, CausalTrainBatch, ParameterTargetShape
+from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
     AttachmentTopology,
@@ -168,6 +169,14 @@ def test_global_multifactor_adamw_matches_oracle_and_publishes_one_version() -> 
 
 def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None:
     model = TinyCausalModel()
+    if torch.cuda.is_available():
+        gpu_model = TinyCausalModel()
+        gpu_model.device = torch.device("cuda", 0)
+        gpu_model.initial_factors = tuple(t.to(gpu_model.device) for t in gpu_model.initial_factors)
+        online = TLMWorkload(TLMConfig(mode=TLMMode.ONLINE), gpu_model)
+        attachment = online.plan_backend(online.specialize(_facts(gpu_model), ExecutionOptions()))
+        assert attachment.inputs.request.overlay_bindings
+        assert attachment.physical.post_sampler == "main"
     batch = CausalTrainBatch(torch.tensor([[0, 2, 3]]), torch.tensor([[0, 2, 3]]))
     for mode in TLMMode:
         config = TLMConfig(mode=mode, threshold=0.0)

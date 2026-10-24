@@ -1,7 +1,7 @@
 """ESamp on a real vLLM MRv2 model: plain inference, captured ESamp, and publish-lag equivalence.
 
 Training-only ESamp (beta 0) must give identical tokens, counters and final optimizer
-state with publish_lag 0 and 1.
+state with publish_lag 0, 1 and 2.
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ def lag_equivalence() -> None:
 
     expected: tuple[tuple[int, ...], int, int] | None = None
     expected_states: list[tuple[torch.Tensor, ...]] = []
-    for lag in (0, 1):
+    for lag in (0, 1, 2):
         states.clear()
         config = ModelConfig(
             "Qwen/Qwen2.5-0.5B-Instruct",
@@ -53,6 +53,7 @@ def lag_equivalence() -> None:
             execution=ExecutionOptions(capture=True, publish_lag=lag, capture_memory_bytes=16 * 1024**2),
         )
         with pllm.make_llm(config, workload=ESampRequestWorkload(ESampRequestConfig(rank=2))) as llm:
+            assert llm.attachment.physical.post_sampler == ("writer" if lag else "main")
             # Requests retire inside generate; read each final version just before it is retired.
             with patch.object(PageBundleArena, "retire", snapshot):
                 outputs = llm.generate(
@@ -75,7 +76,7 @@ def lag_equivalence() -> None:
                         torch.testing.assert_close(field, reference, rtol=0, atol=0)
         gc.collect()
         torch.cuda.empty_cache()
-    print("publish_lag=0/1: identical beta=0 tokens, loss/update counts and all final state fields")
+    print("publish_lag=0/1/2: identical beta=0 tokens, loss/update counts and all final state fields")
 
 
 def main() -> int:

@@ -75,7 +75,9 @@ def mean_capture(publish_lag: int = 0) -> None:
     workload = MeanFit()
     provider = PageBundleProviderFacts("test.mean@1", 6, StateDeviceKind.CUDA)
     facts = backend_facts(4, (resource,), timeline, provider, max_lineages=3)
-    facts = workload.specialize(facts, pllm.ExecutionOptions(capture=True, capture_memory_bytes=16 * 1024**2))
+    facts = workload.specialize(
+        facts, pllm.ExecutionOptions(capture=True, capture_memory_bytes=16 * 1024**2, publish_lag=publish_lag)
+    )
     declaration = workload.declaration(facts)
     # One admitted lineage: the instance state.
     plan = compile_page_bundle_plan(
@@ -87,7 +89,8 @@ def mean_capture(publish_lag: int = 0) -> None:
         device,
     )
     execution = workload.bind_math(facts, plan).bind(PageBundleArena(plan), AnchorId(1))
-    overlap = PostSampleOverlap(execution.arena, publish_lag, device) if publish_lag else None
+    assert plan.timeline.visibility is not None
+    overlap = PostSampleOverlap(execution.arena, plan.timeline.visibility, device) if publish_lag else None
     execution.admit((), stream)
     parameter = torch.nn.Parameter(torch.zeros(4, device=device, dtype=torch.float64))
     optimizer = torch.optim.AdamW((parameter,), lr=0.03, weight_decay=0, capturable=True, foreach=True)

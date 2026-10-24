@@ -301,6 +301,7 @@ class SchedulerTimeline:
     memory_budget_bytes: int | None = None
     reserved_bytes: tuple[int, ...] = ()
     region_policy: RegionSelectionPolicy = RegionSelectionPolicy()
+    visibility: VisibilitySource | None = None
 
 
 @dataclass(frozen=True, slots=True)

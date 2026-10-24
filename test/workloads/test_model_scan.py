@@ -190,6 +190,13 @@ def _check_visibility_relations() -> None:
     for changed in (replace(source, chunk_size=0), replace(source, tail="carry"), replace(source, scope="overlay")):
         with pytest.raises(ValueError, match="state visibility"):
             explain_visibility(changed)
+    lagged = tuple(explain_visibility(VisibilitySource.post_sampler(lag)) for lag in (0, 1, 2))
+    assert len(set(lagged)) == 3 and all(
+        "boundary[" in relation and "writer[t, q] -> latest[t, q]" in relation for relation in lagged
+    )
+    for changed in (replace(source, lag=1), replace(VisibilitySource.post_sampler(1), resources=("a",))):
+        with pytest.raises(ValueError):
+            explain_visibility(changed)
     with pytest.raises(TypeError, match="reads"):
         pllm.Visibility(reads="{ }")
     scan = PrefillAdapters().prefill

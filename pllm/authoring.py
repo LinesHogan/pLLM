@@ -32,6 +32,7 @@ from pllm.contracts.semantic_graph import (
     StateScope,
 )
 from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
+from pllm.contracts.visibility import VisibilitySource
 from pllm.execution.backend_attachment import (
     attachment_buffer_bytes,
     bind_backend_attachment,
@@ -290,6 +291,7 @@ class BackendAuthoring(ABC):
             capabilities=capabilities,
             memory_budget_bytes=min(budgets, default=None),
             region_policy=facts.timeline.region_policy,
+            visibility=VisibilitySource.post_sampler(options.publish_lag),
         )
         graph, layouts, attachment = self.declare(replace(facts, timeline=timeline))
         buffers = attachment_buffer_bytes(facts.probe, graph, layouts, attachment)
