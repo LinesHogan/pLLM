@@ -21,7 +21,14 @@ from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.codec import cuda_graph_pool_bytes
 from pllm.execution.cuda_stream import PinnedStaging
 from pllm.execution.state_execution import StateTaskContext
-from pllm.execution.tensor_frame import FieldRoots, ParameterGradients, RowIndex, TensorFrame, training_observations
+from pllm.execution.tensor_frame import (
+    FieldRoots,
+    ParameterGradients,
+    RowIndex,
+    RowPlan,
+    TensorFrame,
+    training_observations,
+)
 from pllm.execution.tensor_program import PoolAdamW, TaskOutput, TensorBatch
 from pllm.execution.tensor_task import TensorTask
 from pllm.kernels.adamw import AdamWFields, apply_adamw, paged_adamw
@@ -139,41 +146,26 @@ class StepCapture:
     def layout(self) -> TableLayout:
         return TableLayout(self.rows, self.state_count, len(self.pools), len(self.feedback_names))
 
-    def _fill(
-        self, host: npt.NDArray[np.int64], data: TensorFrame, batch: TensorBatch, context: StateTaskContext[TensorFrame]
-    ) -> None:
-        """Write this step's index table into the zeroed host buffer."""
+    def _fill(self, host: npt.NDArray[np.int64], plan: RowPlan) -> None:
+        """Stage a RowPlan and feedback addresses into the zeroed fixed table."""
         layout = self.layout
         rows, counts, last, sources, destinations, feedback = layout.split(host)
-        count = len(data.rows)
-        links = {link.packed_row_index: link.sampler_row_index for link in data.step.sampler_rows.links}
-        if self.feedback_names and any(row.packed_row_index not in links for row in data.rows):
+        count = len(plan.columns[0])
+        if self.feedback_names and -1 in plan.columns[1]:
             raise ValueError("sampler feedback must cover every operation row")
-        states = (
-            np.asarray(batch.selection.indices(data.rows), dtype=np.int64)
-            if batch.roots
-            else np.zeros(count, dtype=np.int64)
-        )
-        versions = batch.selection.refs.versions if batch.roots else states
-        rows[0, :count] = [row.packed_row_index for row in data.rows]
-        rows[1, :count] = [links.get(row.packed_row_index, 0) for row in data.rows]
-        rows[2, :count] = [row.identity.sample_idx for row in data.rows]
         rows[3] = layout.states
-        rows[3, :count] = states
-        rows[4, :count] = versions[states] if batch.roots else 0
+        rows[:5, :count] = plan.columns
+        rows[1, :count] = np.maximum(rows[1, :count], 0)
         rows[5, :count] = 1
-        counts[:] = np.bincount(states, minlength=layout.states + 1)[: layout.states + 1]
-        if batch.roots:
-            last[states] = np.arange(count)  # repeated states keep their last row
-        sources[:] = -1
-        destinations[:] = -1
-        write = context.write
-        if batch.roots:
-            _, slots = batch.slot_matrix()
-            sources[:, : len(slots)] = slots.T
-        if write is not None:
-            _, slots = context.arena.slots((write,) * len(write.after_refs), write.after_refs)
-            destinations[:, list(self.updated)] = slots.T
+        counts[: len(plan.sources) + 1] = plan.counts
+        if len(plan.sources):
+            positions = plan.last
+            last[list(positions)] = tuple(positions.values())
+        sources[:] = destinations[:] = -1
+        sources[:, : len(plan.sources)] = plan.sources.T
+        if plan.writes is not None:
+            updated, slots = plan.writes
+            destinations[:, list(updated)] = slots.T
         for row, value in zip(feedback, self.feedback_values, strict=True):
             row[:] = (value.data_ptr(), value.stride(0), value.stride(1) if value.ndim > 1 else 1)
 
@@ -206,7 +198,7 @@ class StepCapture:
         frame = replace(
             data,
             rows=(data.rows[0],) * self.rows,
-            index=RowIndex((), (), (), (), (), columns[:5], fixed=True),
+            index=RowIndex(columns[:5]),
             fields=fields,
             hidden_inputs=self.hidden_inputs,
             feedback_inputs=self._feedback(columns[1]),
@@ -330,8 +322,9 @@ class StepCapture:
             batch.stream.wait_stream(self.stream)
         self.stream = batch.stream
         addresses = self._inputs(data, batch)
+        plan = RowPlan.build(data, batch)
         if self.optimizer is not None:
-            self.updated = tuple(sorted(set(batch.selection.indices(data.rows))))
+            self.updated = tuple(sorted(plan.last))
             context.write = context.arena.prepare_transition(
                 (
                     batch.selection.refs
@@ -341,7 +334,12 @@ class StepCapture:
                 batch.stream,
                 copy_fields=(),
             )
-        self._prepare(data, batch, context, addresses)
+        if context.write is not None:
+            write = context.write
+            plan = replace(
+                plan, writes=(self.updated, context.arena.slots((write,) * len(write.after_refs), write.after_refs)[1])
+            )
+        self._prepare(data, batch, plan, addresses)
         return self.run(data, batch)
 
     def run(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
@@ -371,19 +369,17 @@ class StepCapture:
                     value.record_stream(batch.stream)
         return addresses
 
-    def _prepare(
-        self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext[TensorFrame], addresses: tuple[int, ...]
-    ) -> None:
+    def _prepare(self, data: TensorFrame, batch: TensorBatch, plan: RowPlan, addresses: tuple[int, ...]) -> None:
         device = next(iter(self.hidden_inputs.values())).device if self.hidden_inputs else self.pools[0].device
         size = self.layout.size
         if self.table is None or self.table.numel() != size:
             self.table = torch.empty(size, dtype=torch.long, device=device)
         if device.type == "cuda":
-            self._fill(self.staging.take(size).numpy(), data, batch, context)
+            self._fill(self.staging.take(size).numpy(), plan)
             self.staging.copy_to(self.table)
         else:
             self.table.zero_()
-            self._fill(self.table.numpy(), data, batch, context)
+            self._fill(self.table.numpy(), plan)
         if self.enabled and (self.graph is None or self.addresses != addresses):
             self._capture(data, batch)
             if device.type == "cuda":

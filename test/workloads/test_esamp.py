@@ -9,6 +9,7 @@ from contextlib import nullcontext
 from dataclasses import replace
 from typing import Annotated
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -21,7 +22,7 @@ from pllm.contracts.packed_hidden import PackedHiddenResourceBinding, PackedHidd
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.sampler import SamplerStage
-from pllm.contracts.semantic_graph import AnchorId
+from pllm.contracts.semantic_graph import AnchorId, TaskSymbol
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution import tensor_binding
 from pllm.execution.cuda_stream import CudaStreamReadiness
@@ -29,7 +30,7 @@ from pllm.execution.declaration import Call
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
-from pllm.execution.tensor_frame import TensorFrame, TensorPort
+from pllm.execution.tensor_frame import RowIndex, RowPlan, TensorFrame, TensorPort, state_means
 from pllm.execution.tensor_program import TaskOutput, TensorBatch
 from pllm.execution.tensor_task import TensorTask
 from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
@@ -101,6 +102,17 @@ def reject_publication(arena, write):
 
 
 def test_esamp_predicts_before_training_and_isolates_request_versions(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Compact positions 0/1 came from operation rows 1/3 of one lineage.
+    positions = (0, 1, 2, 3)
+    plan = RowPlan((positions, positions, positions, (0, 1, 0, 1), (0,) * 4), np.zeros((3, 1), dtype=np.int64))
+    losses = torch.tensor([2.0, 4.0], requires_grad=True)
+    means = state_means(losses, plan.select((1, 3)))
+    torch.testing.assert_close(means, torch.tensor([0.0, 3.0, 0.0]))
+    torch.testing.assert_close(torch.autograd.grad(means.sum(), losses)[0], torch.tensor([0.5, 0.5]))
+    index = RowIndex(torch.tensor(plan.columns), plan)
+    values = torch.arange(12).view(4, 3)
+    assert index.select((1, 2)).take(values, "packed").data_ptr() == values[1].data_ptr()
+    assert index.select((2, 2)).take(values, "packed").stride(0) == 0
     with pytest.raises(ValueError):
         ExecutionOptions(publish_lag=-1)
     with pytest.raises(ValueError):
@@ -363,6 +375,8 @@ def test_sampler_adapts_step_results_in_memory_trace_and_runtime(monkeypatch: py
     workload = ESampRequestWorkload(ESampRequestConfig(rank=2, intervention_beta=0.2))
     facts = workload.specialize(facts_for(torch.device("cpu"), 4, 8), ExecutionOptions())
     assert "meta" in devices
+    with pytest.raises(AssertionError):
+        replace(workload.declaration(facts).operations[TaskSymbol("predict")], mode="update")
     execution = workload.compile_backend(facts).execution
     identities = (RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0))
     latest = execution.admit(identities)

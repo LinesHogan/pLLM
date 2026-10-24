@@ -304,7 +304,12 @@ class Domains(pllm.Workload):
             parameters["weight"].copy_(torch.linspace(-0.2, 0.3, 28).reshape(4, 7))
 
         state = pllm.RequestState if request else pllm.InstanceState
-        self.heads = state({"weight": (4, 7)}, optimizer=pllm.AdamW(lr=0.03, weight_decay=0.1), initialize=initialize)
+        self.heads = state(
+            {"weight": (4, 7)},
+            optimizer=pllm.AdamW(lr=0.03, weight_decay=0.1),
+            initialize=initialize,
+            memory={"carry": (7,)},
+        )
 
     def forward_rows(self, samples: Annotated[torch.Tensor, pllm.Samples()]) -> torch.Tensor:
         return samples.bitwise_and(1) != 0
@@ -338,7 +343,7 @@ class Domains(pllm.Workload):
     @pllm.differentiate(inputs=("features",))
     def train(
         self,
-        features: Annotated[torch.Tensor, pllm.Result("reweight")],
+        features: Annotated[torch.Tensor, pllm.Result("reweight"), pllm.Capture("heads", "carry")],
         samples: Annotated[torch.Tensor, pllm.Samples()],
         tokens: Annotated[torch.Tensor, pllm.SampledTokens()],
     ) -> torch.Tensor:
@@ -381,6 +386,7 @@ def _domains_oracle(device, request, identities) -> None:
     parameters = [torch.nn.Parameter(root[0].reshape(4, 7).clone()) for root in original]
     optimizers = [torch.optim.AdamW((p,), lr=0.03, weight_decay=0.1, foreach=False) for p in parameters]
     hidden = torch.linspace(-0.5, 0.8, 16, device=device).reshape(4, 4)
+    carries = [root[-1].clone() for root in original]
     latest = list(initial)
     patterns = (
         (15,) * 4,
@@ -391,6 +397,7 @@ def _domains_oracle(device, request, identities) -> None:
         (0,) * 4,
         (8, 11, 5, 8),
         (11, 8, 5, 8),
+        (11, 8, 5, 11),
         (15,) * 4,
     )
     for step_id, bits in enumerate(patterns):
@@ -436,7 +443,12 @@ def _domains_oracle(device, request, identities) -> None:
             assert tuple(result.publication.before_refs) == tuple(latest[index] for index in active)
             for index, ref in zip(active, result.publication.after_refs, strict=True):
                 latest[index] = ref
-                assert_roots(execution.snapshot(ref, stream), adam_roots(optimizers[index], parameters[index]))
+                captured = [row for row in forward if not request or row == index]
+                if captured:
+                    carries[index] = expected_output[captured[-1]].detach().clone()
+                assert_roots(
+                    execution.snapshot(ref, stream), (*adam_roots(optimizers[index], parameters[index]), carries[index])
+                )
         else:
             assert result.publication is None
         for index in set(range(len(latest))) - set(active):

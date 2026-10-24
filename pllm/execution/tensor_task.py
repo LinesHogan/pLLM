@@ -23,10 +23,12 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.tensor_frame import (
     LeafRoots,
+    RowPlan,
     TensorFrame,
     TensorMath,
     TensorPort,
     gradient_rows,
+    row_index,
     select_rows,
     selected_rows,
     state_leaf,
@@ -90,7 +92,15 @@ class TensorTask:
                 raise ValueError("row domain must be a boolean mask over the operation rows")
         compacted = bool(policy.forward_rows) and compact
         rows = selected_rows(inputs[policy.forward_rows]) if compacted else tuple(range(len(data.rows)))
-        selected = replace(data, rows=tuple(data.rows[index] for index in rows), index=None) if compacted else data
+        selected = (
+            replace(
+                data,
+                rows=tuple(data.rows[index] for index in rows),
+                index=row_index(data, batch, inputs[policy.forward_rows].device).select(rows),
+            )
+            if compacted
+            else data
+        )
         for key in self.ports:
             inputs[key] = self._input(key, inputs, data, selected, batch, rows, compacted)
         return inputs, rows
@@ -176,10 +186,11 @@ class TensorTask:
             selected = rows
             if self.policy.update_states in self.domains:
                 selected = selected_rows(inputs[self.policy.update_states])
-            indices = batch.selection.row_states
-            active = tuple(sorted({indices[data.rows[row].identity] for row in selected}))
+            plan = row_index(data, batch, state_leaf(data, batch).device).plan
+            assert plan is not None
+            active = tuple(sorted(plan.select(selected).last))
             if rows:
-                outcome = self._step(inputs, rows, active, data, batch)
+                outcome = self._step(inputs, rows, active, plan.select(rows), data, batch)
             else:
                 outcome = TaskOutput(
                     gradients=tuple(torch.zeros_like(state_leaf(data, batch)[index]) for index in active),
@@ -198,10 +209,10 @@ class TensorTask:
         inputs: dict[str, torch.Tensor],
         rows: tuple[int, ...],
         active: tuple[int, ...],
+        plan: RowPlan,
         data: TensorFrame,
         batch: TensorBatch,
     ) -> TaskOutput:
-        indices = batch.selection.row_states
         loss, derivatives = self.differentiate(inputs, rows, data, batch)
         state_gradients = derivatives[0].detach()
         data.parameter_gradient_fields.update(
@@ -216,13 +227,11 @@ class TensorTask:
             loss=loss,
             gradients=tuple(state_gradients[index] for index in active),
             gradient_indices=active,
-            loss_count=len({indices[data.rows[row].identity] for row in rows})
-            if self.policy.reduction == "state_mean"
-            else 1,
+            loss_count=len(plan.last) if self.policy.reduction == "state_mean" else 1,
             update_count=len(active),
             trained_rows=len(rows),
             observations=training_observations(data, batch, loss, hidden, rows),
-            field_writes=self._memory_writes(inputs, rows, active, data, batch),
+            field_writes=self._memory_writes(inputs, plan, active, batch),
         )
 
     def differentiate(
@@ -252,8 +261,9 @@ class TensorTask:
                     0, data.index.column("states"), loss * data.weights
                 ) / data.counts.clamp_min(1)
             else:
-                states = [batch.selection.row_states[data.rows[row].identity] for row in rows]
-                loss = state_means(loss, states, len(batch.roots))
+                plan = row_index(data, batch, loss.device).plan
+                assert plan is not None
+                loss = state_means(loss, plan.select(rows))
             return loss, loss.sum()
         if loss.ndim == 1:
             loss = (
@@ -268,16 +278,24 @@ class TensorTask:
     def _memory_writes(
         self,
         inputs: dict[str, torch.Tensor],
-        rows: tuple[int, ...],
+        plan: RowPlan,
         active: tuple[int, ...],
-        data: TensorFrame,
         batch: TensorBatch,
     ) -> tuple[tuple[LayoutFieldId, torch.Tensor], ...]:
-        """Each lineage's memory fields receive the value of its last selected row."""
-        indices = batch.selection.row_states
-        per_lineage = {indices[data.rows[row].identity]: row for row in rows}
+        """Capture the last compact input, retaining memory for updates without forward rows."""
+        if not active:
+            return ()
+        last = plan.last
         return tuple(
-            (field_id, torch.stack(tuple(inputs[key][per_lineage[index]].detach() for index in active)))
+            (
+                field_id,
+                torch.stack(
+                    tuple(
+                        inputs[key][last[index]].detach() if index in last else batch.roots[index][field_id]
+                        for index in active
+                    )
+                ),
+            )
             for key, field_id in self.captures.items()
         )
 

@@ -330,6 +330,10 @@ class TensorOperation(Generic[D]):
     prepare: Callable[[D], D | None] | None = None
     output: Callable[[D, TensorBatch], TaskOutput] | None = None
 
+    def __post_init__(self) -> None:
+        """Output adapters replace TaskOutput, so training must keep its own effects."""
+        assert self.output is None or (self.mode == "read" and self.optimizer is None)
+
     def input_shapes(
         self, rows: int, hidden: int, training_shapes: tuple[tuple[int, ...], ...]
     ) -> tuple[tuple[int, ...], ...]:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 from pllm.authoring import BackendCompileFacts, TensorStepInput
@@ -88,6 +89,7 @@ def example(
             meta(count, dtype=torch.long),
         ),
         field_slots=lambda field: (pools[field], tuple(range(len(pools[field])))),
+        slot_matrix=lambda: ("", np.repeat(np.arange(len(roots), dtype=np.int64)[:, None], len(pools), axis=1)),
     )
     auxiliary = None
     if binding.weighted_training:
