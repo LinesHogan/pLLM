@@ -278,15 +278,6 @@ class PhysicalTask:
 
 
 @dataclass(frozen=True, slots=True)
-class TaskRegionSchedule:
-    """A source-derived instance order signed with the enclosing physical plan."""
-
-    task: TaskSymbol
-    name: str
-    schedule_map: str
-
-
-@dataclass(frozen=True, slots=True)
 class ScheduleDecision:
     graph_digest: str
     timeline_digest: str
@@ -299,7 +290,6 @@ class ScheduleDecision:
     peak_memory_bytes: int
     fence_count: int
     state_plan_digest: str | None
-    source_schedules: tuple[TaskRegionSchedule, ...] = ()
     schema_version: int = 1
 
 
@@ -311,7 +301,6 @@ class PhysicalPlan:
     fallback_count: int
     region_ends: tuple[int, ...]
     materialized_values: tuple[int, ...]
-    source_schedules: tuple[TaskRegionSchedule, ...] = ()
     schema_version: int = 1
 
 
