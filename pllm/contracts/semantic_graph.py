@@ -9,7 +9,6 @@ from typing import Literal, NewType
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.region_imports import RegionTensorImport
 from pllm.contracts.region_program import Program
-from pllm.contracts.region_proposal import ClosedRegionWindow, ClosedWindowRequest
 from pllm.contracts.region_selection import RegionSelectionPolicy
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.visibility import VisibilitySource
@@ -254,7 +253,6 @@ class TaskSourceRegion:
     name: str
     program: Program
     imports: tuple[RegionTensorImport, ...] = ()
-    window: ClosedWindowRequest | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,7 +317,6 @@ class TaskRegionSchedule:
     task: TaskSymbol
     name: str
     schedule_map: str
-    window: ClosedRegionWindow | None = None
 
 
 @dataclass(frozen=True, slots=True)

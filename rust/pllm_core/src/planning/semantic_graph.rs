@@ -239,7 +239,6 @@ pub(crate) struct TaskSourceRegion {
     pub(crate) name: String,
     pub(super) program: super::region_program::Program,
     pub(super) imports: Vec<super::region_imports::TensorImport>,
-    pub(super) window: Option<super::region_window::Request>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -514,9 +513,6 @@ pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
             let declaration = source.program.functions.iter().find(|f| f.name == import.name())
                 .ok_or("source import names an undeclared function")?;
             import.validate(declaration)?;
-        }
-        if source.window.is_some() && imported.len() != source.program.functions.len() {
-            return Err("closed windows need complete original endpoint imports".into());
         }
         super::region_dependence::analyze(&source.program, false)?;
     }
