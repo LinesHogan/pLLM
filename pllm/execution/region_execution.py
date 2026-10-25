@@ -6,7 +6,6 @@ Resource access goes through the original invocation's page capabilities.
 
 from __future__ import annotations
 
-import gc
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -26,7 +25,6 @@ from pllm.contracts.region_schedule import ScheduleInstance, Statement
 from pllm.contracts.region_selection import RegionPayloadLimit
 from pllm.contracts.region_streams import RegionStateWindow, RegionStreamPlan
 from pllm.contracts.schedule_instructions import LoweredSchedule
-from pllm.execution.codec import cuda_graph_pool_bytes
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_compilation import lower_region_bindings, lower_region_schedule
@@ -51,6 +49,7 @@ from pllm.execution.region_streams import (
 )
 from pllm.execution.region_values import Bank, Data, copy_data
 from pllm.execution.region_window import RegionWindow, WindowBackpressure
+from pllm.execution.step_capture import capture_graph
 from pllm.execution.tensor_access import import_tensor_access_graph
 
 PreparedWindow = tuple[tuple[ScheduleInstance, ...], RegionValueLayout, Routes, tuple[tuple[int, Routes], ...]]
@@ -96,36 +95,22 @@ class RegionTokenCapture:
     ) -> None:
         overlay = invocation.overlay
         started = perf_counter()
-        current = torch.cuda.current_stream(device)
-        stream = torch.cuda.Stream(device=device)
-        stream.wait_stream(current)
+
+        def body():
+            output = invocation.execution.capture_token_body(invocation, instances)
+            if overlay is None:
+                return output, invocation.observation, (), ()
+            return output, invocation.observation, tuple(overlay.results), overlay.captures()
+
         invocation.cold = True
         try:
-            with torch.cuda.stream(stream):
-                for _ in range(3):
-                    if overlay is not None:
-                        overlay.reset()
-                    invocation.execution.capture_token_body(invocation, instances)
-            stream.synchronize()
-            self.graph = torch.cuda.CUDAGraph()
-            collecting = gc.isenabled()
-            gc.disable()
-            try:
-                with torch.cuda.graph(self.graph, stream=stream, pool=torch.cuda.graph_pool_handle()):
-                    if overlay is not None:
-                        overlay.reset()
-                    self.output = invocation.execution.capture_token_body(invocation, instances)
-                    self.observation = invocation.observation
-                    self.overlay_results = () if overlay is None else tuple(overlay.results)
-                    self.overlay_pending = () if overlay is None else overlay.captures()
-            finally:
-                if collecting:
-                    gc.enable()
-            current.wait_stream(stream)
+            self.graph, outputs, self.resident_bytes = (
+                capture_graph(device, body) if overlay is None else capture_graph(device, body, prepare=overlay.reset)
+            )
         finally:
             invocation.cold = False
             invocation.observation = None
-        self.resident_bytes = cuda_graph_pool_bytes(self.graph.pool(), device.index or 0)
+        self.output, self.observation, self.overlay_results, self.overlay_pending = outputs
         self.capture_seconds = perf_counter() - started
 
 
