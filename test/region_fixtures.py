@@ -47,8 +47,8 @@ from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.request_state import RequestStateDirectory
-from pllm.execution.region_compilation import analyze_region_program, lower_region_bindings, lower_region_schedule
-from pllm.execution.region_execution import RegionExecution, RegionExecutionPlan, RegionInstructionExecution
+from pllm.execution.region_compilation import analyze_region_program
+from pllm.execution.region_execution import RegionExecutionPlan, RegionInstructionExecution
 from pllm.execution.region_resources import RegionResources, ResourcePageCell
 from pllm.execution.region_storage import import_region_functions
 from pllm.execution.region_streams import RegionStreamBindings
@@ -130,13 +130,11 @@ def assert_grid_closed_form(values, chunks, layers) -> None:
         torch.testing.assert_close(value, torch.full_like(value, expected), rtol=0, atol=0)
 
 
-def bind(program: Program, cells=None, schedule: str | None = None) -> RegionExecution:
+def bind(program: Program, cells=None, schedule: str | None = None) -> RegionInstructionExecution:
     """Bind the most optimized source candidate unless a schedule is given."""
     if schedule is None:
         schedule = analyze_region_program(program).candidates[-1].schedule_map
-    return RegionExecution(
-        program, lower_region_schedule(program, schedule), lower_region_bindings(program, schedule), cells or {}
-    )
+    return RegionInstructionExecution.at_schedule(program, schedule, cells or {})
 
 
 def single_call(cell) -> Program:

@@ -30,8 +30,8 @@ from pllm.contracts.region_program import (
 from pllm.contracts.region_selection import RegionPayloadLimit, RegionSelectionPolicy
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.memory import MemoryTrace
-from pllm.execution.region_compilation import analyze_region_program, lower_region_bindings, lower_region_schedule
-from pllm.execution.region_execution import RegionExecution, RegionInstructionExecution
+from pllm.execution.region_compilation import analyze_region_program
+from pllm.execution.region_execution import RegionInstructionExecution
 from pllm.execution.region_native import RegionFunction
 from pllm.execution.region_optimization import (
     RegionOptimizationOptions,
@@ -169,9 +169,7 @@ class TensorScan:
         )
         self.program = program
         self._cells = cells
-        self._execution: RegionInstructionExecution = RegionExecution(
-            program, lower_region_schedule(program, schedule), lower_region_bindings(program, schedule), cells
-        )
+        self._execution = RegionInstructionExecution.at_schedule(program, schedule, cells)
         self._carry, self._invariants = carry, invariants
         self._sequences = len(input_types) - fixed
         self._names = tuple(v.name for v in arguments)

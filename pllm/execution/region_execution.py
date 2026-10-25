@@ -163,13 +163,7 @@ class RegionExecutionPlan:
         return self.proposal.stream_plan
 
     def bind(self, cells: Mapping[str, RegionFunction]) -> "RegionInstructionExecution":
-        if any(
-            isinstance(cell, (CompiledPrimitive, AffineScanPrimitive))
-            or isinstance(cell, ExportedCell)
-            and cell.transformations
-            for cell in cells.values()
-        ):
-            raise ValueError("transformed cells require a numerical selection decision")
+        _require_untransformed(cells)
         if import_region_functions(self.program, cells) != self.imports:
             raise ValueError("local functions differ from the planned source imports")
         schedule = self.proposal.payload.capacity.schedule_map
@@ -182,6 +176,17 @@ class RegionExecutionPlan:
             payload_limits=self.payload_limits,
             state_windows=self.state_windows,
         )
+
+
+def _require_untransformed(cells: Mapping[str, RegionFunction]) -> None:
+    """Rewritten or compiled cells change numerics, so only a recorded selection may bind them."""
+    if any(
+        isinstance(cell, (CompiledPrimitive, AffineScanPrimitive))
+        or isinstance(cell, ExportedCell)
+        and cell.transformations
+        for cell in cells.values()
+    ):
+        raise ValueError("transformed cells require a numerical selection decision")
 
 
 def _owns_results(cell: RegionFunction) -> bool:
@@ -197,6 +202,14 @@ def _owns_results(cell: RegionFunction) -> bool:
 
 class RegionInstructionExecution:
     """Prepare each concrete window once, then execute its table with fresh frames."""
+
+    @classmethod
+    def at_schedule(
+        cls, program: Program, schedule: str, cells: Mapping[str, RegionFunction]
+    ) -> "RegionInstructionExecution":
+        """Execute the source's original cells in a verified schedule, e.g. its reference order."""
+        _require_untransformed(cells)
+        return cls(program, lower_region_schedule(program, schedule), lower_region_bindings(program, schedule), cells)
 
     def __init__(
         self,
@@ -453,19 +466,3 @@ class RegionInstructionExecution:
                         concurrent.complete()
                 finally:
                     frame.close()
-
-
-class RegionExecution(RegionInstructionExecution):
-    """Bind original source imports; optimized variants need selection replay."""
-
-    def __init__(
-        self, program: Program, lowered: LoweredSchedule, bindings: RegionBindings, cells: Mapping[str, RegionFunction]
-    ) -> None:
-        if any(
-            isinstance(cell, (CompiledPrimitive, AffineScanPrimitive))
-            or isinstance(cell, ExportedCell)
-            and cell.transformations
-            for cell in cells.values()
-        ):
-            raise ValueError("transformed cells require a numerical selection decision")
-        super().__init__(program, lowered, bindings, cells)

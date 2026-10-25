@@ -8,8 +8,8 @@ import torch
 from pllm.contracts.region_program import Block, Call, Function, Program, Region, TensorType, Value
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.codec import boundary_digest
-from pllm.execution.region_compilation import analyze_region_program, lower_region_bindings, lower_region_schedule
-from pllm.execution.region_execution import RegionExecution
+from pllm.execution.region_compilation import analyze_region_program
+from pllm.execution.region_execution import RegionInstructionExecution
 from pllm.execution.region_native import NativePrimitive, PrimitiveResources
 from pllm.execution.region_storage import analyze_region_capacity
 from pllm.execution.region_values import Data, check_data
@@ -66,12 +66,7 @@ class AdamWRegion:
             (signature,),
         )
         schedule = analyze_region_program(self.program, optimize=False).reference_schedule
-        self._execution = RegionExecution(
-            self.program,
-            lower_region_schedule(self.program, schedule),
-            lower_region_bindings(self.program, schedule),
-            {signature.name: cell},
-        )
+        self._execution = RegionInstructionExecution.at_schedule(self.program, schedule, {signature.name: cell})
         self._names = tuple(v.name for v in inputs)
         self._parameters = parameters
         self.groups = len(parameters)

@@ -39,7 +39,7 @@ from pllm.contracts.tensor_layout import LayoutFieldId, StateTensorLayout, Tenso
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.region_compilation import analyze_region_program
-from pllm.execution.region_execution import RegionExecution
+from pllm.execution.region_execution import RegionInstructionExecution
 from pllm.execution.region_native import NativePrimitive
 from pllm.execution.region_resources import RegionResources, ResourcePageCell
 from pllm.execution.region_values import Bank
@@ -305,7 +305,7 @@ def multistate_arena(*, route=False, instance=True):
 @dataclass
 class ResourceTask:
     implementation_id: int
-    runner: RegionExecution | None = None
+    runner: RegionInstructionExecution | None = None
     program: Program | None = None
     context = None
 

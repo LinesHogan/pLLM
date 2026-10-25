@@ -49,8 +49,8 @@ from pllm.execution.activation import low_rank_affine_delta
 from pllm.execution.codec import boundary_digest
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.exported_resources import borrow_exported_inputs
-from pllm.execution.region_compilation import analyze_region_program, lower_region_bindings, lower_region_schedule
-from pllm.execution.region_execution import RegionExecution
+from pllm.execution.region_compilation import analyze_region_program
+from pllm.execution.region_execution import RegionInstructionExecution
 from pllm.execution.region_native import RegionFunction, source_region_functions
 from pllm.execution.region_resources import ExternalFunction, PagedResourceBinding, RegionPageOwner, RegionResources
 from pllm.execution.region_values import Bank, Data
@@ -547,12 +547,7 @@ class DecoderRegion:
             coordinates,
         )
         schedule = analyze_region_program(self.program, optimize=False).reference_schedule
-        self.execution = RegionExecution(
-            self.program,
-            lower_region_schedule(self.program, schedule),
-            lower_region_bindings(self.program, schedule),
-            self.source.functions,
-        )
+        self.execution = RegionInstructionExecution.at_schedule(self.program, schedule, self.source.functions)
 
     def run(
         self,

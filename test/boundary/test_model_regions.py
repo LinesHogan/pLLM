@@ -47,10 +47,9 @@ from pllm.execution.decoder_region import DecoderRegion
 from pllm.execution.paged_access import PagedLayer, PagedResourceView, bind_paged_access
 from pllm.execution.region_compilation import (
     analyze_region_program,
-    lower_region_bindings,
     lower_region_schedule,
 )
-from pllm.execution.region_execution import RegionExecution
+from pllm.execution.region_execution import RegionInstructionExecution
 from pllm.execution.region_resources import (
     PagedResourceBinding,
     ReadonlyResourceBinding,
@@ -122,12 +121,7 @@ def test_decoder_imports_custom_readonly_modules_and_runs_them_on_borrowed_weigh
         varied.validate(layers)
         program = varied.suffix.program
         schedule = analyze_region_program(program, optimize=False).reference_schedule
-        runner = RegionExecution(
-            program,
-            lower_region_schedule(program, schedule),
-            lower_region_bindings(program, schedule),
-            varied.functions,
-        )
+        runner = RegionInstructionExecution.at_schedule(program, schedule, varied.functions)
         execution, _, rows, _ = owner_fixture(rounds=1)
         invocation = execution.start_step(rows)
         resources = {resource.name: resource for resource in program.resources}
