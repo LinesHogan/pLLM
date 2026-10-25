@@ -24,7 +24,6 @@ from pllm.authoring import (
 )
 from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.hidden_capture import HiddenTaps
-from pllm.backends.vllm.model_scan import VllmModelScan
 from pllm.backends.vllm.overlay_graph import (
     HybridParameterOverlay,
     PinnedParameterOverlay,
@@ -38,11 +37,9 @@ from pllm.backends.vllm.sampler import (
     SamplerGuidance,
     SignedSamplerGuidance,
 )
-from pllm.backends.vllm.window_scheduler import WindowSchedulerOutput, model_scan_admission
 from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
-    AttachmentKind,
     BackendPlacementProbe,
     DecodeWindow,
     SignedBackendAttachment,
@@ -154,7 +151,6 @@ class VllmSession(Generic[DataT, ResultT]):
             raise ValueError("hidden inputs require taps installed when the model was loaded")
         self._taps = taps
         overlay_bindings = attachment.inputs.request.overlay_bindings
-        model_scan = attachment.inputs.request.attachment_kind is AttachmentKind.MODEL_SCAN
         self._overlay_import = bool(overlay_bindings) and (
             plan.semantic_graph.tasks[attachment.inputs.request.task_bindings[0].task_id].timing.after
             == "request.prepare"
@@ -177,18 +173,7 @@ class VllmSession(Generic[DataT, ResultT]):
                 in_forward=self._in_forward_overlay,
                 graphs=probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH,
             )
-            if overlay_bindings and not model_scan
-            else None
-        )
-        self._model_scan = (
-            VllmModelScan(
-                model,
-                deployment.execution,
-                attachment.inputs.request.task_bindings[0].anchor_id,
-                overlay_bindings,
-                model_scan_admission(attachment),
-            )
-            if model_scan
+            if overlay_bindings
             else None
         )
         tasks = tuple(task for task in attachment.inputs.plan.semantic_graph.tasks if task.replay is not None)
@@ -397,15 +382,11 @@ class VllmSession(Generic[DataT, ResultT]):
         self._require_input_live()
         if self._step is not None:
             raise RuntimeError("prior vLLM workload step is still active")
-        if (self._decode_injection or self._model_scan is not None) and (
+        if self._decode_injection and (
             scheduler_output.preempted_req_ids or scheduler_output.scheduled_cached_reqs.resumed_req_ids
         ):
             self._input_failed = True
-            raise RuntimeError("activation injection and ModelScan need requests without vLLM preemption")
-        if self._model_scan is not None:
-            if not isinstance(scheduler_output, WindowSchedulerOutput):
-                raise ValueError("ModelScan needs its closed-window scheduler and original allocation grants")
-            self._model_scan.accept(scheduler_output.window)
+            raise RuntimeError("activation injection needs requests without vLLM preemption")
         execution = self._deployment.execution
         execution.arena.collect_completed()
         finished = tuple(
@@ -457,15 +438,6 @@ class VllmSession(Generic[DataT, ResultT]):
         self._next_step_id += 1
         step = _PackedStep[DataT](rows)
         self._step = step
-        if self._model_scan is not None:
-            execution = self._deployment.execution
-            invocation = execution.start_step(
-                TensorStepInput(rows.row_batch, rows), torch.cuda.current_stream(execution.device)
-            )
-            step.invocation = invocation
-            self._advance(invocation, "request.prepare")
-            self._model_scan.prepare(rows.row_batch, invocation)
-            return
         if isinstance(self._replay, VllmTokenwiseReplay) and self._activation is None:
             execution = self._deployment.execution
             invocation = execution.start_step(
@@ -563,17 +535,17 @@ class VllmSession(Generic[DataT, ResultT]):
 
     def _finish_effects(self) -> None:
         """End-of-forward lifecycle for every active optional primitive."""
-        for effect in (self._overlay, self._activation, self._replay, self._model_scan):
+        for effect in (self._overlay, self._activation, self._replay):
             if effect is not None:
                 effect.clear()
 
     def _abort_effects(self) -> None:
-        for effect in (self._overlay, self._activation, self._model_scan):
+        for effect in (self._overlay, self._activation):
             if effect is not None:
                 effect.clear()
 
     def _close_effects(self) -> None:
-        for effect in (self._overlay, self._activation, self._replay, self._model_scan):
+        for effect in (self._overlay, self._activation, self._replay):
             if effect is not None:
                 effect.close()
 

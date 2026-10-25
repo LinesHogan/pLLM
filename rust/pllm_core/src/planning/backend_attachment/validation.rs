@@ -3,13 +3,13 @@
 use super::super::scheduler::PhysicalPlan;
 use super::super::semantic_graph::{
     HiddenPhase as SemanticHiddenPhase, HiddenSite as SemanticHiddenSite, InputSource, OutputKind,
-    LayerReplay, RequestKeyField, SemanticGraph, SemanticTask, StateEffectKind, StateScope, Timeline,
+    LayerReplay, SemanticGraph, SemanticTask, StateEffectKind, StateScope, Timeline,
 };
 use super::super::state_representation::{StateDeviceKind, StatePhysicalPlan};
 use super::types::{
     ActivationPatchOperator, AttachmentCompilerInputs, AttachmentGraphMode, AttachmentHiddenResource, AttachmentKind, AttachmentTaskBinding,
     AttachmentTaskRole, BackendAttachmentRequest, BackendPlacementProbe, HiddenLayerKind,
-    DecodeRefresh, DecodeWindow, HiddenPhase, HiddenSite, MissingPolicy, OverlayOperator, ParameterModuleKind, ParameterRole, SamplerStage,
+    DecodeRefresh, DecodeWindow, HiddenPhase, HiddenSite, MissingPolicy, OverlayOperator, SamplerStage,
     StreamDependency, SCHEMA_VERSION,
 };
 
@@ -48,9 +48,6 @@ fn validate_request(
     if request.schema_version != SCHEMA_VERSION || request.packed_row_schema_version != 1 {
         return Err("unsupported backend attachment schema".to_owned());
     }
-    if (request.attachment_kind == AttachmentKind::ModelScan) != (request.model_scan_chunk_size > 0) {
-        return Err("model scan requires its declared positive chunk size".into());
-    }
     let composed_replay = request.attachment_kind == AttachmentKind::ModelReplay
         && !request.activation_bindings.is_empty();
     if composed_replay || !matches!(request.attachment_kind, AttachmentKind::ModelReplay | AttachmentKind::Observation) {
@@ -68,19 +65,6 @@ fn validate_request(
     }
     require_text(&request.sampler_anchor_symbol, "sampler_anchor_symbol")?;
     match request.attachment_kind {
-        AttachmentKind::ModelScan => {
-            if request.task_bindings.len() != 1
-                || request.task_bindings[0].role != AttachmentTaskRole::Compute
-                || request.overlay_bindings.is_empty()
-                || request.overlay_bindings.iter().any(|binding|
-                    binding.target.module != ParameterModuleKind::Mlp
-                    || binding.target.role != ParameterRole::DownProjectionWeight
-                    || binding.operator != OverlayOperator::LowRankAdd)
-                || !probe.capabilities.iter().any(|value| value == "model/chunk_scan@1")
-            {
-                return Err("model scan requires a compute owner, down projections and the backend capability".into());
-            }
-        }
         AttachmentKind::ModelReplay if composed_replay => {
             if request.task_bindings.iter().map(|binding| &binding.role).collect::<Vec<_>>()
                 != vec![&AttachmentTaskRole::Compute, &AttachmentTaskRole::Transition, &AttachmentTaskRole::Publish]
@@ -188,7 +172,7 @@ fn validate_request(
                 return Err("request training stream dependencies differ from its task bindings".to_owned());
             }
         }
-        AttachmentKind::ParameterOverlay | AttachmentKind::ActivationPatch | AttachmentKind::ModelScan => {
+        AttachmentKind::ParameterOverlay | AttachmentKind::ActivationPatch => {
             if !probe.hidden_resources.is_empty() {
                 return Err(
                     "hidden/overlay composition is not supported by this attachment".to_owned(),
@@ -648,43 +632,6 @@ fn validate_cross_binding(
         }
     }
     match request.attachment_kind {
-        AttachmentKind::ModelScan => {
-            let task = task_for_dense_id(graph, &request.task_bindings[0])?;
-            let resources: std::collections::BTreeSet<_> = graph.states.iter().map(|state| &state.resource).collect();
-            if resources.len() != request.overlay_bindings.len()
-                || graph.states.iter().any(|state| state.scope != StateScope::Request
-                    || !state.key_fields.contains(&RequestKeyField::RequestId))
-                || !resources.contains(&request.state_resource)
-                || request.overlay_bindings.iter().map(|binding| &binding.resource).collect::<std::collections::BTreeSet<_>>() != resources
-                || task.inputs.len() != 1 || !matches!(task.inputs[0].source, InputSource::PackedRows)
-                || !task.outputs.is_empty() || task.replay.is_some()
-                || task.effects.iter().map(|effect| &effect.resource).collect::<std::collections::BTreeSet<_>>() != resources
-                || task.effects.iter().any(|effect| effect.kind != StateEffectKind::UpdateMaybe || effect.version.is_some())
-                || task.timing.after != "model.execute" || task.timing.before != "state.publish"
-                || graph.source_regions.iter().filter(|source| source.task == task.symbol && source.window.is_some()).count() != 1
-            {
-                return Err("model scan needs independent request-target updates and complete prefill/decode sources".into());
-            }
-            for source in graph.source_regions.iter().filter(|source| source.task == task.symbol) {
-                let declared = source.program.resources.iter().filter_map(|resource| match resource {
-                    super::super::region_program::Resource::State { name, .. } => Some(name),
-                    _ => None,
-                }).collect::<std::collections::BTreeSet<_>>();
-                if declared != resources {
-                    return Err("model scan source must cover every independently published target".into());
-                }
-            }
-            if probe.causal_domain.as_ref().is_some_and(|domain|
-                request.overlay_bindings.iter().any(|binding| u64::from(binding.target.layer) >= domain.layers)) {
-                return Err("model scan target is outside the backend layer domain".into());
-            }
-            if state.representations.iter().any(|provider|
-                3_u64.checked_mul(provider.max_admitted_lineages)
-                    .is_none_or(|needed| provider.page_capacity < needed))
-            {
-                return Err("increase page capacity for the initial, current and private roots of each closed-window request".into());
-            }
-        }
         AttachmentKind::Observation => {
             let task = task_for_dense_id(graph, &request.task_bindings[0])?;
             let mut hidden = task.inputs.iter().filter_map(|input| semantic_hidden_key(&input.source)).collect::<Vec<_>>();
@@ -784,7 +731,7 @@ fn validate_cross_binding(
                 return Err("observation must follow model execution and precede sampling".into());
             }
         }
-        AttachmentKind::ModelReplay | AttachmentKind::ModelScan => {
+        AttachmentKind::ModelReplay => {
             if !timeline.anchors.iter().any(|anchor| anchor.symbol == "model.execute"
                 && anchor.ordinal == request.task_bindings[0].anchor_id as u64)
                 || request.task_bindings[0].anchor_id >= request.sampler_anchor_id
@@ -887,7 +834,7 @@ pub(crate) fn validate_inputs(inputs: &AttachmentCompilerInputs) -> Result<(), S
     for binding in &inputs.request.overlay_bindings {
         let target_layout = plan.tensor_layout_request.layouts.iter().find(|layout| layout.resource == binding.resource)
             .ok_or("projection resource has no signed tensor layout")?;
-        if inputs.request.attachment_kind != AttachmentKind::ModelScan && binding.resource != inputs.request.state_resource {
+        if binding.resource != inputs.request.state_resource {
             return Err("projection resource differs from the attachment state".into());
         }
         if binding.fields.iter().any(|field| !target_layout.layout.fields.iter().any(|known| known.field_id == u64::from(*field))) {

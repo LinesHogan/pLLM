@@ -10,7 +10,7 @@ before prepare_inputs, and Qwen2Model.do_not_compile to bypass compiled training
 The upstream manager owns all capture/replay loops; PTTS owns every request version.
 """
 
-from typing import Protocol
+from typing import Protocol, TypedDict
 
 import numpy as np
 import torch
@@ -69,7 +69,14 @@ def capacities(maximum: int) -> tuple[int, ...]:
     return tuple(sorted({min(1 << i, maximum) for i in range(maximum.bit_length() + 1)}))
 
 
-def graph_options(config: ModelConfig, requirements: BackendRequirements) -> dict[str, object]:
+class GraphOptions(TypedDict, total=False):
+    """The `LLM(...)` arguments that switch on deferred overlay compilation."""
+
+    additional_config: dict[str, int]
+    compilation_config: CompilationConfig
+
+
+def graph_options(config: ModelConfig, requirements: BackendRequirements) -> GraphOptions:
     """Announce deferred overlay compilation before vLLM profiles the model."""
     if not config.cuda_graphs or not requirements.parameter_targets:
         return {}

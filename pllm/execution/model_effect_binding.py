@@ -1,4 +1,4 @@
-"""Model-side tensor effects: ModelScan, parameter overlays, imported overlays, activation patches.
+"""Model-side tensor effects: parameter overlays, imported overlays, activation patches.
 
 ModelEffectBinding declares effects that run inside or alongside the model forward and their
 request-state transitions. Used by TensorBinding.
@@ -18,8 +18,6 @@ from pllm.contracts.backend_attachment import (
     ActivationPatchBinding,
     ActivationPatchOperator,
     AttachmentKind,
-    AttachmentTaskRole,
-    BackendAttachmentSpec,
     DecodeRefresh,
     DecodeWindow,
     MissingPolicy,
@@ -27,27 +25,20 @@ from pllm.contracts.backend_attachment import (
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
     CapturedParameterOperand,
-    ModelScan,
     ParameterOverlayFieldBinding,
     ParameterOverlayOperator,
     ParameterTarget,
 )
-from pllm.contracts.region_imports import NativeTensorImport, region_import_name
-from pllm.contracts.region_proposal import ClosedWindowRequest
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.semantic_graph import (
-    AnchorSymbol,
     ConditionalLayerReplay,
-    SemanticEffect,
     StateEffectKind,
     StateResource,
     StateScope,
-    TaskSourceRegion,
 )
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 from pllm.contracts.visibility import Exact, Visibility, VisibilitySource
 from pllm.execution.declaration import Call, Dimensions, State, When, native
-from pllm.execution.model_scan import ChunkTraining, model_scan_source, target_resource
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION, Recurrence
 from pllm.execution.shared_tensor import tensor_dtype
@@ -55,25 +46,21 @@ from pllm.execution.tensor_frame import (
     OverlayEntry,
     OverlayTargetResult,
     TensorFrame,
-    TensorMath,
     Tensors,
     TensorUpdate,
     finite,
 )
 from pllm.execution.tensor_program import (
-    PageUpdate,
-    PoolSGD,
     TaskOutput,
     TensorBatch,
 )
-from pllm.kernels.adamw import AdamWConfig
 from pllm.kernels.head_overlay import head_correction
 
 if TYPE_CHECKING:
     pass
 
 
-from pllm.execution.binding_base import SGD, Buffer, TensorBindingBase, buffer_field
+from pllm.execution.binding_base import Buffer, TensorBindingBase, buffer_field
 
 
 @dataclass(frozen=True)
@@ -245,125 +232,6 @@ class OverlayTransition:
 class ModelEffectBinding(TensorBindingBase):
     """Declare model-side effects and their request-state transitions."""
 
-    def scan_model(
-        self,
-        name: str,
-        scan: ModelScan,
-        buffers: Mapping[str, Buffer],
-        namespace: str,
-        initialize: Callable[[Mapping[str, torch.Tensor], torch.Generator], None],
-        loss: TensorMath,
-        optimizer: AdamWConfig | SGD,
-        keys: tuple[RequestKeyField, ...],
-        equations_digest: str,
-    ) -> None:
-        """Declare one request-owned scan and its projection consumer."""
-        effect = scan.apply
-        _check_overlay_fields(buffers, effect.factors, effect.targets, effect.operator, effect.scale)
-        if self.graph.tasks or self.graph.states or self.host:
-            raise ValueError("ModelScan needs its own request state and model execution")
-        if self.dimensions is not None:
-            _check_overlay_shapes(buffers, effect.factors, self.dimensions, effect.operator)
-        if self.dimensions is not None and any(
-            target.layer >= self.dimensions.layer_count for target in effect.targets
-        ):
-            raise ValueError("ModelScan targets must be inside the backend's complete layer domain")
-        self.overlay_targets = effect.targets
-        states = tuple(
-            self.state(
-                target_resource(effect.state, target.layer),
-                tuple(
-                    buffer_field(key, buffer, lambda model, i=i: model.target_shapes[i])
-                    for key, buffer in buffers.items()
-                ),
-                namespace=namespace,
-                scope=StateScope.REQUEST,
-                keys=keys,
-                optimizer=optimizer if isinstance(optimizer, AdamWConfig) else None,
-            )
-            for i, target in enumerate(effect.targets)
-        )
-        stride = 5 if states[0].optimizer is not None else 1
-        parameters = tuple(range(0, len(states[0].fields), stride))
-
-        def init(root: tuple[torch.Tensor, ...], generator: torch.Generator) -> None:
-            initialize(dict(zip(buffers, (root[i] for i in parameters), strict=True)), generator)
-
-        self.initializers.update((str(state.declaration.resource), init) for state in states)
-        forward = self.compute(
-            name,
-            inputs={"rows": self.rows()},
-            reads=tuple(SemanticEffect(state.declaration.resource, StateEffectKind.UPDATE_MAYBE) for state in states),
-            when=When.MODEL_UPDATE,
-            implementations=(native("model.chunk_scan@1", "model/chunk_scan@1"),),
-        )
-        self._bind_visibility(
-            forward,
-            VisibilitySource(
-                scan.visibility,
-                "model_scan",
-                equations_digest,
-                tuple(str(state.declaration.resource) for state in states),
-                scan.chunk_size,
-                "include",
-            ),
-        )
-        if self.probe is not None:
-            assert self.dimensions is not None
-            program = model_scan_source(
-                scan, self.layouts, self.probe, self.dimensions.layer_count, parameters, self.max_requests
-            )
-            catalog = {region_import_name(item): item for item in self.probe.region_imports}
-            self.graph = replace(
-                self.graph,
-                source_regions=(
-                    TaskSourceRegion(
-                        forward.symbol,
-                        "model",
-                        program,
-                        tuple(
-                            catalog.get(function.name, NativeTensorImport(function))
-                            for function in sorted(program.functions, key=lambda function: function.name)
-                        ),
-                        ClosedWindowRequest(
-                            tuple(f"prefill{i}" for i in range(self.max_requests)),
-                            scan.chunk_size,
-                            self.probe.max_packed_rows,
-                        ),
-                    ),
-                ),
-            )
-        self.model_scan = (
-            scan,
-            ChunkTraining(
-                loss,
-                tuple(buffers),
-                parameters,
-                PageUpdate(optimizer, len(buffers))
-                if isinstance(optimizer, AdamWConfig)
-                else PoolSGD(optimizer.lr, len(buffers)),
-            ),
-        )
-        self._attach(
-            BackendAttachmentSpec(
-                AttachmentKind.MODEL_SCAN,
-                ((AttachmentTaskRole.COMPUTE, forward.symbol),),
-                AnchorSymbol("sampler.pre_draw"),
-                states[0].declaration.resource,
-                tuple(
-                    ParameterOverlayFieldBinding(
-                        target,
-                        effect.operator,
-                        tuple(LayoutFieldId(i) for i in parameters),
-                        target_resource(effect.state, target.layer),
-                        effect.scale,
-                    )
-                    for target in effect.targets
-                ),
-                model_scan_chunk_size=scan.chunk_size,
-            )
-        )
-
     def _bind_visibility(self, call: Call, source: VisibilitySource) -> None:
         """Attach the read domain; plan validation derives and checks its relation once."""
         self.graph = replace(
@@ -379,6 +247,7 @@ class ModelEffectBinding(TensorBindingBase):
         state_name: str,
         buffers: Mapping[str, Buffer],
         *,
+        initialize: Callable[[Tensors, torch.Generator], None] | None,
         targets: tuple[ParameterTarget, ...],
         applied: tuple[str, ...],
         namespace: str,
@@ -413,6 +282,14 @@ class ModelEffectBinding(TensorBindingBase):
             scope=StateScope.REQUEST,
             keys=keys,
         )
+        if initialize is not None:
+
+            def init(root: tuple[torch.Tensor, ...], generator: torch.Generator) -> None:
+                """Initialize each target's buffers; fields are laid out target by target."""
+                for start in range(0, len(root), len(buffers)):
+                    initialize(dict(zip(buffers, root[start : start + len(buffers)], strict=True)), generator)
+
+            self.initializers[str(state.declaration.resource)] = init
 
         def apply(hidden: torch.Tensor, values: Tensors) -> torch.Tensor:
             if operator is ParameterOverlayOperator.HEAD_ADD:

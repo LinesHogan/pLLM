@@ -25,16 +25,15 @@ def Exact() -> Visibility:
 class VisibilitySource:
     """Internal equation identity and read domain; Rust derives the read-from map.
 
-    Overlays keep their chunk/tail mathematics inside the transition's own scan
-    (chunk_size=0); ModelScan exposes its logical chunk domain to the planner.
+    Overlays keep their chunk/tail mathematics inside the transition's own scan (chunk_size=0).
     """
 
     policy: Visibility
-    scope: Literal["overlay", "model_scan", "post_sampler"]
+    scope: Literal["overlay", "post_sampler"]
     equations_digest: str
     resources: tuple[str, ...]
     chunk_size: int
-    tail: Literal["transition", "include", "carry"]
+    tail: Literal["transition", "carry"]
     lag: int = 0
 
     @staticmethod

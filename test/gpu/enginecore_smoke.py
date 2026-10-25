@@ -153,12 +153,12 @@ def _user_reference_workload() -> None:
         handle.close()
 
 
-def _model_scan_reconstruction() -> None:
+def _prefill_adapter_reconstruction() -> None:
     """A rebuilt worker starts fresh request identities and exact version-zero roots."""
     processes, requests = [], []
     for _ in range(2):
         with pllm.make_llm(
-            workload=PrefillAdapters(chunk_size=3, rank=2), config=engine(tokens=6, memory=0.15)
+            workload=PrefillAdapters(chunk_size=3, rank=2), config=engine(memory=0.15)
         ) as handle:
             handle.observe(TraceSelection(max_events=4096))
             outputs = handle.generate(["The quick brown fox jumps over the lazy dog.", "Hello there."], greedy(2))
@@ -174,7 +174,7 @@ def _model_scan_reconstruction() -> None:
             requests.append({identity.request_id for event in admissions for identity in event.identities})
             assert not torch.cuda.is_initialized()
     assert processes[0] != processes[1] and requests[0].isdisjoint(requests[1])
-    print(f"ModelScan reconstructed workers={processes}; fresh requests={requests}; parent CUDA=off")
+    print(f"prefill adapters reconstructed workers={processes}; fresh requests={requests}; parent CUDA=off")
 
 
 def _dummy_export() -> None:
@@ -558,7 +558,7 @@ def main() -> int:
     _captured_esamp()
     _dummy_export()
     _user_reference_workload()
-    _model_scan_reconstruction()
+    _prefill_adapter_reconstruction()
     _graph_overlay()
     _graph_overlay(exact=True)
     _gpu_shared_input()
@@ -577,7 +577,7 @@ MODES = {
     "--recirculation-measured": lambda: _recirculation_schedules(measured=True),
     "--dummy-only": _dummy_export,
     "--user-only": _user_reference_workload,
-    "--model-scan-only": _model_scan_reconstruction,
+    "--prefill-adapters-only": _prefill_adapter_reconstruction,
     "--tlm-only": _tlm_shared_input,
 }
 

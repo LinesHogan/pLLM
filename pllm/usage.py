@@ -27,16 +27,10 @@ from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.parameter_overlay import (
-    KVPolicy as KVPolicy,
-    ModelScan as ModelScan,
     ParameterEffect as ParameterEffect,
-    ParameterModuleKind,
     ParameterOverlayOperator,
-    ParameterRole,
     ParameterTarget,
 )
-from pllm.contracts.region_imports import RegionTensorImport
-from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY
 from pllm.contracts.request_identity import RequestKeyField, canonical_request_key_fields
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import SamplerStage
@@ -82,7 +76,6 @@ from pllm.execution.module_state import (
     parameter_count,
     skeleton,
 )
-from pllm.execution.region_streams import plan_closed_window
 from pllm.execution.replay import Recurrence as Recurrence
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.task_memory import derive_resources
@@ -92,6 +85,7 @@ from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots,
 from pllm.kernels.adamw import AdamWConfig
 
 F = TypeVar("F", bound=Callable[..., torch.Tensor | TensorUpdate])
+Initializer = Callable[[Tensors, torch.Generator], None]
 C = TypeVar("C")
 
 
@@ -340,7 +334,7 @@ def sampled_tokens() -> Any:
 
 
 def operand(name: Literal["input", "target", "weight"]) -> Any:
-    """A projection operand inside an overlay or ModelScan loss: its input, target or base weight."""
+    """A projection operand inside an overlay: its input, target or base weight."""
     return Operand(name)
 
 
@@ -435,7 +429,7 @@ class InstanceState:
             shapes,
             optimizer=self.optimizer,
             namespace=self.namespace,
-            initialize=None if self.initialize is None else freeze(self.initialize),
+            initialize=_frozen(self.initialize),
             scope=self.scope,
             dtype=TensorDType(str(self.dtype).removeprefix("torch.")),
             alignment=self.alignment,
@@ -517,6 +511,9 @@ class Overlay(ParameterEffect):
     def declare(self, context: _Declaration) -> None:
         """Import externally produced overlay buffers into private roots."""
         definition = context.state_definition(self.state, "external overlays require a declared state")
+        _reject(
+            definition.initialize is not None, "imported overlays take their values from the import; drop initialize"
+        )
         context.binding.import_overlay(
             self.state,
             _buffers(definition),
@@ -530,10 +527,14 @@ class Overlay(ParameterEffect):
         )
 
 
+def _frozen(initialize: Initializer | None) -> Initializer | None:
+    return None if initialize is None else freeze(initialize)
+
+
 def _buffers(state: InstanceState) -> dict[str, Buffer]:
     _reject(
-        state.optimizer is not None or state.initialize is not None,
-        "buffer effects require zero-initialized state without an optimizer",
+        state.optimizer is not None,
+        "buffer effects update their state themselves; drop the optimizer",
     )
     _reject(state.alignment != 16, "buffer effect layouts use their original target alignment")
     _reject(
@@ -826,6 +827,7 @@ class _Overlay(_Effect):
             operation.name,
             self.state,
             buffers,
+            initialize=_frozen(definition.initialize),
             targets=targets,
             applied=applied,
             namespace=definition.namespace,
@@ -917,10 +919,7 @@ def train(
     reset: str = "",
     rows: str = "",
 ) -> Callable[[F], F]:
-    """Minimize the returned per-row loss with `state`'s optimizer.
-
-    Runs after sampling, or inside the model forward when `state` belongs to a ModelScan.
-    """
+    """Minimize the returned per-row loss with `state`'s optimizer; runs after sampling by default."""
     return _mark(effect=_Train(state=state, update=update, reduction=reduction, steps=steps, reset=reset), rows=rows)
 
 
@@ -1092,7 +1091,7 @@ def _property(member: object) -> Callable[..., object] | None:
         if isinstance(member, property)
         and member.fget is not None
         and signature(member.fget, eval_str=False).return_annotation
-        in (InstanceState, RequestState, Activation, Overlay, Recurrence, ModelScan)
+        in (InstanceState, RequestState, Activation, Overlay, Recurrence)
         else None
     )
 
@@ -1127,8 +1126,6 @@ class _Declaration:
     writes: dict[str, tuple[Call, Call]] = field(default_factory=lambda: {})
     prediction: tuple[Call, _Sampler] | None = None
     training: tuple[Call, State] | None = None
-    model_training: set[str] = field(default_factory=lambda: set[str]())
-    implicit_training: set[str] = field(default_factory=lambda: set[str]())
 
     @classmethod
     def read(cls, workload: Workload, binding: TensorBinding) -> _Declaration:
@@ -1156,11 +1153,6 @@ class _Declaration:
             if _property(member):
                 values[name] = object.__getattribute__(owner, name)
         for value in values.values():
-            if isinstance(value, ModelScan):
-                context.overlay_states.add(value.apply.state)
-                for operation in context.operations:
-                    if operation.name == value.learn and operation.name in context.implicit_training:
-                        operation.phase = Phase.MODEL_UPDATE
             if isinstance(value, Overlay):
                 context.overlay_states.add(value.state)
         return context
@@ -1182,9 +1174,6 @@ class _Declaration:
         seeds.extend(candidates[text] for text in texts if isinstance(text, str) and text in candidates)
         if (overlay := _typed(effect, _Overlay)) is not None:
             self.overlay_states.add(overlay.state)
-        if phase is None and isinstance(effect, _Train):
-            # A ModelScan learner trains inside the forward; `read` moves it once the scans are known.
-            self.implicit_training.add(name)
         phase = phase or effect.phase or Phase.AFTER_SAMPLE
         if (function := _typed(member, FunctionType)) is not None:
             seeds.append(function)
@@ -1223,7 +1212,9 @@ class _Declaration:
             keys=definition.request_keys,
         )
         self.states[name] = state
-        ports = self.binding.parameter_ports(state, {field.name: field.shape for field in state.fields})
+        ports = self.binding.parameter_ports(
+            state, {field.name: field.shape for field in state.fields}, initialize=_frozen(definition.initialize)
+        )
         self.parameters.update({(name, field): port for field, port in ports.items()})
 
     def declare_values(self) -> None:
@@ -1236,8 +1227,6 @@ class _Declaration:
                 state.declare(name, self)
 
         for name, value in self.values.items():
-            if isinstance(value, ModelScan):
-                self.declare_model_scan(name, value)
             if isinstance(value, (Activation, Overlay, Recurrence)):
                 self.definitions.append((name, fingerprint(value)))
                 if isinstance(value, Overlay):
@@ -1253,88 +1242,6 @@ class _Declaration:
                 self.binding.recurrence(value)
         if self.binding.feeds:
             self.binding.conditional_input(tuple(feed.resource for feed in self.binding.feeds))
-
-    def declare_model_scan(self, name: str, scan: ModelScan) -> None:
-        """Bind the training method once, under its model scan's advance owner."""
-        effect = scan.apply
-        definition = self.state_definition(effect.state, "ModelScan needs a declared RequestState")
-        _reject(
-            definition.scope is not StateScope.REQUEST
-            or RequestKeyField.REQUEST_ID not in definition.request_keys
-            or any(
-                target.module is not ParameterModuleKind.MLP or target.role is not ParameterRole.DOWN_PROJECTION_WEIGHT
-                for target in effect.targets
-            )
-            or effect.operator is not ParameterOverlayOperator.LOW_RANK_ADD,
-            "ModelScan needs independent request-local low-rank down projections",
-        )
-        _reject(
-            definition.optimizer is None
-            or definition.initialize is None
-            or definition.memory
-            or tuple(definition.fields) != effect.factors
-            or definition.alignment != 16,
-            "ModelScan needs two ordered adapter fields, an initializer and an optimizer",
-        )
-        assert definition.optimizer is not None and definition.initialize is not None
-        _reject(
-            set(definition.fields) & {operand.value for operand in Operand},
-            "adapter field names must differ from the input, target and weight operand names",
-        )
-        dimensions = self.binding.dimensions
-        _reject(
-            dimensions is not None and str(definition.dtype) != "torch." + dimensions.dtype.value,
-            "ModelScan state dtype must match the model's projection dtype",
-        )
-        candidates = tuple(operation for operation in self.operations if operation.name == scan.learn)
-        _reject(len(candidates) != 1 or scan.learn in self.model_training, "ModelScan training needs one advance owner")
-        (operation,) = candidates
-        training = operation.effect
-        _reject(
-            not isinstance(training, _Train)
-            or training.state != effect.state
-            or training.steps != 1
-            or training.reset
-            or training.update
-            or training.reduction != "mean"
-            or operation.phase is not Phase.MODEL_UPDATE
-            or operation.rows
-            or operation.gradient is not None,
-            "ModelScan needs @train on its own state, with one local mean loss",
-        )
-        buffers: dict[str, Buffer] = {}
-        for key, value in definition.fields.items():
-            if isinstance(value, Buffer):
-                buffers[key] = value
-            elif callable(value):
-                raise TypeError("ModelScan operand-dependent shapes require Buffer(input_size, output_size)")
-            else:
-                buffers[key] = Buffer(value, definition.dtype)
-        bindings = {
-            key: source.overlay(effect.state, buffers) for key, source in _arguments(operation.function).items()
-        }
-        _reject(
-            set(bindings.values()) != {"input", "target", "weight", *effect.factors},
-            "ModelScan loss must consume input, target, base weight and both adapter factors",
-        )
-        self.definitions.append((name, fingerprint(scan)))
-        self.binding.scan_model(
-            name,
-            scan,
-            buffers,
-            definition.namespace,
-            freeze(definition.initialize),
-            _invoke(freeze(operation.function), bindings),
-            definition.optimizer,
-            definition.request_keys,
-            boundary_digest(
-                self.definitions,
-                self.bindings,
-                fingerprint(definition.initialize),
-                definition.optimizer,
-            ),
-        )
-        self.model_training.add(scan.learn)
 
     def train(self, call: Call, state: str) -> None:
         _reject(self.training is not None, "tensor sampler attachment requires one training operation")
@@ -1369,7 +1276,6 @@ class _Declaration:
         _reject(
             any(
                 name not in {state.resource for state in b.graph.states}
-                and (b.model_scan is None or name != b.model_scan[0].apply.state)
                 for name, value in self.values.items()
                 if _typed(value, InstanceState) is not None
             ),
@@ -1402,12 +1308,7 @@ class Workload(
         context = _Declaration.read(self, b)
         context.declare_values()
         for operation in sorted(context.operations, key=lambda operation: operation.name):
-            if operation.name not in context.model_training:
-                _reject(
-                    b.model_scan is not None,
-                    "ModelScan owns its state and training; remove other scheduled operations",
-                )
-                operation.effect.declare(operation)
+            operation.effect.declare(operation)
         context.attach_effects()
         context.attach_training()
         context.sign_composition()
@@ -1481,7 +1382,6 @@ class Workload(
             sampler_feedback=any(
                 isinstance(port.source, SamplerFeedbackInputSource) for task in b.graph.tasks for port in task.inputs
             ),
-            prefill_chunk_size=0 if b.model_scan is None else b.model_scan[0].chunk_size,
         )
 
     def declare(self, facts: BackendCompileFacts) -> tuple[SemanticGraph, TensorLayoutRequest, BackendAttachmentSpec]:
@@ -1500,15 +1400,8 @@ class Workload(
 
             def initialize(roots: Roots, keys: tuple[RequestStateKey | None, ...]) -> None:
                 if init is not None:
-                    for root, key in zip(roots, keys, strict=True):
-                        rng = (
-                            generator
-                            if b.model_scan is None
-                            else torch.Generator(device=device).manual_seed(
-                                int(boundary_digest(seed, resource, key)[:16], 16)
-                            )
-                        )
-                        init(root, rng)
+                    for root in roots:
+                        init(root, generator)
 
             return initialize
 
@@ -1557,20 +1450,6 @@ class Workload(
         )
         return owner.operations(facts, plan, b)
 
-    def source_imports(self, facts: BackendCompileFacts) -> tuple[RegionTensorImport, ...]:
-        """Import the local derivatives and the actual shared optimizer implementation."""
-        with FakeTensorMode():
-            binding = self.declaration(facts)
-        if binding.model_scan is None:
-            return ()
-        _, training = binding.model_scan
-        return tuple(
-            training.capture(function).implementation
-            for source in binding.graph.source_regions
-            for function in source.program.functions
-            if function.name.startswith("train.")
-        )
-
     def specialize(self, facts: BackendCompileFacts, options: ExecutionOptions) -> BackendCompileFacts:
         """Fund shared page storage for declared feeds before compiling the plan."""
         if self.declaration(facts).feeds:
@@ -1585,28 +1464,6 @@ class Workload(
         _reject(options.explicit_math, "this workload has no explicit tensor implementation")
         with FakeTensorMode():
             binding = self.declaration(facts)
-        if binding.model_scan is not None:
-            _reject(options.capture, "ModelScan currently needs eager execution")
-            (task,) = binding.graph.tasks
-            windows = tuple(
-                plan_closed_window(
-                    source,
-                    facts.timeline.region_policy,
-                    parallel=REGION_STREAMS_CAPABILITY in facts.probe.capabilities,
-                    budget=options.memory_budget_bytes,
-                )
-                for source in binding.graph.source_regions
-            )
-            return replace(
-                facts.timeline,
-                task_resources=(
-                    TaskResourceFact(
-                        task.symbol,
-                        max(window.workspace_bytes for window in windows),
-                        0,
-                    ),
-                ),
-            )
         timeline = derive_resources(binding, facts, options)
         concurrent = sum(producer.memory().workspace for producer in self.producers)
         return (
@@ -1688,10 +1545,8 @@ __all__ = [
     "Activation",
     "Overlay",
     "Recurrence",
-    "ModelScan",
     "ParameterEffect",
     "Exact",
     "Visibility",
-    "KVPolicy",
     "SGD",
 ]

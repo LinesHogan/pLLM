@@ -18,7 +18,6 @@ from pllm.contracts.backend_attachment import (
 )
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
-    ModelScan,
     ParameterTarget,
 )
 from pllm.contracts.semantic_graph import (
@@ -27,7 +26,6 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.state_feed import FeedBinding
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.declaration import Builder, Dimensions, Field
-from pllm.execution.model_scan import ChunkTraining
 from pllm.execution.tensor_frame import (
     TensorFrame,
 )
@@ -85,4 +83,3 @@ class TensorBindingBase(Builder[TensorFrame]):
         self.overlay_targets: tuple[ParameterTarget, ...] = ()
         self.parameter_phases: tuple[HiddenPhase, ...] = ()
         self.overlay_import = False
-        self.model_scan: tuple[ModelScan, ChunkTraining] | None = None

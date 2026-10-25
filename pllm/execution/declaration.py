@@ -421,10 +421,7 @@ class Builder(Generic[D]):
                     item.implementation_id for item in plan.schedule_physical.tasks if graph.tasks[item.task_id] is task
                 )
             )
-            bound = self.bind_native(task, identity, plan, model_probe)
-            if bound is not None:
-                functions.append(bound)
-            elif isinstance(task.replay, ConditionalLayerReplay):
+            if isinstance(task.replay, ConditionalLayerReplay):
                 if plan is None or self.dimensions is None:
                     raise ValueError("conditional replay requires a specialized backend plan")
                 placements = {(r.device_kind.value, r.device_ordinal) for r in plan.state_physical.representations}
@@ -487,16 +484,6 @@ class Builder(Generic[D]):
             ConditionalProducerTask(function) if function.implementation_id in guarded else function
             for function in functions
         )
-
-    def bind_native(
-        self,
-        task: SemanticTask,
-        identity: ImplementationId,
-        plan: PlanBundle | None,
-        probe: BackendPlacementProbe | None,
-    ) -> TaskGraphImplementation[StateTaskContext[D]] | None:
-        """Bind a declaration's structured implementation before ordinary tensor tasks."""
-        return None
 
     def conditional_input(self, borrowed_resources: tuple[str, ...]) -> None:
         """Declare one atomic input closure without changing the task/state symbols."""

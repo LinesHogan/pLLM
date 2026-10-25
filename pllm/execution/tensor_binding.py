@@ -15,9 +15,7 @@ import torch
 from pllm.contracts.auxiliary import StateTensorUpdate
 from pllm.contracts.backend_attachment import (
     AttachmentKind,
-    BackendPlacementProbe,
 )
-from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.request_identity import RequestKeyField
@@ -25,17 +23,12 @@ from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
 from pllm.contracts.semantic_graph import (
     HiddenInputSource,
-    ImplementationId,
-    SemanticTask,
     StateScope,
 )
 from pllm.contracts.state_ref import StateRef
-from pllm.execution.execution import TaskGraphImplementation
-from pllm.execution.model_scan import ModelScanTask
 from pllm.execution.ptts.page_bundle import PagePublication
 from pllm.execution.scan import ScanContext
 from pllm.execution.shared_tensor import tensor_dtype
-from pllm.execution.state_execution import StateTaskContext
 from pllm.execution.step_capture import StepCapture
 from pllm.execution.tensor_executor import TensorExecutor, reads_rows
 from pllm.execution.tensor_frame import (
@@ -93,20 +86,6 @@ TensorOutput = TensorResult | torch.Tensor | None
 class TensorBinding(ModelEffectBinding, RowTaskBinding):
     """Authoring projections only; tensor results remain invocation-local."""
 
-    def bind_native(
-        self,
-        task: SemanticTask,
-        identity: ImplementationId,
-        plan: PlanBundle | None,
-        probe: BackendPlacementProbe | None,
-    ) -> TaskGraphImplementation[StateTaskContext[TensorFrame]] | None:
-        """Bind the model region using the same signed declaration as its backend."""
-        if self.model_scan is None:
-            return None
-        assert plan is not None and probe is not None
-        scan, training = self.model_scan
-        return ModelScanTask[TensorFrame].bind(task, identity, plan, scan, training)
-
     def configure_scans(self, facts: BackendCompileFacts) -> None:
         """Bind scan specialization to the plan's policy and row capacity."""
         for symbol, operation in self.operations.items():
@@ -159,7 +138,7 @@ class TensorBinding(ModelEffectBinding, RowTaskBinding):
             raise ValueError("tensor execution requires specialized model dimensions")
         if (
             self.attachment is not None
-            and self.attachment.kind in (AttachmentKind.MODEL_REPLAY, AttachmentKind.MODEL_SCAN)
+            and self.attachment.kind is AttachmentKind.MODEL_REPLAY
             and not self.attachment.activation_bindings
         ):
 

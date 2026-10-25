@@ -35,7 +35,6 @@ class AttachmentTopology(StrEnum):
 class AttachmentKind(StrEnum):
     OBSERVATION = "observation"
     MODEL_REPLAY = "model_replay"
-    MODEL_SCAN = "model_scan"
     REQUEST_TRAINING = "request_training"
     PARAMETER_OVERLAY = "parameter_overlay"
     ACTIVATION_PATCH = "activation_patch"
@@ -164,7 +163,6 @@ class BackendAttachmentSpec:
     overlay_bindings: tuple[ParameterOverlayFieldBinding, ...] = ()
     activation_bindings: tuple[ActivationPatchBinding, ...] = ()
     sampler_stage: SamplerStage = SamplerStage.PACKED_POST_FILTER_EXACT
-    model_scan_chunk_size: int = 0
 
     @property
     def guides_sampler(self) -> bool:
@@ -185,7 +183,6 @@ class BackendAttachmentRequest:
     state_resource: str
     overlay_bindings: tuple[ParameterOverlayFieldBinding, ...] = ()
     activation_bindings: tuple[ActivationPatchBinding, ...] = ()
-    model_scan_chunk_size: int = 0
     schema_version: int = 10
 
     @property

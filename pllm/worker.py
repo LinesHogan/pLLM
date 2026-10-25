@@ -57,7 +57,6 @@ class GPUWorker(Worker):
             runner,
             attachment.inputs.plan.timeline,
             publish_lag=0 if visibility is None else visibility.lag,
-            source_workload=workload,
         )
         runner.attach_workload(workload.bind_backend(facts, attachment))
 
@@ -83,17 +82,7 @@ class GPUWorker(Worker):
             match operation:
                 case BackendCommand.PROBE:
                     probe = decode_boundary(payload, BackendProbe)
-                    source_workload = None
-                    if probe.requirements.prefill_chunk_size:
-                        authoring = decode_workload(
-                            probe.definition, device=runner.device, seed=runner.model_config.seed
-                        )
-                        source_workload = authoring
-                    return encode_boundary(
-                        probe_backend(
-                            probe.requirements, runner, publish_lag=probe.publish_lag, source_workload=source_workload
-                        )
-                    )
+                    return encode_boundary(probe_backend(probe.requirements, runner, publish_lag=probe.publish_lag))
                 case BackendCommand.INSTALL:
                     install = decode_boundary(payload, BackendInstall)
                     # The reference names an importable frozen class; the driver compares

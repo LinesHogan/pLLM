@@ -10,7 +10,6 @@ import torch
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.tensor_layout import LayoutFieldId
-from pllm.contracts.visibility import Exact, Visibility
 
 
 class ParameterModuleKind(StrEnum):
@@ -60,12 +59,6 @@ class CapturedParameterOperand:
     base_weight: torch.Tensor
 
 
-class KVPolicy(StrEnum):
-    """Which parameter history the model's cached keys and values represent."""
-
-    CAUSAL_HISTORY = "causal_history"
-
-
 @dataclass(frozen=True)
 class ParameterEffect:
     """Apply request state at original model projections."""
@@ -83,29 +76,8 @@ class ParameterEffect:
         return self.factors if self.operator is ParameterOverlayOperator.LOW_RANK_ADD else (self.weight,)
 
 
-@dataclass(frozen=True)
-class ModelScan:
-    """Learn once per nonempty prefill chunk, including its tail; freeze for decode."""
-
-    chunk_size: int
-    apply: ParameterEffect
-    learn: str
-    visibility: Visibility = Exact()
-    kv: KVPolicy = KVPolicy.CAUSAL_HISTORY
-
-    def __post_init__(self) -> None:
-        if type(self.chunk_size) is not int or self.chunk_size < 1:
-            raise ValueError("ModelScan needs a positive chunk size")
-        if not self.learn:
-            raise ValueError("ModelScan needs a training method")
-        if self.visibility != Exact() or self.kv is not KVPolicy.CAUSAL_HISTORY:
-            raise ValueError("ModelScan needs visibility=Exact() with KVPolicy.CAUSAL_HISTORY")
-
-
 __all__ = [
-    "ModelScan",
     "ParameterEffect",
-    "KVPolicy",
     "ParameterModuleKind",
     "ParameterOverlayFieldBinding",
     "ParameterOverlayOperator",

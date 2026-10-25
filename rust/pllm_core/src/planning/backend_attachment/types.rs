@@ -20,7 +20,6 @@ pub(crate) enum AttachmentTopology {
 pub(crate) enum AttachmentKind {
     Observation,
     ModelReplay,
-    ModelScan,
     RequestTraining,
     ParameterOverlay,
     ActivationPatch,
@@ -255,7 +254,6 @@ pub(crate) struct BackendAttachmentRequest {
     pub(crate) state_resource: String,
     pub(crate) overlay_bindings: Vec<OverlayBinding>,
     pub(crate) activation_bindings: Vec<ActivationPatchBinding>,
-    pub(crate) model_scan_chunk_size: u64,
     pub(crate) schema_version: u64,
 }
 

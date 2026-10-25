@@ -16,11 +16,11 @@ pub(super) struct Visibility { pub kind: Kind }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum Scope { Overlay, ModelScan, PostSampler }
+pub(super) enum Scope { Overlay, PostSampler }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum Tail { Transition, Include, Carry }
+pub(super) enum Tail { Transition, Carry }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -52,7 +52,6 @@ fn relation(source: &Source, ctx: &Context) -> Result<UnionMap, String> {
     if source.lag != 0 { return Err("step lag belongs to post-sampler visibility".into()); }
     let extent = match (&source.scope, &source.policy.kind, &source.tail, source.chunk_size) {
         (Scope::Overlay, Kind::ForwardPinned, Tail::Transition, 0) => "C = 1 and N = 1",
-        (Scope::ModelScan, Kind::Exact, Tail::Include, 1..) => "0 <= C and N = C",
         (Scope::Overlay, Kind::Exact, Tail::Carry, 0) => "0 <= C and C <= N <= C+1",
         _ => return Err("state visibility must use its declaration's chunk and tail domain".into()),
     };
@@ -66,10 +65,6 @@ fn relation(source: &Source, ctx: &Context) -> Result<UnionMap, String> {
         if source.policy.kind == Kind::Exact {
             parts.push(format!("{reader}[r,t,c] -> update[r,t,c-1] : {domain} and 0 < c < {count}"));
         }
-    }
-    if source.scope == Scope::ModelScan {
-        parts.push(format!("decode[r,t] -> entry[r,t] : {domain} and C = 0"));
-        parts.push(format!("decode[r,t] -> update[r,t,C-1] : {domain} and C > 0"));
     }
     isl(UnionMap::read_from_str(ctx, &format!("[C,N,R] -> {{ {} }}", parts.join("; "))))
 }

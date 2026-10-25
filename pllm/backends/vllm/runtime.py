@@ -29,7 +29,6 @@ from vllm.v1.worker.gpu_worker import Worker
 
 from pllm.authoring import (
     AuxiliaryInput,
-    BackendAuthoring,
     BackendCompileFacts,
     BackendDeployment,
     BackendRequirements,
@@ -39,7 +38,6 @@ from pllm.authoring import (
     StateTensorUpdate,
     map_auxiliary,
 )
-from pllm.backends.vllm.model_scan import ModelScanSource
 from pllm.backends.vllm.overlay_graph import (
     graph_mode,
     graph_options,
@@ -49,13 +47,11 @@ from pllm.backends.vllm.parameter_overlay import (
 )
 from pllm.backends.vllm.region_kernels import qwen_region_kernels
 from pllm.backends.vllm.region_layers import VllmDecoderBodies
-from pllm.backends.vllm.window_scheduler import WINDOW_ARGUMENT, model_scan_admission
 from pllm.config import ModelConfig, RunnerKind, VllmDType
 from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
     AttachmentHiddenResource,
-    AttachmentKind,
     BackendPlacementProbe,
     CausalModelDomain,
     SignedBackendAttachment,
@@ -189,7 +185,6 @@ class BackendProbe:
 
     requirements: BackendRequirements
     publish_lag: int = 1
-    definition: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -631,13 +626,6 @@ class VllmLlm(Generic[DataT, ResultT]):
                 raise ValueError("one prompt identity cannot name different input texts")
         validate_auxiliary(auxiliary, self.attachment.inputs.plan, SharedTensor.describe)
         llm = self._require_llm()
-        if self.attachment.inputs.request.attachment_kind is AttachmentKind.MODEL_SCAN:
-            sampling_params = sampling_params.clone()
-            extras = dict(sampling_params.extra_args or {})
-            if WINDOW_ARGUMENT in extras:
-                raise ValueError("closed-window admission is supplied by the installed workload plan")
-            extras[WINDOW_ARGUMENT] = encode_boundary(model_scan_admission(self.attachment))
-            sampling_params.extra_args = extras
         llm.sleep(level=0, mode="keep")
         request_ids: list[str] = []
         lifetime = ExitStack()
@@ -750,10 +738,6 @@ def create_vllm_llm(
     if _VLLM_VERSION != _SUPPORTED_VLLM_VERSION:
         raise RuntimeError("vLLM workload requires vLLM 0.27.1 exactly")
     requirements = workload.backend_requirements()
-    if requirements.prefill_chunk_size and (
-        config.runner is not RunnerKind.MRV2 or config.max_num_batched_tokens < requirements.prefill_chunk_size
-    ):
-        raise ValueError("ModelScan needs MRv2 and enough engine tokens for one complete learning chunk")
     if config.cuda_graphs and requirements.activation_layers:
         raise ValueError("parameter overlays and activation patches do not run under CUDA graphs yet")
     environment = {
@@ -790,11 +774,8 @@ def create_vllm_llm(
             seed=config.seed,
             trust_remote_code=config.trust_remote_code,
             enable_prefix_caching=config.enable_prefix_caching,
-            enable_chunked_prefill=bool(requirements.prefill_chunk_size),
-            scheduler_cls=(
-                "pllm.backends.vllm.window_scheduler.ClosedWindowScheduler" if requirements.prefill_chunk_size else None
-            ),
-            async_scheduling=False if config.runner is RunnerKind.MRV1 or requirements.prefill_chunk_size else None,
+            enable_chunked_prefill=False,
+            async_scheduling=False if config.runner is RunnerKind.MRV1 else None,
         )
     finally:
         for name, value in previous_environment.items():
@@ -811,7 +792,7 @@ def create_vllm_llm(
                 timeout=30.0,
                 args=(
                     BackendCommand.PROBE.value,
-                    encode_boundary(BackendProbe(requirements, config.execution.publish_lag, definition or "")),
+                    encode_boundary(BackendProbe(requirements, config.execution.publish_lag)),
                 ),
             )
             if len(replies) != 1:
@@ -852,7 +833,7 @@ def create_vllm_llm(
                 case _:
                     raise RuntimeError("vLLM workload did not construct its selected runner")
             facts = workload.specialize(
-                probe_backend(requirements, runner, publish_lag=config.execution.publish_lag, source_workload=workload),
+                probe_backend(requirements, runner, publish_lag=config.execution.publish_lag),
                 config.execution,
             )
             deployment = workload.compile_backend(facts)
@@ -869,7 +850,6 @@ def probe_backend(
     timeline: SchedulerTimeline | None = None,
     *,
     publish_lag: int = 1,
-    source_workload: BackendAuthoring | None = None,
 ) -> BackendCompileFacts:
     _require_runner(runner)
     match runner.model:
@@ -898,7 +878,7 @@ def probe_backend(
     )
     targets = inspect_parameter_targets(model, requirements.parameter_targets, runner.dtype)
     replay_capabilities = (
-        ("model/chunk_scan@1", "model/layer_replay@1", "model/tokenwise_replay@1", REGION_STREAMS_CAPABILITY)
+        ("model/layer_replay@1", "model/tokenwise_replay@1", REGION_STREAMS_CAPABILITY)
         if runner.runner_kind is RunnerKind.MRV2 and graph_mode(runner.overlay_graph_bytes) is AttachmentGraphMode.EAGER
         else ()
     )
@@ -994,8 +974,6 @@ def probe_backend(
     # Each lagged step additionally retains its exact input root for readers. No host wait
     # is hidden in this capacity: current + private + GPU reader + publish_lag retained roots.
     capacity = (3 + publish_lag) * runner.max_num_reqs + 2
-    if requirements.prefill_chunk_size:
-        capacity = 3 * runner.max_num_reqs
     facts = BackendCompileFacts(
         probe,
         timeline,
@@ -1014,12 +992,6 @@ def probe_backend(
         model.config.vocab_size,
         layer_count,
     )
-    if requirements.prefill_chunk_size and source_workload is not None:
-        graph, _, attachment = source_workload.declare(facts)
-        source = ModelScanSource.capture(model.model, attachment.overlay_bindings)
-        kernels = source.imports(model.model, graph.source_regions, probe)
-        training = source_workload.source_imports(facts)
-        facts = replace(facts, probe=replace(probe, region_imports=(*probe.region_imports, *kernels, *training)))
     return facts
 
 

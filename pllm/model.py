@@ -1,4 +1,4 @@
-"""In-model interventions and their targets: ModelScan, parameter overlays, activation patches, replay.
+"""In-model interventions and their targets: parameter overlays, activation patches, replay.
 
 Workloads use these together with `pllm.overlay`, `pllm.on` and the Visibility presets.
 """
@@ -19,17 +19,13 @@ from pllm.contracts.parameter_overlay import (
 from pllm.contracts.semantic_graph import ConditionalLayerReplay as ConditionalLayerReplay
 from pllm.usage import (
     Activation as Activation,
-    KVPolicy as KVPolicy,
-    ModelScan as ModelScan,
     Overlay as Overlay,
     ParameterEffect as ParameterEffect,
     Recurrence as Recurrence,
 )
 
 __all__ = [
-    "ModelScan",
     "ParameterEffect",
-    "KVPolicy",
     "ParameterTarget",
     "ParameterModuleKind",
     "ParameterRole",
