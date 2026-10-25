@@ -81,7 +81,7 @@ from pllm.execution.task_memory import derive_resources
 from pllm.execution.tensor_binding import TensorBinding, TensorOutput as TensorOutput
 from pllm.execution.tensor_frame import TensorFrame, TensorPort, Tensors, TensorUpdate as TensorUpdate
 from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots, TensorComputation
-from pllm.execution.token_program import Layers, Tokens
+from pllm.execution.token_program import Tokens
 from pllm.kernels.adamw import AdamWConfig
 
 F = TypeVar("F", bound=Callable[..., torch.Tensor | TensorUpdate])
@@ -944,11 +944,7 @@ def layer_route(*, tokens: Tokens = "all") -> Callable[[F], F]:
     if tokens not in ("prefill", "decode", "all"):
         raise ValueError('set layer_route(tokens=) to "prefill", "decode" or "all"')
 
-    def mark(function: F) -> F:
-        setattr(function, "__pllm_tokens__", tokens)
-        return function
-
-    return mark
+    return _mark(tokens=tokens)
 
 
 def _values(owner: object) -> dict[str, object]:
@@ -1257,11 +1253,7 @@ class _Declaration:
             if isinstance(value, Activation):
                 value.declare(self)
         for name, tokens in self.routes:
-
-            def invoke(layers: Layers) -> torch.Tensor:
-                return self.method(name)(layers)
-
-            self.binding.layer_route(invoke, tokens)
+            self.binding.layer_route(self.method(name), tokens)
         if self.binding.feeds:
             self.binding.conditional_input(tuple(feed.resource for feed in self.binding.feeds))
 

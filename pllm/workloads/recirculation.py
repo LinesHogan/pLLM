@@ -13,8 +13,8 @@ def norm_match(
     """Match source norm in fp32, clamping only its norm, then mix residual streams."""
     src, dst = source.float(), destination.float()
     matched = src * (
-        torch.ops.aten.linalg_vector_norm.default(dst, 2, [-1], True)
-        / torch.ops.aten.linalg_vector_norm.default(src, 2, [-1], True).clamp_min(torch.finfo(torch.float32).tiny)
+        dst.square().sum(-1, keepdim=True).sqrt()
+        / src.square().sum(-1, keepdim=True).sqrt().clamp_min(torch.finfo(torch.float32).tiny)
     )
     return (beta * dst + alpha * matched).to(destination.dtype)
 
