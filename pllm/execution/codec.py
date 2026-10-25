@@ -51,6 +51,17 @@ class _TensorCompiler(Protocol):
     def compile(self, function: TensorFunction, *, fullgraph: bool, dynamic: bool) -> TensorFunction: ...
 
 
+def tensor_decompositions(operators: tuple[OpOverload, ...]) -> dict[OpOverload, Callable[..., torch.Tensor]]:
+    """Torch decompositions for fake tracing without AOT's CUDA RNG initialization."""
+    return cast(
+        dict[OpOverload, Callable[..., torch.Tensor]],
+        {
+            **getattr(_decomp, "core_aten_decompositions")(),
+            **cast(_TensorDecompositions, _decomp).get_decompositions(operators),
+        },
+    )
+
+
 def check_static_export(program: torch.export.ExportedProgram) -> None:
     if cast(_FunctionalExport, program).range_constraints:
         raise ValueError("tensor cell import requires static export shapes; symbolic constraints cannot be discarded")

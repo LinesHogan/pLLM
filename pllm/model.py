@@ -21,7 +21,6 @@ from pllm.usage import (
     Activation as Activation,
     Overlay as Overlay,
     ParameterEffect as ParameterEffect,
-    Recurrence as Recurrence,
 )
 
 __all__ = [
@@ -38,5 +37,4 @@ __all__ = [
     "DecodeRefresh",
     "MissingPolicy",
     "ConditionalLayerReplay",
-    "Recurrence",
 ]

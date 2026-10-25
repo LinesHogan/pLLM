@@ -55,7 +55,6 @@ from pllm.execution.host_runtime import (
 )
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.region_adamw import AdamWRegion
-from pllm.execution.replay import Recurrence
 from pllm.execution.shared_tensor import tensor_dtype
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.tensor_frame import Tensors
@@ -70,7 +69,7 @@ TransactionT = TypeVar("TransactionT")
 SnapshotT = TypeVar("SnapshotT")
 RequestT = TypeVar("RequestT")
 
-_MARKERS = (InstanceState, Activation, Overlay, Recurrence)
+_MARKERS = (InstanceState, Activation, Overlay)
 
 
 def transaction(

@@ -56,7 +56,7 @@ from pllm.contracts.semantic_graph import (
     SamplerFeedbackInputSource,
     SchedulerTimeline,
     StateScope,
-    TokenwiseLayerReplay,
+    TokenProgramEffect,
 )
 from pllm.execution.backend_attachment import attachment_buffer_bytes
 from pllm.execution.cuda_stream import CudaStreamReadiness
@@ -182,7 +182,7 @@ class VllmSession(Generic[DataT, ResultT]):
                 model,
                 attachment.inputs.request.activation_bindings,
                 attachment.inputs.request.state_resource,
-                install=not any(isinstance(task.replay, TokenwiseLayerReplay) for task in tasks),
+                install=not any(isinstance(task.replay, TokenProgramEffect) for task in tasks),
             )
             if (attachment.inputs.request.activation_bindings)
             else None
@@ -203,7 +203,7 @@ class VllmSession(Generic[DataT, ResultT]):
             if isinstance(task.replay, ConditionalLayerReplay) and self._overlay is not None:
                 assert isinstance(self._overlay, PinnedParameterOverlay)
                 self._replay = VllmLayerReplay(model, task.replay, self._overlay, probe.causal_domain)
-            elif isinstance(task.replay, TokenwiseLayerReplay):
+            elif isinstance(task.replay, TokenProgramEffect):
                 self._replay = VllmTokenwiseReplay(
                     model,
                     task,

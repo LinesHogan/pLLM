@@ -71,7 +71,7 @@ from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.semantic_graph import (
     SchedulerTimeline,
     TaskId,
-    TokenwiseLayerReplay,
+    TokenProgramEffect,
 )
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorFieldSpec
@@ -222,7 +222,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         if (
             TOKEN_CAPTURE_CAPABILITY in self.attachment.inputs.probe.capabilities or policy.schedule_policy == "serial"
         ) or not any(
-            isinstance(task.replay, TokenwiseLayerReplay) for task in self.attachment.inputs.plan.semantic_graph.tasks
+            isinstance(task.replay, TokenProgramEffect) for task in self.attachment.inputs.plan.semantic_graph.tasks
         ):
             return
         if policy.tuning == "heuristic":
@@ -232,10 +232,10 @@ class VllmLlm(Generic[DataT, ResultT]):
         task = next(
             task
             for task in self.attachment.inputs.plan.semantic_graph.tasks
-            if isinstance(task.replay, TokenwiseLayerReplay)
+            if isinstance(task.replay, TokenProgramEffect)
         )
         probe = self.attachment.inputs.probe
-        if not isinstance(task.replay, TokenwiseLayerReplay) or probe.causal_domain is None:
+        if not isinstance(task.replay, TokenProgramEffect) or probe.causal_domain is None:
             raise ValueError("native tuning requires its signed causal model domain")
         tensor = TensorType((1, probe.hidden_size), "torch." + probe.tensor_dtype.value, str(self._facts.device))
         budget = next(
@@ -249,6 +249,11 @@ class VllmLlm(Generic[DataT, ResultT]):
                 probe.max_packed_rows,
                 probe.causal_domain,
                 task.replay,
+                next(
+                    source
+                    for source in self.attachment.inputs.plan.semantic_graph.source_regions
+                    if source.task == task.symbol
+                ),
                 self.attachment.inputs.plan.timeline.region_policy,
                 stream_lanes=2 if REGION_STREAMS_CAPABILITY in probe.capabilities else 1,
                 source_imports=probe.region_imports,

@@ -29,18 +29,23 @@ from pllm.contracts.parameter_overlay import (
     ParameterOverlayOperator,
     ParameterTarget,
 )
+from pllm.contracts.region_program import TensorType
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.semantic_graph import (
     ConditionalLayerReplay,
     StateEffectKind,
     StateResource,
     StateScope,
+    TaskSourceRegion,
+    TokenProgramEffect,
 )
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 from pllm.contracts.visibility import Exact, Visibility, VisibilitySource
 from pllm.execution.declaration import Call, Dimensions, State, When, native
+from pllm.execution.decoder_region import decoder_activations
 from pllm.execution.ptts.request_state import RequestStateSelection
-from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION, Recurrence
+from pllm.execution.region_storage import import_region_functions
+from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION
 from pllm.execution.shared_tensor import tensor_dtype
 from pllm.execution.tensor_frame import (
     OverlayEntry,
@@ -54,6 +59,7 @@ from pllm.execution.tensor_program import (
     TaskOutput,
     TensorBatch,
 )
+from pllm.execution.token_program import Layers, TokenProgram, Tokens
 from pllm.kernels.head_overlay import head_correction
 
 if TYPE_CHECKING:
@@ -549,16 +555,41 @@ class ModelEffectBinding(TensorBindingBase):
             ),
         )
 
-    def recurrence(self, effect: Recurrence) -> None:
+    def layer_route(self, function: Callable[[Layers], torch.Tensor], tokens: Tokens) -> None:
+        """Trace a user route and sign its complete model/tensor source before planning."""
         activation = self.attachment is not None and self.attachment.kind is AttachmentKind.ACTIVATION_PATCH
         if self.host or (not activation and (self.attachment is not None or self.graph.tasks or self.graph.states)):
-            raise ValueError("tokenwise recurrence requires a standalone model effect")
+            raise ValueError("layer_route requires a standalone model effect or Activation composition")
         forward = self.compute(
             "forward",
             inputs={"rows": self.rows()},
             outputs=("normal_hidden",),
             when=When.MODEL_UPDATE,
-            replay=None if self.dimensions is None else effect.effect(self.dimensions.layer_count),
+            replay=None if self.dimensions is None else TokenProgramEffect(self.dimensions.layer_count, tokens),
             implementations=(native(TOKENWISE_REPLAY_IMPLEMENTATION, "model/tokenwise_replay@1"),),
         )
         self.model_effect(forward, AttachmentKind.MODEL_REPLAY)
+
+        if self.probe is not None:
+            probe = self.probe
+            assert self.attachment is not None
+            assert probe.causal_domain is not None
+            tensor = TensorType(
+                (1, probe.hidden_size),
+                "torch." + probe.tensor_dtype.value,
+                "cpu" if probe.device_kind.value == "cpu" else f"cuda:{probe.device_ordinal}",
+            )
+            activations = decoder_activations(
+                self.attachment.activation_bindings, self.layouts, self.attachment.state_resource, tensor.device
+            )
+            program, self.route_functions = TokenProgram.capture(function, tensor, probe.causal_domain.layers).lower(
+                tensor, probe.causal_domain, probe.max_packed_rows, activations
+            )
+            self.graph = replace(
+                self.graph,
+                source_regions=(
+                    TaskSourceRegion(
+                        forward.symbol, "layer_route", program, import_region_functions(program, self.route_functions)
+                    ),
+                ),
+            )

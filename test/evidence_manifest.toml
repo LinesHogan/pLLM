@@ -282,12 +282,12 @@ replaces = "Legacy ReFT consumer math and checkpoint/publication tests"
 
 [[evidence]]
 id = 27
-name = "recirculation_selects_rows_and_replays_typed_effect"
+name = "layer_routes_match_serial_recirculation"
 group = "workload"
 path = "test/workloads/test_recirculation.py"
 command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_recirculation.py"
 environment = "Repository .venv, CPU and rebuilt Rust extension"
-observable_contract = "Independent serial normal/mix/replay oracle, exact current-slot versus prior-token KV, prefill-only selection, disabled and zero-source branches, ramp and explicit/complementary beta; current-token failure rollback and between-token cancellation preserve completed history; original graph/task/rows and empty-root pin/completion, no dummy state or version ledger"
+observable_contract = "Independent serial prefill/decode KV and normal-output oracle; device position distinct from token offset, convex beta and ramp; prefill/decode route selectors and missing-return rejection; signed source transport, exact workspace budget, stateless settlement and RNG preservation"
 replaces = "Historical Recirculation recurrence graph, stage binder and serial reference tests without old runtime ownership assertions"
 
 [[evidence]]
@@ -373,7 +373,7 @@ requires_gpu = true
 path = "test/gpu/vllm_recirculation_smoke.py"
 command = "/workspace/pllm/.venv/bin/python test/gpu/vllm_recirculation_smoke.py"
 environment = "Repository .venv, vLLM 0.27.1 MRv2, Qwen2.5-0.5B BF16, FA2, eager in-process, n=1, no prefix caching"
-observable_contract = "8 normal rows and 6 prefill replay rows over two requests; 14 independent PyTorch attention/MLP and current-slot KV comparisons; preserved historical KV and RNG, each next normal token sees its predecessor's replayed KV; decode no-replay, normal output retained and zero owned state roots/fallback"
+observable_contract = "184 normal and replay rows including decode; 368 independent PyTorch attention/MLP and current-slot KV comparisons; preserved historical KV and RNG, normal output retained within bf16 tolerance, capture restores cold KV, sparse slots and backing invalidation, zero owned state roots/fallback"
 replaces = "Legacy prefill recurrence smoke and typed replay callback/binder machinery; uses original model invocation and signed tokenwise effect"
 
 [[evidence]]
@@ -505,3 +505,14 @@ command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_hub
 environment = "Repository .venv; CPU and CUDA when available, two hidden/rank shapes"
 observable_contract = "Originally adapted independently by gpt-6 without core changes, against frozen reference_huber.py SHA256 e853832ffb6904c5dc8b2868e39af896ffc72b4518ebc3744049315f699b6281. Three unequal/reordered mixed-state updates plus singleton and repeated-single-state updates; the latter borrow original parameter storage with broadcast strides. Pre-update version-gated guidance, per-request Huber loss, gradients and all AdamW fields, immutable old pins, cancellation and cleanup. Ordinary eager only; no native paged/capture or vLLM claim"
 replaces = "One independent adaptation experiment; no additional workload/runtime matrix"
+
+[[evidence]]
+id = 48
+name = "layer_loop_matches_eager_model_on_gpu"
+group = "runtime"
+requires_gpu = true
+path = "test/gpu/vllm_layer_loop_smoke.py"
+command = "/workspace/pllm/.venv/bin/python test/gpu/vllm_layer_loop_smoke.py"
+environment = "Repository .venv, vLLM 0.27.1, Qwen2.5-0.5B BF16, Stage A token capture"
+observable_contract = "Decode rows repeat layers 5..8 before continuing at layer 9; captured outputs and current-token KV at every layer match an eager whole-layer oracle bitwise; prefill takes the ordinary model path"
+replaces = "New layer-route evidence"

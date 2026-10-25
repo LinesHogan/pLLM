@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
-import struct
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
-from math import isfinite
 from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
 
 import torch
 
 from pllm.contracts.backend_attachment import CausalModelDomain
-from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.region_composition import RegionFunctionBody
 from pllm.contracts.region_imports import NativeKernelImport, RegionTensorImport
@@ -24,13 +21,15 @@ from pllm.contracts.semantic_graph import (
     ImplementationId,
     SemanticTask,
     TaskId,
-    TokenwiseLayerReplay,
+    TaskSourceRegion,
+    TokenProgramEffect,
 )
 from pllm.contracts.state_ref import StateRef
 from pllm.execution.decoder_region import DecoderActivation
 from pllm.execution.host_borrow import TraceResourceView
 from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin
 from pllm.execution.region_execution import RegionInvocation
+from pllm.execution.region_native import RegionFunction
 from pllm.execution.region_replay import ConditionalReplayRegion
 from pllm.execution.region_resources import (
     ExternalFunction,
@@ -44,7 +43,6 @@ from pllm.execution.region_streams import RegionStreamBindings
 from pllm.execution.tokenwise_region import (
     TokenwiseRegion,
     compile_tokenwise_region,
-    mix_layer_outputs as mix_layer_outputs,
 )
 from pllm.execution.trace import TracePhase
 
@@ -55,39 +53,6 @@ if TYPE_CHECKING:
 DataT = TypeVar("DataT")
 REPLAY_IMPLEMENTATION = ImplementationId("canonical.layer_replay@1")
 TOKENWISE_REPLAY_IMPLEMENTATION = ImplementationId("canonical.tokenwise_layer_replay@1")
-
-
-@dataclass(frozen=True, slots=True)
-class Recurrence:
-    source_layer: int = -1
-    destination_layer: int = 0
-    alpha: float = 0.15
-    beta: float | None = 0.85
-    ramp_tokens: int = 0
-    enabled: bool = True
-
-    def __post_init__(self) -> None:
-        if (
-            not isfinite(self.alpha)
-            or not 0 <= self.alpha <= 1
-            or self.ramp_tokens < 0
-            or self.beta is not None
-            and (not isfinite(self.beta) or not 0 <= self.beta <= 1)
-        ):
-            raise ValueError("recurrence weights must be finite unit-interval scalars with nonnegative ramp")
-
-    def effect(self, layer_count: int) -> TokenwiseLayerReplay:
-        source = self.source_layer if self.source_layer >= 0 else layer_count + self.source_layer
-        destination = self.destination_layer if self.destination_layer >= 0 else layer_count + self.destination_layer
-        return TokenwiseLayerReplay(
-            source,
-            destination,
-            layer_count,
-            struct.unpack("!Q", struct.pack("!d", self.alpha))[0],
-            None if self.beta is None else struct.unpack("!Q", struct.pack("!d", self.beta))[0],
-            self.ramp_tokens,
-            self.enabled,
-        )
 
 
 class TokenwiseReplayPrimitive(ABC):
@@ -172,6 +137,8 @@ class TokenwiseReplayTask(Generic[DataT]):
     def bind(
         cls,
         task: SemanticTask,
+        source: TaskSourceRegion,
+        cells: Mapping[str, RegionFunction],
         tensor: TensorType,
         max_rows: int,
         domain: CausalModelDomain,
@@ -186,13 +153,13 @@ class TokenwiseReplayTask(Generic[DataT]):
         activations: tuple[DecoderActivation, ...] = (),
     ) -> TokenwiseReplayTask[DataT]:
         effect = task.replay
-        if not isinstance(effect, TokenwiseLayerReplay):
-            raise ValueError("tokenwise region requires its declared recurrence")
+        assert isinstance(effect, TokenProgramEffect)
         region = compile_tokenwise_region(
             tensor,
             max_rows,
             domain,
             effect,
+            source,
             policy,
             stream_lanes=stream_lanes,
             token_capture=token_capture,
@@ -200,16 +167,19 @@ class TokenwiseReplayTask(Generic[DataT]):
             function_bodies=function_bodies,
             activations=activations,
         ).within_payload_budget(payload_budget)
-        if set(region.functions) == {function.name for function in region.program.functions}:
-            region = region.bind_functions({})
+        region = region.bind_functions(
+            {
+                name: cell
+                for name, cell in cells.items()
+                if name not in region.functions and name in {function.name for function in region.program.functions}
+            }
+        )
         return cls(task, region, implementation_id, policy)
 
     def execute(self, context: StateTaskContext[DataT]) -> None:
-        if self.policy != context.arena.plan.timeline.region_policy:
-            raise ValueError("tokenwise schedule policy differs from the original signed timeline")
+        assert self.policy == context.arena.plan.timeline.region_policy
         primitive, effect = context.replay, self.task.replay
-        if not isinstance(primitive, TokenwiseReplayPrimitive) or not isinstance(effect, TokenwiseLayerReplay):
-            raise RuntimeError("tokenwise replay requires its original model invocation")
+        assert isinstance(primitive, TokenwiseReplayPrimitive) and isinstance(effect, TokenProgramEffect)
         rows = primitive.rows
         task_id = TaskId(context.arena.plan.semantic_graph.tasks.index(self.task))
 
@@ -225,8 +195,6 @@ class TokenwiseReplayTask(Generic[DataT]):
             hidden: torch.Tensor,
             residual: torch.Tensor | None,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            if (request, token) != (rows[index].request_ordinal, rows[index].token_offset):
-                raise ValueError("layer call differs from its original packed KV coordinates")
             return primitive.layer(rows[index], ordinal, positions, hidden, residual)
 
         def normalize(index: int, hidden: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
@@ -248,7 +216,7 @@ class TokenwiseReplayTask(Generic[DataT]):
         with torch.no_grad(), nullcontext() if context.pin.stream is None else torch.cuda.stream(context.pin.stream):
             outputs = self.region.run(
                 context,
-                tuple(effect.enabled and row.phase is HiddenPhase.PREFILL for row in rows),
+                tuple(effect.rows == "all" or row.phase.value == effect.rows for row in rows),
                 tuple(row.request_ordinal for row in rows),
                 tuple(row.token_offset for row in rows),
                 kv=primitive.bind_kv(self.region.kv, context),

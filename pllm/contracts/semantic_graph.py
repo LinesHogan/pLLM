@@ -172,22 +172,11 @@ class ConditionalLayerReplay:
 
 
 @dataclass(frozen=True, slots=True)
-class TokenwiseLayerReplay:
-    """Normal token then mixed upper-layer KV replay, before the next token."""
+class TokenProgramEffect:
+    """A token program's model domain and selected rows; mathematics lives in its source region."""
 
-    source_layer: int
-    destination_layer: int
     layer_count: int
-    alpha_bits: int
-    beta_bits: int | None
-    ramp_tokens: int = 0
-    enabled: bool = True
-    rows: Literal["prefill"] = "prefill"
-    kv: Literal["overwrite_current_slot"] = "overwrite_current_slot"
-    logits: Literal["normal"] = "normal"
-    rng: Literal["preserve"] = "preserve"
-    gradient: Literal["detach"] = "detach"
-    cancellation: Literal["between_tokens"] = "between_tokens"
+    rows: Literal["prefill", "decode", "all"] = "all"
 
 
 LossReduction = Literal[
@@ -217,7 +206,7 @@ class SemanticTask:
     outputs: tuple[SemanticOutput, ...]
     implementations: tuple[TaskImplementationSpec, ...]
     effects: tuple[SemanticEffect, ...] = ()
-    replay: ConditionalLayerReplay | TokenwiseLayerReplay | None = None
+    replay: ConditionalLayerReplay | TokenProgramEffect | None = None
     math: MathContract | None = None
     visibility: VisibilitySource | None = None
 

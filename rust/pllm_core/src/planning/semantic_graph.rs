@@ -156,27 +156,16 @@ pub(crate) struct ConditionalLayerReplay {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TokenwiseLayerReplay {
-    pub(crate) source_layer: u32,
-    pub(crate) destination_layer: u32,
+pub(crate) struct TokenProgramEffect {
     pub(crate) layer_count: u32,
-    pub(crate) alpha_bits: u64,
-    pub(crate) beta_bits: Option<u64>,
-    pub(crate) ramp_tokens: u32,
-    pub(crate) enabled: bool,
     pub(crate) rows: String,
-    pub(crate) kv: String,
-    pub(crate) logits: String,
-    pub(crate) rng: String,
-    pub(crate) gradient: String,
-    pub(crate) cancellation: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub(crate) enum LayerReplay {
     Conditional(ConditionalLayerReplay),
-    Tokenwise(TokenwiseLayerReplay),
+    Tokenwise(TokenProgramEffect),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -370,18 +359,10 @@ fn validate_task(task: &SemanticTask) -> Result<(), String> {
         }
     }
     if let Some(LayerReplay::Tokenwise(replay)) = &task.replay {
-        let alpha = f64::from_bits(replay.alpha_bits);
-        let beta = replay.beta_bits.map(f64::from_bits);
-        if replay.destination_layer >= replay.source_layer
-            || replay.source_layer >= replay.layer_count
-            || !(0.0..=1.0).contains(&alpha)
-            || beta.is_some_and(|value| !(0.0..=1.0).contains(&value))
-            || replay.rows != "prefill" || replay.kv != "overwrite_current_slot"
-            || replay.logits != "normal" || replay.rng != "preserve"
-            || replay.gradient != "detach" || replay.cancellation != "between_tokens"
+        if replay.layer_count == 0 || !matches!(replay.rows.as_str(), "prefill" | "decode" | "all")
             || task.effects.iter().any(|effect| effect.kind != StateEffectKind::Read)
         {
-            return Err("unsupported tokenwise layer replay effect (state effects must be READ)".to_owned());
+            return Err("layer routes need positive layer_count, prefill/decode/all rows and READ state effects".to_owned());
         }
     }
     require_text(&task.symbol, "tasks.symbol")?;

@@ -15,6 +15,7 @@ from pllm.execution.host_runtime import (
     HostWorkload,
 )
 from pllm.execution.scan import scan as scan
+from pllm.execution.token_program import Layers as Layers, Taps as Taps
 from pllm.usage import (
     SGD as SGD,
     Buffer as Buffer,
@@ -34,6 +35,7 @@ from pllm.usage import (
     guide_sampling as guide_sampling,
     hidden as hidden,
     index as index,
+    layer_route as layer_route,
     module as module,
     on as on,
     operand as operand,
@@ -119,6 +121,9 @@ def make_llm(
 __all__ = [
     "make_llm",
     "scan",
+    "Layers",
+    "Taps",
+    "layer_route",
     "Exact",
     "Visibility",
     "ModelConfig",

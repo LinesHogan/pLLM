@@ -34,7 +34,7 @@ from pllm.contracts.region_program import (
 from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY, RegionScheduleProposal
 from pllm.contracts.region_selection import RegionSelectionPolicy
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.contracts.semantic_graph import AnchorId
+from pllm.contracts.semantic_graph import AnchorId, TaskSourceRegion, TaskSymbol, TokenProgramEffect
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.codec import decode_boundary, encode_boundary
@@ -49,6 +49,7 @@ from pllm.execution.region_streams import RegionStreamBindings
 from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION, TokenwiseReplayPrimitive, TokenwiseReplayTask
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
+from pllm.execution.token_program import TokenProgram
 from pllm.execution.tokenwise_region import compile_tokenwise_region
 from pllm.execution.tokenwise_tuning import TokenwiseTuning
 from pllm.workloads.recirculation import RecirculationWorkload
@@ -95,7 +96,11 @@ def test_tuning_installs_a_parallel_model_proposal_with_the_original_owner():
     imports = import_region_functions(borrowed.program, local_sources)
     workload = RecirculationWorkload()
     domain = CausalModelDomain(1, 3, 4)
-    source = compile_tokenwise_region(tensor, 4, domain, workload.config.effect(3))
+    route, functions = TokenProgram.capture(workload.recirculate, tensor, 3).lower(tensor, domain, 4, ())
+    route_source = TaskSourceRegion(
+        TaskSymbol("forward"), "layer_route", route, import_region_functions(route, functions)
+    )
+    source = compile_tokenwise_region(tensor, 4, domain, TokenProgramEffect(3), route_source)
     # These fixture endpoints use fixed four-element eager operations. Their
     # temporary tensors fit 512 bytes; saved KV belongs to declared retention.
     kernels = tuple(
@@ -175,7 +180,8 @@ print(encode_boundary(planned))
         tensor,
         4,
         probe.causal_domain,
-        workload.config.effect(3),
+        TokenProgramEffect(3),
+        route_source,
         RegionSelectionPolicy(tuning="measured"),
         stream_lanes=2,
         source_imports=imports,
@@ -318,7 +324,8 @@ print(encode_boundary(planned))
         assert not decoder.saved
         assert {stream for _, _, stream in decoder.calls} <= {owner.cuda_stream, streams.auxiliary[0].cuda_stream}
         torch.testing.assert_close(decoder.output, expected_output, rtol=0, atol=0)
-        torch.testing.assert_close(decoder.cache, expected_cache, rtol=0, atol=0)
+        # Reference scaling now multiplies source by the norm ratio; fp32 order can differ by one ULP.
+        torch.testing.assert_close(decoder.cache, expected_cache, rtol=1e-6, atol=3e-6)
         torch.testing.assert_close(norm.scale, original_scale, rtol=0, atol=0)
         return decoder
 
@@ -337,7 +344,7 @@ print(encode_boundary(planned))
             results.append(run())
         for result in results[1:]:
             torch.testing.assert_close(result.output, results[0].output, rtol=0, atol=0)
-            torch.testing.assert_close(result.cache, results[0].cache, rtol=0, atol=0)
+            torch.testing.assert_close(result.cache, results[0].cache, rtol=1e-6, atol=3e-6)
         # Controlled scores exercise installation of a parallel candidate, not a throughput claim.
         winner = next(index for index, plan in enumerate(plans) if plan is not None)
         scores = tuple((100 if index == winner else 200,) for index in range(tuning.count))
@@ -346,7 +353,7 @@ print(encode_boundary(planned))
         torch.testing.assert_close(torch.random.get_rng_state(), rng, rtol=0, atol=0)
         result = run()
         torch.testing.assert_close(result.output, results[0].output, rtol=0, atol=0)
-        torch.testing.assert_close(result.cache, results[0].cache, rtol=0, atol=0)
+        torch.testing.assert_close(result.cache, results[0].cache, rtol=1e-6, atol=3e-6)
     finally:
         tuning.abort()
         owner.synchronize()

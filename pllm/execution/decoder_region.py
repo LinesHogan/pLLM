@@ -249,11 +249,10 @@ class DecoderSource:
             not layers
             or tuple(sorted(set(layers))) != layers
             or any(type(i) is not int or not 0 <= i < domain.layers for i in layers)
-            or len(taps) > 2
             or len(set(taps)) != len(taps)
             or any(i not in layers for i in taps)
         ):
-            raise ValueError("decoder region needs a positive layer count and at most two distinct layer taps")
+            raise ValueError("decoder region needs a positive layer count and distinct taps within its slice")
         if len(tensor.shape) != 2 or tensor.shape[0] != 1 or tensor.shape[1] < 1:
             raise ValueError("decoder region requires a single token's hidden matrix")
         dtypes = {
@@ -338,15 +337,15 @@ class DecoderSource:
         def result_name(hidden: str) -> str:
             return hidden if patch_body is None else "raw_" + hidden
 
+        contiguous = layers == tuple(range(layers[0], layers[0] + len(layers)))
         coordinates = (
             Value("row", index),
             Value("request", index),
             Value("token", index),
-            Value("layer_ids", layer_ids),
+            *(() if contiguous else (Value("layer_ids", layer_ids),)),
             Value("positions", positions),
         )
         entry = (*coordinates, Value("seed", tensor))
-        contiguous = layers == tuple(range(layers[0], layers[0] + len(layers)))
         operations: list[Op] = [
             Coordinate((), (Value("first_layer", index),), AffineIndex(layers[0])),
             Call(
@@ -567,7 +566,11 @@ class DecoderRegion:
         result = self.execution.run(
             {
                 "row": original.packed_row_index,
-                "layer_ids": Bank(self.source.layers),
+                **(
+                    {"layer_ids": Bank(self.source.layers)}
+                    if any(value.name == "layer_ids" for value in self.program.entry.block.arguments)
+                    else {}
+                ),
                 "positions": positions,
                 "seed": hidden,
             },

@@ -28,7 +28,6 @@ class VideoWorkload(pllm.Workload):
     grid_size: int = 8
     layer: int = 0
     gain: float = 0.1
-    recurrence: pllm.model.Recurrence | None = None
 
     def __post_init__(self) -> None:
         if self.grid_size < 1 or self.layer < 0 or not isfinite(self.gain) or self.gain <= 0:

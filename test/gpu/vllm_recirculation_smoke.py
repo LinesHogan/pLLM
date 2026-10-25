@@ -25,7 +25,6 @@ from pllm.backends.vllm.region_attention import TokenAttentionBuffers
 from pllm.backends.vllm.region_layers import VllmDecoderBodies
 from pllm.backends.vllm.replay import VllmTokenwiseReplay
 from pllm.config import ModelConfig, VllmDType
-from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.region_imports import BorrowedTensorImport
 from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.execution.region_compilation import analyze_region_program
@@ -34,13 +33,12 @@ from pllm.execution.region_resources import RegionResources
 from pllm.execution.region_storage import analyze_region_payload
 from pllm.execution.replay import TokenwiseReplayTask
 from pllm.execution.trace import TracePhase
-from pllm.workloads.recirculation import RecirculationConfig, RecirculationWorkload
+from pllm.workloads.recirculation import RecirculationWorkload
 
 
 def main():
-    config = RecirculationConfig(source_layer=-1, destination_layer=22, alpha=0.6, beta=None, ramp_tokens=2)
     handle = pllm.make_llm(
-        workload=RecirculationWorkload(config),
+        workload=RecirculationWorkload(destination=22, alpha=0.6, ramp_tokens=2),
         config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", VllmDType.BFLOAT16, 64, 2, 64, 0.25, seed=7),
     )
     # The default installs a static schedule without cold worker measurement.
@@ -84,13 +82,13 @@ def main():
         with override_forward_context(replace(context, attn_metadata=metadata, slot_mapping=mappings)):
             return native_forward(primitive, *args, **kwargs)
 
-    def check_token_capture(primitive, invocation, row, signature, bank):
+    def check_token_capture(primitive, invocation, row, signature):
         slots = tuple(
             (module.self_attn.attn.kv_cache, *primitive._access.slot(module.self_attn.attn.layer_name, row))
             for module in primitive.model.layers
         )
         saved = tuple(cache[block, :, offset].clone() for cache, block, offset in slots)
-        capture = native_token_capture(primitive, invocation, row, signature, bank)
+        capture = native_token_capture(primitive, invocation, row, signature)
         for (cache, block, offset), value in zip(slots, saved, strict=True):
             torch.testing.assert_close(cache[block, :, offset], value, rtol=0, atol=0)
         return capture
@@ -228,13 +226,19 @@ def main():
                     for value, whole in zip(actual, expected, strict=True):
                         torch.testing.assert_close(value, whole, rtol=0, atol=0)
                     if index == 0:
+                        torch.testing.assert_close(
+                            capture.output,
+                            native_normalize(primitive, row, actual[0] + actual[1], torch.zeros_like(actual[0])),
+                            rtol=0,
+                            atol=0,
+                        )
                         output = native_normalize(primitive, row, *actual)
-                        torch.testing.assert_close(capture.output, output, rtol=0, atol=0)
+                        # The materialized bf16 stream rounds before final norm; main fused the addition.
+                        torch.testing.assert_close(capture.output, output, rtol=0.02, atol=0.02)
                         normal_outputs.append(capture.output.clone())
             finally:
                 cache[block, :, offset].copy_(live)
-            if row.phase is HiddenPhase.PREFILL:
-                replay_calls.append(row)
+            replay_calls.append(row)
             previous_kv[row.identity, row.token_offset] = (live, block, offset)
 
     def check_task(task, context):
@@ -246,7 +250,7 @@ def main():
         for output, saved in retained_outputs:
             torch.testing.assert_close(output, saved, rtol=0, atol=0)
         torch.testing.assert_close(torch.cuda.get_rng_state(), rng, rtol=0, atol=0)
-        expected = tuple(row for row in context.replay.rows if row.phase is HiddenPhase.PREFILL)
+        expected = context.replay.rows
         assert tuple(replay_calls[before:]) == expected
         assert context.publication is None and tuple(context.pin.refs) == ()
         events.extend(
@@ -275,8 +279,8 @@ def main():
         assert len(outputs) == 2 and all(len(output.outputs[0].token_ids) == 2 for output in outputs)
         assert len(replay_calls) == len(events) >= 4
         assert len(numerical) == len(normal_calls) + len(replay_calls)
-        assert len(normal_calls) - len(replay_calls) == 8
-        assert len(recordings) == 4
+        assert len(normal_calls) == len(replay_calls)
+        assert len(recordings) == 2
         diagnostics = execution.diagnostics()
         assert diagnostics.active_lineages == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
         print(f"normal_rows={len(normal_calls)} replay_rows={len(replay_calls)} comparisons={len(numerical)}")

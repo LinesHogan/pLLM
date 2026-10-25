@@ -34,7 +34,7 @@ from pllm.contracts.semantic_graph import (
     TaskResourceFact,
     TaskResultInputSource,
     TaskSymbol,
-    TokenwiseLayerReplay,
+    TokenProgramEffect,
     ValueResourceFact,
 )
 from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
@@ -98,7 +98,7 @@ def attachment_buffer_bytes(
                 buffers += len(replayed) * (rows * (3 * width * hidden + 32) + 16 * width * hidden)
                 buffers += replay_region_workspace_bytes(hidden, width)
                 buffers += decoder_region_workspace_bytes(hidden, width)
-            case TokenwiseLayerReplay():
+            case TokenProgramEffect():
                 buffers += tokenwise_attachment_bytes(hidden, width, rows)
             case None:
                 pass
@@ -120,7 +120,7 @@ def derive_attachment_resources(
     The adapter keeps embeddings and output concatenation in reserved_bytes;
     the replay task pays for its own tensors and recovery lifetimes.
     """
-    tasks = tuple(task for task in graph.tasks if isinstance(task.replay, TokenwiseLayerReplay))
+    tasks = tuple(task for task in graph.tasks if isinstance(task.replay, TokenProgramEffect))
     if not tasks:
         return timeline
     if len(tasks) != 1:
@@ -157,7 +157,7 @@ def derive_attachment_resources(
         ):
             raise ValueError("composed tokenwise costs require their declared publication dependency")
     effect = task.replay
-    if not isinstance(effect, TokenwiseLayerReplay) or probe.causal_domain is None:
+    if not isinstance(effect, TokenProgramEffect) or probe.causal_domain is None:
         raise ValueError("tokenwise attachment requires its original model domain")
     tensor = TensorType(
         (1, probe.hidden_size),
@@ -179,6 +179,7 @@ def derive_attachment_resources(
             probe.max_packed_rows,
             probe.causal_domain,
             effect,
+            next(source for source in graph.source_regions if source.task == task.symbol),
             source_imports=probe.region_imports,
             function_bodies=probe.region_bodies,
             activations=activations,
@@ -191,6 +192,7 @@ def derive_attachment_resources(
             probe.max_packed_rows,
             probe.causal_domain,
             effect,
+            next(source for source in graph.source_regions if source.task == task.symbol),
             timeline.region_policy,
             stream_lanes=2 if REGION_STREAMS_CAPABILITY in probe.capabilities else 1,
             token_capture=TOKEN_CAPTURE_CAPABILITY in probe.capabilities,

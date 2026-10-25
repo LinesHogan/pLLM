@@ -3,7 +3,7 @@
 import multiprocessing as mp
 import os
 from contextlib import ExitStack, contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from math import cos, pi, tanh
 from pathlib import Path
 from unittest.mock import patch
@@ -21,6 +21,7 @@ from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle import BorrowedPage, PageFieldTransfer, PageSlot
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.workloads.recirculation import RecirculationWorkload
 from pllm.workloads.video import VideoWorkload, frame_features
 from test.backend_facts import backend_facts
 
@@ -366,6 +367,11 @@ def run_video(workload, events, steps, config=None):
             assert process.exitcode == 0
 
 
+@dataclass(frozen=True)
+class RecirculatingVideo(VideoWorkload, RecirculationWorkload):
+    """Compose the video Activation and an ordinary user-authored layer route."""
+
+
 @pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="real LLM/CUDA IPC requires a GPU")
 def test_video_session_zero_copy_backpressure_and_ack_lifetime():
@@ -374,11 +380,7 @@ def test_video_session_zero_copy_backpressure_and_ack_lifetime():
         diagnostics, _ = run_video(workload, ("publish",) * 4, 4)
     assert diagnostics.update_count == 4 and diagnostics.fallback_count == 0
     config = replace(model_config(), execution=ExecutionOptions(allow_numerical_transforms=False))
-    workload = VideoWorkload(
-        grid_size=2,
-        layer=1,
-        recurrence=pllm.model.Recurrence(source_layer=-1, destination_layer=0, alpha=0.6, beta=None),
-    )
+    workload = RecirculatingVideo(grid_size=2, layer=1, alpha=0.6)
     with observe_replay(versions=(1, 1, 2, 2, 2)):
         diagnostics, _ = run_video(workload, ("publish", "missing", "publish"), 5, config)
     assert diagnostics.update_count == 2 and diagnostics.hold_count == 3 and diagnostics.fallback_count == 0

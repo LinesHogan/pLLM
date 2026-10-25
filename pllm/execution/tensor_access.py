@@ -68,6 +68,8 @@ _DENSE = frozenset(
         "aten.square.default",
         "aten.pow.Tensor_Scalar",
         "aten.ones_like.default",
+        "aten.full.default",
+        "aten.clamp.default",
         "aten.rsqrt.default",
         "aten.sum.default",
         "aten.sum.dim_IntList",

@@ -56,7 +56,7 @@ from pllm.contracts.semantic_graph import (
     TaskResultInputSource,
     TaskSymbol,
     TimingConstraint,
-    TokenwiseLayerReplay,
+    TokenProgramEffect,
     WorkloadId,
 )
 from pllm.contracts.tensor_layout import (
@@ -71,6 +71,7 @@ from pllm.execution.decoder_region import decoder_activations
 from pllm.execution.execution import TaskGraphImplementation
 from pllm.execution.memory import MemoryUsage, measure
 from pllm.execution.ptts.request_state import RequestStateSelection
+from pllm.execution.region_native import RegionFunction
 from pllm.execution.region_replay import ConditionalReplayRegion
 from pllm.execution.replay import REPLAY_IMPLEMENTATION, ReplayStateTask, TokenwiseReplayTask
 from pllm.execution.state_execution import ConditionalProducerTask, PublishStateTask, StateTaskContext
@@ -194,6 +195,7 @@ class Builder(Generic[D]):
         self.publications: dict[TaskSymbol, PublishStateTask[D]] = {}
         self.host_operations: dict[TaskSymbol, HostOperation[D]] = {}
         self.resources = resources
+        self.route_functions: dict[str, RegionFunction] = {}
 
     def state(
         self,
@@ -297,7 +299,7 @@ class Builder(Generic[D]):
         source: Call | None = None,
         result_schema: str = "",
         output_schemas: Mapping[str, str] | None = None,
-        replay: ConditionalLayerReplay | TokenwiseLayerReplay | None = None,
+        replay: ConditionalLayerReplay | TokenProgramEffect | None = None,
         math: MathContract | None = None,
         function: Callable[[D, TensorBatch], TaskOutput] | None = None,
         host_function: Callable[[D], None] | None = None,
@@ -435,7 +437,7 @@ class Builder(Generic[D]):
                     "cpu" if kind == "cpu" else f"cuda:{ordinal}",
                 )
                 functions.append(ReplayStateTask[D](task, ConditionalReplayRegion(tensor, task.replay), identity))
-            elif isinstance(task.replay, TokenwiseLayerReplay):
+            elif isinstance(task.replay, TokenProgramEffect):
                 if plan is None or model_probe is None or model_probe.causal_domain is None:
                     raise ValueError("tokenwise replay requires a specialized backend plan and model layout")
                 tensor = TensorType(
@@ -451,6 +453,8 @@ class Builder(Generic[D]):
                 functions.append(
                     TokenwiseReplayTask[D].bind(
                         task,
+                        next(source for source in self.graph.source_regions if source.task == task.symbol),
+                        self.route_functions,
                         tensor,
                         model_probe.max_packed_rows,
                         model_probe.causal_domain,

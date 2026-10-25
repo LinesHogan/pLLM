@@ -44,7 +44,7 @@ from pllm.workloads.fttt import (
 from pllm.workloads.fttt.types import FTTTResult
 from pllm.workloads.lora import OutputLoRAConfig, OutputLoRAWorkload
 from pllm.workloads.prefill_adapters import PrefillAdapters
-from pllm.workloads.recirculation import RecirculationConfig, RecirculationWorkload
+from pllm.workloads.recirculation import RecirculationWorkload
 from pllm.workloads.reft import ActivationConfig, ActivationWorkload
 from pllm.workloads.tlm import HfQvConfig, HfQvModel, TLMConfig, TLMWorkload
 from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload
@@ -400,9 +400,7 @@ def _independent_lora_input() -> None:
 
 def _recirculation_schedules(measured: bool = False) -> None:
     assert not torch.cuda.is_initialized()
-    workload = RecirculationWorkload(
-        RecirculationConfig(source_layer=-1, destination_layer=22, alpha=0.6, beta=None, ramp_tokens=2)
-    )
+    workload = RecirculationWorkload(destination=22, alpha=0.6, ramp_tokens=2)
     options = ExecutionOptions(tuning="measured" if measured else "heuristic")
     handle = pllm.make_llm(workload=workload, config=engine(tokens=64, execution=options))
     try:

@@ -28,7 +28,7 @@ from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.region_composition import RegionFunctionBody
 from pllm.contracts.region_imports import NativeKernelImport, RegionTensorImport
 from pllm.contracts.region_program import AccessMode, BorrowedResource, TensorType
-from pllm.contracts.semantic_graph import AnchorId, ConditionalLayerReplay, SemanticTask, TokenwiseLayerReplay
+from pllm.contracts.semantic_graph import AnchorId, ConditionalLayerReplay, SemanticTask, TokenProgramEffect
 from pllm.contracts.state_ref import StateRef
 from pllm.execution.codec import boundary_digest
 from pllm.execution.decoder_region import DecoderRegion
@@ -44,7 +44,7 @@ from pllm.execution.region_resources import (
     ReadonlyResourceBinding,
     RegionPageOwner,
 )
-from pllm.execution.region_values import Bank, Data
+from pllm.execution.region_values import Data
 from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION, TokenwiseReplayPrimitive, TokenwiseReplayTask
 from pllm.execution.state_execution import StateExecution, StateTaskContext
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
@@ -246,7 +246,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         function_bodies: tuple[RegionFunctionBody, ...] = (),
         activation: VllmActivationPatch | None = None,
     ) -> None:
-        if not isinstance(task.replay, TokenwiseLayerReplay) or task.replay.layer_count != len(model.model.layers):
+        if not isinstance(task.replay, TokenProgramEffect) or task.replay.layer_count != len(model.model.layers):
             raise ValueError("tokenwise replay differs from the specialized model")
         validate_attention_resources(
             tuple(layer.self_attn.attn for layer in model.model.layers), hidden_size=model.config.hidden_size
@@ -307,7 +307,6 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         self._identity = ""
         self._seed = torch.empty(tensor.shape, dtype=self.model.norm.weight.dtype, device=self.model.norm.weight.device)
         self._position = torch.empty(1, dtype=torch.int64, device=self._seed.device)
-        self._coefficients = torch.empty(2, dtype=torch.float32, device=self._seed.device)
         self._activation_fields: dict[int, tuple[torch.Tensor, ...]] = {}
         self._activation_rows: tuple[tuple[tuple[torch.Tensor, ...], ...], ...] = ()
         self._access: PagedAccessPlan | None = None
@@ -423,16 +422,11 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
             self._seed.copy_(self._hidden[index : index + 1])
             self._position.copy_(self._positions[index : index + 1])
             TokenAttentionBuffers.refresh(bindings, row)
-            bank = invocation.inputs[f"weights{row.request_ordinal}"]
-            assert isinstance(bank, Bank)
-            coefficient = bank.elements[row.token_offset - invocation.sizes[f"prefix{row.request_ordinal}"]]
-            assert isinstance(coefficient, torch.Tensor)
-            self._coefficients.copy_(coefficient)
             if self.activation is not None:
                 for handle, fields in zip(self.activation.layers, self._activation_rows[index], strict=True):
                     for target, field in zip(self._activation_fields.get(handle.binding.layer, ()), fields):
                         target.copy_(field)
-            capture = self._captures.get(signature) or self._capture_token(invocation, row, signature, bank)
+            capture = self._captures.get(signature) or self._capture_token(invocation, row, signature)
             capture.graph.replay()
             outputs[index : index + 1].copy_(capture.output)
             if signature[0]:
@@ -484,14 +478,10 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         )
 
     def _capture_token(
-        self, invocation: RegionInvocation, row: PackedPhaseRow, signature: tuple[bool, tuple[bool, ...]], bank: Bank
+        self, invocation: RegionInvocation, row: PackedPhaseRow, signature: tuple[bool, tuple[bool, ...]]
     ) -> RegionTokenCapture:
         """Capture one source variant, restoring only its cold writable KV slots."""
         assert self._buffers is not None and self._hidden is not None
-        inputs = dict(invocation.inputs)
-        inputs[f"weights{row.request_ordinal}"] = Bank(tuple(self._coefficients for _ in bank.elements))
-        packed_inputs = invocation.inputs
-        invocation.inputs = inputs
         instances = invocation.execution.prepare_token_body(
             invocation, row.request_ordinal, row.token_offset - invocation.sizes[f"prefix{row.request_ordinal}"]
         )
@@ -503,7 +493,6 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
             with override_forward_context(self._buffers.context):
                 capture = RegionTokenCapture(invocation, instances, self._hidden.device)
         finally:
-            invocation.inputs = packed_inputs
             for (cache, block, offset), value in zip(slots, saved, strict=True):
                 cache[block, :, offset, :].copy_(value)
         self._captures[signature] = capture

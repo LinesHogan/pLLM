@@ -30,7 +30,7 @@ from pllm.execution.replay import (
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
 from pllm.workload_transport import decode_workload, encode_workload
-from pllm.workloads.recirculation import RecirculationConfig, RecirculationWorkload
+from pllm.workloads.recirculation import RecirculationWorkload
 
 PROBE = BackendPlacementProbe(
     "test.replay@1",
@@ -53,7 +53,7 @@ PROBE = BackendPlacementProbe(
 FACTS = BackendCompileFacts(
     PROBE, RuntimeFacts(torch.device("cpu")).timeline(("model/tokenwise_replay@1",)), (), 2, 0, 0, layer_count=3
 )
-CONFIG = RecirculationConfig(alpha=0.7, beta=None, ramp_tokens=2)
+WORKLOAD = RecirculationWorkload(alpha=0.7, ramp_tokens=2)
 IDENTITIES = (RequestIdentity("prefill", 0, 0), RequestIdentity("decode", 1, 0))
 ROWS = PackedPhaseRowBatch(
     1,
@@ -78,8 +78,6 @@ class Decoder(TokenwiseReplayPrimitive):
     def __init__(self):
         self.batch = ROWS
         self.cache = torch.zeros(2, 3, 3, 4)
-        self.normalized = set()
-        self.replaying = set()
         self.seen_layers = set()
         self.output = None
         self.calls = []
@@ -125,9 +123,8 @@ class Decoder(TokenwiseReplayPrimitive):
         # A read-only final normalization can legally move after replay.
         # Observe the second call to a source layer, not normalization's
         # position in the reference program.
-        if (row, ordinal) in self.seen_layers and row not in self.replaying:
+        if (row, ordinal) in self.seen_layers and ordinal == 1:
             self.calls.append((row.packed_row_index, "replay"))
-            self.replaying.add(row)
         self.seen_layers.add((row, ordinal))
         slot = self.cache[row.request_ordinal, ordinal]
         previous = slot[row.token_offset - 1] if row.token_offset else torch.zeros_like(hidden)
@@ -137,16 +134,15 @@ class Decoder(TokenwiseReplayPrimitive):
 
     def begin(self, row):
         self.calls.append((row.packed_row_index, "normal"))
-        return torch.tensor([row.token_offset]), INPUTS[row.packed_row_index : row.packed_row_index + 1].clone()
+        return torch.tensor([row.token_offset + int(row.phase is HiddenPhase.DECODE)]), INPUTS[
+            row.packed_row_index : row.packed_row_index + 1
+        ].clone()
 
     def normalize(self, row, hidden, residual):
-        self.normalized.add(row)
         return hidden + residual
 
     def commit(self, row, record):
         record()
-        self.normalized.discard(row)
-        self.replaying.discard(row)
         self.seen_layers.difference_update((row, layer) for layer in range(self.cache.shape[1]))
 
     def finish(self, outputs):
@@ -167,15 +163,14 @@ def serial_oracle():
             if layer == 0:
                 destination = hidden.clone()
         expected_output.append(hidden.clone())
-        if index < 3:
-            alpha = 0.7 * min(position, 2) / 2
-            hidden = (
-                destination * (1 - alpha) + hidden * alpha * (destination.square().sum() / hidden.square().sum()).sqrt()
-            )
-            for layer in (1, 2):
-                previous = expected_cache[request, layer, position - 1] if position else torch.zeros(4)
-                expected_cache[request, layer, position] = hidden
-                hidden = (hidden * (layer + 1) * 0.8 + previous * 0.6).tanh()
+        alpha = 0.7 * min(position + request, 2) / 2
+        hidden = (
+            destination * (1 - alpha) + hidden * alpha * (destination.square().sum() / hidden.square().sum()).sqrt()
+        )
+        for layer in (1, 2):
+            previous = expected_cache[request, layer, position - 1] if position else torch.zeros(4)
+            expected_cache[request, layer, position] = hidden
+            hidden = (hidden * (layer + 1) * 0.8 + previous * 0.6).tanh()
     return expected_cache, expected_output
 
 
@@ -190,17 +185,7 @@ def run_step(execution, value, decoder):
 
 
 def test_recirculation_declaration_fits_reference_budget_and_crosses_the_wire() -> None:
-    class PlainRecurrence(pllm.Workload):
-        @property
-        def recurrence(self) -> pllm.model.Recurrence:
-            return CONFIG
-
-    workload = RecirculationWorkload(CONFIG)
-    plain = PlainRecurrence().compile_backend(FACTS).execution
-    assert (
-        plain.arena.plan.semantic_graph.tasks
-        == workload.compile_backend(FACTS).execution.arena.plan.semantic_graph.tasks
-    )
+    workload = WORKLOAD
     # A budget that fits only the serial reference still admits a measured-tuning plan; one byte less does not.
     serial_facts = workload.specialize(FACTS, ExecutionOptions(schedule_policy="serial"))
     reference_budget = (
@@ -216,11 +201,11 @@ def test_recirculation_declaration_fits_reference_budget_and_crosses_the_wire() 
     restored = decode_workload(encode_workload(workload), device=torch.device("cpu"), seed=0)
     assert isinstance(restored, RecirculationWorkload) and restored.declare(FACTS) == workload.declare(FACTS)
     with pytest.raises(ValueError):
-        RecirculationWorkload(replace(CONFIG, destination_layer=3)).compile_backend(FACTS)
+        replace(WORKLOAD, destination=3).compile_backend(FACTS)
 
 
 def test_recirculation_replay_matches_serial_oracle() -> None:
-    workload = RecirculationWorkload(CONFIG)
+    workload = WORKLOAD
     execution = workload.compile_backend(workload.specialize(FACTS, ExecutionOptions(tuning="measured"))).execution
     expected_cache, expected_output = serial_oracle()
     assert execution.admit(IDENTITIES) == ()
@@ -234,8 +219,25 @@ def test_recirculation_replay_matches_serial_oracle() -> None:
     assert execution.retire(IDENTITIES) == ()
 
 
-def test_disabled_recirculation_runs_only_the_normal_pass() -> None:
-    disabled = RecirculationWorkload(replace(CONFIG, enabled=False)).compile_backend(FACTS).execution
+@pytest.mark.parametrize("tokens, expected", [("prefill", (2, "replay")), ("decode", (3, "replay"))])
+def test_route_selects_its_declared_rows(tokens, expected) -> None:
+    class Prefill(RecirculationWorkload):
+        @pllm.layer_route(tokens=tokens)
+        def recirculate(self, layers: pllm.Layers) -> torch.Tensor:
+            return super().recirculate(layers)
+
     decoder = Decoder()
-    run_step(disabled, VALUE, decoder)
-    assert decoder.calls == [(index, "normal") for index in range(4)]
+    run_step(Prefill().compile_backend(FACTS).execution, VALUE, decoder)
+    assert [call for call in decoder.calls if call[1] == "replay"] == (
+        [expected] if tokens == "decode" else [(0, "replay"), (1, "replay"), expected]
+    )
+
+
+def test_route_must_return_a_residual_stream() -> None:
+    class MissingOutput(pllm.Workload):
+        @pllm.layer_route()
+        def route(self, layers: pllm.Layers):
+            layers()
+
+    with pytest.raises(ValueError, match="return.*residual"):
+        MissingOutput().compile_backend(FACTS)

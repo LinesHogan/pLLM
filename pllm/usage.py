@@ -76,12 +76,12 @@ from pllm.execution.module_state import (
     parameter_count,
     skeleton,
 )
-from pllm.execution.replay import Recurrence as Recurrence
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.task_memory import derive_resources
 from pllm.execution.tensor_binding import TensorBinding, TensorOutput as TensorOutput
 from pllm.execution.tensor_frame import TensorFrame, TensorPort, Tensors, TensorUpdate as TensorUpdate
 from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots, TensorComputation
+from pllm.execution.token_program import Layers, Tokens
 from pllm.kernels.adamw import AdamWConfig
 
 F = TypeVar("F", bound=Callable[..., torch.Tensor | TensorUpdate])
@@ -939,12 +939,24 @@ def _targets(value: tuple[object, ...]) -> tuple[ParameterTarget, ...]:
     return tuple(item for item in value if isinstance(item, ParameterTarget))
 
 
+def layer_route(*, tokens: Tokens = "all") -> Callable[[F], F]:
+    """Declare a straight-line per-token layer program for the selected model rows."""
+    if tokens not in ("prefill", "decode", "all"):
+        raise ValueError('set layer_route(tokens=) to "prefill", "decode" or "all"')
+
+    def mark(function: F) -> F:
+        setattr(function, "__pllm_tokens__", tokens)
+        return function
+
+    return mark
+
+
 def _values(owner: object) -> dict[str, object]:
-    return owner_values(owner, (InstanceState, Activation, Overlay, Recurrence))
+    return owner_values(owner, (InstanceState, Activation, Overlay))
 
 
 def _snapshot(owner: C, borrowed: tuple[object, ...] = ()) -> C:
-    return owner_snapshot(owner, (InstanceState, Activation, Overlay, Recurrence), borrowed)
+    return owner_snapshot(owner, (InstanceState, Activation, Overlay), borrowed)
 
 
 def _typed(value: object, expected: type[C]) -> C | None:
@@ -1091,7 +1103,7 @@ def _property(member: object) -> Callable[..., object] | None:
         if isinstance(member, property)
         and member.fget is not None
         and signature(member.fget, eval_str=False).return_annotation
-        in (InstanceState, RequestState, Activation, Overlay, Recurrence)
+        in (InstanceState, RequestState, Activation, Overlay)
         else None
     )
 
@@ -1120,6 +1132,7 @@ class _Declaration:
     bindings: tuple[tuple[str, str], ...]
     definitions: list[tuple[str, str]] = field(default_factory=lambda: [])
     operations: list[_Operation] = field(default_factory=lambda: [])
+    routes: list[tuple[str, Tokens]] = field(default_factory=lambda: [])
     overlay_states: set[str] = field(default_factory=lambda: set[str]())
     states: dict[str, State] = field(default_factory=lambda: {})
     parameters: dict[tuple[str, str], SemanticInputSource | TensorPort] = field(default_factory=lambda: {})
@@ -1161,6 +1174,12 @@ class _Declaration:
         self, name: str, member: object, candidates: dict[str, FunctionType], seeds: list[FunctionType]
     ) -> None:
         """Read decorator attributes once; marker values never drive runtime reflection."""
+        tokens = getattr(member, "__pllm_tokens__", None)
+        if tokens is not None:
+            assert tokens in ("prefill", "decode", "all") and isinstance(member, FunctionType)
+            self.routes.append((name, tokens))
+            seeds.append(member)
+            return
         phase, marked, gradient, rows = (
             _typed(getattr(member, "__pllm_phase__", None), Phase),
             _typed(getattr(member, "__pllm_effect__", None), _Effect),
@@ -1227,7 +1246,7 @@ class _Declaration:
                 state.declare(name, self)
 
         for name, value in self.values.items():
-            if isinstance(value, (Activation, Overlay, Recurrence)):
+            if isinstance(value, (Activation, Overlay)):
                 self.definitions.append((name, fingerprint(value)))
                 if isinstance(value, Overlay):
                     value.declare(self)
@@ -1237,9 +1256,12 @@ class _Declaration:
         for value in self.values.values():
             if isinstance(value, Activation):
                 value.declare(self)
-        for value in self.values.values():
-            if isinstance(value, Recurrence):
-                self.binding.recurrence(value)
+        for name, tokens in self.routes:
+
+            def invoke(layers: Layers) -> torch.Tensor:
+                return self.method(name)(layers)
+
+            self.binding.layer_route(invoke, tokens)
         if self.binding.feeds:
             self.binding.conditional_input(tuple(feed.resource for feed in self.binding.feeds))
 
@@ -1266,12 +1288,12 @@ class _Declaration:
     def sign_composition(self) -> None:
         """Validate composed effects and sign ordered definitions and owner values."""
         b = self.binding
-        if any(isinstance(value, Recurrence) for value in self.values.values()):
+        if self.routes:
             attachment = b.attachment
             composed = attachment is not None and attachment.activation_bindings
             _reject(
                 not composed and (len(b.graph.tasks) != 1 or b.graph.states),
-                "tokenwise recurrence requires a standalone model effect",
+                "layer_route requires a standalone model effect or Activation composition",
             )
         _reject(
             any(
@@ -1518,6 +1540,7 @@ class Workload(
 
 __all__ = [
     "Workload",
+    "layer_route",
     "Phase",
     "on",
     "write",
@@ -1546,7 +1569,6 @@ __all__ = [
     "differentiate",
     "Activation",
     "Overlay",
-    "Recurrence",
     "ParameterEffect",
     "Exact",
     "Visibility",

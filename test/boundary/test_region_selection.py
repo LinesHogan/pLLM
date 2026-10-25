@@ -48,10 +48,10 @@ from pllm.execution.region_optimization import (
 from pllm.execution.region_schedule import RegionScheduleExecution
 from pllm.execution.region_storage import analyze_region_payload, import_region_functions
 from pllm.execution.region_values import Bank
-from pllm.execution.replay import Recurrence
 from pllm.execution.tensor_scan import TensorScan
 from pllm.execution.tokenwise_region import TokenwiseRegion
 from pllm.kernels.additive_scan import AdditiveBuffers, launch_window
+from pllm.workloads.recirculation import RecirculationWorkload
 from test.region_fixtures import (
     StorageObserver,
     assert_grid_closed_form,
@@ -62,6 +62,7 @@ from test.region_fixtures import (
     single_call,
     tensor_grid,
 )
+from test.workloads.test_recirculation import FACTS
 
 
 def measured(**changes):
@@ -563,11 +564,18 @@ def test_only_a_joint_rewrite_fits_and_budgets_never_authorize_an_over_budget_on
 
 
 def recovery_region():
-    return TokenwiseRegion(
+    binding = RecirculationWorkload().declaration(
+        replace(FACTS, probe=replace(FACTS.probe, max_packed_rows=8, causal_domain=CausalModelDomain(1, 3, 8)))
+    )
+    region = TokenwiseRegion(
         TensorType((1, 4), "torch.float32"),
         8,
         CausalModelDomain(1, 3, 8),
-        Recurrence().effect(3),
+        binding.graph.tasks[0].replay,
+        binding.graph.source_regions[0],
+    )
+    return region.bind_functions(
+        {name: cell for name, cell in binding.route_functions.items() if name not in region.functions}
     )
 
 
