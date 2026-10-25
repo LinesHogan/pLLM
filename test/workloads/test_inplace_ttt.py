@@ -5,7 +5,6 @@ their entry state, and retirement releases every version.
 """
 
 from dataclasses import replace
-from typing import Annotated
 from unittest.mock import patch
 
 import pytest
@@ -166,10 +165,10 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
         )
         def update(
             self,
-            x: Annotated[torch.Tensor, pllm.Operand.INPUT],
-            y: Annotated[torch.Tensor, pllm.Operand.TARGET],
-            a: Annotated[torch.Tensor, pllm.Parameter("factors", "a")],
-            b: Annotated[torch.Tensor, pllm.Parameter("factors", "b")],
+            x: torch.Tensor = pllm.operand("input"),
+            y: torch.Tensor = pllm.operand("target"),
+            a: torch.Tensor = pllm.parameter("factors", "a"),
+            b: torch.Tensor = pllm.parameter("factors", "b"),
         ) -> TensorUpdate:
             output = x @ (b @ a).T
             a.add_(0.1 * y.T @ x)

@@ -13,7 +13,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Annotated
 from unittest.mock import patch
 
 import torch
@@ -66,11 +65,11 @@ class RequestLowRankTTT(pllm.Workload):
     )
     def transition(
         self,
-        hidden: Annotated[torch.Tensor, pllm.Operand.INPUT],
-        desired: Annotated[torch.Tensor, pllm.Operand.TARGET],
-        base: Annotated[torch.Tensor, pllm.Operand.WEIGHT],
-        a: Annotated[torch.Tensor, pllm.Parameter("factors", "a")],
-        b: Annotated[torch.Tensor, pllm.Parameter("factors", "b")],
+        hidden: torch.Tensor = pllm.operand("input"),
+        desired: torch.Tensor = pllm.operand("target"),
+        base: torch.Tensor = pllm.operand("weight"),
+        a: torch.Tensor = pllm.parameter("factors", "a"),
+        b: torch.Tensor = pllm.parameter("factors", "b"),
     ) -> TensorUpdate:
         output = hidden @ (b @ a).T
         error = hidden @ base.T + 0.5 * output - desired

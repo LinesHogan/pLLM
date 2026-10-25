@@ -32,8 +32,6 @@ class DummyWorkload(pllm.Workload):
     transform: Callable[[torch.Tensor], torch.Tensor] = hidden_rows
     export_name: str = "hidden_rows"
 
-    @pllm.on(pllm.Phase.OBSERVE)
-    @pllm.hook(pllm.Config("config.layer"))
     @pllm.export(
         name=pllm.Config("export_name"),
         every=pllm.Config("config.export_every_n_steps"),
@@ -41,5 +39,5 @@ class DummyWorkload(pllm.Workload):
         max_cols=pllm.Config("config.export_max_cols"),
         enabled=pllm.Config("config.enabled"),
     )
-    def export_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
+    def export_hidden(self, hidden: torch.Tensor = pllm.hidden(pllm.Config("config.layer"))) -> torch.Tensor:
         return self.transform(hidden)

@@ -47,10 +47,10 @@ def test_cuda_ptts_waits_for_exact_fence_before_reclaim() -> None:
     arena = PageBundleArena(_plan())
     device = torch.device("cuda", 0)
     writer, reader = torch.cuda.Stream(device=device), torch.cuda.Stream(device=device)
-    write = arena.prepare_admission(("request_distiller",) * 2, writer)
+    write = arena.prepare_admission(("distiller",) * 2, writer)
     arena.abort(write)
     assert arena.free_pages == 6
-    write = arena.prepare_admission(("request_distiller",) * 2, writer)
+    write = arena.prepare_admission(("distiller",) * 2, writer)
     roots = arena.writable_roots(write)
     with torch.cuda.stream(writer):
         initial = tuple(
@@ -96,7 +96,7 @@ def test_cuda_ptts_waits_for_exact_fence_before_reclaim() -> None:
     torch.testing.assert_close(result[0], initial[0] - 0.01)
     assert result[2].item() == 1
     arena.retire(pressure.after_refs)
-    replacement = arena.publish(arena.prepare_admission(("request_distiller",) * 2, writer))
+    replacement = arena.publish(arena.prepare_admission(("distiller",) * 2, writer))
     arena.settle(replacement)
     torch.testing.assert_close(arena.snapshot(updated, publication.after_refs[0])[0], result[0])
     arena.wait_release(arena.release_pin(updated))
@@ -154,7 +154,7 @@ def _cuda_ipc_lifecycle():
     for outcome in ("complete", "bad_ack", "eof"):
         arena = PageBundleArena(plan)
         stream = torch.cuda.Stream(device=arena.device)
-        initial = arena.prepare_admission(("request_distiller",), stream)
+        initial = arena.prepare_admission(("distiller",), stream)
         with torch.cuda.stream(stream):
             field = arena.write_field(initial, 0, LayoutFieldId(0))
             expected = torch.arange(field.numel(), device=arena.device, dtype=field.dtype)

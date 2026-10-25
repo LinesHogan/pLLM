@@ -2,7 +2,6 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Annotated
 
 import torch
 
@@ -58,11 +57,11 @@ class PrefillAdapters(pllm.Workload):
     @pllm.train(state="adapters")
     def loss(
         self,
-        x: Annotated[torch.Tensor, pllm.Operand.INPUT],
-        target: Annotated[torch.Tensor, pllm.Operand.TARGET],
-        base: Annotated[torch.Tensor, pllm.Operand.WEIGHT],
-        a: Annotated[torch.Tensor, pllm.Parameter("adapters", "a")],
-        b: Annotated[torch.Tensor, pllm.Parameter("adapters", "b")],
+        x: torch.Tensor = pllm.operand("input"),
+        target: torch.Tensor = pllm.operand("target"),
+        base: torch.Tensor = pllm.operand("weight"),
+        a: torch.Tensor = pllm.parameter("adapters", "a"),
+        b: torch.Tensor = pllm.parameter("adapters", "b"),
     ) -> torch.Tensor:
         """Reconstruct this layer's MLP input without differentiating the base model."""
         prediction = x @ base.T + (x @ a.T) @ b.T

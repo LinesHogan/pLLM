@@ -1,18 +1,12 @@
 """Input reconstruction with per-request, gated delta-rule head weights."""
 
 from dataclasses import dataclass
-from typing import Annotated
 
 import torch
 from torch.nn import functional as F
 
 import pllm
 from pllm.workloads.chunk_tail import join_tail, save_tail
-
-Input = Annotated[torch.Tensor, pllm.Operand.INPUT]
-State = Annotated[torch.Tensor, pllm.Parameter("fast_weights", "weights")]
-Tail = Annotated[torch.Tensor, pllm.Parameter("fast_weights", "tail")]
-Length = Annotated[torch.Tensor, pllm.Parameter("fast_weights", "length")]
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +78,13 @@ class GatedDeltaWorkload(pllm.Workload):
         operator=pllm.model.ParameterOverlayOperator.HEAD_ADD,
         decode=pllm.Config("config.update_decode"),
     )
-    def transition(self, hidden: Input, weights: State, tail: Tail, length: Length) -> pllm.TensorUpdate:
+    def transition(
+        self,
+        hidden: torch.Tensor = pllm.operand("input"),
+        weights: torch.Tensor = pllm.parameter("fast_weights", "weights"),
+        tail: torch.Tensor = pllm.parameter("fast_weights", "tail"),
+        length: torch.Tensor = pllm.parameter("fast_weights", "length"),
+    ) -> pllm.TensorUpdate:
         """Train complete chunks, retain the tail and return the training readouts."""
         chunk = self.config.chunk_size
         (rows,), valid = join_tail((tail,), (hidden,), length, chunk)

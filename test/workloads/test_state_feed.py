@@ -2,7 +2,6 @@
 
 from collections import deque
 from dataclasses import dataclass, replace
-from typing import Annotated
 
 import pytest
 import torch
@@ -14,8 +13,8 @@ from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.state_feed import FeedEvent, FeedRecord, select_publications
 from test.backend_facts import backend_facts
 
-Source = Annotated[torch.Tensor, pllm.Parameter("source", "value")]
-Target = Annotated[torch.Tensor, pllm.Parameter("target", "value")]
+SOURCE = pllm.parameter("source", "value")
+TARGET = pllm.parameter("target", "value")
 
 
 @dataclass(frozen=True)
@@ -44,9 +43,8 @@ class FeedWorkload(pllm.Workload):
             on_missing=self.missing,
         )
 
-    @pllm.on(pllm.Phase.BEFORE_MODEL)
     @pllm.write(state="target", field="value")
-    def transform(self, value: Source, previous: Target) -> torch.Tensor:
+    def transform(self, value: torch.Tensor = SOURCE, previous: torch.Tensor = TARGET) -> torch.Tensor:
         """Reading local state and fed state must not be mistaken for two writers."""
         return value * 2 + previous * 0
 
@@ -143,9 +141,8 @@ def test_feed_rejects_local_writers_and_request_scopes():
 
     @dataclass(frozen=True)
     class WritesSource(FeedWorkload):
-        @pllm.on(pllm.Phase.BEFORE_MODEL)
         @pllm.write(state="source", field="value")
-        def transform(self, value: Source, previous: Target) -> torch.Tensor:
+        def transform(self, value: torch.Tensor = SOURCE, previous: torch.Tensor = TARGET) -> torch.Tensor:
             return value + previous
 
     with pytest.raises(ValueError, match="local InstanceState"):
@@ -155,9 +152,8 @@ def test_feed_rejects_local_writers_and_request_scopes():
 def test_write_validates_result_shape_during_specialization():
     @dataclass(frozen=True)
     class WrongShape(FeedWorkload):
-        @pllm.on(pllm.Phase.BEFORE_MODEL)
         @pllm.write(state="target", field="value")
-        def transform(self, value: Source, previous: Target) -> torch.Tensor:
+        def transform(self, value: torch.Tensor = SOURCE, previous: torch.Tensor = TARGET) -> torch.Tensor:
             return (value + previous).sum()
 
     with pytest.raises(ValueError, match="write to target needs shape"):
@@ -178,9 +174,8 @@ def test_ordinary_state_ports_and_write_do_not_depend_on_declaration_order():
         def unrelated(self) -> pllm.InstanceState:
             return pllm.InstanceState({"value": (2,)})
 
-        @pllm.on(pllm.Phase.BEFORE_MODEL)
         @pllm.write(state="target", field="value")
-        def transform(self, value: Source, previous: Target) -> torch.Tensor:
+        def transform(self, value: torch.Tensor = SOURCE, previous: torch.Tensor = TARGET) -> torch.Tensor:
             return torch.ones_like(value) + previous
 
     workload = LocalWorkload()
@@ -206,9 +201,8 @@ def test_write_field_and_feed_field_order_are_signed():
         def activation(self) -> pllm.model.Activation:
             return pllm.model.Activation("target", (0, 1), operator=pllm.model.ActivationPatchOperator.ADD)
 
-        @pllm.on(pllm.Phase.BEFORE_MODEL)
         @pllm.write(state="target", field="value")
-        def transform(self, value: Source, previous: Target) -> torch.Tensor:
+        def transform(self, value: torch.Tensor = SOURCE, previous: torch.Tensor = TARGET) -> torch.Tensor:
             return value + previous
 
     first = Fields().declaration().graph.execution_parameters_digest

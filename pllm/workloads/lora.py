@@ -7,7 +7,6 @@ batches arrive as `pllm.host.WeightedCEBatch` inputs; pllm runs the SGD steps an
 from collections.abc import Callable
 from dataclasses import dataclass
 from math import isfinite
-from typing import Annotated
 
 import torch
 from torch.nn import functional as F
@@ -85,19 +84,17 @@ class OutputLoRAWorkload(pllm.Workload):
         )
         parameters["b"].zero_()
 
-    @pllm.on(pllm.Phase.BEFORE_SAMPLE)
-    @pllm.add_logits
+    @pllm.add_logits()
     def predict(
         self,
-        hidden: Annotated[torch.Tensor, pllm.Hidden(-1, pllm.model.HiddenSite.MODEL_OUTPUT)],
-        down: Annotated[torch.Tensor, pllm.Parameter("output_factors", "a")],
-        up: Annotated[torch.Tensor, pllm.Parameter("output_factors", "b")],
+        hidden: torch.Tensor = pllm.hidden(-1, pllm.model.HiddenSite.MODEL_OUTPUT),
+        down: torch.Tensor = pllm.parameter("output_factors", "a"),
+        up: torch.Tensor = pllm.parameter("output_factors", "b"),
     ) -> torch.Tensor:
         return torch.matmul(torch.matmul(hidden.unsqueeze(1), down), up).squeeze(1) * (
             self.config.alpha / self.config.rank
         )
 
-    @pllm.on(pllm.Phase.AFTER_SAMPLE)
     @pllm.train(
         state="output_factors",
         steps=pllm.Config("config.steps"),
@@ -106,12 +103,12 @@ class OutputLoRAWorkload(pllm.Workload):
     )
     def train(
         self,
-        hidden: Annotated[torch.Tensor, pllm.host.Batch("hidden")],
-        logits: Annotated[torch.Tensor, pllm.host.Batch("base_logits")],
-        labels: Annotated[torch.Tensor, pllm.host.Batch("labels")],
-        weights: Annotated[torch.Tensor, pllm.host.Batch("weights")],
-        down: Annotated[torch.Tensor, pllm.Parameter("output_factors", "a")],
-        up: Annotated[torch.Tensor, pllm.Parameter("output_factors", "b")],
+        hidden: torch.Tensor = pllm.host.batch("hidden"),
+        logits: torch.Tensor = pllm.host.batch("base_logits"),
+        labels: torch.Tensor = pllm.host.batch("labels"),
+        weights: torch.Tensor = pllm.host.batch("weights"),
+        down: torch.Tensor = pllm.parameter("output_factors", "a"),
+        up: torch.Tensor = pllm.parameter("output_factors", "b"),
     ) -> torch.Tensor:
         scores = logits + hidden @ down @ up * (self.config.alpha / self.config.rank)
         row_losses = F.cross_entropy(scores.flatten(0, 1), labels.flatten(), reduction="none").view_as(weights)

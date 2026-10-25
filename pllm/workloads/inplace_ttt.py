@@ -1,7 +1,6 @@
 """Causal chunk mathematics over request-owned, per-target buffers."""
 
 from dataclasses import dataclass
-from typing import Annotated
 
 import torch
 
@@ -9,13 +8,6 @@ import pllm
 from pllm import TensorUpdate
 from pllm.model import ConditionalLayerReplay, ParameterTarget
 from pllm.workloads.chunk_tail import join_tail, save_tail
-
-Input = Annotated[torch.Tensor, pllm.Operand.INPUT]
-Target = Annotated[torch.Tensor, pllm.Operand.TARGET]
-Delta = Annotated[torch.Tensor, pllm.Parameter("dense_fast_weights", "delta")]
-TailInput = Annotated[torch.Tensor, pllm.Parameter("dense_fast_weights", "tail_input")]
-TailTarget = Annotated[torch.Tensor, pllm.Parameter("dense_fast_weights", "tail_target")]
-TailLength = Annotated[torch.Tensor, pllm.Parameter("dense_fast_weights", "tail_length")]
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,12 +75,12 @@ class InPlaceTTTWorkload(pllm.Workload):
     )
     def transition(
         self,
-        hidden: Input,
-        target: Target,
-        delta: Delta,
-        tail_input: TailInput,
-        tail_target: TailTarget,
-        tail_length: TailLength,
+        hidden: torch.Tensor = pllm.operand("input"),
+        target: torch.Tensor = pllm.operand("target"),
+        delta: torch.Tensor = pllm.parameter("dense_fast_weights", "delta"),
+        tail_input: torch.Tensor = pllm.parameter("dense_fast_weights", "tail_input"),
+        tail_target: torch.Tensor = pllm.parameter("dense_fast_weights", "tail_target"),
+        tail_length: torch.Tensor = pllm.parameter("dense_fast_weights", "tail_length"),
     ) -> pllm.TensorUpdate:
         """Return exclusive residuals, update complete chunks and retain unfinished rows."""
         chunk = self.config.chunk_size

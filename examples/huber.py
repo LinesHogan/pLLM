@@ -2,7 +2,6 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Annotated
 
 import torch
 
@@ -29,31 +28,28 @@ class HuberWorkload(pllm.Workload):
             optimizer=pllm.AdamW(lr=0.03, betas=(0.8, 0.95), eps=1e-8, weight_decay=0.1),
         )
 
-    def ready(self, versions: Annotated[torch.Tensor, pllm.StateVersion("adapter")]) -> torch.Tensor:
+    def ready(self, versions: torch.Tensor = pllm.version("adapter")) -> torch.Tensor:
         return versions > 0
 
     def forward(self, source: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         latent = torch.bmm(source.unsqueeze(1), a)
         return source + torch.bmm(latent, b).squeeze(1)
 
-    @pllm.on(pllm.Phase.BEFORE_SAMPLE, rows="ready")
-    @pllm.guide_sampling(beta=0.2)
+    @pllm.guide_sampling(beta=0.2, rows="ready")
     def predict(
         self,
-        source: Annotated[torch.Tensor, pllm.Hidden(0)],
-        a: Annotated[torch.Tensor, pllm.Parameter("adapter", "a")],
-        b: Annotated[torch.Tensor, pllm.Parameter("adapter", "b")],
-        versions: Annotated[torch.Tensor, pllm.StateVersion("adapter")],
+        source: torch.Tensor = pllm.hidden(0),
+        a: torch.Tensor = pllm.parameter("adapter", "a"),
+        b: torch.Tensor = pllm.parameter("adapter", "b"),
     ) -> torch.Tensor:
         return self.forward(source, a, b)
 
-    @pllm.on(pllm.Phase.AFTER_SAMPLE)
     @pllm.train(state="adapter", reduction="state_mean")
     def loss(
         self,
-        source: Annotated[torch.Tensor, pllm.Hidden(0)],
-        target: Annotated[torch.Tensor, pllm.Hidden(-1)],
-        a: Annotated[torch.Tensor, pllm.Parameter("adapter", "a")],
-        b: Annotated[torch.Tensor, pllm.Parameter("adapter", "b")],
+        source: torch.Tensor = pllm.hidden(0),
+        target: torch.Tensor = pllm.hidden(-1),
+        a: torch.Tensor = pllm.parameter("adapter", "a"),
+        b: torch.Tensor = pllm.parameter("adapter", "b"),
     ) -> torch.Tensor:
         return torch.nn.functional.huber_loss(self.forward(source, a, b), target, delta=0.25, reduction="none").mean(1)

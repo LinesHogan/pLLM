@@ -5,9 +5,10 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import KW_ONLY, dataclass, field, replace
 from enum import Enum
+from functools import partial
 from inspect import Parameter as SignatureParameter, signature
 from types import FunctionType, MethodType
-from typing import Annotated, ClassVar, TypeVar, get_args, get_origin
+from typing import Any, ClassVar, Literal, TypeVar
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -73,6 +74,14 @@ from pllm.execution.host_runtime import (
     HostWorkload,
     TensorHostBinding,
 )
+from pllm.execution.module_state import (
+    ModuleCall,
+    ModuleFactory,
+    copy_initial,
+    initial_values,
+    parameter_count,
+    skeleton,
+)
 from pllm.execution.region_streams import plan_closed_window
 from pllm.execution.replay import Recurrence as Recurrence
 from pllm.execution.state_execution import MathBinding, StateExecution
@@ -113,6 +122,10 @@ class _Source:
 
     def batch(self, state: str, definition: InstanceState) -> tuple[str, str]:
         raise ValueError("batch training inputs must name its batch tensors or own parameters")
+
+    def adapt(self, context: _Declaration) -> Callable[[torch.Tensor], object]:
+        """How the method receives the tensor read from this source."""
+        return _same
 
 
 @dataclass(frozen=True)
@@ -177,6 +190,25 @@ class Parameter(_Source):
         if self.state != state or self.field not in definition.fields or self.per_row:
             return super().batch(state, definition)
         return "parameter", self.field
+
+
+def _same(value: torch.Tensor) -> torch.Tensor:
+    return value
+
+
+@dataclass(frozen=True)
+class _Module(Parameter):
+    """A module state, handed to the method as a callable with the module's interface."""
+
+    field: str = "parameters"
+
+    def adapt(self, context: _Declaration) -> Callable[[torch.Tensor], object]:
+        definition = context.state_definition(self.state, f"{self.state}: pllm.module needs a declared module state")
+        factory, dimensions = definition.module, context.binding.dimensions
+        _reject(factory is None, f"{self.state}: pllm.module needs a state declared with module=", TypeError)
+        if factory is None or dimensions is None:
+            return _same  # declared without model dimensions: never invoked
+        return partial(ModuleCall, skeleton(factory, dimensions), per_row=definition.scope is StateScope.REQUEST)
 
 
 @dataclass(frozen=True)
@@ -251,6 +283,81 @@ class Operand(_Source, Enum):
 
 
 @dataclass(frozen=True)
+class _Captured(_Source):
+    """An input whose value a training task also writes into a memory field."""
+
+    source: _Source
+    capture: Capture
+
+
+# Inputs are declared as parameter defaults: `h: torch.Tensor = pllm.hidden(0)`. The factories return the
+# source marker typed `Any`, so the annotation can name the value the method body receives.
+
+
+def hidden(layer: int | Config = 0, site: HiddenSite = HiddenSite.BLOCK_OUTPUT) -> Any:
+    """The hidden state at `layer` (negative counts from the last layer), one row per request."""
+    return Hidden(layer, site)
+
+
+def parameter(state: str, field: str, *, per_row: bool = False) -> Any:
+    """One tensor field of a declared state, aligned to the operation's rows for request state."""
+    return Parameter(state, field, per_row)
+
+
+def module(state: str) -> Any:
+    """A state declared with `module=`, called like the module; request state uses each row's own parameters."""
+    return _Module(state)
+
+
+def version(state: str) -> Any:
+    """How many updates each row's state has received (0 before the first update)."""
+    return StateVersion(state)
+
+
+def index(state: str) -> Any:
+    """Each row's slot in the state pool, for indexing pooled tensors."""
+    return StateIndex(state)
+
+
+def samples(limit: int | Config | None = None) -> Any:
+    """How many samples each request has drawn so far."""
+    return Samples(limit)
+
+
+def result(operation: str) -> Any:
+    """The value another operation of this workload returned in the same step."""
+    return Result(operation)
+
+
+def base_logits() -> Any:
+    """The model's logits before any workload adjustment."""
+    return BaseLogits()
+
+
+def sampled_tokens() -> Any:
+    """The tokens the sampler drew this step."""
+    return SampledTokens()
+
+
+def operand(name: Literal["input", "target", "weight"]) -> Any:
+    """A projection operand inside an overlay or ModelScan loss: its input, target or base weight."""
+    return Operand(name)
+
+
+def capture(source: _Source, *, state: str, field: str) -> Any:
+    """Read `source` and, when the training update publishes, write its value into `state.field`.
+
+    The next step reads that field as its input version; per request the last selected row wins.
+    """
+    return _Captured(source, Capture(state, field))
+
+
+def batch(field: Literal["hidden", "base_logits", "labels", "weights"]) -> Any:
+    """One tensor of the host-supplied `WeightedCEBatch` an SGD training step consumes."""
+    return Batch(field)
+
+
+@dataclass(frozen=True)
 class InstanceState:
     fields: Mapping[str, Shape | Buffer] = field(default_factory=lambda: dict[str, Shape | Buffer]())
     optimizer: AdamWConfig | SGD | None = field(default=None, kw_only=True)
@@ -262,8 +369,17 @@ class InstanceState:
     feed: FeedOrder | None = field(default=None, kw_only=True)
     # Plain per-lineage tensors carried across steps; never optimizer-managed.
     memory: Mapping[str, Shape] = field(default_factory=lambda: dict[str, Shape](), kw_only=True)
+    # An `nn.Module` built from the model's dimensions; its parameters become the state, initialized as the
+    # module initializes them (every request starts from the same values).
+    module: ModuleFactory | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
+        if self.module is not None:
+            _reject(
+                self.fields or self.shape is not None or self.initialize is not None or self.memory or self.feed,
+                "a module state takes its fields and initial values from the module; drop fields/shape/initialize",
+            )
+            object.__setattr__(self, "fields", {"parameters": parameter_count(self.module)})
         _reject(
             self.feed is not None
             and (
@@ -327,6 +443,8 @@ class InstanceState:
             memory=self.memory,
         )
         context.parameters.update({(name, field): port for field, port in ports.items()})
+        if self.module is not None:
+            context.binding.initial_values[name] = partial(initial_values, self.module, dtype=self.dtype)
 
 
 @dataclass(frozen=True)
@@ -435,6 +553,8 @@ class _Effect:
 
     training: ClassVar[bool] = False
     bounded: ClassVar[bool] = False
+    # The phase the effect runs in when no `@pllm.on` names one; None means the author must name it.
+    phase: ClassVar[Phase | None] = None
 
     state: str = ""
     update: str = ""
@@ -448,6 +568,8 @@ class _Effect:
 class _Write(_Effect):
     state: str
     field: str
+
+    phase: ClassVar[Phase | None] = Phase.BEFORE_MODEL
 
     def declare(self, operation: _Operation) -> None:
         context = operation.context
@@ -492,6 +614,7 @@ class _Export(_Effect):
     enabled: bool | Config
 
     bounded: ClassVar[bool] = True
+    phase: ClassVar[Phase | None] = Phase.OBSERVE
 
     def declare(self, operation: _Operation) -> None:
         """Publish bounded tensor observations to the host."""
@@ -570,6 +693,8 @@ class _Train(_Effect):
 class _Sampler(_Effect):
     stage: SamplerStage
     beta: float | Config | None = None  # None for additive logits, which have no guidance strength
+
+    phase: ClassVar[Phase | None] = Phase.BEFORE_SAMPLE
 
     def declare(self, operation: _Operation) -> None:
         """Zero-strength guidance declares no computation or sampler attachment."""
@@ -663,6 +788,8 @@ class _Overlay(_Effect):
     replay: ConditionalLayerReplay | Config | None
     visibility: Visibility | Config
 
+    phase: ClassVar[Phase | None] = Phase.MODEL_UPDATE
+
     def declare(self, operation: _Operation) -> None:
         """Declare a request buffer transition and its parameter overlay attachment."""
         _reject(
@@ -674,10 +801,7 @@ class _Overlay(_Effect):
         definition = context.state_definition(self.state, "parameter overlays require a declared request state")
         _reject(definition.scope is not StateScope.REQUEST, "parameter overlays require a declared request state")
         buffers = _buffers(definition)
-        bindings = {
-            key: source.overlay(self.state, buffers)
-            for key, source in _arguments(operation.function, result_type=TensorUpdate).items()
-        }
+        bindings = {key: source.overlay(self.state, buffers) for key, source in _arguments(operation.function).items()}
         _reject(
             set(buffers) & {source.value for source in Operand}, "overlay buffers conflict with reserved operand names"
         )
@@ -755,14 +879,9 @@ def overlay(
     )
 
 
-def on(phase: Phase, *, rows: str = "") -> Callable[[F], F]:
-    return _mark(phase=phase, rows=rows)
-
-
-def hook(layer: int | Config, *, site: HiddenSite = HiddenSite.BLOCK_OUTPUT) -> Callable[[F], F]:
-    """Declare a supported hidden capture; never register an eager Python model hook."""
-
-    return _mark(hidden=Hidden(layer, site))
+def on(phase: Phase) -> Callable[[F], F]:
+    """Run the method in `phase`; needed for methods without an effect or to move an effect's phase."""
+    return _mark(phase=phase)
 
 
 def export(
@@ -776,21 +895,33 @@ def export(
     return _mark(effect=_Export(name, every, max_rows, max_cols, enabled))
 
 
-def add_logits(function: F) -> F:
-    setattr(function, "__pllm_effect__", _Sampler(SamplerStage.PACKED_PRE_FILTER_ADD))
-    return function
+def add_logits(*, rows: str = "") -> Callable[[F], F]:
+    """Add the returned tensor to the logits before sampling.
+
+    `rows` (here and on the other effects) names a method returning a boolean mask: only those rows run.
+    """
+    return _mark(effect=_Sampler(SamplerStage.PACKED_PRE_FILTER_ADD), rows=rows)
 
 
-def guide_sampling(*, beta: float | Config) -> Callable[[F], F]:
-    """Project selected hidden predictions through the original post-filter sampler."""
-
-    return _mark(effect=_Sampler(SamplerStage.PACKED_POST_FILTER_EXACT, beta))
+def guide_sampling(*, beta: float | Config, rows: str = "") -> Callable[[F], F]:
+    """Steer sampling toward the returned hidden-state prediction with strength `beta`."""
+    return _mark(effect=_Sampler(SamplerStage.PACKED_POST_FILTER_EXACT, beta), rows=rows)
 
 
 def train(
-    *, state: str, update: str = "", reduction: LossReduction = "mean", steps: int | Config = 1, reset: str = ""
+    *,
+    state: str,
+    update: str = "",
+    reduction: LossReduction = "mean",
+    steps: int | Config = 1,
+    reset: str = "",
+    rows: str = "",
 ) -> Callable[[F], F]:
-    return _mark(effect=_Train(state=state, update=update, reduction=reduction, steps=steps, reset=reset))
+    """Minimize the returned per-row loss with `state`'s optimizer.
+
+    Runs after sampling, or inside the model forward when `state` belongs to a ModelScan.
+    """
+    return _mark(effect=_Train(state=state, update=update, reduction=reduction, steps=steps, reset=reset), rows=rows)
 
 
 def _setting(value: C | Config, config: object, expected: type[C]) -> C:
@@ -822,66 +953,26 @@ def _typed(value: object, expected: type[C]) -> C | None:
     return value if isinstance(value, expected) else None
 
 
-def _source(value: object) -> _Source:
-    source = _typed(value, _Source)
-    if source is None:
-        raise TypeError(f"unsupported tensor source: {type(value).__name__}")
-    return source
-
-
-def _arguments(
-    function: Callable[..., torch.Tensor | TensorUpdate],
-    hidden: Hidden | None = None,
-    result_type: type[torch.Tensor] | type[TensorUpdate] = torch.Tensor,
-    captures: dict[str, Capture] | None = None,
-) -> dict[str, _Source]:
+def _arguments(function: Callable[..., torch.Tensor | TensorUpdate]) -> dict[str, _Source]:
+    """Read each parameter's source from its default value, e.g. `h: torch.Tensor = pllm.hidden(0)`."""
     result: dict[str, _Source] = {}
-    _reject(
-        hidden is not None
-        and sum(
-            parameter.annotation is torch.Tensor
-            for parameter in signature(function, eval_str=False).parameters.values()
-        )
-        > 1,
-        "multiple Tensor inputs require explicit Annotated sources",
-        TypeError,
-    )
     for name, parameter in signature(function, eval_str=False).parameters.items():
-        _reject(
-            parameter.kind not in (SignatureParameter.POSITIONAL_OR_KEYWORD, SignatureParameter.KEYWORD_ONLY),
-            f"{name}: tensor operations require named parameters",
-            TypeError,
-        )
-        annotation: object = parameter.annotation
-        if annotation is torch.Tensor and hidden is not None:
-            result[name] = hidden
-            continue
-        _reject(
-            get_origin(annotation) is not Annotated,
-            f"{name}: input source requires Annotated[Tensor, source]; string annotations are not evaluated",
-            TypeError,
-        )
-        args: tuple[object, ...] = get_args(annotation)
-        if len(args) == 3 and (capture := _typed(args[2], Capture)) is not None and captures is not None:
-            captures[name] = capture
-            args = args[:2]
-        _reject(
-            len(args) != 2 or args[0] is not torch.Tensor,
-            f"{name}: expected one source on Annotated[Tensor, source]",
-            TypeError,
-        )
-        result[name] = _source(args[1])
-    _reject(
-        signature(function, eval_str=False).return_annotation is not result_type,
-        f"operation must declare a {result_type.__name__} result",
-        TypeError,
-    )
+        source = _typed(parameter.default, _Source)
+        if source is None or parameter.kind is SignatureParameter.POSITIONAL_ONLY:
+            raise TypeError(
+                f"{name}: give every input a source as its default, e.g. `{name}: torch.Tensor = pllm.hidden(0)`"
+            )
+        result[name] = source
     return result
 
 
-def _invoke(function: Callable[..., C], bindings: Mapping[str, str]) -> Callable[[Tensors], C]:
+def _invoke(
+    function: Callable[..., C],
+    bindings: Mapping[str, str],
+    adapters: Mapping[str, Callable[[torch.Tensor], object]] = {},
+) -> Callable[[Tensors], C]:
     def invoke(inputs: Tensors) -> C:
-        return function(**{key: inputs[source] for key, source in bindings.items()})
+        return function(**{key: adapters.get(key, _same)(inputs[source]) for key, source in bindings.items()})
 
     return invoke
 
@@ -896,15 +987,19 @@ class _Operation:
     effect: _Effect
     gradient: object
     rows: str
-    hidden: Hidden | None
 
     @property
     def function(self) -> FunctionType | MethodType:
         return self.context.method(self.name)
 
     def arguments(self) -> tuple[dict[str, _Source], dict[str, Capture]]:
-        captures: dict[str, Capture] = {}
-        return _arguments(self.function, self.hidden, captures=captures if self.effect.training else None), captures
+        """Split captured inputs into their read source and the memory field the update writes."""
+        sources, captures = _arguments(self.function), dict[str, Capture]()
+        for key, source in sources.items():
+            if (captured := _typed(source, _Captured)) is not None:
+                _reject(not self.effect.training, f"{key}: only training operations capture inputs into memory")
+                sources[key], captures[key] = captured.source, captured.capture
+        return sources, captures
 
     def tensor(
         self,
@@ -949,7 +1044,13 @@ class _Operation:
             update=update,
             math=math,
             captures=writes,
-        )(_invoke(freeze(self.function), {key: key for key in arguments}))
+        )(
+            _invoke(
+                freeze(self.function),
+                {key: key for key in arguments},
+                {key: source.adapt(context) for key, source in arguments.items()},
+            )
+        )
 
     def selectors(
         self,
@@ -958,17 +1059,13 @@ class _Operation:
         math: MathContract,
         domains: dict[str, str],
     ) -> MathContract:
-        """Declare each selector once and connect its row-domain result."""
+        """Declare each selector once and connect its row-domain result; selectors read their own inputs."""
         selectors: dict[str, Call] = {}
         for domain, method in domains.items():
             if not method:
                 continue
             selector = self.context.method(method)
             selected_args = _arguments(selector)
-            _reject(
-                any(key not in arguments or source != arguments[key] for key, source in selected_args.items()),
-                "row selector must use the operation's declared inputs",
-            )
             if method not in selectors:
                 identity = fingerprint(selector)
                 self.context.definitions.append((method, identity))
@@ -976,7 +1073,10 @@ class _Operation:
                     f"__{self.name}_{method}",
                     when=self.phase.value,
                     identity=f"python:{identity}:{self.name}:{method}",
-                    inputs={key: inputs[key] for key in selected_args},
+                    inputs={
+                        key: inputs[key] if arguments.get(key) == source else source.port(self.context)
+                        for key, source in selected_args.items()
+                    },
                 )(_invoke(freeze(selector), {key: key for key in selected_args}))
             key = f"__{domain}"
             _reject(key in inputs, f"{key} is reserved for a row-domain input")
@@ -1058,6 +1158,9 @@ class _Declaration:
         for value in values.values():
             if isinstance(value, ModelScan):
                 context.overlay_states.add(value.apply.state)
+                for operation in context.operations:
+                    if operation.name == value.learn and operation.name in context.implicit_training:
+                        operation.phase = Phase.MODEL_UPDATE
             if isinstance(value, Overlay):
                 context.overlay_states.add(value.state)
         return context
@@ -1066,38 +1169,28 @@ class _Declaration:
         self, name: str, member: object, candidates: dict[str, FunctionType], seeds: list[FunctionType]
     ) -> None:
         """Read decorator attributes once; marker values never drive runtime reflection."""
-        phase, effect, gradient, rows, hidden = (
+        phase, marked, gradient, rows = (
             _typed(getattr(member, "__pllm_phase__", None), Phase),
-            _typed(getattr(member, "__pllm_effect__", None), _Effect) or _Effect(),
+            _typed(getattr(member, "__pllm_effect__", None), _Effect),
             getattr(member, "__pllm_gradient__", None),
             _typed(getattr(member, "__pllm_rows__", ""), str),
-            _typed(getattr(member, "__pllm_hidden__", None), Hidden),
         )
+        if phase is None and marked is None:
+            return
+        effect = marked or _Effect()
         texts = (*vars(effect).values(), *vars(_typed(gradient, _Gradient) or _Gradient((), False)).values(), rows)
         seeds.extend(candidates[text] for text in texts if isinstance(text, str) and text in candidates)
         if (overlay := _typed(effect, _Overlay)) is not None:
             self.overlay_states.add(overlay.state)
-            if phase is None:
-                phase = Phase.MODEL_UPDATE
         if phase is None and isinstance(effect, _Train):
-            phase = Phase.MODEL_UPDATE
+            # A ModelScan learner trains inside the forward; `read` moves it once the scans are known.
             self.implicit_training.add(name)
-        if phase is not None:
-            if (function := _typed(member, FunctionType)) is not None:
-                seeds.append(function)
-            if rows is None:
-                raise TypeError("operation row selector must name a method")
-            self.operations.append(
-                _Operation(
-                    self,
-                    name,
-                    phase,
-                    effect,
-                    gradient,
-                    rows,
-                    hidden,
-                )
-            )
+        phase = phase or effect.phase or Phase.AFTER_SAMPLE
+        if (function := _typed(member, FunctionType)) is not None:
+            seeds.append(function)
+        if rows is None:
+            raise TypeError("operation row selector must name a method")
+        self.operations.append(_Operation(self, name, phase, effect, gradient, rows))
 
     def method(self, name: str) -> FunctionType | MethodType:
         """Bind a named authoring method, including an instance-local replacement."""
@@ -1314,10 +1407,6 @@ class Workload(
                     b.model_scan is not None,
                     "ModelScan owns its state and training; remove other scheduled operations",
                 )
-                _reject(
-                    operation.name in context.implicit_training,
-                    "@train without @on must belong to a ModelScan",
-                )
                 operation.effect.declare(operation)
         context.attach_effects()
         context.attach_training()
@@ -1405,6 +1494,9 @@ class Workload(
 
         def initializer(resource: str) -> Callable[[Roots, tuple[RequestStateKey | None, ...]], None]:
             init = b.initializers.get(resource)
+            if resource in b.initial_values:
+                assert b.dimensions is not None
+                init = partial(copy_initial, b.initial_values[resource](b.dimensions, seed).to(device))
 
             def initialize(roots: Roots, keys: tuple[RequestStateKey | None, ...]) -> None:
                 if init is not None:
@@ -1570,24 +1662,26 @@ __all__ = [
     "Phase",
     "on",
     "write",
-    "hook",
     "export",
     "add_logits",
     "guide_sampling",
     "train",
     "Config",
-    "Hidden",
-    "Samples",
-    "BaseLogits",
-    "SampledTokens",
-    "Parameter",
-    "StateIndex",
-    "StateVersion",
-    "Result",
+    "hidden",
+    "parameter",
+    "module",
+    "version",
+    "index",
+    "samples",
+    "result",
+    "base_logits",
+    "sampled_tokens",
+    "operand",
+    "capture",
+    "batch",
     "InstanceState",
     "RequestState",
     "overlay",
-    "Operand",
     "Buffer",
     "TensorUpdate",
     "differentiate",
@@ -1600,5 +1694,4 @@ __all__ = [
     "Visibility",
     "KVPolicy",
     "SGD",
-    "Batch",
 ]

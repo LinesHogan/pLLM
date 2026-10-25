@@ -31,7 +31,7 @@ from pllm.learning import (
     CompletionWorkload as CompletionWorkload,
     transaction as transaction,
 )
-from pllm.usage import Batch as Batch
+from pllm.usage import batch as batch
 
 __all__ = [
     "transaction",
@@ -46,7 +46,7 @@ __all__ = [
     "CausalModel",
     "CausalTrainBatch",
     "WeightedCEBatch",
-    "Batch",
+    "batch",
     "BarrierState",
     "Completion",
     "CompletionBatch",

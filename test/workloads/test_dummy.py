@@ -6,7 +6,6 @@ signed declarations, chained results, values frozen at compile time and frozen s
 """
 
 from dataclasses import replace
-from typing import Annotated
 from unittest.mock import patch
 
 import pytest
@@ -98,12 +97,11 @@ def test_dummy_runs_graph_sign_plan_execute() -> None:
 
     class Chained(DummyWorkload):
         @pllm.on(pllm.Phase.OBSERVE)
-        def shift(self, x: Annotated[torch.Tensor, pllm.Hidden(0)]) -> torch.Tensor:
+        def shift(self, x: torch.Tensor = pllm.hidden(0)) -> torch.Tensor:
             return x + 1
 
-        @pllm.on(pllm.Phase.OBSERVE)
         @pllm.export(name="chain", max_rows=2, max_cols=3)
-        def export_hidden(self, x: Annotated[torch.Tensor, pllm.Result("shift")]) -> torch.Tensor:
+        def export_hidden(self, x: torch.Tensor = pllm.result("shift")) -> torch.Tensor:
             return x * 2
 
     torch.testing.assert_close(make_llm(CPU, workload=Chained()).step(value(2)), (expected + 1) * 2)
@@ -116,15 +114,13 @@ def test_dummy_runs_graph_sign_plan_execute() -> None:
     torch.testing.assert_close(frozen.step(value(2)), expected * 2)
     torch.testing.assert_close(custom.compile_host(CPU).step(value(2)), expected * 3)
 
-    class Ambiguous(DummyWorkload):
-        @pllm.on(pllm.Phase.OBSERVE)
-        @pllm.hook(0)
+    class Unsourced(DummyWorkload):
         @pllm.export()
-        def export_hidden(self, first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
+        def export_hidden(self, first: torch.Tensor = pllm.hidden(0), second: torch.Tensor = 0) -> torch.Tensor:
             return first + second
 
-    with pytest.raises(TypeError):  # a hook binds exactly one tensor input
-        Ambiguous().backend_requirements()
+    with pytest.raises(TypeError):  # every input names its source
+        Unsourced().backend_requirements()
     _frozen_state_is_readable_by_an_observation()
 
 
@@ -179,23 +175,28 @@ def _trace_selection_and_bounds(plan) -> None:
         assert torch.cuda.max_memory_allocated() - baseline < 64 * 1024
 
 
+class Encoder(torch.nn.Module):
+    """A frozen PyTorch module whose `encode` method an observation calls."""
+
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.eye(4, width))
+
+    def encode(self, hidden: torch.Tensor) -> torch.Tensor:
+        return hidden @ self.weight.T
+
+
 def _frozen_state_is_readable_by_an_observation() -> None:
-    """State declared without an optimizer is initialized at admission and read by an export."""
+    """A module state without an optimizer starts from the module's values and is read by an export."""
 
     class FrozenEncoder(pllm.Workload):
-        encoder = pllm.InstanceState(
-            {"weight": lambda model: (4, model.hidden_size)},
-            dtype=torch.float32,
-            initialize=lambda tensors, generator: tensors["weight"].copy_(torch.eye(4)),
-        )
+        encoder = pllm.InstanceState(module=lambda model: Encoder(model.hidden_size))
 
-        @pllm.on(pllm.Phase.OBSERVE)
-        @pllm.hook(0)
         @pllm.export(name="features", every=1, max_rows=2, max_cols=4)
         def encode(
-            self, hidden: torch.Tensor, weight: Annotated[torch.Tensor, pllm.Parameter("encoder", "weight")]
+            self, hidden: torch.Tensor = pllm.hidden(0), encoder: Encoder = pllm.module("encoder")
         ) -> torch.Tensor:
-            return hidden @ weight.T
+            return encoder.encode(hidden)
 
     timeline = RuntimeFacts(torch.device("cpu")).timeline()
     provider = PageBundleProviderFacts("test.plain@1", 4, StateDeviceKind.CPU)
@@ -218,7 +219,7 @@ def test_unused_helpers_are_neither_signed_nor_frozen() -> None:
             return os.getcwd()
 
         @pllm.on(pllm.Phase.OBSERVE)
-        def observe(self, hidden: Annotated[torch.Tensor, pllm.Hidden(0)]) -> torch.Tensor:
+        def observe(self, hidden: torch.Tensor = pllm.hidden(0)) -> torch.Tensor:
             return hidden * 2
 
     execution = make_llm(workload=Lazy(), config=CPU)

@@ -6,7 +6,6 @@ and the published optimizer state with ``torch.optim``.
 """
 
 from dataclasses import replace
-from typing import Annotated
 
 import pytest
 import torch
@@ -164,28 +163,26 @@ def _request_heads() -> None:
         name = "request_heads"
         heads = pllm.RequestState({"weight": (4, 7)}, optimizer=pllm.AdamW(lr=0.03))
 
-        @pllm.on(pllm.Phase.BEFORE_SAMPLE)
-        @pllm.add_logits
+        @pllm.add_logits()
         def reweight(
             self,
-            hidden: Annotated[torch.Tensor, pllm.Hidden(-1, HiddenSite.MODEL_OUTPUT)],
-            samples: Annotated[torch.Tensor, pllm.Samples()],
-            weight: Annotated[torch.Tensor, pllm.Parameter("heads", "weight")],
+            hidden: torch.Tensor = pllm.hidden(-1, HiddenSite.MODEL_OUTPUT),
+            samples: torch.Tensor = pllm.samples(),
+            weight: torch.Tensor = pllm.parameter("heads", "weight"),
         ) -> torch.Tensor:
             return torch.bmm(hidden.unsqueeze(1), weight).squeeze(1)
 
-        def eligible(self, samples: Annotated[torch.Tensor, pllm.Samples()]) -> torch.Tensor:
+        def eligible(self, samples: torch.Tensor = pllm.samples()) -> torch.Tensor:
             return samples == 0
 
-        @pllm.on(pllm.Phase.AFTER_SAMPLE, rows="eligible")
-        @pllm.train(state="heads")
+        @pllm.train(state="heads", rows="eligible")
         def train(
             self,
-            hidden: Annotated[torch.Tensor, pllm.Hidden(-1, HiddenSite.MODEL_OUTPUT)],
-            samples: Annotated[torch.Tensor, pllm.Samples()],
-            weight: Annotated[torch.Tensor, pllm.Parameter("heads", "weight")],
-            base: Annotated[torch.Tensor, pllm.BaseLogits()],
-            tokens: Annotated[torch.Tensor, pllm.SampledTokens()],
+            hidden: torch.Tensor = pllm.hidden(-1, HiddenSite.MODEL_OUTPUT),
+            samples: torch.Tensor = pllm.samples(),
+            weight: torch.Tensor = pllm.parameter("heads", "weight"),
+            base: torch.Tensor = pllm.base_logits(),
+            tokens: torch.Tensor = pllm.sampled_tokens(),
         ) -> torch.Tensor:
             return F.cross_entropy(base + torch.bmm(hidden.unsqueeze(1), weight).squeeze(1), tokens)
 
@@ -218,14 +215,13 @@ def _chained_heads(facts) -> None:
     class ChainedHeads(pllm.Workload):
         heads = pllm.InstanceState({"weight": (4, 7)}, optimizer=pllm.AdamW(lr=0.03), initialize=initialize_chain)
 
-        @pllm.on(pllm.Phase.BEFORE_SAMPLE)
-        @pllm.add_logits
+        @pllm.add_logits()
         @pllm.differentiate(inputs=("hidden",), parameters=True)
         def reweight(
             self,
-            hidden: Annotated[torch.Tensor, pllm.Hidden(-1, HiddenSite.MODEL_OUTPUT)],
-            samples: Annotated[torch.Tensor, pllm.Samples()],
-            weight: Annotated[torch.Tensor, pllm.Parameter("heads", "weight")],
+            hidden: torch.Tensor = pllm.hidden(-1, HiddenSite.MODEL_OUTPUT),
+            samples: torch.Tensor = pllm.samples(),
+            weight: torch.Tensor = pllm.parameter("heads", "weight"),
         ) -> torch.Tensor:
             return hidden @ weight
 
@@ -233,23 +229,22 @@ def _chained_heads(facts) -> None:
         @pllm.differentiate(inputs=("features",))
         def frozen(
             self,
-            features: Annotated[torch.Tensor, pllm.Result("reweight")],
-            weight: Annotated[torch.Tensor, pllm.Parameter("heads", "weight")],
+            features: torch.Tensor = pllm.result("reweight"),
+            weight: torch.Tensor = pllm.parameter("heads", "weight"),
         ) -> torch.Tensor:
             return features @ weight.T @ weight
 
-        def eligible(self, samples: Annotated[torch.Tensor, pllm.Samples()]) -> torch.Tensor:
+        def eligible(self, samples: torch.Tensor = pllm.samples()) -> torch.Tensor:
             return samples == 0
 
-        @pllm.on(pllm.Phase.AFTER_SAMPLE, rows="eligible")
-        @pllm.train(state="heads")
+        @pllm.train(state="heads", rows="eligible")
         @pllm.differentiate(inputs=("features",))
         def train(
             self,
-            features: Annotated[torch.Tensor, pllm.Result("frozen")],
-            samples: Annotated[torch.Tensor, pllm.Samples()],
-            base: Annotated[torch.Tensor, pllm.BaseLogits()],
-            tokens: Annotated[torch.Tensor, pllm.SampledTokens()],
+            features: torch.Tensor = pllm.result("frozen"),
+            samples: torch.Tensor = pllm.samples(),
+            base: torch.Tensor = pllm.base_logits(),
+            tokens: torch.Tensor = pllm.sampled_tokens(),
         ) -> torch.Tensor:
             return F.cross_entropy(base + features, tokens)
 
@@ -298,53 +293,51 @@ class Domains(pllm.Workload):
             memory={"carry": (7,)},
         )
 
-    def forward_rows(self, samples: Annotated[torch.Tensor, pllm.Samples()]) -> torch.Tensor:
+    def forward_rows(self, samples: torch.Tensor = pllm.samples()) -> torch.Tensor:
         return samples.bitwise_and(1) != 0
 
-    def input_rows(self, samples: Annotated[torch.Tensor, pllm.Samples()]) -> torch.Tensor:
+    def input_rows(self, samples: torch.Tensor = pllm.samples()) -> torch.Tensor:
         return samples.bitwise_and(2) != 0
 
-    def parameter_rows(self, samples: Annotated[torch.Tensor, pllm.Samples()]) -> torch.Tensor:
+    def parameter_rows(self, samples: torch.Tensor = pllm.samples()) -> torch.Tensor:
         return samples.bitwise_and(4) != 0
 
     def updates(
         self,
-        samples: Annotated[torch.Tensor, pllm.Samples()],
-        tokens: Annotated[torch.Tensor, pllm.SampledTokens()],
+        samples: torch.Tensor = pllm.samples(),
+        tokens: torch.Tensor = pllm.sampled_tokens(),
     ) -> torch.Tensor:
         return (samples.bitwise_and(8) != 0) & (tokens == 0)
 
-    @pllm.on(pllm.Phase.BEFORE_SAMPLE, rows="forward_rows")
-    @pllm.add_logits
+    @pllm.add_logits(rows="forward_rows")
     @pllm.differentiate(inputs=("hidden",), parameters=True, input_rows="input_rows", parameter_rows="parameter_rows")
     def reweight(
         self,
-        hidden: Annotated[torch.Tensor, pllm.Hidden(-1, HiddenSite.MODEL_OUTPUT)],
-        samples: Annotated[torch.Tensor, pllm.Samples()],
-        weight: Annotated[torch.Tensor, pllm.Parameter("heads", "weight", per_row=True)],
+        hidden: torch.Tensor = pllm.hidden(-1, HiddenSite.MODEL_OUTPUT),
+        samples: torch.Tensor = pllm.samples(),
+        weight: torch.Tensor = pllm.parameter("heads", "weight", per_row=True),
     ) -> torch.Tensor:
         return torch.bmm(hidden.unsqueeze(1), weight).squeeze(1)
 
-    @pllm.on(pllm.Phase.AFTER_SAMPLE, rows="forward_rows")
-    @pllm.train(state="heads", update="updates")
+    @pllm.train(state="heads", update="updates", rows="forward_rows")
     @pllm.differentiate(inputs=("features",))
     def train(
         self,
-        features: Annotated[torch.Tensor, pllm.Result("reweight"), pllm.Capture("heads", "carry")],
-        samples: Annotated[torch.Tensor, pllm.Samples()],
-        tokens: Annotated[torch.Tensor, pllm.SampledTokens()],
+        features: torch.Tensor = pllm.capture(pllm.result("reweight"), state="heads", field="carry"),
+        samples: torch.Tensor = pllm.samples(),
+        tokens: torch.Tensor = pllm.sampled_tokens(),
     ) -> torch.Tensor:
         return features.square().mean()
 
 
 class EarlyFeedback(Domains):
     @pllm.on(pllm.Phase.BEFORE_SAMPLE)
-    def early(self, tokens: Annotated[torch.Tensor, pllm.SampledTokens()]) -> torch.Tensor:
+    def early(self, tokens: torch.Tensor = pllm.sampled_tokens()) -> torch.Tensor:
         return tokens == 0
 
 
 class IntegerRows(Domains):
-    def forward_rows(self, samples: Annotated[torch.Tensor, pllm.Samples()]) -> torch.Tensor:
+    def forward_rows(self, samples: torch.Tensor = pllm.samples()) -> torch.Tensor:
         return samples
 
 

@@ -8,7 +8,6 @@ sampler buffers and publish lags 0-2.
 import sys
 from dataclasses import replace
 from pathlib import Path
-from typing import Annotated
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -39,23 +38,21 @@ class MeanFit(pllm.Workload):
 
     weights = pllm.InstanceState({"value": (4,)}, optimizer=pllm.AdamW(lr=0.03), dtype=torch.float64)
 
-    @pllm.on(pllm.Phase.BEFORE_SAMPLE)
     @pllm.guide_sampling(beta=0.1)
     def predict(
         self,
-        hidden: Annotated[torch.Tensor, pllm.Hidden(0)],
-        weight: Annotated[torch.Tensor, pllm.Parameter("weights", "value")],
+        hidden: torch.Tensor = pllm.hidden(0),
+        weight: torch.Tensor = pllm.parameter("weights", "value"),
     ) -> torch.Tensor:
         return hidden * weight
 
-    @pllm.on(pllm.Phase.AFTER_SAMPLE)
     @pllm.train(state="weights", reduction="mean")
     def loss(
         self,
-        hidden: Annotated[torch.Tensor, pllm.Hidden(0)],
-        weight: Annotated[torch.Tensor, pllm.Parameter("weights", "value")],
-        target: Annotated[torch.Tensor, pllm.BaseLogits()],
-        token: Annotated[torch.Tensor, pllm.SampledTokens()],
+        hidden: torch.Tensor = pllm.hidden(0),
+        weight: torch.Tensor = pllm.parameter("weights", "value"),
+        target: torch.Tensor = pllm.base_logits(),
+        token: torch.Tensor = pllm.sampled_tokens(),
     ) -> torch.Tensor:
         return (hidden * weight - target - token[:, None]).square().mean(1)
 

@@ -3,7 +3,6 @@
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from math import isfinite
-from typing import Annotated
 
 import torch
 from torch.nn import functional as F
@@ -38,10 +37,10 @@ def head_logits(hidden: torch.Tensor, down: torch.Tensor, up: torch.Tensor, indi
     return torch.bmm(torch.bmm(hidden.unsqueeze(1), down.transpose(1, 2)), up.transpose(1, 2)).squeeze(1)
 
 
-Hidden = Annotated[torch.Tensor, pllm.Hidden(-1, site=pllm.model.HiddenSite.MODEL_OUTPUT)]
-Samples = Annotated[torch.Tensor, pllm.Samples(pllm.Config("config.num_iterations"))]
-Down = Annotated[torch.Tensor, pllm.Parameter("iteration_heads", "down")]
-Up = Annotated[torch.Tensor, pllm.Parameter("iteration_heads", "up")]
+HIDDEN = pllm.hidden(-1, site=pllm.model.HiddenSite.MODEL_OUTPUT)
+SAMPLES = pllm.samples(pllm.Config("config.num_iterations"))
+DOWN = pllm.parameter("iteration_heads", "down")
+UP = pllm.parameter("iteration_heads", "up")
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,27 +66,31 @@ class OverRIDEWorkload(pllm.Workload):
             namespace="canonical.iteration_heads@1",
         )
 
-    @pllm.on(pllm.Phase.BEFORE_SAMPLE)
-    @pllm.add_logits
-    def reweight(self, hidden: Hidden, samples: Samples, down: Down, up: Up) -> torch.Tensor:
+    @pllm.add_logits()
+    def reweight(
+        self,
+        hidden: torch.Tensor = HIDDEN,
+        samples: torch.Tensor = SAMPLES,
+        down: torch.Tensor = DOWN,
+        up: torch.Tensor = UP,
+    ) -> torch.Tensor:
         if not self.config.enabled or self.config.num_iterations == 1:
             return hidden.new_zeros((len(hidden), up.shape[1]))
         return head_logits(hidden, down, up, (samples - 1).clamp_min(0)) * (
             (samples > 0).unsqueeze(1) * self.config.lambd
         )
 
-    def eligible(self, samples: Samples) -> torch.Tensor:
+    def eligible(self, samples: torch.Tensor = SAMPLES) -> torch.Tensor:
         return (samples < self.config.num_iterations - 1) & self.config.enabled
 
-    @pllm.on(pllm.Phase.AFTER_SAMPLE, rows="eligible")
-    @pllm.train(state="iteration_heads")
+    @pllm.train(state="iteration_heads", rows="eligible")
     def train(
         self,
-        hidden: Hidden,
-        samples: Samples,
-        down: Down,
-        up: Up,
-        base: Annotated[torch.Tensor, pllm.BaseLogits()],
-        tokens: Annotated[torch.Tensor, pllm.SampledTokens()],
+        hidden: torch.Tensor = HIDDEN,
+        samples: torch.Tensor = SAMPLES,
+        down: torch.Tensor = DOWN,
+        up: torch.Tensor = UP,
+        base: torch.Tensor = pllm.base_logits(),
+        tokens: torch.Tensor = pllm.sampled_tokens(),
     ) -> torch.Tensor:
         return self.objective(base + head_logits(hidden, down, up, samples), tokens)

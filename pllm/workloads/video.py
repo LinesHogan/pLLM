@@ -5,7 +5,7 @@ Features arrive from a producer; the model consumes a local activation state.
 
 from dataclasses import dataclass
 from math import isfinite, pi
-from typing import Annotated, ClassVar
+from typing import ClassVar
 
 import torch
 from torch.nn import functional as F
@@ -13,11 +13,6 @@ from torch.nn import functional as F
 import pllm
 
 FEATURES = ("qp", "residual_energy", "motion_magnitude", "segmentation")
-QP = Annotated[torch.Tensor, pllm.Parameter("features", "qp")]
-Residual = Annotated[torch.Tensor, pllm.Parameter("features", "residual_energy")]
-Motion = Annotated[torch.Tensor, pllm.Parameter("features", "motion_magnitude")]
-Segments = Annotated[torch.Tensor, pllm.Parameter("features", "segmentation")]
-Injection = Annotated[torch.Tensor, pllm.Parameter("inject", "delta")]
 
 
 def injection_shape(inputs: int, outputs: int) -> tuple[int, ...]:
@@ -71,10 +66,14 @@ class VideoWorkload(pllm.Workload):
             on_missing=pllm.model.MissingPolicy.HOLD,
         )
 
-    @pllm.on(pllm.Phase.BEFORE_MODEL)
     @pllm.write(state="inject", field="delta")
     def encode(
-        self, qp: QP, residual: Residual, motion: Motion, segmentation: Segments, template: Injection
+        self,
+        qp: torch.Tensor = pllm.parameter("features", "qp"),
+        residual: torch.Tensor = pllm.parameter("features", "residual_energy"),
+        motion: torch.Tensor = pllm.parameter("features", "motion_magnitude"),
+        segmentation: torch.Tensor = pllm.parameter("features", "segmentation"),
+        template: torch.Tensor = pllm.parameter("inject", "delta"),
     ) -> torch.Tensor:
         """Project block statistics onto a fixed Fourier basis at model hidden width."""
         signal = torch.cat(

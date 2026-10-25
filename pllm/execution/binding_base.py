@@ -76,6 +76,8 @@ class TensorBindingBase(Builder[TensorFrame]):
         self.exports: dict[TaskSymbol, tuple[int, int, bool]] = {}
         self.tensor_tasks: dict[TaskSymbol, TensorTask] = {}
         self.initializers: dict[str, Callable[[tuple[torch.Tensor, ...], torch.Generator], None]] = {}
+        # Module states: their flat initial values, built once at bind from the model dimensions and seed.
+        self.initial_values: dict[str, Callable[[Dimensions, int], torch.Tensor]] = {}
         self.weighted_training = False
         self.probe: BackendPlacementProbe | None = None
         self.max_requests = 1

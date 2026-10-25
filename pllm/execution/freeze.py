@@ -43,7 +43,8 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
             raise ValueError("reflective mathematics requires an explicit native binding")
         dependencies = {
             **{key: value.__globals__[key] for key in globals_used if key in value.__globals__},
-            **closure.nonlocals,
+            # `__class__` is zero-argument `super()`'s cell: the class being signed, not a dependency.
+            **{key: item for key, item in closure.nonlocals.items() if key != "__class__"},
         }
         return boundary_digest(
             sha256(dumps(_code(value.__code__))).hexdigest(),
@@ -64,8 +65,19 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
     if value is TensorUpdate:
         return TensorUpdate.__qualname__
     if isinstance(value, type):
-        if value is torch.Tensor:
-            return value.__qualname__
+        if value.__module__.partition(".")[0] == "torch":
+            return boundary_digest(value.__module__, value.__qualname__, torch.__version__)
+        if issubclass(value, torch.nn.Module):
+            # A user module (module state) is signed by the code of its own methods.
+            return boundary_digest(
+                tuple(
+                    (key, fingerprint(item, seen))
+                    for cls in value.__mro__
+                    if cls.__module__.partition(".")[0] not in ("torch", "builtins")
+                    for key, item in sorted(vars(cls).items())
+                    if isinstance(item, FunctionType)
+                )
+            )
         raise ValueError("dynamic type dependencies require an explicit native binding")
     if is_dataclass(value) and not isinstance(value, type):
         return boundary_digest(

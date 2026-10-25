@@ -7,7 +7,6 @@ CPU/CUDA and captured implementations, and an ordinary authored distiller with m
 
 from contextlib import nullcontext
 from dataclasses import replace
-from typing import Annotated
 
 import numpy as np
 import pytest
@@ -26,7 +25,8 @@ from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.visibility import VisibilitySource
 from pllm.execution import row_task_binding
 from pllm.execution.backend_attachment import lower_backend_attachment
-from pllm.execution.declaration import Call
+from pllm.execution.declaration import Call, Dimensions
+from pllm.execution.module_state import initial_values
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.request_state import RequestStateDirectory
@@ -124,9 +124,6 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(monkeypatc
         ESampRequestConfig(learning_rate=float("nan"))
     config = ESampRequestConfig(rank=2, intervention_beta=0.2, learning_rate=0.03, weight_decay=0.1)
     facts = facts_for(torch.device("cpu"), 4, 6)
-    keyed = replace(config, key_fields=(RequestKeyField.REQUEST_ID, RequestKeyField.SAMPLE_IDX))
-    with pytest.raises(ValueError):  # attached ESamp keys its state by request id only
-        ESampRequestWorkload(keyed).compile_backend(facts)
     execution = ESampRequestWorkload(config).compile_backend(facts).execution
     identities = (RequestIdentity("first", 0, 0), RequestIdentity("second", 0, 1))
     latest = list(execution.admit(identities))
@@ -135,10 +132,10 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(monkeypatc
         torch.optim.AdamW((p,), lr=config.learning_rate, betas=config.betas, eps=config.eps, weight_decay=0.1)
         for p in parameters
     ]
-    generator = torch.Generator().manual_seed(7)
-    for parameter in parameters:  # up, gate, down ~ N(0, 0.02); bias and scale one; shift zero
-        normal = (torch.empty(8).normal_(0.0, 0.02, generator=generator) for _ in range(3))
-        expected = torch.cat((*normal, torch.ones(2), torch.ones(4), torch.zeros(4)))
+    generator = torch.Generator().manual_seed(facts.initialization_seed)
+    normal = (torch.empty(8).normal_(0.0, 0.02, generator=generator) for _ in range(3))
+    expected = torch.cat((*normal, torch.ones(2), torch.ones(4), torch.zeros(4)))
+    for parameter in parameters:  # every request starts from the module's initialization
         torch.testing.assert_close(parameter, expected, rtol=0, atol=0)
 
     source = torch.tensor([[0.2, -0.1, 0.4, 0.3], [-0.5, 0.7, 0.1, -0.2], [0.1, 0.3, -0.2, 0.8]])
@@ -209,6 +206,7 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(monkeypatc
             if not captured or device != "cpu":
                 _esamp_native_oracle(torch.device(device), normalized, captured)
     _ordinary_request_distillation()
+    _module_request_distillation()
 
 
 def _esamp_native_oracle(device, normalized, captured):
@@ -282,27 +280,24 @@ class Distillation(pllm.Workload):
         memory={"carry": lambda m: (m.hidden_size,)},
     )
 
-    def ready(self, versions: Annotated[torch.Tensor, pllm.StateVersion("heads")]) -> torch.Tensor:
+    def ready(self, versions: torch.Tensor = pllm.version("heads")) -> torch.Tensor:
         return versions > 0
 
-    @pllm.on(pllm.Phase.BEFORE_SAMPLE, rows="ready")
-    @pllm.guide_sampling(beta=0.2)
+    @pllm.guide_sampling(beta=0.2, rows="ready")
     def predict(
         self,
-        source: Annotated[torch.Tensor, pllm.Hidden(0)],
-        weight: Annotated[torch.Tensor, pllm.Parameter("heads", "weight")],
-        versions: Annotated[torch.Tensor, pllm.StateVersion("heads")],
+        source: torch.Tensor = pllm.hidden(0),
+        weight: torch.Tensor = pllm.parameter("heads", "weight"),
     ) -> torch.Tensor:
         return torch.bmm(source.unsqueeze(1), weight).squeeze(1)
 
-    @pllm.on(pllm.Phase.AFTER_SAMPLE)
     @pllm.train(state="heads", reduction="state_mean")
     def train(
         self,
-        source: Annotated[torch.Tensor, pllm.Hidden(0), pllm.Capture("heads", "carry")],
-        target: Annotated[torch.Tensor, pllm.Hidden(-1)],
-        weight: Annotated[torch.Tensor, pllm.Parameter("heads", "weight")],
-        carry: Annotated[torch.Tensor, pllm.Parameter("heads", "carry")],
+        source: torch.Tensor = pllm.capture(pllm.hidden(0), state="heads", field="carry"),
+        target: torch.Tensor = pllm.hidden(-1),
+        weight: torch.Tensor = pllm.parameter("heads", "weight"),
+        carry: torch.Tensor = pllm.parameter("heads", "carry"),
     ) -> torch.Tensor:
         prediction = torch.bmm(source.unsqueeze(1), weight).squeeze(1) + carry
         return (prediction - target).square().mean(1)
@@ -410,3 +405,71 @@ def test_sampler_adapts_step_results_in_memory_trace_and_runtime(monkeypatch: py
         torch.testing.assert_close(result.guidance.values, expected.flip(0) if step else torch.zeros_like(expected))
     assert devices == ["cpu", "cpu"] and calls.count(TaskSymbol("predict")) == 2
     execution.retire(identities)
+
+
+class Head(torch.nn.Module):
+    """An ordinary PyTorch module, used unchanged as per-request state."""
+
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self.up, self.down = torch.nn.Linear(width, 3), torch.nn.Linear(3, width, bias=False)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return hidden + self.down(torch.tanh(self.up(hidden)))
+
+
+class ModuleDistillation(pllm.Workload):
+    head = pllm.RequestState(module=lambda m: Head(m.hidden_size), optimizer=pllm.AdamW(lr=0.03))
+
+    def ready(self, versions: torch.Tensor = pllm.version("head")) -> torch.Tensor:
+        return versions > 0
+
+    @pllm.guide_sampling(beta=0.2, rows="ready")
+    def predict(self, source: torch.Tensor = pllm.hidden(0), head: Head = pllm.module("head")) -> torch.Tensor:
+        return head(source)
+
+    @pllm.train(state="head", reduction="state_mean")
+    def train(
+        self,
+        source: torch.Tensor = pllm.hidden(0),
+        target: torch.Tensor = pllm.hidden(-1),
+        head: Head = pllm.module("head"),
+    ) -> torch.Tensor:
+        return (head(source) - target).square().mean(1)
+
+
+def _module_request_distillation() -> None:
+    """Module state matches one torch copy of the module per request, trained by torch AdamW."""
+    for device_name in DEVICES:
+        device = torch.device(device_name)
+        stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
+        options = ExecutionOptions(capture=device.type == "cuda", capture_memory_bytes=16 * 1024**2)
+        facts = ModuleDistillation().specialize(facts_for(device, 4, 9, lineages=2), options)
+        execution = ModuleDistillation().compile_backend(facts).execution
+        identities = tuple(RequestIdentity(f"r{index}", 0, 0) for index in range(2))
+        latest = list(execution.admit(identities, stream))
+        start = initial_values(
+            lambda m: Head(m.hidden_size), Dimensions(4, 0), facts.initialization_seed, torch.float32
+        )
+        copies = [Head(4).to(device) for _ in identities]
+        for copy in copies:
+            torch.nn.utils.vector_to_parameters(start.to(device, copy=True), copy.parameters())
+        optimizers = [torch.optim.AdamW(copy.parameters(), lr=0.03, weight_decay=0.0) for copy in copies]
+        source = torch.linspace(-0.6, 0.8, 8, device=device).reshape(2, 4)
+        target = torch.linspace(0.7, -0.3, 8, device=device).reshape(2, 4)
+        for step_id in range(3):
+            result = execution.step(step_input(identities, source, target, step_id, stream=stream), stream)
+            rows, values = effective(result.guidance)
+            if step_id:  # predictions use each request's own parameters once it has trained
+                assert rows == (0, 1)
+                with torch.no_grad():
+                    torch.testing.assert_close(values, torch.cat([copies[i](source[i : i + 1]) for i in (0, 1)]))
+            for index, (copy, optimizer) in enumerate(zip(copies, optimizers, strict=True)):
+                optimizer.zero_grad()
+                F.mse_loss(copy(source[index : index + 1]), target[index : index + 1]).backward()
+                optimizer.step()
+                after = result.publication.after_refs[result.publication.before_refs.index(latest[index])]
+                flat = torch.nn.utils.parameters_to_vector(copy.parameters()).detach()
+                torch.testing.assert_close(execution.snapshot(after, stream)[0], flat)
+                latest[index] = after
+        execution.retire(identities)
