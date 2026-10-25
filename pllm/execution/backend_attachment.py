@@ -24,7 +24,7 @@ from pllm.contracts.backend_attachment import (
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator
 from pllm.contracts.region_program import TensorType
-from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY, TOKEN_CAPTURE_CAPABILITY
+from pllm.contracts.region_proposal import TOKEN_CAPTURE_CAPABILITY
 from pllm.contracts.semantic_graph import (
     AnchorId,
     SchedulerTimeline,
@@ -41,7 +41,6 @@ from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.decoder_region import decoder_activations
 from pllm.execution.parameter_projection import ROWS_PER_BLOCK, projection_blocks
 from pllm.execution.tokenwise_region import (
-    compile_tokenwise_region,
     compile_tokenwise_source,
     tokenwise_attachment_bytes,
 )
@@ -108,7 +107,7 @@ def derive_attachment_resources(
     attachment: BackendAttachmentSpec | BackendAttachmentRequest | None = None,
     capture_memory_bytes: int = 0,
 ) -> SchedulerTimeline:
-    """Fund native region candidates through the original AER workspace facts.
+    """Fund the tokenwise reference plan through the original AER workspace facts.
 
     Preserve producer task/value facts when the model reads a publication.
     The adapter keeps embeddings and output concatenation in reserved_bytes;
@@ -186,15 +185,12 @@ def derive_attachment_resources(
             for fact in timeline.task_resources
         )
     else:
-        region = compile_tokenwise_region(
+        region = compile_tokenwise_source(
             tensor,
             probe.max_packed_rows,
             probe.causal_domain,
             effect,
             next(source for source in graph.source_regions if source.task == task.symbol),
-            timeline.region_policy,
-            stream_lanes=2 if REGION_STREAMS_CAPABILITY in probe.capabilities else 1,
-            token_capture=TOKEN_CAPTURE_CAPABILITY in probe.capabilities,
             source_imports=probe.region_imports,
             function_bodies=probe.region_bodies,
             activations=activations,

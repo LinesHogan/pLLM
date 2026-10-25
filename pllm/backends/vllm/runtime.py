@@ -12,7 +12,6 @@ from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from hashlib import sha256
-from time import perf_counter_ns
 from types import TracebackType
 from typing import TYPE_CHECKING, Generic, Literal, TypeVar, overload
 
@@ -65,26 +64,19 @@ from pllm.contracts.feedback import (
     RetryAction,
 )
 from pllm.contracts.region_program import TensorType
-from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY, TOKEN_CAPTURE_CAPABILITY
-from pllm.contracts.region_selection import RegionSelection
+from pllm.contracts.region_proposal import TOKEN_CAPTURE_CAPABILITY
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
-from pllm.contracts.semantic_graph import (
-    SchedulerTimeline,
-    TaskId,
-    TokenProgramEffect,
-)
+from pllm.contracts.semantic_graph import SchedulerTimeline, TaskId
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorFieldSpec
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.cuda_stream import CudaStreamReadiness
-from pllm.execution.decoder_region import decoder_activations
 from pllm.execution.host_runtime import CompletionInput
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.state_execution import StateDiagnostics
 from pllm.execution.state_feed import Feed
-from pllm.execution.tokenwise_region import compile_tokenwise_region
 from pllm.execution.trace import TRACE_SCHEMA_VERSION, TraceSelection, TraceSnapshot
 
 if TYPE_CHECKING:
@@ -173,10 +165,6 @@ class BackendCommand(StrEnum):
     PROFILE = "profile_tasks"
     OBSERVE = "observe"
     DETACH = "detach"
-    TUNE_BEGIN = "tune_begin"
-    TUNE_CANDIDATE = "tune_candidate"
-    TUNE_FINISH = "tune_finish"
-    TUNE_ABORT = "tune_abort"
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,103 +203,6 @@ class VllmLlm(Generic[DataT, ResultT]):
     _closed: bool = False
     _next_prompt_index: int = 0
     _pending_input: ExitStack | None = None
-    region_selection: RegionSelection | None = None
-
-    def tune_native_schedules(self) -> None:
-        policy = self.attachment.inputs.plan.timeline.region_policy
-        if (
-            TOKEN_CAPTURE_CAPABILITY in self.attachment.inputs.probe.capabilities or policy.schedule_policy == "serial"
-        ) or not any(
-            isinstance(task.replay, TokenProgramEffect) for task in self.attachment.inputs.plan.semantic_graph.tasks
-        ):
-            return
-        if policy.tuning == "heuristic":
-            # Static preparation already installed the funded execution,
-            # including stream placement; no private generation is needed.
-            return
-        task = next(
-            task
-            for task in self.attachment.inputs.plan.semantic_graph.tasks
-            if isinstance(task.replay, TokenProgramEffect)
-        )
-        probe = self.attachment.inputs.probe
-        if not isinstance(task.replay, TokenProgramEffect) or probe.causal_domain is None:
-            raise ValueError("native tuning requires its signed causal model domain")
-        tensor = TensorType((1, probe.hidden_size), "torch." + probe.tensor_dtype.value, str(self._facts.device))
-        budget = next(
-            fact.workspace_bytes
-            for fact in self.attachment.inputs.plan.timeline.task_resources
-            if fact.task == task.symbol
-        )
-        proposals = (
-            compile_tokenwise_region(
-                tensor,
-                probe.max_packed_rows,
-                probe.causal_domain,
-                task.replay,
-                next(
-                    source
-                    for source in self.attachment.inputs.plan.semantic_graph.source_regions
-                    if source.task == task.symbol
-                ),
-                self.attachment.inputs.plan.timeline.region_policy,
-                stream_lanes=2 if REGION_STREAMS_CAPABILITY in probe.capabilities else 1,
-                source_imports=probe.region_imports,
-                function_bodies=probe.region_bodies,
-                activations=decoder_activations(
-                    self.attachment.inputs.request.activation_bindings,
-                    self.attachment.inputs.plan.tensor_layout_request,
-                    self.attachment.inputs.request.state_resource,
-                    tensor.device,
-                ),
-            )
-            .within_payload_budget(budget)
-            .candidate_proposals
-        )
-        count = decode_boundary(self.command(BackendCommand.TUNE_BEGIN, encode_boundary(proposals), timeout=600.0), int)
-        if not count:
-            return
-        prompt_index = self._next_prompt_index
-        completed = False
-        try:
-            probe = self.attachment.inputs.probe
-            if probe.causal_domain is None or probe.causal_domain.positions < 2:
-                raise ValueError("native prefill tuning requires room for a prompt and one output")
-            length = min(8, probe.max_packed_rows, probe.causal_domain.positions - 1)
-            prompt = " ".join("a" for _ in range(length))
-            sampling = SamplingParams(max_tokens=1, temperature=0.0, ignore_eos=True)
-            baseline: tuple[tuple[int, ...], ...] | None = None
-            samples: list[list[int]] = [[] for _ in range(count)]
-            # Warm every candidate before scoring any of them. Rotate the
-            # measurement order so the reference is not always timed first.
-            # Candidate binding and RPC stay outside completed generate time.
-            for trial in range(3):
-                for offset in range(count):
-                    index = (offset + trial) % count
-                    self.command(BackendCommand.TUNE_CANDIDATE, encode_boundary(index), timeout=600.0)
-                    started = perf_counter_ns()
-                    outputs = self.generate([prompt], sampling)
-                    finished = perf_counter_ns() - started
-                    tokens = tuple(tuple(output.token_ids) for request in outputs for output in request.outputs)
-                    if baseline is None:
-                        baseline = tokens
-                    elif tokens != baseline:
-                        raise RuntimeError("native schedule changed the private sample's greedy output")
-                    if trial:
-                        samples[index].append(finished)
-            self.region_selection = decode_boundary(
-                self.command(
-                    BackendCommand.TUNE_FINISH,
-                    encode_boundary(tuple(tuple(elapsed) for elapsed in samples)),
-                    timeout=600.0,
-                ),
-                RegionSelection,
-            )
-            completed = True
-        finally:
-            if not completed and not self._closed:
-                self.command(BackendCommand.TUNE_ABORT)
-            self._next_prompt_index = prompt_index
 
     def _require_llm(self) -> LLM:
         if self._closed or self._llm is None:
@@ -846,7 +737,6 @@ def create_vllm_llm(
             deployment = workload.compile_backend(facts)
             runner.attach_workload(deployment)
             handle = VllmLlm(llm, runner, deployment, deployment.attachment, facts)
-        handle.tune_native_schedules()
         construction.pop_all()
         return handle
 
@@ -885,7 +775,7 @@ def probe_backend(
     )
     targets = inspect_parameter_targets(model, requirements.parameter_targets, runner.dtype)
     replay_capabilities = (
-        ("model/tokenwise_replay@1", REGION_STREAMS_CAPABILITY, TOKEN_CAPTURE_CAPABILITY)
+        ("model/tokenwise_replay@1", TOKEN_CAPTURE_CAPABILITY)
         if runner.runner_kind is RunnerKind.MRV2 and graph_mode(runner.overlay_graph_bytes) is AttachmentGraphMode.EAGER
         else ()
     )

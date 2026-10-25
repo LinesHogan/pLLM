@@ -398,15 +398,11 @@ def _independent_lora_input() -> None:
         handle.close()
 
 
-def _recirculation_schedules(measured: bool = False) -> None:
+def _recirculation() -> None:
     assert not torch.cuda.is_initialized()
     workload = RecirculationWorkload(destination=22, alpha=0.6, ramp_tokens=2)
-    options = ExecutionOptions(tuning="measured" if measured else "heuristic")
-    handle = pllm.make_llm(workload=workload, config=engine(tokens=64, execution=options))
+    handle = pllm.make_llm(workload=workload, config=engine(tokens=64))
     try:
-        selection = handle.region_selection
-        # Captured tokens use the verified serial source for either requested tuning policy.
-        assert selection is None
         first = handle.generate(PROMPTS, greedy(2))
         second = handle.generate(PROMPTS, greedy(2))
         tokens = lambda results: tuple(tuple(output.outputs[0].token_ids) for output in results)
@@ -420,7 +416,7 @@ def _recirculation_schedules(measured: bool = False) -> None:
         }
         assert_clean(handle.worker_state().diagnostics)
         assert not torch.cuda.is_initialized()
-        print(f"Recirculation EngineCore: tuning={'measured' if measured else 'heuristic'}, replay rows={len(replay)}")
+        print(f"Recirculation EngineCore: serial replay rows={len(replay)}")
     finally:
         handle.close()
 
@@ -567,8 +563,7 @@ MODES = {
     "--gpu-io-only": _gpu_shared_input,
     "--lora-only": lambda: (_output_lora_shared_input(), _independent_lora_input()),
     "--edit-only": _fttt_activation_retry,
-    "--recirculation-only": _recirculation_schedules,
-    "--recirculation-measured": lambda: _recirculation_schedules(measured=True),
+    "--recirculation-only": _recirculation,
     "--dummy-only": _dummy_export,
     "--user-only": _user_reference_workload,
     "--prefill-adapters-only": _prefill_adapter_reconstruction,

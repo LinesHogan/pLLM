@@ -37,14 +37,13 @@ from pllm.execution.region_resources import (
     RegionPageOwner,
     TensorResourceBinding,
 )
-from pllm.execution.region_streams import RegionStreamBindings
 from pllm.execution.region_values import Data
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import TaskOutput, TensorBatch, TensorOperation, _read  # pyright: ignore[reportPrivateUsage]
 from pllm.execution.token_program import update_function
 from pllm.execution.tokenwise_region import (
     TokenwiseRegion,
-    compile_tokenwise_region,
+    compile_tokenwise_source,
 )
 from pllm.execution.trace import TracePhase
 
@@ -76,10 +75,6 @@ class TokenwiseReplayPrimitive(ABC):
     def kernel_imports(self) -> tuple[NativeKernelImport, ...]:
         """Locally verified execution contracts supplied by this backend."""
         return ()
-
-    def borrow_streams(self, owner: RegionPageOwner, lanes: int) -> RegionStreamBindings:
-        """Backend capability requested only by a selected physical plan."""
-        raise ValueError("this model backend has no auxiliary stream binding")
 
     @property
     @abstractmethod
@@ -137,7 +132,7 @@ class TokenwiseReplayTask(Generic[DataT]):
         cls, implementation: TaskGraphImplementation[StateTaskContext[DataT]]
     ) -> TokenwiseReplayTask[DataT]:
         if not isinstance(implementation, cls):
-            raise ValueError("tokenwise tuning requires its original native task binding")
+            raise ValueError("tokenwise replay requires its original native task binding")
         return implementation
 
     @classmethod
@@ -153,8 +148,6 @@ class TokenwiseReplayTask(Generic[DataT]):
         policy: RegionSelectionPolicy,
         payload_budget: int,
         *,
-        stream_lanes: int = 1,
-        token_capture: bool = False,
         source_imports: tuple[RegionTensorImport, ...] = (),
         function_bodies: tuple[RegionFunctionBody, ...] = (),
         activations: tuple[DecoderActivation, ...] = (),
@@ -163,15 +156,12 @@ class TokenwiseReplayTask(Generic[DataT]):
     ) -> TokenwiseReplayTask[DataT]:
         effect = task.replay
         assert isinstance(effect, TokenProgramEffect)
-        region = compile_tokenwise_region(
+        region = compile_tokenwise_source(
             tensor,
             max_rows,
             domain,
             effect,
             source,
-            policy,
-            stream_lanes=stream_lanes,
-            token_capture=token_capture,
             source_imports=source_imports,
             function_bodies=function_bodies,
             activations=activations,
@@ -252,8 +242,6 @@ class TokenwiseReplayTask(Generic[DataT]):
                 TracePhase.REPLAY, context.invocation_id, task_id=task_id, row=rows[index], iteration=0
             )
 
-        physical = self.region.stream_plan
-        streams = None if physical is None else primitive.borrow_streams(context, physical.lanes)
         with torch.no_grad(), nullcontext() if context.pin.stream is None else torch.cuda.stream(context.pin.stream):
             outputs = self.region.run(
                 context,
@@ -270,7 +258,6 @@ class TokenwiseReplayTask(Generic[DataT]):
                 observe=observe,
                 commit=commit,
                 record=record,
-                streams=streams,
                 run_region=primitive.run_region,
                 kernel_imports=primitive.kernel_imports,
                 function_bodies=primitive.function_bodies,

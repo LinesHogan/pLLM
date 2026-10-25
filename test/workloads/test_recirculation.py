@@ -186,7 +186,7 @@ def run_step(execution, value, decoder):
 
 def test_recirculation_declaration_fits_reference_budget_and_crosses_the_wire() -> None:
     workload = WORKLOAD
-    # A budget that fits only the serial reference still admits a measured-tuning plan; one byte less does not.
+    # The exact serial reference budget admits the plan; one byte less does not.
     serial_facts = workload.specialize(FACTS, ExecutionOptions(schedule_policy="serial"))
     reference_budget = (
         max(serial_facts.timeline.reserved_bytes)

@@ -20,7 +20,6 @@ from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding
 from pllm.contracts.region_program import TensorType
-from pllm.contracts.region_proposal import TOKEN_CAPTURE_CAPABILITY
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
@@ -448,8 +447,6 @@ class Builder(Generic[D]):
                         identity,
                         plan.timeline.region_policy,
                         workspace,
-                        stream_lanes=2 if "execution/region_streams@1" in model_probe.capabilities else 1,
-                        token_capture=TOKEN_CAPTURE_CAPABILITY in model_probe.capabilities,
                         source_imports=model_probe.region_imports,
                         function_bodies=model_probe.region_bodies,
                         operation=None

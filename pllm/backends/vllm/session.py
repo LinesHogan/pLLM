@@ -47,8 +47,6 @@ from pllm.contracts.backend_attachment import (
 )
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedSamplerRowBatch
-from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY, RegionScheduleProposal
-from pllm.contracts.region_selection import RegionSelection
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
 from pllm.contracts.semantic_graph import (
@@ -68,7 +66,6 @@ from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.state_execution import StateDiagnostics, StateTaskContext
 from pllm.execution.state_feed import Feed, FeedReceiver
 from pllm.execution.tensor_frame import TensorFrame
-from pllm.execution.tokenwise_tuning import TokenwiseTuning
 
 if TYPE_CHECKING:
     pass
@@ -223,7 +220,6 @@ class VllmSession(Generic[DataT, ResultT]):
         self._next_step_id = 0
         self._step: _PackedStep[DataT] | None = None
         self._auxiliary: AuxiliaryInput[torch.Tensor] | None = None
-        self._tuning: TokenwiseTuning[TensorStepInput, DataT, ResultT] | None = None
         execution = deployment.execution
         self._post_sample = None
         if attachment.physical.post_sampler != "main":
@@ -248,8 +244,6 @@ class VllmSession(Generic[DataT, ResultT]):
 
     def stage_input(self, batch: AuxiliaryInput[torch.Tensor] | None, identities: tuple[RequestIdentity, ...]) -> None:
         self._require_input_live()
-        if self._tuning is not None and batch is not None:
-            raise ValueError("private native tuning cannot consume user auxiliary input")
         if self._auxiliary is not None or self._step is not None or self._pending_identities or self._identities:
             raise RuntimeError("prior canonical training input is still active")
         validate_auxiliary(batch, self._deployment.attachment.inputs.plan, SharedTensor.describe)
@@ -272,7 +266,6 @@ class VllmSession(Generic[DataT, ResultT]):
             or self._identities
             or self._pending_identities
             or self._auxiliary is not None
-            or self._tuning is not None
             or self._activation is None
             or all(
                 state.resource in self._deployment.execution.arena.owned_resources
@@ -318,53 +311,6 @@ class VllmSession(Generic[DataT, ResultT]):
 
     def diagnostics(self) -> StateDiagnostics:
         return self._deployment.execution.diagnostics()
-
-    def _require_tuning_idle(self) -> None:
-        if self._step is not None or self._identities or self._pending_identities or self._auxiliary is not None:
-            raise RuntimeError("native tuning requires all original requests to finish and retire")
-
-    def begin_tuning(self, proposals: tuple[RegionScheduleProposal, ...]) -> int:
-        self._require_tuning_idle()
-        if self._tuning is not None or self._next_step_id != 0:
-            raise RuntimeError("native tuning is only available before the first request")
-        if (
-            not isinstance(self._replay, VllmTokenwiseReplay)
-            or self.attachment.inputs.plan.semantic_graph.states
-            or self.attachment.inputs.plan.timeline.region_policy.schedule_policy == "serial"
-        ):
-            return 0
-        identity = self.attachment.inputs.request.task_bindings[0].implementation_id
-        tuning = TokenwiseTuning(
-            self._deployment.execution,
-            identity,
-            proposals,
-            stream_lanes=2 if REGION_STREAMS_CAPABILITY in self.attachment.inputs.probe.capabilities else 1,
-        )
-        if tuning.count == 1:
-            tuning.abort()
-            return 0
-        self._tuning = tuning
-        return tuning.count
-
-    def tuning_candidate(self, index: int) -> None:
-        self._require_tuning_idle()
-        if self._tuning is None:
-            raise RuntimeError("native tuning has not started")
-        self._tuning.candidate(index)
-
-    def finish_tuning(self, samples: tuple[tuple[int, ...], ...]) -> RegionSelection:
-        self._require_tuning_idle()
-        if self._tuning is None:
-            raise RuntimeError("native tuning has not started")
-        result = self._tuning.finish(samples)
-        self._tuning = None
-        return result
-
-    def abort_tuning(self) -> None:
-        self._require_tuning_idle()
-        if self._tuning is not None:
-            self._tuning.abort()
-            self._tuning = None
 
     @property
     def sampler(self) -> SamplerGuidance:
@@ -418,8 +364,6 @@ class VllmSession(Generic[DataT, ResultT]):
 
     def prepare_input(self, rows: PackedSamplerRowBatch) -> None:
         self._require_input_live()
-        if self._tuning is not None:
-            self._tuning.record_rows(rows.row_batch.rows)
         if self._step is not None:
             raise RuntimeError("canonical input preparation overlaps a step")
         if rows.step_id != self._next_step_id or rows.plan_epoch != self.attachment.physical.plan_epoch:
@@ -660,7 +604,6 @@ class VllmSession(Generic[DataT, ResultT]):
         try:
             self.abort_active()
             self.retire_all(wait=True)
-            self.abort_tuning()
             execution = self._deployment.execution
             if execution.directory.scope is StateScope.INSTANCE:
                 execution.retire((), wait=True)

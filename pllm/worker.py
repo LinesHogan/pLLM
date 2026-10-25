@@ -20,7 +20,6 @@ from pllm.backends.vllm.runtime import (
 )
 from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import AttachmentTopology, SignedBackendAttachment
-from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.semantic_graph import TaskId
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.trace import TraceSelection
@@ -71,9 +70,6 @@ class GPUWorker(Worker):
                 BackendCommand.STAGE,
                 BackendCommand.PROFILE,
                 BackendCommand.OBSERVE,
-                BackendCommand.TUNE_BEGIN,
-                BackendCommand.TUNE_CANDIDATE,
-                BackendCommand.TUNE_FINISH,
             )
             and payload
         ):
@@ -119,20 +115,6 @@ class GPUWorker(Worker):
                     runner.trace.profile_tasks(decode_boundary(payload, tuple[TaskId, ...]))
                 case BackendCommand.OBSERVE:
                     runner.trace.configure(decode_boundary(payload, TraceSelection))
-                case BackendCommand.TUNE_BEGIN:
-                    return encode_boundary(
-                        runner.require_session().begin_tuning(
-                            decode_boundary(payload, tuple[RegionScheduleProposal, ...])
-                        )
-                    )
-                case BackendCommand.TUNE_CANDIDATE:
-                    runner.require_session().tuning_candidate(decode_boundary(payload, int))
-                case BackendCommand.TUNE_FINISH:
-                    return encode_boundary(
-                        runner.require_session().finish_tuning(decode_boundary(payload, tuple[tuple[int, ...], ...]))
-                    )
-                case BackendCommand.TUNE_ABORT:
-                    runner.require_session().abort_tuning()
                 case BackendCommand.DETACH:
                     runner.detach_workload()
             return ""

@@ -71,7 +71,6 @@ AUTHORITY_FILES = (
     Path("pllm/execution/tensor_batching.py"),
     Path("pllm/execution/decoder_region.py"),
     Path("pllm/execution/tokenwise_region.py"),
-    Path("pllm/execution/tokenwise_tuning.py"),
     Path("pllm/contracts/region_composition.py"),
     Path("pllm/execution/paged_access.py"),
     Path("pllm/execution/tensor_borrow.py"),
@@ -90,7 +89,6 @@ AUTHORITY_FILES = (
 # workload names: worker statistics and registered backend primitives may use
 # those names without acquiring physical scheduling authority.
 NATIVE_BINDING_FILES = (
-    Path("pllm/execution/region_replay.py"),
     Path("pllm/worker.py"),
     Path("pllm/backends/vllm/replay.py"),
     Path("pllm/backends/vllm/region_kernels.py"),

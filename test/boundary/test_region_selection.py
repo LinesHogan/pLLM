@@ -15,13 +15,11 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from pllm.config import ExecutionOptions
-from pllm.contracts.backend_attachment import CausalModelDomain
 from pllm.contracts.region_imports import ScanForm
 from pllm.contracts.region_program import (
     Call,
     Program,
     SizeParameter,
-    TensorType,
     Value,
 )
 from pllm.contracts.region_selection import (
@@ -33,25 +31,17 @@ from pllm.contracts.region_selection import (
 )
 from pllm.execution.affine_scan import candidates as affine_candidates
 from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
-from pllm.execution.region_compilation import (
-    analyze_region_program,
-    analyze_region_retention,
-    explore_region_schedules,
-    lower_region_schedule,
-)
+from pllm.execution.region_compilation import analyze_region_program
 from pllm.execution.region_optimization import (
     assess_region_candidates,
     bind_region_candidate,
     optimize_region,
     select_region_candidate,
 )
-from pllm.execution.region_schedule import RegionScheduleExecution
-from pllm.execution.region_storage import analyze_region_payload, import_region_functions
+from pllm.execution.region_storage import import_region_functions
 from pllm.execution.region_values import Bank
 from pllm.execution.tensor_scan import TensorScan
-from pllm.execution.tokenwise_region import TokenwiseRegion
 from pllm.kernels.additive_scan import AdditiveBuffers, launch_window
-from pllm.workloads.recirculation import RecirculationWorkload
 from test.region_fixtures import (
     StorageObserver,
     assert_grid_closed_form,
@@ -62,7 +52,6 @@ from test.region_fixtures import (
     single_call,
     tensor_grid,
 )
-from test.workloads.test_recirculation import FACTS
 
 
 def measured(**changes):
@@ -561,61 +550,6 @@ def test_only_a_joint_rewrite_fits_and_budgets_never_authorize_an_over_budget_on
                 measurement_rounds=1,
                 **{"options": measured(schedule_policy="serial"), **limit},
             )
-
-
-def recovery_region():
-    binding = RecirculationWorkload().declaration(
-        replace(FACTS, probe=replace(FACTS.probe, max_packed_rows=8, causal_domain=CausalModelDomain(1, 3, 8)))
-    )
-    region = TokenwiseRegion(
-        TensorType((1, 4), "torch.float32"),
-        8,
-        CausalModelDomain(1, 3, 8),
-        binding.graph.tasks[0].replay,
-        binding.graph.source_regions[0],
-    )
-    return region.bind_functions(
-        {name: cell for name, cell in binding.route_functions.items() if name not in region.functions}
-    )
-
-
-def test_bounded_window_is_selected_when_the_faster_candidate_exceeds_the_budget():
-    tokenwise = recovery_region()
-    analysis = analyze_region_program(tokenwise.program)
-    window = next(c for c in explore_region_schedules(tokenwise.program).candidates if "-window-2-" in c.source)
-    bound = analyze_region_retention(tokenwise.program, window.schedule_map, tokenwise.retained)
-    assert bound.allocations[0].peak_instances_upper_bound == 2
-    windowed = RegionScheduleExecution(tokenwise.program, lower_region_schedule(tokenwise.program, window.schedule_map))
-    serial = RegionScheduleExecution(
-        tokenwise.program, lower_region_schedule(tokenwise.program, analysis.reference_schedule)
-    )
-    for count in (0, 1, 3, 8):
-        sizes = {"tokens0": count, "prefix0": 0}
-        actual, expected = tuple(windowed.invocations(sizes)), tuple(serial.invocations(sizes))
-        assert set(actual) == set(expected) and len(actual) == len(expected)
-        windows_seen = tuple(point.coordinates[0] // 2 for point in actual)
-        assert windows_seen == tuple(sorted(windows_seen))
-    imports = import_region_functions(tokenwise.program, tokenwise.functions)
-    payload = analyze_region_payload(tokenwise.program, window.schedule_map, tokenwise.functions, tokenwise.retained)
-    limit = payload.devices[0].peak_bytes_upper_bound
-    # Fixed scores isolate the capacity constraint: the fastest candidate retains too much.
-    request = RegionSelectionRequest(
-        imports,
-        (
-            RegionCandidate(analysis.reference_schedule, imports, (100,)),
-            RegionCandidate(window.schedule_map, imports, (10,)),
-            RegionCandidate(analysis.candidates[-1].schedule_map, imports, (1,)),
-        ),
-        (RegionPayloadLimit("cpu", limit),),
-        True,
-        "window capacity oracle",
-        (RegionTuningSize("prefix0", 0), RegionTuningSize("tokens0", 3)),
-        tokenwise.retained,
-    )
-    selection = select_region_candidate(tokenwise.program, request)
-    assert selection.selected == 1
-    assert [c.feasible for c in selection.candidates] == [True, True, False]
-    assert selection.candidates[1].payload.retention == bound
 
 
 def _check_pinned_projection_borrows():

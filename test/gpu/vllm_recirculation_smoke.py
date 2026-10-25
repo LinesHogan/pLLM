@@ -41,8 +41,6 @@ def main():
         workload=RecirculationWorkload(destination=22, alpha=0.6, ramp_tokens=2),
         config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", VllmDType.BFLOAT16, 64, 2, 64, 0.25, seed=7),
     )
-    # The default installs a static schedule without cold worker measurement.
-    assert handle.region_selection is None
     execution = handle.deployment.execution
     layer = handle.runner.model.model.layers[23]
     native_layer = Qwen2DecoderLayer.forward
