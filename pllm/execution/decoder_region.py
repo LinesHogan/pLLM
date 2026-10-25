@@ -54,6 +54,7 @@ from pllm.execution.region_execution import RegionInstructionExecution
 from pllm.execution.region_native import RegionFunction, source_region_functions
 from pllm.execution.region_resources import ExternalFunction, PagedResourceBinding, RegionPageOwner, RegionResources
 from pllm.execution.region_values import Bank, Data
+from pllm.execution.shared_tensor import region_dtype
 
 LayerForward = Callable[[int, torch.Tensor, torch.Tensor, torch.Tensor | None], tuple[torch.Tensor, torch.Tensor]]
 RowLayerForward = Callable[
@@ -115,13 +116,7 @@ def _activation_body(
                 )
             )
             continue
-        dtypes = {
-            "torch.float16": torch.float16,
-            "torch.bfloat16": torch.bfloat16,
-            "torch.float32": torch.float32,
-            "torch.float64": torch.float64,
-        }
-        dtype = dtypes[tensor.dtype]
+        dtype = region_dtype(tensor.dtype)
         convert = activation.fields[0].dtype != tensor.dtype
 
         def add(hidden: torch.Tensor, delta: torch.Tensor) -> tuple[torch.Tensor, ...]:
@@ -134,7 +129,7 @@ def _activation_body(
 
         with FakeTensorMode():
             examples = tuple(
-                torch.empty(type_.shape, dtype=dtypes[type_.dtype], device=type_.device)
+                torch.empty(type_.shape, dtype=region_dtype(type_.dtype), device=type_.device)
                 for type_ in (tensor, *activation.fields)
             )
             if activation.binding.operator is ActivationPatchOperator.ADD:
@@ -256,14 +251,6 @@ class DecoderSource:
             raise ValueError("decoder region needs a positive layer count and distinct taps within its slice")
         if len(tensor.shape) != 2 or tensor.shape[0] != 1 or tensor.shape[1] < 1:
             raise ValueError("decoder region requires a single token's hidden matrix")
-        dtypes = {
-            "torch.float16": torch.float16,
-            "torch.bfloat16": torch.bfloat16,
-            "torch.float32": torch.float32,
-            "torch.float64": torch.float64,
-        }
-        if tensor.dtype not in dtypes:
-            raise ValueError("decoder region requires floating hidden states")
 
         def add(hidden: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, ...]:
             return (hidden + residual,)
@@ -272,7 +259,7 @@ class DecoderSource:
         if taps:
             # Only tapped layers need this graph; layouts suffice on the driver.
             with FakeTensorMode():
-                example = torch.empty(tensor.shape, dtype=dtypes[tensor.dtype], device=tensor.device)
+                example = torch.empty(tensor.shape, dtype=region_dtype(tensor.dtype), device=tensor.device)
                 addition = ExportedCell.capture(add, ("hidden", "residual"), ("sum",), (example, example.clone()))
         index = ScalarType.INDEX
         positions = TensorType((1,), "torch.int64", tensor.device)

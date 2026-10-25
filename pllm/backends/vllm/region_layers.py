@@ -51,6 +51,7 @@ from pllm.execution.module_graph import (
 )
 from pllm.execution.region_native import TensorSource
 from pllm.execution.region_storage import import_region_functions
+from pllm.execution.shared_tensor import region_dtype
 
 _LAYER_FORWARD = Qwen2DecoderLayer.forward
 
@@ -182,12 +183,9 @@ class VllmDecoderBodies:
         definitions = decoder_partition_bodies(tensor, domain, max_rows, digest)
         suffix = definitions[0].program.functions[1]
         weights = BorrowedResource("weights", (domain.layers + 1,))
-        dtype = {"torch.float16": torch.float16, "torch.bfloat16": torch.bfloat16, "torch.float32": torch.float32}.get(
-            tensor.dtype
+        examples = tuple(
+            torch.empty(tensor.shape, dtype=region_dtype(tensor.dtype), device=tensor.device) for _ in range(2)
         )
-        if dtype is None:
-            raise ValueError("decoder source requires a supported floating tensor dtype")
-        examples = tuple(torch.empty(tensor.shape, dtype=dtype, device=tensor.device) for _ in range(2))
         exports: list[ModuleExport] = []
         source_bodies: list[RegionFunctionBody] = []
         imports: dict[str, RegionTensorImport] = {}

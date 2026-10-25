@@ -13,6 +13,7 @@ from pllm.execution.region_execution import RegionInstructionExecution
 from pllm.execution.region_native import NativePrimitive, PrimitiveResources
 from pllm.execution.region_storage import analyze_region_capacity
 from pllm.execution.region_values import Data, check_data
+from pllm.execution.shared_tensor import region_dtype
 from pllm.execution.tensor_program import FieldSlots
 from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw
 
@@ -77,8 +78,7 @@ class AdamWRegion:
         # Original kernel/loss workspace and private pages remain separately
         # reserved by the owner; capacity marks native internals as unknown.
         def bytes_(type_: TensorType) -> int:
-            widths = {"torch.float16": 2, "torch.bfloat16": 2, "torch.float32": 4, "torch.float64": 8}
-            return prod(type_.shape) * widths[type_.dtype]
+            return prod(type_.shape) * region_dtype(type_.dtype).itemsize
 
         self.copy_workspace_bytes = sum(device.peak_tensor_bytes_upper_bound for device in self.capacity.devices) + sum(
             bytes_(parameter) for parameter in parameters

@@ -32,6 +32,11 @@ def tensor_dtype(dtype: TensorDType) -> torch.dtype:
     return TORCH_DTYPES[dtype]
 
 
+def region_dtype(name: str) -> torch.dtype:
+    """The torch dtype a region TensorType names, e.g. "torch.bfloat16"."""
+    return TORCH_DTYPES[TensorDType(name.removeprefix("torch."))]
+
+
 @dataclass(frozen=True, slots=True)
 class CudaIpcStorage:
     """PyTorch's storage IPC ABI, with no tensor shape or logical state copy."""

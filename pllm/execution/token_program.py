@@ -28,12 +28,11 @@ from pllm.contracts.region_program import (
     TensorType,
     Value,
 )
-from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.codec import tensor_decompositions, tensor_node_metadata
 from pllm.execution.decoder_region import DecoderActivation, DecoderSource
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_native import RegionFunction, external_primitive
-from pllm.execution.shared_tensor import tensor_dtype
+from pllm.execution.shared_tensor import region_dtype
 
 Tokens = Literal["prefill", "decode", "all"]
 
@@ -188,9 +187,7 @@ class TokenProgram:
             return result
 
         with FakeTensorMode(shape_env=ShapeEnv()):
-            seed = torch.empty(
-                tensor.shape, dtype=tensor_dtype(TensorDType(tensor.dtype.removeprefix("torch."))), device=tensor.device
-            )
+            seed = torch.empty(tensor.shape, dtype=region_dtype(tensor.dtype), device=tensor.device)
             position = torch.empty((1,), dtype=torch.int64, device=tensor.device)
             graph = make_fx(
                 invoke,
