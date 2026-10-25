@@ -130,8 +130,9 @@ class TokenAttentionBuffers:
                 num_actual_tokens=1,
                 max_query_len=1,
                 query_start_loc=torch.tensor([0, 1], dtype=metadata.query_start_loc.dtype, device=cache.device),
+                # The launch bound is fixed at capture; the true length is seq_lens. The split count stays
+                # vLLM's own choice (its heuristic, or 1 under VLLM_BATCH_INVARIANT).
                 max_seq_len=capacity,
-                max_num_splits=1,
                 seq_lens=torch.empty(1, dtype=metadata.seq_lens.dtype, device=cache.device),
                 block_table=torch.zeros(
                     (1, (capacity + cache.shape[2] - 1) // cache.shape[2]),

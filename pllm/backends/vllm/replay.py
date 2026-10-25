@@ -417,9 +417,8 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
             (enabled, tuple(bool(fields) for fields in self._activation_rows[index]) if self._activation_rows else ())
             for index, enabled in enumerate(invocation.eligible)
         )
-        submissions = tuple(self._captures.get(signature) for signature in signatures)
         outputs = torch.empty_like(self._hidden)
-        for index, (row, signature, capture) in enumerate(zip(self._rows, signatures, submissions, strict=True)):
+        for index, (row, signature) in enumerate(zip(self._rows, signatures, strict=True)):
             invocation.pages.before_statement()
             self._seed.copy_(self._hidden[index : index + 1])
             self._position.copy_(self._positions[index : index + 1])
@@ -433,10 +432,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
                 for handle, fields in zip(self.activation.layers, self._activation_rows[index], strict=True):
                     for target, field in zip(self._activation_fields.get(handle.binding.layer, ()), fields):
                         target.copy_(field)
-            if capture is None:
-                capture = self._captures.get(signature)
-            if capture is None:
-                capture = self._capture_token(invocation, row, signature, bank)
+            capture = self._captures.get(signature) or self._capture_token(invocation, row, signature, bank)
             capture.graph.replay()
             outputs[index : index + 1].copy_(capture.output)
             if signature[0]:

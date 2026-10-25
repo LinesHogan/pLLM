@@ -112,7 +112,7 @@ def derive_attachment_resources(
     *,
     layouts: TensorLayoutRequest | None = None,
     attachment: BackendAttachmentSpec | BackendAttachmentRequest | None = None,
-    capture_memory_bytes: int | None = None,
+    capture_memory_bytes: int = 0,
 ) -> SchedulerTimeline:
     """Fund native region candidates through the original AER workspace facts.
 
@@ -184,8 +184,6 @@ def derive_attachment_resources(
             activations=activations,
         )
         region.within_payload_budget(existing.workspace_bytes)
-        if resident is not None and resident != existing.resident_bytes:
-            raise ValueError("token capture reservation differs from the signed task funding")
         task_facts = timeline.task_resources
     else:
         region = compile_tokenwise_region(
@@ -206,13 +204,13 @@ def derive_attachment_resources(
             available = min(
                 available,
                 timeline.memory_budget_bytes
-                - (resident or 0)
+                - resident
                 - max(timeline.reserved_bytes, default=0)
                 - sum(fact.workspace_bytes + fact.resident_bytes for fact in timeline.task_resources)
                 - sum(fact.bytes for fact in timeline.value_resources),
             )
         (funded,) = region.within_payload_budget(max(0, available)).payload_limits
-        task_facts = (*timeline.task_resources, TaskResourceFact(task.symbol, funded.bytes, resident or 0))
+        task_facts = (*timeline.task_resources, TaskResourceFact(task.symbol, funded.bytes, resident))
     # The output lives in the original adapter's concatenation reservation;
     # the outer task runner does not allocate a second copy of this value.
     known = {(fact.task, fact.output) for fact in timeline.value_resources}
