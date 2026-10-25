@@ -65,6 +65,7 @@ from pllm.contracts.feedback import (
 from pllm.contracts.region_program import TensorType
 from pllm.contracts.region_proposal import TOKEN_CAPTURE_CAPABILITY
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
+from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import SchedulerTimeline, TaskId
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorFieldSpec
@@ -84,7 +85,6 @@ if TYPE_CHECKING:
 
 
 from pllm.backends.vllm.runner import TAPS_ENV, BackendWorkerState, WorkloadModelRunner
-from pllm.backends.vllm.session import input_reservations
 from pllm.contracts.packed_hidden import hidden_binding
 
 _MP_ENV = "VLLM_ENABLE_V1_MULTIPROCESSING"
@@ -961,3 +961,36 @@ __all__ = [
     "VllmLlm",
     "create_vllm_llm",
 ]
+
+
+def input_reservations(
+    probe: BackendPlacementProbe,
+    timeline: SchedulerTimeline,
+    rows: int,
+    vocab: int,
+    stage: SamplerStage | None,
+    feedback: bool,
+    publish_lag: int = 1,
+) -> tuple[int, ...]:
+    hidden = (1 + bool(publish_lag)) * len(probe.hidden_resources) * probe.max_packed_rows * probe.hidden_size * 4
+    # FP32 envelope for original logits, conversion, projection and rowwise arithmetic.
+    # Excludes upstream sampling/GEMM library scratch, model weights and KV storage.
+    workspace = (
+        rows * (36 * vocab + 4 * probe.hidden_size + 8)
+        if stage is SamplerStage.PACKED_POST_FILTER_EXACT
+        else rows * (12 * vocab + 8)
+        if stage is SamplerStage.PACKED_PRE_FILTER_ADD
+        else 0
+    )
+    retained = rows * (4 * vocab + 8) if feedback else 0
+    # StepCapture retains its feedback pointers until the next table is prepared.
+    # Budget both old and new private copies during handoff, including next forward.
+    private_feedback = 2 * retained if publish_lag else 0
+    sampler = next(anchor.ordinal for anchor in timeline.anchors if anchor.symbol == "sampler.pre_draw")
+    return tuple(
+        hidden
+        + private_feedback
+        + (workspace if anchor.symbol in ("sampler.pre_draw", "sampler.complete") else 0)
+        + (retained if anchor.ordinal >= sampler else 0)
+        for anchor in timeline.anchors
+    )

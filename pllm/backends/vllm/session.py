@@ -35,7 +35,6 @@ from pllm.backends.vllm.sampler import (
 from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
-    BackendPlacementProbe,
     DecodeWindow,
     SignedBackendAttachment,
 )
@@ -46,7 +45,6 @@ from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
 from pllm.contracts.semantic_graph import (
     AnchorId,
     SamplerFeedbackInputSource,
-    SchedulerTimeline,
     StateScope,
     TokenProgramEffect,
 )
@@ -102,23 +100,9 @@ class VllmSession(Generic[DataT, ResultT]):
             for port in task.inputs
         )
         visibility = plan.timeline.visibility
-        required = input_reservations(
-            attachment.inputs.probe,
-            plan.timeline,
-            max_sampler_rows,
-            model.lm_head.weight.shape[0],
-            attachment.inputs.request.sampler_stage if sampler is not None else None,
-            self._capture_feedback,
-            0 if visibility is None else visibility.lag,
-        )
         buffers = attachment_buffer_bytes(
             attachment.inputs.probe, plan.semantic_graph, plan.tensor_layout_request, attachment.inputs.request
         )
-        required = tuple(value + buffers for value in required)
-        if len(plan.timeline.reserved_bytes) != len(required) or any(
-            actual < minimum for actual, minimum in zip(plan.timeline.reserved_bytes, required, strict=True)
-        ):
-            raise ValueError("signed timeline underfunds the backend input/sampler/effect buffers")
         self._deployment = deployment
         self.trace = deployment.execution.trace
         probe = attachment.inputs.probe
@@ -608,36 +592,3 @@ class VllmSession(Generic[DataT, ResultT]):
             if anchor.symbol == symbol:
                 return
         raise RuntimeError("backend event is absent from the original timeline")
-
-
-def input_reservations(
-    probe: BackendPlacementProbe,
-    timeline: SchedulerTimeline,
-    rows: int,
-    vocab: int,
-    stage: SamplerStage | None,
-    feedback: bool,
-    publish_lag: int = 1,
-) -> tuple[int, ...]:
-    hidden = (1 + bool(publish_lag)) * len(probe.hidden_resources) * probe.max_packed_rows * probe.hidden_size * 4
-    # FP32 envelope for original logits, conversion, projection and rowwise arithmetic.
-    # Excludes upstream sampling/GEMM library scratch, model weights and KV storage.
-    workspace = (
-        rows * (36 * vocab + 4 * probe.hidden_size + 8)
-        if stage is SamplerStage.PACKED_POST_FILTER_EXACT
-        else rows * (12 * vocab + 8)
-        if stage is SamplerStage.PACKED_PRE_FILTER_ADD
-        else 0
-    )
-    retained = rows * (4 * vocab + 8) if feedback else 0
-    # StepCapture retains its feedback pointers until the next table is prepared.
-    # Budget both old and new private copies during handoff, including next forward.
-    private_feedback = 2 * retained if publish_lag else 0
-    sampler = next(anchor.ordinal for anchor in timeline.anchors if anchor.symbol == "sampler.pre_draw")
-    return tuple(
-        hidden
-        + private_feedback
-        + (workspace if anchor.symbol in ("sampler.pre_draw", "sampler.complete") else 0)
-        + (retained if anchor.ordinal >= sampler else 0)
-        for anchor in timeline.anchors
-    )
