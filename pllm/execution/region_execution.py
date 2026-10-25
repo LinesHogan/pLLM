@@ -11,6 +11,10 @@ from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
 from time import perf_counter
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pllm.execution.overlay_task import RouteOverlay
 
 import torch
 
@@ -66,6 +70,7 @@ class RegionInvocation:
     record: Callable[[int], None]
     cold: bool = False
     observation: torch.Tensor | None = None
+    overlay: RouteOverlay | None = None
 
     def run(self) -> tuple[torch.Tensor, ...]:
         """Run the CPU interpreter and return its ordered normal rows."""
@@ -84,8 +89,12 @@ class RegionTokenCapture:
     """Owned graph and device results; source resources expire after cold preparation."""
 
     def __init__(
-        self, invocation: RegionInvocation, instances: tuple[ScheduleInstance, ...], device: torch.device
+        self,
+        invocation: RegionInvocation,
+        instances: tuple[ScheduleInstance, ...],
+        device: torch.device,
     ) -> None:
+        overlay = invocation.overlay
         started = perf_counter()
         current = torch.cuda.current_stream(device)
         stream = torch.cuda.Stream(device=device)
@@ -94,6 +103,8 @@ class RegionTokenCapture:
         try:
             with torch.cuda.stream(stream):
                 for _ in range(3):
+                    if overlay is not None:
+                        overlay.reset()
                     invocation.execution.capture_token_body(invocation, instances)
             stream.synchronize()
             self.graph = torch.cuda.CUDAGraph()
@@ -101,8 +112,12 @@ class RegionTokenCapture:
             gc.disable()
             try:
                 with torch.cuda.graph(self.graph, stream=stream, pool=torch.cuda.graph_pool_handle()):
+                    if overlay is not None:
+                        overlay.reset()
                     self.output = invocation.execution.capture_token_body(invocation, instances)
                     self.observation = invocation.observation
+                    self.overlay_results = () if overlay is None else tuple(overlay.results)
+                    self.overlay_pending = () if overlay is None else overlay.captures()
             finally:
                 if collecting:
                     gc.enable()

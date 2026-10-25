@@ -24,7 +24,6 @@ from pllm.execution.memory import MemoryUsage, measure
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot, borrowed_root
 from pllm.execution.ptts.page_bundle import PagePin, PagePublication, PageWrite, Slots
 from pllm.execution.ptts.request_state import RequestStateSelection, StateAddress
-from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.state_execution import StateTaskContext
 from pllm.execution.trace import TracePhase
 from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw, paged_adamw
@@ -444,14 +443,6 @@ class TensorOperation(Generic[D]):
                         root[int(field_id)].copy_(value)
             if self.mode == "update" or self.publish:
                 context.publish()
-            if self.mode != "read":
-                changed = output.changed or (selected if output.gradients else ())
-                transition = context.publication if context.publication is not None else context.write
-                refs = StateRefs.of(batch.after_refs)
-                if transition is not None:
-                    refs = refs.replace_versions(transition.before_refs, transition.after_refs)
-                context.updated_refs = refs.take(changed) if changed else ()
-                context.updated_mask = output.update_mask
             if output.counters is not None:
                 context.overlay_counters = (
                     output.counters if context.overlay_counters is None else context.overlay_counters + output.counters

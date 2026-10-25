@@ -73,7 +73,6 @@ from pllm.contracts.schedule_instructions import (
     ScheduleSequence,
 )
 from pllm.contracts.semantic_graph import (
-    ConditionalLayerReplay,
     HiddenInputSource,
     HostServiceInputSource,
     PackedRowsInputSource,
@@ -83,7 +82,6 @@ from pllm.contracts.semantic_graph import (
     StateSelectionInputSource,
     StepIdInputSource,
     TaskResultInputSource,
-    TokenProgramEffect,
 )
 
 T = TypeVar("T")
@@ -186,19 +184,6 @@ _input_tags: dict[type[object], str] = {
     TaskResultInputSource: "result",
 }
 configure_tagged_union(SemanticInputSource, _converter, tag_generator=_input_tags.__getitem__, tag_name="kind")
-
-
-def _replay(value: object, _target: object) -> ConditionalLayerReplay | TokenProgramEffect | None:
-    if value is None:
-        return None
-    if type(value) is not dict:
-        raise TypeError("replay effect must be a closed object")
-    if "layers" in value:
-        return _converter.structure(value, ConditionalLayerReplay)
-    return _converter.structure(value, TokenProgramEffect)
-
-
-_converter.register_structure_hook(ConditionalLayerReplay | TokenProgramEffect | None, _replay)
 
 
 def _region_type_wire(value: DataType) -> dict[str, object]:

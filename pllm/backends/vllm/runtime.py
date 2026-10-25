@@ -885,7 +885,7 @@ def probe_backend(
     )
     targets = inspect_parameter_targets(model, requirements.parameter_targets, runner.dtype)
     replay_capabilities = (
-        ("model/layer_replay@1", "model/tokenwise_replay@1", REGION_STREAMS_CAPABILITY, TOKEN_CAPTURE_CAPABILITY)
+        ("model/tokenwise_replay@1", REGION_STREAMS_CAPABILITY, TOKEN_CAPTURE_CAPABILITY)
         if runner.runner_kind is RunnerKind.MRV2 and graph_mode(runner.overlay_graph_bytes) is AttachmentGraphMode.EAGER
         else ()
     )

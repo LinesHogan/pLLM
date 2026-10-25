@@ -3,7 +3,7 @@
 use super::super::scheduler::PhysicalPlan;
 use super::super::semantic_graph::{
     HiddenPhase as SemanticHiddenPhase, HiddenSite as SemanticHiddenSite, InputSource, OutputKind,
-    LayerReplay, SemanticGraph, SemanticTask, StateEffectKind, StateScope, Timeline,
+    SemanticGraph, SemanticTask, StateEffectKind, StateScope, Timeline,
 };
 use super::super::state_representation::{StateDeviceKind, StatePhysicalPlan};
 use super::types::{
@@ -558,7 +558,7 @@ fn validate_activation_replay(
         return Err("activation replay cannot hide unrelated state or transitions".into());
     }
     let domain = probe.causal_domain.as_ref().ok_or("activation replay requires its signed model domain")?;
-    if !matches!(&forward.replay, Some(LayerReplay::Tokenwise(effect)) if u64::from(effect.layer_count) == domain.layers)
+    if !matches!(&forward.replay, Some(effect) if u64::from(effect.layer_count) == domain.layers)
         || request.activation_bindings.iter().any(|binding| u64::from(binding.layer) >= domain.layers)
     {
         return Err("activation replay layers differ from the signed model domain".into());
@@ -598,37 +598,40 @@ fn validate_cross_binding(
         .filter(|(_, task)| task.replay.is_some())
         .collect::<Vec<_>>();
     if replay_tasks.len() > 1 {
-        return Err("backend supports one conditional replay task".to_owned());
+        return Err("backend supports one layer route".to_owned());
     }
-    for (task_id, task) in replay_tasks {
-        let Some(LayerReplay::Conditional(replay)) = task.replay.as_ref() else {
-            if request.attachment_kind != AttachmentKind::ModelReplay {
-                return Err("tokenwise replay requires a model replay attachment".into());
-            }
-            continue;
-        };
-        let scheduled = schedule
-            .tasks
-            .iter()
-            .find(|item| item.task_id as usize == task_id)
-            .ok_or_else(|| "replay task is absent from the physical plan".to_owned())?;
-        if request.attachment_kind != AttachmentKind::ParameterOverlay
-            || !task
-                .effects
-                .iter()
-                .any(|effect| effect.resource == request.state_resource)
-            || !replay.layers.iter().all(|layer| {
-                request
-                    .overlay_bindings
-                    .iter()
-                    .any(|binding| binding.target.layer == *layer)
-            })
-            || task.timing.after != "state.publish"
-            || task.timing.before != "sampler.pre_draw"
-            || scheduled.anchor_id < request.task_bindings[1].anchor_id
-            || scheduled.anchor_id >= request.sampler_anchor_id
+    for (_, task) in replay_tasks {
+        let domain = probe.causal_domain.as_ref().ok_or("layer routes need a signed model domain")?;
+        if u64::from(task.replay.as_ref().unwrap().layer_count) != domain.layers
+            || task.timing.after != "model.execute" || task.timing.before != "state.publish"
+            || !graph.source_regions.iter().any(|source| source.task == task.symbol && source.name == "layer_route")
         {
-            return Err("replay requires a published parameter overlay before sampling".to_owned());
+            return Err("layer routes need their model domain, source and forward timing".into());
+        }
+        if request.attachment_kind == AttachmentKind::ParameterOverlay {
+            let publish = task_for_dense_id(graph, &request.task_bindings[1])?;
+            if graph.tasks.len() != 2 || graph.states.len() != 1
+                || graph.states[0].scope != StateScope::Request
+                || publish.effects.len() != 1
+                || !publish.inputs.iter().any(|input| matches!(&input.source,
+                    InputSource::Result { task: source, .. } if source == &task.symbol))
+                || task_for_dense_id(graph, &request.task_bindings[0])?.symbol != task.symbol
+                || task.effects.len() != 1 || task.effects[0].kind != StateEffectKind::TransitionMaybe
+                || task.effects[0].resource != request.state_resource
+                || task.inputs.iter().any(|input| match &input.source {
+                    InputSource::PackedRows => false,
+                    InputSource::StateSelection { resource, .. } => resource != &request.state_resource,
+                    InputSource::HostService { service, port, schema } => service != "parameter.operands"
+                        || port != "dense_pairs" || schema != "canonical.dense_operand_pairs@1",
+                    _ => true,
+                })
+                || !task.inputs.iter().any(|input| matches!(input.source, InputSource::PackedRows))
+                || !request.activation_bindings.is_empty()
+            {
+                return Err("routed overlays need one request transition and its publication".into());
+            }
+        } else if request.attachment_kind != AttachmentKind::ModelReplay {
+            return Err("layer routes need a model replay or parameter overlay attachment".into());
         }
     }
     match request.attachment_kind {
@@ -660,7 +663,7 @@ fn validate_cross_binding(
         }
         AttachmentKind::ModelReplay => {
             let task = task_for_dense_id(graph, &request.task_bindings[0])?;
-            if !matches!(task.replay, Some(LayerReplay::Tokenwise(_)))
+            if task.replay.is_none()
                 || task.timing.after != "model.execute" || task.timing.before != "state.publish"
             {
                 return Err("model replay must execute its original tokenwise effect during forward".into());

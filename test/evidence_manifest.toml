@@ -51,7 +51,7 @@ group = "rust"
 path = "rust/pllm_core/src/planning/aer.rs"
 command = "cargo test --manifest-path rust/pllm_core/Cargo.toml aer_matches_bruteforce_partition_oracle"
 environment = "Rust toolchain; CPU"
-observable_contract = "1296 three-task DAG/window/implementation-class/memory-budget combinations match an independent labelled-partition and per-task-placement enumeration; exact lexicographic boundary bytes, region count, anchor-envelope peak memory, dependency boundaries and placement tie-break; conditional replay remains a closed region. This is a single-execution-domain anchor-envelope model, not distributed/capture or PTTS joint optimality"
+observable_contract = "1296 three-task DAG/window/implementation-class/memory-budget combinations match an independent labelled-partition and per-task-placement enumeration; exact lexicographic boundary bytes, region count, anchor-envelope peak memory, dependency boundaries and placement tie-break; tokenwise replay remains a closed region. This is a single-execution-domain anchor-envelope model, not distributed/capture or PTTS joint optimality"
 replaces = "Provisional per-task earliest-anchor scheduler; no separate semantic or region graph owner"
 
 [[evidence]]
@@ -361,7 +361,7 @@ group = "runtime"
 requires_gpu = true
 path = "test/gpu/vllm_reft_smoke.py"
 command = "/workspace/pllm/.venv/bin/python test/gpu/vllm_reft_smoke.py"
-environment = "Repository .venv, vLLM 0.27.1 MRv2, Qwen2.5-0.5B BF16, single GPU, eager, no prefix caching"
+environment = "Repository .venv, vLLM 0.27.1 MRv2, Qwen2.5-0.5B BF16, single GPU, token CUDA capture, no prefix caching"
 observable_contract = "One explicit publication patches exactly four selected prefill rows through original admission pins; independent tensor arithmetic, unselected rows and residual preserved; no-update call skips and close retires with zero fallback"
 replaces = "Legacy ReFT activation hook smoke"
 
@@ -423,24 +423,24 @@ replaces = "Legacy package/import probes; original plan evidence 39 had no execu
 
 [[evidence]]
 id = 40
-name = "learning_publication_conditional_replay_matches_reference"
+name = "route_updates_match_private_version_reference"
 group = "workload"
-path = "test/workloads/test_conditional_replay.py"
-command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_conditional_replay.py"
+path = "test/workloads/test_route_updates.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_route_updates.py"
 environment = "Repository .venv, CPU and rebuilt Rust extension"
-observable_contract = "Shared signed update/publication/replay graph; independent outer-product update and two-iteration recurrence; mixed request update/skip, tail-only publication skips, exact new pin and immutable old pin, KV rollback on failure/cancellation, original postpublish settlement, signed loop bound and cleanup"
-replaces = "New combination boundary 40; no separate replay state owner or callback DTO fixture"
+observable_contract = "One overlay transition owns the route and one private root; independent state/output/KV formulas cover repeated target concatenation, explicit/empty boundaries, discarded trailing captures, forward-pinned versus Exact entry reads, tail-only publication and source roundtrip; traced while_loop rejected with bounded for-loop guidance"
+replaces = "Retired postpublication conditional replay task, state owner and tests"
 
 [[evidence]]
 id = 41
-name = "public_conditional_replay_preserves_kv_rng_and_request_isolation"
+name = "public_route_updates_preserve_kv_rng_and_request_isolation"
 group = "runtime"
 requires_gpu = true
-path = "test/gpu/vllm_conditional_replay_smoke.py"
-command = "/workspace/pllm/.venv/bin/python test/gpu/vllm_conditional_replay_smoke.py"
-environment = "Repository .venv, vLLM 0.27.1 MRv2, Qwen2.5-0.5B BF16, FlashAttention2, single GPU, eager, no prefix caching"
-observable_contract = "Two update steps (per-target: four updates) and four replay iterations over the signed (22, 23) layer range; independent chained PyTorch attention/MLP oracle and per-layer current-slot KV checks with BF16 operand-rounding bounds; exact historical KV, normal output and CUDA RNG preservation; decode no-update skip, original pin lifecycle and zero fallback"
-replaces = "New combination boundary 41; old callback replay backend and typed_replay contract deleted"
+path = "test/gpu/vllm_route_updates_smoke.py"
+command = "/workspace/pllm/.venv/bin/python test/gpu/vllm_route_updates_smoke.py"
+environment = "Repository .venv, vLLM 0.27.1 MRv2, Qwen2.5-0.5B BF16, FlashAttention2, single GPU, token CUDA capture, no prefix caching"
+observable_contract = "Fixed two-iteration SettledInPlaceTTT route over layers 22/23; two requests reuse Stage A variants; chunk sizes two and one; independent attention/MLP oracle with BF16 operand-rounding and relative error below 0.01, eager/captured output, KV and field parity, RNG preservation, retirement and zero fallback"
+replaces = "Retired postpublication conditional replay backend and smoke"
 
 [[evidence]]
 id = 42

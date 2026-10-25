@@ -30,9 +30,10 @@ from pllm.backends.vllm.overlay_graph import (
     parameter_overlay,
 )
 from pllm.backends.vllm.parameter_overlay import (
+    ExactParameterOverlay,
     validate_projection_sources,
 )
-from pllm.backends.vllm.replay import VllmLayerReplay, VllmTokenwiseReplay
+from pllm.backends.vllm.replay import VllmTokenwiseReplay
 from pllm.backends.vllm.sampler import (
     SamplerGuidance,
     SignedSamplerGuidance,
@@ -52,7 +53,6 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
 from pllm.contracts.semantic_graph import (
     AnchorId,
-    ConditionalLayerReplay,
     SamplerFeedbackInputSource,
     SchedulerTimeline,
     StateScope,
@@ -155,10 +155,11 @@ class VllmSession(Generic[DataT, ResultT]):
             plan.semantic_graph.tasks[attachment.inputs.request.task_bindings[0].task_id].timing.after
             == "request.prepare"
         )
+        routed_overlay = bool(overlay_bindings) and any(task.replay is not None for task in plan.semantic_graph.tasks)
         self._in_forward_overlay = any(
             task.visibility is not None and task.visibility.in_forward for task in plan.semantic_graph.tasks
         )
-        if self._in_forward_overlay or probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH:
+        if routed_overlay or self._in_forward_overlay or probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH:
             validate_projection_sources(model, tuple(binding.target for binding in overlay_bindings))
         self._overlay = (
             parameter_overlay(
@@ -172,6 +173,7 @@ class VllmSession(Generic[DataT, ResultT]):
                 phases=deployment.execution.math.parameter_phases,
                 in_forward=self._in_forward_overlay,
                 graphs=probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH,
+                routed=routed_overlay,
             )
             if overlay_bindings
             else None
@@ -195,15 +197,12 @@ class VllmSession(Generic[DataT, ResultT]):
         self._readonly_receiver: ReadonlyStepReceiver | None = None
         self._received_readonly: ReadonlyStepInput | ReadonlyStepAbsent | ReadonlyStepEnd | None = None
         self._input_failed = False
-        self._replay: VllmLayerReplay | VllmTokenwiseReplay[DataT, ResultT] | None = None
+        self._replay: VllmTokenwiseReplay[DataT, ResultT] | None = None
         if tasks:
             (task,) = tasks
             if probe.causal_domain is None or probe.causal_domain.layers != len(model.model.layers):
                 raise ValueError("backend replay requires its signed causal model domain")
-            if isinstance(task.replay, ConditionalLayerReplay) and self._overlay is not None:
-                assert isinstance(self._overlay, PinnedParameterOverlay)
-                self._replay = VllmLayerReplay(model, task.replay, self._overlay, probe.causal_domain)
-            elif isinstance(task.replay, TokenProgramEffect):
+            if isinstance(task.replay, TokenProgramEffect):
                 self._replay = VllmTokenwiseReplay(
                     model,
                     task,
@@ -212,6 +211,9 @@ class VllmSession(Generic[DataT, ResultT]):
                     source_imports=probe.region_imports,
                     function_bodies=probe.region_bodies,
                     activation=self._activation,
+                    overlay=self._overlay
+                    if isinstance(self._overlay, ExactParameterOverlay) and routed_overlay
+                    else None,
                 )
             else:
                 raise ValueError("backend replay does not match its signed primitives")
@@ -495,9 +497,6 @@ class VllmSession(Generic[DataT, ResultT]):
             self._activation.prepare(rows.row_batch, invocation.context, execution.directory)
         if isinstance(self._replay, VllmTokenwiseReplay):
             self._replay.prepare(rows.row_batch, invocation)
-            invocation.context.replay = self._replay
-        elif isinstance(self._replay, VllmLayerReplay):
-            self._replay.prepare(rows.row_batch, invocation.context)
             invocation.context.replay = self._replay
 
     def complete_forward(self) -> None:

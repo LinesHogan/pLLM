@@ -7,10 +7,14 @@ from typing import Literal
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from pllm.contracts.backend_attachment import CausalModelDomain
 from pllm.contracts.region_composition import inline_region
 from pllm.contracts.region_program import (
+    AccessMode,
+    AccessRange,
+    AffineIndex,
     Block,
     BorrowedResource,
     Call,
@@ -18,6 +22,7 @@ from pllm.contracts.region_program import (
     Op,
     Program,
     Region,
+    ResourceAccess,
     ResourceType,
     ScalarType,
     TensorType,
@@ -27,7 +32,7 @@ from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.codec import tensor_decompositions, tensor_node_metadata
 from pllm.execution.decoder_region import DecoderActivation, DecoderSource
 from pllm.execution.exported_cell import ExportedCell
-from pllm.execution.region_native import RegionFunction
+from pllm.execution.region_native import RegionFunction, external_primitive
 from pllm.execution.shared_tensor import tensor_dtype
 
 Tokens = Literal["prefill", "decode", "all"]
@@ -43,6 +48,37 @@ def _fake_layers(hidden: torch.Tensor, start: int, stop: int) -> list[torch.Tens
 
 
 _layers.register_fake(_fake_layers)  # pyright: ignore[reportUnknownMemberType]
+
+
+@torch.library.custom_op("pllm::apply_updates", mutates_args=())
+def _apply_updates(hidden: torch.Tensor) -> None:
+    raise RuntimeError("call apply_updates only inside a @pllm.layer_route method")
+
+
+def _fake_updates(hidden: torch.Tensor) -> None:
+    pass
+
+
+_apply_updates.register_fake(_fake_updates)  # pyright: ignore[reportUnknownMemberType]
+
+
+def overlay_accesses(resource: BorrowedResource) -> tuple[ResourceAccess, ...]:
+    """Order projection reads, operand captures and explicit boundaries on token staging."""
+    return tuple(
+        ResourceAccess(resource.name, mode, (AccessRange(AffineIndex(), AffineIndex(resource.domain[0])),))
+        for mode in (AccessMode.READ, AccessMode.WRITE)
+    )
+
+
+def update_function(resource: BorrowedResource) -> Function:
+    """An ordered no-result boundary, including when no operands are pending."""
+    return Function(
+        "overlay.apply_updates@1",
+        (ScalarType.INDEX, ScalarType.INDEX),
+        (),
+        (resource.name,),
+        overlay_accesses(resource),
+    )
 
 
 @dataclass(frozen=True)
@@ -74,6 +110,10 @@ class Layers:
             raise ValueError("use 0 <= start < stop <= layer_count and supply hidden when start > 0")
         return Taps(tuple(_layers(self.seed if hidden is None else hidden, start, stop)), start, self.layer_count)
 
+    def apply_updates(self) -> None:
+        """Apply operands captured since the previous boundary to this token's private overlay."""
+        _apply_updates(self.seed)
+
 
 @dataclass(frozen=True)
 class Segment:
@@ -90,6 +130,11 @@ class Cell:
     """A maximal ATen fragment between model slices, retaining its exported source."""
 
     source: ExportedCell
+
+
+@dataclass(frozen=True)
+class ApplyUpdates:
+    """An explicit ordered transition boundary with no tensor return."""
 
 
 @dataclass(frozen=True)
@@ -126,7 +171,7 @@ def _cell(nodes: list[torch.fx.Node]) -> Cell:
 class TokenProgram:
     """Ordered model slices, exported tensor fragments and the sampled residual stream."""
 
-    steps: tuple[Segment | Cell | Output, ...]
+    steps: tuple[Segment | Cell | ApplyUpdates | Output, ...]
     seed: str
     position: str
 
@@ -142,7 +187,7 @@ class TokenProgram:
                 raise ValueError("return a final-layer residual-stream tensor from your layer_route method")
             return result
 
-        with FakeTensorMode():
+        with FakeTensorMode(shape_env=ShapeEnv()):
             seed = torch.empty(
                 tensor.shape, dtype=tensor_dtype(TensorDType(tensor.dtype.removeprefix("torch."))), device=tensor.device
             )
@@ -152,15 +197,22 @@ class TokenProgram:
                 decomposition_table=tensor_decompositions((torch.ops.aten.linalg_vector_norm.default,)),
                 tracing_mode="fake",
             )(seed, position)
-            steps: list[Segment | Cell | Output] = []
+            steps: list[Segment | Cell | ApplyUpdates | Output] = []
             pending: list[torch.fx.Node] = []
             placeholders = tuple(node.name for node in graph.graph.nodes if node.op == "placeholder")
             for node in graph.graph.nodes:
-                if node.target == torch.ops.pllm.layers.default or node.op == "output":
+                if node.target == torch.ops.higher_order.while_loop:
+                    raise ValueError("layer routes do not support traced while_loop; use a bounded for-loop")
+                if (
+                    node.target in (torch.ops.pllm.layers.default, torch.ops.pllm.apply_updates.default)
+                    or node.op == "output"
+                ):
                     if pending:
                         steps.append(_cell(pending))
                         pending = []
-                    if node.op == "output":
+                    if node.target == torch.ops.pllm.apply_updates.default:
+                        steps.append(ApplyUpdates())
+                    elif node.op == "output":
                         result = node.args[0]
                         assert isinstance(result, torch.fx.Node)
                         if _tensor(result).shape != seed.shape or _tensor(result).dtype != seed.dtype:
@@ -193,6 +245,7 @@ class TokenProgram:
         domain: CausalModelDomain,
         max_rows: int,
         activations: tuple[DecoderActivation, ...],
+        overlay: BorrowedResource | None = None,
     ) -> tuple[Program, dict[str, RegionFunction]]:
         """Compose DecoderSource slices with their exported cells in source order."""
         positions = TensorType((1,), "torch.int64", tensor.device)
@@ -206,6 +259,8 @@ class TokenProgram:
         declarations: dict[str, Function] = {}
         weights, context = BorrowedResource("weights", (domain.layers + 1,)), BorrowedResource("context", (max_rows,))
         resources: dict[str, ResourceType] = {resource.name: resource for resource in (weights, context)}
+        if overlay is not None:
+            resources[overlay.name] = overlay
         result = arguments[-1]
         for ordinal, step in enumerate(self.steps):
             if isinstance(step, Segment):
@@ -217,6 +272,7 @@ class TokenProgram:
                     weights=weights,
                     context=context,
                     activations=activations,
+                    overlay=overlay,
                 )
                 segment = inline_region(source.program, (*arguments[:4], values[step.input]), f"segment{ordinal}")
                 operations.extend(segment.operations)
@@ -224,6 +280,14 @@ class TokenProgram:
                 functions.update(source.functions)
                 declarations.update((function.name, function) for function in source.program.functions)
                 resources.update((resource.name, resource) for resource in source.program.resources)
+            elif isinstance(step, ApplyUpdates):
+                if overlay is None:
+                    raise ValueError("apply_updates needs one trained parameter overlay on the same workload")
+                boundary = update_function(overlay)
+                resources[overlay.name] = overlay
+                declarations[boundary.name] = boundary
+                functions[boundary.name] = external_primitive(boundary)
+                operations.append(Call(("row", "request"), (), boundary.name))
             elif isinstance(step, Cell):
                 cell = step.source
                 results = tuple(

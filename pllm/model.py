@@ -16,7 +16,6 @@ from pllm.contracts.parameter_overlay import (
     ParameterRole as ParameterRole,
     ParameterTarget as ParameterTarget,
 )
-from pllm.contracts.semantic_graph import ConditionalLayerReplay as ConditionalLayerReplay
 from pllm.usage import (
     Activation as Activation,
     Overlay as Overlay,
@@ -36,5 +35,4 @@ __all__ = [
     "DecodeWindow",
     "DecodeRefresh",
     "MissingPolicy",
-    "ConditionalLayerReplay",
 ]

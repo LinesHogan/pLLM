@@ -27,7 +27,6 @@ from pllm.contracts.region_program import TensorType
 from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY, TOKEN_CAPTURE_CAPABILITY
 from pllm.contracts.semantic_graph import (
     AnchorId,
-    ConditionalLayerReplay,
     SchedulerTimeline,
     SemanticGraph,
     StateEffectKind,
@@ -39,9 +38,8 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
 from pllm.execution.codec import decode_boundary, encode_boundary
-from pllm.execution.decoder_region import decoder_activations, decoder_region_workspace_bytes
+from pllm.execution.decoder_region import decoder_activations
 from pllm.execution.parameter_projection import ROWS_PER_BLOCK, projection_blocks
-from pllm.execution.region_replay import replay_region_workspace_bytes
 from pllm.execution.tokenwise_region import (
     compile_tokenwise_region,
     compile_tokenwise_source,
@@ -94,10 +92,6 @@ def attachment_buffer_bytes(
         buffers += rows * (width * (2 * hidden + 3 * rank) + 8)
     for task in graph.tasks:
         match task.replay:
-            case ConditionalLayerReplay(layers=replayed):
-                buffers += len(replayed) * (rows * (3 * width * hidden + 32) + 16 * width * hidden)
-                buffers += replay_region_workspace_bytes(hidden, width)
-                buffers += decoder_region_workspace_bytes(hidden, width)
             case TokenProgramEffect():
                 buffers += tokenwise_attachment_bytes(hidden, width, rows)
             case None:
@@ -136,7 +130,7 @@ def derive_attachment_resources(
             raise ValueError("conditional tokenwise costs require the exact signed pinned READ")
         # Both branches use this same model source. Retain all producer facts:
         # the complete DAG funds the worst case, including the fresh encoding.
-    if len(graph.tasks) != 1 or graph.states:
+    if (len(graph.tasks) != 1 or graph.states) and task.effects[0].kind is StateEffectKind.READ:
         if len(task.effects) != 1 or task.effects[0].kind is not StateEffectKind.READ:
             raise ValueError("composed tokenwise costs require an exact publication read")
         (read,) = task.effects
@@ -164,8 +158,10 @@ def derive_attachment_resources(
         "torch." + probe.tensor_dtype.value,
         "cpu" if probe.device_kind.value == "cpu" else f"cuda:{probe.device_ordinal}",
     )
-    if task.effects and (layouts is None or attachment is None or not attachment.activation_bindings):
-        raise ValueError("composed tokenwise costs require signed activation bindings and layouts")
+    if task.effects and (
+        layouts is None or attachment is None or not (attachment.activation_bindings or attachment.overlay_bindings)
+    ):
+        raise ValueError("composed tokenwise costs require signed effect bindings and layouts")
     activations = (
         ()
         if layouts is None or attachment is None
@@ -185,7 +181,10 @@ def derive_attachment_resources(
             activations=activations,
         )
         region.within_payload_budget(existing.workspace_bytes)
-        task_facts = timeline.task_resources
+        task_facts = tuple(
+            replace(fact, resident_bytes=max(fact.resident_bytes, resident)) if fact.task == task.symbol else fact
+            for fact in timeline.task_resources
+        )
     else:
         region = compile_tokenwise_region(
             tensor,

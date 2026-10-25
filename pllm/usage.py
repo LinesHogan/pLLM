@@ -35,7 +35,6 @@ from pllm.contracts.request_identity import RequestKeyField, canonical_request_k
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
-    ConditionalLayerReplay,
     HiddenInputSource,
     LossReduction,
     MathContract,
@@ -786,7 +785,6 @@ class _Overlay(_Effect):
     scale: float | Config
     prefill: bool | Config
     decode: bool | Config
-    replay: ConditionalLayerReplay | Config | None
     visibility: Visibility | Config
 
     phase: ClassVar[Phase | None] = Phase.MODEL_UPDATE
@@ -814,14 +812,8 @@ class _Overlay(_Effect):
         effect = ParameterEffect(
             self.state, targets, self.weight, operator, _setting(self.factors, context.owner, tuple), scale
         )
-        applied, replay = effect.applied_fields, Config.resolve(self.replay, context.owner)
-        if replay is not None and not isinstance(replay, ConditionalLayerReplay):
-            raise TypeError("overlay replay requires a conditional layer replay")
+        applied = effect.applied_fields
         visibility = _setting(self.visibility, context.owner, Visibility)
-        _reject(
-            replay is not None and visibility == Exact(),
-            "Exact overlays use causal-history KV; remove post-forward layer replay",
-        )
         identity = fingerprint(operation.function)
         context.binding.parameter_overlay(
             operation.name,
@@ -837,7 +829,6 @@ class _Overlay(_Effect):
                 for p, enabled in ((HiddenPhase.PREFILL, self.prefill), (HiddenPhase.DECODE, self.decode))
                 if _setting(enabled, context.owner, bool)
             ),
-            replay=replay,
             identity=f"python:{identity}",
             operator=operator,
             scale=scale,
@@ -860,7 +851,6 @@ def overlay(
     scale: float | Config = 1.0,
     prefill: bool | Config = True,
     decode: bool | Config = False,
-    replay: ConditionalLayerReplay | Config | None = None,
     visibility: Visibility | Config = Visibility.forward_pinned(),
 ) -> Callable[[F], F]:
     """Apply residuals using the declared state visibility at each target projection."""
@@ -875,7 +865,6 @@ def overlay(
             scale=scale,
             prefill=prefill,
             decode=decode,
-            replay=replay,
             visibility=visibility,
         )
     )
@@ -1282,7 +1271,7 @@ class _Declaration:
         b = self.binding
         if self.routes:
             attachment = b.attachment
-            composed = attachment is not None and attachment.activation_bindings
+            composed = attachment is not None and (attachment.activation_bindings or attachment.overlay_bindings)
             _reject(
                 not composed and (len(b.graph.tasks) != 1 or b.graph.states),
                 "layer_route requires a standalone model effect or Activation composition",
@@ -1440,7 +1429,11 @@ class Workload(
                 b.probe is not None and value.rows.total_rows > b.probe.max_packed_rows,
                 "packed input exceeds the signed backend row capacity",
             )
-            if b.attachment is not None and b.attachment.activation_bindings:
+            if b.attachment is not None and (
+                b.attachment.activation_bindings
+                or any(task.replay is not None for task in b.graph.tasks)
+                and b.overlay_targets
+            ):
                 return value.rows.rows if b.graph.states[0].scope is StateScope.REQUEST else ()
             if b.attachment is not None and b.attachment.kind is AttachmentKind.MODEL_REPLAY:
                 return ()

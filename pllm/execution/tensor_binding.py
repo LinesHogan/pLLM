@@ -88,6 +88,15 @@ class TensorBinding(ModelEffectBinding, RowTaskBinding):
 
     def configure_scans(self, facts: BackendCompileFacts) -> None:
         """Bind scan specialization to the plan's policy and row capacity."""
+        if self.overlay_math is not None and any(task.replay is not None for task in self.graph.tasks):
+            self.overlay_math = replace(
+                self.overlay_math,
+                function=ScanContext(
+                    facts.timeline.region_policy,
+                    self.route_rows,
+                    facts.device,
+                ).bind(self.overlay_math.function),
+            )
         for symbol, operation in self.operations.items():
             budget = facts.timeline.memory_budget_bytes
             scans = ScanContext(
@@ -138,7 +147,10 @@ class TensorBinding(ModelEffectBinding, RowTaskBinding):
             raise ValueError("tensor execution requires specialized model dimensions")
         if (
             self.attachment is not None
-            and self.attachment.kind is AttachmentKind.MODEL_REPLAY
+            and (
+                self.attachment.kind is AttachmentKind.MODEL_REPLAY
+                or any(task.replay is not None for task in self.graph.tasks)
+            )
             and not self.attachment.activation_bindings
         ):
 

@@ -26,7 +26,6 @@ from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
     AnchorSymbol,
     ConditionalInputGroup,
-    ConditionalLayerReplay,
     ExecutionKind,
     HiddenInputSource,
     HostPayloadSchemaId,
@@ -70,10 +69,10 @@ from pllm.contracts.tensor_layout import (
 from pllm.execution.decoder_region import decoder_activations
 from pllm.execution.execution import TaskGraphImplementation
 from pllm.execution.memory import MemoryUsage, measure
+from pllm.execution.overlay_task import OverlayTransition
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.region_native import RegionFunction
-from pllm.execution.region_replay import ConditionalReplayRegion
-from pllm.execution.replay import REPLAY_IMPLEMENTATION, ReplayStateTask, TokenwiseReplayTask
+from pllm.execution.replay import TokenwiseReplayTask
 from pllm.execution.state_execution import ConditionalProducerTask, PublishStateTask, StateTaskContext
 from pllm.execution.tensor_program import (
     Optimizer,
@@ -106,14 +105,11 @@ class When(Enum):
     BEFORE_MODEL = ("request.prepare", "model.execute")
     MODEL_UPDATE = ("model.execute", "state.publish")
     PUBLISH = ("state.publish", "next.prepare")
-    REPLAY = ("state.publish", "sampler.pre_draw")
     HOST_COMPUTE = ("host.input.ready", "host.compute.end")
     HOST_OUTPUT = ("host.compute.end", "host.output.publish")
     HOST_COMMIT = ("host.output.publish", "host.next")
     HOST = ("host.input.ready", "host.next")
-    # Observation and replay share one window (after publication, before sampling); an Enum makes
-    # equal values one member, so OBSERVE is REPLAY.
-    OBSERVE = REPLAY
+    OBSERVE = ("state.publish", "sampler.pre_draw")
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +192,9 @@ class Builder(Generic[D]):
         self.host_operations: dict[TaskSymbol, HostOperation[D]] = {}
         self.resources = resources
         self.route_functions: dict[str, RegionFunction] = {}
+        self.overlay_math: OverlayTransition | None = None
+        self.route_updates = False
+        self.route_rows = 0
 
     def state(
         self,
@@ -299,7 +298,7 @@ class Builder(Generic[D]):
         source: Call | None = None,
         result_schema: str = "",
         output_schemas: Mapping[str, str] | None = None,
-        replay: ConditionalLayerReplay | TokenProgramEffect | None = None,
+        replay: TokenProgramEffect | None = None,
         math: MathContract | None = None,
         function: Callable[[D, TensorBatch], TaskOutput] | None = None,
         host_function: Callable[[D], None] | None = None,
@@ -404,7 +403,8 @@ class Builder(Generic[D]):
                     )
                     else "published"
                 )
-            functions.append(replace(self.operations[task.symbol], implementation_id=identity, version=version))
+            if task.replay is None:
+                functions.append(replace(self.operations[task.symbol], implementation_id=identity, version=version))
         return tuple(functions)
 
     def bind_all(
@@ -413,7 +413,7 @@ class Builder(Generic[D]):
         functions: list[TaskGraphImplementation[StateTaskContext[D]]] = list(self.bind(plan))
         graph = self.graph if plan is None else plan.semantic_graph
         for task in graph.tasks:
-            if task.symbol in self.operations:
+            if task.symbol in self.operations and task.replay is None:
                 continue
             if plan is None and len(task.implementations) != 1:
                 raise ValueError("multiple implementations require the original signed plan")
@@ -424,20 +424,7 @@ class Builder(Generic[D]):
                     item.implementation_id for item in plan.schedule_physical.tasks if graph.tasks[item.task_id] is task
                 )
             )
-            if isinstance(task.replay, ConditionalLayerReplay):
-                if plan is None or self.dimensions is None:
-                    raise ValueError("conditional replay requires a specialized backend plan")
-                placements = {(r.device_kind.value, r.device_ordinal) for r in plan.state_physical.representations}
-                if len(placements) != 1:
-                    raise ValueError("conditional replay requires one original state device")
-                kind, ordinal = next(iter(placements))
-                tensor = TensorType(
-                    (1, self.dimensions.hidden_size),
-                    "torch." + self.dimensions.dtype.value,
-                    "cpu" if kind == "cpu" else f"cuda:{ordinal}",
-                )
-                functions.append(ReplayStateTask[D](task, ConditionalReplayRegion(tensor, task.replay), identity))
-            elif isinstance(task.replay, TokenProgramEffect):
+            if isinstance(task.replay, TokenProgramEffect):
                 if plan is None or model_probe is None or model_probe.causal_domain is None:
                     raise ValueError("tokenwise replay requires a specialized backend plan and model layout")
                 tensor = TensorType(
@@ -465,6 +452,10 @@ class Builder(Generic[D]):
                         token_capture=TOKEN_CAPTURE_CAPABILITY in model_probe.capabilities,
                         source_imports=model_probe.region_imports,
                         function_bodies=model_probe.region_bodies,
+                        operation=None
+                        if task.symbol not in self.operations
+                        else replace(self.operations[task.symbol], implementation_id=identity),
+                        overlay_math=self.overlay_math,
                         activations=()
                         if self.attachment is None
                         else decoder_activations(
@@ -536,16 +527,6 @@ class Builder(Generic[D]):
         )
         self.publications[call.symbol] = PublishStateTask(implementations[0].implementation_id)
         return call
-
-    def replay(self, publication: Call, state: State, effect: ConditionalLayerReplay) -> Call:
-        return self.compute(
-            "replay",
-            inputs={"publication": publication[publication.outputs[0]]},
-            reads=(state.version(publication),),
-            when=When.REPLAY,
-            replay=effect,
-            implementations=(native(REPLAY_IMPLEMENTATION, "model/layer_replay@1"),),
-        )
 
     def sampler(
         self,

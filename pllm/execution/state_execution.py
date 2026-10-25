@@ -46,10 +46,10 @@ from pllm.execution.ptts.page_bundle import (
 from pllm.execution.ptts.request_state import RequestStateDirectory, RequestStateSelection, StateAddress
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.region_window import WindowBackpressure
-from pllm.execution.replay import LayerReplayPrimitive, TokenwiseReplayPrimitive
 from pllm.execution.trace import ExecutionTrace, TracePhase
 
 if TYPE_CHECKING:
+    from pllm.execution.replay import TokenwiseReplayPrimitive
     from pllm.execution.tensor_program import TensorBatch
 
 InputT = TypeVar("InputT", contravariant=True)
@@ -97,11 +97,8 @@ class StateTaskContext(Generic[DataT]):
     loss_count: int = 0
     update_count: int = 0
     trained_rows: int = 0
-    replay: LayerReplayPrimitive | TokenwiseReplayPrimitive | None = None
-    updated_refs: Sequence[StateRef] = ()
-    updated_mask: torch.Tensor | None = None
+    replay: TokenwiseReplayPrimitive | None = None
     overlay_counters: torch.Tensor | None = None
-    replay_started: bool = False
     cancel_requested: Event = field(default_factory=Event)
     borrowed_roots: tuple[BorrowedStateRoot, ...] = ()
     held_input: HeldInput | None = None

@@ -32,7 +32,6 @@ from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import CapturedParameterOperand, ParameterOverlayFieldBinding
 from pllm.contracts.region_selection import RegionSelectionPolicy
 from pllm.contracts.semantic_graph import StateScope
-from pllm.contracts.state_ref import StateRef
 from pllm.execution.codec import cuda_graph_pool_bytes, decode_boundary, encode_boundary
 from pllm.execution.cuda_stream import CudaStreamReadiness, PinnedStaging
 from pllm.execution.overlay_task import ProjectionTransition
@@ -42,7 +41,7 @@ from pllm.execution.parameter_projection import (
     projection_block_rows,
     projection_blocks,
 )
-from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin, Slots
+from pllm.execution.ptts.page_bundle import PageBundleArena, Slots
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.region_execution import RegionInstructionExecution
@@ -439,20 +438,6 @@ class PinnedParameterOverlay:
                 )
         return tuple(results)
 
-    def prepare_replay(
-        self, row: PackedPhaseRow, layer: int, arena: PageBundleArena, pin: PagePin, ref: StateRef
-    ) -> None:
-        for reader in self.readers:
-            reader.table.zero_()
-            slots, _, owners = reader.ports(reader.table, 1)
-            for index, field in enumerate(reader.binding.fields):
-                _, (slot,) = arena.field_slots((pin,), (ref,), field)
-                slots[:, index].fill_(slot)
-            owners.fill_(0 if reader.binding.target.layer == layer else -1)
-            if reader.binding.target.layer == layer:
-                self.apply_count += 1
-                self.updated_apply_count += int(ref.version_id > 0)
-
     def clear(self) -> None:
         if self.sources:
             assert self.stream is not None
@@ -527,9 +512,10 @@ def parameter_overlay(
     *,
     in_forward: bool,
     graphs: bool,
+    routed: bool = False,
 ) -> PinnedParameterOverlay | ExactParameterOverlay | HybridParameterOverlay:
     """Install each projection wrapper once, before compiling or capturing the model."""
-    if in_forward and not graphs:
+    if routed or in_forward and not graphs:
         return ExactParameterOverlay(model, bindings)
     pinned = PinnedParameterOverlay(
         model, bindings, arena, rows, requests, budget, policy, phases=() if in_forward else phases

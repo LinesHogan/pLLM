@@ -486,24 +486,21 @@ lease 在检查所有资源的版本和冲突后统一取得。Region 的多次 
 旧推理版本的保持。普通作者接口和 vLLM 的单状态效果适配器仍待逐一迁移；
 这些测试不代表多资源模型接线或全局调度已经完成。
 
-## 条件 replay 的生产迁移
+## 路由中的 overlay 更新
 
-[ConditionalReplayRegion](../../pllm/execution/region_replay.py) 显式表达有界 while、
-第一轮分支、relative L2 判断、有限值检查、模型 step 和 trace 次序。旧
-ReplayStateTask 中的 Python 迭代循环已移除；外层仍按原 request selection 和
-已发布 ref 选择行，并在原异常路径调用 `primitive.restore()`。
+[TokenProgram](../../pllm/execution/token_program.py) 保留无返回值的
+`layers.apply_updates()` marker，并下沉为显式读写 token staging 的区域 Call。
+[RouteOverlay](../../pllm/execution/overlay_task.py) 在投影处读取和捕获，边界处按
+目标拼接操作数并调用作者的 transition。它不分配或发布 PTTS 页；整个路由包在
+已有 TensorOperation 中，复用一次私有分配和下游 publication。
 
-首轮没有 previous，因此不做收敛比较；后续只在 `relative <= threshold` 为真
-时停止。测试专门覆盖有限张量的 FP32 norm 溢出导致 NaN distance 的情形，
-保持原比较语义。CUDA 测试核验原 stream，绑定后禁用 ISL 编译入口，确认执行
-不重新生成计划。原语输入/输出副本的额外工作区计入后端 effect reservation，
-不沿用旧调用的复制成本。此处仍是保守上界，后续需与统一活跃值规划合并。
+Stage A 在 token graph 外复制入口/私有字段；每次冷 warmup 和 capture 都重置
+工作字段与 journals。graph 仅保留稳定 staging 和设备输出，不保留请求或页目的地。
+结果计数在真实 replay 后重建。当前只支持已展开的有界 Python for 循环。
 
-已用 `/workspace/pllm/.venv/bin/python test/gpu/vllm_conditional_replay_smoke.py`
-验证真实 Qwen2.5-0.5B-Instruct、bfloat16、22–23 层的条件 replay：4 次 replay、
-4 次独立数值比较、fallback 为 0；检查正常输出、历史 KV、当前槽、RNG、原 pin
-与生命周期。沿用现有数值界限。该测试验证有限层段的原模型接线，不证明全局
-wavefront、吞吐提升或完整模型迁移。
+替代证据为 `test/workloads/test_route_updates.py` 与
+`test/gpu/vllm_route_updates_smoke.py`，覆盖独立状态公式、Qwen attention/MLP
+oracle、captured/eager 完整路由比较和同一 graph 跨请求复用。
 
 ## 模型层循环进入区域程序
 
@@ -635,11 +632,9 @@ NativePrimitive 保留私有输入和独立输出，保护 RMSNorm 等原地修�
 attention/kernel workspace 继续单独计账。后续需要通过活跃值与 bufferization
 证明减少这些副本，不能把这次迁移表述为性能优化。
 
-已有两个真实模型 smoke 使用仓库 `.venv/bin/python` 通过：
-`vllm_recirculation_smoke.py` 检查 8 次 normal、6 次 replay 和 14 次独立数值
-比较；`vllm_conditional_replay_smoke.py` 检查 4 次更新、4 次 replay 和 4 次
-独立数值比较，均为 Qwen2.5-0.5B-Instruct/bfloat16，fallback 为 0。原数值
-界限保持不变，覆盖历史 KV、当前槽、普通输出、RNG 和原发布生命周期。
+真实模型回归包括 `vllm_recirculation_smoke.py` 与
+`vllm_route_updates_smoke.py`。后者使用固定次数的层重跑，独立验证 BF16
+attention/MLP 数值、KV、返回输出和状态字段；验证结果以当前执行记录为准。
 
 ## 第一个生产算法接入
 

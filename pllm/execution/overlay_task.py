@@ -1,17 +1,30 @@
 """Drive in-forward overlay segments at model projections through the existing state task runner."""
 
-from collections.abc import Mapping
-from typing import Generic, Protocol
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Generic, NamedTuple, Protocol, TypeVar
 
 import torch
 
-from pllm.authoring import TensorStepInput
+from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import CapturedParameterOperand, ParameterTarget
+from pllm.contracts.region_program import AccessMode, BorrowedResource
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import PackedSamplerRowBatch
 from pllm.contracts.semantic_graph import TaskId
-from pllm.execution.execution import TaskGraphInvocation
-from pllm.execution.state_execution import DataT, ResultT, StateExecution, StateTaskContext
+from pllm.contracts.visibility import VisibilitySource
+from pllm.execution.tensor_borrow import TensorResourceView
+from pllm.execution.tensor_frame import OverlayEntry, OverlayTargetResult, TensorFrame, Tensors, TensorUpdate
+from pllm.execution.tensor_program import TaskOutput, TensorBatch
+
+DataT = TypeVar("DataT")
+ResultT = TypeVar("ResultT")
+if TYPE_CHECKING:
+    from pllm.authoring import TensorStepInput
+    from pllm.execution.execution import TaskGraphInvocation
+    from pllm.execution.state_execution import StateExecution, StateTaskContext
 
 
 class ProjectionTransition(Protocol):
@@ -40,6 +53,8 @@ class ProjectionTask(Generic[DataT, ResultT]):
         self, operands: tuple[CapturedParameterOperand, ...]
     ) -> Mapping[tuple[RequestIdentity, ParameterTarget], torch.Tensor]:
         """Execute available target segments and hand their residuals to the model reader."""
+        from pllm.authoring import TensorStepInput
+
         targets = {operand.target for operand in operands}
         assert targets and targets <= self.pending
         self.pending.difference_update(targets)
@@ -50,3 +65,289 @@ class ProjectionTask(Generic[DataT, ResultT]):
             complete=not self.pending,
         )
         return self.invocation.context.projection_outputs
+
+
+@dataclass(frozen=True, slots=True)
+class OverlayTransition:
+    """Request/target adaptation shared by source and explicitly lowered math.
+
+    Replacing this immutable callable during binding changes only the imported
+    mathematics. The original TensorOperation still owns private-page access.
+    """
+
+    buffers: tuple[str, ...]
+    targets: tuple[ParameterTarget, ...]
+    phases: tuple[HiddenPhase, ...]
+    apply: Callable[[torch.Tensor, Tensors], torch.Tensor]
+    function: Callable[[Tensors], TensorUpdate]
+    visibility: VisibilitySource
+
+    def __call__(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
+        operands = {
+            (operand.identity, operand.target): operand
+            for operand in data.step.operands
+            if self.visibility.in_forward or operand.phase in self.phases
+        }
+        if not operands:
+            return TaskOutput()
+        start = len(data.entries)
+        changed: dict[int, torch.Tensor] = {}
+        with torch.no_grad():
+            for identity, index in dict.fromkeys(
+                (row.identity, index)
+                for row, index in zip(batch.selection.rows, batch.selection.state_indices, strict=True)
+            ):
+                results: list[OverlayTargetResult] = []
+                for target_index, target in enumerate(self.targets):
+                    if (identity, target) not in operands:
+                        continue
+                    operand = operands[identity, target]
+                    values = dict(
+                        zip(
+                            self.buffers,
+                            batch.roots[index][
+                                len(self.buffers) * target_index : len(self.buffers) * (target_index + 1)
+                            ],
+                            strict=True,
+                        )
+                    )
+                    result = self.result(operand, values)
+                    results.append(OverlayTargetResult(target, result))
+                    changed[index] = result.changed if index not in changed else changed[index] | result.changed
+                if results:
+                    data.entries.append(
+                        OverlayEntry(identity, batch.selection.refs[index], batch.after_refs[index], tuple(results))
+                    )
+        return TaskOutput(
+            residuals={
+                (entry.identity, target.target): target.update.output
+                for entry in data.entries[start:]
+                for target in entry.targets
+            },
+            changed=tuple(changed),
+            update_mask=torch.stack(tuple(changed.values())),
+            counters=torch.stack(
+                tuple(
+                    torch.stack((target.update.update_count, target.update.trained_rows))
+                    for entry in data.entries[start:]
+                    for target in entry.targets
+                )
+            ).sum(0),
+        )
+
+    def result(self, operand: CapturedParameterOperand, values: Tensors) -> TensorUpdate:
+        """Validate the author's result at its tensor boundary without observing CUDA values."""
+        result = (
+            self.function({**values, "input": operand.hidden, "target": operand.desired, "weight": operand.base_weight})
+            if operand.phase in self.phases
+            else TensorUpdate.unchanged(self.apply(operand.hidden, values))
+        )
+        if (
+            result.output.shape != operand.desired.shape
+            or result.output.dtype not in (operand.hidden.dtype, torch.float32)
+            or result.output.device != operand.hidden.device
+        ):
+            raise ValueError("overlay output differs from its target shape, dtype or device")
+        if any(
+            value.shape != () or value.device != operand.hidden.device or value.dtype != dtype
+            for value, dtype in (
+                (result.changed, torch.bool),
+                (result.update_count, torch.int64),
+                (result.trained_rows, torch.int64),
+            )
+        ):
+            raise ValueError("overlay counters need a bool changed flag and int64 counts on the operand device")
+        return result
+
+
+class RouteOverlayStorage:
+    """Stable token ports owned by the backend; graphs never retain page destinations."""
+
+    def __init__(self, resource: BorrowedResource, fields: tuple[torch.Tensor, ...]) -> None:
+        self.resource = resource
+        # The source envelope also pays for invocation journals and copied graph results.
+        self.slab = torch.empty(
+            3 * sum((field.numel() * field.element_size() + 7) // 8 * 8 for field in fields),
+            dtype=torch.uint8,
+            device=fields[0].device,
+        )
+        ports: list[torch.Tensor] = []
+        offset = 0
+        for field in fields * 3:
+            offset = (offset + 7) // 8 * 8
+            size = field.numel() * field.element_size()
+            ports.append(self.slab[offset : offset + size].view(field.dtype).view(field.shape))
+            offset += size
+        self.entry, self.fields, self.saved = (
+            tuple(ports[i : i + len(fields)]) for i in range(0, len(ports), len(fields))
+        )
+
+    def validate(self, protected: tuple[tuple[str, int, int], ...]) -> tuple[tuple[str, int, int], ...]:
+        return TensorResourceView(replace(self.resource, domain=(1,)), (self.slab,)).validate(protected)
+
+    def check(self, mode: AccessMode, ranges: tuple[tuple[int, int], ...]) -> None:
+        assert len(ranges) == 1 and 0 <= ranges[0][0] <= ranges[0][1] <= self.resource.domain[0]
+
+
+class RouteOperand(NamedTuple):
+    """Capture outputs without retaining the cold invocation's request or phase."""
+
+    target: ParameterTarget
+    hidden: torch.Tensor
+    desired: torch.Tensor
+    weight: torch.Tensor
+
+
+class RouteOverlay:
+    """Read and capture at projections; apply grouped operands within one owned transition."""
+
+    def __init__(
+        self,
+        math: OverlayTransition,
+        batch: TensorBatch,
+        entry: TensorBatch,
+        storage: RouteOverlayStorage,
+        data: TensorFrame,
+    ) -> None:
+        self.math, self.batch, self.entry, self.storage, self.data = math, batch, entry, storage, data
+        self.pending: list[CapturedParameterOperand] = []
+        self.ordinary: list[CapturedParameterOperand] = []
+        self.results: list[OverlayTargetResult] = []
+        self.row = 0
+        self.routed = self.private = False
+
+    def stage(self, row: int, routed: bool) -> None:
+        """Resolve input/private roots once, outside cold execution and graph replay."""
+        self.row, self.routed = row, routed
+        index = self.batch.selection.state_indices[row]
+        for ports, fields in (
+            (self.storage.entry, self.entry.roots[index]),
+            (self.storage.saved, self.batch.roots[index]),
+        ):
+            for target, source in zip(ports, fields, strict=True):
+                target.copy_(source)
+        self.reset()
+
+    def reset(self) -> None:
+        """Restore every cold execution from this token's incoming private fields."""
+        for target, source in zip(self.storage.fields, self.storage.saved, strict=True):
+            target.copy_(source)
+        self.pending, self.results = [], []
+        self.private = self.math.visibility.in_forward
+
+    def values(self, target: ParameterTarget, private: bool) -> Tensors:
+        width = len(self.math.buffers)
+        start = self.math.targets.index(target) * width
+        return dict(
+            zip(
+                self.math.buffers,
+                (self.storage.fields if private else self.storage.entry)[start : start + width],
+                strict=True,
+            )
+        )
+
+    def run(
+        self, operands: tuple[CapturedParameterOperand, ...]
+    ) -> Mapping[tuple[RequestIdentity, ParameterTarget], torch.Tensor]:
+        """Own operands immediately because later model calls may mutate their inputs."""
+        outputs: dict[tuple[RequestIdentity, ParameterTarget], torch.Tensor] = {}
+        for operand in operands:
+            captured = replace(
+                operand, hidden=operand.hidden.detach().clone(), desired=operand.desired.detach().clone()
+            )
+            if not self.routed and self.math.visibility.in_forward:
+                result = self.math.result(captured, self.values(operand.target, True))
+                self.results.append(OverlayTargetResult(operand.target, result))
+                output = result.output
+            else:
+                output = self.math.apply(operand.hidden, self.values(operand.target, self.private))
+                self.pending.append(captured)
+            outputs[operand.identity, operand.target] = output
+        return outputs
+
+    def apply_updates(self) -> None:
+        """Concatenate every encounter at a target before invoking the author's batch math."""
+        for target in dict.fromkeys(operand.target for operand in self.pending):
+            records = tuple(operand for operand in self.pending if operand.target == target)
+            operand = replace(
+                records[0],
+                hidden=torch.cat(tuple(record.hidden for record in records)),
+                desired=torch.cat(tuple(record.desired for record in records)),
+            )
+            result = self.math.result(operand, self.values(target, True))
+            self.results.append(OverlayTargetResult(target, result))
+        if self.pending:
+            self.private = True
+        self.pending = []
+
+    def captures(self) -> tuple[RouteOperand, ...]:
+        """Export graph outputs independently of the cold request identity."""
+        return tuple(
+            RouteOperand(operand.target, operand.hidden, operand.desired, operand.base_weight)
+            for operand in self.pending
+        )
+
+    def collect(self, results: tuple[OverlayTargetResult, ...], pending: tuple[RouteOperand, ...]) -> None:
+        """Reconstruct invocation metadata from device outputs, including cached graph replays."""
+        row = self.data.step.rows.rows[self.row]
+        index = self.batch.selection.state_indices[self.row]
+        if self.batch.after_refs[index] != self.batch.selection.refs[index]:
+            for target, source in zip(self.batch.roots[index], self.storage.fields, strict=True):
+                target.copy_(source)
+        copied = tuple(
+            OverlayTargetResult(
+                item.target,
+                replace(
+                    item.update,
+                    output=item.update.output.clone(),
+                    changed=item.update.changed.clone(),
+                    update_count=item.update.update_count.clone(),
+                    trained_rows=item.update.trained_rows.clone(),
+                    metrics={key: value.clone() for key, value in item.update.metrics.items()},
+                ),
+            )
+            for item in results
+        )
+        if copied:
+            self.data.entries.append(
+                OverlayEntry(row.identity, self.batch.selection.refs[index], self.batch.after_refs[index], copied)
+            )
+        if not self.routed:
+            self.ordinary.extend(
+                CapturedParameterOperand(
+                    row.identity,
+                    operand.target,
+                    row.phase,
+                    operand.hidden.clone(),
+                    operand.desired.clone(),
+                    operand.weight,
+                )
+                for operand in pending
+            )
+
+    def finish(self) -> TaskOutput:
+        """Apply ordinary pinned rows once as a batch; routed trailing captures are discarded."""
+        grouped: list[CapturedParameterOperand] = []
+        for identity, target in dict.fromkeys((operand.identity, operand.target) for operand in self.ordinary):
+            records = tuple(
+                operand for operand in self.ordinary if (operand.identity, operand.target) == (identity, target)
+            )
+            grouped.append(
+                replace(
+                    records[0],
+                    hidden=torch.cat(tuple(record.hidden for record in records)),
+                    desired=torch.cat(tuple(record.desired for record in records)),
+                )
+            )
+        self.math(replace(self.data, step=replace(self.data.step, operands=tuple(grouped))), self.batch)
+        return TaskOutput(
+            counters=None
+            if not self.data.entries
+            else torch.stack(
+                tuple(
+                    torch.stack((target.update.update_count, target.update.trained_rows))
+                    for entry in self.data.entries
+                    for target in entry.targets
+                )
+            ).sum(0)
+        )

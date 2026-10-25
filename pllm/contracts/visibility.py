@@ -12,7 +12,7 @@ class Visibility:
 
     @staticmethod
     def forward_pinned() -> "Visibility":
-        """Keep all model reads on the state selected at forward entry."""
+        """Select the entry snapshot; explicit route update boundaries govern subsequent reads."""
         return Visibility("forward_pinned")
 
 
@@ -45,5 +45,5 @@ class VisibilitySource:
 
     @property
     def in_forward(self) -> bool:
-        """An Exact overlay runs its transition at the projection, inside the model forward."""
+        """Exact entry reads and ordinary projection updates use accumulated private state."""
         return self.scope == "overlay" and self.policy == Exact()

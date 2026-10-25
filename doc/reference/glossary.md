@@ -56,12 +56,11 @@
 - **回退（Fallback）** —— 签名原语之外的执行。其计数永远断言为零。
 - **Overlay** —— 模型执行时从状态字段应用的签名参数效果（稠密或低秩），
   与字段的生产方式无关。
-- **重放（Replay）** —— 签名重跑一个层区间（`ConditionalLayerReplay`）或逐
-  token 循环，由同一发布纪律内的逐层 KV 备份/恢复支撑。同一概念的四个
-  名字：`recirculation` 是场景/负载名（`pllm/workloads/recirculation.py`），
-  `Recurrence` 是负载作者的声明 DSL（`pllm/execution/replay.py`），
-  `TokenwiseLayerReplay` / tokenwise replay 是逐 token 循环的执行机制
-  （`pllm/execution/tokenwise_region.py`、`pllm/backends/vllm/replay.py`）。
+- **重放（Replay）** —— `layer_route` 定义逐 token 的层调用与返回 residual；
+  `recirculation` 是使用该接口的负载。组合一个训练 overlay 时，
+  `layers.apply_updates()` 消费捕获并改变本 token 后续读取的私有字段。
+  执行使用 `tokenwise_region.py` 和 vLLM 的稳定 token CUDA graph；状态仍由原
+  transition 与 publication 拥有。
 - **参考调度（Reference schedule）** —— 按程序原始语句顺序排列的那份
   schedule。它没有独立公开符号：构造在 Rust `region_dependence.rs::analyze`
   内部（`reference`），是容量与合法性的基线，也是测量路径的对照组。

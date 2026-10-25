@@ -5,8 +5,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Generic, TypeVar
 
 import torch
 
@@ -17,20 +17,17 @@ from pllm.contracts.region_imports import NativeKernelImport, RegionTensorImport
 from pllm.contracts.region_program import BorrowedResource, TensorType
 from pllm.contracts.region_selection import RegionSelectionPolicy
 from pllm.contracts.semantic_graph import (
-    ConditionalLayerReplay,
     ImplementationId,
     SemanticTask,
     TaskId,
     TaskSourceRegion,
     TokenProgramEffect,
 )
-from pllm.contracts.state_ref import StateRef
 from pllm.execution.decoder_region import DecoderActivation
 from pllm.execution.host_borrow import TraceResourceView
-from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin
+from pllm.execution.overlay_task import OverlayTransition, RouteOverlay, RouteOverlayStorage
 from pllm.execution.region_execution import RegionInvocation
 from pllm.execution.region_native import RegionFunction
-from pllm.execution.region_replay import ConditionalReplayRegion
 from pllm.execution.region_resources import (
     ExternalFunction,
     HostResourceBinding,
@@ -38,8 +35,13 @@ from pllm.execution.region_resources import (
     PinnedResourceBinding,
     ReadonlyResourceBinding,
     RegionPageOwner,
+    TensorResourceBinding,
 )
 from pllm.execution.region_streams import RegionStreamBindings
+from pllm.execution.region_values import Data
+from pllm.execution.tensor_frame import TensorFrame
+from pllm.execution.tensor_program import TaskOutput, TensorBatch, TensorOperation, _read  # pyright: ignore[reportPrivateUsage]
+from pllm.execution.token_program import update_function
 from pllm.execution.tokenwise_region import (
     TokenwiseRegion,
     compile_tokenwise_region,
@@ -51,11 +53,14 @@ if TYPE_CHECKING:
     from pllm.execution.state_execution import StateTaskContext
 
 DataT = TypeVar("DataT")
-REPLAY_IMPLEMENTATION = ImplementationId("canonical.layer_replay@1")
 TOKENWISE_REPLAY_IMPLEMENTATION = ImplementationId("canonical.tokenwise_layer_replay@1")
 
 
 class TokenwiseReplayPrimitive(ABC):
+    overlay: RouteOverlay | None = None
+    overlay_storage: RouteOverlayStorage | None = None
+    token_capture = False
+
     def run_region(self, invocation: RegionInvocation) -> tuple[torch.Tensor, ...]:
         """CPU models use the source interpreter with fresh invocation bindings."""
         return invocation.run()
@@ -124,6 +129,8 @@ class TokenwiseReplayTask(Generic[DataT]):
     region: TokenwiseRegion
     implementation_id: ImplementationId = TOKENWISE_REPLAY_IMPLEMENTATION
     policy: RegionSelectionPolicy = RegionSelectionPolicy()
+    operation: TensorOperation[DataT] | None = None
+    overlay_math: OverlayTransition | None = None
 
     @classmethod
     def from_implementation(
@@ -151,6 +158,8 @@ class TokenwiseReplayTask(Generic[DataT]):
         source_imports: tuple[RegionTensorImport, ...] = (),
         function_bodies: tuple[RegionFunctionBody, ...] = (),
         activations: tuple[DecoderActivation, ...] = (),
+        operation: TensorOperation[DataT] | None = None,
+        overlay_math: OverlayTransition | None = None,
     ) -> TokenwiseReplayTask[DataT]:
         effect = task.replay
         assert isinstance(effect, TokenProgramEffect)
@@ -174,16 +183,41 @@ class TokenwiseReplayTask(Generic[DataT]):
                 if name not in region.functions and name in {function.name for function in region.program.functions}
             }
         )
-        return cls(task, region, implementation_id, policy)
+        return cls(task, region, implementation_id, policy, operation, overlay_math)
 
     def execute(self, context: StateTaskContext[DataT]) -> None:
+        if self.operation is not None:
+            replace(self.operation, body=self._overlay_body).execute(context)
+        else:
+            self.run(context)
+
+    def _overlay_body(self, data: DataT, batch: TensorBatch, context: StateTaskContext[DataT] | None) -> TaskOutput:
+        assert context is not None and isinstance(data, TensorFrame) and self.overlay_math is not None
+        primitive = context.replay
+        assert isinstance(primitive, TokenwiseReplayPrimitive)
+        resource = next(resource for resource in self.region.program.resources if resource.name == "overlay")
+        assert isinstance(resource, BorrowedResource)
+        if primitive.overlay_storage is None:
+            primitive.overlay_storage = RouteOverlayStorage(resource, batch.roots[0])
+        primitive.overlay = RouteOverlay(self.overlay_math, batch, _read(context), primitive.overlay_storage, data)
+        try:
+            self.run(context)
+            return primitive.overlay.finish()
+        finally:
+            primitive.overlay = None
+
+    def run(self, context: StateTaskContext[DataT]) -> None:
         assert self.policy == context.arena.plan.timeline.region_policy
         primitive, effect = context.replay, self.task.replay
         assert isinstance(primitive, TokenwiseReplayPrimitive) and isinstance(effect, TokenProgramEffect)
         rows = primitive.rows
         task_id = TaskId(context.arena.plan.semantic_graph.tasks.index(self.task))
 
+        overlay = primitive.overlay
+
         def begin(index: int) -> tuple[torch.Tensor, torch.Tensor]:
+            if overlay is not None and not primitive.token_capture:
+                overlay.stage(index, effect.rows == "all" or rows[index].phase.value == effect.rows)
             return primitive.begin(rows[index])
 
         def layer(
@@ -204,7 +238,14 @@ class TokenwiseReplayTask(Generic[DataT]):
             context.trace.observe(context.invocation_id, task_id, "replay.hidden", hidden, row=rows[index], iteration=0)
 
         def commit(index: int, record: Callable[[], None]) -> None:
+            if overlay is not None and not primitive.token_capture:
+                overlay.collect(tuple(overlay.results), overlay.captures())
             primitive.commit(rows[index], record)
+
+        def apply_updates(inputs: tuple[Data, ...]) -> tuple[Data, ...]:
+            assert overlay is not None
+            overlay.apply_updates()
+            return ()
 
         def record(index: int) -> None:
             context.trace.record(
@@ -233,7 +274,18 @@ class TokenwiseReplayTask(Generic[DataT]):
                 run_region=primitive.run_region,
                 kernel_imports=primitive.kernel_imports,
                 function_bodies=primitive.function_bodies,
-                model_endpoints=primitive.model_endpoints(),
+                model_endpoints=(
+                    *primitive.model_endpoints(),
+                    *(
+                        ()
+                        if overlay is None
+                        or not any(
+                            function.name == "overlay.apply_updates@1" for function in self.region.program.functions
+                        )
+                        else (ExternalFunction(update_function(overlay.storage.resource), apply_updates),)
+                    ),
+                ),
+                overlay_borrows=() if overlay is None else (TensorResourceBinding(overlay.storage, context),),
                 activation_borrows=tuple(
                     primitive.bind_activation(resource, activation.binding.layer, context)
                     for resource, activation in zip(
@@ -243,92 +295,3 @@ class TokenwiseReplayTask(Generic[DataT]):
                 activation_selected=primitive.activation_selected,
             )
             primitive.finish(outputs)
-
-
-class LayerReplayPrimitive(Protocol):
-    @property
-    def rows(self) -> tuple[PackedPhaseRow, ...]: ...
-
-    def seed(self, row: PackedPhaseRow) -> torch.Tensor: ...
-
-    def step(
-        self, row: PackedPhaseRow, carry: torch.Tensor, arena: PageBundleArena, pin: PagePin, ref: StateRef
-    ) -> torch.Tensor: ...
-
-    def restore(self) -> None: ...
-
-
-@dataclass(frozen=True, slots=True)
-class ReplayStateTask(Generic[DataT]):
-    task: SemanticTask
-    region: ConditionalReplayRegion
-    implementation_id: ImplementationId = REPLAY_IMPLEMENTATION
-
-    def execute(self, context: StateTaskContext[DataT]) -> None:
-        # Conditional replay is explicitly eager and already observes GPU convergence.
-        if context.updated_mask is not None:
-            selected = tuple(bool(value) for value in context.updated_mask.cpu().unbind())
-            context.updated_refs = tuple(
-                ref for ref, active in zip(context.updated_refs, selected, strict=True) if active
-            )
-        publication = context.publication
-        if publication is None or not context.updated_refs:
-            return
-        effect, primitive = self.task.replay, context.replay
-        if (
-            not isinstance(effect, ConditionalLayerReplay)
-            or primitive is None
-            or isinstance(primitive, TokenwiseReplayPrimitive)
-        ):
-            raise RuntimeError("signed replay requires its bound model primitive")
-        if context.replay_started:
-            raise RuntimeError("published replay cannot be retried; settle the original invocation")
-        context.replay_started = True
-        pin = context.borrow_published(context.updated_refs)
-        try:
-            with (
-                torch.no_grad(),
-                nullcontext() if context.pin.stream is None else torch.cuda.stream(context.pin.stream),
-            ):
-                for row in primitive.rows:
-                    before = context.selection.ref_for(row.identity)
-                    if before not in publication.before_refs:
-                        continue
-                    ref = publication.after_refs[publication.before_refs.index(before)]
-                    if ref not in context.updated_refs:
-                        continue
-
-                    def step(carry: torch.Tensor) -> torch.Tensor:
-                        return primitive.step(row, carry, context.arena, pin, ref)
-
-                    def observe(result: torch.Tensor, iteration: int) -> None:
-                        context.trace.observe(
-                            context.invocation_id,
-                            TaskId(context.arena.plan.semantic_graph.tasks.index(self.task)),
-                            "replay.carry",
-                            result,
-                            row=row,
-                            iteration=iteration,
-                            refs=(ref,),
-                        )
-
-                    def record(iteration: int, relative: float | None) -> None:
-                        context.trace.record(
-                            TracePhase.REPLAY,
-                            context.invocation_id,
-                            task_id=TaskId(context.arena.plan.semantic_graph.tasks.index(self.task)),
-                            refs=(ref,),
-                            operation_id=publication.operation_id,
-                            pin_id=pin.pin_id,
-                            row=row,
-                            iteration=iteration,
-                            relative_l2=relative,
-                        )
-
-                    self.region.run(context, primitive.seed(row).detach(), step=step, observe=observe, record=record)
-                if context.cancel_requested.is_set():
-                    raise RuntimeError("conditional replay cancelled before completion")
-        except Exception:
-            with nullcontext() if context.pin.stream is None else torch.cuda.stream(context.pin.stream):
-                primitive.restore()
-            raise

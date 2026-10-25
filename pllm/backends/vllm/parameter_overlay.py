@@ -25,7 +25,7 @@ from pllm.contracts.parameter_overlay import (
 from pllm.contracts.state_ref import StateRef
 from pllm.execution.cuda_stream import upload
 from pllm.execution.module_graph import capture_module_calls
-from pllm.execution.overlay_task import ProjectionTransition
+from pllm.execution.overlay_task import ProjectionTransition, RouteOverlay
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.state_execution import DataT, StateTaskContext
 
@@ -178,7 +178,7 @@ class _ExactProjection:
             self.apply_count += selected.shape[0]
             if item.ref.version_id > 0:
                 self.updated_apply_count += selected.shape[0]
-        self.captures = captures
+        self.captures = () if isinstance(self.transition, RouteOverlay) else captures
         return base
 
     def capture(self, item: _PreparedRows, selected: torch.Tensor) -> CapturedParameterOperand:
@@ -214,6 +214,7 @@ class ExactParameterOverlay:
                 modules[id(module)] = _ExactProjection(module, mlp)
             modules[id(module)].bindings.append((binding, offset, size))
         self._modules = tuple(modules.values())
+        self._token_index = torch.zeros(1, dtype=torch.int64, device=self._modules[0].module.weight.device)
         for handle in self._modules:
             handle.module.forward = handle.forward
             if handle.mlp is not None:
@@ -249,8 +250,21 @@ class ExactParameterOverlay:
             handle.transition = transition
             handle.prepared, handle.total_rows = tuple(prepared), rows.total_rows
 
+    def prepare_token(self, row: PackedPhaseRow, transition: RouteOverlay) -> None:
+        """Bind one row to the shared projection capture integration for this route occurrence."""
+        index = transition.batch.selection.state_indices[transition.row]
+        for handle in self._modules:
+            handle.transition = transition
+            handle.prepared = tuple(
+                _PreparedRows(row, transition.batch.after_refs[index], self._token_index, binding, offset, size)
+                for binding, offset, size in handle.bindings
+            )
+            handle.captures, handle.total_rows = (), 1
+
     def take_captures(self) -> tuple[CapturedParameterOperand, ...]:
         for handle in self._modules:
+            if isinstance(handle.transition, RouteOverlay):
+                continue
             expected = sum(handle.captures_binding(item.binding) for item in handle.prepared)
             assert len(handle.captures) == expected
             handle.captures = ()

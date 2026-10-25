@@ -6,7 +6,7 @@ import torch
 
 import pllm
 from pllm import TensorUpdate
-from pllm.model import ConditionalLayerReplay, ParameterTarget
+from pllm.model import ParameterTarget
 from pllm.workloads.chunk_tail import join_tail, save_tail
 
 
@@ -20,7 +20,6 @@ class InPlaceTTTConfig:
     update_prefill: bool = True
     update_decode: bool = False
     visibility: pllm.Visibility = pllm.Visibility.forward_pinned()
-    replay: ConditionalLayerReplay | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -71,7 +70,6 @@ class InPlaceTTTWorkload(pllm.Workload):
         weight="delta",
         prefill=pllm.Config("config.update_prefill"),
         decode=pllm.Config("config.update_decode"),
-        replay=pllm.Config("config.replay"),
     )
     def transition(
         self,

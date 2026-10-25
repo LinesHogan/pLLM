@@ -64,29 +64,29 @@ class MyLoRA(pllm.Workload):
 两个边界提前说清：后端目前定位 MLP down 与 attention q/v 投影；overlay
 不能用共享前缀缓存（绑定时就拒绝，不是运行时才出错）。
 
-## 重放：让更新立即生效
+## 层路由：让更新当步生效
 
-**要解决的问题**：默认情况下，decode 步的更新要等下一步才可见。如果算法
-（比如 In-Place-TTT）要求更新**当步**生效，就需要重放。
+在同一 workload 上组合一个训练 overlay 与 `@pllm.layer_route(tokens="decode")`。
+`layers(...)` 读取当前可见版本并捕获操作数；`layers.apply_updates()` 将上个边界后
+同一 target 的全部操作数按访问顺序拼接，执行 overlay transition。后续层调用读取
+该 token 的私有字段。空边界不改变可见版本；最后一个边界之后的捕获被丢弃。
+整个步骤复用同一个私有根，结束时由原 publication 发布，包括只更新尾部 buffer 的情况。
 
-`replay=pllm.model.ConditionalLayerReplay((5, 8))` 声明一组升序层：对选中 token，
-用发布后的状态按序重跑这些层。每个被重放的层覆盖自己的当前 KV 槽，集合外
-的层保留正常前向的 KV——混合 KV 是一种**声明过的近似**：它写进了签名，不是
-静默发生的。
+```python
+@pllm.layer_route(tokens="decode")
+def settle(self, layers: pllm.Layers) -> torch.Tensor:
+    taps = layers()
+    layers.apply_updates()
+    for _ in range(2):
+        layers(start=22, stop=24, hidden=taps[21])
+    return taps[-1]
+```
 
-**replay 和重新生成差在哪？** 重放不重解码：logits 与 RNG 原样保留，只有
-选中 token 在签名层集合上的层输出被重算，KV 原位覆盖。它是一个有界、带收敛
-判据的层区间重跑，不是第二次生成。
-
-两条纪律保证这个近似可控。其一，每个被重放的层必须被签名 overlay 的 target
-覆盖——没有补丁的层没有重放的意义，绑定直接拒绝。其二，replay 复用原始的
-发布版本，且只对 `changed=True` 的状态运行：只动了尾部 buffer 的发布不会触发
-重放。教程 04 的"层循环"一节有"重放 vs 不重放"的并排对照，可以直观看差别。
-
-**只想逐 token 循环 hidden，不想动权重呢？** 那是另一条路：在负载上声明一个
-独立的 `pllm.model.Recurrence(source_layer=-1, destination_layer=0, alpha=1.0,
-beta=None, ramp_tokens=0)` 属性即可，无需任何状态（教程 04 的"步循环"一节）。
-代价是它必须独占负载：与普通训练/激活操作混用会在绑定时报错。
+返回值决定采样；示例保留第一遍输出。层调用覆盖当前 token 对应层的 KV，历史槽
+保持不变。未选中的行遵循 overlay 的普通行为。入口读取遵循 `forward_pinned`
+或 `Exact()`；显式边界之后的私有读取由路由源程序表达。
+目前支持有界 Python `for` 循环；被追踪的 `while_loop` 会提示改用有界 for-loop。
+逐 token 的 hidden 循环可直接使用独立 `layer_route`，无需 overlay。
 
 ## 外部生产的 overlay（SHINE 式）
 
@@ -130,7 +130,7 @@ INHERIT 保留原作用域的版本选择，STEP 每步读取本 invocation 新�
 单独声明 HOLD 不会给任意缺根图添加保持能力，完整生命周期见
 [状态与记忆](state-and-memory.md#没有新特征时签署的-hold--stop)。
 
-Activation 可与 Recurrence 组合：注入在 DecoderSource 层输出之后、tap 之前，
+Activation 可与 `layer_route` 组合：注入在 DecoderSource 层输出之后、tap 之前，
 normal/replay 使用同一 ref 和选择位；低秩算子用 replay 新 hidden 重算 delta，
 ADD 不在已注入的结果上重复累加。HOLD 的 source 数学与正常输入相同，只改变
 签署的版本来源；borrowed 输入生产组全部关闭，模型 READ 仍精确绑定 inject。
@@ -145,10 +145,9 @@ prefix caching 仍拒绝组合；没有按注入版本 cache_salt 键控或历�
 
 ## 组合边界：失败关闭
 
-overlay、激活与两种 replay 是彼此独立的声明。**可表达不等于支持任意组合**：
-后端能力检查拒绝不支持的组合，拒绝发生在绑定或安装时——失败关闭，不是静默
-降级。共享前缀缓存与 overlay/重放不兼容、Recurrence 不能与普通训练混用，
-都是这一纪律的实例。
+一个 `layer_route` 可以独立执行，或与一个训练 overlay、一个 Activation 分别
+组合。多个 overlay、外部导入 overlay 加路由、三方组合不在当前支持范围内。
+后端在绑定或安装时拒绝不支持的组合。共享前缀缓存仍与 overlay/层路由不兼容。
 
 精确语义（TensorUpdate 字段、changed 与发布、copy_fields、容量声明）见
 [创作契约](../reference/authoring-contract.md#请求-overlay)。

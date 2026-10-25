@@ -53,7 +53,7 @@ python test/gpu/vllm_inplace_ttt_smoke.py
 python test/gpu/vllm_tlm_smoke.py --mode online
 python test/gpu/vllm_tlm_smoke.py --mode offline
 python test/gpu/vllm_reft_smoke.py
-python test/gpu/vllm_conditional_replay_smoke.py
+python test/gpu/vllm_route_updates_smoke.py
 python test/gpu/vllm_override_smoke.py
 python test/gpu/vllm_recirculation_smoke.py
 python test/gpu/esamp_cuda_graph_replay_smoke.py

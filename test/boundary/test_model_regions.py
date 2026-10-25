@@ -43,7 +43,6 @@ from pllm.contracts.region_program import (
     TensorType,
     Value,
 )
-from pllm.contracts.semantic_graph import ConditionalLayerReplay
 from pllm.execution.decoder_region import DecoderRegion
 from pllm.execution.paged_access import PagedLayer, PagedResourceView, bind_paged_access
 from pllm.execution.region_compilation import (
@@ -52,7 +51,6 @@ from pllm.execution.region_compilation import (
     lower_region_schedule,
 )
 from pllm.execution.region_execution import RegionExecution
-from pllm.execution.region_replay import ConditionalReplayRegion
 from pllm.execution.region_resources import (
     PagedResourceBinding,
     ReadonlyResourceBinding,
@@ -212,54 +210,6 @@ def test_model_source_exposes_kv_before_feed_forward_without_weakening_causality
     lower_region_schedule(expanded, "{ S0[] -> [0]; S1[] -> [2]; S2[] -> [1]; S3[] -> [3] }")
     with pytest.raises(ValueError):
         lower_region_schedule(expanded, "{ S0[] -> [1]; S1[] -> [2]; S2[] -> [0]; S3[] -> [3] }")
-
-
-@pytest.mark.parametrize(
-    "limit,mode,cuda", ((0, "same", False), (6, "converge", True), (4, "converge", False), (4, "nonfinite", True))
-)
-def test_replay_control_matches_the_plain_loop(cuda, limit, mode):
-    if cuda and not torch.cuda.is_available():
-        pytest.skip("requires CUDA")
-    stream = torch.cuda.Stream() if cuda else None
-    execution, _, rows, _ = owner_fixture(rounds=1, stream=stream)
-    invocation = execution.start_step(rows, stream)
-    initial = torch.ones((1, 2), device=execution.arena.device)
-    effect = ConditionalLayerReplay((0,), max_iterations=limit, relative_l2_ppm=100_000)
-    replay = ConditionalReplayRegion(TensorType((1, 2), "torch.float32", str(initial.device)), effect)
-    observed = []
-
-    def step(carry):
-        if stream is not None:
-            assert torch.cuda.current_stream(initial.device) == stream
-        return carry * float("inf") if mode == "nonfinite" else carry * 0.5 + 0.25
-
-    with torch.cuda.stream(stream) if stream is not None else torch.no_grad():
-        run = lambda: replay.run(  # noqa: E731
-            invocation.context,
-            initial,
-            step=step,
-            observe=lambda value, i: observed.append(value.clone()),
-            record=lambda i, relative: None,
-        )
-        if mode == "nonfinite":
-            with pytest.raises(RuntimeError):
-                run()
-        else:
-            run()
-    if stream is not None:
-        torch.cuda.current_stream().wait_stream(stream)
-    # The plain loop: stop at the limit or once the relative change is at most 10%.
-    expected, carry = [], initial
-    for _ in range(0 if mode == "nonfinite" else limit):
-        result = carry * 0.5 + 0.25
-        expected.append(result)
-        if len(expected) > 1 and float((result - carry).norm() / carry.norm()) <= 0.1:
-            break
-        carry = result
-    if mode != "nonfinite":
-        torch.testing.assert_close(observed, expected, rtol=0, atol=0)
-    execution.cancel_step(invocation)
-    execution.retire(tuple(row.identity for row in rows))
 
 
 def test_decoder_binds_request_and_token_for_symbolic_kv_access():

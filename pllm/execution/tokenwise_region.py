@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from copy import copy
+from dataclasses import replace
 from functools import lru_cache, partial
 from math import prod
 from types import MappingProxyType
@@ -76,6 +77,7 @@ from pllm.execution.region_resources import (
     ReadonlyResourceBinding,
     RegionPageOwner,
     RegionResources,
+    TensorResourceBinding,
 )
 from pllm.execution.region_storage import analyze_region_payload, import_region_functions
 from pllm.execution.region_streams import RegionStreamBindings, arrange_region_schedule, plan_region_schedule
@@ -111,6 +113,8 @@ class TokenwiseRegion:
         self.trace = BorrowedResource("trace", ())
         self.activations = activations
         self.activation_resources = tuple(item.resource(max_rows) for item in activations)
+        self.overlay = next((resource for resource in source.program.resources if resource.name == "overlay"), None)
+        assert self.overlay is None or isinstance(self.overlay, BorrowedResource)
         self.normal = DecoderSource(
             tensor,
             tuple(range(effect.layer_count)),
@@ -120,6 +124,7 @@ class TokenwiseRegion:
             source_imports=source_imports,
             function_bodies=function_bodies,
             activations=activations,
+            overlay=self.overlay,
         )
         self.function_bodies = function_bodies
         index, boolean = ScalarType.INDEX, ScalarType.BOOL
@@ -144,6 +149,17 @@ class TokenwiseRegion:
         self.complete = Function(
             "tokenwise.complete@2:" + digest, (index, boolean), (), ("context", "trace"), (context_write, trace_write)
         )
+        if self.overlay is not None:
+            from pllm.execution.token_program import overlay_accesses
+
+            self.begin, self.complete = (
+                replace(
+                    function,
+                    resources=(*function.resources, self.overlay.name),
+                    accesses=(*function.accesses, *overlay_accesses(self.overlay)),
+                )
+                for function in (self.begin, self.complete)
+            )
         args = (
             Value("row", index),
             Value("request", index),
@@ -256,7 +272,14 @@ class TokenwiseRegion:
         self.program = Program(
             Region(Block(tuple(arguments), tuple(operations), tuple(rows))),
             tuple(declarations.values()),
-            (self.context, self.kv, self.trace, self.weights, *self.activation_resources),
+            (
+                self.context,
+                self.kv,
+                self.trace,
+                self.weights,
+                *self.activation_resources,
+                *(() if self.overlay is None else (self.overlay,)),
+            ),
             tuple(parameters),
             tuple(constraints),
         )
@@ -270,6 +293,7 @@ class TokenwiseRegion:
         retained = tokenwise_retained_bytes(tensor.shape[1], width, domain.layers, domain.positions) + sum(
             prod(field.shape) * width for activation in activations for field in activation.fields
         )
+        retained += 0 if self.overlay is None else self.overlay.domain[0]
         self.retained = (
             RetainedAllocation(
                 "tokenwise.buffers",
@@ -485,6 +509,7 @@ class TokenwiseRegion:
         function_bodies: tuple[RegionFunctionBody, ...] = (),
         model_endpoints: tuple[ExternalFunction, ...] = (),
         activation_borrows: tuple[PinnedResourceBinding | ReadonlyResourceBinding, ...] = (),
+        overlay_borrows: tuple[TensorResourceBinding, ...] = (),
         activation_selected: Callable[[int, int], bool] | None = None,
     ) -> tuple[torch.Tensor, ...]:
         assert function_bodies == self.function_bodies
@@ -537,6 +562,13 @@ class TokenwiseRegion:
             for endpoint in (*self.normal.externals(layer, kernel_imports), *model_endpoints)
         }
 
+        if self.overlay is not None:
+            layer_endpoints.update(
+                (function.name, ExternalFunction(function, self.normal.externals(layer)[0].function))
+                for function in self.program.functions
+                if function.name.startswith(("decoder.first_layer@", "decoder.next_layer@"))
+            )
+
         def activation_endpoint(activation: DecoderActivation) -> ExternalFunction:
             def selected(inputs: tuple[Data, ...]) -> tuple[Data, ...]:
                 (row,) = inputs
@@ -564,7 +596,7 @@ class TokenwiseRegion:
                 *(activation_endpoint(item) for item in self.activations),
             ),
             sizes=sizes,
-            borrows=(kv, weights, context, trace, *activation_borrows),
+            borrows=(kv, weights, context, trace, *activation_borrows, *overlay_borrows),
             tensor_borrows=tuple(item for item in self.imports if isinstance(item, BorrowedTensorImport)),
         )
         invocation = RegionInvocation(self.execution, inputs, resources, sizes, streams, eligible, observe, record)

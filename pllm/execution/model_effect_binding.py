@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from math import isfinite
+from math import isfinite, prod
 from typing import TYPE_CHECKING
 
 import torch
@@ -18,21 +18,22 @@ from pllm.contracts.backend_attachment import (
     ActivationPatchBinding,
     ActivationPatchOperator,
     AttachmentKind,
+    AttachmentTaskRole,
     DecodeRefresh,
     DecodeWindow,
     MissingPolicy,
 )
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
-    CapturedParameterOperand,
     ParameterOverlayFieldBinding,
     ParameterOverlayOperator,
     ParameterTarget,
 )
-from pllm.contracts.region_program import TensorType
+from pllm.contracts.region_program import BorrowedResource, TensorType
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.semantic_graph import (
-    ConditionalLayerReplay,
+    PackedRowsInputSource,
+    SemanticInput,
     StateEffectKind,
     StateResource,
     StateScope,
@@ -43,13 +44,12 @@ from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 from pllm.contracts.visibility import Exact, Visibility, VisibilitySource
 from pllm.execution.declaration import Call, Dimensions, State, When, native
 from pllm.execution.decoder_region import decoder_activations
+from pllm.execution.overlay_task import OverlayTransition
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.region_storage import import_region_functions
 from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION
 from pllm.execution.shared_tensor import tensor_dtype
 from pllm.execution.tensor_frame import (
-    OverlayEntry,
-    OverlayTargetResult,
     TensorFrame,
     Tensors,
     TensorUpdate,
@@ -59,7 +59,7 @@ from pllm.execution.tensor_program import (
     TaskOutput,
     TensorBatch,
 )
-from pllm.execution.token_program import Layers, TokenProgram, Tokens
+from pllm.execution.token_program import ApplyUpdates, Layers, Segment, TokenProgram, Tokens
 from pllm.kernels.head_overlay import head_correction
 
 if TYPE_CHECKING:
@@ -145,96 +145,6 @@ def _check_overlay_shapes(
             raise ValueError("overlay fields must match their operator, target shape and dtype")
 
 
-@dataclass(frozen=True, slots=True)
-class OverlayTransition:
-    """Request/target adaptation shared by source and explicitly lowered math.
-
-    Replacing this immutable callable during binding changes only the imported
-    mathematics. The original TensorOperation still owns private-page access.
-    """
-
-    buffers: tuple[str, ...]
-    targets: tuple[ParameterTarget, ...]
-    phases: tuple[HiddenPhase, ...]
-    apply: Callable[[torch.Tensor, Tensors], torch.Tensor]
-    function: Callable[[Tensors], TensorUpdate]
-    visibility: VisibilitySource
-
-    def __call__(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
-        operands = {
-            (operand.identity, operand.target): operand
-            for operand in data.step.operands
-            if self.visibility.in_forward or operand.phase in self.phases
-        }
-        if not operands:
-            return TaskOutput()
-        start = len(data.entries)
-        changed: dict[int, torch.Tensor] = {}
-        with torch.no_grad():
-            for row, index in zip(batch.selection.rows, batch.selection.state_indices, strict=True):
-                results: list[OverlayTargetResult] = []
-                for target_index, target in enumerate(self.targets):
-                    if (row.identity, target) not in operands:
-                        continue
-                    operand = operands[row.identity, target]
-                    values = dict(
-                        zip(
-                            self.buffers,
-                            batch.roots[index][
-                                len(self.buffers) * target_index : len(self.buffers) * (target_index + 1)
-                            ],
-                            strict=True,
-                        )
-                    )
-                    result = self.result(operand, values)
-                    results.append(OverlayTargetResult(target, result))
-                    changed[index] = result.changed if index not in changed else changed[index] | result.changed
-                if results:
-                    data.entries.append(
-                        OverlayEntry(row.identity, batch.selection.refs[index], batch.after_refs[index], tuple(results))
-                    )
-        return TaskOutput(
-            residuals={
-                (entry.identity, target.target): target.update.output
-                for entry in data.entries[start:]
-                for target in entry.targets
-            },
-            changed=tuple(changed),
-            update_mask=torch.stack(tuple(changed.values())),
-            counters=torch.stack(
-                tuple(
-                    torch.stack((target.update.update_count, target.update.trained_rows))
-                    for entry in data.entries[start:]
-                    for target in entry.targets
-                )
-            ).sum(0),
-        )
-
-    def result(self, operand: CapturedParameterOperand, values: Tensors) -> TensorUpdate:
-        """Validate the author's result at its tensor boundary without observing CUDA values."""
-        result = (
-            self.function({**values, "input": operand.hidden, "target": operand.desired, "weight": operand.base_weight})
-            if operand.phase in self.phases
-            else TensorUpdate.unchanged(self.apply(operand.hidden, values))
-        )
-        if (
-            result.output.shape != operand.desired.shape
-            or result.output.dtype not in (operand.hidden.dtype, torch.float32)
-            or result.output.device != operand.hidden.device
-        ):
-            raise ValueError("overlay output differs from its target shape, dtype or device")
-        if any(
-            value.shape != () or value.device != operand.hidden.device or value.dtype != dtype
-            for value, dtype in (
-                (result.changed, torch.bool),
-                (result.update_count, torch.int64),
-                (result.trained_rows, torch.int64),
-            )
-        ):
-            raise ValueError("overlay counters need a bool changed flag and int64 counts on the operand device")
-        return result
-
-
 class ModelEffectBinding(TensorBindingBase):
     """Declare model-side effects and their request-state transitions."""
 
@@ -259,7 +169,6 @@ class ModelEffectBinding(TensorBindingBase):
         namespace: str,
         keys: tuple[RequestKeyField, ...],
         phases: tuple[HiddenPhase, ...],
-        replay: ConditionalLayerReplay | None,
         identity: str,
         operator: ParameterOverlayOperator,
         scale: float,
@@ -327,6 +236,8 @@ class ModelEffectBinding(TensorBindingBase):
             0,
             "carry" if visibility == Exact() else "transition",
         )
+        math = OverlayTransition(tuple(buffers), targets, phases, apply, function, source)
+        self.overlay_math = math
         transition = self.compute(
             name,
             inputs={"operands": self.input("parameter.operands", "dense_pairs", "canonical.dense_operand_pairs@1")},
@@ -334,7 +245,7 @@ class ModelEffectBinding(TensorBindingBase):
             changes=state,
             effect=StateEffectKind.TRANSITION_MAYBE,
             when=When.MODEL_UPDATE,
-            function=OverlayTransition(tuple(buffers), targets, phases, apply, function, source),
+            function=math,
             select=select,
             implementations=(
                 native(identity + ":cpu", "compute/cpu@1", "transition/full_root@1"),
@@ -372,8 +283,6 @@ class ModelEffectBinding(TensorBindingBase):
                 for i, target in enumerate(targets)
             ),
         )
-        if replay is not None:
-            self.replay(publication, state, replay)
 
     def write_result(self, source: Call, state: State, field: str) -> Call:
         """Lower one computed tensor to a private field update."""
@@ -557,18 +466,56 @@ class ModelEffectBinding(TensorBindingBase):
 
     def layer_route(self, function: Callable[[Layers], torch.Tensor], tokens: Tokens) -> None:
         """Trace a user route and sign its complete model/tensor source before planning."""
+        if any(task.replay is not None for task in self.graph.tasks):
+            raise ValueError("compose one layer_route with one trained overlay")
         activation = self.attachment is not None and self.attachment.kind is AttachmentKind.ACTIVATION_PATCH
-        if self.host or (not activation and (self.attachment is not None or self.graph.tasks or self.graph.states)):
-            raise ValueError("layer_route requires a standalone model effect or Activation composition")
-        forward = self.compute(
-            "forward",
-            inputs={"rows": self.rows()},
-            outputs=("normal_hidden",),
-            when=When.MODEL_UPDATE,
-            replay=None if self.dimensions is None else TokenProgramEffect(self.dimensions.layer_count, tokens),
-            implementations=(native(TOKENWISE_REPLAY_IMPLEMENTATION, "model/tokenwise_replay@1"),),
+        composed = (
+            self.attachment is not None
+            and self.attachment.kind is AttachmentKind.PARAMETER_OVERLAY
+            and self.overlay_math is not None
         )
-        self.model_effect(forward, AttachmentKind.MODEL_REPLAY)
+        if self.host or (
+            not activation and not composed and (self.attachment is not None or self.graph.tasks or self.graph.states)
+        ):
+            raise ValueError("layer_route requires a standalone effect, Activation or one trained parameter overlay")
+        effect = None if self.dimensions is None else TokenProgramEffect(self.dimensions.layer_count, tokens)
+        if composed:
+            assert self.attachment is not None
+            symbol = next(symbol for role, symbol in self.attachment.tasks if role is AttachmentTaskRole.TRANSITION)
+            self.graph = replace(
+                self.graph,
+                tasks=tuple(
+                    replace(
+                        task,
+                        replay=effect,
+                        inputs=(*task.inputs, SemanticInput("rows", PackedRowsInputSource())),
+                        implementations=tuple(
+                            replace(
+                                implementation,
+                                required_capabilities=tuple(
+                                    sorted((*implementation.required_capabilities, "model/tokenwise_replay@1"))
+                                ),
+                            )
+                            for implementation in task.implementations
+                        ),
+                    )
+                    if task.symbol == symbol
+                    else task
+                    for task in self.graph.tasks
+                ),
+            )
+            self.operations[symbol] = replace(self.operations[symbol], version="private")
+        else:
+            forward = self.compute(
+                "forward",
+                inputs={"rows": self.rows()},
+                outputs=("normal_hidden",),
+                when=When.MODEL_UPDATE,
+                replay=effect,
+                implementations=(native(TOKENWISE_REPLAY_IMPLEMENTATION, "model/tokenwise_replay@1"),),
+            )
+            symbol = forward.symbol
+            self.model_effect(forward, AttachmentKind.MODEL_REPLAY)
 
         if self.probe is not None:
             probe = self.probe
@@ -582,14 +529,64 @@ class ModelEffectBinding(TensorBindingBase):
             activations = decoder_activations(
                 self.attachment.activation_bindings, self.layouts, self.attachment.state_resource, tensor.device
             )
-            program, self.route_functions = TokenProgram.capture(function, tensor, probe.causal_domain.layers).lower(
-                tensor, probe.causal_domain, probe.max_packed_rows, activations
+            captured = TokenProgram.capture(function, tensor, probe.causal_domain.layers)
+            self.route_rows = probe.max_packed_rows * max(1, sum(isinstance(step, Segment) for step in captured.steps))
+            pending = False
+            for step in captured.steps:
+                if isinstance(step, Segment):
+                    pending |= any(step.start <= target.layer < step.stop for target in self.overlay_targets)
+                elif isinstance(step, ApplyUpdates):
+                    self.route_updates |= pending
+                    pending = False
+            if composed:
+                phases, updates = self.parameter_phases, self.route_updates
+
+                def select(data: TensorFrame, selection: RequestStateSelection) -> tuple[int, ...]:
+                    return tuple(
+                        sorted(
+                            {
+                                index
+                                for row, index in zip(selection.rows, selection.state_indices, strict=True)
+                                if row.phase in phases
+                                and (updates or not (tokens == "all" or row.phase.value == tokens))
+                            }
+                        )
+                    )
+
+                self.operations[symbol] = replace(self.operations[symbol], select=select)
+            program, self.route_functions = captured.lower(
+                tensor,
+                probe.causal_domain,
+                probe.max_packed_rows,
+                activations,
+                None if not composed else BorrowedResource("overlay", (self.overlay_bytes(captured),)),
             )
             self.graph = replace(
                 self.graph,
                 source_regions=(
                     TaskSourceRegion(
-                        forward.symbol, "layer_route", program, import_region_functions(program, self.route_functions)
+                        symbol, "layer_route", program, import_region_functions(program, self.route_functions)
                     ),
                 ),
             )
+
+    def overlay_bytes(self, program: TokenProgram) -> int:
+        """Fund token staging, captured operands and per-boundary device effects from source bounds."""
+        assert self.attachment is not None and self.dimensions is not None and self.probe is not None
+        fields = tuple(field for layout in self.layouts.layouts for field in layout.layout.fields)
+
+        return (
+            3
+            * sum(
+                prod(field.shape) * (8 if field.dtype in (TensorDType.INT64, TensorDType.FLOAT64) else 4) + 8
+                for field in fields
+            )
+            + self.probe.max_packed_rows
+            * sum(
+                16 * (inputs + outputs) + 128
+                for target, (inputs, outputs) in zip(self.overlay_targets, self.dimensions.target_shapes, strict=True)
+                for step in program.steps
+                if isinstance(step, Segment) and step.start <= target.layer < step.stop
+            )
+            + 1024
+        )

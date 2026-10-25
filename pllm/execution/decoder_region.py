@@ -244,6 +244,7 @@ class DecoderSource:
         source_imports: tuple[RegionTensorImport, ...] = (),
         function_bodies: tuple[RegionFunctionBody, ...] = (),
         activations: tuple[DecoderActivation, ...] = (),
+        overlay: BorrowedResource | None = None,
     ) -> None:
         if (
             not layers
@@ -278,8 +279,13 @@ class DecoderSource:
         layer_ids = BankType(index, len(layers))
         if weights is not None and weights.domain != (domain.layers + 1,):
             raise ValueError("decoder weight family requires one cell per layer and final normalization")
-        resources = (context.name, "kv", *(() if weights is None else (weights.name,)))
-        identity = boundary_digest(tensor, layers, domain, taps, weights, context)
+        resources = (
+            context.name,
+            "kv",
+            *(() if weights is None else (weights.name,)),
+            *(() if overlay is None else (overlay.name,)),
+        )
+        identity = boundary_digest(tensor, layers, domain, taps, weights, context, overlay)
         accesses = (
             ResourceAccess(
                 "kv",
@@ -294,6 +300,10 @@ class DecoderSource:
                 else ()
             ),
         )
+        if overlay is not None:
+            from pllm.execution.token_program import overlay_accesses
+
+            accesses += overlay_accesses(overlay)
         self.kv = kv_resource(domain)
         self.first = Function(
             "decoder.first_layer@6:" + identity,
@@ -459,7 +469,13 @@ class DecoderSource:
         self.program = Program(
             Region(Block(entry, tuple(operations), returned)),
             tuple(declarations),
-            (context, self.kv, *(() if weights is None else (weights,)), *patch_resources),
+            (
+                context,
+                self.kv,
+                *(() if weights is None else (weights,)),
+                *patch_resources,
+                *(() if overlay is None else (overlay,)),
+            ),
         )
         if patch_body is not None:
             self.program = inline_function_bodies(self.program, (patch_body,))

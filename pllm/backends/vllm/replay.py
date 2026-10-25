@@ -7,34 +7,29 @@ from dataclasses import dataclass, replace
 from typing import Generic
 
 import torch
-from vllm.forward_context import ForwardContext, get_forward_context, override_forward_context
+from vllm.forward_context import get_forward_context, override_forward_context
 from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 
 from pllm.authoring import DataT, ResultT, TensorStepInput
 from pllm.backends.vllm.activation import VllmActivationPatch
-from pllm.backends.vllm.overlay_graph import PinnedParameterOverlay
+from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay
 from pllm.backends.vllm.region_attention import (
     TokenAttentionBuffers,
     attention_paged_access,
-    select_attention_metadata,
     validate_attention_resources,
 )
 from pllm.backends.vllm.region_kernels import VllmRmsNormKernel
 from pllm.backends.vllm.region_layers import VllmDecoderBodies
-from pllm.contracts.backend_attachment import CausalModelDomain
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.region_composition import RegionFunctionBody
 from pllm.contracts.region_imports import NativeKernelImport, RegionTensorImport
 from pllm.contracts.region_program import AccessMode, BorrowedResource, TensorType
-from pllm.contracts.semantic_graph import AnchorId, ConditionalLayerReplay, SemanticTask, TokenProgramEffect
-from pllm.contracts.state_ref import StateRef
+from pllm.contracts.semantic_graph import AnchorId, SemanticTask, TokenProgramEffect
 from pllm.execution.codec import boundary_digest
-from pllm.execution.decoder_region import DecoderRegion
 from pllm.execution.execution import TaskGraphInvocation
-from pllm.execution.paged_access import PagedAccessPlan, PagedResourceView, validate_paged_views
-from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin
+from pllm.execution.paged_access import PagedAccessPlan, PagedResourceView
 from pllm.execution.region_execution import RegionInvocation, RegionTokenCapture
 from pllm.execution.region_resources import (
     ExternalFunction,
@@ -45,174 +40,9 @@ from pllm.execution.region_resources import (
     RegionPageOwner,
 )
 from pllm.execution.region_values import Data
-from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION, TokenwiseReplayPrimitive, TokenwiseReplayTask
+from pllm.execution.replay import TokenwiseReplayPrimitive, TokenwiseReplayTask
 from pllm.execution.state_execution import StateExecution, StateTaskContext
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
-
-_DecoderForward = Callable[[torch.Tensor, torch.Tensor, torch.Tensor | None], tuple[torch.Tensor, torch.Tensor]]
-
-
-@dataclass(frozen=True, slots=True)
-class _ReplayInput:
-    row: PackedPhaseRow
-    positions: torch.Tensor
-    carry: torch.Tensor
-    metadata: dict[str, FlashAttentionMetadata]
-    slots: tuple[tuple[torch.Tensor, int, int], ...]
-    original_kv: tuple[torch.Tensor, ...]
-
-
-class VllmLayerReplay:
-    """Re-runs the signed ascending layer range per selected token; the hook sits
-    on the range's first layer only, deeper layers are replayed by direct call."""
-
-    def __init__(
-        self,
-        model: Qwen2ForCausalLM,
-        effect: ConditionalLayerReplay,
-        overlay: PinnedParameterOverlay,
-        domain: CausalModelDomain,
-    ) -> None:
-        layers = model.model.layers
-        if not effect.layers or tuple(sorted(set(effect.layers))) != effect.layers or effect.layers[-1] >= len(layers):
-            raise ValueError("conditional replay requires a sorted unique in-range layer set")
-        self.effect, self.overlay = effect, overlay
-        self.layers = tuple(layers[index] for index in effect.layers)
-        validate_attention_resources(
-            tuple(layer.self_attn.attn for layer in self.layers), hidden_size=model.config.hidden_size
-        )
-        self.originals: tuple[_DecoderForward, ...] = tuple(layer.forward for layer in self.layers)
-        tensor = TensorType(
-            (1, model.config.hidden_size), str(model.model.norm.weight.dtype), str(model.model.norm.weight.device)
-        )
-        self.region = DecoderRegion(tensor, effect.layers, domain)
-        self._owner: RegionPageOwner | None = None
-        self._kv: PagedResourceBinding | None = None
-        self._rows: tuple[PackedPhaseRow, ...] = ()
-        self._all_rows: tuple[PackedPhaseRow, ...] = ()
-        self._inputs: tuple[_ReplayInput, ...] = ()
-        self._forward_context: ForwardContext | None = None
-        self._materialized = False
-        self.layers[0].forward = self.forward
-
-    @property
-    def rows(self) -> tuple[PackedPhaseRow, ...]:
-        return self._rows
-
-    def prepare(self, rows: PackedPhaseRowBatch, owner: RegionPageOwner) -> None:
-        self.clear()
-        self._owner = owner
-        self._all_rows = rows.rows
-        self._rows = tuple(
-            row
-            for index, row in enumerate(rows.rows)
-            if index + 1 == len(rows.rows) or rows.rows[index + 1].identity != row.identity
-        )
-
-    def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor, residual: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not self._rows:
-            return self.originals[0](positions, hidden_states, residual)
-        context = get_forward_context()
-        access = attention_paged_access(context, tuple(layer.self_attn.attn for layer in self.layers), self._all_rows)
-        if self._owner is None:
-            raise RuntimeError("conditional KV binding requires its original invocation")
-        view = PagedResourceView(
-            self.region.source.kv,
-            access,
-            tuple(
-                (ordinal, layer.self_attn.attn.layer_name)
-                for ordinal, layer in zip(self.effect.layers, self.layers, strict=True)
-            ),
-        )
-        validate_paged_views((view,), self._owner.arena.allocation_ranges)
-        self._kv = PagedResourceBinding(view, self._owner)
-        prepared: list[_ReplayInput] = []
-        # Decoder residual addition is in-place; own only the selected token inputs.
-        for row in self._rows:
-            index = row.packed_row_index
-            carry = hidden_states[index : index + 1].detach()
-            carry = carry.clone() if residual is None else carry + residual[index : index + 1]
-            position = positions[index : index + 1]
-            length = row.token_offset + 1
-            sequence = torch.tensor([0, 1, length], dtype=torch.int32, device=carry.device)
-            metadata: dict[str, FlashAttentionMetadata] = {}
-            slots: list[tuple[torch.Tensor, int, int]] = []
-            originals: list[torch.Tensor] = []
-            for layer in self.layers:
-                selected, cache, block, offset = select_attention_metadata(
-                    context, layer.self_attn.attn, row, length, sequence, access
-                )
-                metadata[layer.self_attn.attn.layer_name] = selected
-                slots.append((cache, block, offset))
-                originals.append(cache[block, :, offset, :])
-            prepared.append(_ReplayInput(row, position, carry, metadata, tuple(slots), tuple(originals)))
-        output = self.originals[0](positions, hidden_states, residual)
-        # Views follow the in-place KV writes; deeper layers write their slot only
-        # after this hook returns. Clone at the first replay step — after the normal
-        # forward finished, before any replay write — so restore returns the
-        # successful normal token, not the pre-forward or replayed KV.
-        self._inputs = tuple(prepared)
-        self._forward_context = context
-        return output
-
-    def seed(self, row: PackedPhaseRow) -> torch.Tensor:
-        return next(item.carry for item in self._inputs if item.row is row)
-
-    def step(
-        self, row: PackedPhaseRow, carry: torch.Tensor, arena: PageBundleArena, pin: PagePin, ref: StateRef
-    ) -> torch.Tensor:
-        if self._forward_context is None or self._owner is None or self._owner.arena is not arena or self._kv is None:
-            raise RuntimeError("replay requires its original normal forward context")
-        original_context = self._forward_context
-        if not self._materialized:
-            self._inputs = tuple(
-                replace(item, original_kv=tuple(original.clone() for original in item.original_kv))
-                for item in self._inputs
-            )
-            self._materialized = True
-        item = next(item for item in self._inputs if item.row is row)
-
-        def forward(
-            index: int, positions: torch.Tensor, hidden: torch.Tensor, residual: torch.Tensor | None
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            ordinal = self.effect.layers.index(index)
-            layer = self.layers[ordinal]
-            name = layer.self_attn.attn.layer_name
-            metadata = item.metadata[name]
-            context = replace(
-                original_context,
-                attn_metadata={name: metadata},
-                slot_mapping={name: metadata.slot_mapping},
-                batch_descriptor=None,
-                is_padding=None,
-            )
-            self.overlay.prepare_replay(row, index, arena, pin, ref)
-            try:
-                with override_forward_context(context):
-                    return self.originals[ordinal](positions, hidden, residual)
-            finally:
-                self.overlay.clear()
-
-        hidden, residual = self.region.run(self._owner, row, item.positions, carry, forward, kv=self._kv)
-        return hidden + residual
-
-    def restore(self) -> None:
-        for item in self._inputs:
-            for (cache, block, offset), original in zip(item.slots, item.original_kv, strict=True):
-                cache[block, :, offset, :].copy_(original)
-
-    def clear(self) -> None:
-        self._rows, self._inputs, self._forward_context = (), (), None
-        self._all_rows = ()
-        self._owner = None
-        self._kv = None
-        self._materialized = False
-
-    def close(self) -> None:
-        self.clear()
-        self.layers[0].forward = self.originals[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +65,8 @@ class _TokenContextView(Generic[DataT, ResultT]):
 class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
     """Model kernels bound to the original signed task and invocation."""
 
+    token_capture = True
+
     def __init__(
         self,
         model: Qwen2ForCausalLM,
@@ -245,6 +77,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         source_imports: tuple[RegionTensorImport, ...] = (),
         function_bodies: tuple[RegionFunctionBody, ...] = (),
         activation: VllmActivationPatch | None = None,
+        overlay: ExactParameterOverlay | None = None,
     ) -> None:
         if not isinstance(task.replay, TokenProgramEffect) or task.replay.layer_count != len(model.model.layers):
             raise ValueError("tokenwise replay differs from the specialized model")
@@ -252,9 +85,15 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
             tuple(layer.self_attn.attn for layer in model.model.layers), hidden_size=model.config.hidden_size
         )
         self.model, self.effect = model.model, task.replay
+        self.projections = overlay
+        self.implementation_id = next(
+            item.implementation_id
+            for item in execution.arena.plan.schedule_physical.tasks
+            if execution.arena.plan.semantic_graph.tasks[item.task_id].symbol == task.symbol
+        )
         self._capacity = (
             TokenwiseReplayTask[DataT]
-            .from_implementation(execution.implementation(TOKENWISE_REPLAY_IMPLEMENTATION))
+            .from_implementation(execution.implementation(self.implementation_id))
             .region.domain.positions
         )
         self.activation = activation
@@ -267,9 +106,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         self._layer_bodies: VllmDecoderBodies | None = None
         if function_bodies:
             source = (
-                TokenwiseReplayTask[DataT]
-                .from_implementation(execution.implementation(TOKENWISE_REPLAY_IMPLEMENTATION))
-                .region
+                TokenwiseReplayTask[DataT].from_implementation(execution.implementation(self.implementation_id)).region
             )
             self._layer_bodies = VllmDecoderBodies.inspect(
                 tuple(self.model.layers), tensor, source.domain, source.context.domain[0]
@@ -281,7 +118,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
             raise ValueError("local model sources differ from the signed backend catalog")
         if self._layer_bodies is not None:
             implementation = TokenwiseReplayTask[DataT].from_implementation(
-                execution.implementation(TOKENWISE_REPLAY_IMPLEMENTATION)
+                execution.implementation(self.implementation_id)
             )
             missing = {
                 function.name for function in implementation.region.program.functions
@@ -410,10 +247,15 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
     def run_region(self, invocation: RegionInvocation) -> tuple[torch.Tensor, ...]:
         """Stage packed rows and submit source-derived token graphs on the owner stream."""
         assert self._hidden is not None and self._positions is not None and self._invocation is not None
+        invocation.overlay = self.overlay
         bindings = self._prepare_attention(invocation)
         self._prepare_activations(invocation)
         signatures = tuple(
-            (enabled, tuple(bool(fields) for fields in self._activation_rows[index]) if self._activation_rows else ())
+            (
+                enabled,
+                (tuple(bool(fields) for fields in self._activation_rows[index]) if self._activation_rows else ())
+                + (() if self.overlay is None else (self._rows[index].phase.value == "decode",)),
+            )
             for index, enabled in enumerate(invocation.eligible)
         )
         outputs = torch.empty_like(self._hidden)
@@ -426,8 +268,14 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
                 for handle, fields in zip(self.activation.layers, self._activation_rows[index], strict=True):
                     for target, field in zip(self._activation_fields.get(handle.binding.layer, ()), fields):
                         target.copy_(field)
+            if self.overlay is not None:
+                assert self.projections is not None
+                self.overlay.stage(index, signature[0])
+                self.projections.prepare_token(row, self.overlay)
             capture = self._captures.get(signature) or self._capture_token(invocation, row, signature)
             capture.graph.replay()
+            if self.overlay is not None:
+                self.overlay.collect(capture.overlay_results, capture.overlay_pending)
             outputs[index : index + 1].copy_(capture.output)
             if signature[0]:
                 assert capture.observation is not None
@@ -448,6 +296,8 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         self._stream = stream
         identity = boundary_digest(
             invocation.execution.capture_signature,
+            self.execution.arena.plan.semantic_graph.execution_parameters_digest,
+            None if self.overlay_storage is None else self.overlay_storage.slab.data_ptr(),
             tuple(
                 (tensor.data_ptr(), tuple(tensor.shape), tensor.stride(), str(tensor.dtype), str(tensor.device))
                 for tensor in (*tuple(item.kv_cache for item in attentions), *tuple(self.model.parameters()))
@@ -495,12 +345,14 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         finally:
             for (cache, block, offset), value in zip(slots, saved, strict=True):
                 cache[block, :, offset, :].copy_(value)
-        self._captures[signature] = capture
-        resident = sum(item.resident_bytes for item in self._captures.values())
+        if self.overlay is not None:
+            self.overlay.reset()
+        resident = sum(item.resident_bytes for item in self._captures.values()) + capture.resident_bytes
         if resident > self._entitlement.resident_bytes:
             raise ValueError(
                 f"token capture needs {resident} resident bytes; increase capture_memory_bytes above {self._entitlement.resident_bytes}"
             )
+        self._captures[signature] = capture
         return capture
 
     def begin(self, row: PackedPhaseRow) -> tuple[torch.Tensor, torch.Tensor]:

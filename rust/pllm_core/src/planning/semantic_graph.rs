@@ -140,32 +140,9 @@ pub(crate) struct ImplementationCandidate {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ConditionalLayerReplay {
-    pub(crate) layers: Vec<u32>,
-    pub(crate) max_iterations: u32,
-    pub(crate) relative_l2_ppm: u32,
-    pub(crate) predicate: String,
-    pub(crate) rows: String,
-    pub(crate) carry: String,
-    pub(crate) kv: String,
-    pub(crate) logits: String,
-    pub(crate) rng: String,
-    pub(crate) gradient: String,
-    pub(crate) cancellation: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct TokenProgramEffect {
     pub(crate) layer_count: u32,
     pub(crate) rows: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(untagged)]
-pub(crate) enum LayerReplay {
-    Conditional(ConditionalLayerReplay),
-    Tokenwise(TokenProgramEffect),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -191,7 +168,7 @@ pub(crate) struct SemanticTask {
     pub(crate) effects: Vec<SemanticEffect>,
     pub(crate) implementations: Vec<ImplementationCandidate>,
     #[serde(default)]
-    pub(crate) replay: Option<LayerReplay>,
+    pub(crate) replay: Option<TokenProgramEffect>,
     #[serde(default)]
     pub(crate) math: Option<MathContract>,
     #[serde(default)]
@@ -337,32 +314,9 @@ fn validate_task(task: &SemanticTask) -> Result<(), String> {
             return Err(format!("{}: update eligibility requires a declared mutation", task.symbol));
         }
     }
-    if let Some(LayerReplay::Conditional(replay)) = &task.replay {
-        if replay.layers.is_empty()
-            || replay.layers.windows(2).any(|pair| pair[0] >= pair[1])
-        {
-            return Err(format!("{}: replay layers must be sorted and unique", task.symbol));
-        }
-        if replay.max_iterations == 0
-            || replay.max_iterations > 2
-            || replay.relative_l2_ppm > 1_000_000
-            || replay.predicate != "weight_updated"
-            || replay.rows != "last_scheduled_token"
-            || replay.carry != "block_output"
-            || replay.kv != "overwrite_current_slot"
-            || replay.logits != "preserve"
-            || replay.rng != "preserve"
-            || replay.gradient != "detach"
-            || replay.cancellation != "between_iterations_restore_kv"
-        {
-            return Err("unsupported conditional replay effect".to_owned());
-        }
-    }
-    if let Some(LayerReplay::Tokenwise(replay)) = &task.replay {
-        if replay.layer_count == 0 || !matches!(replay.rows.as_str(), "prefill" | "decode" | "all")
-            || task.effects.iter().any(|effect| effect.kind != StateEffectKind::Read)
-        {
-            return Err("layer routes need positive layer_count, prefill/decode/all rows and READ state effects".to_owned());
+    if let Some(replay) = &task.replay {
+        if replay.layer_count == 0 || !matches!(replay.rows.as_str(), "prefill" | "decode" | "all") {
+            return Err("layer routes need positive layer_count and prefill/decode/all rows".to_owned());
         }
     }
     require_text(&task.symbol, "tasks.symbol")?;
@@ -517,36 +471,7 @@ pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
     }
     for task in &graph.tasks {
         validate_task(task)?;
-        if matches!(task.replay, Some(LayerReplay::Conditional(_))) {
-            let reads = task
-                .effects
-                .iter()
-                .filter(|effect| effect.kind == StateEffectKind::Read)
-                .collect::<Vec<_>>();
-            if reads.len() != 1
-                || task.effects.len() != 1
-                || !graph.states.iter().any(|state| {
-                    state.resource == reads[0].resource && state.scope == StateScope::Request
-                })
-                || !task.inputs.iter().any(|input| match &input.source {
-                    InputSource::Result { task: source, .. } => {
-                        graph.tasks.iter().any(|producer| {
-                            producer.symbol == *source
-                                && reads[0].version.as_ref() == Some(source)
-                                && producer.effects.iter().any(|effect| {
-                                    effect.resource == reads[0].resource
-                                        && effect.kind == StateEffectKind::Publish
-                                })
-                        })
-                    }
-                    _ => false,
-                })
-            {
-                return Err(
-                    "replay requires an exact request-state publication dependency".to_owned(),
-                );
-            }
-        }
+
     }
     if graph
         .tasks

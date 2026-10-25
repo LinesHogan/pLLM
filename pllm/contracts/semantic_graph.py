@@ -150,28 +150,6 @@ class TaskImplementationSpec:
 
 
 @dataclass(frozen=True, slots=True)
-class ConditionalLayerReplay:
-    """Seed from hidden+residual at the first replayed layer; carry each detached block output.
-
-    `layers` is the signed ascending set of layers re-run, in order, for the
-    selected token with the published state; each replayed layer overwrites its
-    own current KV slot. Layers outside the set keep their normal-forward KV —
-    a declared approximation, not a silent one."""
-
-    layers: tuple[int, ...]
-    max_iterations: int = 2
-    relative_l2_ppm: int = 10
-    predicate: Literal["weight_updated"] = "weight_updated"
-    rows: Literal["last_scheduled_token"] = "last_scheduled_token"
-    carry: Literal["block_output"] = "block_output"
-    kv: Literal["overwrite_current_slot"] = "overwrite_current_slot"
-    logits: Literal["preserve"] = "preserve"
-    rng: Literal["preserve"] = "preserve"
-    gradient: Literal["detach"] = "detach"
-    cancellation: Literal["between_iterations_restore_kv"] = "between_iterations_restore_kv"
-
-
-@dataclass(frozen=True, slots=True)
 class TokenProgramEffect:
     """A token program's model domain and selected rows; mathematics lives in its source region."""
 
@@ -206,7 +184,7 @@ class SemanticTask:
     outputs: tuple[SemanticOutput, ...]
     implementations: tuple[TaskImplementationSpec, ...]
     effects: tuple[SemanticEffect, ...] = ()
-    replay: ConditionalLayerReplay | TokenProgramEffect | None = None
+    replay: TokenProgramEffect | None = None
     math: MathContract | None = None
     visibility: VisibilitySource | None = None
 
@@ -338,7 +316,6 @@ class PhysicalPlan:
 
 
 __all__ = [
-    "ConditionalLayerReplay",
     "TaskResourceFact",
     "ValueResourceFact",
     "AnchorId",

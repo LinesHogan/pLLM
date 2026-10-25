@@ -206,8 +206,7 @@ worker 重新导入并重建，安装时其编译签名必须与驱动端签名�
 本节约束由引擎内更新产出的加性参数 overlay：状态怎么声明、哪些 buffer 可以
 被原地修改、更新何时发布、replay 重跑哪些层。它存在的原因是 overlay 直接
 作用于模型执行，所以可写集合被显式收窄——只有被授权的 buffer 可以原地修改，
-操作数永远不行。`ConditionalLayerReplay` 是声明过的近似，不是静默近似：
-每个被重放的层必须被签名的 overlay target 覆盖，否则绑定失败。
+操作数永远不行。一个训练 overlay 可以与同一 workload 的一个 `layer_route` 组合。
 写 In-Place-TTT 风格负载时读本节。
 
 `@on(Phase.MODEL_UPDATE)` 和 `@overlay(state=..., targets=..., weight=...)` 把
@@ -228,14 +227,16 @@ buffer 保留自己的 dtype。`Operand.INPUT/TARGET/WEIGHT` 命名捕获的张�
 投影；后端目前定位 MLP down 与 attention q/v 投影。
 
 `prefill`/`decode` 决定更新资格。被禁用的阶段只应用既有 overlay。
-`replay=ConditionalLayerReplay((22, 23), ...)` 命名一组签名的升序层集合：对选中
-token 按序以发布后的状态重跑这些层；每个被重放的层覆盖自己当前的 KV 槽，
-集合外的层保留正常前向的 KV —— 这是声明过的近似，不是静默近似。
-每个被重放的层必须被签名的 overlay target 覆盖。replay 复用原始发布版本，
-且只对 `changed` 的状态运行：仅尾部 buffer 变化不必触发 replay。
+`@pllm.layer_route(tokens="prefill" | "decode" | "all")` 内的 `layers(...)` 捕获每次
+投影的操作数；`layers.apply_updates()` 按 target 拼接自上个边界以来的捕获，并对
+当前私有字段执行 transition。后续调用读取更新后的私有版本，尾部 buffer 变化
+同样保留。空边界不改变状态或可见版本；末尾未消费的捕获被丢弃。每个步骤仅分配
+一个私有版本，并由已有 publication 发布一次。未选中的行保留普通 overlay 语义。
+入口遵循作者的可见性策略；边界后的读取关系由签名路由源决定。
+返回的 residual stream 决定采样。有界 Python for 循环在追踪时展开；当前拒绝
+traced while_loop，并提示使用 bounded for-loop。
 共享绑定拥有 target 覆盖、形状/设备检查、根选择与结果出处。结果的 `entries`
-暴露原始请求/before/after 引用和按 target 的更新。普通效果支持请求作用域的
-稠密与低秩 overlay，不支持激活或任意 replay 组合。
+暴露请求/before/after 引用和按 target 的设备计数与 metrics。
 
 ## 外部 Overlay
 
