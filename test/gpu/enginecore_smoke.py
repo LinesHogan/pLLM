@@ -407,10 +407,8 @@ def _recirculation_schedules(measured: bool = False) -> None:
     handle = pllm.make_llm(workload=workload, config=engine(tokens=64, execution=options))
     try:
         selection = handle.region_selection
-        assert (selection is not None) == measured
-        if selection is not None:
-            assert 1 < len(selection.candidates) <= 8
-            assert all(candidate.feasible and candidate.median_ns is not None for candidate in selection.candidates)
+        # Captured tokens use the verified serial source for either requested tuning policy.
+        assert selection is None
         first = handle.generate(PROMPTS, greedy(2))
         second = handle.generate(PROMPTS, greedy(2))
         tokens = lambda results: tuple(tuple(output.outputs[0].token_ids) for output in results)

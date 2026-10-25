@@ -160,15 +160,18 @@ class VllmActivationPatch:
                     )
             handle.prepared = tuple(prepared)
 
-    def selected(self, row: int, layer: int) -> bool:
-        if not 0 <= row < self.row_count:
-            raise ValueError("activation selection is outside its original packed rows")
-        (handle,) = (handle for handle in self.layers if handle.binding.layer == layer)
-        for item in handle.prepared:
-            if row in item.indices:
-                item.used.setdefault(item.identity, set()).add(item.ref)
-                return True
-        return False
+    def prepare_token_rows(self) -> tuple[tuple[tuple[torch.Tensor, ...], ...], ...]:
+        """Resolve row/layer fields and account their exact pins once per invocation."""
+        rows: list[tuple[tuple[torch.Tensor, ...], ...]] = []
+        for row in range(self.row_count):
+            selected: list[tuple[torch.Tensor, ...]] = []
+            for handle in self.layers:
+                item = next((item for item in handle.prepared if row in item.indices), None)
+                if item is not None:
+                    item.used.setdefault(item.identity, set()).add(item.ref)
+                selected.append(() if item is None else item.fields)
+            rows.append(tuple(selected))
+        return tuple(rows)
 
     def bind_pinned(self, resource: BorrowedResource, layer: int, owner: RegionPageOwner) -> PinnedResourceBinding:
         if (

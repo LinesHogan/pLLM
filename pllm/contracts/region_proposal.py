@@ -7,6 +7,7 @@ from pllm.contracts.region_selection import RegionPayloadLimit
 from pllm.contracts.region_streams import RegionStreamPlan
 
 REGION_STREAMS_CAPABILITY = "execution/region_streams@1"
+TOKEN_CAPTURE_CAPABILITY = "execution/token_capture@1"
 
 
 @dataclass(frozen=True, slots=True)

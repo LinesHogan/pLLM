@@ -286,7 +286,12 @@ class BackendAuthoring(ABC):
             else timeline.reserved_bytes
         )
         timeline = derive_attachment_resources(
-            facts.probe, graph, replace(timeline, reserved_bytes=reserved), layouts=layouts, attachment=attachment
+            facts.probe,
+            graph,
+            replace(timeline, reserved_bytes=reserved),
+            layouts=layouts,
+            attachment=attachment,
+            capture_memory_bytes=options.capture_memory_bytes,
         )
         return replace(facts, timeline=timeline)
 

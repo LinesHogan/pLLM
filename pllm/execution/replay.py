@@ -30,6 +30,7 @@ from pllm.contracts.state_ref import StateRef
 from pllm.execution.decoder_region import DecoderActivation
 from pllm.execution.host_borrow import TraceResourceView
 from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin
+from pllm.execution.region_execution import RegionInvocation
 from pllm.execution.region_replay import ConditionalReplayRegion
 from pllm.execution.region_resources import (
     ExternalFunction,
@@ -90,6 +91,10 @@ class Recurrence:
 
 
 class TokenwiseReplayPrimitive(ABC):
+    def run_region(self, invocation: RegionInvocation) -> tuple[torch.Tensor, ...]:
+        """CPU models use the source interpreter with fresh invocation bindings."""
+        return invocation.run()
+
     @property
     def function_bodies(self) -> tuple[RegionFunctionBody, ...]:
         return ()
@@ -175,6 +180,7 @@ class TokenwiseReplayTask(Generic[DataT]):
         payload_budget: int,
         *,
         stream_lanes: int = 1,
+        token_capture: bool = False,
         source_imports: tuple[RegionTensorImport, ...] = (),
         function_bodies: tuple[RegionFunctionBody, ...] = (),
         activations: tuple[DecoderActivation, ...] = (),
@@ -189,6 +195,7 @@ class TokenwiseReplayTask(Generic[DataT]):
             effect,
             policy,
             stream_lanes=stream_lanes,
+            token_capture=token_capture,
             source_imports=source_imports,
             function_bodies=function_bodies,
             activations=activations,
@@ -255,6 +262,7 @@ class TokenwiseReplayTask(Generic[DataT]):
                 commit=commit,
                 record=record,
                 streams=streams,
+                run_region=primitive.run_region,
                 kernel_imports=primitive.kernel_imports,
                 function_bodies=primitive.function_bodies,
                 model_endpoints=primitive.model_endpoints(),

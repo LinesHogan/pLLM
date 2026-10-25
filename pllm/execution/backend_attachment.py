@@ -24,7 +24,7 @@ from pllm.contracts.backend_attachment import (
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator
 from pllm.contracts.region_program import TensorType
-from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY
+from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY, TOKEN_CAPTURE_CAPABILITY
 from pllm.contracts.semantic_graph import (
     AnchorId,
     ConditionalLayerReplay,
@@ -112,6 +112,7 @@ def derive_attachment_resources(
     *,
     layouts: TensorLayoutRequest | None = None,
     attachment: BackendAttachmentSpec | BackendAttachmentRequest | None = None,
+    capture_memory_bytes: int | None = None,
 ) -> SchedulerTimeline:
     """Fund native region candidates through the original AER workspace facts.
 
@@ -170,6 +171,7 @@ def derive_attachment_resources(
         if layouts is None or attachment is None
         else decoder_activations(attachment.activation_bindings, layouts, attachment.state_resource, tensor.device)
     )
+    resident = capture_memory_bytes if TOKEN_CAPTURE_CAPABILITY in probe.capabilities else 0
     existing = next((fact for fact in timeline.task_resources if fact.task == task.symbol), None)
     if existing is not None:
         region = compile_tokenwise_source(
@@ -182,6 +184,8 @@ def derive_attachment_resources(
             activations=activations,
         )
         region.within_payload_budget(existing.workspace_bytes)
+        if resident is not None and resident != existing.resident_bytes:
+            raise ValueError("token capture reservation differs from the signed task funding")
         task_facts = timeline.task_resources
     else:
         region = compile_tokenwise_region(
@@ -191,6 +195,7 @@ def derive_attachment_resources(
             effect,
             timeline.region_policy,
             stream_lanes=2 if REGION_STREAMS_CAPABILITY in probe.capabilities else 1,
+            token_capture=TOKEN_CAPTURE_CAPABILITY in probe.capabilities,
             source_imports=probe.region_imports,
             function_bodies=probe.region_bodies,
             activations=activations,
@@ -201,12 +206,13 @@ def derive_attachment_resources(
             available = min(
                 available,
                 timeline.memory_budget_bytes
+                - (resident or 0)
                 - max(timeline.reserved_bytes, default=0)
                 - sum(fact.workspace_bytes + fact.resident_bytes for fact in timeline.task_resources)
                 - sum(fact.bytes for fact in timeline.value_resources),
             )
         (funded,) = region.within_payload_budget(max(0, available)).payload_limits
-        task_facts = (*timeline.task_resources, TaskResourceFact(task.symbol, funded.bytes))
+        task_facts = (*timeline.task_resources, TaskResourceFact(task.symbol, funded.bytes, resident or 0))
     # The output lives in the original adapter's concatenation reservation;
     # the outer task runner does not allocate a second copy of this value.
     known = {(fact.task, fact.output) for fact in timeline.value_resources}

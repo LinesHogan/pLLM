@@ -1,23 +1,28 @@
-"""Execute source-verified region instructions with imported cells and PTTS effects.
+"""Execute and capture source-verified region instructions with imported cells and PTTS effects.
 
 The loop cursor and mathematical value frame implement a fixed native plan.
 Resource access goes through the original invocation's page capabilities.
 """
 
-from collections.abc import Mapping
+from __future__ import annotations
+
+import gc
+from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
+from time import perf_counter
 
 import torch
 
 from pllm.contracts.region_bindings import RegionBindings
 from pllm.contracts.region_imports import RegionTensorImport
-from pllm.contracts.region_program import Call, Program, bind_sizes
+from pllm.contracts.region_program import Call, Program, Scan, bind_sizes
 from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.region_schedule import ScheduleInstance, Statement
 from pllm.contracts.region_selection import RegionPayloadLimit
 from pllm.contracts.region_streams import RegionStateWindow, RegionStreamPlan
 from pllm.contracts.schedule_instructions import LoweredSchedule
+from pllm.execution.codec import cuda_graph_pool_bytes
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_compilation import lower_region_bindings, lower_region_schedule
@@ -40,11 +45,73 @@ from pllm.execution.region_streams import (
     record_stream,
     validate_stream_budget,
 )
-from pllm.execution.region_values import Data, copy_data
+from pllm.execution.region_values import Bank, Data, copy_data
 from pllm.execution.region_window import RegionWindow, WindowBackpressure
 from pllm.execution.tensor_access import import_tensor_access_graph
 
 PreparedWindow = tuple[tuple[ScheduleInstance, ...], RegionValueLayout, Routes, tuple[tuple[int, Routes], ...]]
+
+
+@dataclass
+class RegionInvocation:
+    """One invocation's checked resources and host observations, never retained by graphs."""
+
+    execution: RegionInstructionExecution
+    inputs: Mapping[str, Data]
+    pages: RegionResources
+    sizes: Mapping[str, int]
+    streams: RegionStreamBindings | None
+    eligible: tuple[bool, ...]
+    observe: Callable[[int, torch.Tensor], None]
+    record: Callable[[int], None]
+    cold: bool = False
+    observation: torch.Tensor | None = None
+
+    def run(self) -> tuple[torch.Tensor, ...]:
+        """Run the CPU interpreter and return its ordered normal rows."""
+        results = self.execution.run(self.inputs, pages=self.pages, sizes=self.sizes, streams=self.streams).values
+        assert all(isinstance(result, Bank) for result in results)
+        return tuple(
+            value
+            for result in results
+            if isinstance(result, Bank)
+            for value in result.elements
+            if isinstance(value, torch.Tensor)
+        )
+
+
+class RegionTokenCapture:
+    """Owned graph and device results; source resources expire after cold preparation."""
+
+    def __init__(
+        self, invocation: RegionInvocation, instances: tuple[ScheduleInstance, ...], device: torch.device
+    ) -> None:
+        started = perf_counter()
+        current = torch.cuda.current_stream(device)
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(current)
+        invocation.cold = True
+        try:
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    invocation.execution.capture_token_body(invocation, instances)
+            stream.synchronize()
+            self.graph = torch.cuda.CUDAGraph()
+            collecting = gc.isenabled()
+            gc.disable()
+            try:
+                with torch.cuda.graph(self.graph, stream=stream, pool=torch.cuda.graph_pool_handle()):
+                    self.output = invocation.execution.capture_token_body(invocation, instances)
+                    self.observation = invocation.observation
+            finally:
+                if collecting:
+                    gc.enable()
+            current.wait_stream(stream)
+        finally:
+            invocation.cold = False
+            invocation.observation = None
+        self.resident_bytes = cuda_graph_pool_bytes(self.graph.pool(), device.index or 0)
+        self.capture_seconds = perf_counter() - started
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,6 +308,65 @@ class RegionInstructionExecution:
             if self._window is not None:
                 self._window.finish_reads()
 
+    def _validate_pages(
+        self, pages: RegionResources | None, sizes: Mapping[str, int], layout: RegionValueLayout
+    ) -> None:
+        if pages is not None:
+            pages.validate(self._program, sizes)
+            pages.validate_cells(layout.resource_uses)
+            pages.validate_native_kernels(
+                {name: cell.implementation for name, cell in self._cells.items() if isinstance(cell, NativePrimitive)}
+            )
+            pages.validate_tensor_borrows(self._tensor_borrows)
+
+    @property
+    def capture_signature(self) -> str:
+        """Source and selected schedule identity for an owner's persistent graphs."""
+        return self._lowered.signature
+
+    def prepare_token_body(
+        self, invocation: RegionInvocation, request: int, token: int
+    ) -> tuple[ScheduleInstance, ...]:
+        """Select one source Scan iteration from the verified serial instance table."""
+        assert self._stream_plan is None
+        instances, layout, _, _ = self._prepare(tuple(sorted(invocation.sizes.items())))
+        self._validate_pages(invocation.pages, invocation.sizes, layout)
+        scans = tuple(
+            i for i, operation in enumerate(self._program.entry.block.operations) if isinstance(operation, Scan)
+        )
+        return tuple(
+            item
+            for item in instances
+            if self._lowered.statements[item.statement_id].path[:2] == (scans[request], 0)
+            and item.coordinates[0] == token
+        )
+
+    def capture_token_body(self, invocation: RegionInvocation, instances: tuple[ScheduleInstance, ...]) -> torch.Tensor:
+        """Execute the same lowered actions and frame for one cold token capture."""
+        _, layout, _, _ = self._prepare(tuple(sorted(invocation.sizes.items())))
+        frame = RegionValueFrame(layout, invocation.inputs, invocation.sizes, borrow_inputs=True)
+        try:
+            for item in instances:
+                frame.advance(item.time)
+                self._invoke(
+                    frame,
+                    self._lowered.statements[item.statement_id],
+                    item.coordinates,
+                    invocation.pages,
+                    invocation.sizes,
+                )
+            output = next(
+                value
+                for value in self._bindings.values
+                if value.name == "normal_output"
+                and value.path[:2] == self._lowered.statements[instances[0].statement_id].path[:2]
+            )
+            result = frame.read(output.id, instances[0].coordinates[:1])
+            assert isinstance(result, torch.Tensor)
+            return result
+        finally:
+            frame.close()
+
     def run(
         self,
         inputs: Mapping[str, Data],
@@ -269,13 +395,7 @@ class RegionInstructionExecution:
                 streams = None  # Available lanes can be unused by the installed plan.
         if self._program.resources and pages is None:
             raise ValueError("resource programs require PTTS primitive bindings")
-        if pages is not None:
-            pages.validate(self._program, sizes)
-            pages.validate_cells(layout.resource_uses)
-            pages.validate_native_kernels(
-                {name: cell.implementation for name, cell in self._cells.items() if isinstance(cell, NativePrimitive)}
-            )
-            pages.validate_tensor_borrows(self._tensor_borrows)
+        self._validate_pages(pages, sizes, layout)
         scope = pages.scope() if pages is not None else (nullcontext() if owner is None else torch.cuda.stream(owner))
         window_scope = nullcontext() if self._window is None else self._window.reserve()
         page_window = nullcontext() if pages is None or not self._state_windows else pages.window(self._state_windows)

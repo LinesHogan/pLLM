@@ -415,6 +415,14 @@ class RegionResources:
         if implementations != self._tensor_borrows:
             raise ValueError("tensor borrows differ from their original source bindings")
 
+    def stage_token_tensors(self, staging: Mapping[str, tuple[torch.Tensor, ...]]) -> None:
+        """Route admitted pinned reads through capture-owned buffers for this invocation."""
+        for name, implementation in self._tensor_borrows.items():
+            resource = implementation.declaration.resources[0]
+            if resource in staging:
+                for row in range(self._domains[resource][0]):
+                    self._tensors[name, (row,)] = staging[resource][implementation.field]
+
     def borrow_tensor(self, implementation: BorrowedTensorImport, inputs: tuple[Data, ...]) -> torch.Tensor:
         self.before_statement()
         function = implementation.declaration

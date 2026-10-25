@@ -65,7 +65,7 @@ from pllm.contracts.feedback import (
     RetryAction,
 )
 from pllm.contracts.region_program import TensorType
-from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY
+from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY, TOKEN_CAPTURE_CAPABILITY
 from pllm.contracts.region_selection import RegionSelection
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.semantic_graph import (
@@ -219,7 +219,9 @@ class VllmLlm(Generic[DataT, ResultT]):
 
     def tune_native_schedules(self) -> None:
         policy = self.attachment.inputs.plan.timeline.region_policy
-        if policy.schedule_policy == "serial" or not any(
+        if (
+            TOKEN_CAPTURE_CAPABILITY in self.attachment.inputs.probe.capabilities or policy.schedule_policy == "serial"
+        ) or not any(
             isinstance(task.replay, TokenwiseLayerReplay) for task in self.attachment.inputs.plan.semantic_graph.tasks
         ):
             return
@@ -878,7 +880,7 @@ def probe_backend(
     )
     targets = inspect_parameter_targets(model, requirements.parameter_targets, runner.dtype)
     replay_capabilities = (
-        ("model/layer_replay@1", "model/tokenwise_replay@1", REGION_STREAMS_CAPABILITY)
+        ("model/layer_replay@1", "model/tokenwise_replay@1", REGION_STREAMS_CAPABILITY, TOKEN_CAPTURE_CAPABILITY)
         if runner.runner_kind is RunnerKind.MRV2 and graph_mode(runner.overlay_graph_bytes) is AttachmentGraphMode.EAGER
         else ()
     )

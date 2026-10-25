@@ -116,3 +116,68 @@ def select_attention_metadata(
         prefix_scheduler_metadata=None,
     )
     return selected, cache, block, offset
+
+
+class TokenAttentionBuffers:
+    """Stable single-row FA2 metadata; invocation tables and slots are copied before replay."""
+
+    def __init__(self, context: ForwardContext, attentions: tuple[Attention, ...], capacity: int) -> None:
+        self.metadata: dict[str, FlashAttentionMetadata] = {}
+        for attention in attentions:
+            metadata, cache, slots = attention_metadata(context, attention)
+            selected = replace(
+                metadata,
+                num_actual_tokens=1,
+                max_query_len=1,
+                query_start_loc=torch.tensor([0, 1], dtype=metadata.query_start_loc.dtype, device=cache.device),
+                max_seq_len=capacity,
+                max_num_splits=1,
+                seq_lens=torch.empty(1, dtype=metadata.seq_lens.dtype, device=cache.device),
+                block_table=torch.zeros(
+                    (1, (capacity + cache.shape[2] - 1) // cache.shape[2]),
+                    dtype=metadata.block_table.dtype,
+                    device=cache.device,
+                ),
+                slot_mapping=torch.empty(1, dtype=slots.dtype, device=cache.device),
+                num_decode_reqs=1,
+                num_prefill_reqs=0,
+                num_decode_tokens=1,
+                num_prefill_tokens=0,
+                scheduler_metadata=None,
+                prefix_scheduler_metadata=None,
+            )
+            self.metadata[attention.layer_name] = selected
+        self.context = replace(
+            context,
+            attn_metadata=self.metadata,
+            slot_mapping={name: item.slot_mapping for name, item in self.metadata.items()},
+            batch_descriptor=None,
+            is_padding=None,
+        )
+
+    def bind(
+        self, context: ForwardContext, attentions: tuple[Attention, ...], lengths: torch.Tensor
+    ) -> tuple[tuple[FlashAttentionMetadata, torch.Tensor, torch.Tensor, torch.Tensor], ...]:
+        """Resolve the layer-specific invocation views once before row submission."""
+        return tuple(
+            (
+                self.metadata[item.layer_name],
+                attention_metadata(context, item)[0].block_table,
+                attention_metadata(context, item)[2],
+                lengths.to(self.metadata[item.layer_name].seq_lens.dtype),
+            )
+            for item in attentions
+        )
+
+    @staticmethod
+    def refresh(
+        bindings: tuple[tuple[FlashAttentionMetadata, torch.Tensor, torch.Tensor, torch.Tensor], ...],
+        row: PackedPhaseRow,
+    ) -> None:
+        """Queue device copies on the owner's stream without reading device scalars."""
+        index, request = row.packed_row_index, row.request_ordinal
+        for metadata, tables, slots, lengths in bindings:
+            metadata.slot_mapping.copy_(slots[index : index + 1])
+            metadata.seq_lens.copy_(lengths[index : index + 1])
+            width = min(tables.shape[1], metadata.block_table.shape[1])
+            metadata.block_table[:, :width].copy_(tables[request : request + 1, :width])

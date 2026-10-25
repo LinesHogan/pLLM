@@ -6,6 +6,7 @@ import struct
 from collections.abc import Callable, Mapping
 from copy import copy
 from functools import lru_cache, partial
+from math import prod
 from types import MappingProxyType
 
 import torch
@@ -57,7 +58,7 @@ from pllm.execution.decoder_region import (
     kv_resource,
 )
 from pllm.execution.region_compilation import analyze_region_program, explore_region_schedules
-from pllm.execution.region_execution import RegionExecutionPlan, RegionInstructionExecution
+from pllm.execution.region_execution import RegionExecutionPlan, RegionInstructionExecution, RegionInvocation
 from pllm.execution.region_native import NativePrimitive, PrimitiveResources, RegionFunction, source_region_functions
 from pllm.execution.region_optimization import prepare_region_execution
 from pllm.execution.region_resources import (
@@ -78,25 +79,30 @@ Normalize = Callable[[int, torch.Tensor, torch.Tensor], torch.Tensor]
 Observe = Callable[[int, torch.Tensor], None]
 
 
-def mix_layer_outputs(
-    effect: TokenwiseLayerReplay, source: torch.Tensor, destination: torch.Tensor, position: int
-) -> torch.Tensor:
+def mixture_weights(effect: TokenwiseLayerReplay, offsets: tuple[int, ...], device: str) -> torch.Tensor:
+    """Upload independently rounded coefficients using the source's double arithmetic."""
     alpha = struct.unpack("!d", struct.pack("!Q", effect.alpha_bits))[0]
     beta = None if effect.beta_bits is None else struct.unpack("!d", struct.pack("!Q", effect.beta_bits))[0]
-    if effect.ramp_tokens:
-        alpha *= min(position, effect.ramp_tokens) / effect.ramp_tokens
+    alphas = tuple(
+        alpha * (min(offset, effect.ramp_tokens) / effect.ramp_tokens) if effect.ramp_tokens else alpha
+        for offset in offsets
+    )
+    return torch.tensor([(a, 1.0 - a if beta is None else beta) for a in alphas], dtype=torch.float32, device=device)
+
+
+def mix_layer_outputs(source: torch.Tensor, destination: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """Mix normalized layer taps with the current row's device coefficients."""
     source_float, destination_float = source.float(), destination.float()
     normalized = source_float / source_float.square().sum(-1, keepdim=True).sqrt().clamp_min(
         torch.finfo(torch.float32).tiny
     )
     normalized *= destination_float.square().sum(-1, keepdim=True).sqrt()
-    return ((1.0 - alpha if beta is None else beta) * destination_float + alpha * normalized).to(destination.dtype)
+    return (weights[1] * destination_float + weights[0] * normalized).to(destination.dtype)
 
 
-def tokenwise_retained_bytes(hidden: int, width: int, layers: int) -> int:
-    # Original backend: one cloned current KV slot per layer, one shared int32
-    # sequence and at most three converted int64 metadata elements per layer.
-    return 12 + layers * (2 * hidden * width + 24)
+def tokenwise_retained_bytes(hidden: int, width: int, layers: int, positions: int) -> int:
+    # Seed, position and coefficient buffers plus fixed single-row attention counters.
+    return hidden * width + 16 + layers * (32 + 8 * positions)
 
 
 class TokenwiseRegion:
@@ -113,6 +119,9 @@ class TokenwiseRegion:
     ) -> None:
         if domain.layers != effect.layer_count:
             raise ValueError("tokenwise source differs from the signed model layer domain")
+        self.effect = effect
+        self.device = tensor.device
+        coefficients = TensorType((2,), "torch.float32", tensor.device)
         self.weights = BorrowedResource("weights", (domain.layers + 1,))
         self.context = BorrowedResource("context", (max_rows,))
         self.trace = BorrowedResource("trace", ())
@@ -166,17 +175,16 @@ class TokenwiseRegion:
         self.complete = Function(
             "tokenwise.complete@2:" + digest, (index, boolean), (), ("context", "trace"), (context_write, trace_write)
         )
-        blend = Function("tokenwise.mix@1:" + digest, (tensor, tensor, index), (tensor,))
+        blend = Function("tokenwise.mix@2:" + digest, (tensor, tensor, coefficients), (tensor,))
 
         def blend_(inputs: tuple[Data, ...], resources: PrimitiveResources) -> tuple[Data, ...]:
-            source, destination, position = inputs
-            if (
-                not isinstance(source, torch.Tensor)
-                or not isinstance(destination, torch.Tensor)
-                or type(position) is not int
-            ):
-                raise ValueError("token mixture requires hidden tensors and the original token offset")
-            return (mix_layer_outputs(effect, source, destination, position),)
+            source, destination, weights = inputs
+            assert (
+                isinstance(source, torch.Tensor)
+                and isinstance(destination, torch.Tensor)
+                and isinstance(weights, torch.Tensor)
+            )
+            return (mix_layer_outputs(source, destination, weights),)
 
         args = (
             Value("row", index),
@@ -186,6 +194,7 @@ class TokenwiseRegion:
             Value("destination", tensor),
             Value("offset", index),
             Value("layer_ids", replay_layers),
+            Value("coefficients", coefficients),
         )
         replay = inline_region(
             self.replay.program,
@@ -203,7 +212,7 @@ class TokenwiseRegion:
             Block(
                 args,
                 (
-                    Call(("source", "destination", "offset"), (Value("mixed", tensor),), blend.name),
+                    Call(("source", "destination", "coefficients"), (Value("mixed", tensor),), blend.name),
                     Call(("row", "mixed"), (), self.observe.name),
                     *replay.operations,
                 ),
@@ -237,9 +246,12 @@ class TokenwiseRegion:
                 SizeConstraint((ParameterTerm(prefix.name), ParameterTerm(count.name)), domain.positions)
             )
             flags = BankType(boolean, count.name)
-            arguments.append(Value(f"eligible{request}", flags))
+            arguments.extend(
+                (Value(f"eligible{request}", flags), Value(f"weights{request}", BankType(coefficients, count.name)))
+            )
             invariants = (
                 Value("eligible", flags),
+                Value("weights", BankType(coefficients, count.name)),
                 Value("normal_layers", normal_layers),
                 Value("replay_layers", replay_layers),
                 Value("base", index),
@@ -257,6 +269,7 @@ class TokenwiseRegion:
                             ("prefix", "token"), (Value("offset", index),), AffineIndex(0, (IndexTerm(0), IndexTerm(1)))
                         ),
                         Select(("eligible", "token"), (Value("enabled", boolean),)),
+                        Select(("weights", "token"), (Value("coefficients", coefficients),)),
                         Call(
                             ("row", "request", "offset"),
                             (Value("positions", positions), Value("seed", tensor)),
@@ -276,6 +289,7 @@ class TokenwiseRegion:
                                 destination.name,
                                 "offset",
                                 "replay_layers",
+                                "coefficients",
                             ),
                             (),
                             replay_body,
@@ -292,7 +306,14 @@ class TokenwiseRegion:
                     Parameter((), (Value(prefix.name, index),), prefix.name),
                     Parameter((), (Value(count.name, index),), count.name),
                     Scan(
-                        (f"eligible{request}", "normal_layers", "replay_layers", f"base{request}", prefix.name),
+                        (
+                            f"eligible{request}",
+                            f"weights{request}",
+                            "normal_layers",
+                            "replay_layers",
+                            f"base{request}",
+                            prefix.name,
+                        ),
                         outputs,
                         count.name,
                         body,
@@ -323,7 +344,7 @@ class TokenwiseRegion:
             blend_,
             NativeKernelImport(
                 blend,
-                "tokenwise.mix@1",
+                "tokenwise.mix@2",
                 tensor.device,
                 (KernelAllocation("mixture", tensor.device, 16 * tensor.shape[1] * width),),
                 host_reads=False,
@@ -343,10 +364,12 @@ class TokenwiseRegion:
         self.imports = import_region_functions(self.program, self.functions, catalog=source_imports)
         schedule = analyze_region_program(self.program, optimize=False).reference_schedule
         width = 8 if tensor.dtype == "torch.float64" else 4
-        retained = tokenwise_retained_bytes(tensor.shape[1], width, domain.layers)
+        retained = tokenwise_retained_bytes(tensor.shape[1], width, domain.layers, domain.positions) + sum(
+            prod(field.shape) * width for activation in activations for field in activation.fields
+        )
         self.retained = (
             RetainedAllocation(
-                "tokenwise.recovery",
+                "tokenwise.buffers",
                 RetentionEndpoint(self.begin.name, 0),
                 RetentionEndpoint(self.complete.name, 0),
                 tensor.device,
@@ -363,9 +386,9 @@ class TokenwiseRegion:
         self._funded_limits: tuple[RegionPayloadLimit, ...] | None = None
         self.retention = self.payload.retention
         # Reference execution retains one row. Alternate schedules must fit
-        # the original combined tensor/recovery reservation.
+        # the original combined tensor/buffer reservation.
         if self.retention.allocations[0].peak_bytes_upper_bound > retained:
-            raise ValueError("tokenwise schedule exceeds the original recovery reservation")
+            raise ValueError("tokenwise schedule exceeds the fixed buffer reservation")
         self._plan: RegionExecutionPlan = RegionExecutionPlan(
             self.program, self.imports, self.candidate_proposals[0], self.payload_limits
         )
@@ -373,12 +396,16 @@ class TokenwiseRegion:
         self._policy = RegionSelectionPolicy(allow_numerical_transforms=False, schedule_policy="serial")
         self._bind: Callable[[Mapping[str, RegionFunction]], RegionInstructionExecution] = self._plan.bind
         self._parallel = False
+        self._capture = False
 
-    def planned(self, policy: RegionSelectionPolicy, *, stream_lanes: int) -> TokenwiseRegion:
+    def planned(self, policy: RegionSelectionPolicy, *, stream_lanes: int, token_capture: bool) -> TokenwiseRegion:
         if type(stream_lanes) is not int or not 1 <= stream_lanes <= 8:
             raise ValueError("native catalog requires a bounded original stream capability")
         region = copy(self)
         region._policy = policy
+        region._capture = token_capture
+        if region._capture:
+            return region
         region._parallel = stream_lanes > 1 and any(d.device.startswith("cuda") for d in self.payload.devices)
         proposal = plan_region_schedule(
             region.program,
@@ -420,7 +447,7 @@ class TokenwiseRegion:
                 parallel=self._parallel,
                 retained=self.retained,
             )
-            if self._policy.tuning == "heuristic"
+            if self._policy.tuning == "heuristic" and not self._capture
             else self._plan.bind
         )
 
@@ -467,7 +494,9 @@ class TokenwiseRegion:
             if all(device.bytes <= budget for device in proposal.peak_bytes)
         )
         result._funded_limits = tuple(RegionPayloadLimit(device.device, budget) for device in self.payload.devices)
-        if self._policy.tuning == "heuristic":
+        if self._capture:
+            result._install_plan(RegionScheduleProposal(self.payload))
+        elif self._policy.tuning == "heuristic":
             proposal = plan_region_schedule(
                 self.program,
                 self.imports,
@@ -547,6 +576,7 @@ class TokenwiseRegion:
         commit: Callable[[int, Callable[[], None]], None],
         record: Callable[[int], None],
         streams: RegionStreamBindings | None = None,
+        run_region: Callable[[RegionInvocation], tuple[torch.Tensor, ...]] = RegionInvocation.run,
         kernel_imports: tuple[NativeKernelImport, ...] = (),
         function_bodies: tuple[RegionFunctionBody, ...] = (),
         model_endpoints: tuple[ExternalFunction, ...] = (),
@@ -577,7 +607,10 @@ class TokenwiseRegion:
             row, hidden = inputs
             if type(row) is not int or not isinstance(hidden, torch.Tensor):
                 raise ValueError("token observation requires its row and hidden value")
-            observe(row, hidden)
+            if invocation.cold:
+                invocation.observation = hidden
+            else:
+                observe(row, hidden)
             return ()
 
         def complete_(inputs: tuple[Data, ...]) -> tuple[Data, ...]:
@@ -589,7 +622,8 @@ class TokenwiseRegion:
                 if enabled:
                     record(row)
 
-            commit(row, record_)
+            if not invocation.cold:
+                commit(row, record_)
             return ()
 
         if len(eligible) != len(requests) or len(requests) != len(offsets):
@@ -600,6 +634,7 @@ class TokenwiseRegion:
             raise ValueError("token rows differ from the original request-major packed plan")
         sizes: dict[str, int] = {}
         inputs: dict[str, Data] = {"normal_layers": Bank(self.normal.layers), "replay_layers": Bank(self.replay.layers)}
+        coefficients = mixture_weights(self.effect, offsets, self.device)
         start = 0
         for request in range(self.domain.requests):
             end = start
@@ -612,6 +647,7 @@ class TokenwiseRegion:
                 raise ValueError("token offsets must form the original consecutive request span")
             sizes[f"tokens{request}"], sizes[f"prefix{request}"] = end - start, prefix
             inputs[f"eligible{request}"] = Bank(eligible[start:end])
+            inputs[f"weights{request}"] = Bank(tuple(coefficients[start:end].unbind()))
             start = end
         kernels = {kernel.declaration.name: kernel for kernel in kernel_imports}
         if len(kernels) != len(kernel_imports):
@@ -659,16 +695,8 @@ class TokenwiseRegion:
             borrows=(kv, weights, context, trace, *activation_borrows),
             tensor_borrows=tuple(item for item in self.imports if isinstance(item, BorrowedTensorImport)),
         )
-        results = self.execution.run(inputs, pages=resources, sizes=sizes, streams=streams).values
-        outputs: list[torch.Tensor] = []
-        for result in results:
-            if not isinstance(result, Bank):
-                raise RuntimeError("token region did not return its ordered normal outputs")
-            for value in result.elements:
-                if not isinstance(value, torch.Tensor):
-                    raise RuntimeError("token region returned a non-tensor output")
-                outputs.append(value)
-        return tuple(outputs)
+        invocation = RegionInvocation(self.execution, inputs, resources, sizes, streams, eligible, observe, record)
+        return run_region(invocation)
 
 
 @lru_cache(maxsize=8)
@@ -704,6 +732,7 @@ def compile_tokenwise_region(
     policy: RegionSelectionPolicy = RegionSelectionPolicy(),
     *,
     stream_lanes: int = 1,
+    token_capture: bool = False,
     source_imports: tuple[RegionTensorImport, ...] = (),
     function_bodies: tuple[RegionFunctionBody, ...] = (),
     activations: tuple[DecoderActivation, ...] = (),
@@ -721,14 +750,14 @@ def compile_tokenwise_region(
         source_imports=source_imports,
         function_bodies=function_bodies,
         activations=activations,
-    ).planned(policy, stream_lanes=stream_lanes)
+    ).planned(policy, stream_lanes=stream_lanes, token_capture=token_capture)
 
 
 def tokenwise_attachment_bytes(hidden: int, width: int, max_rows: int) -> int:
     """Original adapter allocations outside the source region workspace.
 
-    Embeddings and final concatenation remain in the original model adapter.
+    Embeddings, packed graph outputs and final concatenation belong to the adapter.
     The mixture is accounted by its region kernel import. Model/layer/attention
     library workspace remains separately owned.
     """
-    return 2 * max_rows * hidden * width
+    return 3 * max_rows * hidden * width + 12 * max_rows

@@ -1481,7 +1481,7 @@ class Workload(
         self, operation: str, resources: tuple[TaskResourceFact, ...], *, explicit_math: bool = False
     ) -> tuple[TaskImplementationSpec, ...]:
         _reject(explicit_math, "this workload has no explicit tensor implementation")
-        if any(fact.task == operation and fact.resident_bytes for fact in resources):
+        if any(fact.task == operation and fact.resident_bytes and fact.input_shapes for fact in resources):
             return (native(f"python.cuda_graph:{self.name}:{operation}@1", "compute/cuda_graph@1"),)
         return ()
 
