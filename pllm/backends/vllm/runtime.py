@@ -629,21 +629,17 @@ def create_vllm_llm(
     *,
     definition: str | None = None,
 ) -> VllmLlm[DataT, ResultT]:
-    if config.enable_prefix_caching and (
-        workload.backend_requirements().parameter_targets or workload.backend_requirements().activation_layers
-    ):
+    requirements = workload.backend_requirements()
+    if config.enable_prefix_caching and (requirements.parameter_targets or requirements.activation_layers):
         raise ValueError("parameter-version overlays do not support shared prefix caching")
     if _VLLM_VERSION != _SUPPORTED_VLLM_VERSION:
         raise RuntimeError("vLLM workload requires vLLM 0.27.1 exactly")
-    requirements = workload.backend_requirements()
     if config.cuda_graphs and requirements.activation_layers:
         raise ValueError("parameter overlays and activation patches do not run under CUDA graphs yet")
     environment = {
         _MP_ENV: "1" if config.multiprocessing else "0",
         _V2_RUNNER_ENV: "1" if config.runner is RunnerKind.MRV2 else "0",
-        TAPS_ENV: json.dumps(
-            [[source.layer, source.site.value] for source in workload.backend_requirements().hidden_inputs]
-        ),
+        TAPS_ENV: json.dumps([[source.layer, source.site.value] for source in requirements.hidden_inputs]),
     }
     if config.multiprocessing:
         environment["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"

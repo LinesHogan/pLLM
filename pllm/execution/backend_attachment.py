@@ -164,34 +164,24 @@ def derive_attachment_resources(
         else decoder_activations(attachment.activation_bindings, layouts, attachment.state_resource, tensor.device)
     )
     resident = capture_memory_bytes if TOKEN_CAPTURE_CAPABILITY in probe.capabilities else 0
+    region = compile_tokenwise_source(
+        tensor,
+        probe.max_packed_rows,
+        probe.causal_domain,
+        effect,
+        next(source for source in graph.source_regions if source.task == task.symbol),
+        source_imports=probe.region_imports,
+        function_bodies=probe.region_bodies,
+        activations=activations,
+    )
     existing = next((fact for fact in timeline.task_resources if fact.task == task.symbol), None)
     if existing is not None:
-        region = compile_tokenwise_source(
-            tensor,
-            probe.max_packed_rows,
-            probe.causal_domain,
-            effect,
-            next(source for source in graph.source_regions if source.task == task.symbol),
-            source_imports=probe.region_imports,
-            function_bodies=probe.region_bodies,
-            activations=activations,
-        )
         region.within_payload_budget(existing.workspace_bytes)
         task_facts = tuple(
             replace(fact, resident_bytes=max(fact.resident_bytes, resident)) if fact.task == task.symbol else fact
             for fact in timeline.task_resources
         )
     else:
-        region = compile_tokenwise_source(
-            tensor,
-            probe.max_packed_rows,
-            probe.causal_domain,
-            effect,
-            next(source for source in graph.source_regions if source.task == task.symbol),
-            source_imports=probe.region_imports,
-            function_bodies=probe.region_bodies,
-            activations=activations,
-        )
         (maximum,) = region.payload_limits
         available = maximum.bytes
         if timeline.memory_budget_bytes is not None:
