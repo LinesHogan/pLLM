@@ -13,7 +13,6 @@ import torch
 
 import pllm
 from pllm import _core
-from pllm.authoring import BackendCompileFacts, ParameterTargetShape
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
     AttachmentHiddenResource,
@@ -36,6 +35,7 @@ from pllm.execution.backend_attachment import (
     validate_backend_attachment_physical,
 )
 from pllm.execution.codec import decode_boundary, encode_boundary
+from pllm.execution.compile_facts import BackendCompileFacts, ParameterTargetShape
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload

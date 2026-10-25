@@ -161,8 +161,8 @@ def test_write_validates_result_shape_during_specialization():
 
 
 def test_ordinary_state_ports_and_write_do_not_depend_on_declaration_order():
-    from pllm.authoring import TensorStepInput
     from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
+    from pllm.execution.step_input import TensorStepInput
 
     @dataclass(frozen=True)
     class LocalWorkload(FeedWorkload):

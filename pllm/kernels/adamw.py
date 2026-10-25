@@ -63,22 +63,6 @@ def apply_adamw(
     gradients: tuple[torch.Tensor, ...],
 ) -> None:
     """Apply the bound optimizer to validated page views and matching gradients."""
-    if roots and roots[0][0].is_meta:
-        # Torch's capturable implementation requires a CUDA tag; its storage stays meta.
-        from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
-
-        from pllm.execution.memory import MemoryTrace, measure
-
-        with FakeTensorMode() as mode:
-
-            def operand(value: torch.Tensor) -> torch.Tensor:
-                return FakeTensor(mode, value, torch.device("cuda:0"))
-
-            pages = tuple(tuple(operand(value) for value in root) for root in roots)
-            values = tuple(operand(value) for value in gradients)
-            scratch = measure(lambda: apply_adamw(pages, fields, config, values))
-        MemoryTrace.reserve(scratch.workspace)
-        return
     # PTTS and region input binding already validate page fields; gradients enter here from math.
     if (
         not roots

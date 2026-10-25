@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from pllm.authoring import BackendCompileFacts, TensorStepInput
 from pllm.config import ExecutionOptions
 from pllm.contracts.auxiliary import WeightedCEBatch
 from pllm.contracts.hidden_locator import HiddenPhase
@@ -20,9 +19,11 @@ from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import SamplerFeedback
 from pllm.contracts.semantic_graph import SchedulerTimeline, StateScope, TaskResourceFact, TaskSymbol, ValueResourceFact
 from pllm.contracts.state_ref import LayoutId, LineageId, StateRef, VersionId
+from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.request_state import RequestStateSelection, ResourceSelection
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.shared_tensor import tensor_dtype
+from pllm.execution.step_input import TensorStepInput
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import MemoryOperation, TensorBatch
 

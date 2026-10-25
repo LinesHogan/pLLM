@@ -9,7 +9,7 @@ import pytest
 import torch
 
 import pllm
-from pllm.authoring import BackendCompileFacts, StateTensorUpdate, TensorStepInput
+from pllm.authoring import StateTensorUpdate
 from pllm.contracts.backend_attachment import (
     ActivationPatchOperator,
     AttachmentGraphMode,
@@ -28,8 +28,10 @@ from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.activation import low_rank_affine_delta
 from pllm.execution.codec import encode_boundary
+from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.step_input import TensorStepInput
 from pllm.workloads.reft import ActivationConfig, ActivationWorkload, load_loreft_interventions
 
 

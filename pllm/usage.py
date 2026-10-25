@@ -13,7 +13,7 @@ from typing import Any, ClassVar, Literal, TypeVar
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from pllm.authoring import BackendCompileFacts, BackendRequirements, BackendWorkload, TensorStepInput
+from pllm.authoring import BackendRequirements, BackendWorkload
 from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import (
     ActivationPatchOperator,
@@ -53,6 +53,7 @@ from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorLayou
 from pllm.contracts.visibility import Exact as Exact, Visibility as Visibility
 from pllm.execution.binding_base import SGD as SGD, Buffer as Buffer
 from pllm.execution.codec import boundary_digest
+from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import Call, Dimensions, Shape, State, When, native
 from pllm.execution.freeze import (
     fingerprint,
@@ -76,6 +77,7 @@ from pllm.execution.module_state import (
     skeleton,
 )
 from pllm.execution.state_execution import MathBinding, StateExecution
+from pllm.execution.step_input import TensorStepInput
 from pllm.execution.task_memory import derive_resources
 from pllm.execution.tensor_binding import TensorBinding, TensorOutput as TensorOutput
 from pllm.execution.tensor_frame import TensorFrame, TensorPort, Tensors, TensorUpdate as TensorUpdate

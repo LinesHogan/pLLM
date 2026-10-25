@@ -13,7 +13,6 @@ from dataclasses import dataclass, replace
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from pllm.authoring import BackendCompileFacts, ParameterTargetShape
 from pllm.contracts.backend_attachment import AttachmentGraphMode, AttachmentTopology, BackendPlacementProbe
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
@@ -43,6 +42,7 @@ from pllm.contracts.semantic_graph import AnchorId, SemanticState, StateResource
 from pllm.contracts.state_representation import StateDeviceKind, StateLayoutRequirement, StateRepresentationRequest
 from pllm.contracts.tensor_layout import LayoutFieldId, StateTensorLayout, TensorDType, TensorLayoutRequest
 from pllm.contracts.tensor_rewrite import MatmulReassociation
+from pllm.execution.compile_facts import BackendCompileFacts, ParameterTargetShape
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts

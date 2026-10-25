@@ -16,7 +16,6 @@ import pytest
 import torch
 
 import pllm
-from pllm.authoring import TensorStepInput
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding, PackedHiddenSnapshot, PackedHiddenSnapshotBatch
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
@@ -28,6 +27,7 @@ from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.post_sample import PostSampleOverlap
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
+from pllm.execution.step_input import TensorStepInput
 from pllm.execution.tensor_task import TensorTask
 from test.backend_facts import backend_facts
 from test.workloads.test_esamp import _esamp_native_oracle, _ordinary_request_distillation

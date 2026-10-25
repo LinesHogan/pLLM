@@ -11,7 +11,6 @@ import torch
 from torch.nn import Parameter
 from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
 
-from pllm.authoring import ParameterTargetShape
 from pllm.backends.vllm.region_layers import original_layer
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import (
@@ -23,6 +22,7 @@ from pllm.contracts.parameter_overlay import (
     ParameterTarget,
 )
 from pllm.contracts.state_ref import StateRef
+from pllm.execution.compile_facts import ParameterTargetShape
 from pllm.execution.cuda_stream import upload
 from pllm.execution.module_graph import capture_module_calls
 from pllm.execution.overlay_task import ProjectionTransition, RouteOverlay

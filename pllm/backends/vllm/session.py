@@ -15,13 +15,7 @@ from vllm import SamplingParams
 from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
 from vllm.v1.core.sched.output import SchedulerOutput
 
-from pllm.authoring import (
-    AuxiliaryInput,
-    BackendDeployment,
-    DataT,
-    ResultT,
-    TensorStepInput,
-)
+from pllm.authoring import AuxiliaryInput, BackendDeployment, DataT, ResultT
 from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.hidden_capture import HiddenTaps
 from pllm.backends.vllm.overlay_graph import (
@@ -61,10 +55,16 @@ from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.execution import TaskGraphInvocation
 from pllm.execution.overlay_task import ProjectionTask
 from pllm.execution.post_sample import PostSampleOverlap
-from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.state_execution import StateDiagnostics, StateTaskContext
-from pllm.execution.state_feed import Feed, FeedReceiver
+from pllm.execution.state_feed import (
+    Feed,
+    FeedReceiver,
+    ReadonlyStepAbsent,
+    ReadonlyStepEnd,
+    ReadonlyStepInput,
+)
+from pllm.execution.step_input import TensorStepInput
 from pllm.execution.tensor_frame import TensorFrame
 
 if TYPE_CHECKING:
@@ -76,27 +76,6 @@ class _PackedStep(Generic[DataT]):
     rows: PackedSamplerRowBatch
     invocation: TaskGraphInvocation[StateTaskContext[DataT]] | None = None
     forward_done: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class ReadonlyStepInput:
-    """Internal handoff of complete received grants for one original engine step."""
-
-    plan_epoch: int
-    step_id: int
-    roots: tuple[BorrowedStateRoot, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class ReadonlyStepAbsent:
-    plan_epoch: int
-    step_id: int
-
-
-@dataclass(frozen=True, slots=True)
-class ReadonlyStepEnd:
-    plan_epoch: int
-    step_id: int
 
 
 ReadonlyStepReceiver = Callable[

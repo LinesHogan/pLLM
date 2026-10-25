@@ -16,12 +16,10 @@ from pllm.contracts.auxiliary import (
     WeightedCEBatch as WeightedCEBatch,
     map_auxiliary as map_auxiliary,
 )
-from pllm.contracts.backend_attachment import BackendAttachmentSpec, BackendPlacementProbe, SignedBackendAttachment
+from pllm.contracts.backend_attachment import BackendAttachmentSpec, SignedBackendAttachment
 from pllm.contracts.compilation import PlanBundle as PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase as HiddenPhase, HiddenSite as HiddenSite
-from pllm.contracts.packed_hidden import PackedHiddenSnapshotBatch
-from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
-from pllm.contracts.parameter_overlay import CapturedParameterOperand, ParameterTarget
+from pllm.contracts.parameter_overlay import ParameterTarget
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage as SamplerStage
 from pllm.contracts.semantic_graph import (
     HiddenInputSource,
@@ -38,7 +36,7 @@ from pllm.execution.backend_attachment import (
     derive_attachment_resources,
     validate_backend_attachment_physical,
 )
-from pllm.execution.cuda_stream import CudaStreamReadiness
+from pllm.execution.compile_facts import BackendCompileFacts, ParameterTargetShape
 from pllm.execution.declaration import (
     Builder as Builder,
     Call as Call,
@@ -50,12 +48,13 @@ from pllm.execution.declaration import (
     native as native,
 )
 from pllm.execution.ptts.page_bundle import PageBundleArena
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
+from pllm.execution.ptts.page_bundle_planning import compile_page_bundle_plan
 from pllm.execution.state_execution import (
     MathBinding as MathBinding,
     StateExecution,
     StateTaskContext as StateTaskContext,
 )
+from pllm.execution.step_input import TensorStepInput
 from pllm.execution.tensor_binding import TensorResult as TensorResult
 from pllm.execution.tensor_program import (
     FunctionMath as FunctionMath,
@@ -88,8 +87,6 @@ __all__ = [
     "TaskOutput",
     "InvocationOutput",
     "Observation",
-    "BackendCompileFacts",
-    "TensorStepInput",
     "MathBinding",
     "PlanBundle",
     "Roots",
@@ -107,42 +104,6 @@ __all__ = [
 
 
 @dataclass(frozen=True, slots=True)
-class TensorStepInput:
-    rows: PackedPhaseRowBatch
-    sampler_rows: PackedSamplerRowBatch
-    hidden: PackedHiddenSnapshotBatch | None = None
-    operands: tuple[CapturedParameterOperand, ...] = ()
-    auxiliary: AuxiliaryInput[torch.Tensor] | None = None
-    hidden_readiness: CudaStreamReadiness | None = None
-
-    def __post_init__(self) -> None:
-        if self.sampler_rows.row_batch is not self.rows:
-            raise ValueError("tensor input requires the original packed row provenance")
-        if self.hidden is None:
-            if self.hidden_readiness is not None:
-                raise ValueError("hidden readiness requires its original snapshots")
-        else:
-            if self.hidden.row_batch is not self.rows:
-                raise ValueError("hidden input belongs to another packed step")
-            device = self.hidden.snapshots[0].hidden.device
-            if (
-                (device.type == "cuda") != (self.hidden_readiness is not None)
-                or self.hidden_readiness is not None
-                and self.hidden_readiness.device != device
-            ):
-                raise ValueError("hidden snapshots require readiness from their original device")
-
-    def hidden_batch(self, stream: torch.cuda.Stream | None) -> PackedHiddenSnapshotBatch:
-        if self.hidden is None or (self.hidden_readiness is None) != (stream is None):
-            raise ValueError("hidden snapshots differ from the input device")
-        if self.hidden_readiness is not None and stream is not None:
-            self.hidden_readiness.order_on(stream)
-            for snapshot in self.hidden.snapshots:
-                snapshot.hidden.record_stream(stream)
-        return self.hidden
-
-
-@dataclass(frozen=True, slots=True)
 class BackendRequirements:
     hidden_inputs: tuple[HiddenInputSource, ...] = ()
     parameter_targets: tuple[ParameterTarget, ...] = ()
@@ -155,17 +116,6 @@ class BackendRequirements:
     def __post_init__(self) -> None:
         if self.resident_bytes < 0:
             raise ValueError("frozen dependency residency must be nonnegative")
-
-
-@dataclass(frozen=True, slots=True)
-class ParameterTargetShape:
-    target: ParameterTarget
-    input_size: int
-    output_size: int
-
-    def __post_init__(self) -> None:
-        if self.input_size < 1 or self.output_size < 1:
-            raise ValueError("parameter target dimensions must be positive")
 
 
 class CausalModel(Protocol):
@@ -190,27 +140,6 @@ class CausalModel(Protocol):
     def logits(
         self, batch: CausalTrainBatch[torch.Tensor], factors: tuple[torch.Tensor, ...] | None
     ) -> torch.Tensor: ...
-
-
-@dataclass(frozen=True, slots=True)
-class BackendCompileFacts:
-    probe: BackendPlacementProbe
-    timeline: SchedulerTimeline
-    providers: tuple[PageBundleProviderFacts, ...]
-    max_admitted_lineages: int
-    state_memory_budget_bytes: int
-    initialization_seed: int
-    targets: tuple[ParameterTargetShape, ...] = ()
-    vocab_size: int = 0
-    layer_count: int = 0
-
-    @property
-    def device(self) -> torch.device:
-        return (
-            torch.device("cuda", self.probe.device_ordinal)
-            if self.probe.device_kind.value == "cuda"
-            else torch.device("cpu")
-        )
 
 
 @dataclass(frozen=True, slots=True)

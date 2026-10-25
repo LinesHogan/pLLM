@@ -11,7 +11,6 @@ from enum import StrEnum
 from multiprocessing import get_context
 from multiprocessing.connection import Connection, wait
 from multiprocessing.resource_sharer import DupFd
-from typing import TYPE_CHECKING
 
 import torch
 
@@ -24,8 +23,27 @@ from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle import BorrowedPage, PageBundleArena, PageRelease
 from pllm.execution.shared_tensor import tensor_dtype
 
-if TYPE_CHECKING:
-    from pllm.backends.vllm.session import ReadonlyStepAbsent, ReadonlyStepEnd, ReadonlyStepInput
+
+@dataclass(frozen=True, slots=True)
+class ReadonlyStepInput:
+    """The feed versions one engine step received, handed to the session that consumes them."""
+
+    plan_epoch: int
+    step_id: int
+    roots: tuple[BorrowedStateRoot, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ReadonlyStepAbsent:
+    plan_epoch: int
+    step_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class ReadonlyStepEnd:
+    plan_epoch: int
+    step_id: int
+
 
 Channels = tuple[tuple[Connection, ...], ...]
 
@@ -342,8 +360,6 @@ class FeedReceiver:
     def __call__(
         self, rows: PackedSamplerRowBatch, stream: torch.cuda.Stream
     ) -> ReadonlyStepInput | ReadonlyStepAbsent | ReadonlyStepEnd:
-        from pllm.backends.vllm.session import ReadonlyStepAbsent, ReadonlyStepEnd, ReadonlyStepInput
-
         if self.failed or self.closed or self.writer is not None:
             raise RuntimeError("obtain the feed writer before generate; a failed feed cannot resume")
         try:

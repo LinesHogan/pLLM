@@ -9,11 +9,10 @@ import pytest
 import torch
 
 import pllm
-from pllm.authoring import TensorStepInput
-from pllm.backends.vllm.session import ReadonlyStepEnd
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.execution.ptts.page_bundle import PageBundleArena
-from pllm.execution.state_feed import FeedReceiver
+from pllm.execution.state_feed import FeedReceiver, ReadonlyStepEnd
+from pllm.execution.step_input import TensorStepInput
 from test.workloads.test_state_feed import FeedWorkload, facts_for
 
 pytestmark = [pytest.mark.slow, pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA IPC requires a GPU")]

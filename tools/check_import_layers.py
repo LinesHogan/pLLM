@@ -17,9 +17,11 @@ PKG_ROOT = REPO_ROOT / "pllm"
 # importer package -> allowed internal targets (besides itself).
 RULES: dict[str, frozenset[str]] = {
     "contracts": frozenset(),
-    "execution": frozenset({"contracts", "kernels"}),
+    # `config` holds plain option values with no package dependencies.
+    "execution": frozenset({"config", "contracts", "kernels"}),
     "kernels": frozenset({"contracts"}),
-    "workloads": frozenset({"authoring", "config", "contracts", "execution", "kernels"}),
+    # Workloads may also use the public grouped API modules (pllm.host, pllm.model, pllm.state).
+    "workloads": frozenset({"authoring", "config", "contracts", "execution", "kernels", "host", "model", "state"}),
     "backends": frozenset({"authoring", "config", "contracts", "execution"}),
 }
 

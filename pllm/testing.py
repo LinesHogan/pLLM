@@ -13,7 +13,6 @@ from typing import TypeVar
 
 import torch
 
-from pllm.authoring import TensorStepInput
 from pllm.contracts.auxiliary import AuxiliaryInput
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.packed_hidden import (
@@ -29,6 +28,7 @@ from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
 from pllm.contracts.semantic_graph import AnchorId
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.state_execution import StateExecution
+from pllm.execution.step_input import TensorStepInput
 
 DataT = TypeVar("DataT")
 ResultT = TypeVar("ResultT")

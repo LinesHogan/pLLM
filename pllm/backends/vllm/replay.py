@@ -12,7 +12,7 @@ from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 
-from pllm.authoring import DataT, ResultT, TensorStepInput
+from pllm.authoring import DataT, ResultT
 from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay
 from pllm.backends.vllm.region_attention import (
@@ -42,6 +42,7 @@ from pllm.execution.region_resources import (
 from pllm.execution.region_values import Data
 from pllm.execution.replay import TokenwiseReplayPrimitive, TokenwiseReplayTask
 from pllm.execution.state_execution import StateExecution, StateTaskContext
+from pllm.execution.step_input import TensorStepInput
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
 
 

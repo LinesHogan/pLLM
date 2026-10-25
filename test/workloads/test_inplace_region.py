@@ -13,7 +13,6 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 import pllm
-from pllm.authoring import BackendCompileFacts, ParameterTargetShape
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
     CapturedParameterOperand,
@@ -27,6 +26,7 @@ from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.affine_scan import candidates as affine_candidates
 from pllm.execution.codec import decode_boundary, encode_boundary
+from pllm.execution.compile_facts import BackendCompileFacts, ParameterTargetShape
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts

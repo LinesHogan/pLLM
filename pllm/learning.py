@@ -14,14 +14,7 @@ from typing import ClassVar, Generic, TypeVar, cast
 
 import torch
 
-from pllm.authoring import (
-    BackendCompileFacts,
-    BackendRequirements,
-    BackendWorkload,
-    CausalModel,
-    CausalTrainBatch,
-    TensorStepInput,
-)
+from pllm.authoring import BackendRequirements, BackendWorkload, CausalModel, CausalTrainBatch
 from pllm.contracts.backend_attachment import BackendAttachmentSpec
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.packed_rows import PackedPhaseRow
@@ -41,6 +34,7 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
 from pllm.execution.binding_base import Buffer
 from pllm.execution.codec import boundary_digest
+from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import Builder, Dimensions, Field, Shape, When, native
 from pllm.execution.freeze import fingerprint, freeze, owner_snapshot, owner_values
 from pllm.execution.host_memory import transaction_resources
@@ -57,6 +51,7 @@ from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.region_adamw import AdamWRegion
 from pllm.execution.shared_tensor import tensor_dtype
 from pllm.execution.state_execution import MathBinding, StateExecution
+from pllm.execution.step_input import TensorStepInput
 from pllm.execution.tensor_frame import Tensors
 from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots, TensorBatch, autograd_loss
 from pllm.kernels.adamw import AdamWConfig

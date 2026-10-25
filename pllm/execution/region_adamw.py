@@ -8,6 +8,7 @@ import torch
 from pllm.contracts.region_program import Block, Call, Function, Program, Region, TensorType, Value
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.codec import boundary_digest
+from pllm.execution.memory import apply_adamw_or_reserve
 from pllm.execution.region_compilation import analyze_region_program
 from pllm.execution.region_execution import RegionInstructionExecution
 from pllm.execution.region_native import NativePrimitive, PrimitiveResources
@@ -15,7 +16,7 @@ from pllm.execution.region_storage import analyze_region_capacity
 from pllm.execution.region_values import Data, check_data
 from pllm.execution.shared_tensor import region_dtype
 from pllm.execution.tensor_program import FieldSlots
-from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw
+from pllm.kernels.adamw import AdamWConfig, AdamWFields
 
 
 def adamw_cell(parameter: TensorType, config: AdamWConfig) -> NativePrimitive:
@@ -37,7 +38,7 @@ def adamw_cell(parameter: TensorType, config: AdamWConfig) -> NativePrimitive:
                 raise ValueError("AdamW import requires tensor operands")
             tensors.append(value)
         root = tuple(tensors[:5])
-        apply_adamw((root,), fields, config, (tensors[5],))
+        apply_adamw_or_reserve((root,), fields, config, (tensors[5],))
         return root
 
     return NativePrimitive(declaration, update)
@@ -150,7 +151,7 @@ def adamw_batch_cell(parameters: tuple[TensorType, ...], config: AdamWConfig) ->
             for i in range(0, len(tensors), 5)
         )
         gradients = tuple(tensors[i + 4] for i in range(0, len(tensors), 5))
-        apply_adamw(roots, fields, config, gradients)
+        apply_adamw_or_reserve(roots, fields, config, gradients)
         return tuple(tensor for root in roots for tensor in root)
 
     return NativePrimitive(declaration, update)

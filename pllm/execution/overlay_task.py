@@ -22,9 +22,9 @@ from pllm.execution.tensor_program import TaskOutput, TensorBatch
 DataT = TypeVar("DataT")
 ResultT = TypeVar("ResultT")
 if TYPE_CHECKING:
-    from pllm.authoring import TensorStepInput
     from pllm.execution.execution import TaskGraphInvocation
     from pllm.execution.state_execution import StateExecution, StateTaskContext
+    from pllm.execution.step_input import TensorStepInput
 
 
 class ProjectionTransition(Protocol):
@@ -53,7 +53,7 @@ class ProjectionTask(Generic[DataT, ResultT]):
         self, operands: tuple[CapturedParameterOperand, ...]
     ) -> Mapping[tuple[RequestIdentity, ParameterTarget], torch.Tensor]:
         """Execute available target segments and hand their residuals to the model reader."""
-        from pllm.authoring import TensorStepInput
+        from pllm.execution.step_input import TensorStepInput
 
         targets = {operand.target for operand in operands}
         assert targets and targets <= self.pending

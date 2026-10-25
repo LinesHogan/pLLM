@@ -20,13 +20,13 @@ from pllm.contracts.semantic_graph import ImplementationId, SemanticOutputKind, 
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.cuda_stream import CudaStreamReadiness, upload
-from pllm.execution.memory import MemoryUsage, measure
+from pllm.execution.memory import MemoryUsage, apply_adamw_or_reserve, measure
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot, borrowed_root
 from pllm.execution.ptts.page_bundle import PagePin, PagePublication, PageWrite, Slots
 from pllm.execution.ptts.request_state import RequestStateSelection, StateAddress
 from pllm.execution.state_execution import StateTaskContext
 from pllm.execution.trace import TracePhase
-from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw, paged_adamw
+from pllm.kernels.adamw import AdamWConfig, AdamWFields, paged_adamw
 from pllm.kernels.page_copy import copy_pages
 
 I = TypeVar("I")
@@ -286,7 +286,7 @@ class PageUpdate:
 
     def tensors(self, roots: Sequence[tuple[torch.Tensor, ...]], gradients: tuple[torch.Tensor, ...]) -> None:
         """Apply the same grouped Torch update to ordinary or gathered private fields."""
-        apply_adamw(
+        apply_adamw_or_reserve(
             tuple(root[5 * group : 5 * group + 5] for root in roots for group in range(self.groups)),
             AdamWFields(*(LayoutFieldId(i) for i in range(5))),
             self.config,

@@ -12,7 +12,7 @@ import torch
 
 import pllm
 from pllm import TensorUpdate, testing
-from pllm.authoring import ParameterTargetShape, StateTensorUpdate, TensorStepInput
+from pllm.authoring import StateTensorUpdate
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
     CapturedParameterOperand,
@@ -23,8 +23,10 @@ from pllm.contracts.parameter_overlay import (
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.tensor_layout import TensorDType
+from pllm.execution.compile_facts import ParameterTargetShape
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.step_input import TensorStepInput
 from pllm.execution.visibility import explain_visibility
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
 from test.backend_facts import assert_finite_resources, backend_facts

@@ -9,7 +9,7 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from pllm.authoring import BackendCompileFacts, CausalTrainBatch, ParameterTargetShape
+from pllm.authoring import CausalTrainBatch
 from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
@@ -21,6 +21,7 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import TaskResourceFact, TaskSymbol
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
+from pllm.execution.compile_facts import BackendCompileFacts, ParameterTargetShape
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.kernels.adamw import AdamWConfig

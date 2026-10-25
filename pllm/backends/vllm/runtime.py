@@ -28,7 +28,6 @@ from vllm.v1.worker.gpu_worker import Worker
 
 from pllm.authoring import (
     AuxiliaryInput,
-    BackendCompileFacts,
     BackendDeployment,
     BackendRequirements,
     BackendWorkload,
@@ -70,6 +69,7 @@ from pllm.contracts.semantic_graph import SchedulerTimeline, TaskId
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorFieldSpec
 from pllm.execution.codec import decode_boundary, encode_boundary
+from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.host_runtime import CompletionInput
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts

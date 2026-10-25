@@ -5,7 +5,6 @@ from dataclasses import replace
 import pytest
 
 from pllm import ExecutionOptions
-from pllm.authoring import BackendCompileFacts
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
     AttachmentHiddenResource,
@@ -17,6 +16,7 @@ from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from pllm.contracts.semantic_graph import SchedulerTimeline
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
+from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 
 

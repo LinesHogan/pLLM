@@ -32,7 +32,7 @@ from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.tensor_program import Observation, TensorBatch
 
 if TYPE_CHECKING:
-    from pllm.authoring import TensorStepInput
+    from pllm.execution.step_input import TensorStepInput
 
 
 Tensors = Mapping[str, torch.Tensor]

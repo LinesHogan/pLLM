@@ -6,7 +6,6 @@ import pytest
 import torch
 
 import pllm
-from pllm.authoring import BackendCompileFacts, TensorStepInput
 from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
@@ -22,12 +21,14 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
+from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.paged_access import PagedLayer, PagedResourceView, bind_paged_access
 from pllm.execution.region_resources import HostResourceBinding, PagedResourceBinding, ReadonlyResourceBinding
 from pllm.execution.replay import (
     TokenwiseReplayPrimitive,
 )
 from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.step_input import TensorStepInput
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
 from pllm.workload_transport import decode_workload, encode_workload
 from pllm.workloads.recirculation import RecirculationWorkload

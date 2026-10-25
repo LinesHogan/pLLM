@@ -43,7 +43,8 @@ from pllm.execution.tensor_program import (
 )
 
 if TYPE_CHECKING:
-    from pllm.authoring import BackendCompileFacts, TensorStepInput
+    from pllm.execution.compile_facts import BackendCompileFacts
+    from pllm.execution.step_input import TensorStepInput
 
 
 from pllm.execution.model_effect_binding import ModelEffectBinding

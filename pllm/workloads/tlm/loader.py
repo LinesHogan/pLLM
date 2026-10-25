@@ -12,9 +12,10 @@ from pllm.execution.codec import boundary_digest
 if TYPE_CHECKING:
     from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 
-from pllm.authoring import CausalTrainBatch, ParameterTargetShape
+from pllm.authoring import CausalTrainBatch
 from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
 from pllm.contracts.tensor_layout import TensorDType
+from pllm.execution.compile_facts import ParameterTargetShape
 from pllm.execution.shared_tensor import tensor_dtype
 
 

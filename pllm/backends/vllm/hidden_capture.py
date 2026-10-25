@@ -18,9 +18,9 @@ from typing import cast
 import torch
 from torch import Tensor
 
-from pllm.authoring import TensorStepInput
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding, PackedHiddenSnapshot, PackedHiddenSnapshotBatch
 from pllm.execution.cuda_stream import CudaStreamReadiness
+from pllm.execution.step_input import TensorStepInput
 
 
 @torch.library.custom_op("pllm::tap", mutates_args=("buffer",))
