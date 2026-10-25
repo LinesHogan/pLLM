@@ -15,7 +15,6 @@ from pllm.contracts.region_composition import RegionFunctionBody, inline_functio
 from pllm.contracts.region_imports import BorrowedTensorImport, KernelAllocation, NativeKernelImport, RegionTensorImport
 from pllm.contracts.region_program import (
     AccessMode,
-    AccessRange,
     AffineIndex,
     BankType,
     Block,
@@ -150,11 +149,6 @@ class TokenwiseRegion:
             BankType(index, len(self.replay.layers)),
         )
         digest = boundary_digest(tensor, max_rows, domain, effect)
-        backups = ResourceAccess(
-            "kv",
-            AccessMode.READ,
-            (index_cell(1), AccessRange(AffineIndex(), AffineIndex(domain.layers)), index_cell(2)),
-        )
         context_read = ResourceAccess(self.context.name, AccessMode.READ, (index_cell(0),))
         context_write = ResourceAccess(self.context.name, AccessMode.WRITE, (index_cell(0),))
         trace_write = ResourceAccess(self.trace.name, AccessMode.WRITE, ())
@@ -162,8 +156,8 @@ class TokenwiseRegion:
             "tokenwise.begin@3:" + digest,
             (index, index, index),
             (positions, tensor),
-            ("context", "kv"),
-            (context_write, backups),
+            ("context",),
+            (context_write,),
         )
         self.normalize = decoder_normalize_function(tensor, domain.layers)
         self.observe = Function(
@@ -552,7 +546,6 @@ class TokenwiseRegion:
         observe: Observe,
         commit: Callable[[int, Callable[[], None]], None],
         record: Callable[[int], None],
-        restore: Callable[[], None],
         streams: RegionStreamBindings | None = None,
         kernel_imports: tuple[NativeKernelImport, ...] = (),
         function_bodies: tuple[RegionFunctionBody, ...] = (),
@@ -666,11 +659,7 @@ class TokenwiseRegion:
             borrows=(kv, weights, context, trace, *activation_borrows),
             tensor_borrows=tuple(item for item in self.imports if isinstance(item, BorrowedTensorImport)),
         )
-        try:
-            results = self.execution.run(inputs, pages=resources, sizes=sizes, streams=streams).values
-        except Exception:
-            restore()
-            raise
+        results = self.execution.run(inputs, pages=resources, sizes=sizes, streams=streams).values
         outputs: list[torch.Tensor] = []
         for result in results:
             if not isinstance(result, Bank):

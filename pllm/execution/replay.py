@@ -145,9 +145,6 @@ class TokenwiseReplayPrimitive(ABC):
     def commit(self, row: PackedPhaseRow, record: Callable[[], None]) -> None: ...
 
     @abstractmethod
-    def restore(self) -> None: ...
-
-    @abstractmethod
     def finish(self, outputs: tuple[torch.Tensor, ...]) -> None: ...
 
 
@@ -257,7 +254,6 @@ class TokenwiseReplayTask(Generic[DataT]):
                 observe=observe,
                 commit=commit,
                 record=record,
-                restore=primitive.restore,
                 streams=streams,
                 kernel_imports=primitive.kernel_imports,
                 function_bodies=primitive.function_bodies,

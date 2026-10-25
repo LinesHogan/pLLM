@@ -63,7 +63,6 @@ class _ReplayInput:
 @dataclass(frozen=True, slots=True)
 class _TokenReplayInput:
     context: ForwardContext
-    backups: tuple[tuple[torch.Tensor, int, int, torch.Tensor], ...]
 
 
 class VllmLayerReplay:
@@ -139,7 +138,7 @@ class VllmLayerReplay:
             carry = hidden_states[index : index + 1].detach()
             carry = carry.clone() if residual is None else carry + residual[index : index + 1]
             position = positions[index : index + 1]
-            length = int(position.item()) + 1
+            length = row.token_offset + 1
             sequence = torch.tensor([0, 1, length], dtype=torch.int32, device=carry.device)
             metadata: dict[str, FlashAttentionMetadata] = {}
             slots: list[tuple[torch.Tensor, int, int]] = []
@@ -303,6 +302,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         self._invocation: TaskGraphInvocation[StateTaskContext[DataT]] | None = None
         self._hidden: torch.Tensor | None = None
         self._positions: torch.Tensor | None = None
+        self._sequences = torch.empty((0, 3), dtype=torch.int32)
         self._output: torch.Tensor | None = None
         self._tokens: dict[PackedPhaseRow, _TokenReplayInput] = {}
         self._access: PagedAccessPlan | None = None
@@ -440,6 +440,10 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
                 raise ValueError("tokenwise replay requires model input IDs or embeddings")
             inputs_embeds = self.model.embed_input_ids(input_ids)
         self._hidden, self._positions = inputs_embeds, positions
+        # One (query start, query end, history length) triple per row, copied to the device once per step.
+        self._sequences = torch.tensor([(0, 1, row.token_offset + 1) for row in self._rows], dtype=torch.int32).to(
+            positions.device, non_blocking=True
+        )
         self._access = attention_paged_access(
             get_forward_context(), tuple(layer.self_attn.attn for layer in self.model.layers), self._rows
         )
@@ -457,22 +461,16 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         context = get_forward_context()
         index = row.packed_row_index
         position = positions[index : index + 1]
-        length = int(position.item()) + 1
-        if length != row.token_offset + 1:
-            raise ValueError("tokenwise replay position differs from original packed identity")
+        length = row.token_offset + 1
         # Every layer consumes the same immutable singleton sequence, not a per-layer copy.
-        sequence = torch.tensor([0, 1, length], dtype=torch.int32, device=hidden.device)
+        sequence = self._sequences[index]
         metadata_by_layer: dict[str, FlashAttentionMetadata] = {}
         slots_by_layer: dict[str, torch.Tensor] = {}
-        backups: list[tuple[torch.Tensor, int, int, torch.Tensor]] = []
         for layer in self.model.layers:
             attention = layer.self_attn.attn
-            selected, cache, block, offset = select_attention_metadata(
-                context, attention, row, length, sequence, self._access
-            )
+            selected, _, _, _ = select_attention_metadata(context, attention, row, length, sequence, self._access)
             metadata_by_layer[attention.layer_name] = selected
             slots_by_layer[attention.layer_name] = selected.slot_mapping
-            backups.append((cache, block, offset, cache[block, :, offset, :].clone()))
         selected = replace(
             context,
             attn_metadata=metadata_by_layer,
@@ -480,7 +478,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
             batch_descriptor=None,
             is_padding=None,
         )
-        self._tokens[row] = _TokenReplayInput(selected, tuple(backups))
+        self._tokens[row] = _TokenReplayInput(selected)
         return position, hidden[index : index + 1]
 
     def layer(
@@ -510,16 +508,8 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
     def commit(self, row: PackedPhaseRow, record: Callable[[], None]) -> None:
         if row not in self._tokens:
             raise RuntimeError("tokenwise commit requires its original preparation")
-        # A failed observation/record leaves this row's recovery data intact.
-        # Successful rows release only their own metadata and backups.
         record()
         del self._tokens[row]
-
-    def restore(self) -> None:
-        for item in reversed(tuple(self._tokens.values())):
-            for cache, block, offset, saved in item.backups:
-                cache[block, :, offset, :].copy_(saved)
-        self._tokens.clear()
 
     def finish(self, outputs: tuple[torch.Tensor, ...]) -> None:
         if self._tokens or len(outputs) != len(self._rows):

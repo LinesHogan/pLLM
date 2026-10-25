@@ -157,9 +157,7 @@ def _prefill_adapter_reconstruction() -> None:
     """A rebuilt worker starts fresh request identities and exact version-zero roots."""
     processes, requests = [], []
     for _ in range(2):
-        with pllm.make_llm(
-            workload=PrefillAdapters(chunk_size=3, rank=2), config=engine(memory=0.15)
-        ) as handle:
+        with pllm.make_llm(workload=PrefillAdapters(chunk_size=3, rank=2), config=engine(memory=0.15)) as handle:
             handle.observe(TraceSelection(max_events=4096))
             outputs = handle.generate(["The quick brown fox jumps over the lazy dog.", "Hello there."], greedy(2))
             state = handle.worker_state()

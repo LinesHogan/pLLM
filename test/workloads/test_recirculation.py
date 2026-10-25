@@ -78,13 +78,10 @@ class Decoder(TokenwiseReplayPrimitive):
     def __init__(self):
         self.batch = ROWS
         self.cache = torch.zeros(2, 3, 3, 4)
-        self.saved = {}
         self.normalized = set()
         self.replaying = set()
         self.seen_layers = set()
         self.output = None
-        self.fail = False
-        self.cancel = None
         self.calls = []
 
     @property
@@ -140,8 +137,6 @@ class Decoder(TokenwiseReplayPrimitive):
 
     def begin(self, row):
         self.calls.append((row.packed_row_index, "normal"))
-        assert row not in self.saved
-        self.saved[row] = self.cache[row.request_ordinal, :, row.token_offset].clone()
         return torch.tensor([row.token_offset]), INPUTS[row.packed_row_index : row.packed_row_index + 1].clone()
 
     def normalize(self, row, hidden, residual):
@@ -149,23 +144,10 @@ class Decoder(TokenwiseReplayPrimitive):
         return hidden + residual
 
     def commit(self, row, record):
-        if row in self.replaying and self.fail:
-            raise RuntimeError("replay kernel failed")
-        if row in self.replaying and self.cancel is not None:
-            self.cancel.set()
         record()
-        del self.saved[row]
         self.normalized.discard(row)
         self.replaying.discard(row)
         self.seen_layers.difference_update((row, layer) for layer in range(self.cache.shape[1]))
-
-    def restore(self):
-        for row, saved in reversed(tuple(self.saved.items())):
-            self.cache[row.request_ordinal, :, row.token_offset].copy_(saved)
-        self.saved.clear()
-        self.normalized.clear()
-        self.replaying.clear()
-        self.seen_layers.clear()
 
     def finish(self, outputs):
         self.output = torch.cat(outputs)
@@ -237,7 +219,7 @@ def test_recirculation_declaration_fits_reference_budget_and_crosses_the_wire() 
         RecirculationWorkload(replace(CONFIG, destination_layer=3)).compile_backend(FACTS)
 
 
-def test_recirculation_replay_matches_serial_oracle_and_fails_atomically() -> None:
+def test_recirculation_replay_matches_serial_oracle() -> None:
     workload = RecirculationWorkload(CONFIG)
     execution = workload.compile_backend(workload.specialize(FACTS, ExecutionOptions(tuning="measured"))).execution
     expected_cache, expected_output = serial_oracle()
@@ -249,21 +231,6 @@ def test_recirculation_replay_matches_serial_oracle_and_fails_atomically() -> No
     torch.testing.assert_close(decoder.output, torch.stack(expected_output))
     torch.testing.assert_close(decoder.cache, expected_cache)
     torch.testing.assert_close(torch.random.get_rng_state(), rng, rtol=0, atol=0)
-    # A failed replay restores the KV it wrote; a cancelled one keeps the committed row only.
-    for fail in (True, False):
-        decoder = Decoder()
-        invocation = execution.start_step(VALUE)
-        invocation.context.replay = decoder
-        decoder.fail = fail
-        decoder.cancel = None if fail else invocation.context.cancel_requested
-        execution.execute_anchor(invocation, AnchorId(0))
-        with pytest.raises(RuntimeError):
-            execution.execute_anchor(invocation, AnchorId(1))
-        if fail:
-            assert torch.count_nonzero(decoder.cache) == 0
-        else:
-            torch.testing.assert_close(decoder.cache[0, :, 0], expected_cache[0, :, 0])
-            assert torch.count_nonzero(decoder.cache[:, :, 1:]) == 0
     assert execution.retire(IDENTITIES) == ()
 
 
