@@ -49,13 +49,6 @@ class AttachmentCleanupStage(StrEnum):
     REQUEST_FINISH = "request_finish"
 
 
-class StreamDependency(StrEnum):
-    HIDDEN_PRODUCER_TO_COMPUTE = "hidden_producer_to_compute"
-    COMPUTE_TO_SAMPLER = "compute_to_sampler"
-    SAMPLER_TO_TRANSITION = "sampler_to_transition"
-    TRANSITION_TO_RELEASE = "transition_to_release"
-
-
 class AttachmentTaskRole(StrEnum):
     COMPUTE = "compute"
     TRANSITION = "transition"
@@ -177,7 +170,6 @@ class BackendAttachmentRequest:
     task_bindings: tuple[AttachmentTaskBinding, ...]
     sampler_anchor_id: AnchorId
     sampler_anchor_symbol: str
-    stream_dependencies: tuple[StreamDependency, ...]
     sampler_stage: SamplerStage
     cleanup_stage: AttachmentCleanupStage
     state_resource: str
@@ -248,5 +240,4 @@ __all__ = [
     "BackendAttachmentPhysicalPlan",
     "BackendAttachmentRequest",
     "BackendPlacementProbe",
-    "StreamDependency",
 ]

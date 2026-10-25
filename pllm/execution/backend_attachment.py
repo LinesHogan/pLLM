@@ -9,7 +9,6 @@ from pllm import _core
 from pllm.contracts.backend_attachment import (
     AttachmentCleanupStage,
     AttachmentGraphMode,
-    AttachmentKind,
     AttachmentTaskBinding,
     AttachmentTaskRole,
     BackendAttachmentCompilerInputs,
@@ -19,7 +18,6 @@ from pllm.contracts.backend_attachment import (
     BackendAttachmentSpec,
     BackendPlacementProbe,
     SignedBackendAttachment,
-    StreamDependency,
 )
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator
@@ -78,8 +76,7 @@ def attachment_buffer_bytes(
             outputs = fields[binding.fields[1]].shape[0]
             buffers += rows * (width * (inputs + rank + 2 * outputs) + 8)
         if probe.causal_domain is not None and (
-            probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH
-            or not any(task.visibility is not None and task.visibility.in_forward for task in graph.tasks)
+            probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH or not graph.updates_in_forward
         ):
             blocks = projection_blocks(rows, probe.causal_domain.requests)
             buffers += 24 * (blocks * (ROWS_PER_BLOCK + len(binding.fields)) + rows)
@@ -283,24 +280,12 @@ def bind_backend_attachment(
 ) -> SignedBackendAttachment:
     anchors = {anchor.symbol: anchor for anchor in plan.timeline.anchors}
     sampler = anchors[spec.sampler_anchor]
-    if spec.guides_sampler:
-        dependencies = (
-            StreamDependency.HIDDEN_PRODUCER_TO_COMPUTE,
-            StreamDependency.COMPUTE_TO_SAMPLER,
-            StreamDependency.SAMPLER_TO_TRANSITION,
-            StreamDependency.TRANSITION_TO_RELEASE,
-        )
-    elif spec.kind in (AttachmentKind.OBSERVATION, AttachmentKind.REQUEST_TRAINING):
-        dependencies = (StreamDependency.HIDDEN_PRODUCER_TO_COMPUTE, StreamDependency.TRANSITION_TO_RELEASE)
-    else:
-        dependencies = (StreamDependency.TRANSITION_TO_RELEASE,)
     request = BackendAttachmentRequest(
         attachment_kind=spec.kind,
         packed_row_schema_version=1,
         task_bindings=bind_attachment_tasks(plan, spec.tasks),
         sampler_anchor_id=AnchorId(sampler.ordinal),
         sampler_anchor_symbol=sampler.symbol,
-        stream_dependencies=dependencies,
         sampler_stage=spec.sampler_stage,
         cleanup_stage=AttachmentCleanupStage.REQUEST_FINISH,
         state_resource=spec.state_resource,

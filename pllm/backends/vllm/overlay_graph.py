@@ -172,10 +172,7 @@ class OverlayGraphRunner(GPUModelRunner):
         assert manager is not None
         self.cudagraph_manager = (
             _HybridGraphManager(self.vllm_config, self.device, manager.cudagraph_mode, manager.decode_query_len, phases)
-            if any(
-                task.visibility is not None and task.visibility.in_forward
-                for task in attachment.inputs.plan.semantic_graph.tasks
-            )
+            if attachment.inputs.plan.semantic_graph.updates_in_forward
             else ModelCudaGraphManager(self.vllm_config, self.device, manager.cudagraph_mode, manager.decode_query_len)
         )
         self.projection_model.do_not_compile = False

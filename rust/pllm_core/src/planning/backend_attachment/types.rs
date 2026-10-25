@@ -47,15 +47,6 @@ pub(crate) enum AttachmentCleanupStage {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum StreamDependency {
-    HiddenProducerToCompute,
-    ComputeToSampler,
-    SamplerToTransition,
-    TransitionToRelease,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
 pub(crate) enum AttachmentTaskRole {
     Compute,
     Transition,
@@ -248,7 +239,6 @@ pub(crate) struct BackendAttachmentRequest {
     pub(crate) task_bindings: Vec<AttachmentTaskBinding>,
     pub(crate) sampler_anchor_id: u32,
     pub(crate) sampler_anchor_symbol: String,
-    pub(crate) stream_dependencies: Vec<StreamDependency>,
     pub(crate) sampler_stage: SamplerStage,
     pub(crate) cleanup_stage: AttachmentCleanupStage,
     pub(crate) state_resource: String,

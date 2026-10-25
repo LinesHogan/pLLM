@@ -231,7 +231,7 @@ class TensorBinding(ModelEffectBinding, RowTaskBinding):
             return prepare_replacement
         if self.overlay_targets:
             shapes = dict(zip(self.overlay_targets, dimensions.target_shapes, strict=True))
-            in_forward = any(task.visibility is not None and task.visibility.in_forward for task in self.graph.tasks)
+            in_forward = self.graph.updates_in_forward
 
             def prepare_overlay(value: TensorStepInput, batch: TensorBatch) -> TensorFrame:
                 expected = {

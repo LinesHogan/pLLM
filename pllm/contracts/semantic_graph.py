@@ -233,6 +233,11 @@ class SemanticGraph:
     input_groups: tuple[ConditionalInputGroup, ...] = ()
     source_regions: tuple[TaskSourceRegion, ...] = ()
 
+    @property
+    def updates_in_forward(self) -> bool:
+        """Some task applies state updates inside the model forward (an Exact overlay)."""
+        return any(task.visibility is not None and task.visibility.in_forward for task in self.tasks)
+
 
 @dataclass(frozen=True, slots=True)
 class TimelineAnchor:

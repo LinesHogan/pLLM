@@ -938,7 +938,7 @@ mod tests {
             name: String::new(),
             type_: scalar(ScalarType::Index),
         };
-        let mut named = |name: &str| {
+        let named = |name: &str| {
             let mut value = index();
             value.name = name.into();
             value

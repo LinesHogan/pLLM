@@ -116,9 +116,7 @@ class VllmSession(Generic[DataT, ResultT]):
             == "request.prepare"
         )
         routed_overlay = bool(overlay_bindings) and any(task.replay is not None for task in plan.semantic_graph.tasks)
-        self._in_forward_overlay = any(
-            task.visibility is not None and task.visibility.in_forward for task in plan.semantic_graph.tasks
-        )
+        self._in_forward_overlay = plan.semantic_graph.updates_in_forward
         if routed_overlay or self._in_forward_overlay or probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH:
             validate_projection_sources(model, tuple(binding.target for binding in overlay_bindings))
         self._overlay = (

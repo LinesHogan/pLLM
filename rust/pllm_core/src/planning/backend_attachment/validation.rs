@@ -10,7 +10,7 @@ use super::types::{
     ActivationPatchOperator, AttachmentCompilerInputs, AttachmentGraphMode, AttachmentHiddenResource, AttachmentKind, AttachmentTaskBinding,
     AttachmentTaskRole, BackendAttachmentRequest, BackendPlacementProbe, HiddenLayerKind,
     DecodeRefresh, DecodeWindow, HiddenPhase, HiddenSite, MissingPolicy, OverlayOperator, SamplerStage,
-    StreamDependency, SCHEMA_VERSION,
+    SCHEMA_VERSION,
 };
 
 pub(crate) fn require_text(value: &str, label: &str) -> Result<(), String> {
@@ -129,26 +129,16 @@ fn validate_request(
             return Err("activation patch requires unique layers and exact operator fields".into());
         }
     }
-    if request.stream_dependencies.is_empty()
-        || request
-            .stream_dependencies
-            .windows(2)
-            .any(|pair| pair[0] >= pair[1])
-    {
-        return Err("stream dependencies must be sorted unique".to_owned());
-    }
     match request.attachment_kind {
         AttachmentKind::Observation => {
             if probe.hidden_resources.is_empty() || !request.overlay_bindings.is_empty()
                 || !request.activation_bindings.is_empty()
-                || request.stream_dependencies != vec![StreamDependency::HiddenProducerToCompute, StreamDependency::TransitionToRelease]
             {
-                return Err("observation requires only signed hidden inputs and release ordering".into());
+                return Err("observation requires only signed hidden inputs".into());
             }
         }
         AttachmentKind::ModelReplay => {
             if !probe.hidden_resources.is_empty() || !request.overlay_bindings.is_empty()
-                || request.stream_dependencies != vec![StreamDependency::TransitionToRelease]
                 || !probe.capabilities.iter().any(|value| value == "model/tokenwise_replay@1")
             {
                 return Err("model replay requires the signed tokenwise primitive only".into());
@@ -158,28 +148,12 @@ fn validate_request(
             if !request.overlay_bindings.is_empty() || !request.activation_bindings.is_empty() {
                 return Err("request training cannot bind overlay or activation fields".to_owned());
             }
-            let expected = if guides_sampler {
-                vec![
-                    StreamDependency::HiddenProducerToCompute,
-                    StreamDependency::ComputeToSampler,
-                    StreamDependency::SamplerToTransition,
-                    StreamDependency::TransitionToRelease,
-                ]
-            } else {
-                vec![StreamDependency::HiddenProducerToCompute, StreamDependency::TransitionToRelease]
-            };
-            if request.stream_dependencies != expected {
-                return Err("request training stream dependencies differ from its task bindings".to_owned());
-            }
         }
         AttachmentKind::ParameterOverlay | AttachmentKind::ActivationPatch => {
             if !probe.hidden_resources.is_empty() {
                 return Err(
                     "hidden/overlay composition is not supported by this attachment".to_owned(),
                 );
-            }
-            if request.stream_dependencies != vec![StreamDependency::TransitionToRelease] {
-                return Err("parameter overlay stream dependencies differ from execution".to_owned());
             }
             if request.attachment_kind == AttachmentKind::ActivationPatch {
                 if !request.overlay_bindings.is_empty()
