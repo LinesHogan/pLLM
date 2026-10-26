@@ -53,6 +53,7 @@ def backend_facts(
                 for binding in sorted(hidden, key=lambda item: item.locator_key)
             ),
             (),
+            targets=extra.pop("targets", ()),
         ),
         timeline,
         () if provider is None else (provider,),

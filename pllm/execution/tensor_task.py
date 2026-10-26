@@ -12,9 +12,11 @@ from dataclasses import dataclass, replace
 
 import torch
 
+from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.semantic_graph import (
     MathContract,
     SemanticInputSource,
+    StateResource,
     StateSelectionInputSource,
     TaskResultInputSource,
     TaskSymbol,
@@ -45,9 +47,11 @@ class TensorTask:
     ports: Mapping[str, TensorPort]
     sources: Mapping[str, SemanticInputSource]
     policy: MathContract
-    output: str
+    outputs: tuple[str, ...]
     # Memory fields written from inputs at publication; only training tasks have them.
     captures: Mapping[str, LayoutFieldId]
+    phase: HiddenPhase | None = None
+    resource: StateResource = StateResource("")
 
     def dependencies(self, tasks: Mapping[TaskSymbol, TensorTask]) -> tuple[TensorTask, ...]:
         """This task's tensor DAG in dependency order, ending with the task itself."""
@@ -155,13 +159,15 @@ class TensorTask:
             # Pure predictions run on every row and mask the result; differentiable forwards still
             # compact so gradients see only the selected rows.
             inputs, rows = self.read(data, batch, compact=differentiable and data.weights is None)
-            result = self.function(inputs)
-            # Borrowed inputs cannot escape as result aliases; test_video exercises rejection.
-            for borrowed in batch.borrowed_roots:
-                borrowed.check_output(result)
-            if self.policy.forward_rows:
-                result = self.expand_selected(result, inputs, rows, data)
-        batch.results[self.symbol, self.output] = result
+            results = self.function(inputs)
+            if type(results) is not tuple or len(results) != len(self.outputs):
+                raise ValueError("write must return a tuple matching its declared fields")
+            for name, result in zip(self.outputs, results, strict=True):
+                for borrowed in batch.borrowed_roots:
+                    borrowed.check_output(result)
+                batch.results[self.symbol, name] = (
+                    self.expand_selected(result, inputs, rows, data) if self.policy.forward_rows else result
+                )
         return TaskOutput()
 
     def expand_selected(
@@ -182,7 +188,8 @@ class TensorTask:
         self, inputs: dict[str, torch.Tensor], rows: tuple[int, ...], data: TensorFrame, batch: TensorBatch
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         """Shared eager and captured forward, loss reduction and autograd step."""
-        loss, objective = self._loss(self.function(inputs), rows, data, batch)
+        (loss,) = self.function(inputs)
+        loss, objective = self._loss(loss, rows, data, batch)
         leaf = state_leaf(data, batch)
         targets = (leaf, *data.derivative_sources.values())
         derivatives = (

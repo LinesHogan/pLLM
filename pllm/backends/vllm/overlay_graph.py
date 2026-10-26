@@ -31,7 +31,7 @@ from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import CapturedParameterOperand, ParameterOverlayFieldBinding
 from pllm.contracts.region_selection import RegionSelectionPolicy
-from pllm.contracts.semantic_graph import StateScope
+from pllm.contracts.semantic_graph import StateResource
 from pllm.execution.codec import cuda_graph_pool_bytes, decode_boundary, encode_boundary
 from pllm.execution.cuda_stream import CudaStreamReadiness, PinnedStaging
 from pllm.execution.overlay_task import ProjectionTransition
@@ -229,7 +229,7 @@ class _ProjectionReader:
         self.mlp_base = None if self.mlp is None else self.mlp.forward
         self.binding, self.rows, self.requests = binding, rows, requests
         self.enabled = True
-        self.pools = [arena.field_pool(binding.resource, field) for field in binding.fields]
+        self.pools = [view.read(arena.field_pool(binding.resource, view.field), pooled=True) for view in binding.fields]
         self.table = torch.zeros(
             projection_blocks(rows, requests) * (ROWS_PER_BLOCK + len(binding.fields)) + rows,
             device=self.pools[0].device,
@@ -251,7 +251,11 @@ class _ProjectionReader:
             self.programs[count] = prepare_projection_read(
                 examples,
                 binding.operator,
-                budget + sum(pool.numel() * pool.element_size() for pool in self.pools),
+                budget
+                + sum(
+                    pool.untyped_storage().nbytes()
+                    for pool in {pool.untyped_storage().data_ptr(): pool for pool in self.pools}.values()
+                ),
                 policy,
                 compiler=InductorTensorCompiler(autotune_at_compile_time=False),
             )
@@ -328,7 +332,7 @@ class _ProjectionReader:
         requests = np.repeat(np.arange(len(starts)), lengths)
         offsets = np.arange(total) - starts[requests]
         block_rows = first_blocks[requests] + offsets // width
-        selected = field_slots[:, self.binding.fields]
+        selected = field_slots[:, tuple(view.field for view in self.binding.fields)]
         slots[:] = selected[0]
         slots[: int(blocks.sum())] = np.repeat(selected, blocks, axis=0)
         positions[block_rows, offsets % width] = np.arange(total)
@@ -389,22 +393,26 @@ class PinnedParameterOverlay:
         self.starts = np.flatnonzero(np.append(True, ordinals[1:] != ordinals[:-1]))
         self.sources = tuple(rows.rows[int(index)] for index in self.starts)
         self.total_rows = rows.total_rows
-        if directory.scope is StateScope.INSTANCE:
-            pins = tuple(directory.inference_pin(row.identity, self.stream) for row in self.sources)
-            refs = StateRefs.join(tuple(pin.refs for pin in pins))
-            _, slots = context.arena.slots(pins, refs)
-            versions = refs.versions
-        else:
-            indices = np.fromiter(
-                (context.selection.row_states[row.identity] for row in self.sources), np.int64, len(self.sources)
-            )
-            _, fields = context.arena.slot_matrix(context.pin, context.pin.refs)
-            slots = fields[indices]
-            versions = context.pin.refs.versions[indices]
-        self.updated_apply_count += int(np.diff(np.append(self.starts, rows.total_rows)) @ (versions > 0)) * len(
-            self.readers
-        )
         for reader in self.readers:
+            resource = StateResource(reader.binding.resource)
+            selection = context.selection.for_resource(resource)
+            if selection.keys == (None,):
+                pins = tuple(directory.inference_pin(row.identity, self.stream) for row in self.sources)
+                refs = StateRefs.of(
+                    tuple(next(ref for ref in pin.refs if context.arena.root(ref).resource == resource) for pin in pins)
+                )
+            else:
+                refs = StateRefs.of(
+                    tuple(
+                        context.current_owned_ref(context.selection.ref_for(row.identity, resource))
+                        for row in self.sources
+                    )
+                )
+                pins = tuple(
+                    context.pin if ref in context.pin.refs else context.borrow_published((ref,)) for ref in refs
+                )
+            _, slots = context.arena.slots(pins, refs)
+            self.updated_apply_count += int(np.diff(np.append(self.starts, rows.total_rows)) @ (refs.versions > 0))
             for value in (*reader.pools, reader.table, reader.captured, reader.desired):
                 value.record_stream(self.stream)
             reader.prepare(slots, self.starts, rows.total_rows)

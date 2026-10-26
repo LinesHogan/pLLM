@@ -10,6 +10,7 @@ from typing import Protocol
 
 import torch
 
+from pllm.contracts.parameter_overlay import FieldView
 from pllm.contracts.region_imports import BorrowedTensorImport, NativeKernelImport
 from pllm.contracts.region_program import (
     AccessMode,
@@ -96,7 +97,7 @@ class PinnedResourceCell:
     indices: tuple[int, ...]
     pin: PagePin
     ref: StateRef
-    fields: tuple[LayoutFieldId, ...]
+    fields: tuple[FieldView, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,7 +144,7 @@ class _PinnedTensorView(ReadonlyTensorView):
             ):
                 raise ValueError("pinned view is outside its owner's live exact pin fields")
             for identity, field in zip(cell.identities, proof.fields, strict=True):
-                original = self.owner.arena.borrow_field(proof.pin, proof.ref, field)
+                original = field.read(self.owner.arena.borrow_field(proof.pin, proof.ref, field.field))
                 if metadata(identity.tensor) != metadata(original):
                     raise ValueError("pinned view storage differs from its exact arena field")
 
@@ -166,7 +167,9 @@ class PinnedResourceBinding:
             tensors = (
                 ()
                 if cell is None
-                else tuple(owner.arena.borrow_field(cell.pin, cell.ref, field) for field in cell.fields)
+                else tuple(
+                    field.read(owner.arena.borrow_field(cell.pin, cell.ref, field.field)) for field in cell.fields
+                )
             )
             views.append(ReadonlyTensorCell.bind(indices, tensors))
         view = _PinnedTensorView(resource, tuple(views), owner, cells)

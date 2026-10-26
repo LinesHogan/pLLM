@@ -12,11 +12,11 @@ from pllm.contracts.parameter_overlay import (
     ParameterModuleKind,
     ParameterRole,
     ParameterTarget,
+    ParameterTargetShape,
 )
 from pllm.contracts.semantic_graph import AnchorId
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.codec import decode_boundary, encode_boundary
-from pllm.execution.compile_facts import ParameterTargetShape
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
@@ -27,9 +27,8 @@ TARGET = ParameterTarget(1, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTI
 CAPABILITIES = tuple(sorted(("model/tokenwise_replay@1", "transition/full_root@1", "state/fenced_reclaim@1")))
 ROUTE_FACTS = replace(
     FACTS,
-    probe=replace(FACTS.probe, capabilities=CAPABILITIES),
+    probe=replace(FACTS.probe, capabilities=CAPABILITIES, targets=(ParameterTargetShape(TARGET, 4, 4),)),
     timeline=RuntimeFacts(torch.device("cpu")).timeline(CAPABILITIES),
-    targets=(ParameterTargetShape(TARGET, 4, 4),),
     providers=(PageBundleProviderFacts("test.route@1", 16, StateDeviceKind.CPU),),
     state_memory_budget_bytes=1 << 20,
 )

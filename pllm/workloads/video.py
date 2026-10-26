@@ -65,7 +65,7 @@ class VideoWorkload(pllm.Workload):
             on_missing=pllm.model.MissingPolicy.HOLD,
         )
 
-    @pllm.write(state="inject", field="delta")
+    @pllm.write(state="inject", fields=("delta",))
     def encode(
         self,
         qp: torch.Tensor = pllm.parameter("features", "qp"),
@@ -73,7 +73,7 @@ class VideoWorkload(pllm.Workload):
         motion: torch.Tensor = pllm.parameter("features", "motion_magnitude"),
         segmentation: torch.Tensor = pllm.parameter("features", "segmentation"),
         template: torch.Tensor = pllm.parameter("inject", "delta"),
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, ...]:
         """Project block statistics onto a fixed Fourier basis at model hidden width."""
         signal = torch.cat(
             (qp.flatten() / 63, residual.flatten().sqrt(), motion.flatten() / (2**0.5), segmentation.flatten() / 3)
@@ -81,7 +81,7 @@ class VideoWorkload(pllm.Workload):
         positions = torch.arange(signal.numel(), dtype=torch.float32, device=signal.device) + 0.5
         frequencies = torch.arange(template.numel(), dtype=torch.float32, device=signal.device) + 1
         basis = torch.cos((pi / signal.numel()) * frequencies[:, None] * positions[None, :])
-        return self.gain * torch.tanh((basis @ signal) / signal.numel() ** 0.5)
+        return (self.gain * torch.tanh((basis @ signal) / signal.numel() ** 0.5),)
 
 
 def frame_features(frame: torch.Tensor, previous: torch.Tensor, grid_size: int) -> tuple[torch.Tensor, ...]:

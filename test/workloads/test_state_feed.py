@@ -43,10 +43,10 @@ class FeedWorkload(pllm.Workload):
             on_missing=self.missing,
         )
 
-    @pllm.write(state="target", field="value")
-    def transform(self, value: torch.Tensor = SOURCE, previous: torch.Tensor = TARGET) -> torch.Tensor:
+    @pllm.write(state="target", fields=("value",))
+    def transform(self, value: torch.Tensor = SOURCE, previous: torch.Tensor = TARGET) -> tuple[torch.Tensor, ...]:
         """Reading local state and fed state must not be mistaken for two writers."""
-        return value * 2 + previous * 0
+        return (value * 2 + previous * 0,)
 
 
 def facts_for(device=torch.device("cpu")):
@@ -76,7 +76,7 @@ def test_feed_declaration_signs_order_and_derives_ownership():
                     effect
                     for task in plan.semantic_graph.tasks
                     for effect in task.effects
-                    if effect.kind is StateEffectKind.TRANSITION
+                    if effect.kind is StateEffectKind.TRANSITION_MAYBE
                 ]
             )
             == 1
@@ -141,22 +141,22 @@ def test_feed_rejects_local_writers_and_request_scopes():
 
     @dataclass(frozen=True)
     class WritesSource(FeedWorkload):
-        @pllm.write(state="source", field="value")
-        def transform(self, value: torch.Tensor = SOURCE, previous: torch.Tensor = TARGET) -> torch.Tensor:
-            return value + previous
+        @pllm.write(state="source", fields=("value",))
+        def transform(self, value: torch.Tensor = SOURCE, previous: torch.Tensor = TARGET) -> tuple[torch.Tensor, ...]:
+            return (value + previous,)
 
-    with pytest.raises(ValueError, match="local InstanceState"):
+    with pytest.raises(ValueError, match="one producer"):
         WritesSource().declaration()
 
 
 def test_write_validates_result_shape_during_specialization():
     @dataclass(frozen=True)
     class WrongShape(FeedWorkload):
-        @pllm.write(state="target", field="value")
-        def transform(self, value: torch.Tensor = SOURCE, previous: torch.Tensor = TARGET) -> torch.Tensor:
-            return (value + previous).sum()
+        @pllm.write(state="target", fields=("value",))
+        def transform(self, value: torch.Tensor = SOURCE, previous: torch.Tensor = TARGET) -> tuple[torch.Tensor, ...]:
+            return ((value + previous).sum(),)
 
-    with pytest.raises(ValueError, match="write to target needs shape"):
+    with pytest.raises(ValueError, match="write to target needs finite fields"):
         WrongShape().specialize(facts_for(), pllm.ExecutionOptions())
 
 
@@ -174,9 +174,9 @@ def test_ordinary_state_ports_and_write_do_not_depend_on_declaration_order():
         def unrelated(self) -> pllm.InstanceState:
             return pllm.InstanceState({"value": (2,)})
 
-        @pllm.write(state="target", field="value")
-        def transform(self, value: torch.Tensor = SOURCE, previous: torch.Tensor = TARGET) -> torch.Tensor:
-            return torch.ones_like(value) + previous
+        @pllm.write(state="target", fields=("value",))
+        def transform(self, value: torch.Tensor = SOURCE, previous: torch.Tensor = TARGET) -> tuple[torch.Tensor, ...]:
+            return (torch.ones_like(value) + previous,)
 
     workload = LocalWorkload()
     facts = workload.specialize(facts_for(), pllm.ExecutionOptions())
@@ -201,12 +201,12 @@ def test_write_field_and_feed_field_order_are_signed():
         def activation(self) -> pllm.model.Activation:
             return pllm.model.Activation("target", (0, 1), operator=pllm.model.ActivationPatchOperator.ADD)
 
-        @pllm.write(state="target", field="value")
-        def transform(self, value: torch.Tensor = SOURCE, previous: torch.Tensor = TARGET) -> torch.Tensor:
-            return value + previous
+        @pllm.write(state="target", fields=("value",))
+        def transform(self, value: torch.Tensor = SOURCE, previous: torch.Tensor = TARGET) -> tuple[torch.Tensor, ...]:
+            return (value + previous,)
 
     first = Fields().declaration().graph.execution_parameters_digest
-    pllm.write(state="target", field="second")(Fields.transform)
+    pllm.write(state="target", fields=("second",))(Fields.transform)
     assert Fields().declaration().graph.execution_parameters_digest != first
     Fields.source = pllm.InstanceState({"value": (2,), "extra": (2,)}, feed=pllm.state.FeedOrder.ORDERED)
     first = Fields().declaration().graph.execution_parameters_digest

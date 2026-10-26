@@ -17,9 +17,10 @@ class PackedPhaseRow:
     token_offset: int
     phase: HiddenPhase
     identity: RequestIdentity
+    prompt_length: int = 0
 
     def __post_init__(self) -> None:
-        if self.packed_row_index < 0 or self.request_ordinal < 0 or self.token_offset < 0:
+        if self.packed_row_index < 0 or self.request_ordinal < 0 or self.token_offset < 0 or self.prompt_length < 0:
             raise ValueError("packed phase row indices must be non-negative")
         if not self.identity.request_id or self.identity.prompt_idx < 0 or self.identity.sample_idx < 0:
             raise ValueError("packed phase row requires a resolved request identity")
@@ -59,6 +60,16 @@ class PackedPhaseRowBatch:
                 last.values(),
                 key=lambda row: (row.identity.request_id, row.identity.prompt_idx, row.identity.sample_idx),
             )
+        )
+
+    def producer_rows(self, phase: HiddenPhase | None) -> tuple[PackedPhaseRow, ...]:
+        """Completed prompt endings or latest decode rows; None selects every request."""
+        if phase is None:
+            return self.request_rows
+        return (
+            tuple(row for row in self.prefill_rows if row.token_offset == row.prompt_length - 1)
+            if phase is HiddenPhase.PREFILL
+            else self.latest_decode_rows
         )
 
     @property

@@ -106,6 +106,7 @@ class StateTaskContext(Generic[DataT]):
         default_factory=lambda: dict[RequestIdentity, set[StateRef]]()
     )
     input_step_id: int = -1
+    forward_input_complete: bool = False
     projection_outputs: Mapping[tuple[RequestIdentity, ParameterTarget], torch.Tensor] = field(
         default_factory=lambda: dict[tuple[RequestIdentity, ParameterTarget], torch.Tensor]()
     )
@@ -640,16 +641,44 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                 self.cancel_step(invocation)
                 raise
 
+    def complete_forward_input(
+        self,
+        invocation: TaskGraphInvocation[StateTaskContext[DataT]],
+        value: InputT,
+        readiness: CudaStreamReadiness | None = None,
+    ) -> None:
+        """Complete the original frame once at the model boundary, retaining its results and receipts."""
+        self._submit_input(invocation, value, readiness, completing=True)
+
     def submit_input(
         self,
         invocation: TaskGraphInvocation[StateTaskContext[DataT]],
         value: InputT,
         readiness: CudaStreamReadiness | None = None,
     ) -> None:
+        """Consume the initial invocation input exactly once."""
+        self._submit_input(invocation, value, readiness, completing=False)
+
+    def _submit_input(
+        self,
+        invocation: TaskGraphInvocation[StateTaskContext[DataT]],
+        value: InputT,
+        readiness: CudaStreamReadiness | None,
+        *,
+        completing: bool,
+    ) -> None:
         """Consume original inputs, ordering an external CUDA producer when supplied."""
         with self._lock:
             context = self._context(invocation)
-            if context.value is not None:
+            if completing:
+                if (
+                    context.value is None
+                    or context.forward_input_complete
+                    or invocation.last_anchor_id >= self.sampler_anchor_id
+                ):
+                    raise RuntimeError("forward input completion requires one active pre-sampler frame")
+                context.forward_input_complete = True
+            elif context.value is not None:
                 raise RuntimeError("state invocation input is already supplied")
             try:
                 if readiness is not None:

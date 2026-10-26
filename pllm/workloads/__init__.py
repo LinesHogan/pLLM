@@ -16,5 +16,10 @@ from pllm.workloads.recirculation import (
     RecirculationWorkload as RecirculationWorkload,
 )
 from pllm.workloads.reft import ActivationConfig as ActivationConfig, ActivationWorkload as ActivationWorkload
+from pllm.workloads.state_producers import (
+    DecodeFactors as DecodeFactors,
+    PromptFactors as PromptFactors,
+    PromptMixture as PromptMixture,
+)
 from pllm.workloads.tlm import TLMConfig as TLMConfig, TLMWorkload as TLMWorkload
 from pllm.workloads.ttrl import TTRLConfig as TTRLConfig, TTRLWorkload as TTRLWorkload

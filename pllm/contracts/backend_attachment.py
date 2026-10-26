@@ -9,7 +9,7 @@ from typing import Literal
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
-from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding
+from pllm.contracts.parameter_overlay import FieldView, ParameterOverlayFieldBinding, ParameterTargetShape
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
     AnchorId,
@@ -22,7 +22,7 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.state_representation import (
     StateDeviceKind,
 )
-from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
+from pllm.contracts.tensor_layout import TensorDType
 
 
 class AttachmentTopology(StrEnum):
@@ -99,7 +99,8 @@ class BackendPlacementProbe:
     max_packed_rows: int
     hidden_resources: tuple[AttachmentHiddenResource, ...]
     capabilities: tuple[str, ...]
-    schema_version: int = 2
+    schema_version: int = 3
+    targets: tuple[ParameterTargetShape, ...] = ()
     causal_domain: CausalModelDomain | None = None
     position_states: tuple[tuple[str, float], ...] = ()
 
@@ -135,7 +136,7 @@ class ActivationPatchBinding:
     """Signed tensor operation on selected prefill and declared decode block-output rows."""
 
     layer: int
-    fields: tuple[LayoutFieldId, ...]
+    fields: tuple[FieldView, ...]
     first_tokens: int
     last_tokens: int
     operator: ActivationPatchOperator = ActivationPatchOperator.LOW_RANK_AFFINE
@@ -172,7 +173,7 @@ class BackendAttachmentRequest:
     state_resource: str
     overlay_bindings: tuple[ParameterOverlayFieldBinding, ...] = ()
     activation_bindings: tuple[ActivationPatchBinding, ...] = ()
-    schema_version: int = 10
+    schema_version: int = 11
 
     @property
     def guides_sampler(self) -> bool:
@@ -195,7 +196,7 @@ class BackendAttachmentDecision:
     post_sampler: Literal["main", "lagged", "writer"]
     request_digest: str
     signature: str
-    schema_version: int = 10
+    schema_version: int = 11
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,7 +212,7 @@ class BackendAttachmentPhysicalPlan:
     topology: AttachmentTopology
     graph_mode: AttachmentGraphMode
     bundle_signature: str
-    schema_version: int = 10
+    schema_version: int = 11
 
 
 @dataclass(frozen=True, slots=True)

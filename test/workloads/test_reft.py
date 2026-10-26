@@ -171,7 +171,7 @@ def _decode_declarations_are_signed(facts):
 
         @property
         def intervention(self) -> pllm.InstanceState:
-            return pllm.InstanceState({"delta": pllm.Buffer((4,), dtype=torch.float32)})
+            return pllm.InstanceState({"delta": pllm.Buffer((4,), dtype=torch.float32)}, imported=True)
 
     decoding = replace(legacy, decode=DecodeWindow.ALL)
     declarations = (legacy, decoding, replace(decoding, on_missing=MissingPolicy.HOLD))

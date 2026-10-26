@@ -15,10 +15,13 @@ from typing import TYPE_CHECKING
 import torch
 
 from pllm.contracts.auxiliary import WeightedCEBatch
+from pllm.contracts.hidden_locator import HiddenPhase
+from pllm.contracts.parameter_overlay import FieldView
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
 from pllm.contracts.semantic_graph import (
+    HiddenInputSource,
     HostPayloadSchemaId,
     MathContract,
     PackedSamplerRowsInputSource,
@@ -27,6 +30,7 @@ from pllm.contracts.semantic_graph import (
     SemanticInputSource,
     SemanticOutputKind,
     StateEffectKind,
+    StateResource,
     StateScope,
     StateSelectionInputSource,
     TaskResultInputSource,
@@ -241,43 +245,20 @@ class RowTaskBinding(TensorBindingBase):
         if dimensions is None:
             return {key: state.read() for key in (*shapes, *memory)}
         sizes = tuple(shape(dimensions) if callable(shape) else shape for shape in shapes.values())
-        views: dict[str, Callable[[tuple[torch.Tensor, ...]], torch.Tensor]] = {}
-        # Where each named view lives: (field index, start, size, shape); start is None for whole fields.
-        locations: dict[str, tuple[int, int | None, tuple[int, ...]]] = {}
+        views: dict[str, FieldView] = {}
         offset = 0
         for index, (key, shape) in enumerate(zip(shapes, sizes, strict=True)):
-            size = prod(shape)
-
-            def view(
-                root: tuple[torch.Tensor, ...],
-                start: int = offset,
-                size: int = size,
-                shape: tuple[int, ...] = shape,
-                index: int = index,
-            ) -> torch.Tensor:
-                return root[index] if raw else root[0].narrow(0, start, size).view(shape)
-
-            views[key] = view
-            locations[key] = (index, None, shape) if raw else (0, offset, shape)
-            offset += size
-        # Memory fields follow the optimizer-expanded parameter fields.
+            views[key] = FieldView(LayoutFieldId(index if raw else 0), 0 if raw else offset, shape)
+            offset += prod(shape)
         base = len(shapes) if raw else 5
-        for index, (key, memory_shape) in enumerate(memory.items()):
-
-            def memory_view(root: tuple[torch.Tensor, ...], index: int = base + index) -> torch.Tensor:
-                return root[index]
-
-            views[key] = memory_view
-            locations[key] = (
-                base + index,
-                None,
-                memory_shape(dimensions) if callable(memory_shape) else memory_shape,
-            )
+        for index, (key, shape) in enumerate(memory.items()):
+            views[key] = FieldView(LayoutFieldId(base + index), 0, shape(dimensions) if callable(shape) else shape)
+        self.field_views.update({(str(state.declaration.resource), key): view for key, view in views.items()})
 
         if initialize is not None:
 
             def init(root: tuple[torch.Tensor, ...], generator: torch.Generator) -> None:
-                initialize({key: view(root) for key, view in views.items()}, generator)
+                initialize({key: view.read(root[view.field]) for key, view in views.items()}, generator)
 
             self.initializers[str(state.declaration.resource)] = init
 
@@ -285,17 +266,21 @@ class RowTaskBinding(TensorBindingBase):
             view = views[key]
             return TensorPort(
                 state.read(),
-                lambda data, batch: view(batch.parameter_root(str(state.declaration.resource))),
+                lambda data, batch: view.read(batch.parameter_root(str(state.declaration.resource))[view.field]),
                 rowwise=False,
-                field=locations[key][0],
+                field=view.field,
             )
 
         if state.declaration.scope is StateScope.REQUEST:
 
             def request_port(key: str) -> TensorPort:
-                field_index, start, shape = locations[key]
+                view = views[key]
+                field_index, start, shape = view.field, view.offset, view.shape
 
                 def read(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
+                    selected = batch.for_resource(state.declaration.resource)
+                    data = data if selected is batch else replace(data, index=None, plan=None, leaf=None, fields=())
+                    batch = selected
                     size = prod(shape)
                     if field_index == 0 and data.leaf is not None:
                         leaf = data.leaf.narrow(1, start or 0, size)
@@ -319,7 +304,7 @@ class RowTaskBinding(TensorBindingBase):
         optimizer: SGD,
         steps: int,
         reset: Callable[[Tensors, torch.Generator], None],
-        function: TensorMath,
+        function: Callable[[Tensors], torch.Tensor],
         arguments: Mapping[str, tuple[str, str]],
     ) -> Call:
         if steps < 1 or self.weighted_training or self.host:
@@ -505,7 +490,9 @@ class RowTaskBinding(TensorBindingBase):
                     device=tensors[0].device,
                     dtype=torch.long,
                 )
-            index = row_index(data, batch, batch.roots[0][0].device)
+            selected = batch.for_resource(state.declaration.resource)
+            frame = data if selected is batch else replace(data, index=None, plan=None, leaf=None, fields=())
+            index = row_index(frame, selected, selected.roots[0][0].device)
             return index.versions.device if version else index.states.device
 
         return TensorPort(state.read(), read)
@@ -519,10 +506,33 @@ class RowTaskBinding(TensorBindingBase):
         identity: str = "",
         update: State | None = None,
         math: MathContract | None = None,
-        output: str = "value",
+        outputs: tuple[str, ...] = ("value",),
         captures: Mapping[str, LayoutFieldId] = {},
     ) -> Callable[[TensorMath], Call]:
         sources = {key: value.source if isinstance(value, TensorPort) else value for key, value in inputs.items()}
+
+        def phases(source: SemanticInputSource) -> set[HiddenPhase]:
+            if isinstance(source, HiddenInputSource):
+                return {source.phase}
+            return set[HiddenPhase]().union(
+                *(
+                    phases(port.source)
+                    for task in self.graph.tasks
+                    if isinstance(source, TaskResultInputSource) and task.symbol == source.task
+                    for port in task.inputs
+                )
+            )
+
+        domains = set[HiddenPhase]().union(*(phases(source) for source in sources.values()))
+        if len(domains) > 1 or domains and when is When.BEFORE_MODEL:
+            raise ValueError("tensor inputs need one phase; hidden inputs become available after model forward")
+        phase = next(iter(domains), None)
+        sources = {
+            key: replace(source, phase=phase or HiddenPhase.DECODE)
+            if isinstance(source, StateSelectionInputSource)
+            else source
+            for key, source in sources.items()
+        }
         if captures and update is None:
             raise ValueError("memory captures require the task's own training transition")
         if any(key not in sources for key in captures):
@@ -534,8 +544,8 @@ class RowTaskBinding(TensorBindingBase):
             if "__update_state" in sources:
                 raise ValueError("__update_state is reserved for the optimizer's state selection")
             sources["__update_state"] = update.read()
-        if update is not None and (update.optimizer is None or tuple(self.graph.states) != (update.declaration,)):
-            raise ValueError("ordinary training requires its sole declared instance optimizer state")
+        if update is not None and update.optimizer is None:
+            raise ValueError("training requires an optimizer on its declared state")
         policy = MathContract() if math is None else math
         reads = tuple(
             SemanticEffect(resource, StateEffectKind.READ)
@@ -562,13 +572,32 @@ class RowTaskBinding(TensorBindingBase):
                     raise ValueError(
                         "parameter gradient rows require Parameter(..., per_row=True) for shared parameters"
                     )
-                task = TensorTask(symbol, function, ports, sources, policy, output, captures)
+                task = TensorTask(
+                    symbol,
+                    function,
+                    ports,
+                    sources,
+                    policy,
+                    outputs,
+                    captures,
+                    phase,
+                    update.declaration.resource
+                    if update is not None
+                    else next(
+                        (
+                            source.resource
+                            for source in sources.values()
+                            if isinstance(source, StateSelectionInputSource)
+                        ),
+                        StateResource(""),
+                    ),
+                )
                 self.tensor_tasks[symbol] = task
                 execute = task.evaluate
             call = self.compute(
                 name,
                 inputs=sources,
-                outputs=(output,),
+                outputs=outputs,
                 changes=update,
                 math=math,
                 result_schema="canonical.tensor_training_result@1" if update is not None else "",
@@ -615,8 +644,10 @@ class RowTaskBinding(TensorBindingBase):
                     visit(port.source.task)
 
         visit(training.symbol)
-        if retained - visited or not resources:
-            raise ValueError("training must consume the declared differentiable parameter paths")
+        if retained - visited or resources != {
+            effect.resource for effect in tasks[training.symbol].effects if effect.kind is not StateEffectKind.READ
+        }:
+            raise ValueError("training must consume differentiable paths for its one optimizer state")
 
     def train_from_hidden(self, training: Call, state: State) -> None:
         """Train request state on hidden rows every step, with no effect on the model or the sampler."""

@@ -7,7 +7,7 @@ from typing import ClassVar, Generic, TypeVar
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
-from pllm.contracts.semantic_graph import HostServiceInputSource, StateScope
+from pllm.contracts.semantic_graph import HostServiceInputSource
 from pllm.contracts.tensor_layout import TensorDType, TensorFieldSpec
 
 T = TypeVar("T")
@@ -117,25 +117,9 @@ def validate_auxiliary(
             ):
                 raise ValueError("weighted-CE batch requires aligned states, rows and tensors")
             actual = (hidden_shape, logits_shape)
-        case StateTensorUpdate(values=values, keys=keys):
-            if not values:
-                return
-            (state,) = plan.semantic_graph.states
-            (layout,) = plan.tensor_layout_request.layouts
-            if (
-                len(values) != len(layout.layout.fields)
-                or state.scope is StateScope.INSTANCE
-                and keys
-                or state.scope is StateScope.REQUEST
-                and not keys
-                or len(set(keys)) != len(keys)
-                or any(
-                    shape(tensor) != ((len(keys),) if keys else ()) + field.shape
-                    or describe(tensor).dtype is not field.dtype
-                    for tensor, field in zip(values, layout.layout.fields)
-                )
-            ):
-                raise ValueError("replacement tensors differ from the signed layout or state scope")
+        case StateTensorUpdate():
+            # The bound import validates logical field views, including optimizer slices,
+            # against local roots before allocating or publishing any writes.
             return
     for task in consumers:
         limit = next((fact for fact in plan.timeline.task_resources if fact.task == task.symbol), None)

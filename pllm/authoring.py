@@ -19,7 +19,7 @@ from pllm.contracts.auxiliary import (
 from pllm.contracts.backend_attachment import BackendAttachmentSpec, SignedBackendAttachment
 from pllm.contracts.compilation import PlanBundle as PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase as HiddenPhase, HiddenSite as HiddenSite
-from pllm.contracts.parameter_overlay import ParameterTarget
+from pllm.contracts.parameter_overlay import ParameterTarget, ParameterTargetShape
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage as SamplerStage
 from pllm.contracts.semantic_graph import (
     HiddenInputSource,
@@ -36,7 +36,7 @@ from pllm.execution.backend_attachment import (
     derive_attachment_resources,
     validate_backend_attachment_physical,
 )
-from pllm.execution.compile_facts import BackendCompileFacts, ParameterTargetShape
+from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import (
     Builder as Builder,
     Call as Call,

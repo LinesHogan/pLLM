@@ -235,6 +235,10 @@ class LazyRoots(Sequence[tuple[torch.Tensor, ...]]):
     def __len__(self) -> int:
         return len(self._refs)
 
+    def select(self, indices: tuple[int, ...]) -> LazyRoots:
+        """Borrow a resource-specific subset under the same issued page access."""
+        return LazyRoots(self._arena, tuple(self._access[i] for i in indices), tuple(self._refs[i] for i in indices))
+
     def slot_matrix(self) -> tuple[str, Slots]:
         """One matrix for all fields, in selection order."""
         if self._matrix is None:

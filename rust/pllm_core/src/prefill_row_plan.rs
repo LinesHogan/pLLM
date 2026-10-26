@@ -38,6 +38,8 @@ pub(crate) struct PackedPrefillRowPlan {
     #[pyo3(get)]
     pub(crate) phases: Vec<String>,
     #[pyo3(get)]
+    pub(crate) prompt_lengths: Vec<i64>,
+    #[pyo3(get)]
     pub(crate) request_spans: Vec<PrefillRowSpan>,
     #[pyo3(get)]
     pub(crate) total_rows: i64,
@@ -98,6 +100,7 @@ pub(crate) fn plan_packed_prefill_rows(
     let mut packed_row_indices = Vec::with_capacity(total_rows as usize);
     let mut token_offsets = Vec::with_capacity(total_rows as usize);
     let mut phases = Vec::with_capacity(total_rows as usize);
+    let mut prompt_lengths = Vec::with_capacity(total_rows as usize);
     let mut request_spans = Vec::with_capacity(request_count);
     let mut row_base = 0_i64;
     for (request_ordinal, (&scheduled, (&prompt, &computed))) in scheduled_tokens
@@ -117,6 +120,7 @@ pub(crate) fn plan_packed_prefill_rows(
             request_ordinals.push(request_ordinal as i64);
             packed_row_indices.push(row_base + local_row);
             token_offsets.push(token_offset);
+            prompt_lengths.push(prompt);
             phases.push(if token_offset < prompt {
                 "prefill".into()
             } else {
@@ -139,6 +143,7 @@ pub(crate) fn plan_packed_prefill_rows(
         packed_row_indices,
         token_offsets,
         phases,
+        prompt_lengths,
         request_spans,
         total_rows,
     })

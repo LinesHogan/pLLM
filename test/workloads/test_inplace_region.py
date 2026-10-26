@@ -19,6 +19,7 @@ from pllm.contracts.parameter_overlay import (
     ParameterModuleKind,
     ParameterRole,
     ParameterTarget,
+    ParameterTargetShape,
 )
 from pllm.contracts.region_selection import RegionPayloadLimit, RegionSelectionPolicy
 from pllm.contracts.request_identity import RequestIdentity
@@ -26,7 +27,7 @@ from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.affine_scan import candidates as affine_candidates
 from pllm.execution.codec import decode_boundary, encode_boundary
-from pllm.execution.compile_facts import BackendCompileFacts, ParameterTargetShape
+from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts

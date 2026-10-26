@@ -72,6 +72,14 @@ class RequestStateSelection:
                 return group
         raise KeyError(resource)
 
+    def scoped(self, resource: StateResource) -> RequestStateSelection:
+        """Project one resource, renumbering rows into that resource's roots."""
+        group = self.for_resource(resource)
+        return RequestStateSelection(
+            self.rows,
+            (replace(group, state_indices=tuple(group.refs.index(self.refs[index]) for index in group.state_indices)),),
+        )
+
     def _sole_group(self) -> ResourceSelection:
         if len(self.groups) != 1:
             raise ValueError("state access must name a resource in a multi-state selection")

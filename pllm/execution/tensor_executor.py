@@ -11,6 +11,7 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
+from pllm.contracts.parameter_overlay import FieldView
 from pllm.contracts.semantic_graph import HiddenInputSource, TaskSymbol
 from pllm.execution.cuda_stream import PinnedStaging
 from pllm.execution.state_execution import StateTaskContext
@@ -221,7 +222,7 @@ class TensorExecutor:
                 dependency.evaluate(frame, operands)
         if self.optimizer is None:
             self.task.evaluate(frame, operands)
-            self.result = operands.results[self.task.symbol, self.task.output]
+            self.result = operands.results[self.task.symbol, self.task.outputs[0]]
             return
         with torch.enable_grad():
             self.inputs, self.evaluated_rows = self.task.read(frame, operands, compact=self.compact)
@@ -264,6 +265,15 @@ class TensorExecutor:
         self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext[TensorFrame] | None = None
     ) -> TaskOutput:
         """Prepare operands, run the shared body or graph, then settle invocation outputs."""
+        parent, frame = batch, data
+        if self.task.resource and any(group.resource == self.task.resource for group in batch.selection.groups):
+            batch = batch.for_resource(self.task.resource)
+        eligible = set(data.rows) if self.task.phase is None else set(data.step.rows.producer_rows(self.task.phase))
+        rows = tuple(row for row in data.rows if row in eligible) if self.task.phase is not None else data.rows
+        if rows != data.rows or batch.selection is not parent.selection:
+            data = replace(data, rows=rows, plan=None, index=None)
+        if not data.rows and self.task.phase is not None:
+            return TaskOutput()
         addresses: tuple[int, ...] = ()
         if not self.compact:
             if not data.rows:
@@ -297,7 +307,16 @@ class TensorExecutor:
                 batch.stream,
                 lambda: self.staging.copy_to(table),
             )
-        return self.settle_rows(data, batch)
+        output = self.settle_rows(data, batch)
+        frame.parameter_gradient_fields = data.parameter_gradient_fields
+        if batch.selection is not parent.selection:
+            positions = tuple(parent.selection.refs.index(ref) for ref in batch.selection.refs)
+            output = replace(
+                output,
+                gradient_indices=tuple(positions[i] for i in output.gradient_indices),
+                changed=tuple(positions[i] for i in output.changed),
+            )
+        return output
 
     def _inputs(self, data: TensorFrame, batch: TensorBatch) -> tuple[int, ...]:
         self.active_rows, self.active_states = len(data.rows), len(batch.roots)
@@ -340,7 +359,7 @@ class TensorExecutor:
         )
         value = None if self.result is None else retain_rows(self.result, count, copy=not self.compact)
         if value is not None:
-            batch.results[self.task.symbol, self.task.output] = value
+            batch.results[self.task.symbol, self.task.outputs[0]] = value
         if self.optimizer is None:
             return TaskOutput()
         assert self.gradients is not None
@@ -359,7 +378,7 @@ class TensorExecutor:
         last = plan.last
         writes = tuple(
             (
-                field,
+                FieldView(field, 0, tuple(batch.roots[0][field].shape)),
                 torch.stack(
                     tuple(
                         self.inputs[key][last[index]].detach() if index in last else batch.roots[index][field]

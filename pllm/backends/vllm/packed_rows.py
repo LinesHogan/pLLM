@@ -131,7 +131,7 @@ def _planned_rows(
         plan.request_ordinals, plan.packed_row_indices, plan.token_offsets, plan.phases, strict=True
     ):
         phase = HiddenPhase(raw_phase)
-        rows.append(PackedPhaseRow(packed, request, offset, phase, identities[request]))
+        rows.append(PackedPhaseRow(packed, request, offset, phase, identities[request], plan.prompt_lengths[packed]))
     phase_rows = PackedPhaseRowBatch(plan_epoch, step_id, plan.total_rows, tuple(rows))
     # vLLM samples each request's last scheduled token, which is the last packed row of its span.
     links = tuple(PackedSamplerRowLink(span.request_ordinal, span.packed_row_end - 1) for span in plan.request_spans)

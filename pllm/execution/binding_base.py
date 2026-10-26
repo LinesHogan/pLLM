@@ -18,6 +18,7 @@ from pllm.contracts.backend_attachment import (
 )
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
+    FieldView,
     ParameterTarget,
 )
 from pllm.contracts.semantic_graph import (
@@ -82,4 +83,5 @@ class TensorBindingBase(Builder[TensorFrame]):
         self.sample_limit: int | None = None
         self.overlay_targets: tuple[ParameterTarget, ...] = ()
         self.parameter_phases: tuple[HiddenPhase, ...] = ()
-        self.overlay_import = False
+        self.field_views: dict[tuple[str, str], FieldView] = {}
+        self.imports: dict[str, tuple[FieldView, ...]] = {}

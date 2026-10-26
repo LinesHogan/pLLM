@@ -6,7 +6,7 @@ use super::super::state_representation::StateDeviceKind;
 use super::super::tensor_layout::TensorDType;
 use super::super::PlanBundle;
 
-pub(crate) const SCHEMA_VERSION: u64 = 10;
+pub(crate) const SCHEMA_VERSION: u64 = 11;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -128,6 +128,7 @@ pub(crate) struct BackendPlacementProbe {
     pub(crate) schema_version: u64,
     #[serde(default)]
     pub(crate) causal_domain: Option<CausalModelDomain>,
+    pub(crate) targets: Vec<ParameterTargetShape>,
     #[serde(default)]
     pub(crate) position_states: Vec<(String, serde_json::Number)>,
 }
@@ -171,12 +172,28 @@ pub(crate) enum OverlayOperator {
     HeadAdd,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ParameterTargetShape {
+    pub(crate) target: ParameterTarget,
+    pub(crate) input_size: u64,
+    pub(crate) output_size: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FieldView {
+    pub(crate) field: u32,
+    pub(crate) offset: u64,
+    pub(crate) shape: Vec<u64>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OverlayBinding {
     pub(crate) target: ParameterTarget,
     pub(crate) operator: OverlayOperator,
-    pub(crate) fields: Vec<u32>,
+    pub(crate) fields: Vec<FieldView>,
     pub(crate) resource: String,
     pub(crate) scale: f64,
 }
@@ -213,7 +230,7 @@ pub(crate) enum MissingPolicy {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ActivationPatchBinding {
     pub(crate) layer: u32,
-    pub(crate) fields: Vec<u32>,
+    pub(crate) fields: Vec<FieldView>,
     pub(crate) first_tokens: u32,
     pub(crate) last_tokens: u32,
     pub(crate) operator: ActivationPatchOperator,

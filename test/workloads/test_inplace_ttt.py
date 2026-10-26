@@ -19,11 +19,11 @@ from pllm.contracts.parameter_overlay import (
     ParameterModuleKind,
     ParameterRole,
     ParameterTarget,
+    ParameterTargetShape,
 )
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.tensor_layout import TensorDType
-from pllm.execution.compile_facts import ParameterTargetShape
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.step_input import TensorStepInput
@@ -182,7 +182,11 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
                 output.new_full((), x.shape[0], dtype=torch.int64),
             )
 
-    low_rank = LowRankOverlay().compile_backend(replace(facts, targets=facts.targets[:1])).execution
+    low_rank = (
+        LowRankOverlay()
+        .compile_backend(replace(facts, probe=replace(facts.probe, targets=facts.probe.targets[:1])))
+        .execution
+    )
     requests = (RequestIdentity("first", 0, 0), RequestIdentity("second", 0, 0))
     initial = low_rank.admit(requests)
     result = low_rank.step(
@@ -214,6 +218,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
                 "a": pllm.Buffer(lambda inputs, outputs: (2, inputs)),
                 "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2)),
             },
+            imported=True,
             dtype=torch.float64,
         )
 
@@ -233,7 +238,11 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     )
     imported = (
         ImportedOverlay()
-        .compile_backend(assert_finite_resources(ImportedOverlay(), replace(facts, targets=facts.targets[:1])))
+        .compile_backend(
+            assert_finite_resources(
+                ImportedOverlay(), replace(facts, probe=replace(facts.probe, targets=facts.probe.targets[:1]))
+            )
+        )
         .execution
     )
     prompts = (RequestIdentity("first", 0, 0), RequestIdentity("second", 1, 0))

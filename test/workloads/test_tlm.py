@@ -16,12 +16,12 @@ from pllm.contracts.backend_attachment import (
     AttachmentTopology,
     BackendPlacementProbe,
 )
-from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
+from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget, ParameterTargetShape
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import TaskResourceFact, TaskSymbol
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
-from pllm.execution.compile_facts import BackendCompileFacts, ParameterTargetShape
+from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.kernels.adamw import AdamWConfig
@@ -95,7 +95,7 @@ def _facts(model, *, reserved=None, task_resources=()) -> BackendCompileFacts:
         (),
     )
     provider = PageBundleProviderFacts("test.tlm@1", 4, kind, ordinal)
-    return BackendCompileFacts(probe, timeline, (provider,), 2, 32768, 7, model.targets)
+    return BackendCompileFacts(replace(probe, targets=model.targets), timeline, (provider,), 2, 32768, 7)
 
 
 def _compile(model, config: TLMConfig):

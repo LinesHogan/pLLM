@@ -47,12 +47,8 @@ class MyLoRA(pllm.Workload):
 私有的因子存储。基座权重只是被借用来计算有效权重，补丁落在私有页上，按版本
 发布。
 
-**为什么 buffer 必须零初始化、不允许自定义初始化器？** 零初始化的 overlay
-精确等于没有补丁——导入的零因子会精确复现基座模型，准入与导入都建立在这条
-基准线上。代价是一个退化陷阱值得
-记住：零初始化下，如果因子互相依赖对方的增量（`a += f(b)`、`b += g(a)`），
-两者会永远停在零。至少让一个因子的增量只依赖操作数——上例中 `a` 的增量只用
-`x` 和 `y`。
+`initialize=` 可以初始化逻辑字段。普通 LoRA 训练通常随机初始化 A、将 B 置零，
+这样初始模型增量为零，第一次优化器更新仍能学习 B。
 
 **`prefill`/`decode` 控制什么？** 更新资格（默认 `prefill=True、decode=False`）。
 被禁用的阶段不更新，但仍会应用既有 overlay——它读的是已发布的版本。
@@ -88,12 +84,55 @@ def settle(self, layers: pllm.Layers) -> torch.Tensor:
 目前支持有界 Python `for` 循环；被追踪的 `while_loop` 会提示改用有界 for-loop。
 逐 token 的 hidden 循环可直接使用独立 `layer_route`，无需 overlay。
 
+## 独立声明状态生产者与模型消费者
+
+`pllm.model.Overlay` 只读 `state=` 指定的状态。`initialize=`、普通 `@pllm.train`、
+`@pllm.write` 和显式 `imported=True` 可以生产同一份状态，消费声明不用改变。
+作用域可以是 request 或 instance；一个资源每次 invocation 只允许一个修改生产者。
+没有生产者时读取初始化的版本。AdamW 因子是其扁平参数字段的视图，不复制一份模型因子。
+
+维护中的三个短示例见 [state_producers.py](../../pllm/workloads/state_producers.py)：
+
+```python
+from pllm.workloads.state_producers import PromptFactors, PromptMixture, DecodeFactors
+
+workload = PromptFactors(rank=2)                 # 共享超网络 → 每请求 q/v 因子
+workload = PromptMixture(rank=2, components=3)  # 判别器 → K 个 LoRA 的精确加权和
+workload = DecodeFactors(rank=2)               # hidden 目标 → AdamW → 下次前向
+```
+
+三者继承同一个 `consume` property。形状由模型的 q/v 投影决定，包括 GQA 的不同输出宽度。
+混合 LoRA 使用拼接 A 与加权 B，得到 `sum(p[k] * B[k] @ A[k])`，有效 rank 为 K×rank。
+AdamW 示例的损失只训练旁路预测，不对 vLLM attention 或历史 KV 求梯度。
+
+```python
+@pllm.on(pllm.Phase.OBSERVE)
+@pllm.write(state="factors", fields=("a_0", "b_0", "a_1", "b_1"))
+def produce(self, h=pllm.hidden(8, phase="prefill"), net=pllm.module("network")):
+    return make_factor_tuple(net(h))  # 四个 tensor，前导轴对应本任务的请求行
+```
+
+`make_factor_tuple` 是用户自己的张量数学；完整可运行拆分见上面的示例。
+写入总是返回 tuple，包括只有一个字段时的 `(value,)`；字段作为一个版本原子发布。
+目标展开名称是 `a_0/b_0/a_1/b_1`。InstanceState 写入没有请求轴。
+替换优化器管理的参数保留其 moments/step；不会隐式重置优化器。
+
+`hidden(..., phase="prefill")` 只取**完整 prompt 的最后一个 token**，每个合格请求一行；
+部分 prompt span 不发布。默认仍是 decode。各任务独立选择 phase，结果消费者继承生产者的行域；
+没有显式 join 时不能混合两种 phase。`write` 默认 BEFORE_MODEL，读取本次 hidden 的写入须使用
+OBSERVE 或 AFTER_SAMPLE。前向入口 pin 在整个 forward 内不变；prefill 结果只影响第一次 decode
+forward，不改变已完成的 prompt forward 或由它采样的第一个生成 token。
+
+这些组合当前支持 eager Qwen2、主流生产、TP=PP=1。前缀复用、历史重算抢占、speculative decoding
+不受支持。历史 KV 保留当时使用的因子，更新不会重算整个前缀。完整 SHINE 的独立 context pass、
+Qwen3 与 checkpoint/memory-token 适配仍需另外实现。有限值检查可能同步 CUDA；不能据此宣称零开销。
+
 ## 外部生产的 overlay（SHINE 式）
 
 **要解决的问题**：补丁字段不想在引擎里训练——它来自超网络、加载的
 checkpoint，或任何一段宿主计算。
 
-做法和引擎内训练几乎一样：声明同样的 buffer，再声明一个 `Overlay` property
+声明状态时设置 `imported=True`，例如 `pllm.RequestState(fields, imported=True)`；再声明一个 `Overlay` property
 命名状态、targets、算子、因子与 scale；把产出的张量经
 `generate(..., auxiliary=pllm.state.StateTensorUpdate(values, keys), prompt_indices=...)`
 送入：
@@ -116,7 +155,7 @@ def adapter(self) -> pllm.model.Overlay:
 
 **要解决的问题**：要改的不是权重，而是激活。
 
-声明 buffer 加一个 `pllm.model.Activation` property（命名状态、层、首/末 prefill
+声明 `imported=True` 的 buffer 状态加一个 `pllm.model.Activation` property（命名状态、层、首/末 prefill
 token、算子），同样经 `auxiliary=` 送入。`LOW_RANK_AFFINE` 每层用
 weight/bias/rotation 字段，`ADD` 用一个 FP32 向量。见维护中的
 [ReFT](../../pllm/workloads/reft.py)。

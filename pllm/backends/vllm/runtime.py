@@ -84,6 +84,7 @@ if TYPE_CHECKING:
 from pllm.backends.vllm.position_state import POSITION_ENV
 from pllm.backends.vllm.prefix_cache import POLICY_ENV, CachePolicy
 from pllm.backends.vllm.runner import TAPS_ENV, BackendWorkerState, WorkloadModelRunner
+from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_hidden import hidden_binding
 from pllm.execution.position_state import PositionAnnouncement
 
@@ -781,7 +782,7 @@ def probe_backend(
                 AttachmentHiddenResource(hidden_binding(source.layer, source.site, layer_count), source.phase)
                 for source in requirements.hidden_inputs
             ),
-            key=lambda resource: resource.resource_key,
+            key=lambda resource: (*resource.resource_key, resource.phase is HiddenPhase.DECODE),
         )
     )
     targets = inspect_parameter_targets(model, requirements.parameter_targets, runner.dtype)
@@ -865,7 +866,7 @@ def probe_backend(
     # is hidden in this capacity: current + private + GPU reader + publish_lag retained roots.
     capacity = (3 + publish_lag) * runner.max_num_reqs + 2
     facts = BackendCompileFacts(
-        probe,
+        replace(probe, targets=targets),
         timeline,
         (
             PageBundleProviderFacts(
@@ -878,7 +879,6 @@ def probe_backend(
         runner.max_num_reqs,
         free_bytes,
         runner.model_config.seed,
-        targets,
         model.config.vocab_size,
         layer_count,
     )
@@ -966,7 +966,13 @@ def input_reservations(
     feedback: bool,
     publish_lag: int = 1,
 ) -> tuple[int, ...]:
-    hidden = (1 + bool(publish_lag)) * len(probe.hidden_resources) * probe.max_packed_rows * probe.hidden_size * 4
+    hidden = (
+        (1 + bool(publish_lag))
+        * len({resource.binding for resource in probe.hidden_resources})
+        * probe.max_packed_rows
+        * probe.hidden_size
+        * 4
+    )
     # FP32 envelope for original logits, conversion, projection and rowwise arithmetic.
     # Excludes upstream sampling/GEMM library scratch, model weights and KV storage.
     workspace = (

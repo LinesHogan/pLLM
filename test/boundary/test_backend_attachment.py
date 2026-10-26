@@ -26,6 +26,7 @@ from pllm.contracts.parameter_overlay import (
     ParameterModuleKind,
     ParameterRole,
     ParameterTarget,
+    ParameterTargetShape,
 )
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
@@ -35,7 +36,7 @@ from pllm.execution.backend_attachment import (
     validate_backend_attachment_physical,
 )
 from pllm.execution.codec import decode_boundary, encode_boundary
-from pllm.execution.compile_facts import BackendCompileFacts, ParameterTargetShape
+from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
@@ -64,6 +65,7 @@ def overlay_facts():
         8,
         (),
         (),
+        targets=(ParameterTargetShape(target, 3, 2),),
     )
     facts = BackendCompileFacts(
         probe,
@@ -72,7 +74,6 @@ def overlay_facts():
         2,
         4096,
         7,
-        (ParameterTargetShape(target, 3, 2),),
     )
     return workload, probe, facts
 
@@ -91,7 +92,7 @@ def sampler_deployment(probe, facts):
             for source in esamp.backend_requirements().hidden_inputs
         ),
     )
-    return esamp.compile_backend(replace(facts, probe=sampler_probe, targets=()))
+    return esamp.compile_backend(replace(facts, probe=replace(sampler_probe, targets=())))
 
 
 def test_bind_rejects_a_plan_built_for_other_math_or_other_backend_facts() -> None:

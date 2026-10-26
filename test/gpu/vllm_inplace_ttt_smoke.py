@@ -100,7 +100,7 @@ class ImportedLowRank(pllm.Workload):
 
     @property
     def factors(self) -> pllm.RequestState:
-        return low_rank_factors()
+        return replace(low_rank_factors(), imported=True)
 
     @property
     def adapter(self) -> pllm.model.Overlay:
@@ -189,7 +189,7 @@ def _check_cancelled_projection(handle):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = reader.forward(hidden)[0]
-    slot = execution.arena.field_slots((invocation.context.pin,), (ref,), reader.binding.fields[0])[1][0]
+    slot = execution.arena.field_slots((invocation.context.pin,), (ref,), reader.binding.fields[0].field)[1][0]
     address = reader.pools[0][slot].data_ptr()
     stream.synchronize()
     with patch.object(torch.cuda.Event, "synchronize", side_effect=AssertionError("host cancellation wait")):
@@ -202,7 +202,7 @@ def _check_cancelled_projection(handle):
         other = RequestIdentity("replacement-projection", 42, 0)
         (replacement,) = execution.admit((other,), stream)
         pin = execution.arena.pin_exact((replacement,), stream)
-        new_slot = execution.arena.field_slots((pin,), (replacement,), reader.binding.fields[0])[1][0]
+        new_slot = execution.arena.field_slots((pin,), (replacement,), reader.binding.fields[0].field)[1][0]
         assert reader.pools[0][new_slot].data_ptr() != address
         execution.arena.release_pin(pin)
     stream.synchronize()

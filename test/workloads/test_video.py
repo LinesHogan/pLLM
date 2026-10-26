@@ -45,7 +45,7 @@ def binding_case(*, alias=False, write_failure=False, runtime=False, missing=Non
         "features", {name: (2,) for name in ("qp", "residual", "mv", "segmentation")}, optimizer=None
     )
     encoded = b.tensor("encode", inputs=ports, when=When.BEFORE_MODEL)(
-        lambda values: values["qp"] if alias else sum(values.values())
+        lambda values: (values["qp"] if alias else sum(values.values()),)
     )
     inject = b.state("inject", (Field("delta", (2,)),))
 
@@ -53,7 +53,7 @@ def binding_case(*, alias=False, write_failure=False, runtime=False, missing=Non
         if write_failure:
             raise ArithmeticError("writer failed after private allocation")
         return TaskOutput(
-            field_writes=((LayoutFieldId(0), batch.results[encoded.symbol, "value"].unsqueeze(0)),),
+            field_writes=((inject.view("delta", b.dimensions), batch.results[encoded.symbol, "value"].unsqueeze(0)),),
             changed=(0,),
             update_count=1,
         )
@@ -72,12 +72,11 @@ def binding_case(*, alias=False, write_failure=False, runtime=False, missing=Non
     if runtime:
         b.overlay(
             inject,
-            transition,
-            publication,
+            (transition, publication),
             activations=tuple(
                 ActivationPatchBinding(
                     i,
-                    (LayoutFieldId(0),),
+                    (inject.view("delta", b.dimensions),),
                     1,
                     1,
                     ActivationPatchOperator.ADD,

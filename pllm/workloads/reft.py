@@ -71,6 +71,7 @@ class ActivationWorkload(pllm.Workload):
         return state(
             {f"layer_{layer}_{offset}": buffer for layer in self.config.layers for offset, buffer in enumerate(fields)},
             namespace="canonical.activation@1",
+            imported=True,
         )
 
     @property

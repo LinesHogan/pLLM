@@ -311,7 +311,7 @@ class CausalAdapterWorkload(
         ):
             raise ValueError("causal model residency exceeds the signed timeline reservation")
         if (
-            facts.targets != model.targets
+            facts.probe.targets != model.targets
             or facts.probe.tensor_dtype != model.tensor_dtype
             or model.device.type != "meta"
             and facts.device != model.device
@@ -385,16 +385,18 @@ class CausalAdapterWorkload(
                 reduction="custom",
             ),
         )
-        publication = b.publish(update, state, when=owner.phase.value, schema=f"{owner.name}.result@1")
+        b.publish(update, state, when=owner.phase.value, schema=f"{owner.name}.result@1")
         b.overlay(
             state,
-            update,
-            publication,
+            None,
             tuple(
                 ParameterOverlayFieldBinding(
                     target.target,
                     ParameterOverlayOperator.LOW_RANK_ADD,
-                    (state.field(f"factor_{2 * index}.parameters"), state.field(f"factor_{2 * index + 1}.parameters")),
+                    (
+                        state.view(f"factor_{2 * index}.parameters", b.dimensions),
+                        state.view(f"factor_{2 * index + 1}.parameters", b.dimensions),
+                    ),
                     str(state.declaration.resource),
                     model.scale,
                 )

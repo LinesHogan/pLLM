@@ -42,9 +42,9 @@ def test_stacked_marker_and_unused_declaration():
     @dataclass(frozen=True)
     class Stacked(pllm.Workload):
         @pllm.layer_route()
-        @pllm.write(state="state", field="hidden")
+        @pllm.write(state="state", fields=("hidden",))
         def route(self, layers):
-            return layers.seed
+            return (layers.seed,)
 
     @dataclass(frozen=True)
     class Unused(pllm.Workload):

@@ -18,7 +18,7 @@ from pllm.contracts.backend_attachment import (
 )
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
-from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding
+from pllm.contracts.parameter_overlay import FieldView, ParameterOverlayFieldBinding
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
@@ -137,6 +137,16 @@ class State:
 
     def field(self, name: str) -> LayoutFieldId:
         return LayoutFieldId(next(i for i, field in enumerate(self.fields) if field.name == name))
+
+    def view(self, name: str, dimensions: Dimensions | None) -> FieldView:
+        """Describe a whole allocated field in the model's resolved layout."""
+        index = self.field(name)
+        shape = self.fields[index].shape
+        return FieldView(
+            index,
+            0,
+            shape(dimensions) if callable(shape) and dimensions is not None else () if callable(shape) else shape,
+        )
 
     def version(self, producer: Call | None = None) -> SemanticEffect:
         return SemanticEffect(
@@ -544,8 +554,7 @@ class Builder(Generic[D]):
     def overlay(
         self,
         state: State,
-        transition: Call,
-        publication: Call,
+        producer: tuple[Call, Call] | None,
         bindings: tuple[ParameterOverlayFieldBinding, ...] = (),
         *,
         activations: tuple[ActivationPatchBinding, ...] = (),
@@ -553,7 +562,12 @@ class Builder(Generic[D]):
         self._attach(
             BackendAttachmentSpec(
                 AttachmentKind.ACTIVATION_PATCH if activations else AttachmentKind.PARAMETER_OVERLAY,
-                ((AttachmentTaskRole.TRANSITION, transition.symbol), (AttachmentTaskRole.PUBLISH, publication.symbol)),
+                ()
+                if producer is None
+                else (
+                    (AttachmentTaskRole.TRANSITION, producer[0].symbol),
+                    (AttachmentTaskRole.PUBLISH, producer[1].symbol),
+                ),
                 AnchorSymbol("sampler.complete"),
                 state.declaration.resource,
                 bindings,
@@ -584,19 +598,24 @@ class Builder(Generic[D]):
         if replay.activation_bindings or replay.overlay_bindings or activation.overlay_bindings:
             raise ValueError("model replay requires one activation publication")
         ((_, forward_symbol),) = replay.tasks
-        (_, _), (_, publication_symbol) = activation.tasks
+        publication_symbol = activation.tasks[-1][1] if activation.tasks else None
         forward = next(task for task in self.graph.tasks if task.symbol == forward_symbol)
-        publication = next(task for task in self.graph.tasks if task.symbol == publication_symbol)
+        publication = next((task for task in self.graph.tasks if task.symbol == publication_symbol), None)
         if forward.effects or any(port.name == "activation_publication" for port in forward.inputs):
             raise ValueError("model replay already declares state dependencies")
-        (output,) = publication.outputs
+        dependency = (
+            ()
+            if publication is None
+            else (
+                SemanticInput(
+                    "activation_publication", TaskResultInputSource(publication.symbol, publication.outputs[0].name)
+                ),
+            )
+        )
         # Preserve both the value dependency and the exact state-version read.
         forward = replace(
             forward,
-            inputs=(
-                *forward.inputs,
-                SemanticInput("activation_publication", TaskResultInputSource(publication_symbol, output.name)),
-            ),
+            inputs=(*forward.inputs, *dependency),
             effects=(SemanticEffect(activation.state_resource, StateEffectKind.READ, publication_symbol),),
         )
         self.graph = replace(

@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, overload
 import numpy as np
 import torch
 
-from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.parameter_overlay import ParameterTarget
 from pllm.contracts.request_identity import RequestIdentity
@@ -36,7 +35,7 @@ if TYPE_CHECKING:
 
 
 Tensors = Mapping[str, torch.Tensor]
-TensorMath = Callable[[Tensors], torch.Tensor]
+TensorMath = Callable[[Tensors], tuple[torch.Tensor, ...]]
 TensorReader = Callable[["TensorFrame", TensorBatch], torch.Tensor]
 
 
@@ -421,7 +420,7 @@ def input_port(source: SemanticInputSource | TensorPort) -> TensorPort:
     match source:
         case TensorPort():
             return source
-        case HiddenInputSource(layer=layer, site=site, phase=HiddenPhase.DECODE):
+        case HiddenInputSource(layer=layer, site=site):
 
             def hidden(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
                 if data.hidden_inputs is not None:

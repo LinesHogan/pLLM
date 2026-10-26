@@ -55,7 +55,7 @@ def attachment_buffer_bytes(
     }
     buffers = 1024 if attachment.overlay_bindings else 0
     for binding in attachment.overlay_bindings:
-        first = fields[binding.fields[0]].shape
+        first = binding.fields[0].shape
         if binding.operator is ParameterOverlayOperator.DENSE_ADD:
             outputs, inputs = first
             # Owned hidden/MLP snapshots survive forward; base weights are borrowed.
@@ -67,17 +67,17 @@ def attachment_buffer_bytes(
             buffers += rows * (6 * width * heads * width_per_head + 8)
         else:
             rank, inputs = first
-            outputs = fields[binding.fields[1]].shape[0]
+            outputs = binding.fields[1].shape[0]
             buffers += rows * (width * (inputs + rank + 2 * outputs) + 8)
         if probe.causal_domain is not None and (
             probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH or not graph.updates_in_forward
         ):
             blocks = projection_blocks(rows, probe.causal_domain.requests)
             buffers += 24 * (blocks * (ROWS_PER_BLOCK + len(binding.fields)) + rows)
-            buffers += 2 * blocks * sum(prod(fields[field].shape) * width for field in binding.fields)
+            buffers += 2 * blocks * sum(prod(field.shape) * width for field in binding.fields)
             buffers += blocks * ROWS_PER_BLOCK * 2 * width * (inputs + outputs)
     for binding in attachment.activation_bindings:
-        shape = fields[binding.fields[0]].shape
+        shape = binding.fields[0].shape
         rank = shape[0] if len(shape) == 2 else 0
         buffers += rows * (width * (2 * hidden + 3 * rank) + 8)
     for task in graph.tasks:
@@ -129,7 +129,11 @@ def derive_attachment_resources(
             raise ValueError("conditional tokenwise costs require the exact signed pinned READ")
         # Both branches use this same model source. Retain all producer facts:
         # the complete DAG funds the worst case, including the fresh encoding.
-    if (len(graph.tasks) != 1 or graph.states) and task.effects[0].kind is StateEffectKind.READ:
+    if (
+        (len(graph.tasks) != 1 or graph.states)
+        and task.effects[0].kind is StateEffectKind.READ
+        and task.effects[0].version is not None
+    ):
         if len(task.effects) != 1 or task.effects[0].kind is not StateEffectKind.READ:
             raise ValueError("composed tokenwise costs require an exact publication read")
         (read,) = task.effects
@@ -246,7 +250,7 @@ def bind_backend_attachment(
     sampler = anchors[spec.sampler_anchor]
     request = BackendAttachmentRequest(
         attachment_kind=spec.kind,
-        packed_row_schema_version=1,
+        packed_row_schema_version=2,
         task_bindings=bind_attachment_tasks(plan, spec.tasks),
         sampler_anchor_id=AnchorId(sampler.ordinal),
         sampler_anchor_symbol=sampler.symbol,

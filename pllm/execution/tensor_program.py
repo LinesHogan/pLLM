@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Generic, Literal, Protocol, TypeVar
 
 import torch
@@ -12,7 +12,7 @@ from torch.optim.sgd import sgd
 
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
-from pllm.contracts.parameter_overlay import ParameterTarget
+from pllm.contracts.parameter_overlay import FieldView, ParameterTarget
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
@@ -43,6 +43,10 @@ def _no_matrix() -> tuple[str, Slots]:
     raise RuntimeError("this mathematical batch has no issued page access")
 
 
+def _no_resource(resource: StateResource) -> TensorBatch:
+    raise RuntimeError("this mathematical batch has no resource selection")
+
+
 @dataclass(frozen=True, slots=True)
 class TensorBatch:
     """Borrowed mathematical operands, never a storage or publication capability."""
@@ -62,15 +66,24 @@ class TensorBatch:
     )
     borrowed_roots: tuple[BorrowedStateRoot, ...] = ()
     local_pin: PagePin | None = None
+    select_resource: Callable[[StateResource], TensorBatch] = _no_resource
+
+    def for_resource(self, resource: StateResource) -> TensorBatch:
+        """Use the operation resource without redirecting reads of other states."""
+        return (
+            self
+            if len(self.selection.groups) == 1 and self.selection.groups[0].resource == resource
+            else self.select_resource(resource)
+        )
 
     def parameter_root(self, resource: str) -> tuple[torch.Tensor, ...]:
         borrowed = borrowed_root(self.borrowed_roots, resource)
         if borrowed is not None:
             assert self.local_pin is not None
             return borrowed.tensors(self.local_pin)
-        group = self.selection.for_resource(StateResource(resource))
-        (ref,) = group.refs
-        return self.roots[self.selection.refs.index(ref)]
+        batch = self.for_resource(StateResource(resource))
+        assert len(batch.selection.refs) == 1
+        return batch.roots[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +116,7 @@ class TaskOutput:
     gradient_indices: tuple[int, ...] = ()
     loss: torch.Tensor | None = None
     # Per-lineage memory writes, rows aligned to the gradient/update selection.
-    field_writes: tuple[tuple[LayoutFieldId, torch.Tensor], ...] = ()
+    field_writes: tuple[tuple[FieldView, torch.Tensor], ...] = ()
 
 
 def autograd_loss(
@@ -157,7 +170,20 @@ def _read(context: StateTaskContext[D], version: Literal["input", "private", "pu
         refs = refs.replace_versions(receipt.before_refs, receipt.after_refs)
         access = tuple(pin if index >= 0 else context.pin for index in positions.tolist())
     roots = context.arena.lazy_roots(access, refs)
-    return TensorBatch(
+
+    def scoped(resource: StateResource) -> TensorBatch:
+        selection = context.selection.scoped(resource)
+        selected = roots.select(tuple(context.selection.refs.index(ref) for ref in selection.refs))
+        return replace(
+            batch,
+            selection=selection,
+            roots=selected,
+            after_refs=tuple(refs[context.selection.refs.index(ref)] for ref in selection.refs),
+            field_slots=selected.field_slots,
+            slot_matrix=selected.slot_matrix,
+        )
+
+    batch = TensorBatch(
         context.selection,
         roots,
         refs,
@@ -170,7 +196,9 @@ def _read(context: StateTaskContext[D], version: Literal["input", "private", "pu
         local_pin=context.pin,
         field_slots=roots.field_slots,
         slot_matrix=roots.slot_matrix,
+        select_resource=scoped,
     )
+    return batch
 
 
 @dataclass(frozen=True, slots=True)
@@ -438,9 +466,10 @@ class TensorOperation(Generic[D]):
                     if values.ndim < 1 or values.shape[0] != len(selected):
                         raise ValueError("memory writes require one row per selected lineage")
                     for root, value in zip(roots, values.unbind(), strict=True):
-                        if root[int(field_id)].shape != value.shape or root[int(field_id)].dtype != value.dtype:
+                        target = field_id.read(root[field_id.field])
+                        if target.shape != value.shape or target.dtype != value.dtype:
                             raise ValueError("memory write differs from its signed field shape or dtype")
-                        root[int(field_id)].copy_(value)
+                        target.copy_(value)
             if self.mode == "update" or self.publish:
                 context.publish()
             if output.counters is not None:

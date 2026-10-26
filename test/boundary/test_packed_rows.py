@@ -11,8 +11,12 @@ def test_resumed_history_is_generated_but_only_its_final_row_is_new():
     plan = _core.plan_packed_prefill_rows([7], [4], [0], 7)
     identity = RequestIdentity("r", 0, 0)
     rows = tuple(
-        PackedPhaseRow(packed, 0, offset, HiddenPhase(phase), identity)
+        PackedPhaseRow(packed, 0, offset, HiddenPhase(phase), identity, plan.prompt_lengths[packed])
         for packed, offset, phase in zip(plan.packed_row_indices, plan.token_offsets, plan.phases, strict=True)
     )
     assert [row.phase for row in rows] == [HiddenPhase.PREFILL] * 4 + [HiddenPhase.DECODE] * 3
     assert PackedPhaseRowBatch(1, 0, 7, rows).latest_decode_rows == (rows[6],)
+
+    assert plan.prompt_lengths == [4] * 7
+    assert PackedPhaseRowBatch(1, 0, 7, rows).producer_rows(HiddenPhase.PREFILL) == (rows[3],)
+    assert _core.plan_packed_prefill_rows([2], [4], [0], 2).prompt_lengths == [4, 4]

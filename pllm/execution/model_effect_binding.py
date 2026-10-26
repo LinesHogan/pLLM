@@ -25,6 +25,7 @@ from pllm.contracts.backend_attachment import (
 )
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
+    FieldView,
     ParameterOverlayFieldBinding,
     ParameterOverlayOperator,
     ParameterTarget,
@@ -39,14 +40,12 @@ from pllm.contracts.semantic_graph import (
     StateScope,
     TokenProgramEffect,
 )
-from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 from pllm.contracts.visibility import Exact, Visibility, VisibilitySource
 from pllm.execution.codec import boundary_digest
-from pllm.execution.declaration import Call, Dimensions, State, When, native
+from pllm.execution.declaration import Call, State, When, native
 from pllm.execution.overlay_task import OverlayTransition
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION
-from pllm.execution.shared_tensor import tensor_dtype
 from pllm.execution.tensor_frame import (
     TensorFrame,
     Tensors,
@@ -72,27 +71,48 @@ class FieldWriter:
     """Write a task result into its declared field; used by the write lowering."""
 
     source: Call
-    field: LayoutFieldId
+    fields: tuple[FieldView, ...]
     resource: StateResource
+    phase: HiddenPhase | None
 
     def __call__(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
-        value = batch.results[self.source.symbol, "value"]
-        if value.is_meta:
-            target = batch.parameter_root(self.resource)[self.field]
-            if value.shape != target.shape or value.dtype != target.dtype:
-                raise ValueError(f"write to {self.resource} needs shape {tuple(target.shape)} and dtype {target.dtype}")
-        if not finite(value):
-            raise ValueError("write needs a finite tensor result")
+        selected = self.select(data, batch.selection)
+        if not selected:
+            return TaskOutput()
+        instance = batch.selection.for_resource(self.resource).keys == (None,)
+        values = tuple(batch.results[self.source.symbol, name] for name in self.source.outputs)
+        for view, value in zip(self.fields, values, strict=True):
+            target = view.read(batch.roots[selected[0]][view.field])
+            if (
+                value.shape != ((*(() if instance else (len(selected),)), *view.shape))
+                or value.dtype != target.dtype
+                or value.device != target.device
+                or not finite(value)
+            ):
+                raise ValueError(
+                    f"write to {self.resource} needs finite fields with their declared shape, dtype, device and request axis"
+                )
         return TaskOutput(
-            field_writes=((self.field, value.unsqueeze(0)),), changed=self.select(data, batch.selection), update_count=1
+            field_writes=tuple(
+                (view, value.unsqueeze(0) if instance else value)
+                for view, value in zip(self.fields, values, strict=True)
+            ),
+            changed=selected,
+            update_count=len(selected),
         )
 
     def select(self, data: TensorFrame, selection: RequestStateSelection) -> tuple[int, ...]:
-        """Select the target resource without updating other local states."""
-        return tuple(selection.refs.index(ref) for ref in selection.for_resource(self.resource).refs)
+        """Select only this producer's eligible resource rows."""
+        group = selection.for_resource(self.resource)
+        if self.phase is not None and not data.step.rows.producer_rows(self.phase):
+            return ()
+        if group.keys == (None,):
+            return tuple(selection.refs.index(ref) for ref in group.refs)
+        indices = {row.identity: index for row, index in zip(selection.rows, group.state_indices, strict=True)}
+        return tuple(dict.fromkeys(indices[row.identity] for row in data.step.rows.producer_rows(self.phase)))
 
 
-def _check_overlay_fields(
+def check_overlay_fields(
     buffers: Mapping[str, Buffer],
     applied: tuple[str, ...],
     targets: tuple[ParameterTarget, ...],
@@ -109,38 +129,6 @@ def _check_overlay_fields(
         or not isfinite(scale)
     ):
         raise ValueError("overlay requires ordered unique targets, exact operator fields and a finite scale")
-
-
-def _check_overlay_shapes(
-    buffers: Mapping[str, Buffer], applied: tuple[str, ...], dimensions: Dimensions, operator: ParameterOverlayOperator
-) -> None:
-    def shape_of(key: str, inputs: int, outputs: int) -> tuple[int, ...]:
-        buffer = buffers[key]
-        return buffer.shape(inputs, outputs) if callable(buffer.shape) else buffer.shape
-
-    for inputs, outputs in dimensions.target_shapes:
-        if operator is ParameterOverlayOperator.DENSE_ADD:
-            matched = shape_of(applied[0], inputs, outputs) == (outputs, inputs)
-        elif operator is ParameterOverlayOperator.HEAD_ADD:
-            shape = shape_of(applied[0], inputs, outputs)
-            matched = (
-                len(shape) == 3
-                and shape[0] > 0
-                and shape[1] == shape[2] > 0
-                and shape[0] * shape[1] == inputs == outputs
-            )
-        else:
-            down, up = (shape_of(key, inputs, outputs) for key in applied)
-            matched = (
-                len(down) == 2 and len(up) == 2 and 1 <= down[0] == up[1] and down[1] == inputs and up[0] == outputs
-            )
-        dtypes = (
-            (torch.float32,)
-            if operator is ParameterOverlayOperator.HEAD_ADD
-            else (None, tensor_dtype(dimensions.dtype))
-        )
-        if not matched or any(buffers[key].dtype not in dtypes for key in applied):
-            raise ValueError("overlay fields must match their operator, target shape and dtype")
 
 
 class ModelEffectBinding(TensorBindingBase):
@@ -178,12 +166,11 @@ class ModelEffectBinding(TensorBindingBase):
     ) -> None:
         if self.graph.tasks or self.graph.states or self.host:
             raise ValueError("ordinary overlay requires a sole request state and model transition")
-        _check_overlay_fields(buffers, applied, targets, operator, scale)
+        check_overlay_fields(buffers, applied, targets, operator, scale)
         dimensions = self.dimensions
         if dimensions is not None:
             if len(dimensions.target_shapes) != len(targets):
                 raise ValueError("overlay targets differ from backend specialization")
-            _check_overlay_shapes(buffers, applied, dimensions, operator)
         self.overlay_targets = targets
         self.parameter_phases = phases
         state = self.state(
@@ -270,13 +257,12 @@ class ModelEffectBinding(TensorBindingBase):
         )
         self.overlay(
             state,
-            transition,
-            publication,
+            (transition, publication),
             tuple(
                 ParameterOverlayFieldBinding(
                     target,
                     operator,
-                    tuple(state.field(f"{key}_{i}") for key in applied),
+                    tuple(state.view(f"{key}_{i}", self.dimensions) for key in applied),
                     str(state.declaration.resource),
                     scale,
                 )
@@ -284,20 +270,33 @@ class ModelEffectBinding(TensorBindingBase):
             ),
         )
 
-    def write_result(self, source: Call, state: State, field: str) -> Call:
-        """Lower one computed tensor to a private field update."""
-        writer = FieldWriter(source, state.field(field), state.declaration.resource)
-        return self.compute(
+    def write_result(self, source: Call, state: State, fields: tuple[str, ...], when: When) -> Call:
+        """Bind a computed tuple to one atomic private transition."""
+        task = self.tensor_tasks.get(source.symbol)
+        writer = FieldWriter(
+            source,
+            tuple(self.field_views[state.declaration.resource, key] for key in fields)
+            if self.dimensions is not None
+            else (),
+            state.declaration.resource,
+            None if task is None else task.phase,
+        )
+        update = self.compute(
             f"{source.symbol}.write",
-            inputs={"value": source["value"]},
+            inputs={name: source[name] for name in source.outputs},
             outputs=("updated",),
             changes=state,
-            effect=StateEffectKind.TRANSITION,
-            when=When.BEFORE_MODEL,
+            effect=StateEffectKind.TRANSITION_MAYBE,
+            when=when,
             function=writer,
             select=writer.select,
-            implementations=(native(f"tensor.write:{source.symbol}:{field}@1", "transition/full_root@1"),),
+            implementations=(native(f"tensor.write:{source.symbol}@1", "transition/full_root@1"),),
         )
+
+        self.operations[update.symbol] = replace(
+            self.operations[update.symbol], optimizer=None, mode="transition", copy_fields=None
+        )
+        return update
 
     def import_update(self, state: State, identity: str) -> Call:
         """One BEFORE_MODEL import of externally produced field values into private roots."""
@@ -307,8 +306,8 @@ class ModelEffectBinding(TensorBindingBase):
                 if any(not finite(source) for _, values in data.replacements for source in values):
                     raise ValueError("replacement tensors differ from the signed layout or finite-value contract")
                 for index, values in data.replacements:
-                    for target, source in zip(batch.roots[index], values, strict=True):
-                        target.copy_(source)
+                    for view, source in zip(self.imports[str(state.declaration.resource)], values, strict=True):
+                        view.read(batch.roots[index][view.field]).copy_(source)
             return TaskOutput(
                 update_count=len(data.replacements), changed=tuple(index for index, _ in data.replacements)
             )
@@ -324,87 +323,15 @@ class ModelEffectBinding(TensorBindingBase):
             select=lambda data, selection: tuple(index for index, _ in data.replacements),
             implementations=(native(identity, "transition/full_root@1"),),
         )
-        self.operations[update.symbol] = replace(self.operations[update.symbol], copy_fields=())
+        self.operations[update.symbol] = replace(
+            self.operations[update.symbol], optimizer=None, mode="transition", copy_fields=None
+        )
         return update
-
-    def import_overlay(
-        self,
-        state_name: str,
-        buffers: Mapping[str, Buffer],
-        *,
-        targets: tuple[ParameterTarget, ...],
-        applied: tuple[str, ...],
-        namespace: str,
-        keys: tuple[RequestKeyField, ...],
-        scope: StateScope,
-        operator: ParameterOverlayOperator,
-        scale: float,
-    ) -> None:
-        """Externally produced overlay fields; the model consumption is identical to trained overlays."""
-        if self.graph.tasks or self.graph.states or self.host:
-            raise ValueError("imported overlay requires a sole model state and effect")
-        _check_overlay_fields(buffers, applied, targets, operator, scale)
-        dimensions = self.dimensions
-        if dimensions is not None:
-            if len(dimensions.target_shapes) != len(targets):
-                raise ValueError("overlay targets differ from backend specialization")
-            _check_overlay_shapes(buffers, applied, dimensions, operator)
-        self.overlay_targets = targets
-        self.overlay_import = True
-        state = self.state(
-            state_name,
-            tuple(
-                buffer_field(f"{key}_{index}", buffer, lambda m, i=index: m.target_shapes[i])
-                for index in range(len(targets))
-                for key, buffer in buffers.items()
-            ),
-            namespace=namespace,
-            scope=scope,
-            keys=keys,
-        )
-        update = self.import_update(state, "canonical.overlay:import@1")
-        publication = self.publish(update, state, when=When.BEFORE_MODEL)
-        self.overlay(
-            state,
-            update,
-            publication,
-            tuple(
-                ParameterOverlayFieldBinding(
-                    target,
-                    operator,
-                    tuple(state.field(f"{key}_{i}") for key in applied),
-                    str(state.declaration.resource),
-                    scale,
-                )
-                for i, target in enumerate(targets)
-            ),
-        )
-
-    def buffer_state(
-        self,
-        name: str,
-        buffers: Mapping[str, Buffer],
-        *,
-        namespace: str,
-        scope: StateScope,
-        keys: tuple[RequestKeyField, ...],
-    ) -> State:
-        """Allocate named model-width fields independently of their effect."""
-        return self.state(
-            name,
-            tuple(
-                buffer_field(key, buffer, lambda m: (m.hidden_size, m.hidden_size)) for key, buffer in buffers.items()
-            ),
-            namespace=namespace,
-            scope=scope,
-            keys=keys,
-        )
 
     def activation_patch(
         self,
         state: State,
-        update: Call,
-        publication: Call,
+        producer: tuple[Call, Call] | None,
         *,
         layers: tuple[int, ...],
         operator: ActivationPatchOperator,
@@ -414,45 +341,28 @@ class ModelEffectBinding(TensorBindingBase):
         decode_refresh: DecodeRefresh = DecodeRefresh.INHERIT,
         on_missing: MissingPolicy = MissingPolicy.STOP,
     ) -> None:
-        """Attach an activation to a declared transition and its publication."""
+        """Read logical state views at activation sites; replay/HOLD also bind their publication dependency."""
         width = 1 if operator is ActivationPatchOperator.ADD else 3
+        views = tuple(
+            view for (resource, _), view in self.field_views.items() if resource == state.declaration.resource
+        )
         if (
             self.host
             or not layers
             or tuple(sorted(set(layers))) != layers
             or layers[0] < 0
             or min(first_tokens, last_tokens) < 0
-            or len(state.fields) != len(layers) * width
+            or self.dimensions is not None
+            and len(views) != len(layers) * width
         ):
             raise ValueError("activation fields must cover each ordered layer and operator")
-        if self.dimensions is not None:
-            hidden = self.dimensions.hidden_size
-            (layout,) = (entry.layout for entry in self.layouts.layouts if entry.resource == state.declaration.resource)
-            for index in range(len(layers)):
-                fields = layout.fields[index * width : (index + 1) * width]
-                shapes = tuple(field.shape for field in fields)
-                match shapes:
-                    case ((size,),) if operator is ActivationPatchOperator.ADD and size == hidden:
-                        dtype = TensorDType.FLOAT32
-                    case ((rank, size), (bias,), (outputs, rotation)) if (
-                        operator is ActivationPatchOperator.LOW_RANK_AFFINE
-                        and 1 <= rank <= hidden
-                        and size == outputs == hidden
-                        and rank == bias == rotation
-                    ):
-                        dtype = self.dimensions.dtype
-                    case _:
-                        raise ValueError("activation fields differ from the operator's rank and hidden dimensions")
-                if any(field.dtype is not dtype for field in fields):
-                    raise ValueError("activation fields differ from the operator's dtype")
         self.overlay(
             state,
-            update,
-            publication,
+            producer,
             activations=tuple(
                 ActivationPatchBinding(
                     layer,
-                    tuple(state.field(state.fields[index * width + offset].name) for offset in range(width)),
+                    views[index * width : (index + 1) * width],
                     first_tokens,
                     last_tokens,
                     operator,

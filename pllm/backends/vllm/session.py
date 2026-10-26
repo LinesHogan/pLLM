@@ -37,6 +37,7 @@ from pllm.backends.vllm.sampler import (
 from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
+    AttachmentTaskRole,
     SignedBackendAttachment,
 )
 from pllm.contracts.hidden_locator import HiddenPhase
@@ -46,7 +47,6 @@ from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
 from pllm.contracts.semantic_graph import (
     AnchorId,
     SamplerFeedbackInputSource,
-    StateScope,
     TokenProgramEffect,
 )
 from pllm.execution.backend_attachment import attachment_buffer_bytes
@@ -113,15 +113,11 @@ class VllmSession(Generic[DataT, ResultT]):
         self._deployment = deployment
         self.trace = deployment.execution.trace
         probe = attachment.inputs.probe
-        self._hidden_resources = tuple(resource.binding for resource in probe.hidden_resources)
+        self._hidden_resources = tuple(dict.fromkeys(resource.binding for resource in probe.hidden_resources))
         if self._hidden_resources and taps is None:
             raise ValueError("hidden inputs require taps installed when the model was loaded")
         self._taps = taps
         overlay_bindings = attachment.inputs.request.overlay_bindings
-        self._overlay_import = bool(overlay_bindings) and (
-            plan.semantic_graph.tasks[attachment.inputs.request.task_bindings[0].task_id].timing.after
-            == "request.prepare"
-        )
         routed_overlay = bool(overlay_bindings) and any(task.replay is not None for task in plan.semantic_graph.tasks)
         self._in_forward_overlay = plan.semantic_graph.updates_in_forward
         if routed_overlay or self._in_forward_overlay or probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH:
@@ -200,7 +196,7 @@ class VllmSession(Generic[DataT, ResultT]):
                 execution.device,
                 readers=attachment.physical.post_sampler == "lagged",
             )
-        if execution.directory.scope is StateScope.INSTANCE:
+        if bool(execution.directory.instance_states):
             execution.admit((), torch.cuda.current_stream(execution.device))
         if execution.feeds:
             (binding,) = execution.feeds
@@ -319,7 +315,7 @@ class VllmSession(Generic[DataT, ResultT]):
                 raise ValueError("request cache policy differs from installed workload; submit through its handle")
             pending.append(self._pending_identities[request.req_id])
         if pending:
-            if execution.directory.scope is StateScope.REQUEST:
+            if bool(execution.directory.request_states):
                 execution.admit(tuple(pending), torch.cuda.current_stream(execution.device))
             for identity in pending:
                 self._identities[identity.request_id] = identity
@@ -373,11 +369,11 @@ class VllmSession(Generic[DataT, ResultT]):
             sorted(requests, key=lambda identity: (identity.request_id, identity.prompt_idx, identity.sample_idx))
         )
         stream = torch.cuda.current_stream(execution.device)
-        if execution.directory.scope is StateScope.INSTANCE or self._activation is not None or self._overlay_import:
+        if not self._in_forward_overlay:
             self._receive_readonly(rows, stream)
             value = TensorStepInput(rows.row_batch, rows, auxiliary=self._auxiliary)
             invocation = execution.start_step(value, stream)
-            if execution.directory.scope is StateScope.INSTANCE or not self._pending_identities:
+            if bool(execution.directory.instance_states) or not self._pending_identities:
                 self._auxiliary = None
             step.invocation = invocation
             self._advance(invocation, "request.prepare")
@@ -385,8 +381,7 @@ class VllmSession(Generic[DataT, ResultT]):
             pending = tuple(
                 identity
                 for identity in identities
-                if execution.directory.scope is StateScope.INSTANCE
-                and not execution.directory.has_inference_pin(identity)
+                if bool(execution.directory.instance_states) and not execution.directory.has_inference_pin(identity)
             )
             if pending:
                 execution.admit(pending, stream)
@@ -397,7 +392,11 @@ class VllmSession(Generic[DataT, ResultT]):
             projection = None
             if self._in_forward_overlay:
                 self._advance(invocation, "request.prepare")
-                binding = self.attachment.inputs.request.task_bindings[0]
+                binding = next(
+                    item
+                    for item in self.attachment.inputs.request.task_bindings
+                    if item.role is AttachmentTaskRole.TRANSITION
+                )
                 projection = ProjectionTask(
                     execution,
                     invocation,
@@ -442,6 +441,8 @@ class VllmSession(Generic[DataT, ResultT]):
             self._auxiliary = None
         elif step.invocation.context.value is None:
             execution.submit_input(step.invocation, value, CudaStreamReadiness(stream))
+        elif self._hidden_resources or operands:
+            execution.complete_forward_input(step.invocation, value, CudaStreamReadiness(stream))
         self._advance(step.invocation, "sampler.pre_draw")
         self._finish_effects()
 
@@ -547,7 +548,7 @@ class VllmSession(Generic[DataT, ResultT]):
         execution = self._deployment.execution
         held = (
             tuple(identity for identity in identities if execution.directory.has_inference_pin(identity))
-            if execution.directory.scope is StateScope.INSTANCE
+            if not execution.directory.request_states
             else identities
         )
         if held:
@@ -579,9 +580,9 @@ class VllmSession(Generic[DataT, ResultT]):
             self.abort_active()
             self.retire_all(wait=True)
             execution = self._deployment.execution
-            if execution.directory.scope is StateScope.INSTANCE:
+            if bool(execution.directory.instance_states):
                 execution.retire((), wait=True)
-            else:
+            if execution.directory.request_states:
                 execution.retire_dormant(wait=True)
             self._close_effects()
         finally:

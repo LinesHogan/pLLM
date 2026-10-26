@@ -37,8 +37,8 @@ pub(crate) enum TensorDType {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TensorFieldSpec {
     pub(crate) field_id: u64,
-    shape: Vec<u64>,
-    dtype: TensorDType,
+    pub(crate) shape: Vec<u64>,
+    pub(crate) dtype: TensorDType,
     alignment_bytes: u64,
 }
 

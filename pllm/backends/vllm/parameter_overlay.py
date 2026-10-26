@@ -20,9 +20,9 @@ from pllm.contracts.parameter_overlay import (
     ParameterOverlayOperator,
     ParameterRole,
     ParameterTarget,
+    ParameterTargetShape,
 )
 from pllm.contracts.state_ref import StateRef
-from pllm.execution.compile_facts import ParameterTargetShape
 from pllm.execution.cuda_stream import upload
 from pllm.execution.module_graph import capture_module_calls, module_has_execution_hooks
 from pllm.execution.overlay_task import ProjectionTransition, RouteOverlay

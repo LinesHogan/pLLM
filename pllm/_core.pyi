@@ -15,6 +15,7 @@ class PackedPrefillRowPlan:
     request_ordinals: list[int]
     packed_row_indices: list[int]
     token_offsets: list[int]
+    prompt_lengths: list[int]
     phases: list[str]
     request_spans: list[PrefillRowSpan]
     total_rows: int

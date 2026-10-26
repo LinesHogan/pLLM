@@ -18,7 +18,7 @@ from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRowBatch
 from pllm.contracts.region_program import BorrowedResource
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.contracts.semantic_graph import StateResource, StateScope
+from pllm.contracts.semantic_graph import StateEffectKind, StateResource
 from pllm.contracts.state_ref import StateRef
 from pllm.execution.activation import low_rank_affine_delta
 from pllm.execution.cuda_stream import upload
@@ -138,10 +138,6 @@ class VllmActivationPatch:
                                 context.page_pins[pin] = None
                         versions[key] = pin, ref
                     pin, ref = versions[key]
-                    if ref.version_id == 0:
-                        if phase is HiddenPhase.DECODE:
-                            raise RuntimeError("decode activation requires its first published injection")
-                        continue
                     if context.held_input is not None and not any(
                         identity == held_identity and ref in refs
                         for held_identity, refs, _ in context.held_input.successful
@@ -150,7 +146,10 @@ class VllmActivationPatch:
                     prepared.append(
                         _PatchRows(
                             upload(selected, context.arena.device),
-                            tuple(context.arena.borrow_field(pin, ref, field) for field in handle.binding.fields),
+                            tuple(
+                                view.read(context.arena.borrow_field(pin, ref, view.field))
+                                for view in handle.binding.fields
+                            ),
                             selected,
                             pin,
                             ref,
@@ -199,16 +198,28 @@ class VllmActivationPatch:
         context: StateTaskContext[DataT],
         directory: RequestStateDirectory,
     ) -> tuple[PagePin, StateRef]:
-        if directory.scope is StateScope.INSTANCE and not refresh:
+        if context.selection.for_resource(self.resource).keys == (None,) and not refresh:
             pin = directory.inference_pin(identity, context.pin.stream)
             (ref,) = (ref for ref in pin.refs if context.arena.root(ref).resource == self.resource)
             return pin, ref
-        if directory.scope is StateScope.INSTANCE:
+        if context.selection.for_resource(self.resource).keys == (None,):
             (original,) = context.selection.for_resource(self.resource).refs
         else:
             original = context.selection.ref_for(identity, self.resource)
         ref = context.current_owned_ref(original)
-        if refresh and ref == original and context.held_input is None:
+        if (
+            refresh
+            and ref == original
+            and context.held_input is None
+            and any(
+                task.timing.after == "request.prepare"
+                and any(
+                    effect.resource == self.resource and effect.kind is not StateEffectKind.READ
+                    for effect in task.effects
+                )
+                for task in context.arena.plan.semantic_graph.tasks
+            )
+        ):
             # No implicit HOLD: its signed no-input branch is a separate lifecycle.
             raise RuntimeError("decode STEP requires a new publication; missing-input handling is not enabled")
         if ref == original:

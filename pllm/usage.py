@@ -28,6 +28,7 @@ from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.parameter_overlay import (
     ParameterEffect as ParameterEffect,
+    ParameterOverlayFieldBinding,
     ParameterOverlayOperator,
     ParameterTarget,
 )
@@ -51,7 +52,7 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.state_feed import FeedBinding, FeedOrder
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorLayoutRequest
 from pllm.contracts.visibility import Exact as Exact, Visibility as Visibility
-from pllm.execution.binding_base import SGD as SGD, Buffer as Buffer
+from pllm.execution.binding_base import SGD as SGD, Buffer as Buffer, buffer_field
 from pllm.execution.codec import boundary_digest
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import Call, Dimensions, Shape, State, When, native
@@ -82,11 +83,11 @@ from pllm.execution.step_input import TensorStepInput
 from pllm.execution.task_memory import derive_resources
 from pllm.execution.tensor_binding import TensorBinding, TensorOutput as TensorOutput
 from pllm.execution.tensor_frame import TensorFrame, TensorPort, Tensors, TensorUpdate as TensorUpdate
-from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots, TensorComputation
+from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots, TaskOutput, TensorComputation
 from pllm.execution.token_program import Over, Tokens
 from pllm.kernels.adamw import AdamWConfig
 
-F = TypeVar("F", bound=Callable[..., torch.Tensor | TensorUpdate])
+F = TypeVar("F", bound=Callable[..., torch.Tensor | tuple[torch.Tensor, ...] | TensorUpdate])
 Initializer = Callable[[Tensors, torch.Generator], None]
 C = TypeVar("C")
 
@@ -142,9 +143,10 @@ class Config:
 class Hidden(_Source):
     layer: int | Config = 0
     site: HiddenSite = HiddenSite.BLOCK_OUTPUT
+    phase: HiddenPhase = HiddenPhase.DECODE
 
     def port(self, context: _Declaration) -> SemanticInputSource:
-        return context.binding.hidden(_setting(self.layer, context.owner, int), site=self.site)
+        return context.binding.hidden(_setting(self.layer, context.owner, int), site=self.site, phase=self.phase)
 
 
 @dataclass(frozen=True)
@@ -290,9 +292,14 @@ class _Captured(_Source):
 # source marker typed `Any`, so the annotation can name the value the method body receives.
 
 
-def hidden(layer: int | Config = 0, site: HiddenSite = HiddenSite.BLOCK_OUTPUT) -> Any:
-    """The hidden state at `layer` (negative counts from the last layer), one row per request."""
-    return Hidden(layer, site)
+def hidden(
+    layer: int | Config = 0,
+    site: HiddenSite = HiddenSite.BLOCK_OUTPUT,
+    *,
+    phase: Literal["decode", "prefill"] = "decode",
+) -> Any:
+    """One row per request: latest decode, or the last prompt token of completed prefill."""
+    return Hidden(layer, site, HiddenPhase(phase))
 
 
 def parameter(state: str, field: str, *, per_row: bool = False) -> Any:
@@ -368,6 +375,7 @@ class InstanceState:
     # An `nn.Module` built from the model's dimensions; its parameters become the state, initialized as the
     # module initializes them (every request starts from the same values).
     module: ModuleFactory | None = field(default=None, kw_only=True)
+    imported: bool = field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
         if self.module is not None:
@@ -383,6 +391,7 @@ class InstanceState:
                 or self.optimizer is not None
                 or self.initialize is not None
                 or self.memory
+                or self.imported
             ),
             "fed state needs InstanceState without an optimizer, initializer or memory fields",
         )
@@ -420,10 +429,9 @@ class InstanceState:
             _reject(context.binding.feeds, "declare one fed state per workload")
             context.binding.feeds = (FeedBinding(name, self.feed, tuple(self.fields)),)
         shapes = {key: shape for key, shape in self.fields.items() if not isinstance(shape, Buffer)}
-        if len(shapes) != len(self.fields):
-            _reject(
-                self.optimizer is not None, "optimizer parameters require tensor shapes, not overlay buffers", TypeError
-            )
+        if len(shapes) != len(self.fields) or any(
+            isinstance(value, Overlay) and value.state == name for value in context.values.values()
+        ):
             context.allocate_buffers(name, self)
             return
         context.states[name], ports = context.binding.parameters(
@@ -479,22 +487,14 @@ class Activation:
             "decode window is off; refresh and missing policies require decode rows",
         )
 
-    def allocate(self, context: _Declaration) -> None:
-        """Make activation fields readable before tensor operations are declared."""
+    def declare(self, context: _Declaration) -> None:
+        """Read local state, preserving replay/HOLD publication dependencies when declared."""
         definition = context.state_definition(self.state, "Activation needs a declared state")
         _reject(definition.feed is not None, "Activation needs local state written from fed inputs")
-        context.allocate_buffers(self.state, definition)
-
-    def declare(self, context: _Declaration) -> None:
-        """Attach either a computed or an imported update to the activation."""
         state = context.states[self.state]
-        producer = context.writes.get(self.state)
-        if producer is None:
-            update = context.binding.import_update(state, "canonical.activation:import@1")
-            producer = update, context.binding.publish(update, state, when=When.BEFORE_MODEL)
         context.binding.activation_patch(
             state,
-            *producer,
+            context.writes.get(self.state) if context.routes or context.binding.feeds else None,
             layers=self.layers,
             operator=self.operator,
             first_tokens=self.first_tokens,
@@ -507,25 +507,29 @@ class Activation:
 
 @dataclass(frozen=True)
 class Overlay(ParameterEffect):
-    """Externally produced parameter overlay: field values arrive as a StateTensorUpdate,
-    are imported into private roots and published before the model runs."""
+    """Read declared state at internal model projections, independently of its producer."""
 
     def declare(self, context: _Declaration) -> None:
-        """Import externally produced overlay buffers into private roots."""
-        definition = context.state_definition(self.state, "external overlays require a declared state")
-        _reject(
-            definition.initialize is not None, "imported overlays take their values from the import; drop initialize"
-        )
-        context.binding.import_overlay(
-            self.state,
-            _buffers(definition),
-            targets=self.targets,
-            applied=self.applied_fields,
-            operator=self.operator,
-            scale=self.scale,
-            namespace=definition.namespace,
-            keys=definition.request_keys,
-            scope=definition.scope,
+        """Bind logical parameter views to the model's targets."""
+        state = context.states[self.state]
+        context.binding.overlay(
+            state,
+            None,
+            tuple(
+                ParameterOverlayFieldBinding(
+                    target,
+                    self.operator,
+                    tuple(
+                        context.binding.field_views.get(
+                            (self.state, f"{key}_{i}"), state.view(state.fields[0].name, context.binding.dimensions)
+                        )
+                        for key in self.applied_fields
+                    ),
+                    self.state,
+                    self.scale,
+                )
+                for i, target in enumerate(self.targets)
+            ),
         )
 
 
@@ -566,11 +570,19 @@ class _Effect:
     def declare(self, operation: _Operation) -> None:
         operation.tensor()
 
+    def results(self, function: Callable[[Tensors], Any]) -> Callable[[Tensors], tuple[torch.Tensor, ...]]:
+        """Ordinary tensor methods declare a single result."""
+        return lambda inputs: (function(inputs),)
+
+    @property
+    def outputs(self) -> tuple[str, ...]:
+        return ("value",)
+
 
 @dataclass(frozen=True, kw_only=True)
 class _Write(_Effect):
     state: str
-    field: str
+    fields: tuple[str, ...]
 
     phase: ClassVar[Phase | None] = Phase.BEFORE_MODEL
 
@@ -579,33 +591,35 @@ class _Write(_Effect):
         definition = context.state_definition(self.state, "write needs a declared state")
         _reject(
             definition.feed is not None
-            or definition.optimizer is not None
-            or definition.scope is not StateScope.INSTANCE
             or self.state in context.writes
-            or self.field not in definition.fields
-            or operation.phase is not Phase.BEFORE_MODEL
+            or not self.fields
+            or len(set(self.fields)) != len(self.fields)
+            or any((self.state, key) not in context.parameters for key in self.fields)
             or operation.gradient is not None
             or operation.rows,
-            "write needs one BEFORE_MODEL writer for a local InstanceState field without an optimizer",
+            "write needs one producer, distinct declared fields and no gradient or row mask",
         )
         context.definitions.append((operation.name, fingerprint(self)))
         call = operation.tensor()
         state = context.states[self.state]
-        update = context.binding.write_result(call, state, self.field)
+        update = context.binding.write_result(call, state, self.fields, operation.phase.value)
         context.writes[self.state] = (
             update,
-            context.binding.publish(
-                update,
-                state,
-                when=When.BEFORE_MODEL,
-                name=f"{self.state}.publish",
-            ),
+            context.binding.publish(update, state, when=operation.phase.value, name=f"{self.state}.publish"),
         )
 
+    def results(self, function: Callable[[Tensors], Any]) -> Callable[[Tensors], tuple[torch.Tensor, ...]]:
+        """Write methods already return their declared tuple."""
+        return function
 
-def write(*, state: str, field: str) -> Callable[[F], F]:
-    """Publish a computed tensor into a local state field before the model runs."""
-    return _mark(effect=_Write(state=state, field=field))
+    @property
+    def outputs(self) -> tuple[str, ...]:
+        return self.fields
+
+
+def write(*, state: str, fields: tuple[str, ...]) -> Callable[[F], F]:
+    """Atomically publish a tuple of computed fields; request values have a leading request axis."""
+    return _mark(effect=_Write(state=state, fields=fields))
 
 
 @dataclass(frozen=True)
@@ -742,7 +756,9 @@ class _Gradient:
                 input_gradients=self.inputs,
                 parameter_gradients=tuple(
                     dict.fromkeys(
-                        operation.context.states[source.state].declaration.resource for source in parameters.values()
+                        operation.context.states[source.state].declaration.resource
+                        for source in parameters.values()
+                        if not operation.effect.training or source.state == operation.effect.state
                     )
                 )
                 if self.parameters
@@ -959,7 +975,7 @@ def _typed(value: object, expected: type[C]) -> C | None:
     return value if isinstance(value, expected) else None
 
 
-def _arguments(function: Callable[..., torch.Tensor | TensorUpdate]) -> dict[str, _Source]:
+def _arguments(function: Callable[..., torch.Tensor | tuple[torch.Tensor, ...] | TensorUpdate]) -> dict[str, _Source]:
     """Read each parameter's source from its default value, e.g. `h: torch.Tensor = pllm.hidden(0)`."""
     result: dict[str, _Source] = {}
     for name, parameter in signature(function, eval_str=False).parameters.items():
@@ -1050,11 +1066,14 @@ class _Operation:
             update=update,
             math=math,
             captures=writes,
+            outputs=effect.outputs,
         )(
-            _invoke(
-                freeze(self.function),
-                {key: key for key in arguments},
-                {key: source.adapt(context) for key, source in arguments.items()},
+            effect.results(
+                _invoke(
+                    freeze(self.function),
+                    {key: key for key in arguments},
+                    {key: source.adapt(context) for key, source in arguments.items()},
+                )
             )
         )
 
@@ -1083,7 +1102,7 @@ class _Operation:
                         key: inputs[key] if arguments.get(key) == source else source.port(self.context)
                         for key, source in selected_args.items()
                     },
-                )(_invoke(freeze(selector), {key: key for key in selected_args}))
+                )(_Effect().results(_invoke(freeze(selector), {key: key for key in selected_args})))
             key = f"__{domain}"
             _reject(key in inputs, f"{key} is reserved for a row-domain input")
             inputs[key] = TaskResultInputSource(selectors[method].symbol, "value")
@@ -1161,9 +1180,6 @@ class _Declaration:
         for name, member in members.items():
             if _property(member):
                 values[name] = object.__getattribute__(owner, name)
-        for value in values.values():
-            if isinstance(value, Overlay):
-                context.overlay_states.add(value.state)
         return context
 
     def read_operation(
@@ -1236,39 +1252,80 @@ class _Declaration:
 
     def allocate_buffers(self, name: str, definition: InstanceState) -> None:
         """Register buffer fields as ordinary readable state ports."""
-        state = self.binding.buffer_state(
-            name,
-            _buffers(definition),
-            namespace=definition.namespace,
-            scope=definition.scope,
-            keys=definition.request_keys,
+        from pllm.execution.model_effect_binding import check_overlay_fields
+
+        buffers = _buffers(replace(definition, optimizer=None))
+        consumers = tuple(value for value in self.values.values() if isinstance(value, Overlay) and value.state == name)
+        _reject(len(consumers) > 1, "a state needs one consistent target layout")
+        if consumers:
+            (consumer,) = consumers
+            check_overlay_fields(buffers, consumer.applied_fields, consumer.targets, consumer.operator, consumer.scale)
+            self.binding.overlay_targets = consumer.targets
+        fields = tuple(
+            buffer_field(
+                f"{key}_{i}" if consumers else key,
+                buffer,
+                (lambda m, i=i: m.target_shapes[i]) if consumers else (lambda m: (m.hidden_size, m.hidden_size)),
+            )
+            for i in range(len(consumers[0].targets) if consumers else 1)
+            for key, buffer in buffers.items()
         )
+        shapes = {field.name: field.shape for field in fields}
+        if definition.optimizer is not None:
+            model = self.binding.dimensions
+            _reject(
+                model is not None
+                and len({part.dtype(model) if callable(part.dtype) else part.dtype for part in fields}) != 1,
+                "optimizer buffers must share one dtype",
+            )
+            dtype = fields[0].dtype
+            state, ports = self.binding.parameters(
+                name,
+                shapes,
+                optimizer=definition.optimizer,
+                namespace=definition.namespace,
+                initialize=_frozen(definition.initialize),
+                scope=definition.scope,
+                dtype=dtype(self.binding.dimensions)
+                if callable(dtype) and self.binding.dimensions is not None
+                else TensorDType(str(definition.dtype).removeprefix("torch."))
+                if callable(dtype)
+                else dtype,
+                keys=definition.request_keys,
+            )
+        else:
+            state = self.binding.state(
+                name, fields, namespace=definition.namespace, scope=definition.scope, keys=definition.request_keys
+            )
+            ports = self.binding.parameter_ports(state, shapes, initialize=_frozen(definition.initialize))
         self.states[name] = state
-        ports = self.binding.parameter_ports(
-            state, {field.name: field.shape for field in state.fields}, initialize=_frozen(definition.initialize)
-        )
         self.parameters.update({(name, field): port for field, port in ports.items()})
 
     def declare_values(self) -> None:
         """Allocate ordinary state before effects and operations consume its ports."""
         self.positions = self.position_states()
-        for value in self.values.values():
-            if isinstance(value, Activation):
-                value.allocate(self)
         for name, value in self.values.items():
             if (state := _typed(value, InstanceState)) is not None:
                 state.declare(name, self)
+                if state.imported:
+                    allocated = self.states[name]
+                    self.binding.imports[name] = tuple(
+                        view for (resource, _), view in self.binding.field_views.items() if resource == name
+                    )
+                    update = self.binding.import_update(allocated, f"{name}:import@1")
+                    self.writes[name] = (
+                        update,
+                        self.binding.publish(update, allocated, when=When.BEFORE_MODEL, name=f"{name}.publish"),
+                    )
 
         for name, value in self.values.items():
             if isinstance(value, (Activation, Overlay)):
                 self.definitions.append((name, fingerprint(value)))
-                if isinstance(value, Overlay):
-                    value.declare(self)
 
     def attach_effects(self) -> None:
         """Connect publications before replay and missing-input branches."""
         for value in self.values.values():
-            if isinstance(value, Activation):
+            if isinstance(value, (Activation, Overlay)):
                 value.declare(self)
         if self.routes:
             self.binding.layer_route(
@@ -1286,7 +1343,10 @@ class _Declaration:
         return states
 
     def train(self, call: Call, state: str) -> None:
-        _reject(self.training is not None, "tensor sampler attachment requires one training operation")
+        _reject(
+            self.training is not None or state in self.writes,
+            "training needs one optimizer sink without another state producer",
+        )
         self.training = call, self.states[state]
 
     def attach_training(self) -> None:
@@ -1308,6 +1368,16 @@ class _Declaration:
     def sign_composition(self) -> None:
         """Validate composed effects and sign ordered definitions and owner values."""
         b = self.binding
+        _reject(len(b.imports) > 1, "StateTensorUpdate supplies one imported resource per workload")
+        if not b.graph.tasks and b.attachment is not None:
+            state = self.states[b.attachment.state_resource]
+            b.compute(
+                "model.read",
+                inputs={"state": state.read()},
+                reads=(state.version(),),
+                when=When.MODEL_UPDATE,
+                function=lambda data, batch: TaskOutput(),
+            )
         if self.routes:
             attachment = b.attachment
             composed = attachment is not None and (attachment.activation_bindings or attachment.overlay_bindings)
@@ -1362,7 +1432,7 @@ class Workload(
             else Dimensions(
                 facts.probe.hidden_size,
                 facts.vocab_size,
-                tuple((target.input_size, target.output_size) for target in facts.targets),
+                tuple((target.input_size, target.output_size) for target in facts.probe.targets),
                 facts.probe.tensor_dtype,
                 facts.layer_count,
             )
@@ -1400,7 +1470,7 @@ class Workload(
         _reject(
             facts is not None
             and b.overlay_targets
-            and tuple(target.target for target in facts.targets) != b.overlay_targets,
+            and tuple(target.target for target in facts.probe.targets) != b.overlay_targets,
             "overlay targets differ from backend specialization",
         )
         return b
@@ -1477,14 +1547,24 @@ class Workload(
                 return value.rows.rows if b.graph.states[0].scope is StateScope.REQUEST else ()
             if b.attachment is not None and b.attachment.kind is AttachmentKind.MODEL_REPLAY:
                 return ()
-            return value.rows.request_rows if b.overlay_targets else value.rows.latest_decode_rows
+            return (
+                value.rows.request_rows
+                if b.overlay_targets
+                or any(
+                    source.phase is HiddenPhase.PREFILL
+                    for task in b.graph.tasks
+                    for port in task.inputs
+                    if isinstance(source := port.source, HiddenInputSource)
+                )
+                else value.rows.latest_decode_rows
+            )
 
         return FunctionMath(
             {str(state.resource): initializer(str(state.resource)) for state in b.graph.states},
             rows,
             b.bind_prepare(),
             output,
-            lambda previous, incoming: replace(incoming, entries=previous.entries),
+            lambda previous, incoming: replace(previous, step=incoming.step, rows=incoming.rows, index=None, plan=None),
             parameter_phases=b.parameter_phases,
         )
 

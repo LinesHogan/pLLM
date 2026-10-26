@@ -240,7 +240,13 @@ traced while_loop，并提示使用 bounded for-loop。
 
 ## 外部 Overlay
 
-本节约束字段值来自引擎之外的 overlay（超网络、加载的 checkpoint）。
+`pllm.model.Overlay` 消费状态，不指定生产者。普通 `@pllm.train`、tuple-valued
+`@pllm.write(state=..., fields=(...))`、初始化及 `imported=True` 均可独立生产字段。
+`hidden(layer, phase="prefill")` 读取完整 prompt 的最后一行，默认 phase 为 decode。
+写入默认 BEFORE_MODEL；当前 forward 的 hidden 只能用于 OBSERVE/AFTER_SAMPLE。
+详见[生产者与消费者](../guides/overlays-and-replay.md#独立声明状态生产者与模型消费者)。
+
+以下示例的字段来自引擎之外（超网络、加载的 checkpoint）。
 它与[请求 Overlay](#请求-overlay) 的差别只有产出地点：应用、发布、隔离与
 退役规则完全相同。关键点：导入只发生一次（只进版本零的请求状态），按原始
 prompt 索引作键；之后混合批次中的每一行读到的是自己请求的精确 pin。
@@ -258,7 +264,7 @@ class ShineStyleLoRA(pllm.Workload):
         return pllm.RequestState({
             "a": pllm.Buffer(lambda inputs, outputs: (2, inputs)),
             "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2)),
-        })
+        }, imported=True)
 
     @property
     def adapter(self) -> pllm.model.Overlay:
