@@ -2,8 +2,9 @@
 
 import sys
 from copy import copy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import partial
+from itertools import product
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,11 +18,14 @@ from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.vllm_flash_attn import flash_attn_varlen_func
 
+import pllm
 from pllm.backends.vllm.position_state import PositionCacheProvider
 from pllm.backends.vllm.replay import VllmTokenwiseReplay
-from pllm.backends.vllm.runtime import BackendCommand
+from pllm.backends.vllm.runtime import BackendCommand, BackendInstall, BackendStage
 from pllm.config import KVOffload
 from pllm.contracts.request_identity import RequestIdentity
+from pllm.execution.codec import encode_boundary
+from pllm.workload_transport import encode_workload
 from pllm.workloads.step_loop import StepLoop
 from test.gpu.vllm_recirculation_smoke import replay_handle
 
@@ -31,7 +35,7 @@ PROMPTS = ["One two", "Name a small animal"]
 def forced_preemption(baseline):
     """Constrain the real allocator and prove tail eviction and prefix-state resumption."""
     preempt, lookup = Scheduler._preempt_request, KVCacheManager.get_computed_blocks
-    for capacity in (5, 4):
+    for capacity, policy in product((5, 4), ("reuse", "isolate")):
         events, hits = {}, []
 
         def evict(scheduler, request, *args, **kwargs):
@@ -46,7 +50,7 @@ def forced_preemption(baseline):
                 hits.append((events[request.request_id], tuple(result[0].get_block_ids()[0]), result[1]))
             return result
 
-        handle = replay_handle(StepLoop(), length=64, prefix=True, blocks=capacity)
+        handle = replay_handle(StepLoop(), length=64, prefix=True, generated_kv=policy, blocks=capacity)
         try:
             with (
                 patch.object(Scheduler, "_preempt_request", evict),
@@ -59,7 +63,10 @@ def forced_preemption(baseline):
                 (hit > 0 and old[0] in kept and old[-1] not in kept) if capacity == 5 else hit == 0
                 for old, kept, hit in hits
             ), hits
-            print(f"Forced preemption PASS blocks={capacity} evictions={events} resumed={hits}", flush=True)
+            print(
+                f"Forced preemption PASS policy={policy} blocks={capacity} evictions={events} resumed={hits}",
+                flush=True,
+            )
         finally:
             handle.close()
 
@@ -70,12 +77,14 @@ def generate_ids(handle, prompts, params=None):
     llm.sleep(level=0, mode="keep")
     ids = llm.enqueue(
         [{"prompt_token_ids": tokens} for tokens in prompts],
-        params or [SamplingParams(temperature=0, max_tokens=3, ignore_eos=True) for _ in prompts],
+        [
+            handle.cache_policy().sampling(param)
+            for param in (params or [SamplingParams(temperature=0, max_tokens=3, ignore_eos=True) for _ in prompts])
+        ],
         use_tqdm=False,
     )
-    handle.runner.stage_workload_input(
-        None, tuple(RequestIdentity(name, handle._next_prompt_index + i, 0) for i, name in enumerate(ids))
-    )
+    identities = tuple(RequestIdentity(name, handle._next_prompt_index + i, 0) for i, name in enumerate(ids))
+    handle.command(BackendCommand.STAGE, encode_boundary(BackendStage(identities, None, None)))
     handle._next_prompt_index += len(ids)
     llm.wake_up(tags=["scheduling"])
     outputs = llm.wait_for_completion(RequestOutput, use_tqdm=False)
@@ -88,7 +97,14 @@ def offload_roundtrips(expected):
     stage, lookup = PositionCacheProvider.stage, KVCacheManager.get_computed_blocks
     for connector in ("OffloadingConnector", "SimpleCPUOffloadConnector"):
         local, boundaries = {}, []
-        handle = replay_handle(StepLoop(), length=64, prefix=True, blocks=6, offload=KVOffload(connector, 8 * 1024**2))
+        handle = replay_handle(
+            StepLoop(),
+            length=64,
+            prefix=True,
+            generated_kv="reuse",
+            blocks=6,
+            offload=KVOffload(connector, 8 * 1024**2),
+        )
 
         def locate(manager, request):
             result = lookup(manager, request)
@@ -120,7 +136,7 @@ def offload_roundtrips(expected):
 
 def donor_loss():
     """A reused request recomputes lost donor pages using its own prompt roles."""
-    handle = replay_handle(StepLoop(), length=64, prefix=True, blocks=5)
+    handle = replay_handle(StepLoop(), length=64, prefix=True, generated_kv="reuse", blocks=5)
     lookup, hits = KVCacheManager.get_computed_blocks, []
     frontiers, saved = [], []
     native_forward = VllmTokenwiseReplay.forward
@@ -181,6 +197,64 @@ def donor_loss():
         print("Lost adopted donor prefix matches the cache-loss-history oracle PASS", flush=True)
     finally:
         handle.close()
+
+
+@dataclass(frozen=True)
+class ScaledStepLoop(StepLoop):
+    """Same cache schema with distinct frozen route mathematics."""
+
+    @pllm.layer_route(tokens="all")
+    def loop(self, layers):
+        hidden = torch.where(layers.generated, layers.load("history", offset=-1), layers.seed)
+        result = layers(hidden=hidden)[-1] * 0.999
+        layers.save("history", result)
+        return result
+
+
+def isolated_multiturn():
+    """Warm isolate equals cold prompt computation, also across the EngineCore boundary."""
+    for multiprocessing in (True, False):
+        handle = replay_handle(StepLoop(), length=128, prefix=True, multiprocessing=multiprocessing)
+        try:
+            (donor,) = handle.generate(
+                ["One two three four five six seven eight nine ten " * 2],
+                SamplingParams(temperature=0, max_tokens=35, ignore_eos=True),
+            )
+            receiver = donor.prompt_token_ids + list(donor.outputs[0].token_ids)
+            (warm,) = generate_ids(handle, [receiver])
+            assert warm.num_cached_tokens == len(donor.prompt_token_ids) // 16 * 16 > 0
+            handle._llm.reset_prefix_cache()
+            (cold,) = generate_ids(handle, [receiver])
+            assert warm.outputs[0].token_ids == cold.outputs[0].token_ids and cold.num_cached_tokens == 0
+            namespace = handle.cache_policy().namespace
+            if multiprocessing:
+                from test.gpu.vllm_step_loop_smoke import ScaledStepLoop as ImportedStepLoop
+
+                workload = ImportedStepLoop()
+                handle.attachment = workload.plan_backend(handle._facts)
+                handle.command(BackendCommand.DETACH)
+                handle.command(
+                    BackendCommand.INSTALL,
+                    encode_boundary(BackendInstall(handle.attachment, encode_workload(workload))),
+                )
+            else:
+                handle.runner.detach_workload()
+                handle._deployment = ScaledStepLoop().compile_backend(handle._facts)
+                handle.attachment = handle.deployment.attachment
+                handle.runner.attach_workload(handle.deployment)
+            assert handle.cache_policy().namespace != namespace
+            (changed,) = generate_ids(handle, [receiver])
+            assert changed.num_cached_tokens == 0
+            print(
+                f"Idle same-schema workload replacement has no cross-workload hit PASS EngineCore={multiprocessing}",
+                flush=True,
+            )
+            print(
+                f"Isolate multi-turn cold equality PASS EngineCore={multiprocessing} hit={warm.num_cached_tokens}",
+                flush=True,
+            )
+        finally:
+            handle.close()
 
 
 def rms(value, norm):
@@ -275,7 +349,8 @@ def compare(output, records, oracle, *, cache=None, carry=None, start=0):
 
 
 def main():
-    handle = replay_handle(StepLoop(), length=128, prefix=True)
+    isolated_multiturn()
+    handle = replay_handle(StepLoop(), length=128, prefix=True, generated_kv="reuse")
     primitive = handle.runner._workload_session._replay
     stage, replay = PositionCacheProvider.stage, torch.cuda.CUDAGraph.replay
     records, active = {}, []
@@ -378,7 +453,9 @@ def main():
             carry=references[0][0][hit - 1][0],
             start=hit,
         )
-        print(f"Real multi-turn generated-prefix reuse PASS hit={hit}")
+        cold_reference, _ = oracle.run(receiver, len(receiver))
+        assert not torch.equal(cold_reference[-1][0], records[received.request_id, len(receiver) - 1][0])
+        print(f"Real multi-turn reuse and divergence from isolate cold math PASS hit={hit}")
 
         with (
             torch.profiler.profile(
@@ -398,9 +475,6 @@ def main():
                     for word in ("dtoh", "device to host", "synchronize", "local_scalar_dense")
                 ), event.name
         print("Warmed whole-forward zero-sync PASS")
-        handle.runner.detach_workload()
-        handle._deployment = StepLoop().bind_backend(handle._facts, handle.attachment)
-        handle.runner.attach_workload(handle.deployment)
     finally:
         handle.close()
     forced_preemption([list(output.outputs[0].token_ids) for output in outputs])

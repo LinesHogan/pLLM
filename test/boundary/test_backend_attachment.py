@@ -148,6 +148,7 @@ def test_failed_shutdown_retains_the_shared_input_fd_until_close_retries() -> No
     from vllm import SamplingParams
 
     from pllm.backends.vllm import runtime
+    from pllm.backends.vllm.prefix_cache import CachePolicy
     from pllm.execution.shared_tensor import CpuFileStorage
 
     workload, _, facts = overlay_facts()
@@ -185,7 +186,10 @@ def test_failed_shutdown_retains_the_shared_input_fd_until_close_retries() -> No
     owned = ref(engine.owned)
     handle = runtime.VllmLlm(engine, None, None, overlay, facts)
     del engine
-    with pytest.raises(RuntimeError):
+    with (
+        patch.object(runtime.VllmLlm, "cache_policy", return_value=CachePolicy.for_attachment(overlay, "isolate")),
+        pytest.raises(RuntimeError),
+    ):
         handle.generate(["test"], SamplingParams(max_tokens=1), feedback_group="ownership")
     shared = staged[0].completion.storage
     assert isinstance(shared, CpuFileStorage)

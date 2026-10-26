@@ -28,6 +28,7 @@ from pllm.backends.vllm.parameter_overlay import (
     validate_projection_sources,
 )
 from pllm.backends.vllm.position_state import PositionCacheLayer
+from pllm.backends.vllm.prefix_cache import POLICY_KEY, CachePolicy
 from pllm.backends.vllm.replay import VllmTokenwiseReplay
 from pllm.backends.vllm.sampler import (
     SamplerGuidance,
@@ -49,6 +50,7 @@ from pllm.contracts.semantic_graph import (
     TokenProgramEffect,
 )
 from pllm.execution.backend_attachment import attachment_buffer_bytes
+from pllm.execution.codec import encode_boundary
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.execution import TaskGraphInvocation
 from pllm.execution.overlay_task import ProjectionTask
@@ -93,7 +95,10 @@ class VllmSession(Generic[DataT, ResultT]):
         taps: HiddenTaps | None = None,
         position_layers: tuple[PositionCacheLayer, ...] = (),
         allocation_block_size: int = 16,
+        *,
+        cache_policy: CachePolicy,
     ) -> None:
+        self._cache_envelope = encode_boundary(cache_policy)
         attachment = deployment.attachment
         plan = attachment.inputs.plan
         self._capture_feedback = any(
@@ -312,6 +317,8 @@ class VllmSession(Generic[DataT, ResultT]):
                 raise RuntimeError("vLLM scheduled an invalid request id")
             if type(request.sampling_params) is not SamplingParams or request.sampling_params.n != 1:
                 raise RuntimeError("vLLM workload requires sampling n=1")
+            if (request.sampling_params.extra_args or {}).get(POLICY_KEY) != self._cache_envelope:
+                raise ValueError("request cache policy differs from installed workload; submit through its handle")
             pending.append(self._pending_identities[request.req_id])
         if pending:
             if execution.directory.scope is StateScope.REQUEST:
@@ -563,6 +570,11 @@ class VllmSession(Generic[DataT, ResultT]):
         self._retire(tuple(self._identities[request_id] for request_id in sorted(self._identities)))
         self._pending_identities.clear()
         self._deployment.execution.arena.collect_completed(wait=wait)
+
+    def require_idle(self) -> None:
+        """Workload replacement cannot discard admitted or staged requests."""
+        if self._step is not None or self._identities or self._pending_identities:
+            raise RuntimeError("finish or abort active requests before replacing the workload")
 
     def close(self) -> None:
         try:

@@ -38,7 +38,9 @@ from pllm.execution.trace import TracePhase
 from pllm.workloads.recirculation import RecirculationWorkload
 
 
-def replay_handle(workload, *, length=64, prefix=False, blocks=None, offload=None):
+def replay_handle(
+    workload, *, length=64, prefix=False, blocks=None, offload=None, generated_kv="isolate", multiprocessing=False
+):
     """Shared small-model Stage A engine setup for serial-route GPU evidence."""
     with patch.object(
         runtime, "LLM", runtime.LLM if blocks is None else partial(runtime.LLM, num_gpu_blocks_override=blocks)
@@ -55,6 +57,8 @@ def replay_handle(workload, *, length=64, prefix=False, blocks=None, offload=Non
                 seed=7,
                 enable_prefix_caching=prefix,
                 kv_offload=offload,
+                generated_kv=generated_kv,
+                multiprocessing=multiprocessing,
             ),
         )
 

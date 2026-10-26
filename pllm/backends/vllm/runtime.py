@@ -85,6 +85,7 @@ if TYPE_CHECKING:
 
 
 from pllm.backends.vllm.position_state import POSITION_ENV
+from pllm.backends.vllm.prefix_cache import POLICY_ENV, CachePolicy
 from pllm.backends.vllm.runner import TAPS_ENV, BackendWorkerState, WorkloadModelRunner
 from pllm.contracts.packed_hidden import hidden_binding
 from pllm.execution.position_state import PositionAnnouncement
@@ -324,6 +325,10 @@ class VllmLlm(Generic[DataT, ResultT]):
             self._pending_input.close()
             self._pending_input = None
 
+    def cache_policy(self) -> CachePolicy:
+        """Read the installed identity, including idle workload replacements."""
+        return self.worker_state().cache_policy
+
     def generate_feedback(
         self,
         prompts: list[str],
@@ -530,7 +535,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         request_ids: list[str] = []
         lifetime = ExitStack()
         try:
-            request_ids = llm.enqueue(prompts, sampling_params, use_tqdm=use_tqdm)
+            request_ids = llm.enqueue(prompts, self.cache_policy().sampling(sampling_params), use_tqdm=use_tqdm)
             identities = tuple(
                 RequestIdentity(request_id, index, sample_index, route)
                 for request_id, index, route in zip(
@@ -645,6 +650,7 @@ def create_vllm_llm(
         _MP_ENV: "1" if config.multiprocessing else "0",
         _V2_RUNNER_ENV: "1" if config.runner is RunnerKind.MRV2 else "0",
         TAPS_ENV: json.dumps([[source.layer, source.site.value] for source in requirements.hidden_inputs]),
+        POLICY_ENV: config.generated_kv,
         POSITION_ENV: encode_boundary(PositionAnnouncement(requirements.position_states)),
     }
     if config.multiprocessing:
@@ -675,7 +681,10 @@ def create_vllm_llm(
             trust_remote_code=config.trust_remote_code,
             enable_prefix_caching=config.enable_prefix_caching,
             enable_chunked_prefill=False,
-            async_scheduling=False if config.runner is RunnerKind.MRV1 else None,
+            # The supported uni-process, non-speculative decoder enables async by default.
+            async_scheduling=config.runner is RunnerKind.MRV2,
+            scheduler_cls="pllm.backends.vllm.prefix_cache."
+            + ("WorkloadAsyncScheduler" if config.runner is RunnerKind.MRV2 else "WorkloadScheduler"),
             kv_transfer_config=None if offload is None else offload.options(),
         )
     finally:

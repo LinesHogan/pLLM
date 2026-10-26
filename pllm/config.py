@@ -92,6 +92,7 @@ class ModelConfig:
     seed: int = 0
     trust_remote_code: bool = False
     enable_prefix_caching: bool = False
+    generated_kv: Literal["reuse", "isolate"] = "isolate"
     revision: str | None = None
     multiprocessing: bool = False
     runner: RunnerKind = RunnerKind.MRV2
@@ -102,7 +103,8 @@ class ModelConfig:
 
     def __post_init__(self) -> None:
         if (
-            not self.model
+            self.generated_kv not in ("reuse", "isolate")
+            or not self.model
             or self.max_model_len < 2
             or self.max_num_seqs < 1
             or self.max_num_batched_tokens < self.max_num_seqs

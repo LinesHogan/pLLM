@@ -29,6 +29,7 @@ class LLM:
         trust_remote_code: bool,
         enable_prefix_caching: bool,
         enable_chunked_prefill: bool,
+        scheduler_cls: str | None = ...,
         async_scheduling: bool | None = None,
         additional_config: dict[str, int] | None = None,
         compilation_config: CompilationConfig | None = None,

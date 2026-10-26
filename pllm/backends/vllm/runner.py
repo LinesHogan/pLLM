@@ -10,7 +10,7 @@ import json
 import os
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
+from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar
 
 import torch
 from vllm.config import CacheConfig, ModelConfig as VllmModelConfig, VllmConfig
@@ -38,6 +38,7 @@ from pllm.backends.vllm.overlay_graph import (
 )
 from pllm.backends.vllm.packed_rows import encode_mrv2_rows
 from pllm.backends.vllm.position_state import POSITION_ENV, PositionCacheLayer
+from pllm.backends.vllm.prefix_cache import POLICY_ENV, CachePolicy
 from pllm.backends.vllm.sampler import (
     SamplerGuidance,
     Vllm027Sampler,
@@ -96,6 +97,7 @@ class _RunnerSession(Protocol):
     def abort_active(self) -> None: ...
     def retire_all(self) -> None: ...
     def close(self) -> None: ...
+    def require_idle(self) -> None: ...
     def diagnostics(self) -> StateDiagnostics: ...
     @property
     def attachment(self) -> SignedBackendAttachment: ...
@@ -121,7 +123,7 @@ class Runner(Generic[SamplerT]):
     hidden_taps: HiddenTaps | None = None
     position_states: tuple[tuple[str, float], ...] = ()
     position_layers: tuple[PositionCacheLayer, ...] = ()
-    _cache_math: str | None = None
+    cache_policy: CachePolicy
 
     def _install_hidden_taps(self) -> None:
         """Tap the announced hidden outputs before vLLM compiles and captures the model."""
@@ -141,6 +143,10 @@ class Runner(Generic[SamplerT]):
     overlay_graph_bytes: int = 0
 
     def _initialize_workload(self, topology: AttachmentTopology) -> None:
+        policy = os.environ.get(POLICY_ENV, "isolate")
+        if policy not in ("reuse", "isolate"):
+            raise ValueError("generated_kv must be reuse or isolate")
+        self._generated_kv: Literal["reuse", "isolate"] = "reuse" if policy == "reuse" else "isolate"
         self.workload_topology = topology
         self._workload_session: _RunnerSession | None = None
         self._workload_upstream_sampler: SamplerT | None = None
@@ -167,9 +173,6 @@ class Runner(Generic[SamplerT]):
             or deployment.attachment.inputs.request.overlay_bindings
         ):
             raise ValueError("signed activation injection does not support shared prefix caching")
-        math = deployment.attachment.inputs.plan.semantic_graph.execution_parameters_digest
-        if self.cache_config.enable_prefix_caching and self._cache_math not in (None, math):
-            raise ValueError("prefix caching locks this engine to its first workload math; create a new engine")
         if deployment.attachment.inputs.probe.position_states != self.position_states:
             raise ValueError("PositionState schema changed; create a new engine with this workload")
         request = deployment.attachment.inputs.request
@@ -195,6 +198,7 @@ class Runner(Generic[SamplerT]):
         adapter = self._make_sampler(upstream) if deployment.attachment.inputs.request.guides_sampler else None
         if adapter is not None and not isinstance(adapter, SamplerGuidance):
             raise TypeError("backend sampler must share the original guidance lifecycle")
+        policy = CachePolicy.for_attachment(deployment.attachment, self._generated_kv)
         session = VllmSession(
             deployment,
             model,
@@ -203,6 +207,7 @@ class Runner(Generic[SamplerT]):
             self.hidden_taps,
             self.position_layers,
             self.cache_config.block_size,
+            cache_policy=policy,
         )
         self._workload_upstream_sampler = upstream
         self._workload_session = session
@@ -216,8 +221,7 @@ class Runner(Generic[SamplerT]):
             self.sampler = adapter
             # Both runner ABIs call model.compute_logits; guidance shares that LM-head read.
             setattr(model, "compute_logits", partial(session.compute_logits, model))
-        if self.cache_config.enable_prefix_caching:
-            self._cache_math = math
+        self.cache_policy = policy
 
     def _finish_model_binding(self) -> None:
         """Finish backend model preparation after the session has installed its effects."""
@@ -227,6 +231,7 @@ class Runner(Generic[SamplerT]):
         upstream = self._workload_upstream_sampler
         if session is None or upstream is None:
             raise RuntimeError("canonical runner has no attached session")
+        session.require_idle()
         session.close()
         if self.completion_capture is not None:
             self.completion_capture.synchronize()
@@ -266,7 +271,7 @@ class Runner(Generic[SamplerT]):
 
     def worker_state(self) -> BackendWorkerState:
         session = self.require_session()
-        return BackendWorkerState(os.getpid(), session.diagnostics())
+        return BackendWorkerState(os.getpid(), session.diagnostics(), self.cache_policy)
 
     @property
     def trace(self) -> ExecutionTrace:
@@ -453,3 +458,4 @@ class WorkloadModelRunner(Runner[Sampler | None], OverlayGraphRunner):
 class BackendWorkerState:
     process_id: int
     diagnostics: StateDiagnostics
+    cache_policy: CachePolicy

@@ -185,16 +185,28 @@ def _session(b, execution):
     model = SimpleNamespace(
         model=SimpleNamespace(layers=[_Layer() for _ in range(3)]), lm_head=SimpleNamespace(weight=torch.zeros(2, 2))
     )
-    return VllmSession(deployment, model, None, 2), model, deployment
+    from pllm.backends.vllm.prefix_cache import CachePolicy
+
+    return (
+        VllmSession(
+            deployment, model, None, 2, cache_policy=CachePolicy.for_attachment(deployment.attachment, "isolate")
+        ),
+        model,
+        deployment,
+    )
 
 
-def _scheduler(*identities):
+def _scheduler(session, *identities):
     from vllm import SamplingParams
 
     return SimpleNamespace(
         finished_req_ids=set(),
         scheduled_new_reqs=tuple(
-            SimpleNamespace(req_id=identity.request_id, sampling_params=SamplingParams(n=1)) for identity in identities
+            SimpleNamespace(
+                req_id=identity.request_id,
+                sampling_params=SamplingParams(n=1, extra_args={"pllm.prefix_cache": session._cache_envelope}),
+            )
+            for identity in identities
         ),
     )
 
@@ -249,7 +261,7 @@ def _decode_steps_keep_exact_publications_and_ack_order():
         session.bind_readonly_input(receive)
         session.stage_input(None, identities)
         for step, (root, peers) in enumerate(((first, first_peers), (second, second_peers))):
-            session.before_execute(_scheduler(*(identities if step == 0 else ())))
+            session.before_execute(_scheduler(session, *(identities if step == 0 else ())))
             rows = _step_rows(step, identities)
             rng = torch.random.get_rng_state().clone()
             session.prepare_input(rows)
@@ -307,7 +319,7 @@ def _hold_steps_reuse_the_settled_injection():
         session.stage_input(None, (identity,))
         refs = []
         for step in range(4):
-            session.before_execute(_scheduler(*((identity,) if step == 0 else ())))
+            session.before_execute(_scheduler(session, *((identity,) if step == 0 else ())))
             rng = torch.random.get_rng_state().clone()
             session.prepare_input(rows(step))
             hold = step in (1, 3)
