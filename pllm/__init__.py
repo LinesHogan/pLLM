@@ -8,6 +8,7 @@ from pllm import host as host, model as model, state as state  # noqa: E402
 from pllm.authoring import AdamW as AdamW
 from pllm.config import (
     ExecutionOptions as ExecutionOptions,
+    KVOffload as KVOffload,
     ModelConfig as ModelConfig,
 )
 from pllm.execution.host_runtime import (
@@ -23,6 +24,7 @@ from pllm.usage import (
     Exact as Exact,
     InstanceState as InstanceState,
     Phase as Phase,
+    PositionState as PositionState,
     RequestState as RequestState,
     TensorUpdate as TensorUpdate,
     Visibility as Visibility,
@@ -105,6 +107,7 @@ def make_llm(
             enforce_eager=not config.cuda_graphs,
             trust_remote_code=config.trust_remote_code,
             revision=config.revision,
+            kv_transfer_config=None if config.kv_offload is None else config.kv_offload.options(),
         )
     if not isinstance(workload, BackendWorkload):
         raise TypeError("model execution requires a backend workload")
@@ -128,6 +131,7 @@ __all__ = [
     "Visibility",
     "ModelConfig",
     "ExecutionOptions",
+    "KVOffload",
     "Workload",
     "Phase",
     "on",
@@ -152,6 +156,7 @@ __all__ = [
     "capture",
     "InstanceState",
     "RequestState",
+    "PositionState",
     "AdamW",
     "SGD",
     "Buffer",

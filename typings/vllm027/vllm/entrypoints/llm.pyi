@@ -32,6 +32,7 @@ class LLM:
         async_scheduling: bool | None = None,
         additional_config: dict[str, int] | None = None,
         compilation_config: CompilationConfig | None = None,
+        kv_transfer_config: dict[str, object] | None = None,
     ) -> None: ...
     def generate(
         self,

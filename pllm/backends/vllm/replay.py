@@ -15,6 +15,7 @@ from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 from pllm.authoring import DataT, ResultT
 from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay
+from pllm.backends.vllm.position_state import PositionCacheLayer, PositionCacheProvider
 from pllm.backends.vllm.region_attention import (
     TokenAttentionBuffers,
     attention_paged_access,
@@ -79,6 +80,8 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         function_bodies: tuple[RegionFunctionBody, ...] = (),
         activation: VllmActivationPatch | None = None,
         overlay: ExactParameterOverlay | None = None,
+        position_layers: tuple[PositionCacheLayer, ...] = (),
+        allocation_block_size: int = 16,
     ) -> None:
         if not isinstance(task.replay, TokenProgramEffect) or task.replay.layer_count != len(model.model.layers):
             raise ValueError("tokenwise replay differs from the specialized model")
@@ -100,6 +103,17 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         self.activation = activation
         tensor = TensorType(
             (1, model.config.hidden_size), str(self.model.norm.weight.dtype), str(self.model.norm.weight.device)
+        )
+        region = TokenwiseReplayTask[DataT].from_implementation(execution.implementation(self.implementation_id)).region
+        self.position = (
+            PositionCacheProvider(
+                position_layers,
+                tuple(initial for _, initial in self.effect.position_states),
+                allocation_block_size,
+                self.model.norm.weight[:].reshape(1, -1),
+            )
+            if region.position
+            else None
         )
         self._normalize_kernel = (
             VllmRmsNormKernel.inspect(self.model.norm, tensor, len(self.model.layers)) if source_imports else None
@@ -265,6 +279,9 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
             self._seed.copy_(self._hidden[index : index + 1])
             self._position.copy_(self._positions[index : index + 1])
             TokenAttentionBuffers.refresh(bindings, row)
+            if self.position is not None:
+                assert isinstance(self.position, PositionCacheProvider)
+                self.position.stage(get_forward_context(), row)
             if self.activation is not None:
                 for handle, fields in zip(self.activation.layers, self._activation_rows[index], strict=True):
                     for target, field in zip(self._activation_fields.get(handle.binding.layer, ()), fields):
@@ -301,7 +318,11 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
             None if self.overlay_storage is None else self.overlay_storage.slab.data_ptr(),
             tuple(
                 (tensor.data_ptr(), tuple(tensor.shape), tensor.stride(), str(tensor.dtype), str(tensor.device))
-                for tensor in (*tuple(item.kv_cache for item in attentions), *tuple(self.model.parameters()))
+                for tensor in (
+                    *tuple(item.kv_cache for item in attentions),
+                    *tuple(self.model.parameters()),
+                    *(() if self.position is None else self.position.tables),
+                )
             ),
         )
         if identity != self._identity:
@@ -337,12 +358,20 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         attentions = tuple(layer.self_attn.attn for layer in self.model.layers)
         cells = tuple((attention.kv_cache, *self._access.cell(attention.layer_name, row)) for attention in attentions)
         saved = tuple(cache[block, :, offset, :] for cache, block, offset in cells)
-        try:
-            with override_forward_context(self._buffers.context):
-                capture = RegionTokenCapture(invocation, instances, self._hidden.device)
-        finally:
+        if self.position is not None:
+            self.position.backup()
+
+        def reset() -> None:
             for (cache, block, offset), value in zip(cells, saved, strict=True):
                 cache[block, :, offset, :] = value
+            if self.position is not None:
+                self.position.reset()
+
+        try:
+            with override_forward_context(self._buffers.context):
+                capture = RegionTokenCapture(invocation, instances, self._hidden.device, reset=reset)
+        finally:
+            reset()
         if self.overlay is not None:
             self.overlay.reset()
         resident = sum(item.resident_bytes for item in self._captures.values()) + capture.resident_bytes

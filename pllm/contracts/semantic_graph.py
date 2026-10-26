@@ -155,6 +155,7 @@ class TokenProgramEffect:
 
     layer_count: int
     rows: Literal["prefill", "decode", "all"] = "all"
+    position_states: tuple[tuple[str, float], ...] = ()
 
 
 LossReduction = Literal[

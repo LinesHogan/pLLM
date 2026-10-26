@@ -1,7 +1,7 @@
 """Trace user layer routes with Torch and lower their segments and tensor cells for TokenwiseRegion."""
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import torch
@@ -31,6 +31,7 @@ from pllm.contracts.region_program import (
 from pllm.execution.codec import tensor_decompositions, tensor_node_metadata
 from pllm.execution.decoder_region import DecoderActivation, DecoderSource
 from pllm.execution.exported_cell import ExportedCell
+from pllm.execution.position_state import POSITION_RESOURCE, position_functions, position_save
 from pllm.execution.region_native import RegionFunction, external_primitive
 from pllm.execution.shared_tensor import region_dtype
 
@@ -102,6 +103,23 @@ class Layers:
     seed: torch.Tensor
     position: torch.Tensor
     layer_count: int
+    generated: torch.Tensor
+    entries: dict[str, torch.Tensor] = field(repr=False)
+
+    def load(self, name: str, offset: int = -1) -> torch.Tensor:
+        """Read the previous token's state, even after a save in this token."""
+        if offset != -1:
+            raise ValueError("use offset=-1 for PositionState")
+        if name not in self.entries:
+            raise ValueError(f"declare PositionState {name!r} before loading or saving it")
+        return self.entries[name].clone()
+
+    def save(self, name: str, value: torch.Tensor) -> None:
+        """Save a snapshot at this position; the last save wins."""
+        entry = self.load(name)
+        if value.shape != entry.shape or value.dtype != entry.dtype:
+            raise ValueError(f"save {name} with shape {tuple(entry.shape)} and dtype {entry.dtype}")
+        position_save(value.clone(), name)
 
     def __call__(self, start: int = 0, stop: int | None = None, hidden: torch.Tensor | None = None) -> Taps:
         stop = self.layer_count if stop is None else stop
@@ -143,6 +161,14 @@ class Output:
     value: str
 
 
+@dataclass(frozen=True)
+class Save:
+    """An SSA snapshot selected for the current position's final store."""
+
+    name: str
+    value: str
+
+
 def _tensor(node: torch.fx.Node) -> torch.Tensor:
     value = tensor_node_metadata(node)
     assert value is not None
@@ -170,18 +196,26 @@ def _cell(nodes: list[torch.fx.Node]) -> Cell:
 class TokenProgram:
     """Ordered model slices, exported tensor fragments and the sampled residual stream."""
 
-    steps: tuple[Segment | Cell | ApplyUpdates | Output, ...]
+    steps: tuple[Segment | Cell | ApplyUpdates | Save | Output, ...]
     seed: str
     position: str
+    generated: str
+    entries: tuple[tuple[str, str], ...]
 
     @classmethod
     def capture(
-        cls, function: Callable[[Layers], torch.Tensor | None], tensor: TensorType, layer_count: int
+        cls,
+        function: Callable[[Layers], torch.Tensor | None],
+        tensor: TensorType,
+        layer_count: int,
+        names: tuple[str, ...] = (),
     ) -> "TokenProgram":
         """Trace on fake tensors; Torch rejects data-dependent Python control flow."""
 
-        def invoke(seed: torch.Tensor, position: torch.Tensor) -> torch.Tensor:
-            result = function(Layers(seed, position, layer_count))
+        def invoke(
+            seed: torch.Tensor, position: torch.Tensor, generated: torch.Tensor, *entries: torch.Tensor
+        ) -> torch.Tensor:
+            result = function(Layers(seed, position, layer_count, generated, dict(zip(names, entries, strict=True))))
             if not isinstance(result, torch.Tensor):
                 raise ValueError("return a final-layer residual-stream tensor from your layer_route method")
             return result
@@ -189,25 +223,35 @@ class TokenProgram:
         with FakeTensorMode(shape_env=ShapeEnv()):
             seed = torch.empty(tensor.shape, dtype=region_dtype(tensor.dtype), device=tensor.device)
             position = torch.empty((1,), dtype=torch.int64, device=tensor.device)
+            generated = torch.empty((1,), dtype=torch.bool, device=tensor.device)
             graph = make_fx(
                 invoke,
                 decomposition_table=tensor_decompositions((torch.ops.aten.linalg_vector_norm.default,)),
                 tracing_mode="fake",
-            )(seed, position)
-            steps: list[Segment | Cell | ApplyUpdates | Output] = []
+            )(seed, position, generated, *(torch.empty_like(seed) for _ in names))
+            steps: list[Segment | Cell | ApplyUpdates | Save | Output] = []
             pending: list[torch.fx.Node] = []
             placeholders = tuple(node.name for node in graph.graph.nodes if node.op == "placeholder")
             for node in graph.graph.nodes:
                 if node.target == torch.ops.higher_order.while_loop:
                     raise ValueError("layer routes do not support traced while_loop; use a bounded for-loop")
                 if (
-                    node.target in (torch.ops.pllm.layers.default, torch.ops.pllm.apply_updates.default)
+                    node.target
+                    in (
+                        torch.ops.pllm.layers.default,
+                        torch.ops.pllm.apply_updates.default,
+                        torch.ops.pllm.position_save.default,
+                    )
                     or node.op == "output"
                 ):
                     if pending:
                         steps.append(_cell(pending))
                         pending = []
-                    if node.target == torch.ops.pllm.apply_updates.default:
+                    if node.target == torch.ops.pllm.position_save.default:
+                        value, name = node.args
+                        assert isinstance(value, torch.fx.Node) and isinstance(name, str)
+                        steps.append(Save(name, value.name))
+                    elif node.target == torch.ops.pllm.apply_updates.default:
                         steps.append(ApplyUpdates())
                     elif node.op == "output":
                         result = node.args[0]
@@ -234,7 +278,13 @@ class TokenProgram:
                     arg.target == torch.ops.pllm.layers.default for arg in node.all_input_nodes
                 ):
                     pending.append(node)
-        return cls(tuple(steps), *placeholders)
+        return cls(
+            tuple(steps),
+            placeholders[0],
+            placeholders[1],
+            placeholders[2],
+            tuple(zip(names, placeholders[3:], strict=True)),
+        )
 
     def lower(
         self,
@@ -256,6 +306,19 @@ class TokenProgram:
         declarations: dict[str, Function] = {}
         weights, context = BorrowedResource("weights", (domain.layers + 1,)), BorrowedResource("context", (max_rows,))
         resources: dict[str, ResourceType] = {resource.name: resource for resource in (weights, context)}
+        entry, store = position_functions(tensor, len(self.entries))
+        positional = bool(self.entries) or any(
+            isinstance(step, Cell) and self.generated in step.source.inputs for step in self.steps
+        )
+        saved: dict[str, Value] = {}
+        if positional:
+            ports = (Value(self.generated, entry.outputs[0]), *(Value(value, tensor) for _, value in self.entries))
+            operations.append(Call((), ports, entry.name))
+            values.update((value.name, value) for value in ports)
+            saved.update((name, values[value]) for name, value in self.entries)
+            resources[POSITION_RESOURCE.name] = POSITION_RESOURCE
+            declarations.update((function.name, function) for function in (entry, store))
+            functions.update((function.name, external_primitive(function)) for function in (entry, store))
         if overlay is not None:
             resources[overlay.name] = overlay
         result = arguments[-1]
@@ -285,6 +348,8 @@ class TokenProgram:
                 declarations[boundary.name] = boundary
                 functions[boundary.name] = external_primitive(boundary)
                 operations.append(Call(("row", "request"), (), boundary.name))
+            elif isinstance(step, Save):
+                saved[step.name] = values[step.value]
             elif isinstance(step, Cell):
                 cell = step.source
                 results = tuple(
@@ -296,6 +361,8 @@ class TokenProgram:
                 declarations[cell.digest] = cell.declaration
             else:
                 result = values[step.value]
+        if positional:
+            operations.append(Call(tuple(value.name for value in saved.values()), (), store.name))
         return Program(
             Region(Block(arguments, tuple(operations), (result.name,))),
             tuple(declarations.values()),

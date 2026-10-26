@@ -105,6 +105,7 @@ class BackendPlacementProbe:
     causal_domain: CausalModelDomain | None = None
     region_imports: tuple[RegionTensorImport, ...] = ()
     region_bodies: tuple[RegionFunctionBody, ...] = ()
+    position_states: tuple[tuple[str, float], ...] = ()
 
 
 class ActivationPatchOperator(StrEnum):

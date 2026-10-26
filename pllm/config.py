@@ -17,6 +17,37 @@ class RunnerKind(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class KVOffload:
+    """Batched same-engine CPU offload of complete allocation pages."""
+
+    connector: Literal["OffloadingConnector", "SimpleCPUOffloadConnector"] = "OffloadingConnector"
+    cpu_bytes: int = 512 * 1024**2
+    prompt_only: bool = False
+
+    def __post_init__(self) -> None:
+        if self.connector not in ("OffloadingConnector", "SimpleCPUOffloadConnector") or self.cpu_bytes <= 0:
+            raise ValueError(
+                "use OffloadingConnector or SimpleCPUOffloadConnector with positive cpu_bytes; LMCache does not support PositionState"
+            )
+        if self.prompt_only and self.connector == "SimpleCPUOffloadConnector":
+            raise ValueError(
+                "prompt_only needs OffloadingConnector; SimpleCPUOffloadConnector offloads completed request pages"
+            )
+
+    def options(self) -> dict[str, object]:
+        """Configure stock batched transfers with one complete allocation page per chunk."""
+        return {
+            "kv_connector": self.connector,
+            "kv_role": "kv_both",
+            "kv_connector_extra_config": {
+                "cpu_bytes_to_use": self.cpu_bytes,
+                "blocks_per_chunk": 1,
+                "offload_prompt_only": self.prompt_only,
+            },
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutionOptions:
     """Framework execution policy; lag counts post-sampler steps hidden from readers."""
 
@@ -67,6 +98,7 @@ class ModelConfig:
     execution: ExecutionOptions = ExecutionOptions()
     # Use vLLM model graphs; in-model effects need a supported graph binding.
     cuda_graphs: bool = False
+    kv_offload: KVOffload | None = None
 
     def __post_init__(self) -> None:
         if (

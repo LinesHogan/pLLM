@@ -9,7 +9,6 @@ from vllm import SamplingParams
 from vllm.forward_context import override_forward_context
 
 import pllm
-from pllm.backends.vllm.replay import VllmTokenwiseReplay
 from pllm.config import ModelConfig, VllmDType
 from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
@@ -232,11 +231,12 @@ def run(chunk):
             torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
             ) as profile,
-            patch.object(VllmTokenwiseReplay, "forward", measured(VllmTokenwiseReplay.forward)),
+            patch.object(primitive.model, "forward", measured(primitive.forward)),
         ):
             profile_outputs = handle.generate(
                 ["The sky is", "Water freezes at"], SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True)
             )
+        assert any(event.name == "route.forward" for event in profile.events())
         for event in profile.events():
             parent = event.cpu_parent
             while parent is not None and parent.name != "route.forward":

@@ -84,8 +84,10 @@ if TYPE_CHECKING:
     from pllm.backends.vllm.mrv1 import Mrv1Runner
 
 
+from pllm.backends.vllm.position_state import POSITION_ENV
 from pllm.backends.vllm.runner import TAPS_ENV, BackendWorkerState, WorkloadModelRunner
 from pllm.contracts.packed_hidden import hidden_binding
+from pllm.execution.position_state import PositionAnnouncement
 
 _MP_ENV = "VLLM_ENABLE_V1_MULTIPROCESSING"
 
@@ -630,6 +632,9 @@ def create_vllm_llm(
     definition: str | None = None,
 ) -> VllmLlm[DataT, ResultT]:
     requirements = workload.backend_requirements()
+    offload = config.kv_offload
+    if requirements.position_states and config.runner is RunnerKind.MRV1:
+        raise ValueError("PositionState layer routes require runner=MRV2")
     if config.enable_prefix_caching and (requirements.parameter_targets or requirements.activation_layers):
         raise ValueError("parameter-version overlays do not support shared prefix caching")
     if _VLLM_VERSION != _SUPPORTED_VLLM_VERSION:
@@ -640,6 +645,7 @@ def create_vllm_llm(
         _MP_ENV: "1" if config.multiprocessing else "0",
         _V2_RUNNER_ENV: "1" if config.runner is RunnerKind.MRV2 else "0",
         TAPS_ENV: json.dumps([[source.layer, source.site.value] for source in requirements.hidden_inputs]),
+        POSITION_ENV: encode_boundary(PositionAnnouncement(requirements.position_states)),
     }
     if config.multiprocessing:
         environment["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -670,6 +676,7 @@ def create_vllm_llm(
             enable_prefix_caching=config.enable_prefix_caching,
             enable_chunked_prefill=False,
             async_scheduling=False if config.runner is RunnerKind.MRV1 else None,
+            kv_transfer_config=None if offload is None else offload.options(),
         )
     finally:
         for name, value in previous_environment.items():
@@ -745,6 +752,8 @@ def probe_backend(
     publish_lag: int = 1,
 ) -> BackendCompileFacts:
     _require_runner(runner)
+    if requirements.position_states != runner.position_states:
+        raise ValueError("PositionState schema differs from pre-allocation announcement; create a new engine")
     match runner.model:
         case Qwen2ForCausalLM() as model:
             pass
@@ -948,6 +957,7 @@ def _base_probe(
         hidden_resources=hidden_resources,
         capabilities=capabilities,
         causal_domain=CausalModelDomain(runner.max_num_reqs, layer_count, runner.model_config.max_model_len),
+        position_states=runner.position_states,
     )
 
 

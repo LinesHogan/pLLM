@@ -92,6 +92,7 @@ class RegionTokenCapture:
         invocation: RegionInvocation,
         instances: tuple[ScheduleInstance, ...],
         device: torch.device,
+        reset: Callable[[], None] | None = None,
     ) -> None:
         overlay = invocation.overlay
         started = perf_counter()
@@ -103,10 +104,17 @@ class RegionTokenCapture:
             return output, invocation.observation, tuple(overlay.results), overlay.captures()
 
         invocation.cold = True
+
+        def prepare() -> None:
+            if overlay is not None:
+                overlay.reset()
+
+        def restore() -> None:
+            if reset is not None:
+                reset()
+
         try:
-            self.graph, outputs, self.resident_bytes = (
-                capture_graph(device, body) if overlay is None else capture_graph(device, body, prepare=overlay.reset)
-            )
+            self.graph, outputs, self.resident_bytes = capture_graph(device, body, prepare=prepare, restore=restore)
         finally:
             invocation.cold = False
             invocation.observation = None

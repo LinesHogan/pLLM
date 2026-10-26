@@ -575,6 +575,7 @@ fn validate_cross_binding(
         return Err("backend supports one layer route".to_owned());
     }
     for (_, task) in replay_tasks {
+        validate_position_source(task, graph, probe)?;
         let domain = probe.causal_domain.as_ref().ok_or("layer routes need a signed model domain")?;
         if u64::from(task.replay.as_ref().unwrap().layer_count) != domain.layers
             || task.timing.after != "model.execute" || task.timing.before != "state.publish"
@@ -781,6 +782,42 @@ fn validate_cross_binding(
                 );
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_position_source(task: &SemanticTask, graph: &SemanticGraph, probe: &BackendPlacementProbe) -> Result<(), String> {
+    use super::super::region_program::{AccessMode, Resource, Type};
+    let states = &task.replay.as_ref().unwrap().position_states;
+    if *states != probe.position_states {
+        return Err("PositionState schema must match the pre-allocated provider".into());
+    }
+    let source = graph.source_regions.iter().find(|source| source.task == task.symbol && source.name == "layer_route")
+        .ok_or("layer routes need their source")?;
+    let positional = source.program.resources.iter().any(|resource| resource.name() == "position");
+    if !positional && states.is_empty() { return Ok(()); }
+    if !source.program.resources.contains(&Resource::Borrowed { name: "position".into(), domain: vec![1] })
+        || (!states.is_empty() && (!task.effects.is_empty() || !graph.states.is_empty())) {
+        return Err("PositionState requires a borrowed cache on a pure route".into());
+    }
+    let device = match probe.device_kind {
+        StateDeviceKind::Cpu => "cpu".to_string(),
+        StateDeviceKind::Cuda => format!("cuda:{}", probe.device_ordinal),
+    };
+    let tensor = Type::Tensor { shape: vec![1, probe.hidden_size],
+        dtype: format!("torch.{}", serde_json::to_value(&probe.tensor_dtype).unwrap().as_str().unwrap()), device: device.clone() };
+    let values = vec![tensor; states.len()];
+    let entry = source.program.functions.iter().find(|f| f.name == "position.entry@1").ok_or("PositionState needs an entry read")?;
+    let exit = source.program.functions.iter().find(|f| f.name == "position.exit@1").ok_or("PositionState needs a final store")?;
+    let mut outputs = vec![Type::Tensor { shape: vec![1], dtype: "torch.bool".into(), device }];
+    outputs.extend(values.clone());
+    if !entry.inputs.is_empty() || entry.outputs != outputs || exit.inputs != values || !exit.outputs.is_empty()
+        || [entry, exit].iter().any(|f| f.resources != vec!["position"] || f.accesses.len() != 2
+            || [AccessMode::Read, AccessMode::Write].iter().any(|mode| !f.accesses.iter().any(|a|
+                a.resource == "position" && a.mode == *mode && a.ranges.len() == 1
+                && a.ranges[0].lower.constant == 0 && a.ranges[0].upper.constant == 1
+                && a.ranges[0].lower.terms.is_empty() && a.ranges[0].upper.terms.is_empty()))) {
+        return Err("PositionState ports and whole-cache READ/WRITE effects must match the provider".into());
     }
     Ok(())
 }

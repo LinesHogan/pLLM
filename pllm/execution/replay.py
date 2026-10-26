@@ -26,6 +26,7 @@ from pllm.contracts.semantic_graph import (
 from pllm.execution.decoder_region import DecoderActivation
 from pllm.execution.host_borrow import TraceResourceView
 from pllm.execution.overlay_task import OverlayTransition, RouteOverlay, RouteOverlayStorage
+from pllm.execution.position_state import PositionBuffers
 from pllm.execution.region_execution import RegionInvocation
 from pllm.execution.region_native import RegionFunction
 from pllm.execution.region_resources import (
@@ -59,6 +60,7 @@ class TokenwiseReplayPrimitive(ABC):
     overlay: RouteOverlay | None = None
     overlay_storage: RouteOverlayStorage | None = None
     token_capture = False
+    position: PositionBuffers | None = None
 
     def run_region(self, invocation: RegionInvocation) -> tuple[torch.Tensor, ...]:
         """CPU models use the source interpreter with fresh invocation bindings."""
@@ -263,6 +265,7 @@ class TokenwiseReplayTask(Generic[DataT]):
                 function_bodies=primitive.function_bodies,
                 model_endpoints=(
                     *primitive.model_endpoints(),
+                    *(() if primitive.position is None else primitive.position.endpoints(self.region.tensor)),
                     *(
                         ()
                         if overlay is None
@@ -273,6 +276,9 @@ class TokenwiseReplayTask(Generic[DataT]):
                     ),
                 ),
                 overlay_borrows=() if overlay is None else (TensorResourceBinding(overlay.storage, context),),
+                position_borrows=()
+                if primitive.position is None
+                else (TensorResourceBinding(primitive.position, context),),
                 activation_borrows=tuple(
                     primitive.bind_activation(resource, activation.binding.layer, context)
                     for resource, activation in zip(

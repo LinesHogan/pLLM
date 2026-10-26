@@ -143,6 +143,8 @@ pub(crate) struct ImplementationCandidate {
 pub(crate) struct TokenProgramEffect {
     pub(crate) layer_count: u32,
     pub(crate) rows: String,
+    #[serde(default)]
+    pub(crate) position_states: Vec<(String, serde_json::Number)>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -317,6 +319,10 @@ fn validate_task(task: &SemanticTask) -> Result<(), String> {
     if let Some(replay) = &task.replay {
         if replay.layer_count == 0 || !matches!(replay.rows.as_str(), "prefill" | "decode" | "all") {
             return Err("layer routes need positive layer_count and prefill/decode/all rows".to_owned());
+        }
+        if replay.position_states.iter().any(|(name, initial)| name.is_empty() || initial.as_f64().is_none_or(|x| !x.is_finite()))
+            || replay.position_states.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return Err("PositionState needs sorted unique names and finite scalar initializers".into());
         }
     }
     require_text(&task.symbol, "tasks.symbol")?;

@@ -61,6 +61,7 @@ from pllm.execution.decoder_region import (
     kv_resource,
 )
 from pllm.execution.exported_cell import ExportedCell
+from pllm.execution.position_state import POSITION_RESOURCE, position_functions
 from pllm.execution.region_compilation import analyze_region_program
 from pllm.execution.region_execution import RegionExecutionPlan, RegionInstructionExecution, RegionInvocation
 from pllm.execution.region_native import RegionFunction, source_region_functions
@@ -102,6 +103,7 @@ class TokenwiseRegion:
         activations: tuple[DecoderActivation, ...] = (),
     ) -> None:
         assert domain.layers == effect.layer_count
+        self.tensor = tensor
         self.weights = BorrowedResource("weights", (domain.layers + 1,))
         self.context = BorrowedResource("context", (max_rows,))
         self.trace = BorrowedResource("trace", ())
@@ -180,6 +182,21 @@ class TokenwiseRegion:
             )
         )
         normal_body = Region(Block(args, normal.operations, tuple(value.name for value in normal.results)))
+        self.position = POSITION_RESOURCE in source.program.resources
+        if self.position:
+            entry, store = position_functions(tensor, len(effect.position_states))
+            ports = tuple(Value(f"position{i}", type_) for i, type_ in enumerate(entry.outputs))
+            normal_body = Region(
+                Block(
+                    args,
+                    (
+                        Call((), ports, entry.name),
+                        *normal.operations,
+                        Call(tuple(value.name for value in ports[1:]), (), store.name),
+                    ),
+                    tuple(value.name for value in normal.results),
+                )
+            )
         parameters: list[SizeParameter] = []
         constraints: list[SizeConstraint] = []
         arguments: list[Value] = []
@@ -273,6 +290,7 @@ class TokenwiseRegion:
                 self.weights,
                 *self.activation_resources,
                 *(() if self.overlay is None else (self.overlay,)),
+                *((POSITION_RESOURCE,) if self.position else ()),
             ),
             tuple(parameters),
             tuple(constraints),
@@ -288,6 +306,7 @@ class TokenwiseRegion:
             prod(field.shape) * width for activation in activations for field in activation.fields
         )
         retained += 0 if self.overlay is None else self.overlay.domain[0]
+        retained += (3 * prod(tensor.shape) * width + 16) * len(effect.position_states) + 2 * self.position
         self.retained = (
             RetainedAllocation(
                 "tokenwise.buffers",
@@ -369,6 +388,7 @@ class TokenwiseRegion:
         model_endpoints: tuple[ExternalFunction, ...] = (),
         activation_borrows: tuple[PinnedResourceBinding | ReadonlyResourceBinding, ...] = (),
         overlay_borrows: tuple[TensorResourceBinding, ...] = (),
+        position_borrows: tuple[TensorResourceBinding, ...] = (),
         activation_selected: Callable[[int, int], bool] | None = None,
     ) -> tuple[torch.Tensor, ...]:
         assert function_bodies == self.function_bodies
@@ -455,7 +475,7 @@ class TokenwiseRegion:
                 *(activation_endpoint(item) for item in self.activations),
             ),
             sizes=sizes,
-            borrows=(kv, weights, context, trace, *activation_borrows, *overlay_borrows),
+            borrows=(kv, weights, context, trace, *activation_borrows, *overlay_borrows, *position_borrows),
             tensor_borrows=tuple(item for item in self.imports if isinstance(item, BorrowedTensorImport)),
         )
         invocation = RegionInvocation(self.execution, inputs, resources, sizes, None, eligible, observe, record)

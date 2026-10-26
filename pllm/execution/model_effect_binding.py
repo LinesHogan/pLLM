@@ -148,6 +148,8 @@ def _check_overlay_shapes(
 class ModelEffectBinding(TensorBindingBase):
     """Declare model-side effects and their request-state transitions."""
 
+    position_states: tuple[tuple[str, float], ...] = ()
+
     def _bind_visibility(self, call: Call, source: VisibilitySource) -> None:
         """Attach the read domain; plan validation derives and checks its relation once."""
         self.graph = replace(
@@ -464,7 +466,12 @@ class ModelEffectBinding(TensorBindingBase):
             ),
         )
 
-    def layer_route(self, function: Callable[[Layers], torch.Tensor], tokens: Tokens) -> None:
+    def layer_route(
+        self,
+        function: Callable[[Layers], torch.Tensor],
+        tokens: Tokens,
+        position_states: tuple[tuple[str, float], ...] = (),
+    ) -> None:
         """Trace a user route and sign its complete model/tensor source before planning."""
         if any(task.replay is not None for task in self.graph.tasks):
             raise ValueError("compose one layer_route with one trained overlay")
@@ -478,7 +485,14 @@ class ModelEffectBinding(TensorBindingBase):
             not activation and not composed and (self.attachment is not None or self.graph.tasks or self.graph.states)
         ):
             raise ValueError("layer_route requires a standalone effect, Activation or one trained parameter overlay")
-        effect = None if self.dimensions is None else TokenProgramEffect(self.dimensions.layer_count, tokens)
+        if position_states and (activation or composed):
+            raise ValueError("use PositionState on a pure route without learned overlays or activations")
+        self.position_states = position_states
+        effect = (
+            None
+            if self.dimensions is None
+            else TokenProgramEffect(self.dimensions.layer_count, tokens, position_states)
+        )
         if composed:
             assert self.attachment is not None
             symbol = next(symbol for role, symbol in self.attachment.tasks if role is AttachmentTaskRole.TRANSITION)
@@ -529,7 +543,9 @@ class ModelEffectBinding(TensorBindingBase):
             activations = decoder_activations(
                 self.attachment.activation_bindings, self.layouts, self.attachment.state_resource, tensor.device
             )
-            captured = TokenProgram.capture(function, tensor, probe.causal_domain.layers)
+            captured = TokenProgram.capture(
+                function, tensor, probe.causal_domain.layers, tuple(name for name, _ in position_states)
+            )
             self.route_rows = probe.max_packed_rows * max(1, sum(isinstance(step, Segment) for step in captured.steps))
             pending = False
             for step in captured.steps:

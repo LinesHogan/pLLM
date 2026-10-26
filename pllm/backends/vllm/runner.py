@@ -17,6 +17,7 @@ from vllm.config import CacheConfig, ModelConfig as VllmModelConfig, VllmConfig
 from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.sampler import Sampler as Mrv1Sampler
 from vllm.v1.worker.gpu.async_utils import AsyncOutput
@@ -36,6 +37,7 @@ from pllm.backends.vllm.overlay_graph import (
     OverlayGraphRunner,
 )
 from pllm.backends.vllm.packed_rows import encode_mrv2_rows
+from pllm.backends.vllm.position_state import POSITION_ENV, PositionCacheLayer
 from pllm.backends.vllm.sampler import (
     SamplerGuidance,
     Vllm027Sampler,
@@ -50,7 +52,9 @@ from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.packed_hidden import hidden_binding
 from pllm.contracts.packed_rows import PackedSamplerRowBatch
 from pllm.contracts.request_identity import RequestIdentity
+from pllm.execution.codec import decode_boundary
 from pllm.execution.host_runtime import CompletionCapture
+from pllm.execution.position_state import PositionAnnouncement
 from pllm.execution.state_execution import StateDiagnostics
 from pllm.execution.trace import ExecutionTrace
 
@@ -115,6 +119,9 @@ class Runner(Generic[SamplerT]):
     max_num_reqs: int
 
     hidden_taps: HiddenTaps | None = None
+    position_states: tuple[tuple[str, float], ...] = ()
+    position_layers: tuple[PositionCacheLayer, ...] = ()
+    _cache_math: str | None = None
 
     def _install_hidden_taps(self) -> None:
         """Tap the announced hidden outputs before vLLM compiles and captures the model."""
@@ -155,12 +162,16 @@ class Runner(Generic[SamplerT]):
     ) -> None:
         if self._workload_session is not None:
             raise RuntimeError("canonical runner already owns a workload session")
-        if self.cache_config.enable_prefix_caching and deployment.attachment.inputs.request.activation_bindings:
-            raise ValueError("signed activation injection does not support shared prefix caching")
-        if self.cache_config.enable_prefix_caching and any(
-            task.replay is not None for task in deployment.attachment.inputs.plan.semantic_graph.tasks
+        if self.cache_config.enable_prefix_caching and (
+            deployment.attachment.inputs.request.activation_bindings
+            or deployment.attachment.inputs.request.overlay_bindings
         ):
-            raise ValueError("signed KV replay does not support shared prefix caching")
+            raise ValueError("signed activation injection does not support shared prefix caching")
+        math = deployment.attachment.inputs.plan.semantic_graph.execution_parameters_digest
+        if self.cache_config.enable_prefix_caching and self._cache_math not in (None, math):
+            raise ValueError("prefix caching locks this engine to its first workload math; create a new engine")
+        if deployment.attachment.inputs.probe.position_states != self.position_states:
+            raise ValueError("PositionState schema changed; create a new engine with this workload")
         request = deployment.attachment.inputs.request
         in_model = (
             request.overlay_bindings
@@ -184,7 +195,15 @@ class Runner(Generic[SamplerT]):
         adapter = self._make_sampler(upstream) if deployment.attachment.inputs.request.guides_sampler else None
         if adapter is not None and not isinstance(adapter, SamplerGuidance):
             raise TypeError("backend sampler must share the original guidance lifecycle")
-        session = VllmSession(deployment, model, adapter, self.max_num_reqs, self.hidden_taps)
+        session = VllmSession(
+            deployment,
+            model,
+            adapter,
+            self.max_num_reqs,
+            self.hidden_taps,
+            self.position_layers,
+            self.cache_config.block_size,
+        )
         self._workload_upstream_sampler = upstream
         self._workload_session = session
         try:
@@ -197,6 +216,8 @@ class Runner(Generic[SamplerT]):
             self.sampler = adapter
             # Both runner ABIs call model.compute_logits; guidance shares that LM-head read.
             setattr(model, "compute_logits", partial(session.compute_logits, model))
+        if self.cache_config.enable_prefix_caching:
+            self._cache_math = math
 
     def _finish_model_binding(self) -> None:
         """Finish backend model preparation after the session has installed its effects."""
@@ -285,6 +306,35 @@ class WorkloadModelRunner(Runner[Sampler | None], OverlayGraphRunner):
     def load_model(self, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights)  # pyright: ignore[reportUnknownMemberType]
         self._install_hidden_taps()
+        self.position_states = decode_boundary(
+            os.environ.get(POSITION_ENV, '{"states": [], "revision": 1}'), PositionAnnouncement
+        ).states
+        if self.position_states and self.cache_config.cache_dtype != "auto":
+            raise ValueError("PositionState requires cache_dtype=auto in the model dtype")
+        self.position_layers = tuple(
+            PositionCacheLayer(1, self.model_config.get_hidden_size(), prefix=f"pllm.position.{index}.state")
+            for index, _ in enumerate(
+                self.position_states, self.model_config.get_num_layers(self.vllm_config.parallel_config)
+            )
+        )
+
+    def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        """Validate the admitted allocation layout once before binding route state."""
+        if self.position_states:
+            transfer = self.vllm_config.kv_transfer_config
+            if transfer is not None and transfer.kv_connector not in (
+                "OffloadingConnector",
+                "SimpleCPUOffloadConnector",
+            ):
+                raise ValueError(
+                    "PositionState cannot use LMCache or remote transfer; use OffloadingConnector or SimpleCPUOffloadConnector in batched mode"
+                )
+            if len(kv_cache_config.kv_cache_groups) != 1 or self.cache_config.prefix_match_unit not in (
+                None,
+                self.cache_config.block_size,
+            ):
+                raise ValueError("PositionState requires one KV group with whole allocation-block prefix hits")
+        super().initialize_kv_cache(kv_cache_config)
 
     def _finish_model_binding(self) -> None:
         self.finish_overlay_graphs(self.require_session().attachment, self.require_session().parameter_phases)

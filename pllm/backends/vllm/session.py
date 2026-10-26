@@ -27,6 +27,7 @@ from pllm.backends.vllm.parameter_overlay import (
     ExactParameterOverlay,
     validate_projection_sources,
 )
+from pllm.backends.vllm.position_state import PositionCacheLayer
 from pllm.backends.vllm.replay import VllmTokenwiseReplay
 from pllm.backends.vllm.sampler import (
     SamplerGuidance,
@@ -90,6 +91,8 @@ class VllmSession(Generic[DataT, ResultT]):
         sampler: SamplerGuidance | None,
         max_sampler_rows: int,
         taps: HiddenTaps | None = None,
+        position_layers: tuple[PositionCacheLayer, ...] = (),
+        allocation_block_size: int = 16,
     ) -> None:
         attachment = deployment.attachment
         plan = attachment.inputs.plan
@@ -170,6 +173,8 @@ class VllmSession(Generic[DataT, ResultT]):
                     source_imports=probe.region_imports,
                     function_bodies=probe.region_bodies,
                     activation=self._activation,
+                    position_layers=position_layers,
+                    allocation_block_size=allocation_block_size,
                     overlay=self._overlay
                     if isinstance(self._overlay, ExactParameterOverlay) and routed_overlay
                     else None,

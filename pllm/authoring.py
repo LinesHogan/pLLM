@@ -112,6 +112,7 @@ class BackendRequirements:
     sampler_stage: SamplerStage | None = None
     sampler_feedback: bool = False
     resident_bytes: int = 0
+    position_states: tuple[tuple[str, float], ...] = ()
 
     def __post_init__(self) -> None:
         if self.resident_bytes < 0:

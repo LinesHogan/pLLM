@@ -90,6 +90,7 @@ def attachment_buffer_bytes(
         match task.replay:
             case TokenProgramEffect():
                 buffers += tokenwise_attachment_bytes(hidden, width, rows)
+                buffers += (3 * hidden * width + 16) * len(task.replay.position_states) + 2
             case None:
                 pass
     return buffers

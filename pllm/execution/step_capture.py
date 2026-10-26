@@ -20,7 +20,11 @@ def _ready() -> None:
 
 
 def capture_graph(
-    device: torch.device, body: Callable[[], R], *, prepare: Callable[[], None] = _ready
+    device: torch.device,
+    body: Callable[[], R],
+    *,
+    prepare: Callable[[], None] = _ready,
+    restore: Callable[[], None] = _ready,
 ) -> tuple[torch.cuda.CUDAGraph, R, int]:
     """Warm `body` up three times on a private stream, capture it once and report the graph pool's bytes.
 
@@ -31,6 +35,7 @@ def capture_graph(
     stream.wait_stream(current)
     with torch.cuda.stream(stream):
         for _ in range(3):
+            restore()
             prepare()
             body()
     stream.synchronize()
@@ -38,6 +43,8 @@ def capture_graph(
     collecting = gc.isenabled()
     gc.disable()
     try:
+        with torch.cuda.stream(stream):
+            restore()
         # Cyclic collection can release tensors from another CUDA stream and invalidate capture.
         # Torch's context collects before starting; postpone automatic collection until capture ends.
         with torch.cuda.graph(graph, stream=stream, pool=torch.cuda.graph_pool_handle()):

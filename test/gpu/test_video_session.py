@@ -221,10 +221,10 @@ def observe_replay(*, versions):
         holder.update(session=session, primitive=session._replay, execution=llm.deployment.execution)
         return llm
 
-    def capture(item, invocation, instances, device):
+    def capture(item, invocation, instances, device, **kwargs):
         nonlocal capturing
         capturing = {"patches": [], "normal": None}
-        original_capture(item, invocation, instances, device)
+        original_capture(item, invocation, instances, device, **kwargs)
         recordings[item.graph] = capturing
         capturing = None
 

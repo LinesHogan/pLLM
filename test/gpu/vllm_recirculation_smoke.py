@@ -8,6 +8,7 @@ disturb sampling outputs or the CUDA RNG.
 
 import sys
 from dataclasses import replace
+from functools import partial
 from math import gcd
 from pathlib import Path
 from unittest.mock import patch
@@ -21,6 +22,7 @@ from vllm.forward_context import get_forward_context, override_forward_context
 from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer
 
 import pllm
+from pllm.backends.vllm import runtime
 from pllm.backends.vllm.region_attention import TokenAttentionBuffers
 from pllm.backends.vllm.region_layers import VllmDecoderBodies
 from pllm.backends.vllm.replay import VllmTokenwiseReplay
@@ -36,11 +38,29 @@ from pllm.execution.trace import TracePhase
 from pllm.workloads.recirculation import RecirculationWorkload
 
 
+def replay_handle(workload, *, length=64, prefix=False, blocks=None, offload=None):
+    """Shared small-model Stage A engine setup for serial-route GPU evidence."""
+    with patch.object(
+        runtime, "LLM", runtime.LLM if blocks is None else partial(runtime.LLM, num_gpu_blocks_override=blocks)
+    ):
+        return pllm.make_llm(
+            workload=workload,
+            config=ModelConfig(
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                VllmDType.BFLOAT16,
+                length,
+                2,
+                length,
+                0.25,
+                seed=7,
+                enable_prefix_caching=prefix,
+                kv_offload=offload,
+            ),
+        )
+
+
 def main():
-    handle = pllm.make_llm(
-        workload=RecirculationWorkload(destination=22, alpha=0.6, ramp_tokens=2),
-        config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", VllmDType.BFLOAT16, 64, 2, 64, 0.25, seed=7),
-    )
+    handle = replay_handle(RecirculationWorkload(destination=22, alpha=0.6, ramp_tokens=2))
     execution = handle.deployment.execution
     layer = handle.runner.model.model.layers[23]
     native_layer = Qwen2DecoderLayer.forward
@@ -91,10 +111,10 @@ def main():
             torch.testing.assert_close(cache[block, :, offset], value, rtol=0, atol=0)
         return capture
 
-    def check_capture(capture, invocation, instances, device):
+    def check_capture(capture, invocation, instances, device, **kwargs):
         nonlocal active_records
         active_records = []
-        native_capture(capture, invocation, instances, device)
+        native_capture(capture, invocation, instances, device, **kwargs)
         recordings[capture.graph] = active_records
         active_records = None
 
@@ -263,7 +283,7 @@ def main():
             patch.object(RegionTokenCapture, "__init__", check_capture),
             patch.object(TokenAttentionBuffers, "refresh", check_refresh),
             patch.object(torch.cuda.CUDAGraph, "replay", check_replay),
-            patch.object(VllmTokenwiseReplay, "forward", sparse_forward),
+            patch.object(primitive.model, "forward", partial(sparse_forward, primitive)),
             patch.object(VllmTokenwiseReplay, "_capture_token", check_token_capture),
             patch.object(TokenwiseReplayTask, "execute", check_task),
         ):

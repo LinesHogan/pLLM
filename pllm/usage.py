@@ -76,6 +76,7 @@ from pllm.execution.module_state import (
     parameter_count,
     skeleton,
 )
+from pllm.execution.position_state import PositionState as PositionState
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.step_input import TensorStepInput
 from pllm.execution.task_memory import derive_resources
@@ -939,11 +940,11 @@ def layer_route(*, tokens: Tokens = "all") -> Callable[[F], F]:
 
 
 def _values(owner: object) -> dict[str, object]:
-    return owner_values(owner, (InstanceState, Activation, Overlay))
+    return owner_values(owner, (InstanceState, Activation, Overlay, PositionState))
 
 
 def _snapshot(owner: C, borrowed: tuple[object, ...] = ()) -> C:
-    return owner_snapshot(owner, (InstanceState, Activation, Overlay), borrowed)
+    return owner_snapshot(owner, (InstanceState, Activation, Overlay, PositionState), borrowed)
 
 
 def _typed(value: object, expected: type[C]) -> C | None:
@@ -1090,7 +1091,7 @@ def _property(member: object) -> Callable[..., object] | None:
         if isinstance(member, property)
         and member.fget is not None
         and signature(member.fget, eval_str=False).return_annotation
-        in (InstanceState, RequestState, Activation, Overlay)
+        in (InstanceState, RequestState, Activation, Overlay, PositionState)
         else None
     )
 
@@ -1164,6 +1165,14 @@ class _Declaration:
         tokens = getattr(member, "__pllm_tokens__", None)
         if tokens is not None:
             assert tokens in ("prefill", "decode", "all") and isinstance(member, FunctionType)
+            _reject(
+                tuple(signature(member).parameters) != ("self", "layers")
+                or any(
+                    getattr(member, f"__pllm_{marker}__", None) is not None
+                    for marker in ("phase", "effect", "gradient", "rows")
+                ),
+                "layer_route requires (self, layers) and no stacked markers; use layers.save inside the route instead of @write",
+            )
             self.routes.append((name, tokens))
             seeds.append(member)
             return
@@ -1225,6 +1234,7 @@ class _Declaration:
 
     def declare_values(self) -> None:
         """Allocate ordinary state before effects and operations consume its ports."""
+        self.position_states()
         for value in self.values.values():
             if isinstance(value, Activation):
                 value.allocate(self)
@@ -1244,9 +1254,17 @@ class _Declaration:
             if isinstance(value, Activation):
                 value.declare(self)
         for name, tokens in self.routes:
-            self.binding.layer_route(self.method(name), tokens)
+            self.binding.layer_route(self.method(name), tokens, self.position_states())
         if self.binding.feeds:
             self.binding.conditional_input(tuple(feed.resource for feed in self.binding.feeds))
+
+    def position_states(self) -> tuple[tuple[str, float], ...]:
+        """Resolve the pre-allocation schema without tracing tensors."""
+        states = tuple(
+            (name, value.initial) for name, value in sorted(self.values.items()) if isinstance(value, PositionState)
+        )
+        _reject(bool(states) and not self.routes, "PositionState requires layers.load/save inside a layer_route")
+        return states
 
     def train(self, call: Call, state: str) -> None:
         _reject(self.training is not None, "tensor sampler attachment requires one training operation")
@@ -1389,6 +1407,7 @@ class Workload(
             sampler_feedback=any(
                 isinstance(port.source, SamplerFeedbackInputSource) for task in b.graph.tasks for port in task.inputs
             ),
+            position_states=b.position_states,
         )
 
     def declare(self, facts: BackendCompileFacts) -> tuple[SemanticGraph, TensorLayoutRequest, BackendAttachmentSpec]:

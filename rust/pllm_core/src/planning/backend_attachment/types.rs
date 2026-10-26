@@ -139,6 +139,8 @@ pub(crate) struct BackendPlacementProbe {
     pub(super) region_imports: Vec<super::super::region_imports::TensorImport>,
     #[serde(default)]
     pub(super) region_bodies: Vec<RegionFunctionBody>,
+    #[serde(default)]
+    pub(crate) position_states: Vec<(String, serde_json::Number)>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
