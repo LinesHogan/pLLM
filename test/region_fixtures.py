@@ -253,7 +253,7 @@ def replan_states(plan, graph, layouts: TensorLayoutRequest, memory_bytes: int):
     provider = PageBundleProviderFacts("test.page_bundle@1", 6)
     candidates = tuple(
         provider.materialize_plan(
-            resource=entry.resource, layout=entry.layout, binding=binding, max_admitted_lineages=2
+            resource=entry.resource, layout=entry.layout, binding=binding, max_admitted_lineages=2, graph=graph
         )
         for entry, binding in zip(layouts.layouts, bindings.bindings, strict=True)
     )

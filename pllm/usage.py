@@ -43,6 +43,7 @@ from pllm.contracts.semantic_graph import (
     SchedulerTimeline,
     SemanticGraph,
     SemanticInputSource,
+    StateEffectKind,
     StateScope,
     TaskImplementationSpec,
     TaskResourceFact,
@@ -98,6 +99,7 @@ class Phase(Enum):
     BEFORE_SAMPLE = When.BEFORE_SAMPLE
     AFTER_SAMPLE = When.AFTER_SAMPLE
     MODEL_UPDATE = When.MODEL_UPDATE
+    AUTOMATIC = When.AUTOMATIC
 
 
 def _reject(condition: object, message: str, error: type[Exception] = ValueError) -> None:
@@ -584,7 +586,7 @@ class _Write(_Effect):
     state: str
     fields: tuple[str, ...]
 
-    phase: ClassVar[Phase | None] = Phase.BEFORE_MODEL
+    phase: ClassVar[Phase | None] = Phase.AUTOMATIC
 
     def declare(self, operation: _Operation) -> None:
         context = operation.context
@@ -655,13 +657,20 @@ class _Train(_Effect):
     reset: str
 
     training: ClassVar[bool] = True
+    phase: ClassVar[Phase | None] = Phase.AUTOMATIC
 
     def declare(self, operation: _Operation) -> None:
         """Choose optimizer training or the explicit weighted SGD transition."""
         arguments, captures = operation.arguments()
         definition = operation.context.state_definition(self.state, "training requires a declared optimizer state")
         if isinstance(definition.optimizer, SGD):
-            self.weighted(operation, arguments, captures, definition, definition.optimizer)
+            self.weighted(
+                replace(operation, phase=Phase.AFTER_SAMPLE) if operation.phase is Phase.AUTOMATIC else operation,
+                arguments,
+                captures,
+                definition,
+                definition.optimizer,
+            )
         else:
             _reject(self.reset or self.steps != 1, "multi-step/reset training requires explicit SGD batch parameters")
             operation.context.train(operation.tensor(arguments, captures), self.state)
@@ -1394,8 +1403,23 @@ class _Declaration:
             "state buffers require an overlay effect; unused state is not allocated",
         )
 
+        frozen = {
+            name
+            for name, value in self.values.items()
+            if isinstance(value, InstanceState)
+            and value.module is not None
+            and value.optimizer is None
+            and not value.imported
+            and value.feed is None
+            and not any(
+                effect.resource == name and effect.kind is not StateEffectKind.READ
+                for task in b.graph.tasks
+                for effect in task.effects
+            )
+        }
         b.graph = replace(
             b.graph,
+            states=tuple(replace(state, immutable=state.resource in frozen) for state in b.graph.states),
             execution_parameters_digest=boundary_digest(
                 b.graph.execution_parameters_digest, self.definitions, self.bindings
             ),

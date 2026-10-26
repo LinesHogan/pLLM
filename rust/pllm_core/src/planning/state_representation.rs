@@ -298,7 +298,7 @@ pub(super) fn compile(
         };
         decision.signature = digest(&canonical_ascii_json(&decision)?);
         let physical = project(&decision, plan_epoch);
-        // AER borrows this exact candidate, including retention and reserved
+        // task borrows this exact candidate, including retention and reserved
         // capacity. An infeasible cheap provider must not hide a legal COW plan.
         if let Ok(schedule) = scheduler::compile(graph, timeline, Some(&physical)) {
             if best
@@ -321,7 +321,7 @@ pub(super) fn compile(
         &mut best,
     )?;
     best.ok_or_else(|| {
-        "no joint state representation and AER placement fits versions, timing and capacity".into()
+        "no joint state representation and task placement fits versions, timing and capacity".into()
     })
 }
 
@@ -439,7 +439,7 @@ mod tests {
                         let (decision, physical, schedule) = actual.unwrap();
                         assert_eq!(decision.plans[0].provider_id, provider);
                         assert_eq!(decision.reserved_bytes, bytes);
-                        assert_eq!(schedule.score()[2], bytes + 9);
+                        assert_eq!(schedule.score()[0], bytes + 9);
                         assert_eq!(physical.representations, decision.plans);
                         assert_eq!(physical.representation_signature, decision.signature);
                         assert_eq!(physical.plan_epoch, 7);

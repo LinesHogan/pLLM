@@ -19,6 +19,30 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
         execution = handle.deployment.execution
         overlay = session._overlay
         checked = []
+        launches = []
+        plan = handle.attachment.inputs.plan
+        execute = execution.execute_anchor
+
+        def delayed(invocation, anchor):
+            tasks = tuple(task for task in plan.schedule_physical.tasks if task.anchor_id == anchor)
+            if tasks:
+                assert all(task.lane == "side" and task.read_origin == "latest" for task in tasks)
+                assert invocation.context.pin.stream == session._post_sample.stream
+                with torch.cuda.stream(invocation.context.pin.stream):
+                    torch.cuda._sleep(1_000_000)
+                launches.append(plan.timeline.anchors[anchor].symbol)
+            execute(invocation, anchor)
+
+        monkeypatch.setattr(execution, "execute_anchor", delayed)
+        copy_inputs = session._post_sample.copy_inputs
+
+        def poison_taps(context):
+            hidden = context.data().step.hidden
+            copy_inputs(context)
+            for snapshot in hidden.snapshots:
+                snapshot.storage.fill_(float("nan"))
+
+        monkeypatch.setattr(session._post_sample, "copy_inputs", poison_taps)
         phases = set()
         torch.cuda.reset_peak_memory_stats()
 
@@ -75,6 +99,9 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
         )
         elapsed = time.perf_counter() - start
         assert frozenset((HiddenPhase.PREFILL, HiddenPhase.DECODE)) in phases
+        assert launches and set(launches) == (
+            {"model.layer.9"} if isinstance(workload, DecodeFactors) else {"model.layer.8"}
+        )
         assert len(outputs) == 3 and {entry[2] for entry in checked} == {0, 1}
         assert any(entry[1] == 0 for entry in checked) and any(entry[1] > 0 for entry in checked)
         assert any(entry[3] != entry[4] for entry in checked)

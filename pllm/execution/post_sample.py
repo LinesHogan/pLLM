@@ -1,6 +1,6 @@
-"""Side-stream input ownership and retained reader versions for vLLM's post-sampler phase.
+"""Side-stream input ownership and retained reader versions for vLLM task launches.
 
-The backend uses this for read-only pre-sampler tasks without deferred gradients. With lag L, readers rewind
+The backend protects reusable inputs before a signed writer launch. With lag L, readers rewind
 the last L step inputs (new lineages keep their admission version); writers always extend
 the latest version. CUDA completion never determines which version a reader selects.
 """
@@ -12,7 +12,6 @@ import torch
 
 from pllm.contracts.auxiliary import map_auxiliary
 from pllm.contracts.packed_hidden import PackedHiddenSnapshot, PackedHiddenSnapshotBatch
-from pllm.contracts.visibility import VisibilitySource
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin
 from pllm.execution.ptts.state_refs import StateRefs
@@ -23,12 +22,8 @@ from pllm.execution.tensor_frame import TensorFrame
 class PostSampleOverlap:
     """One serial writer lane, fixed hidden storage and a bounded history of exact pins."""
 
-    def __init__(
-        self, arena: PageBundleArena, visibility: VisibilitySource, device: torch.device, *, readers: bool = True
-    ) -> None:
-        self.arena, self.visibility = arena, visibility
-        self.readers = readers
-        self.stream = torch.cuda.Stream(device=device)
+    def __init__(self, arena: PageBundleArena, lag: int, stream: torch.cuda.Stream) -> None:
+        self.arena, self.lag, self.stream = arena, lag, stream
         self._history: deque[PagePin] = deque()
         self._hidden: dict[tuple[str, str, str], torch.Tensor] = {}
 
@@ -96,7 +91,7 @@ class PostSampleOverlap:
     def retain(self, pin: PagePin) -> None:
         """Retain this transition's input; release expired history on its owning stream."""
         self._history.append(pin)
-        while len(self._history) > self.visibility.lag:
+        while len(self._history) > self.lag:
             self.arena.release_pin(self._history.popleft())
 
     def clear(self) -> None:

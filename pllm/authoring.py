@@ -278,6 +278,7 @@ class BackendWorkload(BackendAuthoring, Generic[DataT, ResultT]):
                 layout=entry.layout,
                 binding=binding,
                 max_admitted_lineages=requirement.max_admitted_lineages,
+                graph=plan.semantic_graph,
             )
             for entry, binding, requirement in zip(
                 plan.tensor_layout_request.layouts,

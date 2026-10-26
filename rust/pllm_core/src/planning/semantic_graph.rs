@@ -119,6 +119,8 @@ pub(crate) struct SemanticState {
     pub(crate) resource: String,
     pub(crate) scope: StateScope,
     pub(crate) key_fields: Vec<RequestKeyField>,
+    #[serde(default)]
+    pub(crate) immutable: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -180,7 +182,7 @@ pub(crate) struct SemanticTask {
     #[serde(default)]
     pub(crate) math: Option<MathContract>,
     #[serde(default)]
-    pub(super) visibility: Option<super::visibility::Source>,
+    pub(super) visibility: Option<VisibilitySource>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -188,6 +190,10 @@ pub(crate) struct SemanticTask {
 pub(crate) struct SemanticEdge {
     pub(crate) source: String,
     pub(crate) target: String,
+    #[serde(default)]
+    pub(crate) step_distance: i64,
+    #[serde(default)]
+    pub(crate) separation: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -216,6 +222,8 @@ pub(crate) struct SemanticGraph {
     pub(crate) states: Vec<SemanticState>,
     pub(crate) schema_version: u64,
     pub(crate) input_groups: Vec<ConditionalInputGroup>,
+    #[serde(default)]
+    pub(crate) model_reads: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -261,7 +269,9 @@ pub(crate) struct Timeline {
     #[serde(default)]
     pub(crate) region_policy: super::region_selection::Policy,
     #[serde(default)]
-    pub(super) visibility: Option<super::visibility::Source>,
+    pub(super) visibility: Option<VisibilitySource>,
+    #[serde(default)]
+    pub(crate) internal_points: bool,
 }
 
 pub(crate) fn decode_graph(payload: &str) -> Result<SemanticGraph, String> {
@@ -418,10 +428,18 @@ fn validate_task(task: &SemanticTask) -> Result<(), String> {
 
 pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
     validate_input_groups(graph)?;
+    require_sorted_unique_text(&graph.model_reads, "model read resources")?;
+    if graph.model_reads.iter().any(|r| !graph.states.iter().any(|s| &s.resource == r)) {
+        return Err("model consumer references an undeclared state".into());
+    }
     for task in &graph.tasks {
+        if task.effects.iter().any(|e| e.kind != StateEffectKind::Read
+            && graph.states.iter().any(|s| s.resource == e.resource && s.immutable)) {
+            return Err("immutable state cannot have a writer".into());
+        }
         if let Some(visibility) = &task.visibility {
-            if visibility.scope == super::visibility::Scope::PostSampler { return Err("post-sampler visibility belongs to the timeline".into()); }
-            super::visibility::validate(visibility)?;
+            if visibility.scope == VisibilityScope::PostSampler { return Err("post-sampler visibility belongs to the timeline".into()); }
+            validate_visibility(visibility)?;
             if visibility.resources.iter().any(|resource|
                 !task.effects.iter().any(|effect| &effect.resource == resource)) {
                 return Err("state visibility resources must belong to the bound task".into());
@@ -484,7 +502,7 @@ pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
     for edge in &graph.edges {
         require_text(&edge.source, "edges.source")?;
         require_text(&edge.target, "edges.target")?;
-        if edge.source == edge.target {
+        if edge.source == edge.target && edge.step_distance == 0 {
             return Err("semantic graph edge cannot be self-referential".to_owned());
         }
     }
@@ -641,8 +659,8 @@ fn validate_input_groups(graph: &SemanticGraph) -> Result<(), String> {
 
 pub(crate) fn validate_timeline(timeline: &Timeline) -> Result<(), String> {
     if let Some(source) = &timeline.visibility {
-        if source.scope != super::visibility::Scope::PostSampler { return Err("timeline visibility needs a post-sampler domain".into()); }
-        super::visibility::validate(source)?;
+        if source.scope != VisibilityScope::PostSampler { return Err("timeline visibility needs a post-sampler domain".into()); }
+        validate_visibility(source)?;
     }
     if timeline.schema_version != SCHEMA_VERSION {
         return Err(format!(
@@ -704,6 +722,58 @@ pub(crate) fn canonical_ascii_json<T: Serialize>(value: &T) -> Result<String, St
 
 pub(crate) fn digest(payload: &str) -> String {
     format!("{:x}", Sha256::digest(payload.as_bytes()))
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum VisibilityKind { ForwardPinned, Exact, StepLag }
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Visibility { pub kind: VisibilityKind }
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum VisibilityScope { Overlay, PostSampler }
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum VisibilityTail { Transition, Carry }
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct VisibilitySource {
+    pub policy: Visibility,
+    pub scope: VisibilityScope,
+    pub equations_digest: String,
+    pub resources: Vec<String>,
+    pub chunk_size: u64,
+    pub tail: VisibilityTail,
+    #[serde(default)]
+    pub lag: u64,
+}
+
+fn validate_visibility(source: &VisibilitySource) -> Result<(), String> {
+    let valid = match (&source.scope, &source.policy.kind, &source.tail) {
+        (VisibilityScope::PostSampler, VisibilityKind::StepLag, VisibilityTail::Transition) => source.chunk_size == 0 && source.resources.is_empty(),
+        (VisibilityScope::Overlay, VisibilityKind::ForwardPinned, VisibilityTail::Transition) | (VisibilityScope::Overlay, VisibilityKind::Exact, VisibilityTail::Carry) => source.chunk_size == 0 && source.lag == 0,
+        _ => false,
+    };
+    if valid { Ok(()) } else { Err("visibility must use its declaration's read, chunk and tail domain".into()) }
+}
+
+#[pyo3::pyfunction]
+pub(crate) fn explain_state_visibility(source_json: &str) -> pyo3::PyResult<String> {
+    let run = || -> Result<String, String> {
+        let source: VisibilitySource = serde_json::from_str(source_json).map_err(|e| e.to_string())?;
+        validate_visibility(&source)?;
+        Ok(match source.policy.kind {
+            VisibilityKind::StepLag => format!("reader[t,q]: entry snapshot, or boundary[max(0,t-{}),q] when retained; writer[t,q]: latest", source.lag),
+            VisibilityKind::ForwardPinned => "model[r,t,c]: entry[r,t]; update[r,t,0]: entry[r,t]".into(),
+            VisibilityKind::Exact => "model[r,t,0], update[r,t,0]: entry[r,t]; model[r,t,c], update[r,t,c]: update[r,t,c-1] for c > 0; tail carries the last update".into(),
+        })
+    };
+    run().map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
 #[cfg(test)]

@@ -605,8 +605,8 @@ fn validate_cross_binding(
             let mut hidden: Vec<_> = graph.tasks.iter().flat_map(|task| &task.inputs).filter_map(|input| semantic_hidden_key(&input.source)).collect();
             let mut signed = probe.hidden_resources.iter().map(attachment_hidden_key).collect::<Result<Vec<_>, _>>()?;
             hidden.sort_unstable(); hidden.dedup(); signed.sort_unstable();
-            if hidden != signed || graph.tasks.iter().any(|task| task.timing.after == "request.prepare" && task.inputs.iter().any(|input| matches!(input.source, InputSource::Hidden { .. }))) {
-                return Err("model producers need their signed hidden phase after forward".into());
+            if hidden != signed {
+                return Err("model producers must use the probed hidden inputs".into());
             }
         }
     }
@@ -667,7 +667,6 @@ fn validate_cross_binding(
         AttachmentKind::RequestTraining => {
             let transition = request.task_bindings.last().unwrap();
             if request.task_bindings.len() == 2 && request.task_bindings[0].anchor_id >= request.sampler_anchor_id
-                || transition.anchor_id <= request.sampler_anchor_id
             {
                 return Err("attachment task anchors violate sampler timing".to_owned());
             }
@@ -739,6 +738,14 @@ fn validate_position_source(task: &SemanticTask, graph: &SemanticGraph, probe: &
 pub(crate) fn validate_inputs(inputs: &AttachmentCompilerInputs) -> Result<(), String> {
     let plan = &inputs.plan;
     plan.validate()?;
+    if plan.timeline.internal_points && inputs.probe.graph_mode != AttachmentGraphMode::Eager {
+        return Err("internal model points require eager backend execution".into());
+    }
+    let mut reads: std::collections::BTreeSet<_> = inputs.request.overlay_bindings.iter().map(|b| b.resource.clone()).collect();
+    if !inputs.request.activation_bindings.is_empty() { reads.insert(inputs.request.state_resource.clone()); }
+    if reads.into_iter().collect::<Vec<_>>() != plan.semantic_graph.model_reads {
+        return Err("model consumer resources differ from the semantic graph".into());
+    }
     if inputs.probe.graph_mode == AttachmentGraphMode::CudaGraph {
         let request = &inputs.request;
         if inputs.probe.device_kind != StateDeviceKind::Cuda

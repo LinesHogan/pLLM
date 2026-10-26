@@ -53,7 +53,7 @@ def lag_equivalence() -> None:
             execution=ExecutionOptions(capture=True, publish_lag=lag, capture_memory_bytes=16 * 1024**2),
         )
         with pllm.make_llm(config, workload=ESampRequestWorkload(ESampRequestConfig(rank=2))) as llm:
-            assert llm.attachment.physical.post_sampler == ("writer" if lag else "main")
+            assert any(task.lane == "side" for task in llm.attachment.inputs.plan.schedule_physical.tasks) == bool(lag)
             # Requests retire inside generate; read each final version just before it is retired.
             with patch.object(PageBundleArena, "retire", snapshot):
                 outputs = llm.generate(

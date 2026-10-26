@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Literal
 
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
@@ -193,7 +192,6 @@ class BackendAttachmentCompilerInputs:
 
 @dataclass(frozen=True, slots=True)
 class BackendAttachmentDecision:
-    post_sampler: Literal["main", "lagged", "writer"]
     request_digest: str
     signature: str
     schema_version: int = 11
@@ -201,7 +199,6 @@ class BackendAttachmentDecision:
 
 @dataclass(frozen=True, slots=True)
 class BackendAttachmentPhysicalPlan:
-    post_sampler: Literal["main", "lagged", "writer"]
     plan_epoch: int
     adapter_id: str
     attachment_signature: str

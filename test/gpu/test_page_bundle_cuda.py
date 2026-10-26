@@ -31,7 +31,7 @@ def _plan(shared=False):
         )
         for layer in (0, -1)
     )
-    anchors = ("model.execute", "sampler.pre_draw", "token.commit", "next.prepare")
+    anchors = ("request.prepare", "model.execute", "sampler.pre_draw", "token.commit", "next.prepare")
     timeline = SchedulerTimeline(
         tuple(TimelineAnchor(AnchorSymbol(name), index) for index, name in enumerate(anchors)),
         ("compute/cuda@1", "state/dense_page_cuda@1"),

@@ -834,7 +834,9 @@ def probe_backend(
                 if timeline is not None and "compute/cuda_graph@1" in timeline.capabilities
                 else ()
             ),
-        )
+        ),
+        layers=layer_count,
+        internal=runner.model_config.enforce_eager and not requirements.position_states,
     )
     required = input_reservations(
         probe,
@@ -843,7 +845,6 @@ def probe_backend(
         model.lm_head.weight.shape[0],
         requirements.sampler_stage,
         requirements.sampler_feedback,
-        publish_lag,
     )
     required = tuple(value + requirements.resident_bytes + runner.overlay_graph_bytes for value in required)
     observed = replace(observed, reserved_bytes=required)
@@ -853,6 +854,7 @@ def probe_backend(
         timeline.anchors != observed.anchors
         or timeline.capabilities != observed.capabilities
         or timeline.schema_version != observed.schema_version
+        or timeline.internal_points != observed.internal_points
     ):
         raise ValueError("worker timeline differs from the supported single-device anchors and capabilities")
     elif len(timeline.reserved_bytes) != len(required) or any(
@@ -964,10 +966,9 @@ def input_reservations(
     vocab: int,
     stage: SamplerStage | None,
     feedback: bool,
-    publish_lag: int = 1,
 ) -> tuple[int, ...]:
     hidden = (
-        (1 + bool(publish_lag))
+        2
         * len({resource.binding for resource in probe.hidden_resources})
         * probe.max_packed_rows
         * probe.hidden_size
@@ -985,7 +986,7 @@ def input_reservations(
     retained = rows * (4 * vocab + 8) if feedback else 0
     # StepCapture retains its feedback pointers until the next table is prepared.
     # Budget both old and new private copies during handoff, including next forward.
-    private_feedback = 2 * retained if publish_lag else 0
+    private_feedback = 2 * retained
     sampler = next(anchor.ordinal for anchor in timeline.anchors if anchor.symbol == "sampler.pre_draw")
     return tuple(
         hidden

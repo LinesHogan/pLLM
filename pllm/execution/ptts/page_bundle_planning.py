@@ -6,7 +6,7 @@ from math import prod
 import torch
 
 from pllm.contracts.compilation import PlanBundle
-from pllm.contracts.semantic_graph import SchedulerTimeline, SemanticGraph
+from pllm.contracts.semantic_graph import SchedulerTimeline, SemanticGraph, StateScope
 from pllm.contracts.state_representation import (
     StateDeviceKind,
     StateLayoutRequirement,
@@ -49,7 +49,11 @@ def compile_page_bundle_plan(
     layout_decision = intern_tensor_layouts(layouts)
     candidates = tuple(
         provider.materialize_plan(
-            resource=entry.resource, layout=entry.layout, binding=binding, max_admitted_lineages=max_admitted_lineages
+            resource=entry.resource,
+            layout=entry.layout,
+            binding=binding,
+            max_admitted_lineages=max_admitted_lineages,
+            graph=graph,
         )
         for entry, binding in zip(layouts.layouts, layout_decision.bindings, strict=True)
         for provider in providers
@@ -65,7 +69,11 @@ def compile_page_bundle_plan(
                 binding.layout_id,
                 binding.layout_namespace,
                 binding.layout_digest,
-                max_admitted_lineages,
+                next(
+                    candidate.max_admitted_lineages
+                    for candidate in candidates
+                    if candidate.resource == binding.resource
+                ),
                 required,
             )
             for binding in layout_decision.bindings
@@ -96,9 +104,18 @@ class PageBundleProviderFacts:
     shared_memory: bool = False
 
     def materialize_plan(
-        self, *, resource: str, layout: TensorLayoutSpec, binding: TensorLayoutBinding, max_admitted_lineages: int
+        self,
+        *,
+        resource: str,
+        layout: TensorLayoutSpec,
+        binding: TensorLayoutBinding,
+        max_admitted_lineages: int,
+        graph: SemanticGraph,
     ) -> StateProviderPlan:
-        capacity = self.page_capacity
+        """Reserve one root for frozen instance state; mutable state keeps its advertised capacity."""
+        state = next(state for state in graph.states if state.resource == resource)
+        immutable_instance = state.scope is StateScope.INSTANCE and state.immutable
+        capacity = 1 if immutable_instance else self.page_capacity
         reserved_bytes = sum(
             capacity * page_stride_bytes(field) + max(field.alignment_bytes - DTYPE_BYTES[field.dtype], 0)
             for field in layout.fields
@@ -111,7 +128,7 @@ class PageBundleProviderFacts:
             layout_id=binding.layout_id,
             layout_namespace=binding.layout_namespace,
             layout_digest=binding.layout_digest,
-            max_admitted_lineages=max_admitted_lineages,
+            max_admitted_lineages=1 if immutable_instance else max_admitted_lineages,
             page_capacity=capacity,
             root_page_count=len(layout.fields),
             reserved_bytes=reserved_bytes,

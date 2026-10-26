@@ -97,6 +97,7 @@ Shape = tuple[int, ...] | Callable[[Dimensions], tuple[int, ...]]
 
 
 class When(Enum):
+    AUTOMATIC = ("request.prepare", "next.prepare")
     BEFORE_SAMPLE = ("model.execute", "sampler.pre_draw")
     AFTER_SAMPLE = ("token.commit", "next.prepare")
     BEFORE_MODEL = ("request.prepare", "model.execute")
@@ -519,6 +520,7 @@ class Builder(Generic[D]):
         stage: SamplerStage = SamplerStage.PACKED_POST_FILTER_EXACT,
     ) -> None:
         prediction[output]
+        # Sampling owns this transaction: cancellation before token commit must not publish its update.
         self.graph = replace(
             self.graph,
             tasks=tuple(
@@ -530,6 +532,9 @@ class Builder(Generic[D]):
                     ),
                 )
                 if task.symbol == prediction.symbol
+                else replace(task, timing=TimingConstraint(*(AnchorSymbol(point) for point in When.AFTER_SAMPLE.value)))
+                if task.symbol == transition.symbol
+                and task.timing == TimingConstraint(*(AnchorSymbol(point) for point in When.AUTOMATIC.value))
                 else task
                 for task in self.graph.tasks
             ),
@@ -543,7 +548,17 @@ class Builder(Generic[D]):
         )
 
     def request_training(self, transition: Call, state: State) -> None:
-        """Train request state from hidden rows without changing the model or the sampler."""
+        """Train request state from hidden rows after the token transaction commits."""
+        self.graph = replace(
+            self.graph,
+            tasks=tuple(
+                replace(task, timing=TimingConstraint(*(AnchorSymbol(point) for point in When.AFTER_SAMPLE.value)))
+                if task.symbol == transition.symbol
+                and task.timing == TimingConstraint(*(AnchorSymbol(point) for point in When.AUTOMATIC.value))
+                else task
+                for task in self.graph.tasks
+            ),
+        )
         self.attachment = BackendAttachmentSpec(
             AttachmentKind.REQUEST_TRAINING,
             ((AttachmentTaskRole.TRANSITION, transition.symbol),),
@@ -588,6 +603,16 @@ class Builder(Generic[D]):
         )
 
     def _attach(self, spec: BackendAttachmentSpec) -> None:
+        self.graph = replace(
+            self.graph,
+            model_reads=tuple(
+                sorted(
+                    set(self.graph.model_reads)
+                    | {StateResource(binding.resource) for binding in spec.overlay_bindings}
+                    | ({spec.state_resource} if spec.activation_bindings else set())
+                )
+            ),
+        )
         previous = self.attachment
         if previous is None:
             self.attachment = spec

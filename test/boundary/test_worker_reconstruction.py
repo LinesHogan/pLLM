@@ -104,7 +104,11 @@ def _worker(connection: Connection) -> None:
             try:
                 catalog = tuple(
                     provider.materialize_plan(
-                        resource=entry.resource, layout=entry.layout, binding=binding, max_admitted_lineages=1
+                        resource=entry.resource,
+                        layout=entry.layout,
+                        binding=binding,
+                        max_admitted_lineages=1,
+                        graph=plan.semantic_graph,
                     )
                     for entry, binding in zip(
                         plan.tensor_layout_request.layouts, plan.tensor_layout_decision.bindings, strict=True

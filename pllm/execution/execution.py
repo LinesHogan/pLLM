@@ -1,4 +1,4 @@
-"""Mechanical execution of original Rust physical tasks and region boundaries."""
+"""Mechanical execution of Rust physical tasks and value releases."""
 
 from __future__ import annotations
 
@@ -77,14 +77,12 @@ class TaskGraphInvocation(Generic[ExecutionContextT]):
         while (
             self._next_task_index < len(plan.tasks) and int(plan.tasks[self._next_task_index].anchor_id) == dense_anchor
         ):
-            end = next(end for end in plan.region_ends if end > self._next_task_index)
-            while self._next_task_index < end:
-                task = plan.tasks[self._next_task_index]
-                with trace.task(self.invocation_id, task.task_id, stream):
-                    self.execution.implementations[int(task.task_id)].execute(self.context)
-                    if task.release_values and self.execution.release_values is not None:
-                        self.execution.release_values(self.context, task.release_values)
-                self._next_task_index += 1
+            task = plan.tasks[self._next_task_index]
+            with trace.task(self.invocation_id, task.task_id, stream):
+                self.execution.implementations[int(task.task_id)].execute(self.context)
+                if task.release_values and self.execution.release_values is not None:
+                    self.execution.release_values(self.context, task.release_values)
+            self._next_task_index += 1
         self.last_anchor_id = dense_anchor
 
     def finish(self) -> ExecutionContextT:

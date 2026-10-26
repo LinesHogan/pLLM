@@ -19,11 +19,13 @@ from pllm.workloads.state_producers import TARGETS, DecodeFactors, ProjectionSta
 from test.backend_facts import backend_facts
 
 
-def deployment(workload):
+def deployment(workload, *, internal=False):
     facts = backend_facts(
         4,
         (),
-        RuntimeFacts(torch.device("cpu")).timeline(("transition/full_root@1", "optimizer/adamw@1")),
+        RuntimeFacts(torch.device("cpu")).timeline(
+            ("transition/full_root@1", "optimizer/adamw@1"), layers=10 if internal else 0, internal=internal
+        ),
         PageBundleProviderFacts("test.producers@1", 16),
         memory_bytes=1 << 20,
         max_rows=8,
@@ -65,6 +67,8 @@ def packed(identities, hidden, phases, lengths=(1, 1)):
 @pytest.mark.parametrize("workload", [PromptFactors(), PromptMixture()])
 def test_prompt_producers_publish_only_completed_requests(workload):
     deployed = deployment(workload)
+    network = next(p for p in deployed.attachment.inputs.plan.state_physical.representations if p.resource == "network")
+    assert network.page_capacity == 1
     execution = deployed.execution
     identities = (RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0))
     execution.admit(())
@@ -222,9 +226,41 @@ def test_initialized_reader_and_hidden_before_model_boundary():
     execution.retire((identity,))
 
     class Cycle(PromptFactors):
+        @pllm.on(pllm.Phase.BEFORE_MODEL)
         @pllm.write(state="factors", fields=("a_0",))
         def produce(self, h=pllm.hidden(8, phase="prefill")):
             return (h,)
 
     with pytest.raises(ValueError, match="after model forward"):
         Cycle().declaration()
+
+
+def test_internal_window_and_memory_witness_reject_tampering():
+    from pllm.contracts.semantic_graph import AnchorSymbol, TimingConstraint
+    from pllm.execution.scheduler import compile_schedule, validate_schedule
+
+    plan = deployment(PromptFactors(), internal=True).attachment.inputs.plan
+    point = next(a.ordinal for a in plan.timeline.anchors if a.symbol == "model.layer.8")
+    assert all(t.earliest == t.anchor_id == point for t in plan.schedule_physical.tasks)
+    constrained = replace(
+        plan.semantic_graph,
+        tasks=tuple(
+            replace(task, timing=TimingConstraint(AnchorSymbol("state.publish"), AnchorSymbol("sampler.pre_draw")))
+            for task in plan.semantic_graph.tasks
+        ),
+    )
+    decision = compile_schedule(constrained, plan.timeline, state=plan.state_physical)
+    assert all(plan.timeline.anchors[task.anchor_id].symbol == "state.publish" for task in decision.tasks)
+    for changed in (
+        replace(plan.schedule_decision.tasks[0], lane="side"),
+        replace(plan.schedule_decision.tasks[0], earliest=0),
+        replace(plan.schedule_decision.tasks[0], read_distance=2),
+        replace(plan.schedule_decision.tasks[0], wait_for=(999,)),
+    ):
+        with pytest.raises(ValueError):
+            validate_schedule(
+                plan.semantic_graph,
+                plan.timeline,
+                replace(plan.schedule_decision, tasks=(changed, *plan.schedule_decision.tasks[1:])),
+                state=plan.state_physical,
+            )

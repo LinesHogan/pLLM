@@ -124,6 +124,7 @@ class SemanticState:
     resource: StateResource
     scope: StateScope
     key_fields: tuple[RequestKeyField, ...]
+    immutable: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +196,8 @@ class SemanticTask:
 class SemanticEdge:
     source: TaskSymbol
     target: TaskSymbol
+    step_distance: int = 0
+    separation: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +226,7 @@ class SemanticGraph:
     edges: tuple[SemanticEdge, ...] = ()
     schema_version: int = 1
     input_groups: tuple[ConditionalInputGroup, ...] = ()
+    model_reads: tuple[StateResource, ...] = ()
 
     @property
     def updates_in_forward(self) -> bool:
@@ -263,6 +267,7 @@ class SchedulerTimeline:
     reserved_bytes: tuple[int, ...] = ()
     region_policy: RegionSelectionPolicy = RegionSelectionPolicy()
     visibility: VisibilitySource | None = None
+    internal_points: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,6 +276,12 @@ class PhysicalTask:
     implementation_id: ImplementationId
     anchor_id: AnchorId
     release_values: tuple[int, ...] = ()
+    lane: Literal["main", "side"] = "main"
+    read_origin: Literal["entry", "boundary", "latest"] = "entry"
+    read_distance: int = 0
+    earliest: int = 0
+    deadline: int = 0
+    wait_for: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,11 +291,7 @@ class ScheduleDecision:
     tasks: tuple[PhysicalTask, ...]
     fallback_count: int
     signature: str
-    region_ends: tuple[int, ...]
-    materialized_values: tuple[int, ...]
-    materialization_bytes: int
     peak_memory_bytes: int
-    fence_count: int
     state_plan_digest: str | None
     schema_version: int = 1
 
@@ -295,8 +302,6 @@ class PhysicalPlan:
     schedule_signature: str
     tasks: tuple[PhysicalTask, ...]
     fallback_count: int
-    region_ends: tuple[int, ...]
-    materialized_values: tuple[int, ...]
     schema_version: int = 1
 
 

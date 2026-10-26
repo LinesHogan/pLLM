@@ -87,7 +87,7 @@ def mean_capture(publish_lag: int = 0) -> None:
     )
     execution = workload.bind_math(facts, plan).bind(PageBundleArena(plan), AnchorId(1))
     assert plan.timeline.visibility is not None
-    overlap = PostSampleOverlap(execution.arena, plan.timeline.visibility, device) if publish_lag else None
+    overlap = PostSampleOverlap(execution.arena, publish_lag, torch.cuda.Stream(device=device)) if publish_lag else None
     execution.admit((), stream)
     parameter = torch.nn.Parameter(torch.zeros(4, device=device, dtype=torch.float64))
     optimizer = torch.optim.AdamW((parameter,), lr=0.03, weight_decay=0, capturable=True, foreach=True)

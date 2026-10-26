@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Generic, cast
 
 import torch
@@ -76,6 +77,7 @@ class _PackedStep(Generic[DataT]):
     rows: PackedSamplerRowBatch
     invocation: TaskGraphInvocation[StateTaskContext[DataT]] | None = None
     forward_done: bool = False
+    handed_off: bool = False
 
 
 ReadonlyStepReceiver = Callable[
@@ -106,7 +108,6 @@ class VllmSession(Generic[DataT, ResultT]):
             for task in plan.semantic_graph.tasks
             for port in task.inputs
         )
-        visibility = plan.timeline.visibility
         buffers = attachment_buffer_bytes(
             attachment.inputs.probe, plan.semantic_graph, plan.tensor_layout_request, attachment.inputs.request
         )
@@ -188,14 +189,25 @@ class VllmSession(Generic[DataT, ResultT]):
         self._auxiliary: AuxiliaryInput[torch.Tensor] | None = None
         execution = deployment.execution
         self._post_sample = None
-        if attachment.physical.post_sampler != "main":
-            assert visibility is not None
+        tasks = plan.schedule_physical.tasks
+        if any(task.read_origin == "latest" for task in tasks):
             self._post_sample = PostSampleOverlap(
                 execution.arena,
-                visibility,
-                execution.device,
-                readers=attachment.physical.post_sampler == "lagged",
+                max(task.read_distance for task in tasks),
+                torch.cuda.Stream(device=execution.device)
+                if any(task.lane == "side" for task in tasks)
+                else torch.cuda.current_stream(execution.device),
             )
+        self._point_hooks = tuple(
+            (
+                model.model.norm
+                if anchor.symbol == "model.norm"
+                else model.model.layers[int(anchor.symbol.rsplit(".", 1)[1])]
+            ).register_forward_hook(partial(self._model_point, str(anchor.symbol)))
+            for anchor in plan.timeline.anchors
+            if (anchor.symbol.startswith("model.layer.") or anchor.symbol == "model.norm")
+            and any(task.anchor_id == anchor.ordinal for task in tasks)
+        )
         if bool(execution.directory.instance_states):
             execution.admit((), torch.cuda.current_stream(execution.device))
         if execution.feeds:
@@ -361,6 +373,22 @@ class VllmSession(Generic[DataT, ResultT]):
             return
         adapter = self._overlay
         if adapter is None and self._activation is None:
+            if self._point_hooks and any(
+                row.phase == resource.phase
+                for row in rows.row_batch.rows
+                for resource in self.attachment.inputs.probe.hidden_resources
+            ):
+                execution = self._deployment.execution
+                value = TensorStepInput(rows.row_batch, rows, auxiliary=self._auxiliary)
+                assert self._taps is not None
+                value = self._taps.publish(value, self._hidden_resources)
+                step.invocation = execution.start_step(
+                    value,
+                    torch.cuda.current_stream(execution.device),
+                    history=() if self._post_sample is None else self._post_sample.history,
+                )
+                self._advance(step.invocation, "request.prepare")
+                self._auxiliary = None
             return
         if isinstance(adapter, (PinnedParameterOverlay, HybridParameterOverlay)):
             adapter.reserve()
@@ -372,6 +400,9 @@ class VllmSession(Generic[DataT, ResultT]):
         if not self._in_forward_overlay:
             self._receive_readonly(rows, stream)
             value = TensorStepInput(rows.row_batch, rows, auxiliary=self._auxiliary)
+            if self._point_hooks:
+                assert self._taps is not None
+                value = self._taps.publish(value, self._hidden_resources)
             invocation = execution.start_step(value, stream)
             if bool(execution.directory.instance_states) or not self._pending_identities:
                 self._auxiliary = None
@@ -411,6 +442,12 @@ class VllmSession(Generic[DataT, ResultT]):
             self._replay.prepare(rows.row_batch, invocation)
             invocation.context.replay = self._replay
 
+    def _model_point(self, symbol: str, _module: torch.nn.Module, _args: tuple[object, ...], _output: object) -> None:
+        """Deliver an eager layer exit after its tap has written the invocation's fixed view."""
+        if self._step is not None and self._step.invocation is not None:
+            with torch.inference_mode(False), torch.enable_grad():
+                self._advance(self._step.invocation, symbol)
+
     def complete_forward(self) -> None:
         step = self._step
         if step is None or step.forward_done:
@@ -431,9 +468,7 @@ class VllmSession(Generic[DataT, ResultT]):
             self._step = None
             return
         if step.invocation is None:
-            # With no pre-sampler tasks there is no reader to lag. Pin the latest state
-            # directly on the writer lane so the main stream never waits for training.
-            if self._post_sample is not None and not self._post_sample.readers:
+            if self._post_sample is not None and not self._post_sample.lag:
                 stream = self._post_sample.stream
             step.invocation = execution.start_step(
                 value, stream, history=() if self._post_sample is None else self._post_sample.history
@@ -520,13 +555,6 @@ class VllmSession(Generic[DataT, ResultT]):
             return
         execution = self._deployment.execution
         invocation = self._invocation()
-        overlap = self._post_sample
-        if overlap is not None:
-            assert isinstance(invocation.context.value, TensorFrame)
-            overlap.copy_inputs(cast(StateTaskContext[TensorFrame], invocation.context))
-            if overlap.readers:
-                with torch.cuda.stream(overlap.stream):
-                    overlap.retain(execution.resume_latest(invocation, overlap.stream))
         self._advance(invocation, "next.prepare")
         execution.finish_step(invocation)
         self._step = None
@@ -576,6 +604,8 @@ class VllmSession(Generic[DataT, ResultT]):
             raise RuntimeError("finish or abort active requests before replacing the workload")
 
     def close(self) -> None:
+        for hook in self._point_hooks:
+            hook.remove()
         try:
             self.abort_active()
             self.retire_all(wait=True)
@@ -596,11 +626,37 @@ class VllmSession(Generic[DataT, ResultT]):
             raise RuntimeError("model inputs have not started the signed invocation")
         return self._step.invocation
 
+    def _handoff(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]]) -> None:
+        """Protect reusable inputs and move ownership before the first signed side task."""
+        overlap = self._post_sample
+        assert overlap is not None
+        assert self._step is not None
+        if not self._step.handed_off:
+            assert isinstance(invocation.context.value, TensorFrame)
+            overlap.copy_inputs(cast(StateTaskContext[TensorFrame], invocation.context))
+            if overlap.lag or invocation.context.pin.stream != overlap.stream:
+                with torch.cuda.stream(overlap.stream):
+                    overlap.retain(self._deployment.execution.resume_latest(invocation, overlap.stream))
+            self._step.handed_off = True
+
     def _advance(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], symbol: str) -> None:
         execution = self._deployment.execution
-        for anchor in execution.arena.plan.timeline.anchors:
-            if anchor.ordinal > invocation.last_anchor_id:
-                execution.execute_anchor(invocation, AnchorId(anchor.ordinal))
-            if anchor.symbol == symbol:
-                return
-        raise RuntimeError("backend event is absent from the original timeline")
+        target = next(anchor.ordinal for anchor in execution.arena.plan.timeline.anchors if anchor.symbol == symbol)
+        points = dict.fromkeys(
+            (
+                *[
+                    task.anchor_id
+                    for task in execution.arena.plan.schedule_physical.tasks
+                    if invocation.last_anchor_id < task.anchor_id <= target
+                ],
+                AnchorId(target),
+            )
+        )
+        for point in points:
+            if point > invocation.last_anchor_id:
+                if any(
+                    task.anchor_id == point and task.read_origin == "latest"
+                    for task in execution.arena.plan.schedule_physical.tasks
+                ):
+                    self._handoff(invocation)
+                execution.execute_anchor(invocation, AnchorId(point))

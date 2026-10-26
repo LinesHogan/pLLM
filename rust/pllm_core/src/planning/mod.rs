@@ -27,7 +27,6 @@ pub(crate) mod semantic_graph;
 pub(crate) mod state_representation;
 pub(crate) mod tensor_layout;
 mod version_hazards;
-mod visibility;
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -141,7 +140,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     region_tiling::register(module)?;
     region_outlining::register(module)?;
     affine_scan::register(module)?;
-    visibility::register(module)?;
+    module.add_function(wrap_pyfunction!(semantic_graph::explain_state_visibility, module)?)?;
     module.add_function(wrap_pyfunction!(compile_state_schedule, module)?)?;
     module.add_function(wrap_pyfunction!(validate_plan_bundle, module)?)?;
     Ok(())

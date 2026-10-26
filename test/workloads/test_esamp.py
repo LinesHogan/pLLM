@@ -221,15 +221,15 @@ def _esamp_native_oracle(device, normalized, captured):
     execution = deployment.execution
     plan = execution.arena.plan
     assert plan.timeline.visibility == VisibilitySource.post_sampler(1)
-    assert deployment.attachment.physical.post_sampler == ("lagged" if stream is not None else "main")
+    assert any(task.lane == "side" for task in plan.schedule_physical.tasks) == (stream is not None)
     if stream is not None and normalized and not captured:
         for lag in (0, 1, 2):
             attachment = workload.plan_backend(
                 replace(facts, timeline=replace(facts.timeline, visibility=VisibilitySource.post_sampler(lag)))
             )
-            assert attachment.physical.post_sampler == ("lagged" if lag else "main")
+            assert any(task.lane == "side" for task in attachment.inputs.plan.schedule_physical.tasks) == bool(lag)
             with pytest.raises(ValueError):
-                lower_backend_attachment(attachment.inputs, replace(attachment.decision, post_sampler="writer"))
+                lower_backend_attachment(attachment.inputs, replace(attachment.decision, signature="0" * 64))
     identities = tuple(RequestIdentity(str(i), i, 0) for i in range(3))
     initial = execution.admit(identities, stream)
     held = execution.arena.pin_exact(initial, stream)

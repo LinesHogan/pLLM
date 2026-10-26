@@ -616,15 +616,14 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     def resume_latest(
         self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], stream: torch.cuda.Stream
     ) -> PagePin:
-        """Move a completed sampler's invocation to its writer stream without losing exact read holds.
+        """Move an invocation to its signed writer stream without losing exact read holds.
 
-        The caller orders the sampler and copies reusable inputs first. Old reader pages remain
+        The caller orders producers and copies reusable inputs first. Old reader pages remain
         pinned on the new stream until settlement, including aliases consumed by later tasks.
         The returned extra pin retains the writer's input for subsequent lagged readers.
         """
         with self._lock:
             context = self._context(invocation)
-            assert context.sampler_phase is _SamplerPhase.COMPLETE
             assert not context.page_writes and not context.page_publications and not context.borrowed_roots
             reader = context.pin
             held = self.arena.pin_exact(reader.refs, stream)

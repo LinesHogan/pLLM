@@ -74,7 +74,6 @@ class PromptFactors(ProjectionState):
             )
         )
 
-    @pllm.on(pllm.Phase.OBSERVE)
     @pllm.write(state="factors", fields=("a_0", "b_0", "a_1", "b_1"))
     def produce(
         self,
