@@ -307,7 +307,7 @@ class WorkloadModelRunner(Runner[Sampler | None], OverlayGraphRunner):
         super().load_model(load_dummy_weights)  # pyright: ignore[reportUnknownMemberType]
         self._install_hidden_taps()
         self.position_states = decode_boundary(
-            os.environ.get(POSITION_ENV, '{"states": [], "revision": 1}'), PositionAnnouncement
+            os.environ.get(POSITION_ENV, '{"states": []}'), PositionAnnouncement
         ).states
         if self.position_states and self.cache_config.cache_dtype != "auto":
             raise ValueError("PositionState requires cache_dtype=auto in the model dtype")

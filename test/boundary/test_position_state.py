@@ -11,7 +11,6 @@ from pllm import KVOffload, _core
 from pllm.backends.vllm.position_state import PositionCacheProvider, PositionMetadata
 from pllm.config import ExecutionOptions
 from pllm.execution.codec import encode_boundary
-from pllm.execution.position_state import PositionAnnouncement
 from pllm.workloads.step_loop import StepLoop
 from test.workloads.test_recirculation import FACTS, ROWS
 
@@ -60,8 +59,6 @@ def test_position_source_cannot_use_stateless_signing_exemption(target):
         _core.compile_backend_attachment(json.dumps(payload))
 
 
-def test_unsupported_schema_and_transfer():
-    with pytest.raises(ValueError, match="revision 1"):
-        PositionAnnouncement(revision=2)
+def test_unsupported_transfer():
     with pytest.raises(ValueError, match="LMCache"):
         KVOffload(connector="LMCacheConnectorV1")

@@ -1121,6 +1121,7 @@ class _Declaration:
     definitions: list[tuple[str, str]] = field(default_factory=lambda: [])
     operations: list[_Operation] = field(default_factory=lambda: [])
     routes: list[tuple[str, Tokens]] = field(default_factory=lambda: [])
+    positions: tuple[tuple[str, float], ...] = ()
     overlay_states: set[str] = field(default_factory=lambda: set[str]())
     states: dict[str, State] = field(default_factory=lambda: {})
     parameters: dict[tuple[str, str], SemanticInputSource | TensorPort] = field(default_factory=lambda: {})
@@ -1234,7 +1235,7 @@ class _Declaration:
 
     def declare_values(self) -> None:
         """Allocate ordinary state before effects and operations consume its ports."""
-        self.position_states()
+        self.positions = self.position_states()
         for value in self.values.values():
             if isinstance(value, Activation):
                 value.allocate(self)
@@ -1254,7 +1255,7 @@ class _Declaration:
             if isinstance(value, Activation):
                 value.declare(self)
         for name, tokens in self.routes:
-            self.binding.layer_route(self.method(name), tokens, self.position_states())
+            self.binding.layer_route(self.method(name), tokens, self.positions)
         if self.binding.feeds:
             self.binding.conditional_input(tuple(feed.resource for feed in self.binding.feeds))
 

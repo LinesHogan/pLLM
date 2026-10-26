@@ -33,19 +33,9 @@ class PositionState:
 
 @dataclass(frozen=True)
 class PositionAnnouncement:
-    """Versioned model-hidden/model-dtype schema sent before backend KV allocation."""
+    """PositionState names and initializers, sent to the worker before vLLM allocates KV."""
 
     states: tuple[tuple[str, float], ...] = ()
-    revision: int = 1
-
-    def __post_init__(self) -> None:
-        names = tuple(name for name, _ in self.states)
-        if (
-            self.revision != 1
-            or names != tuple(sorted(set(names)))
-            or any(not name or not isfinite(initial) for name, initial in self.states)
-        ):
-            raise ValueError("PositionState announcement needs revision 1, unique names and finite initializers")
 
 
 def position_functions(tensor: TensorType, count: int) -> tuple[Function, Function]:

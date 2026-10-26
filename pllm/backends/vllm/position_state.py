@@ -12,6 +12,7 @@ from vllm.model_executor.models.extract_hidden_states import (
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import HiddenStateCacheSpec
 
+from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.execution.position_state import PositionBuffers
 
@@ -86,7 +87,7 @@ class PositionCacheProvider(PositionBuffers):
         """Use each registered layer's mapping, including device-side page permutations."""
         assert isinstance(context.attn_metadata, dict) and isinstance(context.slot_mapping, dict)
         self.flags[0].fill_(row.token_offset == 0)
-        self.flags[1].fill_(row.phase.value == "decode")
+        self.flags[1].fill_(row.phase is HiddenPhase.DECODE)
         for layer, indices in zip(self.layers, self.indices, strict=True):
             metadata = context.attn_metadata[layer.layer_name]
             assert isinstance(metadata, PositionMetadata)
