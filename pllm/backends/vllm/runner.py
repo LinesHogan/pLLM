@@ -144,8 +144,6 @@ class Runner(Generic[SamplerT]):
 
     def _initialize_workload(self, topology: AttachmentTopology) -> None:
         policy = os.environ.get(POLICY_ENV, "isolate")
-        if policy not in ("reuse", "isolate"):
-            raise ValueError("generated_kv must be reuse or isolate")
         self._generated_kv: Literal["reuse", "isolate"] = "reuse" if policy == "reuse" else "isolate"
         self.workload_topology = topology
         self._workload_session: _RunnerSession | None = None

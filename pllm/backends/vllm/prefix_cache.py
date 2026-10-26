@@ -13,6 +13,7 @@ from vllm.v1.request import Request
 
 from pllm.contracts.backend_attachment import SignedBackendAttachment
 from pllm.execution.codec import boundary_digest, decode_boundary, encode_boundary
+from pllm.execution.position_state import POSITION_RESOURCE
 
 POLICY_ENV = "PLLM_GENERATED_KV"
 POLICY_KEY = "pllm.prefix_cache"
@@ -20,12 +21,11 @@ POLICY_KEY = "pllm.prefix_cache"
 
 @dataclass(frozen=True)
 class CachePolicy:
-    """Versioned request envelope, reconstructed independently by the installed worker."""
+    """Per-request cache identity, also rebuilt by the installed worker to reject mismatched requests."""
 
     namespace: str
     role_sensitive: bool
     generated_kv: Literal["reuse", "isolate"]
-    version: int = 1
 
     @classmethod
     def for_attachment(cls, attachment: SignedBackendAttachment, policy: Literal["reuse", "isolate"]) -> "CachePolicy":
@@ -34,13 +34,9 @@ class CachePolicy:
         graph = inputs.plan.semantic_graph
         sensitive = (
             bool(inputs.request.activation_bindings or inputs.request.overlay_bindings)
-            or any(
-                task.replay is not None and (task.replay.rows != "all" or task.replay.position_states)
-                for task in graph.tasks
-            )
-            or any(
-                resource.name == "position" for source in graph.source_regions for resource in source.program.resources
-            )
+            or any(task.replay is not None and task.replay.rows != "all" for task in graph.tasks)
+            # Reading `layers.generated` or PositionState adds the position resource to the route source.
+            or any(POSITION_RESOURCE in source.program.resources for source in graph.source_regions)
         )
         return cls(
             boundary_digest((inputs.probe.model_fingerprint, graph, inputs.probe.position_states)), sensitive, policy
@@ -54,19 +50,11 @@ class CachePolicy:
 
     @classmethod
     def read(cls, params: SamplingParams | None) -> "CachePolicy":
-        """Validate the transport at scheduler admission, including missing raw-call metadata."""
+        """Read the identity at scheduler admission; raw engine calls carry none."""
         value = None if params is None else (params.extra_args or {}).get(POLICY_KEY)
         if not isinstance(value, str):
             raise ValueError("submit requests through the workload handle to supply the cache policy")
-        try:
-            result = decode_boundary(value, cls)
-        except Exception as error:
-            raise ValueError("supply a version 1 workload cache policy envelope") from error
-        if result.version != 1:
-            raise ValueError("supply a version 1 workload cache policy envelope")
-        if len(result.namespace) != 64 or any(c not in "0123456789abcdef" for c in result.namespace):
-            raise ValueError("cache namespace must be a mathematical SHA256 digest")
-        return result
+        return decode_boundary(value, cls)
 
 
 @dataclass(frozen=True)

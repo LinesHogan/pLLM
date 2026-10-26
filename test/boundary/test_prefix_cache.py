@@ -92,14 +92,8 @@ def test_namespace_caller_extras_and_envelope():
     assert request(8, cache_salt="caller").block_hashes != baseline
     assert request(8, policy=replace(POLICY, namespace="b" * 64)).block_hashes != baseline
     assert request(8, policy=replace(POLICY, generated_kv="reuse")).block_hashes != baseline
-    for value in (
-        None,
-        "{}",
-        '{"namespace":"bad","role_sensitive":true,"generated_kv":"isolate","version":1}',
-        '{"namespace":"bad","role_sensitive":true,"generated_kv":"wrong","version":2}',
-    ):
-        with pytest.raises((ValueError, TypeError, KeyError)):
-            CachePolicy.read(SamplingParams(extra_args={"pllm.prefix_cache": value}))
+    with pytest.raises(ValueError, match="workload handle"):
+        CachePolicy.read(SamplingParams())
 
 
 class GeneratedRoute(pllm.Workload):
