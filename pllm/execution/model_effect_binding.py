@@ -57,7 +57,7 @@ from pllm.execution.tensor_program import (
     TaskOutput,
     TensorBatch,
 )
-from pllm.execution.token_program import ApplyUpdates, Cell, Layers, Segment, TokenProgram, Tokens
+from pllm.execution.token_program import ApplyUpdates, Cell, Layers, Over, Segment, TokenProgram, Tokens
 from pllm.kernels.head_overlay import head_correction
 
 if TYPE_CHECKING:
@@ -466,13 +466,11 @@ class ModelEffectBinding(TensorBindingBase):
 
     def layer_route(
         self,
-        function: Callable[[Layers], torch.Tensor],
-        tokens: Tokens,
+        routes: tuple[tuple[Tokens, Over, Callable[[Layers], torch.Tensor]], ...],
         position_states: tuple[tuple[str, float], ...] = (),
     ) -> None:
         """Trace a user route and sign its complete model/tensor source before planning."""
-        if any(task.replay is not None for task in self.graph.tasks):
-            raise ValueError("compose one layer_route with one trained overlay")
+        tokens: Tokens = routes[0][0] if len(routes) == 1 else "all"
         activation = self.attachment is not None and self.attachment.kind is AttachmentKind.ACTIVATION_PATCH
         composed = (
             self.attachment is not None
@@ -538,17 +536,31 @@ class ModelEffectBinding(TensorBindingBase):
                 "torch." + probe.tensor_dtype.value,
                 "cpu" if probe.device_kind.value == "cpu" else f"cuda:{probe.device_ordinal}",
             )
-            captured = TokenProgram.capture(
-                function, tensor, probe.causal_domain.layers, tuple(name for name, _ in position_states)
+            captured = tuple(
+                (
+                    selected,
+                    TokenProgram.capture(
+                        function, tensor, probe.causal_domain.layers, tuple(name for name, _ in position_states), over
+                    ),
+                )
+                for selected, over, function in routes
             )
-            self.route_rows = probe.max_packed_rows * max(1, sum(isinstance(step, Segment) for step in captured.steps))
-            pending = False
-            for step in captured.steps:
-                if isinstance(step, Segment):
-                    pending |= any(step.start <= target.layer < step.stop for target in self.overlay_targets)
-                elif isinstance(step, ApplyUpdates):
-                    self.route_updates |= pending
-                    pending = False
+            programs = {
+                role: program
+                for selected, program in captured
+                for role in ("prefill", "decode")
+                if selected in (role, "all")
+            }
+            steps = tuple(step for _, program in captured for step in program.steps)
+            self.route_rows = probe.max_packed_rows * max(1, sum(isinstance(step, Segment) for step in steps))
+            for _, program in captured:
+                pending = False
+                for step in program.steps:
+                    if isinstance(step, Segment):
+                        pending |= any(step.start <= target.layer < step.stop for target in self.overlay_targets)
+                    elif isinstance(step, ApplyUpdates):
+                        self.route_updates |= pending
+                        pending = False
             if composed:
                 phases, updates = self.parameter_phases, self.route_updates
 
@@ -565,9 +577,9 @@ class ModelEffectBinding(TensorBindingBase):
                     )
 
                 self.operations[symbol] = replace(self.operations[symbol], select=select)
-            if any(isinstance(step, ApplyUpdates) for step in captured.steps) and not composed:
+            if any(isinstance(step, ApplyUpdates) for step in steps) and not composed:
                 raise ValueError("apply_updates needs one trained parameter overlay on the same workload")
-            self.route_program = captured
+            self.route_program = programs
             self.graph = replace(
                 self.graph,
                 tasks=tuple(
@@ -579,11 +591,19 @@ class ModelEffectBinding(TensorBindingBase):
                             position_states,
                             boundary_digest(
                                 tuple(
-                                    str(step.graph.graph) if isinstance(step, Cell) else step for step in captured.steps
+                                    (
+                                        role,
+                                        program.over,
+                                        tuple(
+                                            str(step.graph.graph) if isinstance(step, Cell) else step
+                                            for step in program.steps
+                                        ),
+                                    )
+                                    for role, program in programs.items()
                                 )
                             ),
-                            captured.role_sensitive,
-                            any(isinstance(step, ApplyUpdates) for step in captured.steps),
+                            len(routes) > 1 or any(program.role_sensitive for program in programs.values()),
+                            any(isinstance(step, ApplyUpdates) for step in steps),
                         ),
                     )
                     if task.symbol == symbol

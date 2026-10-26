@@ -121,7 +121,7 @@ def test_direct_route_batches_positions_taps_and_state(width):
     positions = torch.arange(width)
     generated = (positions % 2 == 0).reshape(-1, 1)
 
-    def layer(ordinal, hidden, residual):
+    def layer(ordinal, hidden, residual, kv):
         if residual is not None:
             residual.add_(hidden)
         return hidden * (ordinal + 1), hidden.clone() if residual is None else residual
@@ -170,7 +170,7 @@ def test_constant_cells_expand_without_reading_other_requests(width):
         torch.zeros(width),
         torch.zeros(width, 1, dtype=torch.bool),
         (),
-        lambda layer, hidden, residual: (hidden + 1, torch.zeros_like(hidden)),
+        lambda layer, hidden, residual, kv: (hidden + 1, torch.zeros_like(hidden)),
         lambda: None,
     )
     torch.testing.assert_close(hidden, torch.full((width, 4), 2.0))

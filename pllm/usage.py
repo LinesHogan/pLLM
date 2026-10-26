@@ -83,7 +83,7 @@ from pllm.execution.task_memory import derive_resources
 from pllm.execution.tensor_binding import TensorBinding, TensorOutput as TensorOutput
 from pllm.execution.tensor_frame import TensorFrame, TensorPort, Tensors, TensorUpdate as TensorUpdate
 from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots, TensorComputation
-from pllm.execution.token_program import Tokens
+from pllm.execution.token_program import Over, Tokens
 from pllm.kernels.adamw import AdamWConfig
 
 F = TypeVar("F", bound=Callable[..., torch.Tensor | TensorUpdate])
@@ -931,12 +931,19 @@ def _targets(value: tuple[object, ...]) -> tuple[ParameterTarget, ...]:
     return tuple(item for item in value if isinstance(item, ParameterTarget))
 
 
-def layer_route(*, tokens: Tokens = "all") -> Callable[[F], F]:
-    """Declare a straight-line per-token layer program for the selected model rows."""
+def layer_route(*, tokens: Tokens = "all", over: Over = "token") -> Callable[[F], F]:
+    """Route disjoint token roles through model slices and tensor math.
+
+    ``over="token"`` runs each position independently in causal order. ``over="span"``
+    packs each request's contiguous scheduled tokens into [M, H] hidden tensors;
+    position and generated flags have shape [M, 1]. Spans cannot load predecessors.
+    """
     if tokens not in ("prefill", "decode", "all"):
         raise ValueError('set layer_route(tokens=) to "prefill", "decode" or "all"')
 
-    return _mark(tokens=tokens)
+    if over not in ("token", "span"):
+        raise ValueError("set layer_route(over=) to token or span")
+    return _mark(tokens=tokens, over=over)
 
 
 def _values(owner: object) -> dict[str, object]:
@@ -1120,7 +1127,7 @@ class _Declaration:
     bindings: tuple[tuple[str, str], ...]
     definitions: list[tuple[str, str]] = field(default_factory=lambda: [])
     operations: list[_Operation] = field(default_factory=lambda: [])
-    routes: list[tuple[str, Tokens]] = field(default_factory=lambda: [])
+    routes: list[tuple[str, Tokens, Over]] = field(default_factory=lambda: [])
     positions: tuple[tuple[str, float], ...] = ()
     overlay_states: set[str] = field(default_factory=lambda: set[str]())
     states: dict[str, State] = field(default_factory=lambda: {})
@@ -1174,7 +1181,16 @@ class _Declaration:
                 ),
                 "layer_route requires (self, layers) and no stacked markers; use layers.save inside the route instead of @write",
             )
-            self.routes.append((name, tokens))
+            over = getattr(member, "__pllm_over__")
+            assert over in ("token", "span")
+            overlap = {
+                role
+                for _, selected, _ in self.routes
+                for role in ("prefill", "decode")
+                if selected in (role, "all") and tokens in (role, "all")
+            }
+            _reject(overlap, f"layer_route tokens overlap: {', '.join(sorted(overlap))}")
+            self.routes.append((name, tokens, over))
             seeds.append(member)
             return
         phase, marked, gradient, rows = (
@@ -1254,8 +1270,10 @@ class _Declaration:
         for value in self.values.values():
             if isinstance(value, Activation):
                 value.declare(self)
-        for name, tokens in self.routes:
-            self.binding.layer_route(self.method(name), tokens, self.positions)
+        if self.routes:
+            self.binding.layer_route(
+                tuple((tokens, over, self.method(name)) for name, tokens, over in self.routes), self.positions
+            )
         if self.binding.feeds:
             self.binding.conditional_input(tuple(feed.resource for feed in self.binding.feeds))
 

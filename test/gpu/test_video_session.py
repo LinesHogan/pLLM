@@ -229,7 +229,7 @@ def observe_replay(*, versions):
         recordings[item.graph] = item, capturing
         capturing = None
 
-    def layer(wave, ordinal, hidden, residual):
+    def layer(wave, ordinal, hidden, residual, kv="commit"):
         base = []
 
         def native(module, args, result):
@@ -238,7 +238,7 @@ def observe_replay(*, versions):
 
         hook = wave.replay.model.layers[ordinal].register_forward_hook(native) if ordinal == 1 else None
         try:
-            result = original_layer(wave, ordinal, hidden, residual)
+            result = original_layer(wave, ordinal, hidden, residual, kv)
         finally:
             if hook is not None:
                 hook.remove()

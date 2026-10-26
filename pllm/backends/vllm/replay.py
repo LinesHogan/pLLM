@@ -19,6 +19,7 @@ from pllm.backends.vllm.position_state import PositionCacheLayer, PositionCacheP
 from pllm.backends.vllm.region_attention import (
     BatchAttentionBuffers,
     attention_metadata,
+    attention_mode,
     attention_paged_access,
     validate_attention_resources,
 )
@@ -34,7 +35,7 @@ from pllm.execution.state_execution import StateExecution, StateTaskContext
 from pllm.execution.step_capture import capture_graph
 from pllm.execution.step_input import TensorStepInput
 from pllm.execution.tensor_frame import OverlayTargetResult
-from pllm.execution.token_program import Save, TokenProgram
+from pllm.execution.token_program import KV, Save, TokenProgram
 
 Signature = tuple[bool, tuple[bool, ...], bool]
 
@@ -104,10 +105,11 @@ class RouteWave(Generic[DataT, ResultT]):
             replay.projections.prepare_wave(rows, self.routes, self.lanes)
 
     def layer(
-        self, ordinal: int, hidden: torch.Tensor, residual: torch.Tensor | None
+        self, ordinal: int, hidden: torch.Tensor, residual: torch.Tensor | None, kv: KV = "commit"
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Call the intact native layer and apply any declared post-layer patch."""
-        hidden, residual = self.replay.model.layers[ordinal](self.positions, hidden, residual)
+        with attention_mode(self.replay.attentions[ordinal], self.positions, kv):
+            hidden, residual = self.replay.model.layers[ordinal](self.positions, hidden, residual)
         fields = self.fields.get(ordinal, ())
         if fields:
             if len(fields) == 1:
@@ -129,7 +131,7 @@ class RouteWave(Generic[DataT, ResultT]):
         generated, *entries = self.position.entry(())
         if self.signature[0]:
             hidden, saved = execute_route(
-                self.replay.program,
+                self.replay.program["decode" if self.signature[2] else "prefill"],
                 self.seed,
                 self.positions,
                 generated,
@@ -257,7 +259,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         return self.output
 
     def run(
-        self, program: TokenProgram, effect: TokenProgramEffect, observe: Callable[[int, torch.Tensor], None]
+        self, program: dict[str, TokenProgram], effect: TokenProgramEffect, observe: Callable[[int, torch.Tensor], None]
     ) -> None:
         assert self.hidden is not None and self.positions is not None
         stream = torch.cuda.current_stream(self.hidden.device)
@@ -282,7 +284,11 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         self.observations = torch.empty_like(self.hidden)
         ordinary = tuple(
             (effect.rows != "all" and row.phase.value != effect.rows)
-            or (row.phase.value == "prefill" and program.prompt_pass_is_identity and self.overlay is None)
+            or (
+                row.phase.value == "prefill"
+                and program[row.phase.value].prompt_pass_is_identity
+                and self.overlay is None
+            )
             for row in self.rows
         )
         requests = [
@@ -290,11 +296,16 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
             for request in dict.fromkeys(row.request_ordinal for row in self.rows)
         ]
         while any(requests):
-            spans: list[PackedPhaseRow] = []
+            spans: dict[TokenProgram | None, list[PackedPhaseRow]] = {}
             groups: dict[Signature, list[PackedPhaseRow]] = {}
             for request in requests:
-                while request and ordinary[request[0].packed_row_index]:
-                    spans.append(request.pop(0))
+                while request and (
+                    ordinary[request[0].packed_row_index] or program[request[0].phase.value].over == "span"
+                ):
+                    row = request.pop(0)
+                    spans.setdefault(None if ordinary[row.packed_row_index] else program[row.phase.value], []).append(
+                        row
+                    )
                 if request:
                     row = request.pop(0)
                     signature = (
@@ -305,8 +316,8 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
                         row.phase.value == "decode",
                     )
                     groups.setdefault(signature, []).append(row)
-            if spans:
-                self.span(tuple(spans))
+            for selected_program, span in spans.items():
+                self.span(tuple(span), selected_program)
             for signature, rows in groups.items():
                 selected = tuple(rows)
                 key = len(rows), signature
@@ -328,7 +339,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
             if effect.rows == "all" or row.phase.value == effect.rows:
                 observe(row.packed_row_index, self.observations[row.packed_row_index : row.packed_row_index + 1])
 
-    def span(self, rows: tuple[PackedPhaseRow, ...]) -> None:
+    def span(self, rows: tuple[PackedPhaseRow, ...], program: TokenProgram | None = None) -> None:
         """One native varlen pass, committing the last touched position of every page."""
         assert self.hidden is not None and self.positions is not None and self.output is not None
         context = get_forward_context()
@@ -375,7 +386,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
             parent = self.overlay
             routes = tuple(RouteOverlay(parent.math, parent.batch, parent.entry, parent.data) for _ in groups)
             for route, group in zip(routes, groups, strict=True):
-                route.stage(group[0].packed_row_index, False)
+                route.stage(group[0].packed_row_index, program is not None)
                 route.reset()
             assert self.projections is not None
             self.projections.prepare_wave(
@@ -386,9 +397,10 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         positions = self.positions.index_select(0, packed)
 
         def layer(
-            ordinal: int, hidden: torch.Tensor, residual: torch.Tensor | None
+            ordinal: int, hidden: torch.Tensor, residual: torch.Tensor | None, kv: KV
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            hidden, residual = self.model.layers[ordinal](positions, hidden, residual)
+            with attention_mode(self.attentions[ordinal], positions, kv):
+                hidden, residual = self.model.layers[ordinal](positions, hidden, residual)
             if self.activation is not None:
                 for index, handle in enumerate(self.activation.layers):
                     if handle.binding.layer == ordinal:
@@ -404,8 +416,25 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
             assert residual is not None
             return hidden, residual
 
+        def apply_updates() -> None:
+            for route in routes:
+                route.apply_updates()
+
+        seed = self.hidden.index_select(0, packed)
+        saved: tuple[torch.Tensor, ...] = ()
         with override_forward_context(context):
-            hidden = ordinary_pass(self.hidden.index_select(0, packed), self.effect.layer_count, layer)
+            if program is None:
+                hidden = ordinary_pass(seed, self.effect.layer_count, layer)
+            else:
+                hidden, saved = execute_route(
+                    program,
+                    seed,
+                    positions,
+                    upload(tuple(row.phase.value == "decode" for row in rows), seed.device, torch.bool).reshape(-1, 1),
+                    tuple(torch.empty_like(seed) for _ in program.entries),
+                    layer,
+                    apply_updates,
+                )
             self.output.index_copy_(0, packed, self.model.norm(hidden))
             assert self.observations is not None
             self.observations.index_copy_(0, packed, hidden)
@@ -413,7 +442,17 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
             route.collect(tuple(route.results), route.captures())
             assert self.overlay is not None
             self.overlay.ordinary.extend(route.ordinary)
-        self.save_span(rows, groups, requests, hidden)
+        self.save_span(
+            rows,
+            groups,
+            requests,
+            hidden,
+            {
+                name: value
+                for (name, _), value in zip(() if program is None else program.entries, saved, strict=True)
+                if program is not None and any(isinstance(step, Save) and step.name == name for step in program.steps)
+            },
+        )
 
     def save_span(
         self,
@@ -421,6 +460,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         groups: tuple[tuple[PackedPhaseRow, ...], ...],
         requests: torch.Tensor,
         hidden: torch.Tensor,
+        saved_values: dict[str, torch.Tensor],
     ) -> None:
         """Snapshot predecessor values before scattering page tails in a native span."""
         if not self.position_layers:
@@ -455,7 +495,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         )
         context = get_forward_context()
         assert isinstance(context.slot_mapping, dict)
-        saved_names = {step.name for step in self.program.steps if isinstance(step, Save)}
+        program = self.program.get("prefill")
         for cache, (name, _), entry in zip(self.position_layers, self.effect.position_states, entries, strict=True):
             slots = context.slot_mapping[cache.layer_name].index_select(0, packed) // self.allocation
             values = (
@@ -464,9 +504,13 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
                     hidden.index_select(0, indices.clamp_min(0)),
                     entry.index_select(0, request_indices),
                 )
-                if self.program.prompt_pass_is_identity and name in saved_names
+                if program is not None
+                and program.prompt_pass_is_identity
+                and any(isinstance(step, Save) and step.name == name for step in program.steps)
                 else entry.index_select(0, request_indices)
             )
+            if name in saved_values:
+                values = saved_values[name].index_select(0, upload(tuple(tails.values()), hidden.device))
             cache.kv_cache.view(-1, hidden.shape[1])[slots] = values
 
     def begin(self, row: PackedPhaseRow) -> tuple[torch.Tensor, torch.Tensor]:
@@ -479,8 +523,10 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         positions: torch.Tensor,
         hidden: torch.Tensor,
         residual: torch.Tensor | None,
+        kv: KV = "commit",
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.model.layers[ordinal](positions, hidden, residual)
+        with attention_mode(self.attentions[ordinal], positions, kv):
+            return self.model.layers[ordinal](positions, hidden, residual)
 
     def normalize(self, row: PackedPhaseRow, hidden: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
         return self.model.norm(hidden + residual)

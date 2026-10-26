@@ -1,20 +1,24 @@
-"""Bind vLLM attention resources without inspecting a model implementation.
+"""Bind vLLM attention resources and read-only peek calls for layer-route replay.
 
-The frontend identifies the original Attention endpoints. This adapter retains
-vLLM's cache layout and metadata checks, then supplies logical page accesses to
-the common planner. It never reconstructs attention computation or owns KV.
+vLLM owns the cache and FA2 attention. Peek merges strictly earlier cached
+attention with the fresh diagonal without writing any cache slots.
 """
 
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import replace
+from functools import partial
 
 import torch
 from vllm.config import CUDAGraphMode
-from vllm.forward_context import ForwardContext
+from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl, FlashAttentionMetadata
+from vllm.vllm_flash_attn import flash_attn_varlen_func
 
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.execution.paged_access import PagedAccessPlan, PagedLayer, bind_paged_access
+from pllm.execution.token_program import KV
 
 
 def validate_attention_resources(attentions: tuple[Attention, ...], *, hidden_size: int) -> None:
@@ -146,3 +150,67 @@ class BatchAttentionBuffers:
             metadata.seq_lens.copy_(lengths.index_select(0, rows))
             width = min(tables.shape[1], metadata.block_table.shape[1])
             metadata.block_table[:, :width].copy_(tables.index_select(0, requests)[:, :width])
+
+
+def merge_diagonal(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    off: torch.Tensor,
+    lse: torch.Tensor,
+    positions: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Merge strictly earlier cached attention with each query's fresh diagonal K/V."""
+    grouped = q.float().reshape(q.shape[0], k.shape[1], -1, q.shape[-1])
+    diagonal = (grouped * k.float().unsqueeze(2)).sum(-1).reshape(q.shape[:2]) * scale
+    earlier = lse.T.masked_fill(positions[:, None] == 0, -float("inf"))
+    total = torch.logaddexp(earlier, diagonal)
+    fresh = v.float().repeat_interleave(q.shape[1] // k.shape[1], dim=1)
+    return (torch.exp(earlier - total)[..., None] * off.float() + torch.exp(diagonal - total)[..., None] * fresh).to(
+        q.dtype
+    )
+
+
+def peek_attention(
+    attention: Attention,
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    """Read FA2's cache with visible length seq_len - 1, leaving all cache bytes intact."""
+    metadata, cache, _ = attention_metadata(get_forward_context(), attention)
+    assert isinstance(attention.impl, FlashAttentionImpl)
+    q = query.view(-1, attention.num_heads, attention.head_size)
+    k, v = (tensor.view(-1, attention.num_kv_heads, attention.head_size) for tensor in (key, value))
+    cached_k, cached_v = cache.transpose(1, 2).chunk(2, dim=-1)
+    off, lse = flash_attn_varlen_func(
+        q=q,
+        k=cached_k,
+        v=cached_v,
+        cu_seqlens_q=metadata.query_start_loc,
+        max_seqlen_q=metadata.max_query_len,
+        seqused_k=(metadata.seq_lens - 1).clamp_min(0),
+        max_seqlen_k=max(0, metadata.max_seq_len - 1),
+        softmax_scale=attention.impl.scale,
+        causal=True,
+        block_table=metadata.block_table,
+        return_softmax_lse=True,
+        fa_version=2,
+    )
+    return merge_diagonal(q, k, v, off, lse, positions, attention.impl.scale).reshape(query.shape)
+
+
+@contextmanager
+def attention_mode(attention: Attention, positions: torch.Tensor, kv: KV) -> Generator[None]:
+    """Substitute only the Attention endpoint during a peek, preserving native layer math."""
+    if kv == "commit":
+        yield
+        return
+    forward = attention.forward
+    try:
+        attention.forward = partial(peek_attention, attention, positions)
+        yield
+    finally:
+        attention.forward = forward

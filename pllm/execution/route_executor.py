@@ -4,9 +4,9 @@ from collections.abc import Callable
 
 import torch
 
-from pllm.execution.token_program import ApplyUpdates, Cell, Save, Segment, TokenProgram
+from pllm.execution.token_program import KV, ApplyUpdates, Cell, Save, Segment, TokenProgram
 
-Layer = Callable[[int, torch.Tensor, torch.Tensor | None], tuple[torch.Tensor, torch.Tensor]]
+Layer = Callable[[int, torch.Tensor, torch.Tensor | None, KV], tuple[torch.Tensor, torch.Tensor]]
 
 
 def execute_route(
@@ -28,7 +28,7 @@ def execute_route(
             hidden, residual = values[step.input].clone(), None
             taps = dict(step.taps)
             for ordinal in range(step.start, step.stop):
-                hidden, residual = layer(ordinal, hidden, residual)
+                hidden, residual = layer(ordinal, hidden, residual, step.kv)
                 if ordinal in taps:
                     values[taps[ordinal]] = hidden + residual
         elif isinstance(step, Cell):
@@ -47,6 +47,6 @@ def ordinary_pass(seed: torch.Tensor, count: int, layer: Layer) -> torch.Tensor:
     """Run the model's complete stack while retaining its pre-norm residual stream."""
     hidden, residual = seed.clone(), None
     for ordinal in range(count):
-        hidden, residual = layer(ordinal, hidden, residual)
+        hidden, residual = layer(ordinal, hidden, residual, "commit")
     assert residual is not None
     return hidden + residual

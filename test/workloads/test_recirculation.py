@@ -117,7 +117,7 @@ class Decoder(TokenwiseReplayPrimitive):
         view.resource = resource
         return HostResourceBinding(view, owner)
 
-    def layer(self, row, ordinal, positions, hidden, residual):
+    def layer(self, row, ordinal, positions, hidden, residual, kv="commit"):
         # A read-only final normalization can legally move after replay.
         # Observe the second call to a source layer, not normalization's
         # position in the reference program.
@@ -249,7 +249,11 @@ def test_route_observation_precedes_sampling_normalization():
     decoder, observed = Decoder(), []
     decoder.normalize = lambda row, hidden, residual: 2 * (hidden + residual)
     program = TokenProgram.capture(WORKLOAD.recirculate, TensorType((1, 4), "torch.float32", "cpu"), 3)
-    decoder.run(program, TokenProgramEffect(3), lambda index, hidden: observed.append(hidden.clone()))
+    decoder.run(
+        {"prefill": program, "decode": program},
+        TokenProgramEffect(3),
+        lambda index, hidden: observed.append(hidden.clone()),
+    )
     _, expected = serial_oracle()
     torch.testing.assert_close(torch.cat(observed), torch.stack(expected))
     torch.testing.assert_close(decoder.output, 2 * torch.stack(expected))

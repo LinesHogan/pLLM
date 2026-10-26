@@ -79,7 +79,7 @@ class Updating(pllm.Workload):
 
 
 class UpdatingDecoder(Decoder):
-    def layer(self, row, ordinal, positions, hidden, residual):
+    def layer(self, row, ordinal, positions, hidden, residual, kv="commit"):
         output, carry = super().layer(row, ordinal, positions, hidden, residual)
         if ordinal == TARGET.layer:
             operand = CapturedParameterOperand(row.identity, TARGET, row.phase, hidden, output, torch.eye(4))

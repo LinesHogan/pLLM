@@ -18,7 +18,7 @@ from pllm.execution.position_state import PositionBuffers
 from pllm.execution.route_executor import execute_route, ordinary_pass
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import TaskOutput, TensorBatch, TensorOperation, _read  # pyright: ignore[reportPrivateUsage]
-from pllm.execution.token_program import TokenProgram
+from pllm.execution.token_program import KV, TokenProgram
 from pllm.execution.trace import TracePhase
 
 if TYPE_CHECKING:
@@ -50,6 +50,7 @@ class TokenwiseReplayPrimitive(ABC):
         positions: torch.Tensor,
         hidden: torch.Tensor,
         residual: torch.Tensor | None,
+        kv: KV = "commit",
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
     @abstractmethod
@@ -62,9 +63,10 @@ class TokenwiseReplayPrimitive(ABC):
     def finish(self, outputs: tuple[torch.Tensor, ...]) -> None: ...
 
     def run(
-        self, program: TokenProgram, effect: TokenProgramEffect, observe: Callable[[int, torch.Tensor], None]
+        self, program: dict[str, TokenProgram], effect: TokenProgramEffect, observe: Callable[[int, torch.Tensor], None]
     ) -> None:
-        """Serial CPU reference using the model's layer interface."""
+        """Serial CPU reference; span-capable backends override this method."""
+        assert all(route.over == "token" for route in program.values()), "span routes need a backend span executor"
         outputs: list[torch.Tensor] = []
         for index, row in enumerate(self.rows):
             positions, seed = self.begin(row)
@@ -74,14 +76,14 @@ class TokenwiseReplayPrimitive(ABC):
                 self.overlay.reset()
 
             def layer(
-                ordinal: int, hidden: torch.Tensor, residual: torch.Tensor | None
+                ordinal: int, hidden: torch.Tensor, residual: torch.Tensor | None, kv: KV
             ) -> tuple[torch.Tensor, torch.Tensor]:
-                return self.layer(row, ordinal, positions, hidden, residual)
+                return self.layer(row, ordinal, positions, hidden, residual, kv)
 
             if selected:
                 entries = () if self.position is None else self.position.entry(())[1:]
                 hidden, saved = execute_route(
-                    program,
+                    program[row.phase.value],
                     seed,
                     positions,
                     torch.full((seed.shape[0], 1), row.phase.value == "decode", device=seed.device),
@@ -105,10 +107,10 @@ class TokenwiseReplayPrimitive(ABC):
 
 @dataclass(frozen=True, slots=True)
 class TokenwiseReplayTask(Generic[DataT]):
-    """One traced program and its publication-owned optional overlay transition."""
+    """Disjoint role programs and their publication-owned optional overlay transition."""
 
     task: SemanticTask
-    program: TokenProgram
+    program: dict[str, TokenProgram]
     domain: CausalModelDomain
     implementation_id: ImplementationId = TOKENWISE_REPLAY_IMPLEMENTATION
     operation: TensorOperation[DataT] | None = None

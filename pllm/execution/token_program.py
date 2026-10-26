@@ -5,6 +5,7 @@ from dataclasses import dataclass, field, replace
 from typing import Literal
 
 import torch
+from torch._dynamo.source import LocalSource
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
@@ -15,14 +16,16 @@ from pllm.execution.position_state import position_save
 from pllm.execution.shared_tensor import region_dtype
 
 Tokens = Literal["prefill", "decode", "all"]
+Over = Literal["token", "span"]
+KV = Literal["commit", "peek"]
 
 
 @torch.library.custom_op("pllm::layers", mutates_args=())
-def _layers(hidden: torch.Tensor, start: int, stop: int) -> list[torch.Tensor]:
+def _layers(hidden: torch.Tensor, start: int, stop: int, kv: str) -> list[torch.Tensor]:
     raise RuntimeError("call Layers only inside a @pllm.layer_route method")
 
 
-def _fake_layers(hidden: torch.Tensor, start: int, stop: int) -> list[torch.Tensor]:
+def _fake_layers(hidden: torch.Tensor, start: int, stop: int, kv: str) -> list[torch.Tensor]:
     return [torch.empty_like(hidden) for _ in range(start, stop)]
 
 
@@ -58,16 +61,19 @@ class Taps:
 
 @dataclass(frozen=True)
 class Layers:
-    """Run original model slices, writing the current token's KV; position stays on device."""
+    """Public model slices and position state used inside layer_route methods."""
 
     seed: torch.Tensor
     position: torch.Tensor
     layer_count: int
     generated: torch.Tensor
     entries: dict[str, torch.Tensor] = field(repr=False)
+    over: Over = "token"
 
     def load(self, name: str, offset: int = -1) -> torch.Tensor:
         """Read the previous token's state, even after a save in this token."""
+        if self.over == "span":
+            raise ValueError("use layers.load only in over=token routes; spans have no serial predecessor")
         if offset != -1:
             raise ValueError("use offset=-1 for PositionState")
         if name not in self.entries:
@@ -76,19 +82,30 @@ class Layers:
 
     def save(self, name: str, value: torch.Tensor) -> None:
         """Save a snapshot at this position; the last save wins."""
-        entry = self.load(name)
+        if name not in self.entries:
+            raise ValueError(f"declare PositionState {name!r} before saving it")
+        entry = self.entries[name]
         if value.shape != entry.shape or value.dtype != entry.dtype or value.device != entry.device:
             raise ValueError(f"save {name} with shape {tuple(entry.shape)} and dtype {entry.dtype}")
         position_save(value.clone(), name)
 
-    def __call__(self, start: int = 0, stop: int | None = None, hidden: torch.Tensor | None = None) -> Taps:
+    def __call__(
+        self, start: int = 0, stop: int | None = None, hidden: torch.Tensor | None = None, *, kv: KV = "commit"
+    ) -> Taps:
+        """Commit causal K/V, or peek at earlier committed positions plus fresh own K/V.
+
+        A peek leaves the cache untouched and requires an earlier commit to every
+        layer in this slice within the same route.
+        """
+        if kv not in ("commit", "peek"):
+            raise ValueError("set layers(kv=) to commit or peek")
         stop = self.layer_count if stop is None else stop
         if not 0 <= start < stop <= self.layer_count or hidden is None and start != 0:
             raise ValueError("use 0 <= start < stop <= layer_count and supply hidden when start > 0")
         value = self.seed if hidden is None else hidden
         if value.shape != self.seed.shape or value.dtype != self.seed.dtype or value.device != self.seed.device:
             raise ValueError("supply a hidden tensor with the model shape, dtype and device")
-        return Taps(tuple(_layers(value, start, stop)), start, self.layer_count)
+        return Taps(tuple(_layers(value, start, stop, kv)), start, self.layer_count)
 
     def apply_updates(self) -> None:
         """Apply operands captured since the previous boundary to this token's private overlay."""
@@ -103,6 +120,7 @@ class Segment:
     stop: int
     input: str
     taps: tuple[tuple[int, str], ...]
+    kv: KV = "commit"
 
 
 @dataclass(frozen=True)
@@ -141,9 +159,21 @@ def _tensor(node: torch.fx.Node) -> torch.Tensor:
     return value
 
 
-def _cell(nodes: list[torch.fx.Node]) -> Cell:
+def _cell(nodes: list[torch.fx.Node], over: Over) -> Cell:
+    # Recompute symbolic sizes in each fragment so route boundaries carry tensors only.
+    needed = set(nodes)
+    for node in reversed(tuple(nodes[0].graph.nodes)):
+        if node in needed:
+            needed.update(
+                arg for arg in node.all_input_nodes if arg.op == "call_function" and tensor_node_metadata(arg) is None
+            )
+    nodes = [node for node in nodes[0].graph.nodes if node in needed]
     inputs = tuple(dict.fromkeys(arg for node in nodes for arg in node.all_input_nodes if arg not in nodes))
-    outputs = tuple(node for node in nodes if any(user not in nodes for user in node.users))
+    outputs = tuple(
+        node
+        for node in nodes
+        if tensor_node_metadata(node) is not None and any(user not in nodes for user in node.users)
+    )
     graph = torch.fx.Graph()
     mapped = {node: graph.placeholder(node.name) for node in inputs}
     for node in nodes:
@@ -170,7 +200,12 @@ def _cell(nodes: list[torch.fx.Node]) -> Cell:
         )
         return tuple(value.squeeze(1) if row else value for value, row in zip(results, output_rows, strict=True))
 
-    return Cell(module, batched, tuple(node.name for node in inputs), tuple(node.name for node in outputs))
+    return Cell(
+        module,
+        per_row if over == "span" else batched,
+        tuple(node.name for node in inputs),
+        tuple(node.name for node in outputs),
+    )
 
 
 @dataclass(frozen=True)
@@ -183,6 +218,7 @@ class TokenProgram:
     generated: str
     entries: tuple[tuple[str, str], ...]
     prompt_pass_is_identity: bool = False
+    over: Over = "token"
 
     @classmethod
     def capture(
@@ -191,21 +227,31 @@ class TokenProgram:
         tensor: TensorType,
         layer_count: int,
         names: tuple[str, ...] = (),
+        over: Over = "token",
     ) -> "TokenProgram":
         """Trace on fake tensors; Torch rejects data-dependent Python control flow."""
 
         def invoke(
             seed: torch.Tensor, position: torch.Tensor, generated: torch.Tensor, *entries: torch.Tensor
         ) -> torch.Tensor:
-            result = function(Layers(seed, position, layer_count, generated, dict(zip(names, entries, strict=True))))
+            result = function(
+                Layers(seed, position, layer_count, generated, dict(zip(names, entries, strict=True)), over)
+            )
             if not isinstance(result, torch.Tensor):
                 raise ValueError("return a final-layer residual-stream tensor from your layer_route method")
             return result
 
-        with FakeTensorMode(shape_env=ShapeEnv()):
-            seed = torch.empty(tensor.shape, dtype=region_dtype(tensor.dtype), device=tensor.device)
-            position = torch.empty((1, 1), dtype=torch.int64, device=tensor.device)
-            generated = torch.empty((1, 1), dtype=torch.bool, device=tensor.device)
+        shapes = ShapeEnv()
+        rows = (
+            shapes.create_symintnode(shapes.create_symbol(2, LocalSource("rows")), hint=2, source=LocalSource("rows"))
+            if over == "span"
+            else tensor.shape[0]
+        )
+        with FakeTensorMode(shape_env=shapes):
+            shape = (rows, *tensor.shape[1:])
+            seed = torch.empty(shape, dtype=region_dtype(tensor.dtype), device=tensor.device)
+            position = torch.empty((shape[0], 1), dtype=torch.int64, device=tensor.device)
+            generated = torch.empty((shape[0], 1), dtype=torch.bool, device=tensor.device)
             graph = make_fx(
                 torch.func.functionalize(invoke),
                 decomposition_table=tensor_decompositions((torch.ops.aten.linalg_vector_norm.default,)),
@@ -213,6 +259,7 @@ class TokenProgram:
             )(seed, position, generated, *(torch.empty_like(seed) for _ in names))
             steps: list[Segment | Cell | ApplyUpdates | Save | Output] = []
             pending: list[torch.fx.Node] = []
+            committed: set[int] = set()
             placeholders = tuple(node.name for node in graph.graph.nodes if node.op == "placeholder")
             for node in graph.graph.nodes:
                 if node.target == torch.ops.higher_order.while_loop:
@@ -227,7 +274,7 @@ class TokenProgram:
                     or node.op == "output"
                 ):
                     if pending:
-                        steps.append(_cell(pending))
+                        steps.append(_cell(pending, over))
                         pending = []
                     if node.target == torch.ops.pllm.position_save.default:
                         value, name = node.args
@@ -246,8 +293,13 @@ class TokenProgram:
                             raise ValueError("return a residual stream with the model hidden shape and dtype")
                         steps.append(Output(result.name))
                     else:
-                        hidden, start, stop = node.args
+                        hidden, start, stop, kv = node.args
                         assert isinstance(hidden, torch.fx.Node) and type(start) is int and type(stop) is int
+                        assert kv in ("commit", "peek")
+                        if kv == "peek" and not set(range(start, stop)) <= committed:
+                            raise ValueError("commit every layer in a slice before calling it with kv=peek")
+                        if kv == "commit":
+                            committed.update(range(start, stop))
                         steps.append(
                             Segment(
                                 start,
@@ -258,6 +310,7 @@ class TokenProgram:
                                     for projection in node.users
                                     if projection.users and type(projection.args[1]) is int
                                 ),
+                                kv,
                             )
                         )
                 elif node.op != "placeholder" and not any(
@@ -270,6 +323,7 @@ class TokenProgram:
             placeholders[1],
             placeholders[2],
             tuple(zip(names, placeholders[3:], strict=True)),
+            over=over,
         )
 
         return replace(program, prompt_pass_is_identity=program._prompt_identity(layer_count))

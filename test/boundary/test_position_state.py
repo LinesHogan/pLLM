@@ -60,7 +60,8 @@ def test_unsupported_transfer():
         KVOffload(connector="LMCacheConnectorV1")
 
 
-def test_span_saves_every_page_and_fills_unselected_generated_pages():
+@pytest.mark.parametrize("span", (False, True))
+def test_span_saves_every_page_and_fills_unselected_generated_pages(span):
     from unittest.mock import patch
 
     from pllm.backends.vllm.replay import VllmTokenwiseReplay
@@ -74,7 +75,7 @@ def test_span_saves_every_page_and_fills_unselected_generated_pages():
         position_layers=(layer,),
         allocation=2,
         effect=TokenProgramEffect(3, "prefill", (("history", 2.0),)),
-        program=SimpleNamespace(prompt_pass_is_identity=True, steps=(Save("history", "tap"),)),
+        program={"prefill": SimpleNamespace(prompt_pass_is_identity=not span, steps=(Save("history", "tap"),))},
     )
     for start, stop in ((0, 8), (8, 12)):
         rows = tuple(
@@ -82,7 +83,7 @@ def test_span_saves_every_page_and_fills_unselected_generated_pages():
                 ROWS.rows[0],
                 packed_row_index=i - start,
                 token_offset=i,
-                phase=HiddenPhase.PREFILL if i < 3 else HiddenPhase.DECODE,
+                phase=HiddenPhase.PREFILL if span or i < 3 else HiddenPhase.DECODE,
             )
             for i in range(start, stop)
         )
@@ -93,5 +94,12 @@ def test_span_saves_every_page_and_fills_unselected_generated_pages():
         context = SimpleNamespace(attn_metadata={"carry": metadata}, slot_mapping={"carry": slots})
         hidden = torch.arange(start * 4, stop * 4, dtype=torch.float32).reshape(-1, 4)
         with patch("pllm.backends.vllm.replay.get_forward_context", return_value=context):
-            VllmTokenwiseReplay.save_span(replay, rows, (rows,), torch.tensor([0]), hidden)
-    torch.testing.assert_close(cache.view(6, 4), torch.tensor([[4.0, 5.0, 6.0, 7.0], *([[8.0, 9.0, 10.0, 11.0]] * 5)]))
+            VllmTokenwiseReplay.save_span(
+                replay, rows, (rows,), torch.tensor([0]), hidden, {"history": hidden} if span else {}
+            )
+    torch.testing.assert_close(
+        cache.view(6, 4),
+        torch.arange(48, dtype=torch.float32).reshape(12, 4)[1::2]
+        if span
+        else torch.tensor([[4.0, 5.0, 6.0, 7.0], *([[8.0, 9.0, 10.0, 11.0]] * 5)]),
+    )

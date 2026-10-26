@@ -32,4 +32,5 @@ class FlashAttentionMetadata:
     rswa_window_tensor: torch.Tensor | None = ...
 
 class FlashAttentionImpl:
+    scale: float
     vllm_flash_attn_version: int | None

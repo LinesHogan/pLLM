@@ -12,6 +12,7 @@ from pllm.workloads.lora import OutputLoRAConfig as OutputLoRAConfig, OutputLoRA
 from pllm.workloads.override import OverRIDEConfig as OverRIDEConfig, OverRIDEWorkload as OverRIDEWorkload
 from pllm.workloads.prefill_adapters import PrefillAdapters as PrefillAdapters
 from pllm.workloads.recirculation import (
+    JacobiRecirculation as JacobiRecirculation,
     RecirculationWorkload as RecirculationWorkload,
 )
 from pllm.workloads.reft import ActivationConfig as ActivationConfig, ActivationWorkload as ActivationWorkload

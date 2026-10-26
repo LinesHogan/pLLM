@@ -64,14 +64,14 @@ def record_steps(handle):
                     len(active),
                 )
 
-    def saved(self, rows, groups, requests, hidden):
+    def saved(self, rows, groups, requests, hidden, saved_values):
         for lane, row in enumerate(rows):
             records[external(row), row.token_offset] = (
                 hidden[lane : lane + 1].clone(),
                 self.output[row.packed_row_index : row.packed_row_index + 1].clone(),
                 len(rows),
             )
-        return span(self, rows, groups, requests, hidden)
+        return span(self, rows, groups, requests, hidden, saved_values)
 
     forward = primitive.model.forward
     oracle = Oracle(handle.runner.model, handle.runner.require_session()._replay.domain.positions)
@@ -532,7 +532,7 @@ def main():
             if external(row) not in entered:
                 entered[external(row)] = previous.clone()
 
-    def span_saved(self, rows, groups, requests, hidden):
+    def span_saved(self, rows, groups, requests, hidden, saved_values):
         provider = self.position
         for group in groups:
             row = group[0]
@@ -552,7 +552,7 @@ def main():
                 self.output[row.packed_row_index : row.packed_row_index + 1].clone(),
                 len(rows),
             )
-        return save_span(self, rows, groups, requests, hidden)
+        return save_span(self, rows, groups, requests, hidden, saved_values)
 
     def replayed(graph):
         replay(graph)

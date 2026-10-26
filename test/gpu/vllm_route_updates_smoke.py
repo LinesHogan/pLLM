@@ -135,7 +135,7 @@ def run(chunk):
             adapter.reset()
         context = capture.attention.context
 
-        def layer(ordinal, hidden, residual):
+        def layer(ordinal, hidden, residual, kv="commit"):
             entries = hidden.clone(), None if residual is None else residual.clone()
             deltas = (
                 tuple(

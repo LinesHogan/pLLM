@@ -188,7 +188,7 @@ class Builder(Generic[D]):
         self.publications: dict[TaskSymbol, PublishStateTask[D]] = {}
         self.host_operations: dict[TaskSymbol, HostOperation[D]] = {}
         self.resources = resources
-        self.route_program: TokenProgram | None = None
+        self.route_program: dict[str, TokenProgram] | None = None
         self.overlay_math: OverlayTransition | None = None
         self.route_updates = False
         self.route_rows = 0
