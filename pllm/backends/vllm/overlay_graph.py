@@ -402,14 +402,16 @@ class PinnedParameterOverlay:
                     tuple(next(ref for ref in pin.refs if context.arena.root(ref).resource == resource) for pin in pins)
                 )
             else:
-                refs = StateRefs.of(
-                    tuple(
-                        context.current_owned_ref(context.selection.ref_for(row.identity, resource))
-                        for row in self.sources
-                    )
+                # Resolve every request at once: decode replays prepare this table before each graph launch.
+                index = dict(
+                    zip((row.identity for row in context.selection.rows), selection.state_indices, strict=True)
                 )
+                entry = tuple(context.selection.refs[index[row.identity]] for row in self.sources)
+                refs = StateRefs.of(context.current_owned_refs(entry))
+                published = tuple(ref for ref, original in zip(refs, entry, strict=True) if ref != original)
+                borrowed = context.borrow_published(published) if published else context.pin
                 pins = tuple(
-                    context.pin if ref in context.pin.refs else context.borrow_published((ref,)) for ref in refs
+                    context.pin if ref == original else borrowed for ref, original in zip(refs, entry, strict=True)
                 )
             _, slots = context.arena.slots(pins, refs)
             self.updated_apply_count += int(np.diff(np.append(self.starts, rows.total_rows)) @ (refs.versions > 0))

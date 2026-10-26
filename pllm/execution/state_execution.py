@@ -160,12 +160,21 @@ class StateTaskContext(Generic[DataT]):
     def current_owned_ref(self, original: StateRef) -> StateRef:
         if original not in self.pin.refs:
             raise ValueError("state lineage is outside this invocation's original pin")
-        current = original
+        return self.current_owned_refs((original,))[0]
+
+    def current_owned_refs(self, originals: Sequence[StateRef]) -> tuple[StateRef, ...]:
+        """Follow this invocation's publications from each ref, walking the receipts once for the whole batch."""
+        successor: dict[StateRef, StateRef] = {}
         for receipt in self.page_publications:
             for before, after in zip(receipt.before_refs, receipt.after_refs, strict=True):
-                if before == current:
-                    current = after
-        return current
+                successor.setdefault(before, after)
+
+        def latest(ref: StateRef) -> StateRef:
+            while ref in successor:
+                ref = successor[ref]
+            return ref
+
+        return tuple(map(latest, originals))
 
     def check_page_execution(self) -> None:
         if self.release is not None:
@@ -177,7 +186,7 @@ class StateTaskContext(Generic[DataT]):
         self, sources: tuple[StateRef, ...], fields: tuple[tuple[LayoutFieldId, ...], ...]
     ) -> PageWrite:
         self.check_page_execution()
-        authorized = {self.current_owned_ref(ref) for ref in self.pin.refs}
+        authorized = set(self.current_owned_refs(self.pin.refs))
         if not set(sources) <= authorized:
             raise ValueError("transition must extend this invocation's exact owned versions")
         token = self.arena.prepare_transition(sources, self.pin.stream, fields=fields, copy_fields=())
