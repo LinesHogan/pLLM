@@ -29,7 +29,7 @@ from pllm.contracts.region_streams import RegionStateWindow
 from pllm.contracts.state_ref import LineageId, StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.host_borrow import HostResourceView, validate_host_views
-from pllm.execution.paged_access import PagedResourceView, validate_paged_views
+from pllm.execution.paged_access import PagedResourceView
 from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin, PagePublication, PageRelease, PageWrite
 from pllm.execution.region_frame import Routes
 from pllm.execution.region_values import Bank, Data, check_data
@@ -173,7 +173,7 @@ class PinnedResourceBinding:
         view.validate()
         return cls(view, owner)
 
-    def validate(self, program: Program, paged: tuple[PagedResourceView, ...]) -> None:
+    def validate(self, program: Program) -> None:
         if self.view.owner is not self.owner:
             raise ValueError("pinned view belongs to another invocation")
         name = self.view.resource.name
@@ -182,9 +182,6 @@ class PinnedResourceBinding:
                 accesses = tuple(access for access in function.accesses if access.resource == name)
                 if not accesses or any(access.mode is not AccessMode.READ for access in accesses):
                     raise ValueError("pinned resources require explicit READ effects only")
-        # The pin proves the arena overlap; the existing writable-alias check
-        # remains mandatory. Ordinary readonly validation below is unchanged.
-        validate_readonly_views((self.view,), paged, ())
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,20 +306,18 @@ class RegionResources:
         ):
             raise ValueError("borrowed resource proof belongs to different source storage or invocation")
         if views:
-            paged = tuple(binding.view for binding in borrows if isinstance(binding, PagedResourceBinding))
             readonly = tuple(binding.view for binding in borrows if isinstance(binding, ReadonlyResourceBinding))
             host = tuple(binding.view for binding in borrows if isinstance(binding, HostResourceBinding))
             mutable: tuple[tuple[str, int, int], ...] = ()
             for binding in borrows:
                 if isinstance(binding, TensorResourceBinding):
                     mutable += binding.view.validate((*owner.arena.allocation_ranges, *mutable))
-            validate_paged_views(paged, (*owner.arena.allocation_ranges, *mutable))
-            validate_readonly_views(readonly, paged, (*owner.arena.allocation_ranges, *mutable))
+            validate_readonly_views(readonly, (*owner.arena.allocation_ranges, *mutable))
             validate_host_views(host)
             for binding in borrows:
                 if isinstance(binding, PinnedResourceBinding):
-                    binding.validate(program, paged)
-                    validate_readonly_views((binding.view,), paged, mutable)
+                    binding.validate(program)
+                    validate_readonly_views((binding.view,), mutable)
         self._borrows = views
         self._readonly = tuple(view for view in views.values() if isinstance(view, ReadonlyTensorView))
         external_names = {r.name for r in program.resources if isinstance(r, (ExternalResource, BorrowedResource))}

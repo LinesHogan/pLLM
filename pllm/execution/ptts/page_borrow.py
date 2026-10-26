@@ -48,7 +48,7 @@ class BorrowedStateRoot:
     def claim(self, protected: tuple[tuple[str, int, int], ...]) -> None:
         if self._claimed or self._view is None:
             raise RuntimeError("borrowed root is closed or already staged")
-        validate_readonly_views((self._view,), (), protected)
+        validate_readonly_views((self._view,), protected)
         self._claimed = True
 
     def bind(self, pin: PagePin) -> None:
@@ -67,7 +67,7 @@ class BorrowedStateRoot:
         if self._view is None:
             raise RuntimeError("borrowed root is closed")
         storage = tensor.untyped_storage()
-        validate_readonly_views((self._view,), (), ((str(tensor.device), storage.data_ptr(), storage.nbytes()),))
+        validate_readonly_views((self._view,), ((str(tensor.device), storage.data_ptr(), storage.nbytes()),))
 
     def discard(self) -> None:
         """End all aliases during terminal consumer cleanup without acknowledging success."""

@@ -35,7 +35,6 @@ from pllm.backends.vllm.sampler import (
 from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
-    DecodeWindow,
     SignedBackendAttachment,
 )
 from pllm.contracts.hidden_locator import HiddenPhase
@@ -147,8 +146,10 @@ class VllmSession(Generic[DataT, ResultT]):
             if (attachment.inputs.request.activation_bindings)
             else None
         )
-        self._decode_injection = any(
-            binding.decode is DecodeWindow.ALL for binding in attachment.inputs.request.activation_bindings
+        # Recomputing history after preemption would rerun model-side effects on today's state, not the
+        # state each position originally saw, so these workloads need every token computed exactly once.
+        self._unbroken_history = bool(
+            attachment.inputs.request.overlay_bindings or attachment.inputs.request.activation_bindings
         )
         self._token_frontiers: dict[RequestIdentity, int] = {}
         self._feed: FeedReceiver | None = None
@@ -291,11 +292,6 @@ class VllmSession(Generic[DataT, ResultT]):
         self._require_input_live()
         if self._step is not None:
             raise RuntimeError("prior vLLM workload step is still active")
-        if self._decode_injection and (
-            scheduler_output.preempted_req_ids or scheduler_output.scheduled_cached_reqs.resumed_req_ids
-        ):
-            self._input_failed = True
-            raise RuntimeError("activation injection needs requests without vLLM preemption")
         execution = self._deployment.execution
         execution.arena.collect_completed()
         finished = tuple(
@@ -331,11 +327,13 @@ class VllmSession(Generic[DataT, ResultT]):
             raise ValueError("backend rows differ from the original execution step")
         if rows.row_batch.total_rows > self.attachment.inputs.probe.max_packed_rows:
             raise ValueError("packed input exceeds the signed backend row capacity")
-        if self._decode_injection:
+        if self._unbroken_history:
             if any(row.token_offset < self._token_frontiers.get(row.identity, 0) for row in rows.row_batch.rows):
                 self._input_failed = True
                 raise RuntimeError(
-                    "per-decode activation injection and vLLM preemption/history recomputation cannot be enabled together"
+                    "vLLM preempted a request and would recompute its history, but this workload's parameter "
+                    "overlays or activation patches cannot replay past tokens; give vLLM more KV cache "
+                    "(gpu_memory_utilization) or fewer concurrent sequences (max_num_seqs)"
                 )
             for row in rows.row_batch.rows:
                 self._token_frontiers[row.identity] = max(

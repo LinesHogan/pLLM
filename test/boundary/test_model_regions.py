@@ -21,7 +21,6 @@ from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend, FlashAt
 
 from pllm.backends.vllm.region_attention import (
     attention_paged_access,
-    select_attention_metadata,
     validate_attention_resources,
 )
 from pllm.backends.vllm.region_layers import VllmDecoderBodies, decoder_partition_bodies
@@ -218,10 +217,7 @@ def test_decoder_binds_request_and_token_for_symbolic_kv_access():
     hidden = torch.arange(4, dtype=torch.float32).reshape(1, 4)
     for request, token in ((0, 0), (1, 7), (0, 3)):
         row = replace(rows[0], request_ordinal=request, token_offset=token)
-        caches = tuple(
-            PagedLayer(str(i), torch.zeros(2, 1, 8, 4), torch.tensor([[0], [1]]), torch.tensor([request * 8 + token]))
-            for i in layers
-        )
+        caches = tuple(PagedLayer(str(i), torch.zeros(2, 1, 8, 4), torch.tensor([request * 8 + token])) for i in layers)
         view = PagedResourceView(
             decoder.source.kv, bind_paged_access((row,), caches), tuple((i, str(i)) for i in layers)
         )
@@ -270,14 +266,8 @@ def test_original_attention_resource_binds_without_a_model():
     context = ForwardContext({name: attention}, {name: metadata}, {name: slots})
     batch = paged_rows((16, 17, 16, 17))
     access = attention_paged_access(context, (attention,), batch)
-    selected, cache, block, offset = select_attention_metadata(
-        context, attention, batch[2], 17, torch.tensor([0, 1, 17], dtype=torch.int32), access
-    )
-    assert cache is attention.kv_cache and (block, offset) == (2, 0)
-    torch.testing.assert_close(selected.slot_mapping, slots[2:3])
-    torch.testing.assert_close(selected.block_table, metadata.block_table[1:])
-    assert selected.seq_lens.tolist() == [17] and selected.num_actual_tokens == 1
-    assert context.attn_metadata[name] is metadata and metadata.num_actual_tokens == 4
+    block, offset = access.cell(name, batch[2])
+    assert (block.tolist(), offset.tolist()) == ([2], [0])
     with pytest.raises(ValueError):  # Non-causal attention cannot expose ordinary paged KV.
         attention_paged_access(
             replace(context, attn_metadata={name: replace(metadata, causal=False)}), (attention,), batch

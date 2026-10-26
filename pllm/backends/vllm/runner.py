@@ -305,6 +305,7 @@ class WorkloadModelRunner(Runner[Sampler | None], OverlayGraphRunner):
             session.prepare_input(
                 encode_mrv2_rows(
                     input_batch,
+                    self.req_states.prompt_len.np[input_batch.idx_mapping_np],
                     tuple(session.identity(request_id) for request_id in input_batch.req_ids),
                     plan_epoch=session.attachment.physical.plan_epoch,
                     step_id=session.next_step_id,

@@ -188,13 +188,11 @@ def _session(b, execution):
     return VllmSession(deployment, model, None, 2), model, deployment
 
 
-def _scheduler(*identities, preempted=(), resumed=()):
+def _scheduler(*identities):
     from vllm import SamplingParams
 
     return SimpleNamespace(
         finished_req_ids=set(),
-        preempted_req_ids=set(preempted),
-        scheduled_cached_reqs=SimpleNamespace(resumed_req_ids=set(resumed)),
         scheduled_new_reqs=tuple(
             SimpleNamespace(req_id=identity.request_id, sampling_params=SamplingParams(n=1)) for identity in identities
         ),

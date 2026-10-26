@@ -88,11 +88,8 @@ class Decoder(TokenwiseReplayPrimitive):
         return self.batch.rows
 
     def bind_kv(self, resource, owner):
-        table = torch.arange(self.cache.shape[0]).reshape(-1, 1)
         slots = torch.tensor([row.request_ordinal * self.cache.shape[2] + row.token_offset for row in self.rows])
-        layers = tuple(
-            PagedLayer(str(i), self.cache[:, i].unsqueeze(1), table, slots) for i in range(self.cache.shape[1])
-        )
+        layers = tuple(PagedLayer(str(i), self.cache[:, i].unsqueeze(1), slots) for i in range(self.cache.shape[1]))
         plan = bind_paged_access(self.rows, layers)
         return PagedResourceBinding(
             PagedResourceView(resource, plan, tuple((i, str(i)) for i in range(len(layers)))), owner

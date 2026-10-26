@@ -1,5 +1,6 @@
 """Concrete MRv2 ABI checks followed by the original Rust row plan."""
 
+import numpy as np
 import torch
 from vllm import __version__ as _VLLM_VERSION
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -18,8 +19,14 @@ from pllm.contracts.request_identity import RequestIdentity
 
 
 def encode_mrv2_rows(
-    input_batch: InputBatch, identities: tuple[RequestIdentity, ...], *, plan_epoch: int, step_id: int
+    input_batch: InputBatch,
+    prompt_lengths: np.ndarray,
+    identities: tuple[RequestIdentity, ...],
+    *,
+    plan_epoch: int,
+    step_id: int,
 ) -> PackedSamplerRowBatch:
+    """Label rows against each request's prompt; vLLM's prefill length also covers recomputed output history."""
     if _VLLM_VERSION != "0.27.1":
         raise RuntimeError("canonical MRv2 packed rows require vLLM 0.27.1 exactly")
     if type(input_batch) is not InputBatch:
@@ -39,6 +46,7 @@ def encode_mrv2_rows(
                 input_batch.prefill_len_np,
                 input_batch.num_computed_tokens_np,
                 input_batch.is_prefilling_np,
+                prompt_lengths,
             )
         )
         or len(input_batch.cu_num_logits_np) != count + 1
@@ -57,12 +65,12 @@ def encode_mrv2_rows(
     if any(int(value) != index for index, value in enumerate(input_batch.cu_num_logits_np)):
         raise RuntimeError("canonical MRv2 adapter requires exactly one sampler row per request")
     scheduled = [int(value) for value in input_batch.num_scheduled_tokens]
-    prompt = [int(value) for value in input_batch.prefill_len_np]
+    prompt = [int(value) for value in prompt_lengths]
     computed = [int(value) for value in input_batch.num_computed_tokens_np]
     if any(
         tokens < 1 or bool(prefilling) != (done < length)
         for tokens, length, done, prefilling in zip(
-            scheduled, prompt, computed, input_batch.is_prefilling_np, strict=True
+            scheduled, input_batch.prefill_len_np, computed, input_batch.is_prefilling_np, strict=True
         )
     ):
         raise RuntimeError("vLLM MRv2 InputBatch request columns do not match the signed ABI")

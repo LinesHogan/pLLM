@@ -310,11 +310,8 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
             self._buffers = TokenAttentionBuffers(context, attentions, self._capacity)
             self._identity = identity
         assert self._buffers is not None
-        lengths = torch.tensor(
-            [row.token_offset + 1 for row in self._rows], dtype=torch.int32, device=self._hidden.device
-        )
-        bindings = self._buffers.bind(context, attentions, lengths)
-        return bindings
+        assert self._positions is not None
+        return self._buffers.bind(context, attentions, self._positions + 1)
 
     def _prepare_activations(self, invocation: RegionInvocation) -> None:
         """Bind exact pins once and route captured field reads through owned staging."""
@@ -338,14 +335,14 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         )
         assert self._access is not None
         attentions = tuple(layer.self_attn.attn for layer in self.model.layers)
-        slots = tuple((attention.kv_cache, *self._access.slot(attention.layer_name, row)) for attention in attentions)
-        saved = tuple(cache[block, :, offset, :].clone() for cache, block, offset in slots)
+        cells = tuple((attention.kv_cache, *self._access.cell(attention.layer_name, row)) for attention in attentions)
+        saved = tuple(cache[block, :, offset, :] for cache, block, offset in cells)
         try:
             with override_forward_context(self._buffers.context):
                 capture = RegionTokenCapture(invocation, instances, self._hidden.device)
         finally:
-            for (cache, block, offset), value in zip(slots, saved, strict=True):
-                cache[block, :, offset, :].copy_(value)
+            for (cache, block, offset), value in zip(cells, saved, strict=True):
+                cache[block, :, offset, :] = value
         if self.overlay is not None:
             self.overlay.reset()
         resident = sum(item.resident_bytes for item in self._captures.values()) + capture.resident_bytes

@@ -151,10 +151,12 @@ class OverlayGraphRunner(GPUModelRunner):
             indices = np.fromiter(
                 (self.req_states.req_id_to_index[key] for key in scheduler_output.num_scheduled_tokens), np.int64
             )
-            prefill = self.req_states.num_computed_tokens_np[indices] < self.req_states.prefill_len.np[indices]
+            start = self.req_states.num_computed_tokens_np[indices]
+            end = start + np.fromiter(scheduler_output.num_scheduled_tokens.values(), np.int64)
+            prompt = self.req_states.prompt_len.np[indices]
             manager.eager = bool(
-                (HiddenPhase.PREFILL in manager.phases and prefill.any())
-                or (HiddenPhase.DECODE in manager.phases and (~prefill).any())
+                (HiddenPhase.PREFILL in manager.phases and (start < prompt).any())
+                or (HiddenPhase.DECODE in manager.phases and (end > prompt).any())
             )
             assert self.projection_model is not None
             self.projection_model.do_not_compile = manager.eager

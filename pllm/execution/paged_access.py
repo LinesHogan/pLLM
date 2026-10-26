@@ -1,13 +1,13 @@
-"""Bind causal logical accesses to borrowed paged tensors before any KV write.
+"""Bind causal logical accesses to borrowed paged KV tensors before any KV write.
 
-This is an invocation's physical access evidence, not a page owner or a runtime
-scheduler. The backend must keep its original cache and page tables stable until
-the original invocation completes. Shared read-only prefixes are permitted.
+Used by the tokenwise replay backend and region resources. This is an
+invocation's logical access record, not a page owner or a runtime scheduler.
+The backend must keep its cache and page tables stable until the invocation
+completes.
 """
 
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
-from heapq import heappop, heappush
+from dataclasses import dataclass
 from types import MappingProxyType
 
 import torch
@@ -21,59 +21,25 @@ from pllm.contracts.request_identity import RequestIdentity
 class PagedLayer:
     name: str
     cache: torch.Tensor
-    block_table: torch.Tensor
     slots: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
-class CausalAccess:
-    """One logical interval and its exact strided byte projection for one head."""
-
-    layer: str
-    request: RequestIdentity
-    head: int
-    first: int
-    count: int
-    device: str
-    address: int
-    stride: int
-    width: int
-
-    @property
-    def end(self) -> int:
-        return self.address + (self.count - 1) * self.stride + self.width
-
-    def conflicts(self, write: "CausalAccess") -> bool:
-        # A current-token write is contiguous. Find which strided read cells it
-        # intersects without expanding the history into individual token nodes.
-        first = max(0, (write.address - self.width - self.address) // self.stride + 1)
-        last = min(self.count - 1, (write.end - 1 - self.address) // self.stride)
-        if first > last:
-            return False
-        return not (
-            first == last
-            and self.layer == write.layer
-            and self.request == write.request
-            and self.head == write.head
-            and self.first + first == write.first
-            and self.address + first * self.stride == write.address
-            and self.width == write.width
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class PagedAccessPlan:
-    reads: tuple[CausalAccess, ...]
-    writes: tuple[CausalAccess, ...]
-    _slots: Mapping[tuple[str, int], tuple[PackedPhaseRow, int, int]]
-    layers: tuple[str, ...]
+    """One invocation's logical KV intervals and the device write slot of every packed row.
+
+    Page tables and slot mappings come from vLLM's own allocator and stay on the device;
+    like the attention kernels, the plan trusts their contents and checks only the rows.
+    """
+
+    layers: Mapping[str, PagedLayer]
     ranges: Mapping[tuple[str, int], tuple[int, int]]
 
-    def slot(self, layer: str, row: PackedPhaseRow) -> tuple[int, int]:
-        original, block, offset = self._slots[(layer, row.packed_row_index)]
-        if original != row:
-            raise ValueError("KV access differs from the original packed row")
-        return block, offset
+    def cell(self, layer: str, row: PackedPhaseRow) -> tuple[torch.Tensor, torch.Tensor]:
+        """Device block and offset indices of the row's KV write, shaped (1,) to avoid host reads."""
+        paged = self.layers[layer]
+        slot = paged.slots[row.packed_row_index : row.packed_row_index + 1].long()
+        return slot // paged.cache.shape[2], slot % paged.cache.shape[2]
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,60 +90,9 @@ class PagedResourceView:
                     raise ValueError("paged resource access exceeds its original read/write interval")
 
 
-def validate_paged_views(views: tuple[PagedResourceView, ...], protected: tuple[tuple[str, int, int], ...]) -> None:
-    """Check separation between resource names and every original arena allocation."""
-    if len(views) > 1:
-        reads = tuple(
-            replace(access, layer=str((view.resource.name, access.layer)))
-            for view in views
-            for access in view.plan.reads
-        )
-        writes = tuple(
-            replace(access, layer=str((view.resource.name, access.layer)))
-            for view in views
-            for access in view.plan.writes
-        )
-        _validate_aliases(reads, writes)
-    for view in views:
-        for access in (*view.plan.reads, *view.plan.writes):
-            if any(
-                device == access.device and start < access.end and access.address < start + size
-                for device, start, size in protected
-            ):
-                raise ValueError("borrowed paged access overlaps original arena storage")
-
-
-def _validate_aliases(reads: tuple[CausalAccess, ...], writes: tuple[CausalAccess, ...]) -> None:
-    # Sweep physical envelopes, then use exact strided intersection within the
-    # overlapping pages. This handles HND/NHD and layers interleaved in one root.
-    accesses = (*reads, *writes)
-    devices = {access.device for access in accesses}
-    for device in devices:
-        ordered = sorted((access.address, index) for index, access in enumerate(accesses) if access.device == device)
-        active: dict[int, CausalAccess] = {}
-        active_writes: dict[int, CausalAccess] = {}
-        ends: list[tuple[int, int]] = []
-        for address, index in ordered:
-            while ends and ends[0][0] <= address:
-                _, expired = heappop(ends)
-                active.pop(expired, None)
-                active_writes.pop(expired, None)
-            access = accesses[index]
-            if index >= len(reads):
-                if any(other.conflicts(access) for other in active.values()):
-                    raise ValueError("KV write aliases a different logical layer, request, head or token")
-                active_writes[index] = access
-            elif any(access.conflicts(write) for write in active_writes.values()):
-                raise ValueError("KV history aliases another logical token's write")
-            active[index] = access
-            heappush(ends, (access.end, index))
-
-
 def bind_paged_access(rows: tuple[PackedPhaseRow, ...], layers: tuple[PagedLayer, ...]) -> PagedAccessPlan:
-    """Verify page/slot agreement and writable-cell separation for this invocation.
+    """Check that each request's rows are consecutive positions and record their intervals.
 
-    Cache payloads are borrowed. Only integer metadata is copied to the host,
-    once per distinct table/view, and histories stay compressed as page spans.
     A layer reads [0, token) and replaces token; its read of the newly written
     current KV happens within that same layer call.
     """
@@ -198,92 +113,15 @@ def bind_paged_access(rows: tuple[PackedPhaseRow, ...], layers: tuple[PagedLayer
         limits[row.request_ordinal] = row.token_offset + 1
     if any(not layer.name for layer in layers) or len({layer.name for layer in layers}) != len(layers):
         raise ValueError("paged layers require distinct logical names")
-    hosts: dict[tuple[str, int, tuple[int, ...], tuple[int, ...], torch.dtype], torch.Tensor] = {}
-
-    def host(value: torch.Tensor) -> torch.Tensor:
-        if value.dtype not in (torch.int32, torch.int64):
-            raise ValueError("page tables and slots require integer metadata")
-        key = (str(value.device), value.data_ptr(), tuple(value.shape), tuple(value.stride()), value.dtype)
-        if key not in hosts:
-            hosts[key] = value.detach().cpu()
-        return hosts[key]
-
-    reads: list[CausalAccess] = []
-    writes: list[CausalAccess] = []
-    slots: dict[tuple[str, int], tuple[PackedPhaseRow, int, int]] = {}
-    for layer in layers:
-        cache = layer.cache
-        if cache.ndim != 4 or min(cache.shape) < 1 or cache.stride(3) != 1:
-            raise ValueError("paged access requires packed contiguous KV content lanes")
-        extent = 1
-        for stride, size in sorted(zip(cache.stride(), cache.shape, strict=True)):
-            if size > 1 and stride < extent:
-                raise ValueError("paged KV layout has overlapping logical elements")
-            extent += (size - 1) * stride
-        if layer.block_table.ndim != 2 or layer.slots.ndim != 1:
-            raise ValueError("paged access requires a request block table and packed slot vector")
-        blocks, heads, block_size, content = cache.shape
-        request_count = max(limits, default=-1) + 1
-        page_count = max(((length + block_size - 1) // block_size for length in limits.values()), default=0)
-        table = host(layer.block_table[:request_count, :page_count])
-        mapping = host(layer.slots[: max(row_ids, default=-1) + 1])
-        element = cache.element_size()
-        base, device = cache.data_ptr(), str(cache.device)
-        strides = cache.stride()
-
-        def access(request: int, head: int, first: int, count: int, block: int, offset: int) -> CausalAccess:
-            return CausalAccess(
-                layer.name,
-                identities[request],
-                head,
-                first,
-                count,
-                device,
-                base + element * (block * strides[0] + head * strides[1] + offset * strides[2]),
-                (strides[2] if block_size > 1 else content) * element,
-                content * element,
-            )
-
-        pages: dict[int, tuple[int, ...]] = {}
-        for request, length in limits.items():
-            count = (length + block_size - 1) // block_size
-            if request >= table.shape[0] or count > table.shape[1]:
-                raise ValueError("KV history exceeds its original request page table")
-            physical = tuple(int(value.item()) for value in table[request, :count])
-            if any(not 0 <= block < blocks for block in physical):
-                raise ValueError("KV page table names a block outside the original cache")
-            if len(set(physical)) != len(physical):
-                raise ValueError("one request aliases different logical KV pages")
-            pages[request] = physical
-            # Union of every causal read in this batch: the longest prefix.
-            # Include the current cell as a same-identity read for backup/restore.
-            for logical, block in enumerate(physical):
-                first = logical * block_size
-                count = min(block_size, length - first)
-                reads.extend(access(request, head, first, count, block, 0) for head in range(heads))
-        for row in rows:
-            if row.packed_row_index >= mapping.shape[0]:
-                raise ValueError("packed KV slot is outside the original mapping")
-            physical = pages[row.request_ordinal]
-            page, offset = divmod(row.token_offset, block_size)
-            block = physical[page]
-            if int(mapping[row.packed_row_index].item()) != block * block_size + offset:
-                raise ValueError("KV write slot differs from its causal page-table position")
-            slots[(layer.name, row.packed_row_index)] = (row, block, offset)
-            writes.extend(
-                access(row.request_ordinal, head, row.token_offset, 1, block, offset) for head in range(heads)
-            )
-    ranges: dict[tuple[str, int], tuple[int, int]] = {}
-    for (layer_name, _), (row, _, _) in slots.items():
-        key = (layer_name, row.request_ordinal)
-        first, end = ranges.get(key, (row.token_offset, row.token_offset + 1))
-        ranges[key] = (min(first, row.token_offset), max(end, row.token_offset + 1))
-    result = PagedAccessPlan(
-        tuple(reads),
-        tuple(writes),
-        MappingProxyType(slots),
-        tuple(layer.name for layer in layers),
-        MappingProxyType(ranges),
+    if any(layer.cache.ndim != 4 or layer.slots.ndim != 1 for layer in layers):
+        raise ValueError("paged access requires [blocks, heads, block, content] KV and a packed slot vector")
+    intervals: dict[int, tuple[int, int]] = {}
+    for row in rows:
+        first, end = intervals.get(row.request_ordinal, (row.token_offset, row.token_offset + 1))
+        intervals[row.request_ordinal] = (min(first, row.token_offset), max(end, row.token_offset + 1))
+    return PagedAccessPlan(
+        MappingProxyType({layer.name: layer for layer in layers}),
+        MappingProxyType(
+            {(layer.name, request): interval for layer in layers for request, interval in intervals.items()}
+        ),
     )
-    _validate_aliases(result.reads, result.writes)
-    return result

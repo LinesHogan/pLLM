@@ -1424,7 +1424,7 @@ class Workload(
 
         def rows(value: TensorStepInput) -> tuple[PackedPhaseRow, ...]:
             _reject(
-                row_limit is not None and len(value.rows.decode_rows) > row_limit,
+                row_limit is not None and len(value.rows.latest_decode_rows) > row_limit,
                 "operation rows exceed the signed workspace envelope",
             )
             _reject(
@@ -1439,7 +1439,7 @@ class Workload(
                 return value.rows.rows if b.graph.states[0].scope is StateScope.REQUEST else ()
             if b.attachment is not None and b.attachment.kind is AttachmentKind.MODEL_REPLAY:
                 return ()
-            return value.rows.request_rows if b.overlay_targets else value.rows.decode_rows
+            return value.rows.request_rows if b.overlay_targets else value.rows.latest_decode_rows
 
         return FunctionMath(
             {str(state.resource): initializer(str(state.resource)) for state in b.graph.states},

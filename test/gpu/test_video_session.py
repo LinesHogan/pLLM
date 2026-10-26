@@ -279,7 +279,7 @@ def observe_replay(*, versions):
                 torch.testing.assert_close(view, saved, rtol=0, atol=0)
             for row in self.rows:
                 for ordinal, layer in enumerate(self.model.layers):
-                    block, offset = self._access.slot(layer.self_attn.attn.layer_name, row)
+                    block, offset = map(int, self._access.cell(layer.self_attn.attn.layer_name, row))
                     view = layer.self_attn.attn.kv_cache[block, :, offset, :]
                     history[ordinal, row.token_offset] = view, view.clone()
             step = holder["session"]._step
@@ -391,13 +391,13 @@ def test_video_session_zero_copy_backpressure_and_ack_lifetime():
 def test_video_session_failure_retains_owner_without_fallback():
     from pllm.backends.vllm.session import VllmSession
 
-    before_execute = VllmSession.before_execute
+    prepare_input = VllmSession.prepare_input
 
-    def preempt(session, output):
+    def recompute_history(session, rows):
         if session.next_step_id == 1:
             assert session.diagnostics().update_count == 1
-            output = replace(output, preempted_req_ids=set(session._identities))
-        return before_execute(session, output)
+            session._token_frontiers = dict.fromkeys(session._token_frontiers, 1 << 30)
+        return prepare_input(session, rows)
 
-    with patch.object(VllmSession, "before_execute", preempt), pytest.raises(RuntimeError, match="preempt"):
+    with patch.object(VllmSession, "prepare_input", recompute_history), pytest.raises(RuntimeError, match="preempt"):
         run_video(VideoWorkload(grid_size=2), ("publish", "publish"), 2)

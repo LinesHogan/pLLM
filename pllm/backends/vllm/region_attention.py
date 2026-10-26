@@ -61,61 +61,10 @@ def attention_metadata(
 def attention_paged_access(
     context: ForwardContext, attentions: tuple[Attention, ...], rows: tuple[PackedPhaseRow, ...]
 ) -> PagedAccessPlan:
-    bindings: list[PagedLayer] = []
-    count = max((row.packed_row_index for row in rows), default=-1) + 1
-    for attention in attentions:
-        metadata, cache, slots = attention_metadata(context, attention)
-        declared, actual = metadata.slot_mapping[:count], slots[:count]
-        if declared.ndim != 1 or declared.dtype not in (torch.int32, torch.int64):
-            raise ValueError("attention requires an integer packed slot vector")
-        same_view = (
-            declared.device == actual.device
-            and declared.dtype == actual.dtype
-            and declared.shape == actual.shape
-            and declared.stride() == actual.stride()
-            and declared.data_ptr() == actual.data_ptr()
-        )
-        if not same_view and not torch.equal(declared, actual):
-            raise ValueError("attention and KV update use different slot mappings")
-        bindings.append(PagedLayer(attention.layer_name, cache, metadata.block_table, slots))
-    return bind_paged_access(rows, tuple(bindings))
-
-
-def select_attention_metadata(
-    context: ForwardContext,
-    attention: Attention,
-    row: PackedPhaseRow,
-    length: int,
-    sequence: torch.Tensor,
-    access: PagedAccessPlan,
-) -> tuple[FlashAttentionMetadata, torch.Tensor, int, int]:
-    if length != row.token_offset + 1:
-        raise ValueError("attention history differs from the verified packed token position")
-    metadata, cache, mapping = attention_metadata(context, attention)
-    if metadata.query_start_loc.dtype not in (torch.int32, torch.int64) or metadata.seq_lens.dtype not in (
-        torch.int32,
-        torch.int64,
-    ):
-        raise ValueError("replay sequence metadata requires int32 or int64 storage")
-    slot = mapping[row.packed_row_index : row.packed_row_index + 1]
-    block, offset = access.slot(attention.layer_name, row)
-    selected = replace(
-        metadata,
-        num_actual_tokens=1,
-        max_query_len=1,
-        query_start_loc=sequence[:2].to(metadata.query_start_loc.dtype),
-        max_seq_len=length,
-        seq_lens=sequence[2:].to(metadata.seq_lens.dtype),
-        block_table=metadata.block_table[row.request_ordinal : row.request_ordinal + 1],
-        slot_mapping=slot,
-        num_decode_reqs=1,
-        num_prefill_reqs=0,
-        num_decode_tokens=1,
-        num_prefill_tokens=0,
-        scheduler_metadata=None,
-        prefix_scheduler_metadata=None,
+    return bind_paged_access(
+        rows,
+        tuple(PagedLayer(item.layer_name, *attention_metadata(context, item)[1:]) for item in attentions),
     )
-    return selected, cache, block, offset
 
 
 class TokenAttentionBuffers:

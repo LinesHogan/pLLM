@@ -82,7 +82,7 @@ def main():
 
     def check_token_capture(primitive, invocation, row, signature):
         slots = tuple(
-            (module.self_attn.attn.kv_cache, *primitive._access.slot(module.self_attn.attn.layer_name, row))
+            (module.self_attn.attn.kv_cache, *map(int, primitive._access.cell(module.self_attn.attn.layer_name, row)))
             for module in primitive.model.layers
         )
         saved = tuple(cache[block, :, offset].clone() for cache, block, offset in slots)

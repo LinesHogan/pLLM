@@ -281,7 +281,7 @@ class TensorBinding(ModelEffectBinding, RowTaskBinding):
         }
 
         def rows(value: TensorStepInput) -> tuple[PackedPhaseRow, ...]:
-            return value.rows.decode_rows
+            return value.rows.latest_decode_rows
 
         if self.attachment is not None and self.attachment.sampler_stage is SamplerStage.PACKED_PRE_FILTER_ADD:
 

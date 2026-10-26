@@ -7,7 +7,6 @@ from typing import Protocol
 import torch
 
 from pllm.contracts.region_program import AccessMode, BorrowedResource
-from pllm.execution.paged_access import PagedResourceView
 
 
 class MutableTensorView(Protocol):
@@ -134,11 +133,7 @@ class ReadonlyTensorView:
         )
 
 
-def validate_readonly_views(
-    views: tuple[ReadonlyTensorView, ...],
-    paged: tuple[PagedResourceView, ...],
-    protected: tuple[tuple[str, int, int], ...],
-) -> None:
+def validate_readonly_views(views: tuple[ReadonlyTensorView, ...], protected: tuple[tuple[str, int, int], ...]) -> None:
     for view in views:
         view.validate()
         for device, address, size in view.allocation_ranges:
@@ -147,12 +142,6 @@ def validate_readonly_views(
                 for other, start, count in protected
             ):
                 raise ValueError("read-only resource overlaps original arena storage")
-            if any(
-                device == write.device and address < write.end and write.address < address + size
-                for original in paged
-                for write in original.plan.writes
-            ):
-                raise ValueError("read-only resource aliases writable paged storage")
 
 
 @dataclass(frozen=True, slots=True)

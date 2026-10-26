@@ -9,9 +9,9 @@ from vllm import SamplingParams
 from vllm.forward_context import override_forward_context
 
 import pllm
+from pllm.backends.vllm.replay import VllmTokenwiseReplay
 from pllm.config import ModelConfig, VllmDType
 from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
-from pllm.execution.overlay_task import RouteOverlay
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
 
 
@@ -126,7 +126,7 @@ def run(chunk):
         )
         saved = tuple(cache[slot // cache.shape[2], :, slot % cache.shape[2]].clone() for cache, slot in slots)
         other_slots = tuple(
-            (layer.self_attn.attn.kv_cache, *primitive._access.slot(layer.self_attn.attn.layer_name, row))
+            (layer.self_attn.attn.kv_cache, *map(int, primitive._access.cell(layer.self_attn.attn.layer_name, row)))
             for layer in primitive.model.layers
             for row in primitive.rows
             if row.packed_row_index != adapter.row
@@ -223,7 +223,7 @@ def run(chunk):
 
         def measured(function):
             def run(*args, **kwargs):
-                with torch.profiler.record_function("route.token"):
+                with torch.profiler.record_function("route.forward"):
                     return function(*args, **kwargs)
 
             return run
@@ -232,16 +232,14 @@ def run(chunk):
             torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
             ) as profile,
-            patch.object(RouteOverlay, "stage", measured(RouteOverlay.stage)),
-            patch.object(RouteOverlay, "collect", measured(RouteOverlay.collect)),
-            patch.object(torch.cuda.CUDAGraph, "replay", measured(native)),
+            patch.object(VllmTokenwiseReplay, "forward", measured(VllmTokenwiseReplay.forward)),
         ):
             profile_outputs = handle.generate(
                 ["The sky is", "Water freezes at"], SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True)
             )
         for event in profile.events():
             parent = event.cpu_parent
-            while parent is not None and parent.name != "route.token":
+            while parent is not None and parent.name != "route.forward":
                 parent = parent.cpu_parent
             if parent is not None:
                 assert not any(
