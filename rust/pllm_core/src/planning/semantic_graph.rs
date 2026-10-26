@@ -145,6 +145,12 @@ pub(crate) struct TokenProgramEffect {
     pub(crate) rows: String,
     #[serde(default)]
     pub(crate) position_states: Vec<(String, serde_json::Number)>,
+    #[serde(default)]
+    pub(crate) digest: String,
+    #[serde(default)]
+    pub(crate) role_sensitive: bool,
+    #[serde(default)]
+    pub(crate) apply_updates: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -202,15 +208,6 @@ pub(crate) enum InputVersion { Input }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TaskSourceRegion {
-    pub(crate) task: String,
-    pub(crate) name: String,
-    pub(super) program: super::region_program::Program,
-    pub(super) imports: Vec<super::region_imports::TensorImport>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct SemanticGraph {
     pub(crate) workload_id: String,
     pub(crate) tasks: Vec<SemanticTask>,
@@ -219,8 +216,6 @@ pub(crate) struct SemanticGraph {
     pub(crate) states: Vec<SemanticState>,
     pub(crate) schema_version: u64,
     pub(crate) input_groups: Vec<ConditionalInputGroup>,
-    #[serde(default)]
-    pub(crate) source_regions: Vec<TaskSourceRegion>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -432,30 +427,6 @@ pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
                 return Err("state visibility resources must belong to the bound task".into());
             }
         }
-    }
-    let mut sources = std::collections::BTreeSet::new();
-    for source in &graph.source_regions {
-        let task = graph.tasks.iter().find(|task| task.symbol == source.task)
-            .ok_or("source region names an unknown task")?;
-        if !sources.insert((&source.task, &source.name)) || source.name.is_empty() {
-            return Err("source regions need distinct nonempty task-local names".into());
-        }
-        for resource in &source.program.resources {
-            if let super::region_program::Resource::State { name, .. } = resource {
-                if !task.effects.iter().any(|effect| &effect.resource == name) {
-                    return Err("source region state is outside its task effects".into());
-                }
-            }
-        }
-        // The complete source and endpoint contracts precede physical partitioning.
-        let mut imported = std::collections::BTreeSet::new();
-        for import in &source.imports {
-            if !imported.insert(import.name()) { return Err("source imports must be distinct".into()); }
-            let declaration = source.program.functions.iter().find(|f| f.name == import.name())
-                .ok_or("source import names an undeclared function")?;
-            import.validate(declaration)?;
-        }
-        super::region_dependence::analyze(&source.program, false)?;
     }
     if graph.schema_version != SCHEMA_VERSION {
         return Err(format!(

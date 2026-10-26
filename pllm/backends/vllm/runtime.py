@@ -43,8 +43,6 @@ from pllm.backends.vllm.overlay_graph import (
 from pllm.backends.vllm.parameter_overlay import (
     inspect_parameter_targets,
 )
-from pllm.backends.vllm.region_kernels import qwen_region_kernels
-from pllm.backends.vllm.region_layers import VllmDecoderBodies
 from pllm.config import ModelConfig, RunnerKind, VllmDType
 from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import (
@@ -62,7 +60,6 @@ from pllm.contracts.feedback import (
     FinishReason,
     RetryAction,
 )
-from pllm.contracts.region_program import TensorType
 from pllm.contracts.region_proposal import TOKEN_CAPTURE_CAPABILITY
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.sampler import SamplerStage
@@ -824,24 +821,6 @@ def probe_backend(
             )
         ),
     )
-    if runner.runner_kind is RunnerKind.MRV2 and graph_mode(runner.overlay_graph_bytes) is AttachmentGraphMode.EAGER:
-        probe = replace(
-            probe,
-            region_imports=qwen_region_kernels(
-                model.model.norm, TensorType((1, probe.hidden_size), str(runner.dtype), str(runner.device)), layer_count
-            ),
-        )
-        if probe.causal_domain is not None and not requirements.hidden_inputs and not requirements.parameter_targets:
-            bodies = VllmDecoderBodies.inspect(
-                tuple(model.model.layers),
-                TensorType((1, probe.hidden_size), str(runner.dtype), str(runner.device)),
-                probe.causal_domain,
-                probe.max_packed_rows,
-            )
-            if bodies is not None:
-                probe = replace(
-                    probe, region_bodies=bodies.definitions, region_imports=(*probe.region_imports, *bodies.imports)
-                )
     observed = RuntimeFacts(runner.device).timeline(
         (
             "state/dense_page_cuda@1",

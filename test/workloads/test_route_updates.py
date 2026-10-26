@@ -206,9 +206,7 @@ def test_marker_source_roundtrip_and_while_rejection():
     assert_finite_resources(Updating(), ROUTE_FACTS)
     graph, _, _ = Updating(empty=True).declare(ROUTE_FACTS)
     assert decode_boundary(encode_boundary(graph), type(graph)) == graph
-    assert (
-        sum(function.name == "overlay.apply_updates@1" for function in graph.source_regions[0].program.functions) == 1
-    )
+    assert next(task.replay for task in graph.tasks if task.replay is not None).apply_updates
 
     class TracedWhile(Updating):
         @pllm.layer_route()

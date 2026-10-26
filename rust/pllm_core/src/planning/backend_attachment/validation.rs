@@ -209,64 +209,6 @@ fn validate_probe(probe: &BackendPlacementProbe) -> Result<(), String> {
     {
         return Err("region stream capability requires the original eager CUDA backend".into());
     }
-    let original_device = if probe.device_kind == StateDeviceKind::Cpu {
-        "cpu".to_owned()
-    } else {
-        format!("cuda:{}", probe.device_ordinal)
-    };
-    let mut import_names = std::collections::BTreeSet::new();
-    for imported in &probe.region_imports {
-        use super::super::region_imports::TensorImport;
-        if !import_names.insert(imported.name()) {
-            return Err("backend source catalog requires distinct imports".into());
-        }
-        let declaration = match imported {
-            TensorImport::Compiled { .. } | TensorImport::AffineScan { .. } => return Err("compiled alternatives require numerical selection, not a source catalog".into()),
-            TensorImport::Native { declaration } | TensorImport::Borrowed { declaration, .. } => declaration,
-            TensorImport::NativeKernel { declaration, device, .. }
-                | TensorImport::FunctionalKernel { declaration, device, .. } => {
-                if probe.graph_mode != AttachmentGraphMode::Eager || device != &original_device
-                {
-                    return Err("backend kernel imports require the original eager execution device".into());
-                }
-                declaration
-            },
-            TensorImport::Exported { access } => {
-                if access.storages.iter().any(|storage| storage.device != original_device) {
-                    return Err("backend tensor graphs require the original execution device".into());
-                }
-                probe.region_bodies.iter().flat_map(|body| &body.program.functions)
-                    .find(|function| function.name == imported.name())
-                    .ok_or("backend tensor graph requires its source body declaration")?
-            },
-        };
-        imported.validate(declaration)?;
-        for type_ in declaration.inputs.iter().chain(&declaration.outputs) {
-            if let Some(super::super::region_program::Type::Tensor { device, .. }) = super::super::region_storage::tensor_leaf(type_) {
-                if device != &original_device {
-                    return Err("backend source ports require the original execution device".into());
-                }
-            }
-        }
-    }
-    let body_names: std::collections::BTreeSet<_> = probe.region_bodies.iter().map(|body| &body.declaration.name).collect();
-    if body_names.len() != probe.region_bodies.len() || body_names.iter().any(|name| import_names.contains(name.as_str())) {
-        return Err("backend source definitions require distinct function names".into());
-    }
-    for body in &probe.region_bodies {
-        use super::super::region_program;
-        region_program::verify_function_body(&body.program, &body.declaration)?;
-        if body.program.functions.iter().any(|function| body_names.contains(&function.name)) {
-            return Err("nested or recursive backend source definitions are unsupported".into());
-        }
-        for function in &body.program.functions {
-            if let Some(imported) = probe.region_imports.iter().find(|imported| imported.name() == function.name) {
-                imported.validate(function)?;
-            } else if function.resources.is_empty() {
-                return Err("pure backend functions require an original tensor graph import".into());
-            }
-        }
-    }
     if probe.tensor_parallel_size != 1
         || probe.pipeline_parallel_size != 1
         || probe.hidden_size == 0
@@ -579,7 +521,9 @@ fn validate_cross_binding(
         let domain = probe.causal_domain.as_ref().ok_or("layer routes need a signed model domain")?;
         if u64::from(task.replay.as_ref().unwrap().layer_count) != domain.layers
             || task.timing.after != "model.execute" || task.timing.before != "state.publish"
-            || !graph.source_regions.iter().any(|source| source.task == task.symbol && source.name == "layer_route")
+            || task.replay.as_ref().unwrap().digest.len() != 64
+            || !task.replay.as_ref().unwrap().digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || (task.replay.as_ref().unwrap().apply_updates && request.attachment_kind != AttachmentKind::ParameterOverlay)
         {
             return Err("layer routes need their model domain, source and forward timing".into());
         }
@@ -787,38 +731,12 @@ fn validate_cross_binding(
 }
 
 fn validate_position_source(task: &SemanticTask, graph: &SemanticGraph, probe: &BackendPlacementProbe) -> Result<(), String> {
-    use super::super::region_program::{AccessMode, Resource, Type};
-    let states = &task.replay.as_ref().unwrap().position_states;
-    if *states != probe.position_states {
-        return Err("PositionState schema must match the pre-allocated provider".into());
+    let effect = task.replay.as_ref().unwrap();
+    if effect.position_states != probe.position_states
+        || (!effect.position_states.is_empty() && (!effect.role_sensitive || !task.effects.is_empty() || !graph.states.is_empty())) {
+        return Err("PositionState needs a role-sensitive pure route and its pre-allocated schema".into());
     }
-    let source = graph.source_regions.iter().find(|source| source.task == task.symbol && source.name == "layer_route")
-        .ok_or("layer routes need their source")?;
-    let positional = source.program.resources.iter().any(|resource| resource.name() == "position");
-    if !positional && states.is_empty() { return Ok(()); }
-    if !source.program.resources.contains(&Resource::Borrowed { name: "position".into(), domain: vec![1] })
-        || (!states.is_empty() && (!task.effects.is_empty() || !graph.states.is_empty())) {
-        return Err("PositionState requires a borrowed cache on a pure route".into());
-    }
-    let device = match probe.device_kind {
-        StateDeviceKind::Cpu => "cpu".to_string(),
-        StateDeviceKind::Cuda => format!("cuda:{}", probe.device_ordinal),
-    };
-    let tensor = Type::Tensor { shape: vec![1, probe.hidden_size],
-        dtype: format!("torch.{}", serde_json::to_value(&probe.tensor_dtype).unwrap().as_str().unwrap()), device: device.clone() };
-    let values = vec![tensor; states.len()];
-    let entry = source.program.functions.iter().find(|f| f.name == "position.entry@1").ok_or("PositionState needs an entry read")?;
-    let exit = source.program.functions.iter().find(|f| f.name == "position.exit@1").ok_or("PositionState needs a final store")?;
-    let mut outputs = vec![Type::Tensor { shape: vec![1], dtype: "torch.bool".into(), device }];
-    outputs.extend(values.clone());
-    if !entry.inputs.is_empty() || entry.outputs != outputs || exit.inputs != values || !exit.outputs.is_empty()
-        || [entry, exit].iter().any(|f| f.resources != vec!["position"] || f.accesses.len() != 2
-            || [AccessMode::Read, AccessMode::Write].iter().any(|mode| !f.accesses.iter().any(|a|
-                a.resource == "position" && a.mode == *mode && a.ranges.len() == 1
-                && a.ranges[0].lower.constant == 0 && a.ranges[0].upper.constant == 1
-                && a.ranges[0].lower.terms.is_empty() && a.ranges[0].upper.terms.is_empty()))) {
-        return Err("PositionState ports and whole-cache READ/WRITE effects must match the provider".into());
-    }
+
     Ok(())
 }
 

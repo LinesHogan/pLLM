@@ -19,7 +19,6 @@ from pllm.contracts.backend_attachment import (
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding
-from pllm.contracts.region_program import TensorType
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
@@ -65,12 +64,10 @@ from pllm.contracts.tensor_layout import (
     TensorLayoutRequest,
     TensorLayoutSpec,
 )
-from pllm.execution.decoder_region import decoder_activations
 from pllm.execution.execution import TaskGraphImplementation
 from pllm.execution.memory import MemoryUsage, measure
 from pllm.execution.overlay_task import OverlayTransition
 from pllm.execution.ptts.request_state import RequestStateSelection
-from pllm.execution.region_native import RegionFunction
 from pllm.execution.replay import TokenwiseReplayTask
 from pllm.execution.state_execution import ConditionalProducerTask, PublishStateTask, StateTaskContext
 from pllm.execution.tensor_program import (
@@ -81,6 +78,7 @@ from pllm.execution.tensor_program import (
     TensorOperation,
     native_body,
 )
+from pllm.execution.token_program import TokenProgram
 from pllm.kernels.adamw import AdamWConfig
 
 D = TypeVar("D")
@@ -190,7 +188,7 @@ class Builder(Generic[D]):
         self.publications: dict[TaskSymbol, PublishStateTask[D]] = {}
         self.host_operations: dict[TaskSymbol, HostOperation[D]] = {}
         self.resources = resources
-        self.route_functions: dict[str, RegionFunction] = {}
+        self.route_program: TokenProgram | None = None
         self.overlay_math: OverlayTransition | None = None
         self.route_updates = False
         self.route_rows = 0
@@ -426,41 +424,17 @@ class Builder(Generic[D]):
             if isinstance(task.replay, TokenProgramEffect):
                 if plan is None or model_probe is None or model_probe.causal_domain is None:
                     raise ValueError("tokenwise replay requires a specialized backend plan and model layout")
-                tensor = TensorType(
-                    (1, model_probe.hidden_size),
-                    "torch." + model_probe.tensor_dtype.value,
-                    "cpu" if model_probe.device_kind.value == "cpu" else f"cuda:{model_probe.device_ordinal}",
-                )
-                workspace = next(
-                    (fact.workspace_bytes for fact in plan.timeline.task_resources if fact.task == task.symbol), None
-                )
-                if workspace is None:
-                    raise ValueError("tokenwise replay requires its original signed task workspace")
+                assert self.route_program is not None
                 functions.append(
-                    TokenwiseReplayTask[D].bind(
+                    TokenwiseReplayTask[D](
                         task,
-                        next(source for source in self.graph.source_regions if source.task == task.symbol),
-                        self.route_functions,
-                        tensor,
-                        model_probe.max_packed_rows,
+                        self.route_program,
                         model_probe.causal_domain,
                         identity,
-                        plan.timeline.region_policy,
-                        workspace,
-                        source_imports=model_probe.region_imports,
-                        function_bodies=model_probe.region_bodies,
                         operation=None
                         if task.symbol not in self.operations
                         else replace(self.operations[task.symbol], implementation_id=identity),
                         overlay_math=self.overlay_math,
-                        activations=()
-                        if self.attachment is None
-                        else decoder_activations(
-                            self.attachment.activation_bindings,
-                            plan.tensor_layout_request,
-                            self.attachment.state_resource,
-                            tensor.device,
-                        ),
                     )
                 )
             elif any(effect.kind is StateEffectKind.PUBLISH for effect in task.effects):

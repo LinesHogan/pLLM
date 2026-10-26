@@ -1,7 +1,7 @@
-"""Trace user layer routes with Torch and lower their segments and tensor cells for TokenwiseRegion."""
+"""Trace layer routes into model slices and functional tensor cells for direct execution."""
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 import torch
@@ -9,30 +9,9 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
-from pllm.contracts.backend_attachment import CausalModelDomain
-from pllm.contracts.region_composition import inline_region
-from pllm.contracts.region_program import (
-    AccessMode,
-    AccessRange,
-    AffineIndex,
-    Block,
-    BorrowedResource,
-    Call,
-    Function,
-    Op,
-    Program,
-    Region,
-    ResourceAccess,
-    ResourceType,
-    ScalarType,
-    TensorType,
-    Value,
-)
-from pllm.execution.codec import tensor_decompositions, tensor_node_metadata
-from pllm.execution.decoder_region import DecoderActivation, DecoderSource
-from pllm.execution.exported_cell import ExportedCell
-from pllm.execution.position_state import POSITION_RESOURCE, position_functions, position_save
-from pllm.execution.region_native import RegionFunction, external_primitive
+from pllm.contracts.region_program import TensorType
+from pllm.execution.codec import check_functional_aten, tensor_decompositions, tensor_node_metadata
+from pllm.execution.position_state import position_save
 from pllm.execution.shared_tensor import region_dtype
 
 Tokens = Literal["prefill", "decode", "all"]
@@ -60,25 +39,6 @@ def _fake_updates(hidden: torch.Tensor) -> None:
 
 
 _apply_updates.register_fake(_fake_updates)  # pyright: ignore[reportUnknownMemberType]
-
-
-def overlay_accesses(resource: BorrowedResource) -> tuple[ResourceAccess, ...]:
-    """Order projection reads, operand captures and explicit boundaries on token staging."""
-    return tuple(
-        ResourceAccess(resource.name, mode, (AccessRange(AffineIndex(), AffineIndex(resource.domain[0])),))
-        for mode in (AccessMode.READ, AccessMode.WRITE)
-    )
-
-
-def update_function(resource: BorrowedResource) -> Function:
-    """An ordered no-result boundary, including when no operands are pending."""
-    return Function(
-        "overlay.apply_updates@1",
-        (ScalarType.INDEX, ScalarType.INDEX),
-        (),
-        (resource.name,),
-        overlay_accesses(resource),
-    )
 
 
 @dataclass(frozen=True)
@@ -117,7 +77,7 @@ class Layers:
     def save(self, name: str, value: torch.Tensor) -> None:
         """Save a snapshot at this position; the last save wins."""
         entry = self.load(name)
-        if value.shape != entry.shape or value.dtype != entry.dtype:
+        if value.shape != entry.shape or value.dtype != entry.dtype or value.device != entry.device:
             raise ValueError(f"save {name} with shape {tuple(entry.shape)} and dtype {entry.dtype}")
         position_save(value.clone(), name)
 
@@ -125,7 +85,10 @@ class Layers:
         stop = self.layer_count if stop is None else stop
         if not 0 <= start < stop <= self.layer_count or hidden is None and start != 0:
             raise ValueError("use 0 <= start < stop <= layer_count and supply hidden when start > 0")
-        return Taps(tuple(_layers(self.seed if hidden is None else hidden, start, stop)), start, self.layer_count)
+        value = self.seed if hidden is None else hidden
+        if value.shape != self.seed.shape or value.dtype != self.seed.dtype or value.device != self.seed.device:
+            raise ValueError("supply a hidden tensor with the model shape, dtype and device")
+        return Taps(tuple(_layers(value, start, stop)), start, self.layer_count)
 
     def apply_updates(self) -> None:
         """Apply operands captured since the previous boundary to this token's private overlay."""
@@ -144,9 +107,12 @@ class Segment:
 
 @dataclass(frozen=True)
 class Cell:
-    """A maximal ATen fragment between model slices, retaining its exported source."""
+    """A functional ATen fragment whose row batching preserves per-position tensor math."""
 
-    source: ExportedCell
+    graph: torch.fx.GraphModule
+    function: Callable[..., tuple[torch.Tensor, ...]]
+    inputs: tuple[str, ...]
+    outputs: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -183,24 +149,40 @@ def _cell(nodes: list[torch.fx.Node]) -> Cell:
     for node in nodes:
         mapped[node] = graph.node_copy(node, mapped.__getitem__)
     graph.output(tuple(mapped[node] for node in outputs))
-    return Cell(
-        ExportedCell.from_export(
-            torch.export.export(torch.fx.GraphModule({}, graph), tuple(_tensor(node) for node in inputs), strict=False),
-            inputs=tuple(node.name for node in inputs),
-            outputs=tuple(node.name for node in outputs),
+    for node in nodes:
+        if node.op != "call_function":
+            raise ValueError("layer route cells need functional ATen operations with explicit tensor inputs")
+        check_functional_aten(node.target)
+    module = torch.fx.GraphModule({}, graph)
+    input_rows = tuple(bool(_tensor(node).ndim and _tensor(node).shape[0] == 1) for node in inputs)
+    output_rows = tuple(bool(_tensor(node).ndim and _tensor(node).shape[0] == 1) for node in outputs)
+
+    def per_row(_seed: torch.Tensor, *args: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return module(*args)
+
+    mapped_function = torch.vmap(per_row)
+
+    def batched(seed: torch.Tensor, *args: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        # vmap preserves the single-position meaning of reductions and reshapes;
+        # the model segments still call native [B, H] layers once per wave.
+        results = mapped_function(
+            seed, *(value.unsqueeze(1) if row else value for value, row in zip(args, input_rows, strict=True))
         )
-    )
+        return tuple(value.squeeze(1) if row else value for value, row in zip(results, output_rows, strict=True))
+
+    return Cell(module, batched, tuple(node.name for node in inputs), tuple(node.name for node in outputs))
 
 
 @dataclass(frozen=True)
 class TokenProgram:
-    """Ordered model slices, exported tensor fragments and the sampled residual stream."""
+    """Ordered model slices, functional tensor fragments and the sampled residual stream."""
 
     steps: tuple[Segment | Cell | ApplyUpdates | Save | Output, ...]
     seed: str
     position: str
     generated: str
     entries: tuple[tuple[str, str], ...]
+    prompt_pass_is_identity: bool = False
 
     @classmethod
     def capture(
@@ -222,10 +204,10 @@ class TokenProgram:
 
         with FakeTensorMode(shape_env=ShapeEnv()):
             seed = torch.empty(tensor.shape, dtype=region_dtype(tensor.dtype), device=tensor.device)
-            position = torch.empty((1,), dtype=torch.int64, device=tensor.device)
-            generated = torch.empty((1,), dtype=torch.bool, device=tensor.device)
+            position = torch.empty((1, 1), dtype=torch.int64, device=tensor.device)
+            generated = torch.empty((1, 1), dtype=torch.bool, device=tensor.device)
             graph = make_fx(
-                invoke,
+                torch.func.functionalize(invoke),
                 decomposition_table=tensor_decompositions((torch.ops.aten.linalg_vector_norm.default,)),
                 tracing_mode="fake",
             )(seed, position, generated, *(torch.empty_like(seed) for _ in names))
@@ -256,7 +238,11 @@ class TokenProgram:
                     elif node.op == "output":
                         result = node.args[0]
                         assert isinstance(result, torch.fx.Node)
-                        if _tensor(result).shape != seed.shape or _tensor(result).dtype != seed.dtype:
+                        if (
+                            _tensor(result).shape != seed.shape
+                            or _tensor(result).dtype != seed.dtype
+                            or _tensor(result).device != seed.device
+                        ):
                             raise ValueError("return a residual stream with the model hidden shape and dtype")
                         steps.append(Output(result.name))
                     else:
@@ -278,7 +264,7 @@ class TokenProgram:
                     arg.target == torch.ops.pllm.layers.default for arg in node.all_input_nodes
                 ):
                     pending.append(node)
-        return cls(
+        program = cls(
             tuple(steps),
             placeholders[0],
             placeholders[1],
@@ -286,85 +272,46 @@ class TokenProgram:
             tuple(zip(names, placeholders[3:], strict=True)),
         )
 
-    def lower(
-        self,
-        tensor: TensorType,
-        domain: CausalModelDomain,
-        max_rows: int,
-        activations: tuple[DecoderActivation, ...],
-        overlay: BorrowedResource | None = None,
-    ) -> tuple[Program, dict[str, RegionFunction]]:
-        """Compose DecoderSource slices with their exported cells in source order."""
-        positions = TensorType((1,), "torch.int64", tensor.device)
-        arguments = tuple(Value(name, ScalarType.INDEX) for name in ("row", "request", "offset")) + (
-            Value("positions", positions),
-            Value("seed", tensor),
+        return replace(program, prompt_pass_is_identity=program._prompt_identity(layer_count))
+
+    @property
+    def role_sensitive(self) -> bool:
+        """Generated roles and predecessor storage affect prefix-cache identity."""
+        return bool(self.entries) or any(
+            isinstance(step, Cell) and self.generated in step.inputs for step in self.steps
         )
-        values = {self.seed: arguments[-1], self.position: arguments[-2]}
-        operations: list[Op] = []
-        functions: dict[str, RegionFunction] = {}
-        declarations: dict[str, Function] = {}
-        weights, context = BorrowedResource("weights", (domain.layers + 1,)), BorrowedResource("context", (max_rows,))
-        resources: dict[str, ResourceType] = {resource.name: resource for resource in (weights, context)}
-        entry, store = position_functions(tensor, len(self.entries))
-        positional = bool(self.entries) or any(
-            isinstance(step, Cell) and self.generated in step.source.inputs for step in self.steps
-        )
-        saved: dict[str, Value] = {}
-        if positional:
-            ports = (Value(self.generated, entry.outputs[0]), *(Value(value, tensor) for _, value in self.entries))
-            operations.append(Call((), ports, entry.name))
-            values.update((value.name, value) for value in ports)
-            saved.update((name, values[value]) for name, value in self.entries)
-            resources[POSITION_RESOURCE.name] = POSITION_RESOURCE
-            declarations.update((function.name, function) for function in (entry, store))
-            functions.update((function.name, external_primitive(function)) for function in (entry, store))
-        if overlay is not None:
-            resources[overlay.name] = overlay
-        result = arguments[-1]
-        for ordinal, step in enumerate(self.steps):
-            if isinstance(step, Segment):
-                source = DecoderSource(
-                    tensor,
-                    tuple(range(step.start, step.stop)),
-                    domain,
-                    taps=tuple(layer for layer, _ in step.taps),
-                    weights=weights,
-                    context=context,
-                    activations=activations,
-                    overlay=overlay,
-                )
-                segment = inline_region(source.program, (*arguments[:4], values[step.input]), f"segment{ordinal}")
-                operations.extend(segment.operations)
-                values.update((name, value) for (_, name), value in zip(step.taps, segment.results[2:], strict=True))
-                functions.update(source.functions)
-                declarations.update((function.name, function) for function in source.program.functions)
-                resources.update((resource.name, resource) for resource in source.program.resources)
-            elif isinstance(step, ApplyUpdates):
-                if overlay is None:
-                    raise ValueError("apply_updates needs one trained parameter overlay on the same workload")
-                boundary = update_function(overlay)
-                resources[overlay.name] = overlay
-                declarations[boundary.name] = boundary
-                functions[boundary.name] = external_primitive(boundary)
-                operations.append(Call(("row", "request"), (), boundary.name))
+
+    def _prompt_identity(self, layer_count: int) -> bool:
+        """Prove the prompt branch is one complete decoder pass with final-tap saves."""
+        aliases: dict[str, str | bool] = {self.generated: False}
+        segments: list[Segment] = []
+        saved: list[str | bool] = []
+        result: str | bool = ""
+        for step in self.steps:
+            if isinstance(step, Cell):
+                values: dict[torch.fx.Node, str | bool] = {}
+                for node in step.graph.graph.nodes:
+                    if node.op == "placeholder":
+                        values[node] = aliases[node.name] if node.name in aliases else node.name
+                    elif node.target in (torch.ops.aten.clone.default, torch.ops.aten.detach.default):
+                        values[node] = values[node.all_input_nodes[0]]
+                    elif node.target == torch.ops.aten.where.self and values[node.all_input_nodes[0]] is False:
+                        values[node] = values[node.all_input_nodes[2]]
+                    elif node.op == "output":
+                        aliases.update(zip(step.outputs, (values[arg] for arg in node.all_input_nodes), strict=True))
+                    else:
+                        values[node] = node.name
+            elif isinstance(step, Segment):
+                if aliases.get(step.input, step.input) != self.seed or step.start != 0:
+                    return False
+                segments.append(step)
             elif isinstance(step, Save):
-                saved[step.name] = values[step.value]
-            elif isinstance(step, Cell):
-                cell = step.source
-                results = tuple(
-                    Value(name, type_) for name, type_ in zip(cell.outputs, cell.declaration.outputs, strict=True)
-                )
-                operations.append(Call(tuple(values[name].name for name in cell.inputs), results, cell.digest))
-                values.update((value.name, value) for value in results)
-                functions[cell.digest] = cell
-                declarations[cell.digest] = cell.declaration
+                saved.append(aliases.get(step.value, step.value))
+            elif isinstance(step, Output):
+                result = aliases.get(step.value, step.value)
             else:
-                result = values[step.value]
-        if positional:
-            operations.append(Call(tuple(value.name for value in saved.values()), (), store.name))
-        return Program(
-            Region(Block(arguments, tuple(operations), (result.name,))),
-            tuple(declarations.values()),
-            tuple(resources.values()),
-        ), functions
+                return False
+        if len(segments) != 1 or segments[0].stop != layer_count:
+            return False
+        final = dict(segments[0].taps).get(segments[0].stop - 1)
+        return result == final and all(value == final for value in saved)

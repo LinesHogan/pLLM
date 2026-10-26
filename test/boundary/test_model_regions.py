@@ -11,30 +11,20 @@ from dataclasses import replace
 
 import pytest
 import torch
-from vllm.config import AttentionConfig, CompilationConfig, VllmConfig, set_current_vllm_config
-from vllm.config.compilation import CompilationMode
+from vllm.config import AttentionConfig, VllmConfig, set_current_vllm_config
 from vllm.forward_context import ForwardContext
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.models.qwen2 import Qwen2Attention, Qwen2DecoderLayer
 from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend, FlashAttentionMetadata
 
 from pllm.backends.vllm.region_attention import (
     attention_paged_access,
     validate_attention_resources,
 )
-from pllm.backends.vllm.region_layers import VllmDecoderBodies, decoder_partition_bodies
-from pllm.contracts.backend_attachment import (
-    CausalModelDomain,
-)
 from pllm.contracts.region_composition import RegionFunctionBody, inline_function_bodies, inline_region
-from pllm.contracts.region_imports import BorrowedTensorImport
 from pllm.contracts.region_program import (
-    AffineIndex,
     Block,
     Call,
     Constant,
-    Coordinate,
     Function,
     Program,
     Region,
@@ -42,20 +32,7 @@ from pllm.contracts.region_program import (
     TensorType,
     Value,
 )
-from pllm.execution.decoder_region import DecoderRegion
-from pllm.execution.paged_access import PagedLayer, PagedResourceView, bind_paged_access
-from pllm.execution.region_compilation import (
-    analyze_region_program,
-    lower_region_schedule,
-)
-from pllm.execution.region_execution import RegionInstructionExecution
-from pllm.execution.region_resources import (
-    PagedResourceBinding,
-    ReadonlyResourceBinding,
-    RegionResources,
-)
-from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
-from test.region_fixtures import owner_fixture, paged_rows
+from test.region_fixtures import paged_rows
 from test.region_reference import interpret
 
 
@@ -87,154 +64,6 @@ def test_inlining_preserves_argument_aliases_duplicate_returns_and_fresh_names()
     invalid = replace(leaf, entry=Region(replace(leaf.entry.block, yields=("hidden",))))
     with pytest.raises(ValueError):
         inline_region(invalid, (Value("seed", integer),), "body")
-
-
-def test_decoder_imports_custom_readonly_modules_and_runs_them_on_borrowed_weights():
-    class ResidualSum(torch.nn.Module):
-        def forward(self, hidden, residual):
-            return hidden + residual, residual
-
-    def make_layer(width):
-        layer = Qwen2DecoderLayer.__new__(Qwen2DecoderLayer)
-        torch.nn.Module.__init__(layer)
-        layer.self_attn = Qwen2Attention.__new__(Qwen2Attention)
-        torch.nn.Module.__init__(layer.self_attn)
-        layer.input_layernorm = RMSNorm(4)
-        layer.post_attention_layernorm = ResidualSum()
-        layer.mlp = torch.nn.Sequential(
-            torch.nn.Linear(4, width, bias=False), torch.nn.SiLU(), torch.nn.Linear(width, 4, bias=False)
-        )
-        return layer
-
-    config = VllmConfig(compilation_config=CompilationConfig(mode=CompilationMode.NONE))
-    with set_current_vllm_config(config), torch.inference_mode():
-        # Capture and the feed-forward suffix only, not attention execution. Two different
-        # intermediate shapes use their own parameter fields through the readonly owner.
-        layer = make_layer(8)
-        tensor = TensorType((1, 4), "torch.float32")
-        inputs = torch.randn(1, 4), torch.randn(1, 4)
-
-        layers = layer, make_layer(12)
-        varied = VllmDecoderBodies.inspect(layers, tensor, CausalModelDomain(1, 2, 2), 2)
-        assert varied is not None
-        varied.validate(layers)
-        program = varied.suffix.program
-        schedule = analyze_region_program(program, optimize=False).reference_schedule
-        runner = RegionInstructionExecution.at_schedule(program, schedule, varied.functions)
-        execution, _, rows, _ = owner_fixture(rounds=1)
-        invocation = execution.start_step(rows)
-        resources = {resource.name: resource for resource in program.resources}
-        weight_cells = (
-            *(ReadonlyTensorCell.bind((i,), tuple(item.parameters())) for i, item in enumerate(layers)),
-            ReadonlyTensorCell.bind((2,), ()),
-        )
-        context_cells = tuple(ReadonlyTensorCell.bind((i,), ()) for i in range(2))
-        loans = tuple(item for item in varied.imports if isinstance(item, BorrowedTensorImport))
-        pages = RegionResources(
-            program,
-            invocation.context,
-            (),
-            borrows=(
-                ReadonlyResourceBinding(ReadonlyTensorView(resources["weights"], weight_cells), invocation.context),
-                ReadonlyResourceBinding(ReadonlyTensorView(resources["context"], context_cells), invocation.context),
-            ),
-            tensor_borrows=loans,
-        )
-        try:
-            for i, item in enumerate(layers):
-                actual = runner.run(
-                    {"row": 0, "layer": i, "hidden": inputs[0], "residual": inputs[1]}, pages=pages
-                ).values
-                expected = item.mlp(inputs[0] + inputs[1]), inputs[1]
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        finally:
-            execution.cancel_step(invocation)
-            execution.retire(tuple(row.identity for row in rows))
-
-        # A newly introduced state update cannot inherit the readonly contract.
-        class StatefulResidual(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.register_buffer("counter", torch.zeros(1))
-
-            def forward(self, hidden, residual):
-                self.counter.add_(1)
-                return hidden + residual + self.counter, residual
-
-        layer.post_attention_layernorm = StatefulResidual()
-        with pytest.raises(ValueError):
-            VllmDecoderBodies.inspect((layer,), tensor, CausalModelDomain(1, 1, 2), 2)
-
-
-def test_model_source_exposes_kv_before_feed_forward_without_weakening_causality():
-    tensor = TensorType((1, 4), "torch.float32")
-    bodies = decoder_partition_bodies(tensor, CausalModelDomain(1, 1, 2), 2, "test-source-graph")
-    body, _ = bodies
-    function = body.declaration
-    index = ScalarType.INDEX
-    position = TensorType((1,), "torch.int64")
-    source = Program(
-        Region(
-            Block(
-                (Value("x", tensor), Value("position", position)),
-                (
-                    Coordinate((), (Value("zero", index),), AffineIndex(0)),
-                    Coordinate((), (Value("one", index),), AffineIndex(1)),
-                    Call(
-                        ("zero", "zero", "zero", "zero", "position", "x"),
-                        (Value("h0", tensor), Value("r0", tensor)),
-                        function.name,
-                    ),
-                    Call(
-                        ("one", "zero", "one", "zero", "position", "x"),
-                        (Value("h1", tensor), Value("r1", tensor)),
-                        function.name,
-                    ),
-                ),
-                ("h0", "r0", "h1", "r1"),
-            )
-        ),
-        (function,),
-        body.program.resources,
-    )
-    expanded = inline_function_bodies(source, bodies)
-    # Attention of token 1 may use token 0's published KV before token 0's
-    # feed-forward suffix. Reversing the attention pair remains illegal.
-    lower_region_schedule(expanded, "{ S0[] -> [0]; S1[] -> [2]; S2[] -> [1]; S3[] -> [3] }")
-    with pytest.raises(ValueError):
-        lower_region_schedule(expanded, "{ S0[] -> [1]; S1[] -> [2]; S2[] -> [0]; S3[] -> [3] }")
-
-
-def test_decoder_binds_request_and_token_for_symbolic_kv_access():
-    layers, taps = (1, 2), (2, 1)
-    execution, _, rows, refs = owner_fixture(rounds=1)
-    invocation = execution.start_step(rows)
-    decoder = DecoderRegion(TensorType((1, 4), "torch.float32"), layers, CausalModelDomain(2, 3, 8), taps=taps)
-
-    def layer(ordinal, positions, hidden, residual):
-        return hidden + ordinal + positions, hidden.clone()
-
-    hidden = torch.arange(4, dtype=torch.float32).reshape(1, 4)
-    for request, token in ((0, 0), (1, 7), (0, 3)):
-        row = replace(rows[0], request_ordinal=request, token_offset=token)
-        caches = tuple(PagedLayer(str(i), torch.zeros(2, 1, 8, 4), torch.tensor([request * 8 + token])) for i in layers)
-        view = PagedResourceView(
-            decoder.source.kv, bind_paged_access((row,), caches), tuple((i, str(i)) for i in layers)
-        )
-        kv = PagedResourceBinding(view, invocation.context)
-        result, residual, *observed = decoder.run(invocation.context, row, torch.tensor([token]), hidden, layer, kv=kv)
-        torch.testing.assert_close(result, hidden + sum(layers) + len(layers) * token, rtol=0, atol=0)
-        torch.testing.assert_close(residual, hidden + sum(layers[:-1]) + (len(layers) - 1) * token, rtol=0, atol=0)
-        for tap, actual in zip(taps, observed, strict=True):
-            preceding = layers[: layers.index(tap)]
-            torch.testing.assert_close(
-                actual, 2 * (hidden + sum(preceding) + len(preceding) * token) + tap + token, rtol=0, atol=0
-            )
-    with pytest.raises(ValueError):  # Token offset outside the causal domain.
-        decoder.run(invocation.context, replace(rows[0], token_offset=8), torch.tensor([0]), hidden, layer, kv=kv)
-    assert tuple(execution.arena.latest(ref.lineage_id) for ref in refs) == refs
-    execution.cancel_step(invocation)
-    execution.retire(tuple(row.identity for row in rows))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="vLLM FlashAttention backend requires CUDA")
@@ -272,3 +101,76 @@ def test_original_attention_resource_binds_without_a_model():
         attention_paged_access(
             replace(context, attn_metadata={name: replace(metadata, causal=False)}), (attention,), batch
         )
+
+
+@pytest.mark.parametrize("width", (1, 2, 8))
+def test_direct_route_batches_positions_taps_and_state(width):
+    from pllm.execution.route_executor import execute_route
+    from pllm.execution.token_program import TokenProgram
+
+    def route(layers):
+        seed = torch.where(layers.generated, layers.load("history"), layers.seed)
+        first = layers(stop=2, hidden=seed + layers.position + seed - seed.mean(dim=0, keepdim=True))
+        last = layers(start=1, hidden=first[0].reshape(first[0].shape))[-1]
+        layers.save("history", last)
+        return first[1]
+
+    program = TokenProgram.capture(route, TensorType((1, 4), "torch.float32", "cpu"), 3, ("history",))
+    seed = torch.arange(width * 4, dtype=torch.float32).reshape(width, 4)
+    previous = seed + 10
+    positions = torch.arange(width)
+    generated = (positions % 2 == 0).reshape(-1, 1)
+
+    def layer(ordinal, hidden, residual):
+        if residual is not None:
+            residual.add_(hidden)
+        return hidden * (ordinal + 1), hidden.clone() if residual is None else residual
+
+    output, (saved,) = execute_route(program, seed, positions, generated, (previous,), layer, lambda: None)
+    entry = torch.where(generated, previous, seed) + positions[:, None]
+    torch.testing.assert_close(output, 4 * entry)
+    torch.testing.assert_close(saved, 18 * entry)
+    torch.testing.assert_close(seed, torch.arange(width * 4, dtype=torch.float32).reshape(width, 4))
+
+
+def test_prompt_classification_is_structural_and_requires_the_complete_stack():
+    from pllm.execution.token_program import TokenProgram
+    from pllm.workloads.recirculation import RecirculationWorkload
+    from pllm.workloads.step_loop import StepLoop
+
+    tensor = TensorType((1, 4), "torch.float32", "cpu")
+    assert TokenProgram.capture(StepLoop().loop, tensor, 3, ("history",)).prompt_pass_is_identity
+    assert not TokenProgram.capture(RecirculationWorkload().recirculate, tensor, 3).prompt_pass_is_identity
+    assert not TokenProgram.capture(lambda layers: layers(stop=2)[-2], tensor, 3).prompt_pass_is_identity
+
+
+@pytest.mark.parametrize("kind", ("shape", "dtype", "device"))
+def test_segments_reject_incompatible_hidden_tensors(kind):
+    from pllm.execution.token_program import TokenProgram
+
+    def route(layers):
+        hidden = {"shape": layers.seed[:, :1], "dtype": layers.seed.double(), "device": layers.seed.to("meta")}[kind]
+        return layers(hidden=hidden)[-1]
+
+    with pytest.raises(ValueError, match="hidden tensor"):
+        TokenProgram.capture(route, TensorType((1, 4), "torch.float32", "cpu"), 3)
+
+
+@pytest.mark.parametrize("width", (1, 8))
+def test_constant_cells_expand_without_reading_other_requests(width):
+    from pllm.execution.route_executor import execute_route
+    from pllm.execution.token_program import TokenProgram
+
+    program = TokenProgram.capture(
+        lambda layers: layers(hidden=torch.ones((1, 4)))[-1], TensorType((1, 4), "torch.float32", "cpu"), 1
+    )
+    hidden, _ = execute_route(
+        program,
+        torch.empty(width, 4),
+        torch.zeros(width),
+        torch.zeros(width, 1, dtype=torch.bool),
+        (),
+        lambda layer, hidden, residual: (hidden + 1, torch.zeros_like(hidden)),
+        lambda: None,
+    )
+    torch.testing.assert_close(hidden, torch.full((width, 4), 2.0))

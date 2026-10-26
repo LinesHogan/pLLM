@@ -109,13 +109,6 @@ pub(crate) struct CausalModelDomain {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub(super) struct RegionFunctionBody {
-    pub declaration: super::super::region_program::Function,
-    pub program: super::super::region_program::Program,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct BackendPlacementProbe {
     pub(crate) adapter_id: String,
     pub(crate) backend_abi_digest: String,
@@ -135,10 +128,6 @@ pub(crate) struct BackendPlacementProbe {
     pub(crate) schema_version: u64,
     #[serde(default)]
     pub(crate) causal_domain: Option<CausalModelDomain>,
-    #[serde(default)]
-    pub(super) region_imports: Vec<super::super::region_imports::TensorImport>,
-    #[serde(default)]
-    pub(super) region_bodies: Vec<RegionFunctionBody>,
     #[serde(default)]
     pub(crate) position_states: Vec<(String, serde_json::Number)>,
 }

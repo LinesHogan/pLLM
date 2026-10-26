@@ -69,8 +69,6 @@ AUTHORITY_FILES = (
     Path("pllm/execution/exported_resources.py"),
     Path("pllm/execution/tensor_compilation.py"),
     Path("pllm/execution/tensor_batching.py"),
-    Path("pllm/execution/decoder_region.py"),
-    Path("pllm/execution/tokenwise_region.py"),
     Path("pllm/contracts/region_composition.py"),
     Path("pllm/execution/paged_access.py"),
     Path("pllm/execution/tensor_borrow.py"),
@@ -91,8 +89,6 @@ AUTHORITY_FILES = (
 NATIVE_BINDING_FILES = (
     Path("pllm/worker.py"),
     Path("pllm/backends/vllm/replay.py"),
-    Path("pllm/backends/vllm/region_kernels.py"),
-    Path("pllm/backends/vllm/region_layers.py"),
     Path("pllm/backends/vllm/activation.py"),
     Path("pllm/backends/vllm/parameter_overlay.py"),
 )

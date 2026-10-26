@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from math import isfinite, prod
+from math import isfinite
 from typing import TYPE_CHECKING
 
 import torch
@@ -29,7 +29,7 @@ from pllm.contracts.parameter_overlay import (
     ParameterOverlayOperator,
     ParameterTarget,
 )
-from pllm.contracts.region_program import BorrowedResource, TensorType
+from pllm.contracts.region_program import TensorType
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.semantic_graph import (
     PackedRowsInputSource,
@@ -37,16 +37,14 @@ from pllm.contracts.semantic_graph import (
     StateEffectKind,
     StateResource,
     StateScope,
-    TaskSourceRegion,
     TokenProgramEffect,
 )
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 from pllm.contracts.visibility import Exact, Visibility, VisibilitySource
+from pllm.execution.codec import boundary_digest
 from pllm.execution.declaration import Call, Dimensions, State, When, native
-from pllm.execution.decoder_region import decoder_activations
 from pllm.execution.overlay_task import OverlayTransition
 from pllm.execution.ptts.request_state import RequestStateSelection
-from pllm.execution.region_storage import import_region_functions
 from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION
 from pllm.execution.shared_tensor import tensor_dtype
 from pllm.execution.tensor_frame import (
@@ -59,7 +57,7 @@ from pllm.execution.tensor_program import (
     TaskOutput,
     TensorBatch,
 )
-from pllm.execution.token_program import ApplyUpdates, Layers, Segment, TokenProgram, Tokens
+from pllm.execution.token_program import ApplyUpdates, Cell, Layers, Segment, TokenProgram, Tokens
 from pllm.kernels.head_overlay import head_correction
 
 if TYPE_CHECKING:
@@ -540,9 +538,6 @@ class ModelEffectBinding(TensorBindingBase):
                 "torch." + probe.tensor_dtype.value,
                 "cpu" if probe.device_kind.value == "cpu" else f"cuda:{probe.device_ordinal}",
             )
-            activations = decoder_activations(
-                self.attachment.activation_bindings, self.layouts, self.attachment.state_resource, tensor.device
-            )
             captured = TokenProgram.capture(
                 function, tensor, probe.causal_domain.layers, tuple(name for name, _ in position_states)
             )
@@ -570,39 +565,29 @@ class ModelEffectBinding(TensorBindingBase):
                     )
 
                 self.operations[symbol] = replace(self.operations[symbol], select=select)
-            program, self.route_functions = captured.lower(
-                tensor,
-                probe.causal_domain,
-                probe.max_packed_rows,
-                activations,
-                None if not composed else BorrowedResource("overlay", (self.overlay_bytes(captured),)),
-            )
+            if any(isinstance(step, ApplyUpdates) for step in captured.steps) and not composed:
+                raise ValueError("apply_updates needs one trained parameter overlay on the same workload")
+            self.route_program = captured
             self.graph = replace(
                 self.graph,
-                source_regions=(
-                    TaskSourceRegion(
-                        symbol, "layer_route", program, import_region_functions(program, self.route_functions)
-                    ),
+                tasks=tuple(
+                    replace(
+                        task,
+                        replay=TokenProgramEffect(
+                            probe.causal_domain.layers,
+                            tokens,
+                            position_states,
+                            boundary_digest(
+                                tuple(
+                                    str(step.graph.graph) if isinstance(step, Cell) else step for step in captured.steps
+                                )
+                            ),
+                            captured.role_sensitive,
+                            any(isinstance(step, ApplyUpdates) for step in captured.steps),
+                        ),
+                    )
+                    if task.symbol == symbol
+                    else task
+                    for task in self.graph.tasks
                 ),
             )
-
-    def overlay_bytes(self, program: TokenProgram) -> int:
-        """Fund token staging, captured operands and per-boundary device effects from source bounds."""
-        assert self.attachment is not None and self.dimensions is not None and self.probe is not None
-        fields = tuple(field for layout in self.layouts.layouts for field in layout.layout.fields)
-
-        return (
-            3
-            * sum(
-                prod(field.shape) * (8 if field.dtype in (TensorDType.INT64, TensorDType.FLOAT64) else 4) + 8
-                for field in fields
-            )
-            + self.probe.max_packed_rows
-            * sum(
-                16 * (inputs + outputs) + 128
-                for target, (inputs, outputs) in zip(self.overlay_targets, self.dimensions.target_shapes, strict=True)
-                for step in program.steps
-                if isinstance(step, Segment) and step.start <= target.layer < step.stop
-            )
-            + 1024
-        )

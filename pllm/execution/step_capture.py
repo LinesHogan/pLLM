@@ -1,11 +1,14 @@
-"""CUDA graph capture shared by the tensor executor (whole steps) and the tokenwise region (one token)."""
+"""CUDA graph capture for whole tensor steps and batched layer routes."""
 
 from __future__ import annotations
 
 import gc
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
+
+if TYPE_CHECKING:
+    from torch.cuda import _POOL_HANDLE  # pyright: ignore[reportPrivateUsage]
 
 import torch
 
@@ -25,6 +28,7 @@ def capture_graph(
     *,
     prepare: Callable[[], None] = _ready,
     restore: Callable[[], None] = _ready,
+    pool: _POOL_HANDLE | None = None,
 ) -> tuple[torch.cuda.CUDAGraph, R, int]:
     """Warm `body` up three times on a private stream, capture it once and report the graph pool's bytes.
 
@@ -47,7 +51,7 @@ def capture_graph(
             restore()
         # Cyclic collection can release tensors from another CUDA stream and invalidate capture.
         # Torch's context collects before starting; postpone automatic collection until capture ends.
-        with torch.cuda.graph(graph, stream=stream, pool=torch.cuda.graph_pool_handle()):
+        with torch.cuda.graph(graph, stream=stream, pool=torch.cuda.graph_pool_handle() if pool is None else pool):
             prepare()
             result = body()
     finally:

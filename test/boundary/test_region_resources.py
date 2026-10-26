@@ -28,7 +28,6 @@ from pllm.contracts.region_program import (
     Value,
 )
 from pllm.contracts.region_selection import RegionPayloadLimit, RegionSelectionPolicy
-from pllm.execution.decoder_region import index_cell
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.exported_region import import_exported_region
 from pllm.execution.exported_resources import borrow_exported_inputs
@@ -45,7 +44,7 @@ from pllm.execution.region_resources import (
 from pllm.execution.region_storage import analyze_region_capacity
 from pllm.execution.region_streams import RegionStreamBindings, lower_region_streams
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
-from test.region_fixtures import bind, limits, owner_fixture, paged_rows, region, stream_execution
+from test.region_fixtures import bind, index_cell, limits, owner_fixture, paged_rows, region, stream_execution
 from test.region_reference import interpret
 
 X, I = ScalarType.INDEX, ScalarType.INT

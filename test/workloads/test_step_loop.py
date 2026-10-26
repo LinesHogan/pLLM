@@ -20,7 +20,7 @@ def test_step_loop_signing_and_provider_agreement():
     facts = replace(FACTS, probe=replace(FACTS.probe, position_states=schema))
     deployment = workload.compile_backend(workload.specialize(facts, ExecutionOptions()))
     assert deployment.attachment.inputs.plan.semantic_graph.tasks[0].replay.position_states == schema
-    with pytest.raises(ValueError, match="PositionState schema"):
+    with pytest.raises(ValueError, match="PositionState"):
         workload.compile_backend(workload.specialize(FACTS, ExecutionOptions()))
 
 
@@ -79,7 +79,7 @@ def test_ineligible_and_unsaved_tokens_fill_forward(save):
         current = row.request_ordinal * 2 + row.token_offset // 2
         previous = current - int(row.token_offset > 0 and row.token_offset % 2 == 0)
         decoder.position.indices[0, :, 0] = torch.tensor([current, previous])
-        decoder.position.flags[:] = torch.tensor([row.token_offset == 0, row.phase.value == "decode"])
+        decoder.position.flags[:, 0, 0] = torch.tensor([row.token_offset == 0, row.phase.value == "decode"])
         return begin(row)
 
     decoder.begin = staged

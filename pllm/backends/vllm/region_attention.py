@@ -67,31 +67,36 @@ def attention_paged_access(
     )
 
 
-class TokenAttentionBuffers:
-    """Stable single-row FA2 metadata; invocation tables and slots are copied before replay."""
+class BatchAttentionBuffers:
+    """Stable width-B FA2 metadata; invocation tables and slots are copied before replay."""
 
-    def __init__(self, context: ForwardContext, attentions: tuple[Attention, ...], capacity: int) -> None:
+    def __init__(self, context: ForwardContext, attentions: tuple[Attention, ...], capacity: int, width: int) -> None:
         self.metadata: dict[str, FlashAttentionMetadata] = {}
-        for attention in attentions:
+        self.group_ids = self.mapping_groups(context, attentions)
+        for index, attention in enumerate(attentions):
+            group = self.group_ids[index]
+            if group != index:
+                self.metadata[attention.layer_name] = self.metadata[attentions[group].layer_name]
+                continue
             metadata, cache, slots = attention_metadata(context, attention)
             selected = replace(
                 metadata,
-                num_actual_tokens=1,
+                num_actual_tokens=width,
                 max_query_len=1,
-                query_start_loc=torch.tensor([0, 1], dtype=metadata.query_start_loc.dtype, device=cache.device),
+                query_start_loc=torch.arange(width + 1, dtype=metadata.query_start_loc.dtype, device=cache.device),
                 # The launch bound is fixed at capture; the true length is seq_lens. The split count stays
                 # vLLM's own choice (its heuristic, or 1 under VLLM_BATCH_INVARIANT).
                 max_seq_len=capacity,
-                seq_lens=torch.empty(1, dtype=metadata.seq_lens.dtype, device=cache.device),
+                seq_lens=torch.empty(width, dtype=metadata.seq_lens.dtype, device=cache.device),
                 block_table=torch.zeros(
-                    (1, (capacity + cache.shape[2] - 1) // cache.shape[2]),
+                    (width, (capacity + cache.shape[2] - 1) // cache.shape[2]),
                     dtype=metadata.block_table.dtype,
                     device=cache.device,
                 ),
-                slot_mapping=torch.empty(1, dtype=slots.dtype, device=cache.device),
-                num_decode_reqs=1,
+                slot_mapping=torch.empty(width, dtype=slots.dtype, device=cache.device),
+                num_decode_reqs=width,
                 num_prefill_reqs=0,
-                num_decode_tokens=1,
+                num_decode_tokens=width,
                 num_prefill_tokens=0,
                 scheduler_metadata=None,
                 prefix_scheduler_metadata=None,
@@ -105,6 +110,15 @@ class TokenAttentionBuffers:
             is_padding=None,
         )
 
+    @staticmethod
+    def mapping_groups(context: ForwardContext, attentions: tuple[Attention, ...]) -> tuple[int, ...]:
+        """Share staging only while layers borrow identical device mappings and block shapes."""
+        keys = tuple(
+            (metadata.block_table.data_ptr(), slots.data_ptr(), cache.shape[2])
+            for metadata, cache, slots in (attention_metadata(context, item) for item in attentions)
+        )
+        return tuple(keys.index(key) for key in keys)
+
     def bind(
         self, context: ForwardContext, attentions: tuple[Attention, ...], lengths: torch.Tensor
     ) -> tuple[tuple[FlashAttentionMetadata, torch.Tensor, torch.Tensor, torch.Tensor], ...]:
@@ -116,18 +130,19 @@ class TokenAttentionBuffers:
                 attention_metadata(context, item)[2],
                 lengths.to(self.metadata[item.layer_name].seq_lens.dtype),
             )
-            for item in attentions
+            for index, item in enumerate(attentions)
+            if self.group_ids[index] == index
         )
 
     @staticmethod
     def refresh(
         bindings: tuple[tuple[FlashAttentionMetadata, torch.Tensor, torch.Tensor, torch.Tensor], ...],
-        row: PackedPhaseRow,
+        rows: torch.Tensor,
+        requests: torch.Tensor,
     ) -> None:
         """Queue device copies on the owner's stream without reading device scalars."""
-        index, request = row.packed_row_index, row.request_ordinal
         for metadata, tables, slots, lengths in bindings:
-            metadata.slot_mapping.copy_(slots[index : index + 1])
-            metadata.seq_lens.copy_(lengths[index : index + 1])
+            metadata.slot_mapping.copy_(slots.index_select(0, rows))
+            metadata.seq_lens.copy_(lengths.index_select(0, rows))
             width = min(tables.shape[1], metadata.block_table.shape[1])
-            metadata.block_table[:, :width].copy_(tables[request : request + 1, :width])
+            metadata.block_table[:, :width].copy_(tables.index_select(0, requests)[:, :width])

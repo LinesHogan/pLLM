@@ -12,8 +12,6 @@ from vllm.model_executor.models.extract_hidden_states import (
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import HiddenStateCacheSpec
 
-from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.execution.position_state import PositionBuffers
 
 POSITION_ENV = "PLLM_POSITION_STATES"
@@ -83,22 +81,25 @@ class PositionCacheProvider(PositionBuffers):
             )
         super().__init__(tuple(layer.kv_cache.view(-1, tensor.shape[1]) for layer in layers), initial, tensor)
 
-    def stage(self, context: ForwardContext, row: PackedPhaseRow) -> None:
-        """Use each registered layer's mapping, including device-side page permutations."""
+    def stage(
+        self,
+        context: ForwardContext,
+        rows: torch.Tensor,
+        requests: torch.Tensor,
+        positions: torch.Tensor,
+        generated: torch.Tensor,
+    ) -> None:
+        """Gather from each group's mapping using device indices for the complete wave."""
         assert isinstance(context.attn_metadata, dict) and isinstance(context.slot_mapping, dict)
-        self.flags[0].fill_(row.token_offset == 0)
-        self.flags[1].fill_(row.phase is HiddenPhase.DECODE)
+        self.flags[0].copy_((positions == 0).reshape(-1, 1))
+        self.flags[1].copy_(generated.reshape(-1, 1))
         for layer, indices in zip(self.layers, self.indices, strict=True):
             metadata = context.attn_metadata[layer.layer_name]
             assert isinstance(metadata, PositionMetadata)
-            slot = context.slot_mapping[layer.layer_name][row.packed_row_index : row.packed_row_index + 1]
-            current = slot // self.allocation
+            current = context.slot_mapping[layer.layer_name].index_select(0, rows) // self.allocation
             kernel = layer.kv_cache.shape[1]
-            previous = (
-                current
-                if row.token_offset % self.allocation
-                else metadata.block_table[row.request_ordinal, max(0, row.token_offset - 1) // kernel].reshape(1)
-                // (self.allocation // kernel)
+            previous = metadata.block_table[requests, (positions - 1).clamp_min(0) // kernel] // (
+                self.allocation // kernel
             )
             indices[0].copy_(current)
-            indices[1].copy_(previous)
+            indices[1].copy_(torch.where(positions % self.allocation != 0, current, previous))

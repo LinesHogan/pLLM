@@ -1,4 +1,4 @@
-"""Execute and capture source-verified region instructions with imported cells and PTTS effects.
+"""Execute source-verified region instructions with imported cells and PTTS effects.
 
 The loop cursor and mathematical value frame implement a fixed native plan.
 Resource access goes through the original invocation's page capabilities.
@@ -6,20 +6,19 @@ Resource access goes through the original invocation's page capabilities.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
-from time import perf_counter
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from pllm.execution.overlay_task import RouteOverlay
+    pass
 
 import torch
 
 from pllm.contracts.region_bindings import RegionBindings
 from pllm.contracts.region_imports import RegionTensorImport
-from pllm.contracts.region_program import Call, Program, Scan, bind_sizes
+from pllm.contracts.region_program import Call, Program, bind_sizes
 from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.region_schedule import ScheduleInstance, Statement
 from pllm.contracts.region_selection import RegionPayloadLimit
@@ -47,79 +46,11 @@ from pllm.execution.region_streams import (
     record_stream,
     validate_stream_budget,
 )
-from pllm.execution.region_values import Bank, Data, copy_data
+from pllm.execution.region_values import Data, copy_data
 from pllm.execution.region_window import RegionWindow, WindowBackpressure
-from pllm.execution.step_capture import capture_graph
 from pllm.execution.tensor_access import import_tensor_access_graph
 
 PreparedWindow = tuple[tuple[ScheduleInstance, ...], RegionValueLayout, Routes, tuple[tuple[int, Routes], ...]]
-
-
-@dataclass
-class RegionInvocation:
-    """One invocation's checked resources and host observations, never retained by graphs."""
-
-    execution: RegionInstructionExecution
-    inputs: Mapping[str, Data]
-    pages: RegionResources
-    sizes: Mapping[str, int]
-    streams: RegionStreamBindings | None
-    eligible: tuple[bool, ...]
-    observe: Callable[[int, torch.Tensor], None]
-    record: Callable[[int], None]
-    cold: bool = False
-    observation: torch.Tensor | None = None
-    overlay: RouteOverlay | None = None
-
-    def run(self) -> tuple[torch.Tensor, ...]:
-        """Run the CPU interpreter and return its ordered normal rows."""
-        results = self.execution.run(self.inputs, pages=self.pages, sizes=self.sizes, streams=self.streams).values
-        assert all(isinstance(result, Bank) for result in results)
-        return tuple(
-            value
-            for result in results
-            if isinstance(result, Bank)
-            for value in result.elements
-            if isinstance(value, torch.Tensor)
-        )
-
-
-class RegionTokenCapture:
-    """Owned graph and device results; source resources expire after cold preparation."""
-
-    def __init__(
-        self,
-        invocation: RegionInvocation,
-        instances: tuple[ScheduleInstance, ...],
-        device: torch.device,
-        reset: Callable[[], None] | None = None,
-    ) -> None:
-        overlay = invocation.overlay
-        started = perf_counter()
-
-        def body():
-            output = invocation.execution.capture_token_body(invocation, instances)
-            if overlay is None:
-                return output, invocation.observation, (), ()
-            return output, invocation.observation, tuple(overlay.results), overlay.captures()
-
-        invocation.cold = True
-
-        def prepare() -> None:
-            if overlay is not None:
-                overlay.reset()
-
-        def restore() -> None:
-            if reset is not None:
-                reset()
-
-        try:
-            self.graph, outputs, self.resident_bytes = capture_graph(device, body, prepare=prepare, restore=restore)
-        finally:
-            invocation.cold = False
-            invocation.observation = None
-        self.output, self.observation, self.overlay_results, self.overlay_pending = outputs
-        self.capture_seconds = perf_counter() - started
 
 
 @dataclass(frozen=True, slots=True)
@@ -344,49 +275,6 @@ class RegionInstructionExecution:
     def capture_signature(self) -> str:
         """Source and selected schedule identity for an owner's persistent graphs."""
         return self._lowered.signature
-
-    def prepare_token_body(
-        self, invocation: RegionInvocation, request: int, token: int
-    ) -> tuple[ScheduleInstance, ...]:
-        """Select one source Scan iteration from the verified serial instance table."""
-        assert self._stream_plan is None
-        instances, layout, _, _ = self._prepare(tuple(sorted(invocation.sizes.items())))
-        self._validate_pages(invocation.pages, invocation.sizes, layout)
-        scans = tuple(
-            i for i, operation in enumerate(self._program.entry.block.operations) if isinstance(operation, Scan)
-        )
-        return tuple(
-            item
-            for item in instances
-            if self._lowered.statements[item.statement_id].path[:2] == (scans[request], 0)
-            and item.coordinates[0] == token
-        )
-
-    def capture_token_body(self, invocation: RegionInvocation, instances: tuple[ScheduleInstance, ...]) -> torch.Tensor:
-        """Execute the same lowered actions and frame for one cold token capture."""
-        _, layout, _, _ = self._prepare(tuple(sorted(invocation.sizes.items())))
-        frame = RegionValueFrame(layout, invocation.inputs, invocation.sizes, borrow_inputs=True)
-        try:
-            for item in instances:
-                frame.advance(item.time)
-                self._invoke(
-                    frame,
-                    self._lowered.statements[item.statement_id],
-                    item.coordinates,
-                    invocation.pages,
-                    invocation.sizes,
-                )
-            output = next(
-                value
-                for value in self._bindings.values
-                if value.name == "normal_output"
-                and value.path[:2] == self._lowered.statements[instances[0].statement_id].path[:2]
-            )
-            result = frame.read(output.id, instances[0].coordinates[:1])
-            assert isinstance(result, torch.Tensor)
-            return result
-        finally:
-            frame.close()
 
     def run(
         self,

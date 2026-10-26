@@ -9,9 +9,9 @@ from typing import Protocol
 
 import torch
 from torch.nn import Parameter
-from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.models.qwen2 import Qwen2Attention, Qwen2DecoderLayer, Qwen2ForCausalLM
 
-from pllm.backends.vllm.region_layers import original_layer
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import (
     CapturedParameterOperand,
@@ -24,10 +24,30 @@ from pllm.contracts.parameter_overlay import (
 from pllm.contracts.state_ref import StateRef
 from pllm.execution.compile_facts import ParameterTargetShape
 from pllm.execution.cuda_stream import upload
-from pllm.execution.module_graph import capture_module_calls
+from pllm.execution.module_graph import capture_module_calls, module_has_execution_hooks
 from pllm.execution.overlay_task import ProjectionTransition, RouteOverlay
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.state_execution import DataT, StateTaskContext
+
+_LAYER_FORWARD = Qwen2DecoderLayer.forward
+
+
+def original_layer(layer: Qwen2DecoderLayer) -> bool:
+    """Check the Qwen2 implementation and hooks covered by the native endpoint contract."""
+    if (
+        type(layer) is not Qwen2DecoderLayer
+        or type(layer.self_attn) is not Qwen2Attention
+        or type(layer.input_layernorm) is not RMSNorm
+        or layer.forward != _LAYER_FORWARD.__get__(layer, Qwen2DecoderLayer)
+    ):
+        return False
+    # Existing layer-level captures and parameter/activation adapters retain
+    # their whole-layer endpoint until their effects have explicit source bodies.
+    return all(
+        module.forward == type(module).forward.__get__(module, type(module)) and not module_has_execution_hooks(module)
+        for module in layer.modules()
+    )
+
 
 _LinearOutput = torch.Tensor | tuple[torch.Tensor, Parameter | None]
 _LinearForward = Callable[[torch.Tensor], _LinearOutput]
@@ -142,6 +162,7 @@ class _ExactProjection:
         self.total_rows = 0
         self.apply_count = self.updated_apply_count = 0
         self.transition: ProjectionTransition | None = None
+        self.routes: tuple[RouteOverlay, ...] = ()
 
     def captures_binding(self, binding: ParameterOverlayFieldBinding) -> bool:
         return self.original_mlp_forward is not None or binding.operator is ParameterOverlayOperator.HEAD_ADD
@@ -169,8 +190,21 @@ class _ExactProjection:
             for item, selected in zip(self.prepared, inputs, strict=True)
             if self.captures_binding(item.binding)
         )
-        assert self.transition is not None
-        residuals = self.transition.run(captures)
+        if self.routes:
+            residuals = {
+                key: value
+                for route in self.routes
+                for key, value in route.run(
+                    tuple(
+                        operand
+                        for operand in captures
+                        if operand.identity == route.data.step.rows.rows[route.row].identity
+                    )
+                ).items()
+            }
+        else:
+            assert self.transition is not None
+            residuals = self.transition.run(captures)
         for item, selected in zip(self.prepared, inputs, strict=True):
             delta = (residuals[item.source.identity, item.binding.target] * item.binding.scale).to(output.dtype)
             columns = output[:, item.offset : item.offset + item.size]
@@ -178,7 +212,7 @@ class _ExactProjection:
             self.apply_count += selected.shape[0]
             if item.ref.version_id > 0:
                 self.updated_apply_count += selected.shape[0]
-        self.captures = () if isinstance(self.transition, RouteOverlay) else captures
+        self.captures = () if self.routes else captures
         return base
 
     def capture(self, item: _PreparedRows, selected: torch.Tensor) -> CapturedParameterOperand:
@@ -201,6 +235,7 @@ class _ExactProjection:
         self.mlp_input = None
         self.total_rows = 0
         self.transition = None
+        self.routes = ()
 
 
 class ExactParameterOverlay:
@@ -250,20 +285,29 @@ class ExactParameterOverlay:
             handle.transition = transition
             handle.prepared, handle.total_rows = tuple(prepared), rows.total_rows
 
-    def prepare_token(self, row: PackedPhaseRow, transition: RouteOverlay) -> None:
-        """Bind one row to the shared projection capture integration for this route occurrence."""
-        index = transition.batch.selection.state_indices[transition.row]
+    def prepare_wave(
+        self, rows: tuple[PackedPhaseRow, ...], routes: tuple[RouteOverlay, ...], indices: tuple[torch.Tensor, ...]
+    ) -> None:
+        """Use one projection call across the wave and request-local update operands."""
         for handle in self._modules:
-            handle.transition = transition
+            handle.routes = routes
             handle.prepared = tuple(
-                _PreparedRows(row, transition.batch.after_refs[index], self._token_index, binding, offset, size)
+                _PreparedRows(
+                    row,
+                    route.batch.after_refs[route.batch.selection.state_indices[route.row]],
+                    index,
+                    binding,
+                    offset,
+                    size,
+                )
+                for row, route, index in zip(rows, routes, indices, strict=True)
                 for binding, offset, size in handle.bindings
             )
-            handle.captures, handle.total_rows = (), 1
+            handle.captures, handle.total_rows = (), sum(index.numel() for index in indices)
 
     def take_captures(self) -> tuple[CapturedParameterOperand, ...]:
         for handle in self._modules:
-            if isinstance(handle.transition, RouteOverlay):
+            if handle.routes:
                 continue
             expected = sum(handle.captures_binding(item.binding) for item in handle.prepared)
             assert len(handle.captures) == expected

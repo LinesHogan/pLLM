@@ -7,8 +7,6 @@ from enum import StrEnum
 from typing import Literal, NewType
 
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
-from pllm.contracts.region_imports import RegionTensorImport
-from pllm.contracts.region_program import Program
 from pllm.contracts.region_selection import RegionSelectionPolicy
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.visibility import VisibilitySource
@@ -156,6 +154,9 @@ class TokenProgramEffect:
     layer_count: int
     rows: Literal["prefill", "decode", "all"] = "all"
     position_states: tuple[tuple[str, float], ...] = ()
+    digest: str = ""
+    role_sensitive: bool = False
+    apply_updates: bool = False
 
 
 LossReduction = Literal[
@@ -214,16 +215,6 @@ class ConditionalInputGroup:
 
 
 @dataclass(frozen=True, slots=True)
-class TaskSourceRegion:
-    """Complete task-owned source, available before physical partitioning."""
-
-    task: TaskSymbol
-    name: str
-    program: Program
-    imports: tuple[RegionTensorImport, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
 class SemanticGraph:
     workload_id: WorkloadId
     tasks: tuple[SemanticTask, ...]
@@ -232,7 +223,6 @@ class SemanticGraph:
     edges: tuple[SemanticEdge, ...] = ()
     schema_version: int = 1
     input_groups: tuple[ConditionalInputGroup, ...] = ()
-    source_regions: tuple[TaskSourceRegion, ...] = ()
 
     @property
     def updates_in_forward(self) -> bool:

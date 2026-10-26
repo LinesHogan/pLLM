@@ -10,12 +10,10 @@ import torch
 
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import CapturedParameterOperand, ParameterTarget
-from pllm.contracts.region_program import AccessMode, BorrowedResource
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import PackedSamplerRowBatch
 from pllm.contracts.semantic_graph import TaskId
 from pllm.contracts.visibility import VisibilitySource
-from pllm.execution.tensor_borrow import TensorResourceView
 from pllm.execution.tensor_frame import OverlayEntry, OverlayTargetResult, TensorFrame, Tensors, TensorUpdate
 from pllm.execution.tensor_program import TaskOutput, TensorBatch
 
@@ -160,35 +158,6 @@ class OverlayTransition:
         return result
 
 
-class RouteOverlayStorage:
-    """Stable token ports owned by the backend; graphs never retain page destinations."""
-
-    def __init__(self, resource: BorrowedResource, fields: tuple[torch.Tensor, ...]) -> None:
-        self.resource = resource
-        # The source envelope also pays for invocation journals and copied graph results.
-        self.slab = torch.empty(
-            3 * sum((field.numel() * field.element_size() + 7) // 8 * 8 for field in fields),
-            dtype=torch.uint8,
-            device=fields[0].device,
-        )
-        ports: list[torch.Tensor] = []
-        offset = 0
-        for field in fields * 3:
-            offset = (offset + 7) // 8 * 8
-            size = field.numel() * field.element_size()
-            ports.append(self.slab[offset : offset + size].view(field.dtype).view(field.shape))
-            offset += size
-        self.entry, self.fields, self.saved = (
-            tuple(ports[i : i + len(fields)]) for i in range(0, len(ports), len(fields))
-        )
-
-    def validate(self, protected: tuple[tuple[str, int, int], ...]) -> tuple[tuple[str, int, int], ...]:
-        return TensorResourceView(replace(self.resource, domain=(1,)), (self.slab,)).validate(protected)
-
-    def check(self, mode: AccessMode, ranges: tuple[tuple[int, int], ...]) -> None:
-        assert len(ranges) == 1 and 0 <= ranges[0][0] <= ranges[0][1] <= self.resource.domain[0]
-
-
 class RouteOperand(NamedTuple):
     """Capture outputs without retaining the cold invocation's request or phase."""
 
@@ -206,10 +175,13 @@ class RouteOverlay:
         math: OverlayTransition,
         batch: TensorBatch,
         entry: TensorBatch,
-        storage: RouteOverlayStorage,
         data: TensorFrame,
     ) -> None:
-        self.math, self.batch, self.entry, self.storage, self.data = math, batch, entry, storage, data
+        self.math, self.batch, self.entry, self.data = math, batch, entry, data
+        self.entry_fields: tuple[torch.Tensor, ...] = ()
+        self.fields: tuple[torch.Tensor, ...] = ()
+        self.saved: tuple[torch.Tensor, ...] = ()
+        self.gate = torch.zeros((1, 1), device=batch.roots[0][0].device)
         self.pending: list[CapturedParameterOperand] = []
         self.ordinary: list[CapturedParameterOperand] = []
         self.results: list[OverlayTargetResult] = []
@@ -219,21 +191,25 @@ class RouteOverlay:
     def stage(self, row: int, routed: bool) -> None:
         """Resolve input/private roots once, outside cold execution and graph replay."""
         self.row, self.routed = row, routed
+        if not self.fields:
+            self.entry_fields, self.fields, self.saved = (
+                tuple(torch.empty_like(field) for field in self.batch.roots[0]) for _ in range(3)
+            )
         index = self.batch.selection.state_indices[row]
         for ports, fields in (
-            (self.storage.entry, self.entry.roots[index]),
-            (self.storage.saved, self.batch.roots[index]),
+            (self.entry_fields, self.entry.roots[index]),
+            (self.saved, self.batch.roots[index]),
         ):
             for target, source in zip(ports, fields, strict=True):
                 target.copy_(source)
-        self.reset()
 
     def reset(self) -> None:
         """Restore every cold execution from this token's incoming private fields."""
-        for target, source in zip(self.storage.fields, self.storage.saved, strict=True):
+        for target, source in zip(self.fields, self.saved, strict=True):
             target.copy_(source)
         self.pending, self.results = [], []
         self.private = self.math.visibility.in_forward
+        self.gate.zero_()
 
     def values(self, target: ParameterTarget, private: bool) -> Tensors:
         width = len(self.math.buffers)
@@ -241,7 +217,7 @@ class RouteOverlay:
         return dict(
             zip(
                 self.math.buffers,
-                (self.storage.fields if private else self.storage.entry)[start : start + width],
+                (self.fields if private else self.entry_fields)[start : start + width],
                 strict=True,
             )
         )
@@ -260,7 +236,15 @@ class RouteOverlay:
                 self.results.append(OverlayTargetResult(operand.target, result))
                 output = result.output
             else:
-                output = self.math.apply(operand.hidden, self.values(operand.target, self.private))
+                visible = {
+                    name: torch.where(
+                        self.gate.reshape(()).bool(),
+                        value,
+                        self.values(operand.target, self.math.visibility.in_forward)[name],
+                    )
+                    for name, value in self.values(operand.target, True).items()
+                }
+                output = self.math.apply(operand.hidden, visible)
                 self.pending.append(captured)
             outputs[operand.identity, operand.target] = output
         return outputs
@@ -278,6 +262,7 @@ class RouteOverlay:
             self.results.append(OverlayTargetResult(target, result))
         if self.pending:
             self.private = True
+            self.gate.fill_(1.0)
         self.pending = []
 
     def captures(self) -> tuple[RouteOperand, ...]:
@@ -292,7 +277,7 @@ class RouteOverlay:
         row = self.data.step.rows.rows[self.row]
         index = self.batch.selection.state_indices[self.row]
         if self.batch.after_refs[index] != self.batch.selection.refs[index]:
-            for target, source in zip(self.batch.roots[index], self.storage.fields, strict=True):
+            for target, source in zip(self.batch.roots[index], self.fields, strict=True):
                 target.copy_(source)
         copied = tuple(
             OverlayTargetResult(

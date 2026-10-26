@@ -10,8 +10,6 @@ from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding
-from pllm.contracts.region_composition import RegionFunctionBody
-from pllm.contracts.region_imports import RegionTensorImport
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
     AnchorId,
@@ -103,8 +101,6 @@ class BackendPlacementProbe:
     capabilities: tuple[str, ...]
     schema_version: int = 2
     causal_domain: CausalModelDomain | None = None
-    region_imports: tuple[RegionTensorImport, ...] = ()
-    region_bodies: tuple[RegionFunctionBody, ...] = ()
     position_states: tuple[tuple[str, float], ...] = ()
 
 

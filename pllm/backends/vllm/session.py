@@ -175,8 +175,6 @@ class VllmSession(Generic[DataT, ResultT]):
                     task,
                     deployment.execution,
                     attachment.inputs.request.task_bindings[0].anchor_id,
-                    source_imports=probe.region_imports,
-                    function_bodies=probe.region_bodies,
                     activation=self._activation,
                     position_layers=position_layers,
                     allocation_block_size=allocation_block_size,

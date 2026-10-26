@@ -21,7 +21,6 @@ from pllm.contracts.backend_attachment import (
 )
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator
-from pllm.contracts.region_program import TensorType
 from pllm.contracts.region_proposal import TOKEN_CAPTURE_CAPABILITY
 from pllm.contracts.semantic_graph import (
     AnchorId,
@@ -36,12 +35,7 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
 from pllm.execution.codec import decode_boundary, encode_boundary
-from pllm.execution.decoder_region import decoder_activations
 from pllm.execution.parameter_projection import ROWS_PER_BLOCK, projection_blocks
-from pllm.execution.tokenwise_region import (
-    compile_tokenwise_source,
-    tokenwise_attachment_bytes,
-)
 
 
 def attachment_buffer_bytes(
@@ -89,8 +83,16 @@ def attachment_buffer_bytes(
     for task in graph.tasks:
         match task.replay:
             case TokenProgramEffect():
-                buffers += tokenwise_attachment_bytes(hidden, width, rows)
+                buffers += 2 * rows * hidden * width
                 buffers += (3 * hidden * width + 16) * len(task.replay.position_states) + 2
+                if probe.causal_domain is not None and attachment.overlay_bindings:
+                    requests = probe.causal_domain.requests
+                    # Two phase signatures at every exact width, plus one ordinary span.
+                    buffers += (
+                        3
+                        * (requests * (requests + 1) + requests)
+                        * sum(prod(field.shape) * width for field in fields.values())
+                    )
             case None:
                 pass
     return buffers
@@ -150,52 +152,23 @@ def derive_attachment_resources(
     effect = task.replay
     if not isinstance(effect, TokenProgramEffect) or probe.causal_domain is None:
         raise ValueError("tokenwise attachment requires its original model domain")
-    tensor = TensorType(
-        (1, probe.hidden_size),
-        "torch." + probe.tensor_dtype.value,
-        "cpu" if probe.device_kind.value == "cpu" else f"cuda:{probe.device_ordinal}",
-    )
-    if task.effects and (
-        layouts is None or attachment is None or not (attachment.activation_bindings or attachment.overlay_bindings)
-    ):
-        raise ValueError("composed tokenwise costs require signed effect bindings and layouts")
-    activations = (
-        ()
-        if layouts is None or attachment is None
-        else decoder_activations(attachment.activation_bindings, layouts, attachment.state_resource, tensor.device)
-    )
     resident = capture_memory_bytes if TOKEN_CAPTURE_CAPABILITY in probe.capabilities else 0
-    region = compile_tokenwise_source(
-        tensor,
-        probe.max_packed_rows,
-        probe.causal_domain,
-        effect,
-        next(source for source in graph.source_regions if source.task == task.symbol),
-        source_imports=probe.region_imports,
-        function_bodies=probe.region_bodies,
-        activations=activations,
-    )
+    workspace = probe.max_packed_rows * probe.hidden_size * 8
     existing = next((fact for fact in timeline.task_resources if fact.task == task.symbol), None)
     if existing is not None:
-        region.within_payload_budget(existing.workspace_bytes)
         task_facts = tuple(
             replace(fact, resident_bytes=max(fact.resident_bytes, resident)) if fact.task == task.symbol else fact
             for fact in timeline.task_resources
         )
     else:
-        (maximum,) = region.payload_limits
-        available = maximum.bytes
-        if timeline.memory_budget_bytes is not None:
-            available = min(
-                available,
-                timeline.memory_budget_bytes
-                - resident
-                - max(timeline.reserved_bytes, default=0)
-                - sum(fact.workspace_bytes + fact.resident_bytes for fact in timeline.task_resources)
-                - sum(fact.bytes for fact in timeline.value_resources),
-            )
-        (funded,) = region.within_payload_budget(max(0, available)).payload_limits
-        task_facts = (*timeline.task_resources, TaskResourceFact(task.symbol, funded.bytes, resident))
+        task_facts = (*timeline.task_resources, TaskResourceFact(task.symbol, workspace, resident))
+    if timeline.memory_budget_bytes is not None and (
+        max(timeline.reserved_bytes, default=0)
+        + sum(fact.workspace_bytes + fact.resident_bytes for fact in task_facts)
+        + sum(fact.bytes for fact in timeline.value_resources)
+        > timeline.memory_budget_bytes
+    ):
+        raise ValueError("increase memory_budget_bytes to fund route workspace and captures")
     # The output lives in the original adapter's concatenation reservation;
     # the outer task runner does not allocate a second copy of this value.
     known = {(fact.task, fact.output) for fact in timeline.value_resources}

@@ -1,9 +1,9 @@
-"""Qwen2/FA2 replay bindings and owned per-token CUDA capture for the region executor."""
+"""Direct batched layer-route execution under vLLM's own model and FA2 context."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import Generic
 
 import torch
@@ -17,57 +17,166 @@ from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay
 from pllm.backends.vllm.position_state import PositionCacheLayer, PositionCacheProvider
 from pllm.backends.vllm.region_attention import (
-    TokenAttentionBuffers,
+    BatchAttentionBuffers,
+    attention_metadata,
     attention_paged_access,
     validate_attention_resources,
 )
-from pllm.backends.vllm.region_kernels import VllmRmsNormKernel
-from pllm.backends.vllm.region_layers import VllmDecoderBodies
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
-from pllm.contracts.region_composition import RegionFunctionBody
-from pllm.contracts.region_imports import NativeKernelImport, RegionTensorImport
-from pllm.contracts.region_program import AccessMode, BorrowedResource, TensorType
 from pllm.contracts.semantic_graph import AnchorId, SemanticTask, TokenProgramEffect
-from pllm.execution.codec import boundary_digest
+from pllm.execution.activation import low_rank_affine_delta
+from pllm.execution.cuda_stream import PinnedStaging, upload
 from pllm.execution.execution import TaskGraphInvocation
-from pllm.execution.paged_access import PagedAccessPlan, PagedResourceView
-from pllm.execution.region_execution import RegionInvocation, RegionTokenCapture
-from pllm.execution.region_resources import (
-    ExternalFunction,
-    HostResourceBinding,
-    PagedResourceBinding,
-    PinnedResourceBinding,
-    ReadonlyResourceBinding,
-    RegionPageOwner,
-)
-from pllm.execution.region_values import Data
+from pllm.execution.overlay_task import RouteOperand, RouteOverlay
 from pllm.execution.replay import TokenwiseReplayPrimitive, TokenwiseReplayTask
+from pllm.execution.route_executor import execute_route, ordinary_pass
 from pllm.execution.state_execution import StateExecution, StateTaskContext
+from pllm.execution.step_capture import capture_graph
 from pllm.execution.step_input import TensorStepInput
-from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
+from pllm.execution.tensor_frame import OverlayTargetResult
+from pllm.execution.token_program import Save, TokenProgram
+
+Signature = tuple[bool, tuple[bool, ...], bool]
 
 
-@dataclass(frozen=True, slots=True)
-class _TokenContextView(Generic[DataT, ResultT]):
-    resource: BorrowedResource
-    replay: VllmTokenwiseReplay[DataT, ResultT]
-    rows: tuple[PackedPhaseRow, ...]
+class RouteWave(Generic[DataT, ResultT]):
+    """Stable inputs, page indices and captured outputs for an exact active width."""
 
-    @property
-    def namespace(self) -> int:
-        return id(self.replay)
+    def __init__(self, replay: VllmTokenwiseReplay[DataT, ResultT], width: int, signature: Signature) -> None:
+        self.replay, self.signature = replay, signature
+        tensor = replay.model.norm.weight
+        self.seed = tensor.new_empty((width, tensor.numel()))
+        self.positions = torch.empty(width, device=tensor.device, dtype=torch.long)
+        self.staging = PinnedStaging()
+        self.indices = torch.empty((3, width), device=tensor.device, dtype=torch.long)
+        self.attention = BatchAttentionBuffers(get_forward_context(), replay.attentions, replay.domain.positions, width)
+        self.position = PositionCacheProvider(
+            replay.position_layers,
+            tuple(value for _, value in replay.effect.position_states),
+            replay.allocation,
+            self.seed,
+        )
+        self.fields: dict[int, tuple[torch.Tensor, ...]] = {}
+        if replay.activation is not None:
+            for ordinal, handle in enumerate(replay.activation.layers):
+                if signature[1][ordinal]:
+                    fields = next(items[ordinal] for items in replay.activation_rows if items[ordinal])
+                    self.fields[handle.binding.layer] = tuple(
+                        field.new_empty((width, *field.shape)) for field in fields
+                    )
+        self.routes: tuple[RouteOverlay, ...] = ()
+        self.graph: torch.cuda.CUDAGraph | None = None
+        self.output = self.observation = self.seed
+        self.results: tuple[tuple[tuple[OverlayTargetResult, ...], tuple[RouteOperand, ...]], ...] = ()
+        self.lanes = tuple(torch.tensor([i], device=tensor.device) for i in range(width))
 
-    def validate(self) -> None:
-        assert self.replay.rows is self.rows
+    def stage(self, rows: tuple[PackedPhaseRow, ...]) -> None:
+        """Queue complete wave input copies without reading any device scalar."""
+        replay = self.replay
+        assert replay.hidden is not None and replay.positions is not None
+        host = self.staging.take(self.indices.numel()).view_as(self.indices)
+        host.copy_(
+            torch.tensor(
+                [(row.packed_row_index, row.request_ordinal, int(row.phase.value == "decode")) for row in rows]
+            ).T
+        )
+        self.staging.copy_to(self.indices)
+        packed, requests, generated = self.indices
+        self.seed.copy_(replay.hidden.index_select(0, packed))
+        self.positions.copy_(replay.positions.index_select(0, packed))
+        bindings = self.attention.bind(get_forward_context(), replay.attentions, replay.positions + 1)
+        self.attention.refresh(bindings, packed, requests)
+        self.position.stage(get_forward_context(), packed, requests, self.positions, generated)
+        if replay.activation is not None:
+            for ordinal, handle in enumerate(replay.activation.layers):
+                for column, target in enumerate(self.fields.get(handle.binding.layer, ())):
+                    for lane, row in enumerate(rows):
+                        target[lane].copy_(replay.activation_rows[row.packed_row_index][ordinal][column])
+        if replay.overlay is not None:
+            parent = replay.overlay
+            if not self.routes:
+                self.routes = tuple(RouteOverlay(parent.math, parent.batch, parent.entry, parent.data) for _ in rows)
+            for route, row in zip(self.routes, rows, strict=True):
+                route.batch, route.entry, route.data = parent.batch, parent.entry, parent.data
+                route.ordinary = []
+                route.stage(row.packed_row_index, self.signature[0])
+            assert replay.projections is not None
+            replay.projections.prepare_wave(rows, self.routes, self.lanes)
 
-    def check(self, mode: AccessMode, ranges: tuple[tuple[int, int], ...]) -> None:
-        self.validate()
+    def layer(
+        self, ordinal: int, hidden: torch.Tensor, residual: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Call the intact native layer and apply any declared post-layer patch."""
+        hidden, residual = self.replay.model.layers[ordinal](self.positions, hidden, residual)
+        fields = self.fields.get(ordinal, ())
+        if fields:
+            if len(fields) == 1:
+                hidden = hidden + fields[0].to(hidden.dtype)
+            else:
+                weight, bias, rotation = fields
+                inputs = hidden.unsqueeze(1)
+                delta = (
+                    torch.bmm(inputs, weight.transpose(1, 2)).squeeze(1) + bias - torch.bmm(inputs, rotation).squeeze(1)
+                )
+                hidden = hidden + torch.bmm(delta.unsqueeze(1), rotation.transpose(1, 2)).squeeze(1)
+        assert residual is not None
+        return hidden, residual
+
+    def body(self) -> torch.Tensor:
+        """All route boundaries, including gate changes and state stores, are captured."""
+        for route in self.routes:
+            route.reset()
+        generated, *entries = self.position.entry(())
+        if self.signature[0]:
+            hidden, saved = execute_route(
+                self.replay.program,
+                self.seed,
+                self.positions,
+                generated,
+                tuple(entries),
+                self.layer,
+                self.apply_updates,
+            )
+        else:
+            hidden, saved = ordinary_pass(self.seed, self.replay.effect.layer_count, self.layer), tuple(entries)
+        self.position.exit(saved)
+        self.observation = hidden
+        self.results = tuple((tuple(route.results), route.captures()) for route in self.routes)
+        return self.replay.model.norm(hidden)
+
+    def apply_updates(self) -> None:
+        for route in self.routes:
+            route.apply_updates()
+
+    def capture(self) -> None:
+        """Restore writable KV and PositionState pages after every cold execution."""
+        cells = tuple(
+            (attention.kv_cache, self.attention.metadata[attention.layer_name].slot_mapping)
+            for attention in self.replay.attentions
+        )
+        saved = tuple(cache[slots // cache.shape[2], :, slots % cache.shape[2], :].clone() for cache, slots in cells)
+        self.position.backup()
+
+        def restore() -> None:
+            for (cache, slots), value in zip(cells, saved, strict=True):
+                cache[slots // cache.shape[2], :, slots % cache.shape[2], :] = value
+            self.position.reset()
+
+        try:
+            with override_forward_context(self.attention.context):
+                self.graph, self.output, resident = capture_graph(
+                    self.seed.device, self.body, restore=restore, pool=self.replay.pool
+                )
+            if resident > self.replay.resident_bytes:
+                raise ValueError(
+                    f"route graphs need {resident} bytes; increase capture_memory_bytes above {self.replay.resident_bytes}"
+                )
+        finally:
+            restore()
 
 
 class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
-    """Model kernels bound to the original signed task and invocation."""
-
-    token_capture = True
+    """Run ordinary spans natively and dependent route positions in cross-request waves."""
 
     def __init__(
         self,
@@ -76,164 +185,56 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         execution: StateExecution[TensorStepInput, DataT, ResultT],
         anchor: AnchorId,
         *,
-        source_imports: tuple[RegionTensorImport, ...] = (),
-        function_bodies: tuple[RegionFunctionBody, ...] = (),
         activation: VllmActivationPatch | None = None,
         overlay: ExactParameterOverlay | None = None,
         position_layers: tuple[PositionCacheLayer, ...] = (),
         allocation_block_size: int = 16,
     ) -> None:
-        if not isinstance(task.replay, TokenProgramEffect) or task.replay.layer_count != len(model.model.layers):
-            raise ValueError("tokenwise replay differs from the specialized model")
-        validate_attention_resources(
-            tuple(layer.self_attn.attn for layer in model.model.layers), hidden_size=model.config.hidden_size
-        )
+        assert isinstance(task.replay, TokenProgramEffect)
         self.model, self.effect = model.model, task.replay
-        self.projections = overlay
-        self.implementation_id = next(
-            item.implementation_id
+        self.execution, self.anchor, self.activation, self.projections = execution, anchor, activation, overlay
+        implementation = next(
+            item
             for item in execution.arena.plan.schedule_physical.tasks
             if execution.arena.plan.semantic_graph.tasks[item.task_id].symbol == task.symbol
         )
-        self._capacity = (
-            TokenwiseReplayTask[DataT]
-            .from_implementation(execution.implementation(self.implementation_id))
-            .region.domain.positions
+        binding = TokenwiseReplayTask[DataT].from_implementation(
+            execution.implementation(implementation.implementation_id)
         )
-        self.activation = activation
-        tensor = TensorType(
-            (1, model.config.hidden_size), str(self.model.norm.weight.dtype), str(self.model.norm.weight.device)
+        self.program, self.domain = binding.program, binding.domain
+        self.resident_bytes = next(
+            fact.resident_bytes for fact in execution.arena.plan.timeline.task_resources if fact.task == task.symbol
         )
-        region = TokenwiseReplayTask[DataT].from_implementation(execution.implementation(self.implementation_id)).region
-        self.position = (
-            PositionCacheProvider(
-                position_layers,
-                tuple(initial for _, initial in self.effect.position_states),
-                allocation_block_size,
-                self.model.norm.weight[:].reshape(1, -1),
-            )
-            if region.position
-            else None
+        self.position_layers, self.allocation = position_layers, allocation_block_size
+        self.position = PositionCacheProvider(
+            position_layers,
+            tuple(value for _, value in self.effect.position_states),
+            self.allocation,
+            self.model.norm.weight.reshape(1, -1),
         )
-        self._normalize_kernel = (
-            VllmRmsNormKernel.inspect(self.model.norm, tensor, len(self.model.layers)) if source_imports else None
-        )
-        self._layer_bodies: VllmDecoderBodies | None = None
-        if function_bodies:
-            source = (
-                TokenwiseReplayTask[DataT].from_implementation(execution.implementation(self.implementation_id)).region
-            )
-            self._layer_bodies = VllmDecoderBodies.inspect(
-                tuple(self.model.layers), tensor, source.domain, source.context.domain[0]
-            )
-        if self.function_bodies != function_bodies:
-            raise ValueError("local model source differs from the signed backend definitions")
-        local_imports = (*self.kernel_imports, *(() if self._layer_bodies is None else self._layer_bodies.imports))
-        if local_imports != source_imports:
-            raise ValueError("local model sources differ from the signed backend catalog")
-        if self._layer_bodies is not None:
-            implementation = TokenwiseReplayTask[DataT].from_implementation(
-                execution.implementation(self.implementation_id)
-            )
-            missing = {
-                function.name for function in implementation.region.program.functions
-            } - implementation.region.functions.keys()
-            local_functions = {
-                name: function for name, function in self._layer_bodies.functions.items() if name in missing
-            }
-            execution.rebind_implementation(
-                replace(implementation, region=implementation.region.bind_functions(local_functions))
-            )
-        self.execution, self.anchor = execution, anchor
-        self._entitlement = next(
-            fact for fact in execution.arena.plan.timeline.task_resources if fact.task == task.symbol
-        )
+        self.attentions = tuple(layer.self_attn.attn for layer in self.model.layers)
+        validate_attention_resources(self.attentions, hidden_size=model.config.hidden_size)
         self.original = self.model.forward
         self._rows: tuple[PackedPhaseRow, ...] = ()
-        self._invocation: TaskGraphInvocation[StateTaskContext[DataT]] | None = None
-        self._hidden: torch.Tensor | None = None
-        self._positions: torch.Tensor | None = None
-        self._output: torch.Tensor | None = None
-        self._captures: dict[tuple[bool, tuple[bool, ...]], RegionTokenCapture] = {}
-        self._buffers: TokenAttentionBuffers | None = None
-        self._identity = ""
-        self._seed = torch.empty(tensor.shape, dtype=self.model.norm.weight.dtype, device=self.model.norm.weight.device)
-        self._position = torch.empty(1, dtype=torch.int64, device=self._seed.device)
-        self._activation_fields: dict[int, tuple[torch.Tensor, ...]] = {}
-        self._activation_rows: tuple[tuple[tuple[torch.Tensor, ...], ...], ...] = ()
-        self._access: PagedAccessPlan | None = None
-        self._stream: torch.cuda.Stream | None = None
+        self.invocation: TaskGraphInvocation[StateTaskContext[DataT]] | None = None
+        self.hidden: torch.Tensor | None = None
+        self.positions: torch.Tensor | None = None
+        self.output: torch.Tensor | None = None
+        self.observations: torch.Tensor | None = None
+        self.captures: dict[tuple[int, Signature], RouteWave[DataT, ResultT]] = {}
+        self.activation_rows: tuple[tuple[tuple[torch.Tensor, ...], ...], ...] = ()
+        self.pool = torch.cuda.graph_pool_handle()
+        self.identity: tuple[int, ...] = ()
+        self.stream: torch.cuda.Stream | None = None
         self.model.forward = self.forward
-
-    @property
-    def kernel_imports(self) -> tuple[NativeKernelImport, ...]:
-        return () if self._normalize_kernel is None else (self._normalize_kernel.implementation,)
-
-    @property
-    def function_bodies(self) -> tuple[RegionFunctionBody, ...]:
-        return () if self._layer_bodies is None else self._layer_bodies.definitions
-
-    def model_endpoints(self) -> tuple[ExternalFunction, ...]:
-        provider = self._layer_bodies
-        if provider is None:
-            return ()
-        provider.validate(tuple(self.model.layers))
-
-        def attention(inputs: tuple[Data, ...]) -> tuple[Data, ...]:
-            _row, _request, _token, ordinal, positions, hidden, *rest = inputs
-            residual = rest[0] if rest else None
-            assert type(ordinal) is int and isinstance(positions, torch.Tensor) and isinstance(hidden, torch.Tensor)
-            assert residual is None or isinstance(residual, torch.Tensor)
-            return provider.attention(ordinal, positions, hidden, residual)
-
-        first, next_ = provider.definitions
-        return (
-            ExternalFunction(first.program.functions[0], attention),
-            ExternalFunction(next_.program.functions[0], attention),
-        )
 
     @property
     def rows(self) -> tuple[PackedPhaseRow, ...]:
         return self._rows
 
-    def bind_kv(self, resource: BorrowedResource, owner: RegionPageOwner) -> PagedResourceBinding:
-        if self._invocation is None or owner is not self._invocation.context or self._access is None:
-            raise RuntimeError("tokenwise KV proof requires its original model invocation")
-        view = PagedResourceView(
-            resource,
-            self._access,
-            tuple((ordinal, layer.self_attn.attn.layer_name) for ordinal, layer in enumerate(self.model.layers)),
-        )
-        return PagedResourceBinding(view, owner)
-
-    def bind_weights(self, resource: BorrowedResource, owner: RegionPageOwner) -> ReadonlyResourceBinding:
-        if self._invocation is None or owner is not self._invocation.context:
-            raise RuntimeError("tokenwise weights require their original model invocation")
-        modules = (*self.model.layers, self.model.norm)
-        cells = tuple(
-            ReadonlyTensorCell.bind((ordinal,), tuple(module.parameters())) for ordinal, module in enumerate(modules)
-        )
-        return ReadonlyResourceBinding(ReadonlyTensorView(resource, cells), owner)
-
-    def bind_context(self, resource: BorrowedResource, owner: RegionPageOwner) -> HostResourceBinding:
-        if self._invocation is None or owner is not self._invocation.context:
-            raise RuntimeError("tokenwise context requires its original model invocation")
-        return HostResourceBinding(_TokenContextView(resource, self, self._rows), owner)
-
-    def bind_activation(self, resource: BorrowedResource, layer: int, owner: RegionPageOwner) -> PinnedResourceBinding:
-        if self._invocation is None or owner is not self._invocation.context or self.activation is None:
-            raise RuntimeError("activation fields require their original model invocation")
-        return self.activation.bind_pinned(resource, layer, owner)
-
-    def activation_selected(self, row: int, layer: int) -> bool:
-        assert self.activation is not None
-        return bool(
-            self._activation_rows[row][tuple(item.binding.layer for item in self.activation.layers).index(layer)]
-        )
-
     def prepare(self, rows: PackedPhaseRowBatch, invocation: TaskGraphInvocation[StateTaskContext[DataT]]) -> None:
         self.clear()
-        self._rows, self._invocation = rows.rows, invocation
+        self._rows, self.invocation = rows.rows, invocation
 
     def forward(
         self,
@@ -242,148 +243,234 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        if self._invocation is None:
+        if self.invocation is None:
             return self.original(input_ids, positions, intermediate_tensors, inputs_embeds)
-        if intermediate_tensors is not None or positions.ndim != 1 or positions.numel() != len(self._rows):
-            raise ValueError("tokenwise replay requires one original position per packed row")
+        if intermediate_tensors is not None or positions.ndim != 1 or positions.numel() != len(self.rows):
+            raise ValueError("layer routes need one position per packed row without pipeline parallelism")
         if inputs_embeds is None:
-            if input_ids is None:
-                raise ValueError("tokenwise replay requires model input IDs or embeddings")
+            assert input_ids is not None
             inputs_embeds = self.model.embed_input_ids(input_ids)
-        self._hidden, self._positions = inputs_embeds, positions
-        self._access = attention_paged_access(
-            get_forward_context(), tuple(layer.self_attn.attn for layer in self.model.layers), self._rows
-        )
-        self.execution.execute_anchor(self._invocation, self.anchor)
-        if self._output is None:
-            raise RuntimeError("signed tokenwise task did not return normal hidden states")
-        return self._output
+        self.hidden, self.positions = inputs_embeds, positions
+        attention_paged_access(get_forward_context(), self.attentions, self.rows)
+        self.execution.execute_anchor(self.invocation, self.anchor)
+        assert self.output is not None
+        return self.output
 
-    def run_region(self, invocation: RegionInvocation) -> tuple[torch.Tensor, ...]:
-        """Stage packed rows and submit source-derived token graphs on the owner stream."""
-        assert self._hidden is not None and self._positions is not None and self._invocation is not None
-        invocation.overlay = self.overlay
-        bindings = self._prepare_attention(invocation)
-        self._prepare_activations(invocation)
-        signatures = tuple(
-            (
-                enabled,
-                (tuple(bool(fields) for fields in self._activation_rows[index]) if self._activation_rows else ())
-                + (() if self.overlay is None else (self._rows[index].phase.value == "decode",)),
+    def run(
+        self, program: TokenProgram, effect: TokenProgramEffect, observe: Callable[[int, torch.Tensor], None]
+    ) -> None:
+        assert self.hidden is not None and self.positions is not None
+        stream = torch.cuda.current_stream(self.hidden.device)
+        if self.stream is not None and self.stream != stream:
+            stream.wait_stream(self.stream)
+        self.stream = stream
+        identity = tuple(
+            tensor.data_ptr()
+            for tensor in (
+                *tuple(self.model.parameters()),
+                *(item.kv_cache for item in self.attentions),
+                *(item.kv_cache for item in self.position_layers),
             )
-            for index, enabled in enumerate(invocation.eligible)
         )
-        outputs = torch.empty_like(self._hidden)
-        for index, (row, signature) in enumerate(zip(self._rows, signatures, strict=True)):
-            invocation.pages.before_statement()
-            self._seed.copy_(self._hidden[index : index + 1])
-            self._position.copy_(self._positions[index : index + 1])
-            TokenAttentionBuffers.refresh(bindings, row)
-            if self.position is not None:
-                assert isinstance(self.position, PositionCacheProvider)
-                self.position.stage(get_forward_context(), row)
-            if self.activation is not None:
-                for handle, fields in zip(self.activation.layers, self._activation_rows[index], strict=True):
-                    for target, field in zip(self._activation_fields.get(handle.binding.layer, ()), fields):
-                        target.copy_(field)
-            if self.overlay is not None:
-                assert self.projections is not None
-                self.overlay.stage(index, signature[0])
-                self.projections.prepare_token(row, self.overlay)
-            capture = self._captures.get(signature) or self._capture_token(invocation, row, signature)
-            capture.graph.replay()
-            if self.overlay is not None:
-                self.overlay.collect(capture.overlay_results, capture.overlay_pending)
-            outputs[index : index + 1].copy_(capture.output)
-            if signature[0]:
-                assert capture.observation is not None
-                invocation.observe(index, capture.observation)
-                invocation.record(index)
-        return tuple(outputs[index : index + 1] for index in range(len(self._rows)))
-
-    def _prepare_attention(
-        self, invocation: RegionInvocation
-    ) -> tuple[tuple[FlashAttentionMetadata, torch.Tensor, torch.Tensor, torch.Tensor], ...]:
-        """Bind stable metadata and invalidate graphs when their source or backing changes."""
-        assert self._hidden is not None
-        attentions = tuple(layer.self_attn.attn for layer in self.model.layers)
-        context = get_forward_context()
-        stream = torch.cuda.current_stream(self._hidden.device)
-        if self._stream is not None and self._stream != stream:
-            stream.wait_stream(self._stream)
-        self._stream = stream
-        identity = boundary_digest(
-            invocation.execution.capture_signature,
-            self.execution.arena.plan.semantic_graph.execution_parameters_digest,
-            None if self.overlay_storage is None else self.overlay_storage.slab.data_ptr(),
-            tuple(
-                (tensor.data_ptr(), tuple(tensor.shape), tensor.stride(), str(tensor.dtype), str(tensor.device))
-                for tensor in (
-                    *tuple(item.kv_cache for item in attentions),
-                    *tuple(self.model.parameters()),
-                    *(() if self.position is None else self.position.tables),
-                )
-            ),
-        )
-        if identity != self._identity:
+        identity += BatchAttentionBuffers.mapping_groups(get_forward_context(), self.attentions)
+        if identity != self.identity:
             stream.synchronize()
-            self._captures.clear()
-            self._buffers = TokenAttentionBuffers(context, attentions, self._capacity)
-            self._identity = identity
-        assert self._buffers is not None
-        assert self._positions is not None
-        return self._buffers.bind(context, attentions, self._positions + 1)
-
-    def _prepare_activations(self, invocation: RegionInvocation) -> None:
-        """Bind exact pins once and route captured field reads through owned staging."""
-        self._activation_rows = () if self.activation is None else self.activation.prepare_token_rows()
-        if self.activation is not None:
-            for ordinal, handle in enumerate(self.activation.layers):
-                fields = next((items[ordinal] for items in self._activation_rows if items[ordinal]), ())
-                if fields and handle.binding.layer not in self._activation_fields:
-                    self._activation_fields[handle.binding.layer] = tuple(torch.empty_like(field) for field in fields)
-        invocation.pages.stage_token_tensors(
-            {f"activation.{layer}": fields for layer, fields in self._activation_fields.items()}
+            self.captures.clear()
+            self.identity = identity
+        self.activation_rows = () if self.activation is None else self.activation.prepare_token_rows()
+        self.output = torch.empty_like(self.hidden)
+        self.observations = torch.empty_like(self.hidden)
+        ordinary = tuple(
+            (effect.rows != "all" and row.phase.value != effect.rows)
+            or (row.phase.value == "prefill" and program.prompt_pass_is_identity and self.overlay is None)
+            for row in self.rows
         )
+        requests = [
+            list(row for row in self.rows if row.request_ordinal == request)
+            for request in dict.fromkeys(row.request_ordinal for row in self.rows)
+        ]
+        while any(requests):
+            spans: list[PackedPhaseRow] = []
+            groups: dict[Signature, list[PackedPhaseRow]] = {}
+            for request in requests:
+                while request and ordinary[request[0].packed_row_index]:
+                    spans.append(request.pop(0))
+                if request:
+                    row = request.pop(0)
+                    signature = (
+                        effect.rows == "all" or row.phase.value == effect.rows,
+                        tuple(bool(fields) for fields in self.activation_rows[row.packed_row_index])
+                        if self.activation_rows
+                        else (),
+                        row.phase.value == "decode",
+                    )
+                    groups.setdefault(signature, []).append(row)
+            if spans:
+                self.span(tuple(spans))
+            for signature, rows in groups.items():
+                selected = tuple(rows)
+                key = len(rows), signature
+                if key not in self.captures:
+                    self.captures[key] = RouteWave(self, len(rows), signature)
+                captured = self.captures[key]
+                captured.stage(selected)
+                if captured.graph is None:
+                    captured.capture()
+                assert captured.graph is not None
+                captured.graph.replay()
+                self.output.index_copy_(0, captured.indices[0], captured.output)
+                self.observations.index_copy_(0, captured.indices[0], captured.observation)
+                for route, (results, pending) in zip(captured.routes, captured.results, strict=True):
+                    route.collect(results, pending)
+                    assert self.overlay is not None
+                    self.overlay.ordinary.extend(route.ordinary)
+        for row in self.rows:
+            if effect.rows == "all" or row.phase.value == effect.rows:
+                observe(row.packed_row_index, self.observations[row.packed_row_index : row.packed_row_index + 1])
 
-    def _capture_token(
-        self, invocation: RegionInvocation, row: PackedPhaseRow, signature: tuple[bool, tuple[bool, ...]]
-    ) -> RegionTokenCapture:
-        """Capture one source variant, restoring only its cold writable KV slots."""
-        assert self._buffers is not None and self._hidden is not None
-        instances = invocation.execution.prepare_token_body(
-            invocation, row.request_ordinal, row.token_offset - invocation.sizes[f"prefix{row.request_ordinal}"]
+    def span(self, rows: tuple[PackedPhaseRow, ...]) -> None:
+        """One native varlen pass, committing the last touched position of every page."""
+        assert self.hidden is not None and self.positions is not None and self.output is not None
+        context = get_forward_context()
+        packed = upload(tuple(row.packed_row_index for row in rows), self.hidden.device)
+        groups = tuple(
+            tuple(row for row in rows if row.request_ordinal == request)
+            for request in dict.fromkeys(row.request_ordinal for row in rows)
         )
-        assert self._access is not None
-        attentions = tuple(layer.self_attn.attn for layer in self.model.layers)
-        cells = tuple((attention.kv_cache, *self._access.cell(attention.layer_name, row)) for attention in attentions)
-        saved = tuple(cache[block, :, offset, :] for cache, block, offset in cells)
-        if self.position is not None:
-            self.position.backup()
-
-        def reset() -> None:
-            for (cache, block, offset), value in zip(cells, saved, strict=True):
-                cache[block, :, offset, :] = value
-            if self.position is not None:
-                self.position.reset()
-
-        try:
-            with override_forward_context(self._buffers.context):
-                capture = RegionTokenCapture(invocation, instances, self._hidden.device, reset=reset)
-        finally:
-            reset()
-        if self.overlay is not None:
-            self.overlay.reset()
-        resident = sum(item.resident_bytes for item in self._captures.values()) + capture.resident_bytes
-        if resident > self._entitlement.resident_bytes:
-            raise ValueError(
-                f"token capture needs {resident} resident bytes; increase capture_memory_bytes above {self._entitlement.resident_bytes}"
+        requests = upload(tuple(group[0].request_ordinal for group in groups), self.hidden.device)
+        lengths = tuple(len(group) for group in groups)
+        starts = [0]
+        for length in lengths:
+            starts.append(starts[-1] + length)
+        if rows != self.rows:
+            metadata: dict[str, FlashAttentionMetadata] = {}
+            for attention in self.attentions:
+                source, _, slots = attention_metadata(context, attention)
+                metadata[attention.layer_name] = replace(
+                    source,
+                    num_actual_tokens=len(rows),
+                    max_query_len=max(lengths),
+                    query_start_loc=upload(starts, self.hidden.device, torch.int32),
+                    seq_lens=upload(
+                        tuple(group[-1].token_offset + 1 for group in groups), self.hidden.device, torch.int32
+                    ),
+                    block_table=source.block_table.index_select(0, requests),
+                    slot_mapping=slots.index_select(0, packed),
+                    num_decode_reqs=0,
+                    num_decode_tokens=0,
+                    num_prefill_reqs=len(groups),
+                    num_prefill_tokens=len(rows),
+                    scheduler_metadata=None,
+                    prefix_scheduler_metadata=None,
+                )
+            context = replace(
+                context,
+                attn_metadata=metadata,
+                slot_mapping={name: item.slot_mapping for name, item in metadata.items()},
+                batch_descriptor=None,
+                is_padding=None,
             )
-        self._captures[signature] = capture
-        return capture
+        routes: tuple[RouteOverlay, ...] = ()
+        if self.overlay is not None:
+            parent = self.overlay
+            routes = tuple(RouteOverlay(parent.math, parent.batch, parent.entry, parent.data) for _ in groups)
+            for route, group in zip(routes, groups, strict=True):
+                route.stage(group[0].packed_row_index, False)
+                route.reset()
+            assert self.projections is not None
+            self.projections.prepare_wave(
+                tuple(group[0] for group in groups),
+                routes,
+                tuple(upload(tuple(range(start, stop)), self.hidden.device) for start, stop in zip(starts, starts[1:])),
+            )
+        positions = self.positions.index_select(0, packed)
+
+        def layer(
+            ordinal: int, hidden: torch.Tensor, residual: torch.Tensor | None
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            hidden, residual = self.model.layers[ordinal](positions, hidden, residual)
+            if self.activation is not None:
+                for index, handle in enumerate(self.activation.layers):
+                    if handle.binding.layer == ordinal:
+                        for lane, row in enumerate(rows):
+                            fields = self.activation_rows[row.packed_row_index][index]
+                            if fields:
+                                delta = (
+                                    fields[0].to(hidden.dtype)
+                                    if len(fields) == 1
+                                    else low_rank_affine_delta(hidden[lane : lane + 1], *fields)
+                                )
+                                hidden[lane : lane + 1].add_(delta)
+            assert residual is not None
+            return hidden, residual
+
+        with override_forward_context(context):
+            hidden = ordinary_pass(self.hidden.index_select(0, packed), self.effect.layer_count, layer)
+            self.output.index_copy_(0, packed, self.model.norm(hidden))
+            assert self.observations is not None
+            self.observations.index_copy_(0, packed, hidden)
+        for route in routes:
+            route.collect(tuple(route.results), route.captures())
+            assert self.overlay is not None
+            self.overlay.ordinary.extend(route.ordinary)
+        self.save_span(rows, groups, requests, hidden)
+
+    def save_span(
+        self,
+        rows: tuple[PackedPhaseRow, ...],
+        groups: tuple[tuple[PackedPhaseRow, ...], ...],
+        requests: torch.Tensor,
+        hidden: torch.Tensor,
+    ) -> None:
+        """Snapshot predecessor values before scattering page tails in a native span."""
+        if not self.position_layers:
+            return
+        provider = PositionCacheProvider(
+            self.position_layers,
+            tuple(value for _, value in self.effect.position_states),
+            self.allocation,
+            hidden[: len(groups)],
+        )
+        starts = upload(tuple(group[0].packed_row_index for group in groups), hidden.device)
+        offsets = upload(tuple(group[0].token_offset for group in groups), hidden.device)
+        provider.stage(get_forward_context(), starts, requests, offsets, offsets.new_zeros(offsets.shape))
+        entries = provider.entry(())[1:]
+        tails: dict[tuple[int, int], int] = {}
+        saved: dict[int, int] = {}
+        sources: dict[tuple[int, int], int] = {}
+        for index, row in enumerate(rows):
+            page = row.request_ordinal, row.token_offset // self.allocation
+            tails[page] = index
+            if row.phase.value == "prefill" and self.effect.rows in ("all", "prefill"):
+                saved[row.request_ordinal] = index
+            sources[page] = saved.get(row.request_ordinal, -1)
+        indices = upload(tuple(sources.values()), hidden.device)
+        packed = upload(tuple(rows[index].packed_row_index for index in tails.values()), hidden.device)
+        request_indices = upload(
+            tuple(
+                tuple(group[0].request_ordinal for group in groups).index(rows[index].request_ordinal)
+                for index in tails.values()
+            ),
+            hidden.device,
+        )
+        context = get_forward_context()
+        assert isinstance(context.slot_mapping, dict)
+        saved_names = {step.name for step in self.program.steps if isinstance(step, Save)}
+        for cache, (name, _), entry in zip(self.position_layers, self.effect.position_states, entries, strict=True):
+            slots = context.slot_mapping[cache.layer_name].index_select(0, packed) // self.allocation
+            values = (
+                torch.where(
+                    (indices >= 0).unsqueeze(1),
+                    hidden.index_select(0, indices.clamp_min(0)),
+                    entry.index_select(0, request_indices),
+                )
+                if self.program.prompt_pass_is_identity and name in saved_names
+                else entry.index_select(0, request_indices)
+            )
+            cache.kv_cache.view(-1, hidden.shape[1])[slots] = values
 
     def begin(self, row: PackedPhaseRow) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._position, self._seed
+        raise AssertionError("CUDA routes use batched waves")
 
     def layer(
         self,
@@ -393,34 +480,25 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         hidden: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.model.layers[ordinal].forward(positions, hidden, residual)
+        return self.model.layers[ordinal](positions, hidden, residual)
 
     def normalize(self, row: PackedPhaseRow, hidden: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
-        if self._normalize_kernel is not None:
-            if self.model.norm is not self._normalize_kernel.norm:
-                raise ValueError("model replaced the bound normalization module")
-            return self._normalize_kernel.run(hidden, residual)
-        normal, _ = self.model.norm.forward(hidden, residual)
-        return normal
+        return self.model.norm(hidden + residual)
 
     def commit(self, row: PackedPhaseRow, record: Callable[[], None]) -> None:
         record()
 
     def finish(self, outputs: tuple[torch.Tensor, ...]) -> None:
-        if len(outputs) != len(self._rows):
-            raise RuntimeError("tokenwise outputs require every prepared row to commit")
-        self._output = torch.cat(outputs, dim=0)
-        self._access = None
+        self.output = torch.cat(outputs)
 
     def clear(self) -> None:
-        self._rows, self._invocation = (), None
-        self._hidden, self._positions, self._output = None, None, None
-        self._activation_rows = ()
-        self._access = None
+        self._rows, self.invocation = (), None
+        self.hidden, self.positions, self.output, self.observations = None, None, None, None
+        self.activation_rows = ()
 
     def close(self) -> None:
-        if self._stream is not None:
-            self._stream.synchronize()
-        self._captures.clear()
+        if self.stream is not None:
+            self.stream.synchronize()
+        self.captures.clear()
         self.clear()
         self.model.forward = self.original

@@ -204,15 +204,16 @@ def observe_model(workload):
 
 @contextmanager
 def observe_replay(*, versions):
-    from pllm.backends.vllm.replay import VllmTokenwiseReplay
-    from pllm.execution.exported_cell import ExportedCell
-    from pllm.execution.region_execution import RegionTokenCapture
+    from vllm.forward_context import get_forward_context
 
-    original_make, original_invoke = pllm.make_llm, ExportedCell.invoke
-    original_normalize, original_finish = VllmTokenwiseReplay.normalize, VllmTokenwiseReplay.finish
-    holder, normals, history = {}, [], {}
-    recordings, capturing = {}, None
-    original_capture, original_replay = RegionTokenCapture.__init__, torch.cuda.CUDAGraph.replay
+    from pllm.backends.vllm.region_attention import attention_paged_access
+    from pllm.backends.vllm.replay import RouteWave, VllmTokenwiseReplay
+
+    original_make, original_layer = pllm.make_llm, RouteWave.layer
+    original_run = VllmTokenwiseReplay.run
+    original_capture, original_replay = RouteWave.capture, torch.cuda.CUDAGraph.replay
+    holder, history, recordings = {}, {}, {}
+    capturing = None
     calls, completed = [], []
 
     def make(*args, **kwargs):
@@ -221,36 +222,41 @@ def observe_replay(*, versions):
         holder.update(session=session, primitive=session._replay, execution=llm.deployment.execution)
         return llm
 
-    def capture(item, invocation, instances, device, **kwargs):
+    def capture(item):
         nonlocal capturing
         capturing = {"patches": [], "normal": None}
-        original_capture(item, invocation, instances, device, **kwargs)
-        recordings[item.graph] = capturing
+        original_capture(item)
+        recordings[item.graph] = item, capturing
         capturing = None
 
-    def invoke(cell, args):
-        result = original_invoke(cell, args)
-        if (
-            capturing is not None
-            and torch.cuda.is_current_stream_capturing()
-            and cell.inputs == ("hidden", "delta")
-            and cell.outputs == ("patched",)
-        ):
-            capturing["patches"].append(tuple(value.clone() for value in (*args, result[0])))
-        return result
+    def layer(wave, ordinal, hidden, residual):
+        base = []
 
-    def normalize(self, row, hidden, residual):
-        result = original_normalize(self, row, hidden, residual)
+        def native(module, args, result):
+            if torch.cuda.is_current_stream_capturing():
+                base.append(result[0].clone())
+
+        hook = wave.replay.model.layers[ordinal].register_forward_hook(native) if ordinal == 1 else None
+        try:
+            result = original_layer(wave, ordinal, hidden, residual)
+        finally:
+            if hook is not None:
+                hook.remove()
         if capturing is not None and torch.cuda.is_current_stream_capturing():
-            capturing["normal"] = result.clone()
+            if ordinal == 1 and base and 1 in wave.fields:
+                capturing["patches"].append((base[0], wave.fields[1][0].clone(), result[0].clone()))
+            if ordinal == len(wave.replay.model.layers) - 1 and capturing["normal"] is None:
+                capturing["normal"] = wave.replay.model.norm(result[0] + result[1]).clone()
         return result
 
     def replay(graph):
         original_replay(graph)
         if graph not in recordings:
             return
-        observed = recordings[graph]
-        normals.append(observed["normal"].clone())
+        wave, observed = recordings[graph]
+        torch.testing.assert_close(wave.output, observed["normal"], rtol=0, atol=0)
+        if 1 not in wave.fields:
+            return
         step = holder["session"]._step
         context = step.invocation.context
         if context.held_input is None:
@@ -260,54 +266,44 @@ def observe_replay(*, versions):
             (ref,) = context.pin.refs
             pin = context.pin
         field = context.arena.borrow_field(pin, ref, LayoutFieldId(0))
-        staged = holder["primitive"]._activation_fields[1][0]
+        staged = wave.fields[1][0]
         assert staged.data_ptr() != field.data_ptr()
-        torch.testing.assert_close(staged, field, rtol=0, atol=0)
+        torch.testing.assert_close(staged, field.expand_as(staged), rtol=0, atol=0)
         for hidden, delta, patched in observed["patches"]:
-            torch.testing.assert_close(delta, field, rtol=0, atol=0)
+            torch.testing.assert_close(delta, field.expand_as(delta), rtol=0, atol=0)
             torch.testing.assert_close(patched, hidden + delta.to(hidden.dtype), rtol=0, atol=0)
             calls.append((step.rows.step_id, int(ref.version_id)))
 
-    def finish(self, outputs):
+    def run(self, *args):
+        result = original_run(self, *args)
         if holder and self is holder["primitive"]:
-            for actual, saved in zip(outputs, normals, strict=True):
-                torch.testing.assert_close(
-                    actual, saved, rtol=0, atol=0
-                )  # Sampling receives normal output, not replay output.
-            normals.clear()
             for view, saved in history.values():
                 torch.testing.assert_close(view, saved, rtol=0, atol=0)
+            access = attention_paged_access(get_forward_context(), self.attentions, self.rows)
             for row in self.rows:
                 for ordinal, layer in enumerate(self.model.layers):
-                    block, offset = map(int, self._access.cell(layer.self_attn.attn.layer_name, row))
+                    block, offset = map(int, access.cell(layer.self_attn.attn.layer_name, row))
                     view = layer.self_attn.attn.kv_cache[block, :, offset, :]
                     history[ordinal, row.token_offset] = view, view.clone()
             step = holder["session"]._step
             seen = {ref for step_id, ref in calls if step_id == step.rows.step_id}
             assert seen == {versions[step.rows.step_id]}
             completed.append(tuple(row.identity for row in self.rows))
-        return original_finish(self, outputs)
+        return result
 
-    try:
-        with (
-            patch.object(pllm, "make_llm", make),
-            patch.object(ExportedCell, "invoke", invoke),
-            patch.object(RegionTokenCapture, "__init__", capture),
-            patch.object(torch.cuda.CUDAGraph, "replay", replay),
-            patch.object(VllmTokenwiseReplay, "normalize", normalize),
-            patch.object(VllmTokenwiseReplay, "finish", finish),
-        ):
-            yield
-        assert len(completed) == len(versions) and len({identity for rows in completed for identity in rows}) == 1
-        assert (
-            len([step for step, _ in calls if step == 0]) > 2
-        )  # Real prefill suffix replay also applied the same injection.
-        # The llm handle closes with consume; the detached execution keeps its counters.
-        diagnostics = holder["execution"].diagnostics()
-        assert diagnostics.update_count == len(set(versions))
-        assert diagnostics.hold_count == len(versions) - len(set(versions)) and diagnostics.fallback_count == 0
-    finally:
-        assert not normals
+    with (
+        patch.object(pllm, "make_llm", make),
+        patch.object(RouteWave, "layer", layer),
+        patch.object(RouteWave, "capture", capture),
+        patch.object(torch.cuda.CUDAGraph, "replay", replay),
+        patch.object(VllmTokenwiseReplay, "run", run),
+    ):
+        yield
+    assert len(completed) == len(versions) and len({identity for rows in completed for identity in rows}) == 1
+    assert len([step for step, _ in calls if step == 0]) > 2
+    diagnostics = holder["execution"].diagnostics()
+    assert diagnostics.update_count == len(set(versions))
+    assert diagnostics.hold_count == len(versions) - len(set(versions)) and diagnostics.fallback_count == 0
 
 
 def model_config():

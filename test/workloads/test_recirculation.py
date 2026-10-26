@@ -239,3 +239,17 @@ def test_route_must_return_a_residual_stream() -> None:
 
     with pytest.raises(ValueError, match="return.*residual"):
         MissingOutput().compile_backend(FACTS)
+
+
+def test_route_observation_precedes_sampling_normalization():
+    from pllm.contracts.region_program import TensorType
+    from pllm.contracts.semantic_graph import TokenProgramEffect
+    from pllm.execution.token_program import TokenProgram
+
+    decoder, observed = Decoder(), []
+    decoder.normalize = lambda row, hidden, residual: 2 * (hidden + residual)
+    program = TokenProgram.capture(WORKLOAD.recirculate, TensorType((1, 4), "torch.float32", "cpu"), 3)
+    decoder.run(program, TokenProgramEffect(3), lambda index, hidden: observed.append(hidden.clone()))
+    _, expected = serial_oracle()
+    torch.testing.assert_close(torch.cat(observed), torch.stack(expected))
+    torch.testing.assert_close(decoder.output, 2 * torch.stack(expected))

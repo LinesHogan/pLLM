@@ -13,7 +13,6 @@ from vllm.v1.request import Request
 
 from pllm.contracts.backend_attachment import SignedBackendAttachment
 from pllm.execution.codec import boundary_digest, decode_boundary, encode_boundary
-from pllm.execution.position_state import POSITION_RESOURCE
 
 POLICY_ENV = "PLLM_GENERATED_KV"
 POLICY_KEY = "pllm.prefix_cache"
@@ -36,7 +35,7 @@ class CachePolicy:
             bool(inputs.request.activation_bindings or inputs.request.overlay_bindings)
             or any(task.replay is not None and task.replay.rows != "all" for task in graph.tasks)
             # Reading `layers.generated` or PositionState adds the position resource to the route source.
-            or any(POSITION_RESOURCE in source.program.resources for source in graph.source_regions)
+            or any(task.replay is not None and task.replay.role_sensitive for task in graph.tasks)
         )
         return cls(
             boundary_digest((inputs.probe.model_fingerprint, graph, inputs.probe.position_states)), sensitive, policy

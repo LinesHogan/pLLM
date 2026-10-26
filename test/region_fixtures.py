@@ -388,3 +388,9 @@ def retire_all(execution, rows) -> None:
     assert execution.arena.active_lineages == 0
     usage = execution.arena.usage()
     assert usage.private_versions == usage.pinned_versions == usage.pending_receipts == 0
+
+
+def index_cell(port):
+    from pllm.contracts.region_program import AccessRange, AffineIndex, IndexTerm
+
+    return AccessRange(AffineIndex(0, (IndexTerm(port),)), AffineIndex(1, (IndexTerm(port),)))

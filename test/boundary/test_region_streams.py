@@ -32,7 +32,6 @@ from pllm.contracts.region_program import (
 )
 from pllm.contracts.region_selection import RegionCandidate, RegionPayloadLimit, RegionSelectionRequest
 from pllm.contracts.tensor_layout import LayoutFieldId
-from pllm.execution.decoder_region import index_cell
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_compilation import analyze_region_program
 from pllm.execution.region_native import NativePrimitive, external_primitive
@@ -49,7 +48,16 @@ from pllm.execution.region_values import Bank
 from pllm.execution.region_window import WindowBackpressure
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
 from pllm.execution.tensor_scan import TensorScan
-from test.region_fixtures import bind, inputs_for, limits, owner_fixture, region, stream_execution, tensor_grid
+from test.region_fixtures import (
+    bind,
+    index_cell,
+    inputs_for,
+    limits,
+    owner_fixture,
+    region,
+    stream_execution,
+    tensor_grid,
+)
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
