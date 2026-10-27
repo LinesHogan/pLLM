@@ -72,7 +72,7 @@ class FieldWriter:
                     or value.device != target.device
                 ):
                     raise ValueError(
-                        f"write to {self.resource} needs finite fields with their declared shape, dtype, device and request axis"
+                        f"write to {self.resource} needs fields with their declared shape, dtype, device and request axis"
                     )
         return values
 

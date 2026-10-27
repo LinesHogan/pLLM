@@ -260,8 +260,6 @@ class TensorExecutor:
             assert self.table is not None
             _, _, last, _, destinations, _ = self.layout.split(self.table[: self.layout.size])
             for view, value in zip(self.task.writer.fields, self.inputs.values(), strict=True):
-                if self.task.writer.source is not None:
-                    torch._assert_async(torch.isfinite(value).all(), "computed fields must be finite")  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
                 copy_pages(value, view.read(self.pools[view.field], pooled=True), last, destinations[view.field])
             return
         frame, operands = (data, batch) if self.compact else self._frame(data, batch)
@@ -336,13 +334,12 @@ class TensorExecutor:
                 return TaskOutput()
             addresses = self._inputs(data, batch)
             plan = row_plan(data, batch)
-            self.updated = (
-                tuple(batch.selection.refs.index(parent.selection.refs[i]) for i in selected)
-                if writer is not None
-                else tuple(sorted(plan.last))
-                if self.optimizer is not None
-                else ()
-            )
+            if writer is not None:
+                self.updated = tuple(batch.selection.refs.index(parent.selection.refs[i]) for i in selected)
+            elif self.optimizer is not None:
+                self.updated = tuple(sorted(plan.last))
+            else:
+                self.updated = ()
             for index, value in enumerate(values):
                 key = str(index)
                 if key not in self.inputs:
@@ -408,13 +405,12 @@ class TensorExecutor:
                 pools = (
                     tuple(selected.field_slots(i)[0] for i in range(len(selected.roots[0]))) if selected.roots else ()
                 )
-                states = (
-                    self.state_count
-                    if resource == self.task.resource
-                    else (1 if selected.selection.keys == (None,) else self.rows)
-                    if self.capture
-                    else len(selected.roots)
-                )
+                if resource == self.task.resource:
+                    states = self.state_count
+                elif self.capture is None:
+                    states = len(selected.roots)
+                else:  # A captured reader of another resource: one instance root or one slot per row.
+                    states = 1 if selected.selection.keys == (None,) else self.rows
                 self.resource_pools[resource] = pools
                 self.layouts[resource] = TableLayout(
                     self.rows, states, len(pools), len(self.feedback_names) if resource == self.task.resource else 0

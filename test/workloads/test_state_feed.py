@@ -156,7 +156,7 @@ def test_write_validates_result_shape_during_specialization():
         def transform(self, value: torch.Tensor = SOURCE, previous: torch.Tensor = TARGET) -> tuple[torch.Tensor, ...]:
             return ((value + previous).sum(),)
 
-    with pytest.raises(ValueError, match="write to target needs finite fields"):
+    with pytest.raises(ValueError, match="write to target needs fields"):
         WrongShape().specialize(facts_for(), pllm.ExecutionOptions())
 
 
