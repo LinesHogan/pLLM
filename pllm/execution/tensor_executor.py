@@ -391,6 +391,7 @@ class TensorExecutor:
     def _inputs(self, data: TensorFrame, batch: TensorBatch) -> tuple[int, ...]:
         self.active_rows, self.active_states = len(data.rows), len(batch.roots)
         if not self.resource_pools or self.capture is None:
+            self.inputs = {}
             resources = dict.fromkeys(
                 (
                     self.task.resource,

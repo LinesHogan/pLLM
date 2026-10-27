@@ -228,6 +228,26 @@ def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch
         )
         execution.retire((identity,), wait=True)
         assert execution.diagnostics().active_lineages == execution.diagnostics().pending_state_releases == 0
+        pair = (identity, replace(identity, request_id="another", prompt_idx=1))
+        execution.admit(pair, stream=stream)
+        payload = (
+            None
+            if payload is None
+            else replace(
+                payload,
+                values=tuple(torch.cat((value, value * 3)) for value in values),
+                keys=tuple(RequestStateKey.project(item, (RequestKeyField.PROMPT_IDX,)) for item in pair),
+            )
+        )
+        result = testing.run_step(execution, testing.step_input(pair, auxiliary=payload), stream=stream)
+        for index, item in enumerate(pair):
+            (ref,) = execution.directory.latest_refs((item,))
+            torch.testing.assert_close(
+                execution.snapshot(ref, stream=stream),
+                tuple(value[0] * (3 if index and payload is not None else 1) for value in values),
+            )
+        execution.retire(pair, wait=True)
+        assert execution.diagnostics().active_lineages == execution.diagnostics().pending_state_releases == 0
     execution = written.execution
     (entry,) = execution.admit((identity,), stream=stream)
     before = execution.snapshot(entry, stream=stream)
