@@ -88,9 +88,11 @@ class PostSampleOverlap:
             tensor.record_stream(self.stream)
         return tensor
 
-    def retain(self, pin: PagePin) -> None:
+    def retain(self, refs: StateRefs) -> None:
         """Retain this transition's input; release expired history on its owning stream."""
-        self._history.append(pin)
+        if not self.lag:
+            return
+        self._history.append(self.arena.pin_exact(refs, self.stream))
         while len(self._history) > self.lag:
             self.arena.release_pin(self._history.popleft())
 

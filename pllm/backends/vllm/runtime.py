@@ -835,8 +835,6 @@ def probe_backend(
                 else ()
             ),
         ),
-        layers=layer_count,
-        internal=runner.model_config.enforce_eager and not requirements.position_states,
     )
     required = input_reservations(
         probe,
@@ -854,7 +852,6 @@ def probe_backend(
         timeline.anchors != observed.anchors
         or timeline.capabilities != observed.capabilities
         or timeline.schema_version != observed.schema_version
-        or timeline.internal_points != observed.internal_points
     ):
         raise ValueError("worker timeline differs from the supported single-device anchors and capabilities")
     elif len(timeline.reserved_bytes) != len(required) or any(

@@ -19,13 +19,11 @@ from pllm.workloads.state_producers import TARGETS, DecodeFactors, ProjectionSta
 from test.backend_facts import backend_facts
 
 
-def deployment(workload, *, internal=False):
+def deployment(workload):
     facts = backend_facts(
         4,
         (),
-        RuntimeFacts(torch.device("cpu")).timeline(
-            ("transition/full_root@1", "optimizer/adamw@1"), layers=10 if internal else 0, internal=internal
-        ),
+        RuntimeFacts(torch.device("cpu")).timeline(("transition/full_root@1", "optimizer/adamw@1")),
         PageBundleProviderFacts("test.producers@1", 16),
         memory_bytes=1 << 20,
         max_rows=8,
@@ -235,12 +233,12 @@ def test_initialized_reader_and_hidden_before_model_boundary():
         Cycle().declaration()
 
 
-def test_internal_window_and_memory_witness_reject_tampering():
+def test_backend_points_and_memory_witness_reject_tampering():
     from pllm.contracts.semantic_graph import AnchorSymbol, TimingConstraint
     from pllm.execution.scheduler import compile_schedule, validate_schedule
 
-    plan = deployment(PromptFactors(), internal=True).attachment.inputs.plan
-    point = next(a.ordinal for a in plan.timeline.anchors if a.symbol == "model.layer.8")
+    plan = deployment(PromptFactors()).attachment.inputs.plan
+    point = next(a.ordinal for a in plan.timeline.anchors if a.symbol == "state.publish")
     assert all(t.earliest == t.anchor_id == point for t in plan.schedule_physical.tasks)
     constrained = replace(
         plan.semantic_graph,
@@ -251,6 +249,15 @@ def test_internal_window_and_memory_witness_reject_tampering():
     )
     decision = compile_schedule(constrained, plan.timeline, state=plan.state_physical)
     assert all(plan.timeline.anchors[task.anchor_id].symbol == "state.publish" for task in decision.tasks)
+    undeclared = replace(
+        constrained,
+        tasks=tuple(
+            replace(task, timing=TimingConstraint(AnchorSymbol("model.layer.8"), AnchorSymbol("sampler.pre_draw")))
+            for task in constrained.tasks
+        ),
+    )
+    with pytest.raises(ValueError, match="unknown anchor"):
+        compile_schedule(undeclared, plan.timeline, state=plan.state_physical)
     for changed in (
         replace(plan.schedule_decision.tasks[0], lane="side"),
         replace(plan.schedule_decision.tasks[0], earliest=0),

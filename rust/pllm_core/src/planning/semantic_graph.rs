@@ -270,8 +270,6 @@ pub(crate) struct Timeline {
     pub(crate) region_policy: super::region_selection::Policy,
     #[serde(default)]
     pub(super) visibility: Option<VisibilitySource>,
-    #[serde(default)]
-    pub(crate) internal_points: bool,
 }
 
 pub(crate) fn decode_graph(payload: &str) -> Result<SemanticGraph, String> {

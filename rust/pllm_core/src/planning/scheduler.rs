@@ -182,14 +182,8 @@ fn graph_index(
     for (id, task) in graph.tasks.iter().enumerate() {
         for input in &task.inputs {
             let point = match &input.source {
-                InputSource::Hidden { layer, site, .. } => {
-                    let point = if *site == super::semantic_graph::HiddenSite::ModelOutput { "model.norm".into() }
-                        else {
-                            let count = timeline.anchors.iter().filter(|a| a.symbol.starts_with("model.layer.")).count() as i64;
-                            format!("model.layer.{}", if *layer < 0 { count + layer } else { *layer })
-                        };
-                    anchors.get(point.as_str()).or_else(|| anchors.get("state.publish")).or_else(|| anchors.get("model.execute"))
-                }
+                // Hidden snapshots become task inputs when the backend publishes the completed forward.
+                InputSource::Hidden { .. } => anchors.get("state.publish").or_else(|| anchors.get("model.execute")),
                 InputSource::SamplerFeedback => anchors.get("sampler.complete"),
                 _ => None,
             };
@@ -261,14 +255,6 @@ fn place(graph: &SemanticGraph, timeline: &Timeline, index: &GraphIndex,
         earliest: index.windows[id].0, deadline: index.windows[id].1 - 1,
         wait_for: index.predecessors[id].iter().map(|&p| p as u32).collect(),
     }).collect();
-    for task in &mut tasks {
-        let supported = (task.anchor_id..=task.deadline).find(|&point| {
-            let name = &timeline.anchors[point as usize].symbol;
-            timeline.internal_points || !(name.starts_with("model.layer.") || name == "model.norm")
-        }).ok_or("backend cannot execute within the task window; enable eager internal model points")?;
-        task.anchor_id = supported;
-    }
-    tasks.sort_by_key(|t| t.anchor_id);
     select_lanes(graph, timeline, &mut tasks);
     match check_placement(graph, timeline, index, state, &tasks) {
         Ok(solution) => Ok(solution),
@@ -334,8 +320,6 @@ fn check_placement(graph: &SemanticGraph, timeline: &Timeline, index: &GraphInde
         if id >= tasks.len() || tasks.iter().any(|t| t.lane == Lane::Side) && task.lane != eligible.lane
             || task.read_origin != eligible.read_origin || task.read_distance != eligible.read_distance
             || task.earliest != index.windows[id].0
-            || !timeline.internal_points && (timeline.anchors[task.anchor_id as usize].symbol.starts_with("model.layer.")
-                || timeline.anchors[task.anchor_id as usize].symbol == "model.norm")
             || task.deadline < task.anchor_id || task.deadline >= index.windows[id].1
             || task.wait_for != index.predecessors[id].iter().map(|&p| p as u32).collect::<Vec<_>>() {
             return Err("placement lane, read origin, event edge or deadline differs from its dependencies".into());

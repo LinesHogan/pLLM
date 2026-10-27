@@ -615,24 +615,24 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
 
     def resume_latest(
         self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], stream: torch.cuda.Stream
-    ) -> PagePin:
+    ) -> None:
         """Move an invocation to its signed writer stream without losing exact read holds.
 
         The caller orders producers and copies reusable inputs first. Old reader pages remain
         pinned on the new stream until settlement, including aliases consumed by later tasks.
-        The returned extra pin retains the writer's input for subsequent lagged readers.
+        Equal reader and writer refs share the new pin; retained history owns its own hold.
         """
         with self._lock:
             context = self._context(invocation)
             assert not context.page_writes and not context.page_publications and not context.borrowed_roots
             reader = context.pin
-            held = self.arena.pin_exact(reader.refs, stream)
-            context.page_pins[held] = None
-            context.release_owned_pin(reader)
             context.selection = self.directory.refresh_lease(context.selection)
             context.pin = self.arena.pin_exact(context.selection.refs, stream)
             context.page_pins[context.pin] = None
-            return self.arena.pin_exact(context.selection.refs, stream)
+            if reader.refs != context.pin.refs:
+                held = self.arena.pin_exact(reader.refs, stream)
+                context.page_pins[held] = None
+            context.release_owned_pin(reader)
 
     def step(self, value: InputT, stream: torch.cuda.Stream | None = None) -> ResultT:
         """Run without an external sampler borrower using the same staged lifecycle."""

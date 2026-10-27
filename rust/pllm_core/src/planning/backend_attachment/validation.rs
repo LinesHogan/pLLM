@@ -738,9 +738,6 @@ fn validate_position_source(task: &SemanticTask, graph: &SemanticGraph, probe: &
 pub(crate) fn validate_inputs(inputs: &AttachmentCompilerInputs) -> Result<(), String> {
     let plan = &inputs.plan;
     plan.validate()?;
-    if plan.timeline.internal_points && inputs.probe.graph_mode != AttachmentGraphMode::Eager {
-        return Err("internal model points require eager backend execution".into());
-    }
     let mut reads: std::collections::BTreeSet<_> = inputs.request.overlay_bindings.iter().map(|b| b.resource.clone()).collect();
     if !inputs.request.activation_bindings.is_empty() { reads.insert(inputs.request.state_resource.clone()); }
     if reads.into_iter().collect::<Vec<_>>() != plan.semantic_graph.model_reads {

@@ -267,7 +267,6 @@ class SchedulerTimeline:
     reserved_bytes: tuple[int, ...] = ()
     region_policy: RegionSelectionPolicy = RegionSelectionPolicy()
     visibility: VisibilitySource | None = None
-    internal_points: bool = False
 
 
 @dataclass(frozen=True, slots=True)

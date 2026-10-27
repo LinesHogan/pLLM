@@ -25,30 +25,19 @@ class RuntimeFacts:
     def timeline(
         self,
         extra_capabilities: tuple[str, ...] = (),
-        *,
-        layers: int = 0,
-        internal: bool = False,
     ) -> SchedulerTimeline:
         compute = "compute/cpu@1" if self.device.type == "cpu" else "compute/cuda@1"
         return SchedulerTimeline(
-            anchors=tuple(
-                TimelineAnchor(AnchorSymbol(name), index)
-                for index, name in enumerate(
-                    (
-                        "request.prepare",
-                        "model.execute",
-                        *(f"model.layer.{layer}" for layer in range(layers)),
-                        *(("model.norm",) if layers else ()),
-                        "state.publish",
-                        "sampler.pre_draw",
-                        "sampler.complete",
-                        "token.commit",
-                        "request.finish",
-                        "next.prepare",
-                    )
-                )
+            anchors=(
+                TimelineAnchor(AnchorSymbol("request.prepare"), 0),
+                TimelineAnchor(AnchorSymbol("model.execute"), 1),
+                TimelineAnchor(AnchorSymbol("state.publish"), 2),
+                TimelineAnchor(AnchorSymbol("sampler.pre_draw"), 3),
+                TimelineAnchor(AnchorSymbol("sampler.complete"), 4),
+                TimelineAnchor(AnchorSymbol("token.commit"), 5),
+                TimelineAnchor(AnchorSymbol("request.finish"), 6),
+                TimelineAnchor(AnchorSymbol("next.prepare"), 7),
             ),
-            internal_points=internal,
             capabilities=tuple(sorted((compute, "host/service@1", *extra_capabilities))),
         )
 

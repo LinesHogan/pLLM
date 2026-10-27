@@ -99,8 +99,16 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
         )
         elapsed = time.perf_counter() - start
         assert frozenset((HiddenPhase.PREFILL, HiddenPhase.DECODE)) in phases
-        assert launches and set(launches) == (
-            {"model.layer.9"} if isinstance(workload, DecodeFactors) else {"model.layer.8"}
+        assert launches and set(launches) == {"state.publish"}
+        assert tuple(a.symbol for a in plan.timeline.anchors) == (
+            "request.prepare",
+            "model.execute",
+            "state.publish",
+            "sampler.pre_draw",
+            "sampler.complete",
+            "token.commit",
+            "request.finish",
+            "next.prepare",
         )
         assert len(outputs) == 3 and {entry[2] for entry in checked} == {0, 1}
         assert any(entry[1] == 0 for entry in checked) and any(entry[1] > 0 for entry in checked)

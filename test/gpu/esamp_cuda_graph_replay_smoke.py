@@ -130,7 +130,8 @@ def mean_capture(publish_lag: int = 0) -> None:
                     execution.complete_sampler(invocation, stream, feedback=SamplerFeedback(sampler, target, tokens))
                     if overlap is not None:
                         overlap.copy_inputs(invocation.context)
-                        overlap.retain(execution.resume_latest(invocation, overlap.stream))
+                        execution.resume_latest(invocation, overlap.stream)
+                        overlap.retain(invocation.context.pin.refs)
                         # Model taps and sampler outputs may be overwritten while training reads
                         # its private snapshot, including during captured replay with fewer rows.
                         hidden.fill_(999)
