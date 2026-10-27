@@ -752,15 +752,14 @@ class RowTaskBinding(TensorBindingBase):
             def prepare(data: TensorFrame) -> TensorFrame | None:
                 if not enabled or data.step.rows.step_id % every or not data.rows:
                     return None
-                return replace(data, rows=data.rows[:max_rows], columns=max_cols, index=None, plan=None)
+                return replace(data, rows=data.rows[:max_rows], index=None, plan=None)
 
             def output(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
-                value = batch.results[call.symbol, call.outputs[0]][:max_rows, :max_cols]
                 return TaskOutput(
                     observations=(
                         Observation(
                             name,
-                            value,
+                            batch.results[call.symbol, call.outputs[0]][:max_rows, :max_cols],
                             step_id=data.step.rows.step_id,
                             identities=tuple(row.identity for row in data.rows),
                             export=overflow,

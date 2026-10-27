@@ -13,6 +13,7 @@ import torch
 
 import pllm
 from examples.centered_hidden import centered_hidden
+from examples.sae_export import SAE
 from pllm import make_llm, testing
 from pllm.contracts.backend_attachment import AttachmentHiddenResource
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
@@ -63,7 +64,7 @@ def test_dummy_runs_graph_sign_plan_execute() -> None:
     torch.testing.assert_close(result, expected)
     hidden.copy_(torch.arange(15, dtype=torch.float32).reshape(3, 5))
     variant = make_llm(CPU, workload=centered_hidden(workload.config))
-    torch.testing.assert_close(exported(variant, value(2)), expected - expected.mean(dim=-1, keepdim=True))
+    torch.testing.assert_close(exported(variant, value(2)), expected - hidden[1:3].mean(dim=-1, keepdim=True))
     disabled = DummyWorkload(replace(workload.config, enabled=False)).compile_host(CPU)
     with patch.object(TensorTask, "read", autospec=True, side_effect=TensorTask.read) as reads:
         assert disabled.step(value(2)) is None
@@ -183,13 +184,13 @@ def _trace_selection_and_bounds(plan) -> None:
 
 
 class Encoder(torch.nn.Module):
-    """A frozen PyTorch module whose `encode` method an observation calls."""
+    """A frozen PyTorch module whose forward method an observation calls."""
 
     def __init__(self, width: int) -> None:
         super().__init__()
-        self.weight = torch.nn.Parameter(torch.eye(4, width))
+        self.weight = torch.nn.Parameter(torch.eye(20, width))
 
-    def encode(self, hidden: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         return hidden @ self.weight.T
 
 
@@ -198,39 +199,37 @@ def _frozen_state_is_readable_by_an_observation() -> None:
 
     delivered = []
 
-    class FrozenEncoder(pllm.Workload):
+    class FrozenEncoder(SAE):
         def on_export(self, event):
             delivered.append(event)
 
         encoder = pllm.InstanceState(module=lambda model: Encoder(model.hidden_size))
 
-        @pllm.export(name="features", every=1, max_rows=2, max_cols=4)
-        def encode(
-            self,
-            h3: torch.Tensor = pllm.hidden(3),
-            h5: torch.Tensor = pllm.hidden(5),
-            h17: torch.Tensor = pllm.hidden(17),
-            encoder: Encoder = pllm.module("encoder"),
-        ) -> torch.Tensor:
-            return torch.stack((encoder.encode(h3), encoder.encode(h5), encoder.encode(h17)), dim=1)
-
     bindings = tuple(testing.hidden_binding(layer, HiddenSite.BLOCK_OUTPUT, 18) for layer in (3, 5, 17))
     timeline = RuntimeFacts(torch.device("cpu")).timeline()
     provider = PageBundleProviderFacts("test.plain@1", 4, StateDeviceKind.CPU)
     execution = (
-        FrozenEncoder().compile_backend(backend_facts(4, bindings, timeline, provider, layer_count=18)).execution
+        FrozenEncoder().compile_backend(backend_facts(32, bindings, timeline, provider, layer_count=18)).execution
     )
     identity = RequestIdentity("req", 0, 0)
     execution.admit(())
     execution.admit((identity,))
-    source = (torch.arange(4, dtype=torch.float32) + 1).unsqueeze(0)
+    source = (torch.arange(32, dtype=torch.float32) + 1).unsqueeze(0)
     execution.step(
         testing.step_input((identity,), {binding: source + i for i, binding in enumerate(bindings)}, sampler_order=())
     )
     execution.trace.drain()
-    events = [event.tensor() for event in delivered]
-    assert len(events) == 1 and torch.equal(events[0], torch.stack((source, source + 1, source + 2), dim=1))
-    execution.retire((identity,))
+    assert (
+        len(delivered) == 3
+        and {(event.tensor_name, event.step_id, event.identities) for event in delivered}
+        == {(f"sae.{layer}", 0, (identity,)) for layer in (3, 5, 17)}
+        and [event.sequence for event in delivered] == sorted(event.sequence for event in delivered)
+    )
+    for event in delivered:
+        torch.testing.assert_close(
+            event.tensor(), (source + (3, 5, 17).index(int(event.tensor_name.split(".")[1])))[:, :16]
+        )
+    execution.close()
 
 
 def test_unused_helpers_are_neither_signed_nor_frozen() -> None:
@@ -311,11 +310,12 @@ def test_export_queue_delivery_and_lifecycle(device, overflow) -> None:
 
 
 def test_export_failure_and_meta() -> None:
-    def fail(event):
-        raise RuntimeError("consumer failed")
+    class InvalidConsumer(DummyWorkload):
+        def on_export(self):
+            pass
 
-    execution = DummyWorkload().compile_host(CPU)
-    trace = ExecutionTrace(execution.plan, on_export=fail)
+    execution = InvalidConsumer().compile_host(CPU)
+    trace = execution.trace
     record = lambda device: trace.record(
         TracePhase.TENSOR,
         1,
@@ -327,7 +327,6 @@ def test_export_failure_and_meta() -> None:
     record("meta")
     assert not trace.snapshot().events
     record("cpu")
-    for action in (trace.drain, lambda: record("cpu"), trace.close):
-        with pytest.raises(RuntimeError, match="consumer failed"):
+    for action in (trace.drain, lambda: record("cpu"), execution.close):
+        with pytest.raises(TypeError, match="positional argument"):
             action()
-    execution.close()

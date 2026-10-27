@@ -360,7 +360,6 @@ class ParameterGradients(MutableMapping[StateRef, tuple[torch.Tensor, ...]]):
 class TensorFrame:
     step: TensorStepInput
     rows: tuple[PackedPhaseRow, ...]
-    columns: int | None = None
     entries: list[OverlayEntry] = field(default_factory=lambda: list[OverlayEntry]())
     parameters: tuple[torch.Tensor, ...] = ()
     derivative_sources: dict[tuple[str, str], torch.Tensor] = field(
@@ -441,14 +440,13 @@ def input_port(source: SemanticInputSource | TensorPort) -> TensorPort:
             def hidden(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
                 if data.hidden_inputs is not None:
                     value = data.hidden_inputs[str(layer), "index", site.value]
-                    return row_index(data, batch, value.device).packed.take(value)[:, : data.columns]
+                    return row_index(data, batch, value.device).packed.take(value)
                 (snapshot,) = (
                     item
                     for item in data.step.hidden_batch(batch.stream).snapshots
                     if item.resource.locator_key == (str(layer), "index", site.value)
                 )
-                index = row_index(data, batch, snapshot.hidden.device)
-                return index.packed.take(snapshot.hidden)[:, : data.columns]
+                return row_index(data, batch, snapshot.hidden.device).packed.take(snapshot.hidden)
 
             return TensorPort(source, hidden)
         case PackedSamplerRowsInputSource():

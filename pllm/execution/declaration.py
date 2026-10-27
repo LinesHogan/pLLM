@@ -614,8 +614,8 @@ class Builder(Generic[D]):
             ),
         )
         previous = self.attachment
-        if previous is None:
-            self.attachment = spec
+        if previous is None or previous.kind is spec.kind is AttachmentKind.OBSERVATION:
+            self.attachment = spec if previous is None else replace(previous, tasks=previous.tasks + spec.tasks)
             return
         if {previous.kind, spec.kind} != {AttachmentKind.ACTIVATION_PATCH, AttachmentKind.MODEL_REPLAY}:
             raise ValueError("only activation and tokenwise model effects can share an attachment")

@@ -106,10 +106,22 @@ fn validate_request(
         }
         AttachmentKind::ModelReplay | AttachmentKind::Observation => {
             if !request.state_resource.is_empty()
-                || request.task_bindings.len() != 1
-                || request.task_bindings[0].role != AttachmentTaskRole::Compute
+                || request.task_bindings.is_empty()
+                || (request.attachment_kind == AttachmentKind::ModelReplay
+                    && request.task_bindings.len() != 1)
+                || request
+                    .task_bindings
+                    .iter()
+                    .any(|binding| binding.role != AttachmentTaskRole::Compute)
+                || request
+                    .task_bindings
+                    .iter()
+                    .map(|binding| binding.task_id)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != request.task_bindings.len()
             {
-                return Err("stateless attachment requires one compute task".into());
+                return Err("stateless attachment requires distinct compute tasks".into());
             }
         }
         AttachmentKind::RequestTraining => {
@@ -743,42 +755,40 @@ fn validate_cross_binding(
     }
     match request.attachment_kind {
         AttachmentKind::Observation => {
-            let task = task_for_dense_id(graph, &request.task_bindings[0])?;
-            let mut hidden = task
-                .inputs
+            let hidden = graph
+                .tasks
                 .iter()
+                .flat_map(|task| &task.inputs)
                 .filter_map(|input| semantic_hidden_key(&input.source))
-                .collect::<Vec<_>>();
-            let mut signed = probe
+                .collect::<std::collections::BTreeSet<_>>();
+            let signed = probe
                 .hidden_resources
                 .iter()
                 .map(attachment_hidden_key)
-                .collect::<Result<Vec<_>, _>>()?;
-            hidden.sort_unstable();
-            signed.sort_unstable();
-            if graph.tasks.len() != 1
-                || task
-                    .effects
-                    .iter()
-                    .any(|effect| effect.kind != StateEffectKind::Read || effect.version.is_some())
-                || task.replay.is_some()
+                .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+            if request.task_bindings.len() != graph.tasks.len()
                 || hidden != signed
-                || task
-                    .outputs
-                    .iter()
-                    .any(|output| output.kind != OutputKind::Host)
-                || task.timing.after != "state.publish"
-                || task.timing.before != "sampler.pre_draw"
-                || task.inputs.iter().any(|input| match &input.source {
-                    InputSource::Hidden { .. } | InputSource::StepId => false,
-                    InputSource::StateSelection { resource, .. } => {
-                        !task.effects.iter().any(|effect| {
-                            effect.kind == StateEffectKind::Read
-                                && effect.version.is_none()
-                                && &effect.resource == resource
+                || graph.tasks.iter().any(|task| {
+                    task.effects.iter().any(|effect| {
+                        effect.kind != StateEffectKind::Read || effect.version.is_some()
+                    }) || task.replay.is_some()
+                        || task
+                            .outputs
+                            .iter()
+                            .any(|output| output.kind != OutputKind::Host)
+                        || task.timing.after != "state.publish"
+                        || task.timing.before != "sampler.pre_draw"
+                        || task.inputs.iter().any(|input| match &input.source {
+                            InputSource::Hidden { .. } | InputSource::StepId => false,
+                            InputSource::StateSelection { resource, .. } => {
+                                !task.effects.iter().any(|effect| {
+                                    effect.kind == StateEffectKind::Read
+                                        && effect.version.is_none()
+                                        && &effect.resource == resource
+                                })
+                            }
+                            _ => true,
                         })
-                    }
-                    _ => true,
                 })
             {
                 return Err(
@@ -869,11 +879,11 @@ fn validate_cross_binding(
     }
     match request.attachment_kind {
         AttachmentKind::Observation => {
-            if !timeline.anchors.iter().any(|anchor| {
-                anchor.symbol == "state.publish"
-                    && anchor.ordinal == request.task_bindings[0].anchor_id as u64
-            }) || request.task_bindings[0].anchor_id >= request.sampler_anchor_id
-            {
+            if request.task_bindings.iter().any(|binding| {
+                !timeline.anchors.iter().any(|anchor| {
+                    anchor.symbol == "state.publish" && anchor.ordinal == binding.anchor_id as u64
+                }) || binding.anchor_id >= request.sampler_anchor_id
+            }) {
                 return Err("observation must follow model execution and precede sampling".into());
             }
         }

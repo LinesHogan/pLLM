@@ -193,7 +193,7 @@ class _TraceEntry:
         if self.payload is None:
             return self.event
         host, ready = self.payload
-        if ready is not None and not ready.query():
+        if ready is not None:
             ready.synchronize()
         return replace(
             self.event, tensor_data=b64encode(host.reshape(-1).view(torch.uint8).numpy().tobytes()).decode("ascii")
@@ -218,18 +218,20 @@ class ExecutionTrace:
         self._on_export, self._export_dropped = on_export, 0
         self._closed = False
         self._failure: BaseException | None = None
-        self._thread = Thread(target=self._deliver, name="pllm-export", daemon=True) if on_export is not None else None
+        self._thread = (
+            Thread(target=self._deliver, args=(on_export,), name="pllm-export", daemon=True)
+            if on_export is not None
+            else None
+        )
         if self._thread is not None:
             self._thread.start()
 
     def configure(self, selection: TraceSelection) -> None:
         if not set(selection.tasks).issubset(task.task_id for task in self.plan.tasks):
             raise ValueError("observation selection is outside the original physical plan")
+        if selection.max_events and selection.max_events < (self._events.maxlen or 0):
+            self.drain()
         with self._lock:
-            if selection.max_events and selection.max_events < (self._events.maxlen or 0):
-                self.drain()
-                while any(entry.pending for entry in self._events):
-                    self.drain()
             if selection.max_events:
                 self._dropped += max(0, len(self._events) - selection.max_events)
                 self._events = deque(self._events, maxlen=selection.max_events)
@@ -261,8 +263,8 @@ class ExecutionTrace:
         try:
             yield
         finally:
-            self.snapshot()
             with self._lock:
+                self._settle()
                 (
                     self._events,
                     self._sequence,
@@ -462,7 +464,7 @@ class ExecutionTrace:
                     raise ValueError("tensor trace requires an original task and a bounded explicit snapshot")
                 dtype = TensorDType(str(tensor.dtype).removeprefix("torch."))
                 shape = tuple(tensor.shape)
-                # Own a bounded host copy; only an explicit snapshot may wait for it.
+                # Own a bounded host copy; delivery or explicit snapshot reads wait for it.
                 host = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=tensor.is_cuda)
                 host.copy_(tensor.detach(), non_blocking=True)
                 ready = torch.cuda.Event() if tensor.is_cuda else None
@@ -503,20 +505,15 @@ class ExecutionTrace:
 
             self._lock.notify_all()
 
-    def _deliver(self) -> None:
+    def _deliver(self, on_export: Callable[[TraceEvent], None]) -> None:
         while True:
             with self._lock:
+                self._lock.wait_for(lambda: self._closed or any(entry.pending for entry in self._events))
                 entry = next((entry for entry in self._events if entry.pending), None)
-                if entry is None and self._closed:
+                if entry is None:
                     return
-                if entry is None or (
-                    entry.payload is not None and entry.payload[1] is not None and not entry.payload[1].query()
-                ):
-                    self._lock.wait(None if entry is None else 0.001)
-                    continue
             try:
-                assert self._on_export is not None
-                self._on_export(entry.snapshot())
+                on_export(entry.snapshot())
             except BaseException as exc:
                 with self._lock:
                     self._failure = exc
@@ -536,11 +533,14 @@ class ExecutionTrace:
                     or not any(entry.pending and entry.event.sequence <= watermark for entry in self._events)
                 )
             )
-            for entry in self._events:
-                if entry.event.sequence <= watermark:
-                    entry.snapshot()
             if self._failure is not None:
                 raise self._failure
+
+    def _settle(self) -> None:
+        """Finish history's outstanding host copies before releasing their storage."""
+        for entry in self._events:
+            if entry.payload is not None and entry.payload[1] is not None:
+                entry.payload[1].synchronize()
 
     def close(self) -> None:
         """Stop admission, finish copies and delivery, and release the bounded history."""
@@ -553,6 +553,7 @@ class ExecutionTrace:
             if self._thread is not None:
                 self._thread.join()
             with self._lock:
+                self._settle()
                 self._events.clear()
 
     def snapshot(self) -> TraceSnapshot:
