@@ -1,56 +1,45 @@
-"""Public chunk recurrences and the execution context that specializes them."""
+"""Public chunk recurrences and execution-owned, budgeted FX preparation."""
 
 from collections.abc import Callable
 from contextvars import ContextVar
-from functools import cached_property, lru_cache
+from dataclasses import replace
+from functools import lru_cache
+from time import perf_counter
 from typing import TypeVar
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils._python_dispatch import _disable_current_modes  # pyright: ignore[reportPrivateUsage]
 
-from pllm.contracts.region_program import SizeParameter
-from pllm.contracts.tensor_policy import TensorPolicy
-from pllm.execution.exported_cell import TensorCellModule
-from pllm.execution.exported_region import ExportedRegion, import_exported_region
-from pllm.execution.memory import MemoryTrace
-from pllm.execution.region_streams import RegionStreamBindings
-from pllm.execution.tensor_scan import TensorScan
+from pllm.contracts.tensor_policy import ScanForm, TensorPolicy
+from pllm.execution.memory import MemoryTrace, measure
+from pllm.execution.numerics import warn_numerical_transforms
+from pllm.execution.scan_analysis import Specs, analyze
+from pllm.execution.scan_execution import PreparedScan, Step, associative_prefix, competitive
 
-Step = Callable[..., tuple[torch.Tensor, torch.Tensor]]
 R = TypeVar("R")
-Specs = tuple[tuple[torch.Size, tuple[int, ...], torch.dtype, torch.device], ...]
-
-
-@lru_cache(maxsize=128)
-def _export_step(step: Step, specs: Specs, invariants: int, counted: bool) -> ExportedRegion:
-    """Export one source layout independently of policy and chunk-count buckets."""
-
-    def ordered(carry: torch.Tensor, *args: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        sequences = args[invariants:-1] if counted else args[invariants:]
-        updated, output = step(carry, *sequences, *args[:invariants])
-        return (torch.where(args[-1], updated, carry) if counted else updated), output
-
-    with _disable_current_modes(), FakeTensorMode():
-        samples = tuple(
-            torch.empty_strided(shape, stride, dtype=dtype, device=device) for shape, stride, dtype, device in specs
-        )
-        return import_exported_region(torch.export.export(TensorCellModule(ordered), samples, strict=False), carry=1)
 
 
 class ScanContext:
-    """An operation's region policy, row capacity and CUDA lanes."""
+    """An operation's numerical policy, maximum row count and workspace ceiling."""
 
     active: ContextVar["ScanContext | None"] = ContextVar("scan_context", default=None)
 
     def __init__(
-        self, policy: TensorPolicy, max_rows: int, device: torch.device, payload_bytes: int | None = None
+        self,
+        policy: TensorPolicy,
+        max_rows: int,
+        device: torch.device,
+        payload_bytes: int | None = None,
+        *,
+        replay: bool = True,
     ) -> None:
         self.policy, self.max_rows, self.device = policy, max_rows, device
         self.payload_bytes = payload_bytes
+        self.replay = replay
 
     def bind(self, function: Callable[..., R]) -> Callable[..., R]:
-        """Use the same scope for memory tracing and execution."""
+        """Use the same execution-owned scope for memory tracing and execution."""
 
         def run(*args: object, **kwargs: object) -> R:
             token = self.active.set(self)
@@ -61,18 +50,14 @@ class ScanContext:
 
         return run
 
-    @cached_property
-    def streams(self) -> tuple[torch.cuda.Stream, ...]:
-        return (torch.cuda.Stream(device=self.device),)
-
     @lru_cache(maxsize=128)
     def _template(self, step: Step, specs: Specs, invariants: int, chunk: int, counted: bool) -> "ScanTemplate":
-        return ScanTemplate(self, _export_step(step, specs, invariants, counted), specs, invariants, chunk)
+        return ScanTemplate(self, step, specs, invariants, chunk, counted)
 
     def specialize(
         self, step: Step, specs: Specs, invariants: int, chunk: int, count: int, counted: bool = False
-    ) -> TensorScan:
-        """Reuse source export and one prepared plan per bounded count bucket."""
+    ) -> PreparedScan:
+        """Reuse tracing and preparation across a bounded bucket of actual chunk counts."""
         tracing = specs[0][3].type == "meta"
         layouts = tuple(
             (shape, stride, dtype, self.device if device.type == "meta" else device)
@@ -82,74 +67,151 @@ class ScanContext:
 
 
 class ScanTemplate:
-    """Execution-owned preparation caches; no invocation tensors or carry state."""
+    """Cold shape analysis and one selected plan per count bucket; no carry storage."""
 
-    def __init__(self, context: ScanContext, region: ExportedRegion, specs: Specs, invariants: int, chunk: int) -> None:
-        self.context, self.region, self.specs = context, region, specs
-        self.invariants = invariants
+    def __init__(
+        self, context: ScanContext, step: Step, specs: Specs, invariants: int, chunk: int, counted: bool
+    ) -> None:
+        self.context, self.step, self.specs = context, step, specs
+        self.invariants, self.chunk, self.counted = invariants, chunk, counted
         self.maximum = (context.max_rows + chunk - 1) // chunk + 1
-        self.sources: dict[int, TensorScan] = {}
-        self.plans: dict[int, TensorScan] = {}
+        sequences = specs[1 + invariants : -1] if counted else specs[1 + invariants :]
+        self.analysis = (
+            analyze(step, (specs[0], *sequences, *specs[1 : 1 + invariants]))
+            if context.policy.allow_numerical_transforms
+            else None
+        )
+        self.candidates: dict[int, tuple[PreparedScan, ...]] = {}
+        self.plans: dict[int, PreparedScan] = {}
 
-    def for_count(self, count: int, *, tracing: bool) -> TensorScan:
-        """Tune at the first real C in a bucket, then reuse for the whole guarded domain."""
+    def samples(
+        self, count: int
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], torch.Tensor | None]:
+        values = tuple(
+            torch.empty_strided(shape, stride, dtype=dtype, device=device).zero_()
+            for shape, stride, dtype, device in self.specs
+        )
+        sequences = values[1 + self.invariants : -1] if self.counted else values[1 + self.invariants :]
+        over = tuple(t.new_zeros((count * self.chunk, *t.shape[1:])) for t in sequences)
+        return (
+            values[0],
+            over,
+            values[1 : 1 + self.invariants],
+            values[-1].new_full((), count * self.chunk) if self.counted else None,
+        )
+
+    def funded(self, capacity: int) -> tuple[PreparedScan, ...]:
+        source = PreparedScan(self.step, self.chunk)
+        choices = [source]
+        analysis = self.analysis
+        if analysis is not None and self.specs[0][2] in (torch.float32, torch.bfloat16):
+            maximum = 64 if self.context.payload_bytes is not None or analysis.kind in ("left", "right") else 8
+            for window in (1, 2, 4, 8, 16, 32, 64):
+                if window > min(maximum, 1 << (capacity - 1).bit_length()):
+                    break
+                form = ScanForm.HILLIS_STEELE if window >= 16 or analysis.kind == "diagonal" else ScanForm.ORDERED
+                if analysis.kind in ("left", "right"):
+                    width = self.specs[0][0][-1 if analysis.kind == "right" else -2]
+                    if self.specs[0][2] != torch.float32 or not competitive(width, self.chunk, window, form):
+                        continue
+                choices.append(PreparedScan(self.step, self.chunk, analysis, window, form))
+        funded: list[PreparedScan] = []
+        with _disable_current_modes(), torch.inference_mode(False), FakeTensorMode():
+            args = self.samples(capacity)
+            scratch = torch.backends.cuda.cublas_workspace_size() + torch.backends.cuda.cublaslt_workspace_size()
+            for choice in choices:
+                if choice.analysis is not None:
+                    carry, over, invariants, _ = args
+                    packed = tuple(t.new_empty((choice.window, self.chunk, *t.shape[1:])) for t in over)
+                    choice = replace(choice, analysis=choice.analysis.batched((carry, *packed, *invariants), len(over)))
+                usage = measure(lambda: choice(*args))
+                workspace = usage.workspace + scratch
+                if choice.analysis is not None and choice.analysis.kind == "diagonal":
+                    # Pointwise HOP composition has two products and an addition per
+                    # level. Fund every level's full arrays, even when Inductor fuses them.
+                    workspace += (
+                        4 * choice.window.bit_length() * choice.window * args[0].numel() * args[0].element_size()
+                    )
+                if self.context.payload_bytes is None or workspace <= self.context.payload_bytes:
+                    funded.append(replace(choice, workspace=workspace))
+        if not funded:
+            raise ValueError("increase the scan execution budget to fund its tensor and BLAS workspace")
+        return tuple(funded)
+
+    def for_count(self, count: int, *, tracing: bool) -> PreparedScan:
+        """Reserve the entire bucket before tuning at its first actual chunk count."""
         capacity = min(self.maximum, 1 << (max(1, count) - 1).bit_length())
-        if not self.context.policy.allow_numerical_transforms:
-            capacity = self.maximum  # Only the reference exists; one plan covers every C.
-        if capacity not in self.sources:
-            with _disable_current_modes():
-                self.sources[capacity] = self._source(capacity)
-        scan = self.sources[capacity]
+        if capacity not in self.candidates:
+            self.candidates[capacity] = self.funded(capacity)
+        candidates = self.candidates[capacity]
         if tracing:
-            return scan
+            return replace(candidates[-1], workspace=max(c.workspace for c in candidates))
         if capacity not in self.plans:
-            self.plans[capacity] = self._prepare(scan, count)
+            self.plans[capacity] = self._prepare(candidates, count)
         return self.plans[capacity]
 
-    def _source(self, capacity: int) -> TensorScan:
-        scan = TensorScan(
-            self.region.program,
-            SizeParameter("chunks", 0, capacity),
-            carry=1,
-            invariants=self.invariants,
-            functions=self.region.functions,
-        )
-        if self.context.policy.allow_numerical_transforms:
-            from pllm.execution.affine_scan import payload_budget
-
-            scan.payload_limits = payload_budget(
-                scan.program,
-                self.region.functions,
-                scan.payload_limits,
-                self.context.payload_bytes,
+    def _prepare(self, candidates: tuple[PreparedScan, ...], count: int) -> PreparedScan:
+        selected = candidates[-1]
+        if self.context.policy.tuning == "measured" and len(candidates) > 1:
+            args = self.samples(count)
+            selected = min(
+                (self.executable(plan, args) for plan in candidates), key=lambda plan: self.latency(plan, args)
             )
-        return scan
-
-    def _prepare(self, scan: TensorScan, count: int) -> TensorScan:
-        context = self.context
-        if context.policy.tuning == "heuristic":
-            return scan.prepared(options=context.policy, parallel=True)
-        samples = tuple(
-            torch.empty_strided(shape, stride, dtype=dtype, device=device).zero_()
-            for shape, stride, dtype, device in self.specs[: 1 + self.invariants]
-        )
-        columns = tuple(
-            tuple(
-                torch.empty_strided(
-                    (count, *shape), (shape[0] * stride[0] if shape else 1, *stride), dtype=dtype, device=device
-                )
-                .zero_()
-                .unbind()
+        else:
+            selected = (
+                self.executable(selected, self.samples(count))
+                if selected.analysis is not None and selected.analysis.kind == "diagonal"
+                else selected
             )
-            for shape, stride, dtype, device in self.specs[1 + self.invariants :]
-        )
-        return scan.optimized(
-            samples[:1],
-            samples[1 : 1 + self.invariants],
-            columns,
-            options=context.policy,
-            streams=RegionStreamBindings(torch.cuda.current_stream(context.device), context.streams),
-        )[0]
+        if selected.analysis is not None:
+            warn_numerical_transforms(
+                f"{selected.analysis.coefficients.code}:{selected.window}:{selected.form}",
+                (f"{selected.analysis.kind} scan: batched coefficients and {selected.form.value} prefix",),
+            )
+        return selected
+
+    @staticmethod
+    def executable(
+        plan: PreparedScan,
+        args: tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], torch.Tensor | None],
+    ) -> PreparedScan:
+        """Compile and warm the supported pointwise HOP before capture or selection."""
+        if plan.analysis is not None and plan.analysis.kind == "diagonal":
+            pointwise = torch.compile(  # pyright: ignore[reportUnknownMemberType]
+                associative_prefix, fullgraph=True, dynamic=False, options={"triton.cudagraphs": False}
+            )
+            plan = replace(plan, pointwise=pointwise)
+            plan(*args)
+        return plan
+
+    def latency(
+        self,
+        plan: PreparedScan,
+        args: tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], torch.Tensor | None],
+    ) -> float:
+        """Warm CUDA replay timing includes source execution as a real candidate."""
+        for _ in range(3):
+            plan(*args)
+        torch.cuda.synchronize()
+        if not self.context.replay:
+            started = perf_counter()
+            for _ in range(3):
+                plan(*args)
+                torch.cuda.synchronize()
+            return (perf_counter() - started) * 1000 / 3
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            result = plan(*args)
+        for _ in range(3):
+            graph.replay()
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(10):
+            graph.replay()
+        end.record()
+        end.synchronize()
+        del result
+        return start.elapsed_time(end) / 10
 
 
 _context = lru_cache(maxsize=128)(ScanContext)
@@ -164,22 +226,12 @@ def scan(
     invariants: tuple[torch.Tensor, ...] = (),
     valid_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
-    """Run ``step(carry, *slices, *invariants) -> (next_carry, output)`` in chunk order.
+    """Run ``step(carry, *slices, *invariants)`` in chunk order, returning exclusive readouts.
 
-    Return the final carry and an ordered tuple of outputs (empty for zero rows).
-    With ``valid_rows``, shapes describe capacity: only complete chunks within
-    the device count advance carry. Padded chunks still return their readouts
-    from the unchanged carry; callers select their actual output rows.
-    Inputs are immutable; carry retains its shape, stride, dtype and device.
-    Reuse the same callable with immutable closure/owner constants to reuse its
-    specialization; pass varying tensors through invariants. CPU, partial chunks
-    and differentiable calls execute serially. Bound operations supply their plan policy.
-
-        def step(total, rows, scale):
-            next_total = total + rows.sum(0)
-            return next_total, rows * scale
-        total, outputs = pllm.scan(step, carry=total, over=(rows,), chunk=32, invariants=(scale,))
-        result = torch.cat(outputs)
+    Counted calls advance carry only for complete chunks within the device row count;
+    inactive capacity still evaluates its readout. Strict, CPU, partial, aliased and
+    differentiable calls preserve source operation order. Step owners and closures
+    must be immutable; pass varying tensor values through explicit arguments.
     """
     if chunk < 1 or not over or any(t.ndim == 0 or t.shape[0] != over[0].shape[0] for t in over):
         raise ValueError("scan needs a positive chunk and aligned row tensors")
@@ -188,40 +240,30 @@ def scan(
     ):
         raise ValueError("scan valid_rows needs an int64 scalar on the carry device")
     context = ScanContext.active.get() or _context(TensorPolicy(), over[0].shape[0], carry.device)
+    source = PreparedScan(step, chunk)
     if (
         context.device.type == "cuda"
-        and over[0].shape[0]
-        and over[0].shape[0] % chunk == 0
+        and len(over[0])
+        and len(over[0]) % chunk == 0
+        and carry.is_contiguous()
         and not (torch.is_grad_enabled() and any(t.requires_grad for t in (carry, *over, *invariants)))
         and len({t.untyped_storage() for t in (carry, *over, *invariants)}) == 1 + len(over) + len(invariants)
     ):
-        columns = tuple(tuple(torch.ops.aten.split.Tensor(t, chunk)) for t in over)
-        if valid_rows is not None:
-            active = (torch.arange(len(columns[0]), device=carry.device) + 1) * chunk <= valid_rows
-            columns += (tuple(active.unbind()),)
+        samples = (carry, *invariants, *(t[:chunk] for t in over), *((valid_rows,) if valid_rows is not None else ()))
         compiled = context.specialize(
             step,
-            tuple((t.shape, t.stride(), t.dtype, t.device) for t in (carry, *invariants, *(c[0] for c in columns))),
+            tuple((t.shape, t.stride(), t.dtype, t.device) for t in samples),
             len(invariants),
             chunk,
-            over[0].shape[0] // chunk,
+            len(over[0]) // chunk,
             valid_rows is not None,
         )
         if carry.is_meta:
-            MemoryTrace.reserve(sum(limit.bytes for limit in compiled.payload_limits))
+            MemoryTrace.reserve(compiled.workspace)
+            state, outputs = source(carry, over, invariants, valid_rows)
+            if compiled.analysis is not None:
+                return state.clone(), tuple(output.clone() for output in outputs)
+            return state, outputs
         else:
-            result = compiled(
-                (carry,),
-                invariants,
-                columns,
-                streams=RegionStreamBindings(torch.cuda.current_stream(context.device), context.streams)
-                if compiled.parallel
-                else None,
-            )
-            return result.carry[0], result.columns[0]
-    outputs: list[torch.Tensor] = []
-    for start in range(0, over[0].shape[0], chunk):
-        updated, output = step(carry, *(t[start : start + chunk] for t in over), *invariants)
-        carry = updated if valid_rows is None else torch.where(start + chunk <= valid_rows, updated, carry)
-        outputs.append(output)
-    return carry, tuple(outputs)
+            return compiled(carry, over, invariants, valid_rows)
+    return source(carry, over, invariants, valid_rows)

@@ -30,7 +30,7 @@ from pllm.contracts.parameter_overlay import (
 )
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
-from pllm.execution.affine_scan import AdditiveUpdate, RightMatrixUpdate
+from pllm.execution.scan_execution import PreparedScan
 from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
 
@@ -503,22 +503,15 @@ def main() -> int:
             cache = handle.runner.kv_cache_config
             before = (cache.num_blocks, tuple(tensor.size for tensor in cache.kv_cache_tensors))
             forms: set[tuple[str, int]] = set()
-            execute = AdditiveUpdate.__call__
+            execute = PreparedScan.windows
 
-            def record(update, inputs):
-                forms.add((update.plan.implementation.form.value, update.plan.window))
-                return execute(update, inputs)
+            def record(plan, *args):
+                assert plan.analysis is not None
+                prefix = "right_matrix:" if plan.analysis.kind == "right" else ""
+                forms.add((prefix + plan.form.value, plan.window))
+                return execute(plan, *args)
 
-            execute_right = RightMatrixUpdate.__call__
-
-            def record_right(update, inputs):
-                forms.add(("right_matrix:" + update.plan.implementation.form.value, update.plan.window))
-                return execute_right(update, inputs)
-
-            with (
-                patch.object(AdditiveUpdate, "__call__", record),
-                patch.object(RightMatrixUpdate, "__call__", record_right),
-            ):
+            with patch.object(PreparedScan, "windows", record):
                 results[name] = check(handle)
             if name == "dense_1536" and not any(form == "hillis_steele" for form, _ in forms):
                 raise RuntimeError("large-budget dense overlay did not exercise a tree window")

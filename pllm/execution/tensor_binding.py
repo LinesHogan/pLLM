@@ -93,6 +93,7 @@ class TensorBinding(ModelEffectBinding, RowTaskBinding):
                     facts.timeline.tensor_policy,
                     self.route_rows,
                     facts.device,
+                    replay="compute/cuda_graph@1" in facts.timeline.capabilities,
                 ).bind(self.overlay_math.function),
             )
         for symbol, operation in self.operations.items():
@@ -102,6 +103,7 @@ class TensorBinding(ModelEffectBinding, RowTaskBinding):
                 facts.probe.max_packed_rows,
                 facts.device,
                 None if budget is None else budget // max(1, facts.max_admitted_lineages),
+                replay="compute/cuda_graph@1" in facts.timeline.capabilities,
             )
             self.operations[symbol] = replace(operation, body=scans.bind(operation.body))
 

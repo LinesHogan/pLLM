@@ -21,19 +21,16 @@ from pllm.contracts.parameter_overlay import (
     ParameterTarget,
     ParameterTargetShape,
 )
-from pllm.contracts.region_selection import RegionPayloadLimit
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.contracts.tensor_policy import TensorPolicy
-from pllm.execution.affine_scan import candidates as affine_candidates
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.compile_facts import BackendCompileFacts
-from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.scan import ScanContext, ScanTemplate
-from pllm.execution.tensor_scan import TensorScan
+from pllm.execution.scan_analysis import analyze
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
 from test.backend_facts import backend_facts
 from test.workloads.test_inplace_ttt import _input
@@ -167,22 +164,13 @@ def test_scan_matches_the_serial_loop_including_carry_views(device):
                 result = torch.add(state, result - state, alpha=2)
             return result, output
 
-        if kind not in ("additive", "random"):
-            # Refusal is a source-proof property; compiling and timing an
-            # unrelated fallback for every counterexample adds no coverage.
-            with FakeTensorMode():
-                samples = tuple(torch.empty(shape, device=device) for shape in ((11, 13), (4, 13), (4, 11)))
-                cell = ExportedCell.capture(
-                    transition,
-                    ("state", "inputs", "targets"),
-                    ("next", "output"),
-                    samples,
-                )
-                scan = TensorScan(cell, 5, carry=1, invariants=0)
-            assert not tuple(
-                affine_candidates(scan.program, {cell.digest: cell}, (RegionPayloadLimit(device, 1 << 30),))
-            )
-            continue
+        with FakeTensorMode():
+            samples = tuple(torch.empty(shape, device=device) for shape in ((11, 13), (4, 13), (4, 11)))
+            classification = analyze(transition, tuple((t.shape, t.stride(), t.dtype, t.device) for t in samples))
+        if kind in ("nonlinear", "bilinear", "downcast", "random"):
+            assert classification is None
+        else:
+            assert classification is not None and classification.kind == "additive"
         reference, outputs = carry, []
         rng = torch.cuda.get_rng_state()
         for xx, yy in zip(x.split(4), y.split(4), strict=True):
@@ -191,17 +179,11 @@ def test_scan_matches_the_serial_loop_including_carry_views(device):
         for numerics in (False, True) if kind == "additive" else (True,):
             torch.cuda.set_rng_state(rng)
             context = ScanContext(TensorPolicy(numerics), 20, torch.device(device))
-            if kind == "random":
-                # RNG already needs an opaque backend binding; the affine
-                # optimizer must not silently turn it into a pure coefficient.
-                with pytest.raises(ValueError, match="opaque tensor fragments"):
-                    context.bind(pllm.scan)(transition, carry=carry, over=(x, y), chunk=4)
-                continue
             with warnings.catch_warnings(record=True) as reported:
                 actual = context.bind(pllm.scan)(transition, carry=carry, over=(x, y), chunk=4)
             tolerance = {"rtol": 1e-5, "atol": 1e-6} if numerics else {"rtol": 0, "atol": 0}
             torch.testing.assert_close(actual, (reference, tuple(outputs)), **tolerance)
-            if kind != "additive" or not numerics:
+            if kind not in ("additive", "alpha") or not numerics:
                 assert not any("additive scan" in str(item.message) for item in reported)
     # Alias guards are checked on each invocation, not inferred from fake samples.
     alias_y = x[:, :11]
@@ -218,7 +200,7 @@ def test_scan_matches_the_serial_loop_including_carry_views(device):
     run = context.bind(pllm.scan)
     run(workload.step, carry=carry, over=(x[:20], y[:20]), chunk=4)
     with (
-        patch("torch.export.export", side_effect=AssertionError("warm C caused an export")),
+        patch("pllm.execution.scan.analyze", side_effect=AssertionError("warm C caused a trace")),
         patch.object(ScanTemplate, "_prepare", side_effect=AssertionError("warm C caused plan preparation")),
     ):
         for count in (0, 6, 5, 8, 7):

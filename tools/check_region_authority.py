@@ -30,6 +30,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # to legacy compatibility modules: that would turn this focused hard gate into
 # a migration inventory and encourage exemptions.
 AUTHORITY_FILES = (
+    Path("pllm/execution/scan.py"),
+    Path("pllm/execution/scan_analysis.py"),
+    Path("pllm/execution/scan_execution.py"),
     Path("pllm/execution/exported_region.py"),
     Path("rust/pllm_core/src/planning/aer.rs"),
     Path("rust/pllm_core/src/planning/version_hazards.rs"),
