@@ -267,7 +267,7 @@ pub(crate) struct Timeline {
     #[serde(default)]
     pub(crate) reserved_bytes: Vec<u64>,
     #[serde(default)]
-    pub(crate) region_policy: super::region_selection::Policy,
+    pub(crate) tensor_policy: super::tensor_policy::Policy,
     #[serde(default)]
     pub(super) visibility: Option<VisibilitySource>,
 }

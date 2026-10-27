@@ -10,6 +10,7 @@ from typing import Protocol
 import torch
 
 from pllm.contracts.region_streams import RegionWindowSlot
+from pllm.execution.admission import WindowBackpressure
 from pllm.execution.region_values import Data
 
 _DTYPES = {
@@ -39,10 +40,6 @@ class _StorageSlice(Protocol):
 
 def _storage_slice(storage: _StorageSlice, offset: int, size: int) -> torch.UntypedStorage:
     return storage[offset : offset + size]
-
-
-class WindowBackpressure(RuntimeError):
-    """The caller may retry admission after the current owner releases its window."""
 
 
 @dataclass(eq=False)

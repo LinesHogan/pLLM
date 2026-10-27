@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from threading import Lock
 
 import torch
 from torch.export.graph_signature import InputKind, OutputKind, TensorArgument
@@ -24,31 +22,6 @@ from pllm.execution.codec import (
 from pllm.execution.freeze import fingerprint
 
 CellFunction = Callable[..., tuple[torch.Tensor, ...]]
-
-
-class NumericalTransformWarning(UserWarning):
-    """The selected plan may change floating-point rounding, not algorithm semantics."""
-
-
-_warned: set[str] = set()
-_warning_lock = Lock()
-
-
-def warn_numerical_transforms(signature: str, transformations: tuple[str, ...]) -> None:
-    if not transformations:
-        return
-    with _warning_lock:
-        if signature in _warned:
-            return
-        _warned.add(signature)
-    warnings.warn(
-        "pLLM selected "
-        + ", ".join(transformations)
-        + "; these transformations may change floating-point results, including rounding and overflow. "
-        "Set ExecutionOptions(allow_numerical_transforms=False) to retain the original numerical path.",
-        NumericalTransformWarning,
-        stacklevel=3,
-    )
 
 
 class TensorCellModule(torch.nn.Module):

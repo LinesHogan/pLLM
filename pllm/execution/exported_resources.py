@@ -5,11 +5,9 @@ from collections.abc import Mapping
 from pllm.contracts.region_composition import RegionFunctionBody, inline_region
 from pllm.contracts.region_imports import BorrowedTensorImport
 from pllm.contracts.region_program import (
-    AccessMode,
     AccessRange,
     AffineIndex,
     Block,
-    BorrowedResource,
     Call,
     DataType,
     Function,
@@ -22,6 +20,7 @@ from pllm.contracts.region_program import (
     Value,
     verify,
 )
+from pllm.contracts.tensor_borrow import AccessMode, BorrowedResource
 from pllm.execution.codec import boundary_digest
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.exported_region import ExportedRegion

@@ -31,6 +31,7 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.state_feed import FeedBinding
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
+from pllm.execution.admission import WindowBackpressure
 from pllm.execution.cuda_stream import CudaStreamReadiness, DeviceCounters
 from pllm.execution.execution import TaskGraphExecution, TaskGraphImplementation, TaskGraphInvocation
 from pllm.execution.memory import MemoryUsage
@@ -45,7 +46,6 @@ from pllm.execution.ptts.page_bundle import (
 )
 from pllm.execution.ptts.request_state import RequestStateDirectory, RequestStateSelection, StateAddress
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.execution.region_window import WindowBackpressure
 from pllm.execution.trace import ExecutionTrace, TracePhase
 
 if TYPE_CHECKING:

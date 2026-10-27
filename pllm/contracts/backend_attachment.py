@@ -236,3 +236,6 @@ __all__ = [
     "BackendAttachmentRequest",
     "BackendPlacementProbe",
 ]
+
+
+TOKEN_CAPTURE_CAPABILITY = "execution/token_capture@1"

@@ -30,8 +30,8 @@ from pllm.contracts.backend_attachment import AttachmentGraphMode, SignedBackend
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import CapturedParameterOperand, ParameterOverlayFieldBinding
-from pllm.contracts.region_selection import RegionSelectionPolicy
 from pllm.contracts.semantic_graph import StateResource
+from pllm.contracts.tensor_policy import TensorPolicy
 from pllm.execution.codec import cuda_graph_pool_bytes, decode_boundary, encode_boundary
 from pllm.execution.cuda_stream import CudaStreamReadiness, PinnedStaging
 from pllm.execution.overlay_task import ProjectionTransition
@@ -220,7 +220,7 @@ class _ProjectionReader:
         rows: int,
         requests: int,
         budget: int,
-        policy: RegionSelectionPolicy,
+        policy: TensorPolicy,
     ) -> None:
         from pllm.backends.vllm.parameter_overlay import locate_parameter
 
@@ -357,7 +357,7 @@ class PinnedParameterOverlay:
         rows: int,
         requests: int,
         budget: int,
-        policy: RegionSelectionPolicy,
+        policy: TensorPolicy,
         *,
         phases: tuple[HiddenPhase, ...],
     ) -> None:
@@ -516,7 +516,7 @@ def parameter_overlay(
     rows: int,
     requests: int,
     budget: int,
-    policy: RegionSelectionPolicy,
+    policy: TensorPolicy,
     phases: tuple[HiddenPhase, ...],
     *,
     in_forward: bool,

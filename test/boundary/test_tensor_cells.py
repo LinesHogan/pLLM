@@ -11,8 +11,9 @@ import warnings
 import pytest
 import torch
 
-from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning, warn_numerical_transforms
+from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.module_graph import capture_module_export
+from pllm.execution.numerics import NumericalTransformWarning, warn_numerical_transforms
 from pllm.execution.tensor_program import PoolSGD
 
 

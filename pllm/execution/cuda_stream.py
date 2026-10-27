@@ -10,7 +10,7 @@ from collections.abc import Sequence
 
 import torch
 
-from pllm.execution.region_window import WindowBackpressure
+from pllm.execution.admission import WindowBackpressure
 
 
 def upload(

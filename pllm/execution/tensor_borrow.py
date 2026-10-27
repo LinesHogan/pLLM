@@ -6,7 +6,7 @@ from typing import Protocol
 
 import torch
 
-from pllm.contracts.region_program import AccessMode, BorrowedResource
+from pllm.contracts.tensor_borrow import AccessMode, BorrowedResource
 
 
 class MutableTensorView(Protocol):

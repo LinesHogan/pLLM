@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from pllm.contracts.region_imports import ScanForm
+from pllm.contracts.tensor_policy import ScanForm
 
 
 @triton.jit

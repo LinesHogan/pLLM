@@ -24,6 +24,7 @@ from pllm.contracts.region_schedule import ScheduleInstance, Statement
 from pllm.contracts.region_selection import RegionPayloadLimit
 from pllm.contracts.region_streams import RegionStateWindow, RegionStreamPlan
 from pllm.contracts.schedule_instructions import LoweredSchedule
+from pllm.execution.admission import WindowBackpressure
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_compilation import lower_region_bindings, lower_region_schedule
@@ -47,7 +48,7 @@ from pllm.execution.region_streams import (
     validate_stream_budget,
 )
 from pllm.execution.region_values import Data, copy_data
-from pllm.execution.region_window import RegionWindow, WindowBackpressure
+from pllm.execution.region_window import RegionWindow
 from pllm.execution.tensor_access import import_tensor_access_graph
 
 PreparedWindow = tuple[tuple[ScheduleInstance, ...], RegionValueLayout, Routes, tuple[tuple[int, Routes], ...]]

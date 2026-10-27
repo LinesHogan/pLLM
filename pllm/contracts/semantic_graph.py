@@ -7,8 +7,8 @@ from enum import StrEnum
 from typing import Literal, NewType
 
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
-from pllm.contracts.region_selection import RegionSelectionPolicy
 from pllm.contracts.request_identity import RequestKeyField
+from pllm.contracts.tensor_policy import TensorPolicy
 from pllm.contracts.visibility import VisibilitySource
 
 WorkloadId = NewType("WorkloadId", str)
@@ -265,7 +265,7 @@ class SchedulerTimeline:
     task_resources: tuple[TaskResourceFact, ...] = ()
     memory_budget_bytes: int | None = None
     reserved_bytes: tuple[int, ...] = ()
-    region_policy: RegionSelectionPolicy = RegionSelectionPolicy()
+    tensor_policy: TensorPolicy = TensorPolicy()
     visibility: VisibilitySource | None = None
 
 

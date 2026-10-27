@@ -15,18 +15,7 @@ import torch
 
 from pllm import _core
 from pllm.contracts.region_outlining import CallOutlineEvidence, call_outline_sites
-from pllm.contracts.region_program import (
-    BorrowedResource,
-    Call,
-    If,
-    Map,
-    Program,
-    Region,
-    Scan,
-    TensorType,
-    While,
-    bind_sizes,
-)
+from pllm.contracts.region_program import Call, If, Map, Program, Region, Scan, TensorType, While, bind_sizes
 from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.region_retention import RetainedAllocation
 from pllm.contracts.region_selection import (
@@ -34,15 +23,17 @@ from pllm.contracts.region_selection import (
     RegionCandidateAssessment,
     RegionPayloadLimit,
     RegionSelection,
-    RegionSelectionPolicy,
     RegionSelectionRequest,
     RegionTuningSize,
 )
 from pllm.contracts.tensor_access import TensorAccessGraph
+from pllm.contracts.tensor_borrow import BorrowedResource
 from pllm.contracts.tensor_compilation import TensorCompiler, UnsupportedTensorKernel
+from pllm.contracts.tensor_policy import TensorPolicy
 from pllm.contracts.tensor_rewrite import TensorRewrite
 from pllm.execution.codec import boundary_digest, decode_boundary, encode_boundary
-from pllm.execution.exported_cell import ExportedCell, warn_numerical_transforms
+from pllm.execution.exported_cell import ExportedCell
+from pllm.execution.numerics import warn_numerical_transforms
 from pllm.execution.region_compilation import (
     analyze_region_program,
     explore_region_schedules,
@@ -269,7 +260,7 @@ def prepare_region_implementations(
     program: Program,
     cells: Mapping[str, RegionFunction],
     *,
-    options: RegionOptimizationOptions = RegionSelectionPolicy(),
+    options: RegionOptimizationOptions = TensorPolicy(),
     max_variants: int = 4,
     max_rewrite_depth: int = 2,
     compiler: TensorCompiler = DEFAULT_TENSOR_COMPILER,
@@ -474,7 +465,7 @@ def optimize_region(
     inputs: Mapping[str, Data],
     *,
     payload_limits: tuple[RegionPayloadLimit, ...],
-    options: RegionOptimizationOptions = RegionSelectionPolicy(tuning="measured"),
+    options: RegionOptimizationOptions = TensorPolicy(tuning="measured"),
     warmup_rounds: int = 1,
     measurement_rounds: int = 3,
     max_candidates: int = 8,

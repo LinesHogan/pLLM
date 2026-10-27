@@ -16,7 +16,6 @@ from pllm.contracts.backend_attachment import (
 )
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRowBatch
-from pllm.contracts.region_program import BorrowedResource
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import StateEffectKind, StateResource
 from pllm.contracts.state_ref import StateRef
@@ -24,7 +23,6 @@ from pllm.execution.activation import low_rank_affine_delta
 from pllm.execution.cuda_stream import upload
 from pllm.execution.ptts.page_bundle import PagePin
 from pllm.execution.ptts.request_state import RequestStateDirectory
-from pllm.execution.region_resources import PinnedResourceBinding, PinnedResourceCell, RegionPageOwner
 from pllm.execution.state_execution import DataT, StateTaskContext
 
 _DecoderForward = Callable[[torch.Tensor, torch.Tensor, torch.Tensor | None], tuple[torch.Tensor, torch.Tensor]]
@@ -171,25 +169,6 @@ class VllmActivationPatch:
                 selected.append(() if item is None else item.fields)
             rows.append(tuple(selected))
         return tuple(rows)
-
-    def bind_pinned(self, resource: BorrowedResource, layer: int, owner: RegionPageOwner) -> PinnedResourceBinding:
-        if (
-            self.installed
-            or len(resource.domain) != 1
-            or resource.domain[0] < self.row_count
-            or resource.name != f"activation.{layer}"
-        ):
-            raise ValueError("source activation requires its unhooked model binding")
-        (handle,) = (handle for handle in self.layers if handle.binding.layer == layer)
-        return PinnedResourceBinding.bind(
-            resource,
-            owner,
-            tuple(
-                PinnedResourceCell((row,), item.pin, item.ref, handle.binding.fields)
-                for item in handle.prepared
-                for row in item.indices
-            ),
-        )
 
     def _version(
         self,

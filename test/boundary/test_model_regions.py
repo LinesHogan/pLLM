@@ -21,17 +21,8 @@ from pllm.backends.vllm.region_attention import (
     validate_attention_resources,
 )
 from pllm.contracts.region_composition import RegionFunctionBody, inline_function_bodies, inline_region
-from pllm.contracts.region_program import (
-    Block,
-    Call,
-    Constant,
-    Function,
-    Program,
-    Region,
-    ScalarType,
-    TensorType,
-    Value,
-)
+from pllm.contracts.region_program import Block, Call, Constant, Function, Program, Region, ScalarType, Value
+from pllm.execution.token_program import TokenTensor
 from test.region_reference import interpret
 from test.state_fixtures import paged_rows
 
@@ -115,7 +106,7 @@ def test_direct_route_batches_positions_taps_and_state(width):
         layers.save("history", last)
         return first[1]
 
-    program = TokenProgram.capture(route, TensorType((1, 4), "torch.float32", "cpu"), 3, ("history",))
+    program = TokenProgram.capture(route, TokenTensor((1, 4), torch.float32, "cpu"), 3, ("history",))
     seed = torch.arange(width * 4, dtype=torch.float32).reshape(width, 4)
     previous = seed + 10
     positions = torch.arange(width)
@@ -138,7 +129,7 @@ def test_prompt_classification_is_structural_and_requires_the_complete_stack():
     from pllm.workloads.recirculation import RecirculationWorkload
     from pllm.workloads.step_loop import StepLoop
 
-    tensor = TensorType((1, 4), "torch.float32", "cpu")
+    tensor = TokenTensor((1, 4), torch.float32, "cpu")
     assert TokenProgram.capture(StepLoop().loop, tensor, 3, ("history",)).prompt_pass_is_identity
     assert not TokenProgram.capture(RecirculationWorkload().recirculate, tensor, 3).prompt_pass_is_identity
     assert not TokenProgram.capture(lambda layers: layers(stop=2)[-2], tensor, 3).prompt_pass_is_identity
@@ -153,7 +144,7 @@ def test_segments_reject_incompatible_hidden_tensors(kind):
         return layers(hidden=hidden)[-1]
 
     with pytest.raises(ValueError, match="hidden tensor"):
-        TokenProgram.capture(route, TensorType((1, 4), "torch.float32", "cpu"), 3)
+        TokenProgram.capture(route, TokenTensor((1, 4), torch.float32, "cpu"), 3)
 
 
 @pytest.mark.parametrize("width", (1, 8))
@@ -162,7 +153,7 @@ def test_constant_cells_expand_without_reading_other_requests(width):
     from pllm.execution.token_program import TokenProgram
 
     program = TokenProgram.capture(
-        lambda layers: layers(hidden=torch.ones((1, 4)))[-1], TensorType((1, 4), "torch.float32", "cpu"), 1
+        lambda layers: layers(hidden=torch.ones((1, 4)))[-1], TokenTensor((1, 4), torch.float32, "cpu"), 1
     )
     hidden, _ = execute_route(
         program,

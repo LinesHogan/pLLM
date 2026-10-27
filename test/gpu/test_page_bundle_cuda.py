@@ -222,8 +222,8 @@ def test_bounded_staging_and_diagnostics_wait_for_completion_without_host_waits(
     """Busy host storage backpressures admission; a device snapshot never exposes partial counters."""
     from unittest.mock import patch
 
+    from pllm.execution.admission import WindowBackpressure
     from pllm.execution.cuda_stream import DeviceCounters, PinnedStaging
-    from pllm.execution.region_window import WindowBackpressure
 
     stream = torch.cuda.Stream()
     staging = PinnedStaging(capacity=8, slots=1)

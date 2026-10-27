@@ -10,14 +10,21 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
-from pllm.contracts.region_program import TensorType
 from pllm.execution.codec import check_functional_aten, tensor_decompositions, tensor_node_metadata
 from pllm.execution.position_state import position_save
-from pllm.execution.shared_tensor import region_dtype
 
 Tokens = Literal["prefill", "decode", "all"]
 Over = Literal["token", "span"]
 KV = Literal["commit", "peek"]
+
+
+@dataclass(frozen=True)
+class TokenTensor:
+    """Static seed metadata for layer-route capture without allocating model storage."""
+
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    device: str
 
 
 @torch.library.custom_op("pllm::layers", mutates_args=())
@@ -224,7 +231,7 @@ class TokenProgram:
     def capture(
         cls,
         function: Callable[[Layers], torch.Tensor | None],
-        tensor: TensorType,
+        tensor: TokenTensor,
         layer_count: int,
         names: tuple[str, ...] = (),
         over: Over = "token",
@@ -249,7 +256,7 @@ class TokenProgram:
         )
         with FakeTensorMode(shape_env=shapes):
             shape = (rows, *tensor.shape[1:])
-            seed = torch.empty(shape, dtype=region_dtype(tensor.dtype), device=tensor.device)
+            seed = torch.empty(shape, dtype=tensor.dtype, device=tensor.device)
             position = torch.empty((shape[0], 1), dtype=torch.int64, device=tensor.device)
             generated = torch.empty((shape[0], 1), dtype=torch.bool, device=tensor.device)
             graph = make_fx(

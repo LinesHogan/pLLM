@@ -30,7 +30,6 @@ from pllm.contracts.parameter_overlay import (
     ParameterOverlayOperator,
     ParameterTarget,
 )
-from pllm.contracts.region_program import TensorType
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.semantic_graph import (
     PackedRowsInputSource,
@@ -46,6 +45,7 @@ from pllm.execution.declaration import Call, State, When, native
 from pllm.execution.overlay_task import OverlayTransition
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION
+from pllm.execution.shared_tensor import tensor_dtype
 from pllm.execution.tensor_frame import (
     TensorFrame,
     Tensors,
@@ -56,7 +56,7 @@ from pllm.execution.tensor_program import (
     TaskOutput,
     TensorBatch,
 )
-from pllm.execution.token_program import ApplyUpdates, Cell, Layers, Over, Segment, TokenProgram, Tokens
+from pllm.execution.token_program import ApplyUpdates, Cell, Layers, Over, Segment, TokenProgram, Tokens, TokenTensor
 from pllm.kernels.head_overlay import head_correction
 
 if TYPE_CHECKING:
@@ -441,9 +441,9 @@ class ModelEffectBinding(TensorBindingBase):
             probe = self.probe
             assert self.attachment is not None
             assert probe.causal_domain is not None
-            tensor = TensorType(
+            tensor = TokenTensor(
                 (1, probe.hidden_size),
-                "torch." + probe.tensor_dtype.value,
+                tensor_dtype(probe.tensor_dtype),
                 "cpu" if probe.device_kind.value == "cpu" else f"cuda:{probe.device_ordinal}",
             )
             captured = tuple(

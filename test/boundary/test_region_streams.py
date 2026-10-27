@@ -18,9 +18,7 @@ import torch
 from pllm.config import ExecutionOptions
 from pllm.contracts.region_imports import KernelAllocation, NativeKernelImport
 from pllm.contracts.region_program import (
-    AccessMode,
     AffineIndex,
-    BorrowedResource,
     Call,
     Coordinate,
     Function,
@@ -31,7 +29,9 @@ from pllm.contracts.region_program import (
     Value,
 )
 from pllm.contracts.region_selection import RegionCandidate, RegionPayloadLimit, RegionSelectionRequest
+from pllm.contracts.tensor_borrow import AccessMode, BorrowedResource
 from pllm.contracts.tensor_layout import LayoutFieldId
+from pllm.execution.admission import WindowBackpressure
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_compilation import analyze_region_program
 from pllm.execution.region_native import NativePrimitive, external_primitive
@@ -45,7 +45,6 @@ from pllm.execution.region_streams import (
     plan_region_schedule,
 )
 from pllm.execution.region_values import Bank
-from pllm.execution.region_window import WindowBackpressure
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
 from pllm.execution.tensor_scan import TensorScan
 from test.region_fixtures import (

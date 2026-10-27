@@ -2,8 +2,9 @@
 
 from dataclasses import dataclass
 
-from pllm.contracts.region_imports import AffineScanImport, ScanAction, ScanForm
+from pllm.contracts.region_imports import AffineScanImport, ScanAction
 from pllm.contracts.region_program import Program, TensorType
+from pllm.contracts.tensor_policy import ScanForm
 
 
 @dataclass(frozen=True, slots=True)

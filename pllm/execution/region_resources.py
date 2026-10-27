@@ -13,10 +13,8 @@ import torch
 from pllm.contracts.parameter_overlay import FieldView
 from pllm.contracts.region_imports import BorrowedTensorImport, NativeKernelImport
 from pllm.contracts.region_program import (
-    AccessMode,
     AffineIndex,
     BankType,
-    BorrowedResource,
     DataType,
     ExternalResource,
     Function,
@@ -28,6 +26,7 @@ from pllm.contracts.region_program import (
 )
 from pllm.contracts.region_streams import RegionStateWindow
 from pllm.contracts.state_ref import LineageId, StateRef
+from pllm.contracts.tensor_borrow import AccessMode, BorrowedResource
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.host_borrow import HostResourceView, validate_host_views
 from pllm.execution.paged_access import PagedResourceView

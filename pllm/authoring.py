@@ -163,7 +163,7 @@ class BackendAuthoring(ABC):
         return facts.timeline
 
     def specialize(self, facts: BackendCompileFacts, options: ExecutionOptions) -> BackendCompileFacts:
-        from pllm.contracts.region_selection import RegionSelectionPolicy
+        from pllm.contracts.tensor_policy import TensorPolicy
 
         facts = replace(
             facts,
@@ -173,9 +173,7 @@ class BackendAuthoring(ABC):
                     (n for n in (facts.timeline.memory_budget_bytes, options.memory_budget_bytes) if n is not None),
                     default=None,
                 ),
-                region_policy=RegionSelectionPolicy(
-                    options.allow_numerical_transforms, options.schedule_policy, options.tuning
-                ),
+                tensor_policy=TensorPolicy(options.allow_numerical_transforms, options.schedule_policy, options.tuning),
             ),
         )
         if options.state_memory_bytes:
@@ -205,7 +203,7 @@ class BackendAuthoring(ABC):
             timeline,
             capabilities=capabilities,
             memory_budget_bytes=min(budgets, default=None),
-            region_policy=facts.timeline.region_policy,
+            tensor_policy=facts.timeline.tensor_policy,
             visibility=VisibilitySource.post_sampler(options.publish_lag),
         )
         graph, layouts, attachment = self.declare(replace(facts, timeline=timeline))

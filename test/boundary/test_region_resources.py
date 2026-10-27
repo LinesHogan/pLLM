@@ -13,9 +13,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from pllm.contracts.region_composition import inline_function_bodies
 from pllm.contracts.region_imports import BorrowedTensorImport
 from pllm.contracts.region_program import (
-    AccessMode,
     AffineIndex,
-    BorrowedResource,
     Call,
     Coordinate,
     ExternalResource,
@@ -27,7 +25,9 @@ from pllm.contracts.region_program import (
     TensorType,
     Value,
 )
-from pllm.contracts.region_selection import RegionPayloadLimit, RegionSelectionPolicy
+from pllm.contracts.region_selection import RegionPayloadLimit
+from pllm.contracts.tensor_borrow import AccessMode, BorrowedResource
+from pllm.contracts.tensor_policy import TensorPolicy
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.exported_region import import_exported_region
 from pllm.execution.exported_resources import borrow_exported_inputs
@@ -367,9 +367,7 @@ def test_exported_parameters_and_buffers_are_borrowed_from_the_module():
         ReadonlyTensorView(resource, (ReadonlyTensorCell.bind((0,), (model.weight, model.offset)),)), invocation.context
     )
     pages = RegionResources(program, invocation.context, (), borrows=(proof,), tensor_borrows=loans)
-    options = dict(
-        payload_limits=(RegionPayloadLimit("cpu", 1 << 20),), options=RegionSelectionPolicy(tuning="measured")
-    )
+    options = dict(payload_limits=(RegionPayloadLimit("cpu", 1 << 20),), options=TensorPolicy(tuning="measured"))
     with pytest.raises(ValueError):
         optimize_region(program, functions, {"x": x}, max_candidates=1, **options)
     with pages.scope():

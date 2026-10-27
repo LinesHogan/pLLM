@@ -7,9 +7,8 @@ import torch
 
 import pllm
 from pllm.config import ExecutionOptions
-from pllm.contracts.region_program import TensorType
 from pllm.execution.position_state import PositionBuffers
-from pllm.execution.token_program import Layers, TokenProgram
+from pllm.execution.token_program import Layers, TokenProgram, TokenTensor
 from pllm.workloads.step_loop import StepLoop
 from test.workloads.test_recirculation import FACTS, IDENTITIES, VALUE, Decoder, run_step
 
@@ -35,7 +34,7 @@ def test_positional_authoring_errors(case):
         return layers.seed
 
     with pytest.raises(ValueError, match="PositionState|save history"):
-        TokenProgram.capture(route, TensorType((1, 4), "torch.float32", "cpu"), 3, ("history",))
+        TokenProgram.capture(route, TokenTensor((1, 4), torch.float32, "cpu"), 3, ("history",))
 
 
 def test_stacked_marker_and_unused_declaration():

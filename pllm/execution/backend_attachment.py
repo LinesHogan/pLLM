@@ -7,6 +7,7 @@ from math import prod
 
 from pllm import _core
 from pllm.contracts.backend_attachment import (
+    TOKEN_CAPTURE_CAPABILITY,
     AttachmentCleanupStage,
     AttachmentGraphMode,
     AttachmentTaskBinding,
@@ -21,7 +22,6 @@ from pllm.contracts.backend_attachment import (
 )
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator
-from pllm.contracts.region_proposal import TOKEN_CAPTURE_CAPABILITY
 from pllm.contracts.semantic_graph import (
     AnchorId,
     SchedulerTimeline,

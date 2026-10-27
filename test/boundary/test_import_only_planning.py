@@ -13,9 +13,10 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from pllm.contracts.region_payload import RegionPayload
-from pllm.contracts.region_program import AffineIndex, Block, BorrowedResource, Coordinate, Region
+from pllm.contracts.region_program import AffineIndex, Block, Coordinate, Region
 from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.region_streams import RegionStreamExploration
+from pllm.contracts.tensor_borrow import BorrowedResource
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.exported_resources import borrow_exported_inputs

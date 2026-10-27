@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TypeAlias
 
+from pllm.contracts.tensor_borrow import AccessMode, BorrowedResource
+
 
 class ScalarType(StrEnum):
     INDEX = "index"
@@ -185,11 +187,6 @@ class AccessRange:
     upper: AffineIndex
 
 
-class AccessMode(StrEnum):
-    READ = "read"
-    WRITE = "write"
-
-
 @dataclass(frozen=True, slots=True)
 class ResourceAccess:
     resource: str
@@ -234,18 +231,6 @@ class ExternalResource:
 
     name: str
     domain: tuple[int, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class BorrowedResource:
-    """External indexed storage requiring an invocation-scoped alias proof.
-
-    The original backend owns its storage and recovery. A runtime binding must
-    prove writable-cell separation and enforce every imported access interval.
-    """
-
-    name: str
-    domain: tuple[int, ...]
 
 
 ResourceType: TypeAlias = Resource | ExternalResource | BorrowedResource

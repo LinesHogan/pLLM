@@ -22,10 +22,11 @@ from pllm.contracts.region_imports import (
     NativeKernelImport,
     RegionTensorImport,
     ScanAction,
-    ScanForm,
     region_import_name,
 )
-from pllm.contracts.region_program import AccessMode, Function, ScalarType, TensorType
+from pllm.contracts.region_program import Function, ScalarType, TensorType
+from pllm.contracts.tensor_borrow import AccessMode
+from pllm.contracts.tensor_policy import ScanForm
 from pllm.execution.codec import (
     boundary_digest,
     refresh_tensor_metadata,

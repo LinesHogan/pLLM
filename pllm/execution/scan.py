@@ -10,7 +10,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils._python_dispatch import _disable_current_modes  # pyright: ignore[reportPrivateUsage]
 
 from pllm.contracts.region_program import SizeParameter
-from pllm.contracts.region_selection import RegionSelectionPolicy
+from pllm.contracts.tensor_policy import TensorPolicy
 from pllm.execution.exported_cell import TensorCellModule
 from pllm.execution.exported_region import ExportedRegion, import_exported_region
 from pllm.execution.memory import MemoryTrace
@@ -44,7 +44,7 @@ class ScanContext:
     active: ContextVar["ScanContext | None"] = ContextVar("scan_context", default=None)
 
     def __init__(
-        self, policy: RegionSelectionPolicy, max_rows: int, device: torch.device, payload_bytes: int | None = None
+        self, policy: TensorPolicy, max_rows: int, device: torch.device, payload_bytes: int | None = None
     ) -> None:
         self.policy, self.max_rows, self.device = policy, max_rows, device
         self.payload_bytes = payload_bytes
@@ -187,7 +187,7 @@ def scan(
         valid_rows.shape != () or valid_rows.dtype != torch.int64 or valid_rows.device != carry.device
     ):
         raise ValueError("scan valid_rows needs an int64 scalar on the carry device")
-    context = ScanContext.active.get() or _context(RegionSelectionPolicy(), over[0].shape[0], carry.device)
+    context = ScanContext.active.get() or _context(TensorPolicy(), over[0].shape[0], carry.device)
     if (
         context.device.type == "cuda"
         and over[0].shape[0]

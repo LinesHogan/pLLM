@@ -15,7 +15,6 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from pllm.config import ExecutionOptions
-from pllm.contracts.region_imports import ScanForm
 from pllm.contracts.region_program import (
     Call,
     Program,
@@ -25,12 +24,13 @@ from pllm.contracts.region_program import (
 from pllm.contracts.region_selection import (
     RegionCandidate,
     RegionPayloadLimit,
-    RegionSelectionPolicy,
     RegionSelectionRequest,
     RegionTuningSize,
 )
+from pllm.contracts.tensor_policy import ScanForm, TensorPolicy
 from pllm.execution.affine_scan import candidates as affine_candidates
-from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
+from pllm.execution.exported_cell import ExportedCell
+from pllm.execution.numerics import NumericalTransformWarning
 from pllm.execution.region_compilation import analyze_region_program
 from pllm.execution.region_optimization import (
     assess_region_candidates,
@@ -132,7 +132,7 @@ def test_cold_tuning_measures_candidates_on_private_inputs(device):
         inputs,
         payload_limits=(RegionPayloadLimit(device, 1 << 20),),
         measurement_rounds=2,
-        options=RegionSelectionPolicy(tuning="measured"),
+        options=TensorPolicy(tuning="measured"),
     )
     assert all(len(c.elapsed_ns) == 2 and all(t > 0 for t in c.elapsed_ns) for c in result.request.candidates)
     actual = result.execution.run(inputs)
@@ -159,7 +159,7 @@ def test_tuning_one_example_size_serves_every_declared_size():
         warmup_rounds=0,
         measurement_rounds=1,
         max_candidates=3,
-        options=RegionSelectionPolicy(tuning="measured"),
+        options=TensorPolicy(tuning="measured"),
     )
     for chunks, layers in ((0, 0), (3, 0), (8, 5), (2, 3), (8, 5), (0, 0)):
         result = selected.execution.run(inputs_for(chunks, layers), sizes={"chunks": chunks, "layers": layers})
@@ -501,7 +501,7 @@ def _check_pinned_projection_borrows():
     rows = torch.tensor([[0, 1, 2, 0], [3, 4, 5, 6]], device="cuda")
     owners = torch.tensor([0, 1, 2, 4, 5, 6, 7, -1], device="cuda")
     values = (hidden, slots, rows, owners, pool)
-    execution = prepare_projection_read(values, ParameterOverlayOperator.HEAD_ADD, 128 << 20, RegionSelectionPolicy())
+    execution = prepare_projection_read(values, ParameterOverlayOperator.HEAD_ADD, 128 << 20, TensorPolicy())
     assert execution.borrows_inputs
     arguments = dict(zip(("hidden", "slots", "rows", "owners", "pool0"), values, strict=True))
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU], record_shapes=True) as profile:

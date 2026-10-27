@@ -21,10 +21,11 @@ from pllm.contracts.parameter_overlay import (
     ParameterTarget,
     ParameterTargetShape,
 )
-from pllm.contracts.region_selection import RegionPayloadLimit, RegionSelectionPolicy
+from pllm.contracts.region_selection import RegionPayloadLimit
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
+from pllm.contracts.tensor_policy import TensorPolicy
 from pllm.execution.affine_scan import candidates as affine_candidates
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.compile_facts import BackendCompileFacts
@@ -63,9 +64,9 @@ def test_bound_scan_matches_original_chunk_math_bitwise(device, dtype, numerics)
     device = torch.device(device)
     workload = InPlaceTTTWorkload(InPlaceTTTConfig((TARGET,), chunk_size=3, learning_rate=0.017, update_decode=True))
     facts = facts_for(device, dtype)
-    facts = replace(facts, timeline=replace(facts.timeline, region_policy=RegionSelectionPolicy(numerics)))
+    facts = replace(facts, timeline=replace(facts.timeline, tensor_policy=TensorPolicy(numerics)))
     execution = workload.compile_backend(facts).execution
-    reference_transition = ScanContext(RegionSelectionPolicy(False), 8, device).bind(workload.transition)
+    reference_transition = ScanContext(TensorPolicy(False), 8, device).bind(workload.transition)
     stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
     identity = RequestIdentity("region", 0, 0)
     (ref,) = execution.admit((identity,), stream)
@@ -108,18 +109,18 @@ def test_production_tuning_policy_is_signed_into_worker_facts():
         allow_numerical_transforms=False, schedule_policy="serial", tuning="measured", memory_budget_bytes=1 << 20
     )
     facts = workload.specialize(facts_for(torch.device("cpu"), torch.float32), options)
-    policy = RegionSelectionPolicy(False, "serial", "measured")
-    assert facts.timeline.region_policy == policy
+    policy = TensorPolicy(False, "serial", "measured")
+    assert facts.timeline.tensor_policy == policy
     # The policy crosses the process boundary inside the facts the worker binds with.
     facts = decode_boundary(encode_boundary(facts), BackendCompileFacts)
     attachment = workload.plan_backend(facts)
     rng = torch.get_rng_state().clone()
     workload.bind_backend(facts, attachment)
     assert torch.equal(rng, torch.get_rng_state())  # measurement does not consume the global RNG
-    assert attachment.inputs.plan.timeline.region_policy == policy
+    assert attachment.inputs.plan.timeline.tensor_policy == policy
     with pytest.raises(ValueError):  # worker facts must carry the signed policy
         workload.bind_backend(
-            replace(facts, timeline=replace(facts.timeline, region_policy=RegionSelectionPolicy())), attachment
+            replace(facts, timeline=replace(facts.timeline, tensor_policy=TensorPolicy())), attachment
         )
 
 
@@ -189,7 +190,7 @@ def test_scan_matches_the_serial_loop_including_carry_views(device):
             outputs.append(output)
         for numerics in (False, True) if kind == "additive" else (True,):
             torch.cuda.set_rng_state(rng)
-            context = ScanContext(RegionSelectionPolicy(numerics), 20, torch.device(device))
+            context = ScanContext(TensorPolicy(numerics), 20, torch.device(device))
             if kind == "random":
                 # RNG already needs an opaque backend binding; the affine
                 # optimizer must not silently turn it into a pure coefficient.
@@ -213,7 +214,7 @@ def test_scan_matches_the_serial_loop_including_carry_views(device):
     # Prime bounded buckets with real C, then vary C within them without any
     # warm export. The measured policy must not specialize on every count.
     x, y = torch.cat((x, x[:12])), torch.cat((y, y[:12]))
-    context = ScanContext(RegionSelectionPolicy(True, tuning="measured"), 32, torch.device(device))
+    context = ScanContext(TensorPolicy(True, tuning="measured"), 32, torch.device(device))
     run = context.bind(pllm.scan)
     run(workload.step, carry=carry, over=(x[:20], y[:20]), chunk=4)
     with (
@@ -241,7 +242,7 @@ def test_counted_gated_tail_keeps_inactive_chunks_and_never_reads_device_counts(
 
     target = ParameterTarget(0, ParameterModuleKind.ATTENTION, ParameterRole.QUERY_PROJECTION_WEIGHT)
     workload = GatedDeltaWorkload(GatedDeltaConfig((target,), head_width=4, chunk_size=4))
-    context = ScanContext(RegionSelectionPolicy(numerics), 32, torch.device("cuda:0"), 64 << 20)
+    context = ScanContext(TensorPolicy(numerics), 32, torch.device("cuda:0"), 64 << 20)
     run = context.bind(workload.transition)
     generator = torch.Generator(device="cuda").manual_seed(512)
     weights = torch.randn(2, 4, 4, device="cuda", generator=generator) * 0.1

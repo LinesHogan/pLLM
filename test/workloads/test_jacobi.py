@@ -10,9 +10,8 @@ from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
 import pllm
 from pllm.backends.vllm import region_attention as attention
 from pllm.backends.vllm.prefix_cache import CachePolicy
-from pllm.contracts.region_program import TensorType
 from pllm.execution.route_executor import execute_route
-from pllm.execution.token_program import TokenProgram
+from pllm.execution.token_program import TokenProgram, TokenTensor
 from pllm.workloads.recirculation import JacobiRecirculation
 from test.workloads.test_recirculation import FACTS
 
@@ -38,7 +37,7 @@ def test_overlapping_routes_rejected(tokens):
 )
 def test_capture_rejects_invalid_dependencies(over, route, message):
     with pytest.raises(ValueError, match=message):
-        TokenProgram.capture(route, TensorType((1, 4), "torch.float32", "cpu"), 3, ("state",), over)
+        TokenProgram.capture(route, TokenTensor((1, 4), torch.float32, "cpu"), 3, ("state",), over)
 
 
 @pytest.mark.parametrize("width", (1, 7))
@@ -49,7 +48,7 @@ def test_span_cells_keep_packed_tensor_semantics(width):
         layers.save("state", value.reshape(shape))
         return layers(hidden=value.reshape(shape))[-1]
 
-    program = TokenProgram.capture(route, TensorType((1, 4), "torch.float32", "cpu"), 1, ("state",), "span")
+    program = TokenProgram.capture(route, TokenTensor((1, 4), torch.float32, "cpu"), 1, ("state",), "span")
     seed = torch.arange(width * 4, dtype=torch.float32).reshape(width, 4)
     output, (saved,) = execute_route(
         program,

@@ -7,7 +7,7 @@ alive for the original invocation. Distinct names alone never prove separation.
 from dataclasses import dataclass
 from typing import Protocol
 
-from pllm.contracts.region_program import AccessMode, BorrowedResource
+from pllm.contracts.tensor_borrow import AccessMode, BorrowedResource
 from pllm.execution.trace import ExecutionTrace
 
 

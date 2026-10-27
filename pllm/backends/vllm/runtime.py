@@ -46,6 +46,7 @@ from pllm.backends.vllm.parameter_overlay import (
 from pllm.config import ModelConfig, RunnerKind, VllmDType
 from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import (
+    TOKEN_CAPTURE_CAPABILITY,
     AttachmentGraphMode,
     AttachmentHiddenResource,
     BackendPlacementProbe,
@@ -60,7 +61,6 @@ from pllm.contracts.feedback import (
     FinishReason,
     RetryAction,
 )
-from pllm.contracts.region_proposal import TOKEN_CAPTURE_CAPABILITY
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import SchedulerTimeline, TaskId

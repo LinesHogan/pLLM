@@ -1,7 +1,6 @@
 """Measured candidate selection in AER; payload limits are not device budgets."""
 
 from dataclasses import dataclass
-from typing import Literal
 
 from pllm.contracts.affine_scan import AffineScanEvidence
 from pllm.contracts.region_capacity import RegionCapacity
@@ -10,15 +9,6 @@ from pllm.contracts.region_outlining import CallOutlineEvidence
 from pllm.contracts.region_payload import RegionPayload
 from pllm.contracts.region_retention import RetainedAllocation
 from pllm.contracts.region_streams import RegionStreamPlan
-
-
-@dataclass(frozen=True, slots=True)
-class RegionSelectionPolicy:
-    allow_numerical_transforms: bool = True
-    schedule_policy: Literal["auto", "serial"] = "auto"
-    # Static preparation uses one ISL configuration and a fixed stream mapping.
-    # Extra schedule/math candidates and timing require "measured".
-    tuning: Literal["heuristic", "measured"] = "heuristic"
 
 
 @dataclass(frozen=True, slots=True)

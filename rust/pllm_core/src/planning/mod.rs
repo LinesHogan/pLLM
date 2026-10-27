@@ -18,6 +18,7 @@ mod region_retention;
 mod region_imports;
 mod region_capacity;
 mod region_selection;
+mod tensor_policy;
 mod region_tiling;
 mod region_outlining;
 mod affine_scan;

@@ -23,7 +23,7 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import PhysicalPlan, TaskId
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import TensorDType
-from pllm.execution.region_window import WindowBackpressure
+from pllm.execution.admission import WindowBackpressure
 from pllm.execution.shared_tensor import tensor_dtype
 
 TRACE_SCHEMA_VERSION = 6

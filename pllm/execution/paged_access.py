@@ -13,8 +13,8 @@ from types import MappingProxyType
 import torch
 
 from pllm.contracts.packed_rows import PackedPhaseRow
-from pllm.contracts.region_program import AccessMode, BorrowedResource
 from pllm.contracts.request_identity import RequestIdentity
+from pllm.contracts.tensor_borrow import AccessMode, BorrowedResource
 
 
 @dataclass(frozen=True, slots=True)

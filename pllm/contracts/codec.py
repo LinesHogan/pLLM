@@ -33,9 +33,7 @@ from pllm.contracts.region_imports import (
     RegionTensorImport,
 )
 from pllm.contracts.region_program import (
-    AccessMode,
     BankType,
-    BorrowedResource,
     Call,
     Constant,
     Coordinate,
@@ -83,6 +81,7 @@ from pllm.contracts.semantic_graph import (
     StepIdInputSource,
     TaskResultInputSource,
 )
+from pllm.contracts.tensor_borrow import AccessMode, BorrowedResource
 
 T = TypeVar("T")
 E = TypeVar("E", bound=StrEnum)

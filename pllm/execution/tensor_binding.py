@@ -90,7 +90,7 @@ class TensorBinding(ModelEffectBinding, RowTaskBinding):
             self.overlay_math = replace(
                 self.overlay_math,
                 function=ScanContext(
-                    facts.timeline.region_policy,
+                    facts.timeline.tensor_policy,
                     self.route_rows,
                     facts.device,
                 ).bind(self.overlay_math.function),
@@ -98,7 +98,7 @@ class TensorBinding(ModelEffectBinding, RowTaskBinding):
         for symbol, operation in self.operations.items():
             budget = facts.timeline.memory_budget_bytes
             scans = ScanContext(
-                facts.timeline.region_policy,
+                facts.timeline.tensor_policy,
                 facts.probe.max_packed_rows,
                 facts.device,
                 None if budget is None else budget // max(1, facts.max_admitted_lineages),

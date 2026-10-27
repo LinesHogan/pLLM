@@ -8,8 +8,9 @@ from torch.utils._python_dispatch import _disable_current_modes  # pyright: igno
 
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator
 from pllm.contracts.region_program import Block, Call, Program, Region, Value
-from pllm.contracts.region_selection import RegionPayloadLimit, RegionSelectionPolicy
+from pllm.contracts.region_selection import RegionPayloadLimit
 from pllm.contracts.tensor_compilation import TensorCompiler
+from pllm.contracts.tensor_policy import TensorPolicy
 from pllm.execution.exported_cell import ExportedCell, TensorCellModule
 from pllm.execution.region_execution import RegionInstructionExecution
 from pllm.execution.region_optimization import prepare_region_execution
@@ -60,7 +61,7 @@ def prepare_projection_read(
     examples: tuple[torch.Tensor, ...],
     operator: ParameterOverlayOperator,
     budget: int,
-    policy: RegionSelectionPolicy,
+    policy: TensorPolicy,
     *,
     compiler: TensorCompiler = DEFAULT_TENSOR_COMPILER,
 ) -> RegionInstructionExecution:

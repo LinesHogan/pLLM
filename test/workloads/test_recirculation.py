@@ -242,13 +242,12 @@ def test_route_must_return_a_residual_stream() -> None:
 
 
 def test_route_observation_precedes_sampling_normalization():
-    from pllm.contracts.region_program import TensorType
     from pllm.contracts.semantic_graph import TokenProgramEffect
-    from pllm.execution.token_program import TokenProgram
+    from pllm.execution.token_program import TokenProgram, TokenTensor
 
     decoder, observed = Decoder(), []
     decoder.normalize = lambda row, hidden, residual: 2 * (hidden + residual)
-    program = TokenProgram.capture(WORKLOAD.recirculate, TensorType((1, 4), "torch.float32", "cpu"), 3)
+    program = TokenProgram.capture(WORKLOAD.recirculate, TokenTensor((1, 4), torch.float32, "cpu"), 3)
     decoder.run(
         {"prefill": program, "decode": program},
         TokenProgramEffect(3),

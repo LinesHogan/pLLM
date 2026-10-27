@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from pllm.contracts.region_program import BorrowedResource
+from pllm.contracts.tensor_borrow import BorrowedResource
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView, validate_readonly_views
 
 

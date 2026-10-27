@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from pllm.contracts.region_imports import ScanForm
+from pllm.contracts.tensor_policy import ScanForm
 
 
 def _right_oracle(initial, values, keys, alpha, beta):

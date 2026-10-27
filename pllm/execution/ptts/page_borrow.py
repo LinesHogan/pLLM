@@ -5,8 +5,8 @@ from collections.abc import Sequence
 import torch
 
 from pllm.contracts.compilation import PlanBundle
-from pllm.contracts.region_program import BorrowedResource
 from pllm.contracts.state_ref import StateRef
+from pllm.contracts.tensor_borrow import BorrowedResource
 from pllm.execution.ptts.page_bundle import BorrowedPage, PagePin
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView, validate_readonly_views
 

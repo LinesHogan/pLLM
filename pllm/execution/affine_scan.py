@@ -8,9 +8,10 @@ import torch
 
 from pllm import _core
 from pllm.contracts.affine_scan import AffineScanEvidence, AffineScanPlan
-from pllm.contracts.region_imports import ScanAction, ScanForm
+from pllm.contracts.region_imports import ScanAction
 from pllm.contracts.region_program import Program
 from pllm.contracts.region_selection import RegionCandidate, RegionPayloadLimit
+from pllm.contracts.tensor_policy import ScanForm
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.region_compilation import analyze_region_program
 from pllm.execution.region_native import AffineScanPrimitive, RegionFunction

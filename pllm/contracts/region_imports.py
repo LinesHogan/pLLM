@@ -13,8 +13,10 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TypeAlias
 
-from pllm.contracts.region_program import AccessMode, AffineIndex, Function, IndexTerm, ScalarType, TensorType
+from pllm.contracts.region_program import AffineIndex, Function, IndexTerm, ScalarType, TensorType
 from pllm.contracts.tensor_access import TensorAccessGraph
+from pllm.contracts.tensor_borrow import AccessMode
+from pllm.contracts.tensor_policy import ScanForm
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,13 +130,6 @@ class CompiledTensorImport:
     # Backend tensor allocations include raw results retained during copying;
     # graphs that could lower to opaque external workspaces are rejected by
     # this compiler adapter's normalized-graph operator subset.
-
-
-class ScanForm(StrEnum):
-    """Numerical algorithms admitted for an additive carry."""
-
-    ORDERED = "ordered"
-    HILLIS_STEELE = "hillis_steele"
 
 
 class ScanAction(StrEnum):

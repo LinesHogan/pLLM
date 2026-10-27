@@ -31,7 +31,8 @@ from pllm.contracts.region_program import (
     While,
 )
 from pllm.contracts.region_selection import RegionPayloadLimit
-from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
+from pllm.execution.exported_cell import ExportedCell
+from pllm.execution.numerics import NumericalTransformWarning
 from pllm.execution.region_compilation import analyze_region_program
 from pllm.execution.region_optimization import optimize_region
 from pllm.execution.region_outlining import outline_region_calls

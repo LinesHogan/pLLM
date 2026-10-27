@@ -17,11 +17,9 @@ import torch
 
 from pllm import _core
 from pllm.contracts.region_program import (
-    AccessMode,
     AccessRange,
     AffineIndex,
     BankType,
-    BorrowedResource,
     Call,
     Constant,
     Coordinate,
@@ -50,6 +48,7 @@ from pllm.contracts.region_program import (
     While,
     verify,
 )
+from pllm.contracts.tensor_borrow import AccessMode, BorrowedResource
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_compilation import (

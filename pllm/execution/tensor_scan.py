@@ -27,7 +27,8 @@ from pllm.contracts.region_program import (
     Value,
     verify,
 )
-from pllm.contracts.region_selection import RegionPayloadLimit, RegionSelectionPolicy
+from pllm.contracts.region_selection import RegionPayloadLimit
+from pllm.contracts.tensor_policy import TensorPolicy
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.memory import MemoryTrace
 from pllm.execution.region_compilation import analyze_region_program
@@ -211,7 +212,7 @@ class TensorScan:
         *,
         payload_limits: tuple[RegionPayloadLimit, ...] = (),
         count: int | None = None,
-        options: RegionOptimizationOptions = RegionSelectionPolicy(tuning="measured"),
+        options: RegionOptimizationOptions = TensorPolicy(tuning="measured"),
         warmup_rounds: int = 1,
         measurement_rounds: int = 3,
         max_candidates: int = 8,
