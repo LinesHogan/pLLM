@@ -1461,6 +1461,8 @@ class Workload(
             operation.effect.declare(operation)
         context.attach_effects()
         context.attach_training()
+        if b.exports:
+            signature(self.on_export).bind(None)
         context.sign_composition()
 
     def declaration(self, facts: BackendCompileFacts | None = None) -> TensorBinding:
