@@ -19,7 +19,6 @@ from pllm.contracts.backend_attachment import BackendAttachmentSpec
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding, ParameterOverlayOperator
-from pllm.contracts.region_program import TensorType
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.semantic_graph import (
     AnchorSymbol,
@@ -48,12 +47,11 @@ from pllm.execution.host_runtime import (
     TransactionHostBinding,
 )
 from pllm.execution.ptts.request_state import RequestStateSelection
-from pllm.execution.region_adamw import AdamWRegion
 from pllm.execution.shared_tensor import tensor_dtype
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.step_input import TensorStepInput
 from pllm.execution.tensor_frame import Tensors
-from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots, TensorBatch, autograd_loss
+from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots, TensorAdamW, TensorBatch, autograd_loss
 from pllm.kernels.adamw import AdamWConfig
 from pllm.usage import Activation, InstanceState, Overlay, Phase, RequestState
 
@@ -178,11 +176,7 @@ class CompletionWorkload(
             optimizer=definition.optimizer,
         )
         (layout,) = b.layouts.layouts
-        device = "cpu" if facts.device.type == "cpu" else f"cuda:{facts.device.index or 0}"
-        optimizer = AdamWRegion(
-            tuple(TensorType(field.shape, "torch." + field.dtype.value, device) for field in layout.layout.fields[::5]),
-            definition.optimizer,
-        )
+        optimizer = TensorAdamW(definition.optimizer, len(layout.layout.fields) // 5)
         update = b.compute(
             "train",
             function=autograd_loss(freeze(owner.loss), tuple(shapes), freeze(owner.trained_rows)),
@@ -192,10 +186,7 @@ class CompletionWorkload(
             effect=StateEffectKind.TRANSITION_MAYBE,
             when=When.HOST_COMPUTE,
             implementations=(
-                native(
-                    "region.completion_adamw@1:"
-                    + boundary_digest(identity, optimizer.program, optimizer.capacity, optimizer.copy_workspace_bytes)
-                ),
+                native("tensor.completion_adamw@1:" + boundary_digest(identity, layout, definition.optimizer)),
             ),
             optimizer=optimizer,
             math=MathContract(

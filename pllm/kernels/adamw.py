@@ -63,7 +63,7 @@ def apply_adamw(
     gradients: tuple[torch.Tensor, ...],
 ) -> None:
     """Apply the bound optimizer to validated page views and matching gradients."""
-    # PTTS and region input binding already validate page fields; gradients enter here from math.
+    # PTTS and tensor input binding already validate page fields; gradients enter here from math.
     if (
         not roots
         or len(roots) != len(gradients)

@@ -293,11 +293,31 @@ class PoolSGD:
 
 
 @dataclass(frozen=True, slots=True)
-class PageUpdate:
-    """One update entry point for grouped tensor views and FP32 CUDA page pools."""
+class TensorAdamW:
+    """Apply one Torch AdamW batch to the caller's already-private five-field groups."""
 
     config: AdamWConfig
     groups: int
+
+    def update(
+        self, roots: Sequence[tuple[torch.Tensor, ...]], slots: FieldSlots, gradients: tuple[torch.Tensor, ...]
+    ) -> None:
+        """Update in place; the invocation retains publication and page ownership."""
+        self.tensors(roots, gradients)
+
+    def tensors(self, roots: Sequence[tuple[torch.Tensor, ...]], gradients: tuple[torch.Tensor, ...]) -> None:
+        """Apply the same grouped Torch update to ordinary or gathered private fields."""
+        apply_adamw_or_reserve(
+            tuple(root[5 * group : 5 * group + 5] for root in roots for group in range(self.groups)),
+            AdamWFields(*(LayoutFieldId(i) for i in range(5))),
+            self.config,
+            gradients,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PageUpdate(TensorAdamW):
+    """One update entry point for grouped tensor views and FP32 CUDA page pools."""
 
     def update(
         self, roots: Sequence[tuple[torch.Tensor, ...]], slots: FieldSlots, gradients: tuple[torch.Tensor, ...]
@@ -311,15 +331,6 @@ class PageUpdate:
         pools = tuple(pool.reshape(len(pool), -1) if index != 2 else pool for index, (pool, _) in enumerate(fields))
         table = upload([rows for _, rows in fields], parameter.device)
         paged_adamw(pools, table, torch.stack(gradients).reshape(len(gradients), -1), self.config)
-
-    def tensors(self, roots: Sequence[tuple[torch.Tensor, ...]], gradients: tuple[torch.Tensor, ...]) -> None:
-        """Apply the same grouped Torch update to ordinary or gathered private fields."""
-        apply_adamw_or_reserve(
-            tuple(root[5 * group : 5 * group + 5] for root in roots for group in range(self.groups)),
-            AdamWFields(*(LayoutFieldId(i) for i in range(5))),
-            self.config,
-            gradients,
-        )
 
     @torch.no_grad()
     def staged(

@@ -60,7 +60,6 @@ AUTHORITY_FILES = (
     Path("pllm/execution/region_resources.py"),
     Path("pllm/execution/tensor_scan.py"),
     Path("pllm/execution/region_native.py"),
-    Path("pllm/execution/region_adamw.py"),
     Path("pllm/execution/tensor_access.py"),
     Path("pllm/execution/region_storage.py"),
     Path("pllm/execution/region_optimization.py"),

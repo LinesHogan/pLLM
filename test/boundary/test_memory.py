@@ -38,3 +38,37 @@ def test_meta_memory_tracks_aliases_saved_gradients_and_real_cuda_peaks():
         torch.cuda.synchronize()
         assert torch.cuda.max_memory_allocated() - baseline <= bound
         assert result[1].shape == actual.shape
+
+
+def test_direct_multigroup_adamw_workspace_bounds_cuda_peak():
+    """The shape-only capturable batch funds the real update's temporary storage."""
+    from pllm.execution.memory import measure
+    from pllm.execution.tensor_program import TensorAdamW
+    from pllm.kernels.adamw import AdamWConfig
+
+    optimizer = TensorAdamW(AdamWConfig(0.017), 2)
+    roots = (
+        tuple(
+            value
+            for shape in ((512, 512), (4096,))
+            for value in (
+                torch.ones(shape, device="cuda"),
+                torch.zeros(shape, device="cuda"),
+                torch.zeros((), device="cuda"),
+                torch.zeros(shape, device="cuda"),
+                torch.zeros(shape, device="cuda"),
+            )
+        ),
+    )
+    gradients = tuple(torch.ones_like(roots[0][i]) for i in (0, 5))
+    meta_roots = tuple(tuple(value.to("meta") for value in root) for root in roots)
+    meta_gradients = tuple(value.to("meta") for value in gradients)
+    planned = measure(lambda: optimizer.tensors(meta_roots, meta_gradients))
+    optimizer.tensors(roots, gradients)
+    torch.cuda.synchronize()
+    baseline = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    optimizer.tensors(roots, gradients)
+    torch.cuda.synchronize()
+    observed = torch.cuda.max_memory_allocated() - baseline
+    assert 0 < observed <= planned.workspace
