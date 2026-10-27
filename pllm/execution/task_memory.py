@@ -139,17 +139,20 @@ def example(
             keys,
         )
     dtype = tensor_dtype(facts.probe.tensor_dtype)
+    # A step packs at most max_packed_rows prompt tokens across all rows. The first row takes the remainder,
+    # so both one longest prompt and every row's fixed cost are traced.
+    lengths = (max(1, facts.probe.max_packed_rows - len(rows) + 1), *(1,) * (len(rows) - 1))
     operands = tuple(
         CapturedParameterOperand(
             row.identity,
             target.target,
             HiddenPhase.PREFILL,
-            meta(facts.probe.max_packed_rows, target.input_size, dtype=dtype),
-            meta(facts.probe.max_packed_rows, target.output_size, dtype=dtype),
+            meta(length, target.input_size, dtype=dtype),
+            meta(length, target.output_size, dtype=dtype),
             meta(target.output_size, target.input_size, dtype=dtype),
             meta(dtype=torch.bool),
         )
-        for row in rows
+        for row, length in zip(rows, lengths, strict=True)
         for target in facts.probe.targets
     )
     data = TensorFrame(
