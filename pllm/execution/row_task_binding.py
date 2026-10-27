@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import replace
 from functools import partial
 from math import prod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
@@ -45,7 +45,6 @@ from pllm.execution.tensor_frame import (
     TensorMath,
     TensorPort,
     Tensors,
-    export_tensor,
     feedback_port,
     field_rows,
     finite,
@@ -734,7 +733,15 @@ class RowTaskBinding(TensorBindingBase):
         self.sampler(prediction, training, state, output=prediction.outputs[0], stage=stage)
 
     def export(
-        self, call: Call, *, name: str, every: int = 1, max_rows: int = 1, max_cols: int = 16, enabled: bool = True
+        self,
+        call: Call,
+        *,
+        name: str,
+        every: int = 1,
+        max_rows: int = 1,
+        max_cols: int = 16,
+        enabled: bool = True,
+        overflow: Literal["drop", "block"] = "drop",
     ) -> None:
         self.exports[call.symbol] = (max_rows, max_cols, enabled)
         if min(every, max_rows, max_cols) < 1 or max_rows * max_cols * 8 > MAX_SNAPSHOT_BYTES:
@@ -748,8 +755,7 @@ class RowTaskBinding(TensorBindingBase):
                 return replace(data, rows=data.rows[:max_rows], columns=max_cols, index=None, plan=None)
 
             def output(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
-                value = export_tensor(batch.results[call.symbol, call.outputs[0]][:max_rows, :max_cols])
-                batch.results[call.symbol, call.outputs[0]] = value
+                value = batch.results[call.symbol, call.outputs[0]][:max_rows, :max_cols]
                 return TaskOutput(
                     observations=(
                         Observation(
@@ -757,7 +763,7 @@ class RowTaskBinding(TensorBindingBase):
                             value,
                             step_id=data.step.rows.step_id,
                             identities=tuple(row.identity for row in data.rows),
-                            export=True,
+                            export=overflow,
                         ),
                     )
                 )

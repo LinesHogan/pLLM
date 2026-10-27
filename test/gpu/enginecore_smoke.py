@@ -9,6 +9,7 @@ execute one scenario.
 from __future__ import annotations
 
 import os
+import pickle
 import sys
 from pathlib import Path
 
@@ -175,9 +176,19 @@ def _prefill_adapter_reconstruction() -> None:
     print(f"prefill adapters reconstructed workers={processes}; fresh requests={requests}; parent CUDA=off")
 
 
+class ExportProbe(DummyWorkload):
+    def on_export(self, event: pllm.TraceEvent) -> None:
+        with open("build/worker_exports.pkl", "ab") as output:
+            pickle.dump((event.sequence, event.step_id, event.tensor()), output)
+
+
 def _dummy_export() -> None:
+    from test.gpu.enginecore_smoke import ExportProbe
+
     assert not torch.cuda.is_initialized()
-    workload = DummyWorkload(DummyConfig(layer=3, export_every_n_steps=2, export_max_rows=2, export_max_cols=3))
+    Path("build").mkdir(exist_ok=True)
+    Path("build/worker_exports.pkl").unlink(missing_ok=True)
+    workload = ExportProbe(DummyConfig(layer=3, export_every_n_steps=2, export_max_rows=2, export_max_cols=3))
     handle = pllm.make_llm(workload=workload, config=engine())
     try:
         handle.generate(PROMPTS, greedy(4), prompt_indices=(7, 9))
@@ -196,6 +207,13 @@ def _dummy_export() -> None:
         print("Dummy selected-layer export: snapshots=2 at the original rows and steps")
     finally:
         handle.close()
+
+    with open("build/worker_exports.pkl", "rb") as source:
+        for event in events:
+            sequence, step, tensor = pickle.load(source)
+            assert (sequence, step) == (event.sequence, event.step_id)
+            torch.testing.assert_close(tensor, event.tensor())
+        assert source.read() == b""
 
 
 def _graph_overlay(*, exact: bool = False) -> None:

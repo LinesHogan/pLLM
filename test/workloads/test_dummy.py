@@ -39,6 +39,13 @@ def step_input(step, hidden, count=3):
     return testing.step_input(identities, {BINDING: hidden[:count]}, step_id=step, phases=phases)
 
 
+def exported(execution, value):
+    """Exports are terminal effects; explicit snapshot reads may wait."""
+    assert execution.step(value) is None
+    execution.trace.drain()
+    return next(event.tensor() for event in reversed(execution.trace.snapshot().events) if event.tensor_name)
+
+
 def test_dummy_runs_graph_sign_plan_execute() -> None:
     workload = DummyWorkload(DummyConfig(export_every_n_steps=2, export_max_rows=2, export_max_cols=3))
     execution = make_llm(workload=workload, config=CPU)
@@ -50,13 +57,13 @@ def test_dummy_runs_graph_sign_plan_execute() -> None:
         assert execution.step(value(1)) is None
         assert execution.step(step_input(2, hidden, count=1)) is None
         reads.assert_not_called()
-        exported = execution.step(value(2))
+        result = exported(execution, value(2))
         reads.assert_called_once()
     hidden.fill_(-1)
-    torch.testing.assert_close(exported, expected)
+    torch.testing.assert_close(result, expected)
     hidden.copy_(torch.arange(15, dtype=torch.float32).reshape(3, 5))
     variant = make_llm(CPU, workload=centered_hidden(workload.config))
-    torch.testing.assert_close(variant.step(value(2)), expected - expected.mean(dim=-1, keepdim=True))
+    torch.testing.assert_close(exported(variant, value(2)), expected - expected.mean(dim=-1, keepdim=True))
     disabled = DummyWorkload(replace(workload.config, enabled=False)).compile_host(CPU)
     with patch.object(TensorTask, "read", autospec=True, side_effect=TensorTask.read) as reads:
         assert disabled.step(value(2)) is None
@@ -82,13 +89,13 @@ def test_dummy_runs_graph_sign_plan_execute() -> None:
     bounded = assert_finite_resources(workload, facts)
     deployment = workload.compile_backend(bounded)
     attached = deployment.execution
-    torch.testing.assert_close(attached.step(value(2)), expected)
+    torch.testing.assert_close(exported(attached, value(2)), expected)
     # Four packed rows exceed the signed backend row capacity of three.
     with pytest.raises(ValueError):
         attached.start_step(step_input(2, torch.cat((hidden, hidden[:1])), count=4))
     with pytest.raises(ValueError):  # hidden width differs from the specialized model
         attached.step(step_input(2, torch.zeros(3, 6)))
-    torch.testing.assert_close(attached.step(value(2)), expected)
+    torch.testing.assert_close(exported(attached, value(2)), expected)
     with pytest.raises(ValueError):  # a changed declaration cannot reuse the signed attachment
         DummyWorkload(replace(workload.config, export_every_n_steps=1)).bind_backend(bounded, deployment.attachment)
     other_layer = (AttachmentHiddenResource(replace(BINDING, layer="1"), HiddenPhase.DECODE),)
@@ -104,15 +111,15 @@ def test_dummy_runs_graph_sign_plan_execute() -> None:
         def export_hidden(self, x: torch.Tensor = pllm.result("shift")) -> torch.Tensor:
             return x * 2
 
-    torch.testing.assert_close(make_llm(CPU, workload=Chained()).step(value(2)), (expected + 1) * 2)
+    torch.testing.assert_close(exported(make_llm(CPU, workload=Chained()), value(2)), (expected + 1) * 2)
 
     # A transform's closure values are frozen when the workload compiles.
     scale = [2.0]
     custom = replace(workload, transform=lambda rows: rows * scale[0])
     frozen = custom.compile_host(CPU)
     scale[0] = 3.0
-    torch.testing.assert_close(frozen.step(value(2)), expected * 2)
-    torch.testing.assert_close(custom.compile_host(CPU).step(value(2)), expected * 3)
+    torch.testing.assert_close(exported(frozen, value(2)), expected * 2)
+    torch.testing.assert_close(exported(custom.compile_host(CPU), value(2)), expected * 3)
 
     class Unsourced(DummyWorkload):
         @pllm.export()
@@ -224,3 +231,89 @@ def test_unused_helpers_are_neither_signed_nor_frozen() -> None:
 
     execution = make_llm(workload=Lazy(), config=CPU)
     assert execution.plan.fallback_count == 0
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA"))]
+)
+@pytest.mark.parametrize("overflow", ["drop", "block"])
+def test_export_queue_delivery_and_lifecycle(device, overflow) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    entered, release, delivered = Event(), Event(), []
+
+    def consume(event):
+        entered.set()
+        assert release.wait(10)
+        delivered.append(event)
+
+    execution = DummyWorkload().compile_host(CPU)
+    trace = ExecutionTrace(execution.plan, capacity=1, on_export=consume)
+    value = torch.ones((2, 3), device=device)
+    record = lambda policy: trace.record(
+        TracePhase.TENSOR,
+        1,
+        task_id=execution.plan.tasks[0].task_id,
+        tensor=value,
+        tensor_name="features",
+        export=policy,
+    )
+    try:
+        record(overflow)
+        value.fill_(2)  # Same-stream reuse must follow the DtoH, including on CUDA.
+        assert entered.wait(10)
+        trace.record(TracePhase.BEGIN, 2)
+        with ThreadPoolExecutor() as pool:
+            pending = pool.submit(record, overflow)
+            try:
+                if overflow == "drop":
+                    pending.result(10)
+                    assert trace.snapshot().export_dropped == 1
+                else:
+                    from concurrent.futures import TimeoutError
+
+                    with pytest.raises(TimeoutError):
+                        pending.result(0.05)
+                assert trace.snapshot().dropped == 1
+            finally:
+                release.set()
+            pending.result(10)
+        trace.drain()
+        assert len(delivered) == (1 if overflow == "drop" else 2)
+        torch.testing.assert_close(delivered[0].tensor(), torch.ones((2, 3)))
+        assert [event.sequence for event in delivered] == sorted(event.sequence for event in delivered)
+        with trace.private():
+            record(overflow)
+        assert len(delivered) == (1 if overflow == "drop" else 2)
+        trace.configure(TraceSelection(max_events=2))
+        record(overflow)
+        trace.configure(TraceSelection(max_events=1))
+    finally:
+        release.set()
+        trace.close()
+        execution.close()
+    assert trace._thread is not None and not trace._thread.is_alive()
+
+
+def test_export_failure_and_meta() -> None:
+    def fail(event):
+        raise RuntimeError("consumer failed")
+
+    execution = DummyWorkload().compile_host(CPU)
+    trace = ExecutionTrace(execution.plan, on_export=fail)
+    record = lambda device: trace.record(
+        TracePhase.TENSOR,
+        1,
+        task_id=execution.plan.tasks[0].task_id,
+        tensor=torch.ones(1, device=device),
+        tensor_name="features",
+        export="block",
+    )
+    record("meta")
+    assert not trace.snapshot().events
+    record("cpu")
+    for action in (trace.drain, lambda: record("cpu"), trace.close):
+        with pytest.raises(RuntimeError, match="consumer failed"):
+            action()
+    execution.close()

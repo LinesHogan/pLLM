@@ -5,14 +5,14 @@ from __future__ import annotations
 import os
 from base64 import b64decode, b64encode
 from collections import deque
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from math import prod
-from threading import Lock
+from threading import Condition, Thread
 from time import monotonic_ns
-from typing import Protocol
+from typing import Literal, Protocol
 from uuid import uuid4
 
 import torch
@@ -26,7 +26,7 @@ from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.admission import WindowBackpressure
 from pllm.execution.shared_tensor import tensor_dtype
 
-TRACE_SCHEMA_VERSION = 6
+TRACE_SCHEMA_VERSION = 7
 MAX_SNAPSHOT_BYTES = 32768
 
 
@@ -114,6 +114,7 @@ class TraceSnapshot:
     dropped: int
     capacity: int
     pending_device_timings: int = 0
+    export_dropped: int = 0
     schema_version: int = TRACE_SCHEMA_VERSION
 
     def host_task_times(self) -> dict[TaskId, tuple[int, int]]:
@@ -180,29 +181,52 @@ class TraceSelection:
             raise ValueError("kernel profiling selects whole tasks; request/iteration filters apply to snapshots")
 
 
+@dataclass(slots=True, eq=False)
+class _TraceEntry:
+    event: TraceEvent
+    timing: tuple[torch.cuda.Event, torch.cuda.Event] | None
+    payload: tuple[torch.Tensor, torch.cuda.Event | None] | None
+    pending: bool
+
+    def snapshot(self) -> TraceEvent:
+        """Encode an owned host value after its copy completes."""
+        if self.payload is None:
+            return self.event
+        host, ready = self.payload
+        if ready is not None and not ready.query():
+            ready.synchronize()
+        return replace(
+            self.event, tensor_data=b64encode(host.reshape(-1).view(torch.uint8).numpy().tobytes()).decode("ascii")
+        )
+
+
 class ExecutionTrace:
-    def __init__(self, plan: PhysicalPlan, capacity: int = 256) -> None:
+    def __init__(
+        self, plan: PhysicalPlan, capacity: int = 256, on_export: Callable[[TraceEvent], None] | None = None
+    ) -> None:
         if capacity < 1:
             raise ValueError("trace capacity must be positive")
         self.plan = plan
         self._execution_id = uuid4().hex
-        self._events: deque[
-            tuple[
-                TraceEvent,
-                tuple[torch.cuda.Event, torch.cuda.Event] | None,
-                tuple[torch.Tensor, torch.cuda.Event | None] | None,
-            ]
-        ] = deque(maxlen=capacity)
+        self._events: deque[_TraceEntry] = deque(maxlen=capacity)
         self._timed_tasks: frozenset[TaskId] = frozenset()
         self._selection: TraceSelection = TraceSelection()
         self._kernel_calls: int = 0
         self._sequence: int = 0
         self._dropped: int = 0
-        self._lock = Lock()
+        self._lock = Condition()
+        self._on_export, self._export_dropped = on_export, 0
+        self._closed = False
+        self._failure: BaseException | None = None
+        self._thread = Thread(target=self._deliver, name="pllm-export", daemon=True) if on_export is not None else None
+        if self._thread is not None:
+            self._thread.start()
 
     def configure(self, selection: TraceSelection) -> None:
         if not set(selection.tasks).issubset(task.task_id for task in self.plan.tasks):
             raise ValueError("observation selection is outside the original physical plan")
+        if selection.max_events and selection.max_events < (self._events.maxlen or 0):
+            self.drain()
         with self._lock:
             if selection.max_events:
                 self._dropped += max(0, len(self._events) - selection.max_events)
@@ -216,6 +240,7 @@ class ExecutionTrace:
         The caller must own an idle execution for the whole scope. The recorder
         identity stays unchanged, including its effect namespace in Region IR.
         """
+        self.drain()
         with self._lock:
             saved = (
                 self._events,
@@ -224,13 +249,17 @@ class ExecutionTrace:
                 self._timed_tasks,
                 self._selection,
                 self._kernel_calls,
+                self._on_export,
+                self._export_dropped,
             )
             self._events = deque(maxlen=self._events.maxlen)
-            self._sequence = self._dropped = self._kernel_calls = 0
+            self._sequence = self._dropped = self._kernel_calls = self._export_dropped = 0
+            self._on_export = None
             self._timed_tasks, self._selection = frozenset(), TraceSelection()
         try:
             yield
         finally:
+            self.snapshot()
             with self._lock:
                 (
                     self._events,
@@ -239,6 +268,8 @@ class ExecutionTrace:
                     self._timed_tasks,
                     self._selection,
                     self._kernel_calls,
+                    self._on_export,
+                    self._export_dropped,
                 ) = saved
 
     @property
@@ -392,33 +423,53 @@ class ExecutionTrace:
         source_shape: tuple[int, ...] = (),
         kernel_name: str | None = None,
         device_duration_ns: int | None = None,
+        export: Literal["drop", "block"] | None = None,
     ) -> None:
-        dtype, shape = None, ()
-        payload = None
-        if tensor is not None:
-            if (
-                phase not in (TracePhase.TENSOR, TracePhase.GRADIENT)
-                or not tensor_name
-                or task_id not in {task.task_id for task in self.plan.tasks}
-                or tensor.ndim > 8
-                or tensor.numel() * tensor.element_size() > MAX_SNAPSHOT_BYTES
-            ):
-                raise ValueError("tensor trace requires an original task and a bounded explicit snapshot")
-            dtype = TensorDType(str(tensor.dtype).removeprefix("torch."))
-            shape = tuple(tensor.shape)
-            # Own a bounded host copy; only an explicit snapshot may wait for it.
-            host = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=tensor.is_cuda)
-            host.copy_(tensor.detach(), non_blocking=True)
-            ready = torch.cuda.Event() if tensor.is_cuda else None
-            if ready is not None:
-                ready.record(torch.cuda.current_stream(tensor.device))
-            payload = host, ready
+        if tensor is not None and tensor.is_meta:
+            return
         with self._lock:
-            if len(self._events) == self._events.maxlen:
-                self._dropped += 1
+            while True:
+                if export is not None and self._failure is not None:
+                    raise self._failure
+                if self._closed:
+                    raise RuntimeError("export trace is closed; create a new execution")
+                if len(self._events) < (self._events.maxlen or 0):
+                    break
+                evict = next((entry for entry in self._events if not entry.pending), None)
+                if evict is not None:
+                    self._events.remove(evict)
+                    self._dropped += 1
+                    break
+                if export == "block":
+                    self._lock.wait()
+                    continue
+                self._sequence += 1
+                self._export_dropped += export is not None
+                self._dropped += export is None
+                return
+            dtype, shape = None, ()
+            payload = None
+            if tensor is not None:
+                if (
+                    phase not in (TracePhase.TENSOR, TracePhase.GRADIENT)
+                    or not tensor_name
+                    or task_id not in {task.task_id for task in self.plan.tasks}
+                    or tensor.ndim > 8
+                    or tensor.numel() * tensor.element_size() > MAX_SNAPSHOT_BYTES
+                ):
+                    raise ValueError("tensor trace requires an original task and a bounded explicit snapshot")
+                dtype = TensorDType(str(tensor.dtype).removeprefix("torch."))
+                shape = tuple(tensor.shape)
+                # Own a bounded host copy; only an explicit snapshot may wait for it.
+                host = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=tensor.is_cuda)
+                host.copy_(tensor.detach(), non_blocking=True)
+                ready = torch.cuda.Event() if tensor.is_cuda else None
+                if ready is not None:
+                    ready.record(torch.cuda.current_stream(tensor.device))
+                payload = host, ready
             self._sequence += 1
             self._events.append(
-                (
+                _TraceEntry(
                     TraceEvent(
                         self._sequence,
                         monotonic_ns(),
@@ -444,20 +495,67 @@ class ExecutionTrace:
                     ),
                     timing,
                     payload,
+                    export is not None and self._on_export is not None,
                 )
             )
+
+            self._lock.notify_all()
+
+    def _deliver(self) -> None:
+        while True:
+            with self._lock:
+                entry = next((entry for entry in self._events if entry.pending), None)
+                if entry is None and self._closed:
+                    return
+                if entry is None or (
+                    entry.payload is not None and entry.payload[1] is not None and not entry.payload[1].query()
+                ):
+                    self._lock.wait(None if entry is None else 0.001)
+                    continue
+            try:
+                assert self._on_export is not None
+                self._on_export(entry.snapshot())
+            except BaseException as exc:
+                with self._lock:
+                    self._failure = exc
+                    self._lock.notify_all()
+                return
+            with self._lock:
+                entry.pending = False
+                self._lock.notify_all()
+
+    def drain(self) -> None:
+        """Wait through the current sequence, and surface the first consumer failure."""
+        with self._lock:
+            watermark = self._sequence
+            self._lock.wait_for(
+                lambda: (
+                    self._failure is not None
+                    or not any(entry.pending and entry.event.sequence <= watermark for entry in self._events)
+                )
+            )
+            self.snapshot()
+            if self._failure is not None:
+                raise self._failure
+
+    def close(self) -> None:
+        """Stop admission, finish copies and delivery, and release the bounded history."""
+        with self._lock:
+            self._closed = True
+            self._lock.notify_all()
+        try:
+            self.drain()
+        finally:
+            if self._thread is not None:
+                self._thread.join()
+            self._events.clear()
 
     def snapshot(self) -> TraceSnapshot:
         with self._lock:
             events: list[TraceEvent] = []
             pending = 0
-            for event, timing, payload in self._events:
-                if payload is not None:
-                    host, ready = payload
-                    if ready is not None and not ready.query():
-                        ready.synchronize()
-                    data = b64encode(host.reshape(-1).view(torch.uint8).numpy().tobytes()).decode("ascii")
-                    event = replace(event, tensor_data=data)
+            for entry in self._events:
+                event, timing = entry.snapshot(), entry.timing
                 if timing is not None:
                     if timing[1].query():
                         event = replace(event, device_duration_ns=round(timing[0].elapsed_time(timing[1]) * 1_000_000))
@@ -465,5 +563,11 @@ class ExecutionTrace:
                         pending += 1
                 events.append(event)
             return TraceSnapshot(
-                self._execution_id, os.getpid(), tuple(events), self._dropped, self._events.maxlen or 0, pending
+                self._execution_id,
+                os.getpid(),
+                tuple(events),
+                self._dropped,
+                self._events.maxlen or 0,
+                pending,
+                self._export_dropped,
             )

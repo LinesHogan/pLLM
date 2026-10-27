@@ -17,6 +17,7 @@ from pllm.execution.host_runtime import (
 )
 from pllm.execution.scan import scan as scan
 from pllm.execution.token_program import Layers as Layers, Taps as Taps
+from pllm.execution.trace import TraceEvent as TraceEvent
 from pllm.usage import (
     SGD as SGD,
     Buffer as Buffer,
@@ -137,6 +138,7 @@ __all__ = [
     "on",
     "write",
     "export",
+    "TraceEvent",
     "add_logits",
     "guide_sampling",
     "train",

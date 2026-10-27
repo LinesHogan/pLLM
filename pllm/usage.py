@@ -86,6 +86,7 @@ from pllm.execution.tensor_binding import TensorBinding, TensorOutput as TensorO
 from pllm.execution.tensor_frame import TensorFrame, TensorPort, Tensors, TensorUpdate as TensorUpdate
 from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots, TaskOutput, TensorComputation
 from pllm.execution.token_program import Over, Tokens
+from pllm.execution.trace import TraceEvent
 from pllm.kernels.adamw import AdamWConfig
 
 F = TypeVar("F", bound=Callable[..., torch.Tensor | tuple[torch.Tensor, ...] | TensorUpdate])
@@ -632,6 +633,7 @@ class _Export(_Effect):
     max_rows: int | Config
     max_cols: int | Config
     enabled: bool | Config
+    overflow: Literal["drop", "block"]
 
     bounded: ClassVar[bool] = True
     phase: ClassVar[Phase | None] = Phase.OBSERVE
@@ -646,6 +648,7 @@ class _Export(_Effect):
             max_rows=_setting(self.max_rows, owner, int),
             max_cols=_setting(self.max_cols, owner, int),
             enabled=_setting(self.enabled, owner, bool),
+            overflow=self.overflow,
         )
 
 
@@ -911,8 +914,12 @@ def export(
     max_rows: int | Config = 1,
     max_cols: int | Config = 16,
     enabled: bool | Config = True,
+    overflow: Literal["drop", "block"] = "drop",
 ) -> Callable[[F], F]:
-    return _mark(effect=_Export(name, every, max_rows, max_cols, enabled))
+    """Deliver bounded observations to on_export; block only when explicitly requested."""
+    if overflow not in ("drop", "block"):
+        raise ValueError("export overflow must be 'drop' or 'block'")
+    return _mark(effect=_Export(name, every, max_rows, max_cols, enabled, overflow))
 
 
 def add_logits(*, rows: str = "") -> Callable[[F], F]:
@@ -1435,6 +1442,12 @@ class Workload(
 
     name: ClassVar[str] = "python.workload"
 
+    def on_export(self, event: TraceEvent) -> None:
+        """Consume ordered CPU snapshots in the execution process; never reenter execution.
+
+        The default retains snapshot history only. Own any retained tensors and I/O resources.
+        """
+
     @property
     def producers(self) -> tuple[TensorComputation, ...]:
         """Concurrent tensor producers whose storage can overlap every worker anchor."""
@@ -1658,6 +1671,7 @@ class Workload(
             b.bind_all(plan, model_probe=facts.probe),
             borrowed_resources=tuple(feed.resource for feed in b.feeds),
             feeds=b.feeds,
+            on_export=self.on_export if b.exports else None,
         )
 
     def declare_host(self, facts: HostRuntimeFacts) -> TensorHostBinding[TensorStepInput, TensorFrame, TensorOutput]:
@@ -1672,7 +1686,11 @@ class Workload(
         return TensorHostBinding(
             b.graph,
             b.layouts,
-            MathBinding(self._functions(b, facts.device, facts.initialization_seed), b.bind_all()),
+            MathBinding(
+                self._functions(b, facts.device, facts.initialization_seed),
+                b.bind_all(),
+                on_export=self.on_export if b.exports else None,
+            ),
             facts,
         )
 

@@ -96,7 +96,7 @@ class Observation:
     gradient: bool = False
     identities: tuple[RequestIdentity, ...] = ()
     iteration: int = 0
-    export: bool = False
+    export: Literal["drop", "block"] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,7 +238,7 @@ class FunctionMath(Generic[I, D, R]):
                 for task in reversed(context.arena.plan.schedule_physical.tasks)
                 for output in graph.tasks[task.task_id].outputs
                 if (graph.tasks[task.task_id].symbol, output.name) in context.results
-                and output.kind is not SemanticOutputKind.TEMPORARY
+                and output.kind not in (SemanticOutputKind.TEMPORARY, SemanticOutputKind.HOST)
             ),
             None,
         )
@@ -506,7 +506,7 @@ class TensorOperation(Generic[D]):
                     if task.implementation_id == self.implementation_id
                 )
                 for observation in output.observations:
-                    if observation.export:
+                    if observation.export is not None:
                         context.trace.record(
                             TracePhase.TENSOR,
                             context.invocation_id,
@@ -515,6 +515,7 @@ class TensorOperation(Generic[D]):
                             step_id=observation.step_id,
                             tensor=observation.value,
                             tensor_name=observation.name,
+                            export=observation.export,
                         )
                         continue
                     context.trace.observe(

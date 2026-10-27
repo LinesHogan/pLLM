@@ -577,10 +577,13 @@ class VllmSession(Generic[DataT, ResultT]):
                 execution.retire_dormant(wait=True)
             self._close_effects()
         finally:
-            if self._feed is not None:
-                self._input_failed = True
-                self._deployment.execution.discard_borrows()
-                self._feed.close()
+            try:
+                self._deployment.execution.close()
+            finally:
+                if self._feed is not None:
+                    self._input_failed = True
+                    self._deployment.execution.discard_borrows()
+                    self._feed.close()
 
     def _invocation(self) -> TaskGraphInvocation[StateTaskContext[DataT]]:
         if self._step is None or self._step.invocation is None:

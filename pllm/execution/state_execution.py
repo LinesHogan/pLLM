@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -46,7 +46,7 @@ from pllm.execution.ptts.page_bundle import (
 )
 from pllm.execution.ptts.request_state import RequestStateDirectory, RequestStateSelection, StateAddress
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.execution.trace import ExecutionTrace, TracePhase
+from pllm.execution.trace import ExecutionTrace, TraceEvent, TracePhase
 
 if TYPE_CHECKING:
     from pllm.execution.replay import TokenwiseReplayPrimitive
@@ -273,6 +273,7 @@ class MathBinding(Generic[InputT, DataT, ResultT]):
     tasks: tuple[TaskGraphImplementation[StateTaskContext[DataT]], ...]
     borrowed_resources: tuple[str, ...] = ()
     feeds: tuple[FeedBinding, ...] = ()
+    on_export: Callable[[TraceEvent], None] | None = None
 
     def local_resources(self, plan: PlanBundle) -> tuple[str, ...]:
         states = plan.semantic_graph.states
@@ -316,6 +317,7 @@ class MathBinding(Generic[InputT, DataT, ResultT]):
             sampler_anchor_id,
             _borrowed_resources=self.borrowed_resources,
             feeds=self.feeds,
+            on_export=self.on_export,
         )
         return execution
 
@@ -389,10 +391,11 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         *,
         _borrowed_resources: tuple[str, ...] = (),
         feeds: tuple[FeedBinding, ...] = (),
+        on_export: Callable[[TraceEvent], None] | None = None,
     ) -> None:
         self.arena, self.directory, self.math = arena, directory, math
         self.sampler_anchor_id = sampler_anchor_id
-        self.trace = ExecutionTrace(arena.plan.schedule_physical)
+        self.trace = ExecutionTrace(arena.plan.schedule_physical, on_export=on_export)
         self._values = tuple(
             (task.symbol, output.name) for task in arena.plan.semantic_graph.tasks for output in task.outputs
         )
@@ -419,6 +422,10 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         self._successful_inputs: dict[RequestIdentity, tuple[tuple[StateRef, ...], int]] = {}
         self._hold_count = 0
         self._last_hold: HeldInput | None = None
+
+    def close(self) -> None:
+        """Finish asynchronous exports when direct ownership or a backend session ends."""
+        self.trace.close()
 
     def discard_borrows(self) -> None:
         """Retain failed grants until all GPU work ends, then discard their aliases."""
