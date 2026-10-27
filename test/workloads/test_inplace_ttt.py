@@ -101,6 +101,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
                 hidden[row : row + 1],
                 desired[index, row : row + 1],
                 bases[index],
+                hidden[row : row + 1].new_full((), False, dtype=torch.bool),
             )
             for index, target in enumerate(targets)
         )
@@ -126,7 +127,13 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
         value = _input(
             tuple(
                 CapturedParameterOperand(
-                    identity, target, HiddenPhase.DECODE, hidden[:1], desired[index, :1], bases[index]
+                    identity,
+                    target,
+                    HiddenPhase.DECODE,
+                    hidden[:1],
+                    desired[index, :1],
+                    bases[index],
+                    hidden[:1].new_full((), False, dtype=torch.bool),
                 )
                 for index, target in enumerate(targets)
             )
@@ -190,7 +197,19 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     requests = (RequestIdentity("first", 0, 0), RequestIdentity("second", 0, 0))
     initial = low_rank.admit(requests)
     result = low_rank.step(
-        _input((CapturedParameterOperand(requests[0], targets[0], HiddenPhase.PREFILL, hidden, desired[0], bases[0]),))
+        _input(
+            (
+                CapturedParameterOperand(
+                    requests[0],
+                    targets[0],
+                    HiddenPhase.PREFILL,
+                    hidden,
+                    desired[0],
+                    bases[0],
+                    hidden.new_full((), False, dtype=torch.bool),
+                ),
+            )
+        )
     )
     (updated,) = result.entries
     torch.testing.assert_close(updated.targets[0].update.output, torch.zeros_like(desired[0]))
@@ -203,7 +222,17 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
         ref = updated.after_ref if request_index == 0 else initial[1]
         before = low_rank.snapshot(ref)
         value = _input(
-            (CapturedParameterOperand(identity, targets[0], HiddenPhase.DECODE, hidden, desired[0], bases[0]),)
+            (
+                CapturedParameterOperand(
+                    identity,
+                    targets[0],
+                    HiddenPhase.DECODE,
+                    hidden,
+                    desired[0],
+                    bases[0],
+                    hidden.new_full((), False, dtype=torch.bool),
+                ),
+            )
         )
         result = low_rank.step(replace(value, operands=()))
         assert not result.entries and low_rank.arena.latest(ref.lineage_id) == ref
@@ -347,6 +376,7 @@ def _check_exact_projection_lifecycle():
                 torch.full((count, 1), float(i + 1)),
                 torch.full((count, 1), float(i + 1)),
                 torch.zeros(1, 1),
+                torch.full((count, 1), float(i + 1)).new_full((), False, dtype=torch.bool),
             )
             for i, identity in enumerate(requests)
             for target in targets
@@ -433,7 +463,13 @@ def _check_causality_witness(workload, facts, requests, targets):
     execution.admit(requests[:1])
     operands = tuple(
         CapturedParameterOperand(
-            requests[0], target, HiddenPhase.PREFILL, torch.ones(2, 1), torch.ones(2, 1), torch.zeros(1, 1)
+            requests[0],
+            target,
+            HiddenPhase.PREFILL,
+            torch.ones(2, 1),
+            torch.ones(2, 1),
+            torch.zeros(1, 1),
+            torch.ones(2, 1).new_full((), False, dtype=torch.bool),
         )
         for target in targets
     )
@@ -478,7 +514,13 @@ def _check_exact_additive_projection():
     hidden = torch.arange(1.0, 8).view(-1, 1)
     operands = tuple(
         CapturedParameterOperand(
-            identity, target, HiddenPhase.PREFILL, hidden, hidden * (index + 1), torch.full((1, 1), 17.0)
+            identity,
+            target,
+            HiddenPhase.PREFILL,
+            hidden,
+            hidden * (index + 1),
+            torch.full((1, 1), 17.0),
+            hidden.new_full((), False, dtype=torch.bool),
         )
         for index, target in enumerate(targets)
     )
@@ -530,3 +572,132 @@ def _check_exact_additive_projection():
     _publish_projection(execution, invocation)
     assert execution.finish_step(invocation).publication is None
     execution.retire((identity,))
+
+
+@pytest.mark.parametrize("span", [1, 2, 3, 4, 7, 11])
+def test_prefill_adapters_keep_prompt_chunks_across_scheduler_spans(span):
+    from pllm.contracts.semantic_graph import AnchorId
+    from pllm.execution.overlay_task import ProjectionTask
+    from pllm.workloads.prefill_adapters import TARGETS, PrefillAdapters
+
+    workload = PrefillAdapters(chunk_size=3, rank=2, dtype=torch.float64)
+    facts = backend_facts(
+        3,
+        (),
+        RuntimeFacts(torch.device("cpu")).timeline(("transition/full_root@1",)),
+        PageBundleProviderFacts("test.cpu.full_root@1", 4),
+        memory_bytes=1 << 20,
+        max_rows=32,
+        dtype=TensorDType.FLOAT64,
+        layer_count=10,
+        targets=tuple(ParameterTargetShape(target, 3, 2) for target in TARGETS),
+    )
+    deployed = workload.compile_backend(assert_finite_resources(workload, facts))
+    execution = deployed.execution
+    ids = (RequestIdentity("prompt", 0, 0), RequestIdentity("decode", 1, 0))
+    refs = execution.admit(ids)
+    initial, frozen = (execution.snapshot(ref) for ref in refs)
+    generator = torch.Generator().manual_seed(19)
+    x, desired, base = (
+        torch.randn(shape, generator=generator, dtype=torch.float64) for shape in ((11, 3), (11, 2), (2, 3))
+    )
+    expected, factors = [], []
+    for target_index in range(len(TARGETS)):
+        a, b = (v.clone().requires_grad_() for v in initial[target_index * 5 : target_index * 5 + 2])
+        output = []
+        for start in range(0, len(x), workload.chunk_size):
+            rows, wanted = x[start : start + 3], desired[start : start + 3]
+            delta = rows @ a.T @ b.T
+            output.append(delta.detach())
+            loss = (rows @ base.T + delta - wanted).square().mean()
+            gradients = torch.autograd.grad(loss, (a, b))
+            with torch.no_grad():
+                a.sub_(workload.learning_rate * gradients[0])
+                b.sub_(workload.learning_rate * gradients[1])
+        expected.append(torch.cat(output))
+        factors.append((a.detach(), b.detach()))
+    for start in range(0, len(x), span):
+        end = min(start + span, len(x))
+        operands = tuple(
+            CapturedParameterOperand(
+                identity,
+                target,
+                phase,
+                x[start:end],
+                desired[start:end],
+                base,
+                x[start:end].new_full((), end == len(x), dtype=torch.bool),
+            )
+            for identity, phase in zip(ids, (HiddenPhase.PREFILL, HiddenPhase.DECODE), strict=True)
+            for target in TARGETS
+        )
+        value = _input(operands)
+        invocation = execution.begin(value.rows.request_rows)
+        execution.execute_anchor(invocation, AnchorId(0))
+        task = ProjectionTask(
+            execution,
+            invocation,
+            value.sampler_rows,
+            deployed.attachment.inputs.request.task_bindings[0].task_id,
+            TARGETS,
+        )
+        outputs = task.run(operands)
+        for index, target in enumerate(TARGETS):
+            torch.testing.assert_close(outputs[ids[0], target], expected[index][start:end], rtol=1e-12, atol=1e-12)
+        _publish_projection(execution, invocation)
+        execution.finish_step(invocation)
+        fields = execution.snapshot(execution.arena.latest(refs[0].lineage_id))
+        for index in range(len(TARGETS)):
+            tail = 0 if end == len(x) else end % workload.chunk_size
+            assert fields[index * 5 + 4].item() == tail
+            torch.testing.assert_close(fields[index * 5 + 2][:tail], x[end - tail : end])
+            torch.testing.assert_close(fields[index * 5 + 3][:tail], desired[end - tail : end])
+    for index, pair in enumerate(factors):
+        torch.testing.assert_close(fields[index * 5 : index * 5 + 2], pair, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(execution.snapshot(execution.arena.latest(refs[1].lineage_id)), frozen)
+    assert execution.diagnostics().update_count == 4 * len(TARGETS)
+    assert execution.diagnostics().trained_rows == len(x) * len(TARGETS)
+    execution.retire(ids, wait=True)
+    assert execution.diagnostics().active_lineages == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph operand lifetime")
+def test_prompt_end_operand_stays_live_during_replay():
+    from pllm.workloads.prefill_adapters import TARGETS, PrefillAdapters
+
+    workload = PrefillAdapters(chunk_size=3, rank=2, dtype=torch.float32)
+    math = workload.declaration().overlay_math
+    x, base = torch.ones(1, 3, device="cuda"), torch.zeros(2, 3, device="cuda")
+    values = dict(
+        a=torch.ones(2, 3, device="cuda"),
+        b=torch.zeros(2, 2, device="cuda"),
+        tail_input=torch.zeros(2, 3, device="cuda"),
+        tail_target=torch.zeros(2, 2, device="cuda"),
+        tail_length=torch.zeros((), dtype=torch.int64, device="cuda"),
+    )
+    operand = CapturedParameterOperand(
+        RequestIdentity("graph", 0, 0),
+        TARGETS[0],
+        HiddenPhase.PREFILL,
+        x,
+        x[:, :2],
+        base,
+        torch.zeros((), dtype=torch.bool, device="cuda"),
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream), torch.no_grad():
+        math.result(operand, values)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream), torch.no_grad():
+        result = math.result(operand, values)
+    for name, value in values.items():
+        value.fill_(1 if name == "a" else 0)
+    graph.replay()
+    assert values["tail_length"].item() == 1 and result.update_count.item() == 0
+    operand.prompt_end.fill_(True)
+    graph.replay()
+    assert values["tail_length"].item() == 0 and result.update_count.item() == 1
+    assert result.trained_rows.item() == 2
+    torch.testing.assert_close(values["b"], torch.full_like(values["b"], 0.003))

@@ -148,6 +148,7 @@ class _PreparedRows:
     binding: ParameterOverlayFieldBinding
     offset: int
     size: int
+    prompt_end: torch.Tensor
 
 
 class _ExactProjection:
@@ -228,6 +229,7 @@ class _ExactProjection:
             selected.detach(),
             desired.detach(),
             self.module.weight[item.offset : item.offset + item.size].detach(),
+            item.prompt_end,
         )
 
     def clear(self) -> None:
@@ -279,7 +281,17 @@ class ExactParameterOverlay:
                 ref = context.selection.ref_for(identity)
                 indices = upload(tuple(row.packed_row_index for row in source), handle.module.weight.device)
                 prepared.extend(
-                    _PreparedRows(source[0], ref, indices, binding, offset, size)
+                    _PreparedRows(
+                        source[0],
+                        ref,
+                        indices,
+                        binding,
+                        offset,
+                        size,
+                        handle.module.weight.new_full(
+                            (), source[-1].token_offset == source[-1].prompt_length - 1, dtype=torch.bool
+                        ),
+                    )
                     for binding, offset, size in handle.bindings
                 )
             handle.transition = transition
@@ -289,6 +301,8 @@ class ExactParameterOverlay:
         self, rows: tuple[PackedPhaseRow, ...], routes: tuple[RouteOverlay, ...], indices: tuple[torch.Tensor, ...]
     ) -> None:
         """Use one projection call across the wave and request-local update operands."""
+        for row, route, index in zip(rows, routes, indices, strict=True):
+            route.prompt_end.fill_(row.token_offset + index.numel() == row.prompt_length)
         for handle in self._modules:
             handle.routes = routes
             handle.prepared = tuple(
@@ -299,6 +313,7 @@ class ExactParameterOverlay:
                     binding,
                     offset,
                     size,
+                    route.prompt_end,
                 )
                 for row, route, index in zip(rows, routes, indices, strict=True)
                 for binding, offset, size in handle.bindings

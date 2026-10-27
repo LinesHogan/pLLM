@@ -147,6 +147,7 @@ def example(
             meta(facts.probe.max_packed_rows, target.input_size, dtype=dtype),
             meta(facts.probe.max_packed_rows, target.output_size, dtype=dtype),
             meta(target.output_size, target.input_size, dtype=dtype),
+            meta(dtype=torch.bool),
         )
         for row in rows
         for target in facts.probe.targets

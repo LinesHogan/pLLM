@@ -425,6 +425,7 @@ class PinnedParameterOverlay:
                         hidden,
                         hidden if reader.mlp is None else reader.desired[first:last].clone(),
                         weight,
+                        hidden.new_full((), row.token_offset + last - first == row.prompt_length, dtype=torch.bool),
                     )
                 )
         return tuple(results)

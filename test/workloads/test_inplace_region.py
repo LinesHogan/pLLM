@@ -81,7 +81,9 @@ def test_bound_scan_matches_original_chunk_math_bitwise(device, dtype, numerics)
         hidden = torch.randn(rows, 7, dtype=dtype, device=device, generator=generator)
         desired = torch.randn(rows, 5, dtype=dtype, device=device, generator=generator)
         expected = reference_transition(hidden, desired, *reference)
-        operand = CapturedParameterOperand(identity, TARGET, phase, hidden, desired, base)
+        operand = CapturedParameterOperand(
+            identity, TARGET, phase, hidden, desired, base, hidden.new_full((), False, dtype=torch.bool)
+        )
         (result,) = execution.step(_input((operand,)), stream=stream).entries
         got = result.targets[0].update
         tolerance = {"rtol": 0.02, "atol": 0.001} if numerics else {"rtol": 0, "atol": 0}

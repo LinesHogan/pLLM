@@ -136,7 +136,15 @@ class OverlayTransition:
     def result(self, operand: CapturedParameterOperand, values: Tensors) -> TensorUpdate:
         """Validate the author's result at its tensor boundary without observing CUDA values."""
         result = (
-            self.function({**values, "input": operand.hidden, "target": operand.desired, "weight": operand.base_weight})
+            self.function(
+                {
+                    **values,
+                    "input": operand.hidden,
+                    "target": operand.desired,
+                    "weight": operand.base_weight,
+                    "prompt_end": operand.prompt_end,
+                }
+            )
             if operand.phase in self.phases
             else TensorUpdate.unchanged(self.apply(operand.hidden, values))
         )
@@ -182,6 +190,7 @@ class RouteOverlay:
         self.fields: tuple[torch.Tensor, ...] = ()
         self.saved: tuple[torch.Tensor, ...] = ()
         self.gate = torch.zeros((1, 1), device=batch.roots[0][0].device)
+        self.prompt_end = torch.zeros((), device=batch.roots[0][0].device, dtype=torch.bool)
         self.pending: list[CapturedParameterOperand] = []
         self.ordinary: list[CapturedParameterOperand] = []
         self.results: list[OverlayTargetResult] = []
@@ -257,6 +266,7 @@ class RouteOverlay:
                 records[0],
                 hidden=torch.cat(tuple(record.hidden for record in records)),
                 desired=torch.cat(tuple(record.desired for record in records)),
+                prompt_end=records[-1].prompt_end,
             )
             result = self.math.result(operand, self.values(target, True))
             self.results.append(OverlayTargetResult(target, result))
@@ -306,6 +316,9 @@ class RouteOverlay:
                     operand.hidden.clone(),
                     operand.desired.clone(),
                     operand.weight,
+                    operand.hidden.new_full(
+                        (), row.token_offset + len(operand.hidden) == row.prompt_length, dtype=torch.bool
+                    ),
                 )
                 for operand in pending
             )
@@ -322,6 +335,7 @@ class RouteOverlay:
                     records[0],
                     hidden=torch.cat(tuple(record.hidden for record in records)),
                     desired=torch.cat(tuple(record.desired for record in records)),
+                    prompt_end=records[-1].prompt_end,
                 )
             )
         self.math(replace(self.data, step=replace(self.data.step, operands=tuple(grouped))), self.batch)

@@ -277,6 +277,7 @@ class Operand(_Source, Enum):
     INPUT = "input"
     TARGET = "target"
     WEIGHT = "weight"
+    PROMPT_END = "prompt_end"
 
     def overlay(self, state: str, buffers: Mapping[str, Buffer]) -> str:
         return self.value
@@ -344,8 +345,8 @@ def sampled_tokens() -> Any:
     return SampledTokens()
 
 
-def operand(name: Literal["input", "target", "weight"]) -> Any:
-    """A projection operand inside an overlay: its input, target or base weight."""
+def operand(name: Literal["input", "target", "weight", "prompt_end"]) -> Any:
+    """A projection tensor or scalar bool marking the span that completes the prompt."""
     return Operand(name)
 
 

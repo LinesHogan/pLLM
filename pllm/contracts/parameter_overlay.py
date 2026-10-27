@@ -79,12 +79,15 @@ class ParameterOverlayFieldBinding:
 
 @dataclass(frozen=True, slots=True)
 class CapturedParameterOperand:
+    """Projection tensors and a scalar prompt-end fact, live through captured replay."""
+
     identity: RequestIdentity
     target: ParameterTarget
     phase: HiddenPhase
     hidden: torch.Tensor
     desired: torch.Tensor
     base_weight: torch.Tensor
+    prompt_end: torch.Tensor
 
 
 @dataclass(frozen=True)

@@ -233,6 +233,9 @@ class TensorBinding(ModelEffectBinding, RowTaskBinding):
                 or operand.hidden.shape[1] != inputs
                 or operand.desired.shape != (operand.hidden.shape[0], outputs)
                 or operand.base_weight.shape != (outputs, inputs)
+                or operand.prompt_end.shape != ()
+                or operand.prompt_end.dtype != torch.bool
+                or operand.prompt_end.device != operand.hidden.device
                 or any(
                     tensor.dtype != tensor_dtype(dimensions.dtype) or tensor.device != batch.roots[0][0].device
                     for tensor in (operand.hidden, operand.desired, operand.base_weight)

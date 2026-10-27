@@ -63,6 +63,7 @@ def attachment_buffer_bytes(
     if attachment.overlay_bindings and probe.device_kind is StateDeviceKind.CUDA and pinned:
         buffers += torch.backends.cuda.cublas_workspace_size() + torch.backends.cuda.cublaslt_workspace_size()
     for binding in attachment.overlay_bindings:
+        buffers += rows  # Scalar prompt-end operands for the largest request set.
         first = binding.fields[0].shape
         if binding.operator is ParameterOverlayOperator.DENSE_ADD:
             outputs, inputs = first
@@ -94,10 +95,8 @@ def attachment_buffer_bytes(
                 if probe.causal_domain is not None and attachment.overlay_bindings:
                     requests = probe.causal_domain.requests
                     # Two phase signatures at every exact width, plus one ordinary span.
-                    buffers += (
-                        3
-                        * (requests * (requests + 1) + requests)
-                        * sum(prod(field.shape) * width for field in fields.values())
+                    buffers += (requests * (requests + 1) + requests) * (
+                        3 * sum(prod(field.shape) * width for field in fields.values()) + 1
                     )
             case None:
                 pass
