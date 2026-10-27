@@ -472,15 +472,18 @@ class TensorOperation(Generic[D]):
             if output.field_writes:
                 if context.write is None:
                     raise ValueError("memory writes require the invocation's private transition")
-                roots = context.arena.writable_roots(context.write)
-                for field_id, values in output.field_writes:
-                    if values.ndim < 1 or values.shape[0] != len(selected):
-                        raise ValueError("memory writes require one row per selected lineage")
-                    for root, value in zip(roots, values.unbind(), strict=True):
-                        target = field_id.read(root[field_id.field])
-                        if target.shape != value.shape or target.dtype != value.dtype:
-                            raise ValueError("memory write differs from its signed field shape or dtype")
-                        target.copy_(value)
+                roots = context.arena.lazy_roots((context.write,) * len(selected), context.write.after_refs)
+                for view, values in output.field_writes:
+                    pool, slots = roots.field_slots(view.field)
+                    target = view.read(pool, pooled=True)
+                    if values.shape != (len(selected), *view.shape) or values.dtype != target.dtype:
+                        raise ValueError("memory write differs from its signed field shape or dtype")
+                    copy_pages(
+                        values.detach().contiguous(),
+                        target,
+                        upload(tuple(range(len(selected))), pool.device),
+                        upload(slots, pool.device),
+                    )
             if self.mode == "update" or self.publish:
                 context.publish()
             if output.counters is not None:

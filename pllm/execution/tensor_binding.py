@@ -31,6 +31,7 @@ from pllm.execution.tensor_executor import TensorExecutor, reads_rows
 from pllm.execution.tensor_frame import (
     OverlayEntry,
     TensorFrame,
+    finite,
     flat_gradient,
 )
 from pllm.execution.tensor_program import (
@@ -197,10 +198,13 @@ class TensorBinding(ModelEffectBinding, RowTaskBinding):
         for index, values in data.replacements:
             root = tuple(view.read(batch.roots[index][view.field]) for view in self.imports[resource])
             if len(values) != len(root) or any(
-                source.shape != target.shape or source.dtype != target.dtype or source.device != target.device
+                source.shape != target.shape
+                or source.dtype != target.dtype
+                or source.device != target.device
+                or not finite(source)
                 for source, target in zip(values, root, strict=True)
             ):
-                raise ValueError("replacement tensors differ from the signed layout")
+                raise ValueError("replacement tensors differ from the signed layout or finite-value contract")
 
     def prepare_operands(self, value: TensorStepInput, batch: TensorBatch) -> None:
         """Validate captured projection operands at the model boundary."""

@@ -302,14 +302,15 @@ class ModelEffectBinding(TensorBindingBase):
         """One BEFORE_MODEL import of externally produced field values into private roots."""
 
         def execute(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
-            with torch.no_grad():
-                if any(not finite(source) for _, values in data.replacements for source in values):
-                    raise ValueError("replacement tensors differ from the signed layout or finite-value contract")
-                for index, values in data.replacements:
-                    for view, source in zip(self.imports[str(state.declaration.resource)], values, strict=True):
-                        view.read(batch.roots[index][view.field]).copy_(source)
             return TaskOutput(
-                update_count=len(data.replacements), changed=tuple(index for index, _ in data.replacements)
+                field_writes=tuple(
+                    (view, torch.stack(tuple(values[index] for _, values in data.replacements)))
+                    for index, view in enumerate(self.imports[str(state.declaration.resource)])
+                )
+                if data.replacements
+                else (),
+                update_count=len(data.replacements),
+                changed=tuple(index for index, _ in data.replacements),
             )
 
         update = self.compute(
