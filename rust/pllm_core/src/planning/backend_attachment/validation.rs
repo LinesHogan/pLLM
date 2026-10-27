@@ -113,15 +113,8 @@ fn validate_request(
                     .task_bindings
                     .iter()
                     .any(|binding| binding.role != AttachmentTaskRole::Compute)
-                || request
-                    .task_bindings
-                    .iter()
-                    .map(|binding| binding.task_id)
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .len()
-                    != request.task_bindings.len()
             {
-                return Err("stateless attachment requires distinct compute tasks".into());
+                return Err("stateless attachment requires compute tasks".into());
             }
         }
         AttachmentKind::RequestTraining => {
