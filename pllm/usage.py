@@ -641,6 +641,7 @@ class _Export(_Effect):
     def declare(self, operation: _Operation) -> None:
         """Publish bounded tensor observations to the host."""
         call, owner = operation.tensor(), operation.context.owner
+        signature(owner.on_export).bind(None)
         operation.context.binding.export(
             call,
             name=_setting(self.name, owner, str),
@@ -1461,8 +1462,6 @@ class Workload(
             operation.effect.declare(operation)
         context.attach_effects()
         context.attach_training()
-        if b.exports:
-            signature(self.on_export).bind(None)
         context.sign_composition()
 
     def declaration(self, facts: BackendCompileFacts | None = None) -> TensorBinding:

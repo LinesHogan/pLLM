@@ -552,7 +552,8 @@ class ExecutionTrace:
         finally:
             if self._thread is not None:
                 self._thread.join()
-            self._events.clear()
+            with self._lock:
+                self._events.clear()
 
     def snapshot(self) -> TraceSnapshot:
         with self._lock:
