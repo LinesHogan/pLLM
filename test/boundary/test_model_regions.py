@@ -32,8 +32,8 @@ from pllm.contracts.region_program import (
     TensorType,
     Value,
 )
-from test.region_fixtures import paged_rows
 from test.region_reference import interpret
+from test.state_fixtures import paged_rows
 
 
 def test_inlining_preserves_argument_aliases_duplicate_returns_and_fresh_names():

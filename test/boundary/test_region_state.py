@@ -45,15 +45,9 @@ from pllm.execution.region_resources import RegionResources, ResourcePageCell
 from pllm.execution.region_values import Bank
 from pllm.execution.state_execution import MathBinding, StateSettlementError
 from pllm.execution.tensor_program import FunctionMath
-from test.region_fixtures import (
-    bind,
-    owner_fixture,
-    page_arena,
-    region,
-    replan_states,
-    retire_all,
-)
+from test.region_fixtures import bind, owner_fixture, region, retire_all
 from test.region_reference import interpret
+from test.state_fixtures import page_arena, replan_states
 
 X, I, B = ScalarType.INDEX, ScalarType.INT, ScalarType.BOOL
 

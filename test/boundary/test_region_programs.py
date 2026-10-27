@@ -64,16 +64,9 @@ from pllm.execution.region_native import NativePrimitive, tensor_item
 from pllm.execution.region_storage import analyze_region_capacity
 from pllm.execution.region_values import Bank, copy_data
 from pllm.execution.tensor_scan import TensorScan
-from test.region_fixtures import (
-    StorageObserver,
-    bind,
-    grid_cell,
-    grid_program,
-    inputs_for,
-    region,
-    tensor_grid,
-)
+from test.region_fixtures import bind, grid_cell, grid_program, inputs_for, region, tensor_grid
 from test.region_reference import interpret
+from test.state_fixtures import StorageObserver
 
 I, X, B, F = ScalarType.INT, ScalarType.INDEX, ScalarType.BOOL, ScalarType.FLOAT
 

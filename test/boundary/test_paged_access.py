@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from pllm.execution.paged_access import PagedLayer, bind_paged_access
-from test.region_fixtures import paged_rows
+from test.state_fixtures import paged_rows
 
 
 def test_rows_record_intervals_and_device_cells():

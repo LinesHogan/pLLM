@@ -35,7 +35,8 @@ from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
 from pllm.execution.region_compilation import analyze_region_program
 from pllm.execution.region_optimization import optimize_region
 from pllm.execution.region_outlining import outline_region_calls
-from test.region_fixtures import StorageObserver, bind, reassociation_candidates, region
+from test.region_fixtures import bind, reassociation_candidates, region
+from test.state_fixtures import StorageObserver
 
 
 def chain(device="cpu", *, escape=False):

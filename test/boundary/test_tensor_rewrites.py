@@ -22,7 +22,8 @@ from pllm.execution.region_optimization import optimize_region
 from pllm.execution.tensor_access import profile_tensor_memory, validate_tensor_memory
 from pllm.execution.tensor_batching import batching_steps
 from pllm.execution.tensor_rewrites import TensorRewritePath, explore_tensor_combinations, replay_tensor_rewrites
-from test.region_fixtures import StorageObserver, reassociation_candidates, region, single_call
+from test.region_fixtures import reassociation_candidates, region, single_call
+from test.state_fixtures import StorageObserver
 
 
 def left_chain(a, b, c):

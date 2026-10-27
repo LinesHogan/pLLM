@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from pllm.contracts.tensor_layout import LayoutFieldId
-from test.region_fixtures import page_arena
+from test.state_fixtures import page_arena
 
 F0 = LayoutFieldId(0)
 
