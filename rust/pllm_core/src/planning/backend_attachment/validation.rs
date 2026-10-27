@@ -7,10 +7,10 @@ use super::super::semantic_graph::{
 };
 use super::super::state_representation::{StateDeviceKind, StatePhysicalPlan};
 use super::types::{
-    ActivationPatchOperator, AttachmentCompilerInputs, AttachmentGraphMode, AttachmentHiddenResource, AttachmentKind, AttachmentTaskBinding,
-    AttachmentTaskRole, BackendAttachmentRequest, BackendPlacementProbe, HiddenLayerKind,
-    DecodeRefresh, DecodeWindow, HiddenPhase, HiddenSite, MissingPolicy, OverlayOperator, SamplerStage,
-    SCHEMA_VERSION,
+    ActivationPatchOperator, AttachmentCompilerInputs, AttachmentGraphMode,
+    AttachmentHiddenResource, AttachmentKind, AttachmentTaskBinding, AttachmentTaskRole,
+    BackendAttachmentRequest, BackendPlacementProbe, DecodeRefresh, DecodeWindow, HiddenLayerKind,
+    HiddenPhase, HiddenSite, MissingPolicy, OverlayOperator, SamplerStage, SCHEMA_VERSION,
 };
 
 pub(crate) fn require_text(value: &str, label: &str) -> Result<(), String> {
@@ -50,11 +50,19 @@ fn validate_request(
     }
     let composed_replay = request.attachment_kind == AttachmentKind::ModelReplay
         && !request.activation_bindings.is_empty();
-    if composed_replay || !matches!(request.attachment_kind, AttachmentKind::ModelReplay | AttachmentKind::Observation) {
+    if composed_replay
+        || !matches!(
+            request.attachment_kind,
+            AttachmentKind::ModelReplay | AttachmentKind::Observation
+        )
+    {
         require_text(&request.state_resource, "state_resource")?;
     }
     let guides_sampler = request.attachment_kind == AttachmentKind::RequestTraining
-        && request.task_bindings.first().is_some_and(|binding| binding.role == AttachmentTaskRole::Compute);
+        && request
+            .task_bindings
+            .first()
+            .is_some_and(|binding| binding.role == AttachmentTaskRole::Compute);
     if !guides_sampler && request.sampler_stage != SamplerStage::PackedPostFilterExact {
         return Err("sampler_stage needs a guide_sampling or add_logits operation".into());
     }
@@ -66,17 +74,39 @@ fn validate_request(
     require_text(&request.sampler_anchor_symbol, "sampler_anchor_symbol")?;
     match request.attachment_kind {
         AttachmentKind::ModelReplay if composed_replay => {
-            if request.task_bindings.iter().map(|binding| &binding.role).collect::<Vec<_>>()
-                != vec![&AttachmentTaskRole::Compute, &AttachmentTaskRole::Transition, &AttachmentTaskRole::Publish]
-                && request.task_bindings.iter().map(|binding| &binding.role).collect::<Vec<_>>() != vec![&AttachmentTaskRole::Compute]
-                || request.task_bindings.iter().map(|binding| binding.task_id)
-                    .collect::<std::collections::BTreeSet<_>>().len() != request.task_bindings.len()
+            if request
+                .task_bindings
+                .iter()
+                .map(|binding| &binding.role)
+                .collect::<Vec<_>>()
+                != vec![
+                    &AttachmentTaskRole::Compute,
+                    &AttachmentTaskRole::Transition,
+                    &AttachmentTaskRole::Publish,
+                ]
+                && request
+                    .task_bindings
+                    .iter()
+                    .map(|binding| &binding.role)
+                    .collect::<Vec<_>>()
+                    != vec![&AttachmentTaskRole::Compute]
+                || request
+                    .task_bindings
+                    .iter()
+                    .map(|binding| binding.task_id)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != request.task_bindings.len()
             {
-                return Err("activation replay requires distinct compute, transition and publish roles".into());
+                return Err(
+                    "activation replay requires distinct compute, transition and publish roles"
+                        .into(),
+                );
             }
         }
         AttachmentKind::ModelReplay | AttachmentKind::Observation => {
-            if !request.state_resource.is_empty() || request.task_bindings.len() != 1
+            if !request.state_resource.is_empty()
+                || request.task_bindings.len() != 1
                 || request.task_bindings[0].role != AttachmentTaskRole::Compute
             {
                 return Err("stateless attachment requires one compute task".into());
@@ -84,20 +114,28 @@ fn validate_request(
         }
         AttachmentKind::RequestTraining => {
             // A compute task that guides the sampler is optional; training alone binds only the transition.
-            let roles = request.task_bindings.iter().map(|binding| &binding.role).collect::<Vec<_>>();
+            let roles = request
+                .task_bindings
+                .iter()
+                .map(|binding| &binding.role)
+                .collect::<Vec<_>>();
             if !matches!(
                 roles.as_slice(),
-                [AttachmentTaskRole::Transition] | [AttachmentTaskRole::Compute, AttachmentTaskRole::Transition]
-            ) || (roles.len() == 2 && request.task_bindings[0].task_id == request.task_bindings[1].task_id)
+                [AttachmentTaskRole::Transition]
+                    | [AttachmentTaskRole::Compute, AttachmentTaskRole::Transition]
+            ) || (roles.len() == 2
+                && request.task_bindings[0].task_id == request.task_bindings[1].task_id)
             {
                 return Err("request training binds its transition task, after an optional sampler compute task".to_owned());
             }
         }
         AttachmentKind::ParameterOverlay | AttachmentKind::ActivationPatch => {
-            if !request.task_bindings.is_empty() && (request.task_bindings.len() != 2
-                || request.task_bindings[0].role != AttachmentTaskRole::Transition
-                || request.task_bindings[1].role != AttachmentTaskRole::Publish
-                || request.task_bindings[0].task_id == request.task_bindings[1].task_id) {
+            if !request.task_bindings.is_empty()
+                && (request.task_bindings.len() != 2
+                    || request.task_bindings[0].role != AttachmentTaskRole::Transition
+                    || request.task_bindings[1].role != AttachmentTaskRole::Publish
+                    || request.task_bindings[0].task_id == request.task_bindings[1].task_id)
+            {
                 return Err("inline model effects require their transition and publication".into());
             }
         }
@@ -113,15 +151,24 @@ fn validate_request(
             && (binding.decode_refresh != DecodeRefresh::Inherit
                 || binding.on_missing != MissingPolicy::Stop)
         {
-            return Err("decode window is off; refresh and missing policies require decode rows".into());
+            return Err(
+                "decode window is off; refresh and missing policies require decode rows".into(),
+            );
         }
     }
     if !request.activation_bindings.is_empty() {
-        if request.activation_bindings.windows(2).any(|pair| pair[0].layer >= pair[1].layer)
-            || request.activation_bindings.iter().any(|binding| match (&binding.operator, binding.fields.as_slice()) {
-                (ActivationPatchOperator::LowRankAffine, [a, b, c]) => a == b || a == c || b == c,
-                (ActivationPatchOperator::Add, [_]) => false,
-                _ => true,
+        if request
+            .activation_bindings
+            .windows(2)
+            .any(|pair| pair[0].layer >= pair[1].layer)
+            || request.activation_bindings.iter().any(|binding| {
+                match (&binding.operator, binding.fields.as_slice()) {
+                    (ActivationPatchOperator::LowRankAffine, [a, b, c]) => {
+                        a == b || a == c || b == c
+                    }
+                    (ActivationPatchOperator::Add, [_]) => false,
+                    _ => true,
+                }
             })
         {
             return Err("activation patch requires unique layers and exact operator fields".into());
@@ -129,15 +176,20 @@ fn validate_request(
     }
     match request.attachment_kind {
         AttachmentKind::Observation => {
-            if probe.hidden_resources.is_empty() || !request.overlay_bindings.is_empty()
+            if probe.hidden_resources.is_empty()
+                || !request.overlay_bindings.is_empty()
                 || !request.activation_bindings.is_empty()
             {
                 return Err("observation requires only signed hidden inputs".into());
             }
         }
         AttachmentKind::ModelReplay => {
-            if !probe.hidden_resources.is_empty() || !request.overlay_bindings.is_empty()
-                || !probe.capabilities.iter().any(|value| value == "model/tokenwise_replay@1")
+            if !probe.hidden_resources.is_empty()
+                || !request.overlay_bindings.is_empty()
+                || !probe
+                    .capabilities
+                    .iter()
+                    .any(|value| value == "model/tokenwise_replay@1")
             {
                 return Err("model replay requires the signed tokenwise primitive only".into());
             }
@@ -149,9 +201,7 @@ fn validate_request(
         }
         AttachmentKind::ParameterOverlay | AttachmentKind::ActivationPatch => {
             if request.attachment_kind == AttachmentKind::ActivationPatch {
-                if !request.overlay_bindings.is_empty()
-                    || request.activation_bindings.is_empty()
-                {
+                if !request.overlay_bindings.is_empty() || request.activation_bindings.is_empty() {
                     return Err(
                         "activation patch requires unique layers and exact operator fields"
                             .to_owned(),
@@ -170,7 +220,9 @@ fn validate_request(
                 || bindings.iter().any(|binding| {
                     !binding.scale.is_finite()
                         || match binding.operator {
-                            OverlayOperator::DenseAdd | OverlayOperator::HeadAdd => binding.fields.len() != 1,
+                            OverlayOperator::DenseAdd | OverlayOperator::HeadAdd => {
+                                binding.fields.len() != 1
+                            }
                             OverlayOperator::LowRankAdd => {
                                 binding.fields.len() != 2 || binding.fields[0] == binding.fields[1]
                             }
@@ -201,12 +253,25 @@ fn validate_probe(probe: &BackendPlacementProbe) -> Result<(), String> {
         || probe.pipeline_parallel_size != 1
         || probe.hidden_size == 0
         || probe.max_packed_rows == 0
-        || probe.causal_domain.as_ref().is_some_and(|domain|
-            [domain.requests, domain.layers, domain.positions].iter().any(|&size| size == 0 || size > i64::MAX as u64))
+        || probe.causal_domain.as_ref().is_some_and(|domain| {
+            [domain.requests, domain.layers, domain.positions]
+                .iter()
+                .any(|&size| size == 0 || size > i64::MAX as u64)
+        })
     {
         return Err("backend placement probe topology is unsupported".to_owned());
     }
-    if probe.targets.windows(2).any(|pair| pair[0].target >= pair[1].target) || probe.targets.iter().any(|target| target.input_size == 0 || target.output_size == 0) { return Err("target dimensions must be positive and ordered uniquely".into()); }
+    if probe
+        .targets
+        .windows(2)
+        .any(|pair| pair[0].target >= pair[1].target)
+        || probe
+            .targets
+            .iter()
+            .any(|target| target.input_size == 0 || target.output_size == 0)
+    {
+        return Err("target dimensions must be positive and ordered uniquely".into());
+    }
     for resource in &probe.hidden_resources {
         require_text(&resource.binding.layer, "probe.hidden_resources.layer")?;
         require_text(
@@ -321,7 +386,9 @@ fn validate_request_training_graph(
     if let [compute, _] = request.task_bindings.as_slice() {
         validate_sampler_compute(request, task_for_dense_id(graph, compute)?)?;
     }
-    let mut task_hidden = graph.tasks.iter()
+    let mut task_hidden = graph
+        .tasks
+        .iter()
         .flat_map(|task| task.inputs.iter())
         .filter_map(|input| semantic_hidden_key(&input.source))
         .collect::<Vec<_>>();
@@ -356,7 +423,10 @@ fn validate_request_training_graph(
 }
 
 /// The prediction task that feeds the sampler reads request state over packed sampler rows.
-fn validate_sampler_compute(request: &BackendAttachmentRequest, compute: &SemanticTask) -> Result<(), String> {
+fn validate_sampler_compute(
+    request: &BackendAttachmentRequest,
+    compute: &SemanticTask,
+) -> Result<(), String> {
     if !compute.effects.iter().any(|effect| {
         effect.resource == request.state_resource
             && effect.kind == StateEffectKind::Read
@@ -388,19 +458,43 @@ fn validate_parameter_overlay_graph(
     graph: &SemanticGraph,
     bindings: &[AttachmentTaskBinding],
 ) -> Result<(), String> {
-    if graph.tasks.iter().any(|task| task.outputs.iter().any(|output| output.kind == OutputKind::Sampler)) {
+    if graph.tasks.iter().any(|task| {
+        task.outputs
+            .iter()
+            .any(|output| output.kind == OutputKind::Sampler)
+    }) {
         return Err("model state consumers cannot also guide the sampler".into());
     }
     for state in &graph.states {
-        if graph.tasks.iter().flat_map(|task| &task.effects).filter(|effect| effect.resource == state.resource && matches!(effect.kind, StateEffectKind::Update | StateEffectKind::UpdateMaybe | StateEffectKind::Transition | StateEffectKind::TransitionMaybe)).count() > 1 {
+        if graph
+            .tasks
+            .iter()
+            .flat_map(|task| &task.effects)
+            .filter(|effect| {
+                effect.resource == state.resource
+                    && matches!(
+                        effect.kind,
+                        StateEffectKind::Update
+                            | StateEffectKind::UpdateMaybe
+                            | StateEffectKind::Transition
+                            | StateEffectKind::TransitionMaybe
+                    )
+            })
+            .count()
+            > 1
+        {
             return Err("declare one mutation producer per state resource".into());
         }
     }
     graph
         .states
         .binary_search_by(|state| state.resource.cmp(&request.state_resource))
-        .map_err(|_| "parameter overlay state resource is absent from the semantic graph".to_owned())?;
-    if bindings.is_empty() { return Ok(()); }
+        .map_err(|_| {
+            "parameter overlay state resource is absent from the semantic graph".to_owned()
+        })?;
+    if bindings.is_empty() {
+        return Ok(());
+    }
     let transition = task_for_dense_id(graph, &bindings[0])?;
     if !transition.effects.iter().any(|effect| {
         effect.resource == request.state_resource
@@ -434,43 +528,91 @@ fn validate_activation_replay(
     validate_parameter_overlay_graph(request, graph, &request.task_bindings[1..])?;
     let forward = task_for_dense_id(graph, &request.task_bindings[0])?;
     if request.task_bindings.len() == 1 {
-        if graph.tasks.len() != 1 || forward.effects.len() != 1 || forward.effects[0].kind != StateEffectKind::Read
-            || forward.effects[0].version.is_some() || forward.effects[0].resource != request.state_resource
-            || !graph.input_groups.is_empty() || request.activation_bindings.iter().any(|binding| probe.causal_domain.as_ref().is_none_or(|domain| u64::from(binding.layer) >= domain.layers)) {
-            return Err("initialized activation replay needs its entry READ and signed layers".into());
+        if graph.tasks.len() != 1
+            || forward.effects.len() != 1
+            || forward.effects[0].kind != StateEffectKind::Read
+            || forward.effects[0].version.is_some()
+            || forward.effects[0].resource != request.state_resource
+            || !graph.input_groups.is_empty()
+            || request.activation_bindings.iter().any(|binding| {
+                probe
+                    .causal_domain
+                    .as_ref()
+                    .is_none_or(|domain| u64::from(binding.layer) >= domain.layers)
+            })
+        {
+            return Err(
+                "initialized activation replay needs its entry READ and signed layers".into(),
+            );
         }
         return Ok(());
     }
     let transition = task_for_dense_id(graph, &request.task_bindings[1])?;
     let publication = task_for_dense_id(graph, &request.task_bindings[2])?;
     let depends_on = |consumer: &SemanticTask, producer: &SemanticTask| {
-        consumer.inputs.iter().any(|input| matches!(&input.source,
+        consumer.inputs.iter().any(|input| {
+            matches!(&input.source,
             InputSource::Result { task, output } if task == &producer.symbol
-                && producer.outputs.iter().any(|value| &value.name == output)))
+                && producer.outputs.iter().any(|value| &value.name == output))
+        })
     };
-    if forward.effects.len() != 1 || forward.effects.iter().any(|effect|
-        effect.kind != StateEffectKind::Read || effect.resource != request.state_resource
-            || effect.version.as_ref() != Some(&publication.symbol))
-        || !depends_on(forward, publication) || !depends_on(publication, transition)
-        || transition.effects.len() != 1 || publication.effects.len() != 1
-        || !forward.inputs.iter().any(|input| matches!(input.source, InputSource::PackedRows))
-        || forward.inputs.iter().any(|input| !matches!(&input.source,
-            InputSource::PackedRows | InputSource::Result { .. }))
-        || forward.inputs.iter().any(|input| matches!(&input.source,
-            InputSource::Result { task, .. } if task != &publication.symbol))
+    if forward.effects.len() != 1
+        || forward.effects.iter().any(|effect| {
+            effect.kind != StateEffectKind::Read
+                || effect.resource != request.state_resource
+                || effect.version.as_ref() != Some(&publication.symbol)
+        })
+        || !depends_on(forward, publication)
+        || !depends_on(publication, transition)
+        || transition.effects.len() != 1
+        || publication.effects.len() != 1
+        || !forward
+            .inputs
+            .iter()
+            .any(|input| matches!(input.source, InputSource::PackedRows))
+        || forward.inputs.iter().any(|input| {
+            !matches!(
+                &input.source,
+                InputSource::PackedRows | InputSource::Result { .. }
+            )
+        })
+        || forward.inputs.iter().any(|input| {
+            matches!(&input.source,
+            InputSource::Result { task, .. } if task != &publication.symbol)
+        })
     {
-        return Err("activation replay requires an exact READ of its signed inject publication".into());
+        return Err(
+            "activation replay requires an exact READ of its signed inject publication".into(),
+        );
     }
-    if graph.tasks.iter().filter(|task| task.symbol != transition.symbol && task.symbol != publication.symbol)
-        .any(|task| task.effects.iter().any(|effect| effect.kind != StateEffectKind::Read))
-        || graph.states.iter().any(|state| !graph.tasks.iter().any(|task|
-            task.effects.iter().any(|effect| effect.resource == state.resource)))
+    if graph
+        .tasks
+        .iter()
+        .filter(|task| task.symbol != transition.symbol && task.symbol != publication.symbol)
+        .any(|task| {
+            task.effects
+                .iter()
+                .any(|effect| effect.kind != StateEffectKind::Read)
+        })
+        || graph.states.iter().any(|state| {
+            !graph.tasks.iter().any(|task| {
+                task.effects
+                    .iter()
+                    .any(|effect| effect.resource == state.resource)
+            })
+        })
     {
         return Err("activation replay cannot hide unrelated state or transitions".into());
     }
-    let domain = probe.causal_domain.as_ref().ok_or("activation replay requires its signed model domain")?;
+    let domain = probe
+        .causal_domain
+        .as_ref()
+        .ok_or("activation replay requires its signed model domain")?;
     if !matches!(&forward.replay, Some(effect) if u64::from(effect.layer_count) == domain.layers)
-        || request.activation_bindings.iter().any(|binding| u64::from(binding.layer) >= domain.layers)
+        || request
+            .activation_bindings
+            .iter()
+            .any(|binding| u64::from(binding.layer) >= domain.layers)
     {
         return Err("activation replay layers differ from the signed model domain".into());
     }
@@ -489,17 +631,39 @@ fn validate_cross_binding(
     validate_probe(probe)?;
     for group in &graph.input_groups {
         let readers: Vec<_> = if request.attachment_kind == AttachmentKind::ModelReplay {
-            vec![task_for_dense_id(graph, &request.task_bindings[0])?.symbol.clone()]
-        } else { vec![] };
-        if request.activation_bindings.is_empty() || group.resource != request.state_resource
-            || group.allow_absent != request.activation_bindings.iter().all(|binding| binding.on_missing == MissingPolicy::Hold)
+            vec![task_for_dense_id(graph, &request.task_bindings[0])?
+                .symbol
+                .clone()]
+        } else {
+            vec![]
+        };
+        if request.activation_bindings.is_empty()
+            || group.resource != request.state_resource
+            || group.allow_absent
+                != request
+                    .activation_bindings
+                    .iter()
+                    .all(|binding| binding.on_missing == MissingPolicy::Hold)
             || group.readers != readers
-            || !matches!(request.attachment_kind, AttachmentKind::ActivationPatch | AttachmentKind::ModelReplay)
-            || request.task_bindings.iter().filter(|binding| binding.role != AttachmentTaskRole::Compute)
-                .any(|binding| task_for_dense_id(graph, binding).map_or(true, |task| !group.tasks.contains(&task.symbol)))
-            || task_for_dense_id(graph, request.task_bindings.last().unwrap())?.symbol != group.publication
+            || !matches!(
+                request.attachment_kind,
+                AttachmentKind::ActivationPatch | AttachmentKind::ModelReplay
+            )
+            || request
+                .task_bindings
+                .iter()
+                .filter(|binding| binding.role != AttachmentTaskRole::Compute)
+                .any(|binding| {
+                    task_for_dense_id(graph, binding)
+                        .map_or(true, |task| !group.tasks.contains(&task.symbol))
+                })
+            || task_for_dense_id(graph, request.task_bindings.last().unwrap())?.symbol
+                != group.publication
         {
-            return Err("conditional activation requires its exact inject producer group and pinned READ".into());
+            return Err(
+                "conditional activation requires its exact inject producer group and pinned READ"
+                    .into(),
+            );
         }
     }
     let replay_tasks = graph
@@ -513,36 +677,65 @@ fn validate_cross_binding(
     }
     for (_, task) in replay_tasks {
         validate_position_source(task, graph, probe)?;
-        let domain = probe.causal_domain.as_ref().ok_or("layer routes need a signed model domain")?;
+        let domain = probe
+            .causal_domain
+            .as_ref()
+            .ok_or("layer routes need a signed model domain")?;
         if u64::from(task.replay.as_ref().unwrap().layer_count) != domain.layers
-            || task.timing.after != "model.execute" || task.timing.before != "state.publish"
+            || task.timing.after != "model.execute"
+            || task.timing.before != "state.publish"
             || task.replay.as_ref().unwrap().digest.len() != 64
-            || !task.replay.as_ref().unwrap().digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            || (task.replay.as_ref().unwrap().apply_updates && request.attachment_kind != AttachmentKind::ParameterOverlay)
+            || !task
+                .replay
+                .as_ref()
+                .unwrap()
+                .digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || (task.replay.as_ref().unwrap().apply_updates
+                && request.attachment_kind != AttachmentKind::ParameterOverlay)
         {
             return Err("layer routes need their model domain, source and forward timing".into());
         }
         if request.attachment_kind == AttachmentKind::ParameterOverlay {
             let publish = task_for_dense_id(graph, &request.task_bindings[1])?;
-            if graph.tasks.len() != 2 || graph.states.len() != 1
+            if graph.tasks.len() != 2
+                || graph.states.len() != 1
                 || graph.states[0].scope != StateScope::Request
                 || publish.effects.len() != 1
-                || !publish.inputs.iter().any(|input| matches!(&input.source,
-                    InputSource::Result { task: source, .. } if source == &task.symbol))
+                || !publish.inputs.iter().any(|input| {
+                    matches!(&input.source,
+                    InputSource::Result { task: source, .. } if source == &task.symbol)
+                })
                 || task_for_dense_id(graph, &request.task_bindings[0])?.symbol != task.symbol
-                || task.effects.len() != 1 || task.effects[0].kind != StateEffectKind::TransitionMaybe
+                || task.effects.len() != 1
+                || task.effects[0].kind != StateEffectKind::TransitionMaybe
                 || task.effects[0].resource != request.state_resource
                 || task.inputs.iter().any(|input| match &input.source {
                     InputSource::PackedRows => false,
-                    InputSource::StateSelection { resource, .. } => resource != &request.state_resource,
-                    InputSource::HostService { service, port, schema } => service != "parameter.operands"
-                        || port != "dense_pairs" || schema != "canonical.dense_operand_pairs@1",
+                    InputSource::StateSelection { resource, .. } => {
+                        resource != &request.state_resource
+                    }
+                    InputSource::HostService {
+                        service,
+                        port,
+                        schema,
+                    } => {
+                        service != "parameter.operands"
+                            || port != "dense_pairs"
+                            || schema != "canonical.dense_operand_pairs@1"
+                    }
                     _ => true,
                 })
-                || !task.inputs.iter().any(|input| matches!(input.source, InputSource::PackedRows))
+                || !task
+                    .inputs
+                    .iter()
+                    .any(|input| matches!(input.source, InputSource::PackedRows))
                 || !request.activation_bindings.is_empty()
             {
-                return Err("routed overlays need one request transition and its publication".into());
+                return Err(
+                    "routed overlays need one request transition and its publication".into(),
+                );
             }
         } else if request.attachment_kind != AttachmentKind::ModelReplay {
             return Err("layer routes need a model replay or parameter overlay attachment".into());
@@ -551,42 +744,69 @@ fn validate_cross_binding(
     match request.attachment_kind {
         AttachmentKind::Observation => {
             let task = task_for_dense_id(graph, &request.task_bindings[0])?;
-            let mut hidden = task.inputs.iter().filter_map(|input| semantic_hidden_key(&input.source)).collect::<Vec<_>>();
-            let mut signed = probe.hidden_resources.iter().map(attachment_hidden_key).collect::<Result<Vec<_>, _>>()?;
+            let mut hidden = task
+                .inputs
+                .iter()
+                .filter_map(|input| semantic_hidden_key(&input.source))
+                .collect::<Vec<_>>();
+            let mut signed = probe
+                .hidden_resources
+                .iter()
+                .map(attachment_hidden_key)
+                .collect::<Result<Vec<_>, _>>()?;
             hidden.sort_unstable();
             signed.sort_unstable();
             if graph.tasks.len() != 1
-                || task.effects.iter().any(|effect| {
-                    effect.kind != StateEffectKind::Read || effect.version.is_some()
-                })
-                || task.replay.is_some() || hidden != signed
-                || task.outputs.iter().any(|output| output.kind != OutputKind::Host)
-                || task.timing.after != "state.publish" || task.timing.before != "sampler.pre_draw"
+                || task
+                    .effects
+                    .iter()
+                    .any(|effect| effect.kind != StateEffectKind::Read || effect.version.is_some())
+                || task.replay.is_some()
+                || hidden != signed
+                || task
+                    .outputs
+                    .iter()
+                    .any(|output| output.kind != OutputKind::Host)
+                || task.timing.after != "state.publish"
+                || task.timing.before != "sampler.pre_draw"
                 || task.inputs.iter().any(|input| match &input.source {
                     InputSource::Hidden { .. } | InputSource::StepId => false,
-                    InputSource::StateSelection { resource, .. } => !task.effects.iter().any(|effect| {
-                        effect.kind == StateEffectKind::Read
-                            && effect.version.is_none()
-                            && &effect.resource == resource
-                    }),
+                    InputSource::StateSelection { resource, .. } => {
+                        !task.effects.iter().any(|effect| {
+                            effect.kind == StateEffectKind::Read
+                                && effect.version.is_none()
+                                && &effect.resource == resource
+                        })
+                    }
                     _ => true,
                 })
             {
-                return Err("observation must read its original hidden inputs without changing model state".into());
+                return Err(
+                    "observation must read its original hidden inputs without changing model state"
+                        .into(),
+                );
             }
         }
         AttachmentKind::ModelReplay => {
             let task = task_for_dense_id(graph, &request.task_bindings[0])?;
             if task.replay.is_none()
-                || task.timing.after != "model.execute" || task.timing.before != "state.publish"
+                || task.timing.after != "model.execute"
+                || task.timing.before != "state.publish"
             {
-                return Err("model replay must execute its original tokenwise effect during forward".into());
+                return Err(
+                    "model replay must execute its original tokenwise effect during forward".into(),
+                );
             }
             if request.activation_bindings.is_empty() {
-                if graph.tasks.len() != 1 || !graph.states.is_empty() || !state.representations.is_empty()
+                if graph.tasks.len() != 1
+                    || !graph.states.is_empty()
+                    || !state.representations.is_empty()
                     || !task.effects.is_empty()
                 {
-                    return Err("model replay must execute its original stateless effect during forward".into());
+                    return Err(
+                        "model replay must execute its original stateless effect during forward"
+                            .into(),
+                    );
                 }
             } else {
                 validate_activation_replay(request, probe, graph)?;
@@ -597,18 +817,31 @@ fn validate_cross_binding(
         }
         AttachmentKind::ParameterOverlay | AttachmentKind::ActivationPatch => {
             validate_parameter_overlay_graph(request, graph, &request.task_bindings)?;
-            let mut hidden: Vec<_> = graph.tasks.iter().flat_map(|task| &task.inputs).filter_map(|input| semantic_hidden_key(&input.source)).collect();
-            let mut signed = probe.hidden_resources.iter().map(attachment_hidden_key).collect::<Result<Vec<_>, _>>()?;
-            hidden.sort_unstable(); hidden.dedup(); signed.sort_unstable();
+            let mut hidden: Vec<_> = graph
+                .tasks
+                .iter()
+                .flat_map(|task| &task.inputs)
+                .filter_map(|input| semantic_hidden_key(&input.source))
+                .collect();
+            let mut signed = probe
+                .hidden_resources
+                .iter()
+                .map(attachment_hidden_key)
+                .collect::<Result<Vec<_>, _>>()?;
+            hidden.sort_unstable();
+            hidden.dedup();
+            signed.sort_unstable();
             if hidden != signed {
                 return Err("model producers must use the probed hidden inputs".into());
             }
         }
     }
-    if request.attachment_kind != AttachmentKind::ModelReplay || !request.activation_bindings.is_empty()
+    if request.attachment_kind != AttachmentKind::ModelReplay
+        || !request.activation_bindings.is_empty()
     {
         if state.representations.iter().any(|provider| {
-            provider.device_kind != probe.device_kind || provider.device_ordinal != probe.device_ordinal
+            provider.device_kind != probe.device_kind
+                || provider.device_ordinal != probe.device_ordinal
         }) {
             return Err("attachment placement differs from selected state provider".to_owned());
         }
@@ -636,53 +869,75 @@ fn validate_cross_binding(
     }
     match request.attachment_kind {
         AttachmentKind::Observation => {
-            if !timeline.anchors.iter().any(|anchor| anchor.symbol == "state.publish"
-                && anchor.ordinal == request.task_bindings[0].anchor_id as u64)
-                || request.task_bindings[0].anchor_id >= request.sampler_anchor_id
+            if !timeline.anchors.iter().any(|anchor| {
+                anchor.symbol == "state.publish"
+                    && anchor.ordinal == request.task_bindings[0].anchor_id as u64
+            }) || request.task_bindings[0].anchor_id >= request.sampler_anchor_id
             {
                 return Err("observation must follow model execution and precede sampling".into());
             }
         }
         AttachmentKind::ModelReplay => {
-            if !timeline.anchors.iter().any(|anchor| anchor.symbol == "model.execute"
-                && anchor.ordinal == request.task_bindings[0].anchor_id as u64)
-                || request.task_bindings[0].anchor_id >= request.sampler_anchor_id
+            if !timeline.anchors.iter().any(|anchor| {
+                anchor.symbol == "model.execute"
+                    && anchor.ordinal == request.task_bindings[0].anchor_id as u64
+            }) || request.task_bindings[0].anchor_id >= request.sampler_anchor_id
             {
                 return Err("model replay task must bind the model forward anchor".into());
             }
             if !request.activation_bindings.is_empty()
                 && (request.sampler_anchor_symbol != "sampler.pre_draw"
-                    || request.task_bindings[1..].iter().any(|binding|
-                        !timeline.anchors.iter().any(|anchor| anchor.symbol == "request.prepare"
-                            && anchor.ordinal == u64::from(binding.anchor_id))))
+                    || request.task_bindings[1..].iter().any(|binding| {
+                        !timeline.anchors.iter().any(|anchor| {
+                            anchor.symbol == "request.prepare"
+                                && anchor.ordinal == u64::from(binding.anchor_id)
+                        })
+                    }))
             {
-                return Err("activation replay must publish at request.prepare before model forward".into());
+                return Err(
+                    "activation replay must publish at request.prepare before model forward".into(),
+                );
             }
         }
         AttachmentKind::RequestTraining => {
             let transition = request.task_bindings.last().unwrap();
-            if request.task_bindings.len() == 2 && request.task_bindings[0].anchor_id >= request.sampler_anchor_id
+            if request.task_bindings.len() == 2
+                && request.task_bindings[0].anchor_id >= request.sampler_anchor_id
             {
                 return Err("attachment task anchors violate sampler timing".to_owned());
             }
             let mut past_update = false;
             for scheduled in &schedule.tasks {
                 let task = &graph.tasks[scheduled.task_id as usize];
-                if task.inputs.iter().any(|input| matches!(input.source, InputSource::SamplerFeedback))
+                if task
+                    .inputs
+                    .iter()
+                    .any(|input| matches!(input.source, InputSource::SamplerFeedback))
                     && (request.sampler_stage != SamplerStage::PackedPreFilterAdd
                         || scheduled.anchor_id <= request.sampler_anchor_id
                         || past_update
                         || (scheduled.task_id != transition.task_id
-                            && (task.effects.iter().any(|effect| effect.kind != StateEffectKind::Read)
-                                || task.outputs.iter().any(|output| output.kind != OutputKind::Temporary))))
+                            && (task
+                                .effects
+                                .iter()
+                                .any(|effect| effect.kind != StateEffectKind::Read)
+                                || task
+                                    .outputs
+                                    .iter()
+                                    .any(|output| output.kind != OutputKind::Temporary))))
                 {
-                    return Err("sampler feedback requires a post-sample read or its signed transition".into());
+                    return Err(
+                        "sampler feedback requires a post-sample read or its signed transition"
+                            .into(),
+                    );
                 }
                 past_update |= scheduled.task_id == transition.task_id;
             }
         }
         AttachmentKind::ParameterOverlay | AttachmentKind::ActivationPatch => {
-            if request.task_bindings.is_empty() { return Ok(()); }
+            if request.task_bindings.is_empty() {
+                return Ok(());
+            }
             let transition = &request.task_bindings[0];
             let publish = &request.task_bindings[1];
             let anchor_id = |symbol: &str| {
@@ -700,14 +955,18 @@ fn validate_cross_binding(
             let before_model = Some(transition.anchor_id) == anchor_id("request.prepare")
                 && Some(publish.anchor_id) == anchor_id("request.prepare");
             let supported = if request.attachment_kind == AttachmentKind::ActivationPatch {
-                before_model || (Some(transition.anchor_id) == anchor_id("state.publish") && Some(publish.anchor_id) == anchor_id("state.publish"))
+                before_model
+                    || (Some(transition.anchor_id) == anchor_id("state.publish")
+                        && Some(publish.anchor_id) == anchor_id("state.publish"))
             } else if request_state {
                 // Publication before the request's first forward is KV-safe; mid-request
                 // updates continue through the model-execute publication path.
-                before_model || (Some(transition.anchor_id) == anchor_id("model.execute")
-                    && Some(publish.anchor_id) == anchor_id("state.publish"))
+                before_model
+                    || (Some(transition.anchor_id) == anchor_id("model.execute")
+                        && Some(publish.anchor_id) == anchor_id("state.publish"))
             } else {
-                before_model || (Some(transition.anchor_id) == anchor_id("token.commit")
+                before_model
+                    || (Some(transition.anchor_id) == anchor_id("token.commit")
                         && Some(publish.anchor_id) == anchor_id("token.commit"))
             };
             if !supported {
@@ -720,11 +979,19 @@ fn validate_cross_binding(
     Ok(())
 }
 
-fn validate_position_source(task: &SemanticTask, graph: &SemanticGraph, probe: &BackendPlacementProbe) -> Result<(), String> {
+fn validate_position_source(
+    task: &SemanticTask,
+    graph: &SemanticGraph,
+    probe: &BackendPlacementProbe,
+) -> Result<(), String> {
     let effect = task.replay.as_ref().unwrap();
     if effect.position_states != probe.position_states
-        || (!effect.position_states.is_empty() && (!effect.role_sensitive || !task.effects.is_empty() || !graph.states.is_empty())) {
-        return Err("PositionState needs a role-sensitive pure route and its pre-allocated schema".into());
+        || (!effect.position_states.is_empty()
+            && (!effect.role_sensitive || !task.effects.is_empty() || !graph.states.is_empty()))
+    {
+        return Err(
+            "PositionState needs a role-sensitive pure route and its pre-allocated schema".into(),
+        );
     }
 
     Ok(())
@@ -733,64 +1000,148 @@ fn validate_position_source(task: &SemanticTask, graph: &SemanticGraph, probe: &
 pub(crate) fn validate_inputs(inputs: &AttachmentCompilerInputs) -> Result<(), String> {
     let plan = &inputs.plan;
     plan.validate()?;
-    let mut reads: std::collections::BTreeSet<_> = inputs.request.overlay_bindings.iter().map(|b| b.resource.clone()).collect();
-    if !inputs.request.activation_bindings.is_empty() { reads.insert(inputs.request.state_resource.clone()); }
+    let mut reads: std::collections::BTreeSet<_> = inputs
+        .request
+        .overlay_bindings
+        .iter()
+        .map(|b| b.resource.clone())
+        .collect();
+    if !inputs.request.activation_bindings.is_empty() {
+        reads.insert(inputs.request.state_resource.clone());
+    }
     if reads.into_iter().collect::<Vec<_>>() != plan.semantic_graph.model_reads {
         return Err("model consumer resources differ from the semantic graph".into());
     }
     if inputs.probe.graph_mode == AttachmentGraphMode::CudaGraph {
         let request = &inputs.request;
         if inputs.probe.device_kind != StateDeviceKind::Cuda
-            || !inputs.probe.capabilities.iter().any(|value| value == "backend/vllm_mrv2@1")
+            || !inputs
+                .probe
+                .capabilities
+                .iter()
+                .any(|value| value == "backend/vllm_mrv2@1")
             || request.attachment_kind != AttachmentKind::ParameterOverlay
-            || plan.semantic_graph.states.iter().any(|state|
-                plan.semantic_graph.model_reads.contains(&state.resource) && state.scope != StateScope::Request)
-            || plan.semantic_graph.tasks.iter().any(|task| task.replay.is_some())
+            || plan.semantic_graph.states.iter().any(|state| {
+                plan.semantic_graph.model_reads.contains(&state.resource)
+                    && state.scope != StateScope::Request
+            })
+            || plan
+                .semantic_graph
+                .tasks
+                .iter()
+                .any(|task| task.replay.is_some())
         {
             return Err("Graph overlays need request-owned parameter reads without replay".into());
         }
     }
     if !inputs.request.activation_bindings.is_empty()
-        || !matches!(inputs.request.attachment_kind, AttachmentKind::ModelReplay | AttachmentKind::Observation)
+        || !matches!(
+            inputs.request.attachment_kind,
+            AttachmentKind::ModelReplay | AttachmentKind::Observation
+        )
     {
-    let layout = plan
-        .tensor_layout_request
-        .layouts
-        .iter()
-        .find(|layout| layout.resource == inputs.request.state_resource)
-        .ok_or_else(|| "attachment state has no tensor layout".to_owned())?;
-    for binding in &inputs.request.overlay_bindings {
-        let target_layout = plan.tensor_layout_request.layouts.iter().find(|layout| layout.resource == binding.resource)
-            .ok_or("projection resource has no signed tensor layout")?;
-        if binding.resource != inputs.request.state_resource {
-            return Err("projection resource differs from the attachment state".into());
+        let layout = plan
+            .tensor_layout_request
+            .layouts
+            .iter()
+            .find(|layout| layout.resource == inputs.request.state_resource)
+            .ok_or_else(|| "attachment state has no tensor layout".to_owned())?;
+        for binding in &inputs.request.overlay_bindings {
+            let target_layout = plan
+                .tensor_layout_request
+                .layouts
+                .iter()
+                .find(|layout| layout.resource == binding.resource)
+                .ok_or("projection resource has no signed tensor layout")?;
+            if binding.resource != inputs.request.state_resource {
+                return Err("projection resource differs from the attachment state".into());
+            }
+            validate_views(&binding.fields, &target_layout.layout.fields)?;
+            let dtype = if binding.operator == OverlayOperator::HeadAdd {
+                super::super::tensor_layout::TensorDType::Float32
+            } else {
+                inputs.probe.tensor_dtype.clone()
+            };
+            if binding
+                .fields
+                .iter()
+                .any(|view| target_layout.layout.fields[view.field as usize].dtype != dtype)
+            {
+                return Err("projection dtype differs from signed model".into());
+            }
+            let target = inputs
+                .probe
+                .targets
+                .iter()
+                .find(|target| target.target == binding.target)
+                .ok_or("projection target has no signed dimensions")?;
+            let shapes: Vec<_> = binding
+                .fields
+                .iter()
+                .map(|view| view.shape.as_slice())
+                .collect();
+            let valid = match (&binding.operator, shapes.as_slice()) {
+                (OverlayOperator::DenseAdd, [shape]) => {
+                    *shape == [target.output_size, target.input_size]
+                }
+                (OverlayOperator::LowRankAdd, [a, b]) => {
+                    a.len() == 2
+                        && b.len() == 2
+                        && a[0] > 0
+                        && a[0] == b[1]
+                        && a[1] == target.input_size
+                        && b[0] == target.output_size
+                }
+                (OverlayOperator::HeadAdd, [shape]) => {
+                    shape.len() == 3
+                        && shape[0] > 0
+                        && shape[1] == shape[2]
+                        && shape[0] * shape[1] == target.input_size
+                        && target.input_size == target.output_size
+                }
+                _ => false,
+            };
+            if !valid {
+                return Err("projection views differ from signed target dimensions".into());
+            }
         }
-        validate_views(&binding.fields, &target_layout.layout.fields)?;
-        let dtype = if binding.operator == OverlayOperator::HeadAdd { super::super::tensor_layout::TensorDType::Float32 } else { inputs.probe.tensor_dtype.clone() };
-        if binding.fields.iter().any(|view| target_layout.layout.fields[view.field as usize].dtype != dtype) { return Err("projection dtype differs from signed model".into()); }
-        let target = inputs.probe.targets.iter().find(|target| target.target == binding.target)
-            .ok_or("projection target has no signed dimensions")?;
-        let shapes: Vec<_> = binding.fields.iter().map(|view| view.shape.as_slice()).collect();
-        let valid = match (&binding.operator, shapes.as_slice()) {
-            (OverlayOperator::DenseAdd, [shape]) => *shape == [target.output_size, target.input_size],
-            (OverlayOperator::LowRankAdd, [a, b]) => a.len() == 2 && b.len() == 2 && a[0] > 0 && a[0] == b[1] && a[1] == target.input_size && b[0] == target.output_size,
-            (OverlayOperator::HeadAdd, [shape]) => shape.len() == 3 && shape[0] > 0 && shape[1] == shape[2] && shape[0] * shape[1] == target.input_size && target.input_size == target.output_size,
-            _ => false,
-        };
-        if !valid { return Err("projection views differ from signed target dimensions".into()); }
-    }
-    for binding in &inputs.request.activation_bindings {
-        validate_views(&binding.fields, &layout.layout.fields)?;
-        let shapes: Vec<_> = binding.fields.iter().map(|view| view.shape.as_slice()).collect();
-        let hidden = inputs.probe.hidden_size;
-        let valid = match (&binding.operator, shapes.as_slice()) {
-            (ActivationPatchOperator::Add, [shape]) => *shape == [hidden],
-            (ActivationPatchOperator::LowRankAffine, [a, b, c]) => a.len() == 2 && b.len() == 1 && c.len() == 2 && a[0] > 0 && a[0] <= hidden && a[0] == b[0] && a[0] == c[1] && a[1] == hidden && c[0] == hidden,
-            _ => false,
-        };
-        let dtype = if binding.operator == ActivationPatchOperator::Add { super::super::tensor_layout::TensorDType::Float32 } else { inputs.probe.tensor_dtype.clone() };
-        if !valid || binding.fields.iter().any(|view| layout.layout.fields[view.field as usize].dtype != dtype) { return Err("activation views differ from signed operator shape or dtype".into()); }
-    }
+        for binding in &inputs.request.activation_bindings {
+            validate_views(&binding.fields, &layout.layout.fields)?;
+            let shapes: Vec<_> = binding
+                .fields
+                .iter()
+                .map(|view| view.shape.as_slice())
+                .collect();
+            let hidden = inputs.probe.hidden_size;
+            let valid = match (&binding.operator, shapes.as_slice()) {
+                (ActivationPatchOperator::Add, [shape]) => *shape == [hidden],
+                (ActivationPatchOperator::LowRankAffine, [a, b, c]) => {
+                    a.len() == 2
+                        && b.len() == 1
+                        && c.len() == 2
+                        && a[0] > 0
+                        && a[0] <= hidden
+                        && a[0] == b[0]
+                        && a[0] == c[1]
+                        && a[1] == hidden
+                        && c[0] == hidden
+                }
+                _ => false,
+            };
+            let dtype = if binding.operator == ActivationPatchOperator::Add {
+                super::super::tensor_layout::TensorDType::Float32
+            } else {
+                inputs.probe.tensor_dtype.clone()
+            };
+            if !valid
+                || binding
+                    .fields
+                    .iter()
+                    .any(|view| layout.layout.fields[view.field as usize].dtype != dtype)
+            {
+                return Err("activation views differ from signed operator shape or dtype".into());
+            }
+        }
     }
     validate_cross_binding(
         &inputs.request,
@@ -802,11 +1153,26 @@ pub(crate) fn validate_inputs(inputs: &AttachmentCompilerInputs) -> Result<(), S
     )
 }
 
-fn validate_views(views: &[super::types::FieldView], fields: &[super::super::tensor_layout::TensorFieldSpec]) -> Result<(), String> {
+fn validate_views(
+    views: &[super::types::FieldView],
+    fields: &[super::super::tensor_layout::TensorFieldSpec],
+) -> Result<(), String> {
     for view in views {
-        let field = fields.iter().find(|field| field.field_id == u64::from(view.field)).ok_or("view field is absent from layout")?;
-        let size = view.shape.iter().try_fold(1_u64, |a, b| a.checked_mul(*b)).ok_or("view size overflow")?;
-        if view.offset.checked_add(size).is_none_or(|end| end > field.shape.iter().product()) || size == 0 {
+        let field = fields
+            .iter()
+            .find(|field| field.field_id == u64::from(view.field))
+            .ok_or("view field is absent from layout")?;
+        let size = view
+            .shape
+            .iter()
+            .try_fold(1_u64, |a, b| a.checked_mul(*b))
+            .ok_or("view size overflow")?;
+        if view
+            .offset
+            .checked_add(size)
+            .is_none_or(|end| end > field.shape.iter().product())
+            || size == 0
+        {
             return Err("view is outside its physical field".into());
         }
     }

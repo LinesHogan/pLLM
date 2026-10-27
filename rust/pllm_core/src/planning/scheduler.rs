@@ -32,11 +32,18 @@ impl ScheduleDecision {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Lane { Main, Side }
+pub(crate) enum Lane {
+    Main,
+    Side,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ReadOrigin { Entry, Boundary, Latest }
+pub(crate) enum ReadOrigin {
+    Entry,
+    Boundary,
+    Latest,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -170,14 +177,24 @@ fn graph_index(
     if order.len() != graph.tasks.len() {
         return Err("semantic graph contains a dependency cycle".to_owned());
     }
-    let period = i64::try_from(timeline.anchors.len()).map_err(|_| "timeline rank overflows i64")?;
-    let mut dependencies: Vec<_> = predecessors.iter().enumerate().flat_map(|(v, parents)|
-        parents.iter().map(move |&u| (u, v, 0_i64))).collect();
+    let period =
+        i64::try_from(timeline.anchors.len()).map_err(|_| "timeline rank overflows i64")?;
+    let mut dependencies: Vec<_> = predecessors
+        .iter()
+        .enumerate()
+        .flat_map(|(v, parents)| parents.iter().map(move |&u| (u, v, 0_i64)))
+        .collect();
     for edge in &graph.edges {
-        let shift = edge.step_distance.checked_mul(period)
+        let shift = edge
+            .step_distance
+            .checked_mul(period)
             .and_then(|distance| i64::from(edge.separation).checked_sub(distance))
             .ok_or("step distance times timeline period overflows i64")?;
-        dependencies.push((task_index(graph, &edge.source)?, task_index(graph, &edge.target)?, shift));
+        dependencies.push((
+            task_index(graph, &edge.source)?,
+            task_index(graph, &edge.target)?,
+            shift,
+        ));
     }
     for (id, task) in graph.tasks.iter().enumerate() {
         for input in &task.inputs {
@@ -185,18 +202,35 @@ fn graph_index(
                 // A hidden input is available right after its layer when the backend declares that point
                 // (e.g. a captured in-graph layer boundary); otherwise once the completed forward is published.
                 InputSource::Hidden { layer, site, .. } => {
-                    let layers = timeline.anchors.iter().filter(|a| a.symbol.starts_with("model.layer.")).count() as i64;
-                    let point = if *site == super::semantic_graph::HiddenSite::ModelOutput { "model.norm".to_owned() }
-                        else { format!("model.layer.{}", if *layer < 0 { layers + layer } else { *layer }) };
-                    anchors.get(point.as_str()).or_else(|| anchors.get("state.publish")).or_else(|| anchors.get("model.execute"))
+                    let layers = timeline
+                        .anchors
+                        .iter()
+                        .filter(|a| a.symbol.starts_with("model.layer."))
+                        .count() as i64;
+                    let point = if *site == super::semantic_graph::HiddenSite::ModelOutput {
+                        "model.norm".to_owned()
+                    } else {
+                        format!(
+                            "model.layer.{}",
+                            if *layer < 0 { layers + layer } else { *layer }
+                        )
+                    };
+                    anchors
+                        .get(point.as_str())
+                        .or_else(|| anchors.get("state.publish"))
+                        .or_else(|| anchors.get("model.execute"))
                 }
                 InputSource::SamplerFeedback => anchors.get("sampler.complete"),
                 _ => None,
             };
-            if let Some(&point) = point { windows[id].0 = windows[id].0.max(point); }
+            if let Some(&point) = point {
+                windows[id].0 = windows[id].0.max(point);
+            }
         }
         if task.outputs.iter().any(|o| o.kind == OutputKind::Sampler) {
-            if let Some(&point) = anchors.get("sampler.pre_draw") { windows[id].1 = windows[id].1.min(point); }
+            if let Some(&point) = anchors.get("sampler.pre_draw") {
+                windows[id].1 = windows[id].1.min(point);
+            }
         }
     }
     windows = propagate(&windows, &dependencies)?;
@@ -208,22 +242,45 @@ fn graph_index(
 }
 
 /// Reduced uniform dependence graph: u(t) -> v(t+k) has weight d-k*M.
-fn propagate(bounds: &[(u32, u32)], edges: &[(usize, usize, i64)]) -> Result<Vec<(u32, u32)>, String> {
+fn propagate(
+    bounds: &[(u32, u32)],
+    edges: &[(usize, usize, i64)],
+) -> Result<Vec<(u32, u32)>, String> {
     let mut lo: Vec<_> = bounds.iter().map(|b| i64::from(b.0)).collect();
-    let mut hi: Vec<_> = bounds.iter().map(|b| i64::from(b.1)-1).collect();
+    let mut hi: Vec<_> = bounds.iter().map(|b| i64::from(b.1) - 1).collect();
     for pass in 0..=bounds.len() {
         let mut changed = false;
         for &(u, v, weight) in edges {
-            let lower = lo[u].checked_add(weight).ok_or("placement lower bound overflows i64")?;
-            let upper = hi[v].checked_sub(weight).ok_or("placement upper bound overflows i64")?;
-            if lower > lo[v] { lo[v] = lower; changed = true; }
-            if upper < hi[u] { hi[u] = upper; changed = true; }
+            let lower = lo[u]
+                .checked_add(weight)
+                .ok_or("placement lower bound overflows i64")?;
+            let upper = hi[v]
+                .checked_sub(weight)
+                .ok_or("placement upper bound overflows i64")?;
+            if lower > lo[v] {
+                lo[v] = lower;
+                changed = true;
+            }
+            if upper < hi[u] {
+                hi[u] = upper;
+                changed = true;
+            }
         }
-        if lo.iter().zip(&hi).any(|(a,b)| a > b) {
-            return Err("input availability and consumer deadline leave an empty task window".into());
+        if lo.iter().zip(&hi).any(|(a, b)| a > b) {
+            return Err(
+                "input availability and consumer deadline leave an empty task window".into(),
+            );
         }
-        if !changed { return Ok(lo.iter().zip(&hi).map(|(&a,&b)| (a as u32, b as u32 + 1)).collect()); }
-        if pass == bounds.len() { return Err("placement constraints contain a contradictory cycle".into()); }
+        if !changed {
+            return Ok(lo
+                .iter()
+                .zip(&hi)
+                .map(|(&a, &b)| (a as u32, b as u32 + 1))
+                .collect());
+        }
+        if pass == bounds.len() {
+            return Err("placement constraints contain a contradictory cycle".into());
+        }
     }
     unreachable!()
 }
@@ -248,25 +305,43 @@ struct ValueUse {
     exported: bool,
 }
 
-struct Solution { tasks: Vec<PhysicalTask>, peak: u64 }
+struct Solution {
+    tasks: Vec<PhysicalTask>,
+    peak: u64,
+}
 
-fn place(graph: &SemanticGraph, timeline: &Timeline, index: &GraphIndex,
-         state: Option<&StatePhysicalPlan>, implementations: &[&ImplementationCandidate]) -> Result<Solution, String> {
+fn place(
+    graph: &SemanticGraph,
+    timeline: &Timeline,
+    index: &GraphIndex,
+    state: Option<&StatePhysicalPlan>,
+    implementations: &[&ImplementationCandidate],
+) -> Result<Solution, String> {
     let mut order = index.order.clone();
     order.sort_by_key(|&id| index.windows[id].0);
-    let mut tasks: Vec<_> = order.into_iter().map(|id| PhysicalTask {
-        task_id: id as u32, implementation_id: implementations[id].implementation_id.clone(),
-        anchor_id: index.windows[id].0, release_values: Vec::new(),
-        lane: Lane::Main, read_origin: ReadOrigin::Entry, read_distance: 0,
-        earliest: index.windows[id].0, deadline: index.windows[id].1 - 1,
-        wait_for: index.predecessors[id].iter().map(|&p| p as u32).collect(),
-    }).collect();
+    let mut tasks: Vec<_> = order
+        .into_iter()
+        .map(|id| PhysicalTask {
+            task_id: id as u32,
+            implementation_id: implementations[id].implementation_id.clone(),
+            anchor_id: index.windows[id].0,
+            release_values: Vec::new(),
+            lane: Lane::Main,
+            read_origin: ReadOrigin::Entry,
+            read_distance: 0,
+            earliest: index.windows[id].0,
+            deadline: index.windows[id].1 - 1,
+            wait_for: index.predecessors[id].iter().map(|&p| p as u32).collect(),
+        })
+        .collect();
     select_lanes(graph, timeline, &mut tasks);
     match check_placement(graph, timeline, index, state, &tasks) {
         Ok(solution) => Ok(solution),
         Err(_) => {
             // Memory fallback preserves the selected logical read boundaries.
-            for task in &mut tasks { task.lane = Lane::Main; }
+            for task in &mut tasks {
+                task.lane = Lane::Main;
+            }
             check_placement(graph, timeline, index, state, &tasks)
         }
     }
@@ -274,81 +349,177 @@ fn place(graph: &SemanticGraph, timeline: &Timeline, index: &GraphIndex,
 
 fn select_lanes(graph: &SemanticGraph, timeline: &Timeline, tasks: &mut [PhysicalTask]) {
     use super::semantic_graph::StateEffectKind;
-    let Some(source) = &timeline.visibility else { return; };
-    let Some(model) = timeline.anchors.iter().position(|a| a.symbol == "model.execute") else { return; };
+    let Some(source) = &timeline.visibility else {
+        return;
+    };
+    let Some(model) = timeline
+        .anchors
+        .iter()
+        .position(|a| a.symbol == "model.execute")
+    else {
+        return;
+    };
     if !timeline.capabilities.iter().any(|c| c == "compute/cuda@1")
         || source.lag == 0 && graph.model_reads.is_empty()
-        || graph.tasks.iter().any(|t| t.replay.is_some() || t.visibility.is_some()) { return; }
-    let Some(mut first) = tasks.iter().position(|t| graph.tasks[t.task_id as usize].effects.iter()
-        .any(|e| e.kind != StateEffectKind::Read)) else { return; };
+        || graph
+            .tasks
+            .iter()
+            .any(|t| t.replay.is_some() || t.visibility.is_some())
+    {
+        return;
+    }
+    let Some(mut first) = tasks.iter().position(|t| {
+        graph.tasks[t.task_id as usize]
+            .effects
+            .iter()
+            .any(|e| e.kind != StateEffectKind::Read)
+    }) else {
+        return;
+    };
     // A pure producer's temporary results have no consumer on the model/sampler lane.
-    if graph.tasks.iter().all(|t| t.outputs.iter().all(|o| o.kind != OutputKind::Sampler)
-        && t.inputs.iter().all(|i| !matches!(i.source, InputSource::HostService { .. }))) { first = 0; }
-    if tasks[first].anchor_id as usize <= model || tasks[first..].iter().any(|t| {
-        let semantic = &graph.tasks[t.task_id as usize];
-        semantic.inputs.iter().any(|i| matches!(i.source, InputSource::HostService { .. }))
-            || semantic.outputs.iter().any(|o| o.kind == OutputKind::Sampler)
-            || t.anchor_id >= t.deadline
-    }) || tasks[..first].iter().any(|t| graph.tasks[t.task_id as usize].math.as_ref()
-        .is_some_and(|m| !m.input_gradients.is_empty() || !m.parameter_gradients.is_empty())) { return; }
+    if graph.tasks.iter().all(|t| {
+        t.outputs.iter().all(|o| o.kind != OutputKind::Sampler)
+            && t.inputs
+                .iter()
+                .all(|i| !matches!(i.source, InputSource::HostService { .. }))
+    }) {
+        first = 0;
+    }
+    if tasks[first].anchor_id as usize <= model
+        || tasks[first..].iter().any(|t| {
+            let semantic = &graph.tasks[t.task_id as usize];
+            semantic
+                .inputs
+                .iter()
+                .any(|i| matches!(i.source, InputSource::HostService { .. }))
+                || semantic
+                    .outputs
+                    .iter()
+                    .any(|o| o.kind == OutputKind::Sampler)
+                || t.anchor_id >= t.deadline
+        })
+        || tasks[..first].iter().any(|t| {
+            graph.tasks[t.task_id as usize]
+                .math
+                .as_ref()
+                .is_some_and(|m| !m.input_gradients.is_empty() || !m.parameter_gradients.is_empty())
+        })
+    {
+        return;
+    }
     let captured = tasks[first..].iter().all(|task| {
         let semantic = &graph.tasks[task.task_id as usize];
-        semantic.math.is_none() || semantic.implementations.iter().any(|candidate|
-            candidate.implementation_id == task.implementation_id
-                && candidate.required_capabilities.iter().any(|cap| cap == "compute/cuda_graph@1"))
+        semantic.math.is_none()
+            || semantic.implementations.iter().any(|candidate| {
+                candidate.implementation_id == task.implementation_id
+                    && candidate
+                        .required_capabilities
+                        .iter()
+                        .any(|cap| cap == "compute/cuda_graph@1")
+            })
     });
     for (position, task) in tasks.iter_mut().enumerate() {
-        if position >= first { task.lane = if captured { Lane::Side } else { Lane::Main }; task.read_origin = ReadOrigin::Latest; }
-        else if graph.model_reads.is_empty() {
-            task.read_origin = ReadOrigin::Boundary; task.read_distance = source.lag;
+        if position >= first {
+            task.lane = if captured { Lane::Side } else { Lane::Main };
+            task.read_origin = ReadOrigin::Latest;
+        } else if graph.model_reads.is_empty() {
+            task.read_origin = ReadOrigin::Boundary;
+            task.read_distance = source.lag;
         }
     }
 }
 
 /// Check the supplied witness without selecting another implementation or placement.
-fn check_placement(graph: &SemanticGraph, timeline: &Timeline, index: &GraphIndex,
-                   state: Option<&StatePhysicalPlan>, tasks: &[PhysicalTask]) -> Result<Solution, String> {
+fn check_placement(
+    graph: &SemanticGraph,
+    timeline: &Timeline,
+    index: &GraphIndex,
+    state: Option<&StatePhysicalPlan>,
+    tasks: &[PhysicalTask],
+) -> Result<Solution, String> {
     if tasks.len() != graph.tasks.len() {
         return Err("placement must cover every task exactly once".into());
     }
-    if tasks.iter().any(|t| t.task_id as usize >= graph.tasks.len() || t.anchor_id as usize >= timeline.anchors.len()) {
+    if tasks.iter().any(|t| {
+        t.task_id as usize >= graph.tasks.len() || t.anchor_id as usize >= timeline.anchors.len()
+    }) {
         return Err("placement references an unknown task or anchor".into());
     }
-    if graph.edges.iter().any(|e| e.step_distance != 0) && tasks.iter().any(|t| t.lane == Lane::Side) {
+    if graph.edges.iter().any(|e| e.step_distance != 0)
+        && tasks.iter().any(|t| t.lane == Lane::Side)
+    {
         return Err("explicit cross-step task events require the main lane on this backend".into());
     }
     for edge in &graph.edges {
-        let point = |name: &str| tasks.iter().find(|t| graph.tasks.get(t.task_id as usize).is_some_and(|s| s.symbol == name)).map(|t| i64::from(t.anchor_id));
-        let shift = edge.step_distance.checked_mul(timeline.anchors.len() as i64)
-            .and_then(|d| i64::from(edge.separation).checked_sub(d)).ok_or("step distance overflows i64")?;
-        let bound = point(&edge.source).and_then(|p| p.checked_add(shift)).ok_or("placement omits an edge source")?;
-        if point(&edge.target).is_none_or(|p| p < bound) { return Err("placement violates a shifted dependency".into()); }
+        let point = |name: &str| {
+            tasks
+                .iter()
+                .find(|t| {
+                    graph
+                        .tasks
+                        .get(t.task_id as usize)
+                        .is_some_and(|s| s.symbol == name)
+                })
+                .map(|t| i64::from(t.anchor_id))
+        };
+        let shift = edge
+            .step_distance
+            .checked_mul(timeline.anchors.len() as i64)
+            .and_then(|d| i64::from(edge.separation).checked_sub(d))
+            .ok_or("step distance overflows i64")?;
+        let bound = point(&edge.source)
+            .and_then(|p| p.checked_add(shift))
+            .ok_or("placement omits an edge source")?;
+        if point(&edge.target).is_none_or(|p| p < bound) {
+            return Err("placement violates a shifted dependency".into());
+        }
     }
     let mut expected = tasks.to_vec();
-    for task in &mut expected { task.lane = Lane::Main; task.read_origin = ReadOrigin::Entry; task.read_distance = 0; }
+    for task in &mut expected {
+        task.lane = Lane::Main;
+        task.read_origin = ReadOrigin::Entry;
+        task.read_distance = 0;
+    }
     select_lanes(graph, timeline, &mut expected);
     for (task, eligible) in tasks.iter().zip(&expected) {
         let id = task.task_id as usize;
-        if id >= tasks.len() || tasks.iter().any(|t| t.lane == Lane::Side) && task.lane != eligible.lane
-            || task.read_origin != eligible.read_origin || task.read_distance != eligible.read_distance
+        if id >= tasks.len()
+            || tasks.iter().any(|t| t.lane == Lane::Side) && task.lane != eligible.lane
+            || task.read_origin != eligible.read_origin
+            || task.read_distance != eligible.read_distance
             || task.earliest != index.windows[id].0
-            || task.deadline < task.anchor_id || task.deadline >= index.windows[id].1
-            || task.wait_for != index.predecessors[id].iter().map(|&p| p as u32).collect::<Vec<_>>() {
-            return Err("placement lane, read origin, event edge or deadline differs from its dependencies".into());
+            || task.deadline < task.anchor_id
+            || task.deadline >= index.windows[id].1
+            || task.wait_for
+                != index.predecessors[id]
+                    .iter()
+                    .map(|&p| p as u32)
+                    .collect::<Vec<_>>()
+        {
+            return Err(
+                "placement lane, read origin, event edge or deadline differs from its dependencies"
+                    .into(),
+            );
         }
     }
     let mut positions = vec![usize::MAX; tasks.len()];
     for (position, task) in tasks.iter().enumerate() {
         let id = task.task_id as usize;
-        if id >= tasks.len() || positions[id] != usize::MAX
-            || task.anchor_id < index.windows[id].0 || task.anchor_id >= index.windows[id].1
-            || position > 0 && tasks[position-1].anchor_id > task.anchor_id {
+        if id >= tasks.len()
+            || positions[id] != usize::MAX
+            || task.anchor_id < index.windows[id].0
+            || task.anchor_id >= index.windows[id].1
+            || position > 0 && tasks[position - 1].anchor_id > task.anchor_id
+        {
             return Err("placement has an invalid task identity, order or window".into());
         }
         positions[id] = position;
     }
     for (id, parents) in index.predecessors.iter().enumerate() {
-        if parents.iter().any(|&parent| positions[parent] >= positions[id]) {
+        if parents
+            .iter()
+            .any(|&parent| positions[parent] >= positions[id])
+        {
             return Err("placement violates a result or exact-version dependency".into());
         }
     }
@@ -364,7 +535,8 @@ fn check_placement(graph: &SemanticGraph, timeline: &Timeline, index: &GraphInde
             .any(|pair| (&pair[0].task, &pair[0].output) >= (&pair[1].task, &pair[1].output))
     {
         return Err(
-            "placement resource facts require exact anchor coverage and sorted unique identities".into(),
+            "placement resource facts require exact anchor coverage and sorted unique identities"
+                .into(),
         );
     }
     let mut workspace = vec![0; graph.tasks.len()];
@@ -391,10 +563,13 @@ fn check_placement(graph: &SemanticGraph, timeline: &Timeline, index: &GraphInde
                     .then_some(user)).collect();
             // Autograd may save a consumer's inputs until its downstream gradient sink.
             for &user in &index.order {
-                if graph.tasks[user].math.as_ref().is_some_and(|math|
-                    graph.tasks[user].inputs.iter().any(|input| math.input_gradients.contains(&input.name)
-                        && matches!(&input.source, InputSource::Result { task, .. }
-                            if users.iter().any(|&parent| &graph.tasks[parent].symbol == task)))) {
+                if graph.tasks[user].math.as_ref().is_some_and(|math| {
+                    graph.tasks[user].inputs.iter().any(|input| {
+                        math.input_gradients.contains(&input.name)
+                            && matches!(&input.source, InputSource::Result { task, .. }
+                            if users.iter().any(|&parent| &graph.tasks[parent].symbol == task))
+                    })
+                }) {
                     users.insert(user);
                 }
             }
@@ -406,7 +581,8 @@ fn check_placement(graph: &SemanticGraph, timeline: &Timeline, index: &GraphInde
             });
         }
     }
-    if timeline.memory_budget_bytes.is_some() && timeline.task_resources.len() != graph.tasks.len() {
+    if timeline.memory_budget_bytes.is_some() && timeline.task_resources.len() != graph.tasks.len()
+    {
         return Err("memory-constrained placement requires every task workspace size".into());
     }
     for fact in &timeline.value_resources {
@@ -420,54 +596,113 @@ fn check_placement(graph: &SemanticGraph, timeline: &Timeline, index: &GraphInde
         .iter()
         .map(|value| value.bytes)
         .chain(workspace.iter().copied())
-        .chain(timeline.task_resources.iter().map(|fact| fact.resident_bytes))
+        .chain(
+            timeline
+                .task_resources
+                .iter()
+                .map(|fact| fact.resident_bytes),
+        )
         .chain(timeline.reserved_bytes.iter().copied())
         .chain(state.map(|plan| plan.reserved_bytes))
         .try_fold(0_u64, |sum, bytes| sum.checked_add(bytes))
         .ok_or("placement resource envelope overflows u64")?;
     let mut planned = tasks.to_vec();
-    for task in &mut planned { task.release_values.clear(); }
+    for task in &mut planned {
+        task.release_values.clear();
+    }
     let mut live = vec![0_u128; tasks.len()];
     let mut exported = 0_u128;
     for (id, value) in values.iter().enumerate() {
         let first = positions[value.producer];
-        let last = if value.exported { tasks.len()-1 } else {
-            value.users.iter().map(|&user| positions[user]).chain([first]).max().unwrap()
+        let last = if value.exported {
+            tasks.len() - 1
+        } else {
+            value
+                .users
+                .iter()
+                .map(|&user| positions[user])
+                .chain([first])
+                .max()
+                .unwrap()
         };
-        for bytes in &mut live[first..=last] { *bytes += value.bytes as u128; }
-        if value.exported { exported += value.bytes as u128; }
-        else { planned[last].release_values.push(id as u32); }
+        for bytes in &mut live[first..=last] {
+            *bytes += value.bytes as u128;
+        }
+        if value.exported {
+            exported += value.bytes as u128;
+        } else {
+            planned[last].release_values.push(id as u32);
+        }
     }
-    let resident = timeline.task_resources.iter().map(|f| f.resident_bytes as u128).sum::<u128>()
+    let resident = timeline
+        .task_resources
+        .iter()
+        .map(|f| f.resident_bytes as u128)
+        .sum::<u128>()
         + state.map_or(0, |s| s.reserved_bytes as u128);
     let copies = if tasks.iter().any(|t| t.read_origin == ReadOrigin::Latest) {
-        values.iter().filter(|v| tasks[positions[v.producer]].read_origin != ReadOrigin::Latest
-            && (v.exported || v.users.iter().any(|&u| tasks[positions[u]].read_origin == ReadOrigin::Latest)))
-            .map(|v| v.bytes as u128).sum::<u128>()
-    } else { 0 };
-    let side_workspace = copies + tasks.iter().filter(|t| t.lane == Lane::Side)
-        .map(|t| workspace[t.task_id as usize] as u128 + live[positions[t.task_id as usize]]).max().unwrap_or(0);
+        values
+            .iter()
+            .filter(|v| {
+                tasks[positions[v.producer]].read_origin != ReadOrigin::Latest
+                    && (v.exported
+                        || v.users
+                            .iter()
+                            .any(|&u| tasks[positions[u]].read_origin == ReadOrigin::Latest))
+            })
+            .map(|v| v.bytes as u128)
+            .sum::<u128>()
+    } else {
+        0
+    };
+    let side_workspace = copies
+        + tasks
+            .iter()
+            .filter(|t| t.lane == Lane::Side)
+            .map(|t| workspace[t.task_id as usize] as u128 + live[positions[t.task_id as usize]])
+            .max()
+            .unwrap_or(0);
     let mut peak = 0;
     for (anchor, _) in timeline.anchors.iter().enumerate() {
         let reserved = timeline.reserved_bytes.get(anchor).copied().unwrap_or(0) as u128 + resident;
-        let at: Vec<_> = tasks.iter().enumerate().filter(|(_, t)| t.anchor_id as usize == anchor).collect();
+        let at: Vec<_> = tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.anchor_id as usize == anchor)
+            .collect();
         let bytes = if at.is_empty() {
             // Values spanning an anchor still occupy storage when no task runs there.
-            values.iter().filter(|v| {
-                tasks[positions[v.producer]].anchor_id as usize <= anchor
-                && (v.exported || v.users.iter().any(|&u| tasks[positions[u]].anchor_id as usize >= anchor))
-            }).map(|v| v.bytes as u128).sum()
+            values
+                .iter()
+                .filter(|v| {
+                    tasks[positions[v.producer]].anchor_id as usize <= anchor
+                        && (v.exported
+                            || v.users
+                                .iter()
+                                .any(|&u| tasks[positions[u]].anchor_id as usize >= anchor))
+                })
+                .map(|v| v.bytes as u128)
+                .sum()
         } else {
-            at.iter().map(|(pos, t)| live[*pos] + workspace[t.task_id as usize] as u128).max().unwrap()
+            at.iter()
+                .map(|(pos, t)| live[*pos] + workspace[t.task_id as usize] as u128)
+                .max()
+                .unwrap()
         };
         peak = peak.max(reserved + bytes + side_workspace);
     }
     peak = peak.max(resident + exported);
     let peak = u64::try_from(peak).map_err(|_| "placement memory envelope overflows u64")?;
-    if timeline.memory_budget_bytes.is_some_and(|budget| peak > budget) {
-        return Err("earliest placement exceeds the memory budget".into());
+    if let Some(budget) = timeline.memory_budget_bytes.filter(|&budget| peak > budget) {
+        return Err(format!(
+            "workload tasks need {peak} bytes at their peak but only {budget} fit; lower \
+             max_num_batched_tokens or raise ExecutionOptions.memory_budget_bytes"
+        ));
     }
-    Ok(Solution { tasks: planned, peak })
+    Ok(Solution {
+        tasks: planned,
+        peak,
+    })
 }
 
 pub(super) fn compile(
@@ -478,21 +713,37 @@ pub(super) fn compile(
     validate_graph(graph)?;
     validate_timeline(timeline)?;
     let index = graph_index(graph, timeline, state)?;
-    fn choose<'a>(graph: &'a SemanticGraph, timeline: &Timeline, index: &GraphIndex,
-                  state: Option<&StatePhysicalPlan>, selected: &mut Vec<&'a ImplementationCandidate>,
-                  best: &mut Option<ScheduleDecision>) -> Result<(), String> {
+    fn choose<'a>(
+        graph: &'a SemanticGraph,
+        timeline: &Timeline,
+        index: &GraphIndex,
+        state: Option<&StatePhysicalPlan>,
+        selected: &mut Vec<&'a ImplementationCandidate>,
+        best: &mut Option<ScheduleDecision>,
+        failure: &mut Option<String>,
+    ) -> Result<(), String> {
         if selected.len() == graph.tasks.len() {
-            if let Ok(solution) = place(graph, timeline, index, state, selected) {
-                let decision = sign_solution(graph, timeline, state, selected, solution)?;
-                if best.as_ref().is_none_or(|best| decision.score() < best.score()) {
-                    *best = Some(decision);
+            match place(graph, timeline, index, state, selected) {
+                Ok(solution) => {
+                    let decision = sign_solution(graph, timeline, state, selected, solution)?;
+                    if best
+                        .as_ref()
+                        .is_none_or(|best| decision.score() < best.score())
+                    {
+                        *best = Some(decision);
+                    }
                 }
+                Err(error) => *failure = Some(error),
             }
         } else {
             for candidate in &graph.tasks[selected.len()].implementations {
-                if candidate.required_capabilities.iter().all(|cap| timeline.capabilities.binary_search(cap).is_ok()) {
+                if candidate
+                    .required_capabilities
+                    .iter()
+                    .all(|cap| timeline.capabilities.binary_search(cap).is_ok())
+                {
                     selected.push(candidate);
-                    choose(graph, timeline, index, state, selected, best)?;
+                    choose(graph, timeline, index, state, selected, best, failure)?;
                     selected.pop();
                 }
             }
@@ -500,8 +751,19 @@ pub(super) fn compile(
         Ok(())
     }
     let mut best = None;
-    choose(graph, timeline, &index, state, &mut Vec::new(), &mut best)?;
-    best.ok_or_else(|| "no implementation and earliest placement fits the signed resource facts".into())
+    let mut failure = None;
+    choose(
+        graph,
+        timeline,
+        &index,
+        state,
+        &mut Vec::new(),
+        &mut best,
+        &mut failure,
+    )?;
+    best.ok_or_else(|| {
+        failure.unwrap_or_else(|| "no task implementation is supported by this backend".into())
+    })
 }
 
 fn sign_solution(
@@ -511,10 +773,16 @@ fn sign_solution(
     implementations: &[&ImplementationCandidate],
     solution: Solution,
 ) -> Result<ScheduleDecision, String> {
-    let plans = solution.tasks.into_iter().map(|mut task| {
-        task.implementation_id = implementations[task.task_id as usize].implementation_id.clone();
-        task
-    }).collect();
+    let plans = solution
+        .tasks
+        .into_iter()
+        .map(|mut task| {
+            task.implementation_id = implementations[task.task_id as usize]
+                .implementation_id
+                .clone();
+            task
+        })
+        .collect();
     let mut decision = ScheduleDecision {
         graph_digest: digest(&canonical_ascii_json(graph)?),
         timeline_digest: digest(&canonical_ascii_json(timeline)?),
@@ -558,17 +826,35 @@ fn validate_decision(
         return Err("canonical schedule signature differs from its contents".into());
     }
     let index = graph_index(graph, timeline, state)?;
-    let implementations = graph.tasks.iter().enumerate().map(|(id, task)| {
-        let selected = decision.tasks.iter().find(|selected| selected.task_id as usize == id)
-            .ok_or("canonical schedule is missing a task")?;
-        task.implementations.iter().find(|candidate| candidate.implementation_id == selected.implementation_id
-            && candidate.required_capabilities.iter().all(|capability| timeline.capabilities.binary_search(capability).is_ok()))
-            .ok_or_else(|| "selected implementation is not available in the original timeline".to_owned())
-    }).collect::<Result<Vec<_>, String>>()?;
+    let implementations = graph
+        .tasks
+        .iter()
+        .enumerate()
+        .map(|(id, task)| {
+            let selected = decision
+                .tasks
+                .iter()
+                .find(|selected| selected.task_id as usize == id)
+                .ok_or("canonical schedule is missing a task")?;
+            task.implementations
+                .iter()
+                .find(|candidate| {
+                    candidate.implementation_id == selected.implementation_id
+                        && candidate.required_capabilities.iter().all(|capability| {
+                            timeline.capabilities.binary_search(capability).is_ok()
+                        })
+                })
+                .ok_or_else(|| {
+                    "selected implementation is not available in the original timeline".to_owned()
+                })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let solution = check_placement(graph, timeline, &index, state, &decision.tasks)?;
     let expected = sign_solution(graph, timeline, state, &implementations, solution)?;
     if decision != &expected {
-        return Err("canonical schedule decision differs from its selected placement witness".to_owned());
+        return Err(
+            "canonical schedule decision differs from its selected placement witness".to_owned(),
+        );
     }
     Ok(())
 }
@@ -708,14 +994,30 @@ mod tests {
     #[test]
     fn inline_memory_fallback_preserves_boundary_reads() {
         let mut graph = graph_fixture();
-        graph.states = serde_json::from_value(json!([{"resource":"s", "scope":"request", "key_fields":["request_id"]}])).unwrap();
+        graph.states = serde_json::from_value(
+            json!([{"resource":"s", "scope":"request", "key_fields":["request_id"]}]),
+        )
+        .unwrap();
         graph.tasks[0].outputs[0].kind = super::OutputKind::Sampler;
         for (i, task) in graph.tasks.iter_mut().enumerate() {
-            task.timing.after = if i == 0 {"model.execute"} else {"token.commit"}.into();
-            task.timing.before = if i == 0 {"sampler.pre_draw"} else {"next.prepare"}.into();
-            if i < 2 { task.effects = serde_json::from_value(json!([{
-                "resource":"s", "kind":if i==0 {"read"} else {"update"}
-            }])).unwrap(); }
+            task.timing.after = if i == 0 {
+                "model.execute"
+            } else {
+                "token.commit"
+            }
+            .into();
+            task.timing.before = if i == 0 {
+                "sampler.pre_draw"
+            } else {
+                "next.prepare"
+            }
+            .into();
+            if i < 2 {
+                task.effects = serde_json::from_value(json!([{
+                    "resource":"s", "kind":if i==0 {"read"} else {"update"}
+                }]))
+                .unwrap();
+            }
         }
         let mut timeline = decode_timeline(&json!({
             "schema_version":1, "capabilities":["compute/cuda@1"],
@@ -725,51 +1027,78 @@ mod tests {
             "task_resources":(0..3).map(|i|json!({"task":format!("t{i}"),"workspace_bytes":16})).collect::<Vec<_>>(),
             "value_resources":(0..3).map(|i|json!({"task":format!("t{i}"),"output":"value","bytes":8})).collect::<Vec<_>>()
         }).to_string()).unwrap();
-        let side = compile(&graph,&timeline,None).unwrap();
+        let side = compile(&graph, &timeline, None).unwrap();
         assert_eq!(side.tasks[1].lane, super::Lane::Side);
-        timeline.memory_budget_bytes = Some(side.peak_memory_bytes-1);
-        let inline = compile(&graph,&timeline,None).unwrap();
+        timeline.memory_budget_bytes = Some(side.peak_memory_bytes - 1);
+        let inline = compile(&graph, &timeline, None).unwrap();
         assert!(inline.tasks.iter().all(|t| t.lane == super::Lane::Main));
         assert_eq!(inline.tasks[0].read_distance, 2);
         assert_eq!(inline.tasks[0].read_origin, super::ReadOrigin::Boundary);
         assert_eq!(inline.tasks[1].read_origin, super::ReadOrigin::Latest);
-        validate_decision(&graph,&timeline,&inline,None).unwrap();
-        timeline.memory_budget_bytes = Some(inline.peak_memory_bytes-1);
-        assert!(compile(&graph,&timeline,None).is_err());
+        validate_decision(&graph, &timeline, &inline, None).unwrap();
+        timeline.memory_budget_bytes = Some(inline.peak_memory_bytes - 1);
+        assert!(compile(&graph, &timeline, None).is_err());
         timeline.memory_budget_bytes = None;
         graph.tasks[1].math = Some(serde_json::from_value(json!({"input_gradients":[],"parameter_gradients":[],"detached_inputs":[],"forward_rows":"","input_gradient_rows":"","parameter_gradient_rows":"","update_states":"","reduction":"none"})).unwrap());
-        let mut main = compile(&graph,&timeline,None).unwrap();
+        let mut main = compile(&graph, &timeline, None).unwrap();
         assert!(main.tasks.iter().all(|t| t.lane == super::Lane::Main));
         assert_eq!(main.tasks[0].read_distance, 2);
         main.tasks[1].lane = super::Lane::Side;
         main.signature = decision_signature(&main).unwrap();
-        assert!(validate_decision(&graph,&timeline,&main,None).is_err());
-        graph.tasks[1].implementations[0].required_capabilities.push("compute/cuda_graph@1".into());
+        assert!(validate_decision(&graph, &timeline, &main, None).is_err());
+        graph.tasks[1].implementations[0]
+            .required_capabilities
+            .push("compute/cuda_graph@1".into());
         timeline.capabilities.push("compute/cuda_graph@1".into());
-        assert_eq!(compile(&graph,&timeline,None).unwrap().tasks[1].lane, super::Lane::Side);
+        assert_eq!(
+            compile(&graph, &timeline, None).unwrap().tasks[1].lane,
+            super::Lane::Side
+        );
     }
 
     #[test]
     fn uniform_windows_match_independent_enumeration() {
-        let windows: Vec<_> = (0..4).flat_map(|a| (a+1..=4).map(move |b| (a,b))).collect();
-        for &a in &windows { for &b in &windows {
-            for forward in [None, Some(-1), Some(0), Some(1), Some(2)] {
-                for backward in [None, Some(-1), Some(0), Some(1), Some(2)] {
-                    let edges: Vec<_> = [(0,1,forward),(1,0,backward)].into_iter()
-                        .filter_map(|(u,v,k)| k.map(|k| (u,v,-4*k))).collect();
-                    let legal: Vec<_> = (0..4).flat_map(|x| (0..4).map(move |y| [x,y]))
-                        .filter(|x| a.0 <= x[0] && x[0] < a.1 && b.0 <= x[1] && x[1] < b.1
-                            && edges.iter().all(|&(u,v,w)| i64::from(x[v]) >= i64::from(x[u])+w)).collect();
-                    let result = super::propagate(&[a,b], &edges);
-                    assert_eq!(result.is_ok(), !legal.is_empty());
-                    if !legal.is_empty() {
-                        assert_eq!(result.unwrap(), (0..2).map(|i|
-                            (legal.iter().map(|x| x[i]).min().unwrap(), legal.iter().map(|x| x[i]).max().unwrap()+1)).collect::<Vec<_>>());
+        let windows: Vec<_> = (0..4)
+            .flat_map(|a| (a + 1..=4).map(move |b| (a, b)))
+            .collect();
+        for &a in &windows {
+            for &b in &windows {
+                for forward in [None, Some(-1), Some(0), Some(1), Some(2)] {
+                    for backward in [None, Some(-1), Some(0), Some(1), Some(2)] {
+                        let edges: Vec<_> = [(0, 1, forward), (1, 0, backward)]
+                            .into_iter()
+                            .filter_map(|(u, v, k)| k.map(|k| (u, v, -4 * k)))
+                            .collect();
+                        let legal: Vec<_> = (0..4)
+                            .flat_map(|x| (0..4).map(move |y| [x, y]))
+                            .filter(|x| {
+                                a.0 <= x[0]
+                                    && x[0] < a.1
+                                    && b.0 <= x[1]
+                                    && x[1] < b.1
+                                    && edges
+                                        .iter()
+                                        .all(|&(u, v, w)| i64::from(x[v]) >= i64::from(x[u]) + w)
+                            })
+                            .collect();
+                        let result = super::propagate(&[a, b], &edges);
+                        assert_eq!(result.is_ok(), !legal.is_empty());
+                        if !legal.is_empty() {
+                            assert_eq!(
+                                result.unwrap(),
+                                (0..2)
+                                    .map(|i| (
+                                        legal.iter().map(|x| x[i]).min().unwrap(),
+                                        legal.iter().map(|x| x[i]).max().unwrap() + 1
+                                    ))
+                                    .collect::<Vec<_>>()
+                            );
+                        }
                     }
                 }
             }
-        }}
-        assert!(super::propagate(&[(0,4),(0,4)], &[(0,1,i64::MAX),(1,0,1)]).is_err());
+        }
+        assert!(super::propagate(&[(0, 4), (0, 4)], &[(0, 1, i64::MAX), (1, 0, 1)]).is_err());
     }
 
     #[test]
@@ -778,9 +1107,12 @@ mod tests {
             let mut graph = graph_fixture();
             let sizes = [3_u64, 5, 7];
             let scratch = [2_u64, 4, 1];
-            let arcs: Vec<_> = [(0,1),(0,2),(1,2)].into_iter().enumerate()
-                .filter_map(|(i,e)| (mask & (1<<i) != 0).then_some(e)).collect();
-            for &(u,v) in &arcs {
+            let arcs: Vec<_> = [(0, 1), (0, 2), (1, 2)]
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, e)| (mask & (1 << i) != 0).then_some(e))
+                .collect();
+            for &(u, v) in &arcs {
                 graph.tasks[v].inputs.push(serde_json::from_value(json!({
                     "name": format!("from{u}"), "source": {"kind":"result", "task":format!("t{u}"), "output":"value"}
                 })).unwrap());
@@ -791,13 +1123,31 @@ mod tests {
                 "value_resources":(0..3).map(|i| json!({"task":format!("t{i}"),"output":"value","bytes":sizes[i]})).collect::<Vec<_>>(),
                 "task_resources":(0..3).map(|i| json!({"task":format!("t{i}"),"workspace_bytes":scratch[i],"resident_bytes":1})).collect::<Vec<_>>()
             }).to_string()).unwrap();
-            let expected = (0..3).map(|at| 12 + scratch[at] + (0..=at).filter(|&u|
-                arcs.iter().filter(|&&(from,_)| from == u).map(|&(_,to)| to).chain([u]).max().unwrap() >= at)
-                .map(|u| sizes[u]).sum::<u64>()).max().unwrap();
+            let expected = (0..3)
+                .map(|at| {
+                    12 + scratch[at]
+                        + (0..=at)
+                            .filter(|&u| {
+                                arcs.iter()
+                                    .filter(|&&(from, _)| from == u)
+                                    .map(|&(_, to)| to)
+                                    .chain([u])
+                                    .max()
+                                    .unwrap()
+                                    >= at
+                            })
+                            .map(|u| sizes[u])
+                            .sum::<u64>()
+                })
+                .max()
+                .unwrap();
             timeline.memory_budget_bytes = Some(expected);
-            assert_eq!(compile(&graph,&timeline,None).unwrap().peak_memory_bytes, expected);
-            timeline.memory_budget_bytes = Some(expected-1);
-            assert!(compile(&graph,&timeline,None).is_err());
+            assert_eq!(
+                compile(&graph, &timeline, None).unwrap().peak_memory_bytes,
+                expected
+            );
+            timeline.memory_budget_bytes = Some(expected - 1);
+            assert!(compile(&graph, &timeline, None).is_err());
         }
     }
 
@@ -945,8 +1295,14 @@ mod tests {
         let decision = compile(&graph, &timeline, None).unwrap();
         let physical = lower_physical(&graph, &timeline, &decision, 7, None).unwrap();
         assert_eq!(physical.tasks, decision.tasks);
-        assert_eq!(physical.tasks.iter().map(|task| task.release_values.clone()).collect::<Vec<_>>(),
-            vec![vec![], vec![0], vec![1, 2]]);
+        assert_eq!(
+            physical
+                .tasks
+                .iter()
+                .map(|task| task.release_values.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![], vec![0], vec![1, 2]]
+        );
         let reconstructed =
             super::decode_physical(&serde_json::to_string(&physical).unwrap()).unwrap();
         validate_physical(&graph, &timeline, &decision, &reconstructed, None).unwrap();
@@ -958,7 +1314,11 @@ mod tests {
         later[1].anchor_id = 2;
         later[2].anchor_id = 2;
         let index = graph_index(&graph, &roomy, None).unwrap();
-        let implementations: Vec<_> = graph.tasks.iter().map(|task| &task.implementations[0]).collect();
+        let implementations: Vec<_> = graph
+            .tasks
+            .iter()
+            .map(|task| &task.implementations[0])
+            .collect();
         let witness = check_placement(&graph, &roomy, &index, None, &later).unwrap();
         let signed = sign_solution(&graph, &roomy, None, &implementations, witness).unwrap();
         assert_ne!(signed, compile(&graph, &roomy, None).unwrap());
@@ -1010,8 +1370,14 @@ mod tests {
         // The first value is saved by t1 for the gradient consumed at t2.
         // 8 + 32 + 32 output bytes, 16 workspace, and 24 backend reservation.
         assert_eq!(backward.peak_memory_bytes, 112);
-        assert_eq!(backward.tasks.iter().map(|task| task.release_values.clone()).collect::<Vec<_>>(),
-            vec![vec![], vec![], vec![0, 1]]);
+        assert_eq!(
+            backward
+                .tasks
+                .iter()
+                .map(|task| task.release_values.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![], vec![], vec![0, 1]]
+        );
         roomy.memory_budget_bytes = Some(111);
         assert!(compile(&graph, &roomy, None).is_err());
     }
@@ -1079,7 +1445,8 @@ mod tests {
                         graph.edges.push(SemanticEdge {
                             source: format!("t{a}"),
                             target: format!("t{b}"),
-                            step_distance: 0, separation: 0,
+                            step_distance: 0,
+                            separation: 0,
                         });
                     }
                 }

@@ -2,12 +2,12 @@
 
 use pyo3::prelude::*;
 
-mod tensor_policy;
 pub(crate) mod backend_attachment;
 pub(crate) mod scheduler;
 pub(crate) mod semantic_graph;
 pub(crate) mod state_representation;
 pub(crate) mod tensor_layout;
+mod tensor_policy;
 mod version_hazards;
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq)]
@@ -33,9 +33,18 @@ impl PlanBundle {
             &self.tensor_layout_request,
             &self.tensor_layout_decision,
         )?;
-        state_representation::validate(&self.state_request, &self.state_decision, &self.state_physical)?;
-        scheduler::validate_physical(&self.semantic_graph, &self.timeline, &self.schedule_decision,
-            &self.schedule_physical, Some(&self.state_physical))?;
+        state_representation::validate(
+            &self.state_request,
+            &self.state_decision,
+            &self.state_physical,
+        )?;
+        scheduler::validate_physical(
+            &self.semantic_graph,
+            &self.timeline,
+            &self.schedule_decision,
+            &self.schedule_physical,
+            Some(&self.state_physical),
+        )?;
         for state in &self.state_physical.representations {
             if !self
                 .semantic_graph
@@ -64,10 +73,7 @@ impl PlanBundle {
 
 #[pyfunction]
 #[pyo3(signature = (plan_json, local_candidates_json=None))]
-fn validate_plan_bundle(
-    plan_json: &str,
-    local_candidates_json: Option<&str>,
-) -> PyResult<()> {
+fn validate_plan_bundle(plan_json: &str, local_candidates_json: Option<&str>) -> PyResult<()> {
     let plan: PlanBundle = serde_json::from_str(plan_json)
         .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
     if let Some(payload) = local_candidates_json {
@@ -108,7 +114,10 @@ fn compile_state_schedule(
 }
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(semantic_graph::explain_state_visibility, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        semantic_graph::explain_state_visibility,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(compile_state_schedule, module)?)?;
     module.add_function(wrap_pyfunction!(validate_plan_bundle, module)?)?;
     Ok(())

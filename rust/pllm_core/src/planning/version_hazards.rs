@@ -91,17 +91,29 @@ pub(super) fn dependencies(
                     .insert(publications.get(&previous).copied().unwrap_or(previous));
             }
         }
-        let provider = state.and_then(|state| state.representations.iter()
-            .find(|provider| provider.resource == resource.resource));
-        let retains_versions = provider.is_some_and(|provider| provider.capabilities.iter()
-            .any(|capability| capability == "state/exact_versions@1"));
+        let provider = state.and_then(|state| {
+            state
+                .representations
+                .iter()
+                .find(|provider| provider.resource == resource.resource)
+        });
+        let retains_versions = provider.is_some_and(|provider| {
+            provider
+                .capabilities
+                .iter()
+                .any(|capability| capability == "state/exact_versions@1")
+        });
         if retains_versions && !commits.is_empty() {
             let provider = provider.unwrap();
             // Minimum simultaneous current/private roots, not a ceiling on retained versions.
-            if provider.max_admitted_lineages.checked_mul(2)
+            if provider
+                .max_admitted_lineages
+                .checked_mul(2)
                 .is_none_or(|minimum| provider.page_capacity < minimum)
             {
-                return Err("state pool cannot hold current and private roots for admitted writers".into());
+                return Err(
+                    "state pool cannot hold current and private roots for admitted writers".into(),
+                );
             }
         }
         if !retains_versions {

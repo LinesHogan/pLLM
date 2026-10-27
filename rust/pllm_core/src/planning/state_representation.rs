@@ -262,6 +262,7 @@ pub(super) fn compile(
             StatePhysicalPlan,
             ScheduleDecision,
         )>,
+        failure: &mut Option<String>,
     ) -> Result<(), String> {
         if request.memory_budget_bytes != 0 && reserved_bytes > request.memory_budget_bytes {
             return Ok(());
@@ -277,7 +278,9 @@ pub(super) fn compile(
                     continue;
                 };
                 plans.push(candidate.clone());
-                choose(request, graph, timeline, plan_epoch, plans, bytes, best)?;
+                choose(
+                    request, graph, timeline, plan_epoch, plans, bytes, best, failure,
+                )?;
                 plans.pop();
             }
             return Ok(());
@@ -300,17 +303,21 @@ pub(super) fn compile(
         let physical = project(&decision, plan_epoch);
         // task borrows this exact candidate, including retention and reserved
         // capacity. An infeasible cheap provider must not hide a legal COW plan.
-        if let Ok(schedule) = scheduler::compile(graph, timeline, Some(&physical)) {
-            if best
-                .as_ref()
-                .is_none_or(|(_, _, previous)| schedule.score() < previous.score())
-            {
-                *best = Some((decision, physical, schedule));
+        match scheduler::compile(graph, timeline, Some(&physical)) {
+            Ok(schedule) => {
+                if best
+                    .as_ref()
+                    .is_none_or(|(_, _, previous)| schedule.score() < previous.score())
+                {
+                    *best = Some((decision, physical, schedule));
+                }
             }
+            Err(error) => *failure = Some(error),
         }
         Ok(())
     }
     let mut best = None;
+    let mut failure = None;
     choose(
         request,
         graph,
@@ -319,9 +326,12 @@ pub(super) fn compile(
         &mut Vec::new(),
         0,
         &mut best,
+        &mut failure,
     )?;
     best.ok_or_else(|| {
-        "no joint state representation and task placement fits versions, timing and capacity".into()
+        failure.unwrap_or_else(|| {
+            "state representations exceed ExecutionOptions.memory_budget_bytes".into()
+        })
     })
 }
 
@@ -342,7 +352,8 @@ pub(super) fn validate(
     physical: &StatePhysicalPlan,
 ) -> Result<(), String> {
     validate_request(request)?;
-    if decision.schema_version != SCHEMA_VERSION || physical.plan_epoch == 0
+    if decision.schema_version != SCHEMA_VERSION
+        || physical.plan_epoch == 0
         || decision.request_digest != digest(&canonical_ascii_json(request)?)
         || decision.plans.len() != request.states.len()
     {
@@ -353,17 +364,26 @@ pub(super) fn validate(
             return Err("selected state plan differs from its original provider catalog".into());
         }
     }
-    let bytes = decision.plans.iter().try_fold(0_u64, |sum, plan| sum.checked_add(plan.reserved_bytes))
+    let bytes = decision
+        .plans
+        .iter()
+        .try_fold(0_u64, |sum, plan| sum.checked_add(plan.reserved_bytes))
         .ok_or("selected state capacity overflows u64")?;
-    if bytes != decision.reserved_bytes || (request.memory_budget_bytes != 0 && bytes > request.memory_budget_bytes)
-        || decision.plans.first().is_some_and(|first| decision.plans.iter().any(|plan|
-            plan.device_kind != first.device_kind || plan.device_ordinal != first.device_ordinal))
+    if bytes != decision.reserved_bytes
+        || (request.memory_budget_bytes != 0 && bytes > request.memory_budget_bytes)
+        || decision.plans.first().is_some_and(|first| {
+            decision.plans.iter().any(|plan| {
+                plan.device_kind != first.device_kind || plan.device_ordinal != first.device_ordinal
+            })
+        })
     {
         return Err("selected state capacity or device differs from its request".into());
     }
     let mut unsigned = decision.clone();
     unsigned.signature.clear();
-    if decision.signature != digest(&canonical_ascii_json(&unsigned)?) || physical != &project(decision, physical.plan_epoch) {
+    if decision.signature != digest(&canonical_ascii_json(&unsigned)?)
+        || physical != &project(decision, physical.plan_epoch)
+    {
         return Err("state physical plan differs from its signed decision".into());
     }
     Ok(())

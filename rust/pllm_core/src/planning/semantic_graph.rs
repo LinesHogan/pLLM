@@ -210,7 +210,9 @@ pub(crate) struct ConditionalInputGroup {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum InputVersion { Input }
+pub(crate) enum InputVersion {
+    Input,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -299,33 +301,93 @@ pub(crate) fn require_sorted_unique_text(values: &[String], label: &str) -> Resu
 
 fn validate_task(task: &SemanticTask) -> Result<(), String> {
     if let Some(math) = &task.math {
-        let inputs: BTreeSet<_> = task.inputs.iter().map(|input| input.name.as_str()).collect();
-        for names in [&math.input_gradients, &math.detached_inputs, &math.parameter_gradients] {
+        let inputs: BTreeSet<_> = task
+            .inputs
+            .iter()
+            .map(|input| input.name.as_str())
+            .collect();
+        for names in [
+            &math.input_gradients,
+            &math.detached_inputs,
+            &math.parameter_gradients,
+        ] {
             if names.iter().collect::<BTreeSet<_>>().len() != names.len() {
                 return Err(format!("{}: duplicate mathematical selection", task.symbol));
             }
         }
-        if math.input_gradients.iter().any(|name| math.detached_inputs.contains(name))
-            || math.input_gradients.iter().chain(&math.detached_inputs).any(|name| !inputs.contains(name.as_str()))
-            || [&math.forward_rows, &math.input_gradient_rows, &math.parameter_gradient_rows, &math.update_states]
-                .iter().any(|name| !name.is_empty() && !inputs.contains(name.as_str()))
-            || math.parameter_gradients.iter().any(|resource| !task.effects.iter().any(|effect| effect.resource == *resource))
-            || !matches!(math.reduction.as_str(), "none" | "sum" | "mean" | "state_mean" | "weighted_state_mean" | "weighted_state_mean_then_mean" | "custom")
+        if math
+            .input_gradients
+            .iter()
+            .any(|name| math.detached_inputs.contains(name))
+            || math
+                .input_gradients
+                .iter()
+                .chain(&math.detached_inputs)
+                .any(|name| !inputs.contains(name.as_str()))
+            || [
+                &math.forward_rows,
+                &math.input_gradient_rows,
+                &math.parameter_gradient_rows,
+                &math.update_states,
+            ]
+            .iter()
+            .any(|name| !name.is_empty() && !inputs.contains(name.as_str()))
+            || math.parameter_gradients.iter().any(|resource| {
+                !task
+                    .effects
+                    .iter()
+                    .any(|effect| effect.resource == *resource)
+            })
+            || !matches!(
+                math.reduction.as_str(),
+                "none"
+                    | "sum"
+                    | "mean"
+                    | "state_mean"
+                    | "weighted_state_mean"
+                    | "weighted_state_mean_then_mean"
+                    | "custom"
+            )
         {
-            return Err(format!("{}: mathematical contract differs from original inputs/state", task.symbol));
+            return Err(format!(
+                "{}: mathematical contract differs from original inputs/state",
+                task.symbol
+            ));
         }
-        if !math.update_states.is_empty() && !task.effects.iter().any(|effect|
-            matches!(effect.kind, StateEffectKind::Transition | StateEffectKind::TransitionMaybe | StateEffectKind::Update | StateEffectKind::UpdateMaybe)) {
-            return Err(format!("{}: update eligibility requires a declared mutation", task.symbol));
+        if !math.update_states.is_empty()
+            && !task.effects.iter().any(|effect| {
+                matches!(
+                    effect.kind,
+                    StateEffectKind::Transition
+                        | StateEffectKind::TransitionMaybe
+                        | StateEffectKind::Update
+                        | StateEffectKind::UpdateMaybe
+                )
+            })
+        {
+            return Err(format!(
+                "{}: update eligibility requires a declared mutation",
+                task.symbol
+            ));
         }
     }
     if let Some(replay) = &task.replay {
-        if replay.layer_count == 0 || !matches!(replay.rows.as_str(), "prefill" | "decode" | "all") {
-            return Err("layer routes need positive layer_count and prefill/decode/all rows".to_owned());
+        if replay.layer_count == 0 || !matches!(replay.rows.as_str(), "prefill" | "decode" | "all")
+        {
+            return Err(
+                "layer routes need positive layer_count and prefill/decode/all rows".to_owned(),
+            );
         }
-        if replay.position_states.iter().any(|(name, initial)| name.is_empty() || initial.as_f64().is_none_or(|x| !x.is_finite()))
-            || replay.position_states.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
-            return Err("PositionState needs sorted unique names and finite scalar initializers".into());
+        if replay.position_states.iter().any(|(name, initial)| {
+            name.is_empty() || initial.as_f64().is_none_or(|x| !x.is_finite())
+        }) || replay
+            .position_states
+            .windows(2)
+            .any(|pair| pair[0].0 >= pair[1].0)
+        {
+            return Err(
+                "PositionState needs sorted unique names and finite scalar initializers".into(),
+            );
         }
     }
     require_text(&task.symbol, "tasks.symbol")?;
@@ -427,19 +489,34 @@ fn validate_task(task: &SemanticTask) -> Result<(), String> {
 pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
     validate_input_groups(graph)?;
     require_sorted_unique_text(&graph.model_reads, "model read resources")?;
-    if graph.model_reads.iter().any(|r| !graph.states.iter().any(|s| &s.resource == r)) {
+    if graph
+        .model_reads
+        .iter()
+        .any(|r| !graph.states.iter().any(|s| &s.resource == r))
+    {
         return Err("model consumer references an undeclared state".into());
     }
     for task in &graph.tasks {
-        if task.effects.iter().any(|e| e.kind != StateEffectKind::Read
-            && graph.states.iter().any(|s| s.resource == e.resource && s.immutable)) {
+        if task.effects.iter().any(|e| {
+            e.kind != StateEffectKind::Read
+                && graph
+                    .states
+                    .iter()
+                    .any(|s| s.resource == e.resource && s.immutable)
+        }) {
             return Err("immutable state cannot have a writer".into());
         }
         if let Some(visibility) = &task.visibility {
-            if visibility.scope == VisibilityScope::PostSampler { return Err("post-sampler visibility belongs to the timeline".into()); }
+            if visibility.scope == VisibilityScope::PostSampler {
+                return Err("post-sampler visibility belongs to the timeline".into());
+            }
             validate_visibility(visibility)?;
-            if visibility.resources.iter().any(|resource|
-                !task.effects.iter().any(|effect| &effect.resource == resource)) {
+            if visibility.resources.iter().any(|resource| {
+                !task
+                    .effects
+                    .iter()
+                    .any(|effect| &effect.resource == resource)
+            }) {
                 return Err("state visibility resources must belong to the bound task".into());
             }
         }
@@ -464,7 +541,6 @@ pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
     }
     for task in &graph.tasks {
         validate_task(task)?;
-
     }
     if graph
         .tasks
@@ -580,32 +656,62 @@ fn validate_input_groups(graph: &SemanticGraph) -> Result<(), String> {
         require_sorted_unique_text(&group.borrowed_resources, "input group borrowed resources")?;
         require_sorted_unique_text(&group.readers, "input group readers")?;
         let producer = |name: &String| group.tasks.contains(name);
-        if group.tasks.is_empty() || group.borrowed_resources.is_empty()
+        if group.tasks.is_empty()
+            || group.borrowed_resources.is_empty()
             || group.borrowed_resources.contains(&group.resource)
             || !producer(&group.publication)
-            || group.tasks.iter().chain(&group.readers).any(|name|
-                !graph.tasks.iter().any(|task| &task.symbol == name))
+            || group
+                .tasks
+                .iter()
+                .chain(&group.readers)
+                .any(|name| !graph.tasks.iter().any(|task| &task.symbol == name))
             || group.readers.iter().any(producer)
             || graph.states.len() != group.borrowed_resources.len() + 1
-            || !graph.states.iter().any(|state| state.resource == group.resource)
-            || group.borrowed_resources.iter().any(|resource| !graph.states.iter().any(|state|
-                &state.resource == resource && state.scope == StateScope::Instance))
+            || !graph
+                .states
+                .iter()
+                .any(|state| state.resource == group.resource)
+            || group.borrowed_resources.iter().any(|resource| {
+                !graph
+                    .states
+                    .iter()
+                    .any(|state| &state.resource == resource && state.scope == StateScope::Instance)
+            })
         {
-            return Err("conditional input group must name its exact producer closure and states".into());
+            return Err(
+                "conditional input group must name its exact producer closure and states".into(),
+            );
         }
-        let publication = graph.tasks.iter().find(|task| task.symbol == group.publication).unwrap();
-        if publication.effects.len() != 1 || publication.effects[0].kind != StateEffectKind::Publish
+        let publication = graph
+            .tasks
+            .iter()
+            .find(|task| task.symbol == group.publication)
+            .unwrap();
+        if publication.effects.len() != 1
+            || publication.effects[0].kind != StateEffectKind::Publish
             || publication.effects[0].resource != group.resource
         {
             return Err("conditional input requires its exact owned publication".into());
         }
-        let writes: Vec<_> = graph.tasks.iter().filter(|task| producer(&task.symbol) && task.symbol != group.publication)
-            .flat_map(|task| &task.effects).filter(|effect| effect.resource == group.resource
-                && effect.kind != StateEffectKind::Read).collect();
-        if writes.len() != 1 || !matches!(writes[0].kind, StateEffectKind::Transition | StateEffectKind::TransitionMaybe)
+        let writes: Vec<_> = graph
+            .tasks
+            .iter()
+            .filter(|task| producer(&task.symbol) && task.symbol != group.publication)
+            .flat_map(|task| &task.effects)
+            .filter(|effect| {
+                effect.resource == group.resource && effect.kind != StateEffectKind::Read
+            })
+            .collect();
+        if writes.len() != 1
+            || !matches!(
+                writes[0].kind,
+                StateEffectKind::Transition | StateEffectKind::TransitionMaybe
+            )
             || writes[0].version.is_some()
         {
-            return Err("conditional input requires one owned transition and no hidden writers".into());
+            return Err(
+                "conditional input requires one owned transition and no hidden writers".into(),
+            );
         }
         let mut closure = std::collections::BTreeSet::from([group.publication.clone()]);
         loop {
@@ -613,27 +719,42 @@ fn validate_input_groups(graph: &SemanticGraph) -> Result<(), String> {
             for task in &graph.tasks {
                 if closure.contains(&task.symbol) {
                     for port in &task.inputs {
-                        if let InputSource::Result { task, .. } = &port.source { closure.insert(task.clone()); }
+                        if let InputSource::Result { task, .. } = &port.source {
+                            closure.insert(task.clone());
+                        }
                     }
                 }
             }
-            if before == closure.len() { break; }
+            if before == closure.len() {
+                break;
+            }
         }
         if closure.into_iter().collect::<Vec<_>>() != group.tasks {
-            return Err("conditional producer group must be the complete publication closure".into());
+            return Err(
+                "conditional producer group must be the complete publication closure".into(),
+            );
         }
         for task in &graph.tasks {
             if producer(&task.symbol) {
-                if task.replay.is_some() || task.effects.iter().any(|effect|
-                    if group.borrowed_resources.contains(&effect.resource) {
-                        effect.kind != StateEffectKind::Read || effect.version.is_some()
-                    } else { effect.resource != group.resource })
-                    || task.inputs.iter().any(|port| matches!(&port.source,
-                        InputSource::Result { task, .. } if !producer(task)))
+                if task.replay.is_some()
+                    || task.effects.iter().any(|effect| {
+                        if group.borrowed_resources.contains(&effect.resource) {
+                            effect.kind != StateEffectKind::Read || effect.version.is_some()
+                        } else {
+                            effect.resource != group.resource
+                        }
+                    })
+                    || task.inputs.iter().any(|port| {
+                        matches!(&port.source,
+                        InputSource::Result { task, .. } if !producer(task))
+                    })
                 {
-                    return Err("conditional producer cannot read outside its closed input group".into());
+                    return Err(
+                        "conditional producer cannot read outside its closed input group".into(),
+                    );
                 }
-            } else if !group.readers.contains(&task.symbol) || task.effects.len() != 1
+            } else if !group.readers.contains(&task.symbol)
+                || task.effects.len() != 1
                 || task.effects[0].kind != StateEffectKind::Read
                 || task.effects[0].resource != group.resource
                 || task.effects[0].version.as_ref() != Some(&group.publication)
@@ -643,12 +764,21 @@ fn validate_input_groups(graph: &SemanticGraph) -> Result<(), String> {
                     _ => true,
                 })
             {
-                return Err("conditional reader requires only its publication or pinned input version".into());
+                return Err(
+                    "conditional reader requires only its publication or pinned input version"
+                        .into(),
+                );
             }
         }
-        if group.borrowed_resources.iter().any(|resource| !graph.tasks.iter().any(|task|
-            producer(&task.symbol) && task.effects.iter().any(|effect| &effect.resource == resource)))
-        {
+        if group.borrowed_resources.iter().any(|resource| {
+            !graph.tasks.iter().any(|task| {
+                producer(&task.symbol)
+                    && task
+                        .effects
+                        .iter()
+                        .any(|effect| &effect.resource == resource)
+            })
+        }) {
             return Err("conditional input cannot hide unused borrowed resources".into());
         }
     }
@@ -657,7 +787,9 @@ fn validate_input_groups(graph: &SemanticGraph) -> Result<(), String> {
 
 pub(crate) fn validate_timeline(timeline: &Timeline) -> Result<(), String> {
     if let Some(source) = &timeline.visibility {
-        if source.scope != VisibilityScope::PostSampler { return Err("timeline visibility needs a post-sampler domain".into()); }
+        if source.scope != VisibilityScope::PostSampler {
+            return Err("timeline visibility needs a post-sampler domain".into());
+        }
         validate_visibility(source)?;
     }
     if timeline.schema_version != SCHEMA_VERSION {
@@ -724,19 +856,31 @@ pub(crate) fn digest(payload: &str) -> String {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum VisibilityKind { ForwardPinned, Exact, StepLag }
+pub(super) enum VisibilityKind {
+    ForwardPinned,
+    Exact,
+    StepLag,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Visibility { pub kind: VisibilityKind }
+pub(super) struct Visibility {
+    pub kind: VisibilityKind,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum VisibilityScope { Overlay, PostSampler }
+pub(super) enum VisibilityScope {
+    Overlay,
+    PostSampler,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum VisibilityTail { Transition, Carry }
+pub(super) enum VisibilityTail {
+    Transition,
+    Carry,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -753,17 +897,27 @@ pub(super) struct VisibilitySource {
 
 fn validate_visibility(source: &VisibilitySource) -> Result<(), String> {
     let valid = match (&source.scope, &source.policy.kind, &source.tail) {
-        (VisibilityScope::PostSampler, VisibilityKind::StepLag, VisibilityTail::Transition) => source.chunk_size == 0 && source.resources.is_empty(),
-        (VisibilityScope::Overlay, VisibilityKind::ForwardPinned, VisibilityTail::Transition) | (VisibilityScope::Overlay, VisibilityKind::Exact, VisibilityTail::Carry) => source.chunk_size == 0 && source.lag == 0,
+        (VisibilityScope::PostSampler, VisibilityKind::StepLag, VisibilityTail::Transition) => {
+            source.chunk_size == 0 && source.resources.is_empty()
+        }
+        (VisibilityScope::Overlay, VisibilityKind::ForwardPinned, VisibilityTail::Transition)
+        | (VisibilityScope::Overlay, VisibilityKind::Exact, VisibilityTail::Carry) => {
+            source.chunk_size == 0 && source.lag == 0
+        }
         _ => false,
     };
-    if valid { Ok(()) } else { Err("visibility must use its declaration's read, chunk and tail domain".into()) }
+    if valid {
+        Ok(())
+    } else {
+        Err("visibility must use its declaration's read, chunk and tail domain".into())
+    }
 }
 
 #[pyo3::pyfunction]
 pub(crate) fn explain_state_visibility(source_json: &str) -> pyo3::PyResult<String> {
     let run = || -> Result<String, String> {
-        let source: VisibilitySource = serde_json::from_str(source_json).map_err(|e| e.to_string())?;
+        let source: VisibilitySource =
+            serde_json::from_str(source_json).map_err(|e| e.to_string())?;
         validate_visibility(&source)?;
         Ok(match source.policy.kind {
             VisibilityKind::StepLag => format!("reader[t,q]: entry snapshot, or boundary[max(0,t-{}),q] when retained; writer[t,q]: latest", source.lag),

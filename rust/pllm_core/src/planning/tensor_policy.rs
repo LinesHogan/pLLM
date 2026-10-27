@@ -4,11 +4,17 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum SchedulePolicy { Auto, Serial }
+pub(crate) enum SchedulePolicy {
+    Auto,
+    Serial,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum TuningPolicy { Heuristic, Measured }
+pub(crate) enum TuningPolicy {
+    Heuristic,
+    Measured,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -21,8 +27,10 @@ pub(crate) struct Policy {
 
 impl Default for Policy {
     fn default() -> Self {
-        Self { allow_numerical_transforms: true, schedule_policy: SchedulePolicy::Auto,
-               tuning: TuningPolicy::Heuristic }
+        Self {
+            allow_numerical_transforms: true,
+            schedule_policy: SchedulePolicy::Auto,
+            tuning: TuningPolicy::Heuristic,
+        }
     }
 }
-
