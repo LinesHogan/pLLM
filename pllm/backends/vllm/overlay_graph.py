@@ -39,6 +39,7 @@ from pllm.execution.parameter_projection import (
     prepare_projection_read,
     projection_block_rows,
     projection_blocks,
+    uses_pinned_projection,
 )
 from pllm.execution.ptts.page_bundle import PageBundleArena, Slots
 from pllm.execution.ptts.request_state import RequestStateDirectory
@@ -504,7 +505,7 @@ def parameter_overlay(
     routed: bool = False,
 ) -> PinnedParameterOverlay | ExactParameterOverlay | HybridParameterOverlay:
     """Install each projection wrapper once, before compiling or capturing the model."""
-    if routed or in_forward and not graphs:
+    if routed or not uses_pinned_projection(in_forward=in_forward, graphs=graphs):
         return ExactParameterOverlay(model, bindings)
     pinned = PinnedParameterOverlay(model, bindings, arena, rows, requests, budget, phases=() if in_forward else phases)
     return HybridParameterOverlay(pinned, ExactParameterOverlay(model, bindings), phases) if in_forward else pinned

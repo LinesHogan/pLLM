@@ -16,7 +16,6 @@ from functools import partial
 from unittest.mock import patch
 
 import torch
-from torch._subclasses.fake_tensor import FakeTensor
 from vllm import LLM, SamplingParams
 
 import pllm
@@ -506,12 +505,12 @@ def main() -> int:
             forms: set[tuple[str, int]] = set()
             execute = PreparedScan.windows
 
-            def record(plan, *args):
+            def record(plan, *args, tracing=False):
                 assert plan.analysis is not None
-                if not isinstance(args[0], FakeTensor):
+                if not tracing:
                     prefix = "right_matrix:" if plan.analysis.kind == "right" else ""
                     forms.add((prefix + plan.form.value, plan.window))
-                return execute(plan, *args)
+                return execute(plan, *args, tracing=tracing)
 
             with patch.object(PreparedScan, "windows", record):
                 results[name] = check(handle)

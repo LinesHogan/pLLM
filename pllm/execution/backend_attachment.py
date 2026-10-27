@@ -38,7 +38,7 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
 from pllm.execution.codec import decode_boundary, encode_boundary
-from pllm.execution.parameter_projection import ROWS_PER_BLOCK, projection_blocks
+from pllm.execution.parameter_projection import ROWS_PER_BLOCK, projection_blocks, uses_pinned_projection
 
 
 def attachment_buffer_bytes(
@@ -57,11 +57,10 @@ def attachment_buffer_bytes(
         for field in layout.layout.fields
     }
     buffers = 1024 if attachment.overlay_bindings else 0
-    if (
-        attachment.overlay_bindings
-        and probe.device_kind is StateDeviceKind.CUDA
-        and (probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH or not graph.updates_in_forward)
-    ):
+    pinned = uses_pinned_projection(
+        in_forward=graph.updates_in_forward, graphs=probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH
+    )
+    if attachment.overlay_bindings and probe.device_kind is StateDeviceKind.CUDA and pinned:
         buffers += torch.backends.cuda.cublas_workspace_size() + torch.backends.cuda.cublaslt_workspace_size()
     for binding in attachment.overlay_bindings:
         first = binding.fields[0].shape
@@ -78,9 +77,7 @@ def attachment_buffer_bytes(
             rank, inputs = first
             outputs = binding.fields[1].shape[0]
             buffers += rows * (width * (inputs + rank + 2 * outputs) + 8)
-        if probe.causal_domain is not None and (
-            probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH or not graph.updates_in_forward
-        ):
+        if probe.causal_domain is not None and pinned:
             blocks = projection_blocks(rows, probe.causal_domain.requests)
             buffers += 24 * (blocks * (ROWS_PER_BLOCK + len(binding.fields)) + rows)
             buffers += 2 * blocks * sum(prod(field.shape) * width for field in binding.fields)

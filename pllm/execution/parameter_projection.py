@@ -13,6 +13,11 @@ from pllm.execution.memory import measure
 ROWS_PER_BLOCK = 32
 
 
+def uses_pinned_projection(*, in_forward: bool, graphs: bool) -> bool:
+    """Ordinary overlays use pinned reads except during eager in-forward training."""
+    return graphs or not in_forward
+
+
 def projection_block_rows(rows: int, requests: int) -> int:
     """Uniform decode uses one row per matrix; prefill amortizes each field gather."""
     return 1 if rows <= requests else ROWS_PER_BLOCK

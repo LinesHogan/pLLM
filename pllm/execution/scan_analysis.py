@@ -200,80 +200,14 @@ class _Extract:
         return self.values[arg]
 
     def extract(self, node: Node) -> Affine:
-        op, args = node.target, node.args
-        a = self.value(args[0])
+        op = node.target
+        a = self.value(node.args[0])
         if op in (torch.ops.aten.add.Tensor, torch.ops.aten.sub.Tensor):
-            b = self.value(args[1])
-            alpha = float(node.kwargs.get("alpha", 1)) * (-1 if op == torch.ops.aten.sub.Tensor else 1)  # pyright: ignore[reportArgumentType]
-            linear = self.add_maps(a.linear, b.linear, alpha)
-            bias = a.bias
-            if b.bias is not None:
-                bias = (
-                    self.call(torch.ops.aten.mul.Tensor, b.bias, alpha)
-                    if bias is None
-                    else self.call(torch.ops.aten.add.Tensor, bias, b.bias, alpha=alpha)
-                )
-            return Affine(linear, bias)
+            return self.add_sub(node, a)
         if op in (torch.ops.aten.neg.default, torch.ops.aten.mul.Tensor, torch.ops.aten.div.Tensor):
-            if op == torch.ops.aten.neg.default:
-                factor: Coefficient = -1.0
-                factor_shape: Coefficient = factor
-            else:
-                if a.linear is None and op == torch.ops.aten.mul.Tensor:
-                    a = self.value(args[1])
-                    factor_arg = args[0]
-                else:
-                    factor_arg = args[1]
-                if isinstance(factor_arg, Node):
-                    if self.values[factor_arg].linear is not None:
-                        raise Unsupported
-                    factor = self.independent[factor_arg]
-                elif isinstance(factor_arg, (int, float)):
-                    factor = float(factor_arg)
-                else:
-                    raise Unsupported
-                factor_shape = factor
-                if op == torch.ops.aten.div.Tensor:
-                    factor = (
-                        1 / factor
-                        if isinstance(factor, float)
-                        else self.call(torch.ops.aten.reciprocal.default, factor)
-                    )
-            assert a.linear is not None
-            kind = a.linear.kind
-            if isinstance(factor_shape, Node):
-                metadata: torch.Tensor = factor_shape.meta["val"]
-                if metadata.numel() != 1:
-                    if kind not in ("scalar", "diagonal"):
-                        raise Unsupported
-                    kind = "diagonal"
-            return Affine(
-                Linear(kind, self.multiply(a.linear.coefficient, factor), a.linear.transposed),
-                None if a.bias is None else self.call(torch.ops.aten.mul.Tensor, a.bias, factor),
-            )
+            return self.mul_div_neg(node, a)
         if op in (torch.ops.aten.mm.default, torch.ops.aten.bmm.default, torch.ops.aten.matmul.default):
-            b = self.value(args[1])
-            side: Kind = "right" if a.linear is not None else "left"
-            dependent, independent = (a, b) if side == "right" else (b, a)
-            if independent.linear is not None or independent.bias is None or dependent.linear is None:
-                raise Unsupported
-            linear = dependent.linear
-            coefficient = independent.bias
-            if linear.kind == "scalar":
-                coefficient = self.call(torch.ops.aten.mul.Tensor, coefficient, linear.coefficient)
-            elif linear.kind == side:
-                operands = (linear.coefficient, coefficient) if side == "right" else (coefficient, linear.coefficient)
-                coefficient = self.call(op, *operands)
-            else:
-                raise Unsupported
-            bias = (
-                None
-                if dependent.bias is None
-                else self.call(
-                    op, *((dependent.bias, independent.bias) if side == "right" else (independent.bias, dependent.bias))
-                )
-            )
-            return Affine(Linear(side, coefficient, linear.transposed), bias)
+            return self.matmul(node, a)
         if op in (
             torch.ops.aten.view.default,
             torch.ops.aten.expand.default,
@@ -281,32 +215,115 @@ class _Extract:
             torch.ops.aten.clone.default,
             torch.ops.aten._to_copy.default,
         ):
-            before: torch.Tensor = node.all_input_nodes[0].meta["val"]
-            after: torch.Tensor = node.meta["val"]
-            if before.shape == after.shape and before.dtype == after.dtype and before.device == after.device:
-                return a
-            raise Unsupported
+            return self.view(node, a)
         if op in (torch.ops.aten.t.default, torch.ops.aten.transpose.int, torch.ops.aten.permute.default):
-            if op == torch.ops.aten.permute.default:
-                metadata: torch.Tensor = node.all_input_nodes[0].meta["val"]
-                axes = node.args[1]
-                if axes == list(range(metadata.ndim)):
-                    return a
-                if axes != [*range(metadata.ndim - 2), metadata.ndim - 1, metadata.ndim - 2]:
-                    raise Unsupported
-            if op == torch.ops.aten.transpose.int:
-                metadata: torch.Tensor = node.all_input_nodes[0].meta["val"]
-                assert isinstance(args[1], int) and isinstance(args[2], int)
-                if {args[1] % metadata.ndim, args[2] % metadata.ndim} != {
-                    metadata.ndim - 1,
-                    metadata.ndim - 2,
-                }:  # pyright: ignore[reportArgumentType]
-                    raise Unsupported
-            assert a.linear is not None
-            side = "right" if a.linear.kind == "left" else "left" if a.linear.kind == "right" else a.linear.kind
-            linear = Linear(side, self.transpose(a.linear.coefficient), not a.linear.transposed)  # pyright: ignore[reportArgumentType]
-            return Affine(linear, None if a.bias is None else self.call(op, a.bias, *args[1:]))
+            return self.transpose_value(node, a)
         raise Unsupported
+
+    def add_sub(self, node: Node, a: Affine) -> Affine:
+        op, args = node.target, node.args
+        b = self.value(args[1])
+        alpha = float(node.kwargs.get("alpha", 1)) * (-1 if op == torch.ops.aten.sub.Tensor else 1)  # pyright: ignore[reportArgumentType]
+        linear = self.add_maps(a.linear, b.linear, alpha)
+        bias = a.bias
+        if b.bias is not None:
+            bias = (
+                self.call(torch.ops.aten.mul.Tensor, b.bias, alpha)
+                if bias is None
+                else self.call(torch.ops.aten.add.Tensor, bias, b.bias, alpha=alpha)
+            )
+        return Affine(linear, bias)
+
+    def mul_div_neg(self, node: Node, a: Affine) -> Affine:
+        op, args = node.target, node.args
+        if op == torch.ops.aten.neg.default:
+            factor: Coefficient = -1.0
+            factor_shape: Coefficient = factor
+        else:
+            if a.linear is None and op == torch.ops.aten.mul.Tensor:
+                a = self.value(args[1])
+                factor_arg = args[0]
+            else:
+                factor_arg = args[1]
+            if isinstance(factor_arg, Node):
+                if self.values[factor_arg].linear is not None or factor_arg not in self.independent:
+                    raise Unsupported
+                factor = self.independent[factor_arg]
+            elif isinstance(factor_arg, (int, float)):
+                factor = float(factor_arg)
+            else:
+                raise Unsupported
+            factor_shape = factor
+            if op == torch.ops.aten.div.Tensor:
+                factor = (
+                    1 / factor if isinstance(factor, float) else self.call(torch.ops.aten.reciprocal.default, factor)
+                )
+        assert a.linear is not None
+        kind = a.linear.kind
+        if isinstance(factor_shape, Node):
+            metadata: torch.Tensor = factor_shape.meta["val"]
+            if metadata.numel() != 1:
+                if kind not in ("scalar", "diagonal"):
+                    raise Unsupported
+                kind = "diagonal"
+        return Affine(
+            Linear(kind, self.multiply(a.linear.coefficient, factor), a.linear.transposed),
+            None if a.bias is None else self.call(torch.ops.aten.mul.Tensor, a.bias, factor),
+        )
+
+    def matmul(self, node: Node, a: Affine) -> Affine:
+        op, args = node.target, node.args
+        b = self.value(args[1])
+        side: Kind = "right" if a.linear is not None else "left"
+        dependent, independent = (a, b) if side == "right" else (b, a)
+        if independent.linear is not None or independent.bias is None or dependent.linear is None:
+            raise Unsupported
+        linear = dependent.linear
+        coefficient = independent.bias
+        if linear.kind == "scalar":
+            coefficient = self.call(torch.ops.aten.mul.Tensor, coefficient, linear.coefficient)
+        elif linear.kind == side:
+            operands = (linear.coefficient, coefficient) if side == "right" else (coefficient, linear.coefficient)
+            coefficient = self.call(op, *operands)
+        else:
+            raise Unsupported
+        bias = (
+            None
+            if dependent.bias is None
+            else self.call(
+                op, *((dependent.bias, independent.bias) if side == "right" else (independent.bias, dependent.bias))
+            )
+        )
+        return Affine(Linear(side, coefficient, linear.transposed), bias)
+
+    def view(self, node: Node, a: Affine) -> Affine:
+        before: torch.Tensor = node.all_input_nodes[0].meta["val"]
+        after: torch.Tensor = node.meta["val"]
+        if before.shape == after.shape and before.dtype == after.dtype and before.device == after.device:
+            return a
+        raise Unsupported
+
+    def transpose_value(self, node: Node, a: Affine) -> Affine:
+        op, args = node.target, node.args
+        if op == torch.ops.aten.permute.default:
+            metadata: torch.Tensor = node.all_input_nodes[0].meta["val"]
+            axes = node.args[1]
+            if axes == list(range(metadata.ndim)):
+                return a
+            if axes != [*range(metadata.ndim - 2), metadata.ndim - 1, metadata.ndim - 2]:
+                raise Unsupported
+        if op == torch.ops.aten.transpose.int:
+            metadata: torch.Tensor = node.all_input_nodes[0].meta["val"]
+            assert isinstance(args[1], int) and isinstance(args[2], int)
+            if {args[1] % metadata.ndim, args[2] % metadata.ndim} != {
+                metadata.ndim - 1,
+                metadata.ndim - 2,
+            }:  # pyright: ignore[reportArgumentType]
+                raise Unsupported
+        assert a.linear is not None
+        side = "right" if a.linear.kind == "left" else "left" if a.linear.kind == "right" else a.linear.kind
+        linear = Linear(side, self.transpose(a.linear.coefficient), not a.linear.transposed)  # pyright: ignore[reportArgumentType]
+        return Affine(linear, None if a.bias is None else self.call(op, a.bias, *args[1:]))
 
     def run(self) -> ScanAnalysis | None:
         placeholders = [node for node in self.source.graph.nodes if node.op == "placeholder"]
@@ -328,7 +345,7 @@ class _Extract:
                     if any(n in self.refused for n in node.all_input_nodes):
                         raise Unsupported
                     self.values[node] = self.extract(node)
-                except (Unsupported, KeyError):
+                except Unsupported:
                     # Unsupported pure readout nodes need not disqualify the carry.
                     self.refused.add(node)
                     self.values[node] = Affine(Linear(), None)

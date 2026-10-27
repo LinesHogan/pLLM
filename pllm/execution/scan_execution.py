@@ -5,7 +5,6 @@ from dataclasses import dataclass
 
 import torch
 from torch._higher_order_ops.associative_scan import associative_scan
-from torch._subclasses.fake_tensor import FakeTensor
 
 from pllm.contracts.tensor_policy import ScanForm
 from pllm.execution.scan_analysis import ScanAnalysis, stage
@@ -66,6 +65,8 @@ class PreparedScan:
         over: tuple[torch.Tensor, ...],
         invariants: tuple[torch.Tensor, ...],
         valid_rows: torch.Tensor | None,
+        *,
+        tracing: bool = False,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         if self.analysis is None:
             outputs: list[torch.Tensor] = []
@@ -74,7 +75,7 @@ class PreparedScan:
                 carry = updated if valid_rows is None else torch.where(start + self.chunk <= valid_rows, updated, carry)
                 outputs.append(output)
             return carry, tuple(outputs)
-        return self.windows(carry, over, invariants, valid_rows)
+        return self.windows(carry, over, invariants, valid_rows, tracing=tracing)
 
     def windows(
         self,
@@ -82,6 +83,8 @@ class PreparedScan:
         over: tuple[torch.Tensor, ...],
         invariants: tuple[torch.Tensor, ...],
         valid_rows: torch.Tensor | None,
+        *,
+        tracing: bool = False,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         assert self.analysis is not None
         count = len(over[0]) // self.chunk
@@ -100,7 +103,7 @@ class PreparedScan:
             else:
                 index = torch.arange(self.window, device=carry.device) + start
                 active = (index < count) & ((index + 1) * self.chunk <= valid_rows)
-            states, carry = self.prefix(carry, coefficient, bias, active)
+            states, carry = self.prefix(carry, coefficient, bias, active, tracing=tracing)
             readout = self.analysis.readout(states, *cuts)[:size]
             if self.analysis.copy_readout or size != self.window:
                 readout = readout.clone()
@@ -108,7 +111,13 @@ class PreparedScan:
         return carry, tuple(outputs)
 
     def prefix(
-        self, carry: torch.Tensor, coefficient: torch.Tensor, bias: torch.Tensor, active: torch.Tensor
+        self,
+        carry: torch.Tensor,
+        coefficient: torch.Tensor,
+        bias: torch.Tensor,
+        active: torch.Tensor,
+        *,
+        tracing: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert self.analysis is not None
         bias = torch.broadcast_to(bias, (self.window, *carry.shape))
@@ -118,7 +127,7 @@ class PreparedScan:
             final = torch.empty_like(carry)
             matrix = carry.view(-1, carry.shape[-1] if carry.ndim else 1)
             increments = bias.reshape(self.window, *matrix.shape)
-            if not isinstance(carry, FakeTensor):
+            if not tracing:
                 additive_prefix(
                     increments,
                     matrix,

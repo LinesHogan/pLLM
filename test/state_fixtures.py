@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import weakref
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -12,15 +12,17 @@ from pllm.contracts.backend_attachment import AttachmentGraphMode, AttachmentTop
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget, ParameterTargetShape
-from pllm.contracts.request_identity import RequestIdentity
-from pllm.contracts.semantic_graph import SemanticState, StateResource, StateScope
+from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
+from pllm.contracts.semantic_graph import AnchorId, SemanticState, StateResource, StateScope
 from pllm.contracts.state_representation import StateDeviceKind, StateLayoutRequirement, StateRepresentationRequest
-from pllm.contracts.tensor_layout import StateTensorLayout, TensorDType, TensorLayoutRequest
+from pllm.contracts.tensor_layout import LayoutFieldId, StateTensorLayout, TensorDType, TensorLayoutRequest
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.scheduler import compile_state_schedule, intern_tensor_layouts
+from pllm.execution.state_execution import MathBinding
+from pllm.execution.tensor_program import FunctionMath
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
 
 
@@ -139,3 +141,92 @@ def cuda_arena(stream) -> PageBundleArena:
     """The same request plan, with pages and completion receipts on CUDA."""
     provider = PageBundleProviderFacts("test.region.cuda@1", 6, StateDeviceKind.CUDA)
     return PageBundleArena(inplace_plan(stream.device, provider, ("transition/full_root@1", "state/fenced_reclaim@1")))
+
+
+DENSE = StateResource("dense_fast_weights")
+AUX = StateResource("fast_statistics")
+GLOBAL = StateResource("global_factors")
+
+
+def multistate_arena(*, route=False, instance=True):
+    """Request dense weights, request/route statistics and optional instance factors."""
+    plan = page_arena(heterogeneous=True).plan
+    dense, global_ = plan.tensor_layout_request.layouts
+    aux_layout = replace(
+        global_.layout, namespace="test.auxiliary@1", fields=(replace(global_.layout.fields[0], shape=(3,)),)
+    )
+    layouts = TensorLayoutRequest((dense, StateTensorLayout(str(AUX), aux_layout), *((global_,) if instance else ())))
+    states = plan.semantic_graph.states
+    aux = SemanticState(AUX, StateScope.REQUEST, (RequestKeyField.ROUTE,) if route else states[0].key_fields)
+    graph = replace(plan.semantic_graph, states=(states[0], aux, *((states[1],) if instance else ())))
+    return PageBundleArena(replan_states(plan, graph, layouts, 8192))
+
+
+@dataclass
+class ResourceTask:
+    """Run direct tensor publications through the invocation's state owner."""
+
+    implementation_id: int
+    update = None
+    context = None
+
+    def execute(self, context):
+        """Run the configured update in this invocation."""
+        if self.update is not None:
+            self.context = context
+            self.update(context)
+
+
+def increment_resources(context):
+    """Publish one increment of the first field of every selected resource."""
+    refs = context.current_owned_refs(context.pin.refs)
+    pin = context.arena.pin_exact(refs, context.pin.stream)
+    context.page_pins[pin] = None
+    for ref in refs:
+        (value,) = context.arena.snapshot(pin, ref)[:1]
+        write = context.prepare_owned_write((ref,), ((LayoutFieldId(0),),))
+        context.arena.write_field(write, 0, LayoutFieldId(0)).copy_(value + 1)
+        context.publish_owned_write(write)
+    context.release_owned_pin(pin)
+
+
+def multistate(*, route=False, instance=True, failing=()):
+    """Bind heterogeneous state with optional route sharing and admission failure."""
+    arena = multistate_arena(route=route, instance=instance)
+
+    def initializer(name, value):
+        def initialize(roots, keys):
+            if name in failing:
+                raise RuntimeError("injected admission failure")
+            for root in roots:
+                for field in root:
+                    field.fill_(value)
+
+        return initialize
+
+    functions = FunctionMath(
+        {
+            str(state.resource): initializer(state.resource, value)
+            for state, value in zip(arena.plan.semantic_graph.states, (1, 10, 100))
+        },
+        lambda rows: rows,
+        lambda rows, batch: rows,
+        lambda rows, output: output.selection,
+    )
+    tasks = tuple(ResourceTask(task.implementation_id) for task in arena.plan.schedule_physical.tasks)
+    execution = MathBinding(functions, tasks).bind(arena, AnchorId(arena.plan.timeline.anchors[-1].ordinal))
+    return execution, tasks[0]
+
+
+def rows_for(*identities):
+    """Select one prefill row per request identity."""
+    return tuple(PackedPhaseRow(i, i, 0, HiddenPhase.PREFILL, identity) for i, identity in enumerate(identities))
+
+
+def assert_multistate_reclaimed(execution):
+    """Require retirement to reclaim every resource, inference pin and receipt."""
+    execution.arena.collect_completed(wait=True)
+    usage = execution.arena.usage()
+    assert execution.directory.active_count == execution.arena.active_lineages == 0
+    assert execution.directory.inference_pin_count == 0
+    assert usage.private_versions == usage.pinned_versions == usage.pending_receipts == 0

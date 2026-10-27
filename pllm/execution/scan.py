@@ -129,7 +129,7 @@ class ScanTemplate:
                     carry, over, invariants, _ = args
                     packed = tuple(t.new_empty((choice.window, self.chunk, *t.shape[1:])) for t in over)
                     choice = replace(choice, analysis=choice.analysis.batched((carry, *packed, *invariants), len(over)))
-                usage = measure(lambda: choice(*args))
+                usage = measure(lambda: choice(*args, tracing=True))
                 workspace = usage.workspace + scratch
                 if choice.analysis is not None and choice.analysis.kind == "diagonal":
                     # Pointwise HOP composition has two products and an addition per
