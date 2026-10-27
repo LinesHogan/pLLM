@@ -22,17 +22,27 @@ def _right_oracle(initial, values, keys, alpha, beta):
 
 def _check_right_matrix_graph(initial, values, keys):
     """Changing C reuses one captured window; reversed right actions fail the oracle."""
-    from pllm.kernels.right_matrix_scan import RightMatrixBuffers, launch_window as launch_right_window
+    from pllm.kernels.right_matrix_scan import MatrixPrefixBuffers, launch_prefix
 
     x = initial.new_zeros((8, 2, 4, 3))
     k = torch.zeros_like(x)
     active = torch.zeros(8, dtype=torch.bool, device=initial.device)
-    buffers = RightMatrixBuffers(initial, 8, 4)
-    launch_right_window(x, k, initial, active, buffers, 0.17, 0.83, ScanForm.HILLIS_STEELE)
+    buffers = MatrixPrefixBuffers(initial, 8)
+    output = initial.new_empty((8, 2, 4, 3))
+
+    def execute():
+        eye = torch.eye(3, device=initial.device)
+        mask = active[:, None, None, None]
+        buffers.a.copy_(torch.where(mask, 0.83 * (eye - 0.17 * (k.transpose(-1, -2) @ k)), eye))
+        buffers.b.copy_(torch.where(mask, 0.17 * (x.transpose(-1, -2) @ k), 0))
+        launch_prefix(initial, active, buffers, ScanForm.HILLIS_STEELE)
+        torch.bmm(x.flatten(0, 1), buffers.states[:-1].flatten(0, 1).transpose(1, 2), out=output.flatten(0, 1))
+
+    execute()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        launch_right_window(x, k, initial, active, buffers, 0.17, 0.83, ScanForm.HILLIS_STEELE)
-    storage = (x, k, active, buffers.a, buffers.b, buffers.states, buffers.final, buffers.output)
+        execute()
+    storage = (x, k, active, buffers.a, buffers.b, buffers.states, buffers.final, output)
     addresses = tuple(t.data_ptr() for t in storage)
     for count in (5, 0, 1, 3, 5):
         x.zero_()
@@ -44,7 +54,7 @@ def _check_right_matrix_graph(initial, values, keys):
         expected, outputs = _right_oracle(initial, values[:count], keys[:count], 0.83, 0.17)
         torch.testing.assert_close(buffers.final.double(), expected, rtol=2e-6, atol=2e-7)
         torch.testing.assert_close(
-            tuple(v.transpose(0, 1).double() for v in buffers.output[:count]), outputs, rtol=2e-6, atol=2e-7
+            tuple(v.transpose(0, 1).double() for v in output[:count]), outputs, rtol=2e-6, atol=2e-7
         )
         assert addresses == tuple(t.data_ptr() for t in storage)
     # The counted source's mask bank need not be a prefix: inactive actions are identities.

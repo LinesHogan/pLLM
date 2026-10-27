@@ -25,10 +25,6 @@ RULES: dict[str, frozenset[str]] = {
     "backends": frozenset({"authoring", "config", "contracts", "execution"}),
 }
 
-# One composition point chooses the default tensor compiler. Scheduling and
-# serialization may not reach model adapters or compiler implementations.
-DEFAULT_COMPILER_IMPORT = (Path("execution/tensor_compilation.py"), "pllm.backends.torch_inductor")
-
 
 def _scan_file(path: Path) -> list[str]:
     relative = path.relative_to(PKG_ROOT)
@@ -71,12 +67,7 @@ def _scan_file(path: Path) -> list[str]:
                     violations.append(
                         f"{path}:{node.lineno}: {importer} must use backend contracts instead of importing {target}"
                     )
-                if (
-                    len(parts) > 1
-                    and parts[0] == "pllm"
-                    and parts[1] not in allowed
-                    and (relative, target) != DEFAULT_COMPILER_IMPORT
-                ):
+                if len(parts) > 1 and parts[0] == "pllm" and parts[1] not in allowed:
                     violations.append(f"{path}:{node.lineno}: {importer} cannot import {target}")
                 if importer in ("contracts", "execution") and target.startswith("torch._inductor"):
                     violations.append(f"{path}:{node.lineno}: Inductor internals belong in the tensor compiler backend")

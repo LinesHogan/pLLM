@@ -22,14 +22,11 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.compile_facts import BackendCompileFacts
-from pllm.execution.paged_access import PagedLayer, PagedResourceView, bind_paged_access
-from pllm.execution.region_resources import HostResourceBinding, PagedResourceBinding, ReadonlyResourceBinding
 from pllm.execution.replay import (
     TokenwiseReplayPrimitive,
 )
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.step_input import TensorStepInput
-from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
 from pllm.workload_transport import decode_workload, encode_workload
 from pllm.workloads.recirculation import RecirculationWorkload
 
@@ -86,36 +83,6 @@ class Decoder(TokenwiseReplayPrimitive):
     @property
     def rows(self):
         return self.batch.rows
-
-    def bind_kv(self, resource, owner):
-        slots = torch.tensor([row.request_ordinal * self.cache.shape[2] + row.token_offset for row in self.rows])
-        layers = tuple(PagedLayer(str(i), self.cache[:, i].unsqueeze(1), slots) for i in range(self.cache.shape[1]))
-        plan = bind_paged_access(self.rows, layers)
-        return PagedResourceBinding(
-            PagedResourceView(resource, plan, tuple((i, str(i)) for i in range(len(layers)))), owner
-        )
-
-    def bind_weights(self, resource, owner):
-        # This oracle has scalar formulae rather than learned parameters.
-        cells = tuple(ReadonlyTensorCell.bind((i,), ()) for i in range(4))
-        return ReadonlyResourceBinding(ReadonlyTensorView(resource, cells), owner)
-
-    def bind_context(self, resource, owner):
-        decoder = self
-
-        class ContextView:
-            namespace = id(decoder)
-
-            def validate(self):
-                assert len(decoder.rows) <= self.resource.domain[0]
-
-            def check(self, mode, ranges):
-                self.validate()
-                assert len(ranges) == 1 and 0 <= ranges[0][0] <= ranges[0][1] <= len(decoder.rows)
-
-        view = ContextView()
-        view.resource = resource
-        return HostResourceBinding(view, owner)
 
     def layer(self, row, ordinal, positions, hidden, residual, kv="commit"):
         # A read-only final normalization can legally move after replay.

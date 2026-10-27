@@ -1,4 +1,4 @@
-"""Fixed-capacity additive prefix kernels used by the region executor and graph replay."""
+"""Fixed-capacity additive prefix kernels used by prepared scans and graph replay."""
 
 import torch
 import triton
@@ -92,28 +92,3 @@ def launch_prefix(
         block,
         enable_fp_fusion=False,  # pyright: ignore[reportCallIssue]
     )
-
-
-class AdditiveBuffers:
-    """Fixed window storage owned by one invocation or one future graph slot."""
-
-    def __init__(self, carry: torch.Tensor, window: int, chunk: int) -> None:
-        self.increments = carry.new_empty((window, *carry.shape))
-        self.weights = torch.empty_like(self.increments)
-        self.final = torch.empty_like(carry)
-        self.output = carry.new_empty((window, chunk, carry.shape[0]))
-
-
-def launch_window(
-    inputs: torch.Tensor,
-    targets: torch.Tensor,
-    carry: torch.Tensor,
-    active: torch.Tensor,
-    buffers: AdditiveBuffers,
-    scale: float,
-    form: ScanForm,
-) -> None:
-    """Run the whole window into stable buffers; staging and publication stay outside."""
-    torch.bmm(targets.transpose(1, 2), inputs, out=buffers.increments)
-    launch_prefix(buffers.increments, carry, active, buffers.weights, buffers.final, scale, form)
-    torch.bmm(inputs, buffers.weights.transpose(1, 2), out=buffers.output)

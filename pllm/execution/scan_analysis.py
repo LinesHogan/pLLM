@@ -57,6 +57,7 @@ class ScanAnalysis:
     readout: GraphModule
     orders: tuple[tuple[int, ...], ...] = ()
     scale: float = 1.0
+    copy_readout: bool = True
 
     def batched(self, samples: tuple[torch.Tensor, ...], sequences: int) -> "ScanAnalysis":
         """Lower vmap once on shape-only operands, preserving shared preprocessing nodes."""
@@ -72,7 +73,12 @@ class ScanAnalysis:
         _, _, *cuts = coefficients(*samples)
         states = samples[0].new_empty((samples[1].shape[0], *samples[0].shape))
         readout = make_fx(torch.func.vmap(self.readout))(states, *cuts)
-        return ScanAnalysis(self.kind, coefficients, readout, orders, self.scale)
+        result: torch.Tensor = readout(states, *cuts)
+        storage = result.untyped_storage()
+        copy = storage.nbytes() != result.numel() * result.element_size() or any(
+            storage == value.untyped_storage() for value in (states, *cuts)
+        )
+        return ScanAnalysis(self.kind, coefficients, readout, orders, self.scale, copy)
 
     def matrix_orders(self, sequences: int) -> tuple[tuple[int, ...], ...]:
         """Infer packing from independent transpose chains feeding matrix batch axes."""
@@ -387,8 +393,13 @@ class _Extract:
                 bias, scale = unscaled, float(bias.args[1])
         coefficient = linear.coefficient
         if isinstance(coefficient, float):
+            # Identity needs no coefficient payload or CUDA scalar fill.
             coefficient = self.call(
-                torch.ops.aten.full.default, [], coefficient, dtype=self.sample.dtype, device=self.sample.device
+                torch.ops.aten.full.default,
+                [0] if kind == "additive" else [],
+                coefficient,
+                dtype=self.sample.dtype,
+                device=self.sample.device,
             )
         self.graph.output((coefficient, bias, *cuts))
         self.graph.eliminate_dead_code()
@@ -402,6 +413,8 @@ def analyze(step: Callable[..., tuple[torch.Tensor, torch.Tensor]], specs: Specs
             torch.empty_strided(shape, stride, dtype=dtype, device=device) for shape, stride, dtype, device in specs
         )
         source = make_fx(lambda *args: step(*args), tracing_mode="fake")(*samples)
+        if any(value.requires_grad for value in (*source.parameters(), *source.buffers())):
+            return None
         for node in source.graph.nodes:
             if node.op == "call_function":
                 target = node.target

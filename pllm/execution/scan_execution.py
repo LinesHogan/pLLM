@@ -101,9 +101,11 @@ class PreparedScan:
                 index = torch.arange(self.window, device=carry.device) + start
                 active = (index < count) & ((index + 1) * self.chunk <= valid_rows)
             states, carry = self.prefix(carry, coefficient, bias, active)
-            readout = self.analysis.readout(states, *cuts)
-            outputs.extend(row.clone() for row in readout[:size].unbind())
-        return carry.clone(), tuple(outputs)
+            readout = self.analysis.readout(states, *cuts)[:size]
+            if self.analysis.copy_readout or size != self.window:
+                readout = readout.clone()
+            outputs.extend(readout.unbind())
+        return carry, tuple(outputs)
 
     def prefix(
         self, carry: torch.Tensor, coefficient: torch.Tensor, bias: torch.Tensor, active: torch.Tensor
@@ -114,14 +116,15 @@ class PreparedScan:
         if self.analysis.kind == "additive":
             states = carry.new_empty((self.window, *carry.shape))
             final = torch.empty_like(carry)
-            increments = bias.reshape(self.window, 1, -1)
+            matrix = carry.view(-1, carry.shape[-1] if carry.ndim else 1)
+            increments = bias.reshape(self.window, *matrix.shape)
             if not isinstance(carry, FakeTensor):
                 additive_prefix(
                     increments,
-                    carry.reshape(1, -1),
+                    matrix,
                     active,
-                    states.view(self.window, 1, -1),
-                    final.view(1, -1),
+                    states.view(self.window, *matrix.shape),
+                    final.view_as(matrix),
                     self.analysis.scale,
                     self.form,
                 )

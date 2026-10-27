@@ -15,8 +15,7 @@ pub(crate) enum TuningPolicy { Heuristic, Measured }
 pub(crate) struct Policy {
     pub allow_numerical_transforms: bool,
     pub schedule_policy: SchedulePolicy,
-    // Default keeps the reference without exploring the catalog; see the
-    // Python TensorPolicy contract for the constant-ranking argument.
+    // Heuristic ranks funded tensor paths; measured uses completed execution.
     pub tuning: TuningPolicy,
 }
 

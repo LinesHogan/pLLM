@@ -74,6 +74,11 @@ class ScanTemplate:
     ) -> None:
         self.context, self.step, self.specs = context, step, specs
         self.invariants, self.chunk, self.counted = invariants, chunk, counted
+        self.budget = context.payload_bytes
+        trace = MemoryTrace.active.get()
+        if self.budget is not None and trace is not None:
+            # Caller preprocessing shares the task's workspace ceiling.
+            self.budget -= trace.live
         self.maximum = (context.max_rows + chunk - 1) // chunk + 1
         sequences = specs[1 + invariants : -1] if counted else specs[1 + invariants :]
         self.analysis = (
@@ -116,7 +121,7 @@ class ScanTemplate:
                         continue
                 choices.append(PreparedScan(self.step, self.chunk, analysis, window, form))
         funded: list[PreparedScan] = []
-        with _disable_current_modes(), torch.inference_mode(False), FakeTensorMode():
+        with _disable_current_modes(), torch.inference_mode(False), FakeTensorMode(allow_non_fake_inputs=True):
             args = self.samples(capacity)
             scratch = torch.backends.cuda.cublas_workspace_size() + torch.backends.cuda.cublaslt_workspace_size()
             for choice in choices:
@@ -132,7 +137,7 @@ class ScanTemplate:
                     workspace += (
                         4 * choice.window.bit_length() * choice.window * args[0].numel() * args[0].element_size()
                     )
-                if self.context.payload_bytes is None or workspace <= self.context.payload_bytes:
+                if self.budget is None or workspace <= self.budget:
                     funded.append(replace(choice, workspace=workspace))
         if not funded:
             raise ValueError("increase the scan execution budget to fund its tensor and BLAS workspace")

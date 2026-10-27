@@ -1,19 +1,8 @@
 #!/usr/bin/env python3
-"""Fail-closed authority gate for the Region v1 production path.
+"""Check execution and native planning authority without workload-specific decisions.
 
-The Region executor is intentionally generic.  Workload names, task-level
-partitioning, compiler-policy selection, and executor-string grammars belong
-to the signed Rust decision or to leaf workload/backend adapters, never to the
-physical lowering path.  This checker scans only the small, production-owned
-surface listed below.  It deliberately excludes tests and compatibility
-adapters, where named fixtures are legitimate.
-
-Python files are checked on the AST: an attribute access, call, or name is a
-real use; comments and docstrings are documentation, not authority.  Rust
-files keep a line scan for consumer names (the production surface is small and
-the check is a substring guard, not a grammar).
-
-Usage: ``.venv/bin/python tools/check_region_authority.py``.
+Retained scheduler, ownership, sampler and worker rules cover the live Python/Rust
+boundaries. FX scan classification stays independent of workload identities.
 """
 
 from __future__ import annotations
@@ -33,48 +22,14 @@ AUTHORITY_FILES = (
     Path("pllm/execution/scan.py"),
     Path("pllm/execution/scan_analysis.py"),
     Path("pllm/execution/scan_execution.py"),
-    Path("pllm/execution/exported_region.py"),
-    Path("rust/pllm_core/src/planning/aer.rs"),
     Path("rust/pllm_core/src/planning/version_hazards.rs"),
     Path("rust/pllm_core/src/planning/state_representation.rs"),
     Path("rust/pllm_core/src/planning/scheduler.rs"),
-    Path("rust/pllm_core/src/planning/region_dependence.rs"),
-    Path("rust/pllm_core/src/planning/region_cache.rs"),
-    Path("rust/pllm_core/src/planning/region_ast.rs"),
-    Path("rust/pllm_core/src/planning/region_bindings.rs"),
-    Path("rust/pllm_core/src/planning/region_streams.rs"),
-    Path("rust/pllm_core/src/planning/region_control.rs"),
-    Path("rust/pllm_core/src/planning/tensor_access.rs"),
-    Path("rust/pllm_core/src/planning/region_storage.rs"),
-    Path("rust/pllm_core/src/planning/region_scratch.rs"),
-    Path("rust/pllm_core/src/planning/region_payload.rs"),
-    Path("rust/pllm_core/src/planning/region_capacity.rs"),
-    Path("rust/pllm_core/src/planning/region_imports.rs"),
-    Path("rust/pllm_core/src/planning/region_selection.rs"),
-    Path("rust/pllm_core/src/planning/region_tiling.rs"),
-    Path("rust/pllm_core/src/planning/region_outlining.rs"),
     Path("pllm/execution/replay.py"),
     Path("pllm/execution/execution.py"),
-    Path("pllm/execution/region_schedule.py"),
-    Path("pllm/execution/region_frame.py"),
-    Path("pllm/execution/region_streams.py"),
-    Path("pllm/execution/region_control.py"),
-    Path("pllm/execution/region_execution.py"),
-    Path("pllm/execution/region_resources.py"),
-    Path("pllm/execution/tensor_scan.py"),
-    Path("pllm/execution/region_native.py"),
-    Path("pllm/execution/tensor_access.py"),
-    Path("pllm/execution/region_storage.py"),
-    Path("pllm/execution/region_optimization.py"),
-    Path("pllm/execution/region_outlining.py"),
     Path("pllm/execution/module_graph.py"),
-    Path("pllm/execution/exported_resources.py"),
-    Path("pllm/execution/tensor_compilation.py"),
-    Path("pllm/execution/tensor_batching.py"),
-    Path("pllm/contracts/region_composition.py"),
     Path("pllm/execution/paged_access.py"),
     Path("pllm/execution/tensor_borrow.py"),
-    Path("pllm/execution/host_borrow.py"),
     Path("pllm/execution/state_execution.py"),
     Path("pllm/authoring.py"),
     Path("pllm/backends/vllm/runtime.py"),
@@ -98,12 +53,6 @@ NATIVE_BINDING_FILES = (
 PHYSICAL_FILES = frozenset(
     {
         Path("pllm/execution/execution.py"),
-        Path("pllm/execution/region_schedule.py"),
-        Path("pllm/execution/region_frame.py"),
-        Path("pllm/execution/region_streams.py"),
-        Path("pllm/execution/region_control.py"),
-        Path("pllm/execution/region_execution.py"),
-        Path("pllm/execution/region_resources.py"),
         Path("pllm/execution/state_execution.py"),
     }
 )
@@ -173,7 +122,6 @@ class _PythonAuthority(ast.NodeVisitor):
         self.prefix = "native binding" if self.native else "physical path"
         self.check_consumers = path in AUTHORITY_FILES
         self.check_redecision = physical or self.native
-        self.check_legacy = physical
         self.check_eager = physical
         self.check_sampler = path in SAMPLER_FILES
 
@@ -187,13 +135,13 @@ class _PythonAuthority(ast.NodeVisitor):
 
     def visit_Name(self, node: ast.Name) -> None:
         if self.check_consumers and _consumer_hit(node.id):
-            self._add(node, "consumer authority leaked into Region core")
+            self._add(node, "consumer authority leaked into execution core")
         if self.check_redecision and node.id in REFCOUNT_NAMES:
             self._add(node, f"{self.prefix} may not derive materialization refcounts")
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if self.check_consumers and (_consumer_hit(node.attr) or _attribute_on(node, ("consumers",), ("pllm",))):
-            self._add(node, "consumer authority leaked into Region core")
+            self._add(node, "consumer authority leaked into execution core")
         if self.check_redecision:
             if node.attr == "compile_safe":
                 self._add(node, f"{self.prefix} may not re-decide compile safety")
@@ -201,10 +149,6 @@ class _PythonAuthority(ast.NodeVisitor):
                 self._add(node, f"{self.prefix} may not read raw compile policy")
             if node.attr in REFCOUNT_NAMES:
                 self._add(node, f"{self.prefix} may not derive materialization refcounts")
-            if _attribute_on(node, ("tasks",), ("region", "execution_region")):
-                self._add(node, f"{self.prefix} may not inspect Region task membership")
-        if self.check_legacy and node.attr == "legacy_consumer":
-            self._add(node, "native Region path may not inspect legacy adapter ownership")
         if self.check_sampler and _attribute_on(node, ("config",), ("provider",)):
             self._add(node, "sampler bridge may not infer policy from workload config")
         self.generic_visit(node)
@@ -214,13 +158,6 @@ class _PythonAuthority(ast.NodeVisitor):
             node.func, ("split", "partition", "rsplit"), ("executor", "implementation_id")
         ):
             self._add(node, f"{self.prefix} may not parse executor strings")
-        if (
-            self.check_redecision
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "len"
-            and (len(node.args) == 1 and _attribute_on(node.args[0], ("consumer_regions",), ("binding",)))
-        ):
-            self._add(node, f"{self.prefix} may not derive materialization refcounts")
         if (
             self.check_sampler
             and isinstance(node.func, ast.Name)
@@ -238,7 +175,7 @@ class _PythonAuthority(ast.NodeVisitor):
 
     def visit_Constant(self, node: ast.Constant) -> None:
         if self.check_consumers and isinstance(node.value, str) and _consumer_hit(node.value):
-            self._add(node, "consumer authority leaked into Region core")
+            self._add(node, "consumer authority leaked into execution core")
 
     def visit_Try(self, node: ast.Try) -> None:
         if self.check_eager:
@@ -262,7 +199,7 @@ def _rust_violations(path: Path, source: str) -> list[Violation]:
     """Consumer-name scan over the production half of a Rust planning file."""
     production = source.split("#[cfg(test)]", 1)[0]
     return [
-        Violation(path, number, "consumer authority leaked into Region core", line)
+        Violation(path, number, "consumer authority leaked into execution core", line)
         for number, line in enumerate(production.splitlines(), start=1)
         if _consumer_hit(line)
     ]
@@ -288,9 +225,9 @@ def collect(root: Path = REPO_ROOT) -> list[Violation]:
 def main() -> int:
     violations = collect()
     if not violations:
-        print(f"OK Region authority gate ({len(AUTHORITY_FILES) + len(NATIVE_BINDING_FILES)} production files)")
+        print(f"OK Execution authority gate ({len(AUTHORITY_FILES) + len(NATIVE_BINDING_FILES)} production files)")
         return 0
-    print("FAIL Region authority gate:", file=sys.stderr)
+    print("FAIL Execution authority gate:", file=sys.stderr)
     for violation in violations:
         print(violation.format(), file=sys.stderr)
     return 1

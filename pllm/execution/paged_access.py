@@ -1,6 +1,6 @@
 """Bind causal logical accesses to borrowed paged KV tensors before any KV write.
 
-Used by the tokenwise replay backend and region resources. This is an
+Used by the tokenwise replay backend. This is an
 invocation's logical access record, not a page owner or a runtime scheduler.
 The backend must keep its cache and page tables stable until the invocation
 completes.
@@ -14,7 +14,6 @@ import torch
 
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.contracts.tensor_borrow import AccessMode, BorrowedResource
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,54 +39,6 @@ class PagedAccessPlan:
         paged = self.layers[layer]
         slot = paged.slots[row.packed_row_index : row.packed_row_index + 1].long()
         return slot // paged.cache.shape[2], slot % paged.cache.shape[2]
-
-
-@dataclass(frozen=True, slots=True)
-class PagedResourceView:
-    """A checked logical projection of the original paged access plan."""
-
-    resource: BorrowedResource
-    plan: PagedAccessPlan
-    layers: tuple[tuple[int, str], ...]
-
-    def __post_init__(self) -> None:
-        domain = self.resource.domain
-        if len(domain) != 3 or any(type(size) is not int or size < 1 for size in domain):
-            raise ValueError("paged resource requires request, layer and position domains")
-        ordinals = tuple(ordinal for ordinal, _ in self.layers)
-        names = tuple(name for _, name in self.layers)
-        if (
-            len(set(ordinals)) != len(ordinals)
-            or len(set(names)) != len(names)
-            or set(names) != set(self.plan.layers)
-            or any(type(ordinal) is not int or not 0 <= ordinal < domain[1] for ordinal in ordinals)
-        ):
-            raise ValueError("paged resource layer projection differs from its original plan")
-        if any(
-            not 0 <= request < domain[0] or not 0 <= first < end <= domain[2]
-            for (_, request), (first, end) in self.plan.ranges.items()
-        ):
-            raise ValueError("paged resource rows exceed the declared logical domain")
-
-    def check(self, mode: AccessMode, ranges: tuple[tuple[int, int], ...]) -> None:
-        if len(ranges) != 3 or type(mode) is not AccessMode:
-            raise ValueError("paged resource access requires three indexed dimensions and a mode")
-        if any(not 0 <= first <= end <= size for (first, end), size in zip(ranges, self.resource.domain, strict=True)):
-            raise ValueError("paged resource access exceeds its declared domain")
-        if any(first == end for first, end in ranges):
-            return
-        layers = dict(self.layers)
-        requests, ordinals, positions = ranges
-        for ordinal in range(*ordinals):
-            if ordinal not in layers:
-                raise ValueError("paged resource access names a layer outside its original proof")
-            for request in range(*requests):
-                interval = self.plan.ranges.get((layers[ordinal], request))
-                if interval is None:
-                    raise ValueError("paged resource access names a request outside its original proof")
-                first, end = interval
-                if not (0 if mode is AccessMode.READ else first) <= positions[0] <= positions[1] <= end:
-                    raise ValueError("paged resource access exceeds its original read/write interval")
 
 
 def bind_paged_access(rows: tuple[PackedPhaseRow, ...], layers: tuple[PagedLayer, ...]) -> PagedAccessPlan:

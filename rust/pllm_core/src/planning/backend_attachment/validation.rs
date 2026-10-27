@@ -197,11 +197,6 @@ fn validate_probe(probe: &BackendPlacementProbe) -> Result<(), String> {
     if probe.device_kind == StateDeviceKind::Cpu && probe.device_ordinal != 0 {
         return Err("CPU backend probe device ordinal must be zero".to_owned());
     }
-    if probe.capabilities.iter().any(|capability| capability == "execution/region_streams@1")
-        && (probe.device_kind != StateDeviceKind::Cuda || probe.graph_mode != AttachmentGraphMode::Eager)
-    {
-        return Err("region stream capability requires the original eager CUDA backend".into());
-    }
     if probe.tensor_parallel_size != 1
         || probe.pipeline_parallel_size != 1
         || probe.hidden_size == 0

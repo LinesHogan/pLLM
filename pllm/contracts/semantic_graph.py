@@ -150,7 +150,7 @@ class TaskImplementationSpec:
 
 @dataclass(frozen=True, slots=True)
 class TokenProgramEffect:
-    """A token program's model domain and selected rows; mathematics lives in its source region."""
+    """A token program's model domain and selected rows; mathematics lives in its traced source."""
 
     layer_count: int
     rows: Literal["prefill", "decode", "all"] = "all"

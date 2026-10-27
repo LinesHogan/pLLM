@@ -332,3 +332,64 @@ def test_counted_prefix_masks_nan_inf_and_keeps_exclusive_readouts(kind):
             reads.append(out)
         torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
         torch.testing.assert_close(outputs, tuple(reads), rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("device", ("cpu", "cuda"))
+def test_source_preserves_gradients_of_closed_parameters(device):
+    weight = torch.nn.Parameter(torch.eye(3, device=device))
+    state = torch.zeros(3, 3, device=device)
+    rows = torch.ones(9, 3, device=device)
+
+    def step(s, x):
+        return s + x @ weight, s
+
+    actual, outputs = scan(step, carry=state, over=(rows,), chunk=3)
+    gradient = torch.autograd.grad(actual.sum() + sum(t.sum() for t in outputs), weight)
+    expected, reads = state, []
+    for x in rows.split(3):
+        expected, output = step(expected, x)
+        reads.append(output)
+    wanted = torch.autograd.grad(expected.sum() + sum(t.sum() for t in reads), weight)
+    torch.testing.assert_close(gradient, wanted, rtol=0, atol=0)
+    with torch.no_grad():
+        assert analyze(step, specifications((state, rows[:3]))) is None
+        assert analyze(lambda s, x, w: (s + x @ w, s), specifications((state, rows[:3], weight))) is not None
+
+
+def test_prefix_outputs_own_disjoint_values_even_when_readout_returns_an_input():
+    def step(s, x):
+        return s + x[0], x
+
+    initial = torch.zeros(4, device="cuda")
+    rows = torch.ones(20, 4, device="cuda")
+    final, outputs = scan(step, carry=initial, over=(rows,), chunk=1)
+    outputs[0].fill_(17)
+    assert torch.equal(rows, torch.ones_like(rows))
+    assert all(torch.equal(output, torch.ones_like(output)) for output in outputs[1:])
+    assert (
+        sum(storage.nbytes() for storage in {output.untyped_storage() for output in outputs})
+        == rows.numel() * rows.element_size()
+    )
+    final.fill_(31)
+    assert not initial.any()
+
+
+def test_scan_funding_accounts_for_live_caller_temporaries():
+    from pllm.execution.memory import measure
+
+    def step(s, x):
+        return s + x[0], x + s
+
+    specs = specifications((torch.empty(4, device="meta"), torch.empty(1, 4, device="meta")))
+    policy = TensorPolicy(False)
+    device = torch.device("cuda")
+    bound = ScanContext(policy, 8, device).specialize(step, specs, 0, 1, 8).workspace
+
+    def prepare(budget):
+        live = torch.empty(16, device="meta")
+        plan = ScanContext(policy, 8, device, budget).specialize(step, specs, 0, 1, 8)
+        return live, plan
+
+    with pytest.raises(ValueError, match="budget"):
+        measure(lambda: prepare(bound + 511))
+    measure(lambda: prepare(bound + 512))

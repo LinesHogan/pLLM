@@ -9,7 +9,6 @@ ROOT = Path(__file__).resolve().parents[1]
 CODEC = ROOT / "pllm/execution/codec.py"
 CONTRACT_CODEC = ROOT / "pllm/contracts/codec.py"
 GRAPH_ADAPTER = ROOT / "pllm/execution/module_graph.py"
-COMPILER_ADAPTER = ROOT / "pllm/backends/torch_inductor.py"
 COLD_AUTHORING = {
     ROOT / "pllm/usage.py",
     ROOT / "pllm/execution/freeze.py",
@@ -31,9 +30,7 @@ def main() -> int:
         # Keep those checks at the graph import boundary, outside scheduling.
         # The shared contract codec is the sole dynamic schema adapter; source
         # contracts and semantic rules themselves retain the ordinary strict gate.
-        # Inductor lowering artifacts also expose dynamic upstream types;
-        # only this pinned backend inspects them, through a typed result ABI.
-        if path in (CODEC, CONTRACT_CODEC, GRAPH_ADAPTER, COMPILER_ADAPTER):
+        if path in (CODEC, CONTRACT_CODEC, GRAPH_ADAPTER):
             continue
         source = path.read_text()
         for node in ast.walk(ast.parse(source)):

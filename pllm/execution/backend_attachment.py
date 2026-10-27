@@ -116,7 +116,7 @@ def derive_attachment_resources(
     attachment: BackendAttachmentSpec | BackendAttachmentRequest | None = None,
     capture_memory_bytes: int = 0,
 ) -> SchedulerTimeline:
-    """Fund the tokenwise reference plan through the original AER workspace facts.
+    """Fund the tokenwise reference plan through its task and value resource facts.
 
     Preserve producer task/value facts when the model reads a publication.
     The adapter keeps embeddings and output concatenation in reserved_bytes;

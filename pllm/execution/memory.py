@@ -60,7 +60,7 @@ class MemoryTrace(TorchDispatchMode):
 
     @classmethod
     def reserve(cls, size: int) -> None:
-        """Include a region planner's recovery-lifetime bound at the call's live frontier."""
+        """Include an executable's opaque workspace at the call's live frontier."""
         trace = cls.active.get()
         if trace is not None:
             trace.peak = max(trace.peak, trace.live + size)

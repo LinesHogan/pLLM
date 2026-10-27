@@ -20,41 +20,8 @@ from pllm.backends.vllm.region_attention import (
     attention_paged_access,
     validate_attention_resources,
 )
-from pllm.contracts.region_composition import RegionFunctionBody, inline_function_bodies, inline_region
-from pllm.contracts.region_program import Block, Call, Constant, Function, Program, Region, ScalarType, Value
 from pllm.execution.token_program import TokenTensor
-from test.region_reference import interpret
 from test.state_fixtures import paged_rows
-
-
-def test_inlining_preserves_argument_aliases_duplicate_returns_and_fresh_names():
-    integer = ScalarType.INT
-    leaf = Program(
-        Region(Block((Value("x", integer),), (Constant((), (Value("one", integer),), 1),), ("x", "one", "one")))
-    )
-    declaration = Function("leaf", (integer,), (integer, integer, integer))
-    body = RegionFunctionBody(declaration, leaf)
-    caller = Program(
-        Region(
-            Block(
-                (Value("seed", integer), Value("body0_one", integer)),
-                (
-                    Call(("seed",), (Value("a", integer), Value("b", integer), Value("c", integer)), "leaf"),
-                    Call(("a",), (Value("d", integer), Value("e", integer), Value("f", integer)), "leaf"),
-                ),
-                ("a", "b", "c", "d", "e", "f", "body0_one"),
-            )
-        ),
-        (declaration,),
-    )
-    expanded = inline_function_bodies(caller, (body,))
-    assert interpret(expanded, {"seed": 7, "body0_one": 99}).values == (7, 1, 1, 7, 1, 1, 99)
-    # A body must match its declaration and may not capture undeclared values.
-    with pytest.raises(ValueError):
-        RegionFunctionBody(replace(declaration, outputs=(ScalarType.BOOL,)), leaf).validate()
-    invalid = replace(leaf, entry=Region(replace(leaf.entry.block, yields=("hidden",))))
-    with pytest.raises(ValueError):
-        inline_region(invalid, (Value("seed", integer),), "body")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="vLLM FlashAttention backend requires CUDA")

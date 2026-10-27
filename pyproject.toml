@@ -9,7 +9,7 @@ description = "Auxiliary-workload compiler middle-end for the vLLM inference eng
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
-license-files = ["LICENSE", "rust/vendor/isl-rs/LICENSE", "rust/vendor/isl-rs/isl/LICENSE", "rust/vendor/isl-rs/isl/imath/LICENSE"]
+license-files = ["LICENSE"]
 dependencies = [
     "cattrs>=25.3,<26",
     "torch>=2.13,<2.14",

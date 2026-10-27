@@ -109,7 +109,7 @@ _BACKEND_ABI_FIELDS = (
     "parameter=head_add_fp32/input_reconstruction@1",
     "activation=phase_windows/exact_step_pins/source_readonly@2",
     "model=causal_indexed_layer@5",
-    "region=closed_engine_windows@4/captured_tensor_sources",
+    "tensor=fx_affine_scan/aten_projection@1",
 )
 
 

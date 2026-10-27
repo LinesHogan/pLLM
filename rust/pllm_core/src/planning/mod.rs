@@ -2,26 +2,7 @@
 
 use pyo3::prelude::*;
 
-mod aer;
-mod region_program;
-mod region_cache;
-mod region_dependence;
-mod region_ast;
-mod region_control;
-mod region_bindings;
-mod region_streams;
-mod tensor_access;
-mod region_storage;
-mod region_scratch;
-mod region_payload;
-mod region_retention;
-mod region_imports;
-mod region_capacity;
-mod region_selection;
 mod tensor_policy;
-mod region_tiling;
-mod region_outlining;
-mod affine_scan;
 pub(crate) mod backend_attachment;
 pub(crate) mod scheduler;
 pub(crate) mod semantic_graph;
@@ -127,20 +108,6 @@ fn compile_state_schedule(
 }
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    region_program::register(module)?;
-    region_dependence::register(module)?;
-    region_ast::register(module)?;
-    region_bindings::register(module)?;
-    region_streams::register(module)?;
-    tensor_access::register(module)?;
-    region_storage::register(module)?;
-    region_retention::register(module)?;
-    region_payload::register(module)?;
-    region_capacity::register(module)?;
-    region_selection::register(module)?;
-    region_tiling::register(module)?;
-    region_outlining::register(module)?;
-    affine_scan::register(module)?;
     module.add_function(wrap_pyfunction!(semantic_graph::explain_state_visibility, module)?)?;
     module.add_function(wrap_pyfunction!(compile_state_schedule, module)?)?;
     module.add_function(wrap_pyfunction!(validate_plan_bundle, module)?)?;
