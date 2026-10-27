@@ -253,7 +253,7 @@ def test_unused_helpers_are_neither_signed_nor_frozen() -> None:
 )
 @pytest.mark.parametrize("overflow", ["drop", "block"])
 def test_export_queue_delivery_and_lifecycle(device, overflow) -> None:
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError
     from threading import Event
 
     entered, release, delivered = Event(), Event(), []
@@ -275,6 +275,7 @@ def test_export_queue_delivery_and_lifecycle(device, overflow) -> None:
         export=policy,
     )
     try:
+        torch.cuda._sleep(20_000_000) if device == "cuda" else None
         record(overflow)
         value.fill_(2)  # Same-stream reuse must follow the DtoH, including on CUDA.
         assert entered.wait(10)
@@ -286,8 +287,6 @@ def test_export_queue_delivery_and_lifecycle(device, overflow) -> None:
                     pending.result(10)
                     assert trace.snapshot().export_dropped == 1
                 else:
-                    from concurrent.futures import TimeoutError
-
                     with pytest.raises(TimeoutError):
                         pending.result(0.05)
                 assert trace.snapshot().dropped == 1
