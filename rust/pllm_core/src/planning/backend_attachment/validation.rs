@@ -743,8 +743,9 @@ pub(crate) fn validate_inputs(inputs: &AttachmentCompilerInputs) -> Result<(), S
         if inputs.probe.device_kind != StateDeviceKind::Cuda
             || !inputs.probe.capabilities.iter().any(|value| value == "backend/vllm_mrv2@1")
             || request.attachment_kind != AttachmentKind::ParameterOverlay
-            || plan.semantic_graph.states.iter().any(|state| state.scope != StateScope::Request)
-            || plan.semantic_graph.tasks.iter().any(|task| task.replay.is_some() || task.inputs.iter().any(|input| matches!(input.source, InputSource::Hidden { .. })))
+            || plan.semantic_graph.states.iter().any(|state|
+                plan.semantic_graph.model_reads.contains(&state.resource) && state.scope != StateScope::Request)
+            || plan.semantic_graph.tasks.iter().any(|task| task.replay.is_some())
         {
             return Err("Graph overlays need request-owned parameter reads without replay".into());
         }

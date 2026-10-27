@@ -1,13 +1,16 @@
 """Internal q/v projection oracle on Qwen2 for each independent state producer."""
 
 import time
+from dataclasses import replace
 
 import pytest
 import torch
 from vllm import SamplingParams
 
+from pllm.contracts.backend_attachment import AttachmentKind
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.semantic_graph import StateResource
+from pllm.execution.backend_attachment import compile_backend_attachment
 from pllm.execution.tensor_executor import TensorExecutor
 from pllm.workloads.state_producers import DecodeFactors, PromptFactors, PromptMixture
 from test.gpu.vllm_inplace_ttt_smoke import open_llm
@@ -147,3 +150,56 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
         )
 
     assert execution.diagnostics().active_lineages == 0
+
+
+@pytest.mark.parametrize("workload", [PromptFactors(), DecodeFactors()])
+def test_composed_readers_replay_model_graphs(workload, monkeypatch):
+    from pllm.execution.step_capture import StepCapture
+
+    results = []
+    for graphs in (False, True):
+        with open_llm(
+            workload, cuda_graphs=graphs, capture_memory_bytes=256 << 20, memory_budget_bytes=1 << 30
+        ) as handle:
+            if graphs:
+                inputs = handle.attachment.inputs
+                with pytest.raises(ValueError, match="Graph overlays"):
+                    compile_backend_attachment(
+                        replace(
+                            inputs, request=replace(inputs.request, attachment_kind=AttachmentKind.ACTIVATION_PATCH)
+                        )
+                    )
+                with pytest.raises(ValueError, match="Graph overlays"):
+                    compile_backend_attachment(
+                        replace(
+                            inputs,
+                            probe=replace(
+                                inputs.probe,
+                                capabilities=tuple(c for c in inputs.probe.capabilities if c != "backend/vllm_mrv2@1"),
+                            ),
+                        )
+                    )
+            runs = []
+            run = StepCapture.run
+
+            def record(capture, *args, **kwargs):
+                runs.append(capture)
+                return run(capture, *args, **kwargs)
+
+            with monkeypatch.context() as checks:
+                checks.setattr(StepCapture, "run", record)
+                outputs = handle.generate(
+                    ["Name a color.", "word " * 31],
+                    SamplingParams(max_tokens=5, temperature=0, ignore_eos=True, logprobs=1),
+                )
+                assert runs
+                checks.setattr(TensorExecutor, "_body", lambda *args: pytest.fail("producer body after warmup"))
+                outputs += handle.generate(
+                    ["word " * 31, "Name a color."],
+                    SamplingParams(max_tokens=5, temperature=0, ignore_eos=True, logprobs=1),
+                )
+            results.append([(o.outputs[0].token_ids, o.outputs[0].cumulative_logprob) for o in outputs])
+            assert handle.diagnostics().fallback_count == 0
+    assert [tokens for tokens, _ in results[0]] == [tokens for tokens, _ in results[1]]
+    # vLLM's fused graph kernels and eager BF16 kernels round differently.
+    assert [score for _, score in results[0]] == pytest.approx([score for _, score in results[1]], abs=0.1)
