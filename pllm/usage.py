@@ -1642,7 +1642,16 @@ class Workload(
         self, facts: BackendCompileFacts, plan: PlanBundle, b: TensorBinding
     ) -> MathBinding[TensorStepInput, TensorFrame, TensorOutput]:
         if plan.timeline.task_resources and type(self).operations is Workload.operations:
-            b.configure_steps(facts, "compute/cuda_graph@1" in plan.timeline.capabilities)
+            b.configure_steps(facts)
+            _reject(
+                any(
+                    task.lane == "side"
+                    and plan.semantic_graph.tasks[task.task_id].symbol in b.tensor_tasks
+                    and not b.operations[plan.semantic_graph.tasks[task.task_id].symbol].resident(1)
+                    for task in plan.schedule_physical.tasks
+                ),
+                "side tensor tasks need fixed row inputs; declare row inputs or move the task before the model",
+            )
         return MathBinding(
             self._functions(b, facts.device, facts.initialization_seed),
             b.bind_all(plan, model_probe=facts.probe),

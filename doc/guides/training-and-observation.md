@@ -141,8 +141,9 @@ fresh = llm.trace_snapshot().events[max(0, cursor - snapshot.dropped):]
 
 ### Capture an ordinary tensor step
 
-`ExecutionOptions(capture=True)` captures ordinary CUDA prediction and AdamW training
-methods. ESamp uses this framework path. A training graph contains parameter gathering,
+CUDA backends automatically capture ordinary row-wise prediction, AdamW training,
+computed field writes, and imports. ESamp uses this framework path; there is no task
+capture switch. The model's `cuda_graphs` setting remains independent. A training graph contains parameter gathering,
 the Python method's tensor operations, loss reduction, autograd, memory writes, and the
 optimizer. The CPU still allocates private versions and publishes them through PTTS.
 AdamW reads source slots and writes destination slots, so the five optimizer fields need
@@ -155,8 +156,9 @@ or mix rows with batch normalization, attention, or another cross-row operation.
 framework gives padding zero weight and a sink parameter row that is never optimized.
 Shared instance parameters use one live state; request parameters use the admitted state
 bound. Eager execution uses the same step body with the invocation's actual dimensions.
-Legacy scalar losses and data-dependent update/forward selections remain available with
-`capture=False`; dynamic training selections are rejected when capture is requested.
+CPU execution retains compact training for scalar losses and dynamic selections.
+Tasks with dynamic training selection remain on the main lane with compact rows.
+Captured training requires one loss per row.
 
 One pinned int64 table carries row indices, masks, counts, last-row memory indices and
 source/destination page slots. Hidden reads address the fixed backend tap buffers inside
@@ -166,8 +168,17 @@ loss/gradient outputs are copied out before a later replay can overwrite them.
 
 The first invocation warms up on a side stream and captures into a private graph pool.
 `capture_memory_bytes` reserves resident memory **per task**; the captured pool and index
-table are checked against that reservation. Replacing hidden buffer storage starts a new
+table and owned import/write staging buffers are checked against that reservation.
+Import-only store graphs allocate no tensors during replay and reserve their exact
+fixed storage, up to this limit. Replacing hidden buffer storage starts a new
 cold capture. Subsequent invocations with fixed tap buffers perform no host-device wait.
+
+Each resource has its own source slots and row selection in the table. Only completed
+prompt rows publish prefill-produced fields. All tuple outputs are retained, and changing
+import allocations are copied into fixed staging before replay. External imports are
+checked for finite values at intake. Computed writes check finiteness inside the graph;
+a nonfinite CUDA result fails the worker, rather than raising a recoverable Python
+validation error. Private stores are disabled during warmup and capture.
 
 OutputLoRA still uses its native `KernelCapture` implementation. Its staged loss/update
 binding and the corresponding page-capture API remain until that workload is migrated.

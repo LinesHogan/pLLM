@@ -14,7 +14,6 @@ def main() -> None:
         ESampRequestWorkload(ESampRequestConfig(rank=4, intervention_beta=args.beta)),
         options,
         training_rows=1,
-        capture=True,
         require_training=True,
     )
 

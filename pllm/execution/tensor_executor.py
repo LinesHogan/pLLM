@@ -12,7 +12,7 @@ import numpy.typing as npt
 import torch
 
 from pllm.contracts.parameter_overlay import FieldView
-from pllm.contracts.semantic_graph import HiddenInputSource, TaskSymbol
+from pllm.contracts.semantic_graph import HiddenInputSource, StateResource, StateSelectionInputSource, TaskSymbol
 from pllm.execution.cuda_stream import PinnedStaging
 from pllm.execution.state_execution import StateTaskContext
 from pllm.execution.step_capture import StepCapture
@@ -30,14 +30,14 @@ from pllm.execution.tensor_frame import (
 )
 from pllm.execution.tensor_program import PageUpdate, TaskOutput, TensorBatch
 from pllm.execution.tensor_task import TensorTask
-from pllm.kernels.page_copy import gather_rows
+from pllm.kernels.page_copy import copy_pages, gather_rows
 
 Table = TypeVar("Table", torch.Tensor, npt.NDArray[np.int64])
 
 
 @dataclass(frozen=True, slots=True)
 class TableLayout:
-    """Segments of a step's int64 index table, uploaded to the GPU in one copy per step.
+    """One resource's segments in the shared int64 table, uploaded in one copy per step.
 
     rows          [6, R]   per row: packed hidden row, sampler row, sample index, state, version, weight
     counts        [S + 1]  rows per state; index S is the padding sink
@@ -93,7 +93,7 @@ class TensorExecutor:
     device: torch.device = torch.device("cpu")
     table: torch.Tensor | None = None
     pools: tuple[torch.Tensor, ...] = ()
-    result: torch.Tensor | None = None
+    results: tuple[torch.Tensor, ...] = ()
     gradients: torch.Tensor | None = None
     inputs: dict[str, torch.Tensor] = dataclass_field(default_factory=lambda: dict[str, torch.Tensor]())
     evaluated_rows: tuple[int, ...] = ()
@@ -108,6 +108,12 @@ class TensorExecutor:
     read_fields: frozenset[int] = frozenset()
     feedback_names: tuple[str, ...] = ()
     feedback_values: tuple[torch.Tensor, ...] = ()
+    resource_pools: dict[StateResource, tuple[torch.Tensor, ...]] = dataclass_field(
+        default_factory=lambda: dict[StateResource, tuple[torch.Tensor, ...]]()
+    )
+    layouts: dict[StateResource, TableLayout] = dataclass_field(
+        default_factory=lambda: dict[StateResource, TableLayout]()
+    )
     staging: PinnedStaging = dataclass_field(default_factory=PinnedStaging)
 
     def __post_init__(self) -> None:
@@ -140,12 +146,11 @@ class TensorExecutor:
     def layout(self) -> TableLayout:
         return TableLayout(self.rows, self.state_count, len(self.pools), len(self.feedback_names))
 
-    def _fill(self, host: npt.NDArray[np.int64], plan: RowPlan) -> None:
+    def _fill(self, host: npt.NDArray[np.int64], plan: RowPlan, layout: TableLayout) -> None:
         """Stage a RowPlan and feedback addresses into the zeroed fixed table."""
-        layout = self.layout
         rows, counts, last, sources, destinations, feedback = layout.split(host)
         count = len(plan.packed)
-        if self.feedback_names and -1 in plan.sampler:
+        if layout.feedback and -1 in plan.sampler:
             raise ValueError("sampler feedback must cover every operation row")
         rows[3] = layout.states
         rows[:5, :count] = plan.columns
@@ -160,34 +165,64 @@ class TensorExecutor:
         if plan.writes is not None:
             updated, slots = plan.writes
             destinations[:, list(updated)] = slots.T
-        for row, value in zip(feedback, self.feedback_values, strict=True):
+        if self.task.writer is not None:
+            last[list(self.updated)] = np.arange(len(self.updated))
+        for row, value in zip(feedback, self.feedback_values[: layout.feedback], strict=True):
             row[:] = (value.data_ptr(), value.stride(0), value.stride(1) if value.ndim > 1 else 1)
 
     def _views(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         assert self.table is not None
-        rows, counts, _, sources, destinations, _ = self.layout.split(self.table)
+        rows, counts, _, sources, destinations, _ = self.layout.split(self.table[: self.layout.size])
         return rows, counts, sources, destinations
 
     def _feedback(self, rows: torch.Tensor) -> dict[str, torch.Tensor]:
         assert self.table is not None
-        locations = self.layout.split(self.table)[5]
+        locations = self.layout.split(self.table[: self.layout.size])[5]
         return {
             name: gather_rows(location, rows, value)
             for name, location, value in zip(self.feedback_names, locations, self.feedback_values, strict=True)
         }
 
     def _frame(self, data: TensorFrame, batch: TensorBatch) -> tuple[TensorFrame, TensorBatch]:
-        columns, counts, sources, _ = self._views()
+        frames: dict[StateResource, TensorFrame] = {}
+        batches: dict[StateResource, TensorBatch] = {}
+        assert self.table is not None
+        offset = 0
+        for resource, layout in self.layouts.items():
+            selected = batch.for_resource(resource) if resource else batch
+            frames[resource], batches[resource] = self._resource_frame(
+                data, selected, layout, self.table[offset : offset + layout.size], self.resource_pools[resource]
+            )
+            offset += layout.size
+        frame = frames[self.task.resource]
+        frame.resource_frames = {resource: item for resource, item in frames.items() if item is not frame}
+        return frame, replace(batches[self.task.resource], select_resource=batches.__getitem__)
+
+    def _resource_frame(
+        self,
+        data: TensorFrame,
+        batch: TensorBatch,
+        layout: TableLayout,
+        table: torch.Tensor,
+        pools: tuple[torch.Tensor, ...],
+    ) -> tuple[TensorFrame, TensorBatch]:
+        columns, counts, _, sources, _, _ = layout.split(table)
         reads = self.read_fields
         if self.optimizer is not None and (self.device.type == "cpu" or self.pools[0].dtype != torch.float32):
             reads = reads | frozenset(range(5))
+        instance = batch.selection.keys == (None,)
+        # A single-page instance has no alternate slot; borrow its pool instead of copying the network.
         fields = tuple(
-            pool.index_select(0, slots.clamp_min(0)).masked_fill(
-                (slots < 0).reshape(-1, *(1 for _ in pool.shape[1:])), 0
+            (
+                (pool if len(pool) == 1 else pool.index_select(0, slots[:1]))
+                if instance
+                else pool.index_select(0, slots.clamp_min(0)).masked_fill(
+                    (slots < 0).reshape(-1, *(1 for _ in pool.shape[1:])), 0
+                )
             )
             if field in reads
-            else pool.new_empty((self.state_count + 1, 0))
-            for field, (pool, slots) in enumerate(zip(self.pools, sources, strict=True))
+            else pool.new_empty((layout.states + 1, 0))
+            for field, (pool, slots) in enumerate(zip(pools, sources, strict=True))
         )
         frame = replace(
             data,
@@ -209,20 +244,36 @@ class TensorExecutor:
         return frame, batch
 
     def resident(self, capture_bytes: int) -> int:
-        """Only the graph runner owns capture residency."""
-        return capture_bytes if self.capture is not None else 0
+        """Reserve graph residency; import stores need only their fixed table and inputs."""
+        if self.capture is None:
+            return 0
+        if self.task.writer is not None and self.task.writer.source is None:
+            # Import graphs only store into pages: every allocation is in the table and staging.
+            assert self.table is not None
+            return min(
+                capture_bytes, sum(value.untyped_storage().nbytes() for value in (self.table, *self.inputs.values()))
+            )
+        return capture_bytes
 
     def _body(self, data: TensorFrame, batch: TensorBatch) -> None:
+        if self.task.writer is not None:
+            assert self.table is not None
+            _, _, last, _, destinations, _ = self.layout.split(self.table[: self.layout.size])
+            for view, value in zip(self.task.writer.fields, self.inputs.values(), strict=True):
+                if self.task.writer.source is not None:
+                    torch._assert_async(torch.isfinite(value).all(), "computed fields must be finite")  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
+                copy_pages(value, view.read(self.pools[view.field], pooled=True), last, destinations[view.field])
+            return
         frame, operands = (data, batch) if self.compact else self._frame(data, batch)
         self.evaluated_rows = tuple(range(len(frame.rows)))
-        self.result = self.gradients = None
+        self.results, self.gradients = (), None
         self.input_gradients = {}
         if not self.compact:
             for dependency in self.task.dependencies(self.tasks)[:-1]:
                 dependency.evaluate(frame, operands)
         if self.optimizer is None:
             self.task.evaluate(frame, operands)
-            self.result = operands.results[self.task.symbol, self.task.outputs[0]]
+            self.results = tuple(operands.results[self.task.symbol, name] for name in self.task.outputs)
             return
         with torch.enable_grad():
             self.inputs, self.evaluated_rows = self.task.read(frame, operands, compact=self.compact)
@@ -234,8 +285,8 @@ class TensorExecutor:
                 )
                 self.updated = tuple(sorted(row_plan(data, batch).select(selected).last))
             if self.evaluated_rows:
-                self.result, derivatives = self.task.differentiate(self.inputs, self.evaluated_rows, frame, operands)
-                self.result = self.result.detach()
+                result, derivatives = self.task.differentiate(self.inputs, self.evaluated_rows, frame, operands)
+                self.results = (result.detach(),)
                 self.input_gradients = dict(
                     zip(frame.derivative_sources, (value.detach() for value in derivatives[1:]), strict=True)
                 )
@@ -245,7 +296,7 @@ class TensorExecutor:
         if not self.compact:
             self.gradients = self.gradients[: self.state_count].contiguous()
             assert self.table is not None
-            _, _, last, sources, destinations, _ = self.layout.split(self.table)
+            _, _, last, sources, destinations, _ = self.layout.split(self.table[: self.layout.size])
             self.optimizer.staged(
                 self.pools,
                 frame.fields,
@@ -266,6 +317,11 @@ class TensorExecutor:
     ) -> TaskOutput:
         """Prepare operands, run the shared body or graph, then settle invocation outputs."""
         parent, frame = batch, data
+        writer = self.task.writer
+        selected = () if writer is None else writer.select(data, batch.selection)
+        if writer is not None and not selected:
+            return TaskOutput()
+        values = () if writer is None else writer.values(data, batch, selected, validate=context is None)
         if self.task.resource and any(group.resource == self.task.resource for group in batch.selection.groups):
             batch = batch.for_resource(self.task.resource)
         eligible = set(data.rows) if self.task.phase is None else set(data.step.rows.producer_rows(self.task.phase))
@@ -276,14 +332,25 @@ class TensorExecutor:
             return TaskOutput()
         addresses: tuple[int, ...] = ()
         if not self.compact:
-            if not data.rows:
+            if not data.rows and writer is None:
                 return TaskOutput()
             addresses = self._inputs(data, batch)
             plan = row_plan(data, batch)
-            self.updated = tuple(sorted(plan.last)) if self.optimizer is not None else ()
-            if context is not None and self.optimizer is not None:
+            self.updated = (
+                tuple(batch.selection.refs.index(parent.selection.refs[i]) for i in selected)
+                if writer is not None
+                else tuple(sorted(plan.last))
+                if self.optimizer is not None
+                else ()
+            )
+            for index, value in enumerate(values):
+                key = str(index)
+                if key not in self.inputs:
+                    self.inputs[key] = value.new_zeros((self.state_count, *value.shape[1:]))
+                self.inputs[key][: len(value)].copy_(value.detach())
+            if context is not None and (self.optimizer is not None or writer is not None):
                 context.write = context.arena.prepare_transition(
-                    batch.selection.refs.take(self.updated), batch.stream, copy_fields=()
+                    batch.selection.refs.take(self.updated), batch.stream, copy_fields=() if writer is None else None
                 )
                 write = context.write
                 plan = replace(
@@ -291,9 +358,11 @@ class TensorExecutor:
                     writes=(self.updated, context.arena.slots((write,) * len(write.after_refs), write.after_refs)[1]),
                 )
             if context is None:
-                self.table = torch.empty(self.layout.size, device="meta", dtype=torch.long)
+                self.table = torch.empty(
+                    sum(layout.size for layout in self.layouts.values()), device="meta", dtype=torch.long
+                )
             else:
-                self._prepare(plan)
+                self._prepare(plan, data, batch)
         if self.capture is None or context is None:
             self._body(data, batch)
         else:
@@ -306,6 +375,7 @@ class TensorExecutor:
                 addresses,
                 batch.stream,
                 lambda: self.staging.copy_to(table),
+                buffers=tuple(self.inputs.values()) if writer is not None else (),
             )
         output = self.settle_rows(data, batch)
         frame.parameter_gradient_fields = data.parameter_gradient_fields
@@ -320,12 +390,40 @@ class TensorExecutor:
 
     def _inputs(self, data: TensorFrame, batch: TensorBatch) -> tuple[int, ...]:
         self.active_rows, self.active_states = len(data.rows), len(batch.roots)
-        if not self.pools and batch.roots:
-            self.pools = tuple(batch.field_slots(i)[0] for i in range(len(batch.roots[0])))
+        if not self.resource_pools or self.capture is None:
+            resources = dict.fromkeys(
+                (
+                    self.task.resource,
+                    *(
+                        source.resource
+                        for task in self.task.dependencies(self.tasks)
+                        for source in task.sources.values()
+                        if isinstance(source, StateSelectionInputSource)
+                    ),
+                )
+            )
+            for resource in resources:
+                selected = batch.for_resource(resource) if resource else batch
+                pools = (
+                    tuple(selected.field_slots(i)[0] for i in range(len(selected.roots[0]))) if selected.roots else ()
+                )
+                states = (
+                    self.state_count
+                    if resource == self.task.resource
+                    else (1 if selected.selection.keys == (None,) else self.rows)
+                    if self.capture
+                    else len(selected.roots)
+                )
+                self.resource_pools[resource] = pools
+                self.layouts[resource] = TableLayout(
+                    self.rows, states, len(pools), len(self.feedback_names) if resource == self.task.resource else 0
+                )
+            self.pools = self.resource_pools[self.task.resource]
         snapshots = () if data.step.hidden is None else data.step.hidden_batch(batch.stream).snapshots
         addresses = tuple(item.hidden.data_ptr() for item in snapshots)
         if self.hidden_inputs is None or self.addresses != addresses:
             self.hidden_inputs = {item.resource.locator_key: item.storage for item in snapshots}
+        self.addresses = addresses
         if self.feedback_names:
             assert batch.feedback is not None
             self.feedback_values = tuple(
@@ -337,29 +435,39 @@ class TensorExecutor:
                     value.record_stream(batch.stream)
         return addresses
 
-    def _prepare(self, plan: RowPlan) -> None:
+    def _prepare(self, plan: RowPlan, data: TensorFrame, batch: TensorBatch) -> None:
         device = next(iter(self.hidden_inputs.values())).device if self.hidden_inputs else self.pools[0].device
-        size = self.layout.size
+        size = sum(layout.size for layout in self.layouts.values())
         if self.table is None or self.table.numel() != size:
             self.table = torch.empty(size, dtype=torch.long, device=device)
+        host = self.staging.take(size).numpy() if device.type == "cuda" else self.table.numpy()
+        host.fill(0)
+        offset = 0
+        for resource, layout in self.layouts.items():
+            selected = plan if resource == self.task.resource else RowPlan.build(data, batch.for_resource(resource))
+            self._fill(host[offset : offset + layout.size], selected, layout)
+            offset += layout.size
         if device.type == "cuda":
-            self._fill(self.staging.take(size).numpy(), plan)
             self.staging.copy_to(self.table)
-        else:
-            self.table.zero_()
-            self._fill(self.table.numpy(), plan)
 
     def settle_rows(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
         """Record gradients, losses and observations once for both evaluation strategies."""
+        if self.task.writer is not None:
+            return TaskOutput(changed=self.updated, update_count=len(self.updated))
         rows = self.evaluated_rows if self.compact else tuple(range(len(data.rows)))
         count = (
             len(batch.roots)
             if self.optimizer is not None and self.task.policy.reduction == "state_mean"
             else len(data.rows)
         )
-        value = None if self.result is None else retain_rows(self.result, count, copy=not self.compact)
-        if value is not None:
-            batch.results[self.task.symbol, self.task.outputs[0]] = value
+        values = tuple(
+            result
+            if self.compact
+            else retain_rows(result, count, copy=self.capture is not None or not self.task.differentiable)
+            for result in self.results
+        )
+        batch.results.update(((self.task.symbol, name), value) for name, value in zip(self.task.outputs, values))
+        value = values[0] if values else None
         if self.optimizer is None:
             return TaskOutput()
         assert self.gradients is not None
@@ -409,4 +517,5 @@ class TensorExecutor:
 
 def retain_rows(value: torch.Tensor, count: int, *, copy: bool) -> torch.Tensor:
     """Own graph outputs; ordinary eager results retain their autograd edges."""
-    return (value[:count] if value.ndim else value).detach().clone() if copy else value
+    value = value[:count] if value.ndim else value
+    return value.detach().clone() if copy else value

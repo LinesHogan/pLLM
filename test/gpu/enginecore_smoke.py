@@ -229,7 +229,7 @@ def _graph_overlay(*, exact: bool = False) -> None:
 
 def _captured_esamp(runner: RunnerKind = RunnerKind.MRV2) -> None:
     assert not torch.cuda.is_initialized()
-    options = ExecutionOptions(capture=True, capture_memory_bytes=16 * 1024**2)
+    options = ExecutionOptions(capture_memory_bytes=16 * 1024**2)
     handle = pllm.make_llm(
         workload=ESampRequestWorkload(ESampRequestConfig(rank=2)),
         config=engine(runner=runner, execution=options),
@@ -362,7 +362,7 @@ def _independent_lora_input() -> None:
     workload = OutputLoRAWorkload(
         OutputLoRAConfig(rank=2, learning_rate=10.0, steps=2, seed=7, scope=StateScope.REQUEST)
     )
-    handle = pllm.make_llm(workload=workload, config=engine(execution=ExecutionOptions(capture=True)))
+    handle = pllm.make_llm(workload=workload, config=engine(execution=ExecutionOptions()))
     try:
         # Default lag 1 makes the first decode update visible on the fourth draw.
         sampling = greedy(4, logprobs=1)

@@ -124,7 +124,6 @@ class BenchmarkOptions:
 @dataclass(frozen=True, slots=True)
 class BenchmarkResult:
     implementation: str
-    captured: bool
     cold_seconds: float
     round_seconds: tuple[float, ...]
     output_tokens: int
@@ -172,7 +171,6 @@ class _Requests:
 class _Arm(Generic[D, R]):
     name: str
     workload: BackendWorkload[D, R]
-    captured: bool
     explicit: bool
 
 
@@ -240,7 +238,6 @@ def _measure_arm(
     config = replace(
         options.model_config(),
         execution=ExecutionOptions(
-            arm.captured,
             setup.training_rows,
             capture_memory_bytes=options.capture_memory_bytes,
             explicit_math=arm.explicit,
@@ -272,7 +269,6 @@ def _measure_arm(
         plan = handle.attachment.inputs.plan
         report = BenchmarkResult(
             arm.name,
-            arm.captured,
             cold,
             elapsed,
             tokens,
@@ -372,10 +368,9 @@ def compare(
     prepare: Callable[[VllmLlm[D, R]], AuxiliaryInput[torch.Tensor]] | None = None,
     training_rows: int = 1,
     explicit_math: bool = False,
-    capture: bool = False,
     require_training: bool = False,
     prompt_indices: tuple[int, ...] | None = None,
-    alternatives: tuple[tuple[str, BackendWorkload[D, R], bool], ...] = (),
+    alternatives: tuple[tuple[str, BackendWorkload[D, R]], ...] = (),
 ) -> tuple[BenchmarkResult, ...]:
     """Measure ordinary model workloads; optimized arms and nonzero training are opt-in."""
     indices = tuple(range(options.batch)) if prompt_indices is None else prompt_indices
@@ -409,10 +404,9 @@ def compare(
         )
     )
     arms = (
-        _Arm("tensor", workload, False, False),
-        *((_Arm("tensor_explicit", workload, False, True),) if explicit_math else ()),
-        *((_Arm("tensor_capture", workload, True, False),) if capture else ()),
-        *(_Arm(name, implementation, captured, False) for name, implementation, captured in alternatives),
+        _Arm("tensor", workload, False),
+        *((_Arm("tensor_explicit", workload, True),) if explicit_math else ()),
+        *(_Arm(name, implementation, False) for name, implementation in alternatives),
     )
     if len({arm.name for arm in arms}) != len(arms):
         raise ValueError("benchmark implementation labels must be distinct")

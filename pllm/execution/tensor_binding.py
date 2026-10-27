@@ -108,19 +108,13 @@ class TensorBinding(ModelEffectBinding, RowTaskBinding):
             )
             self.operations[symbol] = replace(operation, body=scans.bind(operation.body))
 
-    def configure_steps(self, facts: BackendCompileFacts, capture: bool) -> None:
+    def configure_steps(self, facts: BackendCompileFacts) -> None:
         """Select the same tensor step for planning and execution."""
-        composed = len(self.graph.states) > 1 or any(
-            task.phase is HiddenPhase.PREFILL or len(task.outputs) > 1 for task in self.tensor_tasks.values()
-        )
-        if composed:
-            if capture:
-                raise ValueError("composed state producers currently need eager tensor execution")
-            return
+        capture = "compute/cuda_graph@1" in facts.timeline.capabilities
         captured = {
             symbol: task
             for symbol, task in self.tensor_tasks.items()
-            if reads_rows(task, self.tensor_tasks) and symbol not in self.exports
+            if (task.writer is not None or reads_rows(task, self.tensor_tasks)) and symbol not in self.exports
         }
         conditional = any(
             task.policy.update_states in task.domains
@@ -128,13 +122,8 @@ class TensorBinding(ModelEffectBinding, RowTaskBinding):
             for symbol, task in captured.items()
         )
         if conditional:
-            if capture:
-                raise ValueError("step capture needs row-wise independent training without dynamic update selection")
             return
         limits = {fact.task: fact for fact in self.resources}
-        states = (
-            facts.max_admitted_lineages if any(state.scope is StateScope.REQUEST for state in self.graph.states) else 1
-        )
         for symbol, task in captured.items():
             operation = self.operations[symbol]
             optimizer = operation.optimizer
@@ -144,7 +133,17 @@ class TensorBinding(ModelEffectBinding, RowTaskBinding):
                 self.tensor_tasks,
                 optimizer,
                 compact=False,
-                capture=StepCapture(limits[symbol], states) if capture else None,
+                capture=StepCapture(
+                    limits[symbol],
+                    facts.max_admitted_lineages
+                    if any(
+                        state.resource == task.resource and state.scope is StateScope.REQUEST
+                        for state in self.graph.states
+                    )
+                    else 1,
+                )
+                if capture
+                else None,
                 device=facts.device,
             )
             self.operations[symbol] = replace(operation, body=executor, capture_resident=executor.resident)

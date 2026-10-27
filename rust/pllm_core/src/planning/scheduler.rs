@@ -251,11 +251,11 @@ struct ValueUse {
 struct Solution { tasks: Vec<PhysicalTask>, peak: u64 }
 
 fn place(graph: &SemanticGraph, timeline: &Timeline, index: &GraphIndex,
-         state: Option<&StatePhysicalPlan>) -> Result<Solution, String> {
+         state: Option<&StatePhysicalPlan>, implementations: &[&ImplementationCandidate]) -> Result<Solution, String> {
     let mut order = index.order.clone();
     order.sort_by_key(|&id| index.windows[id].0);
     let mut tasks: Vec<_> = order.into_iter().map(|id| PhysicalTask {
-        task_id: id as u32, implementation_id: String::new(),
+        task_id: id as u32, implementation_id: implementations[id].implementation_id.clone(),
         anchor_id: index.windows[id].0, release_values: Vec::new(),
         lane: Lane::Main, read_origin: ReadOrigin::Entry, read_distance: 0,
         earliest: index.windows[id].0, deadline: index.windows[id].1 - 1,
@@ -291,8 +291,14 @@ fn select_lanes(graph: &SemanticGraph, timeline: &Timeline, tasks: &mut [Physica
             || t.anchor_id >= t.deadline
     }) || tasks[..first].iter().any(|t| graph.tasks[t.task_id as usize].math.as_ref()
         .is_some_and(|m| !m.input_gradients.is_empty() || !m.parameter_gradients.is_empty())) { return; }
+    let captured = tasks[first..].iter().all(|task| {
+        let semantic = &graph.tasks[task.task_id as usize];
+        semantic.math.is_none() || semantic.implementations.iter().any(|candidate|
+            candidate.implementation_id == task.implementation_id
+                && candidate.required_capabilities.iter().any(|cap| cap == "compute/cuda_graph@1"))
+    });
     for (position, task) in tasks.iter_mut().enumerate() {
-        if position >= first { task.lane = Lane::Side; task.read_origin = ReadOrigin::Latest; }
+        if position >= first { task.lane = if captured { Lane::Side } else { Lane::Main }; task.read_origin = ReadOrigin::Latest; }
         else if graph.model_reads.is_empty() {
             task.read_origin = ReadOrigin::Boundary; task.read_distance = source.lag;
         }
@@ -476,7 +482,7 @@ pub(super) fn compile(
                   state: Option<&StatePhysicalPlan>, selected: &mut Vec<&'a ImplementationCandidate>,
                   best: &mut Option<ScheduleDecision>) -> Result<(), String> {
         if selected.len() == graph.tasks.len() {
-            if let Ok(solution) = place(graph, timeline, index, state) {
+            if let Ok(solution) = place(graph, timeline, index, state, selected) {
                 let decision = sign_solution(graph, timeline, state, selected, solution)?;
                 if best.as_ref().is_none_or(|best| decision.score() < best.score()) {
                     *best = Some(decision);
@@ -730,6 +736,17 @@ mod tests {
         validate_decision(&graph,&timeline,&inline,None).unwrap();
         timeline.memory_budget_bytes = Some(inline.peak_memory_bytes-1);
         assert!(compile(&graph,&timeline,None).is_err());
+        timeline.memory_budget_bytes = None;
+        graph.tasks[1].math = Some(serde_json::from_value(json!({"input_gradients":[],"parameter_gradients":[],"detached_inputs":[],"forward_rows":"","input_gradient_rows":"","parameter_gradient_rows":"","update_states":"","reduction":"none"})).unwrap());
+        let mut main = compile(&graph,&timeline,None).unwrap();
+        assert!(main.tasks.iter().all(|t| t.lane == super::Lane::Main));
+        assert_eq!(main.tasks[0].read_distance, 2);
+        main.tasks[1].lane = super::Lane::Side;
+        main.signature = decision_signature(&main).unwrap();
+        assert!(validate_decision(&graph,&timeline,&main,None).is_err());
+        graph.tasks[1].implementations[0].required_capabilities.push("compute/cuda_graph@1".into());
+        timeline.capabilities.push("compute/cuda_graph@1".into());
+        assert_eq!(compile(&graph,&timeline,None).unwrap().tasks[1].lane, super::Lane::Side);
     }
 
     #[test]

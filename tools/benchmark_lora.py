@@ -66,7 +66,6 @@ def main() -> None:
             replace(options, profile=None if options.profile is None else options.profile / scope.value),
             prepare=lambda handle: prepare(handle.hidden_size, handle.vocab_size, handle.device),
             training_rows=args.training_rows,
-            capture=True,
             require_training=True,
             prompt_indices=indices,
         )

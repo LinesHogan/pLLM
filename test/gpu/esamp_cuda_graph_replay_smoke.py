@@ -73,7 +73,7 @@ def mean_capture(publish_lag: int = 0) -> None:
     provider = PageBundleProviderFacts("test.mean@1", 6, StateDeviceKind.CUDA)
     facts = backend_facts(4, (resource,), timeline, provider, max_lineages=3)
     facts = workload.specialize(
-        facts, pllm.ExecutionOptions(capture=True, capture_memory_bytes=16 * 1024**2, publish_lag=publish_lag)
+        facts, pllm.ExecutionOptions(capture_memory_bytes=16 * 1024**2, publish_lag=publish_lag)
     )
     declaration = workload.declaration(facts)
     # One admitted lineage: the instance state.
@@ -160,8 +160,8 @@ def mean_capture(publish_lag: int = 0) -> None:
 
 def main() -> None:
     """Run the shared eager/captured step against independent numerical oracles."""
-    for normalized, captured in ((False, False), (True, False), (False, True), (True, True)):
-        _esamp_native_oracle(torch.device("cuda", 0), normalized, captured)
+    for normalized in (False, True):
+        _esamp_native_oracle(torch.device("cuda", 0), normalized)
     _ordinary_request_distillation()
     for lag in (0, 1, 2):
         mean_capture(lag)

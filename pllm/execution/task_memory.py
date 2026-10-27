@@ -154,7 +154,17 @@ def example(
     data = TensorFrame(
         TensorStepInput(packed, sampler, hidden, operands=operands, auxiliary=auxiliary),
         rows[::-1],
-        replacements=tuple((i, tuple(torch.empty_like(value) for value in root)) for i, root in enumerate(roots)),
+        replacements=tuple(
+            (
+                i,
+                tuple(
+                    torch.empty_like(view.read(root[view.field]))
+                    for view in binding.imports[str(selection.addresses[i].resource)]
+                ),
+            )
+            for i, root in enumerate(roots)
+            if str(selection.addresses[i].resource) in binding.imports
+        ),
     )
     return data, batch
 
@@ -166,7 +176,7 @@ def derive_resources(
     # Shape-only steps do not allocate a capture pool or consume its eventual entitlement.
     shape = ((facts.max_admitted_lineages, facts.probe.hidden_size),)
     binding.resources = tuple(TaskResourceFact(symbol, 0, 1 << 60, shape) for symbol in binding.tensor_tasks)
-    binding.configure_steps(facts, options.capture)
+    binding.configure_steps(facts)
     data, batch = example(binding, facts, options)
     tasks: list[TaskResourceFact] = []
     values: list[ValueResourceFact] = []
@@ -200,7 +210,7 @@ def derive_resources(
             TaskResourceFact(
                 symbol,
                 usage.workspace,
-                operation.resident(options.capture_memory_bytes if options.capture else 0),
+                operation.resident(options.capture_memory_bytes),
                 shapes,
             )
         )

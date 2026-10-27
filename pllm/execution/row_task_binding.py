@@ -279,7 +279,7 @@ class RowTaskBinding(TensorBindingBase):
 
                 def read(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
                     selected = batch.for_resource(state.declaration.resource)
-                    data = data if selected is batch else replace(data, index=None, plan=None, leaf=None, fields=())
+                    data = data.for_resource(state.declaration.resource, batch)
                     batch = selected
                     size = prod(shape)
                     if field_index == 0 and data.leaf is not None:
@@ -491,7 +491,7 @@ class RowTaskBinding(TensorBindingBase):
                     dtype=torch.long,
                 )
             selected = batch.for_resource(state.declaration.resource)
-            frame = data if selected is batch else replace(data, index=None, plan=None, leaf=None, fields=())
+            frame = data.for_resource(state.declaration.resource, batch)
             index = row_index(frame, selected, selected.roots[0][0].device)
             return index.versions.device if version else index.states.device
 

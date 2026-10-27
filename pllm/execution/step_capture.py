@@ -80,23 +80,30 @@ class StepCapture:
         addresses: tuple[int, ...],
         stream: torch.cuda.Stream | None,
         refill: Callable[[], None],
+        buffers: tuple[torch.Tensor, ...] = (),
     ) -> None:
         """Capture when addresses change; warmup never writes live destinations."""
         if stream is not None and self.stream is not None and stream != self.stream:
             stream.wait_stream(self.stream)
         self.stream = stream
         if self.graph is None or self.addresses != addresses:
-            self._capture(body, table, destinations)
+            self._capture(body, table, destinations, buffers)
             refill()
         self.addresses = addresses
         assert self.graph is not None
         self.graph.replay()
 
-    def _capture(self, body: Callable[[], None], table: torch.Tensor, destinations: torch.Tensor) -> None:
+    def _capture(
+        self,
+        body: Callable[[], None],
+        table: torch.Tensor,
+        destinations: torch.Tensor,
+        buffers: tuple[torch.Tensor, ...],
+    ) -> None:
         # Inactive destinations make warmup and capture read-only with respect to the arena.
         destinations.fill_(-1)
         self.graph, _, pool = capture_graph(table.device, body)
-        self.resident_bytes = table.untyped_storage().nbytes() + pool
+        self.resident_bytes = sum(value.untyped_storage().nbytes() for value in (table, *buffers)) + pool
         if self.resident_bytes > self.entitlement.resident_bytes:
             raise ValueError(
                 f"capture requires {self.resident_bytes} resident bytes, reserved {self.entitlement.resident_bytes}"

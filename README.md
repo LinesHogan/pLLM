@@ -21,7 +21,7 @@ from vllm import SamplingParams
 from pllm import ExecutionOptions, ModelConfig, make_llm
 from pllm.workloads import ESampRequestConfig, ESampRequestWorkload
 
-config = ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", execution=ExecutionOptions(capture=True))
+config = ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", execution=ExecutionOptions())
 with make_llm(config, workload=ESampRequestWorkload(ESampRequestConfig(rank=2))) as llm:
     outputs = llm.generate(["Explain gradient descent:"], SamplingParams(max_tokens=32))
     print(outputs[0].outputs[0].text)
@@ -131,7 +131,7 @@ workload 类必须可导入（不能是 `__main__`/notebook 里的临时类）�
 dataclass、字段可封闭传输（原始配置值、typed contract、模块级函数引用或
 WorkerTransportable）。默认 `multiprocessing=False` 进程内执行没有这些要求。
 
-`ExecutionOptions(capture=True)` 将普通逐行预测或训练步骤捕获为 CUDA graph，包含 autograd、
+CUDA 后端自动将普通逐行预测、训练和字段写入捕获为 CUDA graph，包含 autograd、
 私有页写入和 AdamW；ESamp 使用此通用路径。训练方法返回逐行 loss，由框架屏蔽填充行
 并执行 `mean` 或 `state_mean`，不能在用户方法中混合行。详见
 [训练与观测](doc/guides/training-and-observation.md#capture-an-ordinary-tensor-step)。

@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 import torch
 
 from pllm.contracts.hidden_locator import HiddenPhase
+from pllm.contracts.parameter_overlay import FieldView
 from pllm.contracts.semantic_graph import (
     MathContract,
     SemanticInputSource,
@@ -22,6 +23,8 @@ from pllm.contracts.semantic_graph import (
     TaskSymbol,
 )
 from pllm.contracts.tensor_layout import LayoutFieldId
+from pllm.execution.declaration import Call
+from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.tensor_frame import (
     LeafRoots,
     TensorFrame,
@@ -38,6 +41,54 @@ from pllm.execution.tensor_frame import (
 from pllm.execution.tensor_program import TaskOutput, TensorBatch
 
 
+@dataclass(frozen=True)
+class FieldWriter:
+    """Write a task result into its declared field; used by the write lowering."""
+
+    source: Call | None
+    fields: tuple[FieldView, ...]
+    resource: StateResource
+    phase: HiddenPhase | None
+
+    def values(
+        self, data: TensorFrame, batch: TensorBatch, selected: tuple[int, ...], *, validate: bool
+    ) -> tuple[torch.Tensor, ...]:
+        """Validate field metadata before staging caller-owned results."""
+        instance = batch.selection.for_resource(self.resource).keys == (None,)
+        values = (
+            tuple(batch.results[self.source.symbol, name] for name in self.source.outputs)
+            if self.source is not None
+            else tuple(
+                torch.stack(tuple(fields[i] for _, fields in data.replacements)) for i in range(len(self.fields))
+            )
+        )
+        values = tuple(value.unsqueeze(0) for value in values) if instance and self.source is not None else values
+        if validate:
+            for view, value in zip(self.fields, values, strict=True):
+                target = view.read(batch.roots[selected[0]][view.field])
+                if (
+                    value.shape != (len(selected), *view.shape)
+                    or value.dtype != target.dtype
+                    or value.device != target.device
+                ):
+                    raise ValueError(
+                        f"write to {self.resource} needs finite fields with their declared shape, dtype, device and request axis"
+                    )
+        return values
+
+    def select(self, data: TensorFrame, selection: RequestStateSelection) -> tuple[int, ...]:
+        """Select only this producer's eligible resource rows."""
+        if self.source is None:
+            return tuple(index for index, _ in data.replacements)
+        group = selection.for_resource(self.resource)
+        if self.phase is not None and not data.step.rows.producer_rows(self.phase):
+            return ()
+        if group.keys == (None,):
+            return tuple(selection.refs.index(ref) for ref in group.refs)
+        indices = {row.identity: index for row, index in zip(selection.rows, group.state_indices, strict=True)}
+        return tuple(dict.fromkeys(indices[row.identity] for row in data.step.rows.producer_rows(self.phase)))
+
+
 @dataclass(frozen=True, slots=True)
 class TensorTask:
     """One row-wise method and its input and gradient policies."""
@@ -52,6 +103,7 @@ class TensorTask:
     captures: Mapping[str, LayoutFieldId]
     phase: HiddenPhase | None = None
     resource: StateResource = StateResource("")
+    writer: FieldWriter | None = None
 
     def dependencies(self, tasks: Mapping[TaskSymbol, TensorTask]) -> tuple[TensorTask, ...]:
         """This task's tensor DAG in dependency order, ending with the task itself."""

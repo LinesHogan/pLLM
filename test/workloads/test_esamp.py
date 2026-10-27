@@ -202,27 +202,26 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(monkeypatc
     execution.admit(identities)
     execution.retire(identities)
     for device in DEVICES:
-        for normalized, captured in ((False, False), (True, False), (False, True), (True, True)):
-            if not captured or device != "cpu":
-                _esamp_native_oracle(torch.device(device), normalized, captured)
+        for normalized in (False, True):
+            _esamp_native_oracle(torch.device(device), normalized)
     _ordinary_request_distillation()
     _module_request_distillation()
 
 
-def _esamp_native_oracle(device, normalized, captured):
+def _esamp_native_oracle(device, normalized):
     stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
     config = ESampRequestConfig(
         rank=4, output_layernorm=normalized, intervention_beta=0.2, learning_rate=0.03, weight_decay=0.1
     )
     workload = ESampRequestWorkload(config)
     facts = facts_for(device, 8, 8, lineages=3, memory_bytes=100000)
-    facts = workload.specialize(facts, ExecutionOptions(capture=captured, capture_memory_bytes=16 * 1024**2))
+    facts = workload.specialize(facts, ExecutionOptions(capture_memory_bytes=16 * 1024**2))
     deployment = workload.compile_backend(facts)
     execution = deployment.execution
     plan = execution.arena.plan
     assert plan.timeline.visibility == VisibilitySource.post_sampler(1)
     assert any(task.lane == "side" for task in plan.schedule_physical.tasks) == (stream is not None)
-    if stream is not None and normalized and not captured:
+    if stream is not None and normalized:
         for lag in (0, 1, 2):
             attachment = workload.plan_backend(
                 replace(facts, timeline=replace(facts.timeline, visibility=VisibilitySource.post_sampler(lag)))
@@ -308,7 +307,7 @@ def _ordinary_request_distillation() -> None:
         device = torch.device(device_name)
         stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
         workload = Distillation()
-        options = ExecutionOptions(capture=device.type == "cuda", capture_memory_bytes=16 * 1024**2)
+        options = ExecutionOptions(capture_memory_bytes=16 * 1024**2)
         execution = workload.compile_backend(workload.specialize(facts_for(device, 4, 9, lineages=3), options))
         execution = execution.execution
         # Same request id, different samples: the keys keep three separate lineages.
@@ -443,7 +442,7 @@ def _module_request_distillation() -> None:
     for device_name in DEVICES:
         device = torch.device(device_name)
         stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
-        options = ExecutionOptions(capture=device.type == "cuda", capture_memory_bytes=16 * 1024**2)
+        options = ExecutionOptions(capture_memory_bytes=16 * 1024**2)
         facts = ModuleDistillation().specialize(facts_for(device, 4, 9, lineages=2), options)
         execution = ModuleDistillation().compile_backend(facts).execution
         identities = tuple(RequestIdentity(f"r{index}", 0, 0) for index in range(2))

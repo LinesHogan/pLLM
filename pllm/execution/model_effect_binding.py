@@ -7,7 +7,7 @@ request-state transitions. Used by TensorBinding.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from math import isfinite
 from typing import TYPE_CHECKING
 
@@ -25,17 +25,16 @@ from pllm.contracts.backend_attachment import (
 )
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
-    FieldView,
     ParameterOverlayFieldBinding,
     ParameterOverlayOperator,
     ParameterTarget,
 )
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.semantic_graph import (
+    MathContract,
     PackedRowsInputSource,
     SemanticInput,
     StateEffectKind,
-    StateResource,
     StateScope,
     TokenProgramEffect,
 )
@@ -46,16 +45,14 @@ from pllm.execution.overlay_task import OverlayTransition
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION
 from pllm.execution.shared_tensor import tensor_dtype
+from pllm.execution.tensor_executor import TensorExecutor
 from pllm.execution.tensor_frame import (
     TensorFrame,
     Tensors,
     TensorUpdate,
-    finite,
 )
-from pllm.execution.tensor_program import (
-    TaskOutput,
-    TensorBatch,
-)
+from pllm.execution.tensor_program import TaskOutput
+from pllm.execution.tensor_task import FieldWriter, TensorTask
 from pllm.execution.token_program import ApplyUpdates, Cell, Layers, Over, Segment, TokenProgram, Tokens, TokenTensor
 from pllm.kernels.head_overlay import head_correction
 
@@ -64,52 +61,6 @@ if TYPE_CHECKING:
 
 
 from pllm.execution.binding_base import Buffer, TensorBindingBase, buffer_field
-
-
-@dataclass(frozen=True)
-class FieldWriter:
-    """Write a task result into its declared field; used by the write lowering."""
-
-    source: Call
-    fields: tuple[FieldView, ...]
-    resource: StateResource
-    phase: HiddenPhase | None
-
-    def __call__(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
-        selected = self.select(data, batch.selection)
-        if not selected:
-            return TaskOutput()
-        instance = batch.selection.for_resource(self.resource).keys == (None,)
-        values = tuple(batch.results[self.source.symbol, name] for name in self.source.outputs)
-        for view, value in zip(self.fields, values, strict=True):
-            target = view.read(batch.roots[selected[0]][view.field])
-            if (
-                value.shape != ((*(() if instance else (len(selected),)), *view.shape))
-                or value.dtype != target.dtype
-                or value.device != target.device
-                or not finite(value)
-            ):
-                raise ValueError(
-                    f"write to {self.resource} needs finite fields with their declared shape, dtype, device and request axis"
-                )
-        return TaskOutput(
-            field_writes=tuple(
-                (view, value.unsqueeze(0) if instance else value)
-                for view, value in zip(self.fields, values, strict=True)
-            ),
-            changed=selected,
-            update_count=len(selected),
-        )
-
-    def select(self, data: TensorFrame, selection: RequestStateSelection) -> tuple[int, ...]:
-        """Select only this producer's eligible resource rows."""
-        group = selection.for_resource(self.resource)
-        if self.phase is not None and not data.step.rows.producer_rows(self.phase):
-            return ()
-        if group.keys == (None,):
-            return tuple(selection.refs.index(ref) for ref in group.refs)
-        indices = {row.identity: index for row, index in zip(selection.rows, group.state_indices, strict=True)}
-        return tuple(dict.fromkeys(indices[row.identity] for row in data.step.rows.producer_rows(self.phase)))
 
 
 def check_overlay_fields(
@@ -288,31 +239,30 @@ class ModelEffectBinding(TensorBindingBase):
             changes=state,
             effect=StateEffectKind.TRANSITION_MAYBE,
             when=when,
-            function=writer,
-            select=writer.select,
+            function=lambda data, batch: TaskOutput(),
             implementations=(native(f"tensor.write:{source.symbol}@1", "transition/full_root@1"),),
         )
 
-        self.operations[update.symbol] = replace(
-            self.operations[update.symbol], optimizer=None, mode="transition", copy_fields=None
-        )
+        self._write_task(update, writer)
         return update
+
+    def _write_task(self, update: Call, writer: FieldWriter) -> None:
+        task = TensorTask(
+            update.symbol, lambda values: (), {}, {}, MathContract(), (), {}, writer.phase, writer.resource, writer
+        )
+        self.tensor_tasks[update.symbol] = task
+        executor = TensorExecutor(task, self.tensor_tasks, compact=False)
+        self.operations[update.symbol] = replace(
+            self.operations[update.symbol],
+            body=executor,
+            optimizer=None,
+            mode="read",
+            capture_resident=executor.resident,
+        )
 
     def import_update(self, state: State, identity: str) -> Call:
         """One BEFORE_MODEL import of externally produced field values into private roots."""
-
-        def execute(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
-            return TaskOutput(
-                field_writes=tuple(
-                    (view, torch.stack(tuple(values[index] for _, values in data.replacements)))
-                    for index, view in enumerate(self.imports[str(state.declaration.resource)])
-                )
-                if data.replacements
-                else (),
-                update_count=len(data.replacements),
-                changed=tuple(index for index, _ in data.replacements),
-            )
-
+        writer = FieldWriter(None, self.imports[str(state.declaration.resource)], state.declaration.resource, None)
         update = self.compute(
             "update",
             inputs={"parameters": self.input("input", "state", StateTensorUpdate.schema)},
@@ -320,13 +270,10 @@ class ModelEffectBinding(TensorBindingBase):
             changes=state,
             effect=StateEffectKind.TRANSITION_MAYBE,
             when=When.BEFORE_MODEL,
-            function=execute,
-            select=lambda data, selection: tuple(index for index, _ in data.replacements),
+            function=lambda data, batch: TaskOutput(),
             implementations=(native(identity, "transition/full_root@1"),),
         )
-        self.operations[update.symbol] = replace(
-            self.operations[update.symbol], optimizer=None, mode="transition", copy_fields=None
-        )
+        self._write_task(update, writer)
         return update
 
     def activation_patch(

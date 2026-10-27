@@ -158,7 +158,7 @@ class BackendAuthoring(ABC):
     def backend_requirements(self) -> BackendRequirements: ...
 
     def resource_facts(self, facts: BackendCompileFacts, options: ExecutionOptions) -> SchedulerTimeline:
-        if options.capture or options.explicit_math:
+        if options.explicit_math:
             raise ValueError("this workload has no explicit tensor/capture implementation")
         return facts.timeline
 
@@ -169,6 +169,16 @@ class BackendAuthoring(ABC):
             facts,
             timeline=replace(
                 facts.timeline,
+                capabilities=tuple(
+                    sorted(
+                        set(
+                            (
+                                *facts.timeline.capabilities,
+                                *(("compute/cuda_graph@1",) if "compute/cuda@1" in facts.timeline.capabilities else ()),
+                            )
+                        )
+                    )
+                ),
                 memory_budget_bytes=min(
                     (n for n in (facts.timeline.memory_budget_bytes, options.memory_budget_bytes) if n is not None),
                     default=None,
@@ -186,14 +196,11 @@ class BackendAuthoring(ABC):
             for value in (facts.timeline.memory_budget_bytes, timeline.memory_budget_bytes, options.memory_budget_bytes)
             if value is not None
         )
-        if options.capture and facts.device.type != "cuda":
-            raise ValueError("capture requires CUDA")
         capabilities = tuple(
             sorted(
                 set(
                     (
                         *timeline.capabilities,
-                        *(("compute/cuda_graph@1",) if options.capture else ()),
                         *(("compute/explicit_math@1",) if options.explicit_math else ()),
                     )
                 )

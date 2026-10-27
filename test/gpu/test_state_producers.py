@@ -8,6 +8,7 @@ from vllm import SamplingParams
 
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.semantic_graph import StateResource
+from pllm.execution.tensor_executor import TensorExecutor
 from pllm.workloads.state_producers import DecodeFactors, PromptFactors, PromptMixture
 from test.gpu.vllm_inplace_ttt_smoke import open_llm
 
@@ -18,6 +19,14 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
         session = handle.runner.require_session()
         execution = handle.deployment.execution
         overlay = session._overlay
+        captures = []
+        capture_begin = torch.cuda.CUDAGraph.capture_begin
+
+        def begin(graph, *args, **kwargs):
+            captures.append(graph)
+            return capture_begin(graph, *args, **kwargs)
+
+        monkeypatch.setattr(torch.cuda.CUDAGraph, "capture_begin", begin)
         checked = []
         launches = []
         plan = handle.attachment.inputs.plan
@@ -98,6 +107,18 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
             SamplingParams(max_tokens=4, temperature=0, ignore_eos=True),
         )
         elapsed = time.perf_counter() - start
+        assert len(captures) == (1 if isinstance(workload, DecodeFactors) else 2)
+
+        def forbid_body(*args):
+            raise AssertionError("tensor Python body ran after graph warmup")
+
+        with monkeypatch.context() as replay:
+            replay.setattr(TensorExecutor, "_body", forbid_body)
+            handle.generate(
+                ["Name a color.", "A short question about stars."],
+                SamplingParams(max_tokens=3, temperature=0, ignore_eos=True),
+            )
+        assert len(captures) == (1 if isinstance(workload, DecodeFactors) else 2)
         assert frozenset((HiddenPhase.PREFILL, HiddenPhase.DECODE)) in phases
         assert launches and set(launches) == {"state.publish"}
         assert tuple(a.symbol for a in plan.timeline.anchors) == (

@@ -50,7 +50,7 @@ def lag_equivalence() -> None:
             gpu_memory_utilization=0.25,
             seed=7,
             cuda_graphs=True,
-            execution=ExecutionOptions(capture=True, publish_lag=lag, capture_memory_bytes=16 * 1024**2),
+            execution=ExecutionOptions(publish_lag=lag, capture_memory_bytes=16 * 1024**2),
         )
         with pllm.make_llm(config, workload=ESampRequestWorkload(ESampRequestConfig(rank=2))) as llm:
             assert any(task.lane == "side" for task in llm.attachment.inputs.plan.schedule_physical.tasks) == bool(lag)
@@ -117,7 +117,7 @@ def main() -> int:
             max_num_batched_tokens=64,
             gpu_memory_utilization=0.4,
             seed=7,
-            execution=ExecutionOptions(capture=True, capture_memory_bytes=16 * 1024**2),
+            execution=ExecutionOptions(capture_memory_bytes=16 * 1024**2),
         ),
     )
     match routed:

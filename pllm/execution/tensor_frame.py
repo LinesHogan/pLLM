@@ -21,6 +21,7 @@ from pllm.contracts.semantic_graph import (
     PackedSamplerRowsInputSource,
     SamplerFeedbackInputSource,
     SemanticInputSource,
+    StateResource,
     TaskResultInputSource,
 )
 from pllm.contracts.state_ref import StateRef
@@ -141,7 +142,9 @@ class RowPlan:
         """Resolve operation rows once from the invocation's input and page access."""
         links = {link.packed_row_index: link.sampler_row_index for link in data.step.sampler_rows.links}
         selection = batch.selection
-        states = selection.indices(data.rows) if selection.groups else (0,) * len(data.rows)
+        states = (
+            selection.indices(data.rows) if selection.groups and selection.keys != (None,) else (0,) * len(data.rows)
+        )
         return cls(
             tuple(row.packed_row_index for row in data.rows),
             tuple(links.get(row.packed_row_index, -1) for row in data.rows),
@@ -383,6 +386,19 @@ class TensorFrame:
     counts: torch.Tensor | None = None
     hidden_inputs: Mapping[tuple[str, str, str], torch.Tensor] | None = None
     feedback_inputs: Mapping[str, torch.Tensor] | None = None
+    resource_frames: Mapping[StateResource, TensorFrame] = field(
+        default_factory=lambda: dict[StateResource, TensorFrame]()
+    )
+
+    def for_resource(self, resource: StateResource, batch: TensorBatch) -> TensorFrame:
+        """Read the resource's fixed table, or build its compact row selection."""
+        if resource in self.resource_frames:
+            return self.resource_frames[resource]
+        return (
+            self
+            if batch.for_resource(resource) is batch
+            else replace(self, index=None, plan=None, leaf=None, fields=())
+        )
 
 
 def feedback_port(name: Literal["base_logits", "sampled_tokens"]) -> TensorPort:

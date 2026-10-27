@@ -13,18 +13,24 @@ from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import ParameterTargetShape
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId, StateResource
+from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.workloads.state_producers import TARGETS, DecodeFactors, ProjectionState, PromptFactors, PromptMixture
-from test.backend_facts import backend_facts
+from test.backend_facts import assert_finite_resources, backend_facts
 
 
-def deployment(workload):
+@pytest.fixture(params=("cpu", "cuda:0") if torch.cuda.is_available() else ("cpu",))
+def device(request):
+    return torch.device(request.param)
+
+
+def deployment(workload, device=torch.device("cpu")):
     facts = backend_facts(
         4,
         (),
-        RuntimeFacts(torch.device("cpu")).timeline(("transition/full_root@1", "optimizer/adamw@1")),
-        PageBundleProviderFacts("test.producers@1", 16),
+        RuntimeFacts(device).timeline(("transition/full_root@1", "optimizer/adamw@1")),
+        PageBundleProviderFacts("test.producers@1", 16, StateDeviceKind(device.type)),
         memory_bytes=1 << 20,
         max_rows=8,
         layer_count=10,
@@ -45,11 +51,11 @@ def deployment(workload):
             ),
         ),
     )
-    return workload.compile_backend(workload.specialize(facts, pllm.ExecutionOptions()))
+    return workload.compile_backend(assert_finite_resources(workload, facts, main_fallback=True))
 
 
-def packed(identities, hidden, phases, lengths=(1, 1)):
-    value = testing.step_input(identities, hidden, phases=phases, sampler_order=(1, 0))
+def packed(identities, hidden, phases, lengths=(1, 1), *, stream=None):
+    value = testing.step_input(identities, hidden, phases=phases, sampler_order=(1, 0), stream=stream)
     rows = replace(
         value.rows,
         rows=tuple(replace(row, prompt_length=length) for row, length in zip(value.rows.rows, lengths, strict=True)),
@@ -63,21 +69,22 @@ def packed(identities, hidden, phases, lengths=(1, 1)):
 
 
 @pytest.mark.parametrize("workload", [PromptFactors(), PromptMixture()])
-def test_prompt_producers_publish_only_completed_requests(workload):
-    deployed = deployment(workload)
+def test_prompt_producers_publish_only_completed_requests(workload, device):
+    stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
+    deployed = deployment(workload, device=device)
     network = next(p for p in deployed.attachment.inputs.plan.state_physical.representations if p.resource == "network")
     assert network.page_capacity == 1
     execution = deployed.execution
     identities = (RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0))
-    execution.admit(())
-    initial = execution.admit(identities)
-    context = torch.tensor([[0.2, -0.4, 0.1, 0.7], [-0.6, 0.3, 0.8, -0.2]])
+    execution.admit((), stream=stream)
+    initial = execution.admit(identities, stream=stream)
+    context = torch.tensor([[0.2, -0.4, 0.1, 0.7], [-0.6, 0.3, 0.8, -0.2]], device=device)
     tap = testing.hidden_binding(8, pllm.model.HiddenSite.BLOCK_OUTPUT, layer_count=10)
-    value = packed(identities, {tap: context}, (HiddenPhase.PREFILL, HiddenPhase.PREFILL), (1, 2))
-    invocation = execution.start_step(replace(value, hidden=None))
+    value = packed(identities, {tap: context}, (HiddenPhase.PREFILL, HiddenPhase.PREFILL), (1, 2), stream=stream)
+    invocation = execution.start_step(replace(value, hidden=None, hidden_readiness=None), stream=stream)
     selected = invocation.context.selection.for_resource(StateResource("factors"))
     network_ref = invocation.context.selection.for_resource(StateResource("network")).refs[0]
-    weights = execution.snapshot(network_ref)[0].double()
+    weights = execution.snapshot(network_ref, stream=stream)[0].double()
     refs = tuple(selected.refs)
     execution.execute_anchor(invocation, AnchorId(0))
     assert all(execution.arena.latest(ref.lineage_id) == ref for ref in refs)
@@ -85,11 +92,11 @@ def test_prompt_producers_publish_only_completed_requests(workload):
     for anchor in execution.arena.plan.timeline.anchors[1:]:
         execution.execute_anchor(invocation, AnchorId(anchor.ordinal))
         if anchor.ordinal == execution.sampler_anchor_id:
-            execution.complete_sampler(invocation)
+            execution.complete_sampler(invocation, stream=stream)
     execution.finish_step(invocation)
     changed = execution.arena.latest(refs[0].lineage_id)
     assert changed.version_id == 1 and execution.arena.latest(refs[1].lineage_id) == refs[1]
-    actual = execution.snapshot(changed)
+    actual = execution.snapshot(changed, stream=stream)
     h = context[:1].double()
     if isinstance(workload, PromptMixture):
         k, r = workload.components, workload.rank
@@ -109,23 +116,29 @@ def test_prompt_producers_publish_only_completed_requests(workload):
         )
     # Reordering and decode cannot publish another prompt update; a partial prompt cannot publish early.
     testing.run_step(
-        execution, packed(identities[::-1], {tap: context.flip(0)}, (HiddenPhase.DECODE, HiddenPhase.DECODE))
+        execution,
+        packed(identities[::-1], {tap: context.flip(0)}, (HiddenPhase.DECODE, HiddenPhase.DECODE), stream=stream),
+        stream=stream,
     )
     assert execution.arena.latest(refs[0].lineage_id) == changed
-    torch.testing.assert_close(execution.snapshot(network_ref)[0].double(), weights, rtol=0, atol=0)
-    execution.retire(identities)
-    execution.retire(())
+    torch.testing.assert_close(execution.snapshot(network_ref, stream=stream)[0].double(), weights, rtol=0, atol=0)
+    execution.retire(identities, wait=True)
+    execution.retire((), wait=True)
     assert execution.diagnostics().active_lineages == 0
     assert initial
 
 
-def test_decode_adam_matches_independent_optimizer_and_keeps_entry_pin():
-    execution = deployment(DecodeFactors()).execution
+def test_decode_adam_matches_independent_optimizer_and_keeps_entry_pin(device):
+    stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
+    execution = deployment(DecodeFactors(), device=device).execution
     ids = (RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0))
-    refs = execution.admit(ids)
-    flat = execution.snapshot(refs[0])[0].clone().requires_grad_()
+    refs = execution.admit(ids, stream=stream)
+    flat = execution.snapshot(refs[0], stream=stream)[0].clone().requires_grad_()
     optimizer = torch.optim.AdamW([flat], lr=1e-3, weight_decay=0.0)
-    x, target = torch.tensor([[0.2, -0.4, 0.1, 0.7]]), torch.tensor([[0.1, -0.2, 0.3, -0.4]])
+    x, target = (
+        torch.tensor([[0.2, -0.4, 0.1, 0.7]], device=device),
+        torch.tensor([[0.1, -0.2, 0.3, -0.4]], device=device),
+    )
     aq, bq, av, bv = (
         t.reshape(shape) for t, shape in zip(flat.split((8, 8, 8, 4)), ((2, 4), (4, 2), (2, 4), (2, 2)), strict=True)
     )
@@ -136,24 +149,27 @@ def test_decode_adam_matches_independent_optimizer_and_keeps_entry_pin():
         testing.hidden_binding(0, pllm.model.HiddenSite.BLOCK_OUTPUT, layer_count=10): x.expand(2, -1),
         testing.hidden_binding(9, pllm.model.HiddenSite.BLOCK_OUTPUT, layer_count=10): target.expand(2, -1),
     }
-    result = testing.run_step(execution, packed(ids, hidden, (HiddenPhase.DECODE, HiddenPhase.PREFILL)))
+    result = testing.run_step(
+        execution, packed(ids, hidden, (HiddenPhase.DECODE, HiddenPhase.PREFILL), stream=stream), stream=stream
+    )
     assert tuple(result.publication.before_refs) == (refs[0],)
     latest = execution.arena.latest(refs[0].lineage_id)
-    actual = execution.snapshot(latest)
+    actual = execution.snapshot(latest, stream=stream)
     for tensor, expected in zip(
         (actual[0], actual[2], actual[3], actual[4]),
         (flat, optimizer.state[flat]["step"], optimizer.state[flat]["exp_avg"], optimizer.state[flat]["exp_avg_sq"]),
         strict=True,
     ):
-        torch.testing.assert_close(tensor, expected, rtol=2e-6, atol=1e-8)
+        torch.testing.assert_close(tensor, expected.to(tensor), rtol=2e-6, atol=1e-8)
     assert execution.arena.latest(refs[1].lineage_id) == refs[1]
     assert not x.requires_grad and not target.requires_grad
-    execution.retire(ids)
+    execution.retire(ids, wait=True)
     assert execution.diagnostics().active_lineages == 0
     assert PromptFactors.consume is PromptMixture.consume is DecodeFactors.consume is ProjectionState.consume
 
 
-def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch):
+def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch, device):
+    stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
     from pllm.contracts.request_identity import RequestKeyField
     from pllm.contracts.request_state import RequestStateKey
     from pllm.execution.backend_attachment import compile_backend_attachment
@@ -175,23 +191,46 @@ def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch
         ):
             return tuple(torch.full_like(value, index + 1) for index, value in enumerate((aq, bq, av, bv)))
 
-    imported, written = deployment(Imported()), deployment(Written())
+    imported, written = deployment(Imported(), device=device), deployment(Written(), device=device)
     assert imported.attachment.inputs.request.overlay_bindings == written.attachment.inputs.request.overlay_bindings
     identity = RequestIdentity("swap", 0, 0)
     key = RequestStateKey.project(identity, (RequestKeyField.PROMPT_IDX,))
-    values = tuple(torch.full((1, *shape), index + 1.0) for index, shape in enumerate(((2, 4), (4, 2), (2, 4), (2, 2))))
+    values = tuple(
+        torch.full((1, *shape), index + 1.0, device=device)
+        for index, shape in enumerate(((2, 4), (4, 2), (2, 4), (2, 2)))
+    )
     for deployed, payload in ((imported, pllm.state.StateTensorUpdate(values, (key,))), (written, None)):
         execution = deployed.execution
-        (entry,) = execution.admit((identity,))
-        result = testing.run_step(execution, testing.step_input((identity,), auxiliary=payload))
+        (entry,) = execution.admit((identity,), stream=stream)
+        if payload is not None:
+            with pytest.raises(ValueError, match="finite"):
+                testing.run_step(
+                    execution,
+                    testing.step_input(
+                        (identity,),
+                        auxiliary=replace(payload, values=tuple(value * float("nan") for value in values)),
+                    ),
+                    stream=stream,
+                )
+            assert execution.arena.latest(entry.lineage_id) == entry
+        result = testing.run_step(execution, testing.step_input((identity,), auxiliary=payload), stream=stream)
         torch.testing.assert_close(
-            execution.snapshot(result.publication.after_refs[0]), tuple(value[0] for value in values)
+            execution.snapshot(result.publication.after_refs[0], stream=stream), tuple(value[0] for value in values)
         )
-        execution.retire((identity,))
+        execution.retire((identity,), wait=True)
         assert execution.diagnostics().active_lineages == 0
+        execution.admit((identity,), stream=stream)
+        payload = None if payload is None else replace(payload, values=tuple(value.clone() * 2 for value in values))
+        result = testing.run_step(execution, testing.step_input((identity,), auxiliary=payload), stream=stream)
+        torch.testing.assert_close(
+            execution.snapshot(result.publication.after_refs[0], stream=stream),
+            tuple(value[0] * (2 if payload is not None else 1) for value in values),
+        )
+        execution.retire((identity,), wait=True)
+        assert execution.diagnostics().active_lineages == execution.diagnostics().pending_state_releases == 0
     execution = written.execution
-    (entry,) = execution.admit((identity,))
-    before = execution.snapshot(entry)
+    (entry,) = execution.admit((identity,), stream=stream)
+    before = execution.snapshot(entry, stream=stream)
 
     def fail_before_publish(self, context):
         assert context.write is not None
@@ -199,10 +238,10 @@ def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch
 
     monkeypatch.setattr(PublishStateTask, "execute", fail_before_publish)
     with pytest.raises(RuntimeError, match="cancel between"):
-        testing.run_step(execution, testing.step_input((identity,)))
+        testing.run_step(execution, testing.step_input((identity,)), stream=stream)
     assert execution.arena.latest(entry.lineage_id) == entry
-    torch.testing.assert_close(execution.snapshot(entry), before)
-    execution.retire((identity,))
+    torch.testing.assert_close(execution.snapshot(entry, stream=stream), before)
+    execution.retire((identity,), wait=True)
     assert execution.diagnostics().active_lineages == execution.diagnostics().pending_state_releases == 0
     inputs = written.attachment.inputs
     binding = inputs.request.overlay_bindings[0]

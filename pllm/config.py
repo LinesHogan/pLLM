@@ -51,7 +51,6 @@ class KVOffload:
 class ExecutionOptions:
     """Framework execution policy; lag counts post-sampler steps hidden from readers."""
 
-    capture: bool = False
     training_rows: int = 1
     capture_memory_bytes: int = 64 * 1024**2
     explicit_math: bool = False

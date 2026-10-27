@@ -59,7 +59,7 @@ from pllm.benchmark import BenchmarkOptions, compare
 results = compare(my_workload, BenchmarkOptions(batch=4, tokens=64, rounds=1))
 ```
 
-这测量普通实现。`capture=True` 加一个捕获臂；`explicit_math=True` 加一个
+这测量普通实现；CUDA 张量任务自动捕获。`explicit_math=True` 加一个
 显式张量臂。不支持的请求在正常绑定边界失败。`require_training=True` 要求
 正的 loss、update 与训练行计数——观测或仅激活算法不要开，否则会误报失败。
 无论开不开，所有运行都检查 token 数、清理、回退与等效工作量。
@@ -136,7 +136,7 @@ weights, prompt_indices)`。它构造原始辅助对象及其 prompt/样本键�
 `compare(..., prompt_indices=...)` 把这些键传给每次公开生成，包括预热与
 分析；设置会记录它们以便复现。
 
-用 `alternatives=(("label", workload, captured), ...)` 给同一对比加显式
+用 `alternatives=(("label", workload), ...)` 给同一对比加显式
 实现。分页臂现在用设备侧分组内核，无矩阵打包、无宿主偏移同步。ESamp 的
 捕获 loss 直接读原始池；其捕获 Adam 现在两次启动直接更新全部五个原始字段，
 每状态两个标量偏置因子作为 scratch。LoRA 的分页捕获直接 reset 并更新原始
