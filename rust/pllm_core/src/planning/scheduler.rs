@@ -182,8 +182,14 @@ fn graph_index(
     for (id, task) in graph.tasks.iter().enumerate() {
         for input in &task.inputs {
             let point = match &input.source {
-                // Hidden snapshots become task inputs when the backend publishes the completed forward.
-                InputSource::Hidden { .. } => anchors.get("state.publish").or_else(|| anchors.get("model.execute")),
+                // A hidden input is available right after its layer when the backend declares that point
+                // (e.g. a captured in-graph layer boundary); otherwise once the completed forward is published.
+                InputSource::Hidden { layer, site, .. } => {
+                    let layers = timeline.anchors.iter().filter(|a| a.symbol.starts_with("model.layer.")).count() as i64;
+                    let point = if *site == super::semantic_graph::HiddenSite::ModelOutput { "model.norm".to_owned() }
+                        else { format!("model.layer.{}", if *layer < 0 { layers + layer } else { *layer }) };
+                    anchors.get(point.as_str()).or_else(|| anchors.get("state.publish")).or_else(|| anchors.get("model.execute"))
+                }
                 InputSource::SamplerFeedback => anchors.get("sampler.complete"),
                 _ => None,
             };
