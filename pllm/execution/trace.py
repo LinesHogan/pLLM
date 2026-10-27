@@ -225,9 +225,11 @@ class ExecutionTrace:
     def configure(self, selection: TraceSelection) -> None:
         if not set(selection.tasks).issubset(task.task_id for task in self.plan.tasks):
             raise ValueError("observation selection is outside the original physical plan")
-        if selection.max_events and selection.max_events < (self._events.maxlen or 0):
-            self.drain()
         with self._lock:
+            if selection.max_events and selection.max_events < (self._events.maxlen or 0):
+                self.drain()
+                while any(entry.pending for entry in self._events):
+                    self.drain()
             if selection.max_events:
                 self._dropped += max(0, len(self._events) - selection.max_events)
                 self._events = deque(self._events, maxlen=selection.max_events)
@@ -534,7 +536,9 @@ class ExecutionTrace:
                     or not any(entry.pending and entry.event.sequence <= watermark for entry in self._events)
                 )
             )
-            self.snapshot()
+            for entry in self._events:
+                if entry.event.sequence <= watermark:
+                    entry.snapshot()
             if self._failure is not None:
                 raise self._failure
 

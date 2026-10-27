@@ -196,25 +196,40 @@ class Encoder(torch.nn.Module):
 def _frozen_state_is_readable_by_an_observation() -> None:
     """A module state without an optimizer starts from the module's values and is read by an export."""
 
+    delivered = []
+
     class FrozenEncoder(pllm.Workload):
+        def on_export(self, event):
+            delivered.append(event)
+
         encoder = pllm.InstanceState(module=lambda model: Encoder(model.hidden_size))
 
         @pllm.export(name="features", every=1, max_rows=2, max_cols=4)
         def encode(
-            self, hidden: torch.Tensor = pllm.hidden(0), encoder: Encoder = pllm.module("encoder")
+            self,
+            h3: torch.Tensor = pllm.hidden(3),
+            h5: torch.Tensor = pllm.hidden(5),
+            h17: torch.Tensor = pllm.hidden(17),
+            encoder: Encoder = pllm.module("encoder"),
         ) -> torch.Tensor:
-            return encoder.encode(hidden)
+            return torch.stack((encoder.encode(h3), encoder.encode(h5), encoder.encode(h17)), dim=1)
 
+    bindings = tuple(testing.hidden_binding(layer, HiddenSite.BLOCK_OUTPUT, 18) for layer in (3, 5, 17))
     timeline = RuntimeFacts(torch.device("cpu")).timeline()
     provider = PageBundleProviderFacts("test.plain@1", 4, StateDeviceKind.CPU)
-    execution = FrozenEncoder().compile_backend(backend_facts(4, (BINDING,), timeline, provider)).execution
+    execution = (
+        FrozenEncoder().compile_backend(backend_facts(4, bindings, timeline, provider, layer_count=18)).execution
+    )
     identity = RequestIdentity("req", 0, 0)
     execution.admit(())
     execution.admit((identity,))
     source = (torch.arange(4, dtype=torch.float32) + 1).unsqueeze(0)
-    execution.step(testing.step_input((identity,), {BINDING: source}, sampler_order=()))
-    events = [event.tensor() for event in execution.trace.snapshot().events if event.tensor_name == "features"]
-    assert len(events) == 1 and torch.equal(events[0][0], source[0])
+    execution.step(
+        testing.step_input((identity,), {binding: source + i for i, binding in enumerate(bindings)}, sampler_order=())
+    )
+    execution.trace.drain()
+    events = [event.tensor() for event in delivered]
+    assert len(events) == 1 and torch.equal(events[0], torch.stack((source, source + 1, source + 2), dim=1))
     execution.retire((identity,))
 
 
