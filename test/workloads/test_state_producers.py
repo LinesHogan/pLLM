@@ -54,8 +54,10 @@ def deployment(workload, device=torch.device("cpu")):
     return workload.compile_backend(assert_finite_resources(workload, facts, main_fallback=True))
 
 
-def packed(identities, hidden, phases, lengths=(1, 1), *, stream=None):
-    value = testing.step_input(identities, hidden, phases=phases, sampler_order=(1, 0), stream=stream)
+def packed(identities, hidden, phases, lengths=(1, 1), *, offset=0, stream=None):
+    value = testing.step_input(
+        identities, hidden, phases=phases, sampler_order=(1, 0), token_offset=offset, stream=stream
+    )
     rows = replace(
         value.rows,
         rows=tuple(replace(row, prompt_length=length) for row, length in zip(value.rows.rows, lengths, strict=True)),
@@ -69,7 +71,8 @@ def packed(identities, hidden, phases, lengths=(1, 1), *, stream=None):
 
 
 @pytest.mark.parametrize("workload", [PromptFactors(), PromptMixture()])
-def test_prompt_producers_publish_only_completed_requests(workload, device):
+@pytest.mark.parametrize("length", [1, 75, 127, 128, 129, 2047, 2048, 2049])
+def test_prompt_producers_publish_only_completed_requests(workload, device, length):
     stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
     deployed = deployment(workload, device=device)
     network = next(p for p in deployed.attachment.inputs.plan.state_physical.representations if p.resource == "network")
@@ -80,7 +83,28 @@ def test_prompt_producers_publish_only_completed_requests(workload, device):
     initial = execution.admit(identities, stream=stream)
     context = torch.tensor([[0.2, -0.4, 0.1, 0.7], [-0.6, 0.3, 0.8, -0.2]], device=device)
     tap = testing.hidden_binding(8, pllm.model.HiddenSite.BLOCK_OUTPUT, layer_count=10)
-    value = packed(identities, {tap: context}, (HiddenPhase.PREFILL, HiddenPhase.PREFILL), (1, 2), stream=stream)
+    for offset in range(0, length - 1, 128):
+        testing.run_step(
+            execution,
+            packed(
+                identities,
+                {tap: context},
+                (HiddenPhase.PREFILL, HiddenPhase.PREFILL),
+                (length, length + 1),
+                offset=offset,
+                stream=stream,
+            ),
+            stream=stream,
+        )
+        assert tuple(execution.arena.latest(ref.lineage_id) for ref in initial) == tuple(initial)
+    value = packed(
+        identities,
+        {tap: context},
+        (HiddenPhase.PREFILL, HiddenPhase.PREFILL),
+        (length, length + 1),
+        offset=length - 1,
+        stream=stream,
+    )
     invocation = execution.start_step(replace(value, hidden=None, hidden_readiness=None), stream=stream)
     selected = invocation.context.selection.for_resource(StateResource("factors"))
     network_ref = invocation.context.selection.for_resource(StateResource("network")).refs[0]
