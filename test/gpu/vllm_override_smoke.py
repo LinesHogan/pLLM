@@ -115,6 +115,8 @@ def main() -> None:
                 for index, output in enumerate(outputs):
                     assert drawn[(iteration * 2 + index, iteration)] == list(output.outputs[0].token_ids[1:])
                 assert execution.diagnostics().update_count - before == (2 if iteration < 2 else 0)
+        # Side-lane training releases its pins when its GPU work completes; check after it has.
+        execution.arena.collect_completed(wait=True)
         diagnostics = execution.diagnostics()
         assert diagnostics.loss_count == diagnostics.update_count == 4
         assert diagnostics.inference_pins == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
