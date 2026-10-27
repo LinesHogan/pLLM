@@ -329,7 +329,6 @@ def test_tuned_tensor_scan_keeps_one_symbolic_plan_and_its_guards():
             )
             assert pointers == tuple(t.data_ptr() for t in storage)
         _check_right_matrix_rewrite()
-        _check_pinned_projection_borrows()
 
 
 def _check_right_matrix_rewrite():
@@ -487,41 +486,3 @@ def test_only_a_joint_rewrite_fits_and_budgets_never_authorize_an_over_budget_on
                 measurement_rounds=1,
                 **{"options": measured(schedule_policy="serial"), **limit},
             )
-
-
-def _check_pinned_projection_borrows():
-    """Index tables vary under replay without materializing the field pool."""
-    from pllm.contracts.parameter_overlay import ParameterOverlayOperator
-    from pllm.execution.parameter_projection import prepare_projection_read, projection_read
-
-    generator = torch.Generator(device="cuda").manual_seed(109)
-    hidden = torch.randn(8, 8, device="cuda", generator=generator)
-    pool = torch.randn(32, 2, 4, 4, device="cuda", generator=generator)
-    slots = torch.tensor([[1], [3]], device="cuda")
-    rows = torch.tensor([[0, 1, 2, 0], [3, 4, 5, 6]], device="cuda")
-    owners = torch.tensor([0, 1, 2, 4, 5, 6, 7, -1], device="cuda")
-    values = (hidden, slots, rows, owners, pool)
-    execution = prepare_projection_read(values, ParameterOverlayOperator.HEAD_ADD, 128 << 20, TensorPolicy())
-    assert execution.borrows_inputs
-    arguments = dict(zip(("hidden", "slots", "rows", "owners", "pool0"), values, strict=True))
-    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU], record_shapes=True) as profile:
-        result = execution.run(arguments).values[0]
-    assert not any(
-        event.name == "aten::clone" and event.input_shapes[0] == list(pool.shape) for event in profile.events()
-    )
-    torch.testing.assert_close(result, projection_read(*values, operator=ParameterOverlayOperator.HEAD_ADD)[0])
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        execution.run(arguments)
-    torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        captured = execution.run(arguments).values[0]
-    pointers = tuple(value.data_ptr() for value in values)
-    for state_slots in ((3, 1), (7, 2), (1, 3)):
-        slots.copy_(torch.tensor(state_slots, device="cuda")[:, None])
-        graph.replay()
-        torch.testing.assert_close(captured, projection_read(*values, operator=ParameterOverlayOperator.HEAD_ADD)[0])
-        assert pointers == tuple(value.data_ptr() for value in values)
-    assert not captured[-1].any()

@@ -130,7 +130,6 @@ class VllmSession(Generic[DataT, ResultT]):
                 probe.max_packed_rows,
                 max_sampler_rows,
                 buffers,
-                plan.timeline.tensor_policy,
                 phases=deployment.execution.math.parameter_phases,
                 in_forward=self._in_forward_overlay,
                 graphs=probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH,

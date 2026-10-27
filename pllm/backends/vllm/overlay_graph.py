@@ -10,6 +10,7 @@ before prepare_inputs, and Qwen2Model.do_not_compile to bypass compiled training
 The upstream manager owns all capture/replay loops; PTTS owns every request version.
 """
 
+from collections.abc import Callable
 from typing import Protocol, TypedDict
 
 import numpy as np
@@ -23,7 +24,6 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor, ModelCu
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from pllm.authoring import BackendRequirements
-from pllm.backends.torch_inductor import InductorTensorCompiler
 from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay
 from pllm.config import ModelConfig, RunnerKind
 from pllm.contracts.backend_attachment import AttachmentGraphMode, SignedBackendAttachment
@@ -31,7 +31,6 @@ from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import CapturedParameterOperand, ParameterOverlayFieldBinding
 from pllm.contracts.semantic_graph import StateResource
-from pllm.contracts.tensor_policy import TensorPolicy
 from pllm.execution.codec import cuda_graph_pool_bytes, decode_boundary, encode_boundary
 from pllm.execution.cuda_stream import CudaStreamReadiness, PinnedStaging
 from pllm.execution.overlay_task import ProjectionTransition
@@ -44,7 +43,6 @@ from pllm.execution.parameter_projection import (
 from pllm.execution.ptts.page_bundle import PageBundleArena, Slots
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.execution.region_execution import RegionInstructionExecution
 from pllm.execution.state_execution import DataT, StateTaskContext
 
 _BUDGET = "pllm_pinned_projection_v2_bytes"
@@ -192,7 +190,7 @@ def pinned_projection(
     output: torch.Tensor,
     captured: torch.Tensor,
 ) -> None:
-    """Execute the same prepared tensor region eagerly or during upstream capture."""
+    """Execute the same prepared tensor callable eagerly or during upstream capture."""
     _READERS[table.data_ptr()].emit(hidden, pools, table, output, captured)
 
 
@@ -220,7 +218,6 @@ class _ProjectionReader:
         rows: int,
         requests: int,
         budget: int,
-        policy: TensorPolicy,
     ) -> None:
         from pllm.backends.vllm.parameter_overlay import locate_parameter
 
@@ -240,7 +237,7 @@ class _ProjectionReader:
         self.desired = self.module.weight.new_empty((rows, self.width)) if self.mlp is not None else self.captured
         self.staging = PinnedStaging(capacity=self.table.numel(), slots=2)
         self.host = torch.empty(0, dtype=torch.long)
-        self.programs: dict[int, RegionInstructionExecution] = {}
+        self.programs: dict[int, Callable[..., tuple[torch.Tensor, ...]]] = {}
         for count in capacities(rows):
             with torch.inference_mode(False), FakeTensorMode(allow_non_fake_inputs=True):
                 examples = (
@@ -248,18 +245,8 @@ class _ProjectionReader:
                     *self.ports(self.table, count),
                     *self.pools,
                 )
-            self.programs[count] = prepare_projection_read(
-                examples,
-                binding.operator,
-                budget
-                + sum(
-                    pool.untyped_storage().nbytes()
-                    for pool in {pool.untyped_storage().data_ptr(): pool for pool in self.pools}.values()
-                ),
-                policy,
-                compiler=InductorTensorCompiler(autotune_at_compile_time=False),
-            )
-            # Warm with actual readonly pools; compiler-created fake arena copies can exceed residency.
+            self.programs[count] = prepare_projection_read(examples, binding.operator, budget)
+            # Warm every row bucket against the actual readonly pools before graph capture.
             self.read(self.captured[:count], self.pools, self.table, count)
         _READERS[self.table.data_ptr()] = self
         self.module.forward = self.forward
@@ -312,10 +299,7 @@ class _ProjectionReader:
 
     def read(self, hidden: torch.Tensor, pools: list[torch.Tensor], table: torch.Tensor, count: int) -> torch.Tensor:
         values = (hidden, *self.ports(table, count), *pools)
-        names = ("hidden", "slots", "rows", "owners", *(f"pool{i}" for i in range(len(pools))))
-        result = self.programs[count].run(dict(zip(names, values, strict=True))).values[0]
-        assert isinstance(result, torch.Tensor)
-        return result
+        return self.programs[count](*values)[0]
 
     def prepare(self, field_slots: Slots, starts: Slots, total: int) -> None:
         host = self.host.numpy()
@@ -357,13 +341,10 @@ class PinnedParameterOverlay:
         rows: int,
         requests: int,
         budget: int,
-        policy: TensorPolicy,
         *,
         phases: tuple[HiddenPhase, ...],
     ) -> None:
-        self.readers = tuple(
-            _ProjectionReader(model, binding, arena, rows, requests, budget, policy) for binding in bindings
-        )
+        self.readers = tuple(_ProjectionReader(model, binding, arena, rows, requests, budget) for binding in bindings)
         self.phases = phases
         self.sources: tuple[PackedPhaseRow, ...] = ()
         self.starts: Slots = np.empty(0, dtype=np.int64)
@@ -516,7 +497,6 @@ def parameter_overlay(
     rows: int,
     requests: int,
     budget: int,
-    policy: TensorPolicy,
     phases: tuple[HiddenPhase, ...],
     *,
     in_forward: bool,
@@ -526,7 +506,5 @@ def parameter_overlay(
     """Install each projection wrapper once, before compiling or capturing the model."""
     if routed or in_forward and not graphs:
         return ExactParameterOverlay(model, bindings)
-    pinned = PinnedParameterOverlay(
-        model, bindings, arena, rows, requests, budget, policy, phases=() if in_forward else phases
-    )
+    pinned = PinnedParameterOverlay(model, bindings, arena, rows, requests, budget, phases=() if in_forward else phases)
     return HybridParameterOverlay(pinned, ExactParameterOverlay(model, bindings), phases) if in_forward else pinned

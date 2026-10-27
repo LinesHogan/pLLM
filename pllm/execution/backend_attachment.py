@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import replace
 from math import prod
 
+import torch
+
 from pllm import _core
 from pllm.contracts.backend_attachment import (
     TOKEN_CAPTURE_CAPABILITY,
@@ -33,6 +35,7 @@ from pllm.contracts.semantic_graph import (
     TokenProgramEffect,
     ValueResourceFact,
 )
+from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.parameter_projection import ROWS_PER_BLOCK, projection_blocks
@@ -44,7 +47,7 @@ def attachment_buffer_bytes(
     layouts: TensorLayoutRequest,
     attachment: BackendAttachmentSpec | BackendAttachmentRequest,
 ) -> int:
-    """At least FP32 storage for effect buffers; excludes model/library scratch."""
+    """Fund effect buffers and pinned projection scratch; excludes model scratch."""
     rows, hidden = probe.max_packed_rows, probe.hidden_size
     width = 8 if probe.tensor_dtype is TensorDType.FLOAT64 else 4
     fields = {
@@ -54,6 +57,12 @@ def attachment_buffer_bytes(
         for field in layout.layout.fields
     }
     buffers = 1024 if attachment.overlay_bindings else 0
+    if (
+        attachment.overlay_bindings
+        and probe.device_kind is StateDeviceKind.CUDA
+        and (probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH or not graph.updates_in_forward)
+    ):
+        buffers += torch.backends.cuda.cublas_workspace_size() + torch.backends.cuda.cublaslt_workspace_size()
     for binding in attachment.overlay_bindings:
         first = binding.fields[0].shape
         if binding.operator is ParameterOverlayOperator.DENSE_ADD:

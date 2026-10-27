@@ -158,7 +158,11 @@ def _check(handle: VllmLlm[object, object], label: str) -> tuple[str, ...]:
         or diagnostics.pending_state_releases != 0
         or diagnostics.fallback_count != 0
     ):
-        raise RuntimeError(f"{label} MRv2 parameter-overlay lifecycle evidence is incomplete")
+        raise RuntimeError(
+            f"{label} MRv2 parameter-overlay lifecycle evidence is incomplete: "
+            f"outputs={outputs!r}, diagnostics={diagnostics}, "
+            f"apply={handle.runner.overlay_apply_count}, updated_apply={handle.runner.overlay_updated_apply_count}"
+        )
     return outputs
 
 
@@ -219,7 +223,11 @@ def _check_graph(handle):
     overlay = handle.runner.require_session()._overlay
     assert isinstance(overlay, PinnedParameterOverlay)
     reader = overlay.readers[0]
-    assert all(program.borrows_inputs for program in reader.programs.values())
+    assert all(
+        pool.untyped_storage()
+        == handle.deployment.execution.arena.field_pool(reader.binding.resource, view.field).untyped_storage()
+        for pool, view in zip(reader.pools, reader.binding.fields, strict=True)
+    )
     pointers = (reader.table.data_ptr(), reader.captured.data_ptr(), reader.pools[0].data_ptr())
     prompts = ["The sky is blue. " * 8, "Water freezes when it is cold. " * 2]
     with patch.object(_ProjectionReader, "emit", side_effect=AssertionError("warm replay called Python projection")):

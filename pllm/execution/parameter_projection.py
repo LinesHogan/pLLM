@@ -1,5 +1,6 @@
 """Pinned projection tensor programs used by the eager and captured model adapters."""
 
+from collections.abc import Callable
 from functools import partial
 
 import torch
@@ -7,14 +8,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils._python_dispatch import _disable_current_modes  # pyright: ignore[reportPrivateUsage]
 
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator
-from pllm.contracts.region_program import Block, Call, Program, Region, Value
-from pllm.contracts.region_selection import RegionPayloadLimit
-from pllm.contracts.tensor_compilation import TensorCompiler
-from pllm.contracts.tensor_policy import TensorPolicy
-from pllm.execution.exported_cell import ExportedCell, TensorCellModule
-from pllm.execution.region_execution import RegionInstructionExecution
-from pllm.execution.region_optimization import prepare_region_execution
-from pllm.execution.tensor_compilation import DEFAULT_TENSOR_COMPILER
+from pllm.execution.memory import measure
 
 ROWS_PER_BLOCK = 32
 
@@ -61,29 +55,19 @@ def prepare_projection_read(
     examples: tuple[torch.Tensor, ...],
     operator: ParameterOverlayOperator,
     budget: int,
-    policy: TensorPolicy,
-    *,
-    compiler: TensorCompiler = DEFAULT_TENSOR_COMPILER,
-) -> RegionInstructionExecution:
-    """Select a shared readonly-input region before serving; the caller owns its tensors."""
-    names = ("hidden", "slots", "rows", "owners", *(f"pool{i}" for i in range(len(examples) - 4)))
+) -> Callable[..., tuple[torch.Tensor, ...]]:
+    """Fund direct ATen temporaries without charging borrowed field-pool storage."""
+    function = partial(projection_read, operator=operator)
     with _disable_current_modes(), torch.inference_mode(False), FakeTensorMode():
         samples = tuple(torch.empty_strided(t.shape, t.stride(), dtype=t.dtype, device=t.device) for t in examples)
-        cell = ExportedCell.from_export(
-            torch.export.export(TensorCellModule(partial(projection_read, operator=operator)), samples, strict=False),
-            inputs=names,
-            outputs=("residual",),
-        )
-    declaration = cell.declaration
-    arguments = tuple(Value(name, kind) for name, kind in zip(names, declaration.inputs, strict=True))
-    output = Value("residual", declaration.outputs[0])
-    program = Program(
-        Region(Block(arguments, (Call(names, (output,), declaration.name),), ("residual",))), (declaration,)
+        usage = measure(lambda: function(*samples))
+    # BLAS handles own scratch outside the ATen allocation trace. Charge both
+    # configured libraries, even though a particular bmm may only use cuBLAS.
+    scratch = (
+        torch.backends.cuda.cublas_workspace_size() + torch.backends.cuda.cublaslt_workspace_size()
+        if examples[0].device.type == "cuda"
+        else 0
     )
-    return prepare_region_execution(
-        program,
-        {declaration.name: cell},
-        payload_limits=(RegionPayloadLimit(str(examples[0].device), budget),),
-        options=policy,
-        compiler=compiler,
-    )
+    if usage.workspace + scratch > budget:
+        raise ValueError("increase the projection execution budget to fund its tensor and BLAS workspace")
+    return function
