@@ -1,5 +1,6 @@
 """Storage liveness while the planner executes tensor operations on shape-only operands."""
 
+import weakref
 from collections.abc import Callable, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -28,21 +29,28 @@ class MemoryTrace(TorchDispatchMode):
 
     def __init__(self) -> None:
         super().__init__()  # pyright: ignore[reportUnknownMemberType]
-        self.storages: dict[StorageWeakRef, int] = {}
+        self.sizes: dict[StorageWeakRef, int] = {}
+        self.live = 0
         self.peak = 0
 
-    @property
-    def live(self) -> int:
-        return sum(size for ref, size in self.storages.items() if not ref.expired())
+    def _forget(self, ref: StorageWeakRef) -> None:
+        self.live -= self.sizes.pop(ref)
 
     def _remember(self, values: object, owned: bool) -> None:
         for value in tree_leaves(values):
             if isinstance(value, torch.Tensor):
                 storage = value.untyped_storage()
+                ref = StorageWeakRef(storage)
+                if ref in self.sizes:
+                    continue
                 size = (storage.nbytes() + 511) // 512 * 512
                 # Native large-pool reuse can keep an unsplit tail of up to 1 MiB.
                 size += (1 << 20) if size > (1 << 20) else 0
-                self.storages.setdefault(StorageWeakRef(storage), size if owned else 0)
+                self.sizes[ref] = size if owned else 0
+                self.live += self.sizes[ref]
+                # Torch keeps a storage's Python object as long as its bytes, so this runs exactly at the free;
+                # keeping the total incremental makes tracing linear in the number of operations.
+                weakref.finalize(storage, self._forget, ref)
 
     def __torch_dispatch__(
         self,
@@ -51,7 +59,6 @@ class MemoryTrace(TorchDispatchMode):
         args: tuple[object, ...] = (),
         kwargs: dict[str, object] | None = None,
     ) -> object:
-        self.storages = {ref: size for ref, size in self.storages.items() if not ref.expired()}
         self._remember((args, kwargs), False)
         result = func(*args, **(kwargs or {}))
         self._remember(result, True)
