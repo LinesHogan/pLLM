@@ -33,6 +33,7 @@ def replay_handle(
     multiprocessing=False,
     batch=2,
     budget=None,
+    chunked=False,
 ):
     """Shared small-model Stage A engine setup for serial-route GPU evidence."""
     with patch.object(
@@ -49,6 +50,7 @@ def replay_handle(
                 0.25,
                 seed=7,
                 enable_prefix_caching=prefix,
+                enable_chunked_prefill=chunked,
                 kv_offload=offload,
                 generated_kv=generated_kv,
                 multiprocessing=multiprocessing,
@@ -99,7 +101,13 @@ def layer_reference(layer, positions, hidden, residual, prior):
 
 
 def main():
-    handle = replay_handle(RecirculationWorkload(destination=22, alpha=0.6, ramp_tokens=2))
+    chunked = "--chunked" in sys.argv
+    handle = replay_handle(
+        RecirculationWorkload(destination=22, alpha=0.6, ramp_tokens=2),
+        chunked=chunked,
+        budget=7 if chunked else None,
+        prefix="--prefix" in sys.argv,
+    )
     primitive = handle.runner.require_session()._replay
     layer = primitive.model.layers[23]
     native_layer, native_capture, native_replay = RouteWave.layer, RouteWave.capture, torch.cuda.CUDAGraph.replay

@@ -21,7 +21,7 @@ from vllm import LLM, SamplingParams
 import pllm
 from pllm import TensorUpdate
 from pllm.backends.vllm.runtime import VllmLlm
-from pllm.config import ModelConfig, VllmDType
+from pllm.config import ModelConfig, RunnerKind, VllmDType
 from pllm.contracts.parameter_overlay import (
     ParameterModuleKind,
     ParameterOverlayOperator,
@@ -110,7 +110,15 @@ class ImportedLowRank(pllm.Workload):
 
 
 def open_llm(
-    workload, seqs=2, tokens=64, model_length=64, *, cuda_graphs=False, **execution
+    workload,
+    seqs=2,
+    tokens=64,
+    model_length=64,
+    *,
+    cuda_graphs=False,
+    chunked=False,
+    runner=RunnerKind.MRV2,
+    **execution,
 ) -> VllmLlm[object, object]:
     options = {"execution": pllm.ExecutionOptions(**execution)} if execution else {}
     config = ModelConfig(
@@ -121,6 +129,8 @@ def open_llm(
         max_num_batched_tokens=tokens,
         gpu_memory_utilization=0.25,
         cuda_graphs=cuda_graphs,
+        enable_chunked_prefill=chunked,
+        runner=runner,
         seed=7,
         **options,
     )
@@ -347,6 +357,18 @@ def _check_routed(handle: VllmLlm[object, object]) -> tuple[str, ...]:
 
 
 def main() -> int:
+    from pllm.workloads.prefill_adapters import PrefillAdapters
+
+    adapter_tokens = []
+    for chunked in (False, True):
+        with open_llm(PrefillAdapters(chunk_size=3, rank=2), chunked=chunked, tokens=7 if chunked else 64) as handle:
+            outputs = handle.generate(["The sky is blue. " * 5, "Water freezes at " * 7], SAMPLING)
+            adapter_tokens.append(texts(outputs))
+            diagnostics = handle.diagnostics()
+            assert diagnostics.update_count == 5 * sum((len(output.prompt_token_ids) + 2) // 3 for output in outputs)
+            assert diagnostics.trained_rows == 5 * sum(len(output.prompt_token_ids) for output in outputs)
+            assert diagnostics.active_lineages == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
+    assert adapter_tokens[0] == adapter_tokens[1]
     dense = InPlaceTTTWorkload(
         InPlaceTTTConfig((TARGET,), chunk_size=1, learning_rate=1e-4, update_prefill=True, update_decode=False)
     )

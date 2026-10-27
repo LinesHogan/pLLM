@@ -678,7 +678,7 @@ def create_vllm_llm(
             seed=config.seed,
             trust_remote_code=config.trust_remote_code,
             enable_prefix_caching=config.enable_prefix_caching,
-            enable_chunked_prefill=False,
+            enable_chunked_prefill=config.enable_chunked_prefill,
             # The supported uni-process, non-speculative decoder enables async by default.
             async_scheduling=config.runner is RunnerKind.MRV2,
             scheduler_cls="pllm.backends.vllm.prefix_cache."

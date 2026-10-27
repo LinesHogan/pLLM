@@ -97,7 +97,7 @@ def make_llm(
             data_parallel_size=1,
             distributed_executor_backend="uni",
             worker_cls="auto",
-            enable_chunked_prefill=False,
+            enable_chunked_prefill=config.enable_chunked_prefill,
             max_model_len=config.max_model_len,
             max_num_seqs=config.max_num_seqs,
             max_num_batched_tokens=config.max_num_batched_tokens,

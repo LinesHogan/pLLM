@@ -200,6 +200,51 @@ def test_composed_readers_replay_model_graphs(workload, monkeypatch):
                 )
             results.append([(o.outputs[0].token_ids, o.outputs[0].cumulative_logprob) for o in outputs])
             assert handle.diagnostics().fallback_count == 0
+            if isinstance(workload, PromptFactors):
+                session = handle.runner.require_session()
+                prepare, saved = session.prepare_input, []
+
+                def recompute(rows):
+                    saved.append(rows)
+                    return prepare(replace(saved[0], row_batch=replace(saved[0].row_batch, step_id=rows.step_id)))
+
+                with monkeypatch.context() as replay:
+                    replay.setattr(session, "prepare_input", recompute)
+                    with pytest.raises(RuntimeError, match="would recompute"):
+                        handle.generate(["Name a color."], SamplingParams(max_tokens=3, ignore_eos=True))
     assert [tokens for tokens, _ in results[0]] == [tokens for tokens, _ in results[1]]
     # vLLM's fused graph kernels and eager BF16 kernels round differently.
     assert [score for _, score in results[0]] == pytest.approx([score for _, score in results[1]], abs=0.1)
+
+
+@pytest.mark.parametrize(
+    "runner,budget,seqs",
+    [(runner, budget, 2) for runner in ("mrv1", "mrv2") for budget in (128, 512, 2048)]
+    + [(runner, 128, 128) for runner in ("mrv1", "mrv2")],
+)
+def test_chunked_runners_discard_partial_prompt_feedback(runner, budget, seqs):
+    from pllm.config import RunnerKind
+    from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
+
+    tokens = []
+    prompts = ["word"] * (seqs + 2) if seqs == 128 else ["word " * (budget + 4), "word " * 74]
+    for chunked in (False, True):
+        with open_llm(
+            ESampRequestWorkload(ESampRequestConfig(rank=2)),
+            runner=RunnerKind(runner),
+            seqs=seqs,
+            chunked=chunked,
+            tokens=budget if chunked else 2176,
+            model_length=2176,
+            memory_budget_bytes=4 << 30,
+            capture_memory_bytes=256 << 20,
+        ) as handle:
+            outputs = handle.generate(
+                prompts,
+                SamplingParams(max_tokens=3, temperature=0, ignore_eos=True),
+            )
+            tokens.append([o.outputs[0].token_ids for o in outputs])
+            diagnostics = handle.diagnostics()
+            assert diagnostics.loss_count == diagnostics.update_count == 2 * len(prompts)
+            assert diagnostics.active_lineages == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
+    assert tokens[0] == tokens[1]

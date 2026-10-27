@@ -91,6 +91,7 @@ class ModelConfig:
     seed: int = 0
     trust_remote_code: bool = False
     enable_prefix_caching: bool = False
+    enable_chunked_prefill: bool = False
     generated_kv: Literal["reuse", "isolate"] = "isolate"
     revision: str | None = None
     multiprocessing: bool = False
