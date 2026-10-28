@@ -111,7 +111,7 @@ def gradient_update(
     outputs: list[torch.Tensor] = []
     updates, trained = torch.zeros_like(length), torch.zeros_like(length)
     with torch.inference_mode(False), torch.enable_grad():
-        constants = {name: values[name].clone() for name, source in bindings.items() if source == "weight"}
+        constants = {name: values[name] for name, source in bindings.items() if source == "weight"}
         for start in range(0, len(hidden) + chunk - 1, chunk):
             indices = positions + start - offset
             valid = (indices >= 0) & (indices < len(hidden))
