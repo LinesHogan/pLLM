@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from threading import Event, RLock
-from typing import TYPE_CHECKING, Generic, NoReturn, Protocol, TypeVar
+from typing import TYPE_CHECKING, ClassVar, Generic, Literal, NoReturn, Protocol, TypeVar
 
 import numpy as np
 import torch
@@ -54,6 +54,37 @@ DataT = TypeVar("DataT")
 ResultT = TypeVar("ResultT")
 ResultCo = TypeVar("ResultCo", covariant=True)
 ProjectionResiduals = Mapping[tuple[RequestIdentity, ParameterTarget], torch.Tensor]
+_PagePhase = Literal["abort", "release", "settle"]
+
+
+@dataclass(frozen=True, slots=True)
+class _WriteAbort:
+    write: PageWrite
+    phase: ClassVar[_PagePhase] = "abort"
+
+    def complete(self, arena: PageBundleArena) -> None:
+        arena.abort(self.write)
+
+
+@dataclass(frozen=True, slots=True)
+class _PinRelease:
+    pin: PagePin
+    phase: ClassVar[_PagePhase] = "release"
+
+    def complete(self, arena: PageBundleArena) -> PageRelease:
+        return arena.release_pin(self.pin)
+
+
+@dataclass(frozen=True, slots=True)
+class _PublicationSettlement:
+    receipt: PagePublication
+    phase: ClassVar[_PagePhase] = "settle"
+
+    def complete(self, arena: PageBundleArena) -> None:
+        arena.settle(self.receipt)
+
+
+_PageObligation = _WriteAbort | _PinRelease | _PublicationSettlement
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,11 +110,10 @@ class StateTaskContext(Generic[DataT]):
     results: dict[tuple[TaskSymbol, str], torch.Tensor] = field(
         default_factory=lambda: dict[tuple[TaskSymbol, str], torch.Tensor]()
     )
-    # These collections replace the single-write lifecycle. Every entry is an
-    # original arena-issued capability; no independently mutable latest map.
-    page_writes: dict[PageWrite, None] = field(default_factory=lambda: dict[PageWrite, None]())
-    page_publications: dict[PagePublication, bool] = field(default_factory=lambda: dict[PagePublication, bool]())
-    page_pins: dict[PagePin, PageRelease | None] = field(default_factory=lambda: dict[PagePin, PageRelease | None]())
+    _obligations: list[_PageObligation] = field(default_factory=lambda: list[_PageObligation]())
+    # Receipts are ordered history; only outstanding obligations drive cleanup.
+    publications: list[PagePublication] = field(default_factory=lambda: list[PagePublication]())
+    releases: list[PageRelease] = field(default_factory=lambda: list[PageRelease]())
     guidance: PackedSamplerGuidanceBatch | None = None
     loss: torch.Tensor | None = None
     guidance_ready: CudaStreamReadiness | None = None
@@ -107,16 +137,20 @@ class StateTaskContext(Generic[DataT]):
         return self.value
 
     def __post_init__(self) -> None:
-        self.page_pins[self.pin] = None
+        self.register_pin(self.pin)
+
+    def register_pin(self, pin: PagePin) -> None:
+        """Retain responsibility for releasing an acquired pin."""
+        self._obligations.append(_PinRelease(pin))
 
     def sole_write(self) -> PageWrite | None:
         """The invocation's one pending private write, which its tensor tasks share."""
-        (write,) = self.page_writes or (None,)
+        (write,) = [entry.write for entry in self._obligations if isinstance(entry, _WriteAbort)] or (None,)
         return write
 
     @property
     def publication(self) -> PagePublication | None:
-        return next(reversed(self.page_publications), None)
+        return next(reversed(self.publications), None)
 
     def current_owned_ref(self, original: StateRef) -> StateRef:
         return self.current_owned_refs((original,))[0]
@@ -124,7 +158,7 @@ class StateTaskContext(Generic[DataT]):
     def current_owned_refs(self, originals: Sequence[StateRef]) -> tuple[StateRef, ...]:
         """Follow this invocation's publications from each ref, walking the receipts once for the whole batch."""
         successor: dict[StateRef, StateRef] = {}
-        for receipt in self.page_publications:
+        for receipt in self.publications:
             for before, after in zip(receipt.before_refs, receipt.after_refs, strict=True):
                 successor.setdefault(before, after)
 
@@ -151,50 +185,58 @@ class StateTaskContext(Generic[DataT]):
         authorized = set(self.current_owned_refs(self.pin.refs))
         assert set(sources) <= authorized
         token = self.arena.prepare_transition(sources, self.pin.stream, fields=fields, copy_fields=copy_fields)
-        self.page_writes[token] = None
+        self._obligations.append(_WriteAbort(token))
         return token
 
     def publish_owned_write(self, token: PageWrite) -> PagePublication:
         self.check_page_execution()
-        assert token in self.page_writes
+        obligation = _WriteAbort(token)
+        assert obligation in self._obligations
         receipt = self.arena.publish(token)
-        self.page_publications[receipt] = False
-        del self.page_writes[token]
+        self.publications.append(receipt)
+        self._obligations.remove(obligation)
+        self._obligations.append(_PublicationSettlement(receipt))
         self.trace.record(
             TracePhase.PUBLISH, self.invocation_id, refs=receipt.after_refs, operation_id=receipt.operation_id
         )
         return receipt
 
-    def settle_owned_publication(self, receipt: PagePublication) -> None:
-        assert receipt in self.page_publications
-        if not self.page_publications[receipt]:
-            self.arena.settle(receipt)
-            self.page_publications[receipt] = True
+    def finish_pages(self, phases: tuple[_PagePhase, ...] = ("abort", "release", "settle")) -> None:
+        """Discharge each phase in registration order, retaining failures for retry."""
+        for phase in phases:
+            for obligation in tuple(self._obligations):
+                if obligation.phase == phase:
+                    self._discharge(obligation)
 
-    def abort_owned_writes(self) -> None:
-        for token in tuple(self.page_writes):
-            self.arena.abort(token)
-            del self.page_writes[token]
+    def _discharge(self, obligation: _PageObligation) -> None:
+        assert obligation in self._obligations
+        receipt = obligation.complete(self.arena)
+        if receipt is not None:
+            self.releases.append(receipt)
+        self._obligations.remove(obligation)
 
-    def release_owned_pin(self, pin: PagePin) -> PageRelease:
-        assert pin in self.page_pins
-        receipt = self.page_pins[pin]
-        if receipt is None:
-            receipt = self.page_pins[pin] = self.arena.release_pin(pin)
-        return receipt
+    def release_owned_pin(self, pin: PagePin) -> None:
+        """Discharge an early release through the same operation as terminal cleanup."""
+        self._discharge(_PinRelease(pin))
 
     def borrow_published(self, refs: Sequence[StateRef]) -> PagePin:
         self.check_page_execution()
         refs = StateRefs.of(refs)
         authorized = np.zeros(len(refs), dtype=np.bool_)
-        for receipt in self.page_publications:
+        for receipt in self.publications:
             authorized |= receipt.after_refs.positions(refs) >= 0
         assert refs and authorized.all()
-        for pin, release in self.page_pins.items():
-            if release is None and (pin.refs.positions(refs) >= 0).all():
-                return pin
+        return self.pin_for(refs)
+
+    def pin_for(self, refs: Sequence[StateRef]) -> PagePin:
+        """Reuse a live invocation pin covering these exact refs, or acquire one."""
+        self.check_page_execution()
+        refs = StateRefs.of(refs)
+        for entry in self._obligations:
+            if isinstance(entry, _PinRelease) and (entry.pin.refs.positions(refs) >= 0).all():
+                return entry.pin
         pin = self.arena.pin_exact(refs, self.pin.stream)
-        self.page_pins[pin] = None
+        self.register_pin(pin)
         return pin
 
 
@@ -517,14 +559,14 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         with self._lock:
             if self._borrowed_resources:
                 self._require_borrow_live()
-            assert not context.page_writes and not context.page_publications and not context.borrowed_roots
+            assert context.sole_write() is None and not context.publications and not context.borrowed_roots
             reader = context.pin
             context.selection = self.directory.select(context.selection.rows)
             context.pin = self.arena.pin_exact(context.selection.refs, stream)
-            context.page_pins[context.pin] = None
+            context.register_pin(context.pin)
             if reader.refs != context.pin.refs:
                 held = self.arena.pin_exact(reader.refs, stream)
-                context.page_pins[held] = None
+                context.register_pin(held)
             context.release_owned_pin(reader)
 
     def step(self, value: InputT, stream: torch.cuda.Stream | None = None) -> ResultT:
@@ -679,7 +721,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             if context.borrowed_roots or context.held_input is not None:
                 self._failed(context, RuntimeError("borrowed invocation cancelled; resources retained"))
             self._order_sampler(context, context.sampler_stream)
-            context.abort_owned_writes()
+            context.finish_pages(("abort",))
             self.trace.record(TracePhase.ABORT, context.invocation_id)
             self._release(context)
 
@@ -700,7 +742,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             self._borrow_failed = True
             if context.publication is None:
                 try:
-                    context.abort_owned_writes()
+                    context.finish_pages(("abort",))
                 except Exception as cleanup:
                     exc.add_note(f"local abort also failed; resources retained: {cleanup}")
                 raise exc
@@ -718,12 +760,9 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         context.guidance_ready = None
         for root in context.borrowed_roots:
             root.close()
-        for pin in context.page_pins:
-            context.release_owned_pin(pin)
-        for receipt in context.page_publications:
-            context.settle_owned_publication(receipt)
+        context.finish_pages()
         self._active.pop(context.invocation_id)
-        release = context.release_owned_pin(context.pin)
+        release = next(receipt for receipt in context.releases if receipt.pin is context.pin)
         self.trace.record(
             TracePhase.SETTLED,
             context.invocation_id,

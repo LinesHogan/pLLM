@@ -66,7 +66,7 @@ def test_shared_route_state_persists_until_dormant_retirement():
     execution.cancel_step(invocation)
     invocation = execution.begin(rows_for(b))
     execution.retire((a,))
-    assert invocation.page_pins[invocation.pin] is None
+    assert not invocation.releases
     execution.cancel_step(invocation)
     execution.retire((b,))
     assert execution.directory.active_count == 1  # The shared route persists dormant.
@@ -83,9 +83,9 @@ def test_retiring_a_request_cancels_its_invocation_and_releases_only_its_pins():
     a, b = RequestIdentity("a", 0, 0, "math"), RequestIdentity("b", 1, 0, "math")
     execution.admit((a, b))
     invocation = execution.begin(rows_for(a))
-    assert invocation.page_pins[invocation.pin] is None
+    assert not invocation.releases
     execution.retire((a,))
-    assert invocation.cancel_requested.is_set() and invocation.page_pins[invocation.pin] is not None
+    assert invocation.cancel_requested.is_set() and invocation.releases[0].pin is invocation.pin
     assert not execution.directory.has_inference_pin(a)
     assert tuple(execution.directory.inference_pin(b).refs) == (global_ref,)
     execution.cancel_step(execution.begin(rows_for(b)))
@@ -95,7 +95,7 @@ def test_retiring_a_request_cancels_its_invocation_and_releases_only_its_pins():
     assert tuple(invocation.pin.refs) == (global_ref,)
     assert tuple(invocation.selection.for_resource(DENSE).refs) == ()
     execution.retire(())
-    assert invocation.page_pins[invocation.pin] is not None
+    assert invocation.releases[0].pin is invocation.pin
     execution.retire_dormant()
     assert_multistate_reclaimed(execution)
 

@@ -118,22 +118,10 @@ class VllmActivationPatch:
                     key = (identity, refresh)
                     if key not in versions:
                         pin, ref = self._version(identity, refresh, context, directory)
-                        if (
-                            not self.installed or context.arena.plan.semantic_graph.input_groups
-                        ) and pin not in context.page_pins:
+                        if not self.installed or context.arena.plan.semantic_graph.input_groups:
                             # Admission pins belong to the request directory. Borrow
                             # the same exact version for this invocation's source view.
-                            pin = next(
-                                (
-                                    candidate
-                                    for candidate, release in context.page_pins.items()
-                                    if release is None and ref in candidate.refs
-                                ),
-                                None,
-                            )
-                            if pin is None:
-                                pin = context.arena.pin_exact((ref,), context.pin.stream)
-                                context.page_pins[pin] = None
+                            pin = context.pin_for((ref,))
                         versions[key] = pin, ref
                     pin, ref = versions[key]
                     if context.held_input is not None and not any(

@@ -179,7 +179,7 @@ def increment_resources(context):
     """Publish one increment of the first field of every selected resource."""
     refs = context.current_owned_refs(context.pin.refs)
     pin = context.arena.pin_exact(refs, context.pin.stream)
-    context.page_pins[pin] = None
+    context.register_pin(pin)
     for ref in refs:
         (value,) = context.arena.snapshot(pin, ref)[:1]
         write = context.prepare_owned_write((ref,), ((LayoutFieldId(0),),))

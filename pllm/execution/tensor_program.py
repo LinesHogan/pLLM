@@ -145,7 +145,7 @@ class InvocationOutput:
 
 
 def _read(context: StateTaskContext[D], version: Literal["input", "private", "published"] = "input") -> TensorBatch:
-    assert version == "input" or len(context.page_publications) <= 1
+    assert version == "input" or len(context.publications) <= 1
     refs = context.pin.refs
     access: tuple[PagePin | PageWrite, ...] = (context.pin,) * len(refs)
     write = context.sole_write()
@@ -416,7 +416,7 @@ class TensorOperation(Generic[D]):
             assert len(set(selected)) == len(selected) and all(0 <= i < len(batch.roots) for i in selected)
             write: PageWrite | None = None
             if self.mode == "transition" and selected:
-                if self.version == "input" or not context.page_writes:
+                if self.version == "input" or context.sole_write() is None:
                     write = context.prepare_owned_write(context.pin.refs.take(selected), copy_fields=self.copy_fields)
                 batch = _read(context, "private")
             output = self.body(data, batch, context)

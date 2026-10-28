@@ -434,7 +434,7 @@ def _check_projection_abort(execution, value, targets, binding, refs, operands, 
     execution.execute_anchor(invocation, AnchorId(0))
     task = ProjectionTask(execution, invocation, value.sampler_rows, binding.task_id, targets)
     task.run(tuple(operand for operand in operands if operand.target == targets[0]))
-    assert len(invocation.page_writes) == 1
+    assert invocation.sole_write() is not None
     execution.cancel_step(invocation)
     for ref, expected in zip(refs, before, strict=True):
         torch.testing.assert_close(execution.snapshot(ref), expected)
@@ -558,7 +558,7 @@ def _check_exact_additive_projection():
     )
     for operand, state in zip(decode, expected_states, strict=True):
         torch.testing.assert_close(task.run((operand,))[identity, operand.target], hidden[:1] @ state.T)
-    assert not invocation.page_writes
+    assert invocation.sole_write() is None
     _publish_projection(execution, invocation)
     assert execution.finish_step(invocation).publication is None
     execution.retire((identity,))

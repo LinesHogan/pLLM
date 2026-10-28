@@ -266,7 +266,7 @@ def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch
     before = execution.snapshot(entry, stream=stream)
 
     def fail_before_publish(self, context):
-        assert len(context.page_writes) == 1
+        assert context.sole_write() is not None
         raise RuntimeError("cancel between private write and publication")
 
     monkeypatch.setattr(PublishStateTask, "execute", fail_before_publish)
