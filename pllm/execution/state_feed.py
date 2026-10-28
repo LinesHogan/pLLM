@@ -5,7 +5,8 @@ from __future__ import annotations
 import ctypes
 import os
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from multiprocessing import get_context
@@ -154,18 +155,23 @@ class Feed:
             for channel in row:
                 channel.close()
 
-    def _require_live(self) -> None:
+    @contextmanager
+    def _live(self) -> Generator[None]:
         if self._failed or self._closed or self._moved or self._ended:
             raise RuntimeError("feed is closed, transferred, ended or fail-stopped; start a new session")
+        try:
+            yield
+        except BaseException:
+            self._failed = True
+            raise
 
     def _signal(self) -> None:
         signal = self._control.recv_bytes()
         if signal == b"credit":
             self._credits -= 1
-        elif signal == b"closed":
-            self._quiescent = True
         else:
-            raise RuntimeError("feed received an invalid control reply")
+            assert signal == b"closed"
+            self._quiescent = True
 
     def _wait(self, channels: tuple[Connection, ...] = ()) -> None:
         if self._control in wait((self._control, *channels)):
@@ -202,34 +208,36 @@ class Feed:
 
     def publish(self, **fields: torch.Tensor) -> None:
         """Copy all declared fields, then publish one immutable version; block on capacity."""
-        self._require_live()
-        if fields.keys() != self._fields.keys():
-            raise ValueError(f"{self._binding.resource}: publish exactly {tuple(self._fields)}")
-        for name, field in self._fields.items():
-            value = fields[name]
-            if (
-                value.layout != torch.strided
-                or tuple(value.shape) != field.shape
-                or value.dtype != tensor_dtype(field.dtype)
-                or value.device != self._device
-            ):
-                raise ValueError(
-                    f"{self._binding.resource}.{name}: use a strided {field.shape} {field.dtype} tensor on {self._device}"
-                )
-        try:
+        if (
+            self._failed
+            or self._closed
+            or self._moved
+            or self._ended
+            or fields.keys() != self._fields.keys()
+            or any(
+                fields[name].layout != torch.strided
+                or tuple(fields[name].shape) != field.shape
+                or fields[name].dtype != tensor_dtype(field.dtype)
+                or fields[name].device != self._device
+                for name, field in self._fields.items()
+            )
+        ):
+            with self._live():
+                pass
+            raise ValueError(
+                f"{self._binding.resource}: publish strided tensors on {self._device} matching "
+                f"{ {name: (field.shape, str(field.dtype)) for name, field in self._fields.items()} }"
+            )
+        with self._live():
             stream = torch.cuda.current_stream(self._device)
             arena = self._start(stream)
             assert self._current is not None
             slot = self._current.version_id % len(self._channels)
             self._release(slot)
             write = arena.prepare_transition((self._current,), stream, copy_fields=())
-            try:
-                for name, field in self._fields.items():
-                    arena.write_field(write, 0, field.field_id).copy_(fields[name])
-                publication = arena.publish(write)
-            except BaseException:
-                arena.abort(write)
-                raise
+            for name, field in self._fields.items():
+                arena.write_field(write, 0, field.field_id).copy_(fields[name])
+            publication = arena.publish(write)
             arena.settle(publication)
             (self._current,) = publication.after_refs
             pin = arena.pin_exact((self._current,), stream)
@@ -240,30 +248,19 @@ class Feed:
                 self._pending[slot] = arena.release_pin(pin)
             stream.synchronize()  # Returning transfers no source-tensor lifetime obligation to the caller.
             self._send(FeedRecord(FeedEvent.PUBLISH, slot, self._current))
-        except BaseException:
-            self._failed = True
-            raise
 
     def missing(self) -> None:
         """Submit one explicit absent-input step using the Activation missing policy."""
-        self._require_live()
-        try:
+        with self._live():
             self._send(FeedRecord(FeedEvent.MISSING))
-        except BaseException:
-            self._failed = True
-            raise
 
     def end(self) -> None:
         """End the feed normally; following steps use the declared missing policy."""
         if self._ended and not self._failed:
             return
-        self._require_live()
-        try:
+        with self._live():
             self._send(FeedRecord(FeedEvent.END))
             self._ended = True
-        except BaseException:
-            self._failed = True
-            raise
 
     def _await_shutdown(self) -> None:
         # A broken ACK is not proof of GPU quiescence. Keep the arena until teardown or process death.
@@ -348,8 +345,7 @@ class FeedReceiver:
             raise RuntimeError("feed producer cancelled or sent an invalid record")
 
     def _receive(self, record: FeedRecord, stream: torch.cuda.Stream) -> BorrowedStateRoot:
-        if record.ref is None or not 0 <= record.slot < len(self.channels) or self.partial:
-            raise RuntimeError("feed received an invalid or partial publication")
+        assert record.ref is not None and 0 <= record.slot < len(self.channels) and not self.partial
         for channel in self.channels[record.slot]:
             self.partial.append(PageBundleArena.receive_field(self.plan, channel, stream=stream))
         root = BorrowedStateRoot(self.plan, self.binding.resource, record.ref, tuple(self.partial))
@@ -375,11 +371,9 @@ class FeedReceiver:
                 result = ReadonlyStepInput(rows.plan_epoch, rows.step_id, (self._receive(record, stream),))
             elif record.kind is FeedEvent.MISSING:
                 result = ReadonlyStepAbsent(rows.plan_epoch, rows.step_id)
-            elif record.kind is FeedEvent.END:
+            else:
                 self.ended = True
                 result = ReadonlyStepEnd(rows.plan_epoch, rows.step_id)
-            else:
-                raise RuntimeError("feed producer cancelled or sent an invalid record")
             self.control.send_bytes(b"credit")
             return result
         except BaseException:
