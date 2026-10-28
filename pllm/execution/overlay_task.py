@@ -20,11 +20,13 @@ from pllm.contracts.sampler import PackedSamplerRowBatch
 from pllm.contracts.semantic_graph import TaskId
 from pllm.contracts.visibility import VisibilitySource
 from pllm.execution.chunk_tail import join_tail, save_tail
+from pllm.execution.cuda_stream import upload
 from pllm.execution.scan import scan
 from pllm.execution.scan_execution import Step
 from pllm.execution.tensor_frame import OverlayEntry, OverlayTargetResult, TensorFrame, Tensors, TensorUpdate
 from pllm.execution.tensor_program import PoolSGD, TaskOutput, TensorBatch
 from pllm.kernels.head_overlay import head_correction
+from pllm.kernels.page_copy import copy_pages
 
 DataT = TypeVar("DataT")
 ResultT = TypeVar("ResultT")
@@ -205,34 +207,36 @@ class OverlayTransition:
         }
         if not operands:
             return TaskOutput()
+        selected = dict.fromkeys(
+            (row.identity, index)
+            for row, index in zip(batch.selection.rows, batch.selection.state_indices, strict=True)
+        )
+        indices = {identity: index for identity, index in selected}
+        updates: dict[tuple[RequestIdentity, ParameterTarget], TensorUpdate] = {}
+        with torch.no_grad():
+            for target_index, target in enumerate(self.targets):
+                for train in (False, True):
+                    group = tuple(
+                        operand
+                        for (_, name), operand in operands.items()
+                        if name == target and (operand.phase in self.phases) == train
+                    )
+                    if group:
+                        results = self.group(group, target_index, tuple(indices[o.identity] for o in group), batch)
+                        updates.update(((o.identity, target), result) for o, result in zip(group, results, strict=True))
         start = len(data.entries)
         changed: dict[int, torch.Tensor] = {}
-        with torch.no_grad():
-            for identity, index in dict.fromkeys(
-                (row.identity, index)
-                for row, index in zip(batch.selection.rows, batch.selection.state_indices, strict=True)
-            ):
-                results: list[OverlayTargetResult] = []
-                for target_index, target in enumerate(self.targets):
-                    if (identity, target) not in operands:
-                        continue
-                    operand = operands[identity, target]
-                    values = dict(
-                        zip(
-                            self.buffers,
-                            batch.roots[index][
-                                len(self.buffers) * target_index : len(self.buffers) * (target_index + 1)
-                            ],
-                            strict=True,
-                        )
-                    )
-                    result = self.result(operand, values)
-                    results.append(OverlayTargetResult(target, result))
-                    changed[index] = result.changed if index not in changed else changed[index] | result.changed
-                if results:
-                    data.entries.append(
-                        OverlayEntry(identity, batch.selection.refs[index], batch.after_refs[index], tuple(results))
-                    )
+        for identity, index in selected:
+            results = tuple(
+                OverlayTargetResult(target, updates[identity, target])
+                for target in self.targets
+                if (identity, target) in updates
+            )
+            if results:
+                data.entries.append(
+                    OverlayEntry(identity, batch.selection.refs[index], batch.after_refs[index], results)
+                )
+                changed[index] = torch.stack(tuple(result.update.changed for result in results)).any()
         return TaskOutput(
             residuals={
                 (entry.identity, target.target): target.update.output
@@ -249,6 +253,29 @@ class OverlayTransition:
                 )
             ).sum(0),
         )
+
+    def group(
+        self,
+        operands: tuple[CapturedParameterOperand, ...],
+        target: int,
+        indices: tuple[int, ...],
+        batch: TensorBatch,
+    ) -> tuple[TensorUpdate, ...]:
+        """Gather issued slots once per target/phase; settlement still belongs to the task."""
+        width = len(self.buffers)
+        fields = tuple(batch.field_slots(target * width + i) for i in range(width))
+        pools = tuple(pool for pool, _ in fields)
+        slots = upload(tuple(tuple(slots[i] for i in indices) for _, slots in fields), pools[0].device)
+        values = tuple(pool.index_select(0, row) for pool, row in zip(pools, slots, strict=True))
+        results = tuple(
+            self.result(operand, dict(zip(self.buffers, (value[i] for value in values), strict=True)))
+            for i, operand in enumerate(operands)
+        )
+        if operands[0].phase in self.phases:
+            sources = torch.arange(len(operands), device=pools[0].device)
+            for value, pool, destinations in zip(values, pools, slots, strict=True):
+                copy_pages(value, pool, sources, destinations)
+        return results
 
     def result(self, operand: CapturedParameterOperand, values: Tensors) -> TensorUpdate:
         """Validate the author's result at its tensor boundary without observing CUDA values."""
