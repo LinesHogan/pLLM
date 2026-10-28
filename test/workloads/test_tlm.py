@@ -23,7 +23,7 @@ from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.runtime_facts import model_timeline
 from pllm.kernels.adamw import AdamWConfig
 from pllm.workloads.tlm import TLMConfig, TLMMode, TLMWorkload
 
@@ -74,7 +74,7 @@ class TinyCausalModel:
 def _facts(model, *, reserved=None, task_resources=()) -> BackendCompileFacts:
     """Single-device facts reserving the frozen model's resident bytes (or ``reserved``)."""
     kind, ordinal = StateDeviceKind(model.device.type), model.device.index or 0
-    timeline = RuntimeFacts(model.device).timeline(("optimizer/adamw@1", "transition/full_root@1"))
+    timeline = model_timeline(model.device, ("optimizer/adamw@1", "transition/full_root@1"))
     reserved = model.resident_bytes if reserved is None else reserved
     timeline = replace(timeline, reserved_bytes=(reserved,) * len(timeline.anchors), task_resources=task_resources)
     probe = BackendPlacementProbe(

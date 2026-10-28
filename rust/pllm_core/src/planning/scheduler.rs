@@ -64,7 +64,6 @@ pub(crate) struct PhysicalTask {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PhysicalPlan {
-    pub(crate) plan_epoch: u64,
     pub(crate) schedule_signature: String,
     pub(crate) tasks: Vec<PhysicalTask>,
     pub(crate) fallback_count: u64,
@@ -863,31 +862,23 @@ fn lower_physical(
     graph: &SemanticGraph,
     timeline: &Timeline,
     decision: &ScheduleDecision,
-    plan_epoch: u64,
     state: Option<&StatePhysicalPlan>,
 ) -> Result<PhysicalPlan, String> {
     validate_decision(graph, timeline, decision, state)?;
-    project_physical(decision, plan_epoch)
+    Ok(project_physical(decision))
 }
 
-pub(super) fn project_physical(
-    decision: &ScheduleDecision,
-    plan_epoch: u64,
-) -> Result<PhysicalPlan, String> {
-    if plan_epoch == 0 {
-        return Err("canonical physical plan epoch must be positive".to_owned());
-    }
-    Ok(PhysicalPlan {
-        plan_epoch,
+pub(super) fn project_physical(decision: &ScheduleDecision) -> PhysicalPlan {
+    PhysicalPlan {
         schedule_signature: decision.signature.clone(),
         tasks: decision.tasks.clone(),
         fallback_count: decision.fallback_count,
         schema_version: SCHEMA_VERSION,
-    })
+    }
 }
 
 fn validate_physical_shape(physical: &PhysicalPlan) -> Result<(), String> {
-    if physical.plan_epoch == 0 || physical.schema_version != SCHEMA_VERSION {
+    if physical.schema_version != SCHEMA_VERSION {
         return Err("invalid canonical physical plan envelope".to_owned());
     }
     require_digest(&physical.schedule_signature, "physical.schedule_signature")?;
@@ -905,7 +896,7 @@ pub(crate) fn validate_physical(
     state: Option<&StatePhysicalPlan>,
 ) -> Result<(), String> {
     validate_physical_shape(physical)?;
-    let expected = lower_physical(graph, timeline, decision, physical.plan_epoch, state)?;
+    let expected = lower_physical(graph, timeline, decision, state)?;
     if physical != &expected {
         return Err("canonical physical plan differs from Rust projection".to_owned());
     }
@@ -942,20 +933,18 @@ fn validate_schedule(
 }
 
 #[pyfunction]
-#[pyo3(signature = (graph_json, timeline_json, decision_json, plan_epoch, state_json=None))]
+#[pyo3(signature = (graph_json, timeline_json, decision_json, state_json=None))]
 fn lower_physical_plan(
     graph_json: &str,
     timeline_json: &str,
     decision_json: &str,
-    plan_epoch: u64,
     state_json: Option<&str>,
 ) -> PyResult<String> {
     let graph = decode_graph(graph_json).map_err(error)?;
     let timeline = decode_timeline(timeline_json).map_err(error)?;
     let decision = decode_decision(decision_json).map_err(error)?;
     let state = state_json.map(decode_state).transpose().map_err(error)?;
-    let physical =
-        lower_physical(&graph, &timeline, &decision, plan_epoch, state.as_ref()).map_err(error)?;
+    let physical = lower_physical(&graph, &timeline, &decision, state.as_ref()).map_err(error)?;
     canonical_ascii_json(&physical).map_err(error)
 }
 
@@ -1158,7 +1147,7 @@ mod tests {
             "anchors": (0..4).map(|i| json!({"symbol": format!("a{i}"), "ordinal": i})).collect::<Vec<_>>()
         }).to_string()).unwrap();
         let state = super::decode_state(&json!({
-            "plan_epoch": 1, "schema_version": 1, "request_digest": "a".repeat(64),
+            "schema_version": 1, "request_digest": "a".repeat(64),
             "representation_signature": "b".repeat(64), "reserved_bytes": 32,
             "representations": [{"resource": "state", "provider_id": "pages",
                 "device_kind": "cpu", "device_ordinal": 0, "layout_id": 0,
@@ -1239,7 +1228,7 @@ mod tests {
             }
         }
         let decision = compile(&valid, &timeline, Some(&state)).unwrap();
-        let physical = lower_physical(&valid, &timeline, &decision, 1, Some(&state)).unwrap();
+        let physical = lower_physical(&valid, &timeline, &decision, Some(&state)).unwrap();
         let mut drift = state.clone();
         drift.representations[0].capabilities.clear();
         assert!(validate_physical(&valid, &timeline, &decision, &physical, Some(&drift)).is_err());
@@ -1293,7 +1282,7 @@ mod tests {
             "task_resources": (0..3).map(|task| json!({"task": format!("t{task}"), "workspace_bytes": 16})).collect::<Vec<_>>()
         }).to_string()).unwrap();
         let decision = compile(&graph, &timeline, None).unwrap();
-        let physical = lower_physical(&graph, &timeline, &decision, 7, None).unwrap();
+        let physical = lower_physical(&graph, &timeline, &decision, None).unwrap();
         assert_eq!(physical.tasks, decision.tasks);
         assert_eq!(
             physical
@@ -1335,7 +1324,7 @@ mod tests {
             changed.signature = decision_signature(&changed).unwrap();
             assert!(validate_decision(&graph, &roomy, &changed, None).is_err());
         }
-        for mutation in 0..7 {
+        for mutation in 0..6 {
             let mut changed = reconstructed.clone();
             match mutation {
                 0 => changed.tasks[0].task_id = 2,
@@ -1343,8 +1332,7 @@ mod tests {
                 2 => changed.tasks.swap(0, 1),
                 3 => changed.tasks[1].anchor_id = 2,
                 4 => changed.tasks[1].implementation_id = "local-choice".into(),
-                5 => changed.schedule_signature = "0".repeat(64),
-                _ => changed.plan_epoch = 0,
+                _ => changed.schedule_signature = "0".repeat(64),
             }
             assert!(validate_physical(&graph, &timeline, &decision, &changed, None).is_err());
         }
@@ -1524,7 +1512,7 @@ mod tests {
         assert_eq!(decision.tasks[0].implementation_id, "esamp:cpu@1");
         assert_eq!(decision.tasks[1].anchor_id, 1);
         validate_decision(&graph, &timeline, &decision, None).unwrap();
-        let physical = lower_physical(&graph, &timeline, &decision, 4, None).unwrap();
+        let physical = lower_physical(&graph, &timeline, &decision, None).unwrap();
         validate_physical(&graph, &timeline, &decision, &physical, None).unwrap();
         let mut physical_tampered = physical.clone();
         physical_tampered.tasks[1].anchor_id = 0;

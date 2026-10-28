@@ -20,7 +20,7 @@ from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle import BorrowedPage, PageFieldTransfer, PageSlot
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.runtime_facts import model_timeline
 from pllm.workloads.recirculation import RecirculationWorkload
 from pllm.workloads.video import VideoWorkload, frame_features
 from test.backend_facts import backend_facts
@@ -40,7 +40,7 @@ def test_video_real_frame_math_and_signed_composition():
     values = frame_features(second, first, 2)
     stationary = frame_features(first, first, 2)
     assert torch.count_nonzero(stationary[1]) == torch.count_nonzero(stationary[2]) == 0
-    timeline = RuntimeFacts(torch.device("cpu")).timeline(("transition/full_root@1",))
+    timeline = model_timeline(torch.device("cpu"), ("transition/full_root@1",))
     facts = backend_facts(4, (), timeline, PageBundleProviderFacts("video.cpu@1", 3), layer_count=1)
     workload = VideoWorkload(grid_size=2)
     facts = workload.specialize(facts, ExecutionOptions())
@@ -61,7 +61,7 @@ def test_video_real_frame_math_and_signed_composition():
             pages.append(BorrowedPage(descriptor, value, receiver))
         execution.admit(())
         execution.stage_readonly((BorrowedStateRoot(plan, "features", ref, tuple(pages)),))
-        rows = PackedPhaseRowBatch(1, 0, 0, ())
+        rows = PackedPhaseRowBatch(0, 0, ())
         result = execution.step(pllm.authoring.TensorStepInput(rows, PackedSamplerRowBatch(rows, ())))
         signal = torch.cat(
             (

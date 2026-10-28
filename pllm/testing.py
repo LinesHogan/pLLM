@@ -55,7 +55,6 @@ def step_input(
     count = len(identities)
     row_phases = tuple(phases) if phases is not None else (HiddenPhase.DECODE,) * count
     rows = PackedPhaseRowBatch(
-        1,
         step_id,
         count,
         tuple(

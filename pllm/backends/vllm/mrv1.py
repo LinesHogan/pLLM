@@ -52,7 +52,6 @@ class Mrv1Runner(Runner, GPUModelRunner):
                     scheduler_output,
                     result[0],
                     tuple(session.identity(request_id) for request_id in self.input_batch.req_ids),
-                    plan_epoch=session.attachment.physical.plan_epoch,
                     step_id=session.next_step_id,
                 )
             )

@@ -51,7 +51,7 @@ def example(
     rows = tuple(
         PackedPhaseRow(i, i, 0, HiddenPhase.DECODE, RequestIdentity(str(i), i, 0, str(i))) for i in range(count)
     )
-    packed = PackedPhaseRowBatch(1, 0, count, rows)
+    packed = PackedPhaseRowBatch(0, count, rows)
     sampler = PackedSamplerRowBatch(packed, tuple(PackedSamplerRowLink(i, count - i - 1) for i in range(count)))
     hidden_dtype = torch.float64 if tensor_dtype(facts.probe.tensor_dtype) is torch.float64 else torch.float32
     hidden = (

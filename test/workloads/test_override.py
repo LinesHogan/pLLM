@@ -19,7 +19,7 @@ from pllm.contracts.sampler import SamplerFeedback
 from pllm.contracts.semantic_graph import AnchorId
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.runtime_facts import model_timeline
 from pllm.workloads.override import OverRIDEConfig, OverRIDEWorkload
 from test.backend_facts import assert_finite_resources, backend_facts
 
@@ -31,7 +31,7 @@ TOKENS = torch.tensor([2, 4, 1])
 
 def facts_for(device, lineages=3, pages=3):
     provider = PageBundleProviderFacts("test.page@1", pages, StateDeviceKind(device.type))
-    timeline = RuntimeFacts(device).timeline()
+    timeline = model_timeline(device)
     return backend_facts(
         4, (BINDING,), timeline, provider, max_lineages=lineages, memory_bytes=65536, max_rows=8, vocab_size=7
     )

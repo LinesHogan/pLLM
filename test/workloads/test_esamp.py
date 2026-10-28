@@ -28,7 +28,7 @@ from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.tensor_frame import CompactRows, RowIndex, RowPlan, TensorFrame, state_means
 from pllm.execution.tensor_program import TaskOutput, TensorBatch
 from pllm.execution.tensor_task import TensorTask
@@ -44,7 +44,7 @@ DEVICES = ("cpu", "cuda:0") if torch.cuda.is_available() else ("cpu",)
 
 def facts_for(device, hidden_size, pages, lineages=2, memory_bytes=10000):
     provider = PageBundleProviderFacts("test.esamp@1", pages, StateDeviceKind(device.type))
-    timeline = RuntimeFacts(device).timeline()
+    timeline = model_timeline(device)
     return backend_facts(hidden_size, BINDINGS, timeline, provider, max_lineages=lineages, memory_bytes=memory_bytes)
 
 

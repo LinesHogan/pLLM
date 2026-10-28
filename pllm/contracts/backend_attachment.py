@@ -195,7 +195,6 @@ class BackendAttachmentDecision:
 
 @dataclass(frozen=True, slots=True)
 class BackendAttachmentPhysicalPlan:
-    plan_epoch: int
     adapter_id: str
     attachment_signature: str
     schedule_signature: str

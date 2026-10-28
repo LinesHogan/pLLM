@@ -427,8 +427,7 @@ class CausalAdapterWorkload(
 
         def prepare(value: CausalTrainBatch[torch.Tensor] | TensorStepInput, batch: TensorBatch) -> ContextT:
             match value:
-                case TensorStepInput(rows=step_rows, auxiliary=auxiliary):
-                    assert step_rows.plan_epoch == batch.epoch
+                case TensorStepInput(auxiliary=auxiliary):
                     if auxiliary is None:
                         return prepare_data(None)
                     match auxiliary:

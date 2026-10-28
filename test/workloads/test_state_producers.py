@@ -15,7 +15,7 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId, StateResource
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.runtime_facts import model_timeline
 from pllm.workloads.state_producers import TARGETS, DecodeFactors, ProjectionState, PromptFactors, PromptMixture
 from test.backend_facts import assert_finite_resources, backend_facts
 
@@ -29,7 +29,7 @@ def deployment(workload, device=torch.device("cpu")):
     facts = backend_facts(
         4,
         (),
-        RuntimeFacts(device).timeline(("transition/full_root@1", "optimizer/adamw@1")),
+        model_timeline(device, ("transition/full_root@1", "optimizer/adamw@1")),
         PageBundleProviderFacts("test.producers@1", 16, StateDeviceKind(device.type)),
         memory_bytes=1 << 20,
         max_rows=8,

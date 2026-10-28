@@ -216,8 +216,8 @@ class VllmSession(Generic[DataT, ResultT]):
         try:
             self._received_readonly = self._feed(rows, stream)
             received = self._received_readonly
-            if (received.plan_epoch, received.step_id) != (rows.plan_epoch, rows.step_id):
-                raise ValueError("read-only input differs from the original epoch/step; grants retained")
+            if received.step_id != rows.step_id:
+                raise ValueError("read-only input differs from the requested step; grants retained")
             held_input = None
             if isinstance(received, (ReadonlyStepAbsent, ReadonlyStepEnd)):
                 held_input = self._deployment.execution.stage_hold(

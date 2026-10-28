@@ -23,7 +23,6 @@ def encode_mrv2_rows(
     prompt_lengths: np.ndarray,
     identities: tuple[RequestIdentity, ...],
     *,
-    plan_epoch: int,
     step_id: int,
 ) -> PackedSamplerRowBatch:
     """Label rows against each request's prompt; vLLM's prefill length also covers recomputed output history."""
@@ -75,7 +74,7 @@ def encode_mrv2_rows(
     ):
         raise RuntimeError("vLLM MRv2 InputBatch request columns do not match the signed ABI")
     return _planned_rows(
-        identities, scheduled, prompt, computed, input_batch.logits_indices, input_batch.num_tokens, plan_epoch, step_id
+        identities, scheduled, prompt, computed, input_batch.logits_indices, input_batch.num_tokens, step_id
     )
 
 
@@ -85,7 +84,6 @@ def encode_mrv1_rows(
     logits_indices: torch.Tensor,
     identities: tuple[RequestIdentity, ...],
     *,
-    plan_epoch: int,
     step_id: int,
 ) -> PackedSamplerRowBatch:
     if (
@@ -110,7 +108,6 @@ def encode_mrv1_rows(
         [int(value) for value in batch.num_computed_tokens_cpu[: batch.num_reqs]],
         logits_indices,
         scheduler.total_num_scheduled_tokens,
-        plan_epoch,
         step_id,
     )
 
@@ -122,7 +119,6 @@ def _planned_rows(
     computed: list[int],
     logits_indices: torch.Tensor,
     total: int,
-    plan_epoch: int,
     step_id: int,
 ) -> PackedSamplerRowBatch:
     plan = _core.plan_packed_prefill_rows(scheduled, prompt, computed, total)
@@ -132,7 +128,7 @@ def _planned_rows(
     ):
         phase = HiddenPhase(raw_phase)
         rows.append(PackedPhaseRow(packed, request, offset, phase, identities[request], plan.prompt_lengths[packed]))
-    phase_rows = PackedPhaseRowBatch(plan_epoch, step_id, plan.total_rows, tuple(rows))
+    phase_rows = PackedPhaseRowBatch(step_id, plan.total_rows, tuple(rows))
     # vLLM samples each request's last scheduled token, which is the last packed row of its span.
     links = tuple(PackedSamplerRowLink(span.request_ordinal, span.packed_row_end - 1) for span in plan.request_spans)
     return PackedSamplerRowBatch(phase_rows, links)

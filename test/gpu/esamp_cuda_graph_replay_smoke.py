@@ -97,7 +97,6 @@ def mean_capture(publish_lag: int = 0) -> None:
     for step, count in enumerate((1, 3, 2)):
         hidden.copy_(torch.arange(12, device=device, dtype=torch.float32).view(3, 4) / 10)
         rows = PackedPhaseRowBatch(
-            1,
             step,
             count,
             tuple(PackedPhaseRow(i, i, step, HiddenPhase.DECODE, RequestIdentity(str(i), i, 0)) for i in range(count)),

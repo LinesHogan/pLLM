@@ -49,7 +49,6 @@ pub(crate) fn lower(
     let probe = &inputs.probe;
     let plan = &inputs.plan;
     let mut physical = BackendAttachmentPhysicalPlan {
-        plan_epoch: plan.schedule_physical.plan_epoch,
         adapter_id: probe.adapter_id.clone(),
         attachment_signature: decision.signature.clone(),
         schedule_signature: plan.schedule_physical.schedule_signature.clone(),

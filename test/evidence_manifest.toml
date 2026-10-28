@@ -71,7 +71,7 @@ group = "rust"
 path = "rust/pllm_core/src/planning/scheduler.rs"
 command = "cargo test --manifest-path rust/pllm_core/Cargo.toml physical_plan_is_mechanical_and_reconstruction_is_exact"
 environment = "Rust toolchain; CPU"
-observable_contract = "Resource-constrained AER solution lowers mechanically with the same task record and boundaries; verification evaluates the selected placement once, without enumerating alternatives. A legal nonoptimal witness is preserved; even rehashed invalid timing, duplicate tasks, dependency order or memory claims are rejected. Original physical projection, signature, epoch and local resource drift remain checked; spawned CPU reconstruction is evidence 18"
+observable_contract = "Resource-constrained AER solution lowers mechanically with the same task record and boundaries; verification evaluates the selected placement once, without enumerating alternatives. A legal nonoptimal witness is preserved; even rehashed invalid timing, duplicate tasks, dependency order or memory claims are rejected. Original physical projection, signature and local resource drift remain checked; spawned CPU reconstruction is evidence 18"
 replaces = "Duplicate ScheduledTask/PhysicalTask schemas and task-name/anchor-name mirrors; old Rust physical projection fixture coverage"
 
 [[evidence]]
@@ -111,7 +111,7 @@ group = "ptts"
 path = "test/boundary/test_page_bundle.py"
 command = "/workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_page_bundle.py::test_multi_lineage_admission_and_publication_roll_back_atomically"
 environment = "Repository venv with torch and rebuilt Rust extension; CPU"
-observable_contract = "One signed plan and arena for differently shaped request/instance resources; capacity and partial initialization failure leave no admission; invalid data and aborted private mutation preserve both roots; successful publication advances both exact versions and values; complete reclaim; cross-plan epoch drift rejected by shared Rust validation"
+observable_contract = "One signed plan and arena for differently shaped request/instance resources; capacity and partial initialization failure leave no admission; invalid data and aborted private mutation preserve both roots; successful publication advances both exact versions and values; complete reclaim"
 replaces = "Separate admission/factory rollback and multi-lineage publication tests; does not substitute for TLM numerical evidence 11"
 
 [[evidence]]

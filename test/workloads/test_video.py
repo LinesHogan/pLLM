@@ -30,7 +30,7 @@ from pllm.execution.declaration import Dimensions, Field, When
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle import BorrowedPage, PageBundleArena, PageFieldTransfer, PageSlot
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
-from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.state_execution import MathBinding, StateSettlementError
 from pllm.execution.tensor_binding import TensorBinding
 from pllm.execution.tensor_frame import TensorFrame
@@ -68,7 +68,7 @@ def binding_case(*, alias=False, write_failure=False, runtime=False, missing=Non
         function=write,
     )
     publication = b.publish(transition, inject, when=When.BEFORE_MODEL)
-    timeline = RuntimeFacts(torch.device("cpu")).timeline(("transition/full_root@1",))
+    timeline = model_timeline(torch.device("cpu"), ("transition/full_root@1",))
     if runtime:
         b.overlay(
             inject,
@@ -224,7 +224,6 @@ def _step_rows(step, identities):
         )
     )
     rows = PackedPhaseRowBatch(
-        1,
         step,
         4,
         tuple(
@@ -251,7 +250,7 @@ def _decode_steps_keep_exact_publications_and_ack_order():
         def receive(rows, stream):
             assert execution.diagnostics().update_count == rows.step_id
             received.append(rows.step_id)
-            return ReadonlyStepInput(rows.plan_epoch, rows.step_id, ((first, second)[rows.step_id],))
+            return ReadonlyStepInput(rows.step_id, ((first, second)[rows.step_id],))
 
         session._feed = Mock(spec=FeedReceiver, side_effect=receive)
         session.stage_input(None, identities)
@@ -291,7 +290,6 @@ def _hold_steps_reuse_the_settled_injection():
 
     def rows(step):
         batch = PackedPhaseRowBatch(
-            1,
             step,
             1,
             (PackedPhaseRow(0, 0, step, HiddenPhase.PREFILL if step == 0 else HiddenPhase.DECODE, identity),),
@@ -305,10 +303,10 @@ def _hold_steps_reuse_the_settled_injection():
     ):
         session, model, _ = _session(b, execution)
         outcomes = (
-            ReadonlyStepInput(1, 0, (first,)),
-            ReadonlyStepAbsent(1, 1),
-            ReadonlyStepInput(1, 2, (second,)),
-            ReadonlyStepEnd(1, 3),
+            ReadonlyStepInput(0, (first,)),
+            ReadonlyStepAbsent(1),
+            ReadonlyStepInput(2, (second,)),
+            ReadonlyStepEnd(3),
         )
         session._feed = Mock(spec=FeedReceiver, side_effect=lambda batch, stream: outcomes[batch.step_id])
         session.stage_input(None, (identity,))

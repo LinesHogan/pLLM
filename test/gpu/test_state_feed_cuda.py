@@ -51,7 +51,7 @@ def setup_feed(workload):
 
 
 def step_rows(step):
-    rows = PackedPhaseRowBatch(1, step, 0, ())
+    rows = PackedPhaseRowBatch(step, 0, ())
     return PackedSamplerRowBatch(rows, ())
 
 

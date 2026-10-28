@@ -193,9 +193,7 @@ def _check_cancelled_projection(handle):
     identity = RequestIdentity("cancelled-projection", 41, 0)
     stream = torch.cuda.current_stream()
     (ref,) = execution.admit((identity,), stream)
-    rows = PackedPhaseRowBatch(
-        handle.attachment.physical.plan_epoch, 0, 1, (PackedPhaseRow(0, 0, 0, HiddenPhase.PREFILL, identity),)
-    )
+    rows = PackedPhaseRowBatch(0, 1, (PackedPhaseRow(0, 0, 0, HiddenPhase.PREFILL, identity),))
     invocation = execution.begin(rows.rows, stream)
     overlay.reserve()
     overlay.prepare(rows, invocation, execution.directory)

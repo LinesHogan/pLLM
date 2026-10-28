@@ -38,7 +38,7 @@ from pllm.execution.backend_attachment import (
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.runtime_facts import model_timeline
 from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
 from pllm.workloads.inplace_ttt import (
     InPlaceTTTConfig,
@@ -69,7 +69,7 @@ def overlay_facts():
     )
     facts = BackendCompileFacts(
         probe,
-        RuntimeFacts(torch.device("cpu")).timeline(("state/dense_page_cpu@1", "transition/full_root@1")),
+        model_timeline(torch.device("cpu"), ("state/dense_page_cpu@1", "transition/full_root@1")),
         (PageBundleProviderFacts("test.attachment@1", 4),),
         2,
         4096,

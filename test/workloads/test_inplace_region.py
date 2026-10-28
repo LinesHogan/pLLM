@@ -28,7 +28,7 @@ from pllm.contracts.tensor_policy import TensorPolicy
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.scan import ScanContext, ScanTemplate
 from pllm.execution.scan_analysis import analyze
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
@@ -39,7 +39,7 @@ TARGET = ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTI
 
 
 def facts_for(device, dtype):
-    timeline = RuntimeFacts(device).timeline(("transition/full_root@1", "state/fenced_reclaim@1"))
+    timeline = model_timeline(device, ("transition/full_root@1", "state/fenced_reclaim@1"))
     provider = PageBundleProviderFacts("test.region.full_root@1", 4, StateDeviceKind(device.type))
     return backend_facts(
         7,

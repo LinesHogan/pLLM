@@ -63,7 +63,6 @@ class StateRepresentationDecision:
 
 @dataclass(frozen=True, slots=True)
 class StatePhysicalPlan:
-    plan_epoch: int
     request_digest: str
     representation_signature: str
     representations: tuple[StateProviderPlan, ...]

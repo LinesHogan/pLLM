@@ -89,7 +89,6 @@ class TensorHostBinding(Generic[InputT, DataT, ResultT]):
             1,
             facts.state_memory_budget_bytes,
             facts.device,
-            plan_epoch=facts.plan_epoch,
         )
         (anchor,) = (AnchorId(item.ordinal) for item in timeline.anchors if item.symbol == self.sampler_anchor)
         return self.math.bind(PageBundleArena(plan, device=facts.device), anchor)
@@ -111,9 +110,7 @@ class TransactionHostBinding(Generic[RequestT, TransactionT, ContextT, SnapshotT
             value for value in (timeline.memory_budget_bytes, facts.memory_budget_bytes) if value is not None
         )
         timeline = replace(timeline, memory_budget_bytes=min(limits, default=None))
-        execution = HostExecution(
-            self.graph, timeline, self.state_factory, self.tasks, facts.device, plan_epoch=facts.plan_epoch
-        )
+        execution = HostExecution(self.graph, timeline, self.state_factory, self.tasks, facts.device)
         return HostTransactionCoordinator(self.service, execution)
 
 
@@ -245,11 +242,9 @@ class HostExecution(Generic[TransactionT, ContextT, SnapshotT, ResultT]):
         state_factory: Callable[[], HostTaskState[TransactionT, ContextT, SnapshotT, ResultT]],
         implementations: tuple[TaskGraphImplementation[ContextT, None], ...],
         device: torch.device,
-        *,
-        plan_epoch: int = 1,
     ) -> None:
         self.decision = compile_schedule(graph, timeline)
-        self.plan = lower_physical_plan(graph, timeline, self.decision, plan_epoch=plan_epoch)
+        self.plan = lower_physical_plan(graph, timeline, self.decision)
         self.trace = ExecutionTrace(self.plan)
         self._runner = TaskGraphExecution(self.plan, implementations, self.trace)
         self._state = state_factory()
@@ -390,7 +385,6 @@ class HostTransactionCoordinator(Generic[RequestT, TransactionT, ContextT, Snaps
 @dataclass(frozen=True, slots=True)
 class HostRuntimeFacts:
     device: torch.device
-    plan_epoch: int = 1
     hidden_size: int = 0
     initialization_seed: int = 0
     state_memory_budget_bytes: int = 64 * 1024 * 1024
@@ -400,7 +394,6 @@ class HostRuntimeFacts:
     def __post_init__(self) -> None:
         if (
             self.device.type not in ("cpu", "cuda")
-            or self.plan_epoch < 1
             or self.hidden_size < 0
             or self.initialization_seed < 0
             or self.state_memory_budget_bytes < 0

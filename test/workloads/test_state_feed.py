@@ -9,7 +9,7 @@ import torch
 import pllm
 from pllm.contracts.semantic_graph import SemanticEffect, StateEffectKind, StateResource
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.state_feed import FeedEvent, FeedRecord, select_publications
 from test.backend_facts import backend_facts
 
@@ -52,7 +52,7 @@ class FeedWorkload(pllm.Workload):
 def facts_for(device=torch.device("cpu")):
     from pllm.contracts.state_representation import StateDeviceKind
 
-    timeline = RuntimeFacts(device).timeline(("transition/full_root@1",))
+    timeline = model_timeline(device, ("transition/full_root@1",))
     provider = PageBundleProviderFacts("test.feed@1", 3, StateDeviceKind(device.type), device.index or 0, True)
     return backend_facts(2, (), timeline, provider, layer_count=1, memory_bytes=65536)
 
@@ -182,7 +182,7 @@ def test_ordinary_state_ports_and_write_do_not_depend_on_declaration_order():
     facts = workload.specialize(facts_for(), pllm.ExecutionOptions())
     execution = workload.compile_backend(facts).execution
     execution.admit(())
-    rows = PackedPhaseRowBatch(1, 0, 0, ())
+    rows = PackedPhaseRowBatch(0, 0, ())
     execution.step(TensorStepInput(rows, PackedSamplerRowBatch(rows, ())))
     refs = execution.directory.latest_refs(())
     assert [ref.version_id for ref in refs] == [0, 1, 0]

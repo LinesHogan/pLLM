@@ -29,20 +29,17 @@ from pllm.execution.shared_tensor import tensor_dtype
 class ReadonlyStepInput:
     """The feed versions one engine step received, handed to the session that consumes them."""
 
-    plan_epoch: int
     step_id: int
     roots: tuple[BorrowedStateRoot, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class ReadonlyStepAbsent:
-    plan_epoch: int
     step_id: int
 
 
 @dataclass(frozen=True, slots=True)
 class ReadonlyStepEnd:
-    plan_epoch: int
     step_id: int
 
 
@@ -360,7 +357,7 @@ class FeedReceiver:
             raise RuntimeError("obtain the feed writer before generate; a failed feed cannot resume")
         try:
             if self.ended:
-                return ReadonlyStepEnd(rows.plan_epoch, rows.step_id)
+                return ReadonlyStepEnd(rows.step_id)
             self._snapshot()
             selected = select_publications(self.records, self.binding.order)
             for record in selected[:-1]:
@@ -368,12 +365,12 @@ class FeedReceiver:
                 self.control.send_bytes(b"credit")
             record = selected[-1]
             if record.kind is FeedEvent.PUBLISH:
-                result = ReadonlyStepInput(rows.plan_epoch, rows.step_id, (self._receive(record, stream),))
+                result = ReadonlyStepInput(rows.step_id, (self._receive(record, stream),))
             elif record.kind is FeedEvent.MISSING:
-                result = ReadonlyStepAbsent(rows.plan_epoch, rows.step_id)
+                result = ReadonlyStepAbsent(rows.step_id)
             else:
                 self.ended = True
-                result = ReadonlyStepEnd(rows.plan_epoch, rows.step_id)
+                result = ReadonlyStepEnd(rows.step_id)
             self.control.send_bytes(b"credit")
             return result
         except BaseException:

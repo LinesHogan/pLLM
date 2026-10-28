@@ -24,7 +24,6 @@ class PackedPhaseRow:
 class PackedPhaseRowBatch:
     """Immutable row expansion for one exact packed engine step."""
 
-    plan_epoch: int
     step_id: int
     total_rows: int
     rows: tuple[PackedPhaseRow, ...]
@@ -83,10 +82,6 @@ class PackedSamplerRowBatch:
 
     row_batch: PackedPhaseRowBatch
     links: tuple[PackedSamplerRowLink, ...]
-
-    @property
-    def plan_epoch(self) -> int:
-        return self.row_batch.plan_epoch
 
     @property
     def step_id(self) -> int:

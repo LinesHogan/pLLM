@@ -30,7 +30,7 @@ from pllm.execution.activation import low_rank_affine_delta
 from pllm.execution.codec import encode_boundary
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.step_input import TensorStepInput
 from pllm.workloads.reft import ActivationConfig, ActivationWorkload, load_loreft_interventions
 
@@ -55,7 +55,7 @@ def test_reft_matches_loreft_math_and_publish_skip_semantics(tmp_path) -> None:
             (),
             (),
         ),
-        RuntimeFacts(device).timeline(("transition/full_root@1",)),
+        model_timeline(device, ("transition/full_root@1",)),
         (PageBundleProviderFacts("test.page@1", 4),),
         2,
         65536,
@@ -65,7 +65,7 @@ def test_reft_matches_loreft_math_and_publish_skip_semantics(tmp_path) -> None:
     deployment = workload.compile_backend(facts)
     execution = deployment.execution
     _decode_declarations_are_signed(facts)
-    rows = PackedPhaseRowBatch(1, 0, 0, ())
+    rows = PackedPhaseRowBatch(0, 0, ())
     value = TensorStepInput(rows, PackedSamplerRowBatch(rows, ()))
     (initial,) = execution.admit(())
     assert execution.step(value).publication is None
@@ -128,7 +128,7 @@ def _decode_low_rank_keeps_parameters_and_recomputes_delta(
         deployment.attachment.inputs.request.state_resource,
     )
     rows = PackedPhaseRowBatch(
-        1, 0, len(hidden), tuple(PackedPhaseRow(i, 0, i, HiddenPhase.DECODE, identity) for i in range(len(hidden)))
+        0, len(hidden), tuple(PackedPhaseRow(i, 0, i, HiddenPhase.DECODE, identity) for i in range(len(hidden)))
     )
     invocation = execution.start_step(replace(value, auxiliary=update))
     execution.execute_anchor(invocation, AnchorId(0))
@@ -195,7 +195,6 @@ def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:
     initial = execution.admit(identities)
     old_pin = execution.arena.pin_exact(initial)
     rows = PackedPhaseRowBatch(
-        1,
         0,
         3,
         tuple(

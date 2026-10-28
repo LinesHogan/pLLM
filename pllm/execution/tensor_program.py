@@ -48,7 +48,6 @@ class TensorBatch:
     after_refs: Sequence[StateRef]
     stream: torch.cuda.Stream | None
     feedback: SamplerFeedback | None = None
-    epoch: int = 1
     observing: bool = False
     # Field pool and the slot of every selected state's page, in selection order.
     field_slots: Callable[[int], tuple[torch.Tensor, tuple[int, ...]]] = _unwired
@@ -180,7 +179,6 @@ def _read(context: StateTaskContext[D], version: Literal["input", "private", "pu
         refs,
         context.pin.stream,
         context.sampler_feedback,
-        epoch=context.arena.plan.state_physical.plan_epoch,
         observing=context.trace.observing,
         results=context.results,
         borrowed_roots=context.borrowed_roots,

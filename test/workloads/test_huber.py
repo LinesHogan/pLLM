@@ -11,7 +11,7 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.runtime_facts import model_timeline
 from test import reference_huber as oracle
 from test.backend_facts import backend_facts
 
@@ -42,7 +42,7 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
     facts = backend_facts(
         hidden,
         bindings,
-        RuntimeFacts(device).timeline(),
+        model_timeline(device),
         PageBundleProviderFacts("test.huber@1", 12, StateDeviceKind(device.type)),
         max_lineages=3,
         memory_bytes=100000,

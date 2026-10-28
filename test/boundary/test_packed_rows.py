@@ -17,10 +17,10 @@ def test_resumed_history_is_generated_but_only_its_final_row_is_new():
         for packed, offset, phase in zip(plan.packed_row_indices, plan.token_offsets, plan.phases, strict=True)
     )
     assert [row.phase for row in rows] == [HiddenPhase.PREFILL] * 4 + [HiddenPhase.DECODE] * 3
-    assert PackedPhaseRowBatch(1, 0, 7, rows).latest_decode_rows == (rows[6],)
+    assert PackedPhaseRowBatch(0, 7, rows).latest_decode_rows == (rows[6],)
 
     assert plan.prompt_lengths == [4] * 7
-    assert PackedPhaseRowBatch(1, 0, 7, rows).producer_rows(HiddenPhase.PREFILL) == (rows[3],)
+    assert PackedPhaseRowBatch(0, 7, rows).producer_rows(HiddenPhase.PREFILL) == (rows[3],)
     assert _core.plan_packed_prefill_rows([2], [4], [0], 2).prompt_lengths == [4, 4]
 
 
@@ -43,7 +43,7 @@ def test_prompt_chunks_select_one_completion_among_reordered_decode_rows(length,
                 strict=True,
             )
         )
-        batch = PackedPhaseRowBatch(1, offset, len(rows), rows)
+        batch = PackedPhaseRowBatch(offset, len(rows), rows)
         endings.extend(batch.producer_rows(HiddenPhase.PREFILL))
         assert batch.producer_rows(HiddenPhase.DECODE) == (rows[0],)
     assert len(endings) == 1 and endings[0].token_offset == length - 1

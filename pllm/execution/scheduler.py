@@ -17,11 +17,9 @@ def compile_state_schedule(
     graph: SemanticGraph,
     timeline: SchedulerTimeline,
     request: StateRepresentationRequest,
-    *,
-    plan_epoch: int = 1,
 ) -> tuple[StateRepresentationDecision, StatePhysicalPlan, ScheduleDecision, PhysicalPlan]:
     decision, state, schedule, physical = _core.compile_state_schedule(
-        encode_boundary(graph), encode_boundary(timeline), encode_boundary(request), plan_epoch
+        encode_boundary(graph), encode_boundary(timeline), encode_boundary(request)
     )
     return (
         decode_boundary(decision, StateRepresentationDecision),
@@ -52,7 +50,6 @@ def lower_physical_plan(
     timeline: SchedulerTimeline,
     decision: ScheduleDecision,
     *,
-    plan_epoch: int,
     state: StatePhysicalPlan | None = None,
 ) -> PhysicalPlan:
     return decode_boundary(
@@ -60,7 +57,6 @@ def lower_physical_plan(
             encode_boundary(graph),
             encode_boundary(timeline),
             encode_boundary(decision),
-            plan_epoch,
             None if state is None else encode_boundary(state),
         ),
         PhysicalPlan,

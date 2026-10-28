@@ -266,7 +266,6 @@ pub(crate) struct BackendAttachmentDecision {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BackendAttachmentPhysicalPlan {
-    pub(crate) plan_epoch: u64,
     pub(crate) adapter_id: String,
     pub(crate) attachment_signature: String,
     pub(crate) schedule_signature: String,

@@ -26,9 +26,6 @@ pub(crate) struct PlanBundle {
 
 impl PlanBundle {
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if self.schedule_physical.plan_epoch != self.state_physical.plan_epoch {
-            return Err("schedule and state epochs differ".to_owned());
-        }
         tensor_layout::validate_decision(
             &self.tensor_layout_request,
             &self.tensor_layout_decision,
@@ -94,15 +91,14 @@ fn compile_state_schedule(
     graph_json: &str,
     timeline_json: &str,
     request_json: &str,
-    plan_epoch: u64,
 ) -> PyResult<(String, String, String, String)> {
     let compile = || -> Result<_, String> {
         let graph = semantic_graph::decode_graph(graph_json)?;
         let timeline = semantic_graph::decode_timeline(timeline_json)?;
         let request = state_representation::decode_request(request_json)?;
         let (decision, state, schedule) =
-            state_representation::compile(&request, &graph, &timeline, plan_epoch)?;
-        let physical = scheduler::project_physical(&schedule, plan_epoch)?;
+            state_representation::compile(&request, &graph, &timeline)?;
+        let physical = scheduler::project_physical(&schedule);
         Ok((
             semantic_graph::canonical_ascii_json(&decision)?,
             semantic_graph::canonical_ascii_json(&state)?,

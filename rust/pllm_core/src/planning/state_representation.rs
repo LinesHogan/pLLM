@@ -69,7 +69,6 @@ pub(crate) struct StateRepresentationDecision {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StatePhysicalPlan {
-    pub(crate) plan_epoch: u64,
     pub(crate) request_digest: String,
     pub(crate) representation_signature: String,
     pub(crate) representations: Vec<StateProviderPlan>,
@@ -233,7 +232,6 @@ pub(super) fn compile(
     request: &StateRepresentationRequest,
     graph: &SemanticGraph,
     timeline: &Timeline,
-    plan_epoch: u64,
 ) -> Result<
     (
         StateRepresentationDecision,
@@ -245,16 +243,12 @@ pub(super) fn compile(
     validate_request(request)?;
     validate_graph(graph)?;
     validate_timeline(timeline)?;
-    if plan_epoch == 0 {
-        return Err("state physical plan epoch must be positive".into());
-    }
     // Candidate catalogs are sorted. Strict score improvement therefore also
     // gives a stable provider-key tie-break without another decision ledger.
     fn choose(
         request: &StateRepresentationRequest,
         graph: &SemanticGraph,
         timeline: &Timeline,
-        plan_epoch: u64,
         plans: &mut Vec<StateProviderPlan>,
         reserved_bytes: u64,
         best: &mut Option<(
@@ -278,9 +272,7 @@ pub(super) fn compile(
                     continue;
                 };
                 plans.push(candidate.clone());
-                choose(
-                    request, graph, timeline, plan_epoch, plans, bytes, best, failure,
-                )?;
+                choose(request, graph, timeline, plans, bytes, best, failure)?;
                 plans.pop();
             }
             return Ok(());
@@ -300,7 +292,7 @@ pub(super) fn compile(
             schema_version: SCHEMA_VERSION,
         };
         decision.signature = digest(&canonical_ascii_json(&decision)?);
-        let physical = project(&decision, plan_epoch);
+        let physical = project(&decision);
         // task borrows this exact candidate, including retention and reserved
         // capacity. An infeasible cheap provider must not hide a legal COW plan.
         match scheduler::compile(graph, timeline, Some(&physical)) {
@@ -322,7 +314,6 @@ pub(super) fn compile(
         request,
         graph,
         timeline,
-        plan_epoch,
         &mut Vec::new(),
         0,
         &mut best,
@@ -335,9 +326,8 @@ pub(super) fn compile(
     })
 }
 
-fn project(decision: &StateRepresentationDecision, plan_epoch: u64) -> StatePhysicalPlan {
+fn project(decision: &StateRepresentationDecision) -> StatePhysicalPlan {
     StatePhysicalPlan {
-        plan_epoch,
         request_digest: decision.request_digest.clone(),
         representation_signature: decision.signature.clone(),
         representations: decision.plans.clone(),
@@ -353,7 +343,6 @@ pub(super) fn validate(
 ) -> Result<(), String> {
     validate_request(request)?;
     if decision.schema_version != SCHEMA_VERSION
-        || physical.plan_epoch == 0
         || decision.request_digest != digest(&canonical_ascii_json(request)?)
         || decision.plans.len() != request.states.len()
     {
@@ -382,7 +371,7 @@ pub(super) fn validate(
     let mut unsigned = decision.clone();
     unsigned.signature.clear();
     if decision.signature != digest(&canonical_ascii_json(&unsigned)?)
-        || physical != &project(decision, physical.plan_epoch)
+        || physical != &project(decision)
     {
         return Err("state physical plan differs from its signed decision".into());
     }
@@ -453,7 +442,7 @@ mod tests {
                                 && bytes + 9 <= memory_budget
                         })
                         .min_by_key(|&(provider, bytes, _)| (bytes + 9, provider));
-                    let actual = compile(&request, &graph, &timeline, 7);
+                    let actual = compile(&request, &graph, &timeline);
                     assert_eq!(actual.is_ok(), expected.is_some());
                     if let Some((provider, bytes, _)) = expected {
                         let (decision, physical, schedule) = actual.unwrap();
@@ -462,7 +451,6 @@ mod tests {
                         assert_eq!(schedule.score()[0], bytes + 9);
                         assert_eq!(physical.representations, decision.plans);
                         assert_eq!(physical.representation_signature, decision.signature);
-                        assert_eq!(physical.plan_epoch, 7);
                         let mut unsigned = decision.clone();
                         unsigned.signature.clear();
                         assert_eq!(

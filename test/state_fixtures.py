@@ -19,7 +19,7 @@ from pllm.contracts.tensor_layout import LayoutFieldId, StateTensorLayout, Tenso
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.scheduler import compile_state_schedule, intern_tensor_layouts
 from pllm.execution.state_execution import MathBinding
 from pllm.execution.tensor_program import FunctionMath
@@ -77,7 +77,7 @@ def inplace_plan(device: torch.device, provider: PageBundleProviderFacts, capabi
         (),
         (),
     )
-    timeline = RuntimeFacts(device).timeline(capabilities)
+    timeline = model_timeline(device, capabilities)
     facts = BackendCompileFacts(
         replace(probe, targets=(ParameterTargetShape(target, 3, 2),)), timeline, (provider,), 2, 4096, 0
     )

@@ -17,7 +17,7 @@ from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.semantic_graph import StateScope
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.runtime_facts import model_timeline
 from pllm.workloads.lora import OutputLoRAConfig, OutputLoRAWorkload
 from test.backend_facts import backend_facts
 
@@ -33,7 +33,7 @@ def compile_lora(config, device=torch.device("cpu"), *, lineages=3, pages=3):
         0,
     )
     facts = backend_facts(
-        4, (BINDING,), RuntimeFacts(device).timeline(), provider, max_lineages=lineages, memory_bytes=32 * 1024**2
+        4, (BINDING,), model_timeline(device), provider, max_lineages=lineages, memory_bytes=32 * 1024**2
     )
     workload = OutputLoRAWorkload(config)
     return workload.compile_backend(

@@ -50,10 +50,6 @@ class PackedHiddenSnapshotBatch:
     snapshots: tuple[PackedHiddenSnapshot, ...]
 
     @property
-    def plan_epoch(self) -> int:
-        return self.row_batch.plan_epoch
-
-    @property
     def step_id(self) -> int:
         return self.row_batch.step_id
 

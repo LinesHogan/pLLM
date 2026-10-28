@@ -64,7 +64,7 @@ from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.host_runtime import CompletionInput
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.state_execution import StateDiagnostics
 from pllm.execution.state_feed import Feed
@@ -703,7 +703,8 @@ def probe_backend(
             )
         ),
     )
-    observed = RuntimeFacts(runner.device).timeline(
+    observed = model_timeline(
+        runner.device,
         (
             "state/dense_page_cuda@1",
             "state/fenced_reclaim@1",

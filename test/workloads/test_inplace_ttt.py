@@ -25,7 +25,7 @@ from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.step_input import TensorStepInput
 from pllm.execution.visibility import explain_visibility
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
@@ -60,7 +60,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     facts = backend_facts(
         3,
         (),
-        RuntimeFacts(torch.device("cpu")).timeline(("transition/full_root@1",)),
+        model_timeline(torch.device("cpu"), ("transition/full_root@1",)),
         PageBundleProviderFacts("test.cpu.full_root@1", 4),
         memory_bytes=4096,
         max_rows=8,
@@ -346,7 +346,7 @@ def _check_exact_projection_lifecycle():
     facts = backend_facts(
         1,
         (),
-        RuntimeFacts(torch.device("cpu")).timeline(("transition/full_root@1",)),
+        model_timeline(torch.device("cpu"), ("transition/full_root@1",)),
         PageBundleProviderFacts("test.cpu.full_root@1", 4),
         memory_bytes=4096,
         max_rows=16,
@@ -491,7 +491,7 @@ def _check_exact_additive_projection():
     facts = backend_facts(
         1,
         (),
-        RuntimeFacts(torch.device("cpu")).timeline(("transition/full_root@1",)),
+        model_timeline(torch.device("cpu"), ("transition/full_root@1",)),
         PageBundleProviderFacts("test.cpu.full_root@1", 4),
         memory_bytes=4096,
         max_rows=8,
@@ -574,7 +574,7 @@ def test_prefill_adapters_keep_prompt_chunks_across_scheduler_spans(span):
     facts = backend_facts(
         3,
         (),
-        RuntimeFacts(torch.device("cpu")).timeline(("transition/full_root@1",)),
+        model_timeline(torch.device("cpu"), ("transition/full_root@1",)),
         PageBundleProviderFacts("test.cpu.full_root@1", 4),
         memory_bytes=1 << 20,
         max_rows=32,

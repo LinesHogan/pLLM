@@ -25,7 +25,7 @@ from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.replay import (
     TokenwiseReplayPrimitive,
 )
-from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.step_input import TensorStepInput
 from pllm.workload_transport import decode_workload, encode_workload
 from pllm.workloads.recirculation import RecirculationWorkload
@@ -49,12 +49,11 @@ PROBE = BackendPlacementProbe(
     causal_domain=CausalModelDomain(2, 3, 3),
 )
 FACTS = BackendCompileFacts(
-    PROBE, RuntimeFacts(torch.device("cpu")).timeline(("model/tokenwise_replay@1",)), (), 2, 0, 0, layer_count=3
+    PROBE, model_timeline(torch.device("cpu"), ("model/tokenwise_replay@1",)), (), 2, 0, 0, layer_count=3
 )
 WORKLOAD = RecirculationWorkload(alpha=0.7, ramp_tokens=2)
 IDENTITIES = (RequestIdentity("prefill", 0, 0), RequestIdentity("decode", 1, 0))
 ROWS = PackedPhaseRowBatch(
-    1,
     1,
     4,
     tuple(

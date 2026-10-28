@@ -297,7 +297,6 @@ class ScheduleDecision:
 
 @dataclass(frozen=True, slots=True)
 class PhysicalPlan:
-    plan_epoch: int
     schedule_signature: str
     tasks: tuple[PhysicalTask, ...]
     fallback_count: int

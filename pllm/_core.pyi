@@ -42,7 +42,6 @@ def lower_physical_plan(
     graph_json: str,
     timeline_json: str,
     decision_json: str,
-    plan_epoch: int,
     state_json: str | None = None,
 ) -> str: ...
 def validate_physical_plan(
@@ -80,6 +79,5 @@ def compile_state_schedule(
     graph_json: str,
     timeline_json: str,
     request_json: str,
-    plan_epoch: int,
 ) -> tuple[str, str, str, str]: ...
 def explain_state_visibility(source_json: str) -> str: ...

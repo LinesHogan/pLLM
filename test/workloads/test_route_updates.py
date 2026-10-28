@@ -19,7 +19,7 @@ from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.runtime_facts import model_timeline
 from test.backend_facts import assert_finite_resources
 from test.workloads.test_recirculation import FACTS, IDENTITIES, INPUTS, ROWS, VALUE, Decoder
 
@@ -28,7 +28,7 @@ CAPABILITIES = tuple(sorted(("model/tokenwise_replay@1", "transition/full_root@1
 ROUTE_FACTS = replace(
     FACTS,
     probe=replace(FACTS.probe, capabilities=CAPABILITIES, targets=(ParameterTargetShape(TARGET, 4, 4),)),
-    timeline=RuntimeFacts(torch.device("cpu")).timeline(CAPABILITIES),
+    timeline=model_timeline(torch.device("cpu"), CAPABILITIES),
     providers=(PageBundleProviderFacts("test.route@1", 16, StateDeviceKind.CPU),),
     state_memory_budget_bytes=1 << 20,
 )

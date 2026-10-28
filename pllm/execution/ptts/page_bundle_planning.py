@@ -41,8 +41,6 @@ def compile_page_bundle_plan(
     max_admitted_lineages: int,
     memory_budget_bytes: int,
     device: torch.device,
-    *,
-    plan_epoch: int = 1,
 ) -> PlanBundle:
     """Compile original declarations once; all choices remain Rust-owned."""
     graph, layouts = declaration
@@ -80,9 +78,7 @@ def compile_page_bundle_plan(
         ),
         candidates,
     )
-    decision, state_physical, schedule, physical = compile_state_schedule(
-        graph, timeline, request, plan_epoch=plan_epoch
-    )
+    decision, state_physical, schedule, physical = compile_state_schedule(graph, timeline, request)
     if any(
         item.device_kind.value != device.type or item.device_ordinal != (device.index or 0) for item in decision.plans
     ):

@@ -22,7 +22,7 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.tensor_task import TensorTask
 from pllm.execution.trace import ExecutionTrace, TracePhase, TraceSelection, TraceSnapshot
 from pllm.host import HostRuntimeFacts
@@ -80,7 +80,7 @@ def test_dummy_runs_graph_sign_plan_execute() -> None:
     facts = backend_facts(
         5,
         (BINDING,),
-        RuntimeFacts(torch.device("cpu")).timeline(),
+        model_timeline(torch.device("cpu")),
         None,
         max_lineages=1,
         memory_bytes=0,
@@ -201,7 +201,7 @@ def _frozen_state_is_readable_by_an_observation() -> None:
         encoder = pllm.InstanceState(module=lambda model: Encoder(model.hidden_size))
 
     bindings = tuple(testing.hidden_binding(layer, HiddenSite.BLOCK_OUTPUT, 18) for layer in (3, 5, 17))
-    timeline = RuntimeFacts(torch.device("cpu")).timeline()
+    timeline = model_timeline(torch.device("cpu"))
     provider = PageBundleProviderFacts("test.plain@1", 4, StateDeviceKind.CPU)
     execution = (
         FrozenEncoder().compile_backend(backend_facts(32, bindings, timeline, provider, layer_count=18)).execution
