@@ -37,7 +37,7 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry() -> None:
         torch.device("cpu"), hidden_size=4, initialization_seed=7, max_input_rows=1, memory_budget_bytes=1 << 20
     )
     coordinator = make_llm(workload=workload, config=facts)
-    peak = coordinator.execution.schedule_bundle.schedule_decision.peak_memory_bytes
+    peak = coordinator.execution.decision.peak_memory_bytes
     with pytest.raises(ValueError):
         make_llm(workload=workload, config=replace(facts, memory_budget_bytes=peak - 1))
     with pytest.raises(ValueError):  # host workloads need a finite input row bound

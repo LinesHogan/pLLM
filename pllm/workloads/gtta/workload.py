@@ -11,7 +11,11 @@ from pllm.workloads.gtta.types import GTTAConfig, GTTAHostRequest, GTTAHostTrans
 
 
 class GTTAWorkload(
-    pllm.host.HostWorkload[pllm.host.HostTransactionCoordinator[GTTAHostRequest, GTTAHostTransaction, GTTAResult]]
+    pllm.host.HostWorkload[
+        pllm.host.HostTransactionCoordinator[
+            GTTAHostRequest, GTTAHostTransaction, math.GTTAStepContext, math.GTTADynamicsSnapshot, GTTAResult
+        ]
+    ]
 ):
     def __init__(self, environment: GTTAEnvironmentService | None = None) -> None:
         self.environment = environment if environment is not None else GTTAEnvironmentService(GTTAConfig())

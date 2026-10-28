@@ -10,13 +10,11 @@ from typing import Generic, Protocol, TypeVar
 
 import torch
 
-from pllm.contracts.compilation import ScheduleBundle
 from pllm.contracts.feedback import Completion, CompletionBatch, FinishReason
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import (
     AnchorId,
     AnchorSymbol,
-    PhysicalPlan,
     SchedulerTimeline,
     SemanticGraph,
     TimelineAnchor,
@@ -106,7 +104,7 @@ class TransactionHostBinding(Generic[RequestT, TransactionT, ContextT, SnapshotT
     facts: HostRuntimeFacts
     timeline: SchedulerTimeline | None = None
 
-    def compile(self) -> HostTransactionCoordinator[RequestT, TransactionT, ResultT]:
+    def compile(self) -> HostTransactionCoordinator[RequestT, TransactionT, ContextT, SnapshotT, ResultT]:
         facts = self.facts
         timeline = facts.timeline() if self.timeline is None else self.timeline
         limits = tuple(
@@ -250,21 +248,16 @@ class HostExecution(Generic[TransactionT, ContextT, SnapshotT, ResultT]):
         *,
         plan_epoch: int = 1,
     ) -> None:
-        decision = compile_schedule(graph, timeline)
-        physical = lower_physical_plan(graph, timeline, decision, plan_epoch=plan_epoch)
-        self.schedule_bundle = ScheduleBundle(graph, timeline, decision, physical)
-        self.trace = ExecutionTrace(physical)
-        self._runner = TaskGraphExecution(physical, implementations, self.trace)
+        self.decision = compile_schedule(graph, timeline)
+        self.plan = lower_physical_plan(graph, timeline, self.decision, plan_epoch=plan_epoch)
+        self.trace = ExecutionTrace(self.plan)
+        self._runner = TaskGraphExecution(self.plan, implementations, self.trace)
         self._state = state_factory()
         self._device = device
         self._initialization = CudaStreamReadiness(torch.cuda.current_stream(device)) if device.type == "cuda" else None
         self._active: _Pending[ResultT, SnapshotT] | _Failed | None = None
         self._next_receipt_id = 1
         self._transaction_count = 0
-
-    @property
-    def plan(self) -> PhysicalPlan:
-        return self.schedule_bundle.schedule_physical
 
     def execute(self, transaction: TransactionT) -> HostReceipt[ResultT]:
         if self._active is not None:
@@ -344,21 +337,6 @@ class HostTransactionService(Protocol[RequestT_contra, TransactionT, ResultT]):
     def abort(self, transaction: TransactionT) -> None: ...
 
 
-class HostTransactionExecution(Protocol[TransactionT_contra, ResultT]):
-    @property
-    def trace(self) -> ExecutionTrace: ...
-
-    def execute(self, transaction: TransactionT_contra) -> HostReceipt[ResultT]: ...
-
-    def validate_receipt(self, receipt: HostReceipt[ResultT]) -> object: ...
-
-    def commit(self, receipt: HostReceipt[ResultT]) -> None: ...
-
-    def abort(self, receipt: HostReceipt[ResultT]) -> None: ...
-
-    def diagnostics(self) -> HostDiagnostics: ...
-
-
 @dataclass(frozen=True, slots=True)
 class NoHostRequest:
     """Closed request value for a service driven only by its owned queue."""
@@ -376,11 +354,11 @@ class HostSettlementError(RuntimeError, Generic[ResultT]):
 
 
 @dataclass(frozen=True, slots=True)
-class HostTransactionCoordinator(Generic[RequestT, TransactionT, ResultT]):
+class HostTransactionCoordinator(Generic[RequestT, TransactionT, ContextT, SnapshotT, ResultT]):
     """Atomically settle one typed host transaction and execution receipt."""
 
     service: HostTransactionService[RequestT, TransactionT, ResultT]
-    execution: HostTransactionExecution[TransactionT, ResultT]
+    execution: HostExecution[TransactionT, ContextT, SnapshotT, ResultT]
 
     def run(self, request: RequestT) -> ResultT | None:
         transaction = self.service.begin(request)
@@ -465,7 +443,6 @@ __all__ = [
     "HostExecution",
     "HostReceipt",
     "HostTransactionCoordinator",
-    "HostTransactionExecution",
     "HostTransactionService",
     "NO_HOST_REQUEST",
     "NoHostRequest",

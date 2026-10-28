@@ -55,21 +55,6 @@ def compile_schedule(
     )
 
 
-def validate_schedule(
-    graph: SemanticGraph,
-    timeline: SchedulerTimeline,
-    decision: ScheduleDecision,
-    *,
-    state: StatePhysicalPlan | None = None,
-) -> None:
-    _core.validate_schedule(
-        encode_boundary(graph),
-        encode_boundary(timeline),
-        encode_boundary(decision),
-        None if state is None else encode_boundary(state),
-    )
-
-
 def lower_physical_plan(
     graph: SemanticGraph,
     timeline: SchedulerTimeline,
@@ -90,43 +75,13 @@ def lower_physical_plan(
     )
 
 
-def validate_physical_plan(
-    graph: SemanticGraph,
-    timeline: SchedulerTimeline,
-    decision: ScheduleDecision,
-    plan: PhysicalPlan,
-    *,
-    state: StatePhysicalPlan | None = None,
-) -> None:
-    _core.validate_physical_plan(
-        encode_boundary(graph),
-        encode_boundary(timeline),
-        encode_boundary(decision),
-        encode_boundary(plan),
-        None if state is None else encode_boundary(state),
-    )
-
-
 def intern_tensor_layouts(request: TensorLayoutRequest) -> TensorLayoutDecision:
     return decode_boundary(_core.intern_tensor_layouts(encode_boundary(request)), TensorLayoutDecision)
-
-
-def validate_tensor_layouts(
-    request: TensorLayoutRequest,
-    decision: TensorLayoutDecision,
-) -> None:
-    _core.validate_tensor_layouts(
-        encode_boundary(request),
-        encode_boundary(decision),
-    )
 
 
 __all__ = [
     "compile_state_schedule",
     "intern_tensor_layouts",
-    "validate_tensor_layouts",
     "compile_schedule",
     "lower_physical_plan",
-    "validate_physical_plan",
-    "validate_schedule",
 ]

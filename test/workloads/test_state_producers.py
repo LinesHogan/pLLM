@@ -305,9 +305,9 @@ def test_initialized_reader_and_hidden_before_model_boundary():
         Cycle().declaration()
 
 
-def test_backend_points_and_memory_witness_reject_tampering():
+def test_backend_points_and_compile_rejects_unknown_anchor():
     from pllm.contracts.semantic_graph import AnchorSymbol, TimingConstraint
-    from pllm.execution.scheduler import compile_schedule, validate_schedule
+    from pllm.execution.scheduler import compile_schedule
 
     plan = deployment(PromptFactors()).attachment.inputs.plan
     point = next(a.ordinal for a in plan.timeline.anchors if a.symbol == "state.publish")
@@ -330,16 +330,3 @@ def test_backend_points_and_memory_witness_reject_tampering():
     )
     with pytest.raises(ValueError, match="unknown anchor"):
         compile_schedule(undeclared, plan.timeline, state=plan.state_physical)
-    for changed in (
-        replace(plan.schedule_decision.tasks[0], lane="side"),
-        replace(plan.schedule_decision.tasks[0], earliest=0),
-        replace(plan.schedule_decision.tasks[0], read_distance=2),
-        replace(plan.schedule_decision.tasks[0], wait_for=(999,)),
-    ):
-        with pytest.raises(ValueError):
-            validate_schedule(
-                plan.semantic_graph,
-                plan.timeline,
-                replace(plan.schedule_decision, tasks=(changed, *plan.schedule_decision.tasks[1:])),
-                state=plan.state_physical,
-            )

@@ -18,6 +18,8 @@ class FTTTWorkload(
         pllm.host.HostTransactionCoordinator[
             pllm.host.CompletionInput | pllm.host.NoHostRequest,
             FTTTHostTransaction,
+            tasks.FTTTStepContext,
+            tasks.FTTTEditState,
             FTTTResult,
         ]
     ]

@@ -19,16 +19,6 @@ from pllm.contracts.tensor_layout import TensorLayoutDecision, TensorLayoutReque
 
 
 @dataclass(frozen=True, slots=True)
-class ScheduleBundle:
-    """Complete Rust-signed schedule facts for non-represented instance state."""
-
-    semantic_graph: SemanticGraph
-    timeline: SchedulerTimeline
-    schedule_decision: ScheduleDecision
-    schedule_physical: PhysicalPlan
-
-
-@dataclass(frozen=True, slots=True)
 class PlanBundle:
     """The complete reusable signed plan facts for one specialization."""
 
@@ -43,4 +33,4 @@ class PlanBundle:
     tensor_layout_decision: TensorLayoutDecision
 
 
-__all__ = ["PlanBundle", "ScheduleBundle"]
+__all__ = ["PlanBundle"]
