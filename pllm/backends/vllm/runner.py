@@ -10,7 +10,7 @@ import json
 import os
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Generic, TypeVar
+from typing import Any
 
 import torch
 from vllm.config import CacheConfig, ModelConfig as VllmModelConfig, VllmConfig
@@ -19,12 +19,10 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.sample.sampler import Sampler as Mrv1Sampler
 from vllm.v1.worker.gpu.async_utils import AsyncOutput
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
-from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from pllm.authoring import (
     AuxiliaryInput,
@@ -40,7 +38,7 @@ from pllm.backends.vllm.packed_rows import encode_mrv2_rows
 from pllm.backends.vllm.position_state import POSITION_ENV, PositionCacheLayer
 from pllm.backends.vllm.prefix_cache import CachePolicy
 from pllm.backends.vllm.sampler import (
-    Mrv1Sampler as Mrv1Guidance,
+    SamplerGuidance,
     Vllm027Sampler,
 )
 from pllm.backends.vllm.session import VllmSession
@@ -62,15 +60,11 @@ from pllm.execution.trace import ExecutionTrace
 TAPS_ENV = "PLLM_HIDDEN_TAPS"
 
 
-SamplerT = TypeVar("SamplerT", Sampler, Mrv1Sampler)
-AdapterT = TypeVar("AdapterT", Vllm027Sampler, Mrv1Guidance)
+class Runner:
+    """The workload attachment slot and persistent sampling hook shared by both runner ABIs."""
 
-
-class Runner(Generic[SamplerT, AdapterT]):
-    """The original attachment slot and cleanup, shared by concrete runner adapters."""
-
-    sampler: SamplerT | AdapterT
-    _workload_upstream_sampler: SamplerT | AdapterT
+    # vLLM's two sampler slot types differ; sessions only need their shared guidance lifecycle.
+    _sampler_guidance: SamplerGuidance
     model: torch.nn.Module
     cache_config: CacheConfig
     model_config: VllmModelConfig
@@ -89,12 +83,13 @@ class Runner(Generic[SamplerT, AdapterT]):
             raise ValueError("choose a Qwen2 model for vLLM workloads")
         return self.model
 
-    def _install_hidden_taps(self) -> None:
-        """Tap the announced hidden outputs before vLLM compiles and captures the model."""
+    def _install_model_hooks(self) -> None:
+        """Install the logits hook and announced hidden taps before vLLM compiles the model."""
+        model = self.qwen2_model()
+        setattr(model, "compute_logits", partial(self._compute_logits, model))
         requested: list[tuple[int, str]] = json.loads(os.environ.get(TAPS_ENV, "[]"))
         if not requested:
             return
-        model = self.qwen2_model()
         layers = len(model.model.layers)
         paths = (hidden_binding(layer, HiddenSite(site), layers).module_path for layer, site in requested)
         hidden_size = model.lm_head.weight.shape[1]
@@ -132,8 +127,7 @@ class Runner(Generic[SamplerT, AdapterT]):
         ):
             raise ValueError("parameter overlays, activation patches and layer replay do not run under CUDA graphs yet")
         model = self.qwen2_model()
-        upstream = self.sampler
-        adapter = self._make_sampler() if deployment.attachment.inputs.request.guides_sampler else None
+        adapter = self._sampler_guidance if request.guides_sampler else None
         session = VllmSession(
             deployment,
             model,
@@ -144,7 +138,6 @@ class Runner(Generic[SamplerT, AdapterT]):
             self.cache_config.block_size,
             cache_policy=cache_policy,
         )
-        self._workload_upstream_sampler = upstream
         self._workload_session = session
         try:
             self._finish_model_binding()
@@ -152,26 +145,17 @@ class Runner(Generic[SamplerT, AdapterT]):
             session.close()
             self._workload_session = None
             raise
-        if adapter is not None:
-            self.sampler = adapter
-            # Both runner ABIs call model.compute_logits; guidance shares that LM-head read.
-            setattr(model, "compute_logits", partial(session.compute_logits, model))
 
     def _finish_model_binding(self) -> None:
         """Finish backend model preparation after the session has installed its effects."""
 
     def detach_workload(self) -> None:
         session = self.require_session()
-        upstream = self._workload_upstream_sampler
         session.require_idle()
         session.close()
         if self.completion_capture is not None:
             self.completion_capture.synchronize()
-        if self.sampler is not upstream:
-            self.sampler = upstream
-            self.model.__dict__.pop("compute_logits", None)
         self._workload_session = None
-        del self._workload_upstream_sampler
         self.completion_capture = None
 
     def stage_workload_input(
@@ -216,11 +200,14 @@ class Runner(Generic[SamplerT, AdapterT]):
         assert session is not None
         return session
 
-    def _make_sampler(self) -> AdapterT:
-        raise NotImplementedError
+    def _compute_logits(self, model: Qwen2ForCausalLM, hidden: torch.Tensor) -> torch.Tensor | None:
+        session = self._workload_session
+        if session is None:
+            return Qwen2ForCausalLM.compute_logits(model, hidden)
+        return session.compute_logits(model, hidden)
 
 
-class WorkloadModelRunner(Runner[Sampler, Vllm027Sampler], OverlayGraphRunner):
+class WorkloadModelRunner(Runner, OverlayGraphRunner):
     runner_kind = RunnerKind.MRV2
 
     def __init__(
@@ -234,7 +221,9 @@ class WorkloadModelRunner(Runner[Sampler, Vllm027Sampler], OverlayGraphRunner):
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights)  # pyright: ignore[reportUnknownMemberType]
-        self._install_hidden_taps()
+        assert self.sampler is not None
+        self.sampler = self._sampler_guidance = Vllm027Sampler(self.sampler)
+        self._install_model_hooks()
         self.position_states = decode_boundary(
             os.environ.get(POSITION_ENV, '{"states": []}'), PositionAnnouncement
         ).states
@@ -267,9 +256,6 @@ class WorkloadModelRunner(Runner[Sampler, Vllm027Sampler], OverlayGraphRunner):
 
     def _finish_model_binding(self) -> None:
         self.finish_overlay_graphs(self.require_session().attachment, self.require_session().parameter_phases)
-
-    def _make_sampler(self) -> Vllm027Sampler:
-        return Vllm027Sampler(self.sampler)
 
     def prepare_inputs(
         self,

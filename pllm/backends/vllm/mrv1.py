@@ -7,7 +7,6 @@ from vllm.config import VllmConfig
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput, SamplerOutput
-from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -18,7 +17,7 @@ from pllm.config import RunnerKind
 from pllm.contracts.backend_attachment import AttachmentTopology
 
 
-class Mrv1Runner(Runner[Sampler, Mrv1Sampler], GPUModelRunner):
+class Mrv1Runner(Runner, GPUModelRunner):
     runner_kind = RunnerKind.MRV1
 
     def __init__(
@@ -30,14 +29,14 @@ class Mrv1Runner(Runner[Sampler, Mrv1Sampler], GPUModelRunner):
         super().__init__(vllm_config, device)
         if self.use_async_scheduling:
             raise ValueError("MRv1 workload requires synchronous persistent batch metadata")
+        self.sampler = self._sampler_guidance = Mrv1Sampler(self.sampler)
         self._initialize_workload(topology)
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
+        if self.speculative_config is not None:
+            raise ValueError("disable speculative decoding for MRv1 workloads")
         super().load_model(load_dummy_weights)
-        self._install_hidden_taps()
-
-    def _make_sampler(self) -> Mrv1Sampler:
-        return Mrv1Sampler(self.sampler)
+        self._install_model_hooks()
 
     def _prepare_inputs(
         self, scheduler_output: SchedulerOutput, num_scheduled_tokens: npt.NDArray[np.int32]
