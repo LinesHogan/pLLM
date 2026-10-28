@@ -52,9 +52,18 @@ class TaskGraphExecution(Generic[ExecutionContextT, ExecutionResultT]):
         ):
             raise ValueError("task-graph implementation differs from the Rust physical plan")
 
+    def run(self, context: ExecutionContextT, invocation_id: int) -> ExecutionContextT:
+        """Run every planned host task synchronously and return its context."""
+        for task in self.plan.tasks:
+            with self.trace.task(invocation_id, task.task_id):
+                self.implementations[int(task.task_id)].execute(context)
+                if task.release_values and self.release_values is not None:
+                    self.release_values(context, task.release_values)
+        return context
+
 
 class TaskGraphInvocation(Generic[ExecutionContextT, ExecutionResultT]):
-    """One cursor for synchronous host and externally staged execution."""
+    """One cursor for externally staged execution."""
 
     def __init__(
         self,
@@ -66,11 +75,6 @@ class TaskGraphInvocation(Generic[ExecutionContextT, ExecutionResultT]):
         self._next_task_index = 0
         self.last_anchor_id = -1
         self.finished = False
-
-    def run(self) -> ExecutionContextT:
-        for anchor in dict.fromkeys(task.anchor_id for task in self.execution.plan.tasks):
-            self.execute_anchor(anchor)
-        return self.finish()
 
     def execute_anchor(self, anchor_id: AnchorId, stream: torch.cuda.Stream | None = None) -> None:
         plan, trace = self.execution.plan, self.execution.trace

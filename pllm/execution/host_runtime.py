@@ -22,7 +22,7 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorLayoutRequest
 from pllm.execution.cuda_stream import CudaStreamReadiness
-from pllm.execution.execution import TaskGraphExecution, TaskGraphImplementation, TaskGraphInvocation
+from pllm.execution.execution import TaskGraphExecution, TaskGraphImplementation
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
 from pllm.execution.scheduler import compile_schedule, lower_physical_plan
@@ -274,7 +274,7 @@ class HostExecution(Generic[TransactionT, ContextT, SnapshotT, ResultT]):
             try:
                 context = self._state.prepare(transaction)
                 snapshot = self._state.snapshot()
-                result = self._state.output(TaskGraphInvocation(self._runner, context, receipt_id).run())
+                result = self._state.output(self._runner.run(context, receipt_id))
                 completion = None
                 if stream is not None:
                     completion = torch.cuda.Event(blocking=False)
