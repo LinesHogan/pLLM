@@ -17,8 +17,8 @@ from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
     AttachmentHiddenResource,
     AttachmentTopology,
+    BackendAttachment,
     BackendPlacementProbe,
-    SignedBackendAttachment,
 )
 from pllm.contracts.hidden_locator import HiddenLayerKind
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
@@ -100,11 +100,11 @@ def test_bind_rejects_a_plan_built_for_other_math() -> None:
 
 def test_attachment_inputs_cross_the_wire_and_reject_malformed_payloads() -> None:
     workload, probe, facts = overlay_facts()
-    for signed in (workload.compile_backend(facts).attachment, sampler_deployment(probe, facts).attachment):
-        reconstructed = decode_boundary(encode_boundary(signed), SignedBackendAttachment)
-        assert reconstructed == signed
-        check_backend_attachment(reconstructed.inputs)
-        payload = json.loads(encode_boundary(signed.inputs))
+    for attachment in (workload.compile_backend(facts).attachment, sampler_deployment(probe, facts).attachment):
+        reconstructed = decode_boundary(encode_boundary(attachment), BackendAttachment)
+        assert reconstructed == attachment
+        check_backend_attachment(reconstructed)
+        payload = json.loads(encode_boundary(attachment))
         payload["probe"]["unknown"] = 0
         with pytest.raises(ValueError):
             _core.check_backend_attachment(json.dumps(payload))

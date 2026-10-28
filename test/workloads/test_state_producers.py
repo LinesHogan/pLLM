@@ -75,7 +75,7 @@ def packed(identities, hidden, phases, lengths=(1, 1), *, offset=0, stream=None)
 def test_prompt_producers_publish_only_completed_requests(workload, device, length):
     stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
     deployed = deployment(workload, device=device)
-    network = next(p for p in deployed.attachment.inputs.plan.state_physical.representations if p.resource == "network")
+    network = next(p for p in deployed.attachment.plan.state_physical.representations if p.resource == "network")
     assert network.page_capacity == 1
     execution = deployed.execution
     identities = (RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0))
@@ -216,7 +216,7 @@ def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch
             return tuple(torch.full_like(value, index + 1) for index, value in enumerate((aq, bq, av, bv)))
 
     imported, written = deployment(Imported(), device=device), deployment(Written(), device=device)
-    assert imported.attachment.inputs.request.overlay_bindings == written.attachment.inputs.request.overlay_bindings
+    assert imported.attachment.spec.overlay_bindings == written.attachment.spec.overlay_bindings
     identity = RequestIdentity("swap", 0, 0)
     key = RequestStateKey.project(identity, (RequestKeyField.PROMPT_IDX,))
     values = tuple(
@@ -276,13 +276,14 @@ def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch
     torch.testing.assert_close(execution.snapshot(entry, stream=stream), before)
     execution.retire((identity,), wait=True)
     assert execution.diagnostics().active_lineages == execution.diagnostics().pending_state_releases == 0
-    inputs = written.attachment.inputs
-    binding = inputs.request.overlay_bindings[0]
+    attachment = written.attachment
+    binding = attachment.spec.overlay_bindings[0]
     broken = replace(binding, fields=(replace(binding.fields[0], offset=10000), binding.fields[1]))
     with pytest.raises(ValueError, match="view"):
         check_backend_attachment(
             replace(
-                inputs, request=replace(inputs.request, overlay_bindings=(broken, *inputs.request.overlay_bindings[1:]))
+                attachment,
+                spec=replace(attachment.spec, overlay_bindings=(broken, *attachment.spec.overlay_bindings[1:])),
             )
         )
 
@@ -317,7 +318,7 @@ def test_backend_points_and_compile_rejects_unknown_anchor():
     from pllm.contracts.semantic_graph import AnchorSymbol, TimingConstraint
     from pllm.execution.scheduler import compile_schedule
 
-    plan = deployment(PromptFactors()).attachment.inputs.plan
+    plan = deployment(PromptFactors()).attachment.plan
     point = next(a.ordinal for a in plan.timeline.anchors if a.symbol == "state.publish")
     assert all(t.earliest == t.anchor_id == point for t in plan.schedule_physical.tasks)
     constrained = replace(

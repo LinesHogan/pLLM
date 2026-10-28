@@ -176,8 +176,8 @@ def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None
         gpu_model.initial_factors = tuple(t.to(gpu_model.device) for t in gpu_model.initial_factors)
         online = TLMWorkload(TLMConfig(mode=TLMMode.ONLINE), gpu_model)
         attachment = online.plan_backend(online.specialize(_facts(gpu_model), ExecutionOptions()))
-        assert attachment.inputs.request.overlay_bindings
-        assert all(task.lane == "main" for task in attachment.inputs.plan.schedule_physical.tasks)
+        assert attachment.spec.overlay_bindings
+        assert all(task.lane == "main" for task in attachment.plan.schedule_physical.tasks)
     batch = CausalTrainBatch(torch.tensor([[0, 2, 3]]), torch.tensor([[0, 2, 3]]))
     for mode in TLMMode:
         config = TLMConfig(mode=mode, threshold=0.0)

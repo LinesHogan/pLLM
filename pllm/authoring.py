@@ -16,7 +16,7 @@ from pllm.contracts.auxiliary import (
     WeightedCEBatch as WeightedCEBatch,
     map_auxiliary as map_auxiliary,
 )
-from pllm.contracts.backend_attachment import BackendAttachmentSpec, SignedBackendAttachment
+from pllm.contracts.backend_attachment import BackendAttachment, BackendAttachmentSpec
 from pllm.contracts.compilation import PlanBundle as PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase as HiddenPhase, HiddenSite as HiddenSite
 from pllm.contracts.parameter_overlay import ParameterTarget, ParameterTargetShape
@@ -145,10 +145,10 @@ class CausalModel(Protocol):
 @dataclass(frozen=True, slots=True)
 class BackendDeployment(Generic[DataT, ResultT]):
     execution: StateExecution[TensorStepInput, DataT, ResultT]
-    attachment: SignedBackendAttachment
+    attachment: BackendAttachment
 
     def __post_init__(self) -> None:
-        if self.attachment.inputs.plan is not self.execution.arena.plan:
+        if self.attachment.plan is not self.execution.arena.plan:
             raise ValueError("backend deployment requires the original execution plan")
 
 
@@ -234,7 +234,7 @@ class BackendAuthoring(ABC):
         """Return original graph, logical layouts and effects, never a physical plan."""
         ...
 
-    def plan_backend(self, facts: BackendCompileFacts) -> SignedBackendAttachment:
+    def plan_backend(self, facts: BackendCompileFacts) -> BackendAttachment:
         graph, layouts, attachment = self.declare(facts)
         timeline = derive_attachment_resources(
             facts.probe,
@@ -261,9 +261,9 @@ class BackendWorkload(BackendAuthoring, Generic[DataT, ResultT]):
         ...
 
     def bind_backend(
-        self, facts: BackendCompileFacts, attachment: SignedBackendAttachment
+        self, facts: BackendCompileFacts, attachment: BackendAttachment
     ) -> BackendDeployment[DataT, ResultT]:
-        plan = attachment.inputs.plan
+        plan = attachment.plan
         math = self.bind_math(facts, plan)
         device = (
             torch.device("cpu")
@@ -271,7 +271,7 @@ class BackendWorkload(BackendAuthoring, Generic[DataT, ResultT]):
             else torch.device("cuda", facts.probe.device_ordinal)
         )
         arena = PageBundleArena(plan, device=device, _owned_resources=math.local_resources(plan))
-        return BackendDeployment(math.bind(arena, attachment.inputs.request.sampler_anchor_id), attachment)
+        return BackendDeployment(math.bind(arena, attachment.sampler_anchor_id), attachment)
 
     def compile_backend(self, facts: BackendCompileFacts) -> BackendDeployment[DataT, ResultT]:
         return self.bind_backend(facts, self.plan_backend(facts))

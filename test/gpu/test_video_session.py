@@ -45,7 +45,7 @@ def test_video_real_frame_math_and_signed_composition():
     workload = VideoWorkload(grid_size=2)
     facts = workload.specialize(facts, ExecutionOptions())
     deployment = workload.compile_backend(facts)
-    execution, plan = deployment.execution, deployment.attachment.inputs.plan
+    execution, plan = deployment.execution, deployment.attachment.plan
     (layout,) = (item for item in plan.tensor_layout_decision.bindings if item.resource == "features")
     ref = StateRef(layout.layout_id, LineageId(1), VersionId(1))
     with ExitStack() as lifetime:

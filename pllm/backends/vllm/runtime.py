@@ -42,9 +42,9 @@ from pllm.contracts.backend_attachment import (
     TOKEN_CAPTURE_CAPABILITY,
     AttachmentGraphMode,
     AttachmentHiddenResource,
+    BackendAttachment,
     BackendPlacementProbe,
     CausalModelDomain,
-    SignedBackendAttachment,
 )
 from pllm.contracts.feedback import (
     BarrierState,
@@ -167,7 +167,7 @@ class BackendProbe:
 
 @dataclass(frozen=True, slots=True)
 class BackendInstall:
-    attachment: SignedBackendAttachment
+    attachment: BackendAttachment
     definition: str
     cache_policy: CachePolicy
 
@@ -188,7 +188,7 @@ class VllmLlm(Generic[DataT, ResultT]):
 
     _llm: LLM | None
     _runner: WorkloadModelRunner | Mrv1Runner | None
-    attachment: SignedBackendAttachment
+    attachment: BackendAttachment
     _facts: BackendCompileFacts
     _cache_policy: CachePolicy
     _closed: bool = False
@@ -414,13 +414,13 @@ class VllmLlm(Generic[DataT, ResultT]):
         # A route value is user-computed (regex, discriminator, tenant); the signed
         # graph only declares whether any request state keys on it.
         signed_route = any(
-            RequestKeyField.ROUTE in state.key_fields for state in self.attachment.inputs.plan.semantic_graph.states
+            RequestKeyField.ROUTE in state.key_fields for state in self.attachment.plan.semantic_graph.states
         )
         if routes is not None and (not signed_route or len(routes) != len(texts) or any(not route for route in routes)):
             raise ValueError("routes require a signed route-keyed state and one value per prompt")
         if signed_route and routes is None:
             raise ValueError("a route-keyed request state requires per-prompt routes")
-        validate_auxiliary(auxiliary, self.attachment.inputs.plan, SharedTensor.describe)
+        validate_auxiliary(auxiliary, self.attachment.plan, SharedTensor.describe)
         llm = self._require_open()
         llm.sleep(level=0, mode="keep")
         request_ids: list[str] = []
@@ -492,8 +492,8 @@ class VllmLlm(Generic[DataT, ResultT]):
         output_device = completion_device or (torch.device("cpu") if self._runner is None else self.device)
         if output_device.type == "cuda":
             if output_device == torch.device("cuda"):
-                output_device = torch.device("cuda", self.attachment.inputs.probe.device_ordinal)
-            if output_device.index != self.attachment.inputs.probe.device_ordinal:
+                output_device = torch.device("cuda", self.attachment.probe.device_ordinal)
+            if output_device.index != self.attachment.probe.device_ordinal:
                 raise ValueError("completion IPC currently requires the model's CUDA device")
         elif output_device.type != "cpu":
             raise ValueError("completion output requires CPU or CUDA storage")

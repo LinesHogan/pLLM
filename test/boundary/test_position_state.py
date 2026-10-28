@@ -42,8 +42,8 @@ def test_predecessors_follow_allocation_pages(width, allocation):
 def test_position_source_cannot_use_stateless_signing_exemption(target):
     workload = StepLoop()
     facts = replace(FACTS, probe=replace(FACTS.probe, position_states=(("history", 0.0),)))
-    signed = workload.compile_backend(workload.specialize(facts, ExecutionOptions())).attachment
-    payload = json.loads(encode_boundary(signed.inputs))
+    attachment = workload.compile_backend(workload.specialize(facts, ExecutionOptions())).attachment
+    payload = json.loads(encode_boundary(attachment))
     effect = payload["plan"]["semantic_graph"]["tasks"][0]["replay"]
     if target == "schema":
         payload["probe"]["position_states"] = []

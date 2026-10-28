@@ -11,7 +11,7 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request
 
-from pllm.contracts.backend_attachment import SignedBackendAttachment
+from pllm.contracts.backend_attachment import BackendAttachment
 from pllm.execution.codec import boundary_digest, decode_boundary, encode_boundary
 
 POLICY_KEY = "pllm.prefix_cache"
@@ -26,18 +26,19 @@ class CachePolicy:
     generated_kv: Literal["reuse", "isolate"]
 
     @classmethod
-    def for_attachment(cls, attachment: SignedBackendAttachment, policy: Literal["reuse", "isolate"]) -> "CachePolicy":
-        """Conservatively derive role dependence and stable mathematical identity from signed facts."""
-        inputs = attachment.inputs
-        graph = inputs.plan.semantic_graph
+    def for_attachment(cls, attachment: BackendAttachment, policy: Literal["reuse", "isolate"]) -> "CachePolicy":
+        """Conservatively derive role dependence and stable mathematical identity from backend facts."""
+        graph = attachment.plan.semantic_graph
         sensitive = (
-            bool(inputs.request.activation_bindings or inputs.request.overlay_bindings)
+            bool(attachment.spec.activation_bindings or attachment.spec.overlay_bindings)
             or any(task.replay is not None and task.replay.rows != "all" for task in graph.tasks)
             # Reading `layers.generated` or PositionState adds the position resource to the route source.
             or any(task.replay is not None and task.replay.role_sensitive for task in graph.tasks)
         )
         return cls(
-            boundary_digest((inputs.probe.model_fingerprint, graph, inputs.probe.position_states)), sensitive, policy
+            boundary_digest((attachment.probe.model_fingerprint, graph, attachment.probe.position_states)),
+            sensitive,
+            policy,
         )
 
     def sampling(self, params: SamplingParams) -> SamplingParams:

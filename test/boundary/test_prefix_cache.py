@@ -120,7 +120,7 @@ def test_signed_sensitivity(workload, sensitive):
     assert CachePolicy.for_attachment(attachment, "isolate") == policy
     changed = replace(
         attachment,
-        inputs=replace(attachment.inputs, probe=replace(attachment.inputs.probe, position_states=(("history", 1.0),))),
+        probe=replace(attachment.probe, position_states=(("history", 1.0),)),
     )
     assert CachePolicy.for_attachment(changed, "isolate").namespace != policy.namespace
 

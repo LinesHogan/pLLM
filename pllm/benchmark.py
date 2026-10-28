@@ -266,7 +266,7 @@ def _measure_arm(
                 elapsed, cpu_elapsed, tokens = _generate_rounds(handle, requests, auxiliary, options.rounds)
             profiler.export_chrome_trace(str(directory / f"{arm.name}.json"))
         after = handle.diagnostics()
-        plan = handle.attachment.inputs.plan
+        plan = handle.attachment.plan
         report = BenchmarkResult(
             arm.name,
             cold,

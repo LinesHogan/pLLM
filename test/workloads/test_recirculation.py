@@ -159,7 +159,7 @@ def test_recirculation_declaration_fits_reference_budget_and_crosses_the_wire() 
     )
     tight_facts = workload.specialize(FACTS, ExecutionOptions(memory_budget_bytes=reference_budget, tuning="measured"))
     tight = workload.compile_backend(tight_facts)
-    assert tight.attachment.inputs.plan.timeline.memory_budget_bytes == reference_budget
+    assert tight.attachment.plan.timeline.memory_budget_bytes == reference_budget
     with pytest.raises(ValueError):
         workload.specialize(FACTS, ExecutionOptions(memory_budget_bytes=reference_budget - 1))
     restored = decode_workload(encode_workload(workload))

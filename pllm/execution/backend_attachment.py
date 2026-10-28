@@ -10,15 +10,12 @@ import torch
 from pllm import _core
 from pllm.contracts.backend_attachment import (
     TOKEN_CAPTURE_CAPABILITY,
-    AttachmentCleanupStage,
     AttachmentGraphMode,
     AttachmentTaskBinding,
     AttachmentTaskRole,
-    BackendAttachmentCompilerInputs,
-    BackendAttachmentRequest,
+    BackendAttachment,
     BackendAttachmentSpec,
     BackendPlacementProbe,
-    SignedBackendAttachment,
 )
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator
@@ -43,7 +40,7 @@ def attachment_buffer_bytes(
     probe: BackendPlacementProbe,
     graph: SemanticGraph,
     layouts: TensorLayoutRequest,
-    attachment: BackendAttachmentSpec | BackendAttachmentRequest,
+    attachment: BackendAttachmentSpec,
 ) -> int:
     """Fund effect buffers and pinned projection scratch; excludes model scratch."""
     rows, hidden = probe.max_packed_rows, probe.hidden_size
@@ -107,7 +104,7 @@ def derive_attachment_resources(
     timeline: SchedulerTimeline,
     *,
     layouts: TensorLayoutRequest | None = None,
-    attachment: BackendAttachmentSpec | BackendAttachmentRequest | None = None,
+    attachment: BackendAttachmentSpec | None = None,
     capture_memory_bytes: int = 0,
 ) -> SchedulerTimeline:
     """Fund the tokenwise reference plan through its task and value resource facts.
@@ -194,9 +191,9 @@ def derive_attachment_resources(
     )
 
 
-def check_backend_attachment(inputs: BackendAttachmentCompilerInputs) -> None:
+def check_backend_attachment(attachment: BackendAttachment) -> None:
     """Check declared attachment inputs against their plan and backend facts in Rust."""
-    _core.check_backend_attachment(encode_boundary(inputs))
+    _core.check_backend_attachment(encode_boundary(attachment))
 
 
 def bind_attachment_tasks(
@@ -225,24 +222,18 @@ def bind_backend_attachment(
     plan: PlanBundle,
     probe: BackendPlacementProbe,
     spec: BackendAttachmentSpec,
-) -> SignedBackendAttachment:
+) -> BackendAttachment:
     anchors = {anchor.symbol: anchor for anchor in plan.timeline.anchors}
     sampler = anchors[spec.sampler_anchor]
-    request = BackendAttachmentRequest(
-        attachment_kind=spec.kind,
-        packed_row_schema_version=2,
+    attachment = BackendAttachment(
+        spec=spec,
         task_bindings=bind_attachment_tasks(plan, spec.tasks),
         sampler_anchor_id=AnchorId(sampler.ordinal),
-        sampler_anchor_symbol=sampler.symbol,
-        sampler_stage=spec.sampler_stage,
-        cleanup_stage=AttachmentCleanupStage.REQUEST_FINISH,
-        state_resource=spec.state_resource,
-        overlay_bindings=spec.overlay_bindings,
-        activation_bindings=spec.activation_bindings,
+        probe=probe,
+        plan=plan,
     )
-    inputs = BackendAttachmentCompilerInputs(request, probe, plan)
-    check_backend_attachment(inputs)
-    return SignedBackendAttachment(inputs)
+    check_backend_attachment(attachment)
+    return attachment
 
 
 __all__ = [

@@ -103,26 +103,25 @@ class Runner:
         cache_policy: CachePolicy,
     ) -> None:
         if self.cache_config.enable_prefix_caching and (
-            deployment.attachment.inputs.request.activation_bindings
-            or deployment.attachment.inputs.request.overlay_bindings
+            deployment.attachment.spec.activation_bindings or deployment.attachment.spec.overlay_bindings
         ):
             raise ValueError("disable prefix caching when using parameter overlays or activation patches")
-        if deployment.attachment.inputs.probe.position_states != self.position_states:
+        if deployment.attachment.probe.position_states != self.position_states:
             raise ValueError("PositionState schema changed; create a new engine with this workload")
-        request = deployment.attachment.inputs.request
+        spec = deployment.attachment.spec
         in_model = (
-            request.overlay_bindings
-            or request.activation_bindings
-            or any(task.replay is not None for task in deployment.attachment.inputs.plan.semantic_graph.tasks)
+            spec.overlay_bindings
+            or spec.activation_bindings
+            or any(task.replay is not None for task in deployment.attachment.plan.semantic_graph.tasks)
         )
         if (
             in_model
             and not self.model_config.enforce_eager
-            and deployment.attachment.inputs.probe.graph_mode is not AttachmentGraphMode.CUDA_GRAPH
+            and deployment.attachment.probe.graph_mode is not AttachmentGraphMode.CUDA_GRAPH
         ):
             raise ValueError("parameter overlays, activation patches and layer replay do not run under CUDA graphs yet")
         model = self.qwen2_model()
-        adapter = self._sampler_guidance if request.guides_sampler else None
+        adapter = self._sampler_guidance if spec.guides_sampler else None
         session = VllmSession(
             deployment,
             model,

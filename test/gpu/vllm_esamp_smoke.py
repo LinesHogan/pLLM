@@ -53,7 +53,7 @@ def lag_equivalence() -> None:
             execution=ExecutionOptions(publish_lag=lag, capture_memory_bytes=16 * 1024**2),
         )
         with pllm.make_llm(config, workload=ESampRequestWorkload(ESampRequestConfig(rank=2))) as llm:
-            assert any(task.lane == "side" for task in llm.attachment.inputs.plan.schedule_physical.tasks) == bool(lag)
+            assert any(task.lane == "side" for task in llm.attachment.plan.schedule_physical.tasks) == bool(lag)
             # Requests retire inside generate; read each final version just before it is retired.
             with patch.object(PageBundleArena, "retire", snapshot):
                 outputs = llm.generate(
@@ -127,7 +127,7 @@ def main() -> int:
             raise RuntimeError("public make_llm did not select canonical runtime")
     try:
         outputs = handle.generate(["The sky is"], SamplingParams(max_tokens=3, temperature=0.0, n=1, ignore_eos=True))
-        plan = handle.attachment.inputs.plan.schedule_physical
+        plan = handle.attachment.plan.schedule_physical
         assert sum("cuda_graph" in task.implementation_id for task in plan.tasks) == 3
         diagnostics = handle.diagnostics()
         if (

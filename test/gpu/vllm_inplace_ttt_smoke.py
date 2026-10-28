@@ -295,7 +295,7 @@ def _key(prompt_index: int) -> RequestStateKey:
 
 
 def _check_imported(handle: VllmLlm[object, object]) -> tuple[str, ...]:
-    (layout,) = handle.attachment.inputs.plan.tensor_layout_request.layouts
+    (layout,) = handle.attachment.plan.tensor_layout_request.layouts
     down_shape, up_shape = (tuple(field.shape) for field in layout.layout.fields[:2])
     device = handle.device
     # No import: every row reads its zero-initialized request state, identical to the base model.
@@ -557,8 +557,7 @@ def main() -> int:
                             "kv_blocks": before[0],
                             "kv_bytes": sum(before[1]),
                             "task_workspace": [
-                                (str(f.task), f.workspace_bytes)
-                                for f in handle.attachment.inputs.plan.timeline.task_resources
+                                (str(f.task), f.workspace_bytes) for f in handle.attachment.plan.timeline.task_resources
                             ],
                         }
                     ),

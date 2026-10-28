@@ -42,10 +42,6 @@ class AttachmentGraphMode(StrEnum):
     CUDA_GRAPH = "cuda_graph"
 
 
-class AttachmentCleanupStage(StrEnum):
-    REQUEST_FINISH = "request_finish"
-
-
 class AttachmentTaskRole(StrEnum):
     COMPUTE = "compute"
     TRANSITION = "transition"
@@ -157,44 +153,19 @@ class BackendAttachmentSpec:
 
 
 @dataclass(frozen=True, slots=True)
-class BackendAttachmentRequest:
-    attachment_kind: AttachmentKind
-    packed_row_schema_version: int
+class BackendAttachment:
+    """Declared effects and resolved plan bindings shared by the driver and worker."""
+
+    spec: BackendAttachmentSpec
     task_bindings: tuple[AttachmentTaskBinding, ...]
     sampler_anchor_id: AnchorId
-    sampler_anchor_symbol: str
-    sampler_stage: SamplerStage
-    cleanup_stage: AttachmentCleanupStage
-    state_resource: str
-    overlay_bindings: tuple[ParameterOverlayFieldBinding, ...] = ()
-    activation_bindings: tuple[ActivationPatchBinding, ...] = ()
-    schema_version: int = 11
-
-    @property
-    def guides_sampler(self) -> bool:
-        """True when a compute task feeds the sampler; False for training alone."""
-        return (
-            self.attachment_kind is AttachmentKind.REQUEST_TRAINING
-            and self.task_bindings[0].role is AttachmentTaskRole.COMPUTE
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class BackendAttachmentCompilerInputs:
-    request: BackendAttachmentRequest
     probe: BackendPlacementProbe
     plan: PlanBundle
 
 
-@dataclass(frozen=True, slots=True)
-class SignedBackendAttachment:
-    inputs: BackendAttachmentCompilerInputs
-
-
 __all__ = [
     "BackendAttachmentSpec",
-    "SignedBackendAttachment",
-    "AttachmentCleanupStage",
+    "BackendAttachment",
     "AttachmentGraphMode",
     "AttachmentKind",
     "AttachmentHiddenResource",
@@ -202,8 +173,6 @@ __all__ = [
     "AttachmentTaskBinding",
     "AttachmentTaskRole",
     "AttachmentTopology",
-    "BackendAttachmentCompilerInputs",
-    "BackendAttachmentRequest",
     "BackendPlacementProbe",
 ]
 

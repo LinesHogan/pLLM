@@ -19,7 +19,7 @@ from pllm.backends.vllm.runtime import (
     probe_backend,
 )
 from pllm.contracts.auxiliary import validate_auxiliary
-from pllm.contracts.backend_attachment import AttachmentTopology, SignedBackendAttachment
+from pllm.contracts.backend_attachment import AttachmentTopology, BackendAttachment
 from pllm.contracts.semantic_graph import StateScope, TaskId
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.trace import TraceSelection
@@ -49,10 +49,10 @@ class GPUWorker(Worker):
                 raise RuntimeError("canonical worker has not initialized its runner")
 
     def _install(
-        self, workload: BackendWorkload[DataT, ResultT], attachment: SignedBackendAttachment, cache_policy: CachePolicy
+        self, workload: BackendWorkload[DataT, ResultT], attachment: BackendAttachment, cache_policy: CachePolicy
     ) -> None:
         runner = self.workload_runner
-        plan = attachment.inputs.plan
+        plan = attachment.plan
         visibility = plan.timeline.visibility
         facts = probe_backend(
             workload.backend_requirements(),
@@ -78,7 +78,7 @@ class GPUWorker(Worker):
             )
             for provider in facts.providers
         )
-        if (facts.probe, candidates) != (attachment.inputs.probe, plan.state_request.candidates):
+        if (facts.probe, candidates) != (attachment.probe, plan.state_request.candidates):
             raise ValueError("worker backend facts changed; compile the workload against the current backend")
         runner.attach_workload(workload.bind_backend(facts, attachment), cache_policy)
 
@@ -110,7 +110,7 @@ class GPUWorker(Worker):
                 case BackendCommand.STAGE:
                     stage = decode_boundary(payload, BackendStage)
                     validate_auxiliary(
-                        stage.auxiliary, runner.require_session().attachment.inputs.plan, lambda tensor: tensor.field
+                        stage.auxiliary, runner.require_session().attachment.plan, lambda tensor: tensor.field
                     )
                     peer = os.getppid()
                     stream = torch.cuda.current_stream(runner.device)

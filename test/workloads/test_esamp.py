@@ -219,7 +219,7 @@ def _esamp_native_oracle(device, normalized):
             attachment = workload.plan_backend(
                 replace(facts, timeline=replace(facts.timeline, visibility=VisibilitySource.post_sampler(lag)))
             )
-            assert any(task.lane == "side" for task in attachment.inputs.plan.schedule_physical.tasks) == bool(lag)
+            assert any(task.lane == "side" for task in attachment.plan.schedule_physical.tasks) == bool(lag)
     identities = tuple(RequestIdentity(str(i), i, 0) for i in range(3))
     initial = execution.admit(identities, stream)
     held = execution.arena.pin_exact(initial, stream)

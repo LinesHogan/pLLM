@@ -18,7 +18,7 @@ def test_step_loop_signing_and_provider_agreement():
     schema = workload.backend_requirements().position_states
     facts = replace(FACTS, probe=replace(FACTS.probe, position_states=schema))
     deployment = workload.compile_backend(workload.specialize(facts, ExecutionOptions()))
-    assert deployment.attachment.inputs.plan.semantic_graph.tasks[0].replay.position_states == schema
+    assert deployment.attachment.plan.semantic_graph.tasks[0].replay.position_states == schema
     with pytest.raises(ValueError, match="PositionState"):
         workload.compile_backend(workload.specialize(FACTS, ExecutionOptions()))
 

@@ -26,7 +26,7 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from pllm.authoring import BackendRequirements
 from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay
 from pllm.config import ModelConfig, RunnerKind
-from pllm.contracts.backend_attachment import AttachmentGraphMode, SignedBackendAttachment
+from pllm.contracts.backend_attachment import AttachmentGraphMode, BackendAttachment
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import CapturedParameterOperand, ParameterOverlayFieldBinding
@@ -160,20 +160,20 @@ class OverlayGraphRunner(GPUModelRunner):
             assert self.projection_model is not None
             self.projection_model.do_not_compile = manager.eager
 
-    def finish_overlay_graphs(self, attachment: SignedBackendAttachment, phases: tuple[HiddenPhase, ...]) -> None:
+    def finish_overlay_graphs(self, attachment: BackendAttachment, phases: tuple[HiddenPhase, ...]) -> None:
         """Capture only the bound model; dummy tables have no request ownership or live destinations."""
         if self.projection_model is None:
             return
         # AOT loads before inspecting wrappers: the complete bound plan must enter its key.
         self.vllm_config.additional_config = {
             _BUDGET: self.overlay_graph_bytes,
-            "pllm_pinned_projection_plan": boundary_digest(attachment.inputs),
+            "pllm_pinned_projection_plan": boundary_digest(attachment),
         }
         manager = self.cudagraph_manager
         assert manager is not None
         self.cudagraph_manager = (
             _HybridGraphManager(self.vllm_config, self.device, manager.cudagraph_mode, manager.decode_query_len, phases)
-            if attachment.inputs.plan.semantic_graph.updates_in_forward
+            if attachment.plan.semantic_graph.updates_in_forward
             else ModelCudaGraphManager(self.vllm_config, self.device, manager.cudagraph_mode, manager.decode_query_len)
         )
         self.projection_model.do_not_compile = False

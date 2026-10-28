@@ -120,12 +120,12 @@ def _decode_low_rank_keeps_parameters_and_recomputes_delta(
     from pllm.backends.vllm.activation import VllmActivationPatch
 
     execution = deployment.execution
-    (binding,) = deployment.attachment.inputs.request.activation_bindings
+    (binding,) = deployment.attachment.spec.activation_bindings
     layer = SimpleNamespace(forward=lambda positions, hidden, residual: (hidden.clone(), residual))
     adapter = VllmActivationPatch(
         SimpleNamespace(model=SimpleNamespace(layers=[layer])),
         (replace(binding, decode=DecodeWindow.ALL, decode_refresh=DecodeRefresh.STEP),),
-        deployment.attachment.inputs.request.state_resource,
+        deployment.attachment.spec.state_resource,
     )
     rows = PackedPhaseRowBatch(
         0, len(hidden), tuple(PackedPhaseRow(i, 0, i, HiddenPhase.DECODE, identity) for i in range(len(hidden)))
@@ -176,8 +176,8 @@ def _decode_declarations_are_checked(facts):
     plan = DeclaredActivation(replace(legacy, decode=DecodeWindow.ALL, on_missing=MissingPolicy.HOLD)).plan_backend(
         facts
     )
-    payload = json.loads(encode_boundary(plan.inputs))
-    del payload["request"]["activation_bindings"][0]["on_missing"]
+    payload = json.loads(encode_boundary(plan))
+    del payload["spec"]["activation_bindings"][0]["on_missing"]
     with pytest.raises(ValueError):  # The policy must be explicit on the wire.
         pllm._core.check_backend_attachment(json.dumps(payload))
 
@@ -217,8 +217,8 @@ def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:
     layer = Layer()
     adapter = VllmActivationPatch(
         SimpleNamespace(model=SimpleNamespace(layers=[layer])),
-        deployment.attachment.inputs.request.activation_bindings,
-        deployment.attachment.inputs.request.state_resource,
+        deployment.attachment.spec.activation_bindings,
+        deployment.attachment.spec.state_resource,
     )
     try:
         adapter.prepare(rows, context, execution.directory)

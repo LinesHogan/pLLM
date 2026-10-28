@@ -253,7 +253,7 @@ def _captured_esamp(runner: RunnerKind = RunnerKind.MRV2) -> None:
         config=engine(runner=runner, execution=options),
     )
     try:
-        tasks = handle.attachment.inputs.plan.schedule_physical.tasks
+        tasks = handle.attachment.plan.schedule_physical.tasks
         assert all("cuda_graph" in task.implementation_id for task in tasks)
         selected = tuple(task.task_id for task in tasks)
         handle.profile_tasks(selected)
@@ -486,7 +486,7 @@ def main() -> int:
     handle = pllm.make_llm(workload=workload, config=engine(memory=0.35))
     try:
         assert not torch.cuda.is_initialized(), "frontend allocated a second GPU execution"
-        assert handle.attachment.inputs.probe.topology is AttachmentTopology.ENGINE_CORE
+        assert handle.attachment.probe.topology is AttachmentTopology.ENGINE_CORE
         child = handle.worker_state().process_id
         assert child != os.getpid()
         outputs = handle.generate(
@@ -517,7 +517,7 @@ def main() -> int:
             sample_index=2,
         )
         assert batch.hidden.device.type == "cpu" and batch.readiness is None
-        assert batch.hidden.shape == (3, handle.attachment.inputs.probe.hidden_size)
+        assert batch.hidden.shape == (3, handle.attachment.probe.hidden_size)
         assert torch.isfinite(batch.hidden).all() and torch.count_nonzero(batch.hidden) > 0
         facts = HostRuntimeFacts(torch.device("cpu"), hidden_size=batch.hidden.shape[1])
         edited = pllm.make_llm(workload=FTTTWorkload(), config=facts).run(batch)

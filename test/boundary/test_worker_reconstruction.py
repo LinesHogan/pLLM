@@ -11,7 +11,7 @@ import torch
 from examples.huber import HuberWorkload
 from pllm import make_llm
 from pllm.backends.vllm.prefix_cache import CachePolicy
-from pllm.contracts.backend_attachment import AttachmentTopology, SignedBackendAttachment
+from pllm.contracts.backend_attachment import AttachmentTopology, BackendAttachment
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
@@ -82,7 +82,7 @@ def _worker(connection: Connection) -> None:
             replace(facts, providers=(replace(facts.providers[0], page_capacity=5),)),
             replace(facts, probe=replace(probe, topology=AttachmentTopology.ENGINE_CORE)),
         ):
-            attachment = decode_boundary(connection.recv_bytes().decode(), SignedBackendAttachment)
+            attachment = decode_boundary(connection.recv_bytes().decode(), BackendAttachment)
             runner = Mock()
             try:
                 with (

@@ -357,7 +357,7 @@ def _check_exact_projection_lifecycle():
     requests = (RequestIdentity("exact-a", 0, 0), RequestIdentity("exact-b", 0, 1))
     refs = execution.admit(requests)
     states = {(identity, target): (0.0, []) for identity in requests for target in targets}
-    binding = deployment.attachment.inputs.request.task_bindings[0]
+    binding = deployment.attachment.task_bindings[0]
     # First C=0, then one complete chunk, then a non-power-of-two count with a tail.
     for count in (1, 1, 7):
         operands = tuple(
@@ -470,7 +470,7 @@ def _check_causality_witness(workload, facts, requests, targets):
         execution,
         invocation,
         value.sampler_rows,
-        deployment.attachment.inputs.request.task_bindings[0].task_id,
+        deployment.attachment.task_bindings[0].task_id,
         targets,
     )
     for output in task.run(operands).values():
@@ -521,7 +521,7 @@ def _check_exact_additive_projection():
         execution,
         invocation,
         value.sampler_rows,
-        deployment.attachment.inputs.request.task_bindings[0].task_id,
+        deployment.attachment.task_bindings[0].task_id,
         targets,
     )
     expected_states = []
@@ -553,7 +553,7 @@ def _check_exact_additive_projection():
         execution,
         invocation,
         value.sampler_rows,
-        deployment.attachment.inputs.request.task_bindings[0].task_id,
+        deployment.attachment.task_bindings[0].task_id,
         targets,
     )
     for operand, state in zip(decode, expected_states, strict=True):
@@ -628,7 +628,7 @@ def test_prefill_adapters_keep_prompt_chunks_across_scheduler_spans(span):
             execution,
             invocation,
             value.sampler_rows,
-            deployed.attachment.inputs.request.task_bindings[0].task_id,
+            deployed.attachment.task_bindings[0].task_id,
             TARGETS,
         )
         outputs = task.run(operands)

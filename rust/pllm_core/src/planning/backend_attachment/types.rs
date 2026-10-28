@@ -1,12 +1,10 @@
-//! Closed wire contracts signed by the backend attachment compiler.
+//! Backend attachment facts shared by Python planning and worker installation.
 
 use serde::{Deserialize, Serialize};
 
 use super::super::state_representation::StateDeviceKind;
 use super::super::tensor_layout::TensorDType;
 use super::super::PlanBundle;
-
-pub(crate) const SCHEMA_VERSION: u64 = 11;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -37,12 +35,6 @@ pub(crate) enum AttachmentGraphMode {
 pub(crate) enum SamplerStage {
     PackedPostFilterExact,
     PackedPreFilterAdd,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum AttachmentCleanupStage {
-    RequestFinish,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -135,8 +127,10 @@ pub(crate) struct BackendPlacementProbe {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AttachmentCompilerInputs {
-    pub(crate) request: BackendAttachmentRequest,
+pub(crate) struct BackendAttachment {
+    pub(crate) spec: BackendAttachmentSpec,
+    pub(crate) task_bindings: Vec<AttachmentTaskBinding>,
+    pub(crate) sampler_anchor_id: u32,
     pub(crate) probe: BackendPlacementProbe,
     pub(crate) plan: PlanBundle,
 }
@@ -241,16 +235,12 @@ pub(crate) struct ActivationPatchBinding {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct BackendAttachmentRequest {
-    pub(crate) attachment_kind: AttachmentKind,
-    pub(crate) packed_row_schema_version: u64,
-    pub(crate) task_bindings: Vec<AttachmentTaskBinding>,
-    pub(crate) sampler_anchor_id: u32,
-    pub(crate) sampler_anchor_symbol: String,
-    pub(crate) sampler_stage: SamplerStage,
-    pub(crate) cleanup_stage: AttachmentCleanupStage,
+pub(crate) struct BackendAttachmentSpec {
+    pub(crate) kind: AttachmentKind,
+    pub(crate) tasks: Vec<(AttachmentTaskRole, String)>,
+    pub(crate) sampler_anchor: String,
     pub(crate) state_resource: String,
     pub(crate) overlay_bindings: Vec<OverlayBinding>,
     pub(crate) activation_bindings: Vec<ActivationPatchBinding>,
-    pub(crate) schema_version: u64,
+    pub(crate) sampler_stage: SamplerStage,
 }

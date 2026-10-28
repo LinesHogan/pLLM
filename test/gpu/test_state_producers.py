@@ -32,7 +32,7 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
         monkeypatch.setattr(torch.cuda.CUDAGraph, "capture_begin", begin)
         checked = []
         launches = []
-        plan = handle.attachment.inputs.plan
+        plan = handle.attachment.plan
         execute = execution.execute_anchor
 
         def delayed(invocation, anchor):
@@ -75,7 +75,7 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
                     if isinstance(workload, DecodeFactors):
                         shapes = tuple(
                             (rank, target.input_size) if side == 0 else (target.output_size, rank)
-                            for target in handle.attachment.inputs.probe.targets
+                            for target in handle.attachment.probe.targets
                             for side in range(2)
                         )
                         fields = tuple(
@@ -162,20 +162,20 @@ def test_composed_readers_replay_model_graphs(workload, monkeypatch):
             workload, cuda_graphs=graphs, capture_memory_bytes=256 << 20, memory_budget_bytes=1 << 30
         ) as handle:
             if graphs:
-                inputs = handle.attachment.inputs
+                attachment = handle.attachment
                 with pytest.raises(ValueError, match="Graph overlays"):
                     check_backend_attachment(
-                        replace(
-                            inputs, request=replace(inputs.request, attachment_kind=AttachmentKind.ACTIVATION_PATCH)
-                        )
+                        replace(attachment, spec=replace(attachment.spec, kind=AttachmentKind.ACTIVATION_PATCH))
                     )
                 with pytest.raises(ValueError, match="Graph overlays"):
                     check_backend_attachment(
                         replace(
-                            inputs,
+                            attachment,
                             probe=replace(
-                                inputs.probe,
-                                capabilities=tuple(c for c in inputs.probe.capabilities if c != "backend/vllm_mrv2@1"),
+                                attachment.probe,
+                                capabilities=tuple(
+                                    c for c in attachment.probe.capabilities if c != "backend/vllm_mrv2@1"
+                                ),
                             ),
                         )
                     )

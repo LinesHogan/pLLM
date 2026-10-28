@@ -36,7 +36,7 @@ from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
     AttachmentTaskRole,
-    SignedBackendAttachment,
+    BackendAttachment,
 )
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedSamplerRowBatch
@@ -90,21 +90,21 @@ class VllmSession(Generic[DataT, ResultT]):
     ) -> None:
         self._cache_envelope = encode_boundary(cache_policy)
         attachment = deployment.attachment
-        plan = attachment.inputs.plan
+        plan = attachment.plan
         self._capture_feedback = any(
             isinstance(port.source, SamplerFeedbackInputSource)
             for task in plan.semantic_graph.tasks
             for port in task.inputs
         )
         buffers = attachment_buffer_bytes(
-            attachment.inputs.probe, plan.semantic_graph, plan.tensor_layout_request, attachment.inputs.request
+            attachment.probe, plan.semantic_graph, plan.tensor_layout_request, attachment.spec
         )
         self._deployment = deployment
         self.trace = deployment.execution.trace
-        probe = attachment.inputs.probe
+        probe = attachment.probe
         self._hidden_resources = tuple(dict.fromkeys(resource.binding for resource in probe.hidden_resources))
         self._taps = taps
-        overlay_bindings = attachment.inputs.request.overlay_bindings
+        overlay_bindings = attachment.spec.overlay_bindings
         routed_overlay = bool(overlay_bindings) and any(task.replay is not None for task in plan.semantic_graph.tasks)
         self._in_forward_overlay = plan.semantic_graph.updates_in_forward
         if routed_overlay or self._in_forward_overlay:
@@ -125,22 +125,20 @@ class VllmSession(Generic[DataT, ResultT]):
             if overlay_bindings
             else None
         )
-        tasks = tuple(task for task in attachment.inputs.plan.semantic_graph.tasks if task.replay is not None)
+        tasks = tuple(task for task in attachment.plan.semantic_graph.tasks if task.replay is not None)
         self._activation = (
             VllmActivationPatch(
                 model,
-                attachment.inputs.request.activation_bindings,
-                attachment.inputs.request.state_resource,
+                attachment.spec.activation_bindings,
+                attachment.spec.state_resource,
                 install=not tasks,
             )
-            if (attachment.inputs.request.activation_bindings)
+            if (attachment.spec.activation_bindings)
             else None
         )
         # Recomputing history after preemption would rerun model-side effects on today's state, not the
         # state each position originally saw, so these workloads need every token computed exactly once.
-        self._unbroken_history = bool(
-            attachment.inputs.request.overlay_bindings or attachment.inputs.request.activation_bindings
-        )
+        self._unbroken_history = bool(attachment.spec.overlay_bindings or attachment.spec.activation_bindings)
         self._token_frontiers: dict[RequestIdentity, int] = {}
         self._feed: FeedReceiver | None = None
         self._received_readonly: ReadonlyStepInput | ReadonlyStepAbsent | ReadonlyStepEnd | None = None
@@ -152,7 +150,7 @@ class VllmSession(Generic[DataT, ResultT]):
                 model,
                 task,
                 deployment.execution,
-                attachment.inputs.request.task_bindings[0].anchor_id,
+                attachment.task_bindings[0].anchor_id,
                 activation=self._activation,
                 position_layers=position_layers,
                 allocation_block_size=allocation_block_size,
@@ -195,7 +193,7 @@ class VllmSession(Generic[DataT, ResultT]):
     ) -> None:
         """Stage request inputs and their optional owned completion destination."""
         self._require_input_live()
-        validate_auxiliary(batch, self._deployment.attachment.inputs.plan, SharedTensor.describe)
+        validate_auxiliary(batch, self._deployment.attachment.plan, SharedTensor.describe)
         self.completion_capture = None if completion is None else CompletionCapture(identities, completion)
         self._auxiliary = batch
         self._pending_identities = {identity.request_id: identity for identity in identities}
@@ -237,7 +235,7 @@ class VllmSession(Generic[DataT, ResultT]):
         return self._identities[request_id]
 
     @property
-    def attachment(self) -> SignedBackendAttachment:
+    def attachment(self) -> BackendAttachment:
         return self._deployment.attachment
 
     def diagnostics(self) -> StateDiagnostics:
@@ -344,16 +342,14 @@ class VllmSession(Generic[DataT, ResultT]):
             if self._in_forward_overlay:
                 self._advance(context, "request.prepare")
                 binding = next(
-                    item
-                    for item in self.attachment.inputs.request.task_bindings
-                    if item.role is AttachmentTaskRole.TRANSITION
+                    item for item in self.attachment.task_bindings if item.role is AttachmentTaskRole.TRANSITION
                 )
                 projection = ProjectionTask(
                     execution,
                     context,
                     rows,
                     binding.task_id,
-                    tuple(item.target for item in self.attachment.inputs.request.overlay_bindings),
+                    tuple(item.target for item in self.attachment.spec.overlay_bindings),
                 )
             adapter.prepare(rows.row_batch, context, execution.directory, projection)
         if self._activation is not None:
@@ -375,7 +371,7 @@ class VllmSession(Generic[DataT, ResultT]):
         value = TensorStepInput(step.rows.row_batch, step.rows, operands=operands, auxiliary=self._auxiliary)
         if self._taps is not None and self._hidden_resources:
             value = self._taps.publish(value, self._hidden_resources)
-        phases = {resource.phase for resource in self._deployment.attachment.inputs.probe.hidden_resources}
+        phases = {resource.phase for resource in self._deployment.attachment.probe.hidden_resources}
         if step.context is None and not operands and not any(row.phase in phases for row in step.rows.row_batch.rows):
             self._step = None
             return
@@ -449,7 +445,7 @@ class VllmSession(Generic[DataT, ResultT]):
             feedback = self._sampler.finish_guidance()
         execution = self._deployment.execution
         context = self._context()
-        execution.execute_anchor(context, self._deployment.attachment.inputs.request.sampler_anchor_id)
+        execution.execute_anchor(context, self._deployment.attachment.sampler_anchor_id)
         execution.complete_sampler(context, torch.cuda.current_stream(execution.device), feedback=feedback)
 
     @torch.inference_mode(False)
