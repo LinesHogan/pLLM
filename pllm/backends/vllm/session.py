@@ -306,7 +306,6 @@ class VllmSession(Generic[DataT, ResultT]):
             step.context = context
             self._advance(context, "request.prepare")
             self._replay.prepare(rows.row_batch, context)
-            context.replay = self._replay
             return
         adapter = self._overlay
         if adapter is None and self._activation is None:
@@ -356,7 +355,6 @@ class VllmSession(Generic[DataT, ResultT]):
             self._activation.prepare(rows.row_batch, context, execution.directory)
         if self._replay is not None:
             self._replay.prepare(rows.row_batch, context)
-            context.replay = self._replay
 
     @torch.inference_mode(False)
     @torch.enable_grad()

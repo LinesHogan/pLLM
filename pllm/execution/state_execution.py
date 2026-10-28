@@ -44,7 +44,6 @@ from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.trace import ExecutionTrace, TraceEvent, TracePhase
 
 if TYPE_CHECKING:
-    from pllm.execution.replay import TokenwiseReplayPrimitive
     from pllm.execution.tensor_program import TensorBatch
 
 InputT = TypeVar("InputT", contravariant=True)
@@ -121,7 +120,6 @@ class StateTaskContext(Generic[DataT]):
     loss_count: int = 0
     update_count: int = 0
     trained_rows: int = 0
-    replay: TokenwiseReplayPrimitive | None = None
     overlay_counters: torch.Tensor | None = None
     cancel_requested: Event = field(default_factory=Event)
     borrowed_roots: tuple[BorrowedStateRoot, ...] = ()

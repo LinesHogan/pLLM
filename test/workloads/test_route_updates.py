@@ -186,8 +186,8 @@ def test_updates_match_independent_private_version_oracle(boundaries, visits, em
         patch.object(PageBundleArena, "prepare_transition", allocating),
         patch.object(PageBundleArena, "publish", publishing),
     ):
+        decoder.bind(execution)
         invocation = execution.start_step(VALUE)
-        invocation.replay = decoder
         for anchor in range(len(execution.arena.plan.timeline.anchors)):
             execution.execute_anchor(invocation, AnchorId(anchor))
             if anchor == execution.sampler_anchor_id:
@@ -251,8 +251,8 @@ def test_marker_source_roundtrip_and_while_rejection():
 def test_cancellation_obeys_the_original_publication_boundary(published):
     execution = Updating().compile_backend(ROUTE_FACTS).execution
     refs = execution.admit(IDENTITIES)
+    UpdatingDecoder().bind(execution)
     invocation = execution.start_step(VALUE)
-    invocation.replay = UpdatingDecoder()
     for anchor in range(3 if published else 2):
         execution.execute_anchor(invocation, AnchorId(anchor))
     receipt = invocation.publication
@@ -269,8 +269,8 @@ def test_route_failure_aborts_private_fields():
     execution = Updating().compile_backend(ROUTE_FACTS).execution
     refs = execution.admit(IDENTITIES)
     decoder = UpdatingDecoder()
+    decoder.bind(execution)
     invocation = execution.start_step(VALUE)
-    invocation.replay = decoder
     layer = decoder.layer
 
     def fail(row, ordinal, *args):
@@ -296,8 +296,8 @@ def test_untargeted_route_boundary_allocates_and_publishes_nothing():
 
     execution = Untargeted().compile_backend(ROUTE_FACTS).execution
     execution.admit(IDENTITIES)
+    UpdatingDecoder().bind(execution)
     invocation = execution.start_step(VALUE)
-    invocation.replay = UpdatingDecoder()
     for anchor in range(3):
         execution.execute_anchor(invocation, AnchorId(anchor))
     assert invocation.sole_write() is None and invocation.publication is None

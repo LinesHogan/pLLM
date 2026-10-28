@@ -115,6 +115,7 @@ class TokenwiseReplayTask(Generic[DataT]):
     implementation_id: ImplementationId = TOKENWISE_REPLAY_IMPLEMENTATION
     operation: TensorOperation[DataT] | None = None
     overlay_math: OverlayTransition | None = None
+    primitive: TokenwiseReplayPrimitive | None = None
 
     @classmethod
     def from_implementation(
@@ -132,8 +133,8 @@ class TokenwiseReplayTask(Generic[DataT]):
 
     def _overlay_body(self, data: DataT, batch: TensorBatch, context: StateTaskContext[DataT] | None) -> TaskOutput:
         assert context is not None and isinstance(data, TensorFrame) and self.overlay_math is not None
-        primitive = context.replay
-        assert isinstance(primitive, TokenwiseReplayPrimitive)
+        primitive = self.primitive
+        assert primitive is not None
         primitive.overlay = RouteOverlay(self.overlay_math, batch, _read(context), data)
         try:
             self.run(context)
@@ -142,8 +143,8 @@ class TokenwiseReplayTask(Generic[DataT]):
             primitive.overlay = None
 
     def run(self, context: StateTaskContext[DataT]) -> None:
-        primitive, effect = context.replay, self.task.replay
-        assert isinstance(primitive, TokenwiseReplayPrimitive) and isinstance(effect, TokenProgramEffect)
+        primitive, effect = self.primitive, self.task.replay
+        assert primitive is not None and effect is not None
         task_id = TaskId(context.arena.plan.semantic_graph.tasks.index(self.task))
 
         def observe(index: int, hidden: torch.Tensor) -> None:

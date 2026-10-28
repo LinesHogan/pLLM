@@ -24,6 +24,7 @@ from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.replay import (
     TokenwiseReplayPrimitive,
+    TokenwiseReplayTask,
 )
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.step_input import TensorStepInput
@@ -78,6 +79,15 @@ class Decoder(TokenwiseReplayPrimitive):
         self.seen_layers = set()
         self.output = None
         self.calls = []
+
+    def bind(self, execution):
+        task = next(
+            task
+            for task in execution.arena.plan.schedule.tasks
+            if execution.arena.plan.semantic_graph.tasks[task.task_id].replay is not None
+        )
+        binding = TokenwiseReplayTask.from_implementation(execution.implementation(task.implementation_id))
+        execution.rebind_implementation(replace(binding, primitive=self))
 
     @property
     def rows(self):
@@ -139,8 +149,8 @@ def serial_oracle():
 
 
 def run_step(execution, value, decoder):
+    decoder.bind(execution)
     invocation = execution.start_step(VALUE)
-    invocation.replay = decoder
     for anchor in range(8):
         execution.execute_anchor(invocation, AnchorId(anchor))
         if anchor == 3:

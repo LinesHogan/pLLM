@@ -191,7 +191,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         position_layers: tuple[PositionCacheLayer, ...] = (),
         allocation_block_size: int = 16,
     ) -> None:
-        assert isinstance(task.replay, TokenProgramEffect)
+        assert task.replay is not None
         self.model, self.effect = model.model, task.replay
         self.execution, self.anchor, self.activation, self.projections = execution, anchor, activation, overlay
         implementation = next(
@@ -227,6 +227,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         self.pool = torch.cuda.graph_pool_handle()
         self.identity: tuple[int, ...] = ()
         self.stream: torch.cuda.Stream | None = None
+        execution.rebind_implementation(replace(binding, primitive=self))
         self.model.forward = self.forward
 
     @property
