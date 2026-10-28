@@ -579,12 +579,8 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                     self._borrow_failed = True
                     raise RuntimeError("borrowed step requires complete staged roots on the receiving stream")
             self.arena.collect_completed()
-            selection = self.directory.select_and_lease(rows, history)
-            try:
-                pin = self.arena.pin_exact(selection.refs, stream)
-            except Exception:
-                self.directory.release_transition_lease(selection)
-                raise
+            selection = self.directory.select(rows, history)
+            pin = self.arena.pin_exact(selection.refs, stream)
             context = StateTaskContext[DataT](selection, self.arena, pin, self.trace, self._next_invocation)
             context.held_input, self._pending_hold = self._pending_hold, None
             invocation = TaskGraphInvocation(self._runner, context, self._next_invocation)
@@ -633,7 +629,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             context = self._context(invocation)
             assert not context.page_writes and not context.page_publications and not context.borrowed_roots
             reader = context.pin
-            context.selection = self.directory.refresh_lease(context.selection)
+            context.selection = self.directory.select(context.selection.rows)
             context.pin = self.arena.pin_exact(context.selection.refs, stream)
             context.page_pins[context.pin] = None
             if reader.refs != context.pin.refs:
@@ -887,7 +883,6 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             context.release_owned_pin(pin)
         for receipt in context.page_publications:
             context.settle_owned_publication(receipt)
-        self.directory.release_transition_lease(context.selection)
         self._active.pop(invocation.invocation_id)
         context.value = None
         context.results.clear()

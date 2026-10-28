@@ -55,7 +55,7 @@ def test_admission_failure_rolls_back_every_resource_and_inference_pin():
     assert_multistate_reclaimed(execution)
 
 
-def test_shared_route_state_leases_exclusively_and_persists_until_dormant_retirement():
+def test_shared_route_state_persists_until_dormant_retirement():
     execution, _ = multistate(route=True, instance=False)
     a, b = RequestIdentity("a", 0, 0, "math"), RequestIdentity("b", 1, 0, "math")
     execution.admit((a,))
@@ -63,10 +63,8 @@ def test_shared_route_state_leases_exclusively_and_persists_until_dormant_retire
     left, right = execution.directory.select(rows_for(a)), execution.directory.select(rows_for(b))
     assert left.ref_for(a, AUX) == right.ref_for(b, AUX) == joined[-1]
     invocation = execution.begin(rows_for(a))
-    with pytest.raises(RuntimeError):  # A single writer holds the shared route state.
-        execution.begin(rows_for(b))
     execution.cancel_step(invocation)
-    invocation = execution.begin(rows_for(b))  # No partial lease leaked for b's own dense resource.
+    invocation = execution.begin(rows_for(b))
     execution.retire((a,))
     assert invocation.context.release is None
     execution.cancel_step(invocation)

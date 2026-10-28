@@ -145,8 +145,6 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(monkeypatc
         step = step_input(tuple(identities[owner] for owner in owners), source, target, step_id)
         before = [execution.snapshot(ref) for ref in latest]
         cancelled = execution.start_step(step)
-        with pytest.raises(RuntimeError):  # one invocation at a time
-            execution.start_step(step)
         execution.execute_anchor(cancelled, AnchorId(0))
         execution.cancel_step(cancelled)
         with monkeypatch.context() as fault:
