@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Generic, cast
 
 import torch
-from vllm import SamplingParams
 from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
 from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -47,7 +46,6 @@ from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
 from pllm.contracts.semantic_graph import (
     AnchorId,
     SamplerFeedbackInputSource,
-    TokenProgramEffect,
 )
 from pllm.execution.backend_attachment import attachment_buffer_bytes
 from pllm.execution.codec import encode_boundary
@@ -114,8 +112,6 @@ class VllmSession(Generic[DataT, ResultT]):
         self.trace = deployment.execution.trace
         probe = attachment.inputs.probe
         self._hidden_resources = tuple(dict.fromkeys(resource.binding for resource in probe.hidden_resources))
-        if self._hidden_resources and taps is None:
-            raise ValueError("hidden inputs require taps installed when the model was loaded")
         self._taps = taps
         overlay_bindings = attachment.inputs.request.overlay_bindings
         routed_overlay = bool(overlay_bindings) and any(task.replay is not None for task in plan.semantic_graph.tasks)
@@ -144,7 +140,7 @@ class VllmSession(Generic[DataT, ResultT]):
                 model,
                 attachment.inputs.request.activation_bindings,
                 attachment.inputs.request.state_resource,
-                install=not any(isinstance(task.replay, TokenProgramEffect) for task in tasks),
+                install=not tasks,
             )
             if (attachment.inputs.request.activation_bindings)
             else None
@@ -162,23 +158,16 @@ class VllmSession(Generic[DataT, ResultT]):
         self._replay: VllmTokenwiseReplay[DataT, ResultT] | None = None
         if tasks:
             (task,) = tasks
-            if probe.causal_domain is None or probe.causal_domain.layers != len(model.model.layers):
-                raise ValueError("backend replay requires its signed causal model domain")
-            if isinstance(task.replay, TokenProgramEffect):
-                self._replay = VllmTokenwiseReplay(
-                    model,
-                    task,
-                    deployment.execution,
-                    attachment.inputs.request.task_bindings[0].anchor_id,
-                    activation=self._activation,
-                    position_layers=position_layers,
-                    allocation_block_size=allocation_block_size,
-                    overlay=self._overlay
-                    if isinstance(self._overlay, ExactParameterOverlay) and routed_overlay
-                    else None,
-                )
-            else:
-                raise ValueError("backend replay does not match its signed primitives")
+            self._replay = VllmTokenwiseReplay(
+                model,
+                task,
+                deployment.execution,
+                attachment.inputs.request.task_bindings[0].anchor_id,
+                activation=self._activation,
+                position_layers=position_layers,
+                allocation_block_size=allocation_block_size,
+                overlay=self._overlay if isinstance(self._overlay, ExactParameterOverlay) and routed_overlay else None,
+            )
         self._sampler = sampler
         self._identities: dict[str, RequestIdentity] = {}
         self._pending_identities: dict[str, RequestIdentity] = {}
@@ -210,8 +199,6 @@ class VllmSession(Generic[DataT, ResultT]):
 
     def stage_input(self, batch: AuxiliaryInput[torch.Tensor] | None, identities: tuple[RequestIdentity, ...]) -> None:
         self._require_input_live()
-        if self._auxiliary is not None or self._step is not None or self._pending_identities or self._identities:
-            raise RuntimeError("prior canonical training input is still active")
         validate_auxiliary(batch, self._deployment.attachment.inputs.plan, SharedTensor.describe)
         self._auxiliary = batch
         self._pending_identities = {identity.request_id: identity for identity in identities}
@@ -225,20 +212,6 @@ class VllmSession(Generic[DataT, ResultT]):
     def bind_readonly_input(self, receiver: ReadonlyStepReceiver) -> None:
         """Install the framework transport before requests; it supplies no model mathematics."""
         self._require_input_live()
-        if (
-            self._readonly_receiver is not None
-            or self._step is not None
-            or self._next_step_id
-            or self._identities
-            or self._pending_identities
-            or self._auxiliary is not None
-            or self._activation is None
-            or all(
-                state.resource in self._deployment.execution.arena.owned_resources
-                for state in self.attachment.inputs.plan.semantic_graph.states
-            )
-        ):
-            raise RuntimeError("read-only step input requires an idle borrowed activation session")
         self._readonly_receiver = receiver
 
     def _require_input_live(self) -> None:
@@ -260,8 +233,6 @@ class VllmSession(Generic[DataT, ResultT]):
                     step_id=rows.step_id,
                 )
             else:
-                if any(root.stream != stream for root in received.roots):
-                    raise ValueError("read-only input differs from the receiving stream; grants retained")
                 self._deployment.execution.stage_readonly(received.roots)
             self._received_readonly = None  # Ownership is now the original execution's pending/active borrow.
         except BaseException:
@@ -279,12 +250,6 @@ class VllmSession(Generic[DataT, ResultT]):
         return self._deployment.execution.diagnostics()
 
     @property
-    def sampler(self) -> SamplerGuidance:
-        if self._sampler is None:
-            raise RuntimeError("canonical session has no sampler intervention")
-        return self._sampler
-
-    @property
     def apply_count(self) -> int:
         return 0 if self._overlay is None else self._overlay.apply_count
 
@@ -294,8 +259,6 @@ class VllmSession(Generic[DataT, ResultT]):
 
     def before_execute(self, scheduler_output: SchedulerOutput) -> None:
         self._require_input_live()
-        if self._step is not None:
-            raise RuntimeError("prior vLLM workload step is still active")
         execution = self._deployment.execution
         execution.arena.collect_completed()
         finished = tuple(
@@ -307,11 +270,8 @@ class VllmSession(Generic[DataT, ResultT]):
         for request in scheduler_output.scheduled_new_reqs:
             if request.req_id in self._identities:
                 continue
-            if type(request.req_id) is not str or not request.req_id:
-                raise RuntimeError("vLLM scheduled an invalid request id")
-            if type(request.sampling_params) is not SamplingParams or request.sampling_params.n != 1:
-                raise RuntimeError("vLLM workload requires sampling n=1")
-            if (request.sampling_params.extra_args or {}).get(POLICY_KEY) != self._cache_envelope:
+            params = request.sampling_params
+            if params is None or (params.extra_args or {}).get(POLICY_KEY) != self._cache_envelope:
                 raise ValueError("request cache policy differs from installed workload; submit through its handle")
             pending.append(self._pending_identities[request.req_id])
         if pending:
@@ -327,12 +287,6 @@ class VllmSession(Generic[DataT, ResultT]):
 
     def prepare_input(self, rows: PackedSamplerRowBatch) -> None:
         self._require_input_live()
-        if self._step is not None:
-            raise RuntimeError("canonical input preparation overlaps a step")
-        if rows.step_id != self._next_step_id or rows.plan_epoch != self.attachment.physical.plan_epoch:
-            raise ValueError("backend rows differ from the original execution step")
-        if rows.row_batch.total_rows > self.attachment.inputs.probe.max_packed_rows:
-            raise ValueError("packed input exceeds the signed backend row capacity")
         if self._unbroken_history:
             if any(row.token_offset < self._token_frontiers.get(row.identity, 0) for row in rows.row_batch.rows):
                 self._input_failed = True
@@ -349,7 +303,7 @@ class VllmSession(Generic[DataT, ResultT]):
         self._next_step_id += 1
         step = _PackedStep[DataT](rows)
         self._step = step
-        if isinstance(self._replay, VllmTokenwiseReplay) and self._activation is None:
+        if self._replay is not None and self._activation is None:
             execution = self._deployment.execution
             invocation = execution.start_step(
                 TensorStepInput(rows.row_batch, rows), torch.cuda.current_stream(execution.device)
@@ -407,7 +361,7 @@ class VllmSession(Generic[DataT, ResultT]):
             adapter.prepare(rows.row_batch, invocation.context, execution.directory, projection)
         if self._activation is not None:
             self._activation.prepare(rows.row_batch, invocation.context, execution.directory)
-        if isinstance(self._replay, VllmTokenwiseReplay):
+        if self._replay is not None:
             self._replay.prepare(rows.row_batch, invocation)
             invocation.context.replay = self._replay
 
@@ -493,20 +447,13 @@ class VllmSession(Generic[DataT, ResultT]):
 
     def _sampler_guidance(self) -> PackedSamplerGuidanceBatch:
         execution = self._deployment.execution
-        guidance = execution.sampler_guidance(self._invocation(), torch.cuda.current_stream(execution.device))
-        if guidance.stage is not self._deployment.attachment.inputs.request.sampler_stage:
-            raise ValueError("guidance stage differs from its signed attachment")
-        return guidance
+        return execution.sampler_guidance(self._invocation(), torch.cuda.current_stream(execution.device))
 
     def complete_sampler(self, active: bool) -> None:
         if self._step is None:
-            if active:
-                raise RuntimeError("sampler completion has no active packed step")
             return
         feedback = None
         if self._sampler is not None:
-            if not active:
-                raise RuntimeError("canonical sampler skipped an active intervention")
             feedback = self._sampler.finish_guidance()
         execution = self._deployment.execution
         invocation = self._invocation()
@@ -551,10 +498,6 @@ class VllmSession(Generic[DataT, ResultT]):
             self._token_frontiers.pop(identity, None)
 
     def retire_all(self, *, wait: bool = False) -> None:
-        if self._step is not None:
-            raise RuntimeError("canonical requests cannot retire during a step")
-        if self._auxiliary is not None:
-            raise RuntimeError("generation ended before the signed training input was consumed")
         if self._post_sample is not None:
             self._post_sample.clear()
         self._retire(tuple(self._identities[request_id] for request_id in sorted(self._identities)))
@@ -586,8 +529,7 @@ class VllmSession(Generic[DataT, ResultT]):
                     self._feed.close()
 
     def _invocation(self) -> TaskGraphInvocation[StateTaskContext[DataT]]:
-        if self._step is None or self._step.invocation is None:
-            raise RuntimeError("model inputs have not started the signed invocation")
+        assert self._step is not None and self._step.invocation is not None
         return self._step.invocation
 
     def _handoff(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]]) -> None:

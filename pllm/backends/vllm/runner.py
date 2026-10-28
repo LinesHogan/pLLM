@@ -41,7 +41,6 @@ from pllm.backends.vllm.position_state import POSITION_ENV, PositionCacheLayer
 from pllm.backends.vllm.prefix_cache import POLICY_ENV, CachePolicy
 from pllm.backends.vllm.sampler import (
     Mrv1Sampler as Mrv1Guidance,
-    SamplerGuidance,
     Vllm027Sampler,
 )
 from pllm.config import RunnerKind
@@ -74,8 +73,6 @@ TAPS_ENV = "PLLM_HIDDEN_TAPS"
 class _RunnerSession(Protocol):
     @property
     def trace(self) -> ExecutionTrace: ...
-    @property
-    def sampler(self) -> SamplerGuidance: ...
     @property
     def next_step_id(self) -> int: ...
     @property
