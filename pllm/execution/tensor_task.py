@@ -26,7 +26,7 @@ from pllm.contracts.semantic_graph import (
     TaskSymbol,
 )
 from pllm.contracts.tensor_layout import LayoutFieldId
-from pllm.execution.declaration import Call
+from pllm.execution.declaration import Call, State
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.tensor_frame import (
     LeafRoots,
@@ -146,6 +146,7 @@ class TensorTask:
     export: TensorExport | None = None
     sampler_stage: SamplerStage | None = None
     sampler_beta: float = 0.0
+    training: State | None = None
 
     def sampler_output(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
         """Adapt a computed prediction to sampler rows without executing its mathematics."""

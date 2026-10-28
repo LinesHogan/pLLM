@@ -44,13 +44,11 @@ from pllm.execution.overlay_task import OverlayTransition
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION
 from pllm.execution.shared_tensor import tensor_dtype
-from pllm.execution.tensor_executor import TensorExecutor
 from pllm.execution.tensor_frame import (
     TensorFrame,
     Tensors,
     TensorUpdate,
 )
-from pllm.execution.tensor_program import TaskOutput
 from pllm.execution.tensor_task import FieldWriter, TensorTask
 from pllm.execution.token_program import ApplyUpdates, Cell, Layers, Over, Segment, TokenProgram, Tokens, TokenTensor
 from pllm.kernels.head_overlay import head_correction
@@ -206,7 +204,6 @@ class ModelEffectBinding(TensorBindingBase):
             changes=state,
             effect=StateEffectKind.TRANSITION_MAYBE,
             when=when,
-            function=lambda data, batch: TaskOutput(),
             implementations=(native(f"tensor.write:{source.symbol}@1", "transition/full_root@1"),),
         )
 
@@ -214,17 +211,8 @@ class ModelEffectBinding(TensorBindingBase):
         return update
 
     def _write_task(self, update: Call, writer: FieldWriter) -> None:
-        task = TensorTask(
+        self.tensor_tasks[update.symbol] = TensorTask(
             update.symbol, lambda values: (), {}, {}, MathContract(), (), {}, writer.phase, writer.resource, writer
-        )
-        self.tensor_tasks[update.symbol] = task
-        executor = TensorExecutor(task, self.tensor_tasks, compact=False)
-        self.operations[update.symbol] = replace(
-            self.operations[update.symbol],
-            body=executor,
-            optimizer=None,
-            mode="read",
-            capture_resident=executor.resident,
         )
 
     def import_update(self, state: State, identity: str) -> Call:
@@ -237,7 +225,6 @@ class ModelEffectBinding(TensorBindingBase):
             changes=state,
             effect=StateEffectKind.TRANSITION_MAYBE,
             when=When.BEFORE_MODEL,
-            function=lambda data, batch: TaskOutput(),
             implementations=(native(identity, "transition/full_root@1"),),
         )
         self._write_task(update, writer)

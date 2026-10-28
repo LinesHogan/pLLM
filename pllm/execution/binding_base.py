@@ -23,6 +23,7 @@ from pllm.contracts.parameter_overlay import (
     ParameterTarget,
 )
 from pllm.contracts.semantic_graph import (
+    TaskResourceFact,
     TaskSymbol,
 )
 from pllm.contracts.state_feed import FeedBinding
@@ -86,8 +87,16 @@ def overlay_fields(buffers: Mapping[str, Buffer], effect: ParameterEffect) -> tu
 class TensorBindingBase(Builder[TensorFrame]):
     """State shared by the model-effect and row-task halves of one tensor binding."""
 
-    def __init__(self, name: str, digest: str, dimensions: Dimensions | None = None, *, host: bool = False) -> None:
-        super().__init__(name, digest, dimensions)
+    def __init__(
+        self,
+        name: str,
+        digest: str,
+        dimensions: Dimensions | None = None,
+        *,
+        host: bool = False,
+        resources: tuple[TaskResourceFact, ...] = (),
+    ) -> None:
+        super().__init__(name, digest, dimensions, resources)
         self.host = host
         self.feeds: tuple[FeedBinding, ...] = ()
         self.tensor_tasks: dict[TaskSymbol, TensorTask] = {}

@@ -271,7 +271,7 @@ class CompletionWorkload(
             b.layouts,
             MathBinding(
                 FunctionMath({str(state.declaration.resource): initialize}, lambda value: (), prepare, output_data),
-                b.bind_all(),
+                b.bind_all(operations=b.operations),
             ),
             facts,
             AnchorSymbol("host.compute.end"),
@@ -480,4 +480,4 @@ class CausalAdapterWorkload(
             or builder.layouts != plan.tensor_layout_request
         ):
             raise ValueError("causal mathematics must match the execution device and signed declaration")
-        return MathBinding(functions, builder.bind_all(plan))
+        return MathBinding(functions, builder.bind_all(plan, operations=builder.operations))

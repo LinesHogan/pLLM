@@ -382,11 +382,13 @@ class Builder(Generic[D]):
             raise ValueError("host graph requires a function for every operation")
         return tuple(self.host_operations[task.symbol] for task in self.graph.tasks)
 
-    def bind(self, plan: PlanBundle | None = None) -> tuple[TensorOperation[D], ...]:
+    def bind(
+        self, plan: PlanBundle | None = None, *, operations: Mapping[TaskSymbol, TensorOperation[D]]
+    ) -> tuple[TensorOperation[D], ...]:
         functions: list[TensorOperation[D]] = []
         graph = self.graph if plan is None else plan.semantic_graph
         for task in graph.tasks:
-            if task.symbol not in self.operations:
+            if task.symbol not in operations:
                 continue
             identity = (
                 task.implementations[0].implementation_id
@@ -400,7 +402,7 @@ class Builder(Generic[D]):
                 for effect in task.effects
                 if effect.kind is StateEffectKind.READ and effect.version is not None
             )
-            version = self.operations[task.symbol].version
+            version = operations[task.symbol].version
             if versions:
                 producer = next(item for item in graph.tasks if item.symbol == versions[0])
                 version = (
@@ -412,16 +414,22 @@ class Builder(Generic[D]):
                     else "published"
                 )
             if task.replay is None:
-                functions.append(replace(self.operations[task.symbol], implementation_id=identity, version=version))
+                functions.append(replace(operations[task.symbol], implementation_id=identity, version=version))
         return tuple(functions)
 
     def bind_all(
-        self, plan: PlanBundle | None = None, *, model_probe: BackendPlacementProbe | None = None
+        self,
+        plan: PlanBundle | None = None,
+        *,
+        model_probe: BackendPlacementProbe | None = None,
+        operations: Mapping[TaskSymbol, TensorOperation[D]],
     ) -> tuple[TaskGraphImplementation[StateTaskContext[D], ProjectionResiduals], ...]:
-        functions: list[TaskGraphImplementation[StateTaskContext[D], ProjectionResiduals]] = list(self.bind(plan))
+        functions: list[TaskGraphImplementation[StateTaskContext[D], ProjectionResiduals]] = list(
+            self.bind(plan, operations=operations)
+        )
         graph = self.graph if plan is None else plan.semantic_graph
         for task in graph.tasks:
-            if task.symbol in self.operations and task.replay is None:
+            if task.symbol in operations and task.replay is None:
                 continue
             identity = (
                 task.implementations[0].implementation_id
@@ -440,8 +448,8 @@ class Builder(Generic[D]):
                         model_probe.causal_domain,
                         identity,
                         operation=None
-                        if task.symbol not in self.operations
-                        else replace(self.operations[task.symbol], implementation_id=identity),
+                        if task.symbol not in operations
+                        else replace(operations[task.symbol], implementation_id=identity),
                         overlay_math=self.overlay_math,
                     )
                 )

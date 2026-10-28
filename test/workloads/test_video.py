@@ -101,7 +101,7 @@ def binding_case(*, alias=False, write_failure=False, runtime=False, missing=Non
         lambda value, batch: TensorFrame(value, () if value is None else value.rows.rows),
         lambda data, result: result.publication,
     )
-    binding = MathBinding(math, b.bind_all(plan), borrowed_resources=("features",))
+    binding = MathBinding(math, b.bind_all(plan, operations=b.executables(None, ())), borrowed_resources=("features",))
     arena = PageBundleArena(plan, _owned_resources=("inject",))
     execution = binding.bind(arena, AnchorId(4))
     if not runtime:

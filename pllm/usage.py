@@ -1471,8 +1471,8 @@ class Workload(
                 _values(self).get("config", ()), dimensions, None if facts is None else facts.initialization_seed
             ),
             dimensions,
+            resources=() if facts is None else facts.timeline.task_resources,
         )
-        b.resources = () if facts is None else facts.timeline.task_resources
         b.probe = None if facts is None else facts.probe
         b.max_requests = 1 if facts is None else facts.max_admitted_lineages
         self._build(b)
@@ -1595,12 +1595,12 @@ class Workload(
     def operations(
         self, facts: BackendCompileFacts, plan: PlanBundle, b: TensorBinding
     ) -> MathBinding[TensorStepInput, TensorFrame, TensorOutput]:
+        operations = b.executables(facts, plan.timeline.task_resources)
         if plan.timeline.task_resources:
-            b.configure_steps(facts)
             if any(
                 task.lane == "side"
                 and plan.semantic_graph.tasks[task.task_id].symbol in b.tensor_tasks
-                and not b.operations[plan.semantic_graph.tasks[task.task_id].symbol].resident(1)
+                and not operations[plan.semantic_graph.tasks[task.task_id].symbol].resident(1)
                 for task in plan.schedule_physical.tasks
             ):
                 raise ValueError(
@@ -1608,7 +1608,7 @@ class Workload(
                 )
         return MathBinding(
             self._functions(b, facts.device, facts.initialization_seed),
-            b.bind_all(plan, model_probe=facts.probe),
+            b.bind_all(plan, model_probe=facts.probe, operations=operations),
             borrowed_resources=tuple(feed.resource for feed in b.feeds),
             feeds=b.feeds,
             on_export=self.on_export if b.has_exports else None,
@@ -1629,7 +1629,7 @@ class Workload(
             b.layouts,
             MathBinding(
                 self._functions(b, facts.device, facts.initialization_seed),
-                b.bind_all(),
+                b.bind_all(operations=b.executables(None, ())),
                 on_export=self.on_export if b.has_exports else None,
             ),
             facts,

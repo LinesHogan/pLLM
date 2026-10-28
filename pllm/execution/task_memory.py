@@ -179,12 +179,14 @@ def derive_resources(
     """Ask the executable operations for their memory; canonical plumbing is funded separately."""
     # Shape-only steps do not allocate a capture pool or consume its eventual entitlement.
     shape = ((facts.max_admitted_lineages, facts.probe.hidden_size),)
-    binding.resources = tuple(TaskResourceFact(symbol, 0, 1 << 60, shape) for symbol in binding.tensor_tasks)
-    binding.configure_steps(facts)
+    resources = tuple(TaskResourceFact(symbol, 0, 1 << 60, shape) for symbol in binding.tensor_tasks)
     data, batch = example(binding, facts, options)
     tasks: list[TaskResourceFact] = []
     values: list[ValueResourceFact] = []
-    operations: dict[TaskSymbol, MemoryOperation[TensorFrame]] = {**binding.operations, **binding.publications}
+    operations: dict[TaskSymbol, MemoryOperation[TensorFrame]] = {
+        **binding.executables(facts, resources),
+        **binding.publications,
+    }
     for symbol, operation in operations.items():
         task = binding.tensor_tasks.get(symbol)
         phase = None if task is None else task.phase

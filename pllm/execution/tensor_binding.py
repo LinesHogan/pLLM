@@ -20,10 +20,14 @@ from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
 from pllm.contracts.semantic_graph import (
     HiddenInputSource,
+    StateEffectKind,
     StateResource,
     StateScope,
+    TaskResourceFact,
+    TaskSymbol,
 )
 from pllm.contracts.state_ref import StateRef
+from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.ptts.page_bundle import PagePublication
 from pllm.execution.scan import ScanContext
 from pllm.execution.step_capture import StepCapture
@@ -37,6 +41,7 @@ from pllm.execution.tensor_program import (
     InvocationOutput,
     PageUpdate,
     TensorBatch,
+    TensorOperation,
 )
 
 if TYPE_CHECKING:
@@ -90,7 +95,7 @@ class TensorBinding(ModelEffectBinding, RowTaskBinding):
         return any(task.export is not None for task in self.tensor_tasks.values())
 
     def configure_scans(self, facts: BackendCompileFacts) -> None:
-        """Bind scan specialization to the plan's policy and row capacity."""
+        """Scope model-route scans; ordinary task scopes are built in executables."""
         if self.overlay_math is not None and any(task.replay is not None for task in self.graph.tasks):
             self.overlay_math = replace(
                 self.overlay_math,
@@ -101,42 +106,55 @@ class TensorBinding(ModelEffectBinding, RowTaskBinding):
                     replay="compute/cuda_graph@1" in facts.timeline.capabilities,
                 ).bind(self.overlay_math.function),
             )
-        for symbol, operation in self.operations.items():
-            budget = facts.timeline.memory_budget_bytes
-            scans = ScanContext(
-                facts.timeline.tensor_policy,
-                facts.probe.max_packed_rows,
-                facts.device,
-                None if budget is None else budget // max(1, facts.max_admitted_lineages),
-                replay="compute/cuda_graph@1" in facts.timeline.capabilities,
-            )
-            self.operations[symbol] = replace(operation, body=scans.bind(operation.body))
 
-    def configure_steps(self, facts: BackendCompileFacts) -> None:
-        """Select the same tensor step for planning and execution."""
-        capture = "compute/cuda_graph@1" in facts.timeline.capabilities
-        captured = {
+    def executables(
+        self, facts: BackendCompileFacts | None, resources: tuple[TaskResourceFact, ...]
+    ) -> dict[TaskSymbol, TensorOperation[TensorFrame]]:
+        """Build each tensor operation once, with the same scan scope for eager and captured math."""
+        capture = facts is not None and "compute/cuda_graph@1" in facts.timeline.capabilities
+        fixed = {
             symbol: task
             for symbol, task in self.tensor_tasks.items()
             if (task.writer is not None or reads_rows(task, self.tensor_tasks)) and task.export is None
         }
-        conditional = any(
-            task.policy.update_states in task.domains
-            or (self.operations[symbol].optimizer and task.policy.forward_rows)
-            for symbol, task in captured.items()
-        )
-        if conditional:
-            return
-        limits = {fact.task: fact for fact in self.resources}
-        for symbol, task in captured.items():
-            operation = self.operations[symbol]
-            optimizer = operation.optimizer
-            assert optimizer is None or isinstance(optimizer, PageUpdate)
+        if not resources or any(
+            task.policy.update_states in task.domains or (task.training is not None and task.policy.forward_rows)
+            for task in fixed.values()
+        ):
+            fixed.clear()
+        limits = {fact.task: fact for fact in resources}
+        operations: dict[TaskSymbol, TensorOperation[TensorFrame]] = {}
+        declarations = {task.symbol: task for task in self.graph.tasks}
+        for symbol in (*self.operations, *self.tensor_tasks):
+            declaration = declarations[symbol]
+            scans = (
+                None
+                if facts is None
+                else ScanContext(
+                    facts.timeline.tensor_policy,
+                    facts.probe.max_packed_rows,
+                    facts.device,
+                    None
+                    if facts.timeline.memory_budget_bytes is None
+                    else facts.timeline.memory_budget_bytes // max(1, facts.max_admitted_lineages),
+                    replay=capture,
+                )
+            )
+            if symbol not in self.tensor_tasks:
+                operation = self.operations[symbol]
+                operations[symbol] = operation if scans is None else replace(operation, body=scans.bind(operation.body))
+                continue
+            task = self.tensor_tasks[symbol]
+            state = task.training
+            optimizer = None
+            if state is not None:
+                assert state.optimizer is not None
+                optimizer = PageUpdate(state.optimizer, state.optimizer_fields // 5)
             executor = TensorExecutor(
                 task,
                 self.tensor_tasks,
                 optimizer,
-                compact=False,
+                compact=symbol not in fixed and task.writer is None,
                 capture=StepCapture(
                     limits[symbol],
                     facts.max_admitted_lineages
@@ -146,11 +164,30 @@ class TensorBinding(ModelEffectBinding, RowTaskBinding):
                     )
                     else 1,
                 )
-                if capture
+                if capture and symbol in fixed and facts is not None
                 else None,
-                device=facts.device,
+                device=torch.device("cpu") if facts is None else facts.device,
             )
-            self.operations[symbol] = replace(operation, body=executor, capture_resident=executor.resident)
+            operations[symbol] = TensorOperation(
+                declaration.implementations[0].implementation_id,
+                executor if scans is None else scans.bind(executor),
+                "read"
+                if state is None
+                else "gradient"
+                if any(
+                    effect.kind in (StateEffectKind.TRANSITION, StateEffectKind.TRANSITION_MAYBE)
+                    for effect in declaration.effects
+                )
+                else "update",
+                optimizer=optimizer,
+                copy_fields=None
+                if state is None
+                else tuple(
+                    LayoutFieldId(i) for i in range(len(state.fields)) if i >= state.optimizer_fields or i % 5 != 1
+                ),
+                capture_resident=executor.resident,
+            )
+        return operations
 
     def prepare_import(self, update: StateTensorUpdate[torch.Tensor], batch: TensorBatch, data: TensorFrame) -> None:
         """Validate imported fields and map them onto resource-specific private roots."""

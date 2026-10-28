@@ -39,7 +39,6 @@ from pllm.execution.binding_base import SGD, TensorBindingBase
 from pllm.execution.declaration import Call, Dimensions, Field, Shape, State, When, native
 from pllm.execution.ptts.page_borrow import borrowed_root
 from pllm.execution.ptts.request_state import RequestStateSelection
-from pllm.execution.tensor_executor import TensorExecutor
 from pllm.execution.tensor_frame import (
     TensorFrame,
     TensorMath,
@@ -54,7 +53,6 @@ from pllm.execution.tensor_program import (
     BatchOperation,
     BatchPreparation,
     Observation,
-    PageUpdate,
     PoolSGD,
     TaskOutput,
     TensorBatch,
@@ -503,7 +501,6 @@ class RowTaskBinding(TensorBindingBase):
 
         def decorate(function: TensorMath) -> Call:
             symbol = TaskSymbol(name)
-            execute: Callable[[TensorFrame, TensorBatch], TaskOutput] | None = None
             # Discovery builds only the graph; executable readers require real model facts.
             if self.dimensions is not None:
                 ports = {key: input_port(value) for key, value in inputs.items()}
@@ -538,10 +535,10 @@ class RowTaskBinding(TensorBindingBase):
                     export=export,
                     sampler_stage=sampler_stage,
                     sampler_beta=sampler_beta,
+                    training=update,
                 )
                 self.tensor_tasks[symbol] = task
-                execute = task.evaluate
-            call = self.compute(
+            return self.compute(
                 name,
                 inputs=sources,
                 extra_inputs=sampler_inputs,
@@ -553,17 +550,8 @@ class RowTaskBinding(TensorBindingBase):
                 result_schema="canonical.tensor_training_result@1" if update is not None else result_schema,
                 when=When.HOST if self.host else when,
                 reads=reads,
-                function=execute,
                 implementations=(native(identity or f"{self.graph.workload_id}:{name}@1"),),
             )
-
-            if self.dimensions is not None:
-                operation = self.operations[symbol]
-                optimizer = operation.optimizer
-                assert optimizer is None or isinstance(optimizer, PageUpdate)
-                executor = TensorExecutor(self.tensor_tasks[symbol], self.tensor_tasks, optimizer)
-                self.operations[symbol] = replace(operation, body=executor, capture_resident=executor.resident)
-            return call
 
         return decorate
 
