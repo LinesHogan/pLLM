@@ -20,27 +20,6 @@ pub(crate) fn require_text(value: &str, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn require_digest(value: &str, label: &str) -> Result<(), String> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(format!("{label} must be a lowercase SHA-256 digest"));
-    }
-    Ok(())
-}
-
-fn require_sorted_unique_text(values: &[String], label: &str) -> Result<(), String> {
-    for value in values {
-        require_text(value, label)?;
-    }
-    if values.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(format!("{label} must be sorted unique strings"));
-    }
-    Ok(())
-}
-
 fn validate_declaration(
     attachment: &BackendAttachment,
     probe: &BackendPlacementProbe,
@@ -242,75 +221,6 @@ fn validate_declaration(
         }
     }
     Ok(())
-}
-
-fn validate_probe(probe: &BackendPlacementProbe) -> Result<(), String> {
-    if probe.schema_version != 3 {
-        return Err("unsupported backend placement probe schema".to_owned());
-    }
-    require_text(&probe.adapter_id, "probe.adapter_id")?;
-    require_digest(&probe.backend_abi_digest, "probe.backend_abi_digest")?;
-    require_digest(&probe.runner_fingerprint, "probe.runner_fingerprint")?;
-    require_digest(&probe.model_fingerprint, "probe.model_fingerprint")?;
-    if probe.device_kind == StateDeviceKind::Cpu && probe.device_ordinal != 0 {
-        return Err("CPU backend probe device ordinal must be zero".to_owned());
-    }
-    if probe.tensor_parallel_size != 1
-        || probe.pipeline_parallel_size != 1
-        || probe.hidden_size == 0
-        || probe.max_packed_rows == 0
-        || probe.causal_domain.as_ref().is_some_and(|domain| {
-            [domain.requests, domain.layers, domain.positions]
-                .iter()
-                .any(|&size| size == 0 || size > i64::MAX as u64)
-        })
-    {
-        return Err("backend placement probe topology is unsupported".to_owned());
-    }
-    if probe
-        .targets
-        .windows(2)
-        .any(|pair| pair[0].target >= pair[1].target)
-        || probe
-            .targets
-            .iter()
-            .any(|target| target.input_size == 0 || target.output_size == 0)
-    {
-        return Err("target dimensions must be positive and ordered uniquely".into());
-    }
-    for resource in &probe.hidden_resources {
-        require_text(&resource.binding.layer, "probe.hidden_resources.layer")?;
-        require_text(
-            &resource.binding.module_path,
-            "probe.hidden_resources.module_path",
-        )?;
-        if resource.binding.layer_kind == HiddenLayerKind::Index {
-            let index = resource
-                .binding
-                .layer
-                .parse::<i64>()
-                .map_err(|_| "probe indexed hidden layer is invalid".to_owned())?;
-            if index.to_string() != resource.binding.layer {
-                return Err("probe indexed hidden layer is not canonical".to_owned());
-            }
-        }
-    }
-    if probe.hidden_resources.windows(2).any(|pair| {
-        (
-            pair[0].binding.layer.as_str(),
-            &pair[0].binding.layer_kind,
-            &pair[0].binding.site,
-            matches!(pair[0].phase, HiddenPhase::Decode),
-        ) >= (
-            pair[1].binding.layer.as_str(),
-            &pair[1].binding.layer_kind,
-            &pair[1].binding.site,
-            matches!(pair[1].phase, HiddenPhase::Decode),
-        )
-    }) {
-        return Err("probe hidden resources must be sorted unique".to_owned());
-    }
-    require_sorted_unique_text(&probe.capabilities, "probe.capabilities")
 }
 
 fn semantic_hidden_key(input: &InputSource) -> Option<(i64, u8, u8)> {
@@ -623,7 +533,6 @@ fn validate_cross_binding(
     state: &StateRepresentationDecision,
 ) -> Result<(), String> {
     validate_declaration(attachment, probe)?;
-    validate_probe(probe)?;
     for group in &graph.input_groups {
         let readers: Vec<_> = if attachment.spec.kind == AttachmentKind::ModelReplay {
             vec![graph.tasks[attachment.task_bindings[0].task_id as usize]
