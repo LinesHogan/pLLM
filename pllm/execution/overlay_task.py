@@ -21,10 +21,11 @@ from pllm.contracts.semantic_graph import TaskId
 from pllm.contracts.visibility import VisibilitySource
 from pllm.execution.chunk_tail import join_tail, save_tail
 from pllm.execution.cuda_stream import upload
-from pllm.execution.scan import scan
-from pllm.execution.scan_execution import Step
+from pllm.execution.scan import prepare_scan
+from pllm.execution.scan_execution import PreparedScan, Step
 from pllm.execution.tensor_frame import OverlayEntry, OverlayTargetResult, TensorFrame, Tensors, TensorUpdate
 from pllm.execution.tensor_program import PoolSGD, TaskOutput, TensorBatch
+from pllm.execution.torch_private import MemoryTrace
 from pllm.kernels.head_overlay import head_correction
 from pllm.kernels.page_copy import copy_pages
 
@@ -35,25 +36,54 @@ if TYPE_CHECKING:
     from pllm.execution.step_input import TensorStepInput
 
 
-def chunk_update(step: Step, chunk: int, arguments: tuple[str, ...], /, **values: torch.Tensor) -> TensorUpdate:
-    """Adapt an authored chunk recurrence to the ordinary overlay update boundary."""
-    carry, *columns = arguments
-    rows = tuple(values[name] for name in columns)
-    tails = tuple(values[f"_pending_rows_{name}"] for name in columns)
-    length = values["_pending_length"]
-    joined, valid = join_tail(tails, rows, length, chunk)
-    positions = torch.arange(len(rows[0]), device=length.device) + length
-    trained = valid // chunk * chunk
-    updated, outputs = scan(step, carry=values[carry], over=joined, chunk=chunk, valid_rows=trained)
-    values[carry].copy_(updated)
-    remaining = save_tail(tails, joined, length, valid, trained)
-    return TensorUpdate(
-        torch.cat(outputs).index_select(0, positions),
-        trained > 0,
-        trained // chunk,
-        trained,
-        {"tail_rows": remaining},
-    )
+@dataclass(frozen=True)
+class ChunkUpdate:
+    """Authored recurrence metadata used by both routed and batched overlay execution."""
+
+    step: Step
+    chunk: int
+    arguments: tuple[str, ...]
+
+    def __call__(self, **values: torch.Tensor) -> TensorUpdate:
+        plan = self.prepare(values)
+        if values[self.arguments[0]].is_meta:
+            MemoryTrace.reserve(plan.workspace)
+            plan = PreparedScan(self.step, self.chunk)
+        count = values["_pending_length"].new_full((), len(values[self.arguments[1]]))
+        return self.counted(plan, count, values)
+
+    def prepare(self, values: Tensors) -> PreparedScan:
+        """Inspect storage and select policy outside the mapped mathematical body."""
+        carry, *columns = self.arguments
+        joined, valid = join_tail(
+            tuple(values[f"_pending_rows_{name}"] for name in columns),
+            tuple(values[name] for name in columns),
+            values["_pending_length"],
+            self.chunk,
+        )
+        return prepare_scan(self.step, values[carry], joined, self.chunk, valid_rows=valid)
+
+    def counted(self, plan: PreparedScan, count: torch.Tensor, values: Tensors) -> TensorUpdate:
+        """Advance complete chunks only; padded requests and rows contribute no updates."""
+        carry, *columns = self.arguments
+        rows = tuple(values[name] for name in columns)
+        tails = tuple(values[f"_pending_rows_{name}"] for name in columns)
+        length = values["_pending_length"]
+        length.masked_fill_(count == 0, 0)
+        joined, _ = join_tail(tails, rows, length, self.chunk)
+        valid = length + count
+        positions = torch.arange(len(rows[0]), device=length.device) + length
+        trained = valid // self.chunk * self.chunk
+        updated, outputs = plan(values[carry], joined, (), trained)
+        values[carry].copy_(updated)
+        remaining = save_tail(tails, joined, length, valid, trained)
+        return TensorUpdate(
+            torch.cat(outputs).index_select(0, positions),
+            trained > 0,
+            trained // self.chunk,
+            trained,
+            {"tail_rows": remaining},
+        )
 
 
 def overlay_apply(effect: ParameterEffect, hidden: torch.Tensor, values: Tensors) -> torch.Tensor:
@@ -198,6 +228,7 @@ class OverlayTransition:
     function: Callable[..., TensorUpdate]
     arguments: Mapping[str, str]
     visibility: VisibilitySource
+    chunk: ChunkUpdate | None = None
 
     def __call__(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
         operands = {
@@ -262,6 +293,20 @@ class OverlayTransition:
         batch: TensorBatch,
     ) -> tuple[TensorUpdate, ...]:
         """Gather issued slots once per target/phase; settlement still belongs to the task."""
+        if self.chunk is not None:
+            from pllm.execution.overlay_batch import OverlayBatch
+
+            return OverlayBatch(self).run(operands, target, indices, batch)
+        return self.serial(operands, target, indices, batch)
+
+    def serial(
+        self,
+        operands: tuple[CapturedParameterOperand, ...],
+        target: int,
+        indices: tuple[int, ...],
+        batch: TensorBatch,
+    ) -> tuple[TensorUpdate, ...]:
+        """Keep non-chunk and transformed scan execution on its selected implementation."""
         width = len(self.buffers)
         fields = tuple(batch.field_slots(target * width + i) for i in range(width))
         pools = tuple(pool for pool, _ in fields)

@@ -24,7 +24,7 @@ from pllm.contracts.parameter_overlay import (
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.tensor_layout import TensorDType
-from pllm.execution.overlay_task import chunk_update
+from pllm.execution.overlay_task import ChunkUpdate
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.step_input import TensorStepInput
@@ -312,10 +312,7 @@ def _check_headwise_math_and_tail():
                 state = decayed - 0.2 / 2 * gradient
         pending = joined[trained:]
         expected = torch.cat(outputs)[-len(hidden) :]
-        actual = chunk_update(
-            workload.step,
-            2,
-            ("state", "hidden"),
+        actual = ChunkUpdate(workload.step, 2, ("state", "hidden"))(
             state=weights,
             hidden=hidden,
             _pending_rows_hidden=tail,

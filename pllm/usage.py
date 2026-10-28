@@ -82,7 +82,7 @@ from pllm.execution.module_state import (
     parameter_count,
     skeleton,
 )
-from pllm.execution.overlay_task import chunk_update, gradient_update, overlay_gradient
+from pllm.execution.overlay_task import ChunkUpdate, gradient_update, overlay_gradient
 from pllm.execution.position_state import PositionState as PositionState
 from pllm.execution.row_task_binding import (
     declare_logits,
@@ -847,7 +847,7 @@ def _chunked_overlay(
             )
             for name, source in zip(arguments[1:], sources[1:], strict=True)
         }
-        update = partial(chunk_update, function, chunk, arguments)
+        update = ChunkUpdate(function, chunk, arguments)
     else:
         if (
             "input" not in sources

@@ -6,7 +6,6 @@ the measured region-tuning policy is signed into the backend facts.
 
 import warnings
 from dataclasses import replace
-from functools import partial
 from unittest.mock import patch
 
 import pytest
@@ -28,7 +27,7 @@ from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.contracts.tensor_policy import TensorPolicy
 from pllm.execution.compile_facts import BackendCompileFacts
-from pllm.execution.overlay_task import chunk_update
+from pllm.execution.overlay_task import ChunkUpdate
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.scan import ScanContext, ScanTemplate
@@ -234,7 +233,7 @@ def test_counted_gated_tail_keeps_inactive_chunks_and_never_reads_device_counts(
     target = ParameterTarget(0, ParameterModuleKind.ATTENTION, ParameterRole.QUERY_PROJECTION_WEIGHT)
     workload = GatedDeltaWorkload(GatedDeltaConfig((target,), head_width=4, chunk_size=4))
     context = ScanContext(TensorPolicy(numerics), 32, torch.device("cuda:0"), 64 << 20)
-    run = context.bind(partial(chunk_update, workload.step, 4, ("state", "hidden")))
+    run = context.bind(ChunkUpdate(workload.step, 4, ("state", "hidden")))
     generator = torch.Generator(device="cuda").manual_seed(512)
     weights = torch.randn(2, 4, 4, device="cuda", generator=generator) * 0.1
     tail = torch.zeros(3, 8, device="cuda")

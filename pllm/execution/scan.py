@@ -244,6 +244,25 @@ def scan(
         valid_rows.shape != () or valid_rows.dtype != torch.int64 or valid_rows.device != carry.device
     ):
         raise ValueError("scan valid_rows needs an int64 scalar on the carry device")
+    prepared = prepare_scan(step, carry, over, chunk, invariants, valid_rows)
+    if carry.is_meta:
+        MemoryTrace.reserve(prepared.workspace)
+        state, outputs = PreparedScan(step, chunk)(carry, over, invariants, valid_rows)
+        if prepared.analysis is not None:
+            return state.clone(), tuple(output.clone() for output in outputs)
+        return state, outputs
+    return prepared(carry, over, invariants, valid_rows)
+
+
+def prepare_scan(
+    step: Step,
+    carry: torch.Tensor,
+    over: tuple[torch.Tensor, ...],
+    chunk: int,
+    invariants: tuple[torch.Tensor, ...] = (),
+    valid_rows: torch.Tensor | None = None,
+) -> PreparedScan:
+    """Select the scan using ordinary tensors before entering vmap or CUDA capture."""
     context = ScanContext.active.get() or _context(TensorPolicy(), over[0].shape[0], carry.device)
     source = PreparedScan(step, chunk)
     if (
@@ -255,7 +274,7 @@ def scan(
         and len({t.untyped_storage() for t in (carry, *over, *invariants)}) == 1 + len(over) + len(invariants)
     ):
         samples = (carry, *invariants, *(t[:chunk] for t in over), *((valid_rows,) if valid_rows is not None else ()))
-        compiled = context.specialize(
+        return context.specialize(
             step,
             tuple((t.shape, t.stride(), t.dtype, t.device) for t in samples),
             len(invariants),
@@ -263,12 +282,4 @@ def scan(
             len(over[0]) // chunk,
             valid_rows is not None,
         )
-        if carry.is_meta:
-            MemoryTrace.reserve(compiled.workspace)
-            state, outputs = source(carry, over, invariants, valid_rows)
-            if compiled.analysis is not None:
-                return state.clone(), tuple(output.clone() for output in outputs)
-            return state, outputs
-        else:
-            return compiled(carry, over, invariants, valid_rows)
-    return source(carry, over, invariants, valid_rows)
+    return source
