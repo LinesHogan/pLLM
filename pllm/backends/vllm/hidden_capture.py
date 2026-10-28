@@ -62,14 +62,6 @@ class HiddenCaptureAnnouncement:
     max_num_seqs: int = 1
     dtype: TensorDType = TensorDType.FLOAT32
 
-    def __post_init__(self) -> None:
-        if self.max_num_seqs < 1:
-            raise ValueError("hidden capture requires max_num_seqs >= 1")
-        if self.dtype not in (TensorDType.BFLOAT16, TensorDType.FLOAT16, TensorDType.FLOAT32):
-            raise ValueError("hidden capture requires the model's floating-point dtype")
-        if any(source.phase not in (HiddenPhase.DECODE, HiddenPhase.PREFILL) for source in self.inputs):
-            raise ValueError("hidden capture requires decode or completed-prefill rows")
-
     def resolve(self, layer_count: int, hidden_size: int) -> tuple[HiddenCaptureLayout, ...]:
         """Merge aliases and consumers before capture; phases share one request bound.
 
