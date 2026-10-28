@@ -20,7 +20,7 @@ from torch._C._autograd import DeviceType
 
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.contracts.semantic_graph import PhysicalPlan, TaskId
+from pllm.contracts.semantic_graph import ScheduleDecision, TaskId
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.admission import WindowBackpressure
@@ -194,7 +194,7 @@ class _TraceEntry:
 
 class ExecutionTrace:
     def __init__(
-        self, plan: PhysicalPlan, capacity: int = 256, on_export: Callable[[TraceEvent], None] | None = None
+        self, plan: ScheduleDecision, capacity: int = 256, on_export: Callable[[TraceEvent], None] | None = None
     ) -> None:
         assert capacity >= 1
         self.plan = plan

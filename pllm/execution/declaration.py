@@ -393,9 +393,7 @@ class Builder(Generic[D]):
             identity = (
                 task.implementations[0].implementation_id
                 if plan is None
-                else next(
-                    item.implementation_id for item in plan.schedule_physical.tasks if graph.tasks[item.task_id] is task
-                )
+                else next(item.implementation_id for item in plan.schedule.tasks if graph.tasks[item.task_id] is task)
             )
             versions = tuple(
                 effect.version
@@ -434,9 +432,7 @@ class Builder(Generic[D]):
             identity = (
                 task.implementations[0].implementation_id
                 if plan is None
-                else next(
-                    item.implementation_id for item in plan.schedule_physical.tasks if graph.tasks[item.task_id] is task
-                )
+                else next(item.implementation_id for item in plan.schedule.tasks if graph.tasks[item.task_id] is task)
             )
             if task.replay is not None:
                 assert model_probe is not None and model_probe.causal_domain is not None
@@ -457,7 +453,7 @@ class Builder(Generic[D]):
                 functions.append(replace(self.publications[task.symbol], implementation_id=identity))
         guarded = {
             item.implementation_id
-            for item in (() if plan is None else plan.schedule_physical.tasks)
+            for item in (() if plan is None else plan.schedule.tasks)
             if any(graph.tasks[item.task_id].symbol in group.tasks for group in graph.input_groups)
         }
         return tuple(

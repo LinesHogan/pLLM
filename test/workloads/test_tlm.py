@@ -177,7 +177,7 @@ def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None
         online = TLMWorkload(TLMConfig(mode=TLMMode.ONLINE), gpu_model)
         attachment = online.plan_backend(online.specialize(_facts(gpu_model), ExecutionOptions()))
         assert attachment.spec.overlay_bindings
-        assert all(task.lane == "main" for task in attachment.plan.schedule_physical.tasks)
+        assert all(task.lane == "main" for task in attachment.plan.schedule.tasks)
     batch = CausalTrainBatch(torch.tensor([[0, 2, 3]]), torch.tensor([[0, 2, 3]]))
     for mode in TLMMode:
         config = TLMConfig(mode=mode, threshold=0.0)
@@ -192,7 +192,7 @@ def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None
             execution.step(CausalTrainBatch(tokens, tokens))
         anchors = {
             execution.arena.plan.semantic_graph.tasks[task.task_id].symbol: task.anchor_id
-            for task in execution.arena.plan.schedule_decision.tasks
+            for task in execution.arena.plan.schedule.tasks
         }
         timeline = {item.symbol: item.ordinal for item in execution.arena.plan.timeline.anchors}
         assert anchors["update"] <= anchors["publish"]

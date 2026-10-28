@@ -196,7 +196,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         self.execution, self.anchor, self.activation, self.projections = execution, anchor, activation, overlay
         implementation = next(
             item
-            for item in execution.arena.plan.schedule_physical.tasks
+            for item in execution.arena.plan.schedule.tasks
             if execution.arena.plan.semantic_graph.tasks[item.task_id].symbol == task.symbol
         )
         binding = TokenwiseReplayTask[DataT].from_implementation(

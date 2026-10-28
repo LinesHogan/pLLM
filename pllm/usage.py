@@ -1622,7 +1622,7 @@ class Workload(
                 task.lane == "side"
                 and plan.semantic_graph.tasks[task.task_id].symbol in b.tensor_tasks
                 and not operations[plan.semantic_graph.tasks[task.task_id].symbol].resident(1)
-                for task in plan.schedule_physical.tasks
+                for task in plan.schedule.tasks
             ):
                 raise ValueError(
                     "side tensor tasks need fixed row inputs; declare row inputs or move the task before the model"

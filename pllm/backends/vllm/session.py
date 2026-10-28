@@ -165,7 +165,7 @@ class VllmSession(Generic[DataT, ResultT]):
         self.completion_capture: CompletionCapture | None = None
         execution = deployment.execution
         self._post_sample = None
-        tasks = plan.schedule_physical.tasks
+        tasks = plan.schedule.tasks
         if any(task.read_origin == "latest" for task in tasks):
             self._post_sample = PostSampleOverlap(
                 execution.arena,
@@ -553,7 +553,7 @@ class VllmSession(Generic[DataT, ResultT]):
             (
                 *[
                     task.anchor_id
-                    for task in execution.arena.plan.schedule_physical.tasks
+                    for task in execution.arena.plan.schedule.tasks
                     if context.last_anchor_id < task.anchor_id <= target
                 ],
                 AnchorId(target),
@@ -563,7 +563,7 @@ class VllmSession(Generic[DataT, ResultT]):
             if point > context.last_anchor_id:
                 if any(
                     task.anchor_id == point and task.read_origin == "latest"
-                    for task in execution.arena.plan.schedule_physical.tasks
+                    for task in execution.arena.plan.schedule.tasks
                 ):
                     self._handoff(context)
                 execution.execute_anchor(context, AnchorId(point))

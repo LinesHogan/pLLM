@@ -21,7 +21,7 @@ from pllm.contracts.state_ref import LineageId, StateRef, VersionId
 from pllm.contracts.state_representation import StateDeviceKind, StateProviderPlan
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorLayoutSpec
 from pllm.execution.admission import WindowBackpressure
-from pllm.execution.codec import decode_boundary, encode_boundary
+from pllm.execution.codec import boundary_digest, decode_boundary, encode_boundary
 from pllm.execution.cuda_stream import upload
 from pllm.execution.ptts.page_bundle_planning import DTYPE_BYTES, page_stride_bytes
 from pllm.execution.ptts.state_refs import StateRefs
@@ -1046,7 +1046,7 @@ class PageBundleArena:
     ) -> tuple[PageFieldTransfer, RemoteCompletion]:
         assert stream is not None
         descriptor = PageFieldTransfer(
-            self.plan.schedule_decision.signature,
+            boundary_digest(self.plan),
             owner_id,
             root.ref,
             root.resource,
@@ -1062,7 +1062,7 @@ class PageBundleArena:
         plan: PlanBundle, connection: Connection, *, stream: torch.cuda.Stream | None = None
     ) -> BorrowedPage:
         descriptor = decode_boundary(connection.recv_bytes(65536).decode(), PageFieldTransfer)
-        if descriptor.compilation_signature != plan.schedule_decision.signature:
+        if descriptor.compilation_signature != boundary_digest(plan):
             raise ValueError("the page producer was built for another compilation; restart it from this model's plan")
         ((entry, provider),) = (
             (entry, provider)

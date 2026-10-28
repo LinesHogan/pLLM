@@ -227,21 +227,6 @@ def _frozen_state_is_readable_by_an_observation() -> None:
     execution.close()
 
 
-def test_unused_helpers_are_neither_signed_nor_frozen() -> None:
-    class Lazy(pllm.Workload):
-        def unused(self):
-            import os  # Forbidden dependency: signing this helper would raise.
-
-            return os.getcwd()
-
-        @pllm.on(pllm.Phase.OBSERVE)
-        def observe(self, hidden: torch.Tensor = pllm.hidden(0)) -> torch.Tensor:
-            return hidden * 2
-
-    execution = make_llm(workload=Lazy(), config=CPU)
-    assert execution.plan.fallback_count == 0
-
-
 @pytest.mark.parametrize(
     "device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA"))]
 )

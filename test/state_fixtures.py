@@ -123,12 +123,11 @@ def replan_states(plan, graph, layouts: TensorLayoutRequest, memory_bytes: int):
         ),
         candidates,
     )
-    decision, physical, schedule, scheduled = compile_state_schedule(graph, plan.timeline, request)
+    decision, physical, schedule = compile_state_schedule(graph, plan.timeline, request)
     return replace(
         plan,
         semantic_graph=graph,
-        schedule_decision=schedule,
-        schedule_physical=scheduled,
+        schedule=schedule,
         state_request=request,
         state_decision=decision,
         state_physical=physical,
@@ -214,7 +213,7 @@ def multistate(*, route=False, instance=True, failing=()):
         lambda rows, batch: rows,
         lambda rows, output: output.selection,
     )
-    tasks = tuple(ResourceTask(task.implementation_id) for task in arena.plan.schedule_physical.tasks)
+    tasks = tuple(ResourceTask(task.implementation_id) for task in arena.plan.schedule.tasks)
     execution = MathBinding(functions, tasks).bind(arena, AnchorId(arena.plan.timeline.anchors[-1].ordinal))
     return execution, tasks[0]
 

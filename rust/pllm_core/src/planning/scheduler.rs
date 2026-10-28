@@ -1,8 +1,8 @@
-//! Select task points and lanes; sign and verify placement and memory witnesses.
+//! Select task points and lanes and check placement and memory witnesses.
 
 use super::semantic_graph::{
-    canonical_ascii_json, decode_graph, decode_timeline, digest, validate_graph, validate_timeline,
-    ImplementationCandidate, InputSource, OutputKind, SemanticGraph, Timeline, SCHEMA_VERSION,
+    canonical_ascii_json, decode_graph, decode_timeline, validate_graph, validate_timeline,
+    ImplementationCandidate, InputSource, OutputKind, SemanticGraph, Timeline,
 };
 use super::state_representation::{decode_physical_plan as decode_state, StatePhysicalPlan};
 use super::version_hazards;
@@ -14,14 +14,8 @@ use std::collections::{BTreeSet, HashMap};
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ScheduleDecision {
-    graph_digest: String,
-    timeline_digest: String,
-    tasks: Vec<PhysicalTask>,
-    fallback_count: u64,
-    signature: String,
-    schema_version: u64,
+    pub(crate) tasks: Vec<PhysicalTask>,
     peak_memory_bytes: u64,
-    state_plan_digest: Option<String>,
 }
 
 impl ScheduleDecision {
@@ -61,46 +55,12 @@ pub(crate) struct PhysicalTask {
     pub(crate) wait_for: Vec<u32>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PhysicalPlan {
-    pub(crate) schedule_signature: String,
-    pub(crate) tasks: Vec<PhysicalTask>,
-    pub(crate) fallback_count: u64,
-    pub(crate) schema_version: u64,
-}
-
 fn error(message: impl Into<String>) -> PyErr {
     PyValueError::new_err(message.into())
 }
 
 pub(crate) fn decode_decision(payload: &str) -> Result<ScheduleDecision, String> {
     serde_json::from_str(payload).map_err(|source| format!("invalid ScheduleDecision: {source}"))
-}
-
-pub(crate) fn decode_physical(payload: &str) -> Result<PhysicalPlan, String> {
-    serde_json::from_str(payload).map_err(|source| format!("invalid PhysicalPlan: {source}"))
-}
-
-fn require_digest(value: &str, label: &str) -> Result<(), String> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(format!("{label} must be a lowercase SHA-256 digest"));
-    }
-    Ok(())
-}
-
-fn decision_unsigned(decision: &ScheduleDecision) -> ScheduleDecision {
-    let mut unsigned = decision.clone();
-    unsigned.signature.clear();
-    unsigned
-}
-
-fn decision_signature(decision: &ScheduleDecision) -> Result<String, String> {
-    Ok(digest(&canonical_ascii_json(&decision_unsigned(decision))?))
 }
 
 fn task_index(graph: &SemanticGraph, symbol: &str) -> Result<usize, String> {
@@ -724,7 +684,7 @@ pub(super) fn compile(
         if selected.len() == graph.tasks.len() {
             match place(graph, timeline, index, state, selected) {
                 Ok(solution) => {
-                    let decision = sign_solution(graph, timeline, state, selected, solution)?;
+                    let decision = build_decision(selected, solution);
                     if best
                         .as_ref()
                         .is_none_or(|best| decision.score() < best.score())
@@ -765,13 +725,10 @@ pub(super) fn compile(
     })
 }
 
-fn sign_solution(
-    graph: &SemanticGraph,
-    timeline: &Timeline,
-    state: Option<&StatePhysicalPlan>,
+fn build_decision(
     implementations: &[&ImplementationCandidate],
     solution: Solution,
-) -> Result<ScheduleDecision, String> {
+) -> ScheduleDecision {
     let plans = solution
         .tasks
         .into_iter()
@@ -782,48 +739,20 @@ fn sign_solution(
             task
         })
         .collect();
-    let mut decision = ScheduleDecision {
-        graph_digest: digest(&canonical_ascii_json(graph)?),
-        timeline_digest: digest(&canonical_ascii_json(timeline)?),
+    ScheduleDecision {
         tasks: plans,
-        fallback_count: 0,
-        signature: String::new(),
-        schema_version: SCHEMA_VERSION,
         peak_memory_bytes: solution.peak,
-        state_plan_digest: state
-            .map(canonical_ascii_json)
-            .transpose()?
-            .map(|wire| digest(&wire)),
-    };
-    decision.signature = decision_signature(&decision)?;
-    Ok(decision)
+    }
 }
 
-fn validate_decision_shape(decision: &ScheduleDecision) -> Result<(), String> {
-    if decision.schema_version != SCHEMA_VERSION || decision.fallback_count != 0 {
-        return Err("invalid canonical schedule decision envelope".to_owned());
-    }
-    require_digest(&decision.graph_digest, "decision.graph_digest")?;
-    require_digest(&decision.timeline_digest, "decision.timeline_digest")?;
-    require_digest(&decision.signature, "decision.signature")?;
-    if decision.tasks.is_empty() {
-        return Err("canonical schedule decision requires task plans".to_owned());
-    }
-    Ok(())
-}
-
-fn validate_decision(
+pub(crate) fn validate_decision(
     graph: &SemanticGraph,
     timeline: &Timeline,
     decision: &ScheduleDecision,
     state: Option<&StatePhysicalPlan>,
 ) -> Result<(), String> {
-    validate_decision_shape(decision)?;
     validate_graph(graph)?;
     validate_timeline(timeline)?;
-    if decision.signature != decision_signature(decision)? {
-        return Err("canonical schedule signature differs from its contents".into());
-    }
     let index = graph_index(graph, timeline, state)?;
     let implementations = graph
         .tasks
@@ -849,56 +778,11 @@ fn validate_decision(
         })
         .collect::<Result<Vec<_>, String>>()?;
     let solution = check_placement(graph, timeline, &index, state, &decision.tasks)?;
-    let expected = sign_solution(graph, timeline, state, &implementations, solution)?;
+    let expected = build_decision(&implementations, solution);
     if decision != &expected {
         return Err(
             "canonical schedule decision differs from its selected placement witness".to_owned(),
         );
-    }
-    Ok(())
-}
-
-fn lower_physical(
-    graph: &SemanticGraph,
-    timeline: &Timeline,
-    decision: &ScheduleDecision,
-    state: Option<&StatePhysicalPlan>,
-) -> Result<PhysicalPlan, String> {
-    validate_decision(graph, timeline, decision, state)?;
-    Ok(project_physical(decision))
-}
-
-pub(super) fn project_physical(decision: &ScheduleDecision) -> PhysicalPlan {
-    PhysicalPlan {
-        schedule_signature: decision.signature.clone(),
-        tasks: decision.tasks.clone(),
-        fallback_count: decision.fallback_count,
-        schema_version: SCHEMA_VERSION,
-    }
-}
-
-fn validate_physical_shape(physical: &PhysicalPlan) -> Result<(), String> {
-    if physical.schema_version != SCHEMA_VERSION {
-        return Err("invalid canonical physical plan envelope".to_owned());
-    }
-    require_digest(&physical.schedule_signature, "physical.schedule_signature")?;
-    if physical.tasks.is_empty() || physical.fallback_count != 0 {
-        return Err("invalid canonical physical plan tasks or fallback count".to_owned());
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_physical(
-    graph: &SemanticGraph,
-    timeline: &Timeline,
-    decision: &ScheduleDecision,
-    physical: &PhysicalPlan,
-    state: Option<&StatePhysicalPlan>,
-) -> Result<(), String> {
-    validate_physical_shape(physical)?;
-    let expected = lower_physical(graph, timeline, decision, state)?;
-    if physical != &expected {
-        return Err("canonical physical plan differs from Rust projection".to_owned());
     }
     Ok(())
 }
@@ -932,51 +816,16 @@ fn validate_schedule(
     validate_decision(&graph, &timeline, &decision, state.as_ref()).map_err(error)
 }
 
-#[pyfunction]
-#[pyo3(signature = (graph_json, timeline_json, decision_json, state_json=None))]
-fn lower_physical_plan(
-    graph_json: &str,
-    timeline_json: &str,
-    decision_json: &str,
-    state_json: Option<&str>,
-) -> PyResult<String> {
-    let graph = decode_graph(graph_json).map_err(error)?;
-    let timeline = decode_timeline(timeline_json).map_err(error)?;
-    let decision = decode_decision(decision_json).map_err(error)?;
-    let state = state_json.map(decode_state).transpose().map_err(error)?;
-    let physical = lower_physical(&graph, &timeline, &decision, state.as_ref()).map_err(error)?;
-    canonical_ascii_json(&physical).map_err(error)
-}
-
-#[pyfunction]
-#[pyo3(signature = (graph_json, timeline_json, decision_json, physical_json, state_json=None))]
-fn validate_physical_plan(
-    graph_json: &str,
-    timeline_json: &str,
-    decision_json: &str,
-    physical_json: &str,
-    state_json: Option<&str>,
-) -> PyResult<()> {
-    let graph = decode_graph(graph_json).map_err(error)?;
-    let timeline = decode_timeline(timeline_json).map_err(error)?;
-    let decision = decode_decision(decision_json).map_err(error)?;
-    let physical = decode_physical(physical_json).map_err(error)?;
-    let state = state_json.map(decode_state).transpose().map_err(error)?;
-    validate_physical(&graph, &timeline, &decision, &physical, state.as_ref()).map_err(error)
-}
-
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(compile_schedule, module)?)?;
     module.add_function(wrap_pyfunction!(validate_schedule, module)?)?;
-    module.add_function(wrap_pyfunction!(lower_physical_plan, module)?)?;
-    module.add_function(wrap_pyfunction!(validate_physical_plan, module)?)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{check_placement, decision_signature, graph_index, sign_solution};
-    use super::{compile, lower_physical, validate_decision, validate_physical, ScheduleDecision};
+    use super::{build_decision, check_placement, graph_index};
+    use super::{compile, validate_decision, ScheduleDecision};
     use crate::planning::semantic_graph::{decode_graph, decode_timeline};
     use serde_json::json;
 
@@ -1033,7 +882,6 @@ mod tests {
         assert!(main.tasks.iter().all(|t| t.lane == super::Lane::Main));
         assert_eq!(main.tasks[0].read_distance, 2);
         main.tasks[1].lane = super::Lane::Side;
-        main.signature = decision_signature(&main).unwrap();
         assert!(validate_decision(&graph, &timeline, &main, None).is_err());
         graph.tasks[1].implementations[0]
             .required_capabilities
@@ -1228,10 +1076,6 @@ mod tests {
             }
         }
         let decision = compile(&valid, &timeline, Some(&state)).unwrap();
-        let physical = lower_physical(&valid, &timeline, &decision, Some(&state)).unwrap();
-        let mut drift = state.clone();
-        drift.representations[0].capabilities.clear();
-        assert!(validate_physical(&valid, &timeline, &decision, &physical, Some(&drift)).is_err());
         assert!(validate_decision(&valid, &timeline, &decision, None).is_err());
         for mutation in 0..7 {
             let mut graph = valid.clone();
@@ -1265,7 +1109,7 @@ mod tests {
     }
 
     #[test]
-    fn physical_plan_is_mechanical_and_reconstruction_is_exact() {
+    fn placement_witness_and_memory_accounting_are_exact() {
         let mut graph = graph_fixture();
         graph.tasks[0].timing.before = "a1".into();
         for task in 1..3 {
@@ -1282,19 +1126,14 @@ mod tests {
             "task_resources": (0..3).map(|task| json!({"task": format!("t{task}"), "workspace_bytes": 16})).collect::<Vec<_>>()
         }).to_string()).unwrap();
         let decision = compile(&graph, &timeline, None).unwrap();
-        let physical = lower_physical(&graph, &timeline, &decision, None).unwrap();
-        assert_eq!(physical.tasks, decision.tasks);
         assert_eq!(
-            physical
+            decision
                 .tasks
                 .iter()
                 .map(|task| task.release_values.clone())
                 .collect::<Vec<_>>(),
             vec![vec![], vec![0], vec![1, 2]]
         );
-        let reconstructed =
-            super::decode_physical(&serde_json::to_string(&physical).unwrap()).unwrap();
-        validate_physical(&graph, &timeline, &decision, &reconstructed, None).unwrap();
         // A worker checks this exact legal witness, not the optimizer's preferred
         // alternative. Compilation remains the only placement-selection path.
         let mut roomy = timeline.clone();
@@ -1309,11 +1148,11 @@ mod tests {
             .map(|task| &task.implementations[0])
             .collect();
         let witness = check_placement(&graph, &roomy, &index, None, &later).unwrap();
-        let signed = sign_solution(&graph, &roomy, None, &implementations, witness).unwrap();
-        assert_ne!(signed, compile(&graph, &roomy, None).unwrap());
-        validate_decision(&graph, &roomy, &signed, None).unwrap();
+        let selected = build_decision(&implementations, witness);
+        assert_ne!(selected, compile(&graph, &roomy, None).unwrap());
+        validate_decision(&graph, &roomy, &selected, None).unwrap();
         for mutation in 0..5 {
-            let mut changed = signed.clone();
+            let mut changed = selected.clone();
             match mutation {
                 0 => changed.tasks[0].anchor_id = 3,
                 1 => changed.tasks[1].task_id = changed.tasks[0].task_id,
@@ -1321,28 +1160,8 @@ mod tests {
                 3 => changed.peak_memory_bytes = 1,
                 _ => changed.tasks[1].release_values.clear(),
             }
-            changed.signature = decision_signature(&changed).unwrap();
             assert!(validate_decision(&graph, &roomy, &changed, None).is_err());
         }
-        for mutation in 0..6 {
-            let mut changed = reconstructed.clone();
-            match mutation {
-                0 => changed.tasks[0].task_id = 2,
-                1 => changed.tasks[1].release_values.clear(),
-                2 => changed.tasks.swap(0, 1),
-                3 => changed.tasks[1].anchor_id = 2,
-                4 => changed.tasks[1].implementation_id = "local-choice".into(),
-                _ => changed.schedule_signature = "0".repeat(64),
-            }
-            assert!(validate_physical(&graph, &timeline, &decision, &changed, None).is_err());
-        }
-        let mut drift = timeline.clone();
-        drift.reserved_bytes[1] = 24;
-        assert!(validate_physical(&graph, &drift, &decision, &physical, None).is_err());
-        let mut incomplete = serde_json::to_value(&physical).unwrap();
-        incomplete.as_object_mut().unwrap().remove("tasks");
-        assert!(super::decode_physical(&incomplete.to_string()).is_err());
-
         graph.tasks[1].timing.before = "a2".into();
         graph.tasks[2].timing.after = "a2".into();
         graph.tasks[2].outputs[0].kind = super::super::semantic_graph::OutputKind::Host;
@@ -1512,11 +1331,6 @@ mod tests {
         assert_eq!(decision.tasks[0].implementation_id, "esamp:cpu@1");
         assert_eq!(decision.tasks[1].anchor_id, 1);
         validate_decision(&graph, &timeline, &decision, None).unwrap();
-        let physical = lower_physical(&graph, &timeline, &decision, None).unwrap();
-        validate_physical(&graph, &timeline, &decision, &physical, None).unwrap();
-        let mut physical_tampered = physical.clone();
-        physical_tampered.tasks[1].anchor_id = 0;
-        assert!(validate_physical(&graph, &timeline, &decision, &physical_tampered, None).is_err());
         let mut tampered: ScheduleDecision = decision.clone();
         tampered.tasks[1].anchor_id = 0;
         assert!(validate_decision(&graph, &timeline, &tampered, None).is_err());

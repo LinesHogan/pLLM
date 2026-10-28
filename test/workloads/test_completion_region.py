@@ -58,7 +58,7 @@ def test_default_completion_region_keeps_multigroup_adamw_and_publication(device
     workload = TwoGroups()
     binding = workload.declare_host(facts)
     execution = binding.compile()
-    peak = execution.arena.plan.schedule_decision.peak_memory_bytes
+    peak = execution.arena.plan.schedule.peak_memory_bytes
     with pytest.raises(ValueError):
         workload.compile_host(replace(facts, memory_budget_bytes=peak - 1))
     (initial,) = execution.admit((), stream)

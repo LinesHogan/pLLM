@@ -172,5 +172,5 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
     diagnostics = execution.diagnostics()
     assert diagnostics.loss_count == diagnostics.update_count == updates
     assert diagnostics.trained_rows == trained_rows
-    assert diagnostics.active_lineages == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
+    assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
     assert execution.arena.free_pages == 12

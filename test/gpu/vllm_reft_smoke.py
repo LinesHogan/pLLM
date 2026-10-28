@@ -69,7 +69,7 @@ def main() -> None:
         assert observed == [4]
         diagnostics = execution.diagnostics()
         assert diagnostics.update_count == 1
-        assert diagnostics.inference_pins == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
+        assert diagnostics.inference_pins == diagnostics.pending_state_releases == 0
         print(f"ReFT: publications={diagnostics.update_count} patched_prefill_rows={observed[0]}")
     finally:
         if hook is not None:

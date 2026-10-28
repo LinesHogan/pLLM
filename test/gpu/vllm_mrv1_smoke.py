@@ -86,7 +86,7 @@ def main() -> None:
         assert tuple(entry.identity.prompt_idx for entry in batch.completions.entries) == (7, 9, 11)
         diagnostics = handle.worker_state().diagnostics
         assert diagnostics.loss_count == diagnostics.update_count == 9
-        assert diagnostics.active_lineages == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
+        assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
         print(f"MRv1: rows={row_checks} sampler_checks={sampler_checks} updates={diagnostics.update_count}")
     finally:
         handle.close()

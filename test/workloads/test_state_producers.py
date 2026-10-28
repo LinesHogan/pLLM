@@ -320,7 +320,7 @@ def test_backend_points_and_compile_rejects_unknown_anchor():
 
     plan = deployment(PromptFactors()).attachment.plan
     point = next(a.ordinal for a in plan.timeline.anchors if a.symbol == "state.publish")
-    assert all(t.earliest == t.anchor_id == point for t in plan.schedule_physical.tasks)
+    assert all(t.earliest == t.anchor_id == point for t in plan.schedule.tasks)
     constrained = replace(
         plan.semantic_graph,
         tasks=tuple(

@@ -222,7 +222,7 @@ def main():
         assert all(value == tokens[0] for value in tokens)
         assert 2 in checked and len(numerical) == 2 * sum(checked)
         diagnostics = handle.diagnostics()
-        assert diagnostics.active_lineages == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
+        assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
         print(f"recirculation waves={len(checked)} independent layer comparisons={len(numerical)}")
     finally:
         handle.close()

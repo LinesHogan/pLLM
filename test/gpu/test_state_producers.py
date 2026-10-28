@@ -36,7 +36,7 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
         execute = execution.execute_anchor
 
         def delayed(invocation, anchor):
-            tasks = tuple(task for task in plan.schedule_physical.tasks if task.anchor_id == anchor)
+            tasks = tuple(task for task in plan.schedule.tasks if task.anchor_id == anchor)
             if tasks:
                 assert all(task.lane == "side" and task.read_origin == "latest" for task in tasks)
                 assert invocation.pin.stream == session._post_sample.stream
@@ -199,7 +199,6 @@ def test_composed_readers_replay_model_graphs(workload, monkeypatch):
                     SamplingParams(max_tokens=5, temperature=0, ignore_eos=True, logprobs=1),
                 )
             results.append([(o.outputs[0].token_ids, o.outputs[0].cumulative_logprob) for o in outputs])
-            assert handle.diagnostics().fallback_count == 0
             if isinstance(workload, PromptFactors):
                 session = handle.runner.require_session()
                 prepare, saved = session.prepare_input, []
@@ -247,5 +246,5 @@ def test_chunked_runners_discard_partial_prompt_feedback(runner, budget, seqs):
             diagnostics = handle.diagnostics()
             assert diagnostics.loss_count == diagnostics.update_count == 2 * len(prompts)
             # Releases finish asynchronously; their completion is covered by the page-arena tests.
-            assert diagnostics.active_lineages == diagnostics.fallback_count == 0
+            assert diagnostics.active_lineages == 0
     assert tokens[0] == tokens[1]

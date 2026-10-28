@@ -285,22 +285,10 @@ class PhysicalTask:
 
 @dataclass(frozen=True, slots=True)
 class ScheduleDecision:
-    graph_digest: str
-    timeline_digest: str
+    """Rust-selected task placements and their peak memory usage."""
+
     tasks: tuple[PhysicalTask, ...]
-    fallback_count: int
-    signature: str
     peak_memory_bytes: int
-    state_plan_digest: str | None
-    schema_version: int = 1
-
-
-@dataclass(frozen=True, slots=True)
-class PhysicalPlan:
-    schedule_signature: str
-    tasks: tuple[PhysicalTask, ...]
-    fallback_count: int
-    schema_version: int = 1
 
 
 __all__ = [
@@ -315,7 +303,6 @@ __all__ = [
     "HostServicePort",
     "HostPayloadSchemaId",
     "ImplementationId",
-    "PhysicalPlan",
     "PhysicalTask",
     "PackedRowsInputSource",
     "PackedSamplerRowsInputSource",

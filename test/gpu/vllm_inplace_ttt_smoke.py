@@ -166,7 +166,6 @@ def _check(handle: VllmLlm[object, object], label: str) -> tuple[str, ...]:
         or handle.runner.require_session().updated_apply_count < 1
         or diagnostics.active_lineages != 0
         or diagnostics.pending_state_releases != 0
-        or diagnostics.fallback_count != 0
     ):
         raise RuntimeError(
             f"{label} MRv2 parameter-overlay lifecycle evidence is incomplete: "
@@ -319,12 +318,7 @@ def _check_imported(handle: VllmLlm[object, object]) -> tuple[str, ...]:
     if texts(handle.generate(PROMPTS, SAMPLING, prompt_indices=(4, 5), auxiliary=update)) != baseline:
         raise RuntimeError("imported zero factors must reproduce the base model exactly")
     diagnostics = handle.diagnostics()
-    if (
-        diagnostics.update_count != 3
-        or diagnostics.active_lineages != 0
-        or diagnostics.pending_state_releases != 0
-        or diagnostics.fallback_count != 0
-    ):
+    if diagnostics.update_count != 3 or diagnostics.active_lineages != 0 or diagnostics.pending_state_releases != 0:
         raise RuntimeError("imported overlay lifecycle evidence is incomplete")
     return mixed
 
@@ -349,7 +343,6 @@ def _check_routed(handle: VllmLlm[object, object]) -> tuple[str, ...]:
         or handle.runner.require_session().apply_count < 3
         or handle.runner.require_session().updated_apply_count < 1
         or diagnostics.pending_state_releases != 0
-        or diagnostics.fallback_count != 0
     ):
         raise RuntimeError("routed overlay lifecycle evidence is incomplete")
     return outputs
@@ -366,7 +359,7 @@ def main() -> int:
             diagnostics = handle.diagnostics()
             assert diagnostics.update_count == 5 * sum((len(output.prompt_token_ids) + 2) // 3 for output in outputs)
             assert diagnostics.trained_rows == 5 * sum(len(output.prompt_token_ids) for output in outputs)
-            assert diagnostics.active_lineages == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
+            assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
     assert adapter_tokens[0] == adapter_tokens[1]
     dense = InPlaceTTTWorkload(
         InPlaceTTTConfig((TARGET,), chunk_size=1, learning_rate=1e-4, update_prefill=True, update_decode=False)

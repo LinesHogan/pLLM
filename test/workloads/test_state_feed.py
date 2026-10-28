@@ -57,8 +57,7 @@ def facts_for(device=torch.device("cpu")):
     return backend_facts(2, (), timeline, provider, layer_count=1, memory_bytes=65536)
 
 
-def test_feed_declaration_signs_order_and_derives_ownership():
-    signatures = []
+def test_feed_declaration_derives_ownership():
     for order in pllm.state.FeedOrder:
         workload = FeedWorkload(order)
         assert workload.backend_requirements().activation_layers == (0,)
@@ -67,7 +66,6 @@ def test_feed_declaration_signs_order_and_derives_ownership():
         assert deployment.execution.arena.owned_resources == ("target",)
         assert deployment.execution.feeds[0].fields == ("value",)
         plan = deployment.execution.arena.plan
-        signatures.append(plan.schedule_decision.signature)
         (group,) = plan.semantic_graph.input_groups
         assert group.borrowed_resources == ("source",)
         assert (
@@ -81,7 +79,6 @@ def test_feed_declaration_signs_order_and_derives_ownership():
             )
             == 1
         )
-    assert len(set(signatures)) == 2
 
 
 def test_conditional_input_allows_local_reads_but_rejects_an_extra_writer():

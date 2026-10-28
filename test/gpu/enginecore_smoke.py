@@ -75,7 +75,6 @@ def greedy(max_tokens, **options) -> SamplingParams:
 
 def assert_clean(diagnostics) -> None:
     assert diagnostics.active_lineages == diagnostics.inference_pins == diagnostics.pending_state_releases == 0
-    assert diagnostics.fallback_count == 0
 
 
 class RetryOnce(FTTTJudgeService):
@@ -127,7 +126,7 @@ def _gpu_shared_input() -> None:
         assert torch.isfinite(changed.hidden).all() and not torch.allclose(baseline.hidden, changed.hidden.cpu())
         diagnostics = handle.worker_state().diagnostics
         assert diagnostics.update_count == 1
-        assert diagnostics.inference_pins == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
+        assert diagnostics.inference_pins == diagnostics.pending_state_releases == 0
         expected = changed.hidden.clone()
     finally:
         handle.close()
@@ -253,7 +252,7 @@ def _captured_esamp(runner: RunnerKind = RunnerKind.MRV2) -> None:
         config=engine(runner=runner, execution=options),
     )
     try:
-        tasks = handle.attachment.plan.schedule_physical.tasks
+        tasks = handle.attachment.plan.schedule.tasks
         assert all("cuda_graph" in task.implementation_id for task in tasks)
         selected = tuple(task.task_id for task in tasks)
         handle.profile_tasks(selected)
@@ -266,7 +265,7 @@ def _captured_esamp(runner: RunnerKind = RunnerKind.MRV2) -> None:
             handle.generate(prompts, greedy(3))
         diagnostics = handle.worker_state().diagnostics
         assert diagnostics.loss_count == diagnostics.update_count == 8
-        assert diagnostics.active_lineages == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
+        assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
         assert not torch.cuda.is_initialized()
         trace = handle.trace_snapshot()
         assert trace.pending_device_timings == 0 and {task for task, _ in trace.device_task_times()} == set(selected)
@@ -300,7 +299,7 @@ def _tlm_shared_input(model_id: str = MODEL) -> None:
         )
         diagnostics = handle.worker_state().diagnostics
         assert diagnostics.loss_count == diagnostics.update_count == 1 and diagnostics.trained_rows > 0
-        assert diagnostics.inference_pins == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
+        assert diagnostics.inference_pins == diagnostics.pending_state_releases == 0
         assert batch.hidden.device.type == "cpu" and torch.isfinite(batch.hidden).all()
         assert not torch.cuda.is_initialized()
         # Without a training batch the next invocation does not update.
@@ -332,7 +331,7 @@ def _output_lora_shared_input() -> None:
         trained = handle.generate(PROMPTS, sampling, auxiliary=batch)
         diagnostics = handle.worker_state().diagnostics
         assert diagnostics.loss_count == 2 and diagnostics.update_count == 1 and diagnostics.trained_rows == 2
-        assert diagnostics.inference_pins == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
+        assert diagnostics.inference_pins == diagnostics.pending_state_releases == 0
         changed = False
         for old, new in zip(baseline, trained, strict=True):
             old, new = old.outputs[0], new.outputs[0]
@@ -403,7 +402,7 @@ def _independent_lora_input() -> None:
         assert all(event.refs and torch.isfinite(event.tensor()).all() for event in gradients)
         diagnostics = handle.worker_state().diagnostics
         assert diagnostics.loss_count == 4 and diagnostics.update_count == 2 and diagnostics.trained_rows == 2
-        assert diagnostics.active_lineages == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
+        assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
         # Each request's own published version guides its sampler.
         guided = [event for event in events if event.tensor_name == "guidance" and event.refs[0].version_id > 0]
         assert len(guided) == 2 and {event.row.identity.prompt_idx for event in guided} == {7, 9}
@@ -498,12 +497,12 @@ def main() -> int:
         assert len(outputs) == 3 and all(len(output.outputs[0].token_ids) == 3 for output in outputs)
         diagnostics = handle.worker_state().diagnostics
         assert diagnostics.loss_count == diagnostics.update_count == 6
-        assert diagnostics.active_lineages == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
+        assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
         again = handle.generate(["A second invocation"], greedy(3))
         assert len(again[0].outputs[0].token_ids) == 3
         final = handle.worker_state().diagnostics
         assert final.loss_count == final.update_count == 8
-        assert final.active_lineages == final.pending_state_releases == final.fallback_count == 0
+        assert final.active_lineages == final.pending_state_releases == 0
         trace = handle.trace_snapshot()
         assert trace.process_id == child and trace.host_task_times()
         assert all(event.phase is not TracePhase.TASK_FAILED for event in trace.events)
@@ -553,7 +552,7 @@ def main() -> int:
         assert not torch.equal(baseline.hidden, changed.hidden)
         diagnostics = reft.worker_state().diagnostics
         assert diagnostics.update_count == 1
-        assert diagnostics.inference_pins == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
+        assert diagnostics.inference_pins == diagnostics.pending_state_releases == 0
         assert not torch.cuda.is_initialized()
     finally:
         reft.close()

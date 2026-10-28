@@ -15,8 +15,7 @@ mod version_hazards;
 pub(crate) struct PlanBundle {
     pub(crate) semantic_graph: semantic_graph::SemanticGraph,
     pub(crate) timeline: semantic_graph::Timeline,
-    pub(crate) schedule_decision: scheduler::ScheduleDecision,
-    pub(crate) schedule_physical: scheduler::PhysicalPlan,
+    pub(crate) schedule: scheduler::ScheduleDecision,
     pub(crate) state_request: state_representation::StateRepresentationRequest,
     pub(crate) state_decision: state_representation::StateRepresentationDecision,
     pub(crate) state_physical: state_representation::StatePhysicalPlan,
@@ -35,11 +34,10 @@ impl PlanBundle {
             &self.state_decision,
             &self.state_physical,
         )?;
-        scheduler::validate_physical(
+        scheduler::validate_decision(
             &self.semantic_graph,
             &self.timeline,
-            &self.schedule_decision,
-            &self.schedule_physical,
+            &self.schedule,
             Some(&self.state_physical),
         )?;
         for state in &self.state_physical.representations {
@@ -91,19 +89,17 @@ fn compile_state_schedule(
     graph_json: &str,
     timeline_json: &str,
     request_json: &str,
-) -> PyResult<(String, String, String, String)> {
+) -> PyResult<(String, String, String)> {
     let compile = || -> Result<_, String> {
         let graph = semantic_graph::decode_graph(graph_json)?;
         let timeline = semantic_graph::decode_timeline(timeline_json)?;
         let request = state_representation::decode_request(request_json)?;
         let (decision, state, schedule) =
             state_representation::compile(&request, &graph, &timeline)?;
-        let physical = scheduler::project_physical(&schedule);
         Ok((
             semantic_graph::canonical_ascii_json(&decision)?,
             semantic_graph::canonical_ascii_json(&state)?,
             semantic_graph::canonical_ascii_json(&schedule)?,
-            semantic_graph::canonical_ascii_json(&physical)?,
         ))
     };
     compile().map_err(pyo3::exceptions::PyValueError::new_err)

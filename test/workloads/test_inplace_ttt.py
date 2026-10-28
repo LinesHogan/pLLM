@@ -144,7 +144,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     assert execution.retire(identities) == (latest, refs[1])
     diagnostics = execution.diagnostics()
     assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
-    assert (diagnostics.update_count, diagnostics.trained_rows, diagnostics.fallback_count) == (2, 4, 0)
+    assert (diagnostics.update_count, diagnostics.trained_rows) == (2, 4)
 
     # A request-scope low-rank overlay shares the same signed binding, pin and isolation rules.
     class LowRankOverlay(pllm.Workload):

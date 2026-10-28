@@ -100,7 +100,7 @@ from pllm.host import HostRuntimeFacts
 from pllm.workloads.dummy import DummyWorkload
 execution = pllm.make_llm(workload=DummyWorkload(),
     config=HostRuntimeFacts(torch.device('cpu')))
-assert execution.plan.fallback_count == 0 and not torch.cuda.is_initialized()
+assert not torch.cuda.is_initialized()
 print('isolated wheel: Rust layout codec executed')
 """,
             str(installed),

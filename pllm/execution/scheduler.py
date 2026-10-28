@@ -1,9 +1,9 @@
-"""Closed FFI for clean-room semantic scheduling, layout interning and physical lowering."""
+"""Rust scheduling and layout interning for workload compilation."""
 
 from __future__ import annotations
 
 from pllm import _core
-from pllm.contracts.semantic_graph import PhysicalPlan, ScheduleDecision, SchedulerTimeline, SemanticGraph
+from pllm.contracts.semantic_graph import ScheduleDecision, SchedulerTimeline, SemanticGraph
 from pllm.contracts.state_representation import (
     StatePhysicalPlan,
     StateRepresentationDecision,
@@ -17,15 +17,14 @@ def compile_state_schedule(
     graph: SemanticGraph,
     timeline: SchedulerTimeline,
     request: StateRepresentationRequest,
-) -> tuple[StateRepresentationDecision, StatePhysicalPlan, ScheduleDecision, PhysicalPlan]:
-    decision, state, schedule, physical = _core.compile_state_schedule(
+) -> tuple[StateRepresentationDecision, StatePhysicalPlan, ScheduleDecision]:
+    decision, state, schedule = _core.compile_state_schedule(
         encode_boundary(graph), encode_boundary(timeline), encode_boundary(request)
     )
     return (
         decode_boundary(decision, StateRepresentationDecision),
         decode_boundary(state, StatePhysicalPlan),
         decode_boundary(schedule, ScheduleDecision),
-        decode_boundary(physical, PhysicalPlan),
     )
 
 
@@ -45,24 +44,6 @@ def compile_schedule(
     )
 
 
-def lower_physical_plan(
-    graph: SemanticGraph,
-    timeline: SchedulerTimeline,
-    decision: ScheduleDecision,
-    *,
-    state: StatePhysicalPlan | None = None,
-) -> PhysicalPlan:
-    return decode_boundary(
-        _core.lower_physical_plan(
-            encode_boundary(graph),
-            encode_boundary(timeline),
-            encode_boundary(decision),
-            None if state is None else encode_boundary(state),
-        ),
-        PhysicalPlan,
-    )
-
-
 def intern_tensor_layouts(request: TensorLayoutRequest) -> TensorLayoutDecision:
     return decode_boundary(_core.intern_tensor_layouts(encode_boundary(request)), TensorLayoutDecision)
 
@@ -71,5 +52,4 @@ __all__ = [
     "compile_state_schedule",
     "intern_tensor_layouts",
     "compile_schedule",
-    "lower_physical_plan",
 ]

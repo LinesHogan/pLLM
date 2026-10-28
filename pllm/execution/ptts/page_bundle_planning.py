@@ -78,12 +78,12 @@ def compile_page_bundle_plan(
         ),
         candidates,
     )
-    decision, state_physical, schedule, physical = compile_state_schedule(graph, timeline, request)
+    decision, state_physical, schedule = compile_state_schedule(graph, timeline, request)
     if any(
         item.device_kind.value != device.type or item.device_ordinal != (device.index or 0) for item in decision.plans
     ):
         raise RuntimeError("Rust-selected state placement differs from mathematical specialization")
-    return PlanBundle(graph, timeline, schedule, physical, request, decision, state_physical, layouts, layout_decision)
+    return PlanBundle(graph, timeline, schedule, request, decision, state_physical, layouts, layout_decision)
 
 
 def page_stride_bytes(field: TensorFieldSpec) -> int:

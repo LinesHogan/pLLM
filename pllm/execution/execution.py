@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Generic, Protocol, TypeVar
 
-from pllm.contracts.semantic_graph import ImplementationId, PhysicalPlan
+from pllm.contracts.semantic_graph import ImplementationId, ScheduleDecision
 from pllm.execution.trace import ExecutionTrace
 
 ExecutionContextT = TypeVar("ExecutionContextT")
@@ -26,7 +26,7 @@ class TaskGraphImplementation(Protocol[TaskContextT, TaskResultT]):
 class TaskGraphExecution(Generic[ExecutionContextT, ExecutionResultT]):
     """Mechanically execute Rust-planned tasks by dense semantic task ID."""
 
-    plan: PhysicalPlan
+    plan: ScheduleDecision
     implementations: tuple[TaskGraphImplementation[ExecutionContextT, ExecutionResultT], ...]
     trace: ExecutionTrace
     release_values: Callable[[ExecutionContextT, tuple[int, ...]], None] | None = None

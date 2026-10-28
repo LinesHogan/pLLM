@@ -204,7 +204,7 @@ def bind_attachment_tasks(
     for role, symbol in roles:
         (physical,) = (
             task
-            for task in plan_bundle.schedule_physical.tasks
+            for task in plan_bundle.schedule.tasks
             if plan_bundle.semantic_graph.tasks[task.task_id].symbol == symbol
         )
         bindings.append(

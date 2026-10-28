@@ -25,7 +25,7 @@ from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.execution import TaskGraphExecution, TaskGraphImplementation
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
-from pllm.execution.scheduler import compile_schedule, lower_physical_plan
+from pllm.execution.scheduler import compile_schedule
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.trace import ExecutionTrace, TracePhase
 
@@ -229,11 +229,10 @@ class _Failed:
 class HostDiagnostics:
     transaction_count: int
     state_version: int
-    fallback_count: int
 
 
 class HostExecution(Generic[TransactionT, ContextT, SnapshotT, ResultT]):
-    """One receipt, rollback and completion owner for signed host task graphs."""
+    """One receipt, rollback and completion owner for Rust-planned host task graphs."""
 
     def __init__(
         self,
@@ -244,9 +243,8 @@ class HostExecution(Generic[TransactionT, ContextT, SnapshotT, ResultT]):
         device: torch.device,
     ) -> None:
         self.decision = compile_schedule(graph, timeline)
-        self.plan = lower_physical_plan(graph, timeline, self.decision)
-        self.trace = ExecutionTrace(self.plan)
-        self._runner = TaskGraphExecution(self.plan, implementations, self.trace)
+        self.trace = ExecutionTrace(self.decision)
+        self._runner = TaskGraphExecution(self.decision, implementations, self.trace)
         self._state = state_factory()
         self._device = device
         self._initialization = CudaStreamReadiness(torch.cuda.current_stream(device)) if device.type == "cuda" else None
@@ -319,7 +317,7 @@ class HostExecution(Generic[TransactionT, ContextT, SnapshotT, ResultT]):
             raise
 
     def diagnostics(self) -> HostDiagnostics:
-        return HostDiagnostics(self._transaction_count, self._state.version, self.plan.fallback_count)
+        return HostDiagnostics(self._transaction_count, self._state.version)
 
 
 class HostTransactionService(Protocol[RequestT_contra, TransactionT, ResultT]):

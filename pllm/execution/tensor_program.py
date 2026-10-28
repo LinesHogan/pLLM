@@ -223,7 +223,7 @@ class FunctionMath(Generic[I, D, R]):
         value = next(
             (
                 context.results[graph.tasks[task.task_id].symbol, output.name]
-                for task in reversed(context.arena.plan.schedule_physical.tasks)
+                for task in reversed(context.arena.plan.schedule.tasks)
                 for output in graph.tasks[task.task_id].outputs
                 if (graph.tasks[task.task_id].symbol, output.name) in context.results
                 and output.kind not in (SemanticOutputKind.TEMPORARY, SemanticOutputKind.HOST)
@@ -468,7 +468,7 @@ class TensorOperation(Generic[D]):
             if output.observations:
                 task = next(
                     task
-                    for task in context.arena.plan.schedule_physical.tasks
+                    for task in context.arena.plan.schedule.tasks
                     if task.implementation_id == self.implementation_id
                 )
                 for observation in output.observations:

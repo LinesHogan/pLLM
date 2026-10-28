@@ -281,16 +281,16 @@ def _measure_arm(
             arm.explicit,
             tuple(
                 (str(plan.semantic_graph.tasks[task.task_id].symbol), str(task.implementation_id))
-                for task in plan.schedule_physical.tasks
+                for task in plan.schedule.tasks
             ),
-            plan.schedule_decision.peak_memory_bytes,
+            plan.schedule.peak_memory_bytes,
             cpu_elapsed,
             after.state_usage,
         )
         assert (
             report.output_tokens == options.batch * options.sampling_n * options.tokens * options.rounds
             and (not setup.require_training or min(report.loss_count, report.update_count, report.trained_rows) > 0)
-            and not (after.inference_pins or after.pending_state_releases or after.fallback_count)
+            and not (after.inference_pins or after.pending_state_releases)
         )
         allocation_after = torch.cuda.memory_stats()
         footprint = _ProfileFootprint(

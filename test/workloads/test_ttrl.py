@@ -65,7 +65,7 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         )
         execution = make_llm(workload=workload, config=facts)
         plan = execution.arena.plan
-        peak = plan.schedule_decision.peak_memory_bytes
+        peak = plan.schedule.peak_memory_bytes
         with pytest.raises(ValueError):
             make_llm(workload=workload, config=replace(facts, memory_budget_bytes=peak - 1))
         execution = workload.declare_host(replace(facts, memory_budget_bytes=peak)).compile()

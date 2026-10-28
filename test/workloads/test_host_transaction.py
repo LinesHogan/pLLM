@@ -118,7 +118,6 @@ def test_typed_host_transaction_abort_requeue_and_postpublish_settlement(monkeyp
     assert result is not None and result.update.processed == 0
     assert result.update.state_version == 1
     assert execution.diagnostics().transaction_count == 2
-    assert execution.diagnostics().fallback_count == 0
     before = execution.trace.snapshot()
     assert before.schema_version == TRACE_SCHEMA_VERSION and before.dropped == 0
     assert before.pending_device_timings == 0 and not before.device_task_times()

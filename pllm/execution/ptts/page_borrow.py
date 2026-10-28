@@ -7,6 +7,7 @@ import torch
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_borrow import BorrowedResource
+from pllm.execution.codec import boundary_digest
 from pllm.execution.ptts.page_bundle import BorrowedPage, PagePin
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView, validate_readonly_views
 
@@ -22,13 +23,13 @@ class BorrowedStateRoot:
 
     def __init__(self, plan: PlanBundle, resource: str, ref: StateRef, pages: tuple[BorrowedPage, ...]) -> None:
         self.resource, self.ref, self.pages = resource, ref, pages
-        self.signature = plan.schedule_decision.signature
+        plan_digest = boundary_digest(plan)
         (layout,) = (entry.layout for entry in plan.tensor_layout_request.layouts if entry.resource == resource)
         if (
             not pages
             or len(pages) != len(layout.fields)
             or any(
-                page.descriptor.compilation_signature != self.signature
+                page.descriptor.compilation_signature != plan_digest
                 or page.descriptor.resource != resource
                 or page.descriptor.ref != ref
                 or page.descriptor.field_id != field.field_id

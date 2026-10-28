@@ -17,6 +17,7 @@ from pllm.config import ExecutionOptions, ModelConfig
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.contracts.state_ref import LineageId, StateRef, VersionId
 from pllm.contracts.tensor_layout import LayoutFieldId
+from pllm.execution.codec import boundary_digest
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle import BorrowedPage, PageFieldTransfer, PageSlot
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
@@ -56,7 +57,7 @@ def test_video_real_frame_math_and_signed_composition():
             lifetime.callback(receiver.close)
             # Received-page fixture only; actual receive_field is CUDA-only and tested below.
             descriptor = PageFieldTransfer(
-                plan.schedule_decision.signature, 1, ref, "features", LayoutFieldId(index), PageSlot(0, 0), 0
+                boundary_digest(plan), 1, ref, "features", LayoutFieldId(index), PageSlot(0, 0), 0
             )
             pages.append(BorrowedPage(descriptor, value, receiver))
         execution.admit(())
@@ -303,7 +304,7 @@ def observe_replay(*, versions):
     assert len([step for step, _ in calls if step == 0]) > 2
     diagnostics = holder["execution"].diagnostics()
     assert diagnostics.update_count == len(set(versions))
-    assert diagnostics.hold_count == len(versions) - len(set(versions)) and diagnostics.fallback_count == 0
+    assert diagnostics.hold_count == len(versions) - len(set(versions))
 
 
 def model_config():
@@ -374,12 +375,12 @@ def test_video_session_zero_copy_backpressure_and_ack_lifetime():
     workload = VideoWorkload(grid_size=2)
     with observe_model(workload):
         diagnostics, _ = run_video(workload, ("publish",) * 4, 4)
-    assert diagnostics.update_count == 4 and diagnostics.fallback_count == 0
+    assert diagnostics.update_count == 4
     config = replace(model_config(), execution=ExecutionOptions(allow_numerical_transforms=False))
     workload = RecirculatingVideo(grid_size=2, layer=1, alpha=0.6)
     with observe_replay(versions=(1, 1, 2, 2, 2)):
         diagnostics, _ = run_video(workload, ("publish", "missing", "publish"), 5, config)
-    assert diagnostics.update_count == 2 and diagnostics.hold_count == 3 and diagnostics.fallback_count == 0
+    assert diagnostics.update_count == 2 and diagnostics.hold_count == 3
 
 
 @pytest.mark.slow

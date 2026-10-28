@@ -1,6 +1,6 @@
 //! Semantic, plan, and backend-fact checks for attachment planning.
 
-use super::super::scheduler::PhysicalPlan;
+use super::super::scheduler::ScheduleDecision;
 use super::super::semantic_graph::{
     HiddenPhase as SemanticHiddenPhase, HiddenSite as SemanticHiddenSite, InputSource, OutputKind,
     SemanticGraph, SemanticTask, StateEffectKind, StateScope, Timeline,
@@ -631,7 +631,7 @@ fn validate_cross_binding(
     probe: &BackendPlacementProbe,
     graph: &SemanticGraph,
     timeline: &Timeline,
-    schedule: &PhysicalPlan,
+    schedule: &ScheduleDecision,
     state: &StatePhysicalPlan,
 ) -> Result<(), String> {
     validate_declaration(attachment, probe)?;
@@ -1159,7 +1159,7 @@ pub(crate) fn validate_attachment(attachment: &BackendAttachment) -> Result<(), 
         &attachment.probe,
         &plan.semantic_graph,
         &plan.timeline,
-        &plan.schedule_physical,
+        &plan.schedule,
         &plan.state_physical,
     )
 }

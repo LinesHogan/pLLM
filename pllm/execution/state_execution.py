@@ -20,7 +20,7 @@ from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
 from pllm.contracts.semantic_graph import (
     AnchorId,
     ImplementationId,
-    PhysicalPlan,
+    ScheduleDecision,
     TaskId,
     TaskSymbol,
 )
@@ -298,7 +298,6 @@ class StateDiagnostics:
     trained_rows: int
     completed_sampler_pins: int
     pending_state_releases: int
-    fallback_count: int
     state_usage: PageBundleUsage
     hold_count: int = 0
     last_hold: HeldInput | None = None
@@ -326,13 +325,11 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     ) -> None:
         self.arena, self.directory, self.math = arena, directory, math
         self.sampler_anchor_id = sampler_anchor_id
-        self.trace = ExecutionTrace(arena.plan.schedule_physical, on_export=on_export)
+        self.trace = ExecutionTrace(arena.plan.schedule, on_export=on_export)
         self._values = tuple(
             (task.symbol, output.name) for task in arena.plan.semantic_graph.tasks for output in task.outputs
         )
-        self._runner = TaskGraphExecution(
-            arena.plan.schedule_physical, implementations, self.trace, self._release_values
-        )
+        self._runner = TaskGraphExecution(arena.plan.schedule, implementations, self.trace, self._release_values)
         self._active: dict[int, StateTaskContext[DataT]] = {}
         self._next_invocation = 1
         self._loss_count = self._update_count = self._trained_rows = self._sampler_count = 0
@@ -405,8 +402,8 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                 raise
 
     @property
-    def plan(self) -> PhysicalPlan:
-        return self.arena.plan.schedule_physical
+    def plan(self) -> ScheduleDecision:
+        return self.arena.plan.schedule
 
     def _release_values(self, context: StateTaskContext[DataT], values: tuple[int, ...]) -> None:
         for value in values:
@@ -809,7 +806,6 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                 self._trained_rows + rows,
                 self._sampler_count,
                 self.arena.pending_pin_releases,
-                self.plan.fallback_count,
                 self.arena.usage(),
                 self._hold_count,
                 self._last_hold,

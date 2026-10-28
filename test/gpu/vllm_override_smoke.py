@@ -119,7 +119,7 @@ def main() -> None:
         execution.arena.collect_completed(wait=True)
         diagnostics = execution.diagnostics()
         assert diagnostics.loss_count == diagnostics.update_count == 4
-        assert diagnostics.inference_pins == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
+        assert diagnostics.inference_pins == diagnostics.pending_state_releases == 0
         assert len(observed) == 6 and min(observed[-2:]) > 0
         expected_hidden = {}
         native_sample = WorkloadModelRunner.sample

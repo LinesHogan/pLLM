@@ -25,7 +25,7 @@ from pllm.contracts.semantic_graph import AnchorId, StateEffectKind
 from pllm.contracts.state_ref import LineageId, StateRef, VersionId
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.backend_attachment import attachment_buffer_bytes, bind_backend_attachment
-from pllm.execution.codec import encode_boundary
+from pllm.execution.codec import boundary_digest, encode_boundary
 from pllm.execution.declaration import Dimensions, Field, When
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle import BorrowedPage, PageBundleArena, PageFieldTransfer, PageSlot
@@ -127,7 +127,7 @@ def received_features(plan, *, version=7, scale=1):
             peers.append(peer)
             # Deliberately bypass receive_field: CPU fixtures test roots/ACK ordering, not grant validation.
             descriptor = PageFieldTransfer(
-                plan.schedule_decision.signature, version, ref, "features", LayoutFieldId(i), PageSlot(0, 0), 0
+                boundary_digest(plan), version, ref, "features", LayoutFieldId(i), PageSlot(0, 0), 0
             )
             pages.append(BorrowedPage(descriptor, torch.full((2,), float(scale * (i + 1))), receiver))
         root = BorrowedStateRoot(plan, "features", ref, tuple(pages))

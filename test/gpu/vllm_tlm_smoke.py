@@ -55,7 +55,7 @@ def main() -> None:
         diagnostics = execution.diagnostics()
         assert diagnostics.update_count == diagnostics.loss_count == 1
         assert diagnostics.active_lineages == 1 and diagnostics.inference_pins == 0
-        assert diagnostics.pending_state_releases == diagnostics.fallback_count == 0
+        assert diagnostics.pending_state_releases == 0
         assert (handle.runner.require_session().updated_apply_count == 0) == (mode is TLMMode.ONLINE)
         (current,) = execution.directory.select(()).refs
         assert current.version_id == initial.version_id + 1
@@ -87,7 +87,7 @@ def main() -> None:
         assert tuple(execution.directory.select(()).refs) == (current,)
         assert diagnostics.update_count == 1 and diagnostics.trained_rows > 0
         assert handle.runner.require_session().updated_apply_count > 0
-        assert diagnostics.inference_pins == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
+        assert diagnostics.inference_pins == diagnostics.pending_state_releases == 0
         print(f"TLM {mode}: updates={diagnostics.update_count} qkv_oracle_checks={checks[0]}")
     finally:
         for hook in hooks:
