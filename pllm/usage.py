@@ -103,12 +103,6 @@ class Phase(Enum):
     AUTOMATIC = When.AUTOMATIC
 
 
-def _reject(condition: object, message: str, error: type[Exception] = ValueError) -> None:
-    """Reject an invalid authoring declaration with its specific error type."""
-    if condition:
-        raise error(message)
-
-
 class _Source:
     """An argument marker owns its graph input and derivative eligibility."""
 
@@ -208,8 +202,9 @@ class _Module(Parameter):
     def adapt(self, context: _Declaration) -> Callable[[torch.Tensor], object]:
         definition = context.state_definition(self.state, f"{self.state}: pllm.module needs a declared module state")
         factory, dimensions = definition.module, context.binding.dimensions
-        _reject(factory is None, f"{self.state}: pllm.module needs a state declared with module=", TypeError)
-        if factory is None or dimensions is None:
+        if factory is None:
+            raise TypeError(f"{self.state}: pllm.module needs a state declared with module=")
+        if dimensions is None:
             return _same  # declared without model dimensions: never invoked
         return partial(ModuleCall, skeleton(factory, dimensions), per_row=definition.scope is StateScope.REQUEST)
 
@@ -225,12 +220,11 @@ class Capture:
 
     def declare(self, state: str, update: State | None) -> LayoutFieldId:
         """Validate a memory publication against the training state's fields."""
-        _reject(update is None or self.state != state, "memory captures target the task's own training state")
+        if self.state != state:
+            raise ValueError("memory captures target the task's own training state")
         assert update is not None
-        _reject(
-            self.field not in {field.name for field in update.fields[update.optimizer_fields :]},
-            f"{self.field}: captures name a declared memory field",
-        )
+        if self.field not in {field.name for field in update.fields[update.optimizer_fields :]}:
+            raise ValueError(f"{self.field}: captures name a declared memory field")
         return update.field(self.field)
 
 
@@ -385,40 +379,33 @@ class InstanceState:
 
     def __post_init__(self) -> None:
         if self.module is not None:
-            _reject(
-                self.fields or self.shape is not None or self.initialize is not None or self.memory or self.feed,
-                "a module state takes its fields and initial values from the module; drop fields/shape/initialize",
-            )
+            if self.fields or self.shape is not None or self.initialize is not None or self.memory or self.feed:
+                raise ValueError(
+                    "a module state takes its fields and initial values from the module; drop fields/shape/initialize"
+                )
             object.__setattr__(self, "fields", {"parameters": parameter_count(self.module)})
-        _reject(
-            self.feed is not None
-            and (
-                self.scope is not StateScope.INSTANCE
-                or self.optimizer is not None
-                or self.initialize is not None
-                or self.memory
-                or self.imported
-            ),
-            "fed state needs InstanceState without an optimizer, initializer or memory fields",
-        )
-        _reject(
-            self.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64),
-            "optimizer state requires a supported floating dtype",
-        )
+        if self.feed is not None and (
+            self.scope is not StateScope.INSTANCE
+            or self.optimizer is not None
+            or self.initialize is not None
+            or self.memory
+            or self.imported
+        ):
+            raise ValueError("fed state needs InstanceState without an optimizer, initializer or memory fields")
+        if self.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+            raise ValueError("optimizer state requires a supported floating dtype")
         if self.shape is not None:
-            _reject(self.fields, "declare a single shape or named fields, not both")
+            if self.fields:
+                raise ValueError("declare a single shape or named fields, not both")
             object.__setattr__(self, "fields", {"value": self.shape})
-        _reject(not self.fields, "state requires a shape or named fields")
-        _reject(
-            self.memory and self.optimizer is None,
-            "memory fields ride on the training transition and require an optimizer",
-        )
-        _reject(set(self.memory) & set(self.fields), "memory fields duplicate a parameter field")
-        _reject(
-            any(type(shape) is Buffer for shape in self.memory.values()),
-            "memory fields require tensor shapes, not overlay buffers",
-            TypeError,
-        )
+        if not self.fields:
+            raise ValueError("state requires a shape or named fields")
+        if self.memory and self.optimizer is None:
+            raise ValueError("memory fields ride on the training transition and require an optimizer")
+        if set(self.memory) & set(self.fields):
+            raise ValueError("memory fields duplicate a parameter field")
+        if any(type(shape) is Buffer for shape in self.memory.values()):
+            raise TypeError("memory fields require tensor shapes, not overlay buffers")
 
     scope: ClassVar[StateScope] = StateScope.INSTANCE
 
@@ -432,7 +419,8 @@ class InstanceState:
         if name in context.overlay_states or name in context.states:
             return
         if self.feed is not None:
-            _reject(context.binding.feeds, "declare one fed state per workload")
+            if context.binding.feeds:
+                raise ValueError("declare one fed state per workload")
             context.binding.feeds = (FeedBinding(name, self.feed, tuple(self.fields)),)
         shapes: dict[str, Shape] = {}
         for key, spec in self.fields.items():
@@ -493,16 +481,16 @@ class Activation:
     on_missing: MissingPolicy = MissingPolicy.STOP
 
     def __post_init__(self) -> None:
-        _reject(
-            self.decode is DecodeWindow.NONE
-            and (self.decode_refresh is not DecodeRefresh.INHERIT or self.on_missing is not MissingPolicy.STOP),
-            "decode window is off; refresh and missing policies require decode rows",
-        )
+        if self.decode is DecodeWindow.NONE and (
+            self.decode_refresh is not DecodeRefresh.INHERIT or self.on_missing is not MissingPolicy.STOP
+        ):
+            raise ValueError("decode window is off; refresh and missing policies require decode rows")
 
     def declare(self, context: _Declaration) -> None:
         """Read local state, preserving replay/HOLD publication dependencies when declared."""
         definition = context.state_definition(self.state, "Activation needs a declared state")
-        _reject(definition.feed is not None, "Activation needs local state written from fed inputs")
+        if definition.feed is not None:
+            raise ValueError("Activation needs local state written from fed inputs")
         state = context.states[self.state]
         context.binding.activation_patch(
             state,
@@ -550,11 +538,10 @@ def _frozen(initialize: Initializer | None) -> Initializer | None:
 
 
 def _buffers(state: InstanceState) -> dict[str, Buffer]:
-    _reject(
-        state.optimizer is not None,
-        "buffer effects update their state themselves; drop the optimizer",
-    )
-    _reject(state.alignment != 16, "buffer effect layouts use their original target alignment")
+    if state.optimizer is not None:
+        raise ValueError("buffer effects update their state themselves; drop the optimizer")
+    if state.alignment != 16:
+        raise ValueError("buffer effect layouts use their original target alignment")
     buffers: dict[str, Buffer] = {}
     for key, value in state.fields.items():
         match value:
@@ -601,16 +588,16 @@ class _Write(_Effect):
     def declare(self, operation: _Operation) -> None:
         context = operation.context
         definition = context.state_definition(self.state, "write needs a declared state")
-        _reject(
+        if (
             definition.feed is not None
             or self.state in context.writes
             or not self.fields
             or len(set(self.fields)) != len(self.fields)
             or any((self.state, key) not in context.parameters for key in self.fields)
             or operation.gradient is not None
-            or operation.rows,
-            "write needs one producer, distinct declared fields and no gradient or row mask",
-        )
+            or operation.rows
+        ):
+            raise ValueError("write needs one producer, distinct declared fields and no gradient or row mask")
         context.definitions.append((operation.name, fingerprint(self)))
         call = operation.tensor()
         state = context.states[self.state]
@@ -685,9 +672,8 @@ class _Train(_Effect):
                     optimizer,
                 )
             case _:
-                _reject(
-                    self.reset or self.steps != 1, "multi-step/reset training requires explicit SGD batch parameters"
-                )
+                if self.reset or self.steps != 1:
+                    raise ValueError("multi-step/reset training requires explicit SGD batch parameters")
                 operation.context.train(operation.tensor(arguments, captures), self.state)
 
     def weighted(
@@ -699,22 +685,26 @@ class _Train(_Effect):
         optimizer: SGD,
     ) -> None:
         """Declare the batch transition, including its reset and input bindings."""
-        _reject(captures, "SGD batch training manages its own state writes")
-        _reject(
+        if captures:
+            raise ValueError("SGD batch training manages its own state writes")
+        if (
             operation.gradient is not None
             or operation.rows
             or self.update
             or not self.reset
             or self.reduction != "weighted_state_mean_then_mean"
-            or operation.phase is not Phase.AFTER_SAMPLE,
-            "SGD batch training requires reset, weighted reduction and AFTER_SAMPLE without inference-row selectors",
-        )
+            or operation.phase is not Phase.AFTER_SAMPLE
+        ):
+            raise ValueError(
+                "SGD batch training requires reset, weighted reduction and AFTER_SAMPLE without inference-row selectors"
+            )
         context = operation.context
         sources = {key: source.batch(self.state, definition) for key, source in arguments.items()}
         reset = context.method(self.reset)
         identity = boundary_digest(fingerprint(operation.function), fingerprint(reset), sources, self)
         context.definitions.append((operation.name, identity))
-        _reject(context.training is not None, "tensor sampler attachment requires one training operation")
+        if context.training is not None:
+            raise ValueError("tensor sampler attachment requires one training operation")
         context.training = (
             context.binding.weighted_train(
                 operation.name,
@@ -741,7 +731,8 @@ class _Sampler(_Effect):
         """Zero-strength guidance declares no computation or sampler attachment."""
         if self.beta is None or _setting(self.beta, operation.context.owner, float) != 0:
             call = operation.tensor()
-            _reject(operation.context.prediction is not None, "tensor sampler attachment requires one logits operation")
+            if operation.context.prediction is not None:
+                raise ValueError("tensor sampler attachment requires one logits operation")
             operation.context.prediction = call, self
 
 
@@ -757,24 +748,18 @@ class _Gradient:
         parameters = {
             key: parameter for key, source in arguments.items() if (parameter := _typed(source, Parameter)) is not None
         }
-        _reject(self.parameters and not parameters, "parameter gradients require declared Parameter inputs")
-        _reject(
-            self.input_rows and not self.inputs or self.parameter_rows and not self.parameters,
-            "gradient row selectors require their declared derivative edges",
-        )
-        _reject(
-            len(set(self.inputs)) != len(self.inputs)
-            or any(key not in arguments or key in parameters for key in self.inputs),
-            "input gradients must name distinct nonparameter inputs",
-        )
-        _reject(
-            any(not arguments[key].differentiable for key in self.inputs),
-            "indices, versions and drawn tokens are nondifferentiable inputs",
-        )
-        _reject(
-            operation.effect.bounded and (self.inputs or self.parameters or operation.rows),
-            "bounded host exports use their own row limits and are gradient boundaries",
-        )
+        if self.parameters and not parameters:
+            raise ValueError("parameter gradients require declared Parameter inputs")
+        if self.input_rows and not self.inputs or self.parameter_rows and not self.parameters:
+            raise ValueError("gradient row selectors require their declared derivative edges")
+        if len(set(self.inputs)) != len(self.inputs) or any(
+            key not in arguments or key in parameters for key in self.inputs
+        ):
+            raise ValueError("input gradients must name distinct nonparameter inputs")
+        if any(not arguments[key].differentiable for key in self.inputs):
+            raise ValueError("indices, versions and drawn tokens are nondifferentiable inputs")
+        if operation.effect.bounded and (self.inputs or self.parameters or operation.rows):
+            raise ValueError("bounded host exports use their own row limits and are gradient boundaries")
         math = (
             MathContract(
                 input_gradients=self.inputs,
@@ -834,19 +819,18 @@ class _Overlay(_Effect):
 
     def declare(self, operation: _Operation) -> None:
         """Declare a request buffer transition and its parameter overlay attachment."""
-        _reject(
-            operation.gradient is not None or operation.rows,
-            "ordinary overlays update private buffers without cross-operation autograd",
-        )
-        _reject(operation.phase is not Phase.MODEL_UPDATE, "parameter overlays require MODEL_UPDATE")
+        if operation.gradient is not None or operation.rows:
+            raise ValueError("ordinary overlays update private buffers without cross-operation autograd")
+        if operation.phase is not Phase.MODEL_UPDATE:
+            raise ValueError("parameter overlays require MODEL_UPDATE")
         context = operation.context
         definition = context.state_definition(self.state, "parameter overlays require a declared request state")
-        _reject(definition.scope is not StateScope.REQUEST, "parameter overlays require a declared request state")
+        if definition.scope is not StateScope.REQUEST:
+            raise ValueError("parameter overlays require a declared request state")
         buffers = _buffers(definition)
         bindings = {key: source.overlay(self.state, buffers) for key, source in _arguments(operation.function).items()}
-        _reject(
-            set(buffers) & {source.value for source in Operand}, "overlay buffers conflict with reserved operand names"
-        )
+        if set(buffers) & {source.value for source in Operand}:
+            raise ValueError("overlay buffers conflict with reserved operand names")
         targets, operator, scale = (
             _targets(_setting(self.targets, context.owner, tuple)),
             _setting(self.operator, context.owner, ParameterOverlayOperator),
@@ -928,7 +912,8 @@ def export(
     overflow: Literal["drop", "block"] = "drop",
 ) -> Callable[[F], F]:
     """Deliver bounded observations to on_export; block only when explicitly requested."""
-    _reject(overflow not in ("drop", "block"), "export overflow must be 'drop' or 'block'")
+    if overflow not in ("drop", "block"):
+        raise ValueError("export overflow must be 'drop' or 'block'")
     return _mark(effect=_Export(name, every, max_rows, max_cols, enabled, overflow))
 
 
@@ -967,11 +952,8 @@ def _setting(value: C | Config, config: object, expected: type[C]) -> C:
 
 def _targets(value: tuple[object, ...]) -> tuple[ParameterTarget, ...]:
     targets = tuple(target for item in value if (target := _typed(item, ParameterTarget)) is not None)
-    _reject(
-        len(targets) != len(value),
-        "overlay targets require typed parameter targets",
-        TypeError,
-    )
+    if len(targets) != len(value):
+        raise TypeError("overlay targets require typed parameter targets")
     return targets
 
 
@@ -982,10 +964,10 @@ def layer_route(*, tokens: Tokens = "all", over: Over = "token") -> Callable[[F]
     packs each request's contiguous scheduled tokens into [M, H] hidden tensors;
     position and generated flags have shape [M, 1]. Spans cannot load predecessors.
     """
-    _reject(
-        tokens not in ("prefill", "decode", "all") or over not in ("token", "span"),
-        'set layer_route(tokens="prefill" | "decode" | "all", over="token" | "span")',
-    )
+    if tokens not in ("prefill", "decode", "all"):
+        raise ValueError('set layer_route(tokens=) to "prefill", "decode" or "all"')
+    if over not in ("token", "span"):
+        raise ValueError('set layer_route(over=) to "token" or "span"')
     return _mark(tokens=tokens, over=over)
 
 
@@ -1046,7 +1028,8 @@ class _Operation:
         sources, captures = _arguments(self.function), dict[str, Capture]()
         for key, source in sources.items():
             if (captured := _typed(source, _Captured)) is not None:
-                _reject(not self.effect.training, f"{key}: only training operations capture inputs into memory")
+                if not self.effect.training:
+                    raise ValueError(f"{key}: only training operations capture inputs into memory")
                 sources[key], captures[key] = captured.source, captured.capture
         return sources, captures
 
@@ -1131,7 +1114,6 @@ class _Operation:
                     },
                 )(_Effect().results(_invoke(freeze(selector), {key: key for key in selected_args})))
             key = f"__{domain}"
-            _reject(key in inputs, f"{key} is reserved for a row-domain input")
             inputs[key] = TaskResultInputSource(selectors[method].symbol, "value")
             math = replace(math, **{domain: key})
         return math
@@ -1218,20 +1200,20 @@ class _Declaration:
             return
         markers = vars(function)
         if (tokens := markers.get("__pllm_tokens__")) is not None:
-            _reject(
-                tuple(signature(function).parameters) != ("self", "layers")
-                or any(
-                    markers.get(f"__pllm_{marker}__") is not None for marker in ("phase", "effect", "gradient", "rows")
-                ),
-                "layer_route requires (self, layers) and no stacked markers; use layers.save inside the route instead of @write",
-            )
+            if tuple(signature(function).parameters) != ("self", "layers") or any(
+                markers.get(f"__pllm_{marker}__") is not None for marker in ("phase", "effect", "gradient", "rows")
+            ):
+                raise ValueError(
+                    "layer_route requires (self, layers) and no stacked markers; use layers.save inside the route instead of @write"
+                )
             overlap = {
                 role
                 for _, selected, _ in self.routes
                 for role in ("prefill", "decode")
                 if selected in (role, "all") and tokens in (role, "all")
             }
-            _reject(overlap, f"layer_route tokens overlap: {', '.join(sorted(overlap))}")
+            if overlap:
+                raise ValueError(f"layer_route tokens overlap: {', '.join(sorted(overlap))}")
             self.routes.append((name, tokens, markers["__pllm_over__"]))
             seeds.append(function)
             return
@@ -1250,7 +1232,6 @@ class _Declaration:
             self.overlay_states.add(overlay.state)
         phase = phase or effect.phase or Phase.AFTER_SAMPLE
         seeds.append(function)
-        _reject(rows is None, "operation row selector must name a method", TypeError)
         assert rows is not None
         self.operations.append(_Operation(self, name, phase, effect, gradient, rows))
 
@@ -1271,8 +1252,8 @@ class _Declaration:
 
     def state_definition(self, name: str, error: str) -> InstanceState:
         definition = _typed(self.values.get(name), InstanceState)
-        _reject(definition is None, error)
-        assert definition is not None
+        if definition is None:
+            raise ValueError(error)
         return definition
 
     def allocate_buffers(self, name: str, definition: InstanceState) -> None:
@@ -1285,7 +1266,8 @@ class _Declaration:
             for value in self.values.values()
             if (consumer := _typed(value, Overlay)) is not None and consumer.state == name
         )
-        _reject(len(consumers) > 1, "a state needs one consistent target layout")
+        if len(consumers) > 1:
+            raise ValueError("a state needs one consistent target layout")
         if consumers:
             (consumer,) = consumers
             check_overlay_fields(buffers, consumer.applied_fields, consumer.targets, consumer.operator, consumer.scale)
@@ -1302,11 +1284,11 @@ class _Declaration:
         shapes = {field.name: field.shape for field in fields}
         if definition.optimizer is not None:
             model = self.binding.dimensions
-            _reject(
+            if (
                 model is not None
-                and len({part.dtype(model) if callable(part.dtype) else part.dtype for part in fields}) != 1,
-                "optimizer buffers must share one dtype",
-            )
+                and len({part.dtype(model) if callable(part.dtype) else part.dtype for part in fields}) != 1
+            ):
+                raise ValueError("optimizer buffers must share one dtype")
             dtype = fields[0].dtype
             state, ports = self.binding.parameters(
                 name,
@@ -1370,22 +1352,21 @@ class _Declaration:
             for name, value in sorted(self.values.items())
             if (pos := _typed(value, PositionState)) is not None
         )
-        _reject(bool(states) and not self.routes, "PositionState requires layers.load/save inside a layer_route")
+        if states and not self.routes:
+            raise ValueError("PositionState requires layers.load/save inside a layer_route")
         return states
 
     def train(self, call: Call, state: str) -> None:
-        _reject(
-            self.training is not None or state in self.writes,
-            "training needs one optimizer sink without another state producer",
-        )
+        if self.training is not None or state in self.writes:
+            raise ValueError("training needs one optimizer sink without another state producer")
         self.training = call, self.states[state]
 
     def attach_training(self) -> None:
         """Validate gradients and pair the single prediction and training operations."""
         self.binding.validate_gradients(None if self.training is None else self.training[0])
         if self.prediction is not None:
-            _reject(self.training is None, "logits attachment requires a training operation")
-            assert self.training is not None
+            if self.training is None:
+                raise ValueError("logits attachment requires a training operation")
             call, sampler = self.prediction
             self.binding.logits(
                 call,
@@ -1399,7 +1380,8 @@ class _Declaration:
     def sign_composition(self) -> None:
         """Validate composed effects and sign ordered definitions and owner values."""
         b = self.binding
-        _reject(len(b.imports) > 1, "StateTensorUpdate supplies one imported resource per workload")
+        if len(b.imports) > 1:
+            raise ValueError("StateTensorUpdate supplies one imported resource per workload")
         if not b.graph.tasks and b.attachment is not None:
             state = self.states[b.attachment.state_resource]
             b.compute(
@@ -1412,18 +1394,14 @@ class _Declaration:
         if self.routes:
             attachment = b.attachment
             composed = attachment is not None and (attachment.activation_bindings or attachment.overlay_bindings)
-            _reject(
-                not composed and (len(b.graph.tasks) != 1 or b.graph.states),
-                "layer_route requires a standalone model effect or Activation composition",
-            )
-        _reject(
-            any(
-                name not in {state.resource for state in b.graph.states}
-                for name, value in self.values.items()
-                if _typed(value, InstanceState) is not None
-            ),
-            "state buffers require an overlay effect; unused state is not allocated",
-        )
+            if not composed and (len(b.graph.tasks) != 1 or b.graph.states):
+                raise ValueError("layer_route requires a standalone model effect or Activation composition")
+        if any(
+            name not in {state.resource for state in b.graph.states}
+            for name, value in self.values.items()
+            if _typed(value, InstanceState) is not None
+        ):
+            raise ValueError("state buffers require an overlay effect; unused state is not allocated")
 
         frozen = {
             name
@@ -1519,12 +1497,12 @@ class Workload(
                 for task in b.graph.tasks
             ),
         )
-        _reject(
+        if (
             facts is not None
             and b.overlay_targets
-            and tuple(target.target for target in facts.probe.targets) != b.overlay_targets,
-            "overlay targets differ from backend specialization",
-        )
+            and tuple(target.target for target in facts.probe.targets) != b.overlay_targets
+        ):
+            raise ValueError("overlay targets differ from backend specialization")
         return b
 
     def backend_requirements(self) -> BackendRequirements:
@@ -1585,14 +1563,10 @@ class Workload(
         row_limit = min(limits) if limits and type(self).operations is Workload.operations else None
 
         def rows(value: TensorStepInput) -> tuple[PackedPhaseRow, ...]:
-            _reject(
-                row_limit is not None and len(value.rows.latest_decode_rows) > row_limit,
-                "operation rows exceed the signed workspace envelope",
-            )
-            _reject(
-                b.probe is not None and value.rows.total_rows > b.probe.max_packed_rows,
-                "packed input exceeds the signed backend row capacity",
-            )
+            if row_limit is not None and len(value.rows.latest_decode_rows) > row_limit:
+                raise ValueError("operation rows exceed the signed workspace envelope")
+            if b.probe is not None and value.rows.total_rows > b.probe.max_packed_rows:
+                raise ValueError("packed input exceeds the signed backend row capacity")
             if b.attachment is not None and (
                 b.attachment.activation_bindings
                 or any(task.replay is not None for task in b.graph.tasks)
@@ -1627,10 +1601,8 @@ class Workload(
     ) -> MathBinding[TensorStepInput, TensorFrame, TensorOutput]:
         owner = _snapshot(self)
         b = owner.declaration(facts)
-        _reject(
-            b.graph != plan.semantic_graph or b.layouts != plan.tensor_layout_request,
-            "tensor mathematics differ from the original signed declaration",
-        )
+        if b.graph != plan.semantic_graph or b.layouts != plan.tensor_layout_request:
+            raise ValueError("tensor mathematics differ from the original signed declaration")
         return owner.operations(facts, plan, b)
 
     def specialize(self, facts: BackendCompileFacts, options: ExecutionOptions) -> BackendCompileFacts:
@@ -1644,7 +1616,8 @@ class Workload(
 
     def resource_facts(self, facts: BackendCompileFacts, options: ExecutionOptions) -> SchedulerTimeline:
         """Reserve ordinary tensor scratch and each requested graph's private pool."""
-        _reject(options.explicit_math, "this workload has no explicit tensor implementation")
+        if options.explicit_math:
+            raise ValueError("this workload has no explicit tensor implementation")
         with FakeTensorMode():
             binding = self.declaration(facts)
         timeline = derive_resources(binding, facts, options)
@@ -1663,7 +1636,6 @@ class Workload(
     def implementations(
         self, operation: str, resources: tuple[TaskResourceFact, ...], *, explicit_math: bool = False
     ) -> tuple[TaskImplementationSpec, ...]:
-        _reject(explicit_math, "this workload has no explicit tensor implementation")
         if any(fact.task == operation and fact.resident_bytes for fact in resources):
             return (native(f"python.cuda_graph:{self.name}:{operation}@1", "compute/cuda_graph@1"),)
         return ()
@@ -1673,15 +1645,15 @@ class Workload(
     ) -> MathBinding[TensorStepInput, TensorFrame, TensorOutput]:
         if plan.timeline.task_resources and type(self).operations is Workload.operations:
             b.configure_steps(facts)
-            _reject(
-                any(
-                    task.lane == "side"
-                    and plan.semantic_graph.tasks[task.task_id].symbol in b.tensor_tasks
-                    and not b.operations[plan.semantic_graph.tasks[task.task_id].symbol].resident(1)
-                    for task in plan.schedule_physical.tasks
-                ),
-                "side tensor tasks need fixed row inputs; declare row inputs or move the task before the model",
-            )
+            if any(
+                task.lane == "side"
+                and plan.semantic_graph.tasks[task.task_id].symbol in b.tensor_tasks
+                and not b.operations[plan.semantic_graph.tasks[task.task_id].symbol].resident(1)
+                for task in plan.schedule_physical.tasks
+            ):
+                raise ValueError(
+                    "side tensor tasks need fixed row inputs; declare row inputs or move the task before the model"
+                )
         return MathBinding(
             self._functions(b, facts.device, facts.initialization_seed),
             b.bind_all(plan, model_probe=facts.probe),
@@ -1698,7 +1670,8 @@ class Workload(
             host=True,
         )
         self._build(b)
-        _reject(b.graph.states, "ordinary host tensor authoring currently supports stateless observations")
+        if b.graph.states:
+            raise ValueError("ordinary host tensor authoring currently supports stateless observations")
         return TensorHostBinding(
             b.graph,
             b.layouts,
