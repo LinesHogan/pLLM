@@ -49,7 +49,7 @@ def binding_case(*, alias=False, write_failure=False, runtime=False, missing=Non
         b, "features", {name: (2,) for name in ("qp", "residual", "mv", "segmentation")}, optimizer=None
     )
     encoded = declare_tensor(b, "encode", inputs=ports, when=When.BEFORE_MODEL)(
-        lambda values: (values["qp"] if alias else sum(values.values()),)
+        lambda **values: values["qp"] if alias else sum(values.values())
     )
     inject = b.state("inject", (Field("delta", (2,)),))
 

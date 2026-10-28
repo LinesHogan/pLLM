@@ -77,7 +77,8 @@ def declare_parameter_overlay(
     keys: tuple[RequestKeyField, ...],
     phases: tuple[HiddenPhase, ...],
     identity: str,
-    function: Callable[[Tensors], TensorUpdate],
+    function: Callable[..., TensorUpdate],
+    arguments: Mapping[str, str],
     visibility: Visibility,
     equations_digest: str,
 ) -> None:
@@ -137,7 +138,7 @@ def declare_parameter_overlay(
         0,
         "carry" if visibility == Exact() else "transition",
     )
-    math = OverlayTransition(tuple(buffers), targets, phases, apply, function, source)
+    math = OverlayTransition(tuple(buffers), targets, phases, apply, function, arguments, source)
     b.overlay_math = math
     transition = b.compute(
         name,
@@ -209,7 +210,7 @@ def write_result(b: TensorBinding, source: Call, state: State, fields: tuple[str
 
 def _write_task(b: TensorBinding, update: Call, writer: FieldWriter) -> None:
     b.tensor_tasks[update.symbol] = TensorTask(
-        update.symbol, lambda values: (), {}, {}, MathContract(), (), {}, writer.phase, writer.resource, writer
+        update.symbol, lambda: (), {}, {}, MathContract(), (), {}, writer.phase, writer.resource, writer
     )
 
 

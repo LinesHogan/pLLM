@@ -41,7 +41,6 @@ from pllm.contracts.semantic_graph import (
     MathContract,
     SchedulerTimeline,
     SemanticGraph,
-    SemanticInputSource,
     SemanticOutputKind,
     StateEffectKind,
     StateScope,
@@ -99,7 +98,16 @@ from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.step_input import TensorStepInput
 from pllm.execution.task_memory import derive_resources
 from pllm.execution.tensor_binding import TensorBinding, TensorOutput as TensorOutput
-from pllm.execution.tensor_frame import TensorFrame, TensorPort, Tensors, TensorUpdate as TensorUpdate
+from pllm.execution.tensor_frame import (
+    TensorFrame,
+    TensorPort,
+    Tensors,
+    TensorUpdate as TensorUpdate,
+    feedback_port,
+    hidden_port,
+    result_port,
+    samples_port,
+)
 from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots, TaskOutput
 from pllm.execution.tensor_task import TensorExport
 from pllm.execution.token_program import Over, Tokens
@@ -125,7 +133,7 @@ class _Source:
 
     differentiable: ClassVar[bool] = True
 
-    def port(self, context: _Declaration) -> SemanticInputSource | TensorPort:
+    def port(self, context: _Declaration) -> TensorPort:
         raise TypeError(f"unsupported tensor source: {type(self).__name__}")
 
     def overlay(self, state: str, buffers: Mapping[str, Buffer]) -> str:
@@ -165,8 +173,8 @@ class Hidden(_Source):
         """Resolve the model dependency without building a tensor binding."""
         return HiddenInputSource(_setting(self.layer, owner, int), self.site, self.phase)
 
-    def port(self, context: _Declaration) -> SemanticInputSource:
-        return self.resolve(context.owner)
+    def port(self, context: _Declaration) -> TensorPort:
+        return hidden_port(self.resolve(context.owner))
 
 
 @dataclass(frozen=True)
@@ -175,10 +183,10 @@ class Samples(_Source):
 
     differentiable: ClassVar[bool] = False
 
-    def port(self, context: _Declaration) -> SemanticInputSource:
+    def port(self, context: _Declaration) -> TensorPort:
         if self.limit is not None:
             context.binding.sample_limit = _setting(self.limit, context.owner, int)
-        return context.binding.sampler_rows()
+        return samples_port(context.binding.sampler_rows())
 
 
 @dataclass(frozen=True)
@@ -195,7 +203,7 @@ class Parameter(_Source):
     field: str
     per_row: bool = False
 
-    def port(self, context: _Declaration) -> SemanticInputSource | TensorPort:
+    def port(self, context: _Declaration) -> TensorPort:
         parameter = context.parameters[self.state, self.field]
         return parameter_rows(parameter) if self.per_row else parameter
 
@@ -217,6 +225,9 @@ class _Module(Parameter):
     """A module state, handed to the method as a callable with the module's interface."""
 
     field: str = "parameters"
+
+    def port(self, context: _Declaration) -> TensorPort:
+        return replace(super().port(context), adapt=self.adapt(context))
 
     def adapt(self, context: _Declaration) -> Callable[[torch.Tensor], object]:
         definition = context.state_definition(self.state, f"{self.state}: pllm.module needs a declared module state")
@@ -269,14 +280,14 @@ class StateVersion(_Source):
 class Result(_Source):
     operation: str
 
-    def port(self, context: _Declaration) -> SemanticInputSource:
-        return TaskResultInputSource(TaskSymbol(self.operation), "value")
+    def port(self, context: _Declaration) -> TensorPort:
+        return result_port(TaskResultInputSource(TaskSymbol(self.operation), "value"))
 
 
 @dataclass(frozen=True)
 class BaseLogits(_Source):
-    def port(self, context: _Declaration) -> SemanticInputSource:
-        return context.binding.feedback()
+    def port(self, context: _Declaration) -> TensorPort:
+        return feedback_port("base_logits")
 
 
 @dataclass(frozen=True)
@@ -563,6 +574,7 @@ class _Effect:
 
     training: ClassVar[bool] = False
     bounded: ClassVar[bool] = False
+    tuple_output: ClassVar[bool] = False
     # The phase the effect runs in when no `@pllm.on` names one; None means the author must name it.
     phase: ClassVar[Phase | None] = None
 
@@ -573,10 +585,6 @@ class _Effect:
     def declare(self, operation: _Operation) -> None:
         operation.tensor()
 
-    def results(self, function: Callable[[Tensors], Any]) -> Callable[[Tensors], tuple[torch.Tensor, ...]]:
-        """Ordinary tensor methods declare a single result."""
-        return lambda inputs: (function(inputs),)
-
     @property
     def outputs(self) -> tuple[str, ...]:
         return ("value",)
@@ -584,6 +592,8 @@ class _Effect:
 
 @dataclass(frozen=True, kw_only=True)
 class _Write(_Effect):
+    tuple_output: ClassVar[bool] = True
+
     state: str
     fields: tuple[str, ...]
 
@@ -608,10 +618,6 @@ class _Write(_Effect):
             update,
             context.binding.publish(update, state, when=operation.phase.value, name=f"{self.state}.publish"),
         )
-
-    def results(self, function: Callable[[Tensors], Any]) -> Callable[[Tensors], tuple[torch.Tensor, ...]]:
-        """Write methods already return their declared tuple."""
-        return function
 
     @property
     def outputs(self) -> tuple[str, ...]:
@@ -739,7 +745,7 @@ class _Train(_Effect):
                 optimizer=optimizer,
                 steps=_setting(self.steps, context.owner, int),
                 reset=freeze(reset),
-                function=_invoke(freeze(operation.function), {key: key for key in sources}),
+                function=freeze(operation.function),
                 arguments=sources,
             ),
             context.states[self.state],
@@ -878,7 +884,8 @@ class _Overlay(_Effect):
                 if _setting(enabled, context.owner, bool)
             ),
             identity=f"python:{identity}",
-            function=_invoke(freeze(operation.function), bindings),
+            function=freeze(operation.function),
+            arguments=bindings,
             visibility=visibility,
             equations_digest=boundary_digest(context.definitions, context.bindings),
         )
@@ -1014,17 +1021,6 @@ def _arguments(function: Callable[..., torch.Tensor | tuple[torch.Tensor, ...] |
     return result
 
 
-def _invoke(
-    function: Callable[..., C],
-    bindings: Mapping[str, str],
-    adapters: Mapping[str, Callable[[torch.Tensor], object]] = {},
-) -> Callable[[Tensors], C]:
-    def invoke(inputs: Tensors) -> C:
-        return function(**{key: adapters.get(key, _same)(inputs[source]) for key, source in bindings.items()})
-
-    return invoke
-
-
 @dataclass
 class _Operation:
     """A reflected method, with marker types checked once at the boundary."""
@@ -1091,21 +1087,14 @@ class _Operation:
             math=math,
             captures=writes,
             outputs=effect.outputs,
+            tuple_output=effect.tuple_output,
             effect=update_kind,
             output_kind=output_kind,
             result_schema=result_schema,
             export=export,
             sampler_stage=sampler_stage,
             sampler_beta=sampler_beta,
-        )(
-            effect.results(
-                _invoke(
-                    freeze(self.function),
-                    {key: key for key in arguments},
-                    {key: source.adapt(context) for key, source in arguments.items()},
-                )
-            )
-        )
+        )(freeze(self.function))
 
     @property
     def domains(self) -> dict[str, str]:
@@ -1121,7 +1110,7 @@ class _Operation:
     def selectors(
         self,
         arguments: dict[str, _Source],
-        inputs: dict[str, SemanticInputSource | TensorPort],
+        inputs: dict[str, TensorPort],
         math: MathContract,
     ) -> MathContract:
         """Declare each selector once and connect its row-domain result; selectors read their own inputs."""
@@ -1143,9 +1132,9 @@ class _Operation:
                         key: inputs[key] if arguments.get(key) == source else source.port(self.context)
                         for key, source in selected_args.items()
                     },
-                )(_Effect().results(_invoke(freeze(selector), {key: key for key in selected_args})))
+                )(freeze(selector))
             key = f"__{domain}"
-            inputs[key] = TaskResultInputSource(selectors[method].symbol, "value")
+            inputs[key] = result_port(TaskResultInputSource(selectors[method].symbol, "value"))
             math = replace(math, **{domain: key})
         return math
 
@@ -1193,7 +1182,7 @@ class _Declaration:
     positions: tuple[tuple[str, float], ...] = ()
     overlay_states: set[str] = field(default_factory=lambda: set[str]())
     states: dict[str, State] = field(default_factory=lambda: {})
-    parameters: dict[tuple[str, str], SemanticInputSource | TensorPort] = field(default_factory=lambda: {})
+    parameters: dict[tuple[str, str], TensorPort] = field(default_factory=lambda: {})
     writes: dict[str, tuple[Call, Call]] = field(default_factory=lambda: {})
     prediction: tuple[Call, _Sampler] | None = None
     training: tuple[Call, State] | None = None

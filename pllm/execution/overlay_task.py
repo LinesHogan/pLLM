@@ -75,7 +75,8 @@ class OverlayTransition:
     targets: tuple[ParameterTarget, ...]
     phases: tuple[HiddenPhase, ...]
     apply: Callable[[torch.Tensor, Tensors], torch.Tensor]
-    function: Callable[[Tensors], TensorUpdate]
+    function: Callable[..., TensorUpdate]
+    arguments: Mapping[str, str]
     visibility: VisibilitySource
 
     def __call__(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
@@ -133,16 +134,15 @@ class OverlayTransition:
 
     def result(self, operand: CapturedParameterOperand, values: Tensors) -> TensorUpdate:
         """Validate the author's result at its tensor boundary without observing CUDA values."""
+        inputs = {
+            **values,
+            "input": operand.hidden,
+            "target": operand.desired,
+            "weight": operand.base_weight,
+            "prompt_end": operand.prompt_end,
+        }
         result = (
-            self.function(
-                {
-                    **values,
-                    "input": operand.hidden,
-                    "target": operand.desired,
-                    "weight": operand.base_weight,
-                    "prompt_end": operand.prompt_end,
-                }
-            )
+            self.function(**{key: inputs[source] for key, source in self.arguments.items()})
             if operand.phase in self.phases
             else TensorUpdate.unchanged(self.apply(operand.hidden, values))
         )

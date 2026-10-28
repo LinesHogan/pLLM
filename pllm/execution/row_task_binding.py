@@ -46,7 +46,6 @@ from pllm.execution.tensor_frame import (
     Tensors,
     feedback_port,
     field_rows,
-    input_port,
     row_index,
 )
 from pllm.execution.tensor_program import (
@@ -310,7 +309,7 @@ def declare_weighted_train(
     optimizer: SGD,
     steps: int,
     reset: Callable[[Tensors, torch.Generator], None],
-    function: Callable[[Tensors], torch.Tensor],
+    function: Callable[..., torch.Tensor],
     arguments: Mapping[str, tuple[str, str]],
 ) -> Call:
     """Declare weighted batch preparation and its optimizer transition."""
@@ -350,7 +349,7 @@ def declare_weighted_train(
             }
 
             def step() -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
-                losses = function(inputs)
+                losses = function(**inputs)
                 gradients = (
                     torch.autograd.grad(losses.mean(), tuple(parameters.values()), materialize_grads=True)
                     if losses.requires_grad
@@ -390,9 +389,8 @@ def declare_weighted_train(
     return transition
 
 
-def parameter_rows(source: SemanticInputSource | TensorPort) -> TensorPort:
+def parameter_rows(port: TensorPort) -> TensorPort:
     """Expand shared parameters across the invocation rows."""
-    port = input_port(source)
     if port.rowwise:
         return port
 
@@ -400,7 +398,7 @@ def parameter_rows(source: SemanticInputSource | TensorPort) -> TensorPort:
         value = port.read(data, batch)
         return value.unsqueeze(0).expand(len(data.rows), *value.shape)
 
-    return TensorPort(port.source, read, field=port.field)
+    return replace(port, read=read, rowwise=True)
 
 
 def state_metadata(state: State, *, version: bool) -> TensorPort:
@@ -429,12 +427,13 @@ def declare_tensor(
     b: TensorBinding,
     name: str,
     *,
-    inputs: Mapping[str, SemanticInputSource | TensorPort],
+    inputs: Mapping[str, TensorPort],
     when: When = When.BEFORE_SAMPLE,
     identity: str = "",
     update: State | None = None,
     math: MathContract | None = None,
     outputs: tuple[str, ...] = ("value",),
+    tuple_output: bool = False,
     output_kind: SemanticOutputKind = SemanticOutputKind.TEMPORARY,
     result_schema: str = "",
     effect: StateEffectKind = StateEffectKind.UPDATE_MAYBE,
@@ -444,7 +443,7 @@ def declare_tensor(
     sampler_beta: float = 0.0,
 ) -> Callable[[TensorMath], Call]:
     """Declare a tensor task with its final inputs, effects and output adapter."""
-    sources = {key: value.source if isinstance(value, TensorPort) else value for key, value in inputs.items()}
+    sources = {key: value.source for key, value in inputs.items()}
 
     def phases(source: SemanticInputSource) -> set[HiddenPhase]:
         if isinstance(source, HiddenInputSource):
@@ -506,17 +505,16 @@ def declare_tensor(
 
     def decorate(function: TensorMath) -> Call:
         symbol = TaskSymbol(name)
-        ports = {key: input_port(value) for key, value in inputs.items()}
         if policy.parameter_gradient_rows and any(
             not port.rowwise
-            for port in ports.values()
+            for port in inputs.values()
             if isinstance(port.source, StateSelectionInputSource) and port.source.resource in policy.parameter_gradients
         ):
             raise ValueError("parameter gradient rows require Parameter(..., per_row=True) for shared parameters")
         task = TensorTask(
             symbol,
             function,
-            ports,
+            inputs,
             sources,
             policy,
             outputs,
@@ -528,6 +526,7 @@ def declare_tensor(
                 (source.resource for source in sources.values() if isinstance(source, StateSelectionInputSource)),
                 StateResource(""),
             ),
+            tuple_output=tuple_output,
             export=export,
             sampler_stage=sampler_stage,
             sampler_beta=sampler_beta,

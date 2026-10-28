@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
 
 Tensors = Mapping[str, torch.Tensor]
-TensorMath = Callable[[Tensors], tuple[torch.Tensor, ...]]
+TensorMath = Callable[..., torch.Tensor | tuple[torch.Tensor, ...]]
 TensorReader = Callable[["TensorFrame", TensorBatch], torch.Tensor]
 
 
@@ -101,11 +101,14 @@ class OverlayEntry:
 
 @dataclass(frozen=True, slots=True)
 class TensorPort:
+    """A graph input, its tensor reader and the value handed to the declared method."""
+
     source: SemanticInputSource
     read: TensorReader
     rowwise: bool = True
     field: int | None = None
     feedback: str = ""
+    adapt: Callable[[torch.Tensor], object] = lambda value: value
 
 
 def take_rows(values: torch.Tensor, rows: Sequence[int], device_rows: torch.Tensor | None = None) -> torch.Tensor:
@@ -431,39 +434,37 @@ def training_observations(
     )
 
 
-def input_port(source: SemanticInputSource | TensorPort) -> TensorPort:
-    match source:
-        case TensorPort():
-            return source
-        case HiddenInputSource(layer=layer, site=site):
+def hidden_port(source: HiddenInputSource) -> TensorPort:
+    """Read the declared hidden snapshot for the invocation rows."""
 
-            def hidden(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
-                if data.hidden_inputs is not None:
-                    value = data.hidden_inputs[str(layer), "index", site.value]
-                    return row_index(data, batch, value.device).packed.take(value)
-                (snapshot,) = (
-                    item
-                    for item in data.step.hidden_batch(batch.stream).snapshots
-                    if item.resource.locator_key == (str(layer), "index", site.value)
-                )
-                return row_index(data, batch, snapshot.hidden.device).packed.take(snapshot.hidden)
+    def hidden(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
+        key = (str(source.layer), "index", source.site.value)
+        if data.hidden_inputs is not None:
+            value = data.hidden_inputs[key]
+            return row_index(data, batch, value.device).packed.take(value)
+        (snapshot,) = (
+            item for item in data.step.hidden_batch(batch.stream).snapshots if item.resource.locator_key == key
+        )
+        return row_index(data, batch, snapshot.hidden.device).packed.take(snapshot.hidden)
 
-            return TensorPort(source, hidden)
-        case PackedSamplerRowsInputSource():
+    return TensorPort(source, hidden)
 
-            def samples(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
-                if data.index is not None:
-                    return data.index.samples.device
-                device = data.step.hidden_batch(batch.stream).snapshots[0].hidden.device
-                return row_index(data, batch, device).samples.device
 
-            return TensorPort(source, samples)
-        case SamplerFeedbackInputSource():
-            return feedback_port("base_logits")
-        case TaskResultInputSource(task=task, output=output):
-            return TensorPort(source, lambda data, batch: batch.results[task, output])
-        case _:
-            raise ValueError("unsupported ordinary tensor input; use an explicit native binding")
+def samples_port(source: PackedSamplerRowsInputSource) -> TensorPort:
+    """Read packed sample indices for the invocation rows."""
+
+    def samples(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
+        if data.index is not None:
+            return data.index.samples.device
+        device = data.step.hidden_batch(batch.stream).snapshots[0].hidden.device
+        return row_index(data, batch, device).samples.device
+
+    return TensorPort(source, samples)
+
+
+def result_port(source: TaskResultInputSource) -> TensorPort:
+    """Read a previously evaluated task's named output."""
+    return TensorPort(source, lambda data, batch: batch.results[source.task, source.output])
 
 
 def selected_rows(mask: torch.Tensor) -> tuple[int, ...]:

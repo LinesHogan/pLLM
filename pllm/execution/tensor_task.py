@@ -143,6 +143,8 @@ class TensorTask:
     phase: HiddenPhase | None = None
     resource: StateResource = StateResource("")
     writer: FieldWriter | None = None
+    # A write returns a tuple even when it declares only one field.
+    tuple_output: bool = False
     export: TensorExport | None = None
     sampler_stage: SamplerStage | None = None
     sampler_beta: float = 0.0
@@ -294,6 +296,11 @@ class TensorTask:
                 value = gradient_rows(value, mask.reshape(len(rows), *([1] * (value.ndim - 1))))
         return value
 
+    def arguments(self, inputs: Mapping[str, torch.Tensor]) -> dict[str, object]:
+        """Adapt method arguments after tensor selection and gradient policy, omitting row selectors."""
+        domains = self.domains
+        return {key: port.adapt(inputs[key]) for key, port in self.ports.items() if key not in domains}
+
     def evaluate(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
         """Run a forward method and store its result for later tasks and the invocation output."""
         differentiable = self.differentiable
@@ -301,7 +308,11 @@ class TensorTask:
             # Pure predictions run on every row and mask the result; differentiable forwards still
             # compact so gradients see only the selected rows.
             inputs, rows = self.read(data, batch, compact=differentiable and data.weights is None)
-            results = self.function(inputs)
+            results = self.function(**self.arguments(inputs))
+            if not self.tuple_output:
+                if not isinstance(results, torch.Tensor):
+                    raise ValueError("tensor methods must return one tensor")
+                results = (results,)
             if type(results) is not tuple or len(results) != len(self.outputs):
                 raise ValueError("write must return a tuple matching its declared fields")
             for name, result in zip(self.outputs, results, strict=True):
@@ -330,7 +341,9 @@ class TensorTask:
         self, inputs: dict[str, torch.Tensor], rows: tuple[int, ...], data: TensorFrame, batch: TensorBatch
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         """Shared eager and captured forward, loss reduction and autograd step."""
-        (loss,) = self.function(inputs)
+        loss = self.function(**self.arguments(inputs))
+        if not isinstance(loss, torch.Tensor):
+            raise ValueError("training methods must return a loss tensor")
         loss, objective = self._loss(loss, rows, data, batch)
         leaf = state_leaf(data, batch)
         targets = (leaf, *data.derivative_sources.values())
