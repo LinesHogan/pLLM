@@ -15,6 +15,7 @@ from pllm import make_llm
 from pllm.authoring import FunctionMath
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId
+from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.state_execution import StateSettlementError
 from pllm.host import (
     BarrierState,
@@ -70,7 +71,7 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
             make_llm(workload=workload, config=replace(facts, memory_budget_bytes=peak - 1))
         execution = workload.declare_host(replace(facts, memory_budget_bytes=peak)).compile()
         (initial,) = execution.admit((), stream)
-        old_pin = execution.arena.pin_exact((initial,), stream)
+        old_pin = execution.arena.pin_exact(StateRefs.of((initial,)), stream)
         original = execution.snapshot(initial, stream)
         source = torch.linspace(-1, 1, 24, device=device).reshape(6, 4)
         producer = torch.cuda.current_stream(device) if stream is not None else None

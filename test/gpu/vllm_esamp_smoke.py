@@ -9,7 +9,6 @@ from __future__ import annotations
 import gc
 import os
 import sys
-from collections.abc import Sequence
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,8 +20,8 @@ from vllm import SamplingParams
 import pllm
 from pllm.backends.vllm.runtime import VllmLlm
 from pllm.config import ExecutionOptions, ModelConfig, VllmDType
-from pllm.contracts.state_ref import StateRef
 from pllm.execution.ptts.page_bundle import PageBundleArena
+from pllm.execution.ptts.state_refs import StateRefs
 from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
 
 
@@ -31,7 +30,7 @@ def lag_equivalence() -> None:
     states: list[tuple[torch.Tensor, ...]] = []
     retire = PageBundleArena.retire
 
-    def snapshot(arena: PageBundleArena, refs: Sequence[StateRef]) -> None:
+    def snapshot(arena: PageBundleArena, refs: StateRefs) -> None:
         stream = torch.cuda.current_stream(arena.device)
         pin = arena.pin_exact(refs, stream)
         states.extend(arena.snapshot(pin, ref) for ref in refs)

@@ -22,6 +22,7 @@ from pllm.contracts.state_ref import StateRef
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle import BorrowedPage, PageBundleArena, PageRelease
+from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.shared_tensor import tensor_dtype
 
 
@@ -231,13 +232,13 @@ class Feed:
             assert self._current is not None
             slot = self._current.version_id % len(self._channels)
             self._release(slot)
-            write = arena.prepare_transition((self._current,), stream, copy_fields=())
+            write = arena.prepare_transition(StateRefs.of((self._current,)), stream, copy_fields=())
             for name, field in self._fields.items():
                 arena.write_field(write, 0, field.field_id).copy_(fields[name])
             publication = arena.publish(write)
             arena.settle(publication)
             (self._current,) = publication.after_refs
-            pin = arena.pin_exact((self._current,), stream)
+            pin = arena.pin_exact(publication.after_refs, stream)
             try:
                 for field, channel in zip(self._layout.fields, self._channels[slot], strict=True):
                     arena.send_field(pin, self._current, field.field_id, channel, self._peer)
@@ -285,7 +286,7 @@ class Feed:
                     self._signal()
                 if self._arena is not None:
                     assert self._current is not None
-                    self._arena.retire((self._current,))
+                    self._arena.retire(StateRefs.of((self._current,)))
                     self._arena.collect_completed(wait=True)
         except _ConsumerClosed:
             pass

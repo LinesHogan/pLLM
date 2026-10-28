@@ -174,7 +174,7 @@ class StateTaskContext(Generic[DataT]):
 
     def prepare_owned_write(
         self,
-        sources: Sequence[StateRef],
+        sources: StateRefs,
         fields: tuple[tuple[LayoutFieldId, ...], ...] | None = None,
         *,
         copy_fields: tuple[LayoutFieldId, ...] | None = (),
@@ -218,19 +218,17 @@ class StateTaskContext(Generic[DataT]):
         """Discharge an early release through the same operation as terminal cleanup."""
         self._discharge(_PinRelease(pin))
 
-    def borrow_published(self, refs: Sequence[StateRef]) -> PagePin:
+    def borrow_published(self, refs: StateRefs) -> PagePin:
         self.check_page_execution()
-        refs = StateRefs.of(refs)
         authorized = np.zeros(len(refs), dtype=np.bool_)
         for receipt in self.publications:
             authorized |= receipt.after_refs.positions(refs) >= 0
         assert refs and authorized.all()
         return self.pin_for(refs)
 
-    def pin_for(self, refs: Sequence[StateRef]) -> PagePin:
+    def pin_for(self, refs: StateRefs) -> PagePin:
         """Reuse a live invocation pin covering these exact refs, or acquire one."""
         self.check_page_execution()
-        refs = StateRefs.of(refs)
         for entry in self._obligations:
             if isinstance(entry, _PinRelease) and (entry.pin.refs.positions(refs) >= 0).all():
                 return entry.pin
@@ -816,7 +814,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
 
     def snapshot(self, ref: StateRef, stream: torch.cuda.Stream | None = None) -> tuple[torch.Tensor, ...]:
         with self._lock:
-            pin = self.arena.pin_exact((ref,), stream)
+            pin = self.arena.pin_exact(StateRefs.of((ref,)), stream)
             try:
                 return self.arena.snapshot(pin, ref)
             finally:

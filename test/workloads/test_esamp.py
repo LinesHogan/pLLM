@@ -222,7 +222,7 @@ def _esamp_native_oracle(device, normalized):
             assert any(task.lane == "side" for task in attachment.plan.schedule.tasks) == bool(lag)
     identities = tuple(RequestIdentity(str(i), i, 0) for i in range(3))
     initial = execution.admit(identities, stream)
-    held = execution.arena.pin_exact(initial, stream)
+    held = execution.arena.pin_exact(StateRefs.of(initial), stream)
     with nullcontext() if stream is None else torch.cuda.stream(stream):
         parameters = [execution.snapshot(ref, stream)[0].requires_grad_() for ref in initial]
         originals = [parameter.detach().clone() for parameter in parameters]
@@ -309,7 +309,7 @@ def _ordinary_request_distillation() -> None:
         source = torch.linspace(-0.6, 0.8, 12, device=device).reshape(3, 4)
         target = torch.linspace(0.7, -0.3, 12, device=device).reshape(3, 4)
         initial = tuple(latest)
-        held = execution.arena.pin_exact(initial, stream)
+        held = execution.arena.pin_exact(StateRefs.of(initial), stream)
         # Cross-step memory: carries hold each lineage's last published capture; step 0 reads zeros.
         carries = [torch.zeros(4, device=device) for _ in identities]
         for step_id, owners in enumerate(((0, 1, 0), (2, 0, 0))):

@@ -17,6 +17,7 @@ from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.semantic_graph import StateScope
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
+from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.runtime_facts import model_timeline
 from pllm.workloads.lora import OutputLoRAConfig, OutputLoRAWorkload
 from test.backend_facts import backend_facts
@@ -50,7 +51,7 @@ def test_weighted_ce_shared_update_matches_sgd_and_preserves_original_pins() -> 
     execution = compile_lora(config)
     (initial,) = execution.admit(())
     original = execution.snapshot(initial)
-    old_pin = execution.arena.pin_exact((initial,))
+    old_pin = execution.arena.pin_exact(StateRefs.of((initial,)))
     hidden = torch.tensor([[0.2, -0.1, 0.4, 0.3], [-0.5, 0.7, 0.1, -0.2], [0.1, 0.3, -0.2, 0.8]])
     batch = WeightedCEBatch(
         torch.cat((hidden, torch.full((1, 4), float("nan")))),
@@ -111,7 +112,7 @@ def test_independent_lora_bmm_preserves_keyed_mean_and_private_publication() -> 
         stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
         execution = compile_lora(config, device, pages=8)
         initial = execution.admit(identities, stream)
-        old_pin = execution.arena.pin_exact(initial, stream)
+        old_pin = execution.arena.pin_exact(StateRefs.of(initial), stream)
         with nullcontext() if stream is None else torch.cuda.stream(stream):
             original = tuple(execution.arena.snapshot(old_pin, ref) for ref in initial)
             hidden = torch.linspace(-0.7, 0.9, 32, device=device).reshape(2, 4, 4)

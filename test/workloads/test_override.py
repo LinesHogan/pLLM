@@ -19,6 +19,7 @@ from pllm.contracts.sampler import SamplerFeedback
 from pllm.contracts.semantic_graph import AnchorId
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
+from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.runtime_facts import model_timeline
 from pllm.workloads.override import OverRIDEConfig, OverRIDEWorkload
 from test.backend_facts import assert_finite_resources, backend_facts
@@ -90,7 +91,7 @@ def test_override_matches_reweight_adam_and_final_noop() -> None:
     execution = execution.execution
     (initial,) = execution.admit(())
     original = execution.snapshot(initial)
-    held = execution.arena.pin_exact((initial,))
+    held = execution.arena.pin_exact(StateRefs.of((initial,)))
     down = torch.nn.Parameter(original[0][:16].reshape(2, 2, 4).clone())
     up = torch.nn.Parameter(original[0][16:].reshape(2, 7, 2).clone())
     optimizer = torch.optim.Adam((down, up), lr=config.learning_rate, foreach=False)
@@ -360,7 +361,7 @@ def _domains_oracle(device, request, identities) -> None:
     execution = Domains(request).compile_backend(facts_for(device, lineages=4, pages=16)).execution
     initial = execution.admit(identities if request else (), stream)
     original = tuple(execution.snapshot(ref, stream) for ref in initial)
-    held = execution.arena.pin_exact(initial, stream)
+    held = execution.arena.pin_exact(StateRefs.of(initial), stream)
     parameters = [torch.nn.Parameter(root[0].reshape(4, 7).clone()) for root in original]
     optimizers = [torch.optim.AdamW((p,), lr=0.03, weight_decay=0.1, foreach=False) for p in parameters]
     hidden = torch.linspace(-0.5, 0.8, 16, device=device).reshape(4, 4)

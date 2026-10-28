@@ -219,9 +219,7 @@ class _Pin:
 class LazyRoots(Sequence[tuple[torch.Tensor, ...]]):
     """Batch slot access with tensor views and individual bundles materialized only on demand."""
 
-    def __init__(
-        self, arena: PageBundleArena, access: tuple[PagePin | PageWrite, ...], refs: Sequence[StateRef]
-    ) -> None:
+    def __init__(self, arena: PageBundleArena, access: tuple[PagePin | PageWrite, ...], refs: StateRefs) -> None:
         self._arena, self._access, self._refs = arena, access, refs
         self._views: dict[int, tuple[torch.Tensor, ...]] = {}
         self._matrix: tuple[str, Slots] | None = None
@@ -231,7 +229,7 @@ class LazyRoots(Sequence[tuple[torch.Tensor, ...]]):
 
     def select(self, indices: tuple[int, ...]) -> LazyRoots:
         """Borrow a resource-specific subset under the same issued page access."""
-        return LazyRoots(self._arena, tuple(self._access[i] for i in indices), tuple(self._refs[i] for i in indices))
+        return LazyRoots(self._arena, tuple(self._access[i] for i in indices), self._refs.take(indices))
 
     def slot_matrix(self) -> tuple[str, Slots]:
         """One matrix for all fields, in selection order."""
@@ -255,7 +253,7 @@ class LazyRoots(Sequence[tuple[torch.Tensor, ...]]):
         if isinstance(index, slice):
             return tuple(self[i] for i in range(*index.indices(len(self))))
         if index not in self._views:
-            self._views[index] = self._arena.borrow_roots((self._access[index],), (self._refs[index],))[0]
+            self._views[index] = self._arena.borrow_roots((self._access[index],), self._refs.take((index,)))[0]
         return self._views[index]
 
 
@@ -549,11 +547,10 @@ class PageBundleArena:
                 rows,
             )
 
-    def latest_batch(self, resource: str, lineages: StateRefs | Sequence[LineageId]) -> StateRefs:
+    def latest_batch(self, resource: str, refs: StateRefs) -> StateRefs:
         """Read the latest versions by cached arena row, without allocating individual refs."""
         with self._lock:
             self._require_live()
-            refs = lineages if isinstance(lineages, StateRefs) else self.resolve_lineages(resource, lineages)
             table, rows = self._tables[resource], refs.rows
             assert rows is not None
             assert (table.status[rows] == 2).all() and (table.lineages[rows] == refs.lineages).all()
@@ -572,8 +569,7 @@ class PageBundleArena:
                     return group.bundle(index)
             raise KeyError(ref)
 
-    def _select(self, refs: Sequence[StateRef], *, latest: bool = True) -> tuple[_Pages, ...]:
-        refs = StateRefs.of(refs)
+    def _select(self, refs: StateRefs, *, latest: bool = True) -> tuple[_Pages, ...]:
         groups: list[_Pages] = []
         for table in self._tables.values():
             mask = refs.layouts == table.pools.selected.layout_id
@@ -661,7 +657,7 @@ class PageBundleArena:
                 targets.append(
                     _Pages(table, selected, rows, slots, generations, written=np.ones(slots.shape, dtype=np.bool_))
                 )
-            return self._prepare((), refs, _Write(tuple(targets), ()), stream, None)
+            return self._prepare(StateRefs.of(()), refs, _Write(tuple(targets), ()), stream, None)
 
     def _check_capacity(
         self,
@@ -709,7 +705,7 @@ class PageBundleArena:
 
     def prepare_transition(
         self,
-        sources: Sequence[StateRef],
+        sources: StateRefs,
         stream: torch.cuda.Stream | None = None,
         *,
         fields: tuple[tuple[LayoutFieldId, ...], ...] | None = None,
@@ -718,7 +714,6 @@ class PageBundleArena:
         """Allocate private writable fields; unchanged fields share the exact source pages."""
         with self._lock:
             self._require_stream(stream)
-            sources = StateRefs.of(sources)
             groups = self._select(sources)
             assert not any((group.table.writing[group.rows].any() for group in groups))
             masks = self._write_masks(groups, sources, fields)
@@ -741,7 +736,7 @@ class PageBundleArena:
 
     @staticmethod
     def _write_masks(
-        groups: tuple[_Pages, ...], refs: Sequence[StateRef], fields: tuple[tuple[LayoutFieldId, ...], ...] | None
+        groups: tuple[_Pages, ...], refs: StateRefs, fields: tuple[tuple[LayoutFieldId, ...], ...] | None
     ) -> tuple[npt.NDArray[np.bool_], ...]:
         masks: list[npt.NDArray[np.bool_]] = []
         for group in groups:
@@ -759,13 +754,13 @@ class PageBundleArena:
 
     def _prepare(
         self,
-        sources: Sequence[StateRef],
-        targets: Sequence[StateRef],
+        sources: StateRefs,
+        targets: StateRefs,
         write: _Write,
         stream: torch.cuda.Stream | None,
         copy_fields: tuple[LayoutFieldId, ...] | None,
     ) -> PageWrite:
-        token = PageWrite(self._next_operation, StateRefs.of(sources), StateRefs.of(targets), stream)
+        token = PageWrite(self._next_operation, sources, targets, stream)
         self._next_operation += 1
         self._writes[token] = write
         try:
@@ -799,7 +794,7 @@ class PageBundleArena:
 
     def write_field(self, token: PageWrite, root_index: int, field: LayoutFieldId) -> torch.Tensor:
         with self._lock:
-            (root,) = self._held_fields(token, (token.after_refs[root_index],), (field,))
+            (root,) = self._held_fields(token, token.after_refs.take((root_index,)), (field,))
             return self._pools[root.resource].tensor(field, root.pages[field])
 
     def writable_roots(self, token: PageWrite) -> tuple[tuple[torch.Tensor, ...], ...]:
@@ -848,7 +843,7 @@ class PageBundleArena:
     @contextmanager
     def reserve_window(
         self,
-        refs: tuple[StateRef, ...],
+        refs: StateRefs,
         fields: tuple[tuple[LayoutFieldId, ...], ...],
         roots: tuple[int, ...],
         stream: torch.cuda.Stream | None,
@@ -908,10 +903,9 @@ class PageBundleArena:
                 group.release(receipt.completion)
             self._recycled.add(receipt)
 
-    def pin_exact(self, refs: Sequence[StateRef], stream: torch.cuda.Stream | None = None) -> PagePin:
+    def pin_exact(self, refs: StateRefs, stream: torch.cuda.Stream | None = None) -> PagePin:
         with self._lock:
             self._require_stream(stream)
-            refs = StateRefs.of(refs)
             groups = self._select(refs, latest=False)
             for event in dict.fromkeys(event for group in groups for event in group.readiness):
                 self._order(event, stream)
@@ -929,14 +923,14 @@ class PageBundleArena:
         owned exports use snapshot. The original pin owns completion and reclamation.
         """
         with self._lock:
-            (root,) = self._held_fields(pin, (ref,), (field,))
+            (root,) = self._held_fields(pin, StateRefs.of((ref,)), (field,))
             return self._pools[root.resource].tensor(field, root.pages[field]).detach()
 
     def _access_pages(self, access: PagePin | PageWrite) -> tuple[_Pages, ...]:
         return self._issued_pin(access).pages if isinstance(access, PagePin) else self._issued_write(access).targets
 
     def _held_roots(
-        self, access: tuple[PagePin | PageWrite, ...], refs: Sequence[StateRef]
+        self, access: tuple[PagePin | PageWrite, ...], refs: StateRefs
     ) -> tuple[tuple[PageBundle, frozenset[int] | None], ...]:
         result: list[tuple[PageBundle, frozenset[int] | None]] = []
         for token, ref in zip(access, refs, strict=True):
@@ -964,12 +958,12 @@ class PageBundleArena:
                         return group.table.resource, group.slots[positions]
             raise KeyError(refs)
 
-    def slots(self, access: tuple[PagePin | PageWrite, ...], refs: Sequence[StateRef]) -> tuple[str, Slots]:
+    def slots(self, access: tuple[PagePin | PageWrite, ...], refs: StateRefs) -> tuple[str, Slots]:
         """Resolve all field slots once for a homogeneous resource selection."""
         with self._lock:
             tokens = tuple(dict.fromkeys(access))
             if len(tokens) == 1:
-                return self.slot_matrix(tokens[0], StateRefs.of(refs))
+                return self.slot_matrix(tokens[0], refs)
             else:
                 positions = {
                     token: {ref: (group, i) for group in self._access_pages(token) for i, ref in enumerate(group.refs)}
@@ -980,7 +974,7 @@ class PageBundleArena:
             assert all(group.table.resource == resource for group, _ in selected)
             return resource, np.stack([group.slots[i] for group, i in selected])
 
-    def lazy_roots(self, access: tuple[PagePin | PageWrite, ...], refs: Sequence[StateRef]) -> LazyRoots:
+    def lazy_roots(self, access: tuple[PagePin | PageWrite, ...], refs: StateRefs) -> LazyRoots:
         """Defer individual tensor views; batch slots stay in their exact pin/write matrix."""
         return LazyRoots(self, access, refs)
 
@@ -994,7 +988,7 @@ class PageBundleArena:
             return pools.views(root.slots, root.generations)
 
     def borrow_roots(
-        self, access: tuple[PagePin | PageWrite, ...], refs: Sequence[StateRef]
+        self, access: tuple[PagePin | PageWrite, ...], refs: StateRefs
     ) -> tuple[tuple[torch.Tensor, ...], ...]:
         """Every field of every ref, read under its pin (read-only views) or write (writable)."""
         with self._lock:
@@ -1006,14 +1000,14 @@ class PageBundleArena:
         return self._pools[resource].tensors[field].detach()
 
     def field_slots(
-        self, access: tuple[PagePin | PageWrite, ...], refs: Sequence[StateRef], field: LayoutFieldId
+        self, access: tuple[PagePin | PageWrite, ...], refs: StateRefs, field: LayoutFieldId
     ) -> tuple[torch.Tensor, tuple[int, ...]]:
         """The field pool and each selected exact-version slot."""
         resource, slots = self.slots(access, refs)
         return self._pools[resource].tensors[field].detach(), tuple(slots[:, field].tolist())
 
     def _held_fields(
-        self, access: PagePin | PageWrite, refs: Sequence[StateRef], fields: tuple[LayoutFieldId, ...]
+        self, access: PagePin | PageWrite, refs: StateRefs, fields: tuple[LayoutFieldId, ...]
     ) -> tuple[PageBundle, ...]:
         held = self._held_roots((access,) * len(refs), refs)
         assert all(writable is None or set(fields) <= writable for _, writable in held)
@@ -1026,7 +1020,7 @@ class PageBundleArena:
         """Export over a dedicated channel; the original pin owns remote completion."""
         with self._lock:
             value = self.borrow_field(pin, ref, field)
-            (root,) = self._held_fields(pin, (ref,), (field,))
+            (root,) = self._held_fields(pin, StateRefs.of((ref,)), (field,))
             descriptor, completion = self._export(root, field, value, pin.pin_id, connection, pin.stream)
             self._issued_pin(pin).remote.append(completion)
             # Retain completion before sending: even a partial send may expose the mapping.
@@ -1087,7 +1081,7 @@ class PageBundleArena:
 
     def snapshot(self, pin: PagePin, ref: StateRef) -> tuple[torch.Tensor, ...]:
         with self._lock:
-            ((root, _),) = self._held_roots((pin,), (ref,))
+            ((root, _),) = self._held_roots((pin,), StateRefs.of((ref,)))
             pools = self._pools[root.resource]
             with self._scope(pin.stream):
                 return tuple(pools.tensor(field, page).detach().clone() for field, page in enumerate(root.pages))
@@ -1117,7 +1111,7 @@ class PageBundleArena:
             self.collect_completed()
             return receipt not in self._releases
 
-    def retire(self, refs: Sequence[StateRef]) -> None:
+    def retire(self, refs: StateRefs) -> None:
         with self._lock:
             self._require_live()
             groups = self._select(refs)

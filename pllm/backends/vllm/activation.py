@@ -23,6 +23,7 @@ from pllm.execution.activation import low_rank_affine_delta
 from pllm.execution.cuda_stream import upload
 from pllm.execution.ptts.page_bundle import PagePin
 from pllm.execution.ptts.request_state import RequestStateDirectory
+from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.state_execution import DataT, StateTaskContext
 
 _DecoderForward = Callable[[torch.Tensor, torch.Tensor, torch.Tensor | None], tuple[torch.Tensor, torch.Tensor]]
@@ -121,7 +122,7 @@ class VllmActivationPatch:
                         if not self.installed or context.arena.plan.semantic_graph.input_groups:
                             # Admission pins belong to the request directory. Borrow
                             # the same exact version for this invocation's source view.
-                            pin = context.pin_for((ref,))
+                            pin = context.pin_for(StateRefs.of((ref,)))
                         versions[key] = pin, ref
                     pin, ref = versions[key]
                     if context.held_input is not None and not any(
@@ -196,7 +197,7 @@ class VllmActivationPatch:
             for candidate in context.selection.for_resource(self.resource).refs
             if context.current_owned_ref(candidate) != candidate
         )
-        return context.borrow_published(updated), ref
+        return context.borrow_published(StateRefs.of(updated)), ref
 
     def clear(self) -> None:
         self.row_count = 0

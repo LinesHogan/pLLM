@@ -30,6 +30,7 @@ from pllm.execution.activation import low_rank_affine_delta
 from pllm.execution.codec import encode_boundary
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
+from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.step_input import TensorStepInput
 from pllm.workloads.reft import ActivationConfig, ActivationWorkload, load_loreft_interventions
@@ -192,7 +193,7 @@ def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:
     execution = deployment.execution
     identities = (RequestIdentity("a", 7, 1), RequestIdentity("b", 9, 1))
     initial = execution.admit(identities)
-    old_pin = execution.arena.pin_exact(initial)
+    old_pin = execution.arena.pin_exact(StateRefs.of(initial))
     rows = PackedPhaseRowBatch(
         0,
         3,

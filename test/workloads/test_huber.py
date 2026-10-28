@@ -11,6 +11,7 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
+from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.runtime_facts import model_timeline
 from test import reference_huber as oracle
 from test.backend_facts import backend_facts
@@ -51,7 +52,7 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
     identities = tuple(RequestIdentity(str(i), 0, 0) for i in range(3))
     latest = list(execution.admit(identities, stream))
     initial = tuple(latest)
-    held = execution.arena.pin_exact(initial, stream)
+    held = execution.arena.pin_exact(StateRefs.of(initial), stream)
     originals = tuple(execution.snapshot(ref, stream) for ref in initial)
     generator = torch.Generator(device=device).manual_seed(7)
     parameters = [oracle.initialize(hidden, rank, generator, device) for _ in identities]

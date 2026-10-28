@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from pllm.contracts.tensor_layout import LayoutFieldId
+from pllm.execution.ptts.state_refs import StateRefs
 from test.state_fixtures import page_arena
 
 F0 = LayoutFieldId(0)
@@ -22,9 +23,9 @@ def _admit(arena, count: int = 2):
 def test_copy_on_write_transition_keeps_the_pinned_version_unchanged() -> None:
     arena = page_arena()
     a, b = _admit(arena)
-    pin = arena.pin_exact((a, b))
+    pin = arena.pin_exact(StateRefs.of((a, b)))
     (old_a0,) = arena.snapshot(pin, a)[:1]
-    update = arena.prepare_transition((a,), fields=((F0,),))
+    update = arena.prepare_transition(StateRefs.of((a,)), fields=((F0,),))
     arena.write_field(update, 0, F0).add_(4)
     with pytest.raises(AssertionError):
         arena.write_field(update, 0, LayoutFieldId(1))
@@ -33,14 +34,14 @@ def test_copy_on_write_transition_keeps_the_pinned_version_unchanged() -> None:
     arena.settle(receipt)
     assert new_a.version_id == 1
     assert arena.latest(a.lineage_id) == new_a and arena.latest(b.lineage_id) == b
-    new_pin = arena.pin_exact((new_a,))
+    new_pin = arena.pin_exact(StateRefs.of((new_a,)))
     resource, slots = arena.slot_matrix(pin, pin.refs)
     assert resource == "dense_fast_weights"
     selected = pin.refs.take(np.array([1, 0, 1]))
     np.testing.assert_array_equal(arena.slot_matrix(pin, selected)[1], slots[[1, 0, 1]])
     with pytest.raises(KeyError):
         arena.slot_matrix(pin, new_pin.refs)
-    both = arena.pin_exact((a, new_a))
+    both = arena.pin_exact(StateRefs.of((a, new_a)))
     _, versions = arena.slot_matrix(both, both.refs.take(np.array([1, 0])))
     assert versions[0, 0] != versions[1, 0]
     arena.wait_release(arena.release_pin(both))
@@ -61,8 +62,8 @@ def test_copy_on_write_transition_keeps_the_pinned_version_unchanged() -> None:
 def test_retired_roots_hold_storage_until_pages_are_free() -> None:
     arena = page_arena()
     a, b = _admit(arena)
-    pin = arena.pin_exact((a, b))
-    arena.retire((a, b))
+    pin = arena.pin_exact(StateRefs.of((a, b)))
+    arena.retire(StateRefs.of((a, b)))
     assert arena.active_lineages == 2  # retired roots retain storage, not the admission entitlement
     replacement = arena.publish(arena.prepare_admission(("dense_fast_weights",)))
     arena.settle(replacement)
@@ -91,29 +92,29 @@ def test_versions_stack_until_pool_exhaustion_and_pins_keep_their_version() -> N
     current, idle = published.after_refs
     retained = []
     for value in range(5):
-        held = arena.pin_exact((current,))
+        held = arena.pin_exact(StateRefs.of((current,)))
         retained.append(held)
         borrowed = arena.borrow_field(held, current, F0)
         torch.testing.assert_close(borrowed, torch.full_like(borrowed, float(value)))
         if value < 4:
-            update = arena.prepare_transition((current,), fields=((F0,),), copy_fields=())
+            update = arena.prepare_transition(StateRefs.of((current,)), fields=((F0,),), copy_fields=())
             arena.write_field(update, 0, F0).fill_(value + 1)
             published = arena.publish(update)
             arena.settle(published)
             (current,) = published.after_refs
     assert current.version_id == 4 and arena.free_pages == 0
     with pytest.raises(RuntimeError):
-        arena.prepare_transition((current,), fields=((F0,),))
+        arena.prepare_transition(StateRefs.of((current,)), fields=((F0,),))
     for value, held in enumerate(retained):
         borrowed = arena.borrow_field(held, held.refs[0], F0)
         torch.testing.assert_close(borrowed, torch.full_like(borrowed, float(value)))
     arena.wait_release(arena.release_pin(retained.pop(0)))
-    update = arena.prepare_transition((current,), fields=((F0,),))
+    update = arena.prepare_transition(StateRefs.of((current,)), fields=((F0,),))
     arena.abort(update)
     assert arena.free_pages == 1
     for held in retained:
         arena.wait_release(arena.release_pin(held))
-    arena.retire((current, idle))
+    arena.retire(StateRefs.of((current, idle)))
     assert arena.active_lineages == 0 and arena.free_pages == 6
 
 

@@ -20,6 +20,7 @@ from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle import BorrowedPage, PageFieldTransfer, PageSlot
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
+from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.runtime_facts import model_timeline
 from pllm.workloads.recirculation import RecirculationWorkload
 from pllm.workloads.video import VideoWorkload, frame_features
@@ -261,7 +262,7 @@ def observe_replay(*, versions):
         context = step.context
         if context.held_input is None:
             (ref,) = context.publication.after_refs
-            pin = context.borrow_published((ref,))
+            pin = context.borrow_published(StateRefs.of((ref,)))
         else:
             (ref,) = context.pin.refs
             pin = context.pin

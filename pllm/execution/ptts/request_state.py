@@ -176,7 +176,7 @@ class RequestStateDirectory:
             if not identities:
                 new = tuple(key for key in addresses if key.key is None)
                 holds: tuple[tuple[RequestIdentity, StateAddress], ...] = ()
-                instances: tuple[StateRef, ...] = ()
+                instances = StateRefs.of(())
             else:
                 new = tuple(key for key in addresses if key.key is not None and key not in self._lineages)
                 holds = tuple(
@@ -184,7 +184,9 @@ class RequestStateDirectory:
                     for s in self.request_states
                     for identity in identities
                 )
-                instances = tuple(self.arena.latest(self._lineages[key]) for key in addresses if key.key is None)
+                instances = StateRefs.of(
+                    tuple(self.arena.latest(self._lineages[key]) for key in addresses if key.key is None)
+                )
             write = self.arena.prepare_admission(tuple(str(key.resource) for key in new), stream) if new else None
             pins: list[tuple[RequestIdentity, PagePin]] = []
             receipt = None
@@ -284,7 +286,7 @@ class RequestStateDirectory:
                 )
             refs = tuple(self.arena.latest(self._lineages[key]) for key in releasing)
             if refs:
-                self.arena.retire(refs)
+                self.arena.retire(StateRefs.of(refs))
             if pins:
                 for identity, pin in zip(identities, pins, strict=True):
                     self.arena.release_pin(pin)
@@ -303,7 +305,7 @@ class RequestStateDirectory:
             dormant = tuple(key for key in self._lineages if key.key is not None and key not in held)
             refs = tuple(self.arena.latest(self._lineages[key]) for key in dormant)
             if refs:
-                self.arena.retire(refs)
+                self.arena.retire(StateRefs.of(refs))
             for key in dormant:
                 self._lineages.pop(key)
                 self._projection = None

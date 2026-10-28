@@ -19,6 +19,7 @@ from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
+from pllm.execution.ptts.state_refs import StateRefs
 from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw
 from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
 from test.backend_facts import backend_facts
@@ -163,7 +164,7 @@ def _cuda_ipc_lifecycle():
         initial = arena.publish(initial)
         arena.settle(initial)
         (ref,) = initial.after_refs
-        pin = arena.pin_exact((ref,), stream)
+        pin = arena.pin_exact(StateRefs.of((ref,)), stream)
         control, child_control = context.Pipe()
         read_channel, child_read = context.Pipe()
         process = context.Process(
@@ -185,7 +186,7 @@ def _cuda_ipc_lifecycle():
                 sender.close()
                 receiver.close()
             # A local publication must not overwrite the remote reader's exact old version.
-            write = arena.prepare_transition((ref,), stream, fields=((LayoutFieldId(0),),))
+            write = arena.prepare_transition(StateRefs.of((ref,)), stream, fields=((LayoutFieldId(0),),))
             with torch.cuda.stream(stream):
                 arena.write_field(write, 0, LayoutFieldId(0)).add_(99)
             publication = arena.publish(write)

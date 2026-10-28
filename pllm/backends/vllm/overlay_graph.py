@@ -391,7 +391,7 @@ class PinnedParameterOverlay:
                 entry = tuple(context.selection.refs[index[row.identity]] for row in self.sources)
                 refs = StateRefs.of(context.current_owned_refs(entry))
                 published = tuple(ref for ref, original in zip(refs, entry, strict=True) if ref != original)
-                borrowed = context.borrow_published(published) if published else context.pin
+                borrowed = context.borrow_published(StateRefs.of(published)) if published else context.pin
                 pins = tuple(
                     context.pin if ref == original else borrowed for ref, original in zip(refs, entry, strict=True)
                 )

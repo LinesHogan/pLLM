@@ -66,9 +66,7 @@ class StateRefs(Sequence[StateRef]):
 
     @classmethod
     def of(cls, refs: Sequence[StateRef]) -> StateRefs:
-        """Convert cold individual refs once; array selections pass through unchanged."""
-        if isinstance(refs, cls):
-            return refs
+        """Convert cold individual refs into an array selection at the caller boundary."""
         layouts, lineages, versions = (
             np.fromiter((getattr(ref, name) for ref in refs), np.int64, len(refs))
             for name in ("layout_id", "lineage_id", "version_id")

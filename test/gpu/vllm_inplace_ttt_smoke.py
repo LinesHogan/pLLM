@@ -30,6 +30,7 @@ from pllm.contracts.parameter_overlay import (
 )
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
+from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.scan_execution import PreparedScan
 from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
@@ -201,7 +202,7 @@ def _check_cancelled_projection(handle):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = reader.forward(hidden)[0]
-    slot = execution.arena.field_slots((invocation.pin,), (ref,), reader.binding.fields[0].field)[1][0]
+    slot = execution.arena.field_slots((invocation.pin,), StateRefs.of((ref,)), reader.binding.fields[0].field)[1][0]
     address = reader.pools[0][slot].data_ptr()
     stream.synchronize()
     with patch.object(torch.cuda.Event, "synchronize", side_effect=AssertionError("host cancellation wait")):
@@ -213,8 +214,10 @@ def _check_cancelled_projection(handle):
         assert execution.arena.pending_pin_releases > 0
         other = RequestIdentity("replacement-projection", 42, 0)
         (replacement,) = execution.admit((other,), stream)
-        pin = execution.arena.pin_exact((replacement,), stream)
-        new_slot = execution.arena.field_slots((pin,), (replacement,), reader.binding.fields[0].field)[1][0]
+        pin = execution.arena.pin_exact(StateRefs.of((replacement,)), stream)
+        new_slot = execution.arena.field_slots((pin,), StateRefs.of((replacement,)), reader.binding.fields[0].field)[1][
+            0
+        ]
         assert reader.pools[0][new_slot].data_ptr() != address
         execution.arena.release_pin(pin)
     stream.synchronize()

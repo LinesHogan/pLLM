@@ -19,6 +19,7 @@ from pllm.contracts.tensor_layout import LayoutFieldId, StateTensorLayout, Tenso
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
+from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.scheduler import compile_state_schedule, intern_tensor_layouts
 from pllm.execution.state_execution import MathBinding
@@ -177,12 +178,12 @@ class ResourceTask:
 
 def increment_resources(context):
     """Publish one increment of the first field of every selected resource."""
-    refs = context.current_owned_refs(context.pin.refs)
+    refs = StateRefs.of(context.current_owned_refs(context.pin.refs))
     pin = context.arena.pin_exact(refs, context.pin.stream)
     context.register_pin(pin)
     for ref in refs:
         (value,) = context.arena.snapshot(pin, ref)[:1]
-        write = context.prepare_owned_write((ref,), ((LayoutFieldId(0),),))
+        write = context.prepare_owned_write(StateRefs.of((ref,)), ((LayoutFieldId(0),),))
         context.arena.write_field(write, 0, LayoutFieldId(0)).copy_(value + 1)
         context.publish_owned_write(write)
     context.release_owned_pin(pin)

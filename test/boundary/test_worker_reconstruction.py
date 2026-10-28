@@ -16,6 +16,7 @@ from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.codec import decode_boundary, encode_boundary
+from pllm.execution.ptts.state_refs import StateRefs
 from pllm.host import HostRuntimeFacts
 from pllm.worker import GPUWorker
 from pllm.workload_transport import decode_workload, encode_workload
@@ -99,7 +100,7 @@ def _worker(connection: Connection) -> None:
                 receipt = arena.publish(write)
                 arena.settle(receipt)
                 (ref,) = receipt.after_refs
-                pin = arena.pin_exact((ref,))
+                pin = arena.pin_exact(StateRefs.of((ref,)))
                 assert torch.all(arena.borrow_field(pin, ref, LayoutFieldId(0)) == 3)
                 connection.send_bytes(encode_boundary(ref).encode())
             except ValueError as error:
