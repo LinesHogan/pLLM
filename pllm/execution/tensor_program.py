@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
-from typing import Generic, Literal, Protocol, TypeVar
+from typing import Any, Generic, Literal, Protocol, TypeVar
 
 import torch
 from torch.optim.sgd import sgd
@@ -35,16 +35,8 @@ R = TypeVar("R")
 Roots = tuple[tuple[torch.Tensor, ...], ...]
 
 
-def _no_slots(field: int) -> tuple[torch.Tensor, tuple[int, ...]]:
-    raise RuntimeError("this mathematical batch has no issued page access")
-
-
-def _no_matrix() -> tuple[str, Slots]:
-    raise RuntimeError("this mathematical batch has no issued page access")
-
-
-def _no_resource(resource: StateResource) -> TensorBatch:
-    raise RuntimeError("this mathematical batch has no resource selection")
+def _unwired(*_args: object) -> Any:
+    raise RuntimeError("this mathematical batch has no issued page or resource access")
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,14 +51,14 @@ class TensorBatch:
     epoch: int = 1
     observing: bool = False
     # Field pool and the slot of every selected state's page, in selection order.
-    field_slots: Callable[[int], tuple[torch.Tensor, tuple[int, ...]]] = _no_slots
-    slot_matrix: Callable[[], tuple[str, Slots]] = _no_matrix
+    field_slots: Callable[[int], tuple[torch.Tensor, tuple[int, ...]]] = _unwired
+    slot_matrix: Callable[[], tuple[str, Slots]] = _unwired
     results: dict[tuple[TaskSymbol, str], torch.Tensor] = field(
         default_factory=lambda: dict[tuple[TaskSymbol, str], torch.Tensor]()
     )
     borrowed_roots: tuple[BorrowedStateRoot, ...] = ()
     local_pin: PagePin | None = None
-    select_resource: Callable[[StateResource], TensorBatch] = _no_resource
+    select_resource: Callable[[StateResource], TensorBatch] = _unwired
 
     def for_resource(self, resource: StateResource) -> TensorBatch:
         """Use the operation resource without redirecting reads of other states."""
@@ -133,12 +125,12 @@ def autograd_loss(
             loss = function(data, parameters)
             if loss is None:
                 return TaskOutput()
-            if loss.ndim != 0:
-                raise ValueError("optimizer functions must return a scalar loss")
+            count = trained_rows(data)
+            if loss.ndim != 0 or count < 1:
+                raise ValueError(
+                    "optimizer functions must return a scalar loss with a positive effective row count (or None to skip)"
+                )
             gradients = torch.autograd.grad(loss, tuple(parameters.values()))
-        count = trained_rows(data)
-        if count < 1:
-            raise ValueError("a training loss requires positive effective row count; return None to skip")
         return TaskOutput(loss=loss.detach(), gradients=gradients, loss_count=1, update_count=1, trained_rows=count)
 
     return execute
@@ -154,8 +146,7 @@ class InvocationOutput:
 
 
 def _read(context: StateTaskContext[D], version: Literal["input", "private", "published"] = "input") -> TensorBatch:
-    if version != "input" and len(context.page_publications) > 1:
-        raise ValueError("multiple publications require explicit Region snapshot sources")
+    assert version == "input" or len(context.page_publications) <= 1
     refs = context.pin.refs
     access: tuple[PagePin | PageWrite, ...] = (context.pin,) * len(refs)
     if version == "private" and context.write is not None:
@@ -212,8 +203,7 @@ class FunctionMath(Generic[I, D, R]):
 
     def initialize(self, roots: Roots, addresses: tuple[StateAddress, ...]) -> None:
         resources = tuple(str(address.resource) for address in addresses)
-        if len(roots) != len(addresses) or not set(resources) <= self.initializers.keys():
-            raise ValueError("state initialization requires a named initializer for every root")
+        assert len(roots) == len(addresses) and set(resources) <= self.initializers.keys()
         for resource in dict.fromkeys(resources):
             selected = tuple(
                 (root, address.key)
@@ -359,8 +349,7 @@ class PageUpdate(TensorAdamW):
         for field in set(range(5, len(pools))) - captures.keys():
             copy_pages(pools[field], pools[field], sources[field, :count], destinations[field])
         for field, value in captures.items():
-            if value.shape[1:] != pools[field].shape[1:] or value.dtype != pools[field].dtype:
-                raise ValueError("memory capture must match its declared field shape and dtype")
+            assert value.shape[1:] == pools[field].shape[1:] and value.dtype == pools[field].dtype
             copy_pages(value.detach(), pools[field], last, destinations[field])
 
 
@@ -438,8 +427,7 @@ class TensorOperation(Generic[D]):
                 return
             batch = _read(context, self.version)
             selected = tuple(range(len(batch.roots))) if self.select is None else self.select(data, context.selection)
-            if len(set(selected)) != len(selected) or any(i < 0 or i >= len(batch.roots) for i in selected):
-                raise ValueError("update selection is outside the original state batch")
+            assert len(set(selected)) == len(selected) and all(0 <= i < len(batch.roots) for i in selected)
             if self.mode == "transition" and selected:
                 if self.version == "input" or context.write is None:
                     context.write = context.arena.prepare_transition(
@@ -450,34 +438,30 @@ class TensorOperation(Generic[D]):
             if self.output is not None:
                 output = self.output(data, batch)
             if output.gradient_indices:
-                if (
-                    not output.gradients
-                    or len(set(output.gradient_indices)) != len(output.gradient_indices)
-                    or any(index not in selected for index in output.gradient_indices)
-                ):
-                    raise ValueError("gradient selection must be a subset of the authorized state selection")
+                assert (
+                    output.gradients
+                    and len(set(output.gradient_indices)) == len(output.gradient_indices)
+                    and all(index in selected for index in output.gradient_indices)
+                )
                 selected = output.gradient_indices
             if output.gradients:
-                if (
-                    self.mode not in ("update", "gradient")
-                    or self.optimizer is None
-                    or len(output.gradients) != len(selected) * self.optimizer.groups
-                ):
-                    raise ValueError("gradients require an explicit matching optimizer update")
+                assert (
+                    self.mode in ("update", "gradient")
+                    and self.optimizer is not None
+                    and len(output.gradients) == len(selected) * self.optimizer.groups
+                )
                 context.write = context.arena.prepare_transition(
                     context.pin.refs.take(selected), stream, copy_fields=self.copy_fields
                 )
                 roots = context.arena.lazy_roots((context.write,) * len(selected), context.write.after_refs)
                 self.optimizer.update(roots, roots.field_slots, output.gradients)
             if output.field_writes:
-                if context.write is None:
-                    raise ValueError("memory writes require the invocation's private transition")
+                assert context.write is not None
                 roots = context.arena.lazy_roots((context.write,) * len(selected), context.write.after_refs)
                 for view, values in output.field_writes:
                     pool, slots = roots.field_slots(view.field)
                     target = view.read(pool, pooled=True)
-                    if values.shape != (len(selected), *view.shape) or values.dtype != target.dtype:
-                        raise ValueError("memory write differs from its signed field shape or dtype")
+                    assert values.shape == (len(selected), *view.shape) and values.dtype == target.dtype
                     copy_pages(
                         values.detach().contiguous(),
                         target,
