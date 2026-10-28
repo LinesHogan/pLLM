@@ -11,9 +11,10 @@ import numpy as np
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from pllm.contracts.parameter_overlay import CapturedParameterOperand
+from pllm.contracts.parameter_overlay import CapturedParameterOperand, ParameterOverlayOperator
 from pllm.contracts.semantic_graph import TaskResourceFact
 from pllm.execution.cuda_stream import PinnedStaging
+from pllm.execution.overlay_task import ChunkUpdate, GradientUpdate
 from pllm.execution.step_capture import StepCapture
 from pllm.execution.tensor_frame import Tensors, TensorUpdate
 from pllm.execution.tensor_program import TensorBatch
@@ -31,6 +32,8 @@ class OverlayBatch:
 
     def __init__(self, math: OverlayTransition, entitlement: TaskResourceFact | None = None) -> None:
         self.math, self.entitlement = math, entitlement
+        if entitlement is not None:
+            self.states = min(self.states, entitlement.input_shapes[0][0])
         self.tiles: dict[tuple[int, bool, int], OverlayTile | None] = {}
         self.batchable = False
 
@@ -39,9 +42,10 @@ class OverlayBatch:
         return capture_bytes if self.entitlement is not None and self.batchable else 0
 
     def capacities(self) -> tuple[int, ...]:
+        """Pad within the native power-of-two chunk-count bucket used by scan selection."""
         assert self.math.chunk is not None
         chunk = self.math.chunk.chunk
-        return tuple(dict.fromkeys((1, chunk, 4 * chunk, 8 * chunk)))
+        return tuple(dict.fromkeys((1, chunk + 1, 3 * chunk + 1, 7 * chunk + 1)))
 
     def run(
         self,
@@ -65,9 +69,9 @@ class OverlayBatch:
         for rows, members in groups.items():
             for start in range(0, len(members), self.states):
                 selected = members[start : start + self.states]
-                tile = self.tile(target, train, rows, pools, operands[0], len(selected))
+                tile = self.tile(target, train, rows, pools, operands[selected[0]], len(selected))
                 items = tuple(operands[i] for i in selected)
-                if tile.plan is not None and tile.plan.analysis is not None:
+                if not tile.batchable:
                     values, counts = self.math.serial(items, target, tuple(indices[i] for i in selected), batch)
                 else:
                     values, counts = tile.run(items, slots[:, [indices[i] for i in selected]], pools, batch.stream)
@@ -93,10 +97,10 @@ class OverlayBatch:
                 tile.capture.entitlement = replace(self.entitlement, resident_bytes=self.available(key))
             return tile
         tile = OverlayTile(self.math, pools, operand, self.states if bounded else count, rows, train)
-        self.batchable |= tile.plan is None or tile.plan.analysis is None
+        self.batchable |= tile.batchable
         if capture and key not in self.tiles and self.entitlement is not None:
             remaining = self.available(key)
-            if tile.plan is None or tile.plan.analysis is None:
+            if tile.batchable:
                 with FakeTensorMode(allow_non_fake_inputs=True):
                     workspace = measure(tile.body).workspace
                 needed = workspace + tile.buffer_bytes
@@ -130,6 +134,8 @@ class OverlayTile:
         train: bool,
     ) -> None:
         self.math, self.pools, self.train = math, pools, train
+        self.base = operand.base_weight
+        self.prompt_end = operand.prompt_end.new_zeros((states,))
         self.table = torch.zeros((2 * len(pools) + 1, states), device=pools[0].device, dtype=torch.int64)
         self.hidden = operand.hidden.new_zeros((states, rows, operand.hidden.shape[1]))
         self.desired = operand.desired.new_zeros((states, rows, operand.desired.shape[1]))
@@ -140,25 +146,38 @@ class OverlayTile:
         chunk = math.chunk
         assert chunk is not None
         values = dict(zip(math.buffers, (pool[0] for pool in pools), strict=True))
-        self.plan = chunk.prepare(self.arguments(values, self.hidden[0], self.desired[0])) if train else None
+        self.plan = chunk.prepare(self.arguments(values, operand.hidden, operand.desired)) if train else None
+
+    @property
+    def batchable(self) -> bool:
+        """Dense source GEMMs retain their selected reduction order on the serial path."""
+        if self.plan is None:
+            return self.math.operator is not ParameterOverlayOperator.DENSE_ADD or isinstance(
+                self.math.chunk, GradientUpdate
+            )
+        return (
+            self.math.operator is ParameterOverlayOperator.HEAD_ADD
+            if self.plan.analysis is None
+            else self.plan.analysis.kind == "additive"
+        )
 
     @property
     def buffers(self) -> tuple[torch.Tensor, ...]:
-        return self.hidden, self.desired, self.sources
+        return self.hidden, self.desired, self.sources, self.prompt_end
 
     @property
     def buffer_bytes(self) -> int:
         return sum(value.untyped_storage().nbytes() for value in (self.table, *self.buffers))
 
     def arguments(self, values: Tensors, hidden: torch.Tensor, desired: torch.Tensor) -> Tensors:
-        inputs = {**values, "input": hidden, "target": desired}
+        inputs = {**values, "input": hidden, "target": desired, "weight": self.base, "prompt_end": self.prompt_end}
         return {key: inputs[source] for key, source in self.math.arguments.items()}
 
     def one(self, values: Tensors, hidden: torch.Tensor, desired: torch.Tensor, count: torch.Tensor):
         chunk = self.math.chunk
         assert chunk is not None
         if self.train:
-            assert self.plan is not None
+            assert isinstance(chunk, ChunkUpdate) and self.plan is not None
             result = chunk.counted(self.plan, count, self.arguments(values, hidden, desired))
         else:
             result = TensorUpdate.unchanged(self.math.apply(hidden, values))
@@ -172,10 +191,21 @@ class OverlayTile:
             for i, (name, pool) in enumerate(zip(self.math.buffers, self.pools, strict=True))
         }
         if self.train:
-            values["_pending_length"].masked_fill_(self.table[-1] == 0, 0)
-        fields, output, changed, updates, trained = torch.vmap(self.one)(
-            values, self.hidden, self.desired, self.table[-1]
-        )
+            values["_pending_length"].masked_fill_(self.table[width] < 0, 0)
+        chunk = self.math.chunk
+        if self.train and isinstance(chunk, GradientUpdate):
+            result = chunk.counted(None, self.table[-1], self.arguments(values, self.hidden, self.desired))
+            fields, output, changed, updates, trained = (
+                values,
+                result.output,
+                result.changed,
+                result.update_count,
+                result.trained_rows,
+            )
+        else:
+            fields, output, changed, updates, trained = torch.vmap(self.one)(
+                values, self.hidden, self.desired, self.table[-1]
+            )
         self.output = (
             output,
             changed,
@@ -197,6 +227,7 @@ class OverlayTile:
     ) -> tuple[tuple[TensorUpdate, ...], torch.Tensor]:
         """Fence staging through PinnedStaging and detach outputs before the next tile replay."""
         self.pools = pools
+        self.base = operands[0].base_weight
         if self.capture is not None:
             self.capture.order(stream)
         host = (
@@ -214,9 +245,11 @@ class OverlayTile:
         refill()
         self.hidden.zero_()
         self.desired.zero_()
+        self.prompt_end.zero_()
         for i, operand in enumerate(operands):
             self.hidden[i, : len(operand.hidden)].copy_(operand.hidden)
             self.desired[i, : len(operand.hidden)].copy_(operand.desired)
+            self.prompt_end[i].copy_(operand.prompt_end)
         if self.capture is None:
             self.body()
         else:
@@ -224,7 +257,7 @@ class OverlayTile:
                 self.body,
                 self.table,
                 self.table[width : 2 * width],
-                tuple(pool.data_ptr() for pool in pools),
+                (*tuple(pool.data_ptr() for pool in pools), self.base.data_ptr()),
                 stream,
                 partial(self.staging.copy_to, self.table),
                 self.buffers,

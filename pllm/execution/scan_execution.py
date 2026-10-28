@@ -8,7 +8,7 @@ from torch._higher_order_ops.associative_scan import associative_scan
 
 from pllm.contracts.tensor_policy import ScanForm
 from pllm.execution.scan_analysis import ScanAnalysis, stage
-from pllm.kernels.additive_scan import launch_prefix as additive_prefix
+from pllm.kernels.additive_scan import prefix as additive_prefix
 from pllm.kernels.right_matrix_scan import MatrixPrefixBuffers, launch_prefix as matrix_prefix
 
 Step = Callable[..., tuple[torch.Tensor, torch.Tensor]]
@@ -108,6 +108,8 @@ class PreparedScan:
             if self.analysis.copy_readout or size != self.window:
                 readout = readout.clone()
             outputs.extend(readout.unbind())
+            # A completed window must not overlap the next window's coefficient allocation.
+            del packed, coefficient, bias, cuts, states, active
         return carry, tuple(outputs)
 
     def prefix(
@@ -123,21 +125,14 @@ class PreparedScan:
         bias = torch.broadcast_to(bias, (self.window, *carry.shape))
         mask = active.reshape(self.window, *(1 for _ in carry.shape))
         if self.analysis.kind == "additive":
-            states = carry.new_empty((self.window, *carry.shape))
-            final = torch.empty_like(carry)
+            if tracing:
+                return carry.new_empty((self.window, *carry.shape)), torch.empty_like(carry)
             matrix = carry.view(-1, carry.shape[-1] if carry.ndim else 1)
             increments = bias.reshape(self.window, *matrix.shape)
-            if not tracing:
-                additive_prefix(
-                    increments,
-                    matrix,
-                    active,
-                    states.view(self.window, *matrix.shape),
-                    final.view_as(matrix),
-                    self.analysis.scale,
-                    self.form,
-                )
-            return states, final
+            states, final = additive_prefix(
+                increments.unsqueeze(0), matrix.unsqueeze(0), active.unsqueeze(0), self.analysis.scale, self.form.value
+            )
+            return states.view(self.window, *carry.shape), final.view_as(carry)
         bias = torch.where(mask, bias, 0)
         if self.analysis.kind == "diagonal":
             coefficient = coefficient.reshape(

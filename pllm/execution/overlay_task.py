@@ -25,6 +25,7 @@ from pllm.execution.scan import execute_scan, prepare_scan
 from pllm.execution.scan_execution import PreparedScan, Step
 from pllm.execution.tensor_frame import OverlayEntry, OverlayTargetResult, TensorFrame, Tensors, TensorUpdate
 from pllm.execution.tensor_program import PoolSGD, TaskOutput, TensorBatch
+from pllm.execution.torch_private import MemoryTrace
 from pllm.kernels.head_overlay import head_correction
 from pllm.kernels.page_copy import chunk_capacity, copy_pages
 
@@ -93,82 +94,132 @@ def overlay_apply(effect: ParameterEffect, hidden: torch.Tensor, values: Tensors
     return hidden @ values[applied[0]].T
 
 
-Gradient = Callable[[Tensors, Tensors, torch.Tensor], Tensors]
+Gradient = Callable[[Tensors, Tensors, Tensors, torch.Tensor], Tensors]
 
 
-def overlay_gradient(function: Callable[..., torch.Tensor]) -> Gradient:
-    """Differentiate the sum of valid per-row losses, leaving chunk normalization to execution."""
+def overlay_gradient(function: Callable[..., torch.Tensor], *, batched: bool = False) -> Gradient:
+    """Compose request mapping with differentiation before compiling; broadcast frozen weights."""
 
-    def loss(parameters: Tensors, operands: Tensors, valid: torch.Tensor) -> torch.Tensor:
-        rows = function(**parameters, **operands)
+    def loss(parameters: Tensors, operands: Tensors, constants: Tensors, valid: torch.Tensor) -> torch.Tensor:
+        rows = function(**parameters, **operands, **constants)
         if rows.shape != valid.shape:
             raise ValueError("autograd overlays must return one loss per input row")
         return torch.where(valid, rows, 0).sum()
 
     eager = torch.func.grad(loss)
+    if batched:
+        # Folding requests into the frozen-base GEMM changes CUDA's BF16 reduction.
+        # Compile the chunks together while retaining each source GEMM's shape.
+        eager = torch.vmap(eager, in_dims=(0, 0, None, 0), chunk_size=1)
     compiled = torch.compile(  # pyright: ignore[reportUnknownMemberType]
         eager, fullgraph=True, dynamic=False, options={"triton.cudagraphs": False}
     )
 
-    def gradient(parameters: Tensors, operands: Tensors, valid: torch.Tensor) -> Tensors:
-        # Planning traces the unfused allocations; real invocations warm before capture.
-        return (eager if valid.is_meta else compiled)(parameters, operands, valid)
+    def gradient(parameters: Tensors, operands: Tensors, constants: Tensors, valid: torch.Tensor) -> Tensors:
+        return (eager if valid.is_meta or MemoryTrace.active.get() is not None else compiled)(
+            parameters, operands, constants, valid
+        )
 
     return gradient
 
 
-def gradient_update(
-    gradient: Gradient,
-    optimizer: PoolSGD,
-    effect: ParameterEffect,
-    chunk: int,
-    flush: bool,
-    bindings: Mapping[str, str],
-    /,
-    **values: torch.Tensor,
-) -> TensorUpdate:
-    """Accumulate arriving-row gradients in PTTS and update once per completed chunk."""
-    parameters = {name: values[name] for name, source in bindings.items() if source in effect.applied_fields}
-    row_names = tuple(name for name, source in bindings.items() if source in ("input", "target"))
-    input_name = next(name for name, source in bindings.items() if source == "input")
-    hidden = values[input_name]
-    state = {source: parameters[name] for name, source in bindings.items() if name in parameters}
-    sums = tuple(values[f"_pending_grad_{name}"] for name in parameters)
-    length = values["_pending_length"]
-    offset = length.clone()
-    positions = torch.arange(chunk, device=hidden.device)
-    outputs: list[torch.Tensor] = []
-    updates, trained = torch.zeros_like(length), torch.zeros_like(length)
-    with torch.inference_mode(False), torch.enable_grad():
-        constants = {name: values[name] for name, source in bindings.items() if source == "weight"}
-        for start in range(0, len(hidden) + chunk - 1, chunk):
-            indices = positions + start - offset
-            valid = (indices >= 0) & (indices < len(hidden))
-            rows = {name: values[name].index_select(0, indices.clamp(0, len(hidden) - 1)) for name in row_names}
-            outputs.append(overlay_apply(effect, rows[input_name], state))
-            gradients = gradient(
-                {name: value.clone() for name, value in parameters.items()}, {**constants, **rows}, valid
-            )
-            length.add_(valid.sum())
-            complete = (length == chunk) | (
-                flush & values["_prompt_end"] & (start + chunk >= offset + len(hidden)) & (length > 0)
-            )
-            for total, grad in zip(sums, gradients.values(), strict=True):
-                total.add_(grad)
-            optimizer.tensors(
-                tuple(parameters.values()),
-                tuple(
-                    torch.where(complete, total / length.clamp_min(1), 0).to(parameter.dtype)
-                    for total, parameter in zip(sums, parameters.values(), strict=True)
-                ),
-            )
-            updates.add_(complete)
-            trained.add_(torch.where(complete, length, 0))
-            for total in sums:
-                total.masked_fill_(complete, 0)
-            length.masked_fill_(complete, 0)
-    output = torch.cat(outputs).index_select(0, torch.arange(len(hidden), device=hidden.device) + offset)
-    return TensorUpdate(output, updates > 0, updates, trained, {"tail_rows": length.clone()})
+@dataclass(frozen=True)
+class GradientUpdate:
+    """Chunk gradient sums and optimizer masks over independent request parameters."""
+
+    gradient: Gradient
+    mapped_gradient: Gradient
+    optimizer: PoolSGD
+    effect: ParameterEffect
+    chunk: int
+    flush: bool
+    bindings: Mapping[str, str]
+
+    @property
+    def input_name(self) -> str:
+        """The authored argument carrying arriving rows."""
+        return next(name for name, source in self.bindings.items() if source == "input")
+
+    def __call__(self, **values: torch.Tensor) -> TensorUpdate:
+        count = values["_pending_length"].new_full((), len(values[self.input_name]))
+        return self.advance(values, count, batched=False)
+
+    def prepare(self, values: Tensors) -> None:
+        """Autograd has no scan selection."""
+
+    def counted(self, plan: None, count: torch.Tensor, values: Tensors) -> TensorUpdate:
+        """Execute the already mapped derivative over a tile."""
+        return self.advance(values, count, batched=True)
+
+    def rows(
+        self, values: Tensors, count: torch.Tensor, offset: torch.Tensor, start: int
+    ) -> tuple[Tensors, torch.Tensor, torch.Tensor]:
+        """Gather a request's chunk and read its incoming parameters before the update."""
+        inputs = {name: values[name] for name, source in self.bindings.items() if source in ("input", "target")}
+        hidden = inputs[self.input_name]
+        indices = torch.arange(self.chunk, device=hidden.device) + start - offset
+        valid = (indices >= 0) & (indices < count)
+        rows = {name: value.index_select(0, indices.clamp(0, len(hidden) - 1)) for name, value in inputs.items()}
+        state = {source: values[name] for name, source in self.bindings.items() if source in self.effect.applied_fields}
+        return rows, valid, overlay_apply(self.effect, rows[self.input_name], state)
+
+    def apply(self, values: Tensors, gradients: Tensors, valid: torch.Tensor, complete: torch.Tensor) -> None:
+        """Accumulate each request's valid rows and apply its own completion mask."""
+        length = values["_pending_length"]
+        length.add_(valid.sum())
+        parameters = tuple(values[name] for name in gradients)
+        sums = tuple(values[f"_pending_grad_{name}"] for name in gradients)
+        for total, grad in zip(sums, gradients.values(), strict=True):
+            total.add_(grad)
+        self.optimizer.tensors(
+            parameters,
+            tuple(
+                torch.where(complete, total / length.clamp_min(1), 0).to(parameter.dtype)
+                for total, parameter in zip(sums, parameters, strict=True)
+            ),
+        )
+        for total in sums:
+            total.masked_fill_(complete, 0)
+        length.masked_fill_(complete, 0)
+
+    def advance(self, values: Tensors, count: torch.Tensor, *, batched: bool) -> TensorUpdate:
+        """Keep per-request accumulation and SGD eager around the compiled loss derivative."""
+        parameters = {
+            name: values[name] for name, source in self.bindings.items() if source in self.effect.applied_fields
+        }
+        constants = {name: values[name] for name, source in self.bindings.items() if source == "weight"}
+        fields = {name: value for name, value in values.items() if name not in constants}
+        hidden = fields[self.input_name]
+        length = fields["_pending_length"]
+        offset = length.clone()
+        rows = hidden.shape[int(batched)]
+        updates, trained = torch.zeros_like(length), torch.zeros_like(length)
+        outputs: list[torch.Tensor] = []
+        select = torch.vmap(self.rows, in_dims=(0, 0, 0, None)) if batched else self.rows
+        apply = torch.vmap(self.apply, out_dims=None) if batched else self.apply
+        gradient = self.mapped_gradient if batched else self.gradient
+        with torch.inference_mode(False), torch.enable_grad():
+            for start in range(0, rows + self.chunk - 1, self.chunk):
+                operands, valid, output = select(fields, count, offset, start)
+                outputs.append(output)
+                gradients = gradient(
+                    {name: value.clone() for name, value in parameters.items()}, operands, constants, valid
+                )
+                total = length + valid.sum(-1)
+                complete = (total == self.chunk) | (
+                    self.flush & fields["_prompt_end"] & (start + self.chunk >= offset + count) & (total > 0)
+                )
+                updates.add_(complete)
+                trained.add_(torch.where(complete, total, 0))
+                apply(fields, gradients, valid, complete)
+        output = torch.cat(outputs, dim=int(batched))
+        positions = torch.arange(rows, device=hidden.device) + offset.unsqueeze(-1)
+        output = (
+            torch.vmap(torch.index_select, in_dims=(0, None, 0))(output, 0, positions)
+            if batched
+            else output.index_select(0, positions)
+        )
+        return TensorUpdate(output, updates > 0, updates, trained, {"tail_rows": length.clone()})
 
 
 class ProjectionTransition(Protocol):
@@ -226,7 +277,8 @@ class OverlayTransition:
     arguments: Mapping[str, str]
     visibility: VisibilitySource
     task: TaskSymbol
-    chunk: ChunkUpdate | None = None
+    operator: ParameterOverlayOperator
+    chunk: ChunkUpdate | GradientUpdate | None = None
     executor: OverlayBatch | None = None
 
     def __call__(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
@@ -305,7 +357,7 @@ class OverlayTransition:
         indices: tuple[int, ...],
         batch: TensorBatch,
     ) -> tuple[tuple[TensorUpdate, ...], torch.Tensor]:
-        """Keep non-chunk and transformed scan execution on its selected implementation."""
+        """Keep unbatchable implementations on their selected numerical path."""
         width = len(self.buffers)
         fields = tuple(batch.field_slots(target * width + i) for i in range(width))
         pools = tuple(pool for pool, _ in fields)

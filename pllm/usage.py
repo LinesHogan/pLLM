@@ -82,7 +82,7 @@ from pllm.execution.module_state import (
     parameter_count,
     skeleton,
 )
-from pllm.execution.overlay_task import ChunkUpdate, gradient_update, overlay_gradient
+from pllm.execution.overlay_task import ChunkUpdate, GradientUpdate, overlay_gradient
 from pllm.execution.position_state import PositionState as PositionState
 from pllm.execution.row_task_binding import (
     declare_logits,
@@ -865,9 +865,9 @@ def _chunked_overlay(
             for name, source in bindings.items()
             if source in effect.applied_fields
         }
-        update = partial(
-            gradient_update,
+        update = GradientUpdate(
             overlay_gradient(function),
+            overlay_gradient(function, batched=True),
             PoolSGD(optimizer.lr, len(effect.applied_fields)),
             effect,
             chunk,

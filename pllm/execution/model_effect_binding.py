@@ -28,7 +28,6 @@ from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
     ParameterEffect,
     ParameterOverlayFieldBinding,
-    ParameterOverlayOperator,
 )
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.semantic_graph import (
@@ -43,7 +42,7 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.visibility import Exact, Visibility, VisibilitySource
 from pllm.execution.binding_base import Buffer, overlay_fields
 from pllm.execution.declaration import Call, State, When, native
-from pllm.execution.overlay_task import ChunkUpdate, OverlayTransition, overlay_apply
+from pllm.execution.overlay_task import ChunkUpdate, GradientUpdate, OverlayTransition, overlay_apply
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION
 from pllm.execution.tensor_frame import (
@@ -139,9 +138,8 @@ def declare_parameter_overlay(
         arguments,
         source,
         TaskSymbol(name),
-        function
-        if isinstance(function, ChunkUpdate) and effect.operator is ParameterOverlayOperator.HEAD_ADD
-        else None,
+        effect.operator,
+        function if isinstance(function, (ChunkUpdate, GradientUpdate)) else None,
     )
     b.overlay_math = math
     transition = b.compute(
