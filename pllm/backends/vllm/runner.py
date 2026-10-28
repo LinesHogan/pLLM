@@ -10,7 +10,7 @@ import json
 import os
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 
 import torch
 from vllm.config import CacheConfig, ModelConfig as VllmModelConfig, VllmConfig
@@ -43,15 +43,14 @@ from pllm.backends.vllm.sampler import (
     Mrv1Sampler as Mrv1Guidance,
     Vllm027Sampler,
 )
+from pllm.backends.vllm.session import VllmSession
 from pllm.config import RunnerKind
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
     AttachmentTopology,
-    SignedBackendAttachment,
 )
-from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from pllm.contracts.hidden_locator import HiddenSite
 from pllm.contracts.packed_hidden import hidden_binding
-from pllm.contracts.packed_rows import PackedSamplerRowBatch
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.execution.codec import decode_boundary
 from pllm.execution.host_runtime import CompletionCapture
@@ -59,48 +58,8 @@ from pllm.execution.position_state import PositionAnnouncement
 from pllm.execution.state_execution import StateDiagnostics
 from pllm.execution.trace import ExecutionTrace
 
-if TYPE_CHECKING:
-    pass
-
-
-from pllm.backends.vllm.session import ReadonlyStepReceiver, VllmSession
-from pllm.execution.state_feed import Feed
-
 # Hidden sources the driver announces before construction, so the worker taps them at load time.
 TAPS_ENV = "PLLM_HIDDEN_TAPS"
-
-
-class _RunnerSession(Protocol):
-    @property
-    def trace(self) -> ExecutionTrace: ...
-    @property
-    def next_step_id(self) -> int: ...
-    @property
-    def apply_count(self) -> int: ...
-    @property
-    def updated_apply_count(self) -> int: ...
-    def stage_input(
-        self, batch: AuxiliaryInput[torch.Tensor] | None, identities: tuple[RequestIdentity, ...]
-    ) -> None: ...
-    def bind_readonly_input(self, receiver: ReadonlyStepReceiver) -> None: ...
-
-    def feed(self, name: str) -> Feed: ...
-    def identity(self, request_id: str) -> RequestIdentity: ...
-    def before_execute(self, scheduler_output: SchedulerOutput) -> None: ...
-    def prepare_input(self, rows: PackedSamplerRowBatch) -> None: ...
-    def complete_forward(self) -> None: ...
-    def begin_sampler(self) -> None: ...
-    def complete_sampler(self) -> None: ...
-    def commit_token(self) -> None: ...
-    def abort_active(self) -> None: ...
-    def retire_all(self) -> None: ...
-    def close(self) -> None: ...
-    def require_idle(self) -> None: ...
-    def diagnostics(self) -> StateDiagnostics: ...
-    @property
-    def attachment(self) -> SignedBackendAttachment: ...
-    @property
-    def parameter_phases(self) -> tuple[HiddenPhase, ...]: ...
 
 
 SamplerT = TypeVar("SamplerT", Sampler, Mrv1Sampler)
@@ -148,18 +107,8 @@ class Runner(Generic[SamplerT, AdapterT]):
         policy = os.environ.get(POLICY_ENV, "isolate")
         self._generated_kv: Literal["reuse", "isolate"] = "reuse" if policy == "reuse" else "isolate"
         self.workload_topology = topology
-        self._workload_session: _RunnerSession | None = None
+        self._workload_session: VllmSession[Any, Any] | None = None
         self.completion_capture: CompletionCapture | None = None
-
-    @property
-    def overlay_apply_count(self) -> int:
-        session = self._workload_session
-        return 0 if session is None else session.apply_count
-
-    @property
-    def overlay_updated_apply_count(self) -> int:
-        session = self._workload_session
-        return 0 if session is None else session.updated_apply_count
 
     def attach_workload(
         self,
@@ -266,7 +215,7 @@ class Runner(Generic[SamplerT, AdapterT]):
             self.completion_capture.synchronize()
         self.completion_capture = None
 
-    def require_session(self) -> _RunnerSession:
+    def require_session(self) -> VllmSession[Any, Any]:
         session = self._workload_session
         assert session is not None
         return session

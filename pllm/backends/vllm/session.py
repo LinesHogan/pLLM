@@ -6,7 +6,6 @@ publication) for one attached workload. Used by the runners in runner.py.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Generic, cast
 
@@ -75,11 +74,6 @@ class _PackedStep(Generic[DataT]):
     invocation: TaskGraphInvocation[StateTaskContext[DataT]] | None = None
     forward_done: bool = False
     handed_off: bool = False
-
-
-ReadonlyStepReceiver = Callable[
-    [PackedSamplerRowBatch, torch.cuda.Stream], ReadonlyStepInput | ReadonlyStepAbsent | ReadonlyStepEnd
-]
 
 
 class VllmSession(Generic[DataT, ResultT]):
@@ -152,7 +146,6 @@ class VllmSession(Generic[DataT, ResultT]):
         )
         self._token_frontiers: dict[RequestIdentity, int] = {}
         self._feed: FeedReceiver | None = None
-        self._readonly_receiver: ReadonlyStepReceiver | None = None
         self._received_readonly: ReadonlyStepInput | ReadonlyStepAbsent | ReadonlyStepEnd | None = None
         self._input_failed = False
         self._replay: VllmTokenwiseReplay[DataT, ResultT] | None = None
@@ -190,7 +183,6 @@ class VllmSession(Generic[DataT, ResultT]):
         if execution.feeds:
             (binding,) = execution.feeds
             self._feed = FeedReceiver(execution.arena.plan, binding)
-            self.bind_readonly_input(self._feed)
 
     @property
     def parameter_phases(self) -> tuple[HiddenPhase, ...]:
@@ -209,20 +201,15 @@ class VllmSession(Generic[DataT, ResultT]):
             raise RuntimeError("declare a fed state and obtain its writer before generate")
         return self._feed.take(name)
 
-    def bind_readonly_input(self, receiver: ReadonlyStepReceiver) -> None:
-        """Install the framework transport before requests; it supplies no model mathematics."""
-        self._require_input_live()
-        self._readonly_receiver = receiver
-
     def _require_input_live(self) -> None:
         if self._input_failed:
             raise RuntimeError("canonical step input is fail-stopped; received grants remain retained")
 
     def _receive_readonly(self, rows: PackedSamplerRowBatch, stream: torch.cuda.Stream) -> None:
-        if self._readonly_receiver is None:
+        if self._feed is None:
             return
         try:
-            self._received_readonly = self._readonly_receiver(rows, stream)
+            self._received_readonly = self._feed(rows, stream)
             received = self._received_readonly
             if (received.plan_epoch, received.step_id) != (rows.plan_epoch, rows.step_id):
                 raise ValueError("read-only input differs from the original epoch/step; grants retained")
@@ -399,13 +386,8 @@ class VllmSession(Generic[DataT, ResultT]):
         self._finish_effects()
 
     def _finish_effects(self) -> None:
-        """End-of-forward lifecycle for every active optional primitive."""
+        """Clear every active optional primitive after forward or abort."""
         for effect in (self._overlay, self._activation, self._replay):
-            if effect is not None:
-                effect.clear()
-
-    def _abort_effects(self) -> None:
-        for effect in (self._overlay, self._activation):
             if effect is not None:
                 effect.clear()
 
@@ -470,11 +452,9 @@ class VllmSession(Generic[DataT, ResultT]):
         execution.arena.collect_completed()
 
     def abort_active(self) -> None:
-        if self._replay is not None:
-            self._replay.clear()
         if self._sampler is not None:
             self._sampler.abort_guidance()
-        self._abort_effects()
+        self._finish_effects()
         self._deployment.execution.cancel_active()
         if self._post_sample is not None:
             self._post_sample.clear()

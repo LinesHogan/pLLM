@@ -162,8 +162,8 @@ def _check(handle: VllmLlm[object, object], label: str) -> tuple[str, ...]:
         not all(outputs)
         or diagnostics.update_count < 1
         or diagnostics.trained_rows < 1
-        or handle.runner.overlay_apply_count < 2
-        or handle.runner.overlay_updated_apply_count < 1
+        or handle.runner.require_session().apply_count < 2
+        or handle.runner.require_session().updated_apply_count < 1
         or diagnostics.active_lineages != 0
         or diagnostics.pending_state_releases != 0
         or diagnostics.fallback_count != 0
@@ -171,7 +171,8 @@ def _check(handle: VllmLlm[object, object], label: str) -> tuple[str, ...]:
         raise RuntimeError(
             f"{label} MRv2 parameter-overlay lifecycle evidence is incomplete: "
             f"outputs={outputs!r}, diagnostics={diagnostics}, "
-            f"apply={handle.runner.overlay_apply_count}, updated_apply={handle.runner.overlay_updated_apply_count}"
+            f"apply={handle.runner.require_session().apply_count}, "
+            f"updated_apply={handle.runner.require_session().updated_apply_count}"
         )
     return outputs
 
@@ -347,8 +348,8 @@ def _check_routed(handle: VllmLlm[object, object]) -> tuple[str, ...]:
     if (
         diagnostics.active_lineages != 2
         or diagnostics.update_count < 1
-        or handle.runner.overlay_apply_count < 3
-        or handle.runner.overlay_updated_apply_count < 1
+        or handle.runner.require_session().apply_count < 3
+        or handle.runner.require_session().updated_apply_count < 1
         or diagnostics.pending_state_releases != 0
         or diagnostics.fallback_count != 0
     ):
