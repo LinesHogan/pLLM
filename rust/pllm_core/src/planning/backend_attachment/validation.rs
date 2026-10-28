@@ -5,7 +5,7 @@ use super::super::semantic_graph::{
     HiddenPhase as SemanticHiddenPhase, HiddenSite as SemanticHiddenSite, InputSource, OutputKind,
     SemanticGraph, SemanticTask, StateEffectKind, StateScope, Timeline,
 };
-use super::super::state_representation::{StateDeviceKind, StatePhysicalPlan};
+use super::super::state_representation::{StateDeviceKind, StateRepresentationDecision};
 use super::types::{
     ActivationPatchOperator, AttachmentGraphMode, AttachmentHiddenResource, AttachmentKind,
     AttachmentTaskBinding, AttachmentTaskRole, BackendAttachment, BackendPlacementProbe,
@@ -632,7 +632,7 @@ fn validate_cross_binding(
     graph: &SemanticGraph,
     timeline: &Timeline,
     schedule: &ScheduleDecision,
-    state: &StatePhysicalPlan,
+    state: &StateRepresentationDecision,
 ) -> Result<(), String> {
     validate_declaration(attachment, probe)?;
     validate_probe(probe)?;
@@ -806,7 +806,7 @@ fn validate_cross_binding(
             if attachment.spec.activation_bindings.is_empty() {
                 if graph.tasks.len() != 1
                     || !graph.states.is_empty()
-                    || !state.representations.is_empty()
+                    || !state.plans.is_empty()
                     || !task.effects.is_empty()
                 {
                     return Err(
@@ -845,7 +845,7 @@ fn validate_cross_binding(
     if attachment.spec.kind != AttachmentKind::ModelReplay
         || !attachment.spec.activation_bindings.is_empty()
     {
-        if state.representations.iter().any(|provider| {
+        if state.plans.iter().any(|provider| {
             provider.device_kind != probe.device_kind
                 || provider.device_ordinal != probe.device_ordinal
         }) {
@@ -1160,7 +1160,7 @@ pub(crate) fn validate_attachment(attachment: &BackendAttachment) -> Result<(), 
         &plan.semantic_graph,
         &plan.timeline,
         &plan.schedule,
-        &plan.state_physical,
+        &plan.states,
     )
 }
 

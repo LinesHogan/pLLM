@@ -75,7 +75,7 @@ def packed(identities, hidden, phases, lengths=(1, 1), *, offset=0, stream=None)
 def test_prompt_producers_publish_only_completed_requests(workload, device, length):
     stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
     deployed = deployment(workload, device=device)
-    network = next(p for p in deployed.attachment.plan.state_physical.representations if p.resource == "network")
+    network = next(p for p in deployed.attachment.plan.states.plans if p.resource == "network")
     assert network.page_capacity == 1
     execution = deployed.execution
     identities = (RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0))
@@ -328,7 +328,7 @@ def test_backend_points_and_compile_rejects_unknown_anchor():
             for task in plan.semantic_graph.tasks
         ),
     )
-    decision = compile_schedule(constrained, plan.timeline, state=plan.state_physical)
+    decision = compile_schedule(constrained, plan.timeline, state=plan.states)
     assert all(plan.timeline.anchors[task.anchor_id].symbol == "state.publish" for task in decision.tasks)
     undeclared = replace(
         constrained,
@@ -338,4 +338,4 @@ def test_backend_points_and_compile_rejects_unknown_anchor():
         ),
     )
     with pytest.raises(ValueError, match="unknown anchor"):
-        compile_schedule(undeclared, plan.timeline, state=plan.state_physical)
+        compile_schedule(undeclared, plan.timeline, state=plan.states)

@@ -25,7 +25,7 @@ from pllm.contracts.semantic_graph import AnchorId, StateEffectKind
 from pllm.contracts.state_ref import LineageId, StateRef, VersionId
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.backend_attachment import attachment_buffer_bytes, bind_backend_attachment
-from pllm.execution.codec import boundary_digest, encode_boundary
+from pllm.execution.codec import encode_boundary
 from pllm.execution.declaration import Dimensions, Field, When
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle import BorrowedPage, PageBundleArena, PageFieldTransfer, PageSlot
@@ -110,13 +110,13 @@ def binding_case(*, alias=False, write_failure=False, runtime=False, missing=Non
     execution = binding.bind(arena, AnchorId(4))
     if not runtime:
         execution.admit(())
-    with received_features(plan) as (root, peers):
+    with received_features(arena) as (root, peers):
         yield b, features, ports, binding, execution, root, peers
 
 
 @contextmanager
-def received_features(plan, *, version=7, scale=1):
-    (layout,) = (item for item in plan.tensor_layout_decision.bindings if item.resource == "features")
+def received_features(arena, *, version=7, scale=1):
+    (layout,) = (item for item in arena.plan.tensor_layout_decision.bindings if item.resource == "features")
     ref = StateRef(layout.layout_id, LineageId(1), VersionId(version))
     with ExitStack() as lifetime:
         pages, peers = [], []
@@ -127,10 +127,10 @@ def received_features(plan, *, version=7, scale=1):
             peers.append(peer)
             # Deliberately bypass receive_field: CPU fixtures test roots/ACK ordering, not grant validation.
             descriptor = PageFieldTransfer(
-                boundary_digest(plan), version, ref, "features", LayoutFieldId(i), PageSlot(0, 0), 0
+                arena.plan_digest, version, ref, "features", LayoutFieldId(i), PageSlot(0, 0), 0
             )
             pages.append(BorrowedPage(descriptor, torch.full((2,), float(scale * (i + 1))), receiver))
-        root = BorrowedStateRoot(plan, "features", ref, tuple(pages))
+        root = BorrowedStateRoot(arena, "features", ref, tuple(pages))
         yield root, peers
 
 
@@ -245,7 +245,7 @@ def _decode_steps_keep_exact_publications_and_ack_order():
     # Only the stream adapter is replaced: all state tasks, pins and settlement are real CPU code.
     with (
         binding_case(runtime=True) as (b, _, _, _, execution, first, first_peers),
-        received_features(execution.arena.plan, version=8, scale=2) as (second, second_peers),
+        received_features(execution.arena, version=8, scale=2) as (second, second_peers),
         patch("torch.cuda.current_stream", return_value=None),
     ):
         session, model, _ = _session(b, execution)
@@ -302,7 +302,7 @@ def _hold_steps_reuse_the_settled_injection():
 
     with (
         binding_case(runtime=True, missing=MissingPolicy.HOLD) as (b, _, _, binding, execution, first, peers),
-        received_features(execution.arena.plan, version=8, scale=2) as (second, second_peers),
+        received_features(execution.arena, version=8, scale=2) as (second, second_peers),
         patch("torch.cuda.current_stream", return_value=None),
     ):
         session, model, _ = _session(b, execution)

@@ -9,11 +9,7 @@ from pllm.contracts.semantic_graph import (
     SchedulerTimeline,
     SemanticGraph,
 )
-from pllm.contracts.state_representation import (
-    StatePhysicalPlan,
-    StateRepresentationDecision,
-    StateRepresentationRequest,
-)
+from pllm.contracts.state_representation import StateRepresentationDecision
 from pllm.contracts.tensor_layout import TensorLayoutDecision, TensorLayoutRequest
 
 
@@ -24,9 +20,7 @@ class PlanBundle:
     semantic_graph: SemanticGraph
     timeline: SchedulerTimeline
     schedule: ScheduleDecision
-    state_request: StateRepresentationRequest
-    state_decision: StateRepresentationDecision
-    state_physical: StatePhysicalPlan
+    states: StateRepresentationDecision
     tensor_layout_request: TensorLayoutRequest
     tensor_layout_decision: TensorLayoutDecision
 

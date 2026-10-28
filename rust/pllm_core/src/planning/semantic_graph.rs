@@ -1,7 +1,6 @@
 //! Closed semantic graph and timeline contracts for clean-room scheduling.
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt::Write;
 
@@ -850,10 +849,6 @@ pub(crate) fn canonical_ascii_json<T: Serialize>(value: &T) -> Result<String, St
     Ok(canonical)
 }
 
-pub(crate) fn digest(payload: &str) -> String {
-    format!("{:x}", Sha256::digest(payload.as_bytes()))
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum VisibilityKind {
@@ -930,7 +925,7 @@ pub(crate) fn explain_state_visibility(source_json: &str) -> pyo3::PyResult<Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_ascii_json, decode_graph, digest, validate_graph};
+    use super::{canonical_ascii_json, decode_graph, validate_graph};
     use serde_json::json;
 
     #[test]
@@ -971,13 +966,5 @@ mod tests {
         let mut unknown_state = graph.clone();
         unknown_state["tasks"][0]["effects"][0]["resource"] = json!("missing");
         assert!(validate_graph(&decode_graph(&unknown_state.to_string()).unwrap()).is_err());
-        let mut changed = graph;
-        changed["tasks"][0]["symbol"] = json!("changed");
-        let changed = decode_graph(&changed.to_string()).unwrap();
-        validate_graph(&changed).unwrap();
-        assert_ne!(
-            digest(&canonical),
-            digest(&canonical_ascii_json(&changed).unwrap())
-        );
     }
 }

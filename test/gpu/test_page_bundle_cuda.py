@@ -108,10 +108,10 @@ def test_cuda_ptts_waits_for_exact_fence_before_reclaim() -> None:
 
 def _cuda_ipc_worker(control, read_channel, wire, outcome):
     try:
-        plan = decode_boundary(wire, PlanBundle)
+        arena = PageBundleArena(decode_boundary(wire, PlanBundle), _owned_resources=())
         stream = torch.cuda.Stream(device=torch.device("cuda", 0))
         with torch.cuda.stream(stream):
-            read = PageBundleArena.receive_field(plan, read_channel, stream=stream)
+            read = arena.receive_field(read_channel, stream=stream)
             storage = read.descriptor.cuda_storage
             assert storage is not None and read.tensor.is_cuda
             with pytest.raises(ValueError):  # a descriptor for another GPU cannot be mapped
@@ -178,9 +178,9 @@ def _cuda_ipc_lifecycle():
             assert control.poll(20) and control.recv_bytes() == b"prepared"
             sender, receiver = context.Pipe()
             try:  # a descriptor for a different compiled plan is rejected
-                sender.send_bytes(encode_boundary(replace(descriptor, compilation_signature="b" * 64)).encode())
+                sender.send_bytes(encode_boundary(replace(descriptor, plan_digest="b" * 64)).encode())
                 with pytest.raises(ValueError):
-                    PageBundleArena.receive_field(plan, receiver, stream=stream)
+                    arena.receive_field(receiver, stream=stream)
             finally:
                 sender.close()
                 receiver.close()

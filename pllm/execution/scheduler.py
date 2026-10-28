@@ -5,7 +5,6 @@ from __future__ import annotations
 from pllm import _core
 from pllm.contracts.semantic_graph import ScheduleDecision, SchedulerTimeline, SemanticGraph
 from pllm.contracts.state_representation import (
-    StatePhysicalPlan,
     StateRepresentationDecision,
     StateRepresentationRequest,
 )
@@ -17,13 +16,12 @@ def compile_state_schedule(
     graph: SemanticGraph,
     timeline: SchedulerTimeline,
     request: StateRepresentationRequest,
-) -> tuple[StateRepresentationDecision, StatePhysicalPlan, ScheduleDecision]:
-    decision, state, schedule = _core.compile_state_schedule(
+) -> tuple[StateRepresentationDecision, ScheduleDecision]:
+    decision, schedule = _core.compile_state_schedule(
         encode_boundary(graph), encode_boundary(timeline), encode_boundary(request)
     )
     return (
         decode_boundary(decision, StateRepresentationDecision),
-        decode_boundary(state, StatePhysicalPlan),
         decode_boundary(schedule, ScheduleDecision),
     )
 
@@ -32,7 +30,7 @@ def compile_schedule(
     graph: SemanticGraph,
     timeline: SchedulerTimeline,
     *,
-    state: StatePhysicalPlan | None = None,
+    state: StateRepresentationDecision | None = None,
 ) -> ScheduleDecision:
     return decode_boundary(
         _core.compile_schedule(

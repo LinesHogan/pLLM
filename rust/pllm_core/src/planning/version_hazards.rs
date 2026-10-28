@@ -1,12 +1,12 @@
 //! SSA state-version dependencies over original graph and representation facts.
 
 use super::semantic_graph::{SemanticEffect, SemanticGraph, StateEffectKind};
-use super::state_representation::StatePhysicalPlan;
+use super::state_representation::StateRepresentationDecision;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) fn dependencies(
     graph: &SemanticGraph,
-    state: Option<&StatePhysicalPlan>,
+    state: Option<&StateRepresentationDecision>,
     predecessors: &mut [BTreeSet<usize>],
 ) -> Result<(), String> {
     for resource in &graph.states {
@@ -93,7 +93,7 @@ pub(super) fn dependencies(
         }
         let provider = state.and_then(|state| {
             state
-                .representations
+                .plans
                 .iter()
                 .find(|provider| provider.resource == resource.resource)
         });

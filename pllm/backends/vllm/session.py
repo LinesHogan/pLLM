@@ -178,7 +178,7 @@ class VllmSession(Generic[DataT, ResultT]):
             execution.admit((), torch.cuda.current_stream(execution.device))
         if execution.feeds:
             (binding,) = execution.feeds
-            self._feed = FeedReceiver(execution.arena.plan, binding)
+            self._feed = FeedReceiver(execution.arena, binding)
 
     @property
     def parameter_phases(self) -> tuple[HiddenPhase, ...]:

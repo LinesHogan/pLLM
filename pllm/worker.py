@@ -77,8 +77,12 @@ class GPUWorker(Worker):
                 plan.tensor_layout_request.layouts, plan.tensor_layout_decision.bindings, strict=True
             )
             for provider in facts.providers
+            if any(
+                selected.resource == entry.resource and selected.provider_id == provider.provider_id
+                for selected in plan.states.plans
+            )
         )
-        if (facts.probe, candidates) != (attachment.probe, plan.state_request.candidates):
+        if (facts.probe, candidates) != (attachment.probe, plan.states.plans):
             raise ValueError("worker backend facts changed; compile the workload against the current backend")
         runner.attach_workload(workload.bind_backend(facts, attachment), cache_policy)
 

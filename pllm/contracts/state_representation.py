@@ -54,26 +54,13 @@ class StateRepresentationRequest:
 
 @dataclass(frozen=True, slots=True)
 class StateRepresentationDecision:
-    request_digest: str
     plans: tuple[StateProviderPlan, ...]
     reserved_bytes: int
-    signature: str
-    schema_version: int = 1
-
-
-@dataclass(frozen=True, slots=True)
-class StatePhysicalPlan:
-    request_digest: str
-    representation_signature: str
-    representations: tuple[StateProviderPlan, ...]
-    reserved_bytes: int
-    schema_version: int = 1
 
 
 __all__ = [
     "StateDeviceKind",
     "StateLayoutRequirement",
-    "StatePhysicalPlan",
     "StateProviderPlan",
     "StateRepresentationDecision",
     "StateRepresentationRequest",

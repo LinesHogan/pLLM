@@ -4,7 +4,7 @@ use super::semantic_graph::{
     canonical_ascii_json, decode_graph, decode_timeline, validate_graph, validate_timeline,
     ImplementationCandidate, InputSource, OutputKind, SemanticGraph, Timeline,
 };
-use super::state_representation::{decode_physical_plan as decode_state, StatePhysicalPlan};
+use super::state_representation::{decode_decision as decode_state, StateRepresentationDecision};
 use super::version_hazards;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -79,7 +79,7 @@ pub(super) struct GraphIndex {
 fn graph_index(
     graph: &SemanticGraph,
     timeline: &Timeline,
-    state: Option<&StatePhysicalPlan>,
+    state: Option<&StateRepresentationDecision>,
 ) -> Result<GraphIndex, String> {
     let anchors = anchor_ids(timeline)?;
     let mut windows: Vec<_> = graph
@@ -273,7 +273,7 @@ fn place(
     graph: &SemanticGraph,
     timeline: &Timeline,
     index: &GraphIndex,
-    state: Option<&StatePhysicalPlan>,
+    state: Option<&StateRepresentationDecision>,
     implementations: &[&ImplementationCandidate],
 ) -> Result<Solution, String> {
     let mut order = index.order.clone();
@@ -393,7 +393,7 @@ fn check_placement(
     graph: &SemanticGraph,
     timeline: &Timeline,
     index: &GraphIndex,
-    state: Option<&StatePhysicalPlan>,
+    state: Option<&StateRepresentationDecision>,
     tasks: &[PhysicalTask],
 ) -> Result<Solution, String> {
     if tasks.len() != graph.tasks.len() {
@@ -667,7 +667,7 @@ fn check_placement(
 pub(super) fn compile(
     graph: &SemanticGraph,
     timeline: &Timeline,
-    state: Option<&StatePhysicalPlan>,
+    state: Option<&StateRepresentationDecision>,
 ) -> Result<ScheduleDecision, String> {
     validate_graph(graph)?;
     validate_timeline(timeline)?;
@@ -676,7 +676,7 @@ pub(super) fn compile(
         graph: &'a SemanticGraph,
         timeline: &Timeline,
         index: &GraphIndex,
-        state: Option<&StatePhysicalPlan>,
+        state: Option<&StateRepresentationDecision>,
         selected: &mut Vec<&'a ImplementationCandidate>,
         best: &mut Option<ScheduleDecision>,
         failure: &mut Option<String>,
@@ -749,7 +749,7 @@ pub(crate) fn validate_decision(
     graph: &SemanticGraph,
     timeline: &Timeline,
     decision: &ScheduleDecision,
-    state: Option<&StatePhysicalPlan>,
+    state: Option<&StateRepresentationDecision>,
 ) -> Result<(), String> {
     validate_graph(graph)?;
     validate_timeline(timeline)?;
@@ -995,9 +995,8 @@ mod tests {
             "anchors": (0..4).map(|i| json!({"symbol": format!("a{i}"), "ordinal": i})).collect::<Vec<_>>()
         }).to_string()).unwrap();
         let state = super::decode_state(&json!({
-            "schema_version": 1, "request_digest": "a".repeat(64),
-            "representation_signature": "b".repeat(64), "reserved_bytes": 32,
-            "representations": [{"resource": "state", "provider_id": "pages",
+            "reserved_bytes": 32,
+            "plans": [{"resource": "state", "provider_id": "pages",
                 "device_kind": "cpu", "device_ordinal": 0, "layout_id": 0,
                 "layout_digest": "c".repeat(64), "layout_namespace": "d".repeat(64),
                 "max_admitted_lineages": 1, "page_capacity": 3, "root_page_count": 1,

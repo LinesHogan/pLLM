@@ -45,7 +45,7 @@ def producer(feed, probe):
 def setup_feed(workload):
     facts = workload.specialize(facts_for(torch.device("cuda", 0)), pllm.ExecutionOptions())
     execution = workload.compile_backend(facts).execution
-    receiver = FeedReceiver(execution.arena.plan, execution.feeds[0])
+    receiver = FeedReceiver(execution.arena, execution.feeds[0])
     execution.admit((), torch.cuda.current_stream())
     return execution, receiver
 

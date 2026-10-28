@@ -85,7 +85,7 @@ class PageRelease:
 
 @dataclass(frozen=True, slots=True)
 class PageFieldTransfer:
-    compilation_signature: str
+    plan_digest: str
     owner_id: int  # Original PagePin.pin_id; all remote grants are read-only.
     ref: StateRef
     resource: str
@@ -369,7 +369,8 @@ class PageBundleArena:
         _owned_resources: tuple[str, ...] | None = None,
     ) -> None:
         self.plan = plan
-        placements = {(item.device_kind, item.device_ordinal) for item in plan.state_physical.representations}
+        self.plan_digest = boundary_digest(plan)
+        placements = {(item.device_kind, item.device_ordinal) for item in plan.states.plans}
         if not placements:
             assert device is not None
             self.device = device
@@ -379,7 +380,7 @@ class PageBundleArena:
         self._pools: dict[str, _Pools] = {}
         layouts = {item.resource: item.layout for item in plan.tensor_layout_request.layouts}
         self._owned_resources = tuple(layouts) if _owned_resources is None else _owned_resources
-        for selected in plan.state_physical.representations:
+        for selected in plan.states.plans:
             # Partial materialization owns no remote pool; test_video tests the partition.
             if selected.resource in self._owned_resources:
                 self._pools[selected.resource] = _Pools(layouts[selected.resource], selected, self.device)
@@ -1046,7 +1047,7 @@ class PageBundleArena:
     ) -> tuple[PageFieldTransfer, RemoteCompletion]:
         assert stream is not None
         descriptor = PageFieldTransfer(
-            boundary_digest(self.plan),
+            self.plan_digest,
             owner_id,
             root.ref,
             root.resource,
@@ -1057,17 +1058,15 @@ class PageBundleArena:
         )
         return descriptor, RemoteCompletion(connection, encode_boundary(descriptor).encode())
 
-    @staticmethod
-    def receive_field(
-        plan: PlanBundle, connection: Connection, *, stream: torch.cuda.Stream | None = None
-    ) -> BorrowedPage:
+    def receive_field(self, connection: Connection, *, stream: torch.cuda.Stream | None = None) -> BorrowedPage:
+        """Map a producer grant only when it belongs to this arena's plan."""
         descriptor = decode_boundary(connection.recv_bytes(65536).decode(), PageFieldTransfer)
-        if descriptor.compilation_signature != boundary_digest(plan):
+        if descriptor.plan_digest != self.plan_digest:
             raise ValueError("the page producer was built for another compilation; restart it from this model's plan")
         ((entry, provider),) = (
             (entry, provider)
-            for entry in plan.tensor_layout_request.layouts
-            for provider in plan.state_physical.representations
+            for entry in self.plan.tensor_layout_request.layouts
+            for provider in self.plan.states.plans
             if entry.resource == provider.resource == descriptor.resource
         )
         assert stream is not None

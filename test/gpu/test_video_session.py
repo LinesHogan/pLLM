@@ -17,7 +17,6 @@ from pllm.config import ExecutionOptions, ModelConfig
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.contracts.state_ref import LineageId, StateRef, VersionId
 from pllm.contracts.tensor_layout import LayoutFieldId
-from pllm.execution.codec import boundary_digest
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle import BorrowedPage, PageFieldTransfer, PageSlot
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
@@ -57,11 +56,11 @@ def test_video_real_frame_math_and_signed_composition():
             lifetime.callback(receiver.close)
             # Received-page fixture only; actual receive_field is CUDA-only and tested below.
             descriptor = PageFieldTransfer(
-                boundary_digest(plan), 1, ref, "features", LayoutFieldId(index), PageSlot(0, 0), 0
+                execution.arena.plan_digest, 1, ref, "features", LayoutFieldId(index), PageSlot(0, 0), 0
             )
             pages.append(BorrowedPage(descriptor, value, receiver))
         execution.admit(())
-        execution.stage_readonly((BorrowedStateRoot(plan, "features", ref, tuple(pages)),))
+        execution.stage_readonly((BorrowedStateRoot(execution.arena, "features", ref, tuple(pages)),))
         rows = PackedPhaseRowBatch(0, 0, ())
         result = execution.step(pllm.authoring.TensorStepInput(rows, PackedSamplerRowBatch(rows, ())))
         signal = torch.cat(

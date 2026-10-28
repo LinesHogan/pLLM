@@ -123,14 +123,12 @@ def replan_states(plan, graph, layouts: TensorLayoutRequest, memory_bytes: int):
         ),
         candidates,
     )
-    decision, physical, schedule = compile_state_schedule(graph, plan.timeline, request)
+    states, schedule = compile_state_schedule(graph, plan.timeline, request)
     return replace(
         plan,
         semantic_graph=graph,
         schedule=schedule,
-        state_request=request,
-        state_decision=decision,
-        state_physical=physical,
+        states=states,
         tensor_layout_request=layouts,
         tensor_layout_decision=bindings,
     )

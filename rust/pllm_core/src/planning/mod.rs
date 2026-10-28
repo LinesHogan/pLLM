@@ -16,9 +16,7 @@ pub(crate) struct PlanBundle {
     pub(crate) semantic_graph: semantic_graph::SemanticGraph,
     pub(crate) timeline: semantic_graph::Timeline,
     pub(crate) schedule: scheduler::ScheduleDecision,
-    pub(crate) state_request: state_representation::StateRepresentationRequest,
-    pub(crate) state_decision: state_representation::StateRepresentationDecision,
-    pub(crate) state_physical: state_representation::StatePhysicalPlan,
+    pub(crate) states: state_representation::StateRepresentationDecision,
     pub(crate) tensor_layout_request: tensor_layout::TensorLayoutRequest,
     pub(crate) tensor_layout_decision: tensor_layout::TensorLayoutDecision,
 }
@@ -29,18 +27,13 @@ impl PlanBundle {
             &self.tensor_layout_request,
             &self.tensor_layout_decision,
         )?;
-        state_representation::validate(
-            &self.state_request,
-            &self.state_decision,
-            &self.state_physical,
-        )?;
         scheduler::validate_decision(
             &self.semantic_graph,
             &self.timeline,
             &self.schedule,
-            Some(&self.state_physical),
+            Some(&self.states),
         )?;
-        for state in &self.state_physical.representations {
+        for state in &self.states.plans {
             if !self
                 .semantic_graph
                 .states
@@ -67,38 +60,18 @@ impl PlanBundle {
 }
 
 #[pyfunction]
-#[pyo3(signature = (plan_json, local_candidates_json=None))]
-fn validate_plan_bundle(plan_json: &str, local_candidates_json: Option<&str>) -> PyResult<()> {
-    let plan: PlanBundle = serde_json::from_str(plan_json)
-        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
-    if let Some(payload) = local_candidates_json {
-        let local: Vec<state_representation::StateProviderPlan> = serde_json::from_str(payload)
-            .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
-        if local != plan.state_request.candidates {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "local state provider candidates differ from the signed catalog",
-            ));
-        }
-    }
-    plan.validate()
-        .map_err(pyo3::exceptions::PyValueError::new_err)
-}
-
-#[pyfunction]
 fn compile_state_schedule(
     graph_json: &str,
     timeline_json: &str,
     request_json: &str,
-) -> PyResult<(String, String, String)> {
+) -> PyResult<(String, String)> {
     let compile = || -> Result<_, String> {
         let graph = semantic_graph::decode_graph(graph_json)?;
         let timeline = semantic_graph::decode_timeline(timeline_json)?;
         let request = state_representation::decode_request(request_json)?;
-        let (decision, state, schedule) =
-            state_representation::compile(&request, &graph, &timeline)?;
+        let (decision, schedule) = state_representation::compile(&request, &graph, &timeline)?;
         Ok((
             semantic_graph::canonical_ascii_json(&decision)?,
-            semantic_graph::canonical_ascii_json(&state)?,
             semantic_graph::canonical_ascii_json(&schedule)?,
         ))
     };
@@ -111,6 +84,5 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(compile_state_schedule, module)?)?;
-    module.add_function(wrap_pyfunction!(validate_plan_bundle, module)?)?;
     Ok(())
 }

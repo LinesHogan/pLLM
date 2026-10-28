@@ -4,11 +4,9 @@ from collections.abc import Sequence
 
 import torch
 
-from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_borrow import BorrowedResource
-from pllm.execution.codec import boundary_digest
-from pllm.execution.ptts.page_bundle import BorrowedPage, PagePin
+from pllm.execution.ptts.page_bundle import BorrowedPage, PageBundleArena, PagePin
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView, validate_readonly_views
 
 
@@ -21,15 +19,14 @@ class BorrowedStateRoot:
     CPU unit fixtures exercise view binding only, never CPU page transport.
     """
 
-    def __init__(self, plan: PlanBundle, resource: str, ref: StateRef, pages: tuple[BorrowedPage, ...]) -> None:
+    def __init__(self, arena: PageBundleArena, resource: str, ref: StateRef, pages: tuple[BorrowedPage, ...]) -> None:
         self.resource, self.ref, self.pages = resource, ref, pages
-        plan_digest = boundary_digest(plan)
-        (layout,) = (entry.layout for entry in plan.tensor_layout_request.layouts if entry.resource == resource)
+        (layout,) = (entry.layout for entry in arena.plan.tensor_layout_request.layouts if entry.resource == resource)
         if (
             not pages
             or len(pages) != len(layout.fields)
             or any(
-                page.descriptor.compilation_signature != plan_digest
+                page.descriptor.plan_digest != arena.plan_digest
                 or page.descriptor.resource != resource
                 or page.descriptor.ref != ref
                 or page.descriptor.field_id != field.field_id

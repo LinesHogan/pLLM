@@ -116,7 +116,7 @@ class Feed:
         (self._layout,) = (
             entry.layout for entry in plan.tensor_layout_request.layouts if entry.resource == binding.resource
         )
-        (provider,) = (entry for entry in plan.state_physical.representations if entry.resource == binding.resource)
+        (provider,) = (entry for entry in plan.states.plans if entry.resource == binding.resource)
         self._fields = dict(zip(binding.fields, self._layout.fields, strict=True))
         self._device = torch.device("cuda", provider.device_ordinal)
         self._peer_exit = _process_exit(peer)
@@ -306,16 +306,16 @@ class Feed:
 class FeedReceiver:
     """Install the framework's step input and retain partial receives until teardown."""
 
-    def __init__(self, plan: PlanBundle, binding: FeedBinding) -> None:
-        self.plan, self.binding = plan, binding
-        (provider,) = (p for p in plan.state_physical.representations if p.resource == binding.resource)
-        (layout,) = (e.layout for e in plan.tensor_layout_request.layouts if e.resource == binding.resource)
+    def __init__(self, arena: PageBundleArena, binding: FeedBinding) -> None:
+        self.arena, self.binding = arena, binding
+        (provider,) = (p for p in arena.plan.states.plans if p.resource == binding.resource)
+        (layout,) = (e.layout for e in arena.plan.tensor_layout_request.layouts if e.resource == binding.resource)
         context = get_context("spawn")
         self.control, writer = context.Pipe()
         pipes = tuple(tuple(context.Pipe() for _ in layout.fields) for _ in range(provider.page_capacity))
         self.channels = tuple(tuple(pair[0] for pair in row) for row in pipes)
         self.writer: Feed | None = Feed(
-            plan, binding, writer, tuple(tuple(pair[1] for pair in row) for row in pipes), os.getpid()
+            arena.plan, binding, writer, tuple(tuple(pair[1] for pair in row) for row in pipes), os.getpid()
         )
         self.records: deque[FeedRecord] = deque()
         self.partial: list[BorrowedPage] = []
@@ -344,8 +344,8 @@ class FeedReceiver:
     def _receive(self, record: FeedRecord, stream: torch.cuda.Stream) -> BorrowedStateRoot:
         assert record.ref is not None and 0 <= record.slot < len(self.channels) and not self.partial
         for channel in self.channels[record.slot]:
-            self.partial.append(PageBundleArena.receive_field(self.plan, channel, stream=stream))
-        root = BorrowedStateRoot(self.plan, self.binding.resource, record.ref, tuple(self.partial))
+            self.partial.append(self.arena.receive_field(channel, stream=stream))
+        root = BorrowedStateRoot(self.arena, self.binding.resource, record.ref, tuple(self.partial))
         self.partial.clear()
         self.current = root
         return root

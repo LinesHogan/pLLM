@@ -4,9 +4,7 @@
 //! no workload names, Tensor objects, Python callbacks, or runtime handles.
 
 use super::scheduler::{self, ScheduleDecision};
-use super::semantic_graph::{
-    canonical_ascii_json, digest, validate_graph, validate_timeline, SemanticGraph, Timeline,
-};
+use super::semantic_graph::{validate_graph, validate_timeline, SemanticGraph, Timeline};
 use serde::{Deserialize, Serialize};
 
 const SCHEMA_VERSION: u64 = 1;
@@ -59,21 +57,8 @@ pub(crate) struct StateRepresentationRequest {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StateRepresentationDecision {
-    request_digest: String,
-    plans: Vec<StateProviderPlan>,
-    reserved_bytes: u64,
-    signature: String,
-    schema_version: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct StatePhysicalPlan {
-    pub(crate) request_digest: String,
-    pub(crate) representation_signature: String,
-    pub(crate) representations: Vec<StateProviderPlan>,
+    pub(crate) plans: Vec<StateProviderPlan>,
     pub(crate) reserved_bytes: u64,
-    pub(crate) schema_version: u64,
 }
 
 pub(crate) fn decode_request(payload: &str) -> Result<StateRepresentationRequest, String> {
@@ -81,8 +66,9 @@ pub(crate) fn decode_request(payload: &str) -> Result<StateRepresentationRequest
         .map_err(|source| format!("invalid StateRepresentationRequest: {source}"))
 }
 
-pub(crate) fn decode_physical_plan(payload: &str) -> Result<StatePhysicalPlan, String> {
-    serde_json::from_str(payload).map_err(|source| format!("invalid StatePhysicalPlan: {source}"))
+pub(crate) fn decode_decision(payload: &str) -> Result<StateRepresentationDecision, String> {
+    serde_json::from_str(payload)
+        .map_err(|source| format!("invalid StateRepresentationDecision: {source}"))
 }
 
 fn require_text(value: &str, label: &str) -> Result<(), String> {
@@ -232,14 +218,7 @@ pub(super) fn compile(
     request: &StateRepresentationRequest,
     graph: &SemanticGraph,
     timeline: &Timeline,
-) -> Result<
-    (
-        StateRepresentationDecision,
-        StatePhysicalPlan,
-        ScheduleDecision,
-    ),
-    String,
-> {
+) -> Result<(StateRepresentationDecision, ScheduleDecision), String> {
     validate_request(request)?;
     validate_graph(graph)?;
     validate_timeline(timeline)?;
@@ -251,11 +230,7 @@ pub(super) fn compile(
         timeline: &Timeline,
         plans: &mut Vec<StateProviderPlan>,
         reserved_bytes: u64,
-        best: &mut Option<(
-            StateRepresentationDecision,
-            StatePhysicalPlan,
-            ScheduleDecision,
-        )>,
+        best: &mut Option<(StateRepresentationDecision, ScheduleDecision)>,
         failure: &mut Option<String>,
     ) -> Result<(), String> {
         if request.memory_budget_bytes != 0 && reserved_bytes > request.memory_budget_bytes {
@@ -284,24 +259,19 @@ pub(super) fn compile(
         }) {
             return Ok(());
         }
-        let mut decision = StateRepresentationDecision {
-            request_digest: digest(&canonical_ascii_json(request)?),
+        let decision = StateRepresentationDecision {
             plans: plans.clone(),
             reserved_bytes,
-            signature: String::new(),
-            schema_version: SCHEMA_VERSION,
         };
-        decision.signature = digest(&canonical_ascii_json(&decision)?);
-        let physical = project(&decision);
         // task borrows this exact candidate, including retention and reserved
         // capacity. An infeasible cheap provider must not hide a legal COW plan.
-        match scheduler::compile(graph, timeline, Some(&physical)) {
+        match scheduler::compile(graph, timeline, Some(&decision)) {
             Ok(schedule) => {
                 if best
                     .as_ref()
-                    .is_none_or(|(_, _, previous)| schedule.score() < previous.score())
+                    .is_none_or(|(_, previous)| schedule.score() < previous.score())
                 {
-                    *best = Some((decision, physical, schedule));
+                    *best = Some((decision, schedule));
                 }
             }
             Err(error) => *failure = Some(error),
@@ -326,58 +296,6 @@ pub(super) fn compile(
     })
 }
 
-fn project(decision: &StateRepresentationDecision) -> StatePhysicalPlan {
-    StatePhysicalPlan {
-        request_digest: decision.request_digest.clone(),
-        representation_signature: decision.signature.clone(),
-        representations: decision.plans.clone(),
-        reserved_bytes: decision.reserved_bytes,
-        schema_version: SCHEMA_VERSION,
-    }
-}
-
-pub(super) fn validate(
-    request: &StateRepresentationRequest,
-    decision: &StateRepresentationDecision,
-    physical: &StatePhysicalPlan,
-) -> Result<(), String> {
-    validate_request(request)?;
-    if decision.schema_version != SCHEMA_VERSION
-        || decision.request_digest != digest(&canonical_ascii_json(request)?)
-        || decision.plans.len() != request.states.len()
-    {
-        return Err("selected state plan has an invalid request identity".into());
-    }
-    for (plan, requirement) in decision.plans.iter().zip(&request.states) {
-        if plan.resource != requirement.resource || !request.candidates.contains(plan) {
-            return Err("selected state plan differs from its original provider catalog".into());
-        }
-    }
-    let bytes = decision
-        .plans
-        .iter()
-        .try_fold(0_u64, |sum, plan| sum.checked_add(plan.reserved_bytes))
-        .ok_or("selected state capacity overflows u64")?;
-    if bytes != decision.reserved_bytes
-        || (request.memory_budget_bytes != 0 && bytes > request.memory_budget_bytes)
-        || decision.plans.first().is_some_and(|first| {
-            decision.plans.iter().any(|plan| {
-                plan.device_kind != first.device_kind || plan.device_ordinal != first.device_ordinal
-            })
-        })
-    {
-        return Err("selected state capacity or device differs from its request".into());
-    }
-    let mut unsigned = decision.clone();
-    unsigned.signature.clear();
-    if decision.signature != digest(&canonical_ascii_json(&unsigned)?)
-        || physical != &project(decision)
-    {
-        return Err("state physical plan differs from its signed decision".into());
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::semantic_graph::{decode_graph, decode_timeline};
@@ -385,7 +303,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn representation_selection_and_capacity_are_signed_once() {
+    fn representation_selection_and_capacity_match_oracle() {
         let requirement = |resource| {
             json!({"resource": resource, "layout_id": 0,
             "layout_digest": "a".repeat(64), "layout_namespace": "b".repeat(64),
@@ -445,18 +363,10 @@ mod tests {
                     let actual = compile(&request, &graph, &timeline);
                     assert_eq!(actual.is_ok(), expected.is_some());
                     if let Some((provider, bytes, _)) = expected {
-                        let (decision, physical, schedule) = actual.unwrap();
+                        let (decision, schedule) = actual.unwrap();
                         assert_eq!(decision.plans[0].provider_id, provider);
                         assert_eq!(decision.reserved_bytes, bytes);
                         assert_eq!(schedule.score()[0], bytes + 9);
-                        assert_eq!(physical.representations, decision.plans);
-                        assert_eq!(physical.representation_signature, decision.signature);
-                        let mut unsigned = decision.clone();
-                        unsigned.signature.clear();
-                        assert_eq!(
-                            digest(&canonical_ascii_json(&unsigned).unwrap()),
-                            decision.signature
-                        );
                     }
                 }
             }
