@@ -82,7 +82,7 @@ from pllm.execution.module_state import (
     parameter_count,
     skeleton,
 )
-from pllm.execution.overlay_task import chunk_update
+from pllm.execution.overlay_task import chunk_update, gradient_update, overlay_gradient
 from pllm.execution.position_state import PositionState as PositionState
 from pllm.execution.row_task_binding import (
     declare_logits,
@@ -109,7 +109,7 @@ from pllm.execution.tensor_frame import (
     result_port,
     samples_port,
 )
-from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots, TaskOutput
+from pllm.execution.tensor_program import FunctionMath, InvocationOutput, PoolSGD, Roots, TaskOutput
 from pllm.execution.tensor_task import TensorExport
 from pllm.execution.token_program import Over, Tokens
 from pllm.execution.trace import TraceEvent
@@ -825,29 +825,63 @@ def differentiate(
 
 
 def _chunked_overlay(
-    function: Callable[..., tuple[torch.Tensor, torch.Tensor]],
+    function: Callable[..., Any],
     bindings: dict[str, str],
     buffers: dict[str, Buffer],
-    weight: str,
+    effect: ParameterEffect,
     chunk: int,
+    optimizer: SGD | None,
+    flush: str | None,
 ) -> Callable[..., TensorUpdate]:
     """Generate pending state before layout interning and bind the existing chunk executor."""
     arguments = tuple(bindings)
     sources = tuple(bindings.values())
-    if chunk < 1 or len(sources) < 2 or sources[0] != weight or any(s not in ("input", "target") for s in sources[1:]):
-        raise ValueError("chunk overlays need chunk >= 1, then the weight carry followed by input/target operands")
-    pending = {
-        f"_pending_rows_{name}": Buffer(
-            lambda inputs, outputs, source=source: (max(1, chunk - 1), inputs if source == "input" else outputs)
+    if chunk < 1:
+        raise ValueError("overlay chunk must be positive")
+    if optimizer is None:
+        if len(sources) < 2 or sources[0] != effect.weight or any(s not in ("input", "target") for s in sources[1:]):
+            raise ValueError("chunk overlays need the weight carry followed by input/target operands")
+        pending = {
+            f"_pending_rows_{name}": Buffer(
+                lambda inputs, outputs, source=source: (max(1, chunk - 1), inputs if source == "input" else outputs)
+            )
+            for name, source in zip(arguments[1:], sources[1:], strict=True)
+        }
+        update = partial(chunk_update, function, chunk, arguments)
+    else:
+        if (
+            "input" not in sources
+            or any(source not in (*effect.applied_fields, "input", "target", "weight") for source in sources)
+            or any(sources.count(name) != 1 for name in effect.applied_fields)
+        ):
+            raise ValueError("loss overlays need input rows and each applied parameter exactly once")
+        pending = {
+            f"_pending_grad_{name}": replace(
+                buffers[source],
+                dtype=torch.float32
+                if buffers[source].dtype in (torch.float16, torch.bfloat16)
+                else buffers[source].dtype,
+            )
+            for name, source in bindings.items()
+            if source in effect.applied_fields
+        }
+        update = partial(
+            gradient_update,
+            overlay_gradient(function),
+            PoolSGD(optimizer.lr, len(effect.applied_fields)),
+            effect,
+            chunk,
+            flush == "prompt_end",
+            dict(bindings),
         )
-        for name, source in zip(arguments[1:], sources[1:], strict=True)
-    }
     pending["_pending_length"] = Buffer((), dtype=torch.int64)
-    if pending.keys() & (buffers.keys() | bindings.keys()):
+    if (pending.keys() | {"_prompt_end"}) & (buffers.keys() | bindings.keys()):
         raise ValueError("rename overlay buffers/arguments that conflict with generated _pending_ fields")
     buffers.update(pending)
     bindings.update((name, name) for name in pending)
-    return partial(chunk_update, function, chunk, arguments)
+    if optimizer is not None:
+        bindings["_prompt_end"] = "prompt_end"
+    return update
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -862,6 +896,8 @@ class _Overlay(_Effect):
     decode: bool | Config
     visibility: Visibility | Config
     chunk: int | Config | None
+    optimizer: SGD | Config | None
+    flush: Literal["prompt_end"] | None
 
     phase: ClassVar[Phase | None] = Phase.MODEL_UPDATE
 
@@ -892,6 +928,10 @@ class _Overlay(_Effect):
         identity = fingerprint(operation.function)
         function = freeze(operation.function)
         initialize = _frozen(definition.initialize)
+        if self.flush not in (None, "prompt_end") or (self.flush is not None and self.optimizer is None):
+            raise ValueError("flush='prompt_end' requires an autograd overlay optimizer")
+        if self.optimizer is not None and self.chunk is None:
+            raise ValueError("autograd overlays require a chunk size")
         if self.chunk is not None:
             if initialize is not None:
                 author_initialize, author_buffers = initialize, tuple(buffers)
@@ -902,7 +942,13 @@ class _Overlay(_Effect):
                 initialize = initialize_author
 
             function = _chunked_overlay(
-                function, bindings, buffers, self.weight, _setting(self.chunk, context.owner, int)
+                function,
+                bindings,
+                buffers,
+                effect,
+                _setting(self.chunk, context.owner, int),
+                None if self.optimizer is None else _setting(self.optimizer, context.owner, SGD),
+                self.flush,
             )
         declare_parameter_overlay(
             context.binding,
@@ -921,10 +967,25 @@ class _Overlay(_Effect):
             function=function,
             arguments=bindings,
             visibility=visibility,
-            equations_digest=boundary_digest(context.definitions, context.bindings, self.chunk),
+            equations_digest=boundary_digest(
+                context.definitions, context.bindings, self.chunk, self.optimizer, self.flush
+            ),
         )
         context.definitions.append(
-            (operation.name, boundary_digest(identity, bindings, operator, scale, applied, self.visibility, self.chunk))
+            (
+                operation.name,
+                boundary_digest(
+                    identity,
+                    bindings,
+                    operator,
+                    scale,
+                    applied,
+                    self.visibility,
+                    self.chunk,
+                    self.optimizer,
+                    self.flush,
+                ),
+            )
         )
 
 
@@ -940,11 +1001,15 @@ def overlay(
     decode: bool | Config = False,
     visibility: Visibility | Config = Visibility.forward_pinned(),
     chunk: int | Config | None = None,
+    optimizer: SGD | Config | None = None,
+    flush: Literal["prompt_end"] | None = None,
 ) -> Callable[[F], F]:
     """Apply residuals using the declared state visibility at each target projection.
 
     With ``chunk``, the function takes the weight carry followed by input/target row
     operands and returns (next carry, readouts). Pending rows belong to the framework.
+    With ``optimizer``, return one loss per row instead; gradients accumulate until
+    a chunk completes, including a short final chunk with ``flush="prompt_end"``.
     """
 
     return _mark(
@@ -959,6 +1024,8 @@ def overlay(
             decode=decode,
             visibility=visibility,
             chunk=chunk,
+            optimizer=optimizer,
+            flush=flush,
         )
     )
 

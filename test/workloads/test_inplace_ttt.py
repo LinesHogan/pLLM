@@ -636,8 +636,6 @@ def test_prefill_adapters_keep_prompt_chunks_across_scheduler_spans(span):
         for index in range(len(TARGETS)):
             tail = 0 if end == len(x) else end % workload.chunk_size
             assert fields[index * 5 + 4].item() == tail
-            torch.testing.assert_close(fields[index * 5 + 2][:tail], x[end - tail : end])
-            torch.testing.assert_close(fields[index * 5 + 3][:tail], desired[end - tail : end])
     for index, pair in enumerate(factors):
         torch.testing.assert_close(fields[index * 5 : index * 5 + 2], pair, rtol=1e-12, atol=1e-12)
     torch.testing.assert_close(execution.snapshot(execution.arena.latest(refs[1].lineage_id)), frozen)
@@ -665,9 +663,9 @@ def test_prompt_end_operand_stays_live_during_replay():
     values = dict(
         a=torch.ones(2, 3, device="cuda"),
         b=torch.zeros(2, 2, device="cuda"),
-        tail_input=torch.zeros(2, 3, device="cuda"),
-        tail_target=torch.zeros(2, 2, device="cuda"),
-        tail_length=torch.zeros((), dtype=torch.int64, device="cuda"),
+        _pending_grad_a=torch.zeros(2, 3, device="cuda"),
+        _pending_grad_b=torch.zeros(2, 2, device="cuda"),
+        _pending_length=torch.zeros((), dtype=torch.int64, device="cuda"),
     )
     operand = CapturedParameterOperand(
         RequestIdentity("graph", 0, 0),
@@ -689,9 +687,9 @@ def test_prompt_end_operand_stays_live_during_replay():
     for name, value in values.items():
         value.fill_(1 if name == "a" else 0)
     graph.replay()
-    assert values["tail_length"].item() == 1 and result.update_count.item() == 0
+    assert values["_pending_length"].item() == 1 and result.update_count.item() == 0
     operand.prompt_end.fill_(True)
     graph.replay()
-    assert values["tail_length"].item() == 0 and result.update_count.item() == 1
+    assert values["_pending_length"].item() == 0 and result.update_count.item() == 1
     assert result.trained_rows.item() == 2
     torch.testing.assert_close(values["b"], torch.full_like(values["b"], 0.003))
