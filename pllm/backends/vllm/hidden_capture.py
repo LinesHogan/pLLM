@@ -53,6 +53,15 @@ class HiddenCaptureLayout:
         """Total slot capacity, including the generation being written."""
         return 2 * self.capture_rows
 
+    @property
+    def resident_bytes(self) -> int:
+        """Model-dtype slots plus the persistent source/destination int64 table.
+
+        Retention already includes the producer's slots; there is no separate
+        capture or handoff allocation. Host ownership and pinned staging are not GPU bytes.
+        """
+        return self.retained_rows * self.hidden_size * self.dtype.itemsize + 2 * self.capture_rows * 8
+
     def create_pool(self, device: torch.device) -> SlotPools:
         """Allocate stable storage before capture; steps lease free rows from field zero."""
         field = TensorFieldSpec(LayoutFieldId(0), (self.hidden_size,), self.dtype, self.dtype.itemsize)

@@ -52,7 +52,9 @@ def example(
     )
     packed = PackedPhaseRowBatch(0, count, rows)
     sampler = PackedSamplerRowBatch(packed, tuple(PackedSamplerRowLink(i, count - i - 1) for i in range(count)))
-    hidden_dtype = torch.float64 if facts.probe.tensor_dtype.torch is torch.float64 else torch.float32
+    # Trace hidden_port's model-dtype gather and FP32 conversion, including their
+    # overlapping lifetimes, along with each executor's consumer index table.
+    hidden_dtype = facts.probe.tensor_dtype.torch
     hidden = (
         HiddenRowBatch(
             packed,

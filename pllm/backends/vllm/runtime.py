@@ -28,7 +28,7 @@ from pllm.authoring import (
     StateTensorUpdate,
     map_auxiliary,
 )
-from pllm.backends.vllm.hidden_capture import CAPTURE_ENV, HiddenCaptureAnnouncement
+from pllm.backends.vllm.hidden_capture import CAPTURE_ENV, HiddenCaptureAnnouncement, HiddenCaptureLayout
 from pllm.backends.vllm.overlay_graph import (
     graph_mode,
     graph_options,
@@ -722,6 +722,7 @@ def probe_backend(
     )
     required = input_reservations(
         probe,
+        runner.hidden_layouts,
         observed,
         runner.max_num_reqs,
         model.lm_head.weight.shape[0],
@@ -815,19 +816,17 @@ __all__ = [
 
 def input_reservations(
     probe: BackendPlacementProbe,
+    hidden_layouts: tuple[HiddenCaptureLayout, ...],
     timeline: SchedulerTimeline,
     rows: int,
     vocab: int,
     stage: SamplerStage | None,
     feedback: bool,
 ) -> tuple[int, ...]:
-    hidden = (
-        2
-        * len({resource.binding for resource in probe.hidden_resources})
-        * probe.max_packed_rows
-        * probe.hidden_size
-        * 4
-    )
+    """Reserve persistent capture storage and sampler scratch across model-step anchors."""
+    # Layouts union aliases and phases per module. Slots and capture indices stay
+    # resident across steps; task_memory traces consumer tables, gathers and casts.
+    hidden = sum(layout.resident_bytes for layout in hidden_layouts)
     # FP32 envelope for original logits, conversion, projection and rowwise arithmetic.
     # Excludes upstream sampling/GEMM library scratch, model weights and KV storage.
     workspace = (
