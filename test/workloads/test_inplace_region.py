@@ -6,6 +6,7 @@ the measured region-tuning policy is signed into the backend facts.
 
 import warnings
 from dataclasses import replace
+from functools import partial
 from unittest.mock import patch
 
 import pytest
@@ -27,6 +28,7 @@ from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.contracts.tensor_policy import TensorPolicy
 from pllm.execution.compile_facts import BackendCompileFacts
+from pllm.execution.overlay_task import chunk_update
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.scan import ScanContext, ScanTemplate
@@ -63,7 +65,9 @@ def test_bound_scan_matches_original_chunk_math_bitwise(device, dtype, numerics)
     facts = facts_for(device, dtype)
     facts = replace(facts, timeline=replace(facts.timeline, tensor_policy=TensorPolicy(numerics)))
     execution = workload.compile_backend(facts).execution
-    reference_transition = ScanContext(TensorPolicy(False), 8, device).bind(workload.transition)
+    reference_transition = ScanContext(TensorPolicy(False), 8, device).bind(
+        workload.declaration(facts).overlay_math.function
+    )
     stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
     identity = RequestIdentity("region", 0, 0)
     (ref,) = execution.admit((identity,), stream)
@@ -80,7 +84,14 @@ def test_bound_scan_matches_original_chunk_math_bitwise(device, dtype, numerics)
     ):
         hidden = torch.randn(rows, 7, dtype=dtype, device=device, generator=generator)
         desired = torch.randn(rows, 5, dtype=dtype, device=device, generator=generator)
-        expected = reference_transition(hidden, desired, *reference)
+        expected = reference_transition(
+            delta=reference[0],
+            inputs=hidden,
+            targets=desired,
+            _pending_rows_inputs=reference[1],
+            _pending_rows_targets=reference[2],
+            _pending_length=reference[3],
+        )
         operand = CapturedParameterOperand(
             identity, TARGET, phase, hidden, desired, base, hidden.new_full((), False, dtype=torch.bool)
         )
@@ -223,7 +234,7 @@ def test_counted_gated_tail_keeps_inactive_chunks_and_never_reads_device_counts(
     target = ParameterTarget(0, ParameterModuleKind.ATTENTION, ParameterRole.QUERY_PROJECTION_WEIGHT)
     workload = GatedDeltaWorkload(GatedDeltaConfig((target,), head_width=4, chunk_size=4))
     context = ScanContext(TensorPolicy(numerics), 32, torch.device("cuda:0"), 64 << 20)
-    run = context.bind(workload.transition)
+    run = context.bind(partial(chunk_update, workload.step, 4, ("state", "hidden")))
     generator = torch.Generator(device="cuda").manual_seed(512)
     weights = torch.randn(2, 4, 4, device="cuda", generator=generator) * 0.1
     tail = torch.zeros(3, 8, device="cuda")
@@ -244,7 +255,7 @@ def test_counted_gated_tail_keeps_inactive_chunks_and_never_reads_device_counts(
         retained = joined[complete:]
         expected.append(head_correction(retained, state))
         with patch.object(torch.Tensor, "item", side_effect=AssertionError("device count read")):
-            result = run(hidden, weights, tail, length)
+            result = run(state=weights, hidden=hidden, _pending_rows_hidden=tail, _pending_length=length)
         torch.testing.assert_close(result.output, torch.cat(expected)[-count:], rtol=2e-5, atol=1e-6)
         torch.testing.assert_close(weights, state, rtol=2e-5, atol=1e-6)
         torch.testing.assert_close(tail[: len(retained)], retained, rtol=0, atol=0)
@@ -257,4 +268,4 @@ def test_counted_gated_tail_keeps_inactive_chunks_and_never_reads_device_counts(
         patch.object(torch.cuda.Event, "synchronize", side_effect=AssertionError("host event wait")),
         patch.object(torch.cuda.Stream, "synchronize", side_effect=AssertionError("host stream wait")),
     ):
-        run(hidden, weights, tail, length)
+        run(state=weights, hidden=hidden, _pending_rows_hidden=tail, _pending_length=length)

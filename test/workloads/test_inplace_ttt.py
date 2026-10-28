@@ -24,22 +24,13 @@ from pllm.contracts.parameter_overlay import (
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.tensor_layout import TensorDType
+from pllm.execution.overlay_task import chunk_update
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.step_input import TensorStepInput
 from pllm.execution.visibility import explain_visibility
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
 from test.backend_facts import assert_finite_resources, backend_facts
-
-
-class _ShiftedUpdate(InPlaceTTTWorkload):
-    """Change only a helper's mathematics to check the bound source identity."""
-
-    def step(
-        self, delta: torch.Tensor, inputs: torch.Tensor, targets: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Use a different increment without changing the transition method."""
-        return delta + self.config.learning_rate * torch.mm(targets.T, inputs) + 1, torch.mm(inputs, delta.T)
 
 
 def _input(operands: tuple[CapturedParameterOperand, ...]) -> TensorStepInput:
@@ -80,9 +71,6 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     changed = InPlaceTTTWorkload(replace(config, chunk_size=3)).declaration(facts).graph
     changed_visibility = next(task.visibility for task in changed.tasks if task.visibility is not None)
     assert changed_visibility.equations_digest != visibility.equations_digest
-    helper = _ShiftedUpdate(config).declaration(facts).graph
-    helper_visibility = next(task.visibility for task in helper.tasks if task.visibility is not None)
-    assert helper_visibility.equations_digest != visibility.equations_digest
     identities = (RequestIdentity("same", 0, 0), RequestIdentity("same", 0, 1))
     refs = execution.admit(identities)
     bases = torch.tensor(
@@ -324,7 +312,15 @@ def _check_headwise_math_and_tail():
                 state = decayed - 0.2 / 2 * gradient
         pending = joined[trained:]
         expected = torch.cat(outputs)[-len(hidden) :]
-        actual = workload.transition(hidden, weights, tail, length)
+        actual = chunk_update(
+            workload.step,
+            2,
+            ("state", "hidden"),
+            state=weights,
+            hidden=hidden,
+            _pending_rows_hidden=tail,
+            _pending_length=length,
+        )
         torch.testing.assert_close(actual.output.double(), expected, rtol=2e-6, atol=5e-7)
         torch.testing.assert_close(weights.double(), state, rtol=2e-6, atol=2e-7)
         torch.testing.assert_close(tail[: len(pending)].double(), pending)

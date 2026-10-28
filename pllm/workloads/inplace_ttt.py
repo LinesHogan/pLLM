@@ -5,8 +5,6 @@ from dataclasses import dataclass
 import torch
 
 import pllm
-from pllm import TensorUpdate
-from pllm.execution.chunk_tail import join_tail, save_tail
 from pllm.model import ParameterTarget
 
 
@@ -40,13 +38,9 @@ class InPlaceTTTWorkload(pllm.Workload):
 
     @property
     def dense_fast_weights(self) -> pllm.RequestState:
-        tail = max(1, self.config.chunk_size - 1)
         return pllm.RequestState(
             {
                 "delta": pllm.Buffer(lambda inputs, outputs: (outputs, inputs)),
-                "tail_input": pllm.Buffer(lambda inputs, outputs: (tail, inputs)),
-                "tail_target": pllm.Buffer(lambda inputs, outputs: (tail, outputs)),
-                "tail_length": pllm.Buffer((), dtype=torch.int64),
             },
             namespace="canonical.dense_fast_weight.state@1",
             keys=(
@@ -56,45 +50,24 @@ class InPlaceTTTWorkload(pllm.Workload):
             ),
         )
 
-    def step(
-        self, delta: torch.Tensor, inputs: torch.Tensor, targets: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Read the incoming residual and advance one additive chunk."""
-        output = torch.mm(inputs, delta.T)
-        return delta + (self.config.learning_rate * torch.mm(targets.T, inputs)).to(delta), output
-
     @pllm.overlay(
         visibility=pllm.Config("config.visibility"),
         state="dense_fast_weights",
         targets=pllm.Config("config.targets"),
         weight="delta",
+        chunk=pllm.Config("config.chunk_size"),
         prefill=pllm.Config("config.update_prefill"),
         decode=pllm.Config("config.update_decode"),
     )
-    def transition(
+    def step(
         self,
-        hidden: torch.Tensor = pllm.operand("input"),
-        target: torch.Tensor = pllm.operand("target"),
         delta: torch.Tensor = pllm.parameter("dense_fast_weights", "delta"),
-        tail_input: torch.Tensor = pllm.parameter("dense_fast_weights", "tail_input"),
-        tail_target: torch.Tensor = pllm.parameter("dense_fast_weights", "tail_target"),
-        tail_length: torch.Tensor = pllm.parameter("dense_fast_weights", "tail_length"),
-    ) -> pllm.TensorUpdate:
-        """Return exclusive residuals, update complete chunks and retain unfinished rows."""
-        chunk = self.config.chunk_size
-        (inputs, targets), valid = join_tail((tail_input, tail_target), (hidden, target), tail_length, chunk)
-        positions = torch.arange(len(hidden), device=hidden.device) + tail_length
-        trained = valid // chunk * chunk
-        updated, outputs = pllm.scan(self.step, carry=delta, over=(inputs, targets), chunk=chunk, valid_rows=trained)
-        delta.copy_(updated)
-        remaining = save_tail((tail_input, tail_target), (inputs, targets), tail_length, valid, trained)
-        return TensorUpdate(
-            torch.cat(outputs).index_select(0, positions),
-            trained > 0,
-            trained // chunk,
-            trained,
-            {"tail_rows": remaining},
-        )
+        inputs: torch.Tensor = pllm.operand("input"),
+        targets: torch.Tensor = pllm.operand("target"),
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Read the incoming residual and advance one additive chunk."""
+        output = torch.mm(inputs, delta.T)
+        return delta + (self.config.learning_rate * torch.mm(targets.T, inputs)).to(delta), output
 
 
 __all__ = ["InPlaceTTTConfig", "InPlaceTTTWorkload"]
