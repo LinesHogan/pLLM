@@ -47,10 +47,6 @@ class Completion:
     text: str
     finish_reason: FinishReason
 
-    def __post_init__(self) -> None:
-        if self.output_index < 0 or not self.group_id or any(token_id < 0 for token_id in self.token_ids):
-            raise ValueError("completion is not closed")
-
 
 @dataclass(frozen=True, slots=True)
 class CompletionBatch:

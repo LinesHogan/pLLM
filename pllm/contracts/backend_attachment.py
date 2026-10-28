@@ -76,10 +76,6 @@ class CausalModelDomain:
     layers: int
     positions: int
 
-    def __post_init__(self) -> None:
-        if any(type(size) is not int or not 0 < size < 2**63 for size in (self.requests, self.layers, self.positions)):
-            raise ValueError("causal model domain requires positive bounded index extents")
-
 
 @dataclass(frozen=True, slots=True)
 class BackendPlacementProbe:

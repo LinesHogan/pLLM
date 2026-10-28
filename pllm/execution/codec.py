@@ -6,7 +6,7 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, cast
+from typing import TypedDict
 from uuid import UUID
 
 import torch
@@ -16,45 +16,31 @@ from torch._subclasses.fake_tensor import FakeTensor
 
 from pllm.contracts.codec import (
     boundary_digest as boundary_digest,
-    boundary_scalar as _primitive,
     decode_boundary as decode_boundary,
     encode_boundary as encode_boundary,
 )
 
 
-class _TensorHooks(Protocol):
-    def register_hook(self, hook: Callable[[torch.Tensor], torch.Tensor]) -> torch.utils.hooks.RemovableHandle: ...
-
-
 def register_gradient_hook(tensor: torch.Tensor, hook: Callable[[torch.Tensor], torch.Tensor]) -> None:
-    cast(_TensorHooks, tensor).register_hook(hook)
-
-
-class _TensorDecompositions(Protocol):
-    def get_decompositions(self, aten_ops: tuple[OpOverload, ...]) -> dict[object, object]: ...
+    tensor.register_hook(hook)  # pyright: ignore[reportUnknownMemberType]
 
 
 def tensor_decompositions(operators: tuple[OpOverload, ...]) -> dict[OpOverload, Callable[..., torch.Tensor]]:
     """Torch decompositions for fake tracing without AOT's CUDA RNG initialization."""
-    return cast(
-        dict[OpOverload, Callable[..., torch.Tensor]],
-        {
-            **getattr(_decomp, "core_aten_decompositions")(),
-            **cast(_TensorDecompositions, _decomp).get_decompositions(operators),
-        },
-    )
+    return {  # pyright: ignore[reportReturnType,reportUnknownVariableType]
+        **_decomp.core_aten_decompositions(),  # pyright: ignore[reportUnknownMemberType]
+        **_decomp.get_decompositions(operators),  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
+    }
 
 
 def check_functional_aten(target: object) -> None:
-    if not isinstance(target, OpOverload):
-        raise ValueError(f"export requires ATen operators, got {target}")
-    schema: object = getattr(cast(object, target), "_schema")
-    if not isinstance(schema, torch.FunctionSchema):
-        raise ValueError("export operator has no supported schema")
-    if target.namespace != "aten" or schema.is_mutable:
-        raise ValueError(f"export contains a nonfunctional or external operator: {target}")
-    if torch.Tag.nondeterministic_seeded in target.tags:
-        raise ValueError("export RNG needs explicit instance-addressed inputs")
+    if (
+        not isinstance(target, OpOverload)
+        or target.namespace != "aten"
+        or target._schema.is_mutable  # pyright: ignore[reportPrivateUsage]
+        or torch.Tag.nondeterministic_seeded in target.tags
+    ):
+        raise ValueError(f"export requires deterministic functional ATen operators, got {target}")
 
 
 def tensor_node_metadata(node: torch.fx.Node) -> FakeTensor | None:
@@ -65,77 +51,41 @@ def tensor_node_metadata(node: torch.fx.Node) -> FakeTensor | None:
 def load_tensor_fields(path: Path, fields: tuple[str, ...]) -> tuple[torch.Tensor, ...]:
     """Decode a weights-only checkpoint into the caller's explicit tensor field order."""
     payload: object = torch.load(path, map_location="cpu", weights_only=True)
-    if not isinstance(payload, dict):
-        raise ValueError(f"invalid tensor checkpoint: {path.name}")
-    values = cast(dict[object, object], payload)
-    tensors: list[torch.Tensor] = []
-    for field in fields:
-        value = values.get(field)
-        if not isinstance(value, torch.Tensor):
-            raise ValueError(f"invalid tensor checkpoint field {field}: {path.name}")
-        tensors.append(value)
-    return tuple(tensors)
-
-
-class _CudaDevice(Protocol):
-    uuid: object
-
-
-class _CudaAllocator(Protocol):
-    def memory_snapshot(self, mempool_id: tuple[int, int], include_traces: bool) -> list[dict[str, object]]: ...
-    def get_device_properties(self, device: torch.device) -> _CudaDevice: ...
+    tensors = (
+        tuple(t for f in fields if isinstance(t := payload.get(f), torch.Tensor))  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+        if isinstance(payload, dict)
+        else ()
+    )
+    if len(tensors) != len(fields):
+        raise ValueError(f"checkpoint {path.name} must map {fields} to tensors")
+    return tensors
 
 
 def cuda_device_uuid(device: torch.device) -> str:
-    return str(UUID(str(cast(_CudaAllocator, torch.cuda).get_device_properties(device).uuid)))
+    return str(UUID(str(torch.cuda.get_device_properties(device).uuid)))  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
 
 
 CudaStorageHandle = tuple[int, bytes, int, int, bytes, int, bytes, bool]
 
 
-class _CudaStorage(Protocol):
-    def _share_cuda_(self) -> CudaStorageHandle: ...
-
-    @staticmethod
-    def _new_shared_cuda(
-        device: int,
-        handle: bytes,
-        size: int,
-        offset: int,
-        counter: bytes,
-        counter_offset: int,
-        event: bytes,
-        wait: bool,
-    ) -> torch.UntypedStorage: ...
-
-    def share(self) -> CudaStorageHandle:
-        return self._share_cuda_()
-
-    def open(self, handle: CudaStorageHandle) -> torch.UntypedStorage:
-        return self._new_shared_cuda(*handle)
-
-
 def share_cuda_storage(tensor: torch.Tensor) -> CudaStorageHandle:
-    return _CudaStorage.share(cast(_CudaStorage, tensor.untyped_storage()))
+    return tensor.untyped_storage()._share_cuda_()  # pyright: ignore[reportPrivateUsage,reportAttributeAccessIssue,reportUnknownMemberType,reportUnknownVariableType]
 
 
 def open_cuda_storage(handle: CudaStorageHandle) -> torch.UntypedStorage:
-    return _CudaStorage.open(cast(_CudaStorage, torch.UntypedStorage), handle)
+    return torch.UntypedStorage._new_shared_cuda(*handle)  # pyright: ignore[reportPrivateUsage,reportAttributeAccessIssue,reportUnknownMemberType,reportUnknownVariableType]
+
+
+class _PoolSegment(TypedDict):
+    device: int
+    total_size: int
 
 
 def cuda_graph_pool_bytes(pool: tuple[int, int], device: int) -> int:
     """Decode PyTorch allocator facts at the foreign-data boundary, only in cold planning."""
-    if torch.cuda.get_allocator_backend() != "native" or pool == (0, 0):
-        raise ValueError("CUDA graph residency requires its captured native allocator pool")
-    segments = cast(_CudaAllocator, torch.cuda).memory_snapshot(pool, False)
-    total = 0
-    for segment in segments:
-        if _primitive(segment["device"], int) == device:
-            size = _primitive(segment["total_size"], int)
-            if size < 0:
-                raise ValueError("CUDA graph pool size must be nonnegative")
-            total += size
-    return total
+    assert torch.cuda.get_allocator_backend() == "native" and pool != (0, 0)
+    segments: list[_PoolSegment] = torch.cuda.memory_snapshot(pool, False)  # pyright: ignore[reportUnknownMemberType,reportAssignmentType]
+    return sum(s["total_size"] for s in segments if s["device"] == device)
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +99,21 @@ class CudaProfileTotals:
     memcpy_bytes: int
     cuda_launch_api_count: int
     cuda_graph_launch_api_count: int
+
+
+class _TraceArgs(TypedDict):
+    bytes: int
+
+
+class _TraceEvent(TypedDict):
+    ph: str
+    cat: str
+    name: str
+    pid: int | str
+    tid: int | str
+    ts: float
+    dur: float
+    args: _TraceArgs
 
 
 def _span_totals(spans: dict[tuple[str, str], list[tuple[float, float]]]) -> tuple[int, float]:
@@ -173,8 +138,7 @@ def cuda_profile_totals(path: Path) -> CudaProfileTotals:
     Memcpy bytes exclude kernel-internal loads/stores and all allocator figures.
     Foreign trace metadata is deliberately not a closed PLLM wire contract.
     """
-    payload = cast(dict[str, object], json.loads(path.read_text()))
-    events = cast(list[dict[str, object]], payload["traceEvents"])
+    events: list[_TraceEvent] = json.loads(path.read_text())["traceEvents"]
     kernels, kernel_us, transfer = 0, 0.0, 0
     spans: dict[str, dict[tuple[str, str], list[tuple[float, float]]]] = {
         kind: {} for kind in ("api", "enqueue", "wait", "gpu", "launch", "graph")
@@ -189,8 +153,8 @@ def cuda_profile_totals(path: Path) -> CudaProfileTotals:
             "gpu_memset",
         ):
             continue
-        duration = _primitive(event["dur"], float)
-        start = _primitive(event["ts"], float)
+        duration = float(event["dur"])
+        start = float(event["ts"])
         device_event = category in ("kernel", "gpu_memcpy", "gpu_memset")
         key = (str(event["pid"]), "device" if device_event else str(event["tid"]))
         interval = (start, start + duration)
@@ -199,10 +163,9 @@ def cuda_profile_totals(path: Path) -> CudaProfileTotals:
             kernels += 1
             kernel_us += duration
         elif category == "gpu_memcpy":
-            args = cast(dict[str, object], event["args"])
-            transfer += _primitive(args["bytes"], int)
+            transfer += int(event["args"]["bytes"])
         elif not device_event:
-            name = _primitive(event["name"], str).lower()
+            name = str(event["name"]).lower()
             if "synchronize" in name:
                 spans["wait"].setdefault(key, []).append(interval)
             elif "launch" in name or "async" in name and ("memcpy" in name or "memset" in name):
