@@ -14,24 +14,12 @@ from pllm.contracts.state_representation import (
     StateRepresentationRequest,
 )
 from pllm.contracts.tensor_layout import (
-    TensorDType,
     TensorFieldSpec,
     TensorLayoutBinding,
     TensorLayoutRequest,
     TensorLayoutSpec,
 )
 from pllm.execution.scheduler import compile_state_schedule, intern_tensor_layouts
-
-DTYPE_BYTES = {
-    TensorDType.BOOL: 1,
-    TensorDType.UINT8: 1,
-    TensorDType.INT32: 4,
-    TensorDType.INT64: 8,
-    TensorDType.FLOAT16: 2,
-    TensorDType.BFLOAT16: 2,
-    TensorDType.FLOAT32: 4,
-    TensorDType.FLOAT64: 8,
-}
 
 
 def compile_page_bundle_plan(
@@ -87,7 +75,7 @@ def compile_page_bundle_plan(
 
 
 def page_stride_bytes(field: TensorFieldSpec) -> int:
-    size = prod(field.shape) * DTYPE_BYTES[field.dtype]
+    size = prod(field.shape) * field.dtype.itemsize
     return (size + field.alignment_bytes - 1) // field.alignment_bytes * field.alignment_bytes
 
 
@@ -113,7 +101,7 @@ class PageBundleProviderFacts:
         immutable_instance = state.scope is StateScope.INSTANCE and state.immutable
         capacity = 1 if immutable_instance else self.page_capacity
         reserved_bytes = sum(
-            capacity * page_stride_bytes(field) + max(field.alignment_bytes - DTYPE_BYTES[field.dtype], 0)
+            capacity * page_stride_bytes(field) + max(field.alignment_bytes - field.dtype.itemsize, 0)
             for field in layout.fields
         )
         return StateProviderPlan(

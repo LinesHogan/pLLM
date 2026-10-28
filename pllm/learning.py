@@ -48,7 +48,6 @@ from pllm.execution.host_runtime import (
 )
 from pllm.execution.memory import MemoryTrace, MemoryUsage
 from pllm.execution.ptts.request_state import RequestStateSelection
-from pllm.execution.shared_tensor import tensor_dtype
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.step_input import TensorStepInput
 from pllm.execution.tensor_frame import Tensors
@@ -292,8 +291,7 @@ class CompletionWorkload(
             assert facts.max_input_rows is not None
             data = owner.training_example(facts)
             root = tuple(
-                torch.empty(field.shape, dtype=tensor_dtype(field.dtype), device="meta")
-                for field in layout.layout.fields
+                torch.empty(field.shape, dtype=field.dtype.torch, device="meta") for field in layout.layout.fields
             )
             batch = TensorBatch(RequestStateSelection((), ()), (root,), (), None)
             usage = b.operations[update.symbol].memory(data, batch)
@@ -345,7 +343,7 @@ class CausalAdapterWorkload(
         owner = owner_snapshot(self, _MARKERS, (self.model,))
         model = owner.model
         targets = tuple(item.target for item in model.targets)
-        expected_dtype = tensor_dtype(model.tensor_dtype)
+        expected_dtype = model.tensor_dtype.torch
         if (
             model.resident_bytes < 0
             or model.resident_bytes

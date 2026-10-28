@@ -23,9 +23,9 @@ from pllm.contracts.tensor_layout import LayoutFieldId, TensorLayoutSpec
 from pllm.execution.admission import WindowBackpressure
 from pllm.execution.codec import boundary_digest, decode_boundary, encode_boundary
 from pllm.execution.cuda_stream import upload
-from pllm.execution.ptts.page_bundle_planning import DTYPE_BYTES, page_stride_bytes
+from pllm.execution.ptts.page_bundle_planning import page_stride_bytes
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.execution.shared_tensor import CudaIpcStorage, RemoteCompletion, tensor_dtype
+from pllm.execution.shared_tensor import CudaIpcStorage, RemoteCompletion
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,11 +263,11 @@ class _Pools:
         capacity = selected.page_capacity
         tensors: list[torch.Tensor] = []
         for field in layout.fields:
-            size = DTYPE_BYTES[field.dtype]
+            size = field.dtype.itemsize
             stride = page_stride_bytes(field) // size
             alignment = max(field.alignment_bytes // size, 1)
             count = capacity * stride + alignment - 1
-            pool = torch.zeros(count, dtype=tensor_dtype(field.dtype), device=device)
+            pool = torch.zeros(count, dtype=field.dtype.torch, device=device)
             offset = (-pool.data_ptr() // size) % alignment
             tensors.append(
                 pool[offset : offset + capacity * stride]
@@ -474,7 +474,7 @@ class PageBundleArena:
             private_pages = pages(private) - live_pages
             retiring_pages = pages(retiring) - live_pages - private_pages
             sizes = {
-                (resource, field.field_id): prod(field.shape) * DTYPE_BYTES[field.dtype]
+                (resource, field.field_id): prod(field.shape) * field.dtype.itemsize
                 for resource, pool in self._pools.items()
                 for field in pool.layout.fields
             }
@@ -1062,20 +1062,20 @@ class PageBundleArena:
         )
         assert stream is not None
         spec = entry.layout.fields[descriptor.field_id]
-        size = DTYPE_BYTES[spec.dtype]
+        size = spec.dtype.itemsize
         stride = page_stride_bytes(spec) // size
         alignment = max(spec.alignment_bytes // size, 1)
         storage = descriptor.cuda_storage
         tensor = (
             storage.map(
                 (provider.page_capacity * stride + alignment - 1) * size,
-                tensor_dtype(spec.dtype),
+                spec.dtype.torch,
                 descriptor.storage_offset,
                 spec.shape,
                 stream,
             )
             if storage is not None
-            else torch.empty(spec.shape, dtype=tensor_dtype(spec.dtype), device=stream.device)
+            else torch.empty(spec.shape, dtype=spec.dtype.torch, device=stream.device)
         )
         return BorrowedPage(descriptor, tensor, connection, stream)
 

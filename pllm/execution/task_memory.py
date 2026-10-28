@@ -29,7 +29,6 @@ from pllm.contracts.state_ref import LayoutId, LineageId, StateRef, VersionId
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.request_state import RequestStateSelection, ResourceSelection
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.execution.shared_tensor import tensor_dtype
 from pllm.execution.step_input import TensorStepInput
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import MemoryOperation, TensorBatch
@@ -53,7 +52,7 @@ def example(
     )
     packed = PackedPhaseRowBatch(0, count, rows)
     sampler = PackedSamplerRowBatch(packed, tuple(PackedSamplerRowLink(i, count - i - 1) for i in range(count)))
-    hidden_dtype = torch.float64 if tensor_dtype(facts.probe.tensor_dtype) is torch.float64 else torch.float32
+    hidden_dtype = torch.float64 if facts.probe.tensor_dtype.torch is torch.float64 else torch.float32
     hidden = (
         PackedHiddenSnapshotBatch(
             packed,
@@ -87,7 +86,7 @@ def example(
                 tuple(len(roots) + i for i in range(count)) if state.key_fields else (len(roots),) * count,
             )
         )
-        fields = tuple(meta(states, *field.shape, dtype=tensor_dtype(field.dtype)) for field in layout.layout.fields)
+        fields = tuple(meta(states, *field.shape, dtype=field.dtype.torch) for field in layout.layout.fields)
         resource_pools[state.resource] = fields
         if not pools:
             pools = fields
@@ -138,7 +137,7 @@ def example(
             meta(*shape),
             keys,
         )
-    dtype = tensor_dtype(facts.probe.tensor_dtype)
+    dtype = facts.probe.tensor_dtype.torch
     # A step packs at most max_packed_rows prompt tokens across all rows. The first row takes the remainder,
     # so both one longest prompt and every row's fixed cost are traced.
     lengths = (max(1, facts.probe.max_packed_rows - len(rows) + 1), *(1,) * (len(rows) - 1))

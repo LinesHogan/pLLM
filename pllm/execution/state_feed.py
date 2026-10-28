@@ -23,7 +23,6 @@ from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle import BorrowedPage, PageBundleArena, PageRelease
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.execution.shared_tensor import tensor_dtype
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,7 +214,7 @@ class Feed:
             or any(
                 fields[name].layout != torch.strided
                 or tuple(fields[name].shape) != field.shape
-                or fields[name].dtype != tensor_dtype(field.dtype)
+                or fields[name].dtype != field.dtype.torch
                 or fields[name].device != self._device
                 for name, field in self._fields.items()
             )

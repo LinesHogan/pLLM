@@ -44,7 +44,6 @@ from pllm.execution.declaration import Call, State, When, native
 from pllm.execution.overlay_task import OverlayTransition
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION
-from pllm.execution.shared_tensor import tensor_dtype
 from pllm.execution.tensor_frame import (
     TensorFrame,
     Tensors,
@@ -337,7 +336,7 @@ def declare_layer_route(
         assert probe.causal_domain is not None
         tensor = TokenTensor(
             (1, probe.hidden_size),
-            tensor_dtype(probe.tensor_dtype),
+            probe.tensor_dtype.torch,
             "cpu" if probe.device_kind.value == "cpu" else f"cuda:{probe.device_ordinal}",
         )
         captured = tuple(

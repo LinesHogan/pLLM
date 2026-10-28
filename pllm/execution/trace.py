@@ -24,7 +24,6 @@ from pllm.contracts.semantic_graph import ScheduleDecision, TaskId
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.admission import WindowBackpressure
-from pllm.execution.shared_tensor import tensor_dtype
 
 TRACE_SCHEMA_VERSION = 7
 MAX_SNAPSHOT_BYTES = 32768
@@ -89,7 +88,7 @@ class TraceEvent:
         """Reconstruct an independent CPU value, including exact NaN/Inf and integer bits."""
         if self.tensor_data is None or self.tensor_dtype is None:
             raise ValueError("trace event has no bounded tensor snapshot")
-        dtype = tensor_dtype(self.tensor_dtype)
+        dtype = self.tensor_dtype.torch
         raw = bytearray(b64decode(self.tensor_data, validate=True))
         assert len(raw) == prod(self.tensor_shape) * dtype.itemsize <= MAX_SNAPSHOT_BYTES
         return (

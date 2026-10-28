@@ -16,21 +16,6 @@ import torch
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorFieldSpec
 from pllm.execution.codec import cuda_device_uuid, open_cuda_storage, share_cuda_storage
 
-TORCH_DTYPES = {
-    TensorDType.BOOL: torch.bool,
-    TensorDType.UINT8: torch.uint8,
-    TensorDType.INT32: torch.int32,
-    TensorDType.INT64: torch.int64,
-    TensorDType.FLOAT16: torch.float16,
-    TensorDType.BFLOAT16: torch.bfloat16,
-    TensorDType.FLOAT32: torch.float32,
-    TensorDType.FLOAT64: torch.float64,
-}
-
-
-def tensor_dtype(dtype: TensorDType) -> torch.dtype:
-    return TORCH_DTYPES[dtype]
-
 
 @dataclass(frozen=True, slots=True)
 class CudaIpcStorage:
@@ -106,7 +91,7 @@ class CudaIpcStorage:
         stream: torch.cuda.Stream | None,
     ) -> torch.Tensor:
         assert stream is not None
-        return self.map(self.size_bytes, tensor_dtype(field.dtype), offset, field.shape, stream, stride)
+        return self.map(self.size_bytes, field.dtype.torch, offset, field.shape, stream, stride)
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,15 +108,15 @@ class CpuFileStorage:
         stream: torch.cuda.Stream | None,
     ) -> torch.Tensor:
         assert self.descriptor >= 0 and not offset and not stride
-        size = prod(field.shape) * torch.empty(0, dtype=tensor_dtype(field.dtype)).element_size()
+        size = prod(field.shape) * field.dtype.itemsize
         fd = os.open(f"/proc/{peer_pid}/fd/{self.descriptor}", os.O_RDWR)
         try:
             info = os.fstat(fd)
             assert stat.S_ISREG(info.st_mode) and info.st_ino == self.inode and info.st_size == size
             return (
-                map_cpu_storage(fd, size, tensor_dtype(field.dtype), 0, field.shape)
+                map_cpu_storage(fd, size, field.dtype.torch, 0, field.shape)
                 if size
-                else torch.empty(field.shape, dtype=tensor_dtype(field.dtype))
+                else torch.empty(field.shape, dtype=field.dtype.torch)
             )
         finally:
             os.close(fd)
@@ -153,16 +138,16 @@ class SharedTensor:
     ) -> tuple[torch.Tensor, SharedTensor]:
         assert device.type in ("cpu", "cuda")
         if device.type == "cuda":
-            tensor = torch.empty(field.shape, device=device, dtype=tensor_dtype(field.dtype))
+            tensor = torch.empty(field.shape, device=device, dtype=field.dtype.torch)
             assert tensor.data_ptr() % field.alignment_bytes == 0
             return tensor, replace(cls.export(tensor, lifetime), field=field)
-        size = prod(field.shape) * torch.empty(0, dtype=tensor_dtype(field.dtype)).element_size()
+        size = prod(field.shape) * field.dtype.itemsize
         backing = lifetime.enter_context(TemporaryFile())
         backing.truncate(size)
         tensor = (
-            map_cpu_storage(backing.fileno(), size, tensor_dtype(field.dtype), 0, field.shape)
+            map_cpu_storage(backing.fileno(), size, field.dtype.torch, 0, field.shape)
             if size
-            else torch.empty(field.shape, dtype=tensor_dtype(field.dtype))
+            else torch.empty(field.shape, dtype=field.dtype.torch)
         )
         return tensor, cls(os.getpid(), field, CpuFileStorage(backing.fileno(), os.fstat(backing.fileno()).st_ino))
 
@@ -188,7 +173,7 @@ class SharedTensor:
 
     @staticmethod
     def describe(tensor: torch.Tensor) -> TensorFieldSpec:
-        dtype = next((dtype for dtype, native in TORCH_DTYPES.items() if native == tensor.dtype), None)
+        dtype = next((dtype for dtype in TensorDType if dtype.torch == tensor.dtype), None)
         if dtype is None or tensor.layout != torch.strided or tensor.device.type not in ("cpu", "cuda"):
             raise ValueError("auxiliary tensor must use a strided CPU or CUDA tensor in the closed dtype vocabulary")
         return TensorFieldSpec(LayoutFieldId(0), tuple(tensor.shape), dtype, tensor.element_size())

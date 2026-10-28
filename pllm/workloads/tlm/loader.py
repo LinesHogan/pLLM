@@ -16,7 +16,6 @@ if TYPE_CHECKING:
 from pllm.authoring import CausalTrainBatch
 from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget, ParameterTargetShape
 from pllm.contracts.tensor_layout import TensorDType
-from pllm.execution.shared_tensor import tensor_dtype
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +85,7 @@ class HfQvModel:
                 bias="none",
             ),
         )
-        self.model = adapted.to(dtype=tensor_dtype(config.tensor_dtype)).eval().requires_grad_(False)
+        self.model = adapted.to(dtype=config.tensor_dtype.torch).eval().requires_grad_(False)
         self.targets = tuple(targets)
         self._names = tuple(names)
         parameters = dict(self.model.named_parameters())
@@ -140,17 +139,15 @@ class HfQvModel:
                 trust_remote_code=config.trust_remote_code,
             )
             with torch.device("meta"):
-                return cls(
-                    Qwen2ForCausalLM(topology).to(device=device, dtype=tensor_dtype(config.tensor_dtype)), config
-                )
+                return cls(Qwen2ForCausalLM(topology).to(device=device, dtype=config.tensor_dtype.torch), config)
         return cls(
             Qwen2ForCausalLM.from_pretrained(
                 config.model_id,
                 revision=config.revision,
                 local_files_only=config.local_files_only,
                 trust_remote_code=config.trust_remote_code,
-                torch_dtype=tensor_dtype(config.tensor_dtype),
-            ).to(device=device, dtype=tensor_dtype(config.tensor_dtype)),
+                torch_dtype=config.tensor_dtype.torch,
+            ).to(device=device, dtype=config.tensor_dtype.torch),
             config,
         )
 
