@@ -99,7 +99,7 @@ class TensorHostBinding(Generic[InputT, DataT, ResultT]):
 class TransactionHostBinding(Generic[RequestT, TransactionT, ContextT, SnapshotT, ResultT]):
     graph: SemanticGraph
     state_factory: Callable[[], HostTaskState[TransactionT, ContextT, SnapshotT, ResultT]]
-    tasks: tuple[TaskGraphImplementation[ContextT], ...]
+    tasks: tuple[TaskGraphImplementation[ContextT, None], ...]
     service: HostTransactionService[RequestT, TransactionT, ResultT]
     facts: HostRuntimeFacts
     timeline: SchedulerTimeline | None = None
@@ -243,7 +243,7 @@ class HostExecution(Generic[TransactionT, ContextT, SnapshotT, ResultT]):
         graph: SemanticGraph,
         timeline: SchedulerTimeline,
         state_factory: Callable[[], HostTaskState[TransactionT, ContextT, SnapshotT, ResultT]],
-        implementations: tuple[TaskGraphImplementation[ContextT], ...],
+        implementations: tuple[TaskGraphImplementation[ContextT, None], ...],
         device: torch.device,
         *,
         plan_epoch: int = 1,

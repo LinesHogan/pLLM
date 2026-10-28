@@ -13,21 +13,23 @@ from pllm.execution.trace import ExecutionTrace
 
 ExecutionContextT = TypeVar("ExecutionContextT")
 TaskContextT = TypeVar("TaskContextT", contravariant=True)
+ExecutionResultT = TypeVar("ExecutionResultT")
+TaskResultT = TypeVar("TaskResultT", covariant=True)
 
 
-class TaskGraphImplementation(Protocol[TaskContextT]):
+class TaskGraphImplementation(Protocol[TaskContextT, TaskResultT]):
     @property
     def implementation_id(self) -> ImplementationId: ...
 
-    def execute(self, context: TaskContextT) -> None: ...
+    def execute(self, context: TaskContextT) -> TaskResultT: ...
 
 
 @dataclass(slots=True)
-class TaskGraphExecution(Generic[ExecutionContextT]):
+class TaskGraphExecution(Generic[ExecutionContextT, ExecutionResultT]):
     """Mechanically execute Rust-planned tasks by dense semantic task ID."""
 
     plan: PhysicalPlan
-    implementations: tuple[TaskGraphImplementation[ExecutionContextT], ...]
+    implementations: tuple[TaskGraphImplementation[ExecutionContextT, ExecutionResultT], ...]
     trace: ExecutionTrace
     release_values: Callable[[ExecutionContextT, tuple[int, ...]], None] | None = None
 
@@ -51,11 +53,14 @@ class TaskGraphExecution(Generic[ExecutionContextT]):
             raise ValueError("task-graph implementation differs from the Rust physical plan")
 
 
-class TaskGraphInvocation(Generic[ExecutionContextT]):
+class TaskGraphInvocation(Generic[ExecutionContextT, ExecutionResultT]):
     """One cursor for synchronous host and externally staged execution."""
 
     def __init__(
-        self, execution: TaskGraphExecution[ExecutionContextT], context: ExecutionContextT, invocation_id: int
+        self,
+        execution: TaskGraphExecution[ExecutionContextT, ExecutionResultT],
+        context: ExecutionContextT,
+        invocation_id: int,
     ) -> None:
         self.execution, self.context, self.invocation_id = execution, context, invocation_id
         self._next_task_index = 0
@@ -91,19 +96,20 @@ class TaskGraphInvocation(Generic[ExecutionContextT]):
         self.finished = True
         return self.context
 
-    def execute_part(self, task_id: TaskId, *, complete: bool, stream: torch.cuda.Stream | None) -> None:
+    def execute_part(self, task_id: TaskId, *, complete: bool, stream: torch.cuda.Stream | None) -> ExecutionResultT:
         """Run a projection segment of the current task, retaining its cursor until completion."""
         plan, trace = self.execution.plan, self.execution.trace
         assert not self.finished and self._next_task_index < len(plan.tasks)
         task = plan.tasks[self._next_task_index]
         assert task.task_id == task_id and task.anchor_id >= self.last_anchor_id
         with trace.task(self.invocation_id, task_id, stream):
-            self.execution.implementations[int(task_id)].execute(self.context)
+            result = self.execution.implementations[int(task_id)].execute(self.context)
         self.last_anchor_id = int(task.anchor_id)
         if complete:
             if task.release_values and self.execution.release_values is not None:
                 self.execution.release_values(self.context, task.release_values)
             self._next_task_index += 1
+        return result
 
 
 __all__ = [

@@ -21,7 +21,7 @@ DataT = TypeVar("DataT")
 ResultT = TypeVar("ResultT")
 if TYPE_CHECKING:
     from pllm.execution.execution import TaskGraphInvocation
-    from pllm.execution.state_execution import StateExecution, StateTaskContext
+    from pllm.execution.state_execution import ProjectionResiduals, StateExecution, StateTaskContext
     from pllm.execution.step_input import TensorStepInput
 
 
@@ -39,7 +39,7 @@ class ProjectionTask(Generic[DataT, ResultT]):
     def __init__(
         self,
         execution: StateExecution[TensorStepInput, DataT, ResultT],
-        invocation: TaskGraphInvocation[StateTaskContext[DataT]],
+        invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals],
         rows: PackedSamplerRowBatch,
         task: TaskId,
         targets: tuple[ParameterTarget, ...],
@@ -56,13 +56,12 @@ class ProjectionTask(Generic[DataT, ResultT]):
         targets = {operand.target for operand in operands}
         assert targets and targets <= self.pending
         self.pending.difference_update(targets)
-        self.execution.execute_part(
+        return self.execution.execute_part(
             self.invocation,
             TensorStepInput(self.rows.row_batch, self.rows, operands=operands),
             self.task,
             complete=not self.pending,
         )
-        return self.invocation.context.projection_outputs
 
 
 @dataclass(frozen=True, slots=True)

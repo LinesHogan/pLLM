@@ -24,7 +24,7 @@ from pllm.execution.memory import MemoryUsage, apply_adamw_or_reserve, measure
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot, borrowed_root
 from pllm.execution.ptts.page_bundle import PagePin, PagePublication, PageWrite, Slots
 from pllm.execution.ptts.request_state import RequestStateSelection, StateAddress
-from pllm.execution.state_execution import StateTaskContext
+from pllm.execution.state_execution import ProjectionResiduals, StateTaskContext
 from pllm.execution.trace import TracePhase
 from pllm.kernels.adamw import AdamWConfig, AdamWFields, paged_adamw
 from pllm.kernels.page_copy import copy_pages
@@ -93,7 +93,7 @@ class Observation:
 
 @dataclass(frozen=True, slots=True)
 class TaskOutput:
-    residuals: Mapping[tuple[RequestIdentity, ParameterTarget], torch.Tensor] = field(
+    residuals: ProjectionResiduals = field(
         default_factory=lambda: dict[tuple[RequestIdentity, ParameterTarget], torch.Tensor]()
     )
     guidance: PackedSamplerGuidanceBatch | None = None
@@ -419,12 +419,12 @@ class TensorOperation(Generic[D]):
 
         return measure(run)
 
-    def execute(self, context: StateTaskContext[D]) -> None:
+    def execute(self, context: StateTaskContext[D]) -> ProjectionResiduals:
         data, stream = context.data(), context.pin.stream
         with nullcontext() if stream is None else torch.cuda.stream(stream), torch.inference_mode(False):
             data = data if self.prepare is None else self.prepare(data)
             if data is None:
-                return
+                return {}
             batch = _read(context, self.version)
             selected = tuple(range(len(batch.roots))) if self.select is None else self.select(data, context.selection)
             assert len(set(selected)) == len(selected) and all(0 <= i < len(batch.roots) for i in selected)
@@ -473,7 +473,6 @@ class TensorOperation(Generic[D]):
                 context.overlay_counters = (
                     output.counters if context.overlay_counters is None else context.overlay_counters + output.counters
                 )
-            context.projection_outputs = output.residuals
             if output.guidance is not None:
                 context.guidance = output.guidance
                 context.guidance_ready = CudaStreamReadiness(stream) if stream is not None else None
@@ -513,6 +512,7 @@ class TensorOperation(Generic[D]):
                         step_id=observation.step_id,
                         gradient=observation.gradient,
                     )
+            return output.residuals
 
 
 class BatchOperation(TensorOperation[D]):

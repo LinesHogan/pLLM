@@ -54,7 +54,7 @@ from pllm.execution.host_runtime import CompletionCapture
 from pllm.execution.overlay_task import ProjectionTask
 from pllm.execution.post_sample import PostSampleOverlap
 from pllm.execution.shared_tensor import SharedTensor
-from pllm.execution.state_execution import HeldInput, StateDiagnostics, StateTaskContext
+from pllm.execution.state_execution import HeldInput, ProjectionResiduals, StateDiagnostics, StateTaskContext
 from pllm.execution.state_feed import (
     Feed,
     FeedReceiver,
@@ -69,7 +69,7 @@ from pllm.execution.tensor_frame import TensorFrame
 @dataclass(slots=True)
 class _PackedStep(Generic[DataT]):
     rows: PackedSamplerRowBatch
-    invocation: TaskGraphInvocation[StateTaskContext[DataT]] | None = None
+    invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals] | None = None
     forward_done: bool = False
     handed_off: bool = False
 
@@ -537,11 +537,11 @@ class VllmSession(Generic[DataT, ResultT]):
                     self._deployment.execution.discard_borrows()
                     self._feed.close()
 
-    def _invocation(self) -> TaskGraphInvocation[StateTaskContext[DataT]]:
+    def _invocation(self) -> TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals]:
         assert self._step is not None and self._step.invocation is not None
         return self._step.invocation
 
-    def _handoff(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]]) -> None:
+    def _handoff(self, invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals]) -> None:
         """Protect reusable inputs and move ownership before the first signed side task."""
         overlap = self._post_sample
         assert overlap is not None
@@ -555,7 +555,9 @@ class VllmSession(Generic[DataT, ResultT]):
                     overlap.retain(invocation.context.pin.refs)
             self._step.handed_off = True
 
-    def _advance(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], symbol: str) -> None:
+    def _advance(
+        self, invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals], symbol: str
+    ) -> None:
         execution = self._deployment.execution
         target = next(anchor.ordinal for anchor in execution.arena.plan.timeline.anchors if anchor.symbol == symbol)
         points = dict.fromkeys(

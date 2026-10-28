@@ -175,6 +175,7 @@ class ResourceTask:
         if self.update is not None:
             self.context = context
             self.update(context)
+        return {}
 
 
 def increment_resources(context):

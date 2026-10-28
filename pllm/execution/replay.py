@@ -23,7 +23,7 @@ from pllm.execution.trace import TracePhase
 
 if TYPE_CHECKING:
     from pllm.execution.execution import TaskGraphImplementation
-    from pllm.execution.state_execution import StateTaskContext
+    from pllm.execution.state_execution import ProjectionResiduals, StateTaskContext
 
 DataT = TypeVar("DataT")
 TOKENWISE_REPLAY_IMPLEMENTATION = ImplementationId("canonical.tokenwise_layer_replay@1")
@@ -118,17 +118,17 @@ class TokenwiseReplayTask(Generic[DataT]):
 
     @classmethod
     def from_implementation(
-        cls, implementation: TaskGraphImplementation[StateTaskContext[DataT]]
+        cls, implementation: TaskGraphImplementation[StateTaskContext[DataT], ProjectionResiduals]
     ) -> TokenwiseReplayTask[DataT]:
         if not isinstance(implementation, cls):
             raise ValueError("tokenwise replay requires its native task binding")
         return implementation
 
-    def execute(self, context: StateTaskContext[DataT]) -> None:
+    def execute(self, context: StateTaskContext[DataT]) -> ProjectionResiduals:
         if self.operation is not None:
-            replace(self.operation, body=self._overlay_body).execute(context)
-        else:
-            self.run(context)
+            return replace(self.operation, body=self._overlay_body).execute(context)
+        self.run(context)
+        return {}
 
     def _overlay_body(self, data: DataT, batch: TensorBatch, context: StateTaskContext[DataT] | None) -> TaskOutput:
         assert context is not None and isinstance(data, TensorFrame) and self.overlay_math is not None

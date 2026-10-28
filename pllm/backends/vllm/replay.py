@@ -31,7 +31,7 @@ from pllm.execution.execution import TaskGraphInvocation
 from pllm.execution.overlay_task import RouteOperand, RouteOverlay
 from pllm.execution.replay import TokenwiseReplayPrimitive, TokenwiseReplayTask
 from pllm.execution.route_executor import execute_route, ordinary_pass
-from pllm.execution.state_execution import StateExecution, StateTaskContext
+from pllm.execution.state_execution import ProjectionResiduals, StateExecution, StateTaskContext
 from pllm.execution.step_capture import capture_graph
 from pllm.execution.step_input import TensorStepInput
 from pllm.execution.tensor_frame import OverlayTargetResult
@@ -218,7 +218,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         validate_attention_resources(self.attentions, hidden_size=model.config.hidden_size)
         self.original = self.model.forward
         self._rows: tuple[PackedPhaseRow, ...] = ()
-        self.invocation: TaskGraphInvocation[StateTaskContext[DataT]] | None = None
+        self.invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals] | None = None
         self.hidden: torch.Tensor | None = None
         self.positions: torch.Tensor | None = None
         self.output: torch.Tensor | None = None
@@ -234,7 +234,9 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
     def rows(self) -> tuple[PackedPhaseRow, ...]:
         return self._rows
 
-    def prepare(self, rows: PackedPhaseRowBatch, invocation: TaskGraphInvocation[StateTaskContext[DataT]]) -> None:
+    def prepare(
+        self, rows: PackedPhaseRowBatch, invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals]
+    ) -> None:
         self.clear()
         self._rows, self.invocation = rows.rows, invocation
 

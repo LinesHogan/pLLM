@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from threading import Event, RLock
-from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
+from typing import TYPE_CHECKING, Generic, NoReturn, Protocol, TypeVar
 
 import numpy as np
 import torch
@@ -53,6 +53,7 @@ InputContra = TypeVar("InputContra", contravariant=True)
 DataT = TypeVar("DataT")
 ResultT = TypeVar("ResultT")
 ResultCo = TypeVar("ResultCo", covariant=True)
+ProjectionResiduals = Mapping[tuple[RequestIdentity, ParameterTarget], torch.Tensor]
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,9 +96,6 @@ class StateTaskContext(Generic[DataT]):
         default_factory=lambda: dict[RequestIdentity, set[StateRef]]()
     )
     input_step_id: int = -1
-    projection_outputs: Mapping[tuple[RequestIdentity, ParameterTarget], torch.Tensor] = field(
-        default_factory=lambda: dict[tuple[RequestIdentity, ParameterTarget], torch.Tensor]()
-    )
 
     def data(self) -> DataT:
         assert self.value is not None
@@ -221,7 +219,7 @@ class MathBinding(Generic[InputT, DataT, ResultT]):
     """Local native implementations, separate from the closed data contracts."""
 
     math: StateMath[InputT, DataT, ResultT]
-    tasks: tuple[TaskGraphImplementation[StateTaskContext[DataT]], ...]
+    tasks: tuple[TaskGraphImplementation[StateTaskContext[DataT], ProjectionResiduals], ...]
     borrowed_resources: tuple[str, ...] = ()
     feeds: tuple[FeedBinding, ...] = ()
     on_export: Callable[[TraceEvent], None] | None = None
@@ -251,18 +249,18 @@ class MathBinding(Generic[InputT, DataT, ResultT]):
 
 @dataclass(frozen=True, slots=True)
 class ConditionalProducerTask(Generic[DataT]):
-    original: TaskGraphImplementation[StateTaskContext[DataT]]
+    original: TaskGraphImplementation[StateTaskContext[DataT], ProjectionResiduals]
 
     @property
     def implementation_id(self) -> ImplementationId:
         return self.original.implementation_id
 
-    def execute(self, context: StateTaskContext[DataT]) -> None:
+    def execute(self, context: StateTaskContext[DataT]) -> ProjectionResiduals:
         context.check_page_execution()
         if context.held_input is None:
-            self.original.execute(context)
-        else:
-            context.trace.record(TracePhase.INPUT_SKIPPED, context.invocation_id)
+            return self.original.execute(context)
+        context.trace.record(TracePhase.INPUT_SKIPPED, context.invocation_id)
+        return {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,10 +279,11 @@ class PublishStateTask(Generic[DataT]):
     def resident(self, capture_bytes: int) -> int:
         return 0
 
-    def execute(self, context: StateTaskContext[DataT]) -> None:
+    def execute(self, context: StateTaskContext[DataT]) -> ProjectionResiduals:
         write = context.sole_write()
         if write is not None:
             context.publish_owned_write(write)
+        return {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,7 +302,9 @@ class StateDiagnostics:
 
 
 class StateSettlementError(RuntimeError, Generic[DataT]):
-    def __init__(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], receipt: PagePublication) -> None:
+    def __init__(
+        self, invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals], receipt: PagePublication
+    ) -> None:
         super().__init__("state publication committed; settle the original invocation without replay")
         self.invocation = invocation
         self.receipt = receipt
@@ -315,7 +316,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         arena: PageBundleArena,
         directory: RequestStateDirectory,
         math: StateMath[InputT, DataT, ResultT],
-        implementations: tuple[TaskGraphImplementation[StateTaskContext[DataT]], ...],
+        implementations: tuple[TaskGraphImplementation[StateTaskContext[DataT], ProjectionResiduals], ...],
         sampler_anchor_id: AnchorId,
         *,
         _borrowed_resources: tuple[str, ...] = (),
@@ -331,7 +332,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         self._runner = TaskGraphExecution(
             arena.plan.schedule_physical, implementations, self.trace, self._release_values
         )
-        self._active: dict[int, TaskGraphInvocation[StateTaskContext[DataT]]] = {}
+        self._active: dict[int, TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals]] = {}
         self._next_invocation = 1
         self._loss_count = self._update_count = self._trained_rows = self._sampler_count = 0
         self._overlay_counters = (
@@ -410,10 +411,14 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         for value in values:
             context.results.pop(self._values[value], None)
 
-    def implementation(self, identity: ImplementationId) -> TaskGraphImplementation[StateTaskContext[DataT]]:
+    def implementation(
+        self, identity: ImplementationId
+    ) -> TaskGraphImplementation[StateTaskContext[DataT], ProjectionResiduals]:
         return next(item for item in self._runner.implementations if item.implementation_id == identity)
 
-    def rebind_implementation(self, implementation: TaskGraphImplementation[StateTaskContext[DataT]]) -> None:
+    def rebind_implementation(
+        self, implementation: TaskGraphImplementation[StateTaskContext[DataT], ProjectionResiduals]
+    ) -> None:
         """Install a locally verified lowering while no original invocation is active."""
         with self._lock:
             original = self.implementation(implementation.implementation_id)
@@ -462,7 +467,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         *,
         history: tuple[StateRefs, ...] = (),
         held_input: HeldInput | None = None,
-    ) -> TaskGraphInvocation[StateTaskContext[DataT]]:
+    ) -> TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals]:
         with self._lock:
             if self._borrowed_resources:
                 self._require_borrow_live()
@@ -499,14 +504,14 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         *,
         history: tuple[StateRefs, ...] = (),
         held_input: HeldInput | None = None,
-    ) -> TaskGraphInvocation[StateTaskContext[DataT]]:
+    ) -> TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals]:
         with self._lock:
             invocation = self.begin(self.math.rows(value), stream, history=history, held_input=held_input)
             self.submit_input(invocation, value)
             return invocation
 
     def resume_latest(
-        self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], stream: torch.cuda.Stream
+        self, invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals], stream: torch.cuda.Stream
     ) -> None:
         """Move an invocation to its signed writer stream without losing exact read holds.
 
@@ -543,7 +548,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
 
     def submit_input(
         self,
-        invocation: TaskGraphInvocation[StateTaskContext[DataT]],
+        invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals],
         value: InputT,
         readiness: CudaStreamReadiness | None = None,
     ) -> None:
@@ -563,7 +568,9 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                 self.cancel_step(invocation)
                 raise
 
-    def execute_anchor(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], anchor_id: AnchorId) -> None:
+    def execute_anchor(
+        self, invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals], anchor_id: AnchorId
+    ) -> None:
         with self._lock:
             context = self._context(invocation)
             try:
@@ -577,24 +584,26 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
 
     def execute_part(
         self,
-        invocation: TaskGraphInvocation[StateTaskContext[DataT]],
+        invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals],
         value: InputT,
         task_id: TaskId,
         *,
         complete: bool,
-    ) -> None:
+    ) -> ProjectionResiduals:
         """Supply actual projection operands to one segment of a bound in-forward task."""
         with self._lock:
             context = self._context(invocation)
             try:
                 context.check_page_execution()
                 context.value = self.math.prepare(value, context)
-                invocation.execute_part(task_id, complete=complete, stream=context.pin.stream)
+                return invocation.execute_part(task_id, complete=complete, stream=context.pin.stream)
             except Exception as exc:
                 self._failed(invocation, context, exc)
 
     def sampler_guidance(
-        self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], stream: torch.cuda.Stream | None = None
+        self,
+        invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals],
+        stream: torch.cuda.Stream | None = None,
     ) -> PackedSamplerGuidanceBatch:
         with self._lock:
             context = self._context(invocation)
@@ -607,7 +616,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
 
     def complete_sampler(
         self,
-        invocation: TaskGraphInvocation[StateTaskContext[DataT]],
+        invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals],
         stream: torch.cuda.Stream | None = None,
         *,
         feedback: SamplerFeedback | None = None,
@@ -619,7 +628,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             self._sampler_count += 1
             self.trace.record(TracePhase.SAMPLER_COMPLETE, invocation.invocation_id, pin_id=context.pin.pin_id)
 
-    def finish_step(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]]) -> ResultT:
+    def finish_step(self, invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals]) -> ResultT:
         with self._lock:
             context = self._context(invocation)
             try:
@@ -632,7 +641,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                 raise
             return result
 
-    def cancel_step(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]]) -> None:
+    def cancel_step(self, invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals]) -> None:
         invocation.context.cancel_requested.set()
         with self._lock:
             context = self._context(invocation)
@@ -650,8 +659,11 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                 self.cancel_step(invocation)
 
     def _failed(
-        self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], context: StateTaskContext[DataT], exc: Exception
-    ) -> None:
+        self,
+        invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals],
+        context: StateTaskContext[DataT],
+        exc: Exception,
+    ) -> NoReturn:
         context.cancel_requested.set()
         self.trace.record(
             TracePhase.FAILED,
@@ -673,7 +685,9 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         raise exc
 
     def _release(
-        self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], context: StateTaskContext[DataT]
+        self,
+        invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals],
+        context: StateTaskContext[DataT],
     ) -> None:
         # Only borrowed steps clear aliases and ACK before settlement; test_video checks ACK/failure ordering.
         if context.borrowed_roots:
@@ -718,13 +732,17 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             self._last_hold = context.held_input
 
     def _order_sampler(
-        self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], stream: torch.cuda.Stream | None
+        self,
+        invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals],
+        stream: torch.cuda.Stream | None,
     ) -> None:
         consumer = invocation.context.pin.stream
         if stream is not None and consumer is not None:
             CudaStreamReadiness(stream).order_on(consumer)
 
-    def _context(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]]) -> StateTaskContext[DataT]:
+    def _context(
+        self, invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals]
+    ) -> StateTaskContext[DataT]:
         if self._borrowed_resources:
             self._require_borrow_live()
         return invocation.context

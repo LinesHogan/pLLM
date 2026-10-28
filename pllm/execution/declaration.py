@@ -69,7 +69,12 @@ from pllm.execution.memory import MemoryUsage, measure
 from pllm.execution.overlay_task import OverlayTransition
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.replay import TokenwiseReplayTask
-from pllm.execution.state_execution import ConditionalProducerTask, PublishStateTask, StateTaskContext
+from pllm.execution.state_execution import (
+    ConditionalProducerTask,
+    ProjectionResiduals,
+    PublishStateTask,
+    StateTaskContext,
+)
 from pllm.execution.tensor_program import (
     Optimizer,
     PageUpdate,
@@ -410,8 +415,8 @@ class Builder(Generic[D]):
 
     def bind_all(
         self, plan: PlanBundle | None = None, *, model_probe: BackendPlacementProbe | None = None
-    ) -> tuple[TaskGraphImplementation[StateTaskContext[D]], ...]:
-        functions: list[TaskGraphImplementation[StateTaskContext[D]]] = list(self.bind(plan))
+    ) -> tuple[TaskGraphImplementation[StateTaskContext[D], ProjectionResiduals], ...]:
+        functions: list[TaskGraphImplementation[StateTaskContext[D], ProjectionResiduals]] = list(self.bind(plan))
         graph = self.graph if plan is None else plan.semantic_graph
         for task in graph.tasks:
             if task.symbol in self.operations and task.replay is None:
