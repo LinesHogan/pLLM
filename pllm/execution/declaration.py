@@ -216,15 +216,12 @@ class Builder(Generic[D]):
         memory: tuple[Field, ...] = (),
     ) -> State:
         if fields is None:
-            if optimizer is not None or memory:
-                raise ValueError("an optimizer requires declared parameter fields")
+            assert optimizer is None and not memory, "an optimizer and memory need declared parameter fields"
             declaration = SemanticState(StateResource(name), scope, keys)
             self.graph = replace(
                 self.graph, states=tuple(sorted((*self.graph.states, declaration), key=lambda state: state.resource))
             )
             return State(declaration, ())
-        if memory and any(part.name in {field.name for field in fields} for part in memory):
-            raise ValueError(f"{name}: memory fields duplicate a parameter field")
         optimizer_fields = 0
         if optimizer is not None:
             fields = tuple(

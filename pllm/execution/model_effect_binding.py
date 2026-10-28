@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import replace
-from math import isfinite
 
 import torch
 
@@ -24,9 +23,9 @@ from pllm.contracts.backend_attachment import (
 )
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
+    ParameterEffect,
     ParameterOverlayFieldBinding,
     ParameterOverlayOperator,
-    ParameterTarget,
 )
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.semantic_graph import (
@@ -38,7 +37,7 @@ from pllm.contracts.semantic_graph import (
     TokenProgramEffect,
 )
 from pllm.contracts.visibility import Exact, Visibility, VisibilitySource
-from pllm.execution.binding_base import Buffer, TensorBindingBase, buffer_field
+from pllm.execution.binding_base import Buffer, TensorBindingBase, overlay_fields
 from pllm.execution.codec import boundary_digest
 from pllm.execution.declaration import Call, State, When, native
 from pllm.execution.overlay_task import OverlayTransition
@@ -55,25 +54,6 @@ from pllm.execution.tensor_program import TaskOutput
 from pllm.execution.tensor_task import FieldWriter, TensorTask
 from pllm.execution.token_program import ApplyUpdates, Cell, Layers, Over, Segment, TokenProgram, Tokens, TokenTensor
 from pllm.kernels.head_overlay import head_correction
-
-
-def check_overlay_fields(
-    buffers: Mapping[str, Buffer],
-    applied: tuple[str, ...],
-    targets: tuple[ParameterTarget, ...],
-    operator: ParameterOverlayOperator,
-    scale: float,
-) -> None:
-    arity = 2 if operator is ParameterOverlayOperator.LOW_RANK_ADD else 1
-    if (
-        not targets
-        or tuple(sorted(set(targets))) != targets
-        or len(applied) != arity
-        or len(set(applied)) != arity
-        or any(key not in buffers for key in applied)
-        or not isfinite(scale)
-    ):
-        raise ValueError("overlay requires ordered unique targets, exact operator fields and a finite scale")
 
 
 class ModelEffectBinding(TensorBindingBase):
@@ -93,25 +73,22 @@ class ModelEffectBinding(TensorBindingBase):
     def parameter_overlay(
         self,
         name: str,
-        state_name: str,
+        effect: ParameterEffect,
         buffers: Mapping[str, Buffer],
         *,
         initialize: Callable[[Tensors, torch.Generator], None] | None,
-        targets: tuple[ParameterTarget, ...],
-        applied: tuple[str, ...],
         namespace: str,
         keys: tuple[RequestKeyField, ...],
         phases: tuple[HiddenPhase, ...],
         identity: str,
-        operator: ParameterOverlayOperator,
-        scale: float,
         function: Callable[[Tensors], TensorUpdate],
         visibility: Visibility,
         equations_digest: str,
     ) -> None:
         if self.graph.tasks or self.graph.states or self.host:
             raise ValueError("ordinary overlay requires a sole request state and model transition")
-        check_overlay_fields(buffers, applied, targets, operator, scale)
+        fields = overlay_fields(buffers, effect)
+        targets, applied, operator = effect.targets, effect.applied_fields, effect.operator
         dimensions = self.dimensions
         if dimensions is not None:
             if len(dimensions.target_shapes) != len(targets):
@@ -119,12 +96,8 @@ class ModelEffectBinding(TensorBindingBase):
         self.overlay_targets = targets
         self.parameter_phases = phases
         state = self.state(
-            state_name,
-            tuple(
-                buffer_field(f"{key}_{index}", buffer, lambda m, i=index: m.target_shapes[i])
-                for index in range(len(targets))
-                for key, buffer in buffers.items()
-            ),
+            effect.state,
+            fields,
             namespace=namespace,
             scope=StateScope.REQUEST,
             keys=keys,
@@ -209,7 +182,7 @@ class ModelEffectBinding(TensorBindingBase):
                     operator,
                     tuple(state.view(f"{key}_{i}", self.dimensions) for key in applied),
                     str(state.declaration.resource),
-                    scale,
+                    effect.scale,
                 )
                 for i, target in enumerate(targets)
             ),

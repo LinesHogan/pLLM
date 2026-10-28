@@ -6,7 +6,7 @@ effects; SGD and Buffer are the authoring values both binding halves accept.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from math import isfinite
 
@@ -18,6 +18,8 @@ from pllm.contracts.backend_attachment import (
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
     FieldView,
+    ParameterEffect,
+    ParameterOverlayOperator,
     ParameterTarget,
 )
 from pllm.contracts.semantic_graph import (
@@ -58,6 +60,26 @@ def buffer_field(name: str, buffer: Buffer, dimensions: Callable[[Dimensions], t
         size,
         (lambda model: model.dtype) if buffer.dtype is None else TensorDType(str(buffer.dtype).removeprefix("torch.")),
         8 if buffer.dtype is torch.int64 else 16,
+    )
+
+
+def overlay_fields(buffers: Mapping[str, Buffer], effect: ParameterEffect) -> tuple[Field, ...]:
+    """One copy of the buffers per overlay target, laid out target by target and shaped by that target."""
+    arity = 2 if effect.operator is ParameterOverlayOperator.LOW_RANK_ADD else 1
+    applied = effect.applied_fields
+    if (
+        not effect.targets
+        or tuple(sorted(set(effect.targets))) != effect.targets
+        or len(applied) != arity
+        or len(set(applied)) != arity
+        or any(key not in buffers for key in applied)
+        or not isfinite(effect.scale)
+    ):
+        raise ValueError("overlay requires ordered unique targets, exact operator fields and a finite scale")
+    return tuple(
+        buffer_field(f"{key}_{index}", buffer, lambda m, i=index: m.target_shapes[i])
+        for index in range(len(effect.targets))
+        for key, buffer in buffers.items()
     )
 
 

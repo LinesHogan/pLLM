@@ -51,7 +51,7 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.state_feed import FeedBinding, FeedOrder
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorLayoutRequest
 from pllm.contracts.visibility import Exact as Exact, Visibility as Visibility
-from pllm.execution.binding_base import SGD as SGD, Buffer as Buffer, buffer_field
+from pllm.execution.binding_base import SGD as SGD, Buffer as Buffer, buffer_field, overlay_fields
 from pllm.execution.codec import boundary_digest
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import Call, Dimensions, Shape, State, When, native
@@ -390,6 +390,10 @@ class InstanceState:
             raise ValueError("fed state needs InstanceState without an optimizer, initializer or memory fields")
         if self.shape is not None:
             object.__setattr__(self, "fields", {"value": self.shape})
+        if self.memory and self.optimizer is None:
+            raise ValueError("memory fields ride on the training transition; give the state an optimizer")
+        if set(self.memory) & set(self.fields):
+            raise ValueError("rename the memory fields that repeat a parameter field name")
 
     scope: ClassVar[StateScope] = StateScope.INSTANCE
 
@@ -810,11 +814,9 @@ class _Overlay(_Effect):
         identity = fingerprint(operation.function)
         context.binding.parameter_overlay(
             operation.name,
-            self.state,
+            effect,
             buffers,
             initialize=_frozen(definition.initialize),
-            targets=targets,
-            applied=applied,
             namespace=definition.namespace,
             keys=definition.request_keys,
             phases=tuple(
@@ -823,8 +825,6 @@ class _Overlay(_Effect):
                 if _setting(enabled, context.owner, bool)
             ),
             identity=f"python:{identity}",
-            operator=operator,
-            scale=scale,
             function=_invoke(freeze(operation.function), bindings),
             visibility=visibility,
             equations_digest=boundary_digest(context.definitions, context.bindings),
@@ -1220,8 +1220,6 @@ class _Declaration:
 
     def allocate_buffers(self, name: str, definition: InstanceState) -> None:
         """Register buffer fields as ordinary readable state ports."""
-        from pllm.execution.model_effect_binding import check_overlay_fields
-
         buffers = _buffers(replace(definition, optimizer=None))
         consumers = tuple(
             consumer
@@ -1230,17 +1228,12 @@ class _Declaration:
         )
         if consumers:
             (consumer,) = consumers
-            check_overlay_fields(buffers, consumer.applied_fields, consumer.targets, consumer.operator, consumer.scale)
+            fields = overlay_fields(buffers, consumer)
             self.binding.overlay_targets = consumer.targets
-        fields = tuple(
-            buffer_field(
-                f"{key}_{i}" if consumers else key,
-                buffer,
-                (lambda m, i=i: m.target_shapes[i]) if consumers else (lambda m: (m.hidden_size, m.hidden_size)),
+        else:
+            fields = tuple(
+                buffer_field(key, buffer, lambda m: (m.hidden_size, m.hidden_size)) for key, buffer in buffers.items()
             )
-            for i in range(len(consumers[0].targets) if consumers else 1)
-            for key, buffer in buffers.items()
-        )
         shapes = {field.name: field.shape for field in fields}
         if definition.optimizer is not None:
             dtype = fields[0].dtype

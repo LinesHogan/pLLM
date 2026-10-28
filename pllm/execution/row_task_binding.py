@@ -270,11 +270,6 @@ class RowTaskBinding(TensorBindingBase):
         keys: tuple[RequestKeyField, ...] = (RequestKeyField.REQUEST_ID,),
         memory: Mapping[str, Shape] = {},
     ) -> tuple[State, dict[str, SemanticInputSource | TensorPort]]:
-        if set(memory) & set(shapes):
-            raise ValueError("memory fields duplicate a parameter field")
-        if memory and optimizer is None:
-            raise ValueError("memory fields ride on the training transition and require an optimizer")
-
         def sizes(model: Dimensions) -> tuple[tuple[int, ...], ...]:
             return tuple(shape(model) if callable(shape) else shape for shape in shapes.values())
 
