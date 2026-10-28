@@ -6,7 +6,7 @@ import torch
 from torch.nn import functional as F
 
 import pllm
-from pllm.workloads.chunk_tail import join_tail, save_tail
+from pllm.execution.chunk_tail import join_tail, save_tail
 
 
 @dataclass(frozen=True, slots=True)

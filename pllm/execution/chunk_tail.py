@@ -1,4 +1,4 @@
-"""Counted chunk-tail tensor math shared by the causal fast-weight workloads."""
+"""Counted pending-row math used by overlay execution and chunked trainers."""
 
 import torch
 

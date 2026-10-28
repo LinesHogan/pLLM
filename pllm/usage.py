@@ -82,6 +82,7 @@ from pllm.execution.module_state import (
     parameter_count,
     skeleton,
 )
+from pllm.execution.overlay_task import chunk_update
 from pllm.execution.position_state import PositionState as PositionState
 from pllm.execution.row_task_binding import (
     declare_logits,
@@ -823,6 +824,32 @@ def differentiate(
     return _mark(gradient=_Gradient(inputs, parameters, input_rows, parameter_rows))
 
 
+def _chunked_overlay(
+    function: Callable[..., tuple[torch.Tensor, torch.Tensor]],
+    bindings: dict[str, str],
+    buffers: dict[str, Buffer],
+    weight: str,
+    chunk: int,
+) -> Callable[..., TensorUpdate]:
+    """Generate pending state before layout interning and bind the existing chunk executor."""
+    arguments = tuple(bindings)
+    sources = tuple(bindings.values())
+    if chunk < 1 or len(sources) < 2 or sources[0] != weight or any(s not in ("input", "target") for s in sources[1:]):
+        raise ValueError("chunk overlays need chunk >= 1, then the weight carry followed by input/target operands")
+    pending = {
+        f"_pending_rows_{name}": Buffer(
+            lambda inputs, outputs, source=source: (max(1, chunk - 1), inputs if source == "input" else outputs)
+        )
+        for name, source in zip(arguments[1:], sources[1:], strict=True)
+    }
+    pending["_pending_length"] = Buffer((), dtype=torch.int64)
+    if pending.keys() & (buffers.keys() | bindings.keys()):
+        raise ValueError("rename overlay buffers/arguments that conflict with generated _pending_ fields")
+    buffers.update(pending)
+    bindings.update((name, name) for name in pending)
+    return partial(chunk_update, function, chunk, arguments)
+
+
 @dataclass(frozen=True, kw_only=True)
 class _Overlay(_Effect):
     state: str
@@ -834,6 +861,7 @@ class _Overlay(_Effect):
     prefill: bool | Config
     decode: bool | Config
     visibility: Visibility | Config
+    chunk: int | Config | None
 
     phase: ClassVar[Phase | None] = Phase.MODEL_UPDATE
 
@@ -862,12 +890,26 @@ class _Overlay(_Effect):
         applied = effect.applied_fields
         visibility = _setting(self.visibility, context.owner, Visibility)
         identity = fingerprint(operation.function)
+        function = freeze(operation.function)
+        initialize = _frozen(definition.initialize)
+        if self.chunk is not None:
+            if initialize is not None:
+                author_initialize, author_buffers = initialize, tuple(buffers)
+
+                def initialize_author(values: Tensors, generator: torch.Generator) -> None:
+                    author_initialize({name: values[name] for name in author_buffers}, generator)
+
+                initialize = initialize_author
+
+            function = _chunked_overlay(
+                function, bindings, buffers, self.weight, _setting(self.chunk, context.owner, int)
+            )
         declare_parameter_overlay(
             context.binding,
             operation.name,
             effect,
             buffers,
-            initialize=_frozen(definition.initialize),
+            initialize=initialize,
             namespace=definition.namespace,
             keys=definition.request_keys,
             phases=tuple(
@@ -876,13 +918,13 @@ class _Overlay(_Effect):
                 if _setting(enabled, context.owner, bool)
             ),
             identity=f"python:{identity}",
-            function=freeze(operation.function),
+            function=function,
             arguments=bindings,
             visibility=visibility,
-            equations_digest=boundary_digest(context.definitions, context.bindings),
+            equations_digest=boundary_digest(context.definitions, context.bindings, self.chunk),
         )
         context.definitions.append(
-            (operation.name, boundary_digest(identity, bindings, operator, scale, applied, self.visibility))
+            (operation.name, boundary_digest(identity, bindings, operator, scale, applied, self.visibility, self.chunk))
         )
 
 
@@ -897,8 +939,13 @@ def overlay(
     prefill: bool | Config = True,
     decode: bool | Config = False,
     visibility: Visibility | Config = Visibility.forward_pinned(),
+    chunk: int | Config | None = None,
 ) -> Callable[[F], F]:
-    """Apply residuals using the declared state visibility at each target projection."""
+    """Apply residuals using the declared state visibility at each target projection.
+
+    With ``chunk``, the function takes the weight carry followed by input/target row
+    operands and returns (next carry, readouts). Pending rows belong to the framework.
+    """
 
     return _mark(
         effect=_Overlay(
@@ -911,6 +958,7 @@ def overlay(
             prefill=prefill,
             decode=decode,
             visibility=visibility,
+            chunk=chunk,
         )
     )
 

@@ -6,8 +6,8 @@ import torch
 
 import pllm
 from pllm import TensorUpdate
+from pllm.execution.chunk_tail import join_tail, save_tail
 from pllm.model import ParameterTarget
-from pllm.workloads.chunk_tail import join_tail, save_tail
 
 
 @dataclass(frozen=True, slots=True)

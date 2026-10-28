@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import torch
 
 import pllm
-from pllm.workloads.chunk_tail import join_tail, save_tail
+from pllm.execution.chunk_tail import join_tail, save_tail
 
 TARGETS = tuple(
     pllm.model.ParameterTarget(

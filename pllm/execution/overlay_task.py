@@ -14,6 +14,9 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import PackedSamplerRowBatch
 from pllm.contracts.semantic_graph import TaskId
 from pllm.contracts.visibility import VisibilitySource
+from pllm.execution.chunk_tail import join_tail, save_tail
+from pllm.execution.scan import scan
+from pllm.execution.scan_execution import Step
 from pllm.execution.tensor_frame import OverlayEntry, OverlayTargetResult, TensorFrame, Tensors, TensorUpdate
 from pllm.execution.tensor_program import TaskOutput, TensorBatch
 
@@ -22,6 +25,27 @@ ResultT = TypeVar("ResultT")
 if TYPE_CHECKING:
     from pllm.execution.state_execution import StateExecution, StateTaskContext
     from pllm.execution.step_input import TensorStepInput
+
+
+def chunk_update(step: Step, chunk: int, arguments: tuple[str, ...], /, **values: torch.Tensor) -> TensorUpdate:
+    """Adapt an authored chunk recurrence to the ordinary overlay update boundary."""
+    carry, *columns = arguments
+    rows = tuple(values[name] for name in columns)
+    tails = tuple(values[f"_pending_rows_{name}"] for name in columns)
+    length = values["_pending_length"]
+    joined, valid = join_tail(tails, rows, length, chunk)
+    positions = torch.arange(len(rows[0]), device=length.device) + length
+    trained = valid // chunk * chunk
+    updated, outputs = scan(step, carry=values[carry], over=joined, chunk=chunk, valid_rows=trained)
+    values[carry].copy_(updated)
+    remaining = save_tail(tails, joined, length, valid, trained)
+    return TensorUpdate(
+        torch.cat(outputs).index_select(0, positions),
+        trained > 0,
+        trained // chunk,
+        trained,
+        {"tail_rows": remaining},
+    )
 
 
 class ProjectionTransition(Protocol):
