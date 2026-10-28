@@ -6,13 +6,13 @@ from dataclasses import dataclass
 from typing import Literal
 
 import torch
-from torch._functorch.compile_utils import fx_graph_cse  # pyright: ignore[reportUnknownVariableType]
 from torch._ops import OpOverload
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx import Graph, GraphModule, Node
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.node import Argument, Target
-from torch.utils._python_dispatch import _disable_current_modes  # pyright: ignore[reportPrivateUsage]
+
+from pllm.execution.torch_private import disable_current_modes, fx_graph_cse
 
 Kind = Literal["scalar", "diagonal", "left", "right"]
 Coefficient = Node | float
@@ -123,7 +123,7 @@ class _Extract:
         if target in (torch.ops.aten.mm.default, torch.ops.aten.bmm.default, torch.ops.aten.matmul.default):
             a, scale_a = self.scaled(args[0])
             b, scale_b = self.scaled(args[1])
-            product = self.graph.call_function(target, (a, b), kwargs)  # pyright: ignore[reportArgumentType]
+            product = self.graph.create_node("call_function", target, (a, b), kwargs)
             return (
                 product if scale_a * scale_b == 1 else self.call(torch.ops.aten.mul.Tensor, product, scale_a * scale_b)
             )
@@ -141,7 +141,7 @@ class _Extract:
                     args = (value, factor)
                 case _:
                     pass
-        return self.graph.call_function(target, args, kwargs)  # pyright: ignore[reportArgumentType]
+        return self.graph.create_node("call_function", target, args, kwargs)
 
     @staticmethod
     def scaled(value: Argument) -> tuple[Argument, float]:
@@ -231,7 +231,10 @@ class _Extract:
     def add_sub(self, node: Node, a: Affine) -> Affine:
         op, args = node.target, node.args
         b = self.value(args[1])
-        alpha = float(node.kwargs.get("alpha", 1)) * (-1 if op == torch.ops.aten.sub.Tensor else 1)  # pyright: ignore[reportArgumentType]
+        alpha = node.kwargs.get("alpha", 1)
+        if not isinstance(alpha, (int, float)):
+            raise Unsupported
+        alpha = float(alpha) * (-1 if op == torch.ops.aten.sub.Tensor else 1)
         linear = self.add_maps(a.linear, b.linear, alpha)
         bias = a.bias
         if b.bias is not None:
@@ -330,8 +333,8 @@ class _Extract:
         if not valid:
             raise Unsupported
         assert a.linear is not None
-        side = "right" if a.linear.kind == "left" else "left" if a.linear.kind == "right" else a.linear.kind
-        linear = Linear(side, self.transpose(a.linear.coefficient), not a.linear.transposed)  # pyright: ignore[reportArgumentType]
+        side: Kind = "right" if a.linear.kind == "left" else "left" if a.linear.kind == "right" else a.linear.kind
+        linear = Linear(side, self.transpose(a.linear.coefficient), not a.linear.transposed)
         return Affine(linear, None if a.bias is None else self.call(op, a.bias, *args[1:]))
 
     def run(self) -> ScanAnalysis | None:
@@ -378,7 +381,7 @@ class _Extract:
             or metadata.stride() != self.sample.stride()
         ):
             return None
-        kind = (
+        kind: Literal["additive", "diagonal", "left", "right"] = (
             "additive"
             if linear.kind == "scalar" and linear.coefficient == 1.0
             else "diagonal"
@@ -430,12 +433,12 @@ class _Extract:
                 pass
         self.graph.output((coefficient, bias, *cuts))
         self.graph.eliminate_dead_code()
-        return ScanAnalysis(kind, GraphModule(self.source, self.graph), GraphModule(self.source, read), scale=scale)  # pyright: ignore[reportArgumentType]
+        return ScanAnalysis(kind, GraphModule(self.source, self.graph), GraphModule(self.source, read), scale=scale)
 
 
 def analyze(step: Callable[..., tuple[torch.Tensor, torch.Tensor]], specs: Specs) -> ScanAnalysis | None:
     """Trace shape-only inputs, reject effects, and normalize the returned carry map."""
-    with _disable_current_modes(), torch.inference_mode(False), FakeTensorMode(allow_non_fake_inputs=True):
+    with disable_current_modes(), torch.inference_mode(False), FakeTensorMode(allow_non_fake_inputs=True):
         samples = tuple(
             torch.empty_strided(shape, stride, dtype=dtype, device=device) for shape, stride, dtype, device in specs
         )

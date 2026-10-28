@@ -15,7 +15,7 @@ from pllm.contracts.packed_hidden import PackedHiddenSnapshot, PackedHiddenSnaps
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.execution.state_execution import StateTaskContext
+from pllm.execution.state_execution import DataT, StateTaskContext
 from pllm.execution.tensor_frame import TensorFrame
 
 
@@ -32,7 +32,7 @@ class PostSampleOverlap:
         """Writer inputs, oldest first, retained independently of GPU completion."""
         return tuple(pin.refs for pin in self._history)
 
-    def copy_inputs(self, context: StateTaskContext[TensorFrame]) -> None:
+    def copy_inputs(self, context: StateTaskContext[DataT]) -> None:
         """Copy reusable backend tensors, then let the next forward overwrite them.
 
         Only this copy prefix fences the main stream. Graph replay, page transitions and
@@ -43,6 +43,7 @@ class PostSampleOverlap:
         self.stream.wait_stream(main)
         with torch.cuda.stream(self.stream):
             data = context.data()
+            assert isinstance(data, TensorFrame)
             value = data.step
             if value.auxiliary is not None:
                 # Worker-local device copies of external inputs can be dropped at

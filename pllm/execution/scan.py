@@ -5,19 +5,19 @@ from contextvars import ContextVar
 from dataclasses import replace
 from functools import lru_cache
 from time import perf_counter
-from typing import TypeVar
+from typing import ParamSpec, TypeVar
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
-from torch.utils._python_dispatch import _disable_current_modes  # pyright: ignore[reportPrivateUsage]
 
 from pllm.contracts.tensor_policy import ScanForm, TensorPolicy
-from pllm.execution.memory import MemoryTrace, measure
 from pllm.execution.numerics import warn_numerical_transforms
 from pllm.execution.scan_analysis import Specs, analyze
 from pllm.execution.scan_execution import PreparedScan, Step, associative_prefix, competitive
+from pllm.execution.torch_private import MemoryTrace, disable_current_modes, measure
 
 R = TypeVar("R")
+P = ParamSpec("P")
 
 
 class ScanContext:
@@ -38,10 +38,10 @@ class ScanContext:
         self.payload_bytes = payload_bytes
         self.replay = replay
 
-    def bind(self, function: Callable[..., R]) -> Callable[..., R]:
+    def bind(self, function: Callable[P, R]) -> Callable[P, R]:
         """Use the same execution-owned scope for memory tracing and execution."""
 
-        def run(*args: object, **kwargs: object) -> R:
+        def run(*args: P.args, **kwargs: P.kwargs) -> R:
             token = self.active.set(self)
             try:
                 return function(*args, **kwargs)
@@ -121,7 +121,7 @@ class ScanTemplate:
                         continue
                 choices.append(PreparedScan(self.step, self.chunk, analysis, window, form))
         funded: list[PreparedScan] = []
-        with _disable_current_modes(), torch.inference_mode(False), FakeTensorMode(allow_non_fake_inputs=True):
+        with disable_current_modes(), torch.inference_mode(False), FakeTensorMode(allow_non_fake_inputs=True):
             args = self.samples(capacity)
             scratch = torch.backends.cuda.cublas_workspace_size() + torch.backends.cuda.cublaslt_workspace_size()
             for choice in choices:

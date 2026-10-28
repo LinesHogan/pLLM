@@ -10,13 +10,14 @@ before prepare_inputs, and Qwen2Model.do_not_compile to bypass compiled training
 The upstream manager owns all capture/replay loops; PTTS owns every request version.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Protocol, TypedDict
 
 import numpy as np
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode, VllmConfig
+from vllm.config.utils import SupportsHash
 from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM, Qwen2Model
 from vllm.platforms import current_platform
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -53,7 +54,7 @@ _READERS: dict[int, "_ProjectionReader"] = {}
 
 class _GraphConfiguration(Protocol):
     @property
-    def additional_config(self) -> object: ...
+    def additional_config(self) -> Mapping[str, int | str] | SupportsHash: ...
 
 
 def _graph_budget(config: _GraphConfiguration) -> int:

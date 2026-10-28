@@ -67,11 +67,11 @@ class StateRefs(Sequence[StateRef]):
     @classmethod
     def of(cls, refs: Sequence[StateRef]) -> StateRefs:
         """Convert cold individual refs into an array selection at the caller boundary."""
-        layouts, lineages, versions = (
-            np.fromiter((getattr(ref, name) for ref in refs), np.int64, len(refs))
-            for name in ("layout_id", "lineage_id", "version_id")
+        return cls(
+            np.fromiter((ref.layout_id for ref in refs), np.int64, len(refs)),
+            np.fromiter((ref.lineage_id for ref in refs), np.int64, len(refs)),
+            np.fromiter((ref.version_id for ref in refs), np.int64, len(refs)),
         )
-        return cls(layouts, lineages, versions)
 
     def resolved(self, rows: Indices) -> StateRefs:
         """The same identities with their arena rows attached."""

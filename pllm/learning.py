@@ -46,12 +46,12 @@ from pllm.execution.host_runtime import (
     TensorHostBinding,
     TransactionHostBinding,
 )
-from pllm.execution.memory import MemoryTrace, MemoryUsage
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.step_input import TensorStepInput
 from pllm.execution.tensor_frame import Tensors
 from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots, TensorAdamW, TensorBatch, autograd_loss
+from pllm.execution.torch_private import MemoryTrace, MemoryUsage
 from pllm.kernels.adamw import AdamWConfig
 from pllm.usage import Activation, InstanceState, Overlay, Phase, RequestState
 
@@ -75,7 +75,7 @@ def transaction(
     update: Callable[[ContextT], None],
     query: Callable[[ContextT], None],
     publish: Callable[[ContextT], None],
-    example: Callable[[HostRuntimeFacts], tuple[ContextT, object]] | None = None,
+    example: Callable[[HostRuntimeFacts], tuple[ContextT, SnapshotT]] | None = None,
 ) -> TransactionHostBinding[RequestT, TransactionT, ContextT, SnapshotT, ResultT]:
     """Bind native structured math; retain the original state, service and context."""
     b = Builder[ContextT](name, boundary_digest(config, facts))
@@ -116,7 +116,7 @@ def transaction(
 
 def _transaction_timeline(
     facts: HostRuntimeFacts,
-    example: Callable[[HostRuntimeFacts], tuple[ContextT, object]],
+    example: Callable[[HostRuntimeFacts], tuple[ContextT, SnapshotT]],
     operations: Mapping[TaskSymbol, HostOperation[ContextT]],
     calls: tuple[Call, ...],
 ) -> SchedulerTimeline:

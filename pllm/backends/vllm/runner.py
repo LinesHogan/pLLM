@@ -82,7 +82,7 @@ class Runner:
     def _install_model_hooks(self) -> None:
         """Install the logits hook and announced hidden taps before vLLM compiles the model."""
         model = self.qwen2_model()
-        setattr(model, "compute_logits", partial(self._compute_logits, model))
+        model.compute_logits = partial(self._compute_logits, model)
         requested: list[tuple[int, str]] = json.loads(os.environ.get(TAPS_ENV, "[]"))
         if not requested:
             return
@@ -154,11 +154,11 @@ class Runner:
         assert session is not None
         return session
 
-    def _compute_logits(self, model: Qwen2ForCausalLM, hidden: torch.Tensor) -> torch.Tensor | None:
+    def _compute_logits(self, model: Qwen2ForCausalLM, hidden_states: torch.Tensor) -> torch.Tensor | None:
         session = self._workload_session
         if session is None:
-            return Qwen2ForCausalLM.compute_logits(model, hidden)
-        return session.compute_logits(model, hidden)
+            return Qwen2ForCausalLM.compute_logits(model, hidden_states)
+        return session.compute_logits(model, hidden_states)
 
 
 class WorkloadModelRunner(Runner, OverlayGraphRunner):
@@ -174,7 +174,7 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
         self._initialize_workload(topology)
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
-        super().load_model(load_dummy_weights)  # pyright: ignore[reportUnknownMemberType]
+        super().load_model(load_dummy_weights)
         assert self.sampler is not None
         self.sampler = self._sampler_guidance = Vllm027Sampler(self.sampler)
         self._install_model_hooks()

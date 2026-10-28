@@ -26,6 +26,7 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.state_ref import StateRef
 from pllm.execution.cuda_stream import upload
+from pllm.execution.module_graph import ModuleCall
 from pllm.execution.ptts.page_bundle import Slots
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.tensor_program import Observation, TensorBatch
@@ -108,7 +109,7 @@ class TensorPort:
     rowwise: bool = True
     field: int | None = None
     feedback: str = ""
-    adapt: Callable[[torch.Tensor], object] = lambda value: value
+    adapt: Callable[[torch.Tensor], torch.Tensor | ModuleCall] = lambda value: value
 
 
 def take_rows(values: torch.Tensor, rows: Sequence[int], device_rows: torch.Tensor | None = None) -> torch.Tensor:

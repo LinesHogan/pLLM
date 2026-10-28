@@ -5,10 +5,9 @@ from functools import partial
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
-from torch.utils._python_dispatch import _disable_current_modes  # pyright: ignore[reportPrivateUsage]
 
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator
-from pllm.execution.memory import measure
+from pllm.execution.torch_private import disable_current_modes, measure
 
 ROWS_PER_BLOCK = 32
 
@@ -63,7 +62,7 @@ def prepare_projection_read(
 ) -> Callable[..., tuple[torch.Tensor, ...]]:
     """Fund direct ATen temporaries without charging borrowed field-pool storage."""
     function = partial(projection_read, operator=operator)
-    with _disable_current_modes(), torch.inference_mode(False), FakeTensorMode():
+    with disable_current_modes(), torch.inference_mode(False), FakeTensorMode():
         samples = tuple(torch.empty_strided(t.shape, t.stride(), dtype=t.dtype, device=t.device) for t in examples)
         usage = measure(lambda: function(*samples))
     # BLAS handles own scratch outside the ATen allocation trace. Charge both

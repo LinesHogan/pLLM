@@ -4,7 +4,7 @@ import torch
 
 
 def test_meta_memory_tracks_aliases_saved_gradients_and_real_cuda_peaks():
-    from pllm.execution.memory import measure
+    from pllm.execution.torch_private import measure
 
     source = torch.empty(1024, device="meta")
     assert measure(lambda: source.view(32, 32)).workspace == 0
@@ -42,8 +42,8 @@ def test_meta_memory_tracks_aliases_saved_gradients_and_real_cuda_peaks():
 
 def test_direct_multigroup_adamw_workspace_bounds_cuda_peak():
     """The shape-only capturable batch funds the real update's temporary storage."""
-    from pllm.execution.memory import measure
     from pllm.execution.tensor_program import TensorAdamW
+    from pllm.execution.torch_private import measure
     from pllm.kernels.adamw import AdamWConfig
 
     optimizer = TensorAdamW(AdamWConfig(0.017), 2)

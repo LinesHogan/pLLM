@@ -292,7 +292,7 @@ def test_left_action_restores_rectangular_readout_layout():
 
 
 def test_shape_tracing_retains_owned_prefix_outputs_when_source_returns_aliases():
-    from pllm.execution.memory import measure
+    from pllm.execution.torch_private import measure
 
     def step(s, x):
         return s + x[0], x
@@ -375,7 +375,7 @@ def test_prefix_outputs_own_disjoint_values_even_when_readout_returns_an_input()
 
 
 def test_scan_funding_accounts_for_live_caller_temporaries():
-    from pllm.execution.memory import measure
+    from pllm.execution.torch_private import measure
 
     def step(s, x):
         return s + x[0], x + s

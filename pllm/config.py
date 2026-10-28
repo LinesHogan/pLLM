@@ -36,7 +36,7 @@ class KVOffload:
                 "prompt_only needs OffloadingConnector; SimpleCPUOffloadConnector offloads completed request pages"
             )
 
-    def options(self) -> dict[str, object]:
+    def options(self) -> dict[str, str | dict[str, int | bool]]:
         """Configure stock batched transfers with one complete allocation page per chunk."""
         return {
             "kv_connector": self.connector,

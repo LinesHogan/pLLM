@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import replace
-from typing import cast
+from typing import ParamSpec
 
 import torch
 from torch import Tensor
@@ -34,11 +34,16 @@ def _(hidden: Tensor, buffer: Tensor) -> None:
     return None
 
 
-def _tapped(module: torch.nn.Module, forward: Callable[..., Tensor | tuple[Tensor, ...]]) -> Callable[..., object]:
-    def tapped(*args: object, **kwargs: object) -> Tensor | tuple[Tensor, ...]:
+P = ParamSpec("P")
+
+
+def _tapped(
+    buffer: Tensor, forward: Callable[P, Tensor | tuple[Tensor, ...]]
+) -> Callable[P, Tensor | tuple[Tensor, ...]]:
+    def tapped(*args: P.args, **kwargs: P.kwargs) -> Tensor | tuple[Tensor, ...]:
         output = forward(*args, **kwargs)
         # vLLM decoder layers return (layer output, residual); the tap keeps the layer output.
-        torch.ops.pllm.tap(output if isinstance(output, Tensor) else output[0], cast(Tensor, module.pllm_tap))
+        torch.ops.pllm.tap(output if isinstance(output, Tensor) else output[0], buffer)
         return output
 
     return tapped
@@ -55,7 +60,7 @@ class HiddenTaps:
             module = model.get_submodule(path)
             buffer = torch.zeros(max_tokens, hidden_size, dtype=torch.float32, device=device)
             module.register_buffer("pllm_tap", buffer, persistent=False)
-            module.forward = _tapped(module, module.forward)
+            module.forward = _tapped(buffer, module.forward)
             self.buffers[path] = buffer
 
     def publish(self, value: TensorStepInput, resources: tuple[PackedHiddenResourceBinding, ...]) -> TensorStepInput:

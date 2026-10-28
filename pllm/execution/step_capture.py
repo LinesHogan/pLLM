@@ -5,15 +5,12 @@ from __future__ import annotations
 import gc
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeVar
-
-if TYPE_CHECKING:
-    from torch.cuda import _POOL_HANDLE  # pyright: ignore[reportPrivateUsage]
+from typing import TypeVar
 
 import torch
 
 from pllm.contracts.semantic_graph import TaskResourceFact
-from pllm.execution.torch_private import cuda_graph_pool_bytes
+from pllm.execution.torch_private import CudaPoolHandle, cuda_graph_pool_bytes
 
 R = TypeVar("R")
 
@@ -28,7 +25,7 @@ def capture_graph(
     *,
     prepare: Callable[[], None] = _ready,
     restore: Callable[[], None] = _ready,
-    pool: _POOL_HANDLE | None = None,
+    pool: CudaPoolHandle | None = None,
 ) -> tuple[torch.cuda.CUDAGraph, R, int]:
     """Warm `body` up three times on a private stream, capture it once and report the graph pool's bytes.
 

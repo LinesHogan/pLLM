@@ -65,7 +65,6 @@ from pllm.contracts.tensor_layout import (
     TensorLayoutSpec,
 )
 from pllm.execution.execution import TaskGraphImplementation
-from pllm.execution.memory import MemoryUsage, measure
 from pllm.execution.overlay_task import OverlayTransition
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.replay import TokenwiseReplayTask
@@ -84,6 +83,7 @@ from pllm.execution.tensor_program import (
     native_body,
 )
 from pllm.execution.token_program import TokenProgram
+from pllm.execution.torch_private import MemoryUsage, measure
 from pllm.kernels.adamw import AdamWConfig
 
 D = TypeVar("D")

@@ -27,6 +27,7 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.declaration import Call, State
+from pllm.execution.module_graph import ModuleCall
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.tensor_frame import (
     LeafRoots,
@@ -296,7 +297,7 @@ class TensorTask:
                 value = gradient_rows(value, mask.reshape(len(rows), *([1] * (value.ndim - 1))))
         return value
 
-    def arguments(self, inputs: Mapping[str, torch.Tensor]) -> dict[str, object]:
+    def arguments(self, inputs: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor | ModuleCall]:
         """Adapt method arguments after tensor selection and gradient policy, omitting row selectors."""
         domains = self.domains
         return {key: port.adapt(inputs[key]) for key, port in self.ports.items() if key not in domains}

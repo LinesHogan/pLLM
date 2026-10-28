@@ -17,7 +17,7 @@ from pllm.execution.overlay_task import OverlayTransition, RouteOverlay
 from pllm.execution.position_state import PositionBuffers
 from pllm.execution.route_executor import execute_route, ordinary_pass
 from pllm.execution.tensor_frame import TensorFrame
-from pllm.execution.tensor_program import TaskOutput, TensorBatch, TensorOperation, _read  # pyright: ignore[reportPrivateUsage]
+from pllm.execution.tensor_program import TaskOutput, TensorBatch, TensorOperation, read_batch
 from pllm.execution.token_program import KV, TokenProgram
 from pllm.execution.trace import TracePhase
 
@@ -135,7 +135,7 @@ class TokenwiseReplayTask(Generic[DataT]):
         assert context is not None and isinstance(data, TensorFrame) and self.overlay_math is not None
         primitive = self.primitive
         assert primitive is not None
-        primitive.overlay = RouteOverlay(self.overlay_math, batch, _read(context), data)
+        primitive.overlay = RouteOverlay(self.overlay_math, batch, read_batch(context), data)
         try:
             self.run(context)
             return primitive.overlay.finish()

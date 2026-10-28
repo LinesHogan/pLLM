@@ -7,7 +7,7 @@ publication) for one attached workload. Runners drive its hooks; the worker and 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Generic, cast
+from typing import Generic
 
 import torch
 from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
@@ -62,7 +62,6 @@ from pllm.execution.state_feed import (
     ReadonlyStepInput,
 )
 from pllm.execution.step_input import TensorStepInput
-from pllm.execution.tensor_frame import TensorFrame
 
 
 @dataclass(slots=True)
@@ -536,8 +535,7 @@ class VllmSession(Generic[DataT, ResultT]):
         assert overlap is not None
         assert self._step is not None
         if not self._step.handed_off:
-            assert isinstance(context.value, TensorFrame)
-            overlap.copy_inputs(cast(StateTaskContext[TensorFrame], context))
+            overlap.copy_inputs(context)
             if overlap.lag or context.pin.stream != overlap.stream:
                 with torch.cuda.stream(overlap.stream):
                     self._deployment.execution.resume_latest(context, overlap.stream)

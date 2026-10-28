@@ -1,6 +1,6 @@
 """Request cache identity and admission hashing for vLLM's scheduler process."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Hashable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -61,7 +61,7 @@ class RequestBlockHasher:
     """Incremental upstream hash chaining with a selective generated-boundary extra key."""
 
     block_size: int
-    hash_function: Callable[[object], bytes]
+    hash_function: Callable[[Hashable], bytes]
     policy: CachePolicy
 
     def __call__(self, request: Request) -> list[BlockHash]:

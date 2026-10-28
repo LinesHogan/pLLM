@@ -74,8 +74,8 @@ from pllm.execution.model_effect_binding import (
     import_update,
     write_result,
 )
+from pllm.execution.module_graph import ModuleCall
 from pllm.execution.module_state import (
-    ModuleCall,
     ModuleFactory,
     copy_initial,
     initial_values,
@@ -141,10 +141,6 @@ class _Source:
 
     def batch(self, state: str, definition: InstanceState) -> tuple[str, str]:
         raise ValueError("batch training inputs must name its batch tensors or own parameters")
-
-    def adapt(self, context: _Declaration) -> Callable[[torch.Tensor], object]:
-        """How the method receives the tensor read from this source."""
-        return _same
 
 
 @dataclass(frozen=True)
@@ -216,10 +212,6 @@ class Parameter(_Source):
         return "parameter", self.field
 
 
-def _same(value: torch.Tensor) -> torch.Tensor:
-    return value
-
-
 @dataclass(frozen=True)
 class _Module(Parameter):
     """A module state, handed to the method as a callable with the module's interface."""
@@ -229,7 +221,7 @@ class _Module(Parameter):
     def port(self, context: _Declaration) -> TensorPort:
         return replace(super().port(context), adapt=self.adapt(context))
 
-    def adapt(self, context: _Declaration) -> Callable[[torch.Tensor], object]:
+    def adapt(self, context: _Declaration) -> Callable[[torch.Tensor], ModuleCall]:
         definition = context.state_definition(self.state, f"{self.state}: pllm.module needs a declared module state")
         factory, dimensions = definition.module, context.binding.dimensions
         if factory is None:
@@ -802,7 +794,7 @@ class _Gradient:
                 else (),
                 detached_inputs=tuple(key for key in arguments if key not in parameters and key not in self.inputs),
             )
-            if _typed(operation.gradient, _Gradient) is not None or operation.effect.training
+            if operation.gradient is not None or operation.effect.training
             else MathContract()
         )
 
@@ -969,7 +961,7 @@ def train(
     return _mark(effect=_Train(state=state, update=update, reduction=reduction, steps=steps, reset=reset), rows=rows)
 
 
-def _setting(value: C | Config, config: object, expected: type[C]) -> C:
+def _setting(value: C | Config, config: Workload, expected: type[C]) -> C:
     resolved = Config.resolve(value, config)
     if (typed := _typed(resolved, expected)) is None or type(resolved) is not expected:
         raise TypeError(f"{value}: expected {expected.__name__}")
@@ -1029,7 +1021,7 @@ class _Operation:
     name: str
     phase: Phase
     effect: _Effect
-    gradient: object
+    gradient: _Gradient | None
     rows: str
 
     @property
@@ -1072,7 +1064,7 @@ class _Operation:
                 ),
             )
         )
-        demand = _typed(self.gradient, _Gradient) or _Gradient((), effect.training)
+        demand = self.gradient or _Gradient((), effect.training)
         math = demand.contract(self, arguments)
         update = context.states[effect.state] if effect.training else None
         writes = {key: capture.declare(effect.state, update) for key, capture in (captures or {}).items()}
@@ -1099,7 +1091,7 @@ class _Operation:
     @property
     def domains(self) -> dict[str, str]:
         """Selector methods whose inputs contribute to the operation's model requirements."""
-        demand = _typed(self.gradient, _Gradient) or _Gradient((), self.effect.training)
+        demand = self.gradient or _Gradient((), self.effect.training)
         return {
             "forward_rows": self.rows,
             "input_gradient_rows": demand.input_rows,
@@ -1261,13 +1253,13 @@ class _Declaration:
         phase, marked, gradient, rows = (
             _typed(markers.get("__pllm_phase__"), Phase),
             _typed(markers.get("__pllm_effect__"), _Effect),
-            markers.get("__pllm_gradient__"),
+            _typed(markers.get("__pllm_gradient__"), _Gradient),
             _typed(markers.get("__pllm_rows__", ""), str),
         )
         if phase is None and marked is None:
             return
         effect = marked or _Effect()
-        texts = (*vars(effect).values(), *vars(_typed(gradient, _Gradient) or _Gradient((), False)).values(), rows)
+        texts = (*vars(effect).values(), *vars(gradient or _Gradient((), False)).values(), rows)
         seeds.extend(candidates[text] for text in texts if type(text) is str and text in candidates)
         if (overlay := _typed(effect, _Overlay)) is not None:
             self.overlay_states.add(overlay.state)

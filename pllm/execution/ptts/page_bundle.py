@@ -134,7 +134,7 @@ class _Table:
         self.slots = np.zeros((capacity, width), dtype=np.int64)
         self.generations = np.zeros_like(self.slots)
         self.versions = np.zeros(capacity, dtype=np.int64)
-        self.readiness: npt.NDArray[np.object_] = np.full(capacity, None, dtype=object)
+        self.readiness: npt.NDArray[np.object_] = np.full(capacity, None, dtype=np.object_)
         self.status = np.zeros(capacity, dtype=np.int8)  # 0 free, 1 pending, 2 live, 3 retired
         # Row holds recycle metadata; only the pool's holders decide page lifetime.
         self.owners = np.zeros(capacity, dtype=np.int64)
@@ -240,8 +240,7 @@ class LazyRoots(Sequence[tuple[torch.Tensor, ...]]):
     def field_slots(self, field: int) -> tuple[torch.Tensor, tuple[int, ...]]:
         """The field pool and selected slots, without walking the refs again."""
         resource, slots = self.slot_matrix()
-        pool = self._arena._pools[resource].tensors[field]  # pyright: ignore[reportPrivateUsage]
-        return pool.detach(), tuple(slots[:, field].tolist())
+        return self._arena.field_pool(resource, LayoutFieldId(field)), tuple(slots[:, field].tolist())
 
     @overload
     def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]: ...
@@ -609,7 +608,7 @@ class PageBundleArena:
                     indices = positions[found]
                     slots[found], generations[found] = held.slots[indices], held.generations[indices]
                     if held.readiness:
-                        readiness[found] = np.asarray(held.readiness, dtype=object)[indices]
+                        readiness[found] = np.asarray(held.readiness, dtype=np.object_)[indices]
                     else:
                         readiness[found] = None
                     missing[found] = False

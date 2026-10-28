@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
-from typing import Any, Generic, Literal, Protocol, TypeVar
+from typing import Generic, Literal, Never, Protocol, TypeVar
 
 import torch
 from torch.optim.sgd import sgd
@@ -20,11 +20,12 @@ from pllm.contracts.semantic_graph import ImplementationId, SemanticOutputKind, 
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.cuda_stream import CudaStreamReadiness, upload
-from pllm.execution.memory import MemoryUsage, apply_adamw_or_reserve, measure
+from pllm.execution.memory import apply_adamw_or_reserve
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot, borrowed_root
 from pllm.execution.ptts.page_bundle import PagePin, PagePublication, PageWrite, Slots
 from pllm.execution.ptts.request_state import RequestStateSelection, StateAddress
 from pllm.execution.state_execution import ProjectionResiduals, StateTaskContext
+from pllm.execution.torch_private import MemoryUsage, measure
 from pllm.execution.trace import TracePhase
 from pllm.kernels.adamw import AdamWConfig, AdamWFields, paged_adamw
 from pllm.kernels.page_copy import copy_pages
@@ -35,7 +36,7 @@ R = TypeVar("R")
 Roots = tuple[tuple[torch.Tensor, ...], ...]
 
 
-def _unwired(*_args: object) -> Any:
+def _unwired(*_args: int | StateResource) -> Never:
     raise RuntimeError("this mathematical batch has no issued page or resource access")
 
 
@@ -144,7 +145,10 @@ class InvocationOutput:
     value: torch.Tensor | None = None
 
 
-def _read(context: StateTaskContext[D], version: Literal["input", "private", "published"] = "input") -> TensorBatch:
+def read_batch(
+    context: StateTaskContext[D], version: Literal["input", "private", "published"] = "input"
+) -> TensorBatch:
+    """Borrow the invocation's selected version for tensor operations and layer replay."""
     assert version == "input" or len(context.publications) <= 1
     refs = context.pin.refs
     access: tuple[PagePin | PageWrite, ...] = (context.pin,) * len(refs)
@@ -215,7 +219,7 @@ class FunctionMath(Generic[I, D, R]):
             nullcontext() if context.pin.stream is None else torch.cuda.stream(context.pin.stream),
             torch.inference_mode(False),
         ):
-            data = self.prepare_data(value, _read(context))
+            data = self.prepare_data(value, read_batch(context))
             return data if context.value is None or self.resume_data is None else self.resume_data(context.value, data)
 
     def output(self, context: StateTaskContext[D]) -> R:
@@ -411,14 +415,14 @@ class TensorOperation(Generic[D]):
     def execute(self, context: StateTaskContext[D]) -> ProjectionResiduals:
         data, stream = context.data(), context.pin.stream
         with nullcontext() if stream is None else torch.cuda.stream(stream), torch.inference_mode(False):
-            batch = _read(context, self.version)
+            batch = read_batch(context, self.version)
             selected = tuple(range(len(batch.roots))) if self.select is None else self.select(data, context.selection)
             assert len(set(selected)) == len(selected) and all(0 <= i < len(batch.roots) for i in selected)
             write: PageWrite | None = None
             if self.mode == "transition" and selected:
                 if self.version == "input" or context.sole_write() is None:
                     write = context.prepare_owned_write(context.pin.refs.take(selected), copy_fields=self.copy_fields)
-                batch = _read(context, "private")
+                batch = read_batch(context, "private")
             output = self.body(data, batch, context)
             if output.gradient_indices:
                 assert (

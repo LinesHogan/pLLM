@@ -14,7 +14,7 @@ import torch
 assert not torch.cuda.is_initialized()
 def forbidden(*args, **kwargs):
     raise AssertionError("planning must not allocate tensors or initialize CUDA")
-from pllm.execution.memory import measure
+from pllm.execution.torch_private import measure
 from pllm import scan
 from pllm.execution.parameter_projection import prepare_projection_read
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator

@@ -46,8 +46,8 @@ def test_pinned_projection_borrows():
 def test_projection_math_budget_and_allocator_peak(operator):
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    from pllm.execution.memory import measure
     from pllm.execution.parameter_projection import prepare_projection_read, projection_read
+    from pllm.execution.torch_private import measure
 
     torch.manual_seed(29)
     hidden = torch.randn(16, 8, device="cuda", dtype=torch.bfloat16)
