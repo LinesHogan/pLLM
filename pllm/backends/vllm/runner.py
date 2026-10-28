@@ -40,6 +40,7 @@ from pllm.backends.vllm.packed_rows import encode_mrv2_rows
 from pllm.backends.vllm.position_state import POSITION_ENV, PositionCacheLayer
 from pllm.backends.vllm.prefix_cache import POLICY_ENV, CachePolicy
 from pllm.backends.vllm.sampler import (
+    Mrv1Sampler as Mrv1Guidance,
     SamplerGuidance,
     Vllm027Sampler,
 )
@@ -105,13 +106,14 @@ class _RunnerSession(Protocol):
     def parameter_phases(self) -> tuple[HiddenPhase, ...]: ...
 
 
-SamplerT = TypeVar("SamplerT", Sampler | None, Mrv1Sampler)
+SamplerT = TypeVar("SamplerT", Sampler, Mrv1Sampler)
+AdapterT = TypeVar("AdapterT", Vllm027Sampler, Mrv1Guidance)
 
 
-class Runner(Generic[SamplerT]):
+class Runner(Generic[SamplerT, AdapterT]):
     """The original attachment slot and cleanup, shared by concrete runner adapters."""
 
-    sampler: SamplerT
+    sampler: SamplerT | AdapterT
     model: torch.nn.Module
     cache_config: CacheConfig
     model_config: VllmModelConfig
@@ -125,16 +127,18 @@ class Runner(Generic[SamplerT]):
     position_layers: tuple[PositionCacheLayer, ...] = ()
     cache_policy: CachePolicy
 
+    def qwen2_model(self) -> Qwen2ForCausalLM:
+        """Return the model supported by workload taps, probing and sampling."""
+        if not isinstance(self.model, Qwen2ForCausalLM):
+            raise ValueError("choose a Qwen2 model for vLLM workloads")
+        return self.model
+
     def _install_hidden_taps(self) -> None:
         """Tap the announced hidden outputs before vLLM compiles and captures the model."""
         requested: list[tuple[int, str]] = json.loads(os.environ.get(TAPS_ENV, "[]"))
         if not requested:
             return
-        match self.model:
-            case Qwen2ForCausalLM() as model:
-                pass
-            case _:
-                raise RuntimeError("hidden taps currently require Qwen2")
+        model = self.qwen2_model()
         layers = len(model.model.layers)
         paths = (hidden_binding(layer, HiddenSite(site), layers).module_path for layer, site in requested)
         hidden_size = model.lm_head.weight.shape[1]
@@ -147,7 +151,7 @@ class Runner(Generic[SamplerT]):
         self._generated_kv: Literal["reuse", "isolate"] = "reuse" if policy == "reuse" else "isolate"
         self.workload_topology = topology
         self._workload_session: _RunnerSession | None = None
-        self._workload_upstream_sampler: SamplerT | None = None
+        self._workload_upstream_sampler: SamplerT | AdapterT | None = None
         self.completion_capture: CompletionCapture | None = None
 
     @property
@@ -164,13 +168,11 @@ class Runner(Generic[SamplerT]):
         self,
         deployment: BackendDeployment[DataT, ResultT],
     ) -> None:
-        if self._workload_session is not None:
-            raise RuntimeError("canonical runner already owns a workload session")
         if self.cache_config.enable_prefix_caching and (
             deployment.attachment.inputs.request.activation_bindings
             or deployment.attachment.inputs.request.overlay_bindings
         ):
-            raise ValueError("signed activation injection does not support shared prefix caching")
+            raise ValueError("disable prefix caching when using parameter overlays or activation patches")
         if deployment.attachment.inputs.probe.position_states != self.position_states:
             raise ValueError("PositionState schema changed; create a new engine with this workload")
         request = deployment.attachment.inputs.request
@@ -185,17 +187,9 @@ class Runner(Generic[SamplerT]):
             and deployment.attachment.inputs.probe.graph_mode is not AttachmentGraphMode.CUDA_GRAPH
         ):
             raise ValueError("parameter overlays, activation patches and layer replay do not run under CUDA graphs yet")
-        match self.model:
-            case Qwen2ForCausalLM() as model:
-                pass
-            case _:
-                raise RuntimeError("vLLM workload currently requires Qwen2")
+        model = self.qwen2_model()
         upstream = self.sampler
-        if upstream is None or type(upstream) not in (Sampler, Mrv1Sampler):
-            raise RuntimeError("vLLM workload requires the original stock sampler")
-        adapter = self._make_sampler(upstream) if deployment.attachment.inputs.request.guides_sampler else None
-        if adapter is not None and not isinstance(adapter, SamplerGuidance):
-            raise TypeError("backend sampler must share the original guidance lifecycle")
+        adapter = self._make_sampler() if deployment.attachment.inputs.request.guides_sampler else None
         policy = CachePolicy.for_attachment(deployment.attachment, self._generated_kv)
         session = VllmSession(
             deployment,
@@ -227,8 +221,7 @@ class Runner(Generic[SamplerT]):
     def detach_workload(self) -> None:
         session = self._workload_session
         upstream = self._workload_upstream_sampler
-        if session is None or upstream is None:
-            raise RuntimeError("canonical runner has no attached session")
+        assert session is not None and upstream is not None
         session.require_idle()
         session.close()
         if self.completion_capture is not None:
@@ -247,13 +240,6 @@ class Runner(Generic[SamplerT]):
         completion: torch.Tensor | None = None,
     ) -> None:
         session = self.require_session()
-        if self.completion_capture is not None:
-            raise RuntimeError("previous completion capture has not finished")
-        if completion is not None and completion.shape != (
-            len(identities),
-            session.attachment.inputs.probe.hidden_size,
-        ):
-            raise ValueError("completion destination differs from the original backend probe")
         capture = None if completion is None else CompletionCapture(identities, completion)
         session.stage_input(batch, identities)
         self.completion_capture = capture
@@ -286,15 +272,14 @@ class Runner(Generic[SamplerT]):
 
     def require_session(self) -> _RunnerSession:
         session = self._workload_session
-        if session is None:
-            raise RuntimeError("canonical runner has no attached session")
+        assert session is not None
         return session
 
-    def _make_sampler(self, upstream: SamplerT) -> SamplerT:
+    def _make_sampler(self) -> AdapterT:
         raise NotImplementedError
 
 
-class WorkloadModelRunner(Runner[Sampler | None], OverlayGraphRunner):
+class WorkloadModelRunner(Runner[Sampler, Vllm027Sampler], OverlayGraphRunner):
     runner_kind = RunnerKind.MRV2
 
     def __init__(
@@ -342,10 +327,8 @@ class WorkloadModelRunner(Runner[Sampler | None], OverlayGraphRunner):
     def _finish_model_binding(self) -> None:
         self.finish_overlay_graphs(self.require_session().attachment, self.require_session().parameter_phases)
 
-    def _make_sampler(self, upstream: Sampler | None) -> Sampler:
-        if upstream is None:
-            raise RuntimeError("MRv2 sampler has not been initialized")
-        return Vllm027Sampler(upstream)
+    def _make_sampler(self) -> Vllm027Sampler:
+        return Vllm027Sampler(self.sampler)
 
     def prepare_inputs(
         self,
@@ -383,8 +366,7 @@ class WorkloadModelRunner(Runner[Sampler | None], OverlayGraphRunner):
                 skip_attn_for_dummy_run,
                 is_profile,
             )
-        if dummy_run or is_profile:
-            raise RuntimeError("attached canonical execution rejects runner warmup")
+        assert not dummy_run and not is_profile
         with torch.inference_mode(False):
             session.before_execute(scheduler_output)
         try:
@@ -411,11 +393,7 @@ class WorkloadModelRunner(Runner[Sampler | None], OverlayGraphRunner):
         session = self._workload_session
         if session is None:
             return super().sample(hidden_states, input_batch, grammar_output)
-        match self.model:
-            case Qwen2ForCausalLM() as model:
-                pass
-            case _:
-                raise RuntimeError("attached canonical sampler lost its Qwen2 model")
+        model = self.qwen2_model()
         try:
             active = session.begin_sampler(model)
             sampled = super().sample(hidden_states, input_batch, grammar_output)

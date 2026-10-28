@@ -4,7 +4,6 @@ import numpy as np
 import numpy.typing as npt
 import torch
 from vllm.config import VllmConfig
-from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput, SamplerOutput
@@ -19,7 +18,7 @@ from pllm.config import RunnerKind
 from pllm.contracts.backend_attachment import AttachmentTopology
 
 
-class Mrv1Runner(Runner[Sampler], GPUModelRunner):
+class Mrv1Runner(Runner[Sampler, Mrv1Sampler], GPUModelRunner):
     runner_kind = RunnerKind.MRV1
 
     def __init__(
@@ -37,8 +36,8 @@ class Mrv1Runner(Runner[Sampler], GPUModelRunner):
         super().load_model(load_dummy_weights)
         self._install_hidden_taps()
 
-    def _make_sampler(self, upstream: Sampler) -> Sampler:
-        return Mrv1Sampler(upstream)
+    def _make_sampler(self) -> Mrv1Sampler:
+        return Mrv1Sampler(self.sampler)
 
     def _prepare_inputs(
         self, scheduler_output: SchedulerOutput, num_scheduled_tokens: npt.NDArray[np.int32]
@@ -82,10 +81,8 @@ class Mrv1Runner(Runner[Sampler], GPUModelRunner):
         session = self._workload_session
         if session is None:
             return super()._sample(logits, spec_decode_metadata)
-        if not isinstance(self.model, Qwen2ForCausalLM):
-            raise RuntimeError("attached MRv1 sampler lost its Qwen2 model")
         with torch.inference_mode(False), torch.enable_grad():
-            active = session.begin_sampler(self.model)
+            active = session.begin_sampler(self.qwen2_model())
         sampled = super()._sample(logits, spec_decode_metadata)
         with torch.inference_mode(False), torch.enable_grad():
             session.complete_sampler(active)

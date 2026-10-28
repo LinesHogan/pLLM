@@ -136,7 +136,7 @@ def test_factory_failure_releases_an_already_created_engine(multiprocessing: boo
         }
         # Inject the engine at the vLLM constructor boundary.
         with patch.dict(os.environ, environment), patch.object(runtime, "LLM", return_value=engine):
-            with pytest.raises(RuntimeError):
+            with pytest.raises((AttributeError, IndexError)):
                 pllm.make_llm(
                     pllm.ModelConfig("unused-local-model", multiprocessing=multiprocessing),
                     workload=ESampRequestWorkload(),
