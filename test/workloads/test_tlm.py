@@ -162,7 +162,7 @@ def test_global_multifactor_adamw_matches_oracle_and_publishes_one_version() -> 
             torch.testing.assert_close(actual_old, expected)
     assert second_pin.refs[0].version_id == 1  # A later request pins the version current at its admission.
     execution.retire((first, second))
-    with pytest.raises(RuntimeError):
+    with pytest.raises(AssertionError):
         execution.arena.snapshot(old_pin, ref)
     execution.retire(())
     assert execution.diagnostics().active_lineages == 0

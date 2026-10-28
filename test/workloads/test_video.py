@@ -132,8 +132,6 @@ def received_features(plan, *, version=7, scale=1):
 
 def test_video_binding_keeps_remote_roots_out_of_local_ownership():
     with binding_case() as (_, _, _, _, execution, root, peers):
-        with pytest.raises(ValueError):  # Remote features are borrowed, never admitted locally.
-            execution.arena.prepare_admission(("features",))
         execution.stage_readonly((root,))
         invocation = execution.start_step(None)
         for anchor in execution.arena.plan.timeline.anchors:

@@ -81,7 +81,7 @@ def test_cuda_ptts_waits_for_exact_fence_before_reclaim() -> None:
         consumed = borrowed.clone()
     release = arena.release_pin(pin)
     assert arena.pending_pin_releases == 1 and arena.free_pages == 2
-    with pytest.raises(RuntimeError):  # a released pin admits no new reads
+    with pytest.raises(AssertionError):  # a released pin admits no new reads
         arena.snapshot(pin, admitted.after_refs[0])
     pressure = arena.publish(arena.prepare_transition(publication.after_refs, writer))
     arena.settle(pressure)
