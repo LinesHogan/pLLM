@@ -9,7 +9,12 @@ from typing import TYPE_CHECKING, Generic, NamedTuple, Protocol, TypeVar
 import torch
 
 from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.parameter_overlay import CapturedParameterOperand, ParameterTarget
+from pllm.contracts.parameter_overlay import (
+    CapturedParameterOperand,
+    ParameterEffect,
+    ParameterOverlayOperator,
+    ParameterTarget,
+)
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import PackedSamplerRowBatch
 from pllm.contracts.semantic_graph import TaskId
@@ -18,7 +23,8 @@ from pllm.execution.chunk_tail import join_tail, save_tail
 from pllm.execution.scan import scan
 from pllm.execution.scan_execution import Step
 from pllm.execution.tensor_frame import OverlayEntry, OverlayTargetResult, TensorFrame, Tensors, TensorUpdate
-from pllm.execution.tensor_program import TaskOutput, TensorBatch
+from pllm.execution.tensor_program import PoolSGD, TaskOutput, TensorBatch
+from pllm.kernels.head_overlay import head_correction
 
 DataT = TypeVar("DataT")
 ResultT = TypeVar("ResultT")
@@ -46,6 +52,94 @@ def chunk_update(step: Step, chunk: int, arguments: tuple[str, ...], /, **values
         trained,
         {"tail_rows": remaining},
     )
+
+
+def overlay_apply(effect: ParameterEffect, hidden: torch.Tensor, values: Tensors) -> torch.Tensor:
+    """Read the declared overlay operator for ordinary and chunk-exclusive projections."""
+    applied = effect.applied_fields
+    if effect.operator is ParameterOverlayOperator.HEAD_ADD:
+        return head_correction(hidden, values[applied[0]])
+    if effect.operator is ParameterOverlayOperator.LOW_RANK_ADD:
+        return (hidden @ values[applied[0]].T) @ values[applied[1]].T
+    return hidden @ values[applied[0]].T
+
+
+Gradient = Callable[[Tensors, Tensors, torch.Tensor], Tensors]
+
+
+def overlay_gradient(function: Callable[..., torch.Tensor]) -> Gradient:
+    """Differentiate the sum of valid per-row losses, leaving chunk normalization to execution."""
+
+    def loss(parameters: Tensors, operands: Tensors, valid: torch.Tensor) -> torch.Tensor:
+        rows = function(**parameters, **operands)
+        if rows.shape != valid.shape:
+            raise ValueError("autograd overlays must return one loss per input row")
+        return torch.where(valid, rows, 0).sum()
+
+    eager = torch.func.grad(loss)
+    compiled = torch.compile(  # pyright: ignore[reportUnknownMemberType]
+        eager, fullgraph=True, dynamic=False, options={"triton.cudagraphs": False}
+    )
+
+    def gradient(parameters: Tensors, operands: Tensors, valid: torch.Tensor) -> Tensors:
+        # Planning traces the unfused allocations; real invocations warm before capture.
+        return (eager if valid.is_meta else compiled)(parameters, operands, valid)
+
+    return gradient
+
+
+def gradient_update(
+    gradient: Gradient,
+    optimizer: PoolSGD,
+    effect: ParameterEffect,
+    chunk: int,
+    flush: bool,
+    bindings: Mapping[str, str],
+    /,
+    **values: torch.Tensor,
+) -> TensorUpdate:
+    """Accumulate arriving-row gradients in PTTS and update once per completed chunk."""
+    parameters = {name: values[name] for name, source in bindings.items() if source in effect.applied_fields}
+    row_names = tuple(name for name, source in bindings.items() if source in ("input", "target"))
+    input_name = next(name for name, source in bindings.items() if source == "input")
+    hidden = values[input_name]
+    state = {source: parameters[name] for name, source in bindings.items() if name in parameters}
+    sums = tuple(values[f"_pending_grad_{name}"] for name in parameters)
+    length = values["_pending_length"]
+    offset = length.clone()
+    positions = torch.arange(chunk, device=hidden.device)
+    outputs: list[torch.Tensor] = []
+    updates, trained = torch.zeros_like(length), torch.zeros_like(length)
+    with torch.inference_mode(False), torch.enable_grad():
+        constants = {name: values[name].clone() for name, source in bindings.items() if source == "weight"}
+        for start in range(0, len(hidden) + chunk - 1, chunk):
+            indices = positions + start - offset
+            valid = (indices >= 0) & (indices < len(hidden))
+            rows = {name: values[name].index_select(0, indices.clamp(0, len(hidden) - 1)) for name in row_names}
+            outputs.append(overlay_apply(effect, rows[input_name], state))
+            gradients = gradient(
+                {name: value.clone() for name, value in parameters.items()}, {**constants, **rows}, valid
+            )
+            length.add_(valid.sum())
+            complete = (length == chunk) | (
+                flush & values["_prompt_end"] & (start + chunk >= offset + len(hidden)) & (length > 0)
+            )
+            for total, grad in zip(sums, gradients.values(), strict=True):
+                total.add_(grad)
+            optimizer.tensors(
+                tuple(parameters.values()),
+                tuple(
+                    torch.where(complete, total / length.clamp_min(1), 0).to(parameter.dtype)
+                    for total, parameter in zip(sums, parameters.values(), strict=True)
+                ),
+            )
+            updates.add_(complete)
+            trained.add_(torch.where(complete, length, 0))
+            for total in sums:
+                total.masked_fill_(complete, 0)
+            length.masked_fill_(complete, 0)
+    output = torch.cat(outputs).index_select(0, torch.arange(len(hidden), device=hidden.device) + offset)
+    return TensorUpdate(output, updates > 0, updates, trained, {"tail_rows": length.clone()})
 
 
 class ProjectionTransition(Protocol):

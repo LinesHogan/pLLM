@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import replace
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -27,7 +28,6 @@ from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
     ParameterEffect,
     ParameterOverlayFieldBinding,
-    ParameterOverlayOperator,
 )
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.semantic_graph import (
@@ -41,7 +41,7 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.visibility import Exact, Visibility, VisibilitySource
 from pllm.execution.binding_base import Buffer, overlay_fields
 from pllm.execution.declaration import Call, State, When, native
-from pllm.execution.overlay_task import OverlayTransition
+from pllm.execution.overlay_task import OverlayTransition, overlay_apply
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION
 from pllm.execution.tensor_frame import (
@@ -51,7 +51,6 @@ from pllm.execution.tensor_frame import (
 )
 from pllm.execution.tensor_task import FieldWriter, TensorTask
 from pllm.execution.token_program import ApplyUpdates, Cell, Layers, Over, Segment, TokenProgram, Tokens, TokenTensor
-from pllm.kernels.head_overlay import head_correction
 
 if TYPE_CHECKING:
     from pllm.execution.tensor_binding import TensorBinding
@@ -85,7 +84,7 @@ def declare_parameter_overlay(
     if b.graph.tasks or b.graph.states or b.host:
         raise ValueError("ordinary overlay requires a sole request state and model transition")
     fields = overlay_fields(buffers, effect)
-    targets, applied, operator = effect.targets, effect.applied_fields, effect.operator
+    targets, applied = effect.targets, effect.applied_fields
     dimensions = b.dimensions
     if len(dimensions.target_shapes) != len(targets):
         raise ValueError("overlay targets differ from backend specialization")
@@ -107,15 +106,7 @@ def declare_parameter_overlay(
 
         b.initializers[str(state.declaration.resource)] = init
 
-    def apply(hidden: torch.Tensor, values: Tensors) -> torch.Tensor:
-        if operator is ParameterOverlayOperator.HEAD_ADD:
-            return head_correction(hidden, values[applied[0]])
-        delta = (
-            values[applied[0]]
-            if operator is ParameterOverlayOperator.DENSE_ADD
-            else values[applied[1]] @ values[applied[0]]
-        )
-        return hidden @ delta.T
+    apply = partial(overlay_apply, effect)
 
     def select(data: TensorFrame, selection: RequestStateSelection) -> tuple[int, ...]:
         active = {operand.identity for operand in data.step.operands if operand.phase in phases}
@@ -175,7 +166,7 @@ def declare_parameter_overlay(
         tuple(
             ParameterOverlayFieldBinding(
                 target,
-                operator,
+                effect.operator,
                 tuple(state.view(f"{key}_{i}", b.dimensions) for key in applied),
                 str(state.declaration.resource),
                 effect.scale,

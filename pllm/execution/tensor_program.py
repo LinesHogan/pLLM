@@ -270,8 +270,13 @@ class PoolSGD:
         self, roots: Sequence[tuple[torch.Tensor, ...]], slots: FieldSlots, gradients: tuple[torch.Tensor, ...]
     ) -> None:
         """Use Torch's optimizer implementation without carrying momentum state."""
+        self.tensors(tuple(parameter for root in roots for parameter in root), gradients)
+
+    @torch.no_grad()
+    def tensors(self, parameters: tuple[torch.Tensor, ...], gradients: tuple[torch.Tensor, ...]) -> None:
+        """Update private tensors without requiring pooled field slots."""
         sgd(
-            [parameter for root in roots for parameter in root],
+            list(parameters),
             list(gradients),
             [],
             weight_decay=0,
