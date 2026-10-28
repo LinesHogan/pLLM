@@ -205,7 +205,7 @@ def test_updates_match_independent_private_version_oracle(boundaries, visits, em
         assert sum(int(target.update.trained_rows) for entry in result.entries for target in entry.targets) == sum(
             tails
         )
-    assert invocation.context.write is None
+    assert not invocation.context.page_writes
     execution.retire(IDENTITIES)
 
 
@@ -300,6 +300,6 @@ def test_untargeted_route_boundary_allocates_and_publishes_nothing():
     invocation.context.replay = UpdatingDecoder()
     for anchor in range(3):
         execution.execute_anchor(invocation, AnchorId(anchor))
-    assert invocation.context.write is invocation.context.publication is None
+    assert not invocation.context.page_writes and invocation.context.publication is None
     execution.cancel_step(invocation)
     execution.retire(IDENTITIES)

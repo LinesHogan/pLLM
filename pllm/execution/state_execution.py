@@ -107,38 +107,12 @@ class StateTaskContext(Generic[DataT]):
         self.page_pins[self.pin] = None
 
     @property
-    def write(self) -> PageWrite | None:
-        return next(iter(self.page_writes), None)
-
-    @write.setter
-    def write(self, token: PageWrite | None) -> None:
-        if token is None:
-            pending = self.write
-            if pending is not None:
-                del self.page_writes[pending]
-        else:
-            self.page_writes[token] = None
-
-    @property
     def publication(self) -> PagePublication | None:
         return next(reversed(self.page_publications), None)
 
     @property
     def release(self) -> PageRelease | None:
         return self.page_pins[self.pin]
-
-    @property
-    def published_pin(self) -> PagePin | None:
-        published = StateRefs.join(tuple(receipt.after_refs for receipt in self.page_publications))
-        return next(
-            (pin for pin in reversed(self.page_pins) if pin.refs and (published.positions(pin.refs) >= 0).all()),
-            None,
-        )
-
-    @property
-    def published_release(self) -> PageRelease | None:
-        pin = self.published_pin
-        return None if pin is None else self.page_pins[pin]
 
     def current_owned_ref(self, original: StateRef) -> StateRef:
         return self.current_owned_refs((original,))[0]
@@ -162,12 +136,17 @@ class StateTaskContext(Generic[DataT]):
             raise RuntimeError("state invocation was cancelled")
 
     def prepare_owned_write(
-        self, sources: tuple[StateRef, ...], fields: tuple[tuple[LayoutFieldId, ...], ...]
+        self,
+        sources: Sequence[StateRef],
+        fields: tuple[tuple[LayoutFieldId, ...], ...] | None = None,
+        *,
+        copy_fields: tuple[LayoutFieldId, ...] | None = (),
     ) -> PageWrite:
+        """Prepare and retain a private transition, returning its explicit write token."""
         self.check_page_execution()
         authorized = set(self.current_owned_refs(self.pin.refs))
         assert set(sources) <= authorized
-        token = self.arena.prepare_transition(sources, self.pin.stream, fields=fields, copy_fields=())
+        token = self.arena.prepare_transition(sources, self.pin.stream, fields=fields, copy_fields=copy_fields)
         self.page_writes[token] = None
         return token
 
@@ -197,11 +176,6 @@ class StateTaskContext(Generic[DataT]):
         assert pin in self.page_pins
         if self.page_pins[pin] is None:
             self.page_pins[pin] = self.arena.release_pin(pin)
-
-    def publish(self) -> None:
-        token = self.write
-        if token is not None:
-            self.publish_owned_write(token)
 
     def borrow_published(self, refs: Sequence[StateRef]) -> PagePin:
         self.check_page_execution()
@@ -303,7 +277,10 @@ class PublishStateTask(Generic[DataT]):
         return 0
 
     def execute(self, context: StateTaskContext[DataT]) -> None:
-        context.publish()
+        if context.page_writes:
+            assert len(context.page_writes) == 1
+            (write,) = context.page_writes
+            context.publish_owned_write(write)
 
 
 @dataclass(frozen=True, slots=True)

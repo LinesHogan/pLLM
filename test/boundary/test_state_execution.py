@@ -4,7 +4,9 @@ import pytest
 import torch
 
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.execution.state_execution import StateSettlementError
+from pllm.contracts.tensor_layout import LayoutFieldId
+from pllm.execution.state_execution import PublishStateTask, StateSettlementError
+from pllm.execution.tensor_program import TaskOutput, TensorOperation, _read
 from test.state_fixtures import (
     AUX,
     DENSE,
@@ -146,5 +148,49 @@ def test_task_failure_keeps_the_commit_boundary(committed):
     assert execution.arena.latest(refs[0].lineage_id).version_id == int(committed)
     if committed:
         execution.cancel_step(invocation)
+    execution.retire((identity,))
+    assert_multistate_reclaimed(execution)
+
+
+@pytest.mark.parametrize("handoff", ("read", "task", "operation"))
+def test_single_write_handoffs_reject_multiple_pending_writes(handoff):
+    execution, task = multistate(instance=False)
+    identity = RequestIdentity("a", 0, 0)
+    refs = execution.admit((identity,))
+    invocation = execution.start_step(rows_for(identity))
+    context = invocation.context
+    writes = tuple(context.prepare_owned_write((ref,), ((LayoutFieldId(0),),)) for ref in refs)
+    assert len(writes) == 2
+    with pytest.raises(AssertionError):
+        if handoff == "read":
+            _read(context, "private")
+        elif handoff == "task":
+            PublishStateTask(task.implementation_id).execute(context)
+        else:
+            TensorOperation(task.implementation_id, lambda *_: TaskOutput(), publish=True).execute(context)
+    assert tuple(context.page_writes) == writes
+    assert not context.page_publications
+    # Explicit publication identifies one write and leaves the other pending.
+    receipt = context.publish_owned_write(writes[1])
+    assert receipt.after_refs == writes[1].after_refs
+    assert tuple(context.page_writes) == (writes[0],)
+    execution.cancel_step(invocation)
+    execution.retire((identity,))
+    assert_multistate_reclaimed(execution)
+
+
+@pytest.mark.parametrize("version", ("private", "published"))
+def test_tensor_reads_reject_ambiguous_publications(version):
+    execution, _ = multistate(instance=False)
+    identity = RequestIdentity("a", 0, 0)
+    execution.admit((identity,))
+    invocation = execution.start_step(rows_for(identity))
+    context = invocation.context
+    increment_resources(context)
+    assert len(context.page_publications) == 2
+    with pytest.raises(ValueError, match="multiple publications require explicit Region snapshot sources"):
+        _read(context, version)
+    assert tuple(_read(context).after_refs) == tuple(context.pin.refs)
+    execution.cancel_step(invocation)
     execution.retire((identity,))
     assert_multistate_reclaimed(execution)

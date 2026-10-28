@@ -158,8 +158,9 @@ def _read(context: StateTaskContext[D], version: Literal["input", "private", "pu
         raise ValueError("multiple publications require explicit Region snapshot sources")
     refs = context.pin.refs
     access: tuple[PagePin | PageWrite, ...] = (context.pin,) * len(refs)
-    if version == "private" and context.write is not None:
-        write = context.write
+    if version == "private" and context.page_writes:
+        assert len(context.page_writes) == 1
+        (write,) = context.page_writes
         positions = write.before_refs.positions(refs)
         refs = refs.replace_versions(write.before_refs, write.after_refs)
         access = tuple(write if index >= 0 else context.pin for index in positions.tolist())
@@ -440,11 +441,10 @@ class TensorOperation(Generic[D]):
             selected = tuple(range(len(batch.roots))) if self.select is None else self.select(data, context.selection)
             if len(set(selected)) != len(selected) or any(i < 0 or i >= len(batch.roots) for i in selected):
                 raise ValueError("update selection is outside the original state batch")
+            write: PageWrite | None = None
             if self.mode == "transition" and selected:
-                if self.version == "input" or context.write is None:
-                    context.write = context.arena.prepare_transition(
-                        context.pin.refs.take(selected), stream, copy_fields=self.copy_fields
-                    )
+                if self.version == "input" or not context.page_writes:
+                    write = context.prepare_owned_write(context.pin.refs.take(selected), copy_fields=self.copy_fields)
                 batch = _read(context, "private")
             output = self.body(data, batch, context)
             if self.output is not None:
@@ -464,15 +464,16 @@ class TensorOperation(Generic[D]):
                     or len(output.gradients) != len(selected) * self.optimizer.groups
                 ):
                     raise ValueError("gradients require an explicit matching optimizer update")
-                context.write = context.arena.prepare_transition(
-                    context.pin.refs.take(selected), stream, copy_fields=self.copy_fields
-                )
-                roots = context.arena.lazy_roots((context.write,) * len(selected), context.write.after_refs)
+                write = context.prepare_owned_write(context.pin.refs.take(selected), copy_fields=self.copy_fields)
+                roots = context.arena.lazy_roots((write,) * len(selected), write.after_refs)
                 self.optimizer.update(roots, roots.field_slots, output.gradients)
+            if write is None and context.page_writes and (output.field_writes or self.mode == "update" or self.publish):
+                assert len(context.page_writes) == 1
+                (write,) = context.page_writes
             if output.field_writes:
-                if context.write is None:
+                if write is None:
                     raise ValueError("memory writes require the invocation's private transition")
-                roots = context.arena.lazy_roots((context.write,) * len(selected), context.write.after_refs)
+                roots = context.arena.lazy_roots((write,) * len(selected), write.after_refs)
                 for view, values in output.field_writes:
                     pool, slots = roots.field_slots(view.field)
                     target = view.read(pool, pooled=True)
@@ -484,8 +485,8 @@ class TensorOperation(Generic[D]):
                         upload(tuple(range(len(selected))), pool.device),
                         upload(slots, pool.device),
                     )
-            if self.mode == "update" or self.publish:
-                context.publish()
+            if write is not None and (self.mode == "update" or self.publish):
+                context.publish_owned_write(write)
             if output.counters is not None:
                 context.overlay_counters = (
                     output.counters if context.overlay_counters is None else context.overlay_counters + output.counters
