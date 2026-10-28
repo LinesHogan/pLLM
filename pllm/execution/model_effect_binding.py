@@ -88,9 +88,8 @@ class ModelEffectBinding(TensorBindingBase):
         fields = overlay_fields(buffers, effect)
         targets, applied, operator = effect.targets, effect.applied_fields, effect.operator
         dimensions = self.dimensions
-        if dimensions is not None:
-            if len(dimensions.target_shapes) != len(targets):
-                raise ValueError("overlay targets differ from backend specialization")
+        if len(dimensions.target_shapes) != len(targets):
+            raise ValueError("overlay targets differ from backend specialization")
         self.overlay_targets = targets
         self.parameter_phases = phases
         state = self.state(
@@ -188,14 +187,11 @@ class ModelEffectBinding(TensorBindingBase):
 
     def write_result(self, source: Call, state: State, fields: tuple[str, ...], when: When) -> Call:
         """Bind a computed tuple to one atomic private transition."""
-        task = self.tensor_tasks.get(source.symbol)
         writer = FieldWriter(
             source,
-            tuple(self.field_views[state.declaration.resource, key] for key in fields)
-            if self.dimensions is not None
-            else (),
+            tuple(self.field_views[state.declaration.resource, key] for key in fields),
             state.declaration.resource,
-            None if task is None else task.phase,
+            self.tensor_tasks[source.symbol].phase,
         )
         update = self.compute(
             f"{source.symbol}.write",
@@ -254,8 +250,7 @@ class ModelEffectBinding(TensorBindingBase):
             or tuple(sorted(set(layers))) != layers
             or layers[0] < 0
             or min(first_tokens, last_tokens) < 0
-            or self.dimensions is not None
-            and len(views) != len(layers) * width
+            or len(views) != len(layers) * width
         ):
             raise ValueError("activation fields must cover each ordered layer and operator")
         self.overlay(
@@ -296,11 +291,7 @@ class ModelEffectBinding(TensorBindingBase):
         if position_states and (activation or composed):
             raise ValueError("use PositionState on a pure route without learned overlays or activations")
         self.position_states = position_states
-        effect = (
-            None
-            if self.dimensions is None
-            else TokenProgramEffect(self.dimensions.layer_count, tokens, position_states)
-        )
+        effect = TokenProgramEffect(self.dimensions.layer_count, tokens, position_states)
         if composed:
             assert self.attachment is not None
             symbol = next(symbol for role, symbol in self.attachment.tasks if role is AttachmentTaskRole.TRANSITION)

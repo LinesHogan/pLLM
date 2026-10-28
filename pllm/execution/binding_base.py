@@ -91,12 +91,13 @@ class TensorBindingBase(Builder[TensorFrame]):
         self,
         name: str,
         digest: str,
-        dimensions: Dimensions | None = None,
+        dimensions: Dimensions,
         *,
         host: bool = False,
         resources: tuple[TaskResourceFact, ...] = (),
     ) -> None:
         super().__init__(name, digest, dimensions, resources)
+        self.dimensions = dimensions
         self.host = host
         self.feeds: tuple[FeedBinding, ...] = ()
         self.tensor_tasks: dict[TaskSymbol, TensorTask] = {}

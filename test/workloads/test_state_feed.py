@@ -146,7 +146,7 @@ def test_feed_rejects_local_writers_and_request_scopes():
             return (value + previous,)
 
     with pytest.raises(ValueError, match="unfed state"):
-        WritesSource().declaration()
+        WritesSource().declaration(facts_for())
 
 
 def test_write_validates_result_shape_during_specialization():
@@ -205,13 +205,13 @@ def test_write_field_and_feed_field_order_are_signed():
         def transform(self, value: torch.Tensor = SOURCE, previous: torch.Tensor = TARGET) -> tuple[torch.Tensor, ...]:
             return (value + previous,)
 
-    first = Fields().declaration().graph.execution_parameters_digest
+    first = Fields().declaration(facts_for()).graph.execution_parameters_digest
     pllm.write(state="target", fields=("second",))(Fields.transform)
-    assert Fields().declaration().graph.execution_parameters_digest != first
+    assert Fields().declaration(facts_for()).graph.execution_parameters_digest != first
     Fields.source = pllm.InstanceState({"value": (2,), "extra": (2,)}, feed=pllm.state.FeedOrder.ORDERED)
-    first = Fields().declaration().graph.execution_parameters_digest
+    first = Fields().declaration(facts_for()).graph.execution_parameters_digest
     Fields.source = pllm.InstanceState({"extra": (2,), "value": (2,)}, feed=pllm.state.FeedOrder.ORDERED)
-    assert Fields().declaration().graph.execution_parameters_digest != first
+    assert Fields().declaration(facts_for()).graph.execution_parameters_digest != first
 
 
 def test_fed_buffer_fields_use_the_same_declared_ports():

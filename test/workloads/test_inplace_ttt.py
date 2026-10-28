@@ -75,12 +75,12 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     assert visibility.tail == "transition" and visibility.chunk_size == 0
     assert "model[" in explain_visibility(visibility) and "update[" in explain_visibility(visibility)
     pllm.overlay(state="dense_fast_weights", targets=targets, visibility=pllm.Exact())
-    declaration = workload.declaration().graph
+    declaration = workload.declaration(facts).graph
     assert next(task.visibility for task in declaration.tasks if task.visibility is not None) == visibility
-    changed = InPlaceTTTWorkload(replace(config, chunk_size=3)).declaration().graph
+    changed = InPlaceTTTWorkload(replace(config, chunk_size=3)).declaration(facts).graph
     changed_visibility = next(task.visibility for task in changed.tasks if task.visibility is not None)
     assert changed_visibility.equations_digest != visibility.equations_digest
-    helper = _ShiftedUpdate(config).declaration().graph
+    helper = _ShiftedUpdate(config).declaration(facts).graph
     helper_visibility = next(task.visibility for task in helper.tasks if task.visibility is not None)
     assert helper_visibility.equations_digest != visibility.equations_digest
     identities = (RequestIdentity("same", 0, 0), RequestIdentity("same", 0, 1))
@@ -656,7 +656,15 @@ def test_prompt_end_operand_stays_live_during_replay():
     from pllm.workloads.prefill_adapters import TARGETS, PrefillAdapters
 
     workload = PrefillAdapters(chunk_size=3, rank=2, dtype=torch.float32)
-    math = workload.declaration().overlay_math
+    math = workload.declaration(
+        backend_facts(
+            3,
+            (),
+            RuntimeFacts(torch.device("cpu")).timeline(("transition/full_root@1",)),
+            None,
+            targets=tuple(ParameterTargetShape(target, 3, 2) for target in TARGETS),
+        )
+    ).overlay_math
     x, base = torch.ones(1, 3, device="cuda"), torch.zeros(2, 3, device="cuda")
     values = dict(
         a=torch.ones(2, 3, device="cuda"),

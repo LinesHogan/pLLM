@@ -39,7 +39,6 @@ from pllm.contracts.semantic_graph import (
     HiddenInputSource,
     LossReduction,
     MathContract,
-    SamplerFeedbackInputSource,
     SchedulerTimeline,
     SemanticGraph,
     SemanticInputSource,
@@ -144,8 +143,12 @@ class Hidden(_Source):
     site: HiddenSite = HiddenSite.BLOCK_OUTPUT
     phase: HiddenPhase = HiddenPhase.DECODE
 
+    def resolve(self, owner: Workload) -> HiddenInputSource:
+        """Resolve the model dependency without building a tensor binding."""
+        return HiddenInputSource(_setting(self.layer, owner, int), self.site, self.phase)
+
     def port(self, context: _Declaration) -> SemanticInputSource:
-        return context.binding.hidden(_setting(self.layer, context.owner, int), site=self.site, phase=self.phase)
+        return self.resolve(context.owner)
 
 
 @dataclass(frozen=True)
@@ -202,8 +205,6 @@ class _Module(Parameter):
         factory, dimensions = definition.module, context.binding.dimensions
         if factory is None:
             raise TypeError(f"{self.state}: pllm.module needs a state declared with module=")
-        if dimensions is None:
-            return _same  # declared without model dimensions: never invoked
         return partial(ModuleCall, skeleton(factory, dimensions), per_row=definition.scope is StateScope.REQUEST)
 
 
@@ -509,12 +510,7 @@ class Overlay(ParameterEffect):
                 ParameterOverlayFieldBinding(
                     target,
                     self.operator,
-                    tuple(
-                        context.binding.field_views.get(
-                            (self.state, f"{key}_{i}"), state.view(state.fields[0].name, context.binding.dimensions)
-                        )
-                        for key in self.applied_fields
-                    ),
+                    tuple(context.binding.field_views[self.state, f"{key}_{i}"] for key in self.applied_fields),
                     self.state,
                     self.scale,
                 )
@@ -1062,17 +1058,7 @@ class _Operation:
         math = demand.contract(self, arguments)
         update = context.states[effect.state] if effect.training else None
         writes = {key: capture.declare(effect.state, update) for key, capture in (captures or {}).items()}
-        math = self.selectors(
-            arguments,
-            inputs,
-            math,
-            {
-                "forward_rows": self.rows,
-                "input_gradient_rows": demand.input_rows,
-                "parameter_gradient_rows": demand.parameter_rows,
-                "update_states": effect.update,
-            },
-        )
+        math = self.selectors(arguments, inputs, math)
         return context.binding.tensor(
             self.name,
             inputs=inputs,
@@ -1098,16 +1084,26 @@ class _Operation:
             )
         )
 
+    @property
+    def domains(self) -> dict[str, str]:
+        """Selector methods whose inputs contribute to the operation's model requirements."""
+        demand = _typed(self.gradient, _Gradient) or _Gradient((), self.effect.training)
+        return {
+            "forward_rows": self.rows,
+            "input_gradient_rows": demand.input_rows,
+            "parameter_gradient_rows": demand.parameter_rows,
+            "update_states": self.effect.update,
+        }
+
     def selectors(
         self,
         arguments: dict[str, _Source],
         inputs: dict[str, SemanticInputSource | TensorPort],
         math: MathContract,
-        domains: dict[str, str],
     ) -> MathContract:
         """Declare each selector once and connect its row-domain result; selectors read their own inputs."""
         selectors: dict[str, Call] = {}
-        for domain, method in domains.items():
+        for domain, method in self.domains.items():
             if not method:
                 continue
             selector = self.context.method(method)
@@ -1164,7 +1160,7 @@ class _Declaration:
     """Own the binding, reflected owner and ordered definitions during one build."""
 
     owner: Workload
-    binding: TensorBinding
+    binding: TensorBinding = field(init=False)
     values: dict[str, object]
     bindings: tuple[tuple[str, str], ...]
     definitions: list[tuple[str, str]] = field(default_factory=lambda: [])
@@ -1200,11 +1196,11 @@ class _Declaration:
         )
 
     @classmethod
-    def read(cls, workload: Workload, binding: TensorBinding) -> _Declaration:
+    def read(cls, workload: Workload) -> _Declaration:
         """Snapshot and sign reachable mathematics before evaluating state properties."""
         owner = _snapshot(workload)
         values, members = _values(owner), _members(owner)
-        context, candidates = cls(owner, binding, values, ()), _candidates(owner, values, members)
+        context, candidates = cls(owner, values, ()), _candidates(owner, values, members)
         seeds: list[FunctionType] = []
         for name, member in members.items():
             context.read_operation(name, member, candidates, seeds)
@@ -1314,11 +1310,7 @@ class _Declaration:
                 namespace=definition.namespace,
                 initialize=_frozen(definition.initialize),
                 scope=definition.scope,
-                dtype=dtype(self.binding.dimensions)
-                if callable(dtype) and self.binding.dimensions is not None
-                else TensorDType(str(definition.dtype).removeprefix("torch."))
-                if callable(dtype)
-                else dtype,
+                dtype=dtype(self.binding.dimensions) if callable(dtype) else dtype,
                 keys=definition.request_keys,
             )
         else:
@@ -1445,7 +1437,8 @@ class Workload(
 
     def _build(self, b: TensorBinding) -> None:
         """Declare owner values and operations, then compose and sign their graph."""
-        context = _Declaration.read(self, b)
+        context = _Declaration.read(self)
+        context.binding = b
         context.declare_values()
         for operation in sorted(context.operations, key=lambda operation: operation.name):
             operation.effect.declare(operation)
@@ -1453,31 +1446,25 @@ class Workload(
         context.attach_training()
         context.sign_composition()
 
-    def declaration(self, facts: BackendCompileFacts | None = None) -> TensorBinding:
-        dimensions = (
-            None
-            if facts is None
-            else Dimensions(
-                facts.probe.hidden_size,
-                facts.vocab_size,
-                tuple((target.input_size, target.output_size) for target in facts.probe.targets),
-                facts.probe.tensor_dtype,
-                facts.layer_count,
-            )
+    def declaration(self, facts: BackendCompileFacts) -> TensorBinding:
+        """Build the graph and tensor tasks against the backend's model dimensions."""
+        dimensions = Dimensions(
+            facts.probe.hidden_size,
+            facts.vocab_size,
+            tuple((target.input_size, target.output_size) for target in facts.probe.targets),
+            facts.probe.tensor_dtype,
+            facts.layer_count,
         )
         b = TensorBinding(
             self.name,
-            boundary_digest(
-                _values(self).get("config", ()), dimensions, None if facts is None else facts.initialization_seed
-            ),
+            boundary_digest(_values(self).get("config", ()), dimensions, facts.initialization_seed),
             dimensions,
-            resources=() if facts is None else facts.timeline.task_resources,
+            resources=facts.timeline.task_resources,
         )
-        b.probe = None if facts is None else facts.probe
-        b.max_requests = 1 if facts is None else facts.max_admitted_lineages
+        b.probe = facts.probe
+        b.max_requests = facts.max_admitted_lineages
         self._build(b)
-        if facts is not None:
-            b.configure_scans(facts)
+        b.configure_scans(facts)
         b.graph = replace(
             b.graph,
             tasks=tuple(
@@ -1497,29 +1484,36 @@ class Workload(
         return b
 
     def backend_requirements(self) -> BackendRequirements:
-        b = self.declaration()
+        """Read model dependencies from markers before dimensions or tensor readers exist."""
+        context = _Declaration.read(self)
+        sources: dict[str, tuple[_Source, ...]] = {}
+        targets = tuple(
+            target for value in context.values.values() if isinstance(value, Overlay) for target in value.targets
+        )
+        for operation in sorted(context.operations, key=lambda operation: operation.name):
+            effect = operation.effect
+            if isinstance(effect, _Overlay):
+                targets = _targets(_setting(effect.targets, context.owner, tuple))
+                continue
+            if isinstance(effect, _Sampler) and not effect.enabled(context.owner):
+                continue
+            sources[operation.name] = tuple(operation.arguments()[0].values())
+            for method in operation.domains.values():
+                if method:
+                    sources[f"__{operation.name}_{method}"] = tuple(_arguments(context.method(method)).values())
+        inputs = tuple(source for name in sorted(sources) for source in sources[name])
+        sampler = context.sampler
         return BackendRequirements(
-            tuple(
-                dict.fromkeys(
-                    source
-                    for task in b.graph.tasks
-                    for value in task.inputs
-                    if (source := _typed(value.source, HiddenInputSource)) is not None
-                )
-            ),
-            b.overlay_targets,
+            tuple(dict.fromkeys(source.resolve(context.owner) for source in inputs if isinstance(source, Hidden))),
+            targets,
             activation_layers=()
-            if b.attachment is None
-            else tuple(binding.layer for binding in b.attachment.activation_bindings),
-            sampler_stage=b.attachment.sampler_stage
-            if b.attachment is not None and b.attachment.guides_sampler
-            else None,
-            sampler_feedback=any(
-                _typed(port.source, SamplerFeedbackInputSource) is not None
-                for task in b.graph.tasks
-                for port in task.inputs
+            if sampler is not None
+            else tuple(
+                layer for value in context.values.values() if isinstance(value, Activation) for layer in value.layers
             ),
-            position_states=b.position_states,
+            sampler_stage=None if sampler is None else sampler.stage,
+            sampler_feedback=any(isinstance(source, (BaseLogits, SampledTokens)) for source in inputs),
+            position_states=context.position_states(),
         )
 
     def declare(self, facts: BackendCompileFacts) -> tuple[SemanticGraph, TensorLayoutRequest, BackendAttachmentSpec]:
@@ -1533,7 +1527,6 @@ class Workload(
         def initializer(resource: str) -> Callable[[Roots, tuple[RequestStateKey | None, ...]], None]:
             init = b.initializers.get(resource)
             if resource in b.initial_values:
-                assert b.dimensions is not None
                 init = partial(copy_initial, b.initial_values[resource](b.dimensions, seed).to(device))
 
             def initialize(roots: Roots, keys: tuple[RequestStateKey | None, ...]) -> None:

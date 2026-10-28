@@ -302,7 +302,15 @@ def test_initialized_reader_and_hidden_before_model_boundary():
             return (h,)
 
     with pytest.raises(ValueError, match="after model forward"):
-        Cycle().declaration()
+        Cycle().declaration(
+            backend_facts(
+                4,
+                (),
+                RuntimeFacts(torch.device("cpu")).timeline(),
+                None,
+                targets=tuple(ParameterTargetShape(target, 4, 4) for target in TARGETS),
+            )
+        )
 
 
 def test_backend_points_and_compile_rejects_unknown_anchor():

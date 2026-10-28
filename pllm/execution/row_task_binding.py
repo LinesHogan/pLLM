@@ -214,7 +214,7 @@ class RowTaskBinding(TensorBindingBase):
         alignment: int = 16,
         keys: tuple[RequestKeyField, ...] = (RequestKeyField.REQUEST_ID,),
         memory: Mapping[str, Shape] = {},
-    ) -> tuple[State, dict[str, SemanticInputSource | TensorPort]]:
+    ) -> tuple[State, dict[str, TensorPort]]:
         def sizes(model: Dimensions) -> tuple[tuple[int, ...], ...]:
             return tuple(shape(model) if callable(shape) else shape for shape in shapes.values())
 
@@ -241,12 +241,10 @@ class RowTaskBinding(TensorBindingBase):
         *,
         initialize: Callable[[Tensors, torch.Generator], None] | None = None,
         memory: Mapping[str, Shape] = {},
-    ) -> dict[str, SemanticInputSource | TensorPort]:
+    ) -> dict[str, TensorPort]:
         """Bind named views of an allocated state without creating another root."""
         dimensions = self.dimensions
         raw = state.optimizer is None
-        if dimensions is None:
-            return {key: state.read() for key in (*shapes, *memory)}
         sizes = tuple(shape(dimensions) if callable(shape) else shape for shape in shapes.values())
         views: dict[str, FieldView] = {}
         offset = 0
@@ -316,13 +314,10 @@ class RowTaskBinding(TensorBindingBase):
         fields = tuple(field.name for field in state.fields)
         application = PoolSGD(optimizer.lr, len(fields))
         dimensions = self.dimensions
-        prepare_function: Callable[[TensorFrame, TensorBatch], TaskOutput] | None = None
-        if dimensions is not None:
-            limit = next((fact for fact in self.resources if fact.task == name), None)
-            # Resource derivation builds the graph before the batch bound exists; execution always has it.
-            shape = None if limit is None or not limit.input_shapes else limit.input_shapes[0]
-
-            prepare_function = partial(prepare_weighted_batch, dimensions, shape, fields, reset)
+        limit = next((fact for fact in self.resources if fact.task == name), None)
+        # Resource derivation builds the graph before the batch bound exists; execution always has it.
+        shape = None if limit is None or not limit.input_shapes else limit.input_shapes[0]
+        prepare_function = partial(prepare_weighted_batch, dimensions, shape, fields, reset)
         prepared = self.compute(
             f"__{name}_prepare",
             inputs={"state": state.read(), "batch": self.input("training", "batch", WeightedCEBatch.schema)},
@@ -388,9 +383,7 @@ class RowTaskBinding(TensorBindingBase):
         )
         return transition
 
-    def parameter_rows(self, source: SemanticInputSource | TensorPort) -> SemanticInputSource | TensorPort:
-        if self.dimensions is None:
-            return source
+    def parameter_rows(self, source: SemanticInputSource | TensorPort) -> TensorPort:
         port = input_port(source)
         if port.rowwise:
             return port
@@ -501,43 +494,35 @@ class RowTaskBinding(TensorBindingBase):
 
         def decorate(function: TensorMath) -> Call:
             symbol = TaskSymbol(name)
-            # Discovery builds only the graph; executable readers require real model facts.
-            if self.dimensions is not None:
-                ports = {key: input_port(value) for key, value in inputs.items()}
-                if policy.parameter_gradient_rows and any(
-                    not port.rowwise
-                    for port in ports.values()
-                    if isinstance(port.source, StateSelectionInputSource)
-                    and port.source.resource in policy.parameter_gradients
-                ):
-                    raise ValueError(
-                        "parameter gradient rows require Parameter(..., per_row=True) for shared parameters"
-                    )
-                task = TensorTask(
-                    symbol,
-                    function,
-                    ports,
-                    sources,
-                    policy,
-                    outputs,
-                    captures,
-                    phase,
-                    update.declaration.resource
-                    if update is not None
-                    else next(
-                        (
-                            source.resource
-                            for source in sources.values()
-                            if isinstance(source, StateSelectionInputSource)
-                        ),
-                        StateResource(""),
-                    ),
-                    export=export,
-                    sampler_stage=sampler_stage,
-                    sampler_beta=sampler_beta,
-                    training=update,
-                )
-                self.tensor_tasks[symbol] = task
+            ports = {key: input_port(value) for key, value in inputs.items()}
+            if policy.parameter_gradient_rows and any(
+                not port.rowwise
+                for port in ports.values()
+                if isinstance(port.source, StateSelectionInputSource)
+                and port.source.resource in policy.parameter_gradients
+            ):
+                raise ValueError("parameter gradient rows require Parameter(..., per_row=True) for shared parameters")
+            task = TensorTask(
+                symbol,
+                function,
+                ports,
+                sources,
+                policy,
+                outputs,
+                captures,
+                phase,
+                update.declaration.resource
+                if update is not None
+                else next(
+                    (source.resource for source in sources.values() if isinstance(source, StateSelectionInputSource)),
+                    StateResource(""),
+                ),
+                export=export,
+                sampler_stage=sampler_stage,
+                sampler_beta=sampler_beta,
+                training=update,
+            )
+            self.tensor_tasks[symbol] = task
             return self.compute(
                 name,
                 inputs=sources,
@@ -595,10 +580,6 @@ class RowTaskBinding(TensorBindingBase):
         *,
         stage: SamplerStage = SamplerStage.PACKED_PRE_FILTER_ADD,
     ) -> None:
-        if (
-            stage is SamplerStage.PACKED_PRE_FILTER_ADD
-            and self.dimensions is not None
-            and self.dimensions.vocab_size < 1
-        ):
+        if stage is SamplerStage.PACKED_PRE_FILTER_ADD and self.dimensions.vocab_size < 1:
             raise ValueError("logits binding requires the backend vocabulary size")
         self.sampler(prediction, training, state, output=prediction.outputs[0], stage=stage)
