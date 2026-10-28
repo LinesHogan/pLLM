@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import nullcontext
 from dataclasses import dataclass, field
 from threading import Event, RLock
 from typing import TYPE_CHECKING, ClassVar, Generic, Literal, NoReturn, Protocol, TypeVar
@@ -479,17 +478,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                 self._require_borrow_live()
             if not self.directory.states:
                 return ()
-            batch = self.directory.prepare_admission(identities, stream)
-            try:
-                if batch.write is not None:
-                    with nullcontext() if stream is None else torch.cuda.stream(stream):
-                        self.math.initialize(self.arena.writable_roots(batch.write), batch.keys)
-                receipt = self.directory.commit_admission(batch)
-            except Exception:
-                self.directory.abort_admission(batch)
-                raise
-            if receipt is not None:
-                self.arena.settle(receipt)
+            receipt = self.directory.admit(identities, stream, self.math.initialize)
             # One visible ref per unique admitted key, whether created or joined.
             refs = self.directory.latest_refs(identities)
             if receipt is None:

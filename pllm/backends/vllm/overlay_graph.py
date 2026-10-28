@@ -379,7 +379,7 @@ class PinnedParameterOverlay:
             resource = StateResource(reader.binding.resource)
             selection = context.selection.for_resource(resource)
             if selection.keys == (None,):
-                pins = tuple(directory.inference_pin(row.identity, self.stream) for row in self.sources)
+                pins = tuple(directory.inference_pin(row.identity) for row in self.sources)
                 refs = StateRefs.of(
                     tuple(next(ref for ref in pin.refs if context.arena.root(ref).resource == resource) for pin in pins)
                 )

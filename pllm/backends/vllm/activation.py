@@ -166,7 +166,7 @@ class VllmActivationPatch:
         directory: RequestStateDirectory,
     ) -> tuple[PagePin, StateRef]:
         if context.selection.for_resource(self.resource).keys == (None,) and not refresh:
-            pin = directory.inference_pin(identity, context.pin.stream)
+            pin = directory.inference_pin(identity)
             (ref,) = (ref for ref in pin.refs if context.arena.root(ref).resource == self.resource)
             return pin, ref
         if context.selection.for_resource(self.resource).keys == (None,):
