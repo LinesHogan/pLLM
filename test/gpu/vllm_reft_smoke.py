@@ -20,7 +20,7 @@ def main() -> None:
         workload=ActivationWorkload(ActivationConfig((23,), 2, first_tokens=1, last_tokens=1)),
         config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", VllmDType.BFLOAT16, 64, 2, 64, 0.25, seed=7, execution=BUDGET),
     )
-    execution = handle.deployment.execution
+    execution = handle.runner.require_session()._deployment.execution
     baseline = []
     observed = []
     hook = None

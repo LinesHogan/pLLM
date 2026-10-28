@@ -42,7 +42,7 @@ def main() -> None:
             execution=pllm.ExecutionOptions(memory_budget_bytes=1 << 30),
         ),
     )
-    execution = handle.deployment.execution
+    execution = handle.runner.require_session()._deployment.execution
     hidden = None
     base_logits = None
     observed = []

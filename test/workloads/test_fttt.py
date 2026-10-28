@@ -115,6 +115,7 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
         """Scripted generation: prompt 7 answers correctly; with votes, two of three agree."""
 
         generate_feedback = VllmLlm.generate_feedback
+        _prompt_indices = VllmLlm._prompt_indices
 
         def __init__(self, votes=False):
             self.calls = []

@@ -127,7 +127,7 @@ def observe_model(workload):
         layer.mlp.register_forward_hook(capture)
 
         def check(module, inputs, output):
-            execution = llm.deployment.execution
+            execution = session._deployment.execution
             step = session._step
             (ref,) = step.invocation.context.publication.after_refs
             (delta,) = execution.snapshot(ref, torch.cuda.current_stream())
@@ -219,7 +219,7 @@ def observe_replay(*, versions):
     def make(*args, **kwargs):
         llm = original_make(*args, **kwargs)
         session = llm.runner.require_session()
-        holder.update(session=session, primitive=session._replay, execution=llm.deployment.execution)
+        holder.update(session=session, primitive=session._replay, execution=session._deployment.execution)
         return llm
 
     def capture(item):

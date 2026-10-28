@@ -157,7 +157,7 @@ def _check(handle: VllmLlm[object, object], label: str) -> tuple[str, ...]:
     if label.startswith("gated"):
         prompts = ["The sky is blue. " * 100, "Water freezes when it is cold. " * 80]
     outputs = texts(handle.generate(prompts, SAMPLING))
-    diagnostics = handle.deployment.execution.diagnostics()
+    diagnostics = handle.diagnostics()
     if (
         not all(outputs)
         or diagnostics.update_count < 1
@@ -183,7 +183,7 @@ def _check_cancelled_projection(handle):
     from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
     from pllm.contracts.request_identity import RequestIdentity
 
-    execution = handle.deployment.execution
+    execution = handle.runner.require_session()._deployment.execution
     from pllm.backends.vllm.overlay_graph import HybridParameterOverlay
 
     overlay = handle.runner.require_session()._overlay
@@ -234,9 +234,9 @@ def _check_graph(handle):
     overlay = handle.runner.require_session()._overlay
     assert isinstance(overlay, PinnedParameterOverlay)
     reader = overlay.readers[0]
+    arena = handle.runner.require_session()._deployment.execution.arena
     assert all(
-        pool.untyped_storage()
-        == handle.deployment.execution.arena.field_pool(reader.binding.resource, view.field).untyped_storage()
+        pool.untyped_storage() == arena.field_pool(reader.binding.resource, view.field).untyped_storage()
         for pool, view in zip(reader.pools, reader.binding.fields, strict=True)
     )
     pointers = (reader.table.data_ptr(), reader.captured.data_ptr(), reader.pools[0].data_ptr())
@@ -320,7 +320,7 @@ def _check_imported(handle: VllmLlm[object, object]) -> tuple[str, ...]:
     update = pllm.state.StateTensorUpdate(zeros, (_key(4), _key(5)))
     if texts(handle.generate(PROMPTS, SAMPLING, prompt_indices=(4, 5), auxiliary=update)) != baseline:
         raise RuntimeError("imported zero factors must reproduce the base model exactly")
-    diagnostics = handle.deployment.execution.diagnostics()
+    diagnostics = handle.diagnostics()
     if (
         diagnostics.update_count != 3
         or diagnostics.active_lineages != 0
@@ -342,7 +342,7 @@ def _check_routed(handle: VllmLlm[object, object]) -> tuple[str, ...]:
         raise RuntimeError("route-keyed state accepted generation without routes")
     routes = tuple("math" if re.search(r"\d|plus|sum", prompt) else "code" for prompt in prompts)
     outputs = texts(handle.generate(prompts, SAMPLING, routes=routes))
-    diagnostics = handle.deployment.execution.diagnostics()
+    diagnostics = handle.diagnostics()
     # Three retired requests, two route lineages still resident: the two math
     # prompts shared one adapter, and the dormant pool outlives its requests.
     if (

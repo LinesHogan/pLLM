@@ -221,7 +221,7 @@ def main():
                 tokens.append([list(output.outputs[0].token_ids) for output in outputs])
         assert all(value == tokens[0] for value in tokens)
         assert 2 in checked and len(numerical) == 2 * sum(checked)
-        diagnostics = handle.deployment.execution.diagnostics()
+        diagnostics = handle.diagnostics()
         assert diagnostics.active_lineages == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
         print(f"recirculation waves={len(checked)} independent layer comparisons={len(numerical)}")
     finally:

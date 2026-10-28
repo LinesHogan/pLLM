@@ -247,7 +247,7 @@ def run(chunk):
                     word in event.name.lower()
                     for word in ("dtoh", "device to host", "synchronize", "local_scalar_dense")
                 ), event.name
-        diagnostics = handle.deployment.execution.diagnostics()
+        diagnostics = handle.diagnostics()
         assert diagnostics.trained_rows == diagnostics.update_count * chunk and diagnostics.update_count == len(
             targets
         ) * sum(

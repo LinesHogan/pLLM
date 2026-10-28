@@ -20,7 +20,7 @@ from test.gpu.vllm_inplace_ttt_smoke import open_llm
 def test_internal_projection_consumes_pinned_request_factors(workload, monkeypatch):
     with open_llm(workload, memory_budget_bytes=1 << 30) as handle:
         session = handle.runner.require_session()
-        execution = handle.deployment.execution
+        execution = session._deployment.execution
         overlay = session._overlay
         captures = []
         capture_begin = torch.cuda.CUDAGraph.capture_begin

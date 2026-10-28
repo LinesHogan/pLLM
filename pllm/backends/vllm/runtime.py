@@ -22,7 +22,6 @@ from vllm.entrypoints.llm import LLM
 
 from pllm.authoring import (
     AuxiliaryInput,
-    BackendDeployment,
     BackendRequirements,
     BackendWorkload,
     DataT,
@@ -189,7 +188,6 @@ class VllmLlm(Generic[DataT, ResultT]):
 
     _llm: LLM | None
     _runner: WorkloadModelRunner | Mrv1Runner | None
-    _deployment: BackendDeployment[DataT, ResultT] | None
     attachment: SignedBackendAttachment
     _facts: BackendCompileFacts
     _cache_policy: CachePolicy
@@ -239,19 +237,12 @@ class VllmLlm(Generic[DataT, ResultT]):
         self._require_open()
         return self.worker_state().diagnostics
 
-    def _require_in_process(self) -> tuple[WorkloadModelRunner | Mrv1Runner, BackendDeployment[DataT, ResultT]]:
-        self._require_open()
-        if self._runner is None or self._deployment is None:
-            raise RuntimeError("use multiprocessing=False to access the runner or deployment")
-        return self._runner, self._deployment
-
     @property
     def runner(self) -> WorkloadModelRunner | Mrv1Runner:
-        return self._require_in_process()[0]
-
-    @property
-    def deployment(self) -> BackendDeployment[DataT, ResultT]:
-        return self._require_in_process()[1]
+        self._require_open()
+        if self._runner is None:
+            raise RuntimeError("use multiprocessing=False to access the runner")
+        return self._runner
 
     def command(self, command: BackendCommand, payload: str = "", *, timeout: float = 30.0) -> str:
         replies = self._require_open().collective_rpc(
@@ -263,28 +254,14 @@ class VllmLlm(Generic[DataT, ResultT]):
         return decode_boundary(self.command(BackendCommand.DIAGNOSTICS), BackendWorkerState)
 
     def trace_snapshot(self) -> TraceSnapshot:
-        self._require_open()
-        snapshot = (
-            self._runner.require_session().trace.snapshot()
-            if self._runner is not None
-            else decode_boundary(self.command(BackendCommand.TRACE), TraceSnapshot)
-        )
-        return snapshot
+        return decode_boundary(self.command(BackendCommand.TRACE), TraceSnapshot)
 
     def profile_tasks(self, tasks: tuple[TaskId, ...]) -> None:
-        self._require_open()
-        if self._runner is not None:
-            self._runner.require_session().trace.profile_tasks(tasks)
-        else:
-            self.command(BackendCommand.PROFILE, encode_boundary(tasks))
+        self.command(BackendCommand.PROFILE, encode_boundary(tasks))
 
     def observe(self, selection: TraceSelection) -> None:
         """Configure bounded explicit tensor/gradient snapshots and opt-in Kineto profiling."""
-        self._require_open()
-        if self._runner is not None:
-            self._runner.require_session().trace.configure(selection)
-        else:
-            self.command(BackendCommand.OBSERVE, encode_boundary(selection))
+        self.command(BackendCommand.OBSERVE, encode_boundary(selection))
 
     def close(self) -> None:
         if self._llm is None and self._pending_input is None:
@@ -300,7 +277,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         self._closed = True
         if self._llm is not None:
             self._llm.llm_engine.engine_core.shutdown()
-        self._llm = self._runner = self._deployment = None
+        self._llm = self._runner = None
         if self._pending_input is not None:
             self._pending_input.close()
             self._pending_input = None
@@ -331,14 +308,9 @@ class VllmLlm(Generic[DataT, ResultT]):
         if max_rounds < 1 or not prompts:
             raise ValueError("feedback generation requires a nonempty prompt list and positive finite round bound")
         texts: list[str] = list(prompts)
-        indices: tuple[int, ...] = (
-            tuple(range(self._next_prompt_index, self._next_prompt_index + len(texts)))
-            if prompt_indices is None
-            else prompt_indices
-        )
+        indices: tuple[int, ...] = self._prompt_indices(texts, prompt_indices)
         route_values: list[str] | None = list(routes) if routes is not None else None
         auxiliary: AuxiliaryInput[torch.Tensor] | None = None
-        to_worker: Callable[[torch.Tensor], torch.Tensor] = lambda tensor: tensor.to(self.runner.device)
         for attempt in range(max_rounds):
             batch: CompletionInput = self.generate(
                 texts,
@@ -359,13 +331,13 @@ class VllmLlm(Generic[DataT, ResultT]):
                 members = set(barrier.request_ids)
                 if barrier.state is BarrierState.READY and barrier.ready_count > 0 and result.update_count > 0:
                     ready.update(members)
-            retry = {
+            retry: set[str] = {
                 control.completion.identity.request_id
                 for control in controls
                 if control.action is RetryAction.RETRY
                 and (not control.retry_after_update or control.completion.identity.request_id in ready)
             }
-            stopped = {
+            stopped: set[str] = {
                 control.completion.identity.request_id for control in controls if control.action is RetryAction.STOP
             }
             for barrier in result.update_barriers:
@@ -379,9 +351,6 @@ class VllmLlm(Generic[DataT, ResultT]):
                 index for index, entry in enumerate(entries) if entry.identity.request_id in retry
             )
             auxiliary = edit(result) if edit is not None and selected and attempt + 1 < max_rounds else None
-            if auxiliary is not None and self._runner is not None:
-                validate_auxiliary(auxiliary, self.attachment.inputs.plan, SharedTensor.describe)
-                auxiliary = map_auxiliary(auxiliary, to_worker)
             yield batch, result
             if not selected:
                 return
@@ -436,26 +405,12 @@ class VllmLlm(Generic[DataT, ResultT]):
         self._require_open()
         if completion_device is not None and feedback_group is None:
             raise ValueError("completion device requires completion feedback")
-        output_device = completion_device or (torch.device("cpu") if self._runner is None else self.runner.device)
-        if output_device.type == "cuda":
-            if output_device == torch.device("cuda"):
-                output_device = torch.device("cuda", self.attachment.inputs.probe.device_ordinal)
-            if output_device.index != self.attachment.inputs.probe.device_ordinal:
-                raise ValueError("completion IPC currently requires the model's CUDA device")
-        elif output_device.type != "cpu":
-            raise ValueError("completion output requires CPU or CUDA storage")
         texts = [prompts] if isinstance(prompts, str) else prompts
         if not texts or any(not prompt for prompt in texts) or sampling_params.n != 1:
             raise ValueError("provide non-empty prompts and set sampling n=1")
         if sample_index < 0 or feedback_group is not None and not feedback_group:
             raise ValueError("use a nonnegative sample index and a non-empty feedback group")
-        indices = (
-            tuple(range(self._next_prompt_index, self._next_prompt_index + len(texts)))
-            if prompt_indices is None
-            else prompt_indices
-        )
-        if len(indices) != len(texts) or any(index < 0 for index in indices):
-            raise ValueError("prompt indices must align with the original input prompts")
+        indices = self._prompt_indices(texts, prompt_indices)
         # A route value is user-computed (regex, discriminator, tenant); the signed
         # graph only declares whether any request state keys on it.
         signed_route = any(
@@ -465,10 +420,6 @@ class VllmLlm(Generic[DataT, ResultT]):
             raise ValueError("routes require a signed route-keyed state and one value per prompt")
         if signed_route and routes is None:
             raise ValueError("a route-keyed request state requires per-prompt routes")
-        groups: dict[int, str] = {}
-        for index, prompt in zip(indices, texts, strict=True):
-            if groups.setdefault(index, prompt) != prompt:
-                raise ValueError("one prompt identity cannot name different input texts")
         validate_auxiliary(auxiliary, self.attachment.inputs.plan, SharedTensor.describe)
         llm = self._require_open()
         llm.sleep(level=0, mode="keep")
@@ -476,72 +427,17 @@ class VllmLlm(Generic[DataT, ResultT]):
         lifetime = ExitStack()
         try:
             request_ids = llm.enqueue(prompts, self._cache_policy.sampling(sampling_params), use_tqdm=use_tqdm)
-            identities = tuple(
-                RequestIdentity(request_id, index, sample_index, route)
-                for request_id, index, route in zip(
-                    request_ids, indices, routes if routes is not None else ("",) * len(texts), strict=True
-                )
-            )
+            identities = self._request_identities(request_ids, indices, sample_index, routes)
             # Borrow vLLM's exact frontend mapping before completed entries are removed.
             external = {
                 llm.llm_engine.output_processor.request_states[identity.request_id].external_req_id: identity
                 for identity in identities
             }
-            destination = None
-            completion_wire = None
-            if feedback_group is not None:
-                field = TensorFieldSpec(
-                    LayoutFieldId(0),
-                    (len(identities), self.attachment.inputs.probe.hidden_size),
-                    TensorDType.FLOAT32,
-                    4,
-                )
-                with torch.inference_mode(False):
-                    if self._runner is None:
-                        destination, completion_wire = SharedTensor.allocate(field, lifetime, output_device)
-                    else:
-                        destination = torch.empty(field.shape, device=output_device, dtype=torch.float32)
-            if self._runner is None:
-                auxiliary_wire = map_auxiliary(auxiliary, lambda tensor: SharedTensor.export(tensor, lifetime))
-                self.command(
-                    BackendCommand.STAGE, encode_boundary(BackendStage(identities, auxiliary_wire, completion_wire))
-                )
-            else:
-                self.runner.require_session().stage_input(auxiliary, identities, destination)
+            destination = self._stage(identities, auxiliary, feedback_group, completion_device, lifetime)
             self._next_prompt_index = max(self._next_prompt_index, max(indices) + 1)
             llm.wake_up(tags=["scheduling"])
             outputs = llm.wait_for_completion(RequestOutput, use_tqdm=use_tqdm)
-            result: list[RequestOutput] | CompletionInput = outputs
-            batch = None
-            if feedback_group is not None:
-                completions: dict[RequestIdentity, Completion] = {}
-                for output in outputs:
-                    identity = external[output.request_id]
-                    (completion,) = output.outputs
-                    completions[identity] = Completion(
-                        identity,
-                        completion.index,
-                        feedback_group,
-                        tuple(completion.token_ids),
-                        completion.text,
-                        FinishReason(completion.finish_reason),
-                    )
-                batch = CompletionBatch(tuple(completions[identity] for identity in identities))
-                if self._runner is not None:
-                    capture = self.runner.require_session().completion_capture
-                    assert capture is not None
-                    result = capture.finish(batch)
-            self.command(BackendCommand.FINISH)
-            if batch is not None and self._runner is None:
-                assert destination is not None
-                result = CompletionInput(
-                    batch,
-                    destination,
-                    CudaStreamReadiness(torch.cuda.current_stream(destination.device))
-                    if destination.device.type == "cuda"
-                    else None,
-                )
-            return result
+            return self._collect(outputs, identities, external, feedback_group, destination)
         except Exception as original:
             try:
                 llm.llm_engine.abort_request(request_ids, internal=True)
@@ -560,6 +456,98 @@ class VllmLlm(Generic[DataT, ResultT]):
                 self._pending_input = lifetime
             else:
                 lifetime.close()
+
+    def _prompt_indices(self, texts: list[str], prompt_indices: tuple[int, ...] | None) -> tuple[int, ...]:
+        indices = (
+            tuple(range(self._next_prompt_index, self._next_prompt_index + len(texts)))
+            if prompt_indices is None
+            else prompt_indices
+        )
+        if len(indices) != len(texts) or any(index < 0 for index in indices):
+            raise ValueError("prompt indices must align with the original input prompts")
+        groups: dict[int, str] = {}
+        for index, prompt in zip(indices, texts, strict=True):
+            if groups.setdefault(index, prompt) != prompt:
+                raise ValueError("one prompt identity cannot name different input texts")
+        return indices
+
+    def _request_identities(
+        self, request_ids: list[str], indices: tuple[int, ...], sample_index: int, routes: tuple[str, ...] | None
+    ) -> tuple[RequestIdentity, ...]:
+        return tuple(
+            RequestIdentity(request_id, index, sample_index, route)
+            for request_id, index, route in zip(
+                request_ids, indices, routes if routes is not None else ("",) * len(indices), strict=True
+            )
+        )
+
+    def _stage(
+        self,
+        identities: tuple[RequestIdentity, ...],
+        auxiliary: AuxiliaryInput[torch.Tensor] | None,
+        feedback_group: str | None,
+        completion_device: torch.device | None,
+        lifetime: ExitStack,
+    ) -> torch.Tensor | None:
+        output_device = completion_device or (torch.device("cpu") if self._runner is None else self.device)
+        if output_device.type == "cuda":
+            if output_device == torch.device("cuda"):
+                output_device = torch.device("cuda", self.attachment.inputs.probe.device_ordinal)
+            if output_device.index != self.attachment.inputs.probe.device_ordinal:
+                raise ValueError("completion IPC currently requires the model's CUDA device")
+        elif output_device.type != "cpu":
+            raise ValueError("completion output requires CPU or CUDA storage")
+        destination = None
+        completion_wire = None
+        if feedback_group is not None:
+            field = TensorFieldSpec(LayoutFieldId(0), (len(identities), self.hidden_size), TensorDType.FLOAT32, 4)
+            with torch.inference_mode(False):
+                if self._runner is None:
+                    destination, completion_wire = SharedTensor.allocate(field, lifetime, output_device)
+                else:
+                    destination = torch.empty(field.shape, device=output_device, dtype=torch.float32)
+        if self._runner is None:
+            auxiliary_wire = map_auxiliary(auxiliary, lambda tensor: SharedTensor.export(tensor, lifetime))
+            self.command(
+                BackendCommand.STAGE, encode_boundary(BackendStage(identities, auxiliary_wire, completion_wire))
+            )
+        else:
+            auxiliary = map_auxiliary(auxiliary, lambda tensor: tensor.to(self.device))
+            self.runner.require_session().stage_input(auxiliary, identities, destination)
+        return destination
+
+    def _collect(
+        self,
+        outputs: list[RequestOutput],
+        identities: tuple[RequestIdentity, ...],
+        external: dict[str, RequestIdentity],
+        feedback_group: str | None,
+        destination: torch.Tensor | None,
+    ) -> list[RequestOutput] | CompletionInput:
+        # FINISH validates and synchronizes the staged rows before releasing requests.
+        self.command(BackendCommand.FINISH)
+        if feedback_group is None:
+            return outputs
+        completions: dict[RequestIdentity, Completion] = {}
+        for output in outputs:
+            identity = external[output.request_id]
+            (completion,) = output.outputs
+            completions[identity] = Completion(
+                identity,
+                completion.index,
+                feedback_group,
+                tuple(completion.token_ids),
+                completion.text,
+                FinishReason(completion.finish_reason),
+            )
+        assert destination is not None
+        return CompletionInput(
+            CompletionBatch(tuple(completions[identity] for identity in identities)),
+            destination,
+            CudaStreamReadiness(torch.cuda.current_stream(destination.device))
+            if destination.device.type == "cuda"
+            else None,
+        )
 
 
 def create_vllm_llm(
@@ -633,7 +621,7 @@ def create_vllm_llm(
             facts = workload.specialize(decode_boundary(replies[0], BackendCompileFacts), config.execution)
             attachment = workload.plan_backend(facts)
             policy = CachePolicy.for_attachment(attachment, config.generated_kv)
-            handle = VllmLlm[DataT, ResultT](llm, None, None, attachment, facts, policy)
+            handle = VllmLlm[DataT, ResultT](llm, None, attachment, facts, policy)
             handle.command(
                 BackendCommand.INSTALL, encode_boundary(BackendInstall(attachment, definition or "", policy))
             )
@@ -646,7 +634,7 @@ def create_vllm_llm(
             deployment = workload.compile_backend(facts)
             policy = CachePolicy.for_attachment(deployment.attachment, config.generated_kv)
             runner.attach_workload(deployment, policy)
-            handle = VllmLlm(llm, runner, deployment, deployment.attachment, facts, policy)
+            handle = VllmLlm[DataT, ResultT](llm, runner, deployment.attachment, facts, policy)
         construction.pop_all()
         return handle
 

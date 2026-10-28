@@ -346,8 +346,8 @@ def isolated_multiturn():
                     encode_boundary(BackendInstall(handle.attachment, encode_workload(workload), handle._cache_policy)),
                 )
             else:
-                handle._deployment = workload.bind_backend(handle._facts, handle.attachment)
-                handle.runner.attach_workload(handle.deployment, handle._cache_policy)
+                deployment = workload.bind_backend(handle._facts, handle.attachment)
+                handle.runner.attach_workload(deployment, handle._cache_policy)
             assert handle._cache_policy.namespace != namespace
             (changed,) = generate_ids(handle, [receiver])
             assert changed.num_cached_tokens == 0

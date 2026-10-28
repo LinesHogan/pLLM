@@ -127,9 +127,9 @@ def main() -> int:
             raise RuntimeError("public make_llm did not select canonical runtime")
     try:
         outputs = handle.generate(["The sky is"], SamplingParams(max_tokens=3, temperature=0.0, n=1, ignore_eos=True))
-        execution = handle.deployment.execution
-        assert sum("cuda_graph" in task.implementation_id for task in execution.plan.tasks) == 3
-        diagnostics = execution.diagnostics()
+        plan = handle.attachment.inputs.plan.schedule_physical
+        assert sum("cuda_graph" in task.implementation_id for task in plan.tasks) == 3
+        diagnostics = handle.diagnostics()
         if (
             not outputs[0].outputs[0].text
             or diagnostics.loss_count != 2
@@ -137,7 +137,7 @@ def main() -> int:
             or diagnostics.completed_sampler_pins != 2
             or diagnostics.active_lineages != 0
             or diagnostics.pending_state_releases != 0
-            or execution.plan.fallback_count != 0
+            or diagnostics.fallback_count != 0
         ):
             raise RuntimeError("canonical ESamp lifecycle evidence is incomplete")
         print(f"captured ESamp: text={outputs[0].outputs[0].text!r} loss/update={diagnostics.loss_count}")
