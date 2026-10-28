@@ -46,17 +46,16 @@ class Mrv1Runner(Runner, GPUModelRunner):
         if session is not None:
             if result[1] is not None:
                 raise RuntimeError("MRv1 workload rejects speculative row expansion")
-            with torch.inference_mode(False):
-                session.prepare_input(
-                    encode_mrv1_rows(
-                        self.input_batch,
-                        scheduler_output,
-                        result[0],
-                        tuple(session.identity(request_id) for request_id in self.input_batch.req_ids),
-                        plan_epoch=session.attachment.physical.plan_epoch,
-                        step_id=session.next_step_id,
-                    )
+            session.prepare_input(
+                encode_mrv1_rows(
+                    self.input_batch,
+                    scheduler_output,
+                    result[0],
+                    tuple(session.identity(request_id) for request_id in self.input_batch.req_ids),
+                    plan_epoch=session.attachment.physical.plan_epoch,
+                    step_id=session.next_step_id,
                 )
+            )
         return result
 
     def execute_model(
@@ -66,12 +65,8 @@ class Mrv1Runner(Runner, GPUModelRunner):
         if session is None:
             return super().execute_model(scheduler_output, intermediate_tensors)
         try:
-            with torch.inference_mode(False):
-                session.before_execute(scheduler_output)
-            result = super().execute_model(scheduler_output, intermediate_tensors)
-            with torch.inference_mode(False), torch.enable_grad():
-                session.complete_forward()
-            return result
+            session.before_execute(scheduler_output)
+            return super().execute_model(scheduler_output, intermediate_tensors)
         except Exception:
             session.abort_active()
             raise
@@ -80,11 +75,12 @@ class Mrv1Runner(Runner, GPUModelRunner):
         session = self._workload_session
         if session is None:
             return super()._sample(logits, spec_decode_metadata)
-        with torch.inference_mode(False), torch.enable_grad():
-            session.begin_sampler()
-        sampled = super()._sample(logits, spec_decode_metadata)
-        with torch.inference_mode(False), torch.enable_grad():
+        try:
+            sampled = super()._sample(logits, spec_decode_metadata)
             session.complete_sampler()
+        except Exception:
+            session.abort_active()
+            raise
         return sampled
 
     def sample_tokens(
@@ -95,13 +91,12 @@ class Mrv1Runner(Runner, GPUModelRunner):
             return super().sample_tokens(grammar_output)
         try:
             output = super().sample_tokens(grammar_output)
-            with torch.inference_mode(False), torch.enable_grad():
-                if state is not None and self.completion_capture is not None:
-                    self.completion_capture.write(
-                        tuple(session.identity(request_id) for request_id in self.input_batch.req_ids),
-                        state.sample_hidden_states,
-                    )
-                session.commit_token()
+            if state is not None and self.completion_capture is not None:
+                self.completion_capture.write(
+                    tuple(session.identity(request_id) for request_id in self.input_batch.req_ids),
+                    state.sample_hidden_states,
+                )
+            session.commit_token()
             return output
         except Exception:
             session.abort_active()

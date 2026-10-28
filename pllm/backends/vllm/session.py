@@ -244,6 +244,7 @@ class VllmSession(Generic[DataT, ResultT]):
     def updated_apply_count(self) -> int:
         return 0 if self._overlay is None else self._overlay.updated_apply_count
 
+    @torch.inference_mode(False)
     def before_execute(self, scheduler_output: SchedulerOutput) -> None:
         self._require_input_live()
         execution = self._deployment.execution
@@ -272,6 +273,8 @@ class VllmSession(Generic[DataT, ResultT]):
     def next_step_id(self) -> int:
         return self._next_step_id
 
+    @torch.inference_mode(False)
+    @torch.enable_grad()
     def prepare_input(self, rows: PackedSamplerRowBatch) -> None:
         self._require_input_live()
         if self._unbroken_history:
@@ -352,6 +355,8 @@ class VllmSession(Generic[DataT, ResultT]):
             self._replay.prepare(rows.row_batch, invocation)
             invocation.context.replay = self._replay
 
+    @torch.inference_mode(False)
+    @torch.enable_grad()
     def complete_forward(self) -> None:
         step = self._step
         if step is None or step.forward_done:
@@ -396,40 +401,39 @@ class VllmSession(Generic[DataT, ResultT]):
             if effect is not None:
                 effect.close()
 
+    @torch.inference_mode()
     def compute_logits(self, model: Qwen2ForCausalLM, hidden: torch.Tensor) -> torch.Tensor | None:
         """vLLM's LM head. Post-filter guidance projects its predicted hidden rows in the same call.
 
         Decode-time LM heads are bound by reading the [vocab, hidden] weight, so projecting the
         prediction alongside the model's rows costs about as much as the model's rows alone. A request
-        for logits means the transformer forward is over; MRv1 asks before it reports completion.
+        for logits means the transformer forward is over on both runner ABIs.
         """
-        with torch.inference_mode(False), torch.enable_grad():
-            self.complete_forward()
         lm_head = Qwen2ForCausalLM.compute_logits
-        if (
-            self._step is None
-            or self._sampler is None
-            or self._deployment.attachment.inputs.request.sampler_stage is not SamplerStage.PACKED_POST_FILTER_EXACT
-        ):
+        # Prompt logprobs call the LM head again after sampling; guidance starts only once.
+        if self._step is not None and self._step.forward_done:
+            return lm_head(model, hidden)
+        self.complete_forward()
+        if self._step is None or self._sampler is None:
             return lm_head(model, hidden)
         guidance = self._sampler_guidance()
-        logits = lm_head(model, torch.cat((hidden, guidance.values.to(hidden.dtype))))
-        assert logits is not None
-        self._sampler.begin_guidance(SignedSamplerGuidance(guidance, logits[len(hidden) :], self._capture_feedback))
-        return logits[: len(hidden)]
-
-    def begin_sampler(self) -> None:
-        if self._step is None or self._sampler is None:
-            return
-        # Post-filter guidance began with the LM head; additive logits need no projection.
-        if self._deployment.attachment.inputs.request.sampler_stage is SamplerStage.PACKED_PRE_FILTER_ADD:
-            guidance = self._sampler_guidance()
-            self._sampler.begin_guidance(SignedSamplerGuidance(guidance, guidance.values, self._capture_feedback))
+        if guidance.stage is SamplerStage.PACKED_POST_FILTER_EXACT:
+            logits = lm_head(model, torch.cat((hidden, guidance.values.to(hidden.dtype))))
+            assert logits is not None
+            predicted = logits[len(hidden) :]
+            logits = logits[: len(hidden)]
+        else:
+            logits = lm_head(model, hidden)
+            predicted = guidance.values
+        self._sampler.begin_guidance(SignedSamplerGuidance(guidance, predicted, self._capture_feedback))
+        return logits
 
     def _sampler_guidance(self) -> PackedSamplerGuidanceBatch:
         execution = self._deployment.execution
         return execution.sampler_guidance(self._invocation(), torch.cuda.current_stream(execution.device))
 
+    @torch.inference_mode(False)
+    @torch.enable_grad()
     def complete_sampler(self) -> None:
         if self._step is None:
             return
@@ -441,6 +445,8 @@ class VllmSession(Generic[DataT, ResultT]):
         execution.execute_anchor(invocation, self._deployment.attachment.inputs.request.sampler_anchor_id)
         execution.complete_sampler(invocation, torch.cuda.current_stream(execution.device), feedback=feedback)
 
+    @torch.inference_mode(False)
+    @torch.enable_grad()
     def commit_token(self) -> None:
         if self._step is None:
             return
@@ -451,6 +457,7 @@ class VllmSession(Generic[DataT, ResultT]):
         self._step = None
         execution.arena.collect_completed()
 
+    @torch.inference_mode(False)
     def abort_active(self) -> None:
         if self._sampler is not None:
             self._sampler.abort_guidance()
@@ -476,6 +483,7 @@ class VllmSession(Generic[DataT, ResultT]):
             self._identities.pop(identity.request_id)
             self._token_frontiers.pop(identity, None)
 
+    @torch.inference_mode(False)
     def retire_all(self, *, wait: bool = False) -> None:
         if self._post_sample is not None:
             self._post_sample.clear()
@@ -488,6 +496,7 @@ class VllmSession(Generic[DataT, ResultT]):
         if self._step is not None or self._identities or self._pending_identities:
             raise RuntimeError("finish or abort active requests before replacing the workload")
 
+    @torch.inference_mode(False)
     def close(self) -> None:
         try:
             self.abort_active()

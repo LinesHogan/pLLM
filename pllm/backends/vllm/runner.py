@@ -174,8 +174,7 @@ class Runner:
         if self.completion_capture is not None:
             self.completion_capture.require_complete()
             self.completion_capture.synchronize()
-        with torch.inference_mode(False):
-            session.retire_all()
+        session.retire_all()
         self.completion_capture = None
 
     def worker_state(self) -> BackendWorkerState:
@@ -188,9 +187,8 @@ class Runner:
 
     def abort_workload_requests(self) -> None:
         session = self.require_session()
-        with torch.inference_mode(False):
-            session.abort_active()
-            session.retire_all()
+        session.abort_active()
+        session.retire_all()
         if self.completion_capture is not None:
             self.completion_capture.synchronize()
         self.completion_capture = None
@@ -294,22 +292,18 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
                 is_profile,
             )
         assert not dummy_run and not is_profile
-        with torch.inference_mode(False):
-            session.before_execute(scheduler_output)
         try:
-            result = super().execute_model(
+            session.before_execute(scheduler_output)
+            return super().execute_model(
                 scheduler_output,
                 intermediate_tensors,
                 dummy_run,
                 skip_attn_for_dummy_run,
                 is_profile,
             )
-            with torch.inference_mode(False), torch.enable_grad():
-                session.complete_forward()
         except Exception:
             session.abort_active()
             raise
-        return result
 
     def sample(
         self,
@@ -321,7 +315,6 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
         if session is None:
             return super().sample(hidden_states, input_batch, grammar_output)
         try:
-            session.begin_sampler()
             sampled = super().sample(hidden_states, input_batch, grammar_output)
             session.complete_sampler()
             if self.completion_capture is not None:
@@ -343,8 +336,7 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
             return super().sample_tokens(grammar_output)
         try:
             output = super().sample_tokens(grammar_output)
-            with torch.inference_mode(False), torch.enable_grad():
-                session.commit_token()
+            session.commit_token()
         except Exception:
             session.abort_active()
             raise
