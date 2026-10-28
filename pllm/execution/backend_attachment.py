@@ -126,7 +126,7 @@ def derive_attachment_resources(
             or group.readers != (task.symbol,)
             or group.held_version != "input"
         ):
-            raise ValueError("conditional tokenwise costs require the exact signed pinned READ")
+            raise ValueError("conditional tokenwise costs require a pinned READ of the activation publication")
         # Both branches use this same model source. Retain all producer facts:
         # the complete DAG funds the worst case, including the fresh encoding.
     if (

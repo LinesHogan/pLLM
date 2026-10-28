@@ -1,4 +1,4 @@
-//! Semantic, plan, and backend-fact checks for attachment planning.
+//! Check workload inputs against backend facts and attachment execution limits.
 
 use super::super::scheduler::ScheduleDecision;
 use super::super::semantic_graph::{
@@ -7,161 +7,26 @@ use super::super::semantic_graph::{
 };
 use super::super::state_representation::{StateDeviceKind, StateRepresentationDecision};
 use super::types::{
-    ActivationPatchOperator, AttachmentGraphMode, AttachmentHiddenResource, AttachmentKind,
-    AttachmentTaskBinding, AttachmentTaskRole, BackendAttachment, BackendPlacementProbe,
-    DecodeRefresh, DecodeWindow, HiddenLayerKind, HiddenPhase, HiddenSite, MissingPolicy,
-    OverlayOperator, SamplerStage,
+    ActivationPatchOperator, AttachmentGraphMode, AttachmentKind, AttachmentTaskBinding,
+    AttachmentTaskRole, BackendAttachment, BackendPlacementProbe, HiddenLayerKind, HiddenPhase,
+    HiddenSite, MissingPolicy, OverlayOperator, SamplerStage,
 };
-
-pub(crate) fn require_text(value: &str, label: &str) -> Result<(), String> {
-    if value.is_empty() {
-        return Err(format!("{label} must be a non-empty string"));
-    }
-    Ok(())
-}
 
 fn validate_declaration(
     attachment: &BackendAttachment,
     probe: &BackendPlacementProbe,
 ) -> Result<(), String> {
-    let composed_replay = attachment.spec.kind == AttachmentKind::ModelReplay
-        && !attachment.spec.activation_bindings.is_empty();
-    if composed_replay
-        || !matches!(
-            attachment.spec.kind,
-            AttachmentKind::ModelReplay | AttachmentKind::Observation
-        )
-    {
-        require_text(&attachment.spec.state_resource, "state_resource")?;
-    }
-    let guides_sampler = attachment.spec.kind == AttachmentKind::RequestTraining
-        && attachment
-            .task_bindings
-            .first()
-            .is_some_and(|binding| binding.role == AttachmentTaskRole::Compute);
-    if !guides_sampler && attachment.spec.sampler_stage != SamplerStage::PackedPostFilterExact {
-        return Err("sampler_stage needs a guide_sampling or add_logits operation".into());
-    }
-    if attachment.spec.kind == AttachmentKind::RequestTraining && probe.hidden_resources.is_empty()
-    {
-        return Err("attachment requires hidden resources".to_owned());
-    }
-    require_text(&attachment.spec.sampler_anchor, "sampler_anchor")?;
-    match attachment.spec.kind {
-        AttachmentKind::ModelReplay if composed_replay => {
-            if attachment
-                .task_bindings
-                .iter()
-                .map(|binding| &binding.role)
-                .collect::<Vec<_>>()
-                != vec![
-                    &AttachmentTaskRole::Compute,
-                    &AttachmentTaskRole::Transition,
-                    &AttachmentTaskRole::Publish,
-                ]
-                && attachment
-                    .task_bindings
-                    .iter()
-                    .map(|binding| &binding.role)
-                    .collect::<Vec<_>>()
-                    != vec![&AttachmentTaskRole::Compute]
-                || attachment
-                    .task_bindings
-                    .iter()
-                    .map(|binding| binding.task_id)
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .len()
-                    != attachment.task_bindings.len()
-            {
-                return Err(
-                    "activation replay requires distinct compute, transition and publish roles"
-                        .into(),
-                );
-            }
-        }
-        AttachmentKind::ModelReplay | AttachmentKind::Observation => {
-            if !attachment.spec.state_resource.is_empty()
-                || attachment.task_bindings.is_empty()
-                || (attachment.spec.kind == AttachmentKind::ModelReplay
-                    && attachment.task_bindings.len() != 1)
-                || attachment
-                    .task_bindings
-                    .iter()
-                    .any(|binding| binding.role != AttachmentTaskRole::Compute)
-            {
-                return Err("stateless attachment requires compute tasks".into());
-            }
-        }
-        AttachmentKind::RequestTraining => {
-            // A compute task that guides the sampler is optional; training alone binds only the transition.
-            let roles = attachment
-                .task_bindings
-                .iter()
-                .map(|binding| &binding.role)
-                .collect::<Vec<_>>();
-            if !matches!(
-                roles.as_slice(),
-                [AttachmentTaskRole::Transition]
-                    | [AttachmentTaskRole::Compute, AttachmentTaskRole::Transition]
-            ) || (roles.len() == 2
-                && attachment.task_bindings[0].task_id == attachment.task_bindings[1].task_id)
-            {
-                return Err("request training binds its transition task, after an optional sampler compute task".to_owned());
-            }
-        }
-        AttachmentKind::ParameterOverlay | AttachmentKind::ActivationPatch => {
-            if !attachment.task_bindings.is_empty()
-                && (attachment.task_bindings.len() != 2
-                    || attachment.task_bindings[0].role != AttachmentTaskRole::Transition
-                    || attachment.task_bindings[1].role != AttachmentTaskRole::Publish
-                    || attachment.task_bindings[0].task_id == attachment.task_bindings[1].task_id)
-            {
-                return Err("inline model effects require their transition and publication".into());
-            }
-        }
-    }
-    for binding in &attachment.task_bindings {
-        require_text(
-            &binding.implementation_id,
-            "task_bindings.implementation_id",
-        )?;
-    }
-    for binding in &attachment.spec.activation_bindings {
-        if binding.decode == DecodeWindow::None
-            && (binding.decode_refresh != DecodeRefresh::Inherit
-                || binding.on_missing != MissingPolicy::Stop)
-        {
-            return Err(
-                "decode window is off; refresh and missing policies require decode rows".into(),
-            );
-        }
-    }
-    if !attachment.spec.activation_bindings.is_empty() {
-        if attachment
-            .spec
-            .activation_bindings
-            .windows(2)
-            .any(|pair| pair[0].layer >= pair[1].layer)
-            || attachment.spec.activation_bindings.iter().any(|binding| {
-                match (&binding.operator, binding.fields.as_slice()) {
-                    (ActivationPatchOperator::LowRankAffine, [a, b, c]) => {
-                        a == b || a == c || b == c
-                    }
-                    (ActivationPatchOperator::Add, [_]) => false,
-                    _ => true,
-                }
-            })
-        {
-            return Err("activation patch requires unique layers and exact operator fields".into());
-        }
-    }
     match attachment.spec.kind {
         AttachmentKind::Observation => {
-            if probe.hidden_resources.is_empty()
+            if !attachment.spec.state_resource.is_empty()
+                || attachment.task_bindings.is_empty()
+                || probe.hidden_resources.is_empty()
                 || !attachment.spec.overlay_bindings.is_empty()
                 || !attachment.spec.activation_bindings.is_empty()
             {
-                return Err("observation requires only signed hidden inputs".into());
+                return Err(
+                    "observation requires hidden inputs and no model state bindings".into(),
+                );
             }
         }
         AttachmentKind::ModelReplay => {
@@ -172,193 +37,90 @@ fn validate_declaration(
                     .iter()
                     .any(|value| value == "model/tokenwise_replay@1")
             {
-                return Err("model replay requires the signed tokenwise primitive only".into());
+                return Err("model replay requires tokenwise replay support without hidden or overlay bindings".into());
+            }
+            // Stateless replay execution supports one forward task.
+            if attachment.spec.activation_bindings.is_empty()
+                && (!attachment.spec.state_resource.is_empty()
+                    || attachment.task_bindings.len() != 1)
+            {
+                return Err("stateless model replay requires one compute task".into());
             }
         }
         AttachmentKind::RequestTraining => {
+            if probe.hidden_resources.is_empty() {
+                return Err("request training requires hidden resources".into());
+            }
             if !attachment.spec.overlay_bindings.is_empty()
                 || !attachment.spec.activation_bindings.is_empty()
             {
                 return Err("request training cannot bind overlay or activation fields".to_owned());
             }
         }
-        AttachmentKind::ParameterOverlay | AttachmentKind::ActivationPatch => {
-            if attachment.spec.kind == AttachmentKind::ActivationPatch {
-                if !attachment.spec.overlay_bindings.is_empty()
-                    || attachment.spec.activation_bindings.is_empty()
-                {
-                    return Err(
-                        "activation patch requires unique layers and exact operator fields"
-                            .to_owned(),
-                    );
-                }
-                return Ok(());
+        AttachmentKind::ActivationPatch => {
+            if !attachment.spec.overlay_bindings.is_empty()
+                || attachment.spec.activation_bindings.is_empty()
+            {
+                return Err(
+                    "activation patch requires activation fields without parameter overlays".into(),
+                );
             }
+        }
+        AttachmentKind::ParameterOverlay => {
             if !attachment.spec.activation_bindings.is_empty() {
                 return Err("parameter/activation composition is not supported".to_owned());
             }
-            let bindings = &attachment.spec.overlay_bindings;
-            if bindings.is_empty()
-                || bindings
-                    .windows(2)
-                    .any(|pair| pair[0].target >= pair[1].target)
-                || bindings.iter().any(|binding| {
-                    !binding.scale.is_finite()
-                        || match binding.operator {
-                            OverlayOperator::DenseAdd | OverlayOperator::HeadAdd => {
-                                binding.fields.len() != 1
-                            }
-                            OverlayOperator::LowRankAdd => {
-                                binding.fields.len() != 2 || binding.fields[0] == binding.fields[1]
-                            }
-                        }
-                })
+            if attachment.spec.overlay_bindings.is_empty() {
+                return Err("parameter overlay requires target bindings".into());
+            }
+            if attachment
+                .spec
+                .overlay_bindings
+                .iter()
+                .any(|binding| !binding.scale.is_finite())
             {
-                return Err(
-                    "parameter overlay requires unique targets and exact operator arity".to_owned(),
-                );
+                return Err("parameter overlay scales must be finite".into());
             }
         }
     }
     Ok(())
 }
 
-fn semantic_hidden_key(input: &InputSource) -> Option<(i64, u8, u8)> {
-    let InputSource::Hidden { layer, site, phase } = input else {
-        return None;
-    };
-    let site = match site {
-        SemanticHiddenSite::Post => 0,
-        SemanticHiddenSite::BlockOutput => 1,
-        SemanticHiddenSite::ModelOutput => 2,
-    };
-    let phase = match phase {
-        SemanticHiddenPhase::Prefill => 0,
-        SemanticHiddenPhase::Decode => 1,
-    };
-    Some((*layer, site, phase))
-}
-
-fn attachment_hidden_key(resource: &AttachmentHiddenResource) -> Result<(i64, u8, u8), String> {
-    if resource.binding.layer_kind != HiddenLayerKind::Index {
-        return Err("attachment hidden resources must use indexed graph locators".to_owned());
+fn hidden_inputs_match(graph: &SemanticGraph, probe: &BackendPlacementProbe) -> Result<(), String> {
+    let mut hidden = std::collections::BTreeSet::new();
+    for input in graph.tasks.iter().flat_map(|task| &task.inputs) {
+        if let InputSource::Hidden { layer, site, phase } = &input.source {
+            let site = match site {
+                SemanticHiddenSite::Post => 0,
+                SemanticHiddenSite::BlockOutput => 1,
+                SemanticHiddenSite::ModelOutput => 2,
+            };
+            hidden.insert((*layer, site, matches!(phase, SemanticHiddenPhase::Decode)));
+        }
     }
-    let layer = resource
-        .binding
-        .layer
-        .parse::<i64>()
-        .map_err(|_| "attachment hidden resource layer is invalid".to_owned())?;
-    let site = match resource.binding.site {
-        HiddenSite::BlockOutput => 1,
-        HiddenSite::ModelOutput => 2,
-    };
-    let phase = match resource.phase {
-        HiddenPhase::Prefill => 0,
-        HiddenPhase::Decode => 1,
-    };
-    Ok((layer, site, phase))
-}
-
-fn has_decode_selection(task: &SemanticTask, state_resource: &str) -> bool {
-    task.inputs.iter().any(|input| {
-        matches!(
-            &input.source,
-            InputSource::StateSelection {
-                resource,
-                phase: SemanticHiddenPhase::Decode,
-            } if resource == state_resource
-        )
-    })
-}
-
-fn validate_request_training_graph(
-    attachment: &BackendAttachment,
-    probe: &BackendPlacementProbe,
-    graph: &SemanticGraph,
-) -> Result<(), String> {
-    let state = graph
-        .states
-        .binary_search_by(|state| state.resource.cmp(&attachment.spec.state_resource))
-        .map(|index| &graph.states[index])
-        .map_err(|_| "attachment state resource is absent from the semantic graph".to_owned())?;
-    if state.scope != StateScope::Request
-        && attachment.spec.sampler_stage == SamplerStage::PackedPostFilterExact
-    {
-        return Err("attachment request state differs from semantic graph state".to_owned());
+    let mut probed = std::collections::BTreeSet::new();
+    for resource in &probe.hidden_resources {
+        if resource.binding.layer_kind != HiddenLayerKind::Index {
+            return Err("attachment hidden resources must use indexed graph locators".into());
+        }
+        let layer = resource
+            .binding
+            .layer
+            .parse::<i64>()
+            .map_err(|_| "attachment hidden resource layer is invalid".to_owned())?;
+        let site = match resource.binding.site {
+            HiddenSite::BlockOutput => 1,
+            HiddenSite::ModelOutput => 2,
+        };
+        probed.insert((layer, site, matches!(resource.phase, HiddenPhase::Decode)));
     }
-
-    if let [compute, _] = attachment.task_bindings.as_slice() {
-        validate_sampler_compute(attachment, &graph.tasks[compute.task_id as usize])?;
-    }
-    let mut task_hidden = graph
-        .tasks
-        .iter()
-        .flat_map(|task| task.inputs.iter())
-        .filter_map(|input| semantic_hidden_key(&input.source))
-        .collect::<Vec<_>>();
-    let mut signed_hidden = probe
-        .hidden_resources
-        .iter()
-        .map(attachment_hidden_key)
-        .collect::<Result<Vec<_>, _>>()?;
-    task_hidden.sort_unstable();
-    task_hidden.dedup();
-    signed_hidden.sort_unstable();
-    if task_hidden != signed_hidden {
-        return Err(
-            "attachment hidden inputs differ from the backend's hidden resources".to_owned(),
-        );
-    }
-
-    let transition = &graph.tasks[attachment.task_bindings.last().unwrap().task_id as usize];
-    if !transition.effects.iter().any(|effect| {
-        effect.resource == attachment.spec.state_resource
-            && (effect.kind == StateEffectKind::Update
-                || (effect.kind == StateEffectKind::UpdateMaybe
-                    && attachment.spec.sampler_stage == SamplerStage::PackedPreFilterAdd))
-            && effect.version.is_none()
-    }) || !has_decode_selection(transition, &attachment.spec.state_resource)
-    {
-        return Err(
-            "attachment transition task is missing request-state transition semantics".to_owned(),
-        );
-    }
-    Ok(())
-}
-
-/// The prediction task that feeds the sampler reads request state over packed sampler rows.
-fn validate_sampler_compute(
-    attachment: &BackendAttachment,
-    compute: &SemanticTask,
-) -> Result<(), String> {
-    if !compute.effects.iter().any(|effect| {
-        effect.resource == attachment.spec.state_resource
-            && effect.kind == StateEffectKind::Read
-            && effect.version.is_none()
-    }) || !has_decode_selection(compute, &attachment.spec.state_resource)
-    {
-        return Err("attachment compute task is missing request-state read semantics".to_owned());
-    }
-    if !compute
-        .inputs
-        .iter()
-        .any(|input| matches!(&input.source, InputSource::PackedRows))
-        || !compute
-            .inputs
-            .iter()
-            .any(|input| matches!(&input.source, InputSource::PackedSamplerRows))
-        || !compute
-            .outputs
-            .iter()
-            .any(|output| output.kind == OutputKind::Sampler)
-    {
-        return Err("attachment compute task is missing packed sampler semantics".to_owned());
+    if hidden != probed {
+        return Err("attachment hidden inputs differ from the backend's hidden resources".into());
     }
     Ok(())
 }
 
 fn validate_parameter_overlay_graph(
-    attachment: &BackendAttachment,
     graph: &SemanticGraph,
     bindings: &[AttachmentTaskBinding],
 ) -> Result<(), String> {
@@ -390,33 +152,8 @@ fn validate_parameter_overlay_graph(
             return Err("declare one mutation producer per state resource".into());
         }
     }
-    graph
-        .states
-        .binary_search_by(|state| state.resource.cmp(&attachment.spec.state_resource))
-        .map_err(|_| {
-            "parameter overlay state resource is absent from the semantic graph".to_owned()
-        })?;
     if bindings.is_empty() {
         return Ok(());
-    }
-    let transition = &graph.tasks[bindings[0].task_id as usize];
-    if !transition.effects.iter().any(|effect| {
-        effect.resource == attachment.spec.state_resource
-            && effect.version.is_none()
-            && matches!(
-                effect.kind,
-                StateEffectKind::Transition | StateEffectKind::TransitionMaybe
-            )
-    }) {
-        return Err("parameter overlay transition task is missing transition semantics".to_owned());
-    }
-    let publish = &graph.tasks[bindings[1].task_id as usize];
-    if !publish.effects.iter().any(|effect| {
-        effect.resource == attachment.spec.state_resource
-            && effect.kind == StateEffectKind::Publish
-            && effect.version.as_ref() == Some(&transition.symbol)
-    }) {
-        return Err("parameter overlay publish task is missing publish semantics".to_owned());
     }
     if bindings[0].anchor_id > bindings[1].anchor_id {
         return Err("parameter overlay task anchors are out of order".to_owned());
@@ -426,10 +163,9 @@ fn validate_parameter_overlay_graph(
 
 fn validate_activation_replay(
     attachment: &BackendAttachment,
-    probe: &BackendPlacementProbe,
     graph: &SemanticGraph,
 ) -> Result<(), String> {
-    validate_parameter_overlay_graph(attachment, graph, &attachment.task_bindings[1..])?;
+    validate_parameter_overlay_graph(graph, &attachment.task_bindings[1..])?;
     let forward = &graph.tasks[attachment.task_bindings[0].task_id as usize];
     if attachment.task_bindings.len() == 1 {
         if graph.tasks.len() != 1
@@ -438,15 +174,9 @@ fn validate_activation_replay(
             || forward.effects[0].version.is_some()
             || forward.effects[0].resource != attachment.spec.state_resource
             || !graph.input_groups.is_empty()
-            || attachment.spec.activation_bindings.iter().any(|binding| {
-                probe
-                    .causal_domain
-                    .as_ref()
-                    .is_none_or(|domain| u64::from(binding.layer) >= domain.layers)
-            })
         {
             return Err(
-                "initialized activation replay needs its entry READ and signed layers".into(),
+                "initialized activation replay needs one forward task reading entry state".into(),
             );
         }
         return Ok(());
@@ -486,7 +216,7 @@ fn validate_activation_replay(
         })
     {
         return Err(
-            "activation replay requires an exact READ of its signed inject publication".into(),
+            "activation replay must read the state version published by its inject task".into(),
         );
     }
     if graph
@@ -508,19 +238,6 @@ fn validate_activation_replay(
     {
         return Err("activation replay cannot hide unrelated state or transitions".into());
     }
-    let domain = probe
-        .causal_domain
-        .as_ref()
-        .ok_or("activation replay requires its signed model domain")?;
-    if !matches!(&forward.replay, Some(effect) if u64::from(effect.layer_count) == domain.layers)
-        || attachment
-            .spec
-            .activation_bindings
-            .iter()
-            .any(|binding| u64::from(binding.layer) >= domain.layers)
-    {
-        return Err("activation replay layers differ from the signed model domain".into());
-    }
     Ok(())
 }
 
@@ -533,6 +250,20 @@ fn validate_cross_binding(
     state: &StateRepresentationDecision,
 ) -> Result<(), String> {
     validate_declaration(attachment, probe)?;
+    hidden_inputs_match(graph, probe)?;
+    let attachment_state = graph
+        .states
+        .iter()
+        .find(|state| state.resource == attachment.spec.state_resource);
+    if attachment_state.is_none()
+        && (!attachment.spec.activation_bindings.is_empty()
+            || !matches!(
+                attachment.spec.kind,
+                AttachmentKind::ModelReplay | AttachmentKind::Observation
+            ))
+    {
+        return Err("attachment state resource is absent from the semantic graph".into());
+    }
     for group in &graph.input_groups {
         let readers: Vec<_> = if attachment.spec.kind == AttachmentKind::ModelReplay {
             vec![graph.tasks[attachment.task_bindings[0].task_id as usize]
@@ -586,8 +317,13 @@ fn validate_cross_binding(
         let domain = probe
             .causal_domain
             .as_ref()
-            .ok_or("layer routes need a signed model domain")?;
+            .ok_or("layer routes require backend model dimensions")?;
         if u64::from(task.replay.as_ref().unwrap().layer_count) != domain.layers
+            || attachment
+                .spec
+                .activation_bindings
+                .iter()
+                .any(|binding| u64::from(binding.layer) >= domain.layers)
             || task.timing.after != "model.execute"
             || task.timing.before != "state.publish"
             || task.replay.as_ref().unwrap().digest.len() != 64
@@ -649,19 +385,7 @@ fn validate_cross_binding(
     }
     match attachment.spec.kind {
         AttachmentKind::Observation => {
-            let hidden = graph
-                .tasks
-                .iter()
-                .flat_map(|task| &task.inputs)
-                .filter_map(|input| semantic_hidden_key(&input.source))
-                .collect::<std::collections::BTreeSet<_>>();
-            let signed = probe
-                .hidden_resources
-                .iter()
-                .map(attachment_hidden_key)
-                .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
             if attachment.task_bindings.len() != graph.tasks.len()
-                || hidden != signed
                 || graph.tasks.iter().any(|task| {
                     task.effects.iter().any(|effect| {
                         effect.kind != StateEffectKind::Read || effect.version.is_some()
@@ -686,20 +410,14 @@ fn validate_cross_binding(
                 })
             {
                 return Err(
-                    "observation must read its original hidden inputs without changing model state"
-                        .into(),
+                    "observation must read hidden inputs without changing model state".into(),
                 );
             }
         }
         AttachmentKind::ModelReplay => {
             let task = &graph.tasks[attachment.task_bindings[0].task_id as usize];
-            if task.replay.is_none()
-                || task.timing.after != "model.execute"
-                || task.timing.before != "state.publish"
-            {
-                return Err(
-                    "model replay must execute its original tokenwise effect during forward".into(),
-                );
+            if task.replay.is_none() {
+                return Err("model replay requires a tokenwise effect during forward".into());
             }
             if attachment.spec.activation_bindings.is_empty() {
                 if graph.tasks.len() != 1
@@ -708,36 +426,23 @@ fn validate_cross_binding(
                     || !task.effects.is_empty()
                 {
                     return Err(
-                        "model replay must execute its original stateless effect during forward"
+                        "stateless model replay requires one forward task without state effects"
                             .into(),
                     );
                 }
             } else {
-                validate_activation_replay(attachment, probe, graph)?;
+                validate_activation_replay(attachment, graph)?;
             }
         }
         AttachmentKind::RequestTraining => {
-            validate_request_training_graph(attachment, probe, graph)?;
+            if attachment_state.unwrap().scope != StateScope::Request
+                && attachment.spec.sampler_stage == SamplerStage::PackedPostFilterExact
+            {
+                return Err("attachment request state differs from semantic graph state".into());
+            }
         }
         AttachmentKind::ParameterOverlay | AttachmentKind::ActivationPatch => {
-            validate_parameter_overlay_graph(attachment, graph, &attachment.task_bindings)?;
-            let mut hidden: Vec<_> = graph
-                .tasks
-                .iter()
-                .flat_map(|task| &task.inputs)
-                .filter_map(|input| semantic_hidden_key(&input.source))
-                .collect();
-            let mut signed = probe
-                .hidden_resources
-                .iter()
-                .map(attachment_hidden_key)
-                .collect::<Result<Vec<_>, _>>()?;
-            hidden.sort_unstable();
-            hidden.dedup();
-            signed.sort_unstable();
-            if hidden != signed {
-                return Err("model producers must use the probed hidden inputs".into());
-            }
+            validate_parameter_overlay_graph(graph, &attachment.task_bindings)?;
         }
     }
     match attachment.spec.kind {
@@ -800,7 +505,7 @@ fn validate_cross_binding(
                                     .any(|output| output.kind != OutputKind::Temporary))))
                 {
                     return Err(
-                        "sampler feedback requires a post-sample read or its signed transition"
+                        "sampler feedback requires a post-sample read or the request transition"
                             .into(),
                     );
                 }
@@ -820,11 +525,8 @@ fn validate_cross_binding(
                     .find(|anchor| anchor.symbol == symbol)
                     .map(|anchor| anchor.ordinal as u32)
             };
-            let request_state = graph
-                .states
-                .iter()
-                .find(|state| state.resource == attachment.spec.state_resource)
-                .is_some_and(|state| state.scope == StateScope::Request);
+            let request_state =
+                attachment_state.is_some_and(|state| state.scope == StateScope::Request);
             let before_model = Some(transition.anchor_id) == anchor_id("request.prepare")
                 && Some(publish.anchor_id) == anchor_id("request.prepare");
             let supported = if attachment.spec.kind == AttachmentKind::ActivationPatch {
@@ -872,18 +574,6 @@ fn validate_position_source(
 
 pub(crate) fn validate_attachment(attachment: &BackendAttachment) -> Result<(), String> {
     let plan = &attachment.plan;
-    let mut reads: std::collections::BTreeSet<_> = attachment
-        .spec
-        .overlay_bindings
-        .iter()
-        .map(|b| b.resource.clone())
-        .collect();
-    if !attachment.spec.activation_bindings.is_empty() {
-        reads.insert(attachment.spec.state_resource.clone());
-    }
-    if reads.into_iter().collect::<Vec<_>>() != plan.semantic_graph.model_reads {
-        return Err("model consumer resources differ from the semantic graph".into());
-    }
     if attachment.probe.graph_mode == AttachmentGraphMode::CudaGraph {
         if attachment.probe.device_kind != StateDeviceKind::Cuda
             || !attachment
@@ -923,7 +613,7 @@ pub(crate) fn validate_attachment(attachment: &BackendAttachment) -> Result<(), 
                 .layouts
                 .iter()
                 .find(|layout| layout.resource == binding.resource)
-                .ok_or("projection resource has no signed tensor layout")?;
+                .ok_or("projection resource has no tensor layout")?;
             if binding.resource != attachment.spec.state_resource {
                 return Err("projection resource differs from the attachment state".into());
             }
@@ -938,14 +628,14 @@ pub(crate) fn validate_attachment(attachment: &BackendAttachment) -> Result<(), 
                 .iter()
                 .any(|view| target_layout.layout.fields[view.field as usize].dtype != dtype)
             {
-                return Err("projection dtype differs from signed model".into());
+                return Err("projection dtype must match the model dtype".into());
             }
             let target = attachment
                 .probe
                 .targets
                 .iter()
                 .find(|target| target.target == binding.target)
-                .ok_or("projection target has no signed dimensions")?;
+                .ok_or("projection target has no backend dimensions")?;
             let shapes: Vec<_> = binding
                 .fields
                 .iter()
@@ -973,7 +663,7 @@ pub(crate) fn validate_attachment(attachment: &BackendAttachment) -> Result<(), 
                 _ => false,
             };
             if !valid {
-                return Err("projection views differ from signed target dimensions".into());
+                return Err("projection views must match the target dimensions".into());
             }
         }
         for binding in &attachment.spec.activation_bindings {
@@ -1010,7 +700,7 @@ pub(crate) fn validate_attachment(attachment: &BackendAttachment) -> Result<(), 
                     .iter()
                     .any(|view| layout.layout.fields[view.field as usize].dtype != dtype)
             {
-                return Err("activation views differ from signed operator shape or dtype".into());
+                return Err("activation views must match the operator shape and dtype".into());
             }
         }
     }
