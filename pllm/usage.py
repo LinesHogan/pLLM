@@ -1486,17 +1486,7 @@ class Workload(
                 return value.rows.rows if b.graph.states[0].scope is StateScope.REQUEST else ()
             if b.attachment is not None and b.attachment.kind is AttachmentKind.MODEL_REPLAY:
                 return ()
-            return (
-                value.rows.request_rows
-                if b.overlay_targets
-                or any(
-                    source.phase is HiddenPhase.PREFILL
-                    for task in b.graph.tasks
-                    for port in task.inputs
-                    if (source := _typed(port.source, HiddenInputSource)) is not None
-                )
-                else value.rows.latest_decode_rows
-            )
+            return b.read_rows(value.rows)
 
         return FunctionMath(
             {str(state.resource): initializer(str(state.resource)) for state in b.graph.states},
@@ -1518,7 +1508,7 @@ class Workload(
 
     def specialize(self, facts: BackendCompileFacts, options: ExecutionOptions) -> BackendCompileFacts:
         """Fund shared page storage for declared feeds before compiling the plan."""
-        if self.declaration(facts).feeds:
+        if any(state.feed is not None for value in _values(self).values() if (state := _typed(value, InstanceState))):
             facts = replace(
                 facts,
                 providers=tuple(replace(provider, page_capacity=3, shared_memory=True) for provider in facts.providers),

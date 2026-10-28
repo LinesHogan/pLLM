@@ -14,6 +14,7 @@ import torch
 
 from pllm.contracts.auxiliary import StateTensorUpdate
 from pllm.contracts.hidden_locator import HiddenPhase
+from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
@@ -195,22 +196,26 @@ class TensorBinding(ModelEffectBinding, RowTaskBinding):
             ):
                 raise ValueError("replacement tensors must match the declared layout shape, dtype and device")
 
+    def read_rows(self, rows: PackedPhaseRowBatch) -> tuple[PackedPhaseRow, ...]:
+        """Rows the tensor tasks read: every request's final row for overlays, activation patches and prefill
+        inputs, otherwise each request's latest decode row."""
+        return (
+            rows.request_rows
+            if self.overlay_targets
+            or (self.attachment is not None and self.attachment.activation_bindings)
+            or any(
+                isinstance(port.source, HiddenInputSource) and port.source.phase is HiddenPhase.PREFILL
+                for task in self.graph.tasks
+                for port in task.inputs
+            )
+            else rows.latest_decode_rows
+        )
+
     def bind_prepare(self) -> Callable[[TensorStepInput, TensorBatch], TensorFrame]:
         """Prepare independent input channels into the same invocation frame."""
 
         def prepare(value: TensorStepInput, batch: TensorBatch) -> TensorFrame:
-            rows = (
-                value.rows.request_rows
-                if self.overlay_targets
-                or any(
-                    isinstance(port.source, HiddenInputSource) and port.source.phase is HiddenPhase.PREFILL
-                    for task in self.graph.tasks
-                    for port in task.inputs
-                )
-                or self.attachment is not None
-                and self.attachment.activation_bindings
-                else value.rows.latest_decode_rows
-            )
+            rows = self.read_rows(value.rows)
             if (
                 self.attachment is not None
                 and self.attachment.guides_sampler
