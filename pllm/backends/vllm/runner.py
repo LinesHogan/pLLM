@@ -269,9 +269,6 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
         except Exception:
             session.abort_active()
             raise
-        finally:
-            if self.hidden_taps is not None:
-                self.hidden_taps.clear()
 
     def sample(
         self,

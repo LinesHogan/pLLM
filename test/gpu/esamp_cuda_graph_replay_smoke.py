@@ -17,7 +17,7 @@ import torch
 
 import pllm
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
-from pllm.contracts.packed_hidden import PackedHiddenResourceBinding, PackedHiddenSnapshot, PackedHiddenSnapshotBatch
+from pllm.contracts.packed_hidden import HiddenRowBatch, HiddenRows, PackedHiddenResourceBinding
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import SamplerFeedback
@@ -105,7 +105,7 @@ def mean_capture(publish_lag: int = 0) -> None:
         value = TensorStepInput(
             rows,
             sampler,
-            PackedHiddenSnapshotBatch(rows, (PackedHiddenSnapshot(resource, hidden[:count], hidden),)),
+            HiddenRowBatch(rows, (HiddenRows(resource, hidden, dict(enumerate(range(count)))),)),
             hidden_readiness=CudaStreamReadiness(stream),
         )
         target = target_buffer[:count].fill_(step * 0.2)
@@ -131,9 +131,7 @@ def mean_capture(publish_lag: int = 0) -> None:
                         overlap.copy_inputs(invocation)
                         execution.resume_latest(invocation, overlap.stream)
                         overlap.retain(invocation.pin.refs)
-                        # Model taps and sampler outputs may be overwritten while training reads
-                        # its private snapshot, including during captured replay with fewer rows.
-                        hidden.fill_(999)
+                        # Sampler outputs may be overwritten after the handoff copy.
                         target.fill_(999)
                         tokens.fill_(999)
             result = execution.finish_step(invocation)

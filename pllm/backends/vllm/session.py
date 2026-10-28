@@ -372,6 +372,7 @@ class VllmSession(Generic[DataT, ResultT]):
             value = self._taps.publish(value, self._hidden_resources)
         phases = {resource.phase for resource in self._deployment.attachment.probe.hidden_resources}
         if step.context is None and not operands and not any(row.phase in phases for row in step.rows.row_batch.rows):
+            self._finish_effects()
             self._step = None
             return
         if step.context is None:
@@ -385,12 +386,14 @@ class VllmSession(Generic[DataT, ResultT]):
             execution.submit_input(step.context, value, CudaStreamReadiness(stream))
         elif self._hidden_resources or operands:
             execution.submit_input(step.context, value, CudaStreamReadiness(stream))
+        if self._taps is not None and self._hidden_resources:
+            self._taps.hold(step.context)
         self._advance(step.context, "sampler.pre_draw")
         self._finish_effects()
 
     def _finish_effects(self) -> None:
         """Clear every active optional primitive after forward or abort."""
-        for effect in (self._overlay, self._activation, self._replay):
+        for effect in (self._taps, self._overlay, self._activation, self._replay):
             if effect is not None:
                 effect.clear()
 
@@ -461,8 +464,6 @@ class VllmSession(Generic[DataT, ResultT]):
 
     @torch.inference_mode(False)
     def abort_active(self) -> None:
-        if self._taps is not None:
-            self._taps.clear()
         if self._sampler is not None:
             self._sampler.abort_guidance()
         self._finish_effects()

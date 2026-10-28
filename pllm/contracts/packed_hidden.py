@@ -1,7 +1,8 @@
-"""Typed provenance and payloads for eager packed hidden snapshots."""
+"""Hidden resource bindings and slot-addressed publications passed to tensor consumers."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import torch
@@ -25,29 +26,20 @@ class PackedHiddenResourceBinding:
 
 
 @dataclass(frozen=True, slots=True)
-class PackedHiddenSnapshot:
-    """One hidden resource's rows for this step.
-
-    `hidden` holds the step's rows. `buffer`, when set, is the fixed-address tensor `hidden` is a
-    leading-row view of (a model tap); captured steps read from it so replays see new rows.
-    """
+class HiddenRows:
+    """One module's immutable publication, addressed within its stable slot storage."""
 
     resource: PackedHiddenResourceBinding
-    hidden: torch.Tensor
-    buffer: torch.Tensor | None = None
-
-    @property
-    def storage(self) -> torch.Tensor:
-        """The fixed tensor to index from: the tap buffer, or the rows themselves."""
-        return self.hidden if self.buffer is None else self.buffer
+    storage: torch.Tensor
+    slots: Mapping[int, int]
 
 
 @dataclass(frozen=True, slots=True)
-class PackedHiddenSnapshotBatch:
-    """Owned resource-keyed tensors for one exact packed row batch."""
+class HiddenRowBatch:
+    """Resource-keyed slot publications for one exact packed row batch."""
 
     row_batch: PackedPhaseRowBatch
-    snapshots: tuple[PackedHiddenSnapshot, ...]
+    captures: tuple[HiddenRows, ...]
 
     @property
     def step_id(self) -> int:
@@ -56,8 +48,8 @@ class PackedHiddenSnapshotBatch:
 
 __all__ = [
     "PackedHiddenResourceBinding",
-    "PackedHiddenSnapshot",
-    "PackedHiddenSnapshotBatch",
+    "HiddenRows",
+    "HiddenRowBatch",
 ]
 
 

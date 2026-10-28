@@ -104,8 +104,8 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(monkeypatc
         *(CompactRows(column, rows) for column, rows in zip(torch.tensor(plan.columns), plan.columns, strict=True))
     )
     values = torch.arange(12).view(4, 3)
-    assert index.select((1, 2)).packed.take(values).data_ptr() == values[1].data_ptr()
-    assert index.select((2, 2)).packed.take(values).stride(0) == 0
+    assert index.select((1, 2)).sampler.take(values).data_ptr() == values[1].data_ptr()
+    assert index.select((2, 2)).sampler.take(values).stride(0) == 0
     refs = StateRefs(np.array([0, 0, 1]), np.array([1, 2, 3]), np.array([9, 5, 0]))
     history = (
         StateRefs(refs.layouts[:1], refs.lineages[:1], np.array([3])),

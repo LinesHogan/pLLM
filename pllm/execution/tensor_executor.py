@@ -39,7 +39,7 @@ Table = TypeVar("Table", torch.Tensor, npt.NDArray[np.int64])
 class TableLayout:
     """One resource's segments in the shared int64 table, uploaded in one copy per step.
 
-    rows          [6, R]   per row: packed hidden row, sampler row, sample index, state, version, weight
+    rows          [5, R]   per row: sampler row, sample index, state, version, weight
     counts        [S + 1]  rows per state; index S is the padding sink
     last          [S]      last row of each state (memory-field writes)
     sources       [F, S+1] source page slot per field and state (-1: none)
@@ -55,7 +55,7 @@ class TableLayout:
     @property
     def shapes(self) -> tuple[tuple[int, ...], ...]:
         rows, states, fields = self.rows, self.states, self.fields
-        return ((6, rows), (states + 1,), (states,), (fields, states + 1), (fields, states), (self.feedback, 3))
+        return ((5, rows), (states + 1,), (states,), (fields, states + 1), (fields, states), (self.feedback, 3))
 
     @property
     def size(self) -> int:
@@ -130,7 +130,7 @@ class TensorExecutor:
         )
         if (
             self.capture is not None
-            and 8 * (6 * self.rows + self.state_count + 1) > self.capture.entitlement.resident_bytes
+            and 8 * (5 * self.rows + self.state_count + 1) > self.capture.entitlement.resident_bytes
         ):
             raise ValueError("capture index table exceeds the task resident bytes")
 
@@ -146,16 +146,21 @@ class TensorExecutor:
     def layout(self) -> TableLayout:
         return TableLayout(self.rows, self.state_count, len(self.pools), len(self.feedback_names))
 
+    @property
+    def table_size(self) -> int:
+        """Resource tables followed by one hidden slot column per bound locator."""
+        return sum(layout.size for layout in self.layouts.values()) + len(self.hidden_inputs or {}) * self.rows
+
     def _fill(self, host: npt.NDArray[np.int64], plan: RowPlan, layout: TableLayout) -> None:
         """Stage a RowPlan and feedback addresses into the zeroed fixed table."""
         rows, counts, last, sources, destinations, feedback = layout.split(host)
         count = len(plan.packed)
         if layout.feedback and -1 in plan.sampler:
             raise ValueError("sampler feedback must cover every operation row")
-        rows[3] = layout.states
-        rows[:5, :count] = plan.columns
-        rows[1, :count] = np.maximum(rows[1, :count], 0)
-        rows[5, :count] = 1
+        rows[2] = layout.states
+        rows[:4, :count] = plan.columns
+        rows[0, :count] = np.maximum(rows[0, :count], 0)
+        rows[4, :count] = 1
         counts[: len(plan.sources) + 1] = plan.counts
         if len(plan.sources):
             positions = plan.last
@@ -206,6 +211,7 @@ class TensorExecutor:
         table: torch.Tensor,
         pools: tuple[torch.Tensor, ...],
     ) -> tuple[TensorFrame, TensorBatch]:
+        assert self.table is not None
         columns, counts, _, sources, _, _ = layout.split(table)
         reads = self.read_fields
         if self.optimizer is not None and (self.device.type == "cpu" or self.pools[0].dtype != torch.float32):
@@ -227,12 +233,19 @@ class TensorExecutor:
         frame = replace(
             data,
             rows=(data.rows[0],) * self.rows,
-            index=RowIndex(*(MaskedRows(column) for column in columns[:5])),
+            index=RowIndex(*(MaskedRows(column) for column in columns[:4])),
             fields=fields,
-            hidden_inputs=self.hidden_inputs,
-            feedback_inputs=self._feedback(columns[1]),
+            hidden_inputs={
+                key: (pool, slots)
+                for (key, pool), slots in zip(
+                    (self.hidden_inputs or {}).items(),
+                    self.table[sum(item.size for item in self.layouts.values()) :].view(-1, self.rows),
+                    strict=True,
+                )
+            },
+            feedback_inputs=self._feedback(columns[0]),
             leaf=None,
-            weights=columns[5] if self.capture is not None or self.task.policy.reduction == "state_mean" else None,
+            weights=columns[4] if self.capture is not None or self.task.policy.reduction == "state_mean" else None,
             counts=counts,
             derivative_sources={},
             input_gradients={},
@@ -358,9 +371,7 @@ class TensorExecutor:
                     writes=(self.updated, context.arena.slots((write,) * len(write.after_refs), write.after_refs)[1]),
                 )
             if context is None:
-                self.table = torch.empty(
-                    sum(layout.size for layout in self.layouts.values()), device="meta", dtype=torch.long
-                )
+                self.table = torch.empty(self.table_size, device="meta", dtype=torch.long)
             else:
                 self._prepare(plan, data, batch)
         if self.capture is None or context is None:
@@ -419,10 +430,10 @@ class TensorExecutor:
                     self.rows, states, len(pools), len(self.feedback_names) if resource == self.task.resource else 0
                 )
             self.pools = self.resource_pools[self.task.resource]
-        snapshots = () if data.step.hidden is None else data.step.hidden_batch(batch.stream).snapshots
-        addresses = tuple(item.hidden.data_ptr() for item in snapshots)
+        captures = () if data.step.hidden is None else data.step.hidden_batch(batch.stream).captures
+        addresses = tuple(item.storage.data_ptr() for item in captures)
         if self.hidden_inputs is None or self.addresses != addresses:
-            self.hidden_inputs = {item.resource.locator_key: item.storage for item in snapshots}
+            self.hidden_inputs = {item.resource.locator_key: item.storage for item in captures}
         self.addresses = addresses
         if self.feedback_names:
             assert batch.feedback is not None
@@ -437,7 +448,7 @@ class TensorExecutor:
 
     def _prepare(self, plan: RowPlan, data: TensorFrame, batch: TensorBatch) -> None:
         device = next(iter(self.hidden_inputs.values())).device if self.hidden_inputs else self.pools[0].device
-        size = sum(layout.size for layout in self.layouts.values())
+        size = self.table_size
         if self.table is None or self.table.numel() != size:
             self.table = torch.empty(size, dtype=torch.long, device=device)
         host = self.staging.take(size).numpy() if device.type == "cuda" else self.table.numpy()
@@ -447,6 +458,14 @@ class TensorExecutor:
             selected = plan if resource == self.task.resource else RowPlan.build(data, batch.for_resource(resource))
             self._fill(host[offset : offset + layout.size], selected, layout)
             offset += layout.size
+        captures = () if data.step.hidden is None else data.step.hidden.captures
+        for capture in captures:
+            padding = next(iter(capture.slots.values()), 0)
+            host[offset : offset + self.rows] = padding
+            host[offset : offset + len(data.rows)] = [
+                capture.slots.get(row.packed_row_index, padding) for row in data.rows
+            ]
+            offset += self.rows
         if device.type == "cuda":
             self.staging.copy_to(self.table)
 

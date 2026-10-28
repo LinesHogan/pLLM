@@ -11,8 +11,7 @@ from dataclasses import replace
 import torch
 
 from pllm.contracts.auxiliary import map_auxiliary
-from pllm.contracts.packed_hidden import PackedHiddenSnapshot, PackedHiddenSnapshotBatch
-from pllm.execution.cuda_stream import CudaStreamReadiness
+from pllm.contracts.packed_hidden import HiddenRowBatch, HiddenRows
 from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.state_execution import DataT, StateTaskContext
@@ -49,12 +48,6 @@ class PostSampleOverlap:
                 # Worker-local device copies of external inputs can be dropped at
                 # host settlement while their side-stream consumers are still running.
                 map_auxiliary(value.auxiliary, self._record_input)
-            if value.hidden is not None:
-                value = replace(
-                    value,
-                    hidden=self._copy_hidden(value.hidden),
-                    hidden_readiness=CudaStreamReadiness(self.stream),
-                )
             feedback = context.sampler_feedback
             if feedback is not None:
                 context.sampler_feedback = replace(
@@ -71,18 +64,18 @@ class PostSampleOverlap:
             # Cached row versions and parameter leaves belong to the reader's selection.
             context.value = replace(data, step=value, index=None, plan=None, leaf=None, fields=(), hidden_inputs=None)
 
-    def _copy_hidden(self, batch: PackedHiddenSnapshotBatch) -> PackedHiddenSnapshotBatch:
-        snapshots: list[PackedHiddenSnapshot] = []
-        for snapshot in batch.snapshots:
+    def _copy_hidden(self, batch: HiddenRowBatch) -> HiddenRowBatch:
+        snapshots: list[HiddenRows] = []
+        for snapshot in batch.captures:
             key = snapshot.resource.locator_key
             if key not in self._hidden:
                 self._hidden[key] = torch.empty_like(snapshot.storage)
             buffer = self._hidden[key]
-            hidden = buffer[: len(snapshot.hidden)]
-            hidden.copy_(snapshot.hidden)
-            snapshot.hidden.record_stream(self.stream)
-            snapshots.append(PackedHiddenSnapshot(snapshot.resource, hidden, buffer))
-        return PackedHiddenSnapshotBatch(batch.row_batch, tuple(snapshots))
+            hidden = buffer[: len(snapshot.storage)]
+            hidden.copy_(snapshot.storage)
+            snapshot.storage.record_stream(self.stream)
+            snapshots.append(HiddenRows(snapshot.resource, buffer, snapshot.slots))
+        return HiddenRowBatch(batch.row_batch, tuple(snapshots))
 
     def _record_input(self, tensor: torch.Tensor) -> torch.Tensor:
         if tensor.is_cuda:

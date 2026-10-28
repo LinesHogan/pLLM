@@ -11,7 +11,7 @@ import torch
 from pllm.config import ExecutionOptions
 from pllm.contracts.auxiliary import WeightedCEBatch
 from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.packed_hidden import PackedHiddenSnapshot, PackedHiddenSnapshotBatch
+from pllm.contracts.packed_hidden import HiddenRowBatch, HiddenRows
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
 from pllm.contracts.parameter_overlay import CapturedParameterOperand
 from pllm.contracts.request_identity import RequestIdentity
@@ -54,10 +54,12 @@ def example(
     sampler = PackedSamplerRowBatch(packed, tuple(PackedSamplerRowLink(i, count - i - 1) for i in range(count)))
     hidden_dtype = torch.float64 if facts.probe.tensor_dtype.torch is torch.float64 else torch.float32
     hidden = (
-        PackedHiddenSnapshotBatch(
+        HiddenRowBatch(
             packed,
             tuple(
-                PackedHiddenSnapshot(resource, meta(count, facts.probe.hidden_size, dtype=hidden_dtype))
+                HiddenRows(
+                    resource, meta(count, facts.probe.hidden_size, dtype=hidden_dtype), dict(enumerate(range(count)))
+                )
                 for resource in dict.fromkeys(item.binding for item in facts.probe.hidden_resources)
             ),
         )

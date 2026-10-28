@@ -19,9 +19,9 @@ from torch import Tensor
 
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_hidden import (
+    HiddenRowBatch,
+    HiddenRows,
     PackedHiddenResourceBinding,
-    PackedHiddenSnapshot,
-    PackedHiddenSnapshotBatch,
     hidden_binding,
 )
 from pllm.contracts.packed_rows import PackedPhaseRowBatch
@@ -29,6 +29,7 @@ from pllm.contracts.semantic_graph import HiddenInputSource
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorFieldSpec, TensorLayoutSpec
 from pllm.execution.cuda_stream import CudaStreamReadiness, PinnedStaging
 from pllm.execution.ptts.page_bundle import SlotPools, Slots
+from pllm.execution.state_execution import DataT, StateTaskContext
 from pllm.execution.step_input import TensorStepInput
 from pllm.kernels.page_copy import copy_pages
 
@@ -128,6 +129,7 @@ class HiddenTaps:
         self.buffers: dict[str, Tensor] = {}
         self.indices: dict[str, Tensor] = {}
         self._slots: dict[str, Slots] = {}
+        self._rows: dict[str, dict[int, int]] = {}
         self._staging = PinnedStaging()
         for layout in layouts:
             path = layout.module_path
@@ -150,6 +152,7 @@ class HiddenTaps:
             indices = self.indices[path]
             slots, _ = self.pools[path].allocate(0, len(selected), torch.cuda.current_stream(indices.device))
             self._slots[path] = slots[:, None]
+            self._rows[path] = dict(zip((row.packed_row_index for row in selected), slots.tolist(), strict=True))
             host = self._staging.take(indices.numel()).view(indices.shape).numpy()
             host.fill(-1)
             host[0, : len(selected)] = [row.packed_row_index for row in selected]
@@ -170,21 +173,20 @@ class HiddenTaps:
 
     def publish(self, value: TensorStepInput, resources: tuple[PackedHiddenResourceBinding, ...]) -> TensorStepInput:
         """Attach the current step's hidden rows for `resources` to `value`."""
-        missing = [resource.module_path for resource in resources if resource.module_path not in self.buffers]
-        if missing:
-            raise ValueError(f"hidden outputs of {missing} were not tapped when the model was loaded")
-        rows = value.rows.total_rows
-        snapshots = tuple(
-            PackedHiddenSnapshot(resource, buffer[:rows], buffer)
+        captures = tuple(
+            HiddenRows(resource, self.pools[resource.module_path].tensors[0], self._rows[resource.module_path])
             for resource in resources
-            for buffer in (self.buffers[resource.module_path],)
         )
         stream = torch.cuda.current_stream()
         return replace(
             value,
-            hidden=PackedHiddenSnapshotBatch(value.rows, snapshots),
+            hidden=HiddenRowBatch(value.rows, captures),
             hidden_readiness=CudaStreamReadiness(stream),
         )
+
+    def hold(self, context: StateTaskContext[DataT]) -> None:
+        """Acquire the reader's holds before the runner releases the producer."""
+        context.hold_slots(tuple((self.pools[path], slots) for path, slots in self._slots.items()))
 
 
 __all__ = ["CAPTURE_ENV", "HiddenCaptureAnnouncement", "HiddenCaptureLayout", "HiddenTaps", "tap"]

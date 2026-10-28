@@ -16,9 +16,9 @@ import torch
 from pllm.contracts.auxiliary import AuxiliaryInput
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.packed_hidden import (
+    HiddenRowBatch,
+    HiddenRows,
     PackedHiddenResourceBinding,
-    PackedHiddenSnapshot,
-    PackedHiddenSnapshotBatch,
     hidden_binding,
 )
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
@@ -63,14 +63,14 @@ def step_input(
         ),
     )
     order = range(count) if sampler_order is None else sampler_order
-    snapshots = tuple(
-        PackedHiddenSnapshot(binding, tensor)
+    captures = tuple(
+        HiddenRows(binding, tensor, dict(enumerate(range(count))))
         for binding, tensor in sorted((hidden or {}).items(), key=lambda item: item[0].locator_key)
     )
     return TensorStepInput(
         rows,
         PackedSamplerRowBatch(rows, tuple(PackedSamplerRowLink(i, row) for i, row in enumerate(order))),
-        PackedHiddenSnapshotBatch(rows, snapshots) if snapshots else None,
+        HiddenRowBatch(rows, captures) if captures else None,
         operands=operands,
         auxiliary=auxiliary,
         hidden_readiness=None if stream is None else CudaStreamReadiness(stream),

@@ -128,7 +128,7 @@ def take_rows(values: torch.Tensor, rows: Sequence[int], device_rows: torch.Tens
 class RowPlan:
     """Host row facts and authorized slots shared by eager views and fixed tables.
 
-    Columns serialize in packed/sampler/samples/states/versions order; sources are [state, field] slots. Writes pair the
+    Columns serialize in sampler/samples/states/versions order; sources are [state, field] slots. Writes pair the
     update-state positions with their issued destination slots. Selecting rows
     changes only columns; page access stays in the invocation's state order.
     """
@@ -172,7 +172,7 @@ class RowPlan:
     @property
     def columns(self) -> tuple[tuple[int, ...], ...]:
         """Serialize named fields only at the device-table boundary."""
-        return self.packed, self.sampler, self.samples, self.states, self.versions
+        return self.sampler, self.samples, self.states, self.versions
 
     @property
     def counts(self) -> Slots:
@@ -223,9 +223,8 @@ RowColumn = MaskedRows | CompactRows
 
 
 class RowIndex(NamedTuple):
-    """Named read strategies for an invocation's five index columns."""
+    """Named read strategies for an invocation's four index columns."""
 
-    packed: RowColumn
     sampler: RowColumn
     samples: RowColumn
     states: RowColumn
@@ -387,7 +386,7 @@ class TensorFrame:
     fields: tuple[torch.Tensor, ...] = ()
     weights: torch.Tensor | None = None
     counts: torch.Tensor | None = None
-    hidden_inputs: Mapping[tuple[str, str, str], torch.Tensor] | None = None
+    hidden_inputs: Mapping[tuple[str, str, str], tuple[torch.Tensor, torch.Tensor]] | None = None
     feedback_inputs: Mapping[str, torch.Tensor] | None = None
     resource_frames: Mapping[StateResource, TensorFrame] = field(
         default_factory=lambda: dict[StateResource, TensorFrame]()
@@ -436,17 +435,20 @@ def training_observations(
 
 
 def hidden_port(source: HiddenInputSource) -> TensorPort:
-    """Read the declared hidden snapshot for the invocation rows."""
+    """Gather the declared module's slots, promoting model dtypes for FP32 consumer math."""
 
     def hidden(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
         key = (str(source.layer), "index", source.site.value)
         if data.hidden_inputs is not None:
-            value = data.hidden_inputs[key]
-            return row_index(data, batch, value.device).packed.take(value)
-        (snapshot,) = (
-            item for item in data.step.hidden_batch(batch.stream).snapshots if item.resource.locator_key == key
-        )
-        return row_index(data, batch, snapshot.hidden.device).packed.take(snapshot.hidden)
+            value, slots = data.hidden_inputs[key]
+            result = value.index_select(0, slots)
+        else:
+            (capture,) = (
+                item for item in data.step.hidden_batch(batch.stream).captures if item.resource.locator_key == key
+            )
+            slots = upload(tuple(capture.slots[row.packed_row_index] for row in data.rows), capture.storage.device)
+            result = capture.storage.index_select(0, slots)
+        return result.to(torch.float32) if result.dtype in (torch.float16, torch.bfloat16) else result
 
     return TensorPort(source, hidden)
 
@@ -457,7 +459,7 @@ def samples_port(source: PackedSamplerRowsInputSource) -> TensorPort:
     def samples(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
         if data.index is not None:
             return data.index.samples.device
-        device = data.step.hidden_batch(batch.stream).snapshots[0].hidden.device
+        device = data.step.hidden_batch(batch.stream).captures[0].storage.device
         return row_index(data, batch, device).samples.device
 
     return TensorPort(source, samples)

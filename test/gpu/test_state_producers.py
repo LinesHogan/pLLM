@@ -46,15 +46,6 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
             execute(invocation, anchor)
 
         monkeypatch.setattr(execution, "execute_anchor", delayed)
-        copy_inputs = session._post_sample.copy_inputs
-
-        def poison_taps(context):
-            hidden = context.data().step.hidden
-            copy_inputs(context)
-            for snapshot in hidden.snapshots:
-                snapshot.storage.fill_(float("nan"))
-
-        monkeypatch.setattr(session._post_sample, "copy_inputs", poison_taps)
         phases = set()
         torch.cuda.reset_peak_memory_stats()
 

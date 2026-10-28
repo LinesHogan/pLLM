@@ -37,6 +37,8 @@ from pllm.execution.ptts.page_bundle import (
     PagePublication,
     PageRelease,
     PageWrite,
+    SlotPools,
+    Slots,
 )
 from pllm.execution.ptts.request_state import RequestStateDirectory, RequestStateSelection, StateAddress
 from pllm.execution.ptts.state_refs import StateRefs
@@ -82,7 +84,22 @@ class _PublicationSettlement:
         arena.settle(self.receipt)
 
 
-_PageObligation = _WriteAbort | _PinRelease | _PublicationSettlement
+@dataclass(frozen=True, slots=True, eq=False)
+class _SlotRelease:
+    allocations: tuple[tuple[SlotPools, Slots], ...]
+    stream: torch.cuda.Stream | None
+    phase: ClassVar[_PagePhase] = "release"
+
+    def complete(self, arena: PageBundleArena) -> None:
+        completion = None
+        if self.stream is not None:
+            completion = torch.cuda.Event()
+            completion.record(self.stream)
+        for pools, slots in self.allocations:
+            pools.release(slots, completion)
+
+
+_PageObligation = _WriteAbort | _PinRelease | _PublicationSettlement | _SlotRelease
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +156,19 @@ class StateTaskContext(Generic[DataT]):
     def register_pin(self, pin: PagePin) -> None:
         """Retain responsibility for releasing an acquired pin."""
         self._obligations.append(_PinRelease(pin))
+
+    def hold_slots(self, allocations: tuple[tuple[SlotPools, Slots], ...]) -> None:
+        """Retain transient inputs until this reader stream completes, also on cancellation."""
+        for pools, slots in allocations:
+            pools.hold(slots)
+        self._obligations.append(_SlotRelease(allocations, self.pin.stream))
+
+    def move_slots(self) -> None:
+        """Transfer input holds to the current pin's stream before releasing prior readers."""
+        for obligation in tuple(self._obligations):
+            if isinstance(obligation, _SlotRelease):
+                self.hold_slots(obligation.allocations)
+                self._discharge(obligation)
 
     def sole_write(self) -> PageWrite | None:
         """The invocation's one pending private write, which its tensor tasks share."""
@@ -549,6 +579,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             context.selection = self.directory.select(context.selection.rows)
             context.pin = self.arena.pin_exact(context.selection.refs, stream)
             context.register_pin(context.pin)
+            context.move_slots()
             if reader.refs != context.pin.refs:
                 held = self.arena.pin_exact(reader.refs, stream)
                 context.register_pin(held)
