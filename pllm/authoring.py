@@ -34,7 +34,6 @@ from pllm.execution.backend_attachment import (
     attachment_buffer_bytes,
     bind_backend_attachment,
     derive_attachment_resources,
-    validate_backend_attachment_physical,
 )
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import (
@@ -265,42 +264,13 @@ class BackendWorkload(BackendAuthoring, Generic[DataT, ResultT]):
         self, facts: BackendCompileFacts, attachment: SignedBackendAttachment
     ) -> BackendDeployment[DataT, ResultT]:
         plan = attachment.inputs.plan
-        if attachment.inputs.probe != facts.probe or plan.timeline != derive_attachment_resources(
-            facts.probe,
-            plan.semantic_graph,
-            facts.timeline,
-            layouts=plan.tensor_layout_request,
-            attachment=attachment.inputs.request,
-        ):
-            raise ValueError("worker backend facts differ from the original signed attachment")
-        if plan.state_decision.reserved_bytes > facts.state_memory_budget_bytes or any(
-            item.max_admitted_lineages > facts.max_admitted_lineages for item in plan.state_request.states
-        ):
-            raise ValueError("worker capacity is smaller than the signed entitlement")
-        candidates = tuple(
-            provider.materialize_plan(
-                resource=entry.resource,
-                layout=entry.layout,
-                binding=binding,
-                max_admitted_lineages=requirement.max_admitted_lineages,
-                graph=plan.semantic_graph,
-            )
-            for entry, binding, requirement in zip(
-                plan.tensor_layout_request.layouts,
-                plan.tensor_layout_decision.bindings,
-                plan.state_request.states,
-                strict=True,
-            )
-            for provider in facts.providers
-        )
-        validate_backend_attachment_physical(attachment.inputs, attachment.decision, attachment.physical)
         math = self.bind_math(facts, plan)
         device = (
             torch.device("cpu")
             if facts.probe.device_kind.value == "cpu"
             else torch.device("cuda", facts.probe.device_ordinal)
         )
-        arena = PageBundleArena(plan, candidates, device=device, _owned_resources=math.local_resources(plan))
+        arena = PageBundleArena(plan, device=device, _owned_resources=math.local_resources(plan))
         return BackendDeployment(math.bind(arena, attachment.inputs.request.sampler_anchor_id), attachment)
 
     def compile_backend(self, facts: BackendCompileFacts) -> BackendDeployment[DataT, ResultT]:

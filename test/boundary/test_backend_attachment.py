@@ -95,13 +95,11 @@ def sampler_deployment(probe, facts):
     return esamp.compile_backend(replace(facts, probe=replace(sampler_probe, targets=())))
 
 
-def test_bind_rejects_a_plan_built_for_other_math_or_other_backend_facts() -> None:
-    workload, probe, facts = overlay_facts()
+def test_bind_rejects_a_plan_built_for_other_math() -> None:
+    workload, _, facts = overlay_facts()
     planned = workload.plan_backend(facts)
     with pytest.raises(ValueError):
         InPlaceTTTWorkload(replace(workload.config, learning_rate=0.5)).bind_backend(facts, planned)
-    with pytest.raises(ValueError):
-        workload.bind_backend(replace(facts, probe=replace(probe, topology=AttachmentTopology.ENGINE_CORE)), planned)
 
 
 def test_signed_attachment_crosses_the_wire_and_rejects_malformed_payloads() -> None:

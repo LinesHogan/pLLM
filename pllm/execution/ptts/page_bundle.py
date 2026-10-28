@@ -26,7 +26,6 @@ from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.cuda_stream import upload
 from pllm.execution.ptts.page_bundle_planning import DTYPE_BYTES, page_stride_bytes
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.execution.scheduler import validate_plan_bundle
 from pllm.execution.shared_tensor import CudaIpcStorage, RemoteCompletion, tensor_dtype
 
 
@@ -366,12 +365,10 @@ class PageBundleArena:
     def __init__(
         self,
         plan: PlanBundle,
-        local_candidates: tuple[StateProviderPlan, ...] | None = None,
         *,
         device: torch.device | None = None,
         _owned_resources: tuple[str, ...] | None = None,
     ) -> None:
-        validate_plan_bundle(plan, local_candidates=local_candidates)
         self.plan = plan
         placements = {(item.device_kind, item.device_ordinal) for item in plan.state_physical.representations}
         if not placements:

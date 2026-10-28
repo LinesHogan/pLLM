@@ -20,7 +20,7 @@ from pllm.backends.vllm.runtime import (
 )
 from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import AttachmentTopology, SignedBackendAttachment
-from pllm.contracts.semantic_graph import TaskId
+from pllm.contracts.semantic_graph import StateScope, TaskId
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.trace import TraceSelection
 from pllm.workload_transport import decode_workload as decode_workload, encode_workload as encode_workload
@@ -52,13 +52,34 @@ class GPUWorker(Worker):
         self, workload: BackendWorkload[DataT, ResultT], attachment: SignedBackendAttachment, cache_policy: CachePolicy
     ) -> None:
         runner = self.workload_runner
-        visibility = attachment.inputs.plan.timeline.visibility
+        plan = attachment.inputs.plan
+        visibility = plan.timeline.visibility
         facts = probe_backend(
             workload.backend_requirements(),
             runner,
-            attachment.inputs.plan.timeline,
+            plan.timeline,
             publish_lag=0 if visibility is None else visibility.lag,
         )
+        max_lineages = (
+            facts.max_admitted_lineages
+            if any(state.scope is StateScope.REQUEST for state in plan.semantic_graph.states)
+            else 1
+        )
+        candidates = tuple(
+            provider.materialize_plan(
+                resource=entry.resource,
+                layout=entry.layout,
+                binding=binding,
+                max_admitted_lineages=max_lineages,
+                graph=plan.semantic_graph,
+            )
+            for entry, binding in zip(
+                plan.tensor_layout_request.layouts, plan.tensor_layout_decision.bindings, strict=True
+            )
+            for provider in facts.providers
+        )
+        if (facts.probe, candidates) != (attachment.inputs.probe, plan.state_request.candidates):
+            raise ValueError("worker backend facts changed; compile the workload against the current backend")
         runner.attach_workload(workload.bind_backend(facts, attachment), cache_policy)
 
     def workload_command(self, command: str, payload: str) -> str:

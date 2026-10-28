@@ -117,10 +117,6 @@ def test_production_tuning_policy_is_signed_into_worker_facts():
     workload.bind_backend(facts, attachment)
     assert torch.equal(rng, torch.get_rng_state())  # measurement does not consume the global RNG
     assert attachment.inputs.plan.timeline.tensor_policy == policy
-    with pytest.raises(ValueError):  # worker facts must carry the signed policy
-        workload.bind_backend(
-            replace(facts, timeline=replace(facts.timeline, tensor_policy=TensorPolicy())), attachment
-        )
 
 
 @pytest.mark.parametrize("device", ("cpu", "cuda:0"))

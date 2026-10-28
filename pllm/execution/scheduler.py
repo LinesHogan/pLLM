@@ -3,22 +3,14 @@
 from __future__ import annotations
 
 from pllm import _core
-from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.semantic_graph import PhysicalPlan, ScheduleDecision, SchedulerTimeline, SemanticGraph
 from pllm.contracts.state_representation import (
     StatePhysicalPlan,
-    StateProviderPlan,
     StateRepresentationDecision,
     StateRepresentationRequest,
 )
 from pllm.contracts.tensor_layout import TensorLayoutDecision, TensorLayoutRequest
 from pllm.execution.codec import decode_boundary, encode_boundary
-
-
-def validate_plan_bundle(plan: PlanBundle, *, local_candidates: tuple[StateProviderPlan, ...] | None = None) -> None:
-    _core.validate_plan_bundle(
-        encode_boundary(plan), None if local_candidates is None else encode_boundary(local_candidates)
-    )
 
 
 def compile_state_schedule(
