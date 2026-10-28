@@ -106,6 +106,11 @@ class StateTaskContext(Generic[DataT]):
     def __post_init__(self) -> None:
         self.page_pins[self.pin] = None
 
+    def sole_write(self) -> PageWrite | None:
+        """The invocation's one pending private write, which its tensor tasks share."""
+        (write,) = self.page_writes or (None,)
+        return write
+
     @property
     def publication(self) -> PagePublication | None:
         return next(reversed(self.page_publications), None)
@@ -277,9 +282,8 @@ class PublishStateTask(Generic[DataT]):
         return 0
 
     def execute(self, context: StateTaskContext[DataT]) -> None:
-        if context.page_writes:
-            assert len(context.page_writes) == 1
-            (write,) = context.page_writes
+        write = context.sole_write()
+        if write is not None:
             context.publish_owned_write(write)
 
 

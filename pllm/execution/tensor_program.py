@@ -158,9 +158,8 @@ def _read(context: StateTaskContext[D], version: Literal["input", "private", "pu
         raise ValueError("multiple publications require explicit Region snapshot sources")
     refs = context.pin.refs
     access: tuple[PagePin | PageWrite, ...] = (context.pin,) * len(refs)
-    if version == "private" and context.page_writes:
-        assert len(context.page_writes) == 1
-        (write,) = context.page_writes
+    write = context.sole_write()
+    if version == "private" and write is not None:
         positions = write.before_refs.positions(refs)
         refs = refs.replace_versions(write.before_refs, write.after_refs)
         access = tuple(write if index >= 0 else context.pin for index in positions.tolist())
@@ -467,9 +466,8 @@ class TensorOperation(Generic[D]):
                 write = context.prepare_owned_write(context.pin.refs.take(selected), copy_fields=self.copy_fields)
                 roots = context.arena.lazy_roots((write,) * len(selected), write.after_refs)
                 self.optimizer.update(roots, roots.field_slots, output.gradients)
-            if write is None and context.page_writes and (output.field_writes or self.mode == "update" or self.publish):
-                assert len(context.page_writes) == 1
-                (write,) = context.page_writes
+            if write is None:
+                write = context.sole_write()
             if output.field_writes:
                 if write is None:
                     raise ValueError("memory writes require the invocation's private transition")
