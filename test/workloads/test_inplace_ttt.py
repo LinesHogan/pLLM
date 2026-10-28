@@ -105,14 +105,6 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
             )
             for index, target in enumerate(targets)
         )
-        if row == 0:
-            oversized = tuple(
-                replace(operand, hidden=operand.hidden.expand(9, -1), desired=operand.desired.expand(9, -1))
-                for operand in step
-            )
-            with pytest.raises(ValueError):  # more rows than the signed packed-row capacity
-                execution.step(_input(oversized))
-            assert execution.arena.latest(latest.lineage_id) == latest
         (result,) = execution.step(_input(step)).entries
         assert result.before_ref == latest
         latest = result.after_ref

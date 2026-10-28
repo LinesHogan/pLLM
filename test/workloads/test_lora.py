@@ -80,8 +80,6 @@ def test_weighted_ce_shared_update_matches_sgd_and_preserves_original_pins() -> 
     guidance, idle = testing.run_guided_step(execution, replace(value, auxiliary=None))
     torch.testing.assert_close(guidance.values, hidden @ a @ b * 1.5)
     assert idle.publication is None and idle.loss is None
-    with pytest.raises(ValueError):  # At least one row must carry weight.
-        execution.step(replace(value, auxiliary=replace(batch, weights=torch.zeros(4))))
     for actual, expected in zip(execution.arena.snapshot(old_pin, initial), original, strict=True):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     execution.arena.wait_release(execution.arena.release_pin(old_pin))

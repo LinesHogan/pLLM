@@ -370,14 +370,13 @@ def test_sampler_adapts_step_results_in_memory_trace_and_runtime(monkeypatch: py
 
     def output(
         prediction: Call,
-        width: int,
         stage: SamplerStage,
         beta: float,
         mask: TensorPort | None,
         data: TensorFrame,
         batch: TensorBatch,
     ) -> TaskOutput:
-        result = adapt(prediction, width, stage, beta, mask, data, batch)
+        result = adapt(prediction, stage, beta, mask, data, batch)
         assert result.guidance is not None
         devices.append(result.guidance.values.device.type)
         return result

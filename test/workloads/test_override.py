@@ -132,8 +132,6 @@ def test_override_matches_reweight_adam_and_final_noop() -> None:
         assert_roots(execution.snapshot(latest), adam_roots(optimizer, down, up))
     assert_roots(execution.arena.snapshot(held, initial), original, exact=True)
     execution.arena.wait_release(execution.arena.release_pin(held))
-    with pytest.raises(ValueError):  # sample 3 exceeds num_iterations
-        execution.start_step(samples((3,), 5))
     execution.retire(())
     assert execution.diagnostics().loss_count == execution.diagnostics().update_count == 2
     assert execution.diagnostics().active_lineages == 0

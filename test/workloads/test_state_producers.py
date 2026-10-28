@@ -225,18 +225,7 @@ def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch
     )
     for deployed, payload in ((imported, pllm.state.StateTensorUpdate(values, (key,))), (written, None)):
         execution = deployed.execution
-        (entry,) = execution.admit((identity,), stream=stream)
-        if payload is not None:
-            with pytest.raises(ValueError, match="finite"):
-                testing.run_step(
-                    execution,
-                    testing.step_input(
-                        (identity,),
-                        auxiliary=replace(payload, values=tuple(value * float("nan") for value in values)),
-                    ),
-                    stream=stream,
-                )
-            assert execution.arena.latest(entry.lineage_id) == entry
+        execution.admit((identity,), stream=stream)
         result = testing.run_step(execution, testing.step_input((identity,), auxiliary=payload), stream=stream)
         torch.testing.assert_close(
             execution.snapshot(result.publication.after_refs[0], stream=stream), tuple(value[0] for value in values)

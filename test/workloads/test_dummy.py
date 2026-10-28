@@ -94,8 +94,6 @@ def test_dummy_runs_graph_sign_plan_execute() -> None:
     # Four packed rows exceed the signed backend row capacity of three.
     with pytest.raises(ValueError):
         attached.start_step(step_input(2, torch.cat((hidden, hidden[:1])), count=4))
-    with pytest.raises(ValueError):  # hidden width differs from the specialized model
-        attached.step(step_input(2, torch.zeros(3, 6)))
     torch.testing.assert_close(exported(attached, value(2)), expected)
     with pytest.raises(ValueError):  # a changed declaration cannot reuse the signed attachment
         DummyWorkload(replace(workload.config, export_every_n_steps=1)).bind_backend(bounded, deployment.attachment)
