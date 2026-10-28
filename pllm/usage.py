@@ -68,6 +68,13 @@ from pllm.execution.host_runtime import (
     HostWorkload,
     TensorHostBinding,
 )
+from pllm.execution.model_effect_binding import (
+    declare_activation_patch,
+    declare_layer_route,
+    declare_parameter_overlay,
+    import_update,
+    write_result,
+)
 from pllm.execution.module_state import (
     ModuleCall,
     ModuleFactory,
@@ -483,7 +490,8 @@ class Activation:
         if definition.feed is not None:
             raise ValueError("Activation needs local state written from fed inputs")
         state = context.states[self.state]
-        context.binding.activation_patch(
+        declare_activation_patch(
+            context.binding,
             state,
             context.writes.get(self.state) if context.routes or context.binding.feeds else None,
             layers=self.layers,
@@ -583,7 +591,7 @@ class _Write(_Effect):
         context.definitions.append((operation.name, fingerprint(self)))
         call = operation.tensor()
         state = context.states[self.state]
-        update = context.binding.write_result(call, state, self.fields, operation.phase.value)
+        update = write_result(context.binding, call, state, self.fields, operation.phase.value)
         context.writes[self.state] = (
             update,
             context.binding.publish(update, state, when=operation.phase.value, name=f"{self.state}.publish"),
@@ -843,7 +851,8 @@ class _Overlay(_Effect):
         applied = effect.applied_fields
         visibility = _setting(self.visibility, context.owner, Visibility)
         identity = fingerprint(operation.function)
-        context.binding.parameter_overlay(
+        declare_parameter_overlay(
+            context.binding,
             operation.name,
             effect,
             buffers,
@@ -1332,7 +1341,7 @@ class _Declaration:
                     self.binding.imports[name] = tuple(
                         view for (resource, _), view in self.binding.field_views.items() if resource == name
                     )
-                    update = self.binding.import_update(allocated, f"{name}:import@1")
+                    update = import_update(self.binding, allocated, f"{name}:import@1")
                     self.writes[name] = (
                         update,
                         self.binding.publish(update, allocated, when=When.BEFORE_MODEL, name=f"{name}.publish"),
@@ -1348,8 +1357,10 @@ class _Declaration:
             if (effect := _typed(value, Activation) or _typed(value, Overlay)) is not None:
                 effect.declare(self)
         if self.routes:
-            self.binding.layer_route(
-                tuple((tokens, over, self.method(name)) for name, tokens, over in self.routes), self.positions
+            declare_layer_route(
+                self.binding,
+                tuple((tokens, over, self.method(name)) for name, tokens, over in self.routes),
+                self.positions,
             )
         if self.binding.feeds:
             self.binding.conditional_input(tuple(feed.resource for feed in self.binding.feeds))

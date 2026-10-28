@@ -112,3 +112,4 @@ class TensorBindingBase(Builder[TensorFrame]):
         self.parameter_phases: tuple[HiddenPhase, ...] = ()
         self.field_views: dict[tuple[str, str], FieldView] = {}
         self.imports: dict[str, tuple[FieldView, ...]] = {}
+        self.position_states: tuple[tuple[str, float], ...] = ()

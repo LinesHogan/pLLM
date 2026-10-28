@@ -1,6 +1,6 @@
 """Tensor declarations bound once to the plan: model effects, row tasks and their execution binding.
 
-TensorBinding combines ModelEffectBinding and RowTaskBinding and binds the declared tasks to the
+TensorBinding holds declaration state and binds the declared tasks to the
 specialized plan (native implementations, scans, fixed-shape steps, input preparation).
 """
 
@@ -49,7 +49,6 @@ if TYPE_CHECKING:
     from pllm.execution.step_input import TensorStepInput
 
 
-from pllm.execution.model_effect_binding import ModelEffectBinding
 from pllm.execution.row_task_binding import RowTaskBinding
 
 
@@ -86,7 +85,7 @@ class TensorResult:
 TensorOutput = TensorResult | torch.Tensor | None
 
 
-class TensorBinding(ModelEffectBinding, RowTaskBinding):
+class TensorBinding(RowTaskBinding):
     """Authoring projections only; tensor results remain invocation-local."""
 
     @property
