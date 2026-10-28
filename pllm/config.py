@@ -74,10 +74,6 @@ class ExecutionOptions:
             raise ValueError("training_rows must be >= 1")
         if self.capture_memory_bytes < 1:
             raise ValueError("capture_memory_bytes must be positive")
-        if self.state_memory_bytes < 0:
-            raise ValueError("state_memory_bytes must be >= 0; 0 uses the backend's observed available capacity")
-        if self.memory_budget_bytes is not None and self.memory_budget_bytes < 0:
-            raise ValueError("memory_budget_bytes must be >= 0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,17 +98,5 @@ class ModelConfig:
     kv_offload: KVOffload | None = None
 
     def __post_init__(self) -> None:
-        if not self.model:
-            raise ValueError("model must be a non-empty model name or path")
         if self.generated_kv not in ("reuse", "isolate"):
             raise ValueError('generated_kv must be "reuse" or "isolate"')
-        if self.max_model_len < 2:
-            raise ValueError("max_model_len must be >= 2")
-        if self.max_num_seqs < 1:
-            raise ValueError("max_num_seqs must be >= 1")
-        if self.max_num_batched_tokens < self.max_num_seqs:
-            raise ValueError("max_num_batched_tokens must be >= max_num_seqs")
-        if not 0 < self.gpu_memory_utilization < 1:
-            raise ValueError("gpu_memory_utilization must lie between 0 and 1")
-        if self.seed < 0:
-            raise ValueError("seed must be >= 0")

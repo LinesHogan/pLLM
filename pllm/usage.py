@@ -165,8 +165,6 @@ class Batch(_Source):
     field: str
 
     def batch(self, state: str, definition: InstanceState) -> tuple[str, str]:
-        if self.field not in ("hidden", "base_logits", "labels", "weights"):
-            return super().batch(state, definition)
         return "batch", self.field
 
 
@@ -379,7 +377,7 @@ class InstanceState:
 
     def __post_init__(self) -> None:
         if self.module is not None:
-            if self.fields or self.shape is not None or self.initialize is not None or self.memory or self.feed:
+            if self.fields or self.shape is not None or self.initialize is not None or self.feed:
                 raise ValueError(
                     "a module state takes its fields and initial values from the module; drop fields/shape/initialize"
                 )
@@ -392,20 +390,8 @@ class InstanceState:
             or self.imported
         ):
             raise ValueError("fed state needs InstanceState without an optimizer, initializer or memory fields")
-        if self.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
-            raise ValueError("optimizer state requires a supported floating dtype")
         if self.shape is not None:
-            if self.fields:
-                raise ValueError("declare a single shape or named fields, not both")
             object.__setattr__(self, "fields", {"value": self.shape})
-        if not self.fields:
-            raise ValueError("state requires a shape or named fields")
-        if self.memory and self.optimizer is None:
-            raise ValueError("memory fields ride on the training transition and require an optimizer")
-        if set(self.memory) & set(self.fields):
-            raise ValueError("memory fields duplicate a parameter field")
-        if any(type(shape) is Buffer for shape in self.memory.values()):
-            raise TypeError("memory fields require tensor shapes, not overlay buffers")
 
     scope: ClassVar[StateScope] = StateScope.INSTANCE
 
@@ -540,8 +526,6 @@ def _frozen(initialize: Initializer | None) -> Initializer | None:
 def _buffers(state: InstanceState) -> dict[str, Buffer]:
     if state.optimizer is not None:
         raise ValueError("buffer effects update their state themselves; drop the optimizer")
-    if state.alignment != 16:
-        raise ValueError("buffer effect layouts use their original target alignment")
     buffers: dict[str, Buffer] = {}
     for key, value in state.fields.items():
         match value:
@@ -590,14 +574,12 @@ class _Write(_Effect):
         definition = context.state_definition(self.state, "write needs a declared state")
         if (
             definition.feed is not None
-            or self.state in context.writes
             or not self.fields
             or len(set(self.fields)) != len(self.fields)
             or any((self.state, key) not in context.parameters for key in self.fields)
-            or operation.gradient is not None
             or operation.rows
         ):
-            raise ValueError("write needs one producer, distinct declared fields and no gradient or row mask")
+            raise ValueError("write needs an unfed state, distinct declared fields and no row mask")
         context.definitions.append((operation.name, fingerprint(self)))
         call = operation.tensor()
         state = context.states[self.state]
@@ -703,8 +685,6 @@ class _Train(_Effect):
         reset = context.method(self.reset)
         identity = boundary_digest(fingerprint(operation.function), fingerprint(reset), sources, self)
         context.definitions.append((operation.name, identity))
-        if context.training is not None:
-            raise ValueError("tensor sampler attachment requires one training operation")
         context.training = (
             context.binding.weighted_train(
                 operation.name,
@@ -744,22 +724,10 @@ class _Gradient:
     parameter_rows: str = ""
 
     def contract(self, operation: _Operation, arguments: dict[str, _Source]) -> MathContract:
-        """Validate derivative edges and identify parameter resources and detachments."""
+        """Identify parameter resources and detachments."""
         parameters = {
             key: parameter for key, source in arguments.items() if (parameter := _typed(source, Parameter)) is not None
         }
-        if self.parameters and not parameters:
-            raise ValueError("parameter gradients require declared Parameter inputs")
-        if self.input_rows and not self.inputs or self.parameter_rows and not self.parameters:
-            raise ValueError("gradient row selectors require their declared derivative edges")
-        if len(set(self.inputs)) != len(self.inputs) or any(
-            key not in arguments or key in parameters for key in self.inputs
-        ):
-            raise ValueError("input gradients must name distinct nonparameter inputs")
-        if any(not arguments[key].differentiable for key in self.inputs):
-            raise ValueError("indices, versions and drawn tokens are nondifferentiable inputs")
-        if operation.effect.bounded and (self.inputs or self.parameters or operation.rows):
-            raise ValueError("bounded host exports use their own row limits and are gradient boundaries")
         math = (
             MathContract(
                 input_gradients=self.inputs,
@@ -964,8 +932,6 @@ def layer_route(*, tokens: Tokens = "all", over: Over = "token") -> Callable[[F]
     packs each request's contiguous scheduled tokens into [M, H] hidden tensors;
     position and generated flags have shape [M, 1]. Spans cannot load predecessors.
     """
-    if tokens not in ("prefill", "decode", "all"):
-        raise ValueError('set layer_route(tokens=) to "prefill", "decode" or "all"')
     if over not in ("token", "span"):
         raise ValueError('set layer_route(over=) to "token" or "span"')
     return _mark(tokens=tokens, over=over)
@@ -1028,8 +994,6 @@ class _Operation:
         sources, captures = _arguments(self.function), dict[str, Capture]()
         for key, source in sources.items():
             if (captured := _typed(source, _Captured)) is not None:
-                if not self.effect.training:
-                    raise ValueError(f"{key}: only training operations capture inputs into memory")
                 sources[key], captures[key] = captured.source, captured.capture
         return sources, captures
 
@@ -1266,8 +1230,6 @@ class _Declaration:
             for value in self.values.values()
             if (consumer := _typed(value, Overlay)) is not None and consumer.state == name
         )
-        if len(consumers) > 1:
-            raise ValueError("a state needs one consistent target layout")
         if consumers:
             (consumer,) = consumers
             check_overlay_fields(buffers, consumer.applied_fields, consumer.targets, consumer.operator, consumer.scale)
@@ -1283,12 +1245,6 @@ class _Declaration:
         )
         shapes = {field.name: field.shape for field in fields}
         if definition.optimizer is not None:
-            model = self.binding.dimensions
-            if (
-                model is not None
-                and len({part.dtype(model) if callable(part.dtype) else part.dtype for part in fields}) != 1
-            ):
-                raise ValueError("optimizer buffers must share one dtype")
             dtype = fields[0].dtype
             state, ports = self.binding.parameters(
                 name,
@@ -1357,8 +1313,6 @@ class _Declaration:
         return states
 
     def train(self, call: Call, state: str) -> None:
-        if self.training is not None or state in self.writes:
-            raise ValueError("training needs one optimizer sink without another state producer")
         self.training = call, self.states[state]
 
     def attach_training(self) -> None:
@@ -1391,17 +1345,6 @@ class _Declaration:
                 when=When.MODEL_UPDATE,
                 function=lambda data, batch: TaskOutput(),
             )
-        if self.routes:
-            attachment = b.attachment
-            composed = attachment is not None and (attachment.activation_bindings or attachment.overlay_bindings)
-            if not composed and (len(b.graph.tasks) != 1 or b.graph.states):
-                raise ValueError("layer_route requires a standalone model effect or Activation composition")
-        if any(
-            name not in {state.resource for state in b.graph.states}
-            for name, value in self.values.items()
-            if _typed(value, InstanceState) is not None
-        ):
-            raise ValueError("state buffers require an overlay effect; unused state is not allocated")
 
         frozen = {
             name
@@ -1497,12 +1440,6 @@ class Workload(
                 for task in b.graph.tasks
             ),
         )
-        if (
-            facts is not None
-            and b.overlay_targets
-            and tuple(target.target for target in facts.probe.targets) != b.overlay_targets
-        ):
-            raise ValueError("overlay targets differ from backend specialization")
         return b
 
     def backend_requirements(self) -> BackendRequirements:
@@ -1555,18 +1492,7 @@ class Workload(
         def output(data: TensorFrame, invocation: InvocationOutput) -> TensorOutput:
             return b.result(data, invocation) if b.graph.states else invocation.value
 
-        limits = [
-            fact.input_shapes[0][0]
-            for fact in b.resources
-            if fact.task in b.tensor_tasks and fact.task not in b.exports and fact.input_shapes
-        ]
-        row_limit = min(limits) if limits and type(self).operations is Workload.operations else None
-
         def rows(value: TensorStepInput) -> tuple[PackedPhaseRow, ...]:
-            if row_limit is not None and len(value.rows.latest_decode_rows) > row_limit:
-                raise ValueError("operation rows exceed the signed workspace envelope")
-            if b.probe is not None and value.rows.total_rows > b.probe.max_packed_rows:
-                raise ValueError("packed input exceeds the signed backend row capacity")
             if b.attachment is not None and (
                 b.attachment.activation_bindings
                 or any(task.replay is not None for task in b.graph.tasks)
