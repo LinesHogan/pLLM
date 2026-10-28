@@ -30,14 +30,17 @@ class RequestStateKey:
         fields: tuple[RequestKeyField, ...],
     ) -> "RequestStateKey":
         fields = canonical_request_key_fields(fields)
-        if RequestKeyField.REQUEST_ID in fields and not identity.request_id:
-            raise ValueError("request_id state key requires a non-empty request id")
-        if RequestKeyField.PROMPT_IDX in fields and identity.prompt_idx < 0:
-            raise ValueError("prompt_idx state key requires resolved prompt metadata")
-        if RequestKeyField.SAMPLE_IDX in fields and identity.sample_idx < 0:
-            raise ValueError("sample_idx state key requires resolved sample metadata")
-        if RequestKeyField.ROUTE in fields and not identity.route:
-            raise ValueError("route state key requires a user-computed route value")
+        if (
+            RequestKeyField.REQUEST_ID in fields
+            and not identity.request_id
+            or RequestKeyField.PROMPT_IDX in fields
+            and identity.prompt_idx < 0
+            or RequestKeyField.SAMPLE_IDX in fields
+            and identity.sample_idx < 0
+            or RequestKeyField.ROUTE in fields
+            and not identity.route
+        ):
+            raise ValueError(f"RequestIdentity {identity} is missing a field required by {fields}")
         return cls(
             fields=fields,
             request_id=(identity.request_id if RequestKeyField.REQUEST_ID in fields else ""),

@@ -49,24 +49,6 @@ class PackedHiddenSnapshotBatch:
     row_batch: PackedPhaseRowBatch
     snapshots: tuple[PackedHiddenSnapshot, ...]
 
-    def __post_init__(self) -> None:
-        if not self.snapshots:
-            raise ValueError("packed hidden snapshots must be non-empty")
-        locator_keys = tuple(snapshot.resource.locator_key for snapshot in self.snapshots)
-        if tuple(sorted(locator_keys)) != locator_keys or len(set(locator_keys)) != len(locator_keys):
-            raise ValueError("packed hidden snapshots must have sorted unique resources")
-        reference = self.snapshots[0].hidden
-        if reference.ndim != 2 or int(reference.shape[0]) != self.row_batch.total_rows:
-            raise ValueError("packed hidden snapshots must align with one row batch")
-        if any(
-            snapshot.hidden.shape != reference.shape
-            or snapshot.hidden.dtype is not reference.dtype
-            or snapshot.hidden.device != reference.device
-            or torch.is_inference(snapshot.hidden)
-            for snapshot in self.snapshots
-        ):
-            raise ValueError("packed hidden snapshots must be aligned ordinary tensors")
-
     @property
     def plan_epoch(self) -> int:
         return self.row_batch.plan_epoch
@@ -87,11 +69,9 @@ def hidden_binding(layer: int, site: HiddenSite, layer_count: int) -> PackedHidd
     """The binding a Qwen2-style decoder exposes: block outputs by layer index, the final output as `model.norm`."""
     if site is HiddenSite.MODEL_OUTPUT and layer == -1:
         return PackedHiddenResourceBinding(str(layer), HiddenLayerKind.INDEX, site, "model.norm")
-    if site is not HiddenSite.BLOCK_OUTPUT:
-        raise ValueError("Qwen2 hidden input requires a block or final model output")
     module_index = layer if layer >= 0 else layer_count + layer
-    if module_index < 0 or module_index >= layer_count:
-        raise ValueError("hidden layer does not identify a Qwen2 block")
+    if site is not HiddenSite.BLOCK_OUTPUT or not 0 <= module_index < layer_count:
+        raise ValueError(f"hidden layer {layer} at site {site.value} is outside 0..{layer_count - 1}")
     return PackedHiddenResourceBinding(
         str(layer), HiddenLayerKind.INDEX, HiddenSite.BLOCK_OUTPUT, f"model.layers.{module_index}"
     )

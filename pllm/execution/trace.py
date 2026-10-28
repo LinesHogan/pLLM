@@ -87,18 +87,11 @@ class TraceEvent:
 
     def tensor(self) -> torch.Tensor:
         """Reconstruct an independent CPU value, including exact NaN/Inf and integer bits."""
-        if (
-            self.tensor_data is None
-            or self.tensor_dtype is None
-            or len(self.tensor_shape) > 8
-            or any(size < 0 for size in self.tensor_shape)
-            or len(self.tensor_data) > 4 * ((MAX_SNAPSHOT_BYTES + 2) // 3)
-        ):
+        if self.tensor_data is None or self.tensor_dtype is None:
             raise ValueError("trace event has no bounded tensor snapshot")
         dtype = tensor_dtype(self.tensor_dtype)
         raw = bytearray(b64decode(self.tensor_data, validate=True))
-        if len(raw) != prod(self.tensor_shape) * dtype.itemsize or len(raw) > MAX_SNAPSHOT_BYTES:
-            raise ValueError("trace tensor bytes differ from their shape and dtype")
+        assert len(raw) == prod(self.tensor_shape) * dtype.itemsize <= MAX_SNAPSHOT_BYTES
         return (
             torch.frombuffer(raw, dtype=dtype).reshape(self.tensor_shape)
             if raw
@@ -175,10 +168,9 @@ class TraceSelection:
             or not 8 <= self.max_tensor_bytes <= MAX_SNAPSHOT_BYTES
             or not 0 <= self.kernel_calls <= 16
             or any(index < 0 for index in self.iterations)
+            or (self.kernel_calls and (self.identities or self.iterations))
         ):
             raise ValueError("trace selection exceeds its tensor/iteration/profiler bounds")
-        if self.kernel_calls and (self.identities or self.iterations):
-            raise ValueError("kernel profiling selects whole tasks; request/iteration filters apply to snapshots")
 
 
 @dataclass(slots=True, eq=False)
@@ -204,8 +196,7 @@ class ExecutionTrace:
     def __init__(
         self, plan: PhysicalPlan, capacity: int = 256, on_export: Callable[[TraceEvent], None] | None = None
     ) -> None:
-        if capacity < 1:
-            raise ValueError("trace capacity must be positive")
+        assert capacity >= 1
         self.plan = plan
         self._execution_id = uuid4().hex
         self._events: deque[_TraceEntry] = deque(maxlen=capacity)
@@ -314,8 +305,7 @@ class ExecutionTrace:
             and (not identities or not set(identities).issubset(selection.identities))
         ):
             return
-        if tensor.is_cuda and torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("tensor/gradient observations require execution outside CUDA capture")
+        assert not (tensor.is_cuda and torch.cuda.is_current_stream_capturing())
         shape = tuple(tensor.shape)
         if tensor.numel() * tensor.element_size() > selection.max_tensor_bytes:
             count = selection.max_tensor_bytes // tensor.element_size()
@@ -354,11 +344,11 @@ class ExecutionTrace:
             if kernels:
                 self._kernel_calls -= 1
         if kernels and (
-            stream is None or torch.profiler.ProfilerActivity.CUDA not in torch.profiler.supported_activities()
+            stream is None
+            or torch.profiler.ProfilerActivity.CUDA not in torch.profiler.supported_activities()
+            or torch.cuda.is_current_stream_capturing()
         ):
-            raise RuntimeError("kernel profiling requires a CUDA task and Kineto CUDA activity support")
-        if kernels and torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("kernel profiling cannot start inside CUDA capture")
+            raise RuntimeError("kernel profiling requires a non-capturing CUDA task and Kineto CUDA activity support")
         profiler = (
             torch.profiler.profile(
                 activities=[
@@ -379,11 +369,12 @@ class ExecutionTrace:
                 yield
             if timing is not None:
                 timing[1].record(stream)
-        except WindowBackpressure:
-            self.record(TracePhase.BACKPRESSURE, invocation_id, task_id=task_id)
-            raise
-        except Exception:
-            self.record(TracePhase.TASK_FAILED, invocation_id, task_id=task_id)
+        except Exception as exc:
+            match exc:
+                case WindowBackpressure():
+                    self.record(TracePhase.BACKPRESSURE, invocation_id, task_id=task_id)
+                case _:
+                    self.record(TracePhase.TASK_FAILED, invocation_id, task_id=task_id)
             raise
         if profiler is not None:
             events = tuple[_KernelEvent, ...](profiler.events() or ())
@@ -435,8 +426,7 @@ class ExecutionTrace:
             while True:
                 if export is not None and self._failure is not None:
                     raise self._failure
-                if self._closed:
-                    raise RuntimeError("export trace is closed; create a new execution")
+                assert not self._closed
                 if len(self._events) < (self._events.maxlen or 0):
                     break
                 evict = next((entry for entry in self._events if not entry.pending), None)
@@ -454,14 +444,7 @@ class ExecutionTrace:
             dtype, shape = None, ()
             payload = None
             if tensor is not None:
-                if (
-                    phase not in (TracePhase.TENSOR, TracePhase.GRADIENT)
-                    or not tensor_name
-                    or task_id not in {task.task_id for task in self.plan.tasks}
-                    or tensor.ndim > 8
-                    or tensor.numel() * tensor.element_size() > MAX_SNAPSHOT_BYTES
-                ):
-                    raise ValueError("tensor trace requires an original task and a bounded explicit snapshot")
+                assert tensor_name and tensor.numel() * tensor.element_size() <= MAX_SNAPSHOT_BYTES
                 dtype = TensorDType(str(tensor.dtype).removeprefix("torch."))
                 shape = tuple(tensor.shape)
                 # Own a bounded host copy; delivery or explicit snapshot reads wait for it.

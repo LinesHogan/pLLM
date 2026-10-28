@@ -35,13 +35,12 @@ class FTTTEditState:
             transaction.batch.hidden.shape[1] != self.specialization.hidden_size
             or transaction.batch.hidden.dtype != torch.float32
             or transaction.batch.hidden.device != self.specialization.device
-        ):
-            raise ValueError("FTTT transaction differs from specialization")
-        if (
-            self.specialization.max_input_rows is not None
+            or self.specialization.max_input_rows is not None
             and len(transaction.batch.hidden) > self.specialization.max_input_rows
         ):
-            raise ValueError("FTTT completion rows exceed the signed input capacity")
+            raise ValueError(
+                "FTTT batch hidden tensor must match specialized device, float32 dtype, width and row limit"
+            )
         if transaction.batch.readiness is not None:
             transaction.batch.readiness.order_on(torch.cuda.current_stream(self.specialization.device))
         return FTTTStepContext(transaction, self)
@@ -64,8 +63,7 @@ class FTTTEditState:
         self.step, self.version = snapshot.step, snapshot.version
 
     def output(self, context: FTTTStepContext) -> FTTTResult:
-        if context.delta is None or context.intent is None:
-            raise RuntimeError("FTTT signed graph did not produce its result")
+        assert context.delta is not None and context.intent is not None
         return FTTTResult(
             context.transaction.intent.transaction_id,
             context.delta,
@@ -136,8 +134,7 @@ def train(config: FTTTConfig, context: FTTTStepContext) -> None:
 
 
 def predict(context: FTTTStepContext) -> None:
-    if context.edit_input is None:
-        raise RuntimeError("FTTT prediction requires its signed training input")
+    assert context.edit_input is not None
     context.delta = F.linear(F.linear(context.edit_input, context.edit_state.down), context.edit_state.up).detach()
 
 

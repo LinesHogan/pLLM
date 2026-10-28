@@ -19,14 +19,6 @@ class PackedPhaseRow:
     identity: RequestIdentity
     prompt_length: int = 0
 
-    def __post_init__(self) -> None:
-        if self.packed_row_index < 0 or self.request_ordinal < 0 or self.token_offset < 0 or self.prompt_length < 0:
-            raise ValueError("packed phase row indices must be non-negative")
-        if not self.identity.request_id or self.identity.prompt_idx < 0 or self.identity.sample_idx < 0:
-            raise ValueError("packed phase row requires a resolved request identity")
-        if self.phase not in (HiddenPhase.PREFILL, HiddenPhase.DECODE):
-            raise ValueError("packed row requires prefill or decode phase")
-
 
 @dataclass(frozen=True, slots=True)
 class PackedPhaseRowBatch:
@@ -36,16 +28,6 @@ class PackedPhaseRowBatch:
     step_id: int
     total_rows: int
     rows: tuple[PackedPhaseRow, ...]
-
-    def __post_init__(self) -> None:
-        if self.plan_epoch < 1:
-            raise ValueError("packed phase batch plan epoch must be positive")
-        if self.step_id < 0 or self.total_rows < 0:
-            raise ValueError("packed phase batch facts must be non-negative")
-        if self.total_rows != len(self.rows):
-            raise ValueError("packed phase batch must contain every planned row")
-        if tuple(row.packed_row_index for row in self.rows) != tuple(range(self.total_rows)):
-            raise ValueError("packed phase batch rows must preserve packed plan order")
 
     @property
     def identities(self) -> tuple[RequestIdentity, ...]:
@@ -94,10 +76,6 @@ class PackedSamplerRowLink:
     sampler_row_index: int
     packed_row_index: int
 
-    def __post_init__(self) -> None:
-        if self.sampler_row_index < 0 or self.packed_row_index < 0:
-            raise ValueError("packed sampler row indices must be non-negative")
-
 
 @dataclass(frozen=True, slots=True)
 class PackedSamplerRowBatch:
@@ -105,12 +83,6 @@ class PackedSamplerRowBatch:
 
     row_batch: PackedPhaseRowBatch
     links: tuple[PackedSamplerRowLink, ...]
-
-    def __post_init__(self) -> None:
-        if tuple(link.sampler_row_index for link in self.links) != tuple(range(len(self.links))):
-            raise ValueError("packed sampler links must preserve sampler row order")
-        if any(link.packed_row_index >= self.row_batch.total_rows for link in self.links):
-            raise ValueError("packed sampler link is outside its packed row batch")
 
     @property
     def plan_epoch(self) -> int:

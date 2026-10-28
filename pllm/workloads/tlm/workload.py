@@ -40,7 +40,7 @@ class TLMConfig:
 
     def __post_init__(self) -> None:
         if not isfinite(self.threshold) or not isfinite(self.lamb) or self.lamb < 0:
-            raise ValueError("TLM objective configuration is not finite or closed")
+            raise ValueError("TLMConfig needs finite threshold and finite, nonnegative lamb")
 
 
 @dataclass(frozen=True, slots=True)

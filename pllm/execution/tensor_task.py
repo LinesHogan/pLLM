@@ -63,17 +63,15 @@ class FieldWriter:
             )
         )
         values = tuple(value.unsqueeze(0) for value in values) if instance and self.source is not None else values
-        if validate:
-            for view, value in zip(self.fields, values, strict=True):
-                target = view.read(batch.roots[selected[0]][view.field])
-                if (
-                    value.shape != (len(selected), *view.shape)
-                    or value.dtype != target.dtype
-                    or value.device != target.device
-                ):
-                    raise ValueError(
-                        f"write to {self.resource} needs fields with their declared shape, dtype, device and request axis"
-                    )
+        if validate and any(
+            value.shape != (len(selected), *view.shape)
+            or value.dtype != (target := view.read(batch.roots[selected[0]][view.field])).dtype
+            or value.device != target.device
+            for view, value in zip(self.fields, values, strict=True)
+        ):
+            raise ValueError(
+                f"write to {self.resource} needs fields with their declared shape, dtype, device and request axis"
+            )
         return values
 
     def select(self, data: TensorFrame, selection: RequestStateSelection) -> tuple[int, ...]:
@@ -109,10 +107,12 @@ class TensorTask:
         """This task's tensor DAG in dependency order, ending with the task itself."""
         ordered: dict[TaskSymbol, TensorTask] = {}
         for source in self.sources.values():
-            if isinstance(source, TaskResultInputSource):
-                ordered.update((task.symbol, task) for task in tasks[source.task].dependencies(tasks))
-        ordered[self.symbol] = self
-        return tuple(ordered.values())
+            match source:
+                case TaskResultInputSource(task=upstream):
+                    ordered.update((task.symbol, task) for task in tasks[upstream].dependencies(tasks))
+                case _:
+                    pass
+        return (*ordered.values(), self)
 
     @property
     def domains(self) -> tuple[str, ...]:
@@ -120,7 +120,9 @@ class TensorTask:
         policy = self.policy
         keys = (policy.forward_rows, policy.input_gradient_rows, policy.parameter_gradient_rows, policy.update_states)
         return tuple(
-            dict.fromkeys(key for key in keys if key and not isinstance(self.sources[key], StateSelectionInputSource))
+            key
+            for key in dict.fromkeys(keys)
+            if key in self.sources and type(self.sources[key]) is not StateSelectionInputSource
         )
 
     @property
@@ -140,10 +142,8 @@ class TensorTask:
             batch = replace(batch, roots=LeafRoots(state_leaf(data, batch), batch.roots))
         domains = self.domains
         inputs = {key: self.ports[key].read(data, batch) for key in domains}
-        for key in domains:
-            mask = inputs[key]
-            if mask.dtype != torch.bool or mask.shape != (len(data.rows),):
-                raise ValueError("row domain must be a boolean mask over the operation rows")
+        if any(inputs[key].dtype != torch.bool or inputs[key].shape != (len(data.rows),) for key in domains):
+            raise ValueError("row domain must be a boolean mask over the operation rows")
         compacted = bool(policy.forward_rows) and compact
         rows = selected_rows(inputs[policy.forward_rows]) if compacted else tuple(range(len(data.rows)))
         selected = (
@@ -172,34 +172,35 @@ class TensorTask:
     ) -> torch.Tensor:
         """Read one input and attach the gradient behaviour its declaration asks for."""
         policy, port, source = self.policy, self.ports[key], self.sources[key]
-        state_rows = isinstance(source, StateSelectionInputSource) and port.rowwise
+        match source:
+            case StateSelectionInputSource(resource=state_resource):
+                state_rows = port.rowwise
+                differentiable = key not in policy.detached_inputs and state_resource in policy.parameter_gradients
+                leaf = False
+                domain = policy.parameter_gradient_rows
+            case TaskResultInputSource():
+                state_rows = False
+                differentiable = key not in policy.detached_inputs and key in policy.input_gradients
+                leaf = False
+                domain = policy.input_gradient_rows
+            case _:
+                state_rows = False
+                differentiable = key not in policy.detached_inputs and key in policy.input_gradients
+                leaf = True
+                domain = policy.input_gradient_rows
         value = inputs[key] if key in self.domains else port.read(selected if state_rows else data, batch)
-        differentiable = key not in policy.detached_inputs and (
-            source.resource in policy.parameter_gradients
-            if isinstance(source, StateSelectionInputSource)
-            else key in policy.input_gradients
-        )
         if not differentiable:
             value = value.detach()
-        elif not isinstance(source, (StateSelectionInputSource, TaskResultInputSource)):
-            if not value.is_floating_point():
-                raise ValueError("input gradients require floating tensors")
+        elif leaf:
+            assert value.is_floating_point()
             value = value.detach().requires_grad_(True)
             data.derivative_sources[str(self.symbol), key] = value
         if compacted and port.rowwise and key not in self.domains and not state_rows:
-            mask = inputs[policy.forward_rows]
-            if value.ndim == 0 or value.shape[0] != len(data.rows) or value.device != mask.device:
-                raise ValueError("forward rows require aligned row tensors on the same device")
+            assert value.ndim > 0 and value.shape[0] == len(data.rows)
             value = select_rows(value, rows)
-        domain = (
-            policy.parameter_gradient_rows
-            if isinstance(source, StateSelectionInputSource)
-            else policy.input_gradient_rows
-        )
         if differentiable and domain:
             mask = select_rows(inputs[domain], rows) if compacted else inputs[domain]
-            if not port.rowwise or value.ndim == 0 or value.shape[0] != len(rows) or mask.device != value.device:
-                raise ValueError("gradient rows require aligned row tensors on the same device")
+            assert port.rowwise and value.ndim > 0 and value.shape[0] == len(rows)
             if value.requires_grad:
                 value = gradient_rows(value, mask.reshape(len(rows), *([1] * (value.ndim - 1))))
         return value
@@ -270,9 +271,7 @@ class TensorTask:
             loss = (
                 loss.mean() if data.weights is None else (loss * data.weights).sum() / data.weights.sum().clamp_min(1)
             )
-        elif data.weights is not None:
-            raise ValueError("captured training must return one loss per row; move the row mean into pllm")
-        if loss.ndim != 0:
+        elif loss.ndim != 0 or data.weights is not None:
             raise ValueError("optimizer functions must return a scalar or one loss per row")
         return loss, loss
 

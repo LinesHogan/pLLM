@@ -287,15 +287,11 @@ def _measure_arm(
             cpu_elapsed,
             after.state_usage,
         )
-        if (
-            report.output_tokens != options.batch * options.sampling_n * options.tokens * options.rounds
-            or setup.require_training
-            and (report.loss_count <= 0 or report.update_count <= 0 or report.trained_rows <= 0)
-            or after.inference_pins
-            or after.pending_state_releases
-            or after.fallback_count
-        ):
-            raise RuntimeError("benchmark failed effective-work or cleanup contract")
+        assert (
+            report.output_tokens == options.batch * options.sampling_n * options.tokens * options.rounds
+            and (not setup.require_training or min(report.loss_count, report.update_count, report.trained_rows) > 0)
+            and not (after.inference_pins or after.pending_state_releases or after.fallback_count)
+        )
         allocation_after = torch.cuda.memory_stats()
         footprint = _ProfileFootprint(
             allocation_after["allocated_bytes.all.allocated"] - allocation_before["allocated_bytes.all.allocated"],
@@ -331,16 +327,10 @@ def _print_profile(
 ) -> None:
     """Check the profiled replay against the measured arm and print the profile summary."""
     measured = next(item for item in reports if item.implementation == report.implementation)
-    if report.effective_work != measured.effective_work or report.schedule_signature != measured.schedule_signature:
-        raise RuntimeError(
-            f"{report.implementation}: profile reconstruction changed plan/work: "
-            f"measured={measured.schedule_signature}/{measured.effective_work}, "
-            f"profile={report.schedule_signature}/{report.effective_work}"
-        )
+    assert report.effective_work == measured.effective_work and report.schedule_signature == measured.schedule_signature
     path = directory / f"{report.implementation}.json"
     activity = cuda_profile_totals(path)
-    if activity.kernel_count == 0:
-        raise RuntimeError("profile generation recorded no CUDA activity")
+    assert activity.kernel_count > 0
     print(
         json.dumps(
             {
@@ -374,8 +364,6 @@ def compare(
 ) -> tuple[BenchmarkResult, ...]:
     """Measure ordinary model workloads; optimized arms and nonzero training are opt-in."""
     indices = tuple(range(options.batch)) if prompt_indices is None else prompt_indices
-    if len(indices) != options.batch or any(index < 0 for index in indices):
-        raise ValueError("benchmark prompt indices must cover the original request batch")
     # Workload generate takes n=1, so each prompt is repeated sampling_n times for every arm,
     # vanilla included; without prefix caching vLLM prefills each completion of n>1 anyway.
     indices = tuple(index for index in indices for _ in range(options.sampling_n))
@@ -408,14 +396,8 @@ def compare(
         *((_Arm("tensor_explicit", workload, True),) if explicit_math else ()),
         *(_Arm(name, implementation, False) for name, implementation in alternatives),
     )
-    if len({arm.name for arm in arms}) != len(arms):
-        raise ValueError("benchmark implementation labels must be distinct")
     if options.profile is not None:
         options.profile.mkdir(parents=True, exist_ok=True)
-        for arm in arms:
-            path = options.profile / f"{arm.name}.json"
-            if path.exists():
-                raise FileExistsError(f"profile output already exists: {path}")
     requests = _Requests(prompts, sampling, indices)
     setup = _Setup(options, requests, prepare, training_rows, require_training)
     vanilla = _vanilla(options, requests)
@@ -431,6 +413,5 @@ def compare(
                 _print_profile(options, reports, directory, report, footprint)
             gc.collect()
             torch.cuda.empty_cache()
-    if len({item.effective_work for item in reports}) != 1:
-        raise RuntimeError("comparison arms executed different effective work")
+    assert len({item.effective_work for item in reports}) == 1
     return tuple(reports)

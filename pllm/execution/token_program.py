@@ -79,21 +79,19 @@ class Layers:
 
     def load(self, name: str, offset: int = -1) -> torch.Tensor:
         """Read the previous token's state, even after a save in this token."""
-        if self.over == "span":
-            raise ValueError("use layers.load only in over=token routes; spans have no serial predecessor")
-        if offset != -1:
-            raise ValueError("use offset=-1 for PositionState")
-        if name not in self.entries:
-            raise ValueError(f"declare PositionState {name!r} before loading or saving it")
+        if self.over == "span" or offset != -1 or name not in self.entries:
+            raise ValueError(
+                f"use layers.load({name!r}, offset=-1) in over=token routes with a declared PositionState {name!r} "
+                "(spans have no serial predecessor)"
+            )
         return self.entries[name].clone()
 
     def save(self, name: str, value: torch.Tensor) -> None:
         """Save a snapshot at this position; the last save wins."""
-        if name not in self.entries:
-            raise ValueError(f"declare PositionState {name!r} before saving it")
-        entry = self.entries[name]
-        if value.shape != entry.shape or value.dtype != entry.dtype or value.device != entry.device:
-            raise ValueError(f"save {name} with shape {tuple(entry.shape)} and dtype {entry.dtype}")
+        entry = self.entries.get(name)
+        if entry is None or value.shape != entry.shape or value.dtype != entry.dtype or value.device != entry.device:
+            expected = "" if entry is None else f" with shape {tuple(entry.shape)} and dtype {entry.dtype}"
+            raise ValueError(f"declare PositionState {name!r} and save {name}{expected}")
         position_save(value.clone(), name)
 
     def __call__(
@@ -104,14 +102,20 @@ class Layers:
         A peek leaves the cache untouched and requires an earlier commit to every
         layer in this slice within the same route.
         """
-        if kv not in ("commit", "peek"):
-            raise ValueError("set layers(kv=) to commit or peek")
         stop = self.layer_count if stop is None else stop
-        if not 0 <= start < stop <= self.layer_count or hidden is None and start != 0:
-            raise ValueError("use 0 <= start < stop <= layer_count and supply hidden when start > 0")
         value = self.seed if hidden is None else hidden
-        if value.shape != self.seed.shape or value.dtype != self.seed.dtype or value.device != self.seed.device:
-            raise ValueError("supply a hidden tensor with the model shape, dtype and device")
+        if (
+            kv not in ("commit", "peek")
+            or not 0 <= start < stop <= self.layer_count
+            or (hidden is None and start != 0)
+            or value.shape != self.seed.shape
+            or value.dtype != self.seed.dtype
+            or value.device != self.seed.device
+        ):
+            raise ValueError(
+                "use 0 <= start < stop <= layer_count, kv in ('commit', 'peek'), "
+                "and supply a hidden tensor with the model shape, dtype and device when start > 0"
+            )
         return Taps(tuple(_layers(value, start, stop, kv)), start, self.layer_count)
 
     def apply_updates(self) -> None:
@@ -187,8 +191,7 @@ def _cell(nodes: list[torch.fx.Node], over: Over) -> Cell:
         mapped[node] = graph.node_copy(node, mapped.__getitem__)
     graph.output(tuple(mapped[node] for node in outputs))
     for node in nodes:
-        if node.op != "call_function":
-            raise ValueError("layer route cells need functional ATen operations with explicit tensor inputs")
+        assert node.op == "call_function"
         check_functional_aten(node.target)
     module = torch.fx.GraphModule({}, graph)
     input_rows = tuple(bool(_tensor(node).ndim and _tensor(node).shape[0] == 1) for node in inputs)
@@ -244,8 +247,13 @@ class TokenProgram:
             result = function(
                 Layers(seed, position, layer_count, generated, dict(zip(names, entries, strict=True)), over)
             )
-            if not isinstance(result, torch.Tensor):
-                raise ValueError("return a final-layer residual-stream tensor from your layer_route method")
+            if (
+                not isinstance(result, torch.Tensor)
+                or result.shape != seed.shape
+                or result.dtype != seed.dtype
+                or result.device != seed.device
+            ):
+                raise ValueError("return a residual-stream tensor with the model hidden shape, dtype and device")
             return result
 
         shapes = ShapeEnv()
@@ -284,25 +292,14 @@ class TokenProgram:
                         steps.append(_cell(pending, over))
                         pending = []
                     if node.target == torch.ops.pllm.position_save.default:
-                        value, name = node.args
-                        assert isinstance(value, torch.fx.Node) and isinstance(name, str)
-                        steps.append(Save(name, value.name))
+                        steps.append(Save(str(node.args[1]), node.all_input_nodes[0].name))
                     elif node.target == torch.ops.pllm.apply_updates.default:
                         steps.append(ApplyUpdates())
                     elif node.op == "output":
-                        result = node.args[0]
-                        assert isinstance(result, torch.fx.Node)
-                        if (
-                            _tensor(result).shape != seed.shape
-                            or _tensor(result).dtype != seed.dtype
-                            or _tensor(result).device != seed.device
-                        ):
-                            raise ValueError("return a residual stream with the model hidden shape and dtype")
-                        steps.append(Output(result.name))
+                        steps.append(Output(node.all_input_nodes[0].name))
                     else:
-                        hidden, start, stop, kv = node.args
-                        assert isinstance(hidden, torch.fx.Node) and type(start) is int and type(stop) is int
-                        assert kv in ("commit", "peek")
+                        _, start, stop, kv = node.args
+                        assert type(start) is int and type(stop) is int and kv in ("commit", "peek")
                         if kv == "peek" and not set(range(start, stop)) <= committed:
                             raise ValueError("commit every layer in a slice before calling it with kv=peek")
                         if kv == "commit":
@@ -311,7 +308,7 @@ class TokenProgram:
                             Segment(
                                 start,
                                 stop,
-                                hidden.name,
+                                node.all_input_nodes[0].name,
                                 tuple(
                                     (start + projection.args[1], projection.name)
                                     for projection in node.users
@@ -338,9 +335,13 @@ class TokenProgram:
     @property
     def role_sensitive(self) -> bool:
         """Generated roles and predecessor storage affect prefix-cache identity."""
-        return bool(self.entries) or any(
-            isinstance(step, Cell) and self.generated in step.inputs for step in self.steps
-        )
+        for step in self.steps:
+            match step:
+                case Cell(inputs=inputs) if self.generated in inputs:
+                    return True
+                case _:
+                    pass
+        return bool(self.entries)
 
     def _prompt_identity(self, layer_count: int) -> bool:
         """Prove the prompt branch is one complete decoder pass with final-tap saves."""
@@ -349,29 +350,32 @@ class TokenProgram:
         saved: list[str | bool] = []
         result: str | bool = ""
         for step in self.steps:
-            if isinstance(step, Cell):
-                values: dict[torch.fx.Node, str | bool] = {}
-                for node in step.graph.graph.nodes:
-                    if node.op == "placeholder":
-                        values[node] = aliases[node.name] if node.name in aliases else node.name
-                    elif node.target in (torch.ops.aten.clone.default, torch.ops.aten.detach.default):
-                        values[node] = values[node.all_input_nodes[0]]
-                    elif node.target == torch.ops.aten.where.self and values[node.all_input_nodes[0]] is False:
-                        values[node] = values[node.all_input_nodes[2]]
-                    elif node.op == "output":
-                        aliases.update(zip(step.outputs, (values[arg] for arg in node.all_input_nodes), strict=True))
-                    else:
-                        values[node] = node.name
-            elif isinstance(step, Segment):
-                if aliases.get(step.input, step.input) != self.seed or step.start != 0:
+            match step:
+                case Cell():
+                    values: dict[torch.fx.Node, str | bool] = {}
+                    for node in step.graph.graph.nodes:
+                        if node.op == "placeholder":
+                            values[node] = aliases[node.name] if node.name in aliases else node.name
+                        elif node.target in (torch.ops.aten.clone.default, torch.ops.aten.detach.default):
+                            values[node] = values[node.all_input_nodes[0]]
+                        elif node.target == torch.ops.aten.where.self and values[node.all_input_nodes[0]] is False:
+                            values[node] = values[node.all_input_nodes[2]]
+                        elif node.op == "output":
+                            aliases.update(
+                                zip(step.outputs, (values[arg] for arg in node.all_input_nodes), strict=True)
+                            )
+                        else:
+                            values[node] = node.name
+                case Segment():
+                    if aliases.get(step.input, step.input) != self.seed or step.start != 0:
+                        return False
+                    segments.append(step)
+                case Save():
+                    saved.append(aliases.get(step.value, step.value))
+                case Output():
+                    result = aliases.get(step.value, step.value)
+                case ApplyUpdates():
                     return False
-                segments.append(step)
-            elif isinstance(step, Save):
-                saved.append(aliases.get(step.value, step.value))
-            elif isinstance(step, Output):
-                result = aliases.get(step.value, step.value)
-            else:
-                return False
         if len(segments) != 1 or segments[0].stop != layer_count:
             return False
         final = dict(segments[0].taps).get(segments[0].stop - 1)

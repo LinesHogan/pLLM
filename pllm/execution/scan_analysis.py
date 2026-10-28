@@ -92,9 +92,11 @@ class ScanAnalysis:
             ):
                 root, order = views[node.all_input_nodes[0]]
                 axes = list(order)
-                a, b = (-1, -2) if node.target == torch.ops.aten.t.default else (node.args[1], node.args[2])
-                assert isinstance(a, int) and isinstance(b, int)
-                axes[a], axes[b] = axes[b], axes[a]
+                match node.args:
+                    case (_, int() as a, int() as b):
+                        axes[a], axes[b] = axes[b], axes[a]
+                    case _:
+                        axes[-1], axes[-2] = axes[-2], axes[-1]
                 views[node] = root, tuple(axes)
             elif node.target in (torch.ops.aten.bmm.default, torch.ops.aten.matmul.default):
                 for operand in node.all_input_nodes:
@@ -129,37 +131,43 @@ class _Extract:
             value, scale = self.scaled(args[0])
             if scale != 1:
                 return self.call(torch.ops.aten.mul.Tensor, self.call(target, value, *args[1:]), scale)
-        if target == torch.ops.aten.mul.Tensor and isinstance(args[1], (int, float)):
-            value, scale = self.scaled(args[0])
-            factor = scale * args[1]
-            if isinstance(value, Node) and factor == 1:
-                return value
-            args = (value, factor)
+        if target == torch.ops.aten.mul.Tensor:
+            match args:
+                case (lhs, int() | float() as rhs):
+                    value, scale = self.scaled(lhs)
+                    factor = scale * rhs
+                    if type(value) is Node and factor == 1:
+                        return value
+                    args = (value, factor)
+                case _:
+                    pass
         return self.graph.call_function(target, args, kwargs)  # pyright: ignore[reportArgumentType]
 
     @staticmethod
     def scaled(value: Argument) -> tuple[Argument, float]:
-        if (
-            isinstance(value, Node)
-            and value.target == torch.ops.aten.mul.Tensor
-            and isinstance(value.args[1], (int, float))
-        ):
-            return value.args[0], float(value.args[1])
-        return value, 1.0
+        match value:
+            case Node(target=torch.ops.aten.mul.Tensor, args=(base, int() | float() as factor)):
+                return base, float(factor)
+            case _:
+                return value, 1.0
 
     def multiply(self, a: Coefficient, b: Coefficient) -> Coefficient:
-        if isinstance(a, float) and isinstance(b, float):
-            return a * b
-        return self.call(torch.ops.aten.mul.Tensor, a, b)
+        match (a, b):
+            case (float(), float()):
+                return a * b
+            case _:
+                return self.call(torch.ops.aten.mul.Tensor, a, b)
 
     def transpose(self, value: Coefficient) -> Coefficient:
-        return value if isinstance(value, float) else self.call(torch.ops.aten.transpose.int, value, -1, -2)
+        match value:
+            case float():
+                return value
+            case _:
+                return self.call(torch.ops.aten.transpose.int, value, -1, -2)
 
     def matrix(self, linear: Linear, side: Kind) -> Coefficient:
         if linear.kind == side:
             return linear.coefficient
-        if linear.kind != "scalar":
-            raise Unsupported
         axis = -1 if side == "right" else -2
         width = self.sample.shape[-3 - axis if linear.transposed else axis]
         eye = self.call(torch.ops.aten.eye.default, width, dtype=self.sample.dtype, device=self.sample.device)
@@ -170,34 +178,34 @@ class _Extract:
             return a
         if a is None:
             return Linear(b.kind, self.multiply(b.coefficient, alpha), b.transposed)
-        if a.transposed != b.transposed:
-            raise Unsupported
         side = b.kind if a.kind == "scalar" else a.kind
-        if b.kind not in ("scalar", side):
+        if a.transposed != b.transposed or b.kind not in ("scalar", side):
             raise Unsupported
         aa, bb = (
             (self.matrix(value, side) for value in (a, b))
             if side in ("left", "right")
             else (a.coefficient, b.coefficient)
         )
-        coefficient = (
-            aa + alpha * bb
-            if isinstance(aa, float) and isinstance(bb, float)
-            else self.call(torch.ops.aten.add.Tensor, aa, bb, alpha=alpha)
-        )
+        match (aa, bb):
+            case (float(), float()):
+                coefficient: Coefficient = aa + alpha * bb
+            case _:
+                coefficient = self.call(torch.ops.aten.add.Tensor, aa, bb, alpha=alpha)
         return Linear(side, coefficient, a.transposed)
 
     def value(self, arg: Argument) -> Affine:
-        if isinstance(arg, (int, float)):
-            return Affine(
-                None,
-                self.call(
-                    torch.ops.aten.scalar_tensor.default, arg, dtype=self.sample.dtype, device=self.sample.device
-                ),
-            )
-        if not isinstance(arg, Node):
-            raise Unsupported
-        return self.values[arg]
+        match arg:
+            case int() | float():
+                return Affine(
+                    None,
+                    self.call(
+                        torch.ops.aten.scalar_tensor.default, arg, dtype=self.sample.dtype, device=self.sample.device
+                    ),
+                )
+            case Node():
+                return self.values[arg]
+            case _:
+                raise Unsupported
 
     def extract(self, node: Node) -> Affine:
         op = node.target
@@ -237,35 +245,36 @@ class _Extract:
     def mul_div_neg(self, node: Node, a: Affine) -> Affine:
         op, args = node.target, node.args
         if op == torch.ops.aten.neg.default:
+            assert a.linear is not None
             factor: Coefficient = -1.0
-            factor_shape: Coefficient = factor
+            kind = a.linear.kind
         else:
             if a.linear is None and op == torch.ops.aten.mul.Tensor:
                 a = self.value(args[1])
                 factor_arg = args[0]
             else:
                 factor_arg = args[1]
-            if isinstance(factor_arg, Node):
-                if self.values[factor_arg].linear is not None or factor_arg not in self.independent:
+            match factor_arg:
+                case int() | float():
+                    assert a.linear is not None
+                    factor = float(factor_arg)
+                    kind = a.linear.kind
+                case Node() if (
+                    a.linear is not None
+                    and self.values[factor_arg].linear is None
+                    and (factor_arg.meta["val"].numel() == 1 or a.linear.kind in ("scalar", "diagonal"))
+                ):
+                    factor = self.independent[factor_arg]
+                    kind = "diagonal" if factor_arg.meta["val"].numel() != 1 else a.linear.kind
+                case _:
                     raise Unsupported
-                factor = self.independent[factor_arg]
-            elif isinstance(factor_arg, (int, float)):
-                factor = float(factor_arg)
-            else:
-                raise Unsupported
-            factor_shape = factor
+            assert a.linear is not None
             if op == torch.ops.aten.div.Tensor:
-                factor = (
-                    1 / factor if isinstance(factor, float) else self.call(torch.ops.aten.reciprocal.default, factor)
-                )
-        assert a.linear is not None
-        kind = a.linear.kind
-        if isinstance(factor_shape, Node):
-            metadata: torch.Tensor = factor_shape.meta["val"]
-            if metadata.numel() != 1:
-                if kind not in ("scalar", "diagonal"):
-                    raise Unsupported
-                kind = "diagonal"
+                match factor:
+                    case float():
+                        factor = 1 / factor
+                    case _:
+                        factor = self.call(torch.ops.aten.reciprocal.default, factor)
         return Affine(
             Linear(kind, self.multiply(a.linear.coefficient, factor), a.linear.transposed),
             None if a.bias is None else self.call(torch.ops.aten.mul.Tensor, a.bias, factor),
@@ -276,17 +285,20 @@ class _Extract:
         b = self.value(args[1])
         side: Kind = "right" if a.linear is not None else "left"
         dependent, independent = (a, b) if side == "right" else (b, a)
-        if independent.linear is not None or independent.bias is None or dependent.linear is None:
+        if (
+            independent.linear is not None
+            or independent.bias is None
+            or dependent.linear is None
+            or dependent.linear.kind not in ("scalar", side)
+        ):
             raise Unsupported
         linear = dependent.linear
         coefficient = independent.bias
         if linear.kind == "scalar":
             coefficient = self.call(torch.ops.aten.mul.Tensor, coefficient, linear.coefficient)
-        elif linear.kind == side:
+        else:
             operands = (linear.coefficient, coefficient) if side == "right" else (coefficient, linear.coefficient)
             coefficient = self.call(op, *operands)
-        else:
-            raise Unsupported
         bias = (
             None
             if dependent.bias is None
@@ -305,21 +317,18 @@ class _Extract:
 
     def transpose_value(self, node: Node, a: Affine) -> Affine:
         op, args = node.target, node.args
-        if op == torch.ops.aten.permute.default:
-            metadata: torch.Tensor = node.all_input_nodes[0].meta["val"]
-            axes = node.args[1]
-            if axes == list(range(metadata.ndim)):
+        ndim = node.all_input_nodes[0].meta["val"].ndim
+        match args:
+            case (_, list() as axes) if axes == list(range(ndim)):
                 return a
-            if axes != [*range(metadata.ndim - 2), metadata.ndim - 1, metadata.ndim - 2]:
-                raise Unsupported
-        if op == torch.ops.aten.transpose.int:
-            metadata: torch.Tensor = node.all_input_nodes[0].meta["val"]
-            assert isinstance(args[1], int) and isinstance(args[2], int)
-            if {args[1] % metadata.ndim, args[2] % metadata.ndim} != {
-                metadata.ndim - 1,
-                metadata.ndim - 2,
-            }:  # pyright: ignore[reportArgumentType]
-                raise Unsupported
+            case (_, list() as axes):
+                valid = axes == [*range(ndim - 2), ndim - 1, ndim - 2]
+            case (_, int() as d0, int() as d1):
+                valid = {d0 % ndim, d1 % ndim} == {ndim - 1, ndim - 2}
+            case _:
+                valid = True
+        if not valid:
+            raise Unsupported
         assert a.linear is not None
         side = "right" if a.linear.kind == "left" else "left" if a.linear.kind == "right" else a.linear.kind
         linear = Linear(side, self.transpose(a.linear.coefficient), not a.linear.transposed)  # pyright: ignore[reportArgumentType]
@@ -350,13 +359,12 @@ class _Extract:
                     self.refused.add(node)
                     self.values[node] = Affine(Linear(), None)
             elif node.op == "output":
-                outputs: tuple[Argument, ...] = node.args[0]  # pyright: ignore[reportAssignmentType]
-                assert isinstance(outputs, tuple)
-                updated: Argument = outputs[0]
-                output: Argument = outputs[1]
-                assert isinstance(updated, Node) and isinstance(output, Node)
-                return None if updated in self.refused else self.finish(carry, updated, output)
-        raise AssertionError("FX graph has no output")
+                match node.args[0]:
+                    case (Node() as updated, Node() as output):
+                        return None if updated in self.refused else self.finish(carry, updated, output)
+                    case _:
+                        pass
+        return None
 
     def finish(self, carry: Node, updated: Node, output: Node) -> ScanAnalysis | None:
         value = self.values[updated]
@@ -400,24 +408,26 @@ class _Extract:
                 device=self.sample.device,
             )
         scale = 1.0
-        if kind == "additive" and bias.target == torch.ops.aten.mul.Tensor and isinstance(bias.args[1], (int, float)):
-            unscaled = bias.args[0]
-            if (
-                isinstance(unscaled, Node)
-                and "val" in unscaled.meta
-                and unscaled.meta["val"].dtype == self.sample.dtype
+        match bias:
+            case Node(target=torch.ops.aten.mul.Tensor, args=(Node() as unscaled, int() | float() as factor)) if (
+                kind == "additive" and "val" in unscaled.meta and unscaled.meta["val"].dtype == self.sample.dtype
             ):
-                bias, scale = unscaled, float(bias.args[1])
+                bias, scale = unscaled, float(factor)
+            case _:
+                pass
         coefficient = linear.coefficient
-        if isinstance(coefficient, float):
-            # Identity needs no coefficient payload or CUDA scalar fill.
-            coefficient = self.call(
-                torch.ops.aten.full.default,
-                [0] if kind == "additive" else [],
-                coefficient,
-                dtype=self.sample.dtype,
-                device=self.sample.device,
-            )
+        match coefficient:
+            case float():
+                # Identity needs no coefficient payload or CUDA scalar fill.
+                coefficient = self.call(
+                    torch.ops.aten.full.default,
+                    [0] if kind == "additive" else [],
+                    coefficient,
+                    dtype=self.sample.dtype,
+                    device=self.sample.device,
+                )
+            case _:
+                pass
         self.graph.output((coefficient, bias, *cuts))
         self.graph.eliminate_dead_code()
         return ScanAnalysis(kind, GraphModule(self.source, self.graph), GraphModule(self.source, read), scale=scale)  # pyright: ignore[reportArgumentType]

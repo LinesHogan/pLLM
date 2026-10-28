@@ -8,9 +8,9 @@ transition. They are ordinary clients of the DSL, not a second authoring stack.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import replace
-from typing import ClassVar, Generic, TypeVar, cast
+from typing import ClassVar, Generic, TypeVar
 
 import torch
 
@@ -145,15 +145,26 @@ class CompletionWorkload(
         return self.prepare(CompletionInput.example(facts))
 
     def declare_host(self, facts: HostRuntimeFacts) -> TensorHostBinding[CompletionInput, ContextT, ResultT]:
-        if facts.hidden_size < 1:
-            raise ValueError("completion learning requires a positive hidden size")
         owner = owner_snapshot(self, _MARKERS)
         definition = owner.parameters
-        if isinstance(definition, RequestState) or not isinstance(definition.optimizer, AdamWConfig):
-            raise ValueError("completion learning requires instance parameters with an optimizer")
-        if any(isinstance(shape, Buffer) for shape in definition.fields.values()):
-            raise ValueError("completion parameters require tensor shapes, not overlay buffers")
-        shapes = cast(Mapping[str, Shape], definition.fields)
+        shapes: dict[str, Shape] = {}
+        for name, field in definition.fields.items():
+            match field:
+                case Buffer():
+                    break
+                case shape:
+                    shapes[name] = shape
+        if (
+            facts.hidden_size < 1
+            or type(definition) is RequestState
+            or type(definition.optimizer) is not AdamWConfig
+            or len(shapes) != len(definition.fields)
+            or facts.memory_budget_bytes is not None
+            and facts.max_input_rows is None
+        ):
+            raise ValueError(
+                "completion learning requires hidden_size >= 1, instance tensor parameters with an AdamW optimizer, and max_input_rows when memory_budget_bytes is set"
+            )
         identity = fingerprint(owner.loss)
         b = Builder[ContextT](
             self.name,
@@ -216,21 +227,26 @@ class CompletionWorkload(
                 initialize_parameters({name: root[5 * index] for index, name in enumerate(shapes)}, generator)
 
         def prepare(value: CompletionInput, batch: TensorBatch) -> ContextT:
-            if value.hidden.shape[1] != facts.hidden_size or value.hidden.device != facts.device:
-                raise ValueError("completion hidden rows differ from specialization")
-            if facts.max_input_rows is not None and len(value.hidden) > facts.max_input_rows:
-                raise ValueError("completion rows exceed the signed input capacity")
+            if (
+                value.hidden.shape[1] != facts.hidden_size
+                or value.hidden.device != facts.device
+                or facts.max_input_rows is not None
+                and len(value.hidden) > facts.max_input_rows
+                or value.readiness is not None
+                and batch.stream is None
+            ):
+                raise ValueError(
+                    "completion input shape, device, row count, or CUDA stream differs from specialization"
+                )
             if value.readiness is not None:
-                if batch.stream is None:
-                    raise ValueError("CUDA completion input requires a CUDA invocation")
+                assert batch.stream is not None
                 value.readiness.order_on(batch.stream)
                 value.hidden.record_stream(batch.stream)
             return prepare_data(value)
 
         timeline = facts.timeline()
         if facts.memory_budget_bytes is not None:
-            if facts.max_input_rows is None:
-                raise ValueError("finite completion costs require max_input_rows")
+            assert facts.max_input_rows is not None
             data = owner.training_example(facts)
             root = tuple(
                 torch.empty(field.shape, dtype=tensor_dtype(field.dtype), device="meta")
@@ -292,6 +308,8 @@ class CausalAdapterWorkload(
     ) -> tuple[Builder[ContextT], FunctionMath[CausalTrainBatch[torch.Tensor] | TensorStepInput, ContextT, ResultT]]:
         owner = owner_snapshot(self, _MARKERS, (self.model,))
         model = owner.model
+        targets = tuple(item.target for item in model.targets)
+        expected_dtype = tensor_dtype(model.tensor_dtype)
         if (
             model.resident_bytes < 0
             or model.resident_bytes
@@ -299,23 +317,14 @@ class CausalAdapterWorkload(
                 len(facts.timeline.reserved_bytes) != len(facts.timeline.anchors)
                 or any(reserved < model.resident_bytes for reserved in facts.timeline.reserved_bytes)
             )
-        ):
-            raise ValueError("causal model residency exceeds the signed timeline reservation")
-        if (
-            facts.probe.targets != model.targets
+            or facts.probe.targets != model.targets
             or facts.probe.tensor_dtype != model.tensor_dtype
-            or model.device.type != "meta"
-            and facts.device != model.device
-        ):
-            raise ValueError("causal model and backend projection facts differ")
-        if owner.phase not in (Phase.BEFORE_MODEL, Phase.AFTER_SAMPLE):
-            raise ValueError("causal adapter updates require BEFORE_MODEL or AFTER_SAMPLE")
-        targets = tuple(item.target for item in model.targets)
-        if not targets or targets != tuple(sorted(set(targets))) or len(model.initial_factors) != 2 * len(targets):
-            raise ValueError("causal adapters require sorted unique targets and one A/B pair per target")
-        for index, target in enumerate(model.targets):
-            down, up = model.initial_factors[2 * index : 2 * index + 2]
-            if (
+            or (model.device.type != "meta" and facts.device != model.device)
+            or owner.phase not in (Phase.BEFORE_MODEL, Phase.AFTER_SAMPLE)
+            or not targets
+            or targets != tuple(sorted(set(targets)))
+            or len(model.initial_factors) != 2 * len(targets)
+            or any(
                 down.ndim != 2
                 or up.ndim != 2
                 or down.shape[0] < 1
@@ -324,10 +333,16 @@ class CausalAdapterWorkload(
                 or up.shape[0] != target.output_size
                 or down.device != model.device
                 or up.device != model.device
-                or down.dtype != tensor_dtype(model.tensor_dtype)
+                or down.dtype != expected_dtype
                 or up.dtype != down.dtype
-            ):
-                raise ValueError("causal adapter factors differ from their target shape, device or dtype")
+                for target, down, up in zip(
+                    model.targets, model.initial_factors[::2], model.initial_factors[1::2], strict=True
+                )
+            )
+        ):
+            raise ValueError(
+                "causal adapter model, phase, targets, or factors do not match the signed backend facts and timeline reservation"
+            )
         identity = fingerprint(owner.loss)
         values = {key: value for key, value in owner_values(owner, _MARKERS).items() if key != "model"}
         b = Builder[ContextT](
@@ -411,14 +426,18 @@ class CausalAdapterWorkload(
             raise ValueError("causal training costs require signed [sequences, tokens] input bounds")
 
         def prepare(value: CausalTrainBatch[torch.Tensor] | TensorStepInput, batch: TensorBatch) -> ContextT:
-            if isinstance(value, TensorStepInput):
-                if value.rows.plan_epoch != batch.epoch:
-                    raise ValueError("causal input differs from the signed epoch")
-                if value.auxiliary is None:
-                    return prepare_data(None)
-                if not isinstance(value.auxiliary, CausalTrainBatch):
-                    raise ValueError("causal adapter requires causal training tensors")
-                value = value.auxiliary
+            match value:
+                case TensorStepInput(rows=step_rows, auxiliary=auxiliary):
+                    assert step_rows.plan_epoch == batch.epoch
+                    if auxiliary is None:
+                        return prepare_data(None)
+                    match auxiliary:
+                        case CausalTrainBatch() as train_batch:
+                            value = train_batch
+                        case _:
+                            raise ValueError("causal adapter auxiliary input must be a CausalTrainBatch")
+                case _:
+                    pass
             if (
                 value.input_ids.ndim != 2
                 or value.input_ids.shape != value.labels.shape
@@ -430,18 +449,20 @@ class CausalAdapterWorkload(
                 or value.labels.device != model.device
                 or value.attention_mask is not None
                 and (value.attention_mask.shape != value.input_ids.shape or value.attention_mask.device != model.device)
+                or limit is not None
+                and any(size > bound for size, bound in zip(value.input_ids.shape, limit.input_shapes[0], strict=True))
             ):
-                raise ValueError("causal batch must contain aligned token/label tensors")
-            if limit is not None and any(
-                size > bound for size, bound in zip(value.input_ids.shape, limit.input_shapes[0], strict=True)
-            ):
-                raise ValueError("causal auxiliary input exceeds its signed input bounds")
+                raise ValueError(
+                    "causal batch must contain aligned int64 token/label tensors within signed input bounds"
+                )
             return prepare_data(value)
 
         def rows(value: CausalTrainBatch[torch.Tensor] | TensorStepInput) -> tuple[PackedPhaseRow, ...]:
-            if isinstance(value, TensorStepInput) and value.rows.total_rows > facts.probe.max_packed_rows:
-                raise ValueError("packed input exceeds the signed backend row capacity")
-            return ()
+            match value:
+                case TensorStepInput(rows=step_rows) if step_rows.total_rows > facts.probe.max_packed_rows:
+                    raise ValueError("packed input exceeds the signed backend row capacity")
+                case _:
+                    return ()
 
         return b, FunctionMath({str(state.declaration.resource): initialize}, rows, prepare, output_data)
 
@@ -452,9 +473,11 @@ class CausalAdapterWorkload(
     def bind_math(
         self, facts: BackendCompileFacts, plan: PlanBundle
     ) -> MathBinding[TensorStepInput, ContextT, ResultT]:
-        if self.model.device != facts.device:
-            raise ValueError("causal mathematics require the materialized model on the execution device")
         builder, functions = self._binding(facts)
-        if builder.graph != plan.semantic_graph or builder.layouts != plan.tensor_layout_request:
-            raise ValueError("causal mathematics differ from the original signed declaration")
+        if (
+            self.model.device != facts.device
+            or builder.graph != plan.semantic_graph
+            or builder.layouts != plan.tensor_layout_request
+        ):
+            raise ValueError("causal mathematics must match the execution device and signed declaration")
         return MathBinding(functions, builder.bind_all(plan))

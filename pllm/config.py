@@ -25,10 +25,12 @@ class KVOffload:
     prompt_only: bool = False
 
     def __post_init__(self) -> None:
-        if self.connector not in ("OffloadingConnector", "SimpleCPUOffloadConnector") or self.cpu_bytes <= 0:
+        if self.connector not in ("OffloadingConnector", "SimpleCPUOffloadConnector"):
             raise ValueError(
-                "use OffloadingConnector or SimpleCPUOffloadConnector with positive cpu_bytes; LMCache does not support PositionState"
+                "use OffloadingConnector or SimpleCPUOffloadConnector; LMCache does not support PositionState"
             )
+        if self.cpu_bytes <= 0:
+            raise ValueError("cpu_bytes must be positive, e.g. 512 * 1024**2")
         if self.prompt_only and self.connector == "SimpleCPUOffloadConnector":
             raise ValueError(
                 "prompt_only needs OffloadingConnector; SimpleCPUOffloadConnector offloads completed request pages"
@@ -64,20 +66,14 @@ class ExecutionOptions:
     publish_lag: int = 1
 
     def __post_init__(self) -> None:
-        if type(self.publish_lag) is not int or self.publish_lag < 0:
-            raise ValueError("publish_lag must be a nonnegative integer; use 0 for strict ordering")
-        if self.schedule_policy not in ("auto", "serial"):
-            raise ValueError("schedule_policy must be auto or serial")
+        if self.publish_lag < 0:
+            raise ValueError("publish_lag must be >= 0; use 0 for strict ordering")
         if self.tuning not in ("heuristic", "measured"):
             raise ValueError("tuning must be heuristic or measured")
-        if (
-            self.training_rows < 1
-            or self.capture_memory_bytes < 1
-            or self.state_memory_bytes < 0
-            or self.memory_budget_bytes is not None
-            and self.memory_budget_bytes < 0
-        ):
-            raise ValueError("training rows/capture capacity must be positive and memory limits nonnegative")
+        if self.training_rows < 1:
+            raise ValueError("training_rows must be >= 1")
+        if self.capture_memory_bytes < 1:
+            raise ValueError("capture_memory_bytes must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,13 +98,5 @@ class ModelConfig:
     kv_offload: KVOffload | None = None
 
     def __post_init__(self) -> None:
-        if (
-            self.generated_kv not in ("reuse", "isolate")
-            or not self.model
-            or self.max_model_len < 2
-            or self.max_num_seqs < 1
-            or self.max_num_batched_tokens < self.max_num_seqs
-            or not 0 < self.gpu_memory_utilization < 1
-            or self.seed < 0
-        ):
-            raise ValueError("invalid model configuration")
+        if self.generated_kv not in ("reuse", "isolate"):
+            raise ValueError('generated_kv must be "reuse" or "isolate"')

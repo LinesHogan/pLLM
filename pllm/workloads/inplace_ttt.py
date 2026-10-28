@@ -28,7 +28,7 @@ class InPlaceTTTConfig:
             or self.chunk_size < 1
             or self.learning_rate <= 0.0
         ):
-            raise ValueError("In-Place-TTT mathematical configuration is invalid")
+            raise ValueError("InPlaceTTTConfig needs sorted unique targets, chunk_size >= 1, and learning_rate > 0")
 
 
 @dataclass(frozen=True)

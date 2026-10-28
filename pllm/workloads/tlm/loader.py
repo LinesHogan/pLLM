@@ -49,7 +49,7 @@ class HfQvModel:
     """Frozen base and initialization template, never another mutable factor store."""
 
     def __init__(self, base: Qwen2ForCausalLM, config: HfQvConfig) -> None:
-        from peft import LoraConfig, PeftModelForCausalLM, TaskType, get_peft_model
+        from peft import LoraConfig, PeftModelForCausalLM, TaskType
 
         self.config = config
         self.tensor_dtype = config.tensor_dtype
@@ -63,8 +63,6 @@ class HfQvModel:
                 (ParameterRole.QUERY_PROJECTION_WEIGHT, "q_proj", layer.self_attn.q_proj),
                 (ParameterRole.VALUE_PROJECTION_WEIGHT, "v_proj", layer.self_attn.v_proj),
             ):
-                if projection.weight.dtype != tensor_dtype(config.tensor_dtype):
-                    raise ValueError("HF projection dtype differs from the frozen tensor layout")
                 targets.append(
                     ParameterTargetShape(
                         ParameterTarget(index, ParameterModuleKind.ATTENTION, role),
@@ -76,7 +74,7 @@ class HfQvModel:
                     f"base_model.model.model.layers.{index}.self_attn.{name}.lora_{factor}.default.weight"
                     for factor in ("A", "B")
                 )
-        adapted = get_peft_model(
+        adapted = PeftModelForCausalLM(
             base,
             LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
@@ -88,8 +86,6 @@ class HfQvModel:
                 bias="none",
             ),
         )
-        if not isinstance(adapted, PeftModelForCausalLM):
-            raise TypeError("PEFT did not construct the supported causal model")
         self.model = adapted.to(dtype=tensor_dtype(config.tensor_dtype)).eval().requires_grad_(False)
         self.targets = tuple(targets)
         self._names = tuple(names)
@@ -127,8 +123,7 @@ class HfQvModel:
             # functional_call temporarily binds the original leaf views and restores
             # the frozen template on success or failure. It does not copy factors.
             output = torch.func.functional_call(self.model, dict(zip(self._names, factors, strict=True)), (), arguments)
-        if not isinstance(output, CausalLMOutputWithPast) or output.logits is None:
-            raise TypeError("HF causal model did not produce dense logits")
+        assert isinstance(output, CausalLMOutputWithPast) and output.logits is not None
         return output.logits
 
     @classmethod

@@ -146,39 +146,21 @@ class CompletionInput:
     ) -> CompletionInput:
         if (
             (hidden.device.type == "cuda") != (stream is not None)
-            or stream is not None
-            and stream.device != hidden.device
+            or (stream is not None and stream.device != hidden.device)
+            or hidden.ndim != 2
+            or hidden.shape[0] != len(completions.entries)
+            or hidden.device.type not in ("cpu", "cuda")
         ):
-            raise ValueError("completion input requires its original producer stream")
+            raise ValueError("completion input requires rows aligned to completions on its producer stream")
         with nullcontext() if stream is None else torch.cuda.stream(stream), torch.inference_mode(False):
             owned = hidden.detach().to(dtype=torch.float32, copy=True)
             return cls(completions, owned, CudaStreamReadiness(stream) if stream is not None else None)
-
-    def __post_init__(self) -> None:
-        if (
-            self.hidden.ndim != 2
-            or self.hidden.shape[0] != len(self.completions.entries)
-            or self.hidden.dtype != torch.float32
-            or torch.is_inference(self.hidden)
-            or self.hidden.device.type not in ("cpu", "cuda", "meta")
-            or (self.hidden.device.type == "cuda") != (self.readiness is not None)
-        ):
-            raise ValueError("completion input requires owned float32 rows aligned to completions")
 
 
 class CompletionCapture:
     """Write final sampling rows directly into the original owned output tensor."""
 
     def __init__(self, identities: tuple[RequestIdentity, ...], hidden: torch.Tensor) -> None:
-        if (
-            hidden.ndim != 2
-            or hidden.shape[0] != len(identities)
-            or hidden.dtype != torch.float32
-            or hidden.device.type not in ("cpu", "cuda")
-            or torch.is_inference(hidden)
-            or len(set(identities)) != len(identities)
-        ):
-            raise ValueError("completion capture requires distinct identities and owned float32 rows")
         self.identities, self.hidden = identities, hidden
         self._indices = {identity: index for index, identity in enumerate(identities)}
         self._written: set[RequestIdentity] = set()
@@ -187,8 +169,7 @@ class CompletionCapture:
         )
 
     def write(self, identities: tuple[RequestIdentity, ...], rows: torch.Tensor) -> None:
-        if rows.shape != (len(identities), self.hidden.shape[1]):
-            raise ValueError("sampling rows differ from the completion destination")
+        assert rows.shape == (len(identities), self.hidden.shape[1])
         with torch.inference_mode(False), torch.no_grad():
             if self._readiness is not None:
                 self._readiness.order_on(torch.cuda.current_stream(self.hidden.device))
@@ -209,8 +190,7 @@ class CompletionCapture:
 
     def finish(self, completions: CompletionBatch) -> CompletionInput:
         self.require_complete()
-        if tuple(entry.identity for entry in completions.entries) != self.identities:
-            raise ValueError("completion rows differ from the original capture identities")
+        assert tuple(entry.identity for entry in completions.entries) == self.identities
         return CompletionInput(completions, self.hidden, self._readiness)
 
 
@@ -296,14 +276,11 @@ class HostExecution(Generic[TransactionT, ContextT, SnapshotT, ResultT]):
         if stream is not None and self._initialization is not None:
             self._initialization.order_on(stream)
         # Readiness is ordered before the snapshot; no workload owns a second cursor.
+        snapshot: SnapshotT | None = None
         with torch.inference_mode(False), torch.enable_grad():
             try:
                 context = self._state.prepare(transaction)
                 snapshot = self._state.snapshot()
-            except Exception:
-                self.trace.record(TracePhase.FAILED, receipt_id)
-                raise
-            try:
                 result = self._state.output(TaskGraphInvocation(self._runner, context, receipt_id).run())
                 completion = None
                 if stream is not None:
@@ -312,18 +289,19 @@ class HostExecution(Generic[TransactionT, ContextT, SnapshotT, ResultT]):
                     completion.synchronize()
             except Exception:
                 self.trace.record(TracePhase.FAILED, receipt_id)
-                self._restore(snapshot, stream)
-                self.trace.record(TracePhase.ABORT, receipt_id)
+                if snapshot is not None:
+                    self._restore(snapshot, stream)
+                    self.trace.record(TracePhase.ABORT, receipt_id)
                 raise
         receipt = HostReceipt(receipt_id, result, completion)
         self._active = _Pending(receipt, snapshot, stream)
         self.trace.record(TracePhase.PREPARED, receipt_id)
         return receipt
 
-    def validate_receipt(self, receipt: HostReceipt[ResultT]) -> None:
+    def validate_receipt(self, receipt: HostReceipt[ResultT]) -> _Pending[ResultT, SnapshotT]:
         match self._active:
-            case _Pending(receipt=issued) if issued is receipt:
-                pass
+            case _Pending(receipt=issued) as pending if issued is receipt:
+                return pending
             case _:
                 raise RuntimeError("host execution receipt is not active")
 
@@ -334,14 +312,10 @@ class HostExecution(Generic[TransactionT, ContextT, SnapshotT, ResultT]):
         self.trace.record(TracePhase.SETTLED, receipt.receipt_id)
 
     def abort(self, receipt: HostReceipt[ResultT]) -> None:
-        self.validate_receipt(receipt)
-        match self._active:
-            case _Pending(snapshot=snapshot, stream=stream):
-                self._restore(snapshot, stream)
-                self._active = None
-                self.trace.record(TracePhase.ABORT, receipt.receipt_id)
-            case _:
-                raise RuntimeError("host execution lost its active receipt")
+        pending = self.validate_receipt(receipt)
+        self._restore(pending.snapshot, pending.stream)
+        self._active = None
+        self.trace.record(TracePhase.ABORT, receipt.receipt_id)
 
     def _restore(self, snapshot: SnapshotT, stream: torch.cuda.Stream | None) -> None:
         try:
@@ -376,7 +350,7 @@ class HostTransactionExecution(Protocol[TransactionT_contra, ResultT]):
 
     def execute(self, transaction: TransactionT_contra) -> HostReceipt[ResultT]: ...
 
-    def validate_receipt(self, receipt: HostReceipt[ResultT]) -> None: ...
+    def validate_receipt(self, receipt: HostReceipt[ResultT]) -> object: ...
 
     def commit(self, receipt: HostReceipt[ResultT]) -> None: ...
 

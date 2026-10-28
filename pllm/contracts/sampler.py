@@ -21,17 +21,6 @@ class SamplerFeedback:
     base_logits: torch.Tensor
     sampled_tokens: torch.Tensor
 
-    def __post_init__(self) -> None:
-        count = len(self.sampler_rows.links)
-        if (
-            self.base_logits.ndim != 2
-            or self.base_logits.shape[0] != count
-            or self.sampled_tokens.shape != (count,)
-            or self.sampled_tokens.dtype not in (torch.int32, torch.int64)
-            or self.sampled_tokens.device != self.base_logits.device
-        ):
-            raise ValueError("sampler feedback must align original logits and tokens with packed rows")
-
 
 @dataclass(frozen=True, slots=True)
 class PackedSamplerGuidanceBatch:
@@ -44,14 +33,6 @@ class PackedSamplerGuidanceBatch:
     stage: SamplerStage = SamplerStage.PACKED_POST_FILTER_EXACT
     # Optional per-row multiplier of beta on the device; rows with weight 0 are left unchanged.
     row_weights: torch.Tensor | None = None
-
-    def __post_init__(self) -> None:
-        if self.beta < 0.0 or self.values.ndim != 2 or int(self.values.shape[0]) != len(self.affected_row_ids):
-            raise ValueError("packed sampler guidance must align predictions with affected rows")
-        if self.affected_row_ids != tuple(sorted(set(self.affected_row_ids))):
-            raise ValueError("packed sampler guidance rows must be sorted and unique")
-        if any(row_id < 0 or row_id >= len(self.sampler_rows.links) for row_id in self.affected_row_ids):
-            raise ValueError("packed sampler guidance row is out of bounds")
 
     @property
     def total_rows(self) -> int:
