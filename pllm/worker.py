@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-from typing import cast
 
 import torch
 from vllm.v1.worker.gpu_worker import Worker
@@ -81,12 +80,8 @@ class GPUWorker(Worker):
                     return encode_boundary(probe_backend(probe.requirements, runner, publish_lag=probe.publish_lag))
                 case BackendCommand.INSTALL:
                     install = decode_boundary(payload, BackendInstall)
-                    # The reference names an importable frozen class; the driver compares
-                    # the rebuilt compilation signature against its own signed plan.
-                    authoring = decode_workload(install.definition, device=runner.device, seed=runner.model_config.seed)
-                    if not isinstance(authoring, BackendWorkload):
-                        raise ValueError("referenced workload is not a backend workload")
-                    self._install(cast(BackendWorkload[object, object], authoring), install.attachment)
+                    # The driver compares the rebuilt compilation signature against its own plan.
+                    self._install(decode_workload(install.definition), install.attachment)
                     return encode_boundary(runner.worker_state())
                 case BackendCommand.STAGE:
                     stage = decode_boundary(payload, BackendStage)

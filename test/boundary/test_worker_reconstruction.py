@@ -7,13 +7,11 @@ from multiprocessing.connection import Connection
 import pytest
 import torch
 
-import pllm
 from examples.huber import HuberWorkload
 from pllm import make_llm
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
-from pllm.contracts.workload_reference import WorkloadReference
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
@@ -31,57 +29,34 @@ def doubled_cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> torch.T
     return cross_entropy(logits, labels) * 2
 
 
-class PlainProbe(pllm.Workload):
-    """Not a frozen dataclass: EngineCore reference transport rejects it with guidance."""
-
-
 @dataclass(frozen=True, slots=True)
-class FakeTransportConfig:
+class FakeTemplate:
+    """Stands in for a template model: travels as its config and is rebuilt by the worker."""
+
     value: int
 
-
-class FakeTransport:
-    """WorkerTransportable test double; rebuild proves the worker-side hook ran."""
-
-    def __init__(self, config: FakeTransportConfig) -> None:
-        self.config = config
-
-    def transport_payload(self) -> FakeTransportConfig:
-        return self.config
-
-    @classmethod
-    def transport_payload_type(cls) -> type[FakeTransportConfig]:
-        return FakeTransportConfig
-
-    @classmethod
-    def transport_rebuild(cls, payload: FakeTransportConfig, *, device: torch.device, seed: int) -> "FakeTransport":
-        return cls(FakeTransportConfig(payload.value + seed))
+    def __reduce__(self) -> tuple[type["FakeTemplate"], tuple[int]]:
+        return FakeTemplate, (self.value + 1,)
 
 
 @dataclass(frozen=True)
-class TransportHolder(DummyWorkload):
-    extra: FakeTransport = FakeTransport(FakeTransportConfig(1))
+class TemplateHolder(DummyWorkload):
+    extra: FakeTemplate = FakeTemplate(1)
 
 
-def test_workload_transport_round_trips_frozen_workloads_and_rejects_what_the_worker_cannot_import() -> None:
-    # Built-ins and user workloads travel identically: class coordinates plus frozen fields;
-    # module-level function replacements are imported by the worker.
+def test_workload_transport_round_trips_workloads_and_rejects_what_the_worker_cannot_import() -> None:
+    # Built-ins and user workloads travel identically; module-level function replacements are imported by the worker.
     for workload in (
         DummyWorkload(),
         replace(OverRIDEWorkload(), objective=doubled_cross_entropy),
         HuberWorkload(3),
         PrefillAdapters(dtype=torch.float64),
     ):
-        assert decode_workload(encode_workload(workload), device=torch.device("cpu"), seed=0) == workload
-    holder = TransportHolder(extra=FakeTransport(FakeTransportConfig(2)))
-    restored = decode_workload(encode_workload(holder), device=torch.device("cpu"), seed=0)
-    assert isinstance(restored, TransportHolder) and restored.extra.config == FakeTransportConfig(2)
-    for workload in (PlainProbe(), replace(DummyWorkload(), transform=lambda hidden: hidden)):
-        with pytest.raises(ValueError):
-            encode_workload(workload)
-    reference = decode_boundary(encode_workload(DummyWorkload()), WorkloadReference)
+        assert decode_workload(encode_workload(workload)) == workload
+    restored = decode_workload(encode_workload(TemplateHolder(extra=FakeTemplate(2))))
+    assert isinstance(restored, TemplateHolder) and restored.extra == FakeTemplate(3)
     with pytest.raises(ValueError):
-        decode_workload(encode_boundary(replace(reference, module_digest="0" * 64)), device=torch.device("cpu"), seed=0)
+        encode_workload(replace(DummyWorkload(), transform=lambda hidden: hidden))
 
 
 def _plan() -> PlanBundle:

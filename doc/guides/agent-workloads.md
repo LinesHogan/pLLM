@@ -139,14 +139,11 @@ PLLM 的加速技术（内置的 advanced 精细操作）；但自动页表总�
   能力检查会拒绝不支持的组合。
 
 关于执行模式：自定义 Python workload 默认走进程内公共工厂。EngineCore
-多进程下 workload 按引用跨进程传输（以 `pllm/contracts/workload_reference.py`
-与 `pllm/worker.py` 为准）：
+多进程下 workload 用 pickle 送到 worker（以 `pllm/workload_transport.py` 与 `pllm/worker.py` 为准）：
 
-- workload 必须是**可导入的冻结 dataclass 类**（无字段亦可），字段值必须是
-  封闭可传输的；
-- **函数体从不序列化**——跨进程传递的是类坐标（module + qualname）、模块
-  源码 digest 与封闭字段编码，worker 导入同一模块重建实例并重新绑定；
-- driver 随后**逐字节复核** worker 重建出的编译签名是否等于自己签定的计划，
+- 类和模块级函数按导入路径传递，worker 导入同一份源码重建实例；lambda、闭包、
+  `__main__` 里定义的类无法传递；
+- driver 随后**逐字节复核** worker 重建出的编译签名是否等于自己的计划，
   任何代码漂移都响亮失败，而不是静默跑不同的数学。
 
 因此多进程交付的正确做法是让双方从相同源码启动，而不是在签名与 spawn 之间

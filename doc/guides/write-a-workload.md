@@ -105,15 +105,13 @@ notebook 和随手脚本都走这条路。上生产时，`ModelConfig(multiproce
 所以"两个进程里跑的是不是同一份数学"是一个校验问题，不是信任问题：worker
 不相信驱动端传来的任何代码，它只相信自己从同一源码重建后逐字节对上的签名。
 
-代价是三条纪律。好消息是违反了会立刻报错，且报错会指明具体缺哪条：
+代价是两条纪律。好消息是违反了会立刻报错，且报错会指明具体缺哪条：
 
 1. **类必须可导入**：写在 `.py` 模块里。`__main__`、notebook cell、函数
    局部定义的类都无法被 spawn 出来的 worker import，留在同进程模式即可。
-2. **必须是冻结 dataclass**（无字段也行：`@dataclass(frozen=True)`）——
-   冻结是"字段值可以安全封闭传输"的前提。
-3. **字段必须可封闭传输**：原始配置值、typed contract 声明、模块级函数
-   （按引用），或实现 `WorkerTransportable` 的对象（如 TLM 的 meta 模型模板）。
-   字段里夹了 lambda、活模型或文件句柄会被拒绝，并点名字段。
+2. **可以被 pickle**：workload 用 pickle 送到 worker，类和模块级函数按导入路径传递。
+   字段里夹了 lambda 或闭包会报错；不该按字节传的对象（如 TLM 的 meta 模型模板）
+   用 `__reduce__` 只传配置，由 worker 自己加载。
 
 最后一条隐性要求：模块必须 import-safe。spawn 会让 worker 重新导入你的模块，
 顶层不能有 GPU 工作——否则它在 import 阶段就炸了，而不是在你以为的初始化
