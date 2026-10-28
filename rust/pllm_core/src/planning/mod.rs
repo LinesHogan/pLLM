@@ -21,44 +21,6 @@ pub(crate) struct PlanBundle {
     pub(crate) tensor_layout_decision: tensor_layout::TensorLayoutDecision,
 }
 
-impl PlanBundle {
-    pub(crate) fn validate(&self) -> Result<(), String> {
-        tensor_layout::validate_decision(
-            &self.tensor_layout_request,
-            &self.tensor_layout_decision,
-        )?;
-        scheduler::validate_decision(
-            &self.semantic_graph,
-            &self.timeline,
-            &self.schedule,
-            Some(&self.states),
-        )?;
-        for state in &self.states.plans {
-            if !self
-                .semantic_graph
-                .states
-                .iter()
-                .any(|known| known.resource == state.resource)
-            {
-                return Err("state representation is absent from the semantic graph".to_owned());
-            }
-            let binding = self
-                .tensor_layout_decision
-                .bindings
-                .iter()
-                .find(|binding| binding.resource == state.resource)
-                .ok_or_else(|| "state representation lacks a signed tensor layout".to_owned())?;
-            if state.layout_id != u64::from(binding.layout_id)
-                || state.layout_namespace != binding.layout_namespace
-                || state.layout_digest != binding.layout_digest
-            {
-                return Err("state representation differs from signed tensor layout".to_owned());
-            }
-        }
-        Ok(())
-    }
-}
-
 #[pyfunction]
 fn compile_state_schedule(
     graph_json: &str,

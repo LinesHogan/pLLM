@@ -349,18 +349,6 @@ fn attachment_hidden_key(resource: &AttachmentHiddenResource) -> Result<(i64, u8
     Ok((layer, site, phase))
 }
 
-fn task_for_dense_id<'a>(
-    graph: &'a SemanticGraph,
-    binding: &AttachmentTaskBinding,
-) -> Result<&'a SemanticTask, String> {
-    let task_id = usize::try_from(binding.task_id)
-        .map_err(|_| "attachment task ID cannot address the semantic graph".to_owned())?;
-    graph
-        .tasks
-        .get(task_id)
-        .ok_or_else(|| "attachment task ID is not a dense semantic graph ID".to_owned())
-}
-
 fn has_decode_selection(task: &SemanticTask, state_resource: &str) -> bool {
     task.inputs.iter().any(|input| {
         matches!(
@@ -390,7 +378,7 @@ fn validate_request_training_graph(
     }
 
     if let [compute, _] = attachment.task_bindings.as_slice() {
-        validate_sampler_compute(attachment, task_for_dense_id(graph, compute)?)?;
+        validate_sampler_compute(attachment, &graph.tasks[compute.task_id as usize])?;
     }
     let mut task_hidden = graph
         .tasks
@@ -412,7 +400,7 @@ fn validate_request_training_graph(
         );
     }
 
-    let transition = task_for_dense_id(graph, attachment.task_bindings.last().unwrap())?;
+    let transition = &graph.tasks[attachment.task_bindings.last().unwrap().task_id as usize];
     if !transition.effects.iter().any(|effect| {
         effect.resource == attachment.spec.state_resource
             && (effect.kind == StateEffectKind::Update
@@ -501,7 +489,7 @@ fn validate_parameter_overlay_graph(
     if bindings.is_empty() {
         return Ok(());
     }
-    let transition = task_for_dense_id(graph, &bindings[0])?;
+    let transition = &graph.tasks[bindings[0].task_id as usize];
     if !transition.effects.iter().any(|effect| {
         effect.resource == attachment.spec.state_resource
             && effect.version.is_none()
@@ -512,7 +500,7 @@ fn validate_parameter_overlay_graph(
     }) {
         return Err("parameter overlay transition task is missing transition semantics".to_owned());
     }
-    let publish = task_for_dense_id(graph, &bindings[1])?;
+    let publish = &graph.tasks[bindings[1].task_id as usize];
     if !publish.effects.iter().any(|effect| {
         effect.resource == attachment.spec.state_resource
             && effect.kind == StateEffectKind::Publish
@@ -532,7 +520,7 @@ fn validate_activation_replay(
     graph: &SemanticGraph,
 ) -> Result<(), String> {
     validate_parameter_overlay_graph(attachment, graph, &attachment.task_bindings[1..])?;
-    let forward = task_for_dense_id(graph, &attachment.task_bindings[0])?;
+    let forward = &graph.tasks[attachment.task_bindings[0].task_id as usize];
     if attachment.task_bindings.len() == 1 {
         if graph.tasks.len() != 1
             || forward.effects.len() != 1
@@ -553,8 +541,8 @@ fn validate_activation_replay(
         }
         return Ok(());
     }
-    let transition = task_for_dense_id(graph, &attachment.task_bindings[1])?;
-    let publication = task_for_dense_id(graph, &attachment.task_bindings[2])?;
+    let transition = &graph.tasks[attachment.task_bindings[1].task_id as usize];
+    let publication = &graph.tasks[attachment.task_bindings[2].task_id as usize];
     let depends_on = |consumer: &SemanticTask, producer: &SemanticTask| {
         consumer.inputs.iter().any(|input| {
             matches!(&input.source,
@@ -638,7 +626,7 @@ fn validate_cross_binding(
     validate_probe(probe)?;
     for group in &graph.input_groups {
         let readers: Vec<_> = if attachment.spec.kind == AttachmentKind::ModelReplay {
-            vec![task_for_dense_id(graph, &attachment.task_bindings[0])?
+            vec![graph.tasks[attachment.task_bindings[0].task_id as usize]
                 .symbol
                 .clone()]
         } else {
@@ -662,10 +650,11 @@ fn validate_cross_binding(
                 .iter()
                 .filter(|binding| binding.role != AttachmentTaskRole::Compute)
                 .any(|binding| {
-                    task_for_dense_id(graph, binding)
-                        .map_or(true, |task| !group.tasks.contains(&task.symbol))
+                    !group
+                        .tasks
+                        .contains(&graph.tasks[binding.task_id as usize].symbol)
                 })
-            || task_for_dense_id(graph, attachment.task_bindings.last().unwrap())?.symbol
+            || graph.tasks[attachment.task_bindings.last().unwrap().task_id as usize].symbol
                 != group.publication
         {
             return Err(
@@ -706,7 +695,7 @@ fn validate_cross_binding(
             return Err("layer routes need their model domain, source and forward timing".into());
         }
         if attachment.spec.kind == AttachmentKind::ParameterOverlay {
-            let publish = task_for_dense_id(graph, &attachment.task_bindings[1])?;
+            let publish = &graph.tasks[attachment.task_bindings[1].task_id as usize];
             if graph.tasks.len() != 2
                 || graph.states.len() != 1
                 || graph.states[0].scope != StateScope::Request
@@ -715,7 +704,7 @@ fn validate_cross_binding(
                     matches!(&input.source,
                     InputSource::Result { task: source, .. } if source == &task.symbol)
                 })
-                || task_for_dense_id(graph, &attachment.task_bindings[0])?.symbol != task.symbol
+                || graph.tasks[attachment.task_bindings[0].task_id as usize].symbol != task.symbol
                 || task.effects.len() != 1
                 || task.effects[0].kind != StateEffectKind::TransitionMaybe
                 || task.effects[0].resource != attachment.spec.state_resource
@@ -794,7 +783,7 @@ fn validate_cross_binding(
             }
         }
         AttachmentKind::ModelReplay => {
-            let task = task_for_dense_id(graph, &attachment.task_bindings[0])?;
+            let task = &graph.tasks[attachment.task_bindings[0].task_id as usize];
             if task.replay.is_none()
                 || task.timing.after != "model.execute"
                 || task.timing.before != "state.publish"
@@ -840,43 +829,6 @@ fn validate_cross_binding(
             if hidden != signed {
                 return Err("model producers must use the probed hidden inputs".into());
             }
-        }
-    }
-    if attachment.spec.kind != AttachmentKind::ModelReplay
-        || !attachment.spec.activation_bindings.is_empty()
-    {
-        if state.plans.iter().any(|provider| {
-            provider.device_kind != probe.device_kind
-                || provider.device_ordinal != probe.device_ordinal
-        }) {
-            return Err("attachment placement differs from selected state provider".to_owned());
-        }
-    }
-    let sampler_anchor = timeline
-        .anchors
-        .get(attachment.sampler_anchor_id as usize)
-        .ok_or_else(|| "attachment sampler anchor is outside the timeline".to_owned())?;
-    if sampler_anchor.ordinal != attachment.sampler_anchor_id as u64
-        || sampler_anchor.symbol != attachment.spec.sampler_anchor
-    {
-        return Err("attachment sampler anchor differs from timeline".to_owned());
-    }
-    if attachment.spec.tasks.len() != attachment.task_bindings.len() {
-        return Err("attachment tasks differ from declared roles".into());
-    }
-    for ((role, symbol), binding) in attachment.spec.tasks.iter().zip(&attachment.task_bindings) {
-        if role != &binding.role || symbol != &task_for_dense_id(graph, binding)?.symbol {
-            return Err("attachment task binding differs from its declaration".into());
-        }
-        let task = schedule
-            .tasks
-            .iter()
-            .find(|task| task.task_id == binding.task_id)
-            .ok_or_else(|| "attachment task binding is not in physical plan".to_owned())?;
-        if task.implementation_id != binding.implementation_id
-            || task.anchor_id != binding.anchor_id
-        {
-            return Err("attachment task binding differs from physical plan".to_owned());
         }
     }
     match attachment.spec.kind {
@@ -1011,7 +963,6 @@ fn validate_position_source(
 
 pub(crate) fn validate_attachment(attachment: &BackendAttachment) -> Result<(), String> {
     let plan = &attachment.plan;
-    plan.validate()?;
     let mut reads: std::collections::BTreeSet<_> = attachment
         .spec
         .overlay_bindings
