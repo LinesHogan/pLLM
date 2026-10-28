@@ -68,7 +68,10 @@ def test_retired_roots_hold_storage_until_pages_are_free() -> None:
     arena.settle(replacement)
     with pytest.raises(RuntimeError):
         arena.prepare_admission(("dense_fast_weights",) * 2)
-    arena.wait_release(arena.release_pin(pin))
+    release = arena.release_pin(pin)
+    arena.wait_release(release)
+    assert arena.release_complete(release)
+    arena.wait_release(release)
     with pytest.raises(AssertionError):
         arena.borrow_field(pin, a, F0)
     arena.retire(replacement.after_refs)

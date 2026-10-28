@@ -10,7 +10,6 @@ from math import prod
 from multiprocessing.connection import Connection
 from threading import RLock
 from typing import overload
-from weakref import WeakSet
 
 import numpy as np
 import numpy.typing as npt
@@ -76,7 +75,7 @@ class PagePin:
     stream: torch.cuda.Stream | None
 
 
-@dataclass(frozen=True, slots=True, eq=False, weakref_slot=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class PageRelease:
     release_id: int
     pin: PagePin
@@ -394,7 +393,6 @@ class PageBundleArena:
         self._window_active = False
         self._window_completion: torch.cuda.Event | None = None
         self._storage_streams: set[int] = set()
-        self._issued_releases: WeakSet[PageRelease] = WeakSet()
         self._pending_events: dict[torch.cuda.Stream, deque[PagePublication | PageRelease]] = {}
         self._ready_receipts: dict[PagePublication | PageRelease, None] = {}
         self._next_lineage = 1
@@ -1104,14 +1102,13 @@ class PageBundleArena:
             receipt = PageRelease(self._next_release, pin, self._record(pin.stream), tuple(held.remote))
             self._next_release += 1
             self._pins.pop(pin)
-            self._issued_releases.add(receipt)
             self._releases[receipt] = held
             self._queue_completion(receipt, pin.stream)
             return receipt
 
     def wait_release(self, receipt: PageRelease) -> None:
         with self._lock:
-            self._issued_release(receipt)
+            self._require_live()
             if receipt.completion is not None:
                 receipt.completion.synchronize()
             for read in receipt.remote_reads:
@@ -1120,7 +1117,7 @@ class PageBundleArena:
 
     def release_complete(self, receipt: PageRelease) -> bool:
         with self._lock:
-            self._issued_release(receipt)
+            self._require_live()
             self.collect_completed()
             return receipt not in self._releases
 
@@ -1220,10 +1217,6 @@ class PageBundleArena:
         issued = self._pins.get(pin)
         assert issued is not None
         return issued
-
-    def _issued_release(self, receipt: PageRelease) -> None:
-        self._require_live()
-        assert receipt in self._issued_releases
 
     def _require_live(self) -> None:
         if self._poisoned:
