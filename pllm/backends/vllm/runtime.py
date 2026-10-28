@@ -747,7 +747,7 @@ def probe_backend(
     # is hidden in this capacity: current + private + GPU reader + publish_lag retained roots.
     capacity = (3 + publish_lag) * runner.max_num_reqs + 2
     facts = BackendCompileFacts(
-        replace(probe, targets=targets),
+        replace(probe, targets=targets, position_states=requirements.position_states),
         timeline,
         (
             PageBundleProviderFacts(
