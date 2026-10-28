@@ -113,10 +113,6 @@ class StateTaskContext(Generic[DataT]):
     def publication(self) -> PagePublication | None:
         return next(reversed(self.page_publications), None)
 
-    @property
-    def release(self) -> PageRelease | None:
-        return self.page_pins[self.pin]
-
     def current_owned_ref(self, original: StateRef) -> StateRef:
         return self.current_owned_refs((original,))[0]
 
@@ -175,10 +171,12 @@ class StateTaskContext(Generic[DataT]):
             self.arena.abort(token)
             del self.page_writes[token]
 
-    def release_owned_pin(self, pin: PagePin) -> None:
+    def release_owned_pin(self, pin: PagePin) -> PageRelease:
         assert pin in self.page_pins
-        if self.page_pins[pin] is None:
-            self.page_pins[pin] = self.arena.release_pin(pin)
+        receipt = self.page_pins[pin]
+        if receipt is None:
+            receipt = self.page_pins[pin] = self.arena.release_pin(pin)
+        return receipt
 
     def borrow_published(self, refs: Sequence[StateRef]) -> PagePin:
         self.check_page_execution()
@@ -689,27 +687,20 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals],
         context: StateTaskContext[DataT],
     ) -> None:
-        # Only borrowed steps clear aliases and ACK before settlement; test_video checks ACK/failure ordering.
-        if context.borrowed_roots:
-            context.value = None
-            context.results.clear()
-            context.loss = None
-            context.guidance = context.sampler_feedback = None
-            context.guidance_ready = None
-            for root in context.borrowed_roots:
-                root.close()
-        for pin in context.page_pins:
-            context.release_owned_pin(pin)
-        for receipt in context.page_publications:
-            context.settle_owned_publication(receipt)
-        self._active.pop(invocation.invocation_id)
+        # Discard aliases before borrowed ACKs and settlement; test_video checks ACK/failure ordering.
         context.value = None
         context.results.clear()
         context.loss = None
         context.guidance = context.sampler_feedback = None
         context.guidance_ready = None
-        release = context.release
-        assert release is not None
+        for root in context.borrowed_roots:
+            root.close()
+        for pin in context.page_pins:
+            context.release_owned_pin(pin)
+        for receipt in context.page_publications:
+            context.settle_owned_publication(receipt)
+        self._active.pop(invocation.invocation_id)
+        release = context.release_owned_pin(context.pin)
         self.trace.record(
             TracePhase.SETTLED,
             invocation.invocation_id,
