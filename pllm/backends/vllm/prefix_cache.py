@@ -14,13 +14,12 @@ from vllm.v1.request import Request
 from pllm.contracts.backend_attachment import SignedBackendAttachment
 from pllm.execution.codec import boundary_digest, decode_boundary, encode_boundary
 
-POLICY_ENV = "PLLM_GENERATED_KV"
 POLICY_KEY = "pllm.prefix_cache"
 
 
 @dataclass(frozen=True)
 class CachePolicy:
-    """Per-request cache identity, also rebuilt by the installed worker to reject mismatched requests."""
+    """Driver-owned cache identity, sent to the worker to reject mismatched requests."""
 
     namespace: str
     role_sensitive: bool

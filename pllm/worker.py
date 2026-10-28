@@ -9,6 +9,7 @@ from vllm.v1.worker.gpu_worker import Worker
 
 from pllm.authoring import BackendWorkload, DataT, ResultT, map_auxiliary
 from pllm.backends.vllm.mrv1 import Mrv1Runner
+from pllm.backends.vllm.prefix_cache import CachePolicy
 from pllm.backends.vllm.runner import WorkloadModelRunner
 from pllm.backends.vllm.runtime import (
     BackendCommand,
@@ -47,7 +48,9 @@ class GPUWorker(Worker):
             case _:
                 raise RuntimeError("canonical worker has not initialized its runner")
 
-    def _install(self, workload: BackendWorkload[DataT, ResultT], attachment: SignedBackendAttachment) -> None:
+    def _install(
+        self, workload: BackendWorkload[DataT, ResultT], attachment: SignedBackendAttachment, cache_policy: CachePolicy
+    ) -> None:
         runner = self.workload_runner
         visibility = attachment.inputs.plan.timeline.visibility
         facts = probe_backend(
@@ -56,7 +59,7 @@ class GPUWorker(Worker):
             attachment.inputs.plan.timeline,
             publish_lag=0 if visibility is None else visibility.lag,
         )
-        runner.attach_workload(workload.bind_backend(facts, attachment))
+        runner.attach_workload(workload.bind_backend(facts, attachment), cache_policy)
 
     def workload_command(self, command: str, payload: str) -> str:
         runner = self.workload_runner
@@ -81,7 +84,7 @@ class GPUWorker(Worker):
                 case BackendCommand.INSTALL:
                     install = decode_boundary(payload, BackendInstall)
                     # The driver compares the rebuilt compilation signature against its own plan.
-                    self._install(decode_workload(install.definition), install.attachment)
+                    self._install(decode_workload(install.definition), install.attachment, install.cache_policy)
                     return encode_boundary(runner.worker_state())
                 case BackendCommand.STAGE:
                     stage = decode_boundary(payload, BackendStage)

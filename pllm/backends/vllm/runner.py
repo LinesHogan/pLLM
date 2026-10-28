@@ -10,7 +10,7 @@ import json
 import os
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Generic, Literal, TypeVar
+from typing import Any, Generic, TypeVar
 
 import torch
 from vllm.config import CacheConfig, ModelConfig as VllmModelConfig, VllmConfig
@@ -38,7 +38,7 @@ from pllm.backends.vllm.overlay_graph import (
 )
 from pllm.backends.vllm.packed_rows import encode_mrv2_rows
 from pllm.backends.vllm.position_state import POSITION_ENV, PositionCacheLayer
-from pllm.backends.vllm.prefix_cache import POLICY_ENV, CachePolicy
+from pllm.backends.vllm.prefix_cache import CachePolicy
 from pllm.backends.vllm.sampler import (
     Mrv1Sampler as Mrv1Guidance,
     Vllm027Sampler,
@@ -82,7 +82,6 @@ class Runner(Generic[SamplerT, AdapterT]):
     hidden_taps: HiddenTaps | None = None
     position_states: tuple[tuple[str, float], ...] = ()
     position_layers: tuple[PositionCacheLayer, ...] = ()
-    cache_policy: CachePolicy
 
     def qwen2_model(self) -> Qwen2ForCausalLM:
         """Return the model supported by workload taps, probing and sampling."""
@@ -104,8 +103,6 @@ class Runner(Generic[SamplerT, AdapterT]):
     overlay_graph_bytes: int = 0
 
     def _initialize_workload(self, topology: AttachmentTopology) -> None:
-        policy = os.environ.get(POLICY_ENV, "isolate")
-        self._generated_kv: Literal["reuse", "isolate"] = "reuse" if policy == "reuse" else "isolate"
         self.workload_topology = topology
         self._workload_session: VllmSession[Any, Any] | None = None
         self.completion_capture: CompletionCapture | None = None
@@ -113,6 +110,7 @@ class Runner(Generic[SamplerT, AdapterT]):
     def attach_workload(
         self,
         deployment: BackendDeployment[DataT, ResultT],
+        cache_policy: CachePolicy,
     ) -> None:
         if self.cache_config.enable_prefix_caching and (
             deployment.attachment.inputs.request.activation_bindings
@@ -136,7 +134,6 @@ class Runner(Generic[SamplerT, AdapterT]):
         model = self.qwen2_model()
         upstream = self.sampler
         adapter = self._make_sampler() if deployment.attachment.inputs.request.guides_sampler else None
-        policy = CachePolicy.for_attachment(deployment.attachment, self._generated_kv)
         session = VllmSession(
             deployment,
             model,
@@ -145,7 +142,7 @@ class Runner(Generic[SamplerT, AdapterT]):
             self.hidden_taps,
             self.position_layers,
             self.cache_config.block_size,
-            cache_policy=policy,
+            cache_policy=cache_policy,
         )
         self._workload_upstream_sampler = upstream
         self._workload_session = session
@@ -159,7 +156,6 @@ class Runner(Generic[SamplerT, AdapterT]):
             self.sampler = adapter
             # Both runner ABIs call model.compute_logits; guidance shares that LM-head read.
             setattr(model, "compute_logits", partial(session.compute_logits, model))
-        self.cache_policy = policy
 
     def _finish_model_binding(self) -> None:
         """Finish backend model preparation after the session has installed its effects."""
@@ -200,7 +196,7 @@ class Runner(Generic[SamplerT, AdapterT]):
 
     def worker_state(self) -> BackendWorkerState:
         session = self.require_session()
-        return BackendWorkerState(os.getpid(), session.diagnostics(), self.cache_policy)
+        return BackendWorkerState(os.getpid(), session.diagnostics())
 
     @property
     def trace(self) -> ExecutionTrace:
@@ -378,4 +374,3 @@ class WorkloadModelRunner(Runner[Sampler, Vllm027Sampler], OverlayGraphRunner):
 class BackendWorkerState:
     process_id: int
     diagnostics: StateDiagnostics
-    cache_policy: CachePolicy

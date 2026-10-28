@@ -76,7 +76,7 @@ if TYPE_CHECKING:
 
 
 from pllm.backends.vllm.position_state import POSITION_ENV
-from pllm.backends.vllm.prefix_cache import POLICY_ENV, CachePolicy
+from pllm.backends.vllm.prefix_cache import CachePolicy
 from pllm.backends.vllm.runner import TAPS_ENV, BackendWorkerState, WorkloadModelRunner
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_hidden import hidden_binding
@@ -170,6 +170,7 @@ class BackendProbe:
 class BackendInstall:
     attachment: SignedBackendAttachment
     definition: str
+    cache_policy: CachePolicy
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +192,7 @@ class VllmLlm(Generic[DataT, ResultT]):
     _deployment: BackendDeployment[DataT, ResultT] | None
     attachment: SignedBackendAttachment
     _facts: BackendCompileFacts
+    _cache_policy: CachePolicy
     _closed: bool = False
     _next_prompt_index: int = 0
     _pending_input: ExitStack | None = None
@@ -302,10 +304,6 @@ class VllmLlm(Generic[DataT, ResultT]):
         if self._pending_input is not None:
             self._pending_input.close()
             self._pending_input = None
-
-    def cache_policy(self) -> CachePolicy:
-        """Read the installed identity, including idle workload replacements."""
-        return self.worker_state().cache_policy
 
     def generate_feedback(
         self,
@@ -477,7 +475,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         request_ids: list[str] = []
         lifetime = ExitStack()
         try:
-            request_ids = llm.enqueue(prompts, self.cache_policy().sampling(sampling_params), use_tqdm=use_tqdm)
+            request_ids = llm.enqueue(prompts, self._cache_policy.sampling(sampling_params), use_tqdm=use_tqdm)
             identities = tuple(
                 RequestIdentity(request_id, index, sample_index, route)
                 for request_id, index, route in zip(
@@ -580,7 +578,6 @@ def create_vllm_llm(
         _MP_ENV: "1" if config.multiprocessing else "0",
         _V2_RUNNER_ENV: "1" if config.runner is RunnerKind.MRV2 else "0",
         TAPS_ENV: json.dumps([[source.layer, source.site.value] for source in requirements.hidden_inputs]),
-        POLICY_ENV: config.generated_kv,
         POSITION_ENV: encode_boundary(PositionAnnouncement(requirements.position_states)),
     }
     if config.multiprocessing:
@@ -635,8 +632,11 @@ def create_vllm_llm(
             )
             facts = workload.specialize(decode_boundary(replies[0], BackendCompileFacts), config.execution)
             attachment = workload.plan_backend(facts)
-            handle = VllmLlm[DataT, ResultT](llm, None, None, attachment, facts)
-            handle.command(BackendCommand.INSTALL, encode_boundary(BackendInstall(attachment, definition or "")))
+            policy = CachePolicy.for_attachment(attachment, config.generated_kv)
+            handle = VllmLlm[DataT, ResultT](llm, None, None, attachment, facts, policy)
+            handle.command(
+                BackendCommand.INSTALL, encode_boundary(BackendInstall(attachment, definition or "", policy))
+            )
         else:
             runner = llm.llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner
             facts = workload.specialize(
@@ -644,8 +644,9 @@ def create_vllm_llm(
                 config.execution,
             )
             deployment = workload.compile_backend(facts)
-            runner.attach_workload(deployment)
-            handle = VllmLlm(llm, runner, deployment, deployment.attachment, facts)
+            policy = CachePolicy.for_attachment(deployment.attachment, config.generated_kv)
+            runner.attach_workload(deployment, policy)
+            handle = VllmLlm(llm, runner, deployment, deployment.attachment, facts, policy)
         construction.pop_all()
         return handle
 
