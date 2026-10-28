@@ -22,7 +22,6 @@ from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
 from pllm.contracts.semantic_graph import (
     HiddenInputSource,
-    HostPayloadSchemaId,
     MathContract,
     PackedSamplerRowsInputSource,
     SemanticEffect,
@@ -486,6 +485,9 @@ class RowTaskBinding(TensorBindingBase):
         update: State | None = None,
         math: MathContract | None = None,
         outputs: tuple[str, ...] = ("value",),
+        output_kind: SemanticOutputKind = SemanticOutputKind.TEMPORARY,
+        result_schema: str = "",
+        effect: StateEffectKind = StateEffectKind.UPDATE_MAYBE,
         captures: Mapping[str, LayoutFieldId] = {},
     ) -> Callable[[TensorMath], Call]:
         sources = {key: value.source if isinstance(value, TensorPort) else value for key, value in inputs.items()}
@@ -535,6 +537,18 @@ class RowTaskBinding(TensorBindingBase):
                 and (update is None or source.resource != update.declaration.resource)
             )
         )
+        sampler_inputs = (
+            (
+                SemanticInput("packed_rows", self.rows()),
+                *(
+                    (SemanticInput("__sampler_rows", self.sampler_rows()),)
+                    if not any(isinstance(source, PackedSamplerRowsInputSource) for source in sources.values())
+                    else ()
+                ),
+            )
+            if output_kind is SemanticOutputKind.SAMPLER
+            else ()
+        )
 
         def decorate(function: TensorMath) -> Call:
             symbol = TaskSymbol(name)
@@ -576,10 +590,13 @@ class RowTaskBinding(TensorBindingBase):
             call = self.compute(
                 name,
                 inputs=sources,
+                extra_inputs=sampler_inputs,
                 outputs=outputs,
+                output_kind=output_kind,
                 changes=update,
+                effect=effect,
                 math=math,
-                result_schema="canonical.tensor_training_result@1" if update is not None else "",
+                result_schema="canonical.tensor_training_result@1" if update is not None else result_schema,
                 when=When.HOST if self.host else when,
                 reads=reads,
                 function=execute,
@@ -628,35 +645,6 @@ class RowTaskBinding(TensorBindingBase):
         }:
             raise ValueError("training must consume differentiable paths for its one optimizer state")
 
-    def train_from_hidden(self, training: Call, state: State) -> None:
-        """Train request state on hidden rows every step, with no effect on the model or the sampler."""
-        self._unconditional_update(training, state)
-        self.request_training(training, state)
-
-    def _unconditional_update(self, training: Call, state: State) -> None:
-        update = next(task for task in self.graph.tasks if task.symbol == training.symbol)
-        if update.math is None or update.math.forward_rows or update.math.update_states == "__update_states":
-            raise ValueError(
-                "request training updates every selected state: remove rows= and custom update_states from @pllm.train"
-            )
-        self.graph = replace(
-            self.graph,
-            tasks=tuple(
-                replace(
-                    task,
-                    effects=tuple(
-                        replace(effect, kind=StateEffectKind.UPDATE)
-                        if effect.resource == state.declaration.resource
-                        else effect
-                        for effect in task.effects
-                    ),
-                )
-                if task.symbol == training.symbol
-                else task
-                for task in self.graph.tasks
-            ),
-        )
-
     def logits(
         self,
         prediction: Call,
@@ -672,32 +660,10 @@ class RowTaskBinding(TensorBindingBase):
             and self.dimensions.vocab_size < 1
         ):
             raise ValueError("logits binding requires the backend vocabulary size")
-        if stage is SamplerStage.PACKED_POST_FILTER_EXACT:
-            self._unconditional_update(training, state)
         prediction_task = next(task for task in self.graph.tasks if task.symbol == prediction.symbol)
         domain = "" if prediction_task.math is None else prediction_task.math.forward_rows
         mask = (
             input_port(next(port.source for port in prediction_task.inputs if port.name == domain)) if domain else None
-        )
-        self.graph = replace(
-            self.graph,
-            tasks=tuple(
-                replace(
-                    task,
-                    inputs=(
-                        *task.inputs,
-                        SemanticInput("packed_rows", self.rows()),
-                        *(
-                            (SemanticInput("__sampler_rows", self.sampler_rows()),)
-                            if not any(isinstance(port.source, PackedSamplerRowsInputSource) for port in task.inputs)
-                            else ()
-                        ),
-                    ),
-                )
-                if task.symbol == prediction.symbol
-                else task
-                for task in self.graph.tasks
-            ),
         )
         if self.dimensions is not None:
             operation = self.operations[prediction.symbol]
@@ -742,21 +708,4 @@ class RowTaskBinding(TensorBindingBase):
                 )
 
             self.operations[call.symbol] = replace(operation, prepare=prepare, output=output)
-        self.graph = replace(
-            self.graph,
-            tasks=tuple(
-                replace(
-                    task,
-                    outputs=tuple(
-                        replace(
-                            value, kind=SemanticOutputKind.HOST, schema=HostPayloadSchemaId("canonical.hidden_export@1")
-                        )
-                        for value in task.outputs
-                    ),
-                )
-                if task.symbol == call.symbol
-                else task
-                for task in self.graph.tasks
-            ),
-        )
         self.model_effect(call)

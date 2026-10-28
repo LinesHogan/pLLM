@@ -297,6 +297,7 @@ class Builder(Generic[D]):
         name: str,
         *,
         inputs: Mapping[str, SemanticInputSource],
+        extra_inputs: tuple[SemanticInput, ...] = (),
         outputs: tuple[str, ...] = (),
         implementations: tuple[TaskImplementationSpec, ...] = (),
         when: When,
@@ -305,6 +306,7 @@ class Builder(Generic[D]):
         effect: StateEffectKind = StateEffectKind.UPDATE_MAYBE,
         source: Call | None = None,
         result_schema: str = "",
+        output_kind: SemanticOutputKind = SemanticOutputKind.TEMPORARY,
         output_schemas: Mapping[str, str] | None = None,
         replay: TokenProgramEffect | None = None,
         math: MathContract | None = None,
@@ -333,11 +335,11 @@ class Builder(Generic[D]):
         task = SemanticTask(
             TaskSymbol(name),
             TimingConstraint(*(AnchorSymbol(value) for value in when.value)),
-            tuple(SemanticInput(key, value) for key, value in inputs.items()),
+            tuple(SemanticInput(key, value) for key, value in inputs.items()) + extra_inputs,
             tuple(
                 SemanticOutput(
                     output,
-                    SemanticOutputKind.HOST if schemas.get(output) else SemanticOutputKind.TEMPORARY,
+                    SemanticOutputKind.HOST if schemas.get(output) else output_kind,
                     HostPayloadSchemaId(schemas.get(output, "")),
                 )
                 for output in outputs
@@ -511,25 +513,6 @@ class Builder(Generic[D]):
         stage: SamplerStage = SamplerStage.PACKED_POST_FILTER_EXACT,
     ) -> None:
         prediction[output]
-        # Sampling owns this transaction: cancellation before token commit must not publish its update.
-        self.graph = replace(
-            self.graph,
-            tasks=tuple(
-                replace(
-                    task,
-                    outputs=tuple(
-                        replace(value, kind=SemanticOutputKind.SAMPLER) if value.name == output else value
-                        for value in task.outputs
-                    ),
-                )
-                if task.symbol == prediction.symbol
-                else replace(task, timing=TimingConstraint(*(AnchorSymbol(point) for point in When.AFTER_SAMPLE.value)))
-                if task.symbol == transition.symbol
-                and task.timing == TimingConstraint(*(AnchorSymbol(point) for point in When.AUTOMATIC.value))
-                else task
-                for task in self.graph.tasks
-            ),
-        )
         self.attachment = BackendAttachmentSpec(
             AttachmentKind.REQUEST_TRAINING,
             ((AttachmentTaskRole.COMPUTE, prediction.symbol), (AttachmentTaskRole.TRANSITION, transition.symbol)),
@@ -540,16 +523,6 @@ class Builder(Generic[D]):
 
     def request_training(self, transition: Call, state: State) -> None:
         """Train request state from hidden rows after the token transaction commits."""
-        self.graph = replace(
-            self.graph,
-            tasks=tuple(
-                replace(task, timing=TimingConstraint(*(AnchorSymbol(point) for point in When.AFTER_SAMPLE.value)))
-                if task.symbol == transition.symbol
-                and task.timing == TimingConstraint(*(AnchorSymbol(point) for point in When.AUTOMATIC.value))
-                else task
-                for task in self.graph.tasks
-            ),
-        )
         self.attachment = BackendAttachmentSpec(
             AttachmentKind.REQUEST_TRAINING,
             ((AttachmentTaskRole.TRANSITION, transition.symbol),),

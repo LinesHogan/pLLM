@@ -43,6 +43,7 @@ from pllm.contracts.semantic_graph import (
     SchedulerTimeline,
     SemanticGraph,
     SemanticInputSource,
+    SemanticOutputKind,
     StateEffectKind,
     StateScope,
     TaskResultInputSource,
@@ -619,7 +620,8 @@ class _Export(_Effect):
 
     def declare(self, operation: _Operation) -> None:
         """Publish bounded tensor observations to the host."""
-        call, owner = operation.tensor(), operation.context.owner
+        call = operation.tensor(result_schema="canonical.hidden_export@1")
+        owner = operation.context.owner
         operation.context.binding.export(
             call,
             name=_setting(self.name, owner, str),
@@ -658,7 +660,31 @@ class _Train(_Effect):
             case _:
                 if self.reset or self.steps != 1:
                     raise ValueError("multi-step/reset training requires explicit SGD batch parameters")
-                operation.context.train(operation.tensor(arguments, captures), self.state)
+                context = operation.context
+                sampler = context.sampler
+                request_training = sampler is not None or not context.has_model_effect
+                unconditional = request_training and (
+                    sampler is None or sampler.stage is SamplerStage.PACKED_POST_FILTER_EXACT
+                )
+                if unconditional and (operation.rows or self.update):
+                    raise ValueError(
+                        "request training updates every selected state: remove rows= and custom update_states from @pllm.train"
+                    )
+                # Token commit owns request training; selectors keep their declared phase.
+                when = (
+                    When.AFTER_SAMPLE
+                    if request_training and operation.phase is Phase.AUTOMATIC
+                    else operation.phase.value
+                )
+                context.train(
+                    operation.tensor(
+                        arguments,
+                        captures,
+                        when=when,
+                        update_kind=StateEffectKind.UPDATE if unconditional else StateEffectKind.UPDATE_MAYBE,
+                    ),
+                    self.state,
+                )
 
     def weighted(
         self,
@@ -709,10 +735,14 @@ class _Sampler(_Effect):
 
     phase: ClassVar[Phase | None] = Phase.BEFORE_SAMPLE
 
+    def enabled(self, owner: Workload) -> bool:
+        """Zero-strength guidance has no sampler attachment."""
+        return self.beta is None or _setting(self.beta, owner, float) != 0
+
     def declare(self, operation: _Operation) -> None:
         """Zero-strength guidance declares no computation or sampler attachment."""
-        if self.beta is None or _setting(self.beta, operation.context.owner, float) != 0:
-            call = operation.tensor()
+        if self.enabled(operation.context.owner):
+            call = operation.tensor(output_kind=SemanticOutputKind.SAMPLER)
             if operation.context.prediction is not None:
                 raise ValueError("tensor sampler attachment requires one logits operation")
             operation.context.prediction = call, self
@@ -999,6 +1029,11 @@ class _Operation:
         self,
         arguments: dict[str, _Source] | None = None,
         captures: dict[str, Capture] | None = None,
+        *,
+        when: When | None = None,
+        update_kind: StateEffectKind = StateEffectKind.UPDATE_MAYBE,
+        output_kind: SemanticOutputKind = SemanticOutputKind.TEMPORARY,
+        result_schema: str = "",
     ) -> Call:
         """Declare tensor mathematics, derivative domains and memory publication."""
         if arguments is None:
@@ -1033,12 +1068,15 @@ class _Operation:
         return context.binding.tensor(
             self.name,
             inputs=inputs,
-            when=self.phase.value,
+            when=self.phase.value if when is None else when,
             identity=f"python:{identity}",
             update=update,
             math=math,
             captures=writes,
             outputs=effect.outputs,
+            effect=update_kind,
+            output_kind=output_kind,
+            result_schema=result_schema,
         )(
             effect.results(
                 _invoke(
@@ -1128,6 +1166,27 @@ class _Declaration:
     writes: dict[str, tuple[Call, Call]] = field(default_factory=lambda: {})
     prediction: tuple[Call, _Sampler] | None = None
     training: tuple[Call, State] | None = None
+
+    @property
+    def sampler(self) -> _Sampler | None:
+        """Find active guidance before either prediction or training is emitted."""
+        return next(
+            (
+                sampler
+                for operation in self.operations
+                if (sampler := _typed(operation.effect, _Sampler)) is not None and sampler.enabled(self.owner)
+            ),
+            None,
+        )
+
+    @property
+    def has_model_effect(self) -> bool:
+        """Model effects own training unless a sampler pairs with it."""
+        return (
+            bool(self.routes)
+            or any(isinstance(value, (Activation, Overlay)) for value in self.values.values())
+            or any(isinstance(operation.effect, (_Export, _Overlay)) for operation in self.operations)
+        )
 
     @classmethod
     def read(cls, workload: Workload, binding: TensorBinding) -> _Declaration:
@@ -1320,7 +1379,7 @@ class _Declaration:
                 beta=0.0 if sampler.beta is None else _setting(sampler.beta, self.owner, float),
             )
         elif self.training is not None and self.binding.attachment is None:
-            self.binding.train_from_hidden(*self.training)
+            self.binding.request_training(*self.training)
 
     def sign_composition(self) -> None:
         """Validate composed effects and sign ordered definitions and owner values."""
