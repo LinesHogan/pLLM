@@ -306,13 +306,13 @@ class _Pools:
         np.add.at(self.holders[field], slots, 1)
 
     def tensor(self, field: int, page: PageSlot) -> torch.Tensor:
-        assert not (self.generations[field, page.slot_id] != page.generation or self.holders[field, page.slot_id] < 1)
+        assert self.generations[field, page.slot_id] == page.generation and self.holders[field, page.slot_id] >= 1
         return self.tensors[field][page.slot_id]
 
     def views(self, slots: Slots, generations: Slots) -> tuple[torch.Tensor, ...]:
         """One tensor view per field of a version, after checking none of its pages was reclaimed."""
         fields = np.arange(len(slots))
-        assert not ((self.generations[fields, slots] != generations).any() or (self.holders[fields, slots] < 1).any())
+        assert (self.generations[fields, slots] == generations).all() and (self.holders[fields, slots] >= 1).all()
         return tuple(tensor[slot] for tensor, slot in zip(self.tensors, slots.tolist()))
 
     def _counts(self, slots: Slots) -> Slots:
@@ -539,14 +539,14 @@ class PageBundleArena:
                 row = table.row_of.get(lineage)
                 if row is not None and table.status[row] == 2:
                     return table.ref(row)
-            assert False
+            raise KeyError(lineage)
 
     def resolve_lineages(self, resource: str, lineages: Sequence[LineageId]) -> StateRefs:
         """Resolve directory membership once; selections reuse these rows until membership changes."""
         with self._lock:
             table = self._tables[resource]
             rows = np.asarray([table.row_of.get(lineage, -1) for lineage in lineages], dtype=np.int64)
-            assert not ((rows < 0).any() or (table.status[rows] != 2).any())
+            assert (rows >= 0).all() and (table.status[rows] == 2).all()
             return StateRefs(
                 np.full(len(rows), table.pools.selected.layout_id, dtype=np.int64),
                 table.lineages[rows],
@@ -561,7 +561,7 @@ class PageBundleArena:
             refs = lineages if isinstance(lineages, StateRefs) else self.resolve_lineages(resource, lineages)
             table, rows = self._tables[resource], refs.rows
             assert rows is not None
-            assert not ((table.status[rows] != 2).any() or (table.lineages[rows] != refs.lineages).any())
+            assert (table.status[rows] == 2).all() and (table.lineages[rows] == refs.lineages).all()
             return StateRefs(refs.layouts, refs.lineages, table.versions[rows], rows)
 
     def root(self, ref: StateRef) -> PageBundle:
@@ -575,7 +575,7 @@ class PageBundleArena:
                 index = group.position(ref)
                 if index is not None:
                     return group.bundle(index)
-            assert False
+            raise KeyError(ref)
 
     def _select(self, refs: Sequence[StateRef], *, latest: bool = True) -> tuple[_Pages, ...]:
         refs = StateRefs.of(refs)
@@ -594,9 +594,9 @@ class PageBundleArena:
                     (table.row_of.get(lineage, -1) for lineage in selected.lineages.tolist()), np.int64, len(selected)
                 )
                 selected = selected.resolved(rows)
-            assert not ((rows < 0).any() or (table.lineages[rows] != selected.lineages).any())
+            assert (rows >= 0).all() and (table.lineages[rows] == selected.lineages).all()
             versions = selected.versions
-            assert not (table.status[rows] != 2).any()
+            assert (table.status[rows] == 2).all()
             if (table.versions[rows] == versions).all():
                 groups.append(
                     _Pages(
@@ -956,7 +956,7 @@ class PageBundleArena:
                     result.append((group.bundle(index), writable))
                     break
             else:
-                assert False
+                raise KeyError(ref)
         return tuple(result)
 
     def slot_matrix(self, access: PagePin | PageWrite, refs: StateRefs) -> tuple[str, Slots]:
@@ -969,7 +969,7 @@ class PageBundleArena:
                     positions = group.refs.positions(refs)
                     if np.all(positions >= 0):
                         return group.table.resource, group.slots[positions]
-            assert False
+            raise KeyError(refs)
 
     def slots(self, access: tuple[PagePin | PageWrite, ...], refs: Sequence[StateRef]) -> tuple[str, Slots]:
         """Resolve all field slots once for a homogeneous resource selection."""
@@ -1023,7 +1023,7 @@ class PageBundleArena:
         self, access: PagePin | PageWrite, refs: Sequence[StateRef], fields: tuple[LayoutFieldId, ...]
     ) -> tuple[PageBundle, ...]:
         held = self._held_roots((access,) * len(refs), refs)
-        assert not any((writable is not None and (not set(fields) <= writable) for _, writable in held))
+        assert all(writable is None or set(fields) <= writable for _, writable in held)
         roots = tuple(root for root, _ in held)
         return roots
 
@@ -1067,56 +1067,31 @@ class PageBundleArena:
         plan: PlanBundle, connection: Connection, *, stream: torch.cuda.Stream | None = None
     ) -> BorrowedPage:
         descriptor = decode_boundary(connection.recv_bytes(65536).decode(), PageFieldTransfer)
-        entries = tuple(
-            (entry, binding, provider)
-            for entry, binding in zip(
-                plan.tensor_layout_request.layouts, plan.tensor_layout_decision.bindings, strict=True
-            )
+        if descriptor.compilation_signature != plan.schedule_decision.signature:
+            raise ValueError("the page producer was built for another compilation; restart it from this model's plan")
+        ((entry, provider),) = (
+            (entry, provider)
+            for entry in plan.tensor_layout_request.layouts
             for provider in plan.state_physical.representations
-            if entry.resource == binding.resource == provider.resource == descriptor.resource
+            if entry.resource == provider.resource == descriptor.resource
         )
-        if (
-            descriptor.compilation_signature != plan.schedule_decision.signature
-            or descriptor.owner_id < 1
-            or descriptor.ref.lineage_id < 1
-            or descriptor.ref.version_id < 0
-            or len(entries) != 1
-            or entries[0][2].device_kind is not StateDeviceKind.CUDA
-            or "state/shared_cuda@1" not in entries[0][2].capabilities
-            or entries[0][1].layout_id != descriptor.ref.layout_id
-            or not 0 <= descriptor.field_id < len(entries[0][0].layout.fields)
-        ):
-            raise ValueError("receive a page from this compilation's owner, resource and CUDA layout")
-        entry, _, provider = entries[0]
+        assert stream is not None
         spec = entry.layout.fields[descriptor.field_id]
-        capacity = provider.page_capacity
         size = DTYPE_BYTES[spec.dtype]
         stride = page_stride_bytes(spec) // size
         alignment = max(spec.alignment_bytes // size, 1)
-        head = descriptor.storage_offset - descriptor.page.slot_id * stride
-        tensor = None
         storage = descriptor.cuda_storage
-        if (
-            0 <= descriptor.page.slot_id < capacity
-            and descriptor.page.generation >= 0
-            and 0 <= head < alignment
-            and stream is not None
-            and stream.device == torch.device("cuda", provider.device_ordinal)
-            and bool(prod(spec.shape)) == (storage is not None)
-        ):
-            tensor = (
-                storage.map(
-                    (capacity * stride + alignment - 1) * size,
-                    tensor_dtype(spec.dtype),
-                    descriptor.storage_offset,
-                    spec.shape,
-                    stream,
-                )
-                if storage is not None
-                else torch.empty(spec.shape, dtype=tensor_dtype(spec.dtype), device=stream.device)
+        tensor = (
+            storage.map(
+                (provider.page_capacity * stride + alignment - 1) * size,
+                tensor_dtype(spec.dtype),
+                descriptor.storage_offset,
+                spec.shape,
+                stream,
             )
-        if tensor is None or tensor.data_ptr() % spec.alignment_bytes:
-            raise ValueError("receive an aligned page within pool capacity, with matching storage and CUDA stream")
+            if storage is not None
+            else torch.empty(spec.shape, dtype=tensor_dtype(spec.dtype), device=stream.device)
+        )
         return BorrowedPage(descriptor, tensor, connection, stream)
 
     def snapshot(self, pin: PagePin, ref: StateRef) -> tuple[torch.Tensor, ...]:

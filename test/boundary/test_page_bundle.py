@@ -38,7 +38,7 @@ def test_copy_on_write_transition_keeps_the_pinned_version_unchanged() -> None:
     assert resource == "dense_fast_weights"
     selected = pin.refs.take(np.array([1, 0, 1]))
     np.testing.assert_array_equal(arena.slot_matrix(pin, selected)[1], slots[[1, 0, 1]])
-    with pytest.raises(AssertionError):
+    with pytest.raises(KeyError):
         arena.slot_matrix(pin, new_pin.refs)
     both = arena.pin_exact((a, new_a))
     _, versions = arena.slot_matrix(both, both.refs.take(np.array([1, 0])))
@@ -52,7 +52,7 @@ def test_copy_on_write_transition_keeps_the_pinned_version_unchanged() -> None:
     )
     assert arena.borrow_field(new_pin, new_a, F0).data_ptr() != arena.borrow_field(pin, a, F0).data_ptr()
     # An exact pin sees only its own version.
-    with pytest.raises(AssertionError):
+    with pytest.raises(KeyError):
         arena.borrow_field(pin, new_a, F0)
     torch.testing.assert_close(arena.snapshot(pin, a)[0], old_a0)
     torch.testing.assert_close(arena.snapshot(new_pin, new_a)[0], old_a0 + 4)
