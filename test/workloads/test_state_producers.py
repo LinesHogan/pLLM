@@ -306,7 +306,7 @@ def test_initialized_reader_and_hidden_before_model_boundary():
             backend_facts(
                 4,
                 (),
-                RuntimeFacts(torch.device("cpu")).timeline(),
+                model_timeline(torch.device("cpu")),
                 None,
                 targets=tuple(ParameterTargetShape(target, 4, 4) for target in TARGETS),
             )

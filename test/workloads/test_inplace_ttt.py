@@ -660,7 +660,7 @@ def test_prompt_end_operand_stays_live_during_replay():
         backend_facts(
             3,
             (),
-            RuntimeFacts(torch.device("cpu")).timeline(("transition/full_root@1",)),
+            model_timeline(torch.device("cpu"), ("transition/full_root@1",)),
             None,
             targets=tuple(ParameterTargetShape(target, 3, 2) for target in TARGETS),
         )
