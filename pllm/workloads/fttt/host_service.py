@@ -192,8 +192,7 @@ class FTTTFeedbackService:
         return bool(records)
 
     def begin(self, request: CompletionInput | NoHostRequest) -> FTTTHostTransaction | None:
-        if self._active is not None:
-            raise RuntimeError("active FTTT transaction is unresolved")
+        assert self._active is None
         if isinstance(request, CompletionInput):
             self.enqueue(request)
         if not self._queue:
@@ -209,19 +208,12 @@ class FTTTFeedbackService:
         receipt: HostReceipt[FTTTResult],
     ) -> None:
         intent = receipt.result.intent
-        if self._active is not transaction:
-            raise RuntimeError("FTTT service has no active transaction")
-        expected = replace(
-            transaction.intent,
-            adapter_version=intent.adapter_version,
-        )
-        if intent != expected:
-            raise RuntimeError("FTTT execution rewrote the host-service intent")
+        assert self._active is transaction
+        assert intent == replace(transaction.intent, adapter_version=intent.adapter_version)
         settled = dict(self._instances)
         for transition in intent.transitions:
             current = settled.get(transition.key, FTTTInstanceState())
-            if current.retries != transition.previous.retries or current.stopped != transition.previous.stopped:
-                raise RuntimeError("FTTT lifecycle transition is stale")
+            assert current.retries == transition.previous.retries and current.stopped == transition.previous.stopped
             version = intent.adapter_version if transition.trained else current.adapter_version
             settled[transition.key] = replace(
                 transition.next,
@@ -233,8 +225,7 @@ class FTTTFeedbackService:
         self._projected_instances = projected
 
     def abort(self, transaction: FTTTHostTransaction) -> None:
-        if self._active is not transaction:
-            raise RuntimeError("FTTT abort does not match active transaction")
+        assert self._active is transaction
         self._active = None
         self._queue.clear()
         self._queued_feedback = 0

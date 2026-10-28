@@ -25,7 +25,7 @@ class GTTAConfig:
 
     def __post_init__(self) -> None:
         if self.max_queue_size < 0 or not 0.0 <= self.score_momentum <= 1.0:
-            raise ValueError("GTTA configuration values are invalid")
+            raise ValueError("GTTAConfig needs nonnegative max_queue_size and score_momentum in [0, 1]")
 
 
 def canonical_state_signature(observation: str) -> str:
@@ -43,7 +43,7 @@ class TrajectoryFeedback:
 
     def __post_init__(self) -> None:
         if not self.task_id.strip() or not self.action.strip():
-            raise ValueError("GTTA feedback requires a task and action")
+            raise ValueError("GTTA feedback requires a non-empty task_id and action")
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,15 +55,6 @@ class DynamicsEvent:
     next_observation: str
     environmental_dynamics: str
     reward: float
-
-    def __post_init__(self) -> None:
-        if (
-            not self.task_id
-            or self.task_id != self.task_id.strip()
-            or not self.action
-            or self.action != self.action.strip()
-        ):
-            raise ValueError("GTTA dynamics event identity is not canonical")
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +75,7 @@ class GTTAQuery:
 
     def __post_init__(self) -> None:
         if self.prompt_idx < 0 or self.max_records < 0:
-            raise ValueError("GTTA query bounds are invalid")
+            raise ValueError("GTTAQuery needs nonnegative prompt_idx and max_records")
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,19 +84,11 @@ class PromptContext:
     text: str
     position: GTTAPromptPosition
 
-    def __post_init__(self) -> None:
-        if self.prompt_idx < 0:
-            raise ValueError("GTTA prompt index is invalid")
-
 
 @dataclass(frozen=True, slots=True)
 class GTTAUpdateReceipt:
     processed: int
     state_version: int
-
-    def __post_init__(self) -> None:
-        if self.processed < 0 or self.state_version < 0:
-            raise ValueError("GTTA update receipt is not closed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,7 +105,7 @@ class GTTAHostRequest:
 
     def __post_init__(self) -> None:
         if self.limit < 0:
-            raise ValueError("GTTA host request limit must be non-negative")
+            raise ValueError("GTTAHostRequest limit must be nonnegative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,10 +113,6 @@ class GTTAHostTransaction:
     transaction_id: int
     trajectories: GTTATrajectoryBatch
     query: GTTAQuery
-
-    def __post_init__(self) -> None:
-        if self.transaction_id < 1:
-            raise ValueError("GTTA host transaction is not closed")
 
 
 __all__ = [

@@ -64,7 +64,9 @@ class FTTTConfig:
             or self.edit_scale < 0.0
             or not isfinite(self.positive_reward_threshold)
         ):
-            raise ValueError("FTTT configuration is invalid")
+            raise ValueError(
+                "FTTTConfig needs positive rank/feedback_feature_size, nonnegative max_queue_size/max_retries/edit_scale, and finite thresholds"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,10 +78,6 @@ class FTTTJudgeResult:
     label: str
     judge: str
     skip_reason: str
-
-    def __post_init__(self) -> None:
-        if any(token_id < 0 for token_id in self.feedback_token_ids) or not self.judge:
-            raise ValueError("FTTT judge result is not closed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,10 +93,6 @@ class FTTTInstanceState:
     retries: int = 0
     stopped: bool = False
     adapter_version: int = 0
-
-    def __post_init__(self) -> None:
-        if self.retries < 0 or self.adapter_version < 0:
-            raise ValueError("FTTT instance state is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,32 +113,12 @@ class FTTTClosedLoopIntent:
     transitions: tuple[FTTTLifecycleTransition, ...]
     adapter_version: int = 0
 
-    def __post_init__(self) -> None:
-        count = len(self.transitions)
-        if (
-            self.transaction_id < 1
-            or len(self.reward_outcomes) != count
-            or len(self.retry_controls) != count
-            or len(self.update_barriers) != count
-            or self.adapter_version < 0
-        ):
-            raise ValueError("FTTT closed-loop intent is not transaction-aligned")
-
 
 @dataclass(frozen=True, slots=True)
 class FTTTHostTransaction:
     batch: CompletionInput
     selected_rows: tuple[int, ...]
     intent: FTTTClosedLoopIntent
-
-    def __post_init__(self) -> None:
-        if (
-            len(self.intent.transitions) != len(self.batch.completions.entries)
-            or self.selected_rows != tuple(sorted(set(self.selected_rows)))
-            or any(row < 0 or row >= len(self.intent.transitions) for row in self.selected_rows)
-            or len(self.selected_rows) != len(self.intent.feedback_records)
-        ):
-            raise ValueError("FTTT training plan is not row-aligned")
 
 
 __all__ = [

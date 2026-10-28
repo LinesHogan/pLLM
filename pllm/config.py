@@ -64,20 +64,21 @@ class ExecutionOptions:
     publish_lag: int = 1
 
     def __post_init__(self) -> None:
-        if type(self.publish_lag) is not int or self.publish_lag < 0:
-            raise ValueError("publish_lag must be a nonnegative integer; use 0 for strict ordering")
-        if self.schedule_policy not in ("auto", "serial"):
-            raise ValueError("schedule_policy must be auto or serial")
-        if self.tuning not in ("heuristic", "measured"):
-            raise ValueError("tuning must be heuristic or measured")
         if (
-            self.training_rows < 1
+            type(self.publish_lag) is not int
+            or self.publish_lag < 0
+            or self.schedule_policy not in ("auto", "serial")
+            or self.tuning not in ("heuristic", "measured")
+            or self.training_rows < 1
             or self.capture_memory_bytes < 1
             or self.state_memory_bytes < 0
             or self.memory_budget_bytes is not None
             and self.memory_budget_bytes < 0
         ):
-            raise ValueError("training rows/capture capacity must be positive and memory limits nonnegative")
+            raise ValueError(
+                "ExecutionOptions needs nonnegative int publish_lag, schedule_policy in ('auto', 'serial'), "
+                "tuning in ('heuristic', 'measured'), positive training_rows/capture_memory_bytes, and nonnegative memory limits"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,4 +112,7 @@ class ModelConfig:
             or not 0 < self.gpu_memory_utilization < 1
             or self.seed < 0
         ):
-            raise ValueError("invalid model configuration")
+            raise ValueError(
+                "ModelConfig needs a non-empty model, generated_kv in ('reuse', 'isolate'), max_model_len >= 2, "
+                "1 <= max_num_seqs <= max_num_batched_tokens, 0 < gpu_memory_utilization < 1, and seed >= 0"
+            )

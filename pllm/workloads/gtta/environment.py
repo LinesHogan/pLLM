@@ -48,7 +48,10 @@ class GTTAEnvironmentService:
         return len(self._queue)
 
     def enqueue_feedback(self, feedback: TrajectoryFeedback) -> bool:
-        return self.enqueue_event(
+        if len(self._queue) >= self._config.max_queue_size:
+            self._dropped_trajectories += 1
+            return False
+        self._queue.append(
             DynamicsEvent(
                 task_id=feedback.task_id.strip(),
                 state_signature=canonical_state_signature(feedback.previous_observation),
@@ -59,17 +62,10 @@ class GTTAEnvironmentService:
                 reward=feedback.reward,
             )
         )
-
-    def enqueue_event(self, event: DynamicsEvent) -> bool:
-        if len(self._queue) >= self._config.max_queue_size:
-            self._dropped_trajectories += 1
-            return False
-        self._queue.append(event)
         return True
 
     def begin(self, request: GTTAHostRequest) -> GTTAHostTransaction:
-        if self._active is not None:
-            raise RuntimeError("GTTA active transaction is unresolved")
+        assert self._active is None
         count = len(self._queue) if request.limit == 0 else min(request.limit, len(self._queue))
         transaction = GTTAHostTransaction(
             self._next_transaction_id,
@@ -86,18 +82,14 @@ class GTTAEnvironmentService:
         receipt: HostReceipt[GTTAResult],
     ) -> None:
         del receipt
-        self._active_transaction(transaction)
+        assert self._active is transaction
         self._active = None
 
     def abort(self, transaction: GTTAHostTransaction) -> None:
-        self._active_transaction(transaction)
+        assert self._active is transaction
         for event in reversed(transaction.trajectories.entries):
             self._queue.appendleft(event)
         self._active = None
-
-    def _active_transaction(self, transaction: GTTAHostTransaction) -> None:
-        if self._active is not transaction:
-            raise RuntimeError("GTTA transaction does not match the active batch")
 
 
 __all__ = ["GTTAEnvironmentService"]

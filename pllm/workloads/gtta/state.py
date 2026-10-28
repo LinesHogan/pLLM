@@ -45,8 +45,7 @@ class GTTADynamicsState:
         return GTTAStepContext(transaction, self)
 
     def output(self, context: GTTAStepContext) -> GTTAResult:
-        if context.result is None:
-            raise RuntimeError("GTTA signed graph did not produce its outputs")
+        assert context.result is not None
         return context.result
 
     def snapshot(self) -> GTTADynamicsSnapshot:
@@ -143,6 +142,5 @@ def query(context: GTTAStepContext) -> None:
 
 
 def publish(context: GTTAStepContext) -> None:
-    if context.update is None or context.queried is None:
-        raise RuntimeError("GTTA publish requires update and query outputs")
+    assert context.update is not None and context.queried is not None
     context.result = GTTAResult(context.transaction.transaction_id, context.update, context.queried)

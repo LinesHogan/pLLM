@@ -36,10 +36,11 @@ class OutputLoRAConfig:
             or not isfinite(self.learning_rate)
             or self.learning_rate <= 0
             or not 0 <= self.seed < 2**63
+            or self.scope not in (pllm.state.StateScope.INSTANCE, pllm.state.StateScope.REQUEST)
         ):
-            raise ValueError("output LoRA requires positive rank/steps/scale/rate and a nonnegative seed")
-        if self.scope not in (pllm.state.StateScope.INSTANCE, pllm.state.StateScope.REQUEST):
-            raise ValueError("output LoRA supports instance or independent request state")
+            raise ValueError(
+                "output LoRA requires positive rank/steps/scale/rate, 0 <= seed < 2**63, and instance or request scope"
+            )
 
 
 @dataclass(frozen=True)
