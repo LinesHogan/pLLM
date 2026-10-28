@@ -185,7 +185,7 @@ def weighted_selection(batch: WeightedCEBatch[torch.Tensor], selection: RequestS
     shared = selection.keys == (None,)
     fields = batch.keys[0].fields if batch.keys else ()
     row_states: dict[RequestStateKey, int] = {}
-    if not shared:
+    if not shared and batch.keys:
         for row, index in zip(selection.rows, selection.state_indices, strict=True):
             row_states.setdefault(RequestStateKey.project(row.identity, fields), index)
     selected = (0,) if shared else tuple(row_states[key] for key in batch.keys if key in row_states)
