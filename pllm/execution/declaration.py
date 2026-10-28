@@ -1,4 +1,4 @@
-"""Local authoring references that construct the original semantic graph directly."""
+"""Build semantic graphs and bind planned implementations for workload declarations."""
 
 from __future__ import annotations
 
@@ -250,16 +250,14 @@ class Builder(Generic[D]):
             shapes: list[tuple[int, ...]] = []
             for field in fields:
                 if callable(field.shape):
-                    if self.dimensions is None:
-                        raise ValueError("model dimensions are not specialized")
+                    assert self.dimensions is not None
                     shapes.append(field.shape(self.dimensions))
                 else:
                     shapes.append(field.shape)
 
             def dtype(field: Field) -> TensorDType:
                 if callable(field.dtype):
-                    if self.dimensions is None:
-                        raise ValueError("model dtype is not specialized")
+                    assert self.dimensions is not None
                     return field.dtype(self.dimensions)
                 return field.dtype
 
@@ -386,8 +384,6 @@ class Builder(Generic[D]):
         for task in graph.tasks:
             if task.symbol not in self.operations:
                 continue
-            if plan is None and len(task.implementations) != 1:
-                raise ValueError("multiple implementations require the original signed plan")
             identity = (
                 task.implementations[0].implementation_id
                 if plan is None
@@ -423,8 +419,6 @@ class Builder(Generic[D]):
         for task in graph.tasks:
             if task.symbol in self.operations and task.replay is None:
                 continue
-            if plan is None and len(task.implementations) != 1:
-                raise ValueError("multiple implementations require the original signed plan")
             identity = (
                 task.implementations[0].implementation_id
                 if plan is None
@@ -432,9 +426,8 @@ class Builder(Generic[D]):
                     item.implementation_id for item in plan.schedule_physical.tasks if graph.tasks[item.task_id] is task
                 )
             )
-            if isinstance(task.replay, TokenProgramEffect):
-                if plan is None or model_probe is None or model_probe.causal_domain is None:
-                    raise ValueError("tokenwise replay requires a specialized backend plan and model layout")
+            if task.replay is not None:
+                assert model_probe is not None and model_probe.causal_domain is not None
                 assert self.route_program is not None
                 functions.append(
                     TokenwiseReplayTask[D](
@@ -448,17 +441,13 @@ class Builder(Generic[D]):
                         overlay_math=self.overlay_math,
                     )
                 )
-            elif any(effect.kind is StateEffectKind.PUBLISH for effect in task.effects):
-                functions.append(replace(self.publications[task.symbol], implementation_id=identity))
             else:
-                raise ValueError(f"{task.symbol}: no explicit native implementation")
+                functions.append(replace(self.publications[task.symbol], implementation_id=identity))
         guarded = {
             item.implementation_id
             for item in (() if plan is None else plan.schedule_physical.tasks)
             if any(graph.tasks[item.task_id].symbol in group.tasks for group in graph.input_groups)
         }
-        if graph.input_groups and plan is None:
-            raise ValueError("conditional input binding requires its original signed plan")
         return tuple(
             ConditionalProducerTask(function) if function.implementation_id in guarded else function
             for function in functions
