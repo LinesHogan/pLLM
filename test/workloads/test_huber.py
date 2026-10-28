@@ -169,7 +169,7 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
             for actual, expected in zip(execution.arena.snapshot(held, ref), snapshot, strict=True):
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     execution.arena.wait_release(execution.arena.release_pin(held))
-    execution.retire(identities)
+    execution.retire(identities, wait=True)
     diagnostics = execution.diagnostics()
     assert diagnostics.loss_count == diagnostics.update_count == updates
     assert diagnostics.trained_rows == trained_rows

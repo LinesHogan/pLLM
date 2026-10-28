@@ -435,5 +435,5 @@ def _domains_oracle(device, request, identities) -> None:
     for ref, root in zip(initial, original, strict=True):
         assert_roots(execution.arena.snapshot(held, ref), root, exact=True)
     execution.arena.wait_release(execution.arena.release_pin(held))
-    execution.retire(identities if request else ())
+    execution.retire(identities if request else (), wait=True)
     assert execution.diagnostics().active_lineages == execution.diagnostics().pending_state_releases == 0

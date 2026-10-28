@@ -108,5 +108,5 @@ def test_default_completion_region_keeps_multigroup_adamw_and_publication(device
     assert result.publication is None
     assert execution.arena.latest(initial.lineage_id) == latest
     assert execution.diagnostics().update_count == 3
-    execution.retire(())
+    execution.retire((), wait=True)
     assert execution.diagnostics().active_lineages == execution.diagnostics().pending_state_releases == 0

@@ -171,7 +171,7 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
             execution.step(
                 replace(batch, completions=CompletionBatch((completions.entries[0],)), hidden=batch.hidden[:1]), stream
             )
-        execution.retire(())
+        execution.retire((), wait=True)
         diagnostics = execution.diagnostics()
         assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
 

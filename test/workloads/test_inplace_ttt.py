@@ -141,7 +141,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
         for index in range(len(targets)):
             weight = deltas[index] if request_index == 0 else torch.zeros_like(bases[index])
             torch.testing.assert_close(fields[4 * index], weight)
-    assert execution.retire(identities) == (latest, refs[1])
+    assert execution.retire(identities, wait=True) == (latest, refs[1])
     diagnostics = execution.diagnostics()
     assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
     assert (diagnostics.update_count, diagnostics.trained_rows) == (2, 4)
@@ -289,7 +289,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
             )
             assert again.publication is None
         published.append(ref)
-    assert imported.retire(prompts) == tuple(published)
+    assert imported.retire(prompts, wait=True) == tuple(published)
     diagnostics = imported.diagnostics()
     assert diagnostics.update_count == 2
     assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0

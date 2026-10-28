@@ -261,6 +261,7 @@ def test_cancellation_obeys_the_original_publication_boundary(published):
     for ref in refs if receipt is None else receipt.after_refs:
         fields = execution.snapshot(ref)
         assert bool(fields[0].any()) == published
+    execution.arena.collect_completed(wait=True)
     assert execution.diagnostics().pending_state_releases == 0
     execution.retire(IDENTITIES)
 
@@ -282,6 +283,7 @@ def test_route_failure_aborts_private_fields():
         execution.execute_anchor(invocation, AnchorId(1))
     for ref in refs:
         assert not bool(execution.snapshot(ref)[0].any())
+    execution.arena.collect_completed(wait=True)
     assert execution.diagnostics().pending_state_releases == 0
     execution.retire(IDENTITIES)
 

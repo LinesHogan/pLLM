@@ -182,7 +182,7 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(monkeypatc
         for owner in set(range(2)) - set(owners):
             assert_roots(execution.snapshot(latest[owner]), before[owner], rtol=0, atol=0)
 
-    execution.retire(identities)
+    execution.retire(identities, wait=True)
     diagnostics = execution.diagnostics()
     assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
     assert diagnostics.loss_count == diagnostics.update_count == 3 and diagnostics.trained_rows == 4
@@ -342,7 +342,7 @@ def _ordinary_request_distillation() -> None:
         for ref in initial:
             assert torch.count_nonzero(execution.arena.snapshot(held, ref)[0]) == 0
         execution.arena.wait_release(execution.arena.release_pin(held))
-        execution.retire(identities)
+        execution.retire(identities, wait=True)
         diagnostics = execution.diagnostics()
         assert diagnostics.loss_count == diagnostics.update_count == 4 and diagnostics.trained_rows == 6
         assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
