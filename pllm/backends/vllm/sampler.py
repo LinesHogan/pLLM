@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
-from typing import cast
 
 import numpy as np
 import torch
@@ -36,10 +34,7 @@ def _reweight_unfused(survivors: torch.Tensor, prediction: torch.Tensor, beta: t
     )
 
 
-_reweight = cast(
-    Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
-    torch.compile(_reweight_unfused, dynamic=True, fullgraph=True),  # pyright: ignore[reportUnknownMemberType]
-)
+_reweight = torch.compile(_reweight_unfused, dynamic=True, fullgraph=True)  # pyright: ignore[reportUnknownMemberType]
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,14 +44,6 @@ class SignedSamplerGuidance:
     guidance: PackedSamplerGuidanceBatch
     pred_dense_logits: torch.Tensor
     capture_feedback: bool = False
-
-    def __post_init__(self) -> None:
-        if (
-            self.pred_dense_logits.ndim != 2
-            or int(self.pred_dense_logits.shape[0]) != len(self.guidance.affected_row_ids)
-            or self.pred_dense_logits.device != self.guidance.values.device
-        ):
-            raise ValueError("signed sampler guidance is not tensor-aligned")
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,8 +57,7 @@ class SamplerGuidance:
     _active_guidance: SignedSamplerGuidance | _SampledGuidance | None = None
 
     def begin_guidance(self, guidance: SignedSamplerGuidance) -> None:
-        if self._active_guidance is not None:
-            raise RuntimeError("canonical sampler guidance is already active")
+        assert self._active_guidance is None
         self._active_guidance = guidance
 
     def finish_guidance(self) -> SamplerFeedback | None:
@@ -80,15 +66,14 @@ class SamplerGuidance:
                 self._active_guidance = None
                 return feedback
             case _:
-                raise RuntimeError("canonical sampler has no sampled guidance to finish")
+                assert False
 
     def abort_guidance(self) -> None:
         self._active_guidance = None
 
     @staticmethod
     def _add_logits(logits: torch.Tensor, guidance: SignedSamplerGuidance) -> torch.Tensor:
-        if logits.shape != (guidance.guidance.total_rows, guidance.pred_dense_logits.shape[1]):
-            raise ValueError("additive guidance differs from sampler logits")
+        assert logits.shape == (guidance.guidance.total_rows, guidance.pred_dense_logits.shape[1])
         if guidance.guidance.affected_row_ids == tuple(range(logits.shape[0])):
             return logits + guidance.pred_dense_logits.to(logits)
         rows = upload(guidance.guidance.affected_row_ids, logits.device)
@@ -98,11 +83,10 @@ class SamplerGuidance:
 
     @staticmethod
     def _reweight_finite_survivors(processed_logits: torch.Tensor, guidance: SignedSamplerGuidance) -> torch.Tensor:
-        if (
-            processed_logits.shape != (guidance.guidance.total_rows, guidance.pred_dense_logits.shape[1])
-            or guidance.pred_dense_logits.device != processed_logits.device
-        ):
-            raise ValueError("signed guidance differs from the active sampler logits")
+        assert (
+            processed_logits.shape == (guidance.guidance.total_rows, guidance.pred_dense_logits.shape[1])
+            and guidance.pred_dense_logits.device == processed_logits.device
+        )
         if not guidance.guidance.affected_row_ids or guidance.guidance.beta == 0.0:
             return processed_logits
         dense = guidance.guidance.affected_row_ids == tuple(range(processed_logits.shape[0]))
@@ -114,7 +98,7 @@ class SamplerGuidance:
             if weights is None
             else guidance.guidance.beta * weights.to(survivors).unsqueeze(1)
         )
-        reweighted = _reweight(survivors, guidance.pred_dense_logits, beta)
+        reweighted: torch.Tensor = _reweight(survivors, guidance.pred_dense_logits, beta)  # pyright: ignore[reportAssignmentType]
         if dense:
             return reweighted
         output = processed_logits.clone()
@@ -133,19 +117,20 @@ class Vllm027Sampler(Sampler, SamplerGuidance):
     __slots__ = ("_active_guidance",)
 
     def __init__(self, upstream: Sampler) -> None:
-        if type(upstream) is not Sampler:
-            raise TypeError("canonical sampler requires an exact vLLM 0.27.1 Sampler")
-        if upstream.num_speculative_tokens != 1:
-            raise ValueError("canonical post-filter sampler does not support speculative decoding")
+        assert type(upstream) is Sampler
 
         # Explicit state adoption is the only bridge from the loaded vLLM
         # instance.  These fields are precisely the state read by inherited
         # apply/logprob methods and by the active gumbel draw below.
         match upstream.logprobs_mode:
-            case ("raw_logits" | "raw_logprobs" | "processed_logits" | "processed_logprobs") as logprobs_mode:
+            case ("raw_logits" | "raw_logprobs" | "processed_logits" | "processed_logprobs") as logprobs_mode if (
+                upstream.num_speculative_tokens == 1
+            ):
                 self.logprobs_mode: LogprobsMode = logprobs_mode
             case _:
-                raise ValueError("vLLM sampler has an unsupported logprobs mode")
+                raise ValueError(
+                    "canonical sampler requires non-speculative decoding (num_speculative_tokens == 1) and a supported logprobs mode"
+                )
         self.compute_nans: bool = upstream.compute_nans
         self.use_fp64_gumbel: bool = upstream.use_fp64_gumbel
         self.req_states: RequestState = upstream.req_states
@@ -213,7 +198,7 @@ class Vllm027Sampler(Sampler, SamplerGuidance):
                 self._active_guidance = _SampledGuidance(feedback)
                 return sampled
             case _SampledGuidance():
-                raise RuntimeError("canonical sampler guidance may sample only once before finish")
+                assert False
 
     def _sample_signed_guidance(
         self,
@@ -258,8 +243,7 @@ class Vllm027Sampler(Sampler, SamplerGuidance):
 
 class Mrv1Sampler(UpstreamMrv1Sampler, SamplerGuidance):
     def __init__(self, upstream: UpstreamMrv1Sampler) -> None:
-        if type(upstream) is not UpstreamMrv1Sampler:
-            raise TypeError("MRv1 workload requires its original stock sampler")
+        assert type(upstream) is UpstreamMrv1Sampler
         torch.nn.Module.__init__(self)
         self.topk_topp_sampler = upstream.topk_topp_sampler
         self.logprobs_mode, self.use_fp64_gumbel = upstream.logprobs_mode, upstream.use_fp64_gumbel
@@ -273,26 +257,27 @@ class Mrv1Sampler(UpstreamMrv1Sampler, SamplerGuidance):
         predict_bonus_token: bool = False,
         logprobs_mode_override: LogprobsMode | None = None,
     ) -> Mrv1SamplerOutput:
-        guidance = self._active_guidance
-        if guidance is None:
-            return super().forward(logits, sampling_metadata, predict_bonus_token, logprobs_mode_override)
-        if isinstance(guidance, _SampledGuidance) or predict_bonus_token:
-            raise RuntimeError("canonical sampler permits one non-speculative draw per guidance")
-        with torch.inference_mode(False):
-            base = logits.detach().clone() if guidance.capture_feedback else None
-        if guidance.guidance.stage is SamplerStage.PACKED_PRE_FILTER_ADD:
-            logits = self._add_logits(logits, guidance)
-        result = super().forward(logits, sampling_metadata, False, logprobs_mode_override)
-        with torch.inference_mode(False):
-            feedback = (
-                SamplerFeedback(
-                    guidance.guidance.sampler_rows, base, result.sampled_token_ids.detach().reshape(-1).clone()
-                )
-                if base is not None
-                else None
-            )
-        self._active_guidance = _SampledGuidance(feedback)
-        return result
+        match self._active_guidance:
+            case None:
+                return super().forward(logits, sampling_metadata, predict_bonus_token, logprobs_mode_override)
+            case SignedSamplerGuidance() as guidance if not predict_bonus_token:
+                with torch.inference_mode(False):
+                    base = logits.detach().clone() if guidance.capture_feedback else None
+                if guidance.guidance.stage is SamplerStage.PACKED_PRE_FILTER_ADD:
+                    logits = self._add_logits(logits, guidance)
+                result = super().forward(logits, sampling_metadata, False, logprobs_mode_override)
+                with torch.inference_mode(False):
+                    feedback = (
+                        SamplerFeedback(
+                            guidance.guidance.sampler_rows, base, result.sampled_token_ids.detach().reshape(-1).clone()
+                        )
+                        if base is not None
+                        else None
+                    )
+                self._active_guidance = _SampledGuidance(feedback)
+                return result
+            case _:
+                raise RuntimeError("canonical sampler permits one non-speculative draw per guidance")
 
     def sample(
         self,
@@ -300,16 +285,16 @@ class Mrv1Sampler(UpstreamMrv1Sampler, SamplerGuidance):
         sampling_metadata: SamplingMetadata,
         logprobs_mode_override: LogprobsMode | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        guidance = self._active_guidance
-        if (
-            not isinstance(guidance, SignedSamplerGuidance)
-            or guidance.guidance.stage is SamplerStage.PACKED_PRE_FILTER_ADD
-        ):
-            return super().sample(logits, sampling_metadata, logprobs_mode_override)
+        match self._active_guidance:
+            case SignedSamplerGuidance() as guidance if (
+                guidance.guidance.stage is not SamplerStage.PACKED_PRE_FILTER_ADD
+            ):
+                pass
+            case _:
+                return super().sample(logits, sampling_metadata, logprobs_mode_override)
         metadata = sampling_metadata
         if not metadata.all_greedy:
-            if metadata.temperature is None:
-                raise ValueError("random MRv1 sampling requires original temperatures")
+            assert metadata.temperature is not None
             logits = self.apply_temperature(logits, metadata.temperature, metadata.all_random)
             for processor in metadata.logitsprocs.argmax_invariant:
                 logits = processor.apply(logits)

@@ -93,15 +93,18 @@ def validate_projection_sources(model: Qwen2ForCausalLM, targets: tuple[Paramete
         packed = next(node for node in nodes if node.target is operator.getitem and node.args == (projection, 0))
         split = next(node for node in nodes if node.op == "call_method" and node.target == "split")
         attention = layer.self_attn
-        if split.args != (packed, [attention.q_size, attention.kv_size, attention.kv_size]) or split.kwargs != {
-            "dim": -1
-        }:
-            raise ValueError("Exact query overlays need disjoint query, key and value slices from the fused projection")
+        slices = tuple(node.args[1] for node in split.users if node.target is operator.getitem)
+        if (
+            split.args != (packed, [attention.q_size, attention.kv_size, attention.kv_size])
+            or split.kwargs != {"dim": -1}
+            or slices != (0, 1, 2)
+            or tuple(packed.users) != (split,)
+        ):
+            raise ValueError(
+                "Exact query overlays need disjoint query, key, and value slices from the original Qwen2 fused projection"
+            )
         # Original Qwen2 independently normalizes Q/K and rotates each with the same positions.
         # Only qkv[:q_size] is changed; K/V here retain history, while higher layers see corrected hidden.
-        slices = tuple(node.args[1] for node in split.users if node.target is operator.getitem)
-        if slices != (0, 1, 2) or tuple(packed.users) != (split,):
-            raise ValueError("Exact overlays need the original Qwen2 Q/K/V consumers")
         query = next(node for node in split.users if node.args[1] == 0)
         rotary = next(node for node in nodes if node.op == "call_module" and node.target == "rotary_emb")
         consumer = next(node for node in nodes if node.op == "call_module" and node.target == "attn")
@@ -110,11 +113,11 @@ def validate_projection_sources(model: Qwen2ForCausalLM, targets: tuple[Paramete
             parents = node.all_input_nodes
             if node.target is operator.getitem and node.args[0] is rotary:
                 # The original RoPE endpoint rotates Q and K independently with shared positions.
-                output = node.args[1]
-                assert isinstance(output, int)
-                parent = rotary.args[1 + output]
-                assert isinstance(parent, torch.fx.Node)
-                parents = [parent]
+                match node.args, rotary.args:
+                    case (_, int(output)), args if type(parent := args[1 + output]) is torch.fx.Node:
+                        parents = [parent]
+                    case _:
+                        assert False
             if any(parent in dependent for parent in parents):
                 dependent.add(node)
         if consumer.args[1] in dependent or consumer.args[2] in dependent:
@@ -125,17 +128,16 @@ def inspect_parameter_targets(
     model: Qwen2ForCausalLM, targets: tuple[ParameterTarget, ...], dtype: torch.dtype
 ) -> tuple[ParameterTargetShape, ...]:
     specs: list[ParameterTargetShape] = []
-    if len(set(targets)) != len(targets):
-        raise ValueError("parameter targets must be unique")
-    for target in targets:
+    for index, target in enumerate(targets):
         module, offset, size, _ = locate_parameter(model, target)
         if (
-            module.tp_size != 1
+            target in targets[:index]
+            or module.tp_size != 1
             or not module.return_bias
             or module.weight.dtype is not dtype
             or offset + size > module.weight.shape[0]
         ):
-            raise ValueError("Qwen2 overlay requires an exact unsharded projection")
+            raise ValueError("Qwen2 overlay requires unique, exact unsharded projections matching model dtype")
         specs.append(ParameterTargetShape(target, int(module.weight.shape[1]), size))
     return tuple(specs)
 
@@ -169,8 +171,7 @@ class _ExactProjection:
         return self.original_mlp_forward is not None or binding.operator is ParameterOverlayOperator.HEAD_ADD
 
     def forward_mlp(self, value: torch.Tensor) -> torch.Tensor:
-        if self.original_mlp_forward is None:
-            raise RuntimeError("operand capture requires an MLP")
+        assert self.original_mlp_forward is not None
         self.mlp_input = value.detach()
         try:
             return self.original_mlp_forward(value)
@@ -181,10 +182,13 @@ class _ExactProjection:
         base = self.original_forward(hidden)
         if not self.prepared:
             return base
-        if hidden.shape[0] != self.total_rows or self.captures:
-            raise RuntimeError("parameter application differs from the prepared model step")
+        assert hidden.shape[0] == self.total_rows and not self.captures
         # The unquantized TP1 projection owns this fresh output, not an input or state page.
-        output = base[0] if isinstance(base, tuple) else base
+        match base:
+            case (output, *_):
+                pass
+            case output:
+                pass
         inputs = tuple(hidden.index_select(0, item.rows) for item in self.prepared)
         captures = tuple(
             self.capture(item, selected)
