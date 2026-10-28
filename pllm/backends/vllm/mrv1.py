@@ -86,16 +86,11 @@ class Mrv1Runner(Runner, GPUModelRunner):
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
-        session, state = self._workload_session, self.execute_model_state
+        session = self._workload_session
         if session is None:
             return super().sample_tokens(grammar_output)
         try:
             output = super().sample_tokens(grammar_output)
-            if state is not None and self.completion_capture is not None:
-                self.completion_capture.write(
-                    tuple(session.identity(request_id) for request_id in self.input_batch.req_ids),
-                    state.sample_hidden_states,
-                )
             session.commit_token()
             return output
         except Exception:

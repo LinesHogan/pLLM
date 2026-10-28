@@ -265,7 +265,7 @@ class VllmLlm(Generic[DataT, ResultT]):
     def trace_snapshot(self) -> TraceSnapshot:
         self._require_open()
         snapshot = (
-            self._runner.trace.snapshot()
+            self._runner.require_session().trace.snapshot()
             if self._runner is not None
             else decode_boundary(self.command(BackendCommand.TRACE), TraceSnapshot)
         )
@@ -274,7 +274,7 @@ class VllmLlm(Generic[DataT, ResultT]):
     def profile_tasks(self, tasks: tuple[TaskId, ...]) -> None:
         self._require_open()
         if self._runner is not None:
-            self._runner.trace.profile_tasks(tasks)
+            self._runner.require_session().trace.profile_tasks(tasks)
         else:
             self.command(BackendCommand.PROFILE, encode_boundary(tasks))
 
@@ -282,7 +282,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         """Configure bounded explicit tensor/gradient snapshots and opt-in Kineto profiling."""
         self._require_open()
         if self._runner is not None:
-            self._runner.trace.configure(selection)
+            self._runner.require_session().trace.configure(selection)
         else:
             self.command(BackendCommand.OBSERVE, encode_boundary(selection))
 
@@ -507,7 +507,7 @@ class VllmLlm(Generic[DataT, ResultT]):
                     BackendCommand.STAGE, encode_boundary(BackendStage(identities, auxiliary_wire, completion_wire))
                 )
             else:
-                self.runner.stage_workload_input(auxiliary, identities, destination)
+                self.runner.require_session().stage_input(auxiliary, identities, destination)
             self._next_prompt_index = max(self._next_prompt_index, max(indices) + 1)
             llm.wake_up(tags=["scheduling"])
             outputs = llm.wait_for_completion(RequestOutput, use_tqdm=use_tqdm)
@@ -528,7 +528,7 @@ class VllmLlm(Generic[DataT, ResultT]):
                     )
                 batch = CompletionBatch(tuple(completions[identity] for identity in identities))
                 if self._runner is not None:
-                    capture = self.runner.completion_capture
+                    capture = self.runner.require_session().completion_capture
                     assert capture is not None
                     result = capture.finish(batch)
             self.command(BackendCommand.FINISH)

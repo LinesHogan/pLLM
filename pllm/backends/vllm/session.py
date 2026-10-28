@@ -1,7 +1,7 @@
 """One vLLM session: a signed tensor-state invocation driven step by step inside the model runner.
 
 VllmSession owns the per-step lifecycle (row preparation, model effects, sampler guidance, completion and
-publication) for one attached workload. Used by the runners in runner.py.
+publication) for one attached workload. Runners drive its hooks; the worker and driver stage and retire requests.
 """
 
 from __future__ import annotations
@@ -50,6 +50,7 @@ from pllm.execution.backend_attachment import attachment_buffer_bytes
 from pllm.execution.codec import encode_boundary
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.execution import TaskGraphInvocation
+from pllm.execution.host_runtime import CompletionCapture
 from pllm.execution.overlay_task import ProjectionTask
 from pllm.execution.post_sample import PostSampleOverlap
 from pllm.execution.shared_tensor import SharedTensor
@@ -167,6 +168,7 @@ class VllmSession(Generic[DataT, ResultT]):
         self._next_step_id = 0
         self._step: _PackedStep[DataT] | None = None
         self._auxiliary: AuxiliaryInput[torch.Tensor] | None = None
+        self.completion_capture: CompletionCapture | None = None
         execution = deployment.execution
         self._post_sample = None
         tasks = plan.schedule_physical.tasks
@@ -189,9 +191,16 @@ class VllmSession(Generic[DataT, ResultT]):
         """Authored update phases used by hybrid model dispatch."""
         return self._deployment.execution.math.parameter_phases
 
-    def stage_input(self, batch: AuxiliaryInput[torch.Tensor] | None, identities: tuple[RequestIdentity, ...]) -> None:
+    def stage_input(
+        self,
+        batch: AuxiliaryInput[torch.Tensor] | None,
+        identities: tuple[RequestIdentity, ...],
+        completion: torch.Tensor | None = None,
+    ) -> None:
+        """Stage request inputs and their optional owned completion destination."""
         self._require_input_live()
         validate_auxiliary(batch, self._deployment.attachment.inputs.plan, SharedTensor.describe)
+        self.completion_capture = None if completion is None else CompletionCapture(identities, completion)
         self._auxiliary = batch
         self._pending_identities = {identity.request_id: identity for identity in identities}
 
@@ -410,9 +419,13 @@ class VllmSession(Generic[DataT, ResultT]):
         for logits means the transformer forward is over on both runner ABIs.
         """
         lm_head = Qwen2ForCausalLM.compute_logits
-        # Prompt logprobs call the LM head again after sampling; guidance starts only once.
-        if self._step is not None and self._step.forward_done:
+        step = self._step
+        # Prompt logprobs call the LM head again; capture and guidance run only for the sampling rows.
+        if step is None or step.forward_done:
             return lm_head(model, hidden)
+        # Forward completion can discard a prefill step that has no workload inputs.
+        if self.completion_capture is not None:
+            self.completion_capture.write(step.rows.identities, hidden)
         self.complete_forward()
         if self._step is None or self._sampler is None:
             return lm_head(model, hidden)
@@ -485,11 +498,20 @@ class VllmSession(Generic[DataT, ResultT]):
 
     @torch.inference_mode(False)
     def retire_all(self, *, wait: bool = False) -> None:
+        if self.completion_capture is not None:
+            self.completion_capture.synchronize()
         if self._post_sample is not None:
             self._post_sample.clear()
         self._retire(tuple(self._identities[request_id] for request_id in sorted(self._identities)))
         self._pending_identities.clear()
         self._deployment.execution.arena.collect_completed(wait=wait)
+        self.completion_capture = None
+
+    def finish_requests(self) -> None:
+        """Require every submitted completion row before releasing the generation's requests."""
+        if self.completion_capture is not None:
+            self.completion_capture.require_complete()
+        self.retire_all()
 
     def require_idle(self) -> None:
         """Workload replacement cannot discard admitted or staged requests."""

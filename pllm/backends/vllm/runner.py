@@ -25,7 +25,6 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 from pllm.authoring import (
-    AuxiliaryInput,
     BackendDeployment,
     DataT,
     ResultT,
@@ -49,12 +48,9 @@ from pllm.contracts.backend_attachment import (
 )
 from pllm.contracts.hidden_locator import HiddenSite
 from pllm.contracts.packed_hidden import hidden_binding
-from pllm.contracts.request_identity import RequestIdentity
 from pllm.execution.codec import decode_boundary
-from pllm.execution.host_runtime import CompletionCapture
 from pllm.execution.position_state import PositionAnnouncement
 from pllm.execution.state_execution import StateDiagnostics
-from pllm.execution.trace import ExecutionTrace
 
 # Hidden sources the driver announces before construction, so the worker taps them at load time.
 TAPS_ENV = "PLLM_HIDDEN_TAPS"
@@ -100,7 +96,6 @@ class Runner:
     def _initialize_workload(self, topology: AttachmentTopology) -> None:
         self.workload_topology = topology
         self._workload_session: VllmSession[Any, Any] | None = None
-        self.completion_capture: CompletionCapture | None = None
 
     def attach_workload(
         self,
@@ -153,45 +148,7 @@ class Runner:
         session = self.require_session()
         session.require_idle()
         session.close()
-        if self.completion_capture is not None:
-            self.completion_capture.synchronize()
         self._workload_session = None
-        self.completion_capture = None
-
-    def stage_workload_input(
-        self,
-        batch: AuxiliaryInput[torch.Tensor] | None,
-        identities: tuple[RequestIdentity, ...],
-        completion: torch.Tensor | None = None,
-    ) -> None:
-        session = self.require_session()
-        capture = None if completion is None else CompletionCapture(identities, completion)
-        session.stage_input(batch, identities)
-        self.completion_capture = capture
-
-    def retire_completed_requests(self) -> None:
-        session = self.require_session()
-        if self.completion_capture is not None:
-            self.completion_capture.require_complete()
-            self.completion_capture.synchronize()
-        session.retire_all()
-        self.completion_capture = None
-
-    def worker_state(self) -> BackendWorkerState:
-        session = self.require_session()
-        return BackendWorkerState(os.getpid(), session.diagnostics())
-
-    @property
-    def trace(self) -> ExecutionTrace:
-        return self.require_session().trace
-
-    def abort_workload_requests(self) -> None:
-        session = self.require_session()
-        session.abort_active()
-        session.retire_all()
-        if self.completion_capture is not None:
-            self.completion_capture.synchronize()
-        self.completion_capture = None
 
     def require_session(self) -> VllmSession[Any, Any]:
         session = self._workload_session
@@ -317,11 +274,6 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
         try:
             sampled = super().sample(hidden_states, input_batch, grammar_output)
             session.complete_sampler()
-            if self.completion_capture is not None:
-                self.completion_capture.write(
-                    tuple(session.identity(request_id) for request_id in input_batch.req_ids),
-                    hidden_states[input_batch.logits_indices],
-                )
         except Exception:
             session.abort_active()
             raise
