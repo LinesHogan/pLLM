@@ -1,4 +1,4 @@
-"""Hidden-state taps that live inside vLLM's compiled forward and CUDA graphs.
+"""Declaration-derived capture layouts and hidden-state taps used by vLLM runners.
 
 Taps are installed when the model loads, before vLLM compiles and captures it. On every
 forward, each tapped module copies its output into a fixed fp32 buffer through the
@@ -12,15 +12,78 @@ forward's stream are ordered before that write.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import ParamSpec
 
 import torch
 from torch import Tensor
 
-from pllm.contracts.packed_hidden import PackedHiddenResourceBinding, PackedHiddenSnapshot, PackedHiddenSnapshotBatch
+from pllm.contracts.hidden_locator import HiddenPhase
+from pllm.contracts.packed_hidden import (
+    PackedHiddenResourceBinding,
+    PackedHiddenSnapshot,
+    PackedHiddenSnapshotBatch,
+    hidden_binding,
+)
+from pllm.contracts.semantic_graph import HiddenInputSource
+from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.step_input import TensorStepInput
+
+CAPTURE_ENV = "PLLM_HIDDEN_CAPTURE"
+
+
+@dataclass(frozen=True, slots=True)
+class HiddenCaptureLayout:
+    """One module's union of latest-decode and completed-prompt-ending rows.
+
+    All consumers share each captured row. Two generations fund a producer and an
+    outstanding reader; reuse must wait for every reader's completion, regardless of
+    publish_lag. This describes the slot pool, not the full-token taps still in use.
+    """
+
+    module_path: str
+    phases: tuple[HiddenPhase, ...]
+    capture_rows: int
+    hidden_size: int
+    dtype: TensorDType
+
+    @property
+    def retained_rows(self) -> int:
+        """Total slot capacity, including the generation being written."""
+        return 2 * self.capture_rows
+
+
+@dataclass(frozen=True, slots=True)
+class HiddenCaptureAnnouncement:
+    """Declaration bounds sent before engine construction, resolved when the model loads."""
+
+    inputs: tuple[HiddenInputSource, ...] = ()
+    max_num_seqs: int = 1
+    dtype: TensorDType = TensorDType.FLOAT32
+
+    def __post_init__(self) -> None:
+        if self.max_num_seqs < 1:
+            raise ValueError("hidden capture requires max_num_seqs >= 1")
+        if self.dtype not in (TensorDType.BFLOAT16, TensorDType.FLOAT16, TensorDType.FLOAT32):
+            raise ValueError("hidden capture requires the model's floating-point dtype")
+        if any(source.phase not in (HiddenPhase.DECODE, HiddenPhase.PREFILL) for source in self.inputs):
+            raise ValueError("hidden capture requires decode or completed-prefill rows")
+
+    def resolve(self, layer_count: int, hidden_size: int) -> tuple[HiddenCaptureLayout, ...]:
+        """Merge aliases and consumers before capture; phases share one request bound.
+
+        Prefill here selects prompt endings, never all prompt tokens. An all-token
+        declaration needs its own token bound rather than this request capacity.
+        """
+        modules: dict[str, set[HiddenPhase]] = {}
+        for source in self.inputs:
+            path = hidden_binding(source.layer, source.site, layer_count).module_path
+            modules.setdefault(path, set()).add(source.phase)
+        return tuple(
+            HiddenCaptureLayout(path, tuple(sorted(phases)), self.max_num_seqs, hidden_size, self.dtype)
+            for path, phases in sorted(modules.items())
+        )
 
 
 @torch.library.custom_op("pllm::tap", mutates_args=("buffer",))
@@ -82,4 +145,4 @@ class HiddenTaps:
         )
 
 
-__all__ = ["HiddenTaps", "tap"]
+__all__ = ["CAPTURE_ENV", "HiddenCaptureAnnouncement", "HiddenCaptureLayout", "HiddenTaps", "tap"]

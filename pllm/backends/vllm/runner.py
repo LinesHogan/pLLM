@@ -6,7 +6,6 @@ worker instantiates. Used by runtime.py (construction) and pllm.worker.
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
 from functools import partial
@@ -29,7 +28,12 @@ from pllm.authoring import (
     DataT,
     ResultT,
 )
-from pllm.backends.vllm.hidden_capture import HiddenTaps
+from pllm.backends.vllm.hidden_capture import (
+    CAPTURE_ENV,
+    HiddenCaptureAnnouncement,
+    HiddenCaptureLayout,
+    HiddenTaps,
+)
 from pllm.backends.vllm.overlay_graph import (
     OverlayGraphRunner,
 )
@@ -47,13 +51,8 @@ from pllm.contracts.backend_attachment import (
     AttachmentTopology,
 )
 from pllm.contracts.codec import decode_boundary
-from pllm.contracts.hidden_locator import HiddenSite
-from pllm.contracts.packed_hidden import hidden_binding
 from pllm.execution.position_state import PositionAnnouncement
 from pllm.execution.state_execution import StateDiagnostics
-
-# Hidden sources the driver announces before construction, so the worker taps them at load time.
-TAPS_ENV = "PLLM_HIDDEN_TAPS"
 
 
 class Runner:
@@ -70,6 +69,7 @@ class Runner:
     max_num_reqs: int
 
     hidden_taps: HiddenTaps | None = None
+    hidden_layouts: tuple[HiddenCaptureLayout, ...] = ()
     position_states: tuple[tuple[str, float], ...] = ()
     position_layers: tuple[PositionCacheLayer, ...] = ()
 
@@ -83,12 +83,13 @@ class Runner:
         """Install the logits hook and announced hidden taps before vLLM compiles the model."""
         model = self.qwen2_model()
         model.compute_logits = partial(self._compute_logits, model)
-        requested: list[tuple[int, str]] = json.loads(os.environ.get(TAPS_ENV, "[]"))
-        if not requested:
-            return
-        layers = len(model.model.layers)
-        paths = (hidden_binding(layer, HiddenSite(site), layers).module_path for layer, site in requested)
+        announcement = decode_boundary(os.environ.get(CAPTURE_ENV, "{}"), HiddenCaptureAnnouncement)
         hidden_size = model.lm_head.weight.shape[1]
+        self.hidden_layouts = announcement.resolve(len(model.model.layers), hidden_size)
+        if not self.hidden_layouts:
+            return
+        paths = (layout.module_path for layout in self.hidden_layouts)
+        # Full-token FP32 taps remain until slot publication and consumers migrate.
         self.hidden_taps = HiddenTaps(model, paths, self.max_num_tokens, hidden_size, self.device)
 
     overlay_graph_bytes: int = 0

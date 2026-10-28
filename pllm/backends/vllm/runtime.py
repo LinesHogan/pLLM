@@ -5,7 +5,6 @@ Sessions live in session.py and runners in runner.py; this module builds the eng
 
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack
@@ -29,6 +28,7 @@ from pllm.authoring import (
     StateTensorUpdate,
     map_auxiliary,
 )
+from pllm.backends.vllm.hidden_capture import CAPTURE_ENV, HiddenCaptureAnnouncement
 from pllm.backends.vllm.overlay_graph import (
     graph_mode,
     graph_options,
@@ -76,7 +76,7 @@ if TYPE_CHECKING:
 
 from pllm.backends.vllm.position_state import POSITION_ENV
 from pllm.backends.vllm.prefix_cache import CachePolicy
-from pllm.backends.vllm.runner import TAPS_ENV, BackendWorkerState, WorkloadModelRunner
+from pllm.backends.vllm.runner import BackendWorkerState, WorkloadModelRunner
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_hidden import hidden_binding
 from pllm.execution.position_state import PositionAnnouncement
@@ -565,7 +565,9 @@ def create_vllm_llm(
     environment = {
         _MP_ENV: "1" if config.multiprocessing else "0",
         _V2_RUNNER_ENV: "1" if config.runner is RunnerKind.MRV2 else "0",
-        TAPS_ENV: json.dumps([[source.layer, source.site.value] for source in requirements.hidden_inputs]),
+        CAPTURE_ENV: encode_boundary(
+            HiddenCaptureAnnouncement(requirements.hidden_inputs, config.max_num_seqs, TensorDType(config.dtype.value))
+        ),
         POSITION_ENV: encode_boundary(PositionAnnouncement(requirements.position_states)),
     }
     if config.multiprocessing:
