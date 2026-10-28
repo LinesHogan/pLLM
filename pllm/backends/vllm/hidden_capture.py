@@ -1,11 +1,8 @@
 """Declaration-derived capture layouts and hidden-state taps used by vLLM runners.
 
 Taps are installed before vLLM compiles and captures the model. Persistent index tables
-select packed rows to copy into PTTS slots. The full-token fp32 buffers remain in parallel
-until consumers migrate to slots; sessions still publish views of those buffers.
-
-The views stay valid until the next forward overwrites the buffers; consumers on the
-forward's stream are ordered before that write.
+select packed rows to copy into PTTS slots. Consumers retain holds until their own
+streams complete; the session releases producer holds after publication.
 """
 
 from __future__ import annotations
@@ -42,7 +39,7 @@ class HiddenCaptureLayout:
 
     All consumers share each captured row. Two generations fund a producer and an
     outstanding reader; reuse must wait for every reader's completion, regardless of
-    publish_lag. This describes the slot pool, not the full-token taps still in use.
+    publish_lag.
     """
 
     module_path: str
@@ -86,28 +83,16 @@ class HiddenCaptureAnnouncement:
         )
 
 
-@torch.library.custom_op("pllm::tap", mutates_args=("buffer",))
-def tap(hidden: Tensor, buffer: Tensor) -> None:
-    """Copy `hidden` into the leading rows of `buffer`."""
-    buffer[: hidden.shape[0]].copy_(hidden)
-
-
-@tap.register_fake  # pyright: ignore[reportUnknownMemberType]
-def _(hidden: Tensor, buffer: Tensor) -> None:
-    return None
-
-
 P = ParamSpec("P")
 
 
 def _tapped(
-    buffer: Tensor, slots: Tensor, indices: Tensor, forward: Callable[P, Tensor | tuple[Tensor, ...]]
+    slots: Tensor, indices: Tensor, forward: Callable[P, Tensor | tuple[Tensor, ...]]
 ) -> Callable[P, Tensor | tuple[Tensor, ...]]:
     def tapped(*args: P.args, **kwargs: P.kwargs) -> Tensor | tuple[Tensor, ...]:
         output = forward(*args, **kwargs)
         # vLLM decoder layers return (layer output, residual); the tap keeps the layer output.
         hidden = output if isinstance(output, Tensor) else output[0]
-        torch.ops.pllm.tap(hidden, buffer)
         copy_pages(hidden, slots, indices[0], indices[1])
         return output
 
@@ -115,18 +100,16 @@ def _tapped(
 
 
 class HiddenTaps:
-    """Fixed buffers holding the latest forward's output of chosen modules, keyed by module path."""
+    """Selective model-dtype capture into stable PTTS pools, keyed by module path."""
 
     def __init__(
         self,
         model: torch.nn.Module,
         layouts: tuple[HiddenCaptureLayout, ...],
         pools: dict[str, SlotPools],
-        max_tokens: int,
         device: torch.device,
     ) -> None:
         self.layouts, self.pools = layouts, pools
-        self.buffers: dict[str, Tensor] = {}
         self.indices: dict[str, Tensor] = {}
         self._slots: dict[str, Slots] = {}
         self._rows: dict[str, dict[int, int]] = {}
@@ -134,14 +117,11 @@ class HiddenTaps:
         for layout in layouts:
             path = layout.module_path
             module = model.get_submodule(path)
-            buffer = torch.zeros(max_tokens, layout.hidden_size, dtype=torch.float32, device=device)
             indices = torch.full((2, layout.capture_rows), -1, dtype=torch.long, device=device)
             slots = pools[path].tensors[0]
-            module.register_buffer("pllm_tap", buffer, persistent=False)
             module.register_buffer("pllm_hidden_slots", slots, persistent=False)
             module.register_buffer("pllm_hidden_indices", indices, persistent=False)
-            module.forward = _tapped(buffer, slots, indices, module.forward)
-            self.buffers[path] = buffer
+            module.forward = _tapped(slots, indices, module.forward)
             self.indices[path] = indices
 
     def prepare(self, rows: PackedPhaseRowBatch) -> None:
@@ -161,13 +141,14 @@ class HiddenTaps:
 
     @torch.inference_mode()
     def clear(self) -> None:
-        """Disable capture and release producer holds; slot readers will join this lifecycle in A4."""
+        """Disable capture and release producer holds independently of reader completion."""
         completion = torch.cuda.Event() if self._slots else None
         if completion is not None:
             completion.record()
         for path, slots in self._slots.items():
             self.pools[path].release(slots, completion)
         self._slots.clear()
+        self._rows.clear()
         for indices in self.indices.values():
             indices[1].fill_(-1)
 
@@ -189,4 +170,4 @@ class HiddenTaps:
         context.hold_slots(tuple((self.pools[path], slots) for path, slots in self._slots.items()))
 
 
-__all__ = ["CAPTURE_ENV", "HiddenCaptureAnnouncement", "HiddenCaptureLayout", "HiddenTaps", "tap"]
+__all__ = ["CAPTURE_ENV", "HiddenCaptureAnnouncement", "HiddenCaptureLayout", "HiddenTaps"]

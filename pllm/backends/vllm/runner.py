@@ -91,8 +91,7 @@ class Runner:
         self.hidden_pools = {layout.module_path: layout.create_pool(self.device) for layout in self.hidden_layouts}
         if not self.hidden_layouts:
             return
-        # Full-token FP32 taps remain until slot publication and consumers migrate.
-        self.hidden_taps = HiddenTaps(model, self.hidden_layouts, self.hidden_pools, self.max_num_tokens, self.device)
+        self.hidden_taps = HiddenTaps(model, self.hidden_layouts, self.hidden_pools, self.device)
 
     overlay_graph_bytes: int = 0
 
