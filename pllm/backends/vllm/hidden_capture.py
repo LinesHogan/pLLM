@@ -26,8 +26,9 @@ from pllm.contracts.packed_hidden import (
     hidden_binding,
 )
 from pllm.contracts.semantic_graph import HiddenInputSource
-from pllm.contracts.tensor_layout import TensorDType
+from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorFieldSpec, TensorLayoutSpec
 from pllm.execution.cuda_stream import CudaStreamReadiness
+from pllm.execution.ptts.page_bundle import SlotPools
 from pllm.execution.step_input import TensorStepInput
 
 CAPTURE_ENV = "PLLM_HIDDEN_CAPTURE"
@@ -52,6 +53,11 @@ class HiddenCaptureLayout:
     def retained_rows(self) -> int:
         """Total slot capacity, including the generation being written."""
         return 2 * self.capture_rows
+
+    def create_pool(self, device: torch.device) -> SlotPools:
+        """Allocate stable storage before capture; steps lease free rows from field zero."""
+        field = TensorFieldSpec(LayoutFieldId(0), (self.hidden_size,), self.dtype, self.dtype.itemsize)
+        return SlotPools(TensorLayoutSpec("pllm.hidden@1", (field,)), self.retained_rows, device)
 
 
 @dataclass(frozen=True, slots=True)

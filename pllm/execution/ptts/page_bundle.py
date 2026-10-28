@@ -126,8 +126,8 @@ class BorrowedPage:
 class _Table:
     """Latest versions and lineage ownership for one resource; rows survive retirement until the last hold."""
 
-    def __init__(self, resource: str, pools: _Pools) -> None:
-        self.resource, self.pools = resource, pools
+    def __init__(self, selected: StateProviderPlan, pools: SlotPools) -> None:
+        self.resource, self.selected, self.pools = selected.resource, selected, pools
         capacity, width = pools.holders.shape[1], len(pools.tensors)
         self.row_of: dict[LineageId, int] = {}
         self.lineages = np.zeros(capacity, dtype=np.int64)
@@ -149,9 +149,7 @@ class _Table:
         return rows
 
     def ref(self, row: int) -> StateRef:
-        return StateRef(
-            self.pools.selected.layout_id, LineageId(int(self.lineages[row])), VersionId(int(self.versions[row]))
-        )
+        return StateRef(self.selected.layout_id, LineageId(int(self.lineages[row])), VersionId(int(self.versions[row])))
 
     def reclaim(self) -> None:
         rows = np.flatnonzero((self.owners == 0) & (self.status != 0))
@@ -256,10 +254,19 @@ class LazyRoots(Sequence[tuple[torch.Tensor, ...]]):
         return self._views[index]
 
 
-class _Pools:
-    def __init__(self, layout: TensorLayoutSpec, selected: StateProviderPlan, device: torch.device) -> None:
-        self.layout, self.selected = layout, selected
-        capacity = selected.page_capacity
+class SlotPools:
+    """Stable field storage shared by versioned state and transient hidden rows.
+
+    Allocate each producer batch from free slots; allocation owns the first hold
+    and orders the writer after prior releases. Readers add holds before the
+    producer releases, wait for producer completion, and release with their own
+    completion events. Hold/release take [rows, fields] slot matrices; tensor/views
+    check allocation generations. Callers serialize ownership changes and keep
+    storage alive until GPU work completes.
+    """
+
+    def __init__(self, layout: TensorLayoutSpec, capacity: int, device: torch.device) -> None:
+        self.layout = layout
         tensors: list[torch.Tensor] = []
         for field in layout.fields:
             size = field.dtype.itemsize
@@ -275,20 +282,21 @@ class _Pools:
             )
         self.tensors = tuple(tensors)
         self.addresses = tuple(pool.data_ptr() for pool in self.tensors)
-        # Per field and slot: how many versions share the page (0 = free), and how often it was reused.
+        # Per field and slot: how many owners share the page (0 = free), and how often it was reused.
         self.holders = np.zeros((len(layout.fields), capacity), dtype=np.int32)
         self.generations = np.zeros((len(layout.fields), capacity), dtype=np.int64)
         self._field_offsets = np.arange(len(layout.fields), dtype=np.int64) * capacity
         self._readiness: dict[tuple[int, int], set[torch.cuda.Event]] = {}
 
     def free_count(self, field: int) -> int:
+        """Slots available for allocation, possibly still awaiting GPU completion."""
         return int(np.count_nonzero(self.holders[field] == 0))
 
     def allocate(self, field: int, count: int, stream: torch.cuda.Stream | None) -> tuple[Slots, Slots]:
         """`count` free pages of one field, smallest slots first, with their generations."""
         slots = np.flatnonzero(self.holders[field] == 0)[:count]
         if len(slots) < count:
-            raise RuntimeError("PageBundle capacity is exhausted")
+            raise WindowBackpressure("Slot capacity is exhausted; release current holders before retrying")
         for slot in slots:
             for event in self._readiness.pop((field, int(slot)), ()):
                 assert stream is not None
@@ -301,6 +309,7 @@ class _Pools:
         np.add.at(self.holders[field], slots, 1)
 
     def tensor(self, field: int, page: PageSlot) -> torch.Tensor:
+        """Borrow one live allocation; the caller retains its hold while using the view."""
         assert self.generations[field, page.slot_id] == page.generation and self.holders[field, page.slot_id] >= 1
         return self.tensors[field][page.slot_id]
 
@@ -316,7 +325,7 @@ class _Pools:
         )
 
     def hold(self, slots: Slots) -> None:
-        """Add a batch of exact-version holders, including repeated shared pages."""
+        """Add a batch of holders, including repeated shared pages."""
         self.holders += self._counts(slots).astype(np.int32)
 
     def release(self, slots: Slots, completion: torch.cuda.Event | None = None) -> None:
@@ -374,14 +383,17 @@ class PageBundleArena:
         else:
             kind, ordinal = placements.pop()
             self.device = torch.device("cpu") if kind is StateDeviceKind.CPU else torch.device("cuda", ordinal)
-        self._pools: dict[str, _Pools] = {}
+        self._pools: dict[str, SlotPools] = {}
+        self._tables: dict[str, _Table] = {}
         layouts = {item.resource: item.layout for item in plan.tensor_layout_request.layouts}
         self._owned_resources = tuple(layouts) if _owned_resources is None else _owned_resources
         for selected in plan.states.plans:
             # Partial materialization owns no remote pool; test_video tests the partition.
             if selected.resource in self._owned_resources:
-                self._pools[selected.resource] = _Pools(layouts[selected.resource], selected, self.device)
-        self._tables = {resource: _Table(resource, pools) for resource, pools in self._pools.items()}
+                self._pools[selected.resource] = SlotPools(
+                    layouts[selected.resource], selected.page_capacity, self.device
+                )
+                self._tables[selected.resource] = _Table(selected, self._pools[selected.resource])
         self._writes: dict[PageWrite, _Write] = {}
         self._pins: dict[PagePin, _Pin] = {}
         self._publications: dict[PagePublication, _Publication] = {}
@@ -477,7 +489,7 @@ class PageBundleArena:
                 for resource, pool in self._pools.items()
                 for field in pool.layout.fields
             }
-            reserved = sum(pool.selected.reserved_bytes for pool in self._pools.values())
+            reserved = sum(table.selected.reserved_bytes for table in self._tables.values())
             return PageBundleUsage(
                 reserved,
                 sum(
@@ -488,9 +500,9 @@ class PageBundleArena:
                 sum(sizes[resource, field] for resource, field, _ in live_pages | private_pages | retiring_pages),
                 reserved
                 - sum(
-                    pool.selected.page_capacity * sizes[resource, field.field_id]
-                    for resource, pool in self._pools.items()
-                    for field in pool.layout.fields
+                    table.selected.page_capacity * sizes[resource, field.field_id]
+                    for resource, table in self._tables.items()
+                    for field in table.pools.layout.fields
                 ),
                 sum(pool.free_count(field) for pool in self._pools.values() for field in range(len(pool.tensors))),
                 len(live_pages),
@@ -540,7 +552,7 @@ class PageBundleArena:
             rows = np.asarray([table.row_of.get(lineage, -1) for lineage in lineages], dtype=np.int64)
             assert (rows >= 0).all() and (table.status[rows] == 2).all()
             return StateRefs(
-                np.full(len(rows), table.pools.selected.layout_id, dtype=np.int64),
+                np.full(len(rows), table.selected.layout_id, dtype=np.int64),
                 table.lineages[rows],
                 table.versions[rows],
                 rows,
@@ -571,7 +583,7 @@ class PageBundleArena:
     def _select(self, refs: StateRefs, *, latest: bool = True) -> tuple[_Pages, ...]:
         groups: list[_Pages] = []
         for table in self._tables.values():
-            mask = refs.layouts == table.pools.selected.layout_id
+            mask = refs.layouts == table.selected.layout_id
             if len(self._tables) > 1:
                 # Different resources may share an interned layout ID.
                 mask &= np.isin(refs.lineages, table.lineages[table.status != 0])
@@ -632,12 +644,12 @@ class PageBundleArena:
             for resource, table in self._tables.items():
                 if (
                     np.count_nonzero((table.status == 1) | (table.status == 2)) + resources.count(resource)
-                    > table.pools.selected.max_admitted_lineages
+                    > table.selected.max_admitted_lineages
                 ):
                     self._admission_capacity_failures += 1
                     raise RuntimeError("PageBundle admission capacity is exhausted")
             refs = StateRefs(
-                np.asarray([self._pools[resource].selected.layout_id for resource in resources], dtype=np.int64),
+                np.asarray([self._tables[resource].selected.layout_id for resource in resources], dtype=np.int64),
                 np.arange(self._next_lineage, self._next_lineage + len(resources), dtype=np.int64),
                 np.zeros(len(resources), dtype=np.int64),
             )

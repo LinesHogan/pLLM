@@ -52,6 +52,7 @@ from pllm.contracts.backend_attachment import (
 )
 from pllm.contracts.codec import decode_boundary
 from pllm.execution.position_state import PositionAnnouncement
+from pllm.execution.ptts.page_bundle import SlotPools
 from pllm.execution.state_execution import StateDiagnostics
 
 
@@ -70,6 +71,7 @@ class Runner:
 
     hidden_taps: HiddenTaps | None = None
     hidden_layouts: tuple[HiddenCaptureLayout, ...] = ()
+    hidden_pools: dict[str, SlotPools]
     position_states: tuple[tuple[str, float], ...] = ()
     position_layers: tuple[PositionCacheLayer, ...] = ()
 
@@ -86,6 +88,7 @@ class Runner:
         announcement = decode_boundary(os.environ.get(CAPTURE_ENV, "{}"), HiddenCaptureAnnouncement)
         hidden_size = model.lm_head.weight.shape[1]
         self.hidden_layouts = announcement.resolve(len(model.model.layers), hidden_size)
+        self.hidden_pools = {layout.module_path: layout.create_pool(self.device) for layout in self.hidden_layouts}
         if not self.hidden_layouts:
             return
         paths = (layout.module_path for layout in self.hidden_layouts)
