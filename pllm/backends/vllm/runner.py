@@ -91,9 +91,8 @@ class Runner:
         self.hidden_pools = {layout.module_path: layout.create_pool(self.device) for layout in self.hidden_layouts}
         if not self.hidden_layouts:
             return
-        paths = (layout.module_path for layout in self.hidden_layouts)
         # Full-token FP32 taps remain until slot publication and consumers migrate.
-        self.hidden_taps = HiddenTaps(model, paths, self.max_num_tokens, hidden_size, self.device)
+        self.hidden_taps = HiddenTaps(model, self.hidden_layouts, self.hidden_pools, self.max_num_tokens, self.device)
 
     overlay_graph_bytes: int = 0
 
@@ -215,6 +214,12 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
     def _finish_model_binding(self) -> None:
         self.finish_overlay_graphs(self.require_session().attachment, self.require_session().parameter_phases)
 
+    def capture_model(self) -> int:
+        """Capture and warm up with no hidden-slot destinations, including deferred capture."""
+        if self.hidden_taps is not None:
+            self.hidden_taps.clear()
+        return super().capture_model()
+
     def prepare_inputs(
         self,
         scheduler_output: SchedulerOutput,
@@ -242,7 +247,9 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         session = self._workload_session
-        if session is None:
+        if session is None or dummy_run or is_profile:
+            if self.hidden_taps is not None:
+                self.hidden_taps.clear()
             return super().execute_model(
                 scheduler_output,
                 intermediate_tensors,
@@ -250,7 +257,6 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
                 skip_attn_for_dummy_run,
                 is_profile,
             )
-        assert not dummy_run and not is_profile
         try:
             session.before_execute(scheduler_output)
             return super().execute_model(
@@ -263,6 +269,9 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
         except Exception:
             session.abort_active()
             raise
+        finally:
+            if self.hidden_taps is not None:
+                self.hidden_taps.clear()
 
     def sample(
         self,

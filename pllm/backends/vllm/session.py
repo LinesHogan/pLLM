@@ -297,6 +297,8 @@ class VllmSession(Generic[DataT, ResultT]):
         self._next_step_id += 1
         step = _PackedStep[DataT](rows)
         self._step = step
+        if self._taps is not None:
+            self._taps.prepare(rows.row_batch)
         if self._replay is not None and self._activation is None:
             execution = self._deployment.execution
             context = execution.start_step(
@@ -459,6 +461,8 @@ class VllmSession(Generic[DataT, ResultT]):
 
     @torch.inference_mode(False)
     def abort_active(self) -> None:
+        if self._taps is not None:
+            self._taps.clear()
         if self._sampler is not None:
             self._sampler.abort_guidance()
         self._finish_effects()

@@ -69,6 +69,9 @@ class Mrv1Runner(Runner, GPUModelRunner):
         except Exception:
             session.abort_active()
             raise
+        finally:
+            if self.hidden_taps is not None:
+                self.hidden_taps.clear()
 
     def _sample(self, logits: torch.Tensor | None, spec_decode_metadata: SpecDecodeMetadata | None) -> SamplerOutput:
         session = self._workload_session
