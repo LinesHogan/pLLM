@@ -35,8 +35,8 @@ class OverlayBatch:
         self.batchable = False
 
     def resident(self, capture_bytes: int) -> int:
-        """Charge the existing task budget; limit overlay residency to 512 MiB per task."""
-        return min(capture_bytes, 512 << 20) if self.entitlement is not None and self.batchable else 0
+        """Reserve the planner's capture budget for batchable overlays."""
+        return capture_bytes if self.entitlement is not None and self.batchable else 0
 
     def capacities(self) -> tuple[int, ...]:
         assert self.math.chunk is not None
@@ -99,8 +99,7 @@ class OverlayBatch:
             if tile.plan is None or tile.plan.analysis is None:
                 with FakeTensorMode(allow_non_fake_inputs=True):
                     workspace = measure(tile.body).workspace
-                # Graph allocator segments and the BLAS handle round beyond tensor storage.
-                needed = workspace + tile.buffer_bytes + (4 << 20)
+                needed = workspace + tile.buffer_bytes
                 if needed <= remaining:
                     tile.capture = StepCapture(replace(self.entitlement, resident_bytes=remaining), self.states)
                     self.tiles[key] = tile
