@@ -46,6 +46,7 @@ from pllm.contracts.backend_attachment import (
     BackendPlacementProbe,
     CausalModelDomain,
 )
+from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.feedback import (
     BarrierState,
     Completion,
@@ -59,7 +60,6 @@ from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import SchedulerTimeline, TaskId
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorFieldSpec
-from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.host_runtime import CompletionInput

@@ -27,11 +27,11 @@ from pllm.authoring import BackendRequirements
 from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay
 from pllm.config import ModelConfig, RunnerKind
 from pllm.contracts.backend_attachment import AttachmentGraphMode, BackendAttachment
+from pllm.contracts.codec import boundary_digest, decode_boundary, encode_boundary
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import CapturedParameterOperand, ParameterOverlayFieldBinding
 from pllm.contracts.semantic_graph import StateResource
-from pllm.execution.codec import boundary_digest, cuda_graph_pool_bytes, decode_boundary, encode_boundary
 from pllm.execution.cuda_stream import CudaStreamReadiness, PinnedStaging
 from pllm.execution.overlay_task import ProjectionTransition
 from pllm.execution.parameter_projection import (
@@ -45,6 +45,7 @@ from pllm.execution.ptts.page_bundle import PageBundleArena, Slots
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.state_execution import DataT, StateTaskContext
+from pllm.execution.torch_private import cuda_graph_pool_bytes
 
 _BUDGET = "pllm_pinned_projection_v2_bytes"
 _READERS: dict[int, "_ProjectionReader"] = {}

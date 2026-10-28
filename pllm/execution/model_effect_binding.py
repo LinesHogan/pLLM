@@ -22,6 +22,7 @@ from pllm.contracts.backend_attachment import (
     DecodeWindow,
     MissingPolicy,
 )
+from pllm.contracts.codec import boundary_digest
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
     ParameterEffect,
@@ -39,7 +40,6 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.visibility import Exact, Visibility, VisibilitySource
 from pllm.execution.binding_base import Buffer, overlay_fields
-from pllm.execution.codec import boundary_digest
 from pllm.execution.declaration import Call, State, When, native
 from pllm.execution.overlay_task import OverlayTransition
 from pllm.execution.ptts.request_state import RequestStateSelection

@@ -17,6 +17,7 @@ from pllm.contracts.backend_attachment import (
     BackendAttachmentSpec,
     BackendPlacementProbe,
 )
+from pllm.contracts.codec import encode_boundary
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator
 from pllm.contracts.semantic_graph import (
@@ -32,7 +33,6 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
-from pllm.execution.codec import encode_boundary
 from pllm.execution.parameter_projection import ROWS_PER_BLOCK, projection_blocks, uses_pinned_projection
 
 

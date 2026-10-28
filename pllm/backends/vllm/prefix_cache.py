@@ -12,7 +12,7 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request
 
 from pllm.contracts.backend_attachment import BackendAttachment
-from pllm.execution.codec import boundary_digest, decode_boundary, encode_boundary
+from pllm.contracts.codec import boundary_digest, decode_boundary, encode_boundary
 
 POLICY_KEY = "pllm.prefix_cache"
 

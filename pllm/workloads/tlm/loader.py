@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from pllm.execution.codec import boundary_digest
+from pllm.contracts.codec import boundary_digest
 
 if TYPE_CHECKING:
     from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM

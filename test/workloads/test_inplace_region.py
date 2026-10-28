@@ -13,6 +13,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 import pllm
+from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
     CapturedParameterOperand,
@@ -25,7 +26,6 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.contracts.tensor_policy import TensorPolicy
-from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline

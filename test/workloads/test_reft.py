@@ -19,6 +19,7 @@ from pllm.contracts.backend_attachment import (
     DecodeWindow,
     MissingPolicy,
 )
+from pllm.contracts.codec import encode_boundary
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
@@ -27,7 +28,6 @@ from pllm.contracts.semantic_graph import AnchorId, StateScope
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.activation import low_rank_affine_delta
-from pllm.execution.codec import encode_boundary
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.state_refs import StateRefs

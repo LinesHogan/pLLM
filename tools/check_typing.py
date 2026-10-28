@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-CODEC = ROOT / "pllm/execution/codec.py"
+TORCH_PRIVATE = ROOT / "pllm/execution/torch_private.py"
 CONTRACT_CODEC = ROOT / "pllm/contracts/codec.py"
 GRAPH_ADAPTER = ROOT / "pllm/execution/module_graph.py"
 COLD_AUTHORING = {
@@ -19,7 +19,7 @@ COLD_AUTHORING = {
     # Worker RPC erases the reconstructed workload's generic payload types.
     ROOT / "pllm/worker.py",
 }
-DYNAMIC_IMPORT = {CODEC, ROOT / "pllm/workload_transport.py"}
+DYNAMIC_IMPORT = {TORCH_PRIVATE, ROOT / "pllm/workload_transport.py"}
 FORBIDDEN = {"Any", "object", "cast", "getattr", "setattr", "hasattr"}
 
 
@@ -30,7 +30,7 @@ def main() -> int:
         # Keep those checks at the graph import boundary, outside scheduling.
         # The shared contract codec is the sole dynamic schema adapter; source
         # contracts and semantic rules themselves retain the ordinary strict gate.
-        if path in (CODEC, CONTRACT_CODEC, GRAPH_ADAPTER):
+        if path in (TORCH_PRIVATE, CONTRACT_CODEC, GRAPH_ADAPTER):
             continue
         source = path.read_text()
         for node in ast.walk(ast.parse(source)):

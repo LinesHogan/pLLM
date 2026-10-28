@@ -10,7 +10,7 @@ import torch
 from pllm import KVOffload, _core
 from pllm.backends.vllm.position_state import PositionCacheProvider, PositionMetadata
 from pllm.config import ExecutionOptions
-from pllm.execution.codec import encode_boundary
+from pllm.contracts.codec import encode_boundary
 from pllm.workloads.step_loop import StepLoop
 from test.workloads.test_recirculation import FACTS, ROWS
 

@@ -10,8 +10,8 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
-from pllm.execution.codec import check_functional_aten, tensor_decompositions, tensor_node_metadata
 from pllm.execution.position_state import position_save
+from pllm.execution.torch_private import check_functional_aten, tensor_decompositions, tensor_node_metadata
 
 Tokens = Literal["prefill", "decode", "all"]
 Over = Literal["token", "span"]

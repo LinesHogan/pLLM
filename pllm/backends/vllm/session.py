@@ -38,6 +38,7 @@ from pllm.contracts.backend_attachment import (
     AttachmentTaskRole,
     BackendAttachment,
 )
+from pllm.contracts.codec import encode_boundary
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedSamplerRowBatch
 from pllm.contracts.request_identity import RequestIdentity
@@ -47,7 +48,6 @@ from pllm.contracts.semantic_graph import (
     SamplerFeedbackInputSource,
 )
 from pllm.execution.backend_attachment import attachment_buffer_bytes
-from pllm.execution.codec import encode_boundary
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.host_runtime import CompletionCapture
 from pllm.execution.overlay_task import ProjectionTask

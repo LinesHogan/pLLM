@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from pllm import _core
+from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.semantic_graph import ScheduleDecision, SchedulerTimeline, SemanticGraph
 from pllm.contracts.state_representation import (
     StateRepresentationDecision,
     StateRepresentationRequest,
 )
 from pllm.contracts.tensor_layout import TensorLayoutDecision, TensorLayoutRequest
-from pllm.execution.codec import decode_boundary, encode_boundary
 
 
 def compile_state_schedule(

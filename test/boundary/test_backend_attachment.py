@@ -20,6 +20,7 @@ from pllm.contracts.backend_attachment import (
     BackendAttachment,
     BackendPlacementProbe,
 )
+from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.hidden_locator import HiddenLayerKind
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from pllm.contracts.parameter_overlay import (
@@ -31,7 +32,6 @@ from pllm.contracts.parameter_overlay import (
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.backend_attachment import check_backend_attachment
-from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline

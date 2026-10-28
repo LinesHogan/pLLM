@@ -7,6 +7,7 @@ import pytest
 import torch
 
 import pllm
+from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.parameter_overlay import (
     CapturedParameterOperand,
     ParameterModuleKind,
@@ -16,7 +17,6 @@ from pllm.contracts.parameter_overlay import (
 )
 from pllm.contracts.semantic_graph import AnchorId
 from pllm.contracts.state_representation import StateDeviceKind
-from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline

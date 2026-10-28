@@ -23,6 +23,7 @@ from pllm.contracts.backend_attachment import (
     DecodeWindow,
     MissingPolicy,
 )
+from pllm.contracts.codec import boundary_digest
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.packed_rows import PackedPhaseRow
@@ -51,7 +52,6 @@ from pllm.contracts.state_feed import FeedBinding, FeedOrder
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorLayoutRequest
 from pllm.contracts.visibility import Exact as Exact, Visibility as Visibility
 from pllm.execution.binding_base import SGD as SGD, Buffer as Buffer, buffer_field, overlay_fields
-from pllm.execution.codec import boundary_digest
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import Call, Dimensions, Shape, State, When, native
 from pllm.execution.freeze import (

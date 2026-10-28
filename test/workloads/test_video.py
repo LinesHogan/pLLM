@@ -18,6 +18,7 @@ from pllm.contracts.backend_attachment import (
     DecodeWindow,
     MissingPolicy,
 )
+from pllm.contracts.codec import encode_boundary
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
 from pllm.contracts.request_identity import RequestIdentity
@@ -25,7 +26,6 @@ from pllm.contracts.semantic_graph import AnchorId, StateEffectKind
 from pllm.contracts.state_ref import LineageId, StateRef, VersionId
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.backend_attachment import attachment_buffer_bytes, bind_backend_attachment
-from pllm.execution.codec import encode_boundary
 from pllm.execution.declaration import Dimensions, Field, When
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle import BorrowedPage, PageBundleArena, PageFieldTransfer, PageSlot

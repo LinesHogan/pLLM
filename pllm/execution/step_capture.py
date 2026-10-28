@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 import torch
 
 from pllm.contracts.semantic_graph import TaskResourceFact
-from pllm.execution.codec import cuda_graph_pool_bytes
+from pllm.execution.torch_private import cuda_graph_pool_bytes
 
 R = TypeVar("R")
 

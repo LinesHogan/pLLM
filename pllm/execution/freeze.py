@@ -23,7 +23,7 @@ from typing import TypeVar, cast
 
 import torch
 
-from pllm.execution.codec import boundary_digest
+from pllm.contracts.codec import boundary_digest
 
 G = TypeVar("G", bound=Callable[..., object])
 C = TypeVar("C")

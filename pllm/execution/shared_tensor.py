@@ -14,7 +14,7 @@ from tempfile import TemporaryFile
 import torch
 
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorFieldSpec
-from pllm.execution.codec import cuda_device_uuid, open_cuda_storage, share_cuda_storage
+from pllm.execution.torch_private import cuda_device_uuid, open_cuda_storage, share_cuda_storage
 
 
 @dataclass(frozen=True, slots=True)

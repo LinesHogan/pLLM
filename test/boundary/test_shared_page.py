@@ -9,8 +9,8 @@ import pytest
 import torch
 
 from pllm.authoring import CausalTrainBatch, StateTensorUpdate
+from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.host_runtime import CompletionCapture
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.host import Completion, CompletionBatch, FinishReason

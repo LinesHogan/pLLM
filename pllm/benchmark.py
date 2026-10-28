@@ -11,7 +11,7 @@ from importlib.metadata import version
 from pathlib import Path
 from statistics import median
 from time import perf_counter, process_time
-from typing import TYPE_CHECKING, Generic, TypeVar
+from typing import TYPE_CHECKING, Generic, TypedDict, TypeVar
 
 import torch
 from vllm import SamplingParams
@@ -19,7 +19,7 @@ from vllm import SamplingParams
 from pllm import make_llm
 from pllm.authoring import AuxiliaryInput, BackendWorkload
 from pllm.config import ExecutionOptions, ModelConfig
-from pllm.execution.codec import boundary_digest, cuda_profile_totals
+from pllm.contracts.codec import boundary_digest
 from pllm.execution.ptts.page_bundle import PageBundleUsage
 
 if TYPE_CHECKING:
@@ -315,6 +315,106 @@ def _print_arm(report: BenchmarkResult, requests: _Requests, vanilla: float) -> 
                 "peak_extra_allocated_bytes": report.peak_allocated_bytes - report.baseline_allocated_bytes,
             }
         )
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class CudaProfileTotals:
+    kernel_count: int
+    kernel_microseconds: float
+    cuda_api_microseconds: float
+    cuda_enqueue_api_microseconds: float
+    cuda_wait_api_microseconds: float
+    gpu_activity_microseconds: float
+    memcpy_bytes: int
+    cuda_launch_api_count: int
+    cuda_graph_launch_api_count: int
+
+
+class _TraceArgs(TypedDict):
+    bytes: int
+
+
+class _TraceEvent(TypedDict):
+    ph: str
+    cat: str
+    name: str
+    pid: int | str
+    tid: int | str
+    ts: float
+    dur: float
+    args: _TraceArgs
+
+
+def _span_totals(spans: dict[tuple[str, str], list[tuple[float, float]]]) -> tuple[int, float]:
+    count = 0
+    total = 0.0
+    for intervals in spans.values():
+        end = float("-inf")
+        for start, stop in sorted(intervals):
+            count += start >= end
+            total += max(0.0, stop - max(start, end))
+            end = max(end, stop)
+    return count, total
+
+
+def cuda_profile_totals(path: Path) -> CudaProfileTotals:
+    """Decode Kineto activity, merging nested API spans per thread and GPU spans per device.
+
+    Enqueue API time is not total Python submission time and calls may block internally.
+    Launch counts merge nested runtime/driver calls on each host thread; graph
+    launches are a subset, not the number of device kernels executed by a graph.
+    Kernel duration sums may overlap; GPU activity includes memcpy/memset without overlap.
+    Memcpy bytes exclude kernel-internal loads/stores and all allocator figures.
+    Foreign trace metadata is deliberately not a closed PLLM wire contract.
+    """
+    events: list[_TraceEvent] = json.loads(path.read_text())["traceEvents"]
+    kernels, kernel_us, transfer = 0, 0.0, 0
+    spans: dict[str, dict[tuple[str, str], list[tuple[float, float]]]] = {
+        kind: {} for kind in ("api", "enqueue", "wait", "gpu", "launch", "graph")
+    }
+    for event in events:
+        category = event.get("cat")
+        if event.get("ph") != "X" or category not in (
+            "kernel",
+            "cuda_runtime",
+            "cuda_driver",
+            "gpu_memcpy",
+            "gpu_memset",
+        ):
+            continue
+        duration = float(event["dur"])
+        start = float(event["ts"])
+        device_event = category in ("kernel", "gpu_memcpy", "gpu_memset")
+        key = (str(event["pid"]), "device" if device_event else str(event["tid"]))
+        interval = (start, start + duration)
+        spans["gpu" if device_event else "api"].setdefault(key, []).append(interval)
+        if category == "kernel":
+            kernels += 1
+            kernel_us += duration
+        elif category == "gpu_memcpy":
+            transfer += int(event["args"]["bytes"])
+        elif not device_event:
+            name = str(event["name"]).lower()
+            if "synchronize" in name:
+                spans["wait"].setdefault(key, []).append(interval)
+            elif "launch" in name or "async" in name and ("memcpy" in name or "memset" in name):
+                spans["enqueue"].setdefault(key, []).append(interval)
+                if "launch" in name:
+                    spans["launch"].setdefault(key, []).append(interval)
+                    if "graphlaunch" in name:
+                        spans["graph"].setdefault(key, []).append(interval)
+    totals = {key: _span_totals(value) for key, value in spans.items()}
+    return CudaProfileTotals(
+        kernels,
+        kernel_us,
+        totals["api"][1],
+        totals["enqueue"][1],
+        totals["wait"][1],
+        totals["gpu"][1],
+        transfer,
+        totals["launch"][0],
+        totals["graph"][0],
     )
 
 

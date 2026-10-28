@@ -15,11 +15,11 @@ from multiprocessing.resource_sharer import DupFd
 
 import torch
 
+from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.packed_rows import PackedSamplerRowBatch
 from pllm.contracts.state_feed import FeedBinding, FeedOrder
 from pllm.contracts.state_ref import StateRef
-from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle import BorrowedPage, PageBundleArena, PageRelease
 from pllm.execution.ptts.state_refs import StateRefs

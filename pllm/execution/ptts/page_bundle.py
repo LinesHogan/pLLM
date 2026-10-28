@@ -15,13 +15,13 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
+from pllm.contracts.codec import boundary_digest, decode_boundary, encode_boundary
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.semantic_graph import StateEffectKind
 from pllm.contracts.state_ref import LineageId, StateRef, VersionId
 from pllm.contracts.state_representation import StateDeviceKind, StateProviderPlan
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorLayoutSpec
 from pllm.execution.admission import WindowBackpressure
-from pllm.execution.codec import boundary_digest, decode_boundary, encode_boundary
 from pllm.execution.cuda_stream import upload
 from pllm.execution.ptts.page_bundle_planning import page_stride_bytes
 from pllm.execution.ptts.state_refs import StateRefs

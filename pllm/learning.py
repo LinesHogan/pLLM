@@ -17,6 +17,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 from pllm.authoring import BackendRequirements, BackendWorkload, CausalModel, CausalTrainBatch
 from pllm.contracts.backend_attachment import BackendAttachmentSpec
+from pllm.contracts.codec import boundary_digest
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding, ParameterOverlayOperator
@@ -33,7 +34,6 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
 from pllm.execution.binding_base import Buffer
-from pllm.execution.codec import boundary_digest
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import Builder, Call, Dimensions, Field, HostOperation, Shape, When, native
 from pllm.execution.freeze import fingerprint, freeze, owner_snapshot, owner_values

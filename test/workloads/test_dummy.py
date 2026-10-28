@@ -16,11 +16,11 @@ from examples.centered_hidden import centered_hidden
 from examples.sae_export import SAE
 from pllm import make_llm, testing
 from pllm.contracts.backend_attachment import AttachmentHiddenResource
+from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.state_representation import StateDeviceKind
-from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.tensor_task import TensorTask

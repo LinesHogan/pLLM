@@ -46,9 +46,9 @@ from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
     AttachmentTopology,
 )
+from pllm.contracts.codec import decode_boundary
 from pllm.contracts.hidden_locator import HiddenSite
 from pllm.contracts.packed_hidden import hidden_binding
-from pllm.execution.codec import decode_boundary
 from pllm.execution.position_state import PositionAnnouncement
 from pllm.execution.state_execution import StateDiagnostics
 

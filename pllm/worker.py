@@ -20,8 +20,8 @@ from pllm.backends.vllm.runtime import (
 )
 from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import AttachmentTopology, BackendAttachment
+from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.semantic_graph import StateScope, TaskId
-from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.trace import TraceSelection
 from pllm.workload_transport import decode_workload as decode_workload, encode_workload as encode_workload
 

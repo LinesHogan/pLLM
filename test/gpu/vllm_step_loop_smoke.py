@@ -25,8 +25,8 @@ from pllm.backends.vllm.prefix_cache import CachePolicy
 from pllm.backends.vllm.replay import RouteWave, VllmTokenwiseReplay
 from pllm.backends.vllm.runtime import BackendCommand, BackendInstall, BackendStage
 from pllm.config import KVOffload
+from pllm.contracts.codec import encode_boundary
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.execution.codec import encode_boundary
 from pllm.workload_transport import encode_workload
 from pllm.workloads.step_loop import StepLoop
 from test.gpu.vllm_recirculation_smoke import replay_handle

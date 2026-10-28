@@ -8,8 +8,8 @@ import torch
 
 import pllm
 from pllm import make_llm
+from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.execution import trace as trace_module
-from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.host_runtime import HostExecution, HostSettlementError
 from pllm.execution.trace import TRACE_SCHEMA_VERSION, TracePhase, TraceSnapshot
 from pllm.host import HostReceipt, HostRuntimeFacts

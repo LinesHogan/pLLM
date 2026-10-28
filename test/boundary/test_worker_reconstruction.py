@@ -12,10 +12,10 @@ from examples.huber import HuberWorkload
 from pllm import make_llm
 from pllm.backends.vllm.prefix_cache import CachePolicy
 from pllm.contracts.backend_attachment import AttachmentTopology, BackendAttachment
+from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
-from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.host import HostRuntimeFacts
 from pllm.worker import GPUWorker
