@@ -390,7 +390,6 @@ class PageBundleArena:
         self._publications: dict[PagePublication, _Publication] = {}
         self._releases: dict[PageRelease, _Pin] = {}
         self._recycled: set[PagePublication | PageRelease] = set()
-        self._aborted: dict[torch.cuda.Event, _Write] = {}
         self._window_active = False
         self._window_completion: torch.cuda.Event | None = None
         self._storage_streams: set[int] = set()
@@ -503,7 +502,7 @@ class PageBundleArena:
                 len(private),
                 len(retiring),
                 len(held),
-                len(self._publications) + len(self._releases) + len(self._aborted),
+                len(self._publications) + len(self._releases),
                 self._admission_capacity_failures,
             )
 
@@ -845,8 +844,6 @@ class PageBundleArena:
                 group.table.writing[group.rows] = False
                 group.release(completion)
             self._writes.pop(token)
-            if completion is not None:
-                self._aborted[completion] = write
 
     @contextmanager
     def reserve_window(
@@ -1166,11 +1163,6 @@ class PageBundleArena:
         with self._lock:
             self._require_live()
             self._poll_completions(wait, resources)
-            for completion in tuple(self._aborted):
-                if wait:
-                    completion.synchronize()
-                if completion.query():
-                    del self._aborted[completion]
             completed: list[_Pages] = []
             receipts: list[PagePublication | PageRelease] = []
             for receipt in self._ready_receipts:
