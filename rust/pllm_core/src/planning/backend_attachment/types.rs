@@ -254,26 +254,3 @@ pub(crate) struct BackendAttachmentRequest {
     pub(crate) activation_bindings: Vec<ActivationPatchBinding>,
     pub(crate) schema_version: u64,
 }
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct BackendAttachmentDecision {
-    pub(crate) request_digest: String,
-    pub(crate) signature: String,
-    pub(crate) schema_version: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct BackendAttachmentPhysicalPlan {
-    pub(crate) adapter_id: String,
-    pub(crate) attachment_signature: String,
-    pub(crate) schedule_signature: String,
-    pub(crate) state_representation_signature: String,
-    pub(crate) device_kind: StateDeviceKind,
-    pub(crate) device_ordinal: u64,
-    pub(crate) topology: AttachmentTopology,
-    pub(crate) graph_mode: AttachmentGraphMode,
-    pub(crate) bundle_signature: String,
-    pub(crate) schema_version: u64,
-}

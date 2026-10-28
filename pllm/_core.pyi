@@ -51,29 +51,7 @@ def validate_physical_plan(
     physical_json: str,
     state_json: str | None = None,
 ) -> None: ...
-def compile_backend_attachment(
-    inputs_json: str,
-) -> str: ...
-def validate_backend_attachment(
-    inputs_json: str,
-    decision_json: str,
-) -> None: ...
-def lower_backend_attachment(
-    inputs_json: str,
-    decision_json: str,
-) -> str: ...
-def validate_backend_attachment_physical(
-    inputs_json: str,
-    decision_json: str,
-    physical_json: str,
-) -> None: ...
-def validate_backend_attachment_reconstruction(
-    inputs_json: str,
-    decision_json: str,
-    physical_json: str,
-    local_inputs_json: str,
-    local_physical_json: str,
-) -> None: ...
+def check_backend_attachment(inputs_json: str) -> None: ...
 def validate_plan_bundle(plan_json: str, local_candidates_json: str | None = None) -> None: ...
 def compile_state_schedule(
     graph_json: str,

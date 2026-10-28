@@ -1,4 +1,4 @@
-"""Closed backend attachment facts bound to canonical physical plans."""
+"""Closed backend attachment inputs shared by planning and worker installation."""
 
 from __future__ import annotations
 
@@ -187,31 +187,8 @@ class BackendAttachmentCompilerInputs:
 
 
 @dataclass(frozen=True, slots=True)
-class BackendAttachmentDecision:
-    request_digest: str
-    signature: str
-    schema_version: int = 11
-
-
-@dataclass(frozen=True, slots=True)
-class BackendAttachmentPhysicalPlan:
-    adapter_id: str
-    attachment_signature: str
-    schedule_signature: str
-    state_representation_signature: str
-    device_kind: StateDeviceKind
-    device_ordinal: int
-    topology: AttachmentTopology
-    graph_mode: AttachmentGraphMode
-    bundle_signature: str
-    schema_version: int = 11
-
-
-@dataclass(frozen=True, slots=True)
 class SignedBackendAttachment:
     inputs: BackendAttachmentCompilerInputs
-    decision: BackendAttachmentDecision
-    physical: BackendAttachmentPhysicalPlan
 
 
 __all__ = [
@@ -225,9 +202,7 @@ __all__ = [
     "AttachmentTaskBinding",
     "AttachmentTaskRole",
     "AttachmentTopology",
-    "BackendAttachmentDecision",
     "BackendAttachmentCompilerInputs",
-    "BackendAttachmentPhysicalPlan",
     "BackendAttachmentRequest",
     "BackendPlacementProbe",
 ]

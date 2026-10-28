@@ -1,4 +1,4 @@
-"""Effect buffer facts and closed Python-Rust binding for signed backend attachments."""
+"""Effect buffer facts and the Python-Rust input check used by attachment planning."""
 
 from __future__ import annotations
 
@@ -15,8 +15,6 @@ from pllm.contracts.backend_attachment import (
     AttachmentTaskBinding,
     AttachmentTaskRole,
     BackendAttachmentCompilerInputs,
-    BackendAttachmentDecision,
-    BackendAttachmentPhysicalPlan,
     BackendAttachmentRequest,
     BackendAttachmentSpec,
     BackendPlacementProbe,
@@ -37,7 +35,7 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
-from pllm.execution.codec import decode_boundary, encode_boundary
+from pllm.execution.codec import encode_boundary
 from pllm.execution.parameter_projection import ROWS_PER_BLOCK, projection_blocks, uses_pinned_projection
 
 
@@ -196,32 +194,9 @@ def derive_attachment_resources(
     )
 
 
-def compile_backend_attachment(
-    inputs: BackendAttachmentCompilerInputs,
-) -> BackendAttachmentDecision:
-    return decode_boundary(_core.compile_backend_attachment(encode_boundary(inputs)), BackendAttachmentDecision)
-
-
-def lower_backend_attachment(
-    inputs: BackendAttachmentCompilerInputs,
-    decision: BackendAttachmentDecision,
-) -> BackendAttachmentPhysicalPlan:
-    return decode_boundary(
-        _core.lower_backend_attachment(encode_boundary(inputs), encode_boundary(decision)),
-        BackendAttachmentPhysicalPlan,
-    )
-
-
-def validate_backend_attachment_physical(
-    inputs: BackendAttachmentCompilerInputs,
-    decision: BackendAttachmentDecision,
-    physical: BackendAttachmentPhysicalPlan,
-) -> None:
-    _core.validate_backend_attachment_physical(
-        encode_boundary(inputs),
-        encode_boundary(decision),
-        encode_boundary(physical),
-    )
+def check_backend_attachment(inputs: BackendAttachmentCompilerInputs) -> None:
+    """Check declared attachment inputs against their plan and backend facts in Rust."""
+    _core.check_backend_attachment(encode_boundary(inputs))
 
 
 def bind_attachment_tasks(
@@ -266,14 +241,12 @@ def bind_backend_attachment(
         activation_bindings=spec.activation_bindings,
     )
     inputs = BackendAttachmentCompilerInputs(request, probe, plan)
-    decision = compile_backend_attachment(inputs)
-    return SignedBackendAttachment(inputs, decision, lower_backend_attachment(inputs, decision))
+    check_backend_attachment(inputs)
+    return SignedBackendAttachment(inputs)
 
 
 __all__ = [
     "bind_attachment_tasks",
     "bind_backend_attachment",
-    "compile_backend_attachment",
-    "lower_backend_attachment",
-    "validate_backend_attachment_physical",
+    "check_backend_attachment",
 ]

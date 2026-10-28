@@ -1,4 +1,4 @@
-//! Semantic, plan, and backend-fact validation for attachment signing.
+//! Semantic, plan, and backend-fact checks for attachment planning.
 
 use super::super::scheduler::PhysicalPlan;
 use super::super::semantic_graph::{

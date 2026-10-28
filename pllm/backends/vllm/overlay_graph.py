@@ -31,7 +31,7 @@ from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import CapturedParameterOperand, ParameterOverlayFieldBinding
 from pllm.contracts.semantic_graph import StateResource
-from pllm.execution.codec import cuda_graph_pool_bytes, decode_boundary, encode_boundary
+from pllm.execution.codec import boundary_digest, cuda_graph_pool_bytes, decode_boundary, encode_boundary
 from pllm.execution.cuda_stream import CudaStreamReadiness, PinnedStaging
 from pllm.execution.overlay_task import ProjectionTransition
 from pllm.execution.parameter_projection import (
@@ -167,7 +167,7 @@ class OverlayGraphRunner(GPUModelRunner):
         # AOT loads before inspecting wrappers: the complete bound plan must enter its key.
         self.vllm_config.additional_config = {
             _BUDGET: self.overlay_graph_bytes,
-            "pllm_pinned_projection_plan": attachment.physical.bundle_signature,
+            "pllm_pinned_projection_plan": boundary_digest(attachment.inputs),
         }
         manager = self.cudagraph_manager
         assert manager is not None

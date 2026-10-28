@@ -64,7 +64,7 @@ def test_reft_matches_loreft_math_and_publish_skip_semantics(tmp_path) -> None:
     workload = ActivationWorkload(ActivationConfig((0,), 2, first_tokens=1, last_tokens=1))
     deployment = workload.compile_backend(facts)
     execution = deployment.execution
-    _decode_declarations_are_signed(facts)
+    _decode_declarations_are_checked(facts)
     rows = PackedPhaseRowBatch(0, 0, ())
     value = TensorStepInput(rows, PackedSamplerRowBatch(rows, ()))
     (initial,) = execution.admit(())
@@ -155,7 +155,7 @@ def _decode_low_rank_keeps_parameters_and_recomputes_delta(
         adapter.close()
 
 
-def _decode_declarations_are_signed(facts):
+def _decode_declarations_are_checked(facts):
     legacy = pllm.model.Activation("intervention", (0,), 1, 1, ActivationPatchOperator.ADD)
     assert (legacy.decode, legacy.decode_refresh, legacy.on_missing) == (
         DecodeWindow.NONE,
@@ -173,14 +173,13 @@ def _decode_declarations_are_signed(facts):
         def intervention(self) -> pllm.InstanceState:
             return pllm.InstanceState({"delta": pllm.Buffer((4,), dtype=torch.float32)}, imported=True)
 
-    decoding = replace(legacy, decode=DecodeWindow.ALL)
-    declarations = (legacy, decoding, replace(decoding, on_missing=MissingPolicy.HOLD))
-    plans = tuple(DeclaredActivation(declaration).plan_backend(facts) for declaration in declarations)
-    assert len({plan.decision.signature for plan in plans}) == 3
-    payload = json.loads(encode_boundary(plans[-1].inputs))
+    plan = DeclaredActivation(replace(legacy, decode=DecodeWindow.ALL, on_missing=MissingPolicy.HOLD)).plan_backend(
+        facts
+    )
+    payload = json.loads(encode_boundary(plan.inputs))
     del payload["request"]["activation_bindings"][0]["on_missing"]
     with pytest.raises(ValueError):  # The policy must be explicit on the wire.
-        pllm._core.compile_backend_attachment(json.dumps(payload))
+        pllm._core.check_backend_attachment(json.dumps(payload))
 
 
 def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:

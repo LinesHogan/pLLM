@@ -19,7 +19,7 @@ from vllm import SamplingParams
 from pllm import make_llm
 from pllm.authoring import AuxiliaryInput, BackendWorkload
 from pllm.config import ExecutionOptions, ModelConfig
-from pllm.execution.codec import cuda_profile_totals
+from pllm.execution.codec import boundary_digest, cuda_profile_totals
 from pllm.execution.ptts.page_bundle import PageBundleUsage
 
 if TYPE_CHECKING:
@@ -132,7 +132,7 @@ class BenchmarkResult:
     trained_rows: int
     peak_allocated_bytes: int
     baseline_allocated_bytes: int
-    schedule_signature: str
+    plan_digest: str
     explicit_math: bool
     task_implementations: tuple[tuple[str, str], ...]
     planned_peak_memory_bytes: int
@@ -277,7 +277,7 @@ def _measure_arm(
             after.trained_rows - before.trained_rows,
             torch.cuda.max_memory_allocated(),
             baseline,
-            handle.attachment.physical.schedule_signature,
+            boundary_digest(plan),
             arm.explicit,
             tuple(
                 (str(plan.semantic_graph.tasks[task.task_id].symbol), str(task.implementation_id))
@@ -327,7 +327,7 @@ def _print_profile(
 ) -> None:
     """Check the profiled replay against the measured arm and print the profile summary."""
     measured = next(item for item in reports if item.implementation == report.implementation)
-    assert report.effective_work == measured.effective_work and report.schedule_signature == measured.schedule_signature
+    assert report.effective_work == measured.effective_work and report.plan_digest == measured.plan_digest
     path = directory / f"{report.implementation}.json"
     activity = cuda_profile_totals(path)
     assert activity.kernel_count > 0

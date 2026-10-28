@@ -52,7 +52,7 @@ def test_position_source_cannot_use_stateless_signing_exemption(target):
     else:
         effect["digest"] = ""
     with pytest.raises(ValueError):
-        _core.compile_backend_attachment(json.dumps(payload))
+        _core.check_backend_attachment(json.dumps(payload))
 
 
 def test_unsupported_transfer():

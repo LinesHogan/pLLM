@@ -196,7 +196,7 @@ def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch
     stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
     from pllm.contracts.request_identity import RequestKeyField
     from pllm.contracts.request_state import RequestStateKey
-    from pllm.execution.backend_attachment import compile_backend_attachment
+    from pllm.execution.backend_attachment import check_backend_attachment
     from pllm.execution.state_execution import PublishStateTask
 
     class Imported(ProjectionState):
@@ -280,7 +280,7 @@ def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch
     binding = inputs.request.overlay_bindings[0]
     broken = replace(binding, fields=(replace(binding.fields[0], offset=10000), binding.fields[1]))
     with pytest.raises(ValueError, match="view"):
-        compile_backend_attachment(
+        check_backend_attachment(
             replace(
                 inputs, request=replace(inputs.request, overlay_bindings=(broken, *inputs.request.overlay_bindings[1:]))
             )

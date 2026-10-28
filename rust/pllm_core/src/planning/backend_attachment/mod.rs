@@ -1,7 +1,6 @@
-//! Rust-signed backend attachment facts for canonical execution.
+//! Backend attachment input checks shared with Python planning.
 
 mod ffi;
-mod signing;
 mod types;
 mod validation;
 

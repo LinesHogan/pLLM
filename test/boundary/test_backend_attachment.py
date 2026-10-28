@@ -30,11 +30,7 @@ from pllm.contracts.parameter_overlay import (
 )
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
-from pllm.execution.backend_attachment import (
-    compile_backend_attachment,
-    lower_backend_attachment,
-    validate_backend_attachment_physical,
-)
+from pllm.execution.backend_attachment import check_backend_attachment
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
@@ -102,18 +98,16 @@ def test_bind_rejects_a_plan_built_for_other_math() -> None:
         InPlaceTTTWorkload(replace(workload.config, learning_rate=0.5)).bind_backend(facts, planned)
 
 
-def test_signed_attachment_crosses_the_wire_and_rejects_malformed_payloads() -> None:
+def test_attachment_inputs_cross_the_wire_and_reject_malformed_payloads() -> None:
     workload, probe, facts = overlay_facts()
     for signed in (workload.compile_backend(facts).attachment, sampler_deployment(probe, facts).attachment):
         reconstructed = decode_boundary(encode_boundary(signed), SignedBackendAttachment)
         assert reconstructed == signed
-        validate_backend_attachment_physical(reconstructed.inputs, reconstructed.decision, reconstructed.physical)
-        assert compile_backend_attachment(signed.inputs) == signed.decision
-        assert lower_backend_attachment(signed.inputs, signed.decision) == signed.physical
+        check_backend_attachment(reconstructed.inputs)
         payload = json.loads(encode_boundary(signed.inputs))
         payload["probe"]["unknown"] = 0
         with pytest.raises(ValueError):
-            _core.compile_backend_attachment(json.dumps(payload))
+            _core.check_backend_attachment(json.dumps(payload))
 
 
 @pytest.mark.parametrize("multiprocessing", (False, True))

@@ -10,7 +10,7 @@ from vllm import SamplingParams
 from pllm.contracts.backend_attachment import AttachmentKind
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.semantic_graph import StateResource
-from pllm.execution.backend_attachment import compile_backend_attachment
+from pllm.execution.backend_attachment import check_backend_attachment
 from pllm.execution.tensor_executor import TensorExecutor
 from pllm.workloads.state_producers import DecodeFactors, PromptFactors, PromptMixture
 from test.gpu.vllm_inplace_ttt_smoke import open_llm
@@ -164,13 +164,13 @@ def test_composed_readers_replay_model_graphs(workload, monkeypatch):
             if graphs:
                 inputs = handle.attachment.inputs
                 with pytest.raises(ValueError, match="Graph overlays"):
-                    compile_backend_attachment(
+                    check_backend_attachment(
                         replace(
                             inputs, request=replace(inputs.request, attachment_kind=AttachmentKind.ACTIVATION_PATCH)
                         )
                     )
                 with pytest.raises(ValueError, match="Graph overlays"):
-                    compile_backend_attachment(
+                    check_backend_attachment(
                         replace(
                             inputs,
                             probe=replace(
