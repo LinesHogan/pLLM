@@ -1,8 +1,4 @@
-"""Per-binding declaration state and the authoring values shared by model effects and row tasks.
-
-TensorBindingBase owns the attributes every tensor binding accumulates while a workload declares its
-effects; SGD and Buffer are the authoring values both binding halves accept.
-"""
+"""Optimizer and buffer authoring values used by workload markers and binding functions."""
 
 from __future__ import annotations
 
@@ -12,27 +8,12 @@ from math import isfinite
 
 import torch
 
-from pllm.contracts.backend_attachment import (
-    BackendPlacementProbe,
-)
-from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
-    FieldView,
     ParameterEffect,
     ParameterOverlayOperator,
-    ParameterTarget,
 )
-from pllm.contracts.semantic_graph import (
-    TaskResourceFact,
-    TaskSymbol,
-)
-from pllm.contracts.state_feed import FeedBinding
 from pllm.contracts.tensor_layout import TensorDType
-from pllm.execution.declaration import Builder, Dimensions, Field
-from pllm.execution.tensor_frame import (
-    TensorFrame,
-)
-from pllm.execution.tensor_task import TensorTask
+from pllm.execution.declaration import Dimensions, Field
 
 
 @dataclass(frozen=True)
@@ -82,34 +63,3 @@ def overlay_fields(buffers: Mapping[str, Buffer], effect: ParameterEffect) -> tu
         for index in range(len(effect.targets))
         for key, buffer in buffers.items()
     )
-
-
-class TensorBindingBase(Builder[TensorFrame]):
-    """State shared by the model-effect and row-task halves of one tensor binding."""
-
-    def __init__(
-        self,
-        name: str,
-        digest: str,
-        dimensions: Dimensions,
-        *,
-        host: bool = False,
-        resources: tuple[TaskResourceFact, ...] = (),
-    ) -> None:
-        super().__init__(name, digest, dimensions, resources)
-        self.dimensions = dimensions
-        self.host = host
-        self.feeds: tuple[FeedBinding, ...] = ()
-        self.tensor_tasks: dict[TaskSymbol, TensorTask] = {}
-        self.initializers: dict[str, Callable[[tuple[torch.Tensor, ...], torch.Generator], None]] = {}
-        # Module states: their flat initial values, built once at bind from the model dimensions and seed.
-        self.initial_values: dict[str, Callable[[Dimensions, int], torch.Tensor]] = {}
-        self.weighted_training = False
-        self.probe: BackendPlacementProbe | None = None
-        self.max_requests = 1
-        self.sample_limit: int | None = None
-        self.overlay_targets: tuple[ParameterTarget, ...] = ()
-        self.parameter_phases: tuple[HiddenPhase, ...] = ()
-        self.field_views: dict[tuple[str, str], FieldView] = {}
-        self.imports: dict[str, tuple[FieldView, ...]] = {}
-        self.position_states: tuple[tuple[str, float], ...] = ()

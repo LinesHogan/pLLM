@@ -13,8 +13,10 @@ from typing import TYPE_CHECKING
 import torch
 
 from pllm.contracts.auxiliary import StateTensorUpdate
+from pllm.contracts.backend_attachment import BackendPlacementProbe
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
+from pllm.contracts.parameter_overlay import FieldView, ParameterTarget
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
@@ -26,8 +28,10 @@ from pllm.contracts.semantic_graph import (
     TaskResourceFact,
     TaskSymbol,
 )
+from pllm.contracts.state_feed import FeedBinding
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
+from pllm.execution.declaration import Builder, Dimensions
 from pllm.execution.ptts.page_bundle import PagePublication
 from pllm.execution.scan import ScanContext
 from pllm.execution.step_capture import StepCapture
@@ -43,13 +47,11 @@ from pllm.execution.tensor_program import (
     TensorBatch,
     TensorOperation,
 )
+from pllm.execution.tensor_task import TensorTask
 
 if TYPE_CHECKING:
     from pllm.execution.compile_facts import BackendCompileFacts
     from pllm.execution.step_input import TensorStepInput
-
-
-from pllm.execution.row_task_binding import RowTaskBinding
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,8 +87,35 @@ class TensorResult:
 TensorOutput = TensorResult | torch.Tensor | None
 
 
-class TensorBinding(RowTaskBinding):
-    """Authoring projections only; tensor results remain invocation-local."""
+class TensorBinding(Builder[TensorFrame]):
+    """Own tensor declaration state and bind tasks; results remain invocation-local."""
+
+    def __init__(
+        self,
+        name: str,
+        digest: str,
+        dimensions: Dimensions,
+        *,
+        host: bool = False,
+        resources: tuple[TaskResourceFact, ...] = (),
+    ) -> None:
+        super().__init__(name, digest, dimensions, resources)
+        self.dimensions = dimensions
+        self.host = host
+        self.feeds: tuple[FeedBinding, ...] = ()
+        self.tensor_tasks: dict[TaskSymbol, TensorTask] = {}
+        self.initializers: dict[str, Callable[[tuple[torch.Tensor, ...], torch.Generator], None]] = {}
+        # Module states: their flat initial values, built once at bind from the model dimensions and seed.
+        self.initial_values: dict[str, Callable[[Dimensions, int], torch.Tensor]] = {}
+        self.weighted_training = False
+        self.probe: BackendPlacementProbe | None = None
+        self.max_requests = 1
+        self.sample_limit: int | None = None
+        self.overlay_targets: tuple[ParameterTarget, ...] = ()
+        self.parameter_phases: tuple[HiddenPhase, ...] = ()
+        self.field_views: dict[tuple[str, str], FieldView] = {}
+        self.imports: dict[str, tuple[FieldView, ...]] = {}
+        self.position_states: tuple[tuple[str, float], ...] = ()
 
     @property
     def has_exports(self) -> bool:

@@ -84,6 +84,17 @@ from pllm.execution.module_state import (
     skeleton,
 )
 from pllm.execution.position_state import PositionState as PositionState
+from pllm.execution.row_task_binding import (
+    declare_logits,
+    declare_parameters,
+    declare_tensor,
+    declare_weighted_train,
+    parameter_ports,
+    parameter_rows,
+    sampled_token_port,
+    state_metadata,
+    validate_gradients,
+)
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.step_input import TensorStepInput
 from pllm.execution.task_memory import derive_resources
@@ -186,7 +197,7 @@ class Parameter(_Source):
 
     def port(self, context: _Declaration) -> SemanticInputSource | TensorPort:
         parameter = context.parameters[self.state, self.field]
-        return context.binding.parameter_rows(parameter) if self.per_row else parameter
+        return parameter_rows(parameter) if self.per_row else parameter
 
     def overlay(self, state: str, buffers: Mapping[str, Buffer]) -> str:
         return self.field if self.state == state and self.field in buffers else super().overlay(state, buffers)
@@ -241,7 +252,7 @@ class StateIndex(_Source):
     differentiable: ClassVar[bool] = False
 
     def port(self, context: _Declaration) -> TensorPort:
-        return context.binding.state_metadata(context.states[self.state], version=False)
+        return state_metadata(context.states[self.state], version=False)
 
 
 @dataclass(frozen=True)
@@ -251,7 +262,7 @@ class StateVersion(_Source):
     differentiable: ClassVar[bool] = False
 
     def port(self, context: _Declaration) -> TensorPort:
-        return context.binding.state_metadata(context.states[self.state], version=True)
+        return state_metadata(context.states[self.state], version=True)
 
 
 @dataclass(frozen=True)
@@ -273,7 +284,7 @@ class SampledTokens(_Source):
     differentiable: ClassVar[bool] = False
 
     def port(self, context: _Declaration) -> TensorPort:
-        return context.binding.sampled_tokens()
+        return sampled_token_port()
 
 
 class Operand(_Source, Enum):
@@ -432,7 +443,8 @@ class InstanceState:
         ):
             context.allocate_buffers(name, self)
             return
-        context.states[name], ports = context.binding.parameters(
+        context.states[name], ports = declare_parameters(
+            context.binding,
             name,
             shapes,
             optimizer=self.optimizer,
@@ -719,7 +731,8 @@ class _Train(_Effect):
         identity = boundary_digest(fingerprint(operation.function), fingerprint(reset), sources, self)
         context.definitions.append((operation.name, identity))
         context.training = (
-            context.binding.weighted_train(
+            declare_weighted_train(
+                context.binding,
                 operation.name,
                 context.states[self.state],
                 identity=f"python:{identity}",
@@ -1068,7 +1081,8 @@ class _Operation:
         update = context.states[effect.state] if effect.training else None
         writes = {key: capture.declare(effect.state, update) for key, capture in (captures or {}).items()}
         math = self.selectors(arguments, inputs, math)
-        return context.binding.tensor(
+        return declare_tensor(
+            context.binding,
             self.name,
             inputs=inputs,
             when=self.phase.value if when is None else when,
@@ -1120,7 +1134,8 @@ class _Operation:
             if method not in selectors:
                 identity = fingerprint(selector)
                 self.context.definitions.append((method, identity))
-                selectors[method] = self.context.binding.tensor(
+                selectors[method] = declare_tensor(
+                    self.context.binding,
                     f"__{self.name}_{method}",
                     when=self.phase.value,
                     identity=f"python:{identity}:{self.name}:{method}",
@@ -1312,7 +1327,8 @@ class _Declaration:
         shapes = {field.name: field.shape for field in fields}
         if definition.optimizer is not None:
             dtype = fields[0].dtype
-            state, ports = self.binding.parameters(
+            state, ports = declare_parameters(
+                self.binding,
                 name,
                 shapes,
                 optimizer=definition.optimizer,
@@ -1326,7 +1342,7 @@ class _Declaration:
             state = self.binding.state(
                 name, fields, namespace=definition.namespace, scope=definition.scope, keys=definition.request_keys
             )
-            ports = self.binding.parameter_ports(state, shapes, initialize=_frozen(definition.initialize))
+            ports = parameter_ports(self.binding, state, shapes, initialize=_frozen(definition.initialize))
         self.states[name] = state
         self.parameters.update({(name, field): port for field, port in ports.items()})
 
@@ -1381,12 +1397,13 @@ class _Declaration:
 
     def attach_training(self) -> None:
         """Validate gradients and pair the single prediction and training operations."""
-        self.binding.validate_gradients(None if self.training is None else self.training[0])
+        validate_gradients(self.binding, None if self.training is None else self.training[0])
         if self.prediction is not None:
             if self.training is None:
                 raise ValueError("logits attachment requires a training operation")
             call, sampler = self.prediction
-            self.binding.logits(
+            declare_logits(
+                self.binding,
                 call,
                 *self.training,
                 stage=sampler.stage,

@@ -30,6 +30,10 @@ from pllm.execution.declaration import Dimensions, Field, When
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle import BorrowedPage, PageBundleArena, PageFieldTransfer, PageSlot
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
+from pllm.execution.row_task_binding import (
+    declare_parameters,
+    declare_tensor,
+)
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.state_execution import MathBinding, StateSettlementError
 from pllm.execution.tensor_binding import TensorBinding
@@ -41,10 +45,10 @@ from test.backend_facts import backend_facts
 @contextmanager
 def binding_case(*, alias=False, write_failure=False, runtime=False, missing=None):
     b = TensorBinding("video.binding", "a" * 64, Dimensions(2, 0))
-    features, ports = b.parameters(
-        "features", {name: (2,) for name in ("qp", "residual", "mv", "segmentation")}, optimizer=None
+    features, ports = declare_parameters(
+        b, "features", {name: (2,) for name in ("qp", "residual", "mv", "segmentation")}, optimizer=None
     )
-    encoded = b.tensor("encode", inputs=ports, when=When.BEFORE_MODEL)(
+    encoded = declare_tensor(b, "encode", inputs=ports, when=When.BEFORE_MODEL)(
         lambda values: (values["qp"] if alias else sum(values.values()),)
     )
     inject = b.state("inject", (Field("delta", (2,)),))
