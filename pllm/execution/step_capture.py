@@ -80,15 +80,19 @@ class StepCapture:
         buffers: tuple[torch.Tensor, ...] = (),
     ) -> None:
         """Capture when addresses change; warmup never writes live destinations."""
-        if stream is not None and self.stream is not None and stream != self.stream:
-            stream.wait_stream(self.stream)
-        self.stream = stream
+        self.order(stream)
         if self.graph is None or self.addresses != addresses:
             self._capture(body, table, destinations, buffers)
             refill()
         self.addresses = addresses
         assert self.graph is not None
         self.graph.replay()
+
+    def order(self, stream: torch.cuda.Stream | None) -> None:
+        """Order buffer refills as well as replay after the preceding use."""
+        if stream is not None and self.stream is not None and stream != self.stream:
+            stream.wait_stream(self.stream)
+        self.stream = stream
 
     def _capture(
         self,
@@ -97,6 +101,8 @@ class StepCapture:
         destinations: torch.Tensor,
         buffers: tuple[torch.Tensor, ...],
     ) -> None:
+        # Release the invalidated pool before allocating its replacement.
+        self.graph = None
         # Inactive destinations make warmup and capture read-only with respect to the arena.
         destinations.fill_(-1)
         self.graph, _, pool = capture_graph(table.device, body)

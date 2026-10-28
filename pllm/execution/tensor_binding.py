@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -32,6 +33,7 @@ from pllm.contracts.state_feed import FeedBinding
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.declaration import Builder, Dimensions
+from pllm.execution.overlay_batch import OverlayBatch
 from pllm.execution.ptts.page_bundle import PagePublication
 from pllm.execution.scan import ScanContext
 from pllm.execution.step_capture import StepCapture
@@ -46,6 +48,7 @@ from pllm.execution.tensor_program import (
     PageUpdate,
     TensorBatch,
     TensorOperation,
+    native_body,
 )
 from pllm.execution.tensor_task import TensorTask
 
@@ -170,6 +173,14 @@ class TensorBinding(Builder[TensorFrame]):
             )
             if symbol not in self.tensor_tasks:
                 operation = self.operations[symbol]
+                math = self.overlay_math
+                if math is not None and math.chunk is not None and symbol == math.task:
+                    overlay = OverlayBatch(math, limits.get(symbol) if capture else None)
+                    operation = replace(
+                        operation,
+                        body=partial(native_body, replace(math, executor=overlay)),
+                        capture_resident=overlay.resident,
+                    )
                 operations[symbol] = operation if scans is None else replace(operation, body=scans.bind(operation.body))
                 continue
             task = self.tensor_tasks[symbol]

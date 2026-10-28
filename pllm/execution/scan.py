@@ -245,9 +245,20 @@ def scan(
     ):
         raise ValueError("scan valid_rows needs an int64 scalar on the carry device")
     prepared = prepare_scan(step, carry, over, chunk, invariants, valid_rows)
+    return execute_scan(prepared, carry, over, invariants, valid_rows)
+
+
+def execute_scan(
+    prepared: PreparedScan,
+    carry: torch.Tensor,
+    over: tuple[torch.Tensor, ...],
+    invariants: tuple[torch.Tensor, ...],
+    valid_rows: torch.Tensor | None,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+    """Execute a selected plan, funding opaque workspace at the prepared input frontier."""
     if carry.is_meta:
         MemoryTrace.reserve(prepared.workspace)
-        state, outputs = PreparedScan(step, chunk)(carry, over, invariants, valid_rows)
+        state, outputs = PreparedScan(prepared.step, prepared.chunk)(carry, over, invariants, valid_rows)
         if prepared.analysis is not None:
             return state.clone(), tuple(output.clone() for output in outputs)
         return state, outputs

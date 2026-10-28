@@ -82,6 +82,11 @@ def gather_rows_meta(descriptor: torch.Tensor, rows: torch.Tensor, source: torch
     return source.new_empty((len(rows), *source.shape[1:]))
 
 
+def chunk_capacity(rows: int, chunk: int) -> int:
+    """Chunk-aligned room for arriving rows and at most chunk minus one pending rows."""
+    return ((rows + chunk - 2) // chunk + 1) * chunk
+
+
 def prepend_rows(
     tails: tuple[torch.Tensor, ...],
     rows: tuple[torch.Tensor, ...],
@@ -89,7 +94,7 @@ def prepend_rows(
     chunk: int,
 ) -> tuple[torch.Tensor, ...]:
     """Join device-counted tails into a chunk-aligned capacity without reading the count."""
-    capacity = ((len(rows[0]) + chunk - 2) // chunk + 1) * chunk
+    capacity = chunk_capacity(len(rows[0]), chunk)
     indices = torch.arange(capacity, device=length.device)
     joined: list[torch.Tensor] = []
     for tail, value in zip(tails, rows, strict=True):

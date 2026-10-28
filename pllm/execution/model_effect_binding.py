@@ -37,6 +37,7 @@ from pllm.contracts.semantic_graph import (
     SemanticInput,
     StateEffectKind,
     StateScope,
+    TaskSymbol,
     TokenProgramEffect,
 )
 from pllm.contracts.visibility import Exact, Visibility, VisibilitySource
@@ -137,6 +138,7 @@ def declare_parameter_overlay(
         function,
         arguments,
         source,
+        TaskSymbol(name),
         function
         if isinstance(function, ChunkUpdate) and effect.operator is ParameterOverlayOperator.HEAD_ADD
         else None,

@@ -17,21 +17,21 @@ from pllm.contracts.parameter_overlay import (
 )
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import PackedSamplerRowBatch
-from pllm.contracts.semantic_graph import TaskId
+from pllm.contracts.semantic_graph import TaskId, TaskSymbol
 from pllm.contracts.visibility import VisibilitySource
 from pllm.execution.chunk_tail import join_tail, save_tail
 from pllm.execution.cuda_stream import upload
-from pllm.execution.scan import prepare_scan
+from pllm.execution.scan import execute_scan, prepare_scan
 from pllm.execution.scan_execution import PreparedScan, Step
 from pllm.execution.tensor_frame import OverlayEntry, OverlayTargetResult, TensorFrame, Tensors, TensorUpdate
 from pllm.execution.tensor_program import PoolSGD, TaskOutput, TensorBatch
-from pllm.execution.torch_private import MemoryTrace
 from pllm.kernels.head_overlay import head_correction
-from pllm.kernels.page_copy import copy_pages
+from pllm.kernels.page_copy import chunk_capacity, copy_pages
 
 DataT = TypeVar("DataT")
 ResultT = TypeVar("ResultT")
 if TYPE_CHECKING:
+    from pllm.execution.overlay_batch import OverlayBatch
     from pllm.execution.state_execution import StateExecution, StateTaskContext
     from pllm.execution.step_input import TensorStepInput
 
@@ -46,22 +46,20 @@ class ChunkUpdate:
 
     def __call__(self, **values: torch.Tensor) -> TensorUpdate:
         plan = self.prepare(values)
-        if values[self.arguments[0]].is_meta:
-            MemoryTrace.reserve(plan.workspace)
-            plan = PreparedScan(self.step, self.chunk)
         count = values["_pending_length"].new_full((), len(values[self.arguments[1]]))
         return self.counted(plan, count, values)
 
     def prepare(self, values: Tensors) -> PreparedScan:
         """Inspect storage and select policy outside the mapped mathematical body."""
         carry, *columns = self.arguments
-        joined, valid = join_tail(
-            tuple(values[f"_pending_rows_{name}"] for name in columns),
-            tuple(values[name] for name in columns),
-            values["_pending_length"],
-            self.chunk,
+        over = tuple(
+            values[name].new_empty(
+                (chunk_capacity(len(values[name]), self.chunk), *values[name].shape[1:]),
+                dtype=torch.promote_types(values[name].dtype, values[f"_pending_rows_{name}"].dtype),
+            )
+            for name in columns
         )
-        return prepare_scan(self.step, values[carry], joined, self.chunk, valid_rows=valid)
+        return prepare_scan(self.step, values[carry], over, self.chunk, valid_rows=values["_pending_length"])
 
     def counted(self, plan: PreparedScan, count: torch.Tensor, values: Tensors) -> TensorUpdate:
         """Advance complete chunks only; padded requests and rows contribute no updates."""
@@ -69,12 +67,11 @@ class ChunkUpdate:
         rows = tuple(values[name] for name in columns)
         tails = tuple(values[f"_pending_rows_{name}"] for name in columns)
         length = values["_pending_length"]
-        length.masked_fill_(count == 0, 0)
         joined, _ = join_tail(tails, rows, length, self.chunk)
         valid = length + count
         positions = torch.arange(len(rows[0]), device=length.device) + length
         trained = valid // self.chunk * self.chunk
-        updated, outputs = plan(values[carry], joined, (), trained)
+        updated, outputs = execute_scan(plan, values[carry], joined, (), trained)
         values[carry].copy_(updated)
         remaining = save_tail(tails, joined, length, valid, trained)
         return TensorUpdate(
@@ -228,7 +225,9 @@ class OverlayTransition:
     function: Callable[..., TensorUpdate]
     arguments: Mapping[str, str]
     visibility: VisibilitySource
+    task: TaskSymbol
     chunk: ChunkUpdate | None = None
+    executor: OverlayBatch | None = None
 
     def __call__(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
         operands = {
@@ -244,6 +243,7 @@ class OverlayTransition:
         )
         indices = {identity: index for identity, index in selected}
         updates: dict[tuple[RequestIdentity, ParameterTarget], TensorUpdate] = {}
+        counters: list[torch.Tensor] = []
         with torch.no_grad():
             for target_index, target in enumerate(self.targets):
                 for train in (False, True):
@@ -253,7 +253,10 @@ class OverlayTransition:
                         if name == target and (operand.phase in self.phases) == train
                     )
                     if group:
-                        results = self.group(group, target_index, tuple(indices[o.identity] for o in group), batch)
+                        results, counts = self.group(
+                            group, target_index, tuple(indices[o.identity] for o in group), batch
+                        )
+                        counters.append(counts)
                         updates.update(((o.identity, target), result) for o, result in zip(group, results, strict=True))
         start = len(data.entries)
         changed: dict[int, torch.Tensor] = {}
@@ -267,7 +270,9 @@ class OverlayTransition:
                 data.entries.append(
                     OverlayEntry(identity, batch.selection.refs[index], batch.after_refs[index], results)
                 )
-                changed[index] = torch.stack(tuple(result.update.changed for result in results)).any()
+                changed[index] = results[0].update.changed
+                for result in results[1:]:
+                    changed[index] = changed[index] | result.update.changed
         return TaskOutput(
             residuals={
                 (entry.identity, target.target): target.update.output
@@ -276,13 +281,7 @@ class OverlayTransition:
             },
             changed=tuple(changed),
             update_mask=torch.stack(tuple(changed.values())),
-            counters=torch.stack(
-                tuple(
-                    torch.stack((target.update.update_count, target.update.trained_rows))
-                    for entry in data.entries[start:]
-                    for target in entry.targets
-                )
-            ).sum(0),
+            counters=torch.stack(counters).sum(0),
         )
 
     def group(
@@ -291,12 +290,12 @@ class OverlayTransition:
         target: int,
         indices: tuple[int, ...],
         batch: TensorBatch,
-    ) -> tuple[TensorUpdate, ...]:
+    ) -> tuple[tuple[TensorUpdate, ...], torch.Tensor]:
         """Gather issued slots once per target/phase; settlement still belongs to the task."""
         if self.chunk is not None:
             from pllm.execution.overlay_batch import OverlayBatch
 
-            return OverlayBatch(self).run(operands, target, indices, batch)
+            return (self.executor or OverlayBatch(self)).run(operands, target, indices, batch)
         return self.serial(operands, target, indices, batch)
 
     def serial(
@@ -305,7 +304,7 @@ class OverlayTransition:
         target: int,
         indices: tuple[int, ...],
         batch: TensorBatch,
-    ) -> tuple[TensorUpdate, ...]:
+    ) -> tuple[tuple[TensorUpdate, ...], torch.Tensor]:
         """Keep non-chunk and transformed scan execution on its selected implementation."""
         width = len(self.buffers)
         fields = tuple(batch.field_slots(target * width + i) for i in range(width))
@@ -320,7 +319,7 @@ class OverlayTransition:
             sources = torch.arange(len(operands), device=pools[0].device)
             for value, pool, destinations in zip(values, pools, slots, strict=True):
                 copy_pages(value, pool, sources, destinations)
-        return results
+        return results, torch.stack(tuple(torch.stack((r.update_count, r.trained_rows)) for r in results)).sum(0)
 
     def result(self, operand: CapturedParameterOperand, values: Tensors) -> TensorUpdate:
         """Validate the author's result at its tensor boundary without observing CUDA values."""
@@ -336,6 +335,11 @@ class OverlayTransition:
             if operand.phase in self.phases
             else TensorUpdate.unchanged(self.apply(operand.hidden, values))
         )
+        return self.validate(result, operand)
+
+    @staticmethod
+    def validate(result: TensorUpdate, operand: CapturedParameterOperand) -> TensorUpdate:
+        """Check authored results at the same boundary for eager and batched execution."""
         if (
             result.output.shape != operand.desired.shape
             or result.output.dtype not in (operand.hidden.dtype, torch.float32)
