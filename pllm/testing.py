@@ -86,12 +86,12 @@ def run_step(
     stream: torch.cuda.Stream | None = None,
 ) -> ResultT:
     """Execute every anchor of one step, completing the sampler with `feedback` when the workload reads it."""
-    invocation = execution.start_step(value, stream)
+    context = execution.start_step(value, stream)
     for anchor in execution.arena.plan.timeline.anchors:
-        execution.execute_anchor(invocation, AnchorId(anchor.ordinal))
+        execution.execute_anchor(context, AnchorId(anchor.ordinal))
         if anchor.ordinal == execution.sampler_anchor_id:
-            execution.complete_sampler(invocation, stream, feedback=feedback)
-    return execution.finish_step(invocation)
+            execution.complete_sampler(context, stream, feedback=feedback)
+    return execution.finish_step(context)
 
 
 def run_guided_step(
@@ -102,15 +102,15 @@ def run_guided_step(
     stream: torch.cuda.Stream | None = None,
 ) -> tuple[PackedSamplerGuidanceBatch, ResultT]:
     """Like `run_step`, also returning the sampler guidance the workload produced before sampling."""
-    invocation = execution.start_step(value, stream)
+    context = execution.start_step(value, stream)
     guidance: PackedSamplerGuidanceBatch | None = None
     for anchor in execution.arena.plan.timeline.anchors:
-        execution.execute_anchor(invocation, AnchorId(anchor.ordinal))
+        execution.execute_anchor(context, AnchorId(anchor.ordinal))
         if anchor.ordinal == execution.sampler_anchor_id:
-            guidance = execution.sampler_guidance(invocation, stream)
-            execution.complete_sampler(invocation, stream, feedback=feedback)
+            guidance = execution.sampler_guidance(context, stream)
+            execution.complete_sampler(context, stream, feedback=feedback)
     assert guidance is not None
-    return guidance, execution.finish_step(invocation)
+    return guidance, execution.finish_step(context)
 
 
 __all__ = [

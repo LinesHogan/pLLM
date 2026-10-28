@@ -81,7 +81,7 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
             for anchor in range(last_anchor + 1):
                 execution.execute_anchor(cancelled, AnchorId(anchor))
             execution.cancel_step(cancelled)
-            assert cancelled.context.value is None and cancelled.context.loss is None
+            assert cancelled.value is None and cancelled.loss is None
             for ref, snapshot in zip(latest, before, strict=True):
                 assert execution.arena.latest(ref.lineage_id) == ref
                 for actual, expected in zip(execution.snapshot(ref, stream), snapshot, strict=True):
@@ -118,7 +118,7 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
 
         def save(tensor):
             if tensor.shape == (count, rank, hidden):
-                pointers.add(handle.context.value.leaf.untyped_storage().data_ptr())
+                pointers.add(handle.value.leaf.untyped_storage().data_ptr())
                 saved_parameters.append((tensor.untyped_storage().data_ptr(), tensor.stride(0)))
             return tensor
 
@@ -132,7 +132,7 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
             )
         result = execution.finish_step(handle)
         assert isinstance(result, TensorResult)
-        assert handle.context.value is None and handle.context.loss is None
+        assert handle.value is None and handle.loss is None
         assert result.publication is not None and result.loss is not None
         assert result.guidance is guidance
         for old, new, loss in zip(

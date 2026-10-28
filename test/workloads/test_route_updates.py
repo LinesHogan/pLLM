@@ -187,7 +187,7 @@ def test_updates_match_independent_private_version_oracle(boundaries, visits, em
         patch.object(PageBundleArena, "publish", publishing),
     ):
         invocation = execution.start_step(VALUE)
-        invocation.context.replay = decoder
+        invocation.replay = decoder
         for anchor in range(len(execution.arena.plan.timeline.anchors)):
             execution.execute_anchor(invocation, AnchorId(anchor))
             if anchor == execution.sampler_anchor_id:
@@ -205,7 +205,7 @@ def test_updates_match_independent_private_version_oracle(boundaries, visits, em
         assert sum(int(target.update.trained_rows) for entry in result.entries for target in entry.targets) == sum(
             tails
         )
-    assert not invocation.context.page_writes
+    assert not invocation.page_writes
     execution.retire(IDENTITIES)
 
 
@@ -252,10 +252,10 @@ def test_cancellation_obeys_the_original_publication_boundary(published):
     execution = Updating().compile_backend(ROUTE_FACTS).execution
     refs = execution.admit(IDENTITIES)
     invocation = execution.start_step(VALUE)
-    invocation.context.replay = UpdatingDecoder()
+    invocation.replay = UpdatingDecoder()
     for anchor in range(3 if published else 2):
         execution.execute_anchor(invocation, AnchorId(anchor))
-    receipt = invocation.context.publication
+    receipt = invocation.publication
     execution.cancel_step(invocation)
     assert (receipt is not None) == published
     for ref in refs if receipt is None else receipt.after_refs:
@@ -270,7 +270,7 @@ def test_route_failure_aborts_private_fields():
     refs = execution.admit(IDENTITIES)
     decoder = UpdatingDecoder()
     invocation = execution.start_step(VALUE)
-    invocation.context.replay = decoder
+    invocation.replay = decoder
     layer = decoder.layer
 
     def fail(row, ordinal, *args):
@@ -297,9 +297,9 @@ def test_untargeted_route_boundary_allocates_and_publishes_nothing():
     execution = Untargeted().compile_backend(ROUTE_FACTS).execution
     execution.admit(IDENTITIES)
     invocation = execution.start_step(VALUE)
-    invocation.context.replay = UpdatingDecoder()
+    invocation.replay = UpdatingDecoder()
     for anchor in range(3):
         execution.execute_anchor(invocation, AnchorId(anchor))
-    assert not invocation.context.page_writes and invocation.context.publication is None
+    assert not invocation.page_writes and invocation.publication is None
     execution.cancel_step(invocation)
     execution.retire(IDENTITIES)

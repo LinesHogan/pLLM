@@ -133,7 +133,7 @@ def _decode_low_rank_keeps_parameters_and_recomputes_delta(
     invocation = execution.start_step(replace(value, auxiliary=update))
     execution.execute_anchor(invocation, AnchorId(0))
     try:
-        adapter.prepare(rows, invocation.context, execution.directory)
+        adapter.prepare(rows, invocation, execution.directory)
         actual, _ = layer.forward(torch.arange(len(hidden)), hidden, None)
         torch.testing.assert_close(actual, hidden + expected)
         # The same exact parameters must operate on each forward's current hidden.
@@ -149,7 +149,7 @@ def _decode_low_rank_keeps_parameters_and_recomputes_delta(
         missing = execution.start_step(value)
         execution.execute_anchor(missing, AnchorId(0))
         with pytest.raises(RuntimeError):  # Decode refresh needs a publication in this step.
-            adapter.prepare(rows, missing.context, execution.directory)
+            adapter.prepare(rows, missing, execution.directory)
         execution.cancel_step(missing)
     finally:
         adapter.close()
@@ -208,7 +208,7 @@ def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:
     value = TensorStepInput(rows, PackedSamplerRowBatch(rows, ()), auxiliary=StateTensorUpdate((delta,), keys))
     invocation = execution.start_step(value)
     execution.execute_anchor(invocation, AnchorId(0))
-    context = invocation.context
+    context = invocation
 
     class Layer(torch.nn.Module):
         def forward(self, positions, hidden_states, residual=None):

@@ -62,7 +62,7 @@ def main() -> None:
 
         def inspect_guidance(owner, invocation, stream=None):
             nonlocal reader_ref
-            (reader_ref,) = invocation.context.pin.refs
+            (reader_ref,) = invocation.pin.refs
             return native_guidance(owner, invocation, stream)
 
         def inspect_add(logits, guidance):

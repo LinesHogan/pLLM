@@ -141,7 +141,7 @@ def serial_oracle():
 
 def run_step(execution, value, decoder):
     invocation = execution.start_step(VALUE)
-    invocation.context.replay = decoder
+    invocation.replay = decoder
     for anchor in range(8):
         execution.execute_anchor(invocation, AnchorId(anchor))
         if anchor == 3:

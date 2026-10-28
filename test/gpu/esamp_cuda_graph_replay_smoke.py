@@ -123,15 +123,15 @@ def mean_capture(publish_lag: int = 0) -> None:
         )
         with guard:
             invocation = execution.start_step(value, stream, history=() if overlap is None else overlap.history)
-            assert invocation.context.pin.refs[0].version_id == max(0, step - publish_lag)
+            assert invocation.pin.refs[0].version_id == max(0, step - publish_lag)
             for anchor in plan.timeline.anchors:
                 execution.execute_anchor(invocation, AnchorId(anchor.ordinal))
                 if anchor.ordinal == 1:
                     execution.complete_sampler(invocation, stream, feedback=SamplerFeedback(sampler, target, tokens))
                     if overlap is not None:
-                        overlap.copy_inputs(invocation.context)
+                        overlap.copy_inputs(invocation)
                         execution.resume_latest(invocation, overlap.stream)
-                        overlap.retain(invocation.context.pin.refs)
+                        overlap.retain(invocation.pin.refs)
                         # Model taps and sampler outputs may be overwritten while training reads
                         # its private snapshot, including during captured replay with fewer rows.
                         hidden.fill_(999)

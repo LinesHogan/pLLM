@@ -154,11 +154,11 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
             with pytest.raises(StateSettlementError) as failure:
                 execution.step(batch, stream)
         # Settlement can be retried: it returns the publication that already happened.
-        retry = execution.finish_step(failure.value.invocation)
+        retry = execution.finish_step(failure.value.context)
         assert retry.publication is failure.value.receipt
         assert execution.diagnostics().update_count == 3
         with pytest.raises(RuntimeError):
-            execution.finish_step(failure.value.invocation)
+            execution.finish_step(failure.value.context)
         missing = replace(
             batch, completions=CompletionBatch(tuple(replace(c, text="missing") for c in completions.entries))
         )

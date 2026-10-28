@@ -198,13 +198,13 @@ def _check_cancelled_projection(handle):
     )
     invocation = execution.begin(rows.rows, stream)
     overlay.reserve()
-    overlay.prepare(rows, invocation.context, execution.directory)
+    overlay.prepare(rows, invocation, execution.directory)
     hidden = reader.captured.new_ones((1, reader.captured.shape[1]))
     reader.forward(hidden)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = reader.forward(hidden)[0]
-    slot = execution.arena.field_slots((invocation.context.pin,), (ref,), reader.binding.fields[0].field)[1][0]
+    slot = execution.arena.field_slots((invocation.pin,), (ref,), reader.binding.fields[0].field)[1][0]
     address = reader.pools[0][slot].data_ptr()
     stream.synchronize()
     with patch.object(torch.cuda.Event, "synchronize", side_effect=AssertionError("host cancellation wait")):

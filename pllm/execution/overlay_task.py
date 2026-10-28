@@ -20,8 +20,7 @@ from pllm.execution.tensor_program import TaskOutput, TensorBatch
 DataT = TypeVar("DataT")
 ResultT = TypeVar("ResultT")
 if TYPE_CHECKING:
-    from pllm.execution.execution import TaskGraphInvocation
-    from pllm.execution.state_execution import ProjectionResiduals, StateExecution, StateTaskContext
+    from pllm.execution.state_execution import StateExecution, StateTaskContext
     from pllm.execution.step_input import TensorStepInput
 
 
@@ -39,12 +38,12 @@ class ProjectionTask(Generic[DataT, ResultT]):
     def __init__(
         self,
         execution: StateExecution[TensorStepInput, DataT, ResultT],
-        invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals],
+        context: StateTaskContext[DataT],
         rows: PackedSamplerRowBatch,
         task: TaskId,
         targets: tuple[ParameterTarget, ...],
     ) -> None:
-        self.execution, self.invocation, self.rows, self.task = execution, invocation, rows, task
+        self.execution, self.context, self.rows, self.task = execution, context, rows, task
         self.pending = set(targets)
 
     def run(
@@ -57,7 +56,7 @@ class ProjectionTask(Generic[DataT, ResultT]):
         assert targets and targets <= self.pending
         self.pending.difference_update(targets)
         return self.execution.execute_part(
-            self.invocation,
+            self.context,
             TensorStepInput(self.rows.row_batch, self.rows, operands=operands),
             self.task,
             complete=not self.pending,

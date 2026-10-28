@@ -49,12 +49,11 @@ from pllm.contracts.semantic_graph import (
 from pllm.execution.backend_attachment import attachment_buffer_bytes
 from pllm.execution.codec import encode_boundary
 from pllm.execution.cuda_stream import CudaStreamReadiness
-from pllm.execution.execution import TaskGraphInvocation
 from pllm.execution.host_runtime import CompletionCapture
 from pllm.execution.overlay_task import ProjectionTask
 from pllm.execution.post_sample import PostSampleOverlap
 from pllm.execution.shared_tensor import SharedTensor
-from pllm.execution.state_execution import HeldInput, ProjectionResiduals, StateDiagnostics, StateTaskContext
+from pllm.execution.state_execution import HeldInput, StateDiagnostics, StateTaskContext
 from pllm.execution.state_feed import (
     Feed,
     FeedReceiver,
@@ -69,7 +68,7 @@ from pllm.execution.tensor_frame import TensorFrame
 @dataclass(slots=True)
 class _PackedStep(Generic[DataT]):
     rows: PackedSamplerRowBatch
-    invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals] | None = None
+    context: StateTaskContext[DataT] | None = None
     forward_done: bool = False
     handed_off: bool = False
 
@@ -303,13 +302,13 @@ class VllmSession(Generic[DataT, ResultT]):
         self._step = step
         if self._replay is not None and self._activation is None:
             execution = self._deployment.execution
-            invocation = execution.start_step(
+            context = execution.start_step(
                 TensorStepInput(rows.row_batch, rows), torch.cuda.current_stream(execution.device)
             )
-            step.invocation = invocation
-            self._advance(invocation, "request.prepare")
-            self._replay.prepare(rows.row_batch, invocation)
-            invocation.context.replay = self._replay
+            step.context = context
+            self._advance(context, "request.prepare")
+            self._replay.prepare(rows.row_batch, context)
+            context.replay = self._replay
             return
         adapter = self._overlay
         if adapter is None and self._activation is None:
@@ -324,11 +323,11 @@ class VllmSession(Generic[DataT, ResultT]):
         if not self._in_forward_overlay:
             held_input = self._receive_readonly(rows, stream)
             value = TensorStepInput(rows.row_batch, rows, auxiliary=self._auxiliary)
-            invocation = execution.start_step(value, stream, held_input=held_input)
+            context = execution.start_step(value, stream, held_input=held_input)
             if bool(execution.directory.instance_states) or not self._pending_identities:
                 self._auxiliary = None
-            step.invocation = invocation
-            self._advance(invocation, "request.prepare")
+            step.context = context
+            self._advance(context, "request.prepare")
             # Offline publication precedes admission; existing request pins remain unchanged.
             pending = tuple(
                 identity
@@ -338,12 +337,12 @@ class VllmSession(Generic[DataT, ResultT]):
             if pending:
                 execution.admit(pending, stream)
         else:
-            invocation = execution.begin(rows.row_batch.request_rows, stream)
-            step.invocation = invocation
+            context = execution.begin(rows.row_batch.request_rows, stream)
+            step.context = context
         if adapter is not None:
             projection = None
             if self._in_forward_overlay:
-                self._advance(invocation, "request.prepare")
+                self._advance(context, "request.prepare")
                 binding = next(
                     item
                     for item in self.attachment.inputs.request.task_bindings
@@ -351,17 +350,17 @@ class VllmSession(Generic[DataT, ResultT]):
                 )
                 projection = ProjectionTask(
                     execution,
-                    invocation,
+                    context,
                     rows,
                     binding.task_id,
                     tuple(item.target for item in self.attachment.inputs.request.overlay_bindings),
                 )
-            adapter.prepare(rows.row_batch, invocation.context, execution.directory, projection)
+            adapter.prepare(rows.row_batch, context, execution.directory, projection)
         if self._activation is not None:
-            self._activation.prepare(rows.row_batch, invocation.context, execution.directory)
+            self._activation.prepare(rows.row_batch, context, execution.directory)
         if self._replay is not None:
-            self._replay.prepare(rows.row_batch, invocation)
-            invocation.context.replay = self._replay
+            self._replay.prepare(rows.row_batch, context)
+            context.replay = self._replay
 
     @torch.inference_mode(False)
     @torch.enable_grad()
@@ -377,25 +376,21 @@ class VllmSession(Generic[DataT, ResultT]):
         if self._taps is not None and self._hidden_resources:
             value = self._taps.publish(value, self._hidden_resources)
         phases = {resource.phase for resource in self._deployment.attachment.inputs.probe.hidden_resources}
-        if (
-            step.invocation is None
-            and not operands
-            and not any(row.phase in phases for row in step.rows.row_batch.rows)
-        ):
+        if step.context is None and not operands and not any(row.phase in phases for row in step.rows.row_batch.rows):
             self._step = None
             return
-        if step.invocation is None:
+        if step.context is None:
             if self._post_sample is not None and not self._post_sample.lag:
                 stream = self._post_sample.stream
-            step.invocation = execution.start_step(
+            step.context = execution.start_step(
                 value, stream, history=() if self._post_sample is None else self._post_sample.history
             )
             self._auxiliary = None
-        elif step.invocation.context.value is None:
-            execution.submit_input(step.invocation, value, CudaStreamReadiness(stream))
+        elif step.context.value is None:
+            execution.submit_input(step.context, value, CudaStreamReadiness(stream))
         elif self._hidden_resources or operands:
-            execution.submit_input(step.invocation, value, CudaStreamReadiness(stream))
-        self._advance(step.invocation, "sampler.pre_draw")
+            execution.submit_input(step.context, value, CudaStreamReadiness(stream))
+        self._advance(step.context, "sampler.pre_draw")
         self._finish_effects()
 
     def _finish_effects(self) -> None:
@@ -442,7 +437,7 @@ class VllmSession(Generic[DataT, ResultT]):
 
     def _sampler_guidance(self) -> PackedSamplerGuidanceBatch:
         execution = self._deployment.execution
-        return execution.sampler_guidance(self._invocation(), torch.cuda.current_stream(execution.device))
+        return execution.sampler_guidance(self._context(), torch.cuda.current_stream(execution.device))
 
     @torch.inference_mode(False)
     @torch.enable_grad()
@@ -453,9 +448,9 @@ class VllmSession(Generic[DataT, ResultT]):
         if self._sampler is not None:
             feedback = self._sampler.finish_guidance()
         execution = self._deployment.execution
-        invocation = self._invocation()
-        execution.execute_anchor(invocation, self._deployment.attachment.inputs.request.sampler_anchor_id)
-        execution.complete_sampler(invocation, torch.cuda.current_stream(execution.device), feedback=feedback)
+        context = self._context()
+        execution.execute_anchor(context, self._deployment.attachment.inputs.request.sampler_anchor_id)
+        execution.complete_sampler(context, torch.cuda.current_stream(execution.device), feedback=feedback)
 
     @torch.inference_mode(False)
     @torch.enable_grad()
@@ -463,9 +458,9 @@ class VllmSession(Generic[DataT, ResultT]):
         if self._step is None:
             return
         execution = self._deployment.execution
-        invocation = self._invocation()
-        self._advance(invocation, "next.prepare")
-        execution.finish_step(invocation)
+        context = self._context()
+        self._advance(context, "next.prepare")
+        execution.finish_step(context)
         self._step = None
         execution.arena.collect_completed()
 
@@ -537,27 +532,25 @@ class VllmSession(Generic[DataT, ResultT]):
                     self._deployment.execution.discard_borrows()
                     self._feed.close()
 
-    def _invocation(self) -> TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals]:
-        assert self._step is not None and self._step.invocation is not None
-        return self._step.invocation
+    def _context(self) -> StateTaskContext[DataT]:
+        assert self._step is not None and self._step.context is not None
+        return self._step.context
 
-    def _handoff(self, invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals]) -> None:
+    def _handoff(self, context: StateTaskContext[DataT]) -> None:
         """Protect reusable inputs and move ownership before the first signed side task."""
         overlap = self._post_sample
         assert overlap is not None
         assert self._step is not None
         if not self._step.handed_off:
-            assert isinstance(invocation.context.value, TensorFrame)
-            overlap.copy_inputs(cast(StateTaskContext[TensorFrame], invocation.context))
-            if overlap.lag or invocation.context.pin.stream != overlap.stream:
+            assert isinstance(context.value, TensorFrame)
+            overlap.copy_inputs(cast(StateTaskContext[TensorFrame], context))
+            if overlap.lag or context.pin.stream != overlap.stream:
                 with torch.cuda.stream(overlap.stream):
-                    self._deployment.execution.resume_latest(invocation, overlap.stream)
-                    overlap.retain(invocation.context.pin.refs)
+                    self._deployment.execution.resume_latest(context, overlap.stream)
+                    overlap.retain(context.pin.refs)
             self._step.handed_off = True
 
-    def _advance(
-        self, invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals], symbol: str
-    ) -> None:
+    def _advance(self, context: StateTaskContext[DataT], symbol: str) -> None:
         execution = self._deployment.execution
         target = next(anchor.ordinal for anchor in execution.arena.plan.timeline.anchors if anchor.symbol == symbol)
         points = dict.fromkeys(
@@ -565,16 +558,16 @@ class VllmSession(Generic[DataT, ResultT]):
                 *[
                     task.anchor_id
                     for task in execution.arena.plan.schedule_physical.tasks
-                    if invocation.last_anchor_id < task.anchor_id <= target
+                    if context.last_anchor_id < task.anchor_id <= target
                 ],
                 AnchorId(target),
             )
         )
         for point in points:
-            if point > invocation.last_anchor_id:
+            if point > context.last_anchor_id:
                 if any(
                     task.anchor_id == point and task.read_origin == "latest"
                     for task in execution.arena.plan.schedule_physical.tasks
                 ):
-                    self._handoff(invocation)
-                execution.execute_anchor(invocation, AnchorId(point))
+                    self._handoff(context)
+                execution.execute_anchor(context, AnchorId(point))

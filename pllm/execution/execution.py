@@ -6,9 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Generic, Protocol, TypeVar
 
-import torch
-
-from pllm.contracts.semantic_graph import AnchorId, ImplementationId, PhysicalPlan, TaskId
+from pllm.contracts.semantic_graph import ImplementationId, PhysicalPlan
 from pllm.execution.trace import ExecutionTrace
 
 ExecutionContextT = TypeVar("ExecutionContextT")
@@ -62,62 +60,7 @@ class TaskGraphExecution(Generic[ExecutionContextT, ExecutionResultT]):
         return context
 
 
-class TaskGraphInvocation(Generic[ExecutionContextT, ExecutionResultT]):
-    """One cursor for externally staged execution."""
-
-    def __init__(
-        self,
-        execution: TaskGraphExecution[ExecutionContextT, ExecutionResultT],
-        context: ExecutionContextT,
-        invocation_id: int,
-    ) -> None:
-        self.execution, self.context, self.invocation_id = execution, context, invocation_id
-        self._next_task_index = 0
-        self.last_anchor_id = -1
-        self.finished = False
-
-    def execute_anchor(self, anchor_id: AnchorId, stream: torch.cuda.Stream | None = None) -> None:
-        plan, trace = self.execution.plan, self.execution.trace
-        dense_anchor = int(anchor_id)
-        if self.finished or dense_anchor < 0 or dense_anchor < self.last_anchor_id:
-            raise RuntimeError("task invocation anchor progression is invalid")
-        if self._next_task_index < len(plan.tasks) and int(plan.tasks[self._next_task_index].anchor_id) < dense_anchor:
-            raise RuntimeError("task invocation skipped a signed execution anchor")
-        while (
-            self._next_task_index < len(plan.tasks) and int(plan.tasks[self._next_task_index].anchor_id) == dense_anchor
-        ):
-            task = plan.tasks[self._next_task_index]
-            with trace.task(self.invocation_id, task.task_id, stream):
-                self.execution.implementations[int(task.task_id)].execute(self.context)
-                if task.release_values and self.execution.release_values is not None:
-                    self.execution.release_values(self.context, task.release_values)
-            self._next_task_index += 1
-        self.last_anchor_id = dense_anchor
-
-    def finish(self) -> ExecutionContextT:
-        if self.finished or self._next_task_index != len(self.execution.plan.tasks):
-            raise RuntimeError("task invocation has unfinished signed tasks")
-        self.finished = True
-        return self.context
-
-    def execute_part(self, task_id: TaskId, *, complete: bool, stream: torch.cuda.Stream | None) -> ExecutionResultT:
-        """Run a projection segment of the current task, retaining its cursor until completion."""
-        plan, trace = self.execution.plan, self.execution.trace
-        assert not self.finished and self._next_task_index < len(plan.tasks)
-        task = plan.tasks[self._next_task_index]
-        assert task.task_id == task_id and task.anchor_id >= self.last_anchor_id
-        with trace.task(self.invocation_id, task_id, stream):
-            result = self.execution.implementations[int(task_id)].execute(self.context)
-        self.last_anchor_id = int(task.anchor_id)
-        if complete:
-            if task.release_values and self.execution.release_values is not None:
-                self.execution.release_values(self.context, task.release_values)
-            self._next_task_index += 1
-        return result
-
-
 __all__ = [
     "TaskGraphExecution",
     "TaskGraphImplementation",
-    "TaskGraphInvocation",
 ]

@@ -129,7 +129,7 @@ def observe_model(workload):
         def check(module, inputs, output):
             execution = session._deployment.execution
             step = session._step
-            (ref,) = step.invocation.context.publication.after_refs
+            (ref,) = step.context.publication.after_refs
             (delta,) = execution.snapshot(ref, torch.cuda.current_stream())
             expected, prior_kv = before.pop()
             original = expected.clone()
@@ -258,7 +258,7 @@ def observe_replay(*, versions):
         if 1 not in wave.fields:
             return
         step = holder["session"]._step
-        context = step.invocation.context
+        context = step.context
         if context.held_input is None:
             (ref,) = context.publication.after_refs
             pin = context.borrow_published((ref,))

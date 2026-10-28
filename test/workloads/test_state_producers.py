@@ -106,8 +106,8 @@ def test_prompt_producers_publish_only_completed_requests(workload, device, leng
         stream=stream,
     )
     invocation = execution.start_step(replace(value, hidden=None, hidden_readiness=None), stream=stream)
-    selected = invocation.context.selection.for_resource(StateResource("factors"))
-    network_ref = invocation.context.selection.for_resource(StateResource("network")).refs[0]
+    selected = invocation.selection.for_resource(StateResource("factors"))
+    network_ref = invocation.selection.for_resource(StateResource("network")).refs[0]
     weights = execution.snapshot(network_ref, stream=stream)[0].double()
     refs = tuple(selected.refs)
     execution.execute_anchor(invocation, AnchorId(0))

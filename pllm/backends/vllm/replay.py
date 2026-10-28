@@ -27,11 +27,10 @@ from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.semantic_graph import AnchorId, SemanticTask, TokenProgramEffect
 from pllm.execution.activation import low_rank_affine_delta
 from pllm.execution.cuda_stream import PinnedStaging, upload
-from pllm.execution.execution import TaskGraphInvocation
 from pllm.execution.overlay_task import RouteOperand, RouteOverlay
 from pllm.execution.replay import TokenwiseReplayPrimitive, TokenwiseReplayTask
 from pllm.execution.route_executor import execute_route, ordinary_pass
-from pllm.execution.state_execution import ProjectionResiduals, StateExecution, StateTaskContext
+from pllm.execution.state_execution import StateExecution, StateTaskContext
 from pllm.execution.step_capture import capture_graph
 from pllm.execution.step_input import TensorStepInput
 from pllm.execution.tensor_frame import OverlayTargetResult
@@ -218,7 +217,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         validate_attention_resources(self.attentions, hidden_size=model.config.hidden_size)
         self.original = self.model.forward
         self._rows: tuple[PackedPhaseRow, ...] = ()
-        self.invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals] | None = None
+        self.context: StateTaskContext[DataT] | None = None
         self.hidden: torch.Tensor | None = None
         self.positions: torch.Tensor | None = None
         self.output: torch.Tensor | None = None
@@ -234,11 +233,9 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
     def rows(self) -> tuple[PackedPhaseRow, ...]:
         return self._rows
 
-    def prepare(
-        self, rows: PackedPhaseRowBatch, invocation: TaskGraphInvocation[StateTaskContext[DataT], ProjectionResiduals]
-    ) -> None:
+    def prepare(self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT]) -> None:
         self.clear()
-        self._rows, self.invocation = rows.rows, invocation
+        self._rows, self.context = rows.rows, context
 
     def forward(
         self,
@@ -247,7 +244,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        if self.invocation is None:
+        if self.context is None:
             return self.original(input_ids, positions, intermediate_tensors, inputs_embeds)
         if intermediate_tensors is not None or positions.ndim != 1 or positions.numel() != len(self.rows):
             raise ValueError("layer routes need one position per packed row without pipeline parallelism")
@@ -256,7 +253,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
             inputs_embeds = self.model.embed_input_ids(input_ids)
         self.hidden, self.positions = inputs_embeds, positions
         attention_paged_access(get_forward_context(), self.attentions, self.rows)
-        self.execution.execute_anchor(self.invocation, self.anchor)
+        self.execution.execute_anchor(self.context, self.anchor)
         assert self.output is not None
         return self.output
 
@@ -540,7 +537,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         self.output = torch.cat(outputs)
 
     def clear(self) -> None:
-        self._rows, self.invocation = (), None
+        self._rows, self.context = (), None
         self.hidden, self.positions, self.output, self.observations = None, None, None, None
         self.activation_rows = ()
 
