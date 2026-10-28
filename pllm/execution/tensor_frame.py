@@ -133,7 +133,7 @@ class RowPlan:
     changes only columns; page access stays in the invocation's state order.
     """
 
-    packed: tuple[int, ...]
+    packed: Slots
     sampler: tuple[int, ...]
     samples: tuple[int, ...]
     states: tuple[int, ...]
@@ -150,7 +150,7 @@ class RowPlan:
             selection.indices(data.rows) if selection.groups and selection.keys != (None,) else (0,) * len(data.rows)
         )
         return cls(
-            tuple(row.packed_row_index for row in data.rows),
+            np.fromiter((row.packed_row_index for row in data.rows), dtype=np.int64, count=len(data.rows)),
             tuple(links.get(row.packed_row_index, -1) for row in data.rows),
             tuple(row.identity.sample_idx for row in data.rows),
             states,
@@ -162,7 +162,7 @@ class RowPlan:
         """Keep operation-row order; capture positions refer to the compact inputs."""
         return replace(
             self,
-            packed=tuple(self.packed[row] for row in rows),
+            packed=self.packed[list(rows)],
             sampler=tuple(self.sampler[row] for row in rows),
             samples=tuple(self.samples[row] for row in rows),
             states=tuple(self.states[row] for row in rows),
@@ -446,7 +446,7 @@ def hidden_port(source: HiddenInputSource) -> TensorPort:
             (capture,) = (
                 item for item in data.step.hidden_batch(batch.stream).captures if item.resource.locator_key == key
             )
-            slots = upload(tuple(capture.slots[row.packed_row_index] for row in data.rows), capture.storage.device)
+            slots = upload(capture.slots[row_plan(data, batch).packed], capture.storage.device)
             result = capture.storage.index_select(0, slots)
         return result.to(torch.float32) if result.dtype in (torch.float16, torch.bfloat16) else result
 

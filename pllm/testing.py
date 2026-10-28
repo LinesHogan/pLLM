@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import TypeVar
 
+import numpy as np
 import torch
 
 from pllm.contracts.auxiliary import AuxiliaryInput
@@ -64,7 +65,7 @@ def step_input(
     )
     order = range(count) if sampler_order is None else sampler_order
     captures = tuple(
-        HiddenRows(binding, tensor, dict(enumerate(range(count))))
+        HiddenRows(binding, tensor, np.arange(count, dtype=np.int64))
         for binding, tensor in sorted((hidden or {}).items(), key=lambda item: item[0].locator_key)
     )
     return TensorStepInput(

@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+import numpy as np
 import pytest
 import torch
 
@@ -105,7 +106,7 @@ def mean_capture(publish_lag: int = 0) -> None:
         value = TensorStepInput(
             rows,
             sampler,
-            HiddenRowBatch(rows, (HiddenRows(resource, hidden, dict(enumerate(range(count)))),)),
+            HiddenRowBatch(rows, (HiddenRows(resource, hidden, np.arange(count, dtype=np.int64)),)),
             hidden_readiness=CudaStreamReadiness(stream),
         )
         target = target_buffer[:count].fill_(step * 0.2)

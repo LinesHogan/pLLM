@@ -460,11 +460,8 @@ class TensorExecutor:
             offset += layout.size
         captures = () if data.step.hidden is None else data.step.hidden.captures
         for capture in captures:
-            padding = next(iter(capture.slots.values()), 0)
-            host[offset : offset + self.rows] = padding
-            host[offset : offset + len(data.rows)] = [
-                capture.slots.get(row.packed_row_index, padding) for row in data.rows
-            ]
+            host[offset : offset + self.rows] = capture.slots[0] if capture.slots.size else 0
+            host[offset : offset + len(data.rows)] = capture.slots[plan.packed]
             offset += self.rows
         if device.type == "cuda":
             self.staging.copy_to(self.table)

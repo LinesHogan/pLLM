@@ -95,7 +95,9 @@ def reject_publication(arena, write):
 def test_esamp_predicts_before_training_and_isolates_request_versions(monkeypatch: pytest.MonkeyPatch) -> None:
     # Compact positions 0/1 came from operation rows 1/3 of one lineage.
     positions = (0, 1, 2, 3)
-    plan = RowPlan(positions, positions, positions, (0, 1, 0, 1), (0,) * 4, np.zeros((3, 1), dtype=np.int64))
+    plan = RowPlan(
+        np.asarray(positions), positions, positions, (0, 1, 0, 1), (0,) * 4, np.zeros((3, 1), dtype=np.int64)
+    )
     losses = torch.tensor([2.0, 4.0], requires_grad=True)
     means = state_means(losses, plan.select((1, 3)))
     torch.testing.assert_close(means, torch.tensor([0.0, 3.0, 0.0]))

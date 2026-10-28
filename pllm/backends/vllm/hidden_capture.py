@@ -11,6 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import ParamSpec
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -28,7 +29,6 @@ from pllm.execution.cuda_stream import CudaStreamReadiness, PinnedStaging
 from pllm.execution.ptts.page_bundle import SlotPools, Slots
 from pllm.execution.state_execution import DataT, StateTaskContext
 from pllm.execution.step_input import TensorStepInput
-from pllm.kernels.page_copy import copy_pages
 
 CAPTURE_ENV = "PLLM_HIDDEN_CAPTURE"
 
@@ -96,13 +96,13 @@ P = ParamSpec("P")
 
 
 def _tapped(
-    slots: Tensor, indices: Tensor, forward: Callable[P, Tensor | tuple[Tensor, ...]]
+    pool: SlotPools, indices: Tensor, forward: Callable[P, Tensor | tuple[Tensor, ...]]
 ) -> Callable[P, Tensor | tuple[Tensor, ...]]:
     def tapped(*args: P.args, **kwargs: P.kwargs) -> Tensor | tuple[Tensor, ...]:
         output = forward(*args, **kwargs)
         # vLLM decoder layers return (layer output, residual); the tap keeps the layer output.
         hidden = output if isinstance(output, Tensor) else output[0]
-        copy_pages(hidden, slots, indices[0], indices[1])
+        pool.copy_from(0, hidden, indices[0], indices[1])
         return output
 
     return tapped
@@ -119,34 +119,48 @@ class HiddenTaps:
         device: torch.device,
     ) -> None:
         self.layouts, self.pools = layouts, pools
-        self.indices: dict[str, Tensor] = {}
+        self.indices = torch.full(
+            (sum(2 * layout.capture_rows for layout in layouts),), -1, dtype=torch.long, device=device
+        )
         self._slots: dict[str, Slots] = {}
-        self._rows: dict[str, dict[int, int]] = {}
+        self._rows: dict[str, Slots] = {}
         self._staging = PinnedStaging()
+        offset = 0
         for layout in layouts:
             path = layout.module_path
             module = model.get_submodule(path)
-            indices = torch.full((2, layout.capture_rows), -1, dtype=torch.long, device=device)
+            size = 2 * layout.capture_rows
+            indices = self.indices[offset : offset + size].view(2, layout.capture_rows)
+            offset += size
             slots = pools[path].tensors[0]
             module.register_buffer("pllm_hidden_slots", slots, persistent=False)
             module.register_buffer("pllm_hidden_indices", indices, persistent=False)
-            module.forward = _tapped(slots, indices, module.forward)
-            self.indices[path] = indices
+            module.forward = _tapped(pools[path], indices, module.forward)
 
     def prepare(self, rows: PackedPhaseRowBatch) -> None:
         """Reserve the declared row union and upload its packed-row to slot mapping before forward."""
+        host = self._staging.take(self.indices.numel()).numpy()
+        host.fill(-1)
+        stream = torch.cuda.current_stream(self.indices.device)
+        phase_rows = tuple(
+            (phase, np.fromiter((row.packed_row_index for row in rows.producer_rows(phase)), dtype=np.int64))
+            for phase in sorted({phase for layout in self.layouts for phase in layout.phases})
+        )
+        offset = 0
         for layout in self.layouts:
             path = layout.module_path
-            selected = tuple(row for phase in layout.phases for row in rows.producer_rows(phase))
-            indices = self.indices[path]
-            slots, _ = self.pools[path].allocate(0, len(selected), torch.cuda.current_stream(indices.device))
+            selected = np.concatenate(tuple(indices for phase, indices in phase_rows if phase in layout.phases))
+            slots, _ = self.pools[path].allocate(0, len(selected), stream)
             self._slots[path] = slots[:, None]
-            self._rows[path] = dict(zip((row.packed_row_index for row in selected), slots.tolist(), strict=True))
-            host = self._staging.take(indices.numel()).view(indices.shape).numpy()
-            host.fill(-1)
-            host[0, : len(selected)] = [row.packed_row_index for row in selected]
-            host[1, : len(selected)] = slots
-            self._staging.copy_to(indices)
+            mapping = np.full(rows.total_rows, slots[0] if slots.size else 0, dtype=np.int64)
+            mapping[selected] = slots
+            self._rows[path] = mapping
+            size = 2 * layout.capture_rows
+            indices = host[offset : offset + size].reshape(2, layout.capture_rows)
+            indices[0, : len(selected)] = selected
+            indices[1, : len(selected)] = slots
+            offset += size
+        self._staging.copy_to(self.indices)
 
     @torch.inference_mode()
     def clear(self) -> None:
@@ -158,8 +172,7 @@ class HiddenTaps:
             self.pools[path].release(slots, completion)
         self._slots.clear()
         self._rows.clear()
-        for indices in self.indices.values():
-            indices[1].fill_(-1)
+        self.indices.fill_(-1)
 
     def publish(self, value: TensorStepInput, resources: tuple[PackedHiddenResourceBinding, ...]) -> TensorStepInput:
         """Attach the current step's hidden rows for `resources` to `value`."""

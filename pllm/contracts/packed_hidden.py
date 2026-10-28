@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 
+import numpy as np
+import numpy.typing as npt
 import torch
 
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
@@ -31,7 +32,8 @@ class HiddenRows:
 
     resource: PackedHiddenResourceBinding
     storage: torch.Tensor
-    slots: Mapping[int, int]
+    # Dense packed-row -> slot lookup. Uncaptured rows address a valid padding slot.
+    slots: npt.NDArray[np.int64]
 
 
 @dataclass(frozen=True, slots=True)

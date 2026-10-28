@@ -8,13 +8,17 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+import numpy as np
+import numpy.typing as npt
 import torch
 
 from pllm.execution.admission import WindowBackpressure
 
 
 def upload(
-    values: Sequence[int] | Sequence[Sequence[int]], device: torch.device, dtype: torch.dtype = torch.long
+    values: Sequence[int] | Sequence[Sequence[int]] | npt.NDArray[np.int64],
+    device: torch.device,
+    dtype: torch.dtype = torch.long,
 ) -> torch.Tensor:
     """Copy small host index lists to `device` without blocking the host.
 

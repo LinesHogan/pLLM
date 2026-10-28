@@ -60,7 +60,7 @@ def example(
             packed,
             tuple(
                 HiddenRows(
-                    resource, meta(count, facts.probe.hidden_size, dtype=hidden_dtype), dict(enumerate(range(count)))
+                    resource, meta(count, facts.probe.hidden_size, dtype=hidden_dtype), np.arange(count, dtype=np.int64)
                 )
                 for resource in dict.fromkeys(item.binding for item in facts.probe.hidden_resources)
             ),

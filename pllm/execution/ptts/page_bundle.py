@@ -26,6 +26,7 @@ from pllm.execution.cuda_stream import upload
 from pllm.execution.ptts.page_bundle_planning import page_stride_bytes
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.shared_tensor import CudaIpcStorage, RemoteCompletion
+from pllm.kernels.page_copy import copy_pages
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,21 +287,38 @@ class SlotPools:
         self.holders = np.zeros((len(layout.fields), capacity), dtype=np.int32)
         self.generations = np.zeros((len(layout.fields), capacity), dtype=np.int64)
         self._field_offsets = np.arange(len(layout.fields), dtype=np.int64) * capacity
-        self._readiness: dict[tuple[int, int], set[torch.cuda.Event]] = {}
+        # Each completion fences a batch of field-offset slot IDs, independent of current holders.
+        self._readiness: dict[torch.cuda.Event, Slots] = {}
 
     def free_count(self, field: int) -> int:
         """Slots available for allocation, possibly still awaiting GPU completion."""
         return int(np.count_nonzero(self.holders[field] == 0))
 
     def allocate(self, field: int, count: int, stream: torch.cuda.Stream | None) -> tuple[Slots, Slots]:
-        """`count` free pages of one field, smallest slots first, with their generations."""
-        slots = np.flatnonzero(self.holders[field] == 0)[:count]
-        if len(slots) < count:
+        """Lease free pages, preferring ready slots before ordering reuse behind pending readers."""
+        free = np.flatnonzero(self.holders[field] == 0)
+        if len(free) < count:
             raise WindowBackpressure("Slot capacity is exhausted; release current holders before retrying")
-        for slot in slots:
-            for event in self._readiness.pop((field, int(slot)), ()):
-                assert stream is not None
-                stream.wait_event(event)
+        self._collect_completed()
+        slots = free[:count]
+        if self._readiness:
+            fenced = np.isin(free + self._field_offsets[field], np.concatenate(tuple(self._readiness.values())))
+            ready = free[~fenced][:count]
+            reuse = free[fenced][: count - len(ready)]
+            slots = np.concatenate((ready, reuse))
+            if reuse.size:
+                allocated = reuse + self._field_offsets[field]
+                for event, pending in tuple(self._readiness.items()):
+                    overlap = np.isin(pending, allocated, assume_unique=True, kind="sort")
+                    if overlap.any():
+                        assert stream is not None
+                        stream.wait_event(event)
+                        # Other slots may be reused on another stream and still need this fence.
+                        remaining = pending[~overlap]
+                        if remaining.size:
+                            self._readiness[event] = remaining
+                        else:
+                            del self._readiness[event]
         self.holders[field, slots] = 1
         return slots, self.generations[field, slots]
 
@@ -313,6 +331,10 @@ class SlotPools:
         assert self.generations[field, page.slot_id] == page.generation and self.holders[field, page.slot_id] >= 1
         return self.tensors[field][page.slot_id]
 
+    def copy_from(self, field: int, source: torch.Tensor, rows: torch.Tensor, slots: torch.Tensor) -> None:
+        """Copy selected source rows into leased slots; negative destinations disable padded entries."""
+        copy_pages(source, self.tensors[field], rows, slots)
+
     def views(self, slots: Slots, generations: Slots) -> tuple[torch.Tensor, ...]:
         """One tensor view per field of a version, after checking none of its pages was reclaimed."""
         fields = np.arange(len(slots))
@@ -324,19 +346,24 @@ class SlotPools:
             self.holders.shape
         )
 
+    def _collect_completed(self) -> None:
+        for event in tuple(self._readiness):
+            if event.query():
+                del self._readiness[event]
+
     def hold(self, slots: Slots) -> None:
         """Add a batch of holders, including repeated shared pages."""
-        self.holders += self._counts(slots).astype(np.int32)
+        self.holders += self._counts(slots)
 
     def release(self, slots: Slots, completion: torch.cuda.Event | None = None) -> None:
         """Drop a batch of holders; only the last holder advances the allocation generation."""
+        counts = self._counts(slots)
         if completion is not None:
-            for field in range(slots.shape[1]):
-                for slot in np.unique(slots[:, field]):
-                    key = field, int(slot)
-                    self._readiness[key] = {event for event in self._readiness.get(key, ()) if not event.query()}
-                    self._readiness[key].add(completion)
-        counts = self._counts(slots).astype(np.int32)
+            self._collect_completed()
+            pending = np.flatnonzero(counts)
+            if completion in self._readiness:
+                pending = np.union1d(self._readiness[completion], pending)
+            self._readiness[completion] = pending
         self.holders -= counts
         self.generations += (counts != 0) & (self.holders == 0)
 
