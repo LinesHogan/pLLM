@@ -82,10 +82,10 @@ class Mrv1Runner(Runner[Sampler, Mrv1Sampler], GPUModelRunner):
         if session is None:
             return super()._sample(logits, spec_decode_metadata)
         with torch.inference_mode(False), torch.enable_grad():
-            active = session.begin_sampler(self.qwen2_model())
+            session.begin_sampler()
         sampled = super()._sample(logits, spec_decode_metadata)
         with torch.inference_mode(False), torch.enable_grad():
-            session.complete_sampler(active)
+            session.complete_sampler()
         return sampled
 
     def sample_tokens(

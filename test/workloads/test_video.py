@@ -271,7 +271,7 @@ def _decode_steps_keep_exact_publications_and_ack_order():
                 torch.testing.assert_close(actual, hidden * 2 + torch.tensor(values)[:, None], rtol=0, atol=0)
                 assert carry is residual
             session.complete_forward()
-            session.complete_sampler(False)
+            session.complete_sampler()
             assert not any(peer.poll() for peer in peers), "sampler completion alone is not settlement"
             session.commit_token()
             assert torch.equal(rng, torch.random.get_rng_state())
@@ -326,7 +326,7 @@ def _hold_steps_reuse_the_settled_injection():
                 actual, _ = layer(torch.zeros(1), torch.ones(1, 2))
                 torch.testing.assert_close(actual, torch.full((1, 2), float(2 + delta)))
             session.complete_forward()
-            session.complete_sampler(False)
+            session.complete_sampler()
             session.commit_token()
             assert torch.equal(rng, torch.random.get_rng_state())
             assert execution.diagnostics().update_count == (step // 2 + 1)

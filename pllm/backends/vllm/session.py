@@ -436,20 +436,19 @@ class VllmSession(Generic[DataT, ResultT]):
         self._sampler.begin_guidance(SignedSamplerGuidance(guidance, logits[len(hidden) :], self._capture_feedback))
         return logits[: len(hidden)]
 
-    def begin_sampler(self, model: Qwen2ForCausalLM) -> bool:
+    def begin_sampler(self) -> None:
         if self._step is None or self._sampler is None:
-            return False
+            return
         # Post-filter guidance began with the LM head; additive logits need no projection.
         if self._deployment.attachment.inputs.request.sampler_stage is SamplerStage.PACKED_PRE_FILTER_ADD:
             guidance = self._sampler_guidance()
             self._sampler.begin_guidance(SignedSamplerGuidance(guidance, guidance.values, self._capture_feedback))
-        return True
 
     def _sampler_guidance(self) -> PackedSamplerGuidanceBatch:
         execution = self._deployment.execution
         return execution.sampler_guidance(self._invocation(), torch.cuda.current_stream(execution.device))
 
-    def complete_sampler(self, active: bool) -> None:
+    def complete_sampler(self) -> None:
         if self._step is None:
             return
         feedback = None

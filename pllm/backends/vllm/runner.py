@@ -89,8 +89,8 @@ class _RunnerSession(Protocol):
     def before_execute(self, scheduler_output: SchedulerOutput) -> None: ...
     def prepare_input(self, rows: PackedSamplerRowBatch) -> None: ...
     def complete_forward(self) -> None: ...
-    def begin_sampler(self, model: Qwen2ForCausalLM) -> bool: ...
-    def complete_sampler(self, active: bool) -> None: ...
+    def begin_sampler(self) -> None: ...
+    def complete_sampler(self) -> None: ...
     def commit_token(self) -> None: ...
     def abort_active(self) -> None: ...
     def retire_all(self) -> None: ...
@@ -111,6 +111,7 @@ class Runner(Generic[SamplerT, AdapterT]):
     """The original attachment slot and cleanup, shared by concrete runner adapters."""
 
     sampler: SamplerT | AdapterT
+    _workload_upstream_sampler: SamplerT | AdapterT
     model: torch.nn.Module
     cache_config: CacheConfig
     model_config: VllmModelConfig
@@ -148,7 +149,6 @@ class Runner(Generic[SamplerT, AdapterT]):
         self._generated_kv: Literal["reuse", "isolate"] = "reuse" if policy == "reuse" else "isolate"
         self.workload_topology = topology
         self._workload_session: _RunnerSession | None = None
-        self._workload_upstream_sampler: SamplerT | AdapterT | None = None
         self.completion_capture: CompletionCapture | None = None
 
     @property
@@ -216,9 +216,8 @@ class Runner(Generic[SamplerT, AdapterT]):
         """Finish backend model preparation after the session has installed its effects."""
 
     def detach_workload(self) -> None:
-        session = self._workload_session
+        session = self.require_session()
         upstream = self._workload_upstream_sampler
-        assert session is not None and upstream is not None
         session.require_idle()
         session.close()
         if self.completion_capture is not None:
@@ -227,7 +226,7 @@ class Runner(Generic[SamplerT, AdapterT]):
             self.sampler = upstream
             self.model.__dict__.pop("compute_logits", None)
         self._workload_session = None
-        self._workload_upstream_sampler = None
+        del self._workload_upstream_sampler
         self.completion_capture = None
 
     def stage_workload_input(
@@ -390,11 +389,10 @@ class WorkloadModelRunner(Runner[Sampler, Vllm027Sampler], OverlayGraphRunner):
         session = self._workload_session
         if session is None:
             return super().sample(hidden_states, input_batch, grammar_output)
-        model = self.qwen2_model()
         try:
-            active = session.begin_sampler(model)
+            session.begin_sampler()
             sampled = super().sample(hidden_states, input_batch, grammar_output)
-            session.complete_sampler(active)
+            session.complete_sampler()
             if self.completion_capture is not None:
                 self.completion_capture.write(
                     tuple(session.identity(request_id) for request_id in input_batch.req_ids),
