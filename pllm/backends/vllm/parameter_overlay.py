@@ -22,8 +22,9 @@ from pllm.contracts.parameter_overlay import (
     ParameterTarget,
     ParameterTargetShape,
 )
+from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.state_ref import StateRef
-from pllm.execution.cuda_stream import upload
+from pllm.execution.cuda_stream import PinnedStaging
 from pllm.execution.module_graph import capture_module_calls, module_has_execution_hooks
 from pllm.execution.overlay_task import ProjectionTransition, RouteOverlay
 from pllm.execution.ptts.request_state import RequestStateDirectory
@@ -255,7 +256,7 @@ class ExactParameterOverlay:
                 modules[id(module)] = _ExactProjection(module, mlp)
             modules[id(module)].bindings.append((binding, offset, size))
         self._modules = tuple(modules.values())
-        self._token_index = torch.zeros(1, dtype=torch.int64, device=self._modules[0].module.weight.device)
+        self._staging = PinnedStaging()
         for handle in self._modules:
             handle.module.forward = handle.forward
             if handle.mlp is not None:
@@ -277,29 +278,30 @@ class ExactParameterOverlay:
         transition: ProjectionTransition | None = None,
     ) -> None:
         assert transition is not None
-        identities = tuple(dict.fromkeys(row.identity for row in rows.rows))
+        grouped: dict[RequestIdentity, list[PackedPhaseRow]] = {}
+        for row in rows.rows:
+            grouped.setdefault(row.identity, []).append(row)
+        table = self._modules[0].module.weight.new_empty((len(rows.rows) + len(grouped),), dtype=torch.long)
+        host = self._staging.take(table.numel()).numpy()
+        host[: len(rows.rows)] = [row.packed_row_index for source in grouped.values() for row in source]
+        host[len(rows.rows) :] = [
+            source[-1].token_offset == source[-1].prompt_length - 1 for source in grouped.values()
+        ]
+        self._staging.copy_to(table)
+        indices = torch.split(table[: len(rows.rows)], [len(source) for source in grouped.values()])
+        prompt_ends = table[len(rows.rows) :].bool().unbind()
+        requests = tuple(
+            (source[0], context.selection.ref_for(identity), index, prompt_end)
+            for (identity, source), index, prompt_end in zip(grouped.items(), indices, prompt_ends, strict=True)
+        )
         for handle in self._modules:
-            prepared: list[_PreparedRows] = []
-            for identity in identities:
-                source = tuple(row for row in rows.rows if row.identity == identity)
-                ref = context.selection.ref_for(identity)
-                indices = upload(tuple(row.packed_row_index for row in source), handle.module.weight.device)
-                prepared.extend(
-                    _PreparedRows(
-                        source[0],
-                        ref,
-                        indices,
-                        binding,
-                        offset,
-                        size,
-                        handle.module.weight.new_full(
-                            (), source[-1].token_offset == source[-1].prompt_length - 1, dtype=torch.bool
-                        ),
-                    )
-                    for binding, offset, size in handle.bindings
-                )
             handle.transition = transition
-            handle.prepared, handle.total_rows = tuple(prepared), rows.total_rows
+            handle.prepared = tuple(
+                _PreparedRows(source, ref, index, binding, offset, size, prompt_end)
+                for source, ref, index, prompt_end in requests
+                for binding, offset, size in handle.bindings
+            )
+            handle.total_rows = rows.total_rows
 
     def prepare_wave(
         self, rows: tuple[PackedPhaseRow, ...], routes: tuple[RouteOverlay, ...], indices: tuple[torch.Tensor, ...]
