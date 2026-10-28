@@ -45,8 +45,6 @@ from pllm.contracts.semantic_graph import (
     SemanticInputSource,
     StateEffectKind,
     StateScope,
-    TaskImplementationSpec,
-    TaskResourceFact,
     TaskResultInputSource,
     TaskSymbol,
 )
@@ -84,7 +82,7 @@ from pllm.execution.step_input import TensorStepInput
 from pllm.execution.task_memory import derive_resources
 from pllm.execution.tensor_binding import TensorBinding, TensorOutput as TensorOutput
 from pllm.execution.tensor_frame import TensorFrame, TensorPort, Tensors, TensorUpdate as TensorUpdate
-from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots, TaskOutput, TensorComputation
+from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots, TaskOutput
 from pllm.execution.token_program import Over, Tokens
 from pllm.execution.trace import TraceEvent
 from pllm.kernels.adamw import AdamWConfig
@@ -1383,11 +1381,6 @@ class Workload(
         The default retains snapshot history only. Own any retained tensors and I/O resources.
         """
 
-    @property
-    def producers(self) -> tuple[TensorComputation, ...]:
-        """Concurrent tensor producers whose storage can overlap every worker anchor."""
-        return ()
-
     def _build(self, b: TensorBinding) -> None:
         """Declare owner values and operations, then compose and sign their graph."""
         context = _Declaration.read(self, b)
@@ -1428,12 +1421,11 @@ class Workload(
             tasks=tuple(
                 replace(
                     task,
-                    implementations=self.implementations(
-                        str(task.symbol),
-                        b.resources,
-                        explicit_math=facts is not None and "compute/explicit_math@1" in facts.timeline.capabilities,
-                    )
-                    or task.implementations,
+                    implementations=(
+                        (native(f"python.cuda_graph:{self.name}:{task.symbol}@1", "compute/cuda_graph@1"),)
+                        if any(fact.task == str(task.symbol) and fact.resident_bytes for fact in b.resources)
+                        else task.implementations
+                    ),
                 )
                 if task.symbol in b.tensor_tasks
                 else task
@@ -1546,30 +1538,12 @@ class Workload(
             raise ValueError("this workload has no explicit tensor implementation")
         with FakeTensorMode():
             binding = self.declaration(facts)
-        timeline = derive_resources(binding, facts, options)
-        concurrent = sum(producer.memory().workspace for producer in self.producers)
-        return (
-            replace(
-                timeline,
-                reserved_bytes=tuple(
-                    value + concurrent for value in (timeline.reserved_bytes or (0,) * len(timeline.anchors))
-                ),
-            )
-            if concurrent
-            else timeline
-        )
-
-    def implementations(
-        self, operation: str, resources: tuple[TaskResourceFact, ...], *, explicit_math: bool = False
-    ) -> tuple[TaskImplementationSpec, ...]:
-        if any(fact.task == operation and fact.resident_bytes for fact in resources):
-            return (native(f"python.cuda_graph:{self.name}:{operation}@1", "compute/cuda_graph@1"),)
-        return ()
+        return derive_resources(binding, facts, options)
 
     def operations(
         self, facts: BackendCompileFacts, plan: PlanBundle, b: TensorBinding
     ) -> MathBinding[TensorStepInput, TensorFrame, TensorOutput]:
-        if plan.timeline.task_resources and type(self).operations is Workload.operations:
+        if plan.timeline.task_resources:
             b.configure_steps(facts)
             if any(
                 task.lane == "side"

@@ -7,7 +7,7 @@ publication) for one attached workload. Runners drive its hooks; the worker and 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Generic, cast
+from typing import Generic, cast
 
 import torch
 from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
@@ -64,9 +64,6 @@ from pllm.execution.state_feed import (
 )
 from pllm.execution.step_input import TensorStepInput
 from pllm.execution.tensor_frame import TensorFrame
-
-if TYPE_CHECKING:
-    pass
 
 
 @dataclass(slots=True)

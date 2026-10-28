@@ -9,7 +9,6 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from math import isfinite
-from typing import TYPE_CHECKING
 
 import torch
 
@@ -39,6 +38,7 @@ from pllm.contracts.semantic_graph import (
     TokenProgramEffect,
 )
 from pllm.contracts.visibility import Exact, Visibility, VisibilitySource
+from pllm.execution.binding_base import Buffer, TensorBindingBase, buffer_field
 from pllm.execution.codec import boundary_digest
 from pllm.execution.declaration import Call, State, When, native
 from pllm.execution.overlay_task import OverlayTransition
@@ -55,12 +55,6 @@ from pllm.execution.tensor_program import TaskOutput
 from pllm.execution.tensor_task import FieldWriter, TensorTask
 from pllm.execution.token_program import ApplyUpdates, Cell, Layers, Over, Segment, TokenProgram, Tokens, TokenTensor
 from pllm.kernels.head_overlay import head_correction
-
-if TYPE_CHECKING:
-    pass
-
-
-from pllm.execution.binding_base import Buffer, TensorBindingBase, buffer_field
 
 
 def check_overlay_fields(

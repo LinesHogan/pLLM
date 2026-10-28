@@ -9,7 +9,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from math import isfinite
-from typing import TYPE_CHECKING
 
 import torch
 
@@ -31,9 +30,6 @@ from pllm.execution.tensor_frame import (
     TensorFrame,
 )
 from pllm.execution.tensor_task import TensorTask
-
-if TYPE_CHECKING:
-    pass
 
 
 @dataclass(frozen=True)

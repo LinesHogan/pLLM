@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import replace
 from functools import partial
 from math import prod
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 import torch
 
@@ -37,6 +37,7 @@ from pllm.contracts.semantic_graph import (
     TaskSymbol,
 )
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
+from pllm.execution.binding_base import SGD, TensorBindingBase
 from pllm.execution.declaration import Call, Dimensions, Field, Shape, State, When, native
 from pllm.execution.ptts.page_borrow import borrowed_root
 from pllm.execution.ptts.request_state import RequestStateSelection
@@ -64,12 +65,6 @@ from pllm.execution.tensor_program import (
 from pllm.execution.tensor_task import TensorTask
 from pllm.execution.trace import MAX_SNAPSHOT_BYTES
 from pllm.kernels.adamw import AdamWConfig
-
-if TYPE_CHECKING:
-    pass
-
-
-from pllm.execution.binding_base import SGD, TensorBindingBase
 
 
 @torch.no_grad()

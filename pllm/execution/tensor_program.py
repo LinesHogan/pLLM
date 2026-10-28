@@ -531,19 +531,3 @@ class BatchPreparation(BatchOperation[D]):
         self, rows: int, hidden: int, training_shapes: tuple[tuple[int, ...], ...]
     ) -> tuple[tuple[int, ...], ...]:
         return training_shapes
-
-
-@dataclass(frozen=True)
-class TensorComputation:
-    """A producer's tensor program and homogeneous input shapes, runnable outside the worker."""
-
-    function: Callable[..., tuple[torch.Tensor, ...]]
-    shapes: tuple[tuple[int, ...], ...]
-    dtype: torch.dtype
-
-    def __call__(self, *inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        return self.function(*inputs)
-
-    def memory(self) -> MemoryUsage:
-        inputs = tuple(torch.empty(shape, device="meta", dtype=self.dtype) for shape in self.shapes)
-        return measure(lambda: self(*inputs))
