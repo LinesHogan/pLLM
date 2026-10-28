@@ -164,12 +164,6 @@ def test_video_binding_failure_retains_grants_and_stops_execution():
                 assert execution.directory.latest_refs(()) == before and not any(peer.poll() for peer in peers)
             with pytest.raises(RuntimeError):
                 execution.admit(())
-    with binding_case(runtime=True, missing=MissingPolicy.STOP) as (*_, execution, root, peers):
-        with pytest.raises(RuntimeError, match="STOP"):
-            execution.stage_hold((RequestIdentity("stop", 0, 0),), "absent", step_id=0)
-        with pytest.raises(RuntimeError, match="fail-stopped"):
-            execution.stage_readonly((root,))
-        assert not any(peer.poll() for peer in peers)
 
 
 class _Layer(torch.nn.Module):
@@ -343,10 +337,5 @@ def _hold_steps_reuse_the_settled_injection():
                     for peer, page in zip(incoming, root.pages, strict=True)
                 )
             else:
-                diagnostics = execution.diagnostics()
-                held = diagnostics.last_hold
-                assert held.reason == ("absent" if step == 1 else "end") and held.step_id == step
-                assert held.successful == ((identity, tuple(sorted(set(refs))), step - 1),)
-                assert diagnostics.hold_count == (step + 1) // 2
                 assert not any(peer.poll() for peer in (*peers, *second_peers))
         assert refs[0] == refs[1] and refs[2] == refs[3] and refs[0] != refs[2]

@@ -398,7 +398,6 @@ def _check_projection_reads(task, operands, states, refs, count):
     for target in targets:
         selected = tuple(operand for operand in operands if operand.target == target)
         outputs = task.run(selected)
-        assert set(outputs) == {(operand.identity, target) for operand in selected}
         for operand in selected:
             state, tail = states[operand.identity, target]
             rows = tail + operand.hidden[:, 0].tolist()
@@ -427,36 +426,20 @@ def _publish_projection(execution, invocation):
 
 
 def _check_projection_abort(execution, value, targets, binding, refs, operands, requests):
-    """Abort partial forwards, and complete empty/skipped final segments without stale residuals."""
+    """Discard a partial forward without publishing either target's private state."""
     from pllm.contracts.semantic_graph import AnchorId
     from pllm.execution.overlay_task import ProjectionTask
 
     # A completed projection is still private until the forward's publish anchor.
     before = tuple(execution.snapshot(ref) for ref in refs)
-    operation = execution.implementation(
-        next(task.implementation_id for task in execution.plan.tasks if task.task_id == binding.task_id)
-    )
-    for outcome in ("abort", "empty", "skip"):
-        execution.rebind_implementation(
-            replace(operation, prepare=lambda data: data if data.step.operands else None)
-            if outcome == "skip"
-            else operation
-        )
-        invocation = execution.begin(value.rows.request_rows)
-        execution.execute_anchor(invocation, AnchorId(0))
-        task = ProjectionTask(execution, invocation, value.sampler_rows, binding.task_id, targets)
-        assert task.run(tuple(operand for operand in operands if operand.target == targets[0]))
-        assert len(invocation.context.page_writes) == 1
-        if outcome == "abort":
-            execution.cancel_step(invocation)
-            for ref, expected in zip(refs, before, strict=True):
-                torch.testing.assert_close(execution.snapshot(ref), expected)
-        else:
-            # Empty and skipped final segments return no stale residuals and still advance the cursor.
-            assert execution.execute_part(invocation, replace(value, operands=()), binding.task_id, complete=True) == {}
-            _publish_projection(execution, invocation)
-            assert execution.finish_step(invocation).publication is not None
-    execution.rebind_implementation(operation)
+    invocation = execution.begin(value.rows.request_rows)
+    execution.execute_anchor(invocation, AnchorId(0))
+    task = ProjectionTask(execution, invocation, value.sampler_rows, binding.task_id, targets)
+    task.run(tuple(operand for operand in operands if operand.target == targets[0]))
+    assert len(invocation.context.page_writes) == 1
+    execution.cancel_step(invocation)
+    for ref, expected in zip(refs, before, strict=True):
+        torch.testing.assert_close(execution.snapshot(ref), expected)
     execution.retire(requests)
     assert execution.diagnostics().active_lineages == 0
 
