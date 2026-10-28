@@ -90,7 +90,6 @@ class TensorBindingBase(Builder[TensorFrame]):
         super().__init__(name, digest, dimensions)
         self.host = host
         self.feeds: tuple[FeedBinding, ...] = ()
-        self.exports: dict[TaskSymbol, tuple[int, int, bool]] = {}
         self.tensor_tasks: dict[TaskSymbol, TensorTask] = {}
         self.initializers: dict[str, Callable[[tuple[torch.Tensor, ...], torch.Generator], None]] = {}
         # Module states: their flat initial values, built once at bind from the model dimensions and seed.

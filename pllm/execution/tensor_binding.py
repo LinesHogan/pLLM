@@ -84,6 +84,11 @@ TensorOutput = TensorResult | torch.Tensor | None
 class TensorBinding(ModelEffectBinding, RowTaskBinding):
     """Authoring projections only; tensor results remain invocation-local."""
 
+    @property
+    def has_exports(self) -> bool:
+        """Whether tensor tasks need a host observation callback."""
+        return any(task.export is not None for task in self.tensor_tasks.values())
+
     def configure_scans(self, facts: BackendCompileFacts) -> None:
         """Bind scan specialization to the plan's policy and row capacity."""
         if self.overlay_math is not None and any(task.replay is not None for task in self.graph.tasks):
@@ -113,7 +118,7 @@ class TensorBinding(ModelEffectBinding, RowTaskBinding):
         captured = {
             symbol: task
             for symbol, task in self.tensor_tasks.items()
-            if (task.writer is not None or reads_rows(task, self.tensor_tasks)) and symbol not in self.exports
+            if (task.writer is not None or reads_rows(task, self.tensor_tasks)) and task.export is None
         }
         conditional = any(
             task.policy.update_states in task.domains

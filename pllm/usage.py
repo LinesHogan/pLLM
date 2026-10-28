@@ -84,6 +84,7 @@ from pllm.execution.task_memory import derive_resources
 from pllm.execution.tensor_binding import TensorBinding, TensorOutput as TensorOutput
 from pllm.execution.tensor_frame import TensorFrame, TensorPort, Tensors, TensorUpdate as TensorUpdate
 from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots, TaskOutput
+from pllm.execution.tensor_task import TensorExport
 from pllm.execution.token_program import Over, Tokens
 from pllm.execution.trace import TraceEvent
 from pllm.kernels.adamw import AdamWConfig
@@ -620,10 +621,8 @@ class _Export(_Effect):
 
     def declare(self, operation: _Operation) -> None:
         """Publish bounded tensor observations to the host."""
-        call = operation.tensor(result_schema="canonical.hidden_export@1")
         owner = operation.context.owner
-        operation.context.binding.export(
-            call,
+        export = TensorExport(
             name=_setting(self.name, owner, str),
             every=_setting(self.every, owner, int),
             max_rows=_setting(self.max_rows, owner, int),
@@ -631,6 +630,8 @@ class _Export(_Effect):
             enabled=_setting(self.enabled, owner, bool),
             overflow=self.overflow,
         )
+        call = operation.tensor(result_schema="canonical.hidden_export@1", export=export)
+        operation.context.binding.model_effect(call)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -742,7 +743,11 @@ class _Sampler(_Effect):
     def declare(self, operation: _Operation) -> None:
         """Zero-strength guidance declares no computation or sampler attachment."""
         if self.enabled(operation.context.owner):
-            call = operation.tensor(output_kind=SemanticOutputKind.SAMPLER)
+            call = operation.tensor(
+                output_kind=SemanticOutputKind.SAMPLER,
+                sampler_stage=self.stage,
+                sampler_beta=0.0 if self.beta is None else _setting(self.beta, operation.context.owner, float),
+            )
             if operation.context.prediction is not None:
                 raise ValueError("tensor sampler attachment requires one logits operation")
             operation.context.prediction = call, self
@@ -1034,6 +1039,9 @@ class _Operation:
         update_kind: StateEffectKind = StateEffectKind.UPDATE_MAYBE,
         output_kind: SemanticOutputKind = SemanticOutputKind.TEMPORARY,
         result_schema: str = "",
+        export: TensorExport | None = None,
+        sampler_stage: SamplerStage | None = None,
+        sampler_beta: float = 0.0,
     ) -> Call:
         """Declare tensor mathematics, derivative domains and memory publication."""
         if arguments is None:
@@ -1077,6 +1085,9 @@ class _Operation:
             effect=update_kind,
             output_kind=output_kind,
             result_schema=result_schema,
+            export=export,
+            sampler_stage=sampler_stage,
+            sampler_beta=sampler_beta,
         )(
             effect.results(
                 _invoke(
@@ -1376,7 +1387,6 @@ class _Declaration:
                 call,
                 *self.training,
                 stage=sampler.stage,
-                beta=0.0 if sampler.beta is None else _setting(sampler.beta, self.owner, float),
             )
         elif self.training is not None and self.binding.attachment is None:
             self.binding.request_training(*self.training)
@@ -1601,7 +1611,7 @@ class Workload(
             b.bind_all(plan, model_probe=facts.probe),
             borrowed_resources=tuple(feed.resource for feed in b.feeds),
             feeds=b.feeds,
-            on_export=self.on_export if b.exports else None,
+            on_export=self.on_export if b.has_exports else None,
         )
 
     def declare_host(self, facts: HostRuntimeFacts) -> TensorHostBinding[TensorStepInput, TensorFrame, TensorOutput]:
@@ -1620,7 +1630,7 @@ class Workload(
             MathBinding(
                 self._functions(b, facts.device, facts.initialization_seed),
                 b.bind_all(),
-                on_export=self.on_export if b.exports else None,
+                on_export=self.on_export if b.has_exports else None,
             ),
             facts,
         )

@@ -379,7 +379,7 @@ def _no_resident(capture_bytes: int) -> int:
 
 @dataclass(frozen=True, slots=True)
 class TensorOperation(Generic[D]):
-    """Run one mathematical body, then adapt its result and settle declared effects."""
+    """Run one mathematical body and settle its declared effects."""
 
     implementation_id: ImplementationId
     body: Callable[[D, TensorBatch, StateTaskContext[D] | None], TaskOutput]
@@ -390,12 +390,6 @@ class TensorOperation(Generic[D]):
     version: Literal["input", "private", "published"] = "input"
     copy_fields: tuple[LayoutFieldId, ...] | None = None
     capture_resident: Callable[[int], int] = _no_resident
-    prepare: Callable[[D], D | None] | None = None
-    output: Callable[[D, TensorBatch], TaskOutput] | None = None
-
-    def __post_init__(self) -> None:
-        """Output adapters replace TaskOutput, so training must keep its own effects."""
-        assert self.output is None or (self.mode == "read" and self.optimizer is None)
 
     def input_shapes(
         self, rows: int, hidden: int, training_shapes: tuple[tuple[int, ...], ...]
@@ -409,22 +403,16 @@ class TensorOperation(Generic[D]):
         """Execute this operation's tensor path, excluding the already-funded pages."""
 
         def run() -> TaskOutput:
-            inputs = data if self.prepare is None else self.prepare(data)
-            if inputs is None:
-                return TaskOutput()
-            output = self.body(inputs, batch, None)
+            output = self.body(data, batch, None)
             if self.optimizer is not None and output.gradients:
                 self.optimizer.update(batch.roots, batch.field_slots, output.gradients)
-            return output if self.output is None else self.output(inputs, batch)
+            return output
 
         return measure(run)
 
     def execute(self, context: StateTaskContext[D]) -> ProjectionResiduals:
         data, stream = context.data(), context.pin.stream
         with nullcontext() if stream is None else torch.cuda.stream(stream), torch.inference_mode(False):
-            data = data if self.prepare is None else self.prepare(data)
-            if data is None:
-                return {}
             batch = _read(context, self.version)
             selected = tuple(range(len(batch.roots))) if self.select is None else self.select(data, context.selection)
             assert len(set(selected)) == len(selected) and all(0 <= i < len(batch.roots) for i in selected)
@@ -434,8 +422,6 @@ class TensorOperation(Generic[D]):
                     write = context.prepare_owned_write(context.pin.refs.take(selected), copy_fields=self.copy_fields)
                 batch = _read(context, "private")
             output = self.body(data, batch, context)
-            if self.output is not None:
-                output = self.output(data, batch)
             if output.gradient_indices:
                 assert (
                     output.gradients

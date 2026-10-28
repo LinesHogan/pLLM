@@ -314,6 +314,10 @@ class TensorExecutor:
         self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext[TensorFrame] | None = None
     ) -> TaskOutput:
         """Prepare operands, run the shared body or graph, then settle invocation outputs."""
+        prepared = data if self.task.export is None else self.task.export.prepare(data)
+        if prepared is None:
+            return TaskOutput()
+        data = prepared
         parent, frame = batch, data
         writer = self.task.writer
         selected = () if writer is None else writer.select(data, batch.selection)
@@ -465,6 +469,10 @@ class TensorExecutor:
         batch.results.update(((self.task.symbol, name), value) for name, value in zip(self.task.outputs, values))
         value = values[0] if values else None
         if self.optimizer is None:
+            if self.task.export is not None:
+                return self.task.export.output(values[0], data)
+            if self.task.sampler_stage is not None:
+                return self.task.sampler_output(data, batch)
             return TaskOutput()
         assert self.gradients is not None
         gradients = retain_rows(self.gradients, len(batch.roots), copy=not self.compact)

@@ -19,19 +19,17 @@ from pllm.config import ExecutionOptions
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
-from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import AnchorId, TaskSymbol
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.visibility import VisibilitySource
-from pllm.execution import row_task_binding
-from pllm.execution.declaration import Call, Dimensions
+from pllm.execution.declaration import Dimensions
 from pllm.execution.module_state import initial_values
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.runtime_facts import RuntimeFacts
-from pllm.execution.tensor_frame import CompactRows, RowIndex, RowPlan, TensorFrame, TensorPort, state_means
+from pllm.execution.tensor_frame import CompactRows, RowIndex, RowPlan, TensorFrame, state_means
 from pllm.execution.tensor_program import TaskOutput, TensorBatch
 from pllm.execution.tensor_task import TensorTask
 from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
@@ -353,7 +351,7 @@ def _ordinary_request_distillation() -> None:
 def test_sampler_adapts_step_results_in_memory_trace_and_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     """Fixed steps never re-enter prediction evaluation, including the meta resource trace."""
     evaluate = TensorTask.evaluate
-    adapt = row_task_binding.sampler_output
+    adapt = TensorTask.sampler_output
     devices: list[str] = []
     calls: list[TaskSymbol] = []
 
@@ -362,25 +360,20 @@ def test_sampler_adapts_step_results_in_memory_trace_and_runtime(monkeypatch: py
         return evaluate(task, data, batch)
 
     def output(
-        prediction: Call,
-        stage: SamplerStage,
-        beta: float,
-        mask: TensorPort | None,
+        task: TensorTask,
         data: TensorFrame,
         batch: TensorBatch,
     ) -> TaskOutput:
-        result = adapt(prediction, stage, beta, mask, data, batch)
+        result = adapt(task, data, batch)
         assert result.guidance is not None
         devices.append(result.guidance.values.device.type)
         return result
 
     monkeypatch.setattr(TensorTask, "evaluate", dependency)
-    monkeypatch.setattr(row_task_binding, "sampler_output", output)
+    monkeypatch.setattr(TensorTask, "sampler_output", output)
     workload = ESampRequestWorkload(ESampRequestConfig(rank=2, intervention_beta=0.2))
     facts = workload.specialize(facts_for(torch.device("cpu"), 4, 8), ExecutionOptions())
     assert "meta" in devices
-    with pytest.raises(AssertionError):
-        replace(workload.declaration(facts).operations[TaskSymbol("predict")], mode="update")
     execution = workload.compile_backend(facts).execution
     identities = (RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0))
     latest = execution.admit(identities)

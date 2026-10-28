@@ -2,18 +2,21 @@
 
 A TensorTask reads the method's inputs for the current rows, calls it, and stores the result. A
 training task also differentiates its loss with respect to the selected states' parameters and
-hands the per-state gradients to the optimizer. TensorBinding builds one per declared method.
+hands the per-state gradients to the optimizer. Export and sampler settings adapt the stored result
+after execution. TensorBinding builds one per declared method.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from typing import Literal
 
 import torch
 
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import FieldView
+from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
 from pllm.contracts.semantic_graph import (
     MathContract,
     SemanticInputSource,
@@ -37,8 +40,10 @@ from pllm.execution.tensor_frame import (
     selected_rows,
     state_leaf,
     state_means,
+    take_rows,
 )
-from pllm.execution.tensor_program import TaskOutput, TensorBatch
+from pllm.execution.tensor_program import Observation, TaskOutput, TensorBatch
+from pllm.execution.trace import MAX_SNAPSHOT_BYTES
 
 
 @dataclass(frozen=True)
@@ -88,8 +93,44 @@ class FieldWriter:
 
 
 @dataclass(frozen=True, slots=True)
+class TensorExport:
+    """Bounded observation settings carried by an exported TensorTask."""
+
+    name: str
+    every: int
+    max_rows: int
+    max_cols: int
+    enabled: bool
+    overflow: Literal["drop", "block"]
+
+    def __post_init__(self) -> None:
+        if min(self.every, self.max_rows, self.max_cols) < 1 or self.max_rows * self.max_cols * 8 > MAX_SNAPSHOT_BYTES:
+            raise ValueError("tensor export requires positive stride and bounded snapshot dimensions")
+
+    def prepare(self, data: TensorFrame) -> TensorFrame | None:
+        """Skip disabled steps and bound the rows before evaluating tensor math."""
+        if not self.enabled or data.step.rows.step_id % self.every or not data.rows:
+            return None
+        return replace(data, rows=data.rows[: self.max_rows], index=None, plan=None)
+
+    def output(self, value: torch.Tensor, data: TensorFrame) -> TaskOutput:
+        """Publish the bounded result with its row identities and delivery policy."""
+        return TaskOutput(
+            observations=(
+                Observation(
+                    self.name,
+                    value[: self.max_rows, : self.max_cols],
+                    step_id=data.step.rows.step_id,
+                    identities=tuple(row.identity for row in data.rows),
+                    export=self.overflow,
+                ),
+            )
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class TensorTask:
-    """One row-wise method and its input and gradient policies."""
+    """One row-wise method with its input, gradient and output policies."""
 
     symbol: TaskSymbol
     function: TensorMath
@@ -102,6 +143,53 @@ class TensorTask:
     phase: HiddenPhase | None = None
     resource: StateResource = StateResource("")
     writer: FieldWriter | None = None
+    export: TensorExport | None = None
+    sampler_stage: SamplerStage | None = None
+    sampler_beta: float = 0.0
+
+    def sampler_output(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
+        """Adapt a computed prediction to sampler rows without executing its mathematics."""
+        result = batch.results[self.symbol, self.outputs[0]]
+        stage = self.sampler_stage
+        assert stage is not None
+        mask = self.ports[self.policy.forward_rows] if self.policy.forward_rows else None
+        local = {row.packed_row_index: index for index, row in enumerate(data.rows)}
+        links = tuple(link for link in data.step.sampler_rows.links if link.packed_row_index in local)
+        weights = None
+        if stage is SamplerStage.PACKED_POST_FILTER_EXACT:
+            positions = tuple(local[link.packed_row_index] for link in links)
+            result = take_rows(result, positions)
+            # Unselected rows keep weight 0, so the sampler leaves their logits unchanged;
+            # selecting rows on the host would need a device-to-host read.
+            if mask is not None:
+                weights = take_rows(mask.read(data, batch), positions).to(result.dtype)
+        observations = (
+            tuple(
+                Observation(
+                    "guidance",
+                    result[index],
+                    data.step.rows.rows[link.packed_row_index],
+                    batch.selection.refs[0]
+                    if batch.selection.keys == (None,)
+                    else batch.selection.ref_for(data.step.rows.rows[link.packed_row_index].identity),
+                    data.step.rows.step_id,
+                )
+                for index, link in enumerate(links)
+            )
+            if batch.observing
+            else ()
+        )
+        return TaskOutput(
+            guidance=PackedSamplerGuidanceBatch(
+                data.step.sampler_rows,
+                result.detach(),
+                tuple(link.sampler_row_index for link in links),
+                self.sampler_beta,
+                stage=stage,
+                row_weights=weights,
+            ),
+            observations=observations,
+        )
 
     def dependencies(self, tasks: Mapping[TaskSymbol, TensorTask]) -> tuple[TensorTask, ...]:
         """This task's tensor DAG in dependency order, ending with the task itself."""
