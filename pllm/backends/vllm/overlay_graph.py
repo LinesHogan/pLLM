@@ -70,16 +70,20 @@ def capacities(maximum: int) -> tuple[int, ...]:
 
 
 class GraphOptions(TypedDict, total=False):
-    """The `LLM(...)` arguments that switch on deferred overlay compilation."""
+    """The `LLM(...)` arguments for graph sizing and deferred overlay compilation."""
 
     additional_config: dict[str, int]
     compilation_config: CompilationConfig
 
 
 def graph_options(config: ModelConfig, requirements: BackendRequirements) -> GraphOptions:
-    """Announce deferred overlay compilation before vLLM profiles the model."""
-    if not config.cuda_graphs or not requirements.parameter_targets:
+    """Size model graphs and announce overlays before vLLM profiles the model."""
+    if not config.cuda_graphs:
         return {}
+    if not requirements.parameter_targets:
+        return {
+            "compilation_config": CompilationConfig(max_cudagraph_capture_size=config.max_num_batched_tokens),
+        }
     if config.runner is not RunnerKind.MRV2:
         raise ValueError("Graph overlays need the MRv2 runner")
     return {
