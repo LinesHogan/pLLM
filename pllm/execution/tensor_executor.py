@@ -346,10 +346,9 @@ class TensorExecutor:
                     self.inputs[key] = value.new_zeros((self.state_count, *value.shape[1:]))
                 self.inputs[key][: len(value)].copy_(value.detach())
             if context is not None and (self.optimizer is not None or writer is not None):
-                context.write = context.arena.prepare_transition(
-                    batch.selection.refs.take(self.updated), batch.stream, copy_fields=() if writer is None else None
+                write = context.prepare_owned_write(
+                    batch.selection.refs.take(self.updated), copy_fields=() if writer is None else None
                 )
-                write = context.write
                 plan = replace(
                     plan,
                     writes=(self.updated, context.arena.slots((write,) * len(write.after_refs), write.after_refs)[1]),

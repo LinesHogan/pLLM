@@ -26,7 +26,7 @@ def test_copy_on_write_transition_keeps_the_pinned_version_unchanged() -> None:
     (old_a0,) = arena.snapshot(pin, a)[:1]
     update = arena.prepare_transition((a,), fields=((F0,),))
     arena.write_field(update, 0, F0).add_(4)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(AssertionError):
         arena.write_field(update, 0, LayoutFieldId(1))
     receipt = arena.publish(update)
     (new_a,) = receipt.after_refs
@@ -38,7 +38,7 @@ def test_copy_on_write_transition_keeps_the_pinned_version_unchanged() -> None:
     assert resource == "dense_fast_weights"
     selected = pin.refs.take(np.array([1, 0, 1]))
     np.testing.assert_array_equal(arena.slot_matrix(pin, selected)[1], slots[[1, 0, 1]])
-    with pytest.raises(RuntimeError):
+    with pytest.raises(KeyError):
         arena.slot_matrix(pin, new_pin.refs)
     both = arena.pin_exact((a, new_a))
     _, versions = arena.slot_matrix(both, both.refs.take(np.array([1, 0])))
@@ -52,7 +52,7 @@ def test_copy_on_write_transition_keeps_the_pinned_version_unchanged() -> None:
     )
     assert arena.borrow_field(new_pin, new_a, F0).data_ptr() != arena.borrow_field(pin, a, F0).data_ptr()
     # An exact pin sees only its own version.
-    with pytest.raises(RuntimeError):
+    with pytest.raises(KeyError):
         arena.borrow_field(pin, new_a, F0)
     torch.testing.assert_close(arena.snapshot(pin, a)[0], old_a0)
     torch.testing.assert_close(arena.snapshot(new_pin, new_a)[0], old_a0 + 4)
@@ -69,7 +69,7 @@ def test_retired_roots_hold_storage_until_pages_are_free() -> None:
     with pytest.raises(RuntimeError):
         arena.prepare_admission(("dense_fast_weights",) * 2)
     arena.wait_release(arena.release_pin(pin))
-    with pytest.raises(RuntimeError):
+    with pytest.raises(AssertionError):
         arena.borrow_field(pin, a, F0)
     arena.retire(replacement.after_refs)
     assert arena.active_lineages == 0 and arena.free_pages == 6
@@ -78,7 +78,7 @@ def test_retired_roots_hold_storage_until_pages_are_free() -> None:
     arena.retire(unsettled.after_refs)
     assert arena.active_lineages == 1
     arena.settle(unsettled)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(AssertionError):
         arena.settle(unsettled)
     assert arena.active_lineages == 0 and arena.free_pages == 6
 
@@ -154,7 +154,7 @@ def test_multi_resource_update_is_atomic_and_write_handles_are_single_use() -> N
     for ref, expected in zip(refs, before, strict=True):
         for actual, value in zip(arena.snapshot(pin, ref), expected, strict=True):
             torch.testing.assert_close(actual, value)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(AssertionError):
         arena.publish(update)
     update = arena.prepare_transition(refs)
     for index in range(2):

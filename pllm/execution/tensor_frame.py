@@ -473,9 +473,3 @@ def selected_rows(mask: torch.Tensor) -> tuple[int, ...]:
         if mask.is_meta
         else tuple(int(index.item()) for index in mask.nonzero().flatten().cpu())
     )
-
-
-def finite(value: torch.Tensor) -> bool:
-    """Validate tensor contents; meta execution can trace the check but cannot inspect its result."""
-    result = torch.isfinite(value).all()
-    return value.is_meta or bool(result)

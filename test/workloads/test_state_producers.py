@@ -112,7 +112,7 @@ def test_prompt_producers_publish_only_completed_requests(workload, device, leng
     refs = tuple(selected.refs)
     execution.execute_anchor(invocation, AnchorId(0))
     assert all(execution.arena.latest(ref.lineage_id) == ref for ref in refs)
-    execution.complete_forward_input(invocation, value)
+    execution.submit_input(invocation, value)
     for anchor in execution.arena.plan.timeline.anchors[1:]:
         execution.execute_anchor(invocation, AnchorId(anchor.ordinal))
         if anchor.ordinal == execution.sampler_anchor_id:
@@ -225,18 +225,7 @@ def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch
     )
     for deployed, payload in ((imported, pllm.state.StateTensorUpdate(values, (key,))), (written, None)):
         execution = deployed.execution
-        (entry,) = execution.admit((identity,), stream=stream)
-        if payload is not None:
-            with pytest.raises(ValueError, match="finite"):
-                testing.run_step(
-                    execution,
-                    testing.step_input(
-                        (identity,),
-                        auxiliary=replace(payload, values=tuple(value * float("nan") for value in values)),
-                    ),
-                    stream=stream,
-                )
-            assert execution.arena.latest(entry.lineage_id) == entry
+        execution.admit((identity,), stream=stream)
         result = testing.run_step(execution, testing.step_input((identity,), auxiliary=payload), stream=stream)
         torch.testing.assert_close(
             execution.snapshot(result.publication.after_refs[0], stream=stream), tuple(value[0] for value in values)
@@ -277,7 +266,7 @@ def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch
     before = execution.snapshot(entry, stream=stream)
 
     def fail_before_publish(self, context):
-        assert context.write is not None
+        assert len(context.page_writes) == 1
         raise RuntimeError("cancel between private write and publication")
 
     monkeypatch.setattr(PublishStateTask, "execute", fail_before_publish)

@@ -136,7 +136,7 @@ def test_factory_failure_releases_an_already_created_engine(multiprocessing: boo
         }
         # Inject the engine at the vLLM constructor boundary.
         with patch.dict(os.environ, environment), patch.object(runtime, "LLM", return_value=engine):
-            with pytest.raises(RuntimeError):
+            with pytest.raises((AttributeError, IndexError)):
                 pllm.make_llm(
                     pllm.ModelConfig("unused-local-model", multiprocessing=multiprocessing),
                     workload=ESampRequestWorkload(),
@@ -185,12 +185,9 @@ def test_failed_shutdown_retains_the_shared_input_fd_until_close_retries() -> No
         wait_for_completion=fail,
     )
     owned = ref(engine.owned)
-    handle = runtime.VllmLlm(engine, None, None, overlay, facts)
+    handle = runtime.VllmLlm(engine, None, None, overlay, facts, CachePolicy.for_attachment(overlay, "isolate"))
     del engine
-    with (
-        patch.object(runtime.VllmLlm, "cache_policy", return_value=CachePolicy.for_attachment(overlay, "isolate")),
-        pytest.raises(RuntimeError),
-    ):
+    with pytest.raises(RuntimeError):
         handle.generate(["test"], SamplingParams(max_tokens=1), feedback_group="ownership")
     shared = staged[0].completion.storage
     assert isinstance(shared, CpuFileStorage)

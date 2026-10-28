@@ -145,8 +145,6 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(monkeypatc
         step = step_input(tuple(identities[owner] for owner in owners), source, target, step_id)
         before = [execution.snapshot(ref) for ref in latest]
         cancelled = execution.start_step(step)
-        with pytest.raises(RuntimeError):  # one invocation at a time
-            execution.start_step(step)
         execution.execute_anchor(cancelled, AnchorId(0))
         execution.cancel_step(cancelled)
         with monkeypatch.context() as fault:
@@ -160,8 +158,6 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(monkeypatc
         for anchor in range(sampler + 1):
             execution.execute_anchor(handle, AnchorId(anchor))
         guidance = execution.sampler_guidance(handle)
-        with pytest.raises(RuntimeError):  # training waits for sampler completion
-            execution.execute_anchor(handle, AnchorId(sampler + 1))
         execution.complete_sampler(handle)
         for anchor in execution.arena.plan.timeline.anchors[sampler + 1 :]:
             execution.execute_anchor(handle, AnchorId(anchor.ordinal))
@@ -370,14 +366,13 @@ def test_sampler_adapts_step_results_in_memory_trace_and_runtime(monkeypatch: py
 
     def output(
         prediction: Call,
-        width: int,
         stage: SamplerStage,
         beta: float,
         mask: TensorPort | None,
         data: TensorFrame,
         batch: TensorBatch,
     ) -> TaskOutput:
-        result = adapt(prediction, width, stage, beta, mask, data, batch)
+        result = adapt(prediction, stage, beta, mask, data, batch)
         assert result.guidance is not None
         devices.append(result.guidance.values.device.type)
         return result

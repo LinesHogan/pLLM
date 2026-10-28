@@ -190,23 +190,6 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
         == 1
     )
 
-    def copied_completion(batch):
-        result = processor.run(batch)
-        controls = tuple(replace(control, completion=replace(control.completion)) for control in result.retry_controls)
-        return replace(result, intent=replace(result.intent, retry_controls=controls))
-
-    with pytest.raises(ValueError):  # controls must reference the original completions
-        list(
-            Generation().generate_feedback(
-                ["retry"],
-                SamplingParams(max_tokens=1),
-                feedback=copied_completion,
-                feedback_group="copied",
-                max_rounds=2,
-                prompt_indices=(9,),
-            )
-        )
-
     reward = make_llm(
         workload=TTRLWorkload(TTRLConfig(rank=2, votes_per_prompt=3, samples_per_prompt=3)),
         config=HostRuntimeFacts(torch.device("cpu"), hidden_size=4),

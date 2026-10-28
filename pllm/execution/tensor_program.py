@@ -149,8 +149,8 @@ def _read(context: StateTaskContext[D], version: Literal["input", "private", "pu
     assert version == "input" or len(context.page_publications) <= 1
     refs = context.pin.refs
     access: tuple[PagePin | PageWrite, ...] = (context.pin,) * len(refs)
-    if version == "private" and context.write is not None:
-        write = context.write
+    write = context.sole_write()
+    if version == "private" and write is not None:
         positions = write.before_refs.positions(refs)
         refs = refs.replace_versions(write.before_refs, write.after_refs)
         access = tuple(write if index >= 0 else context.pin for index in positions.tolist())
@@ -428,11 +428,10 @@ class TensorOperation(Generic[D]):
             batch = _read(context, self.version)
             selected = tuple(range(len(batch.roots))) if self.select is None else self.select(data, context.selection)
             assert len(set(selected)) == len(selected) and all(0 <= i < len(batch.roots) for i in selected)
+            write: PageWrite | None = None
             if self.mode == "transition" and selected:
-                if self.version == "input" or context.write is None:
-                    context.write = context.arena.prepare_transition(
-                        context.pin.refs.take(selected), stream, copy_fields=self.copy_fields
-                    )
+                if self.version == "input" or not context.page_writes:
+                    write = context.prepare_owned_write(context.pin.refs.take(selected), copy_fields=self.copy_fields)
                 batch = _read(context, "private")
             output = self.body(data, batch, context)
             if self.output is not None:
@@ -450,14 +449,14 @@ class TensorOperation(Generic[D]):
                     and self.optimizer is not None
                     and len(output.gradients) == len(selected) * self.optimizer.groups
                 )
-                context.write = context.arena.prepare_transition(
-                    context.pin.refs.take(selected), stream, copy_fields=self.copy_fields
-                )
-                roots = context.arena.lazy_roots((context.write,) * len(selected), context.write.after_refs)
+                write = context.prepare_owned_write(context.pin.refs.take(selected), copy_fields=self.copy_fields)
+                roots = context.arena.lazy_roots((write,) * len(selected), write.after_refs)
                 self.optimizer.update(roots, roots.field_slots, output.gradients)
+            if write is None:
+                write = context.sole_write()
             if output.field_writes:
-                assert context.write is not None
-                roots = context.arena.lazy_roots((context.write,) * len(selected), context.write.after_refs)
+                assert write is not None
+                roots = context.arena.lazy_roots((write,) * len(selected), write.after_refs)
                 for view, values in output.field_writes:
                     pool, slots = roots.field_slots(view.field)
                     target = view.read(pool, pooled=True)
@@ -468,8 +467,8 @@ class TensorOperation(Generic[D]):
                         upload(tuple(range(len(selected))), pool.device),
                         upload(slots, pool.device),
                     )
-            if self.mode == "update" or self.publish:
-                context.publish()
+            if write is not None and (self.mode == "update" or self.publish):
+                context.publish_owned_write(write)
             if output.counters is not None:
                 context.overlay_counters = (
                     output.counters if context.overlay_counters is None else context.overlay_counters + output.counters

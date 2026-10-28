@@ -39,6 +39,7 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 from pllm.execution.declaration import Call, Dimensions, Field, Shape, State, When, native
 from pllm.execution.ptts.page_borrow import borrowed_root
+from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.tensor_executor import TensorExecutor
 from pllm.execution.tensor_frame import (
     TensorFrame,
@@ -47,7 +48,6 @@ from pllm.execution.tensor_frame import (
     Tensors,
     feedback_port,
     field_rows,
-    finite,
     input_port,
     row_index,
     take_rows,
@@ -124,7 +124,6 @@ def weighted_training_output(
 
 def sampler_output(
     prediction: Call,
-    width: int,
     stage: SamplerStage,
     beta: float,
     mask: TensorPort | None,
@@ -133,8 +132,6 @@ def sampler_output(
 ) -> TaskOutput:
     """Adapt a computed prediction to sampler rows without executing its mathematics."""
     result = batch.results[prediction.symbol, prediction.outputs[0]]
-    if result.shape != (len(data.rows), width):
-        raise ValueError("sampler output differs from its signed row and feature dimensions")
     local = {row.packed_row_index: index for index, row in enumerate(data.rows)}
     links = tuple(link for link in data.step.sampler_rows.links if link.packed_row_index in local)
     weights = None
@@ -175,14 +172,86 @@ def sampler_output(
 
 
 def weighted_rows(valid: torch.Tensor) -> tuple[int, bool]:
-    """Resolve host validation and masking; meta uses the allocation-heavy partial-batch path."""
+    """Count training rows for accounting; meta traces the partial-batch masking path."""
     counts = valid.sum(-1)
     if valid.is_meta:
         return valid.numel(), True
-    if not counts.all():
-        raise ValueError("weighted CE requires at least one valid weighted label per state")
     count = int(counts.sum().item())
     return count, count != valid.numel()
+
+
+def weighted_selection(batch: WeightedCEBatch[torch.Tensor], selection: RequestStateSelection) -> tuple[int, ...]:
+    """Resolve imported prompt keys to distinct co-resident state roots."""
+    shared = selection.keys == (None,)
+    fields = batch.keys[0].fields if batch.keys else ()
+    row_states: dict[RequestStateKey, int] = {}
+    if not shared and batch.keys:
+        for row, index in zip(selection.rows, selection.state_indices, strict=True):
+            row_states.setdefault(RequestStateKey.project(row.identity, fields), index)
+    selected = (0,) if shared else tuple(row_states[key] for key in batch.keys if key in row_states)
+    if (shared and batch.keys) or (
+        not shared
+        and (
+            not batch.keys
+            or any(key.fields != fields for key in batch.keys)
+            or len(selected) != len(batch.keys)
+            or len(set(selected)) != len(selected)
+        )
+    ):
+        raise ValueError("use distinct co-resident request keys for weighted CE, or no keys for shared state")
+    return selected
+
+
+def prepare_weighted_batch(
+    dimensions: Dimensions,
+    shape: tuple[int, ...] | None,
+    fields: tuple[str, ...],
+    reset: Callable[[Tensors, torch.Generator], None],
+    data: TensorFrame,
+    view: TensorBatch,
+) -> TaskOutput:
+    """Validate imported weighted-CE metadata and initialize the selected parameters."""
+    match data.step.auxiliary:
+        case WeightedCEBatch() as batch:
+            pass
+        case _:
+            return TaskOutput()
+    selected = weighted_selection(batch, view.selection)
+    tensors = (batch.hidden, batch.base_logits, batch.labels, batch.weights)
+    hidden, logits, labels, weights = (
+        tensor.detach().unsqueeze(0) if view.selection.keys == (None,) else tensor.detach() for tensor in tensors
+    )
+    root = view.roots[selected[0]]
+    if (
+        hidden.ndim != 3
+        or hidden.shape[0] != len(selected)
+        or hidden.shape[2] != dimensions.hidden_size
+        or logits.shape != (*hidden.shape[:2], dimensions.vocab_size)
+        or labels.shape != hidden.shape[:2]
+        or weights.shape != labels.shape
+        or labels.dtype != torch.long
+        or any(tensor.device != root[0].device for tensor in tensors)
+        or any(tensor.dtype != root[0].dtype for tensor in (hidden, logits, weights))
+        or shape is not None
+        and any(actual > bound for actual, bound in zip(hidden.shape, shape, strict=True))
+    ):
+        raise ValueError("align weighted-CE tensors with the parameter shape, dtype, device and input bounds")
+    valid = (labels >= 0) & (labels < dimensions.vocab_size) & (weights > 0)
+    data.selected = selected
+    data.trained_rows, incomplete = weighted_rows(valid)
+    if incomplete:
+        hidden, logits = (tensor.masked_fill(~valid.unsqueeze(-1), 0) for tensor in (hidden, logits))
+        labels, weights = (tensor.masked_fill(~valid, 0) for tensor in (labels, weights))
+    data.batch_inputs = tuple(
+        tensor.clone() if torch.is_inference(tensor) else tensor for tensor in (hidden, logits, labels, weights)
+    )
+    data.parameters = tuple(tensor.new_empty((len(selected), *tensor.shape)) for tensor in root)
+    with torch.no_grad():
+        reset(
+            dict(zip(fields, data.parameters, strict=True)),
+            torch.Generator(device="cpu" if root[0].is_meta else root[0].device),
+        )
+    return TaskOutput()
 
 
 class RowTaskBinding(TensorBindingBase):
@@ -315,87 +384,10 @@ class RowTaskBinding(TensorBindingBase):
         prepare_function: Callable[[TensorFrame, TensorBatch], TaskOutput] | None = None
         if dimensions is not None:
             limit = next((fact for fact in self.resources if fact.task == name), None)
-            if limit is not None and len(limit.input_shapes) != 1:
-                raise ValueError("weighted training requires one signed input shape")
             # Resource derivation builds the graph before the batch bound exists; execution always has it.
             shape = None if limit is None or not limit.input_shapes else limit.input_shapes[0]
-            if shape is not None and (
-                len(shape) != 3
-                or min(shape) < 1
-                or shape[2] != dimensions.hidden_size
-                or state.declaration.scope is StateScope.INSTANCE
-                and shape[0] != 1
-            ):
-                raise ValueError("weighted training input shape differs from its state and hidden dimensions")
 
-            def prepare(data: TensorFrame, view: TensorBatch) -> TaskOutput:
-                batch = data.step.auxiliary
-                if batch is None:
-                    return TaskOutput()
-                if not isinstance(batch, WeightedCEBatch):
-                    raise TypeError("weighted training requires its declared weighted-CE input")
-                shared = view.selection.keys == (None,)
-                if shared and batch.keys:
-                    raise ValueError("weighted CE keys require distinct co-resident original request states")
-                selected = (0,)
-                if not shared:
-                    if (
-                        not batch.keys
-                        or len(set(batch.keys)) != len(batch.keys)
-                        or len({key.fields for key in batch.keys}) != 1
-                    ):
-                        raise ValueError("weighted CE keys require distinct co-resident original request states")
-                    batch_fields = batch.keys[0].fields
-                    # Batch keys name rows under their own projection, independent of
-                    # how the state is keyed (request, prompt/sample, route, ...).
-                    row_states: dict[RequestStateKey, int] = {}
-                    for row, index in zip(view.selection.rows, view.selection.state_indices, strict=True):
-                        row_states.setdefault(RequestStateKey.project(row.identity, batch_fields), index)
-                    selected = tuple(row_states[key] for key in batch.keys if key in row_states)
-                    if len(selected) != len(batch.keys) or len(set(selected)) != len(selected):
-                        raise ValueError("weighted CE keys require distinct co-resident original request states")
-                tensors = (batch.hidden, batch.base_logits, batch.labels, batch.weights)
-                hidden, logits, labels, weights = (
-                    tensor.detach().unsqueeze(0) if shared else tensor.detach() for tensor in tensors
-                )
-                root = view.roots[selected[0]]
-                if (
-                    hidden.ndim != 3
-                    or hidden.shape[0] != len(selected)
-                    or hidden.shape[2] != dimensions.hidden_size
-                    or logits.shape != (*hidden.shape[:2], dimensions.vocab_size)
-                    or labels.shape != hidden.shape[:2]
-                    or weights.shape != labels.shape
-                    or labels.dtype != torch.long
-                    or any(tensor.device != root[0].device for tensor in tensors)
-                    or any(tensor.dtype != root[0].dtype for tensor in (hidden, logits, weights))
-                    or shape is not None
-                    and any(actual > bound for actual, bound in zip(hidden.shape, shape, strict=True))
-                ):
-                    raise ValueError("weighted-CE batch differs from signed parameters or input bounds")
-                if not finite(weights):
-                    raise ValueError("weighted CE weights must be finite")
-                valid = (labels >= 0) & (labels < dimensions.vocab_size) & (weights > 0)
-                data.selected = selected
-                data.trained_rows, incomplete = weighted_rows(valid)
-                if incomplete:
-                    hidden, logits = (tensor.masked_fill(~valid.unsqueeze(-1), 0) for tensor in (hidden, logits))
-                    labels, weights = (tensor.masked_fill(~valid, 0) for tensor in (labels, weights))
-                if not finite(hidden) or not finite(logits):
-                    raise ValueError("weighted-CE active rows must be finite")
-                data.batch_inputs = tuple(
-                    tensor.clone() if torch.is_inference(tensor) else tensor
-                    for tensor in (hidden, logits, labels, weights)
-                )
-                data.parameters = tuple(tensor.new_empty((len(selected), *tensor.shape)) for tensor in root)
-                with torch.no_grad():
-                    reset(
-                        dict(zip(fields, data.parameters, strict=True)),
-                        torch.Generator(device="cpu" if root[0].is_meta else root[0].device),
-                    )
-                return TaskOutput()
-
-            prepare_function = prepare
+            prepare_function = partial(prepare_weighted_batch, dimensions, shape, fields, reset)
         prepared = self.compute(
             f"__{name}_prepare",
             inputs={"state": state.read(), "batch": self.input("training", "batch", WeightedCEBatch.schema)},
@@ -423,8 +415,6 @@ class RowTaskBinding(TensorBindingBase):
 
                 def step() -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
                     losses = function(inputs)
-                    if losses.shape != (len(data.selected),):
-                        raise ValueError("weighted_state_mean_then_mean requires one mean loss per selected state")
                     gradients = (
                         torch.autograd.grad(losses.mean(), tuple(parameters.values()), materialize_grads=True)
                         if losses.requires_grad
@@ -721,14 +711,8 @@ class RowTaskBinding(TensorBindingBase):
         )
         if self.dimensions is not None:
             operation = self.operations[prediction.symbol]
-            width = (
-                self.dimensions.hidden_size
-                if stage is SamplerStage.PACKED_POST_FILTER_EXACT
-                else self.dimensions.vocab_size
-            )
-
             self.operations[prediction.symbol] = replace(
-                operation, output=partial(sampler_output, prediction, width, stage, beta, mask)
+                operation, output=partial(sampler_output, prediction, stage, beta, mask)
             )
         self.sampler(prediction, training, state, output=prediction.outputs[0], stage=stage)
 

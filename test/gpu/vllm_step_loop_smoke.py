@@ -21,6 +21,7 @@ from vllm.vllm_flash_attn import flash_attn_varlen_func
 
 import pllm
 from pllm.backends.vllm.position_state import PositionCacheProvider
+from pllm.backends.vllm.prefix_cache import CachePolicy
 from pllm.backends.vllm.replay import RouteWave, VllmTokenwiseReplay
 from pllm.backends.vllm.runtime import BackendCommand, BackendInstall, BackendStage
 from pllm.config import KVOffload
@@ -164,7 +165,7 @@ def generate_ids(handle, prompts, params=None):
     ids = llm.enqueue(
         [{"prompt_token_ids": tokens} for tokens in prompts],
         [
-            handle.cache_policy().sampling(param)
+            handle._cache_policy.sampling(param)
             for param in (params or [SamplingParams(temperature=0, max_tokens=3, ignore_eos=True) for _ in prompts])
         ],
         use_tqdm=False,
@@ -319,6 +320,8 @@ class ScaledStepLoop(StepLoop):
 
 def isolated_multiturn():
     """Warm isolate equals cold prompt computation, also across the EngineCore boundary."""
+    from test.gpu.vllm_step_loop_smoke import ScaledStepLoop as ImportedStepLoop
+
     for multiprocessing in (True, False):
         handle = replay_handle(StepLoop(), length=128, prefix=True, multiprocessing=multiprocessing)
         try:
@@ -332,23 +335,20 @@ def isolated_multiturn():
             handle._llm.reset_prefix_cache()
             (cold,) = generate_ids(handle, [receiver])
             assert warm.outputs[0].token_ids == cold.outputs[0].token_ids and cold.num_cached_tokens == 0
-            namespace = handle.cache_policy().namespace
+            namespace = handle._cache_policy.namespace
+            workload = ImportedStepLoop()
+            handle.attachment = workload.plan_backend(handle._facts)
+            handle._cache_policy = CachePolicy.for_attachment(handle.attachment, "isolate")
+            handle.command(BackendCommand.DETACH)
             if multiprocessing:
-                from test.gpu.vllm_step_loop_smoke import ScaledStepLoop as ImportedStepLoop
-
-                workload = ImportedStepLoop()
-                handle.attachment = workload.plan_backend(handle._facts)
-                handle.command(BackendCommand.DETACH)
                 handle.command(
                     BackendCommand.INSTALL,
-                    encode_boundary(BackendInstall(handle.attachment, encode_workload(workload))),
+                    encode_boundary(BackendInstall(handle.attachment, encode_workload(workload), handle._cache_policy)),
                 )
             else:
-                handle.runner.detach_workload()
-                handle._deployment = ScaledStepLoop().compile_backend(handle._facts)
-                handle.attachment = handle.deployment.attachment
-                handle.runner.attach_workload(handle.deployment)
-            assert handle.cache_policy().namespace != namespace
+                handle._deployment = workload.bind_backend(handle._facts, handle.attachment)
+                handle.runner.attach_workload(handle.deployment, handle._cache_policy)
+            assert handle._cache_policy.namespace != namespace
             (changed,) = generate_ids(handle, [receiver])
             assert changed.num_cached_tokens == 0
             print(

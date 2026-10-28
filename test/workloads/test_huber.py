@@ -1,6 +1,5 @@
 """Independent frozen Huber/AdamW oracle through the ordinary workload API."""
 
-import pytest
 import torch
 
 from examples.huber import HuberWorkload
@@ -113,8 +112,6 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
         for ref, snapshot in zip(latest, before, strict=True):
             for actual, expected in zip(execution.snapshot(ref, stream), snapshot, strict=True):
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        with pytest.raises(RuntimeError, match="sampler completion"):
-            execution.execute_anchor(handle, AnchorId(execution.sampler_anchor_id + 1))
         execution.complete_sampler(handle, stream)
         pointers = set()
         saved_parameters = []

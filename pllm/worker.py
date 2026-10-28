@@ -9,7 +9,8 @@ from vllm.v1.worker.gpu_worker import Worker
 
 from pllm.authoring import BackendWorkload, DataT, ResultT, map_auxiliary
 from pllm.backends.vllm.mrv1 import Mrv1Runner
-from pllm.backends.vllm.runner import WorkloadModelRunner
+from pllm.backends.vllm.prefix_cache import CachePolicy
+from pllm.backends.vllm.runner import BackendWorkerState, WorkloadModelRunner
 from pllm.backends.vllm.runtime import (
     BackendCommand,
     BackendInstall,
@@ -47,7 +48,9 @@ class GPUWorker(Worker):
             case _:
                 raise RuntimeError("canonical worker has not initialized its runner")
 
-    def _install(self, workload: BackendWorkload[DataT, ResultT], attachment: SignedBackendAttachment) -> None:
+    def _install(
+        self, workload: BackendWorkload[DataT, ResultT], attachment: SignedBackendAttachment, cache_policy: CachePolicy
+    ) -> None:
         runner = self.workload_runner
         visibility = attachment.inputs.plan.timeline.visibility
         facts = probe_backend(
@@ -56,7 +59,7 @@ class GPUWorker(Worker):
             attachment.inputs.plan.timeline,
             publish_lag=0 if visibility is None else visibility.lag,
         )
-        runner.attach_workload(workload.bind_backend(facts, attachment))
+        runner.attach_workload(workload.bind_backend(facts, attachment), cache_policy)
 
     def workload_command(self, command: str, payload: str) -> str:
         runner = self.workload_runner
@@ -81,8 +84,8 @@ class GPUWorker(Worker):
                 case BackendCommand.INSTALL:
                     install = decode_boundary(payload, BackendInstall)
                     # The driver compares the rebuilt compilation signature against its own plan.
-                    self._install(decode_workload(install.definition), install.attachment)
-                    return encode_boundary(runner.worker_state())
+                    self._install(decode_workload(install.definition), install.attachment, install.cache_policy)
+                    return encode_boundary(BackendWorkerState(os.getpid(), runner.require_session().diagnostics()))
                 case BackendCommand.STAGE:
                     stage = decode_boundary(payload, BackendStage)
                     validate_auxiliary(
@@ -93,23 +96,25 @@ class GPUWorker(Worker):
                     auxiliary = map_auxiliary(
                         stage.auxiliary, lambda tensor: tensor.map(peer, stream).to(runner.device)
                     )
-                    runner.stage_workload_input(
+                    runner.require_session().stage_input(
                         auxiliary,
                         stage.identities,
                         None if stage.completion is None else stage.completion.map(peer, stream),
                     )
                 case BackendCommand.FINISH:
-                    runner.retire_completed_requests()
+                    runner.require_session().finish_requests()
                 case BackendCommand.ABORT:
-                    runner.abort_workload_requests()
+                    session = runner.require_session()
+                    session.abort_active()
+                    session.retire_all()
                 case BackendCommand.DIAGNOSTICS:
-                    return encode_boundary(runner.worker_state())
+                    return encode_boundary(BackendWorkerState(os.getpid(), runner.require_session().diagnostics()))
                 case BackendCommand.TRACE:
-                    return encode_boundary(runner.trace.snapshot())
+                    return encode_boundary(runner.require_session().trace.snapshot())
                 case BackendCommand.PROFILE:
-                    runner.trace.profile_tasks(decode_boundary(payload, tuple[TaskId, ...]))
+                    runner.require_session().trace.profile_tasks(decode_boundary(payload, tuple[TaskId, ...]))
                 case BackendCommand.OBSERVE:
-                    runner.trace.configure(decode_boundary(payload, TraceSelection))
+                    runner.require_session().trace.configure(decode_boundary(payload, TraceSelection))
                 case BackendCommand.DETACH:
                     runner.detach_workload()
             return ""

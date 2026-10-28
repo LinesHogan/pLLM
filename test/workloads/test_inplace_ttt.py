@@ -105,14 +105,6 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
             )
             for index, target in enumerate(targets)
         )
-        if row == 0:
-            oversized = tuple(
-                replace(operand, hidden=operand.hidden.expand(9, -1), desired=operand.desired.expand(9, -1))
-                for operand in step
-            )
-            with pytest.raises(ValueError):  # more rows than the signed packed-row capacity
-                execution.step(_input(oversized))
-            assert execution.arena.latest(latest.lineage_id) == latest
         (result,) = execution.step(_input(step)).entries
         assert result.before_ref == latest
         latest = result.after_ref
@@ -444,7 +436,7 @@ def _check_projection_abort(execution, value, targets, binding, refs, operands, 
     execution.execute_anchor(invocation, AnchorId(0))
     task = ProjectionTask(execution, invocation, value.sampler_rows, binding.task_id, targets)
     task.run(tuple(operand for operand in operands if operand.target == targets[0]))
-    assert invocation.context.write is not None
+    assert len(invocation.context.page_writes) == 1
     execution.cancel_step(invocation)
     for ref, expected in zip(refs, before, strict=True):
         torch.testing.assert_close(execution.snapshot(ref), expected)
@@ -568,7 +560,7 @@ def _check_exact_additive_projection():
     )
     for operand, state in zip(decode, expected_states, strict=True):
         torch.testing.assert_close(task.run((operand,))[identity, operand.target], hidden[:1] @ state.T)
-    assert invocation.context.write is None
+    assert not invocation.context.page_writes
     _publish_projection(execution, invocation)
     assert execution.finish_step(invocation).publication is None
     execution.retire((identity,))

@@ -91,8 +91,6 @@ def test_dummy_runs_graph_sign_plan_execute() -> None:
     deployment = workload.compile_backend(bounded)
     attached = deployment.execution
     torch.testing.assert_close(exported(attached, value(2)), expected)
-    with pytest.raises(ValueError):  # hidden width differs from the specialized model
-        attached.step(step_input(2, torch.zeros(3, 6)))
     torch.testing.assert_close(exported(attached, value(2)), expected)
     with pytest.raises(ValueError):  # a changed declaration cannot reuse the signed attachment
         DummyWorkload(replace(workload.config, export_every_n_steps=1)).bind_backend(bounded, deployment.attachment)

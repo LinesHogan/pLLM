@@ -110,8 +110,6 @@ class BorrowedPage:
     def tensor(self) -> torch.Tensor:
         if self._tensor is None:
             raise RuntimeError("remote page borrow is closed")
-        if self.stream is not None and torch.cuda.current_stream(self.stream.device) != self.stream:
-            raise RuntimeError("remote CUDA page access requires its original receiving stream")
         return self._tensor
 
     def discard(self) -> None:
@@ -121,8 +119,6 @@ class BorrowedPage:
         self._tensor = None
 
     def close(self) -> None:
-        if self._tensor is None:
-            raise RuntimeError("remote page borrow is already closed")
         if self.stream is not None:
             self.stream.synchronize()
         self._tensor = None
@@ -270,7 +266,6 @@ class _Pools:
         self.layout, self.selected = layout, selected
         capacity = selected.page_capacity
         tensors: list[torch.Tensor] = []
-        allocated_bytes = 0
         for field in layout.fields:
             size = DTYPE_BYTES[field.dtype]
             stride = page_stride_bytes(field) // size
@@ -283,7 +278,6 @@ class _Pools:
                 .view(capacity, stride)[:, : prod(field.shape)]
                 .view(capacity, *field.shape)
             )
-            allocated_bytes += pool.numel() * size
         self.tensors = tuple(tensors)
         self.addresses = tuple(pool.data_ptr() for pool in self.tensors)
         # Per field and slot: how many versions share the page (0 = free), and how often it was reused.
@@ -291,8 +285,6 @@ class _Pools:
         self.generations = np.zeros((len(layout.fields), capacity), dtype=np.int64)
         self._field_offsets = np.arange(len(layout.fields), dtype=np.int64) * capacity
         self._readiness: dict[tuple[int, int], set[torch.cuda.Event]] = {}
-        if allocated_bytes != selected.reserved_bytes:
-            raise ValueError("PageBundle pool allocation differs from signed capacity")
 
     def free_count(self, field: int) -> int:
         return int(np.count_nonzero(self.holders[field] == 0))
@@ -314,15 +306,13 @@ class _Pools:
         np.add.at(self.holders[field], slots, 1)
 
     def tensor(self, field: int, page: PageSlot) -> torch.Tensor:
-        if self.generations[field, page.slot_id] != page.generation or self.holders[field, page.slot_id] < 1:
-            raise RuntimeError("PageBundle allocation generation was reclaimed")
+        assert self.generations[field, page.slot_id] == page.generation and self.holders[field, page.slot_id] >= 1
         return self.tensors[field][page.slot_id]
 
     def views(self, slots: Slots, generations: Slots) -> tuple[torch.Tensor, ...]:
         """One tensor view per field of a version, after checking none of its pages was reclaimed."""
         fields = np.arange(len(slots))
-        if (self.generations[fields, slots] != generations).any() or (self.holders[fields, slots] < 1).any():
-            raise RuntimeError("PageBundle allocation generation was reclaimed")
+        assert (self.generations[fields, slots] == generations).all() and (self.holders[fields, slots] >= 1).all()
         return tuple(tensor[slot] for tensor, slot in zip(self.tensors, slots.tolist()))
 
     def _counts(self, slots: Slots) -> Slots:
@@ -384,25 +374,15 @@ class PageBundleArena:
         validate_plan_bundle(plan, local_candidates=local_candidates)
         self.plan = plan
         placements = {(item.device_kind, item.device_ordinal) for item in plan.state_physical.representations}
-        if not placements and not plan.semantic_graph.states and device is not None:
-            if f"compute/{device.type}@1" not in plan.timeline.capabilities:
-                raise ValueError("stateless execution device differs from the signed timeline")
+        if not placements:
+            assert device is not None
             self.device = device
-        elif len(placements) == 1:
+        else:
             kind, ordinal = placements.pop()
             self.device = torch.device("cpu") if kind is StateDeviceKind.CPU else torch.device("cuda", ordinal)
-            if device is not None and device != self.device:
-                raise ValueError("explicit device differs from the signed state placement")
-        else:
-            raise ValueError("PageBundle arena requires one signed device placement")
         self._pools: dict[str, _Pools] = {}
         layouts = {item.resource: item.layout for item in plan.tensor_layout_request.layouts}
         self._owned_resources = tuple(layouts) if _owned_resources is None else _owned_resources
-        if (
-            len(set(self._owned_resources)) != len(self._owned_resources)
-            or not set(self._owned_resources) <= layouts.keys()
-        ):
-            raise ValueError("arena ownership must name distinct original plan resources")
         for selected in plan.state_physical.representations:
             # Partial materialization owns no remote pool; test_video tests the partition.
             if selected.resource in self._owned_resources:
@@ -559,15 +539,14 @@ class PageBundleArena:
                 row = table.row_of.get(lineage)
                 if row is not None and table.status[row] == 2:
                     return table.ref(row)
-            raise RuntimeError("PageBundle lineage is unadmitted or retiring")
+            raise KeyError(lineage)
 
     def resolve_lineages(self, resource: str, lineages: Sequence[LineageId]) -> StateRefs:
         """Resolve directory membership once; selections reuse these rows until membership changes."""
         with self._lock:
             table = self._tables[resource]
             rows = np.asarray([table.row_of.get(lineage, -1) for lineage in lineages], dtype=np.int64)
-            if (rows < 0).any() or (table.status[rows] != 2).any():
-                raise RuntimeError("PageBundle lineage is unadmitted or retiring")
+            assert (rows >= 0).all() and (table.status[rows] == 2).all()
             return StateRefs(
                 np.full(len(rows), table.pools.selected.layout_id, dtype=np.int64),
                 table.lineages[rows],
@@ -582,8 +561,7 @@ class PageBundleArena:
             refs = lineages if isinstance(lineages, StateRefs) else self.resolve_lineages(resource, lineages)
             table, rows = self._tables[resource], refs.rows
             assert rows is not None
-            if (table.status[rows] != 2).any() or (table.lineages[rows] != refs.lineages).any():
-                raise RuntimeError("PageBundle lineage is unadmitted or retiring")
+            assert (table.status[rows] == 2).all() and (table.lineages[rows] == refs.lineages).all()
             return StateRefs(refs.layouts, refs.lineages, table.versions[rows], rows)
 
     def root(self, ref: StateRef) -> PageBundle:
@@ -597,7 +575,7 @@ class PageBundleArena:
                 index = group.position(ref)
                 if index is not None:
                     return group.bundle(index)
-            raise RuntimeError("PageBundle root is unknown or reclaimed")
+            raise KeyError(ref)
 
     def _select(self, refs: Sequence[StateRef], *, latest: bool = True) -> tuple[_Pages, ...]:
         refs = StateRefs.of(refs)
@@ -616,20 +594,17 @@ class PageBundleArena:
                     (table.row_of.get(lineage, -1) for lineage in selected.lineages.tolist()), np.int64, len(selected)
                 )
                 selected = selected.resolved(rows)
-            if (rows < 0).any() or (table.lineages[rows] != selected.lineages).any():
-                raise RuntimeError("PageBundle root is unknown or reclaimed")
+            assert (rows >= 0).all() and (table.lineages[rows] == selected.lineages).all()
             versions = selected.versions
-            if (table.status[rows] != 2).any():
-                raise RuntimeError("PageBundle lineage is retiring; no new pins or writes may start")
+            assert (table.status[rows] == 2).all()
             if (table.versions[rows] == versions).all():
                 groups.append(
                     _Pages(
                         table, selected, rows, table.slots[rows], table.generations[rows], tuple(table.readiness[rows])
                     )
                 )
-            elif latest:
-                raise RuntimeError("PageBundle transition source is not latest")
             else:
+                assert not latest
                 # Lagged readers usually select an entire retained step. Resolve batches
                 # against the issued holds instead of scanning every hold for every row.
                 slots, generations = table.slots[rows].copy(), table.generations[rows].copy()
@@ -647,8 +622,7 @@ class PageBundleArena:
                     else:
                         readiness[found] = None
                     missing[found] = False
-                if missing.any():
-                    raise RuntimeError("PageBundle root is unknown or reclaimed")
+                assert not missing.any()
                 groups.append(
                     _Pages(
                         table,
@@ -665,8 +639,6 @@ class PageBundleArena:
         with self._lock:
             self._require_stream(stream)
             self.collect_completed()
-            if not resources or any(resource not in self._pools for resource in resources):
-                raise ValueError("PageBundle admission requires signed resources")
             for resource, table in self._tables.items():
                 if (
                     np.count_nonzero((table.status == 1) | (table.status == 2)) + resources.count(resource)
@@ -737,7 +709,7 @@ class PageBundleArena:
             if not sources:
                 self._admission_capacity_failures += 1
                 raise WindowBackpressure("page capacity is held by live owners; retry admission asynchronously")
-            assert not self._window_active, "admitted window exceeded its COW reservation"
+            assert not self._window_active
             raise RuntimeError("page capacity is unavailable without waiting; reserve an execution window")
 
     def prepare_transition(
@@ -753,8 +725,7 @@ class PageBundleArena:
             self._require_stream(stream)
             sources = StateRefs.of(sources)
             groups = self._select(sources)
-            if any(group.table.writing[group.rows].any() for group in groups):
-                raise RuntimeError("PageBundle lineage already has a pending write")
+            assert not any((group.table.writing[group.rows].any() for group in groups))
             masks = self._write_masks(groups, sources, fields)
             self._check_capacity((), groups, masks)
             targets = sources.next_versions()
@@ -866,8 +837,7 @@ class PageBundleArena:
     def settle(self, receipt: PagePublication) -> None:
         with self._lock:
             publication = self._publications.get(receipt)
-            if publication is None or publication.settled:
-                raise RuntimeError("PageBundle publication is not an issued receipt or is already settled")
+            assert publication is not None and not publication.settled
             publication.settled = True
 
     def abort(self, token: PageWrite) -> None:
@@ -986,7 +956,7 @@ class PageBundleArena:
                     result.append((group.bundle(index), writable))
                     break
             else:
-                raise RuntimeError("PageBundle root is not held or written by this transaction")
+                raise KeyError(ref)
         return tuple(result)
 
     def slot_matrix(self, access: PagePin | PageWrite, refs: StateRefs) -> tuple[str, Slots]:
@@ -999,7 +969,7 @@ class PageBundleArena:
                     positions = group.refs.positions(refs)
                     if np.all(positions >= 0):
                         return group.table.resource, group.slots[positions]
-            raise RuntimeError("PageBundle slots require exact refs held by the issued token")
+            raise KeyError(refs)
 
     def slots(self, access: tuple[PagePin | PageWrite, ...], refs: Sequence[StateRef]) -> tuple[str, Slots]:
         """Resolve all field slots once for a homogeneous resource selection."""
@@ -1025,8 +995,7 @@ class PageBundleArena:
         with self._lock:
             self._require_live()
             pools = self._pools[root.resource]
-            if writable is not None and len(writable) != len(root.slots):
-                raise RuntimeError("PageBundle field is not writable in this transaction")
+            assert writable is None or len(writable) == len(root.slots)
             if writable is None:
                 return tuple(view.detach() for view in pools.views(root.slots, root.generations))
             return pools.views(root.slots, root.generations)
@@ -1053,16 +1022,9 @@ class PageBundleArena:
     def _held_fields(
         self, access: PagePin | PageWrite, refs: Sequence[StateRef], fields: tuple[LayoutFieldId, ...]
     ) -> tuple[PageBundle, ...]:
-        if not refs or len(set(refs)) != len(refs):
-            raise ValueError("captured selection requires distinct nonempty original refs")
         held = self._held_roots((access,) * len(refs), refs)
-        if any(writable is not None and not set(fields) <= writable for _, writable in held):
-            raise RuntimeError("PageBundle field is not writable in this transaction")
+        assert all(writable is None or set(fields) <= writable for _, writable in held)
         roots = tuple(root for root, _ in held)
-        if len({root.resource for root in roots}) != 1:
-            raise ValueError("captured selection must use one original resource layout")
-        if any(not 0 <= field < len(roots[0].slots) for field in fields):
-            raise ValueError("PageBundle field is outside the signed layout")
         return roots
 
     def send_field(
@@ -1087,22 +1049,7 @@ class PageBundleArena:
         connection: Connection,
         stream: torch.cuda.Stream | None,
     ) -> tuple[PageFieldTransfer, RemoteCompletion]:
-        if (
-            stream is None
-            or value.device.type != "cuda"
-            or "state/shared_cuda@1" not in self._pools[root.resource].selected.capabilities
-        ):
-            raise ValueError("page export requires a signed shared CUDA provider and stream")
-        held_reads = (
-            read
-            for reads in (
-                *(pin.remote for pin in self._pins.values()),
-                *(release.remote_reads for release in self._releases),
-            )
-            for read in reads
-        )
-        if any(remote.connection is connection for remote in held_reads):
-            raise ValueError("each remote page access requires its own completion channel")
+        assert stream is not None
         descriptor = PageFieldTransfer(
             self.plan.schedule_decision.signature,
             owner_id,
@@ -1120,54 +1067,31 @@ class PageBundleArena:
         plan: PlanBundle, connection: Connection, *, stream: torch.cuda.Stream | None = None
     ) -> BorrowedPage:
         descriptor = decode_boundary(connection.recv_bytes(65536).decode(), PageFieldTransfer)
-        if (
-            descriptor.compilation_signature != plan.schedule_decision.signature
-            or descriptor.owner_id < 1
-            or descriptor.ref.lineage_id < 1
-            or descriptor.ref.version_id < 0
-        ):
-            raise ValueError("shared page belongs to another compilation or owner")
-        entries = tuple(
-            (entry, binding, provider)
-            for entry, binding in zip(
-                plan.tensor_layout_request.layouts, plan.tensor_layout_decision.bindings, strict=True
-            )
+        if descriptor.compilation_signature != plan.schedule_decision.signature:
+            raise ValueError("the page producer was built for another compilation; restart it from this model's plan")
+        ((entry, provider),) = (
+            (entry, provider)
+            for entry in plan.tensor_layout_request.layouts
             for provider in plan.state_physical.representations
-            if entry.resource == binding.resource == provider.resource == descriptor.resource
+            if entry.resource == provider.resource == descriptor.resource
         )
-        if len(entries) != 1:
-            raise ValueError("shared page resource is absent from the original plan")
-        entry, binding, provider = entries[0]
-        if (
-            provider.device_kind is not StateDeviceKind.CUDA
-            or "state/shared_cuda@1" not in provider.capabilities
-            or binding.layout_id != descriptor.ref.layout_id
-            or not 0 <= descriptor.field_id < len(entry.layout.fields)
-        ):
-            raise ValueError("shared page differs from the signed layout or placement")
+        assert stream is not None
         spec = entry.layout.fields[descriptor.field_id]
-        capacity = provider.page_capacity
         size = DTYPE_BYTES[spec.dtype]
         stride = page_stride_bytes(spec) // size
         alignment = max(spec.alignment_bytes // size, 1)
-        head = descriptor.storage_offset - descriptor.page.slot_id * stride
-        if not 0 <= descriptor.page.slot_id < capacity or descriptor.page.generation < 0 or not 0 <= head < alignment:
-            raise ValueError("shared page slot or offset is outside signed capacity")
-        nbytes = (capacity * stride + alignment - 1) * size
-        if stream is None or stream.device != torch.device("cuda", provider.device_ordinal):
-            raise ValueError("remote CUDA page requires its signed receiving device and stream")
-        if prod(spec.shape):
-            if descriptor.cuda_storage is None:
-                raise ValueError("remote CUDA page is missing its storage handle")
-            tensor = descriptor.cuda_storage.map(
-                nbytes, tensor_dtype(spec.dtype), descriptor.storage_offset, spec.shape, stream
+        storage = descriptor.cuda_storage
+        tensor = (
+            storage.map(
+                (provider.page_capacity * stride + alignment - 1) * size,
+                tensor_dtype(spec.dtype),
+                descriptor.storage_offset,
+                spec.shape,
+                stream,
             )
-            if tensor.data_ptr() % spec.alignment_bytes:
-                raise ValueError("CUDA IPC page mapping violates the signed alignment")
-        else:
-            if descriptor.cuda_storage is not None:
-                raise ValueError("empty CUDA page must not carry an allocation handle")
-            tensor = torch.empty(spec.shape, dtype=tensor_dtype(spec.dtype), device=stream.device)
+            if storage is not None
+            else torch.empty(spec.shape, dtype=tensor_dtype(spec.dtype), device=stream.device)
+        )
         return BorrowedPage(descriptor, tensor, connection, stream)
 
     def snapshot(self, pin: PagePin, ref: StateRef) -> tuple[torch.Tensor, ...]:
@@ -1207,8 +1131,7 @@ class PageBundleArena:
         with self._lock:
             self._require_live()
             groups = self._select(refs)
-            if any(group.table.writing[group.rows].any() for group in groups):
-                raise RuntimeError("PageBundle retirement overlaps a write or stale version")
+            assert not any((group.table.writing[group.rows].any() for group in groups))
             for group in groups:
                 group.table.status[group.rows] = 3
                 group.release()
@@ -1292,21 +1215,18 @@ class PageBundleArena:
     def _issued_write(self, token: PageWrite) -> _Write:
         self._require_live()
         write = self._writes.get(token)
-        if write is None:
-            raise RuntimeError("PageBundle write is not an issued token or is already consumed")
+        assert write is not None
         return write
 
     def _issued_pin(self, pin: PagePin) -> _Pin:
         self._require_live()
         issued = self._pins.get(pin)
-        if issued is None:
-            raise RuntimeError("PageBundle pin is not an issued token or is released; no new reads may start")
+        assert issued is not None
         return issued
 
     def _issued_release(self, receipt: PageRelease) -> None:
         self._require_live()
-        if receipt not in self._issued_releases:
-            raise RuntimeError("PageBundle release differs from the issued receipt")
+        assert receipt in self._issued_releases
 
     def _require_live(self) -> None:
         if self._poisoned:
@@ -1314,13 +1234,6 @@ class PageBundleArena:
 
     def _require_stream(self, stream: torch.cuda.Stream | None) -> None:
         self._require_live()
-        if (
-            self.device.type == "cpu"
-            and stream is not None
-            or self.device.type == "cuda"
-            and (stream is None or stream.device != self.device)
-        ):
-            raise RuntimeError("PageBundle stream differs from its signed device")
         self._order(self._initialization, stream)
         if stream is not None and stream.cuda_stream not in self._storage_streams:
             # The arena may be destroyed after asynchronous cancellation. CUDA's

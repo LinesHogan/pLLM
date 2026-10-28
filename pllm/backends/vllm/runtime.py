@@ -19,12 +19,6 @@ import torch
 from vllm import RequestOutput, SamplingParams, __version__ as _VLLM_VERSION
 from vllm.config import VllmConfig
 from vllm.entrypoints.llm import LLM
-from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
-from vllm.v1.engine.core_client import InprocClient
-from vllm.v1.executor.uniproc_executor import UniProcExecutor
-from vllm.v1.sample.sampler import Sampler as Mrv1Sampler
-from vllm.v1.worker.gpu.sample.sampler import Sampler
-from vllm.v1.worker.gpu_worker import Worker
 
 from pllm.authoring import (
     AuxiliaryInput,
@@ -75,14 +69,14 @@ from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.state_execution import StateDiagnostics
 from pllm.execution.state_feed import Feed
-from pllm.execution.trace import TRACE_SCHEMA_VERSION, TraceSelection, TraceSnapshot
+from pllm.execution.trace import TraceSelection, TraceSnapshot
 
 if TYPE_CHECKING:
     from pllm.backends.vllm.mrv1 import Mrv1Runner
 
 
 from pllm.backends.vllm.position_state import POSITION_ENV
-from pllm.backends.vllm.prefix_cache import POLICY_ENV, CachePolicy
+from pllm.backends.vllm.prefix_cache import CachePolicy
 from pllm.backends.vllm.runner import TAPS_ENV, BackendWorkerState, WorkloadModelRunner
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_hidden import hidden_binding
@@ -134,15 +128,11 @@ def _digest(fields: tuple[str, ...]) -> str:
 
 
 def _tensor_dtype(dtype: torch.dtype) -> TensorDType:
-    match dtype:
-        case torch.float16:
-            return TensorDType.FLOAT16
-        case torch.bfloat16:
-            return TensorDType.BFLOAT16
-        case torch.float32:
-            return TensorDType.FLOAT32
-        case _:
-            raise RuntimeError("vLLM workload runner dtype is unsupported")
+    return {
+        torch.float16: TensorDType.FLOAT16,
+        torch.bfloat16: TensorDType.BFLOAT16,
+        torch.float32: TensorDType.FLOAT32,
+    }[dtype]
 
 
 def _model_dtype(dtype: VllmDType) -> Literal["bfloat16", "float16", "float32"]:
@@ -180,6 +170,7 @@ class BackendProbe:
 class BackendInstall:
     attachment: SignedBackendAttachment
     definition: str
+    cache_policy: CachePolicy
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,11 +192,12 @@ class VllmLlm(Generic[DataT, ResultT]):
     _deployment: BackendDeployment[DataT, ResultT] | None
     attachment: SignedBackendAttachment
     _facts: BackendCompileFacts
+    _cache_policy: CachePolicy
     _closed: bool = False
     _next_prompt_index: int = 0
     _pending_input: ExitStack | None = None
 
-    def _require_llm(self) -> LLM:
+    def _require_open(self) -> LLM:
         if self._closed or self._llm is None:
             raise RuntimeError("model handle is closed")
         return self._llm
@@ -223,8 +215,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         return self._facts.device
 
     def __enter__(self) -> VllmLlm[DataT, ResultT]:
-        if self._closed:
-            raise RuntimeError("model handle is closed")
+        self._require_open()
         return self
 
     def __exit__(
@@ -239,68 +230,59 @@ class VllmLlm(Generic[DataT, ResultT]):
 
     def feed(self, name: str) -> Feed:
         """Return the producer handle for a declared externally fed state."""
-        self._require_llm()
+        self._require_open()
         if self._runner is None:
             raise ValueError("state feeds need multiprocessing=False; pass the writer to a spawned producer")
         return self.runner.require_session().feed(name)
 
     def diagnostics(self) -> StateDiagnostics:
-        if self._closed:
-            raise RuntimeError("model handle is closed")
+        self._require_open()
         return self.worker_state().diagnostics
+
+    def _require_in_process(self) -> tuple[WorkloadModelRunner | Mrv1Runner, BackendDeployment[DataT, ResultT]]:
+        self._require_open()
+        if self._runner is None or self._deployment is None:
+            raise RuntimeError("use multiprocessing=False to access the runner or deployment")
+        return self._runner, self._deployment
 
     @property
     def runner(self) -> WorkloadModelRunner | Mrv1Runner:
-        if self._closed:
-            raise RuntimeError("model handle is closed")
-        if self._runner is None:
-            raise RuntimeError("the model runner belongs to the EngineCore child")
-        return self._runner
+        return self._require_in_process()[0]
 
     @property
     def deployment(self) -> BackendDeployment[DataT, ResultT]:
-        if self._closed:
-            raise RuntimeError("model handle is closed")
-        if self._deployment is None:
-            raise RuntimeError("the execution and arena belong to the EngineCore child")
-        return self._deployment
+        return self._require_in_process()[1]
 
     def command(self, command: BackendCommand, payload: str = "", *, timeout: float = 30.0) -> str:
-        replies = self._require_llm().collective_rpc("workload_command", timeout=timeout, args=(command.value, payload))
-        if len(replies) != 1:
-            self._shutdown()
-            raise RuntimeError("canonical worker quorum differs from the signed single-worker topology")
+        replies = self._require_open().collective_rpc(
+            "workload_command", timeout=timeout, args=(command.value, payload)
+        )
         return replies[0]
 
     def worker_state(self) -> BackendWorkerState:
         return decode_boundary(self.command(BackendCommand.DIAGNOSTICS), BackendWorkerState)
 
     def trace_snapshot(self) -> TraceSnapshot:
-        if self._closed:
-            raise RuntimeError("vLLM workload handle is closed")
+        self._require_open()
         snapshot = (
-            self._runner.trace.snapshot()
+            self._runner.require_session().trace.snapshot()
             if self._runner is not None
             else decode_boundary(self.command(BackendCommand.TRACE), TraceSnapshot)
         )
-        if snapshot.schema_version != TRACE_SCHEMA_VERSION:
-            raise RuntimeError("worker trace differs from the original schema")
         return snapshot
 
     def profile_tasks(self, tasks: tuple[TaskId, ...]) -> None:
-        if self._closed:
-            raise RuntimeError("vLLM workload handle is closed")
+        self._require_open()
         if self._runner is not None:
-            self._runner.trace.profile_tasks(tasks)
+            self._runner.require_session().trace.profile_tasks(tasks)
         else:
             self.command(BackendCommand.PROFILE, encode_boundary(tasks))
 
     def observe(self, selection: TraceSelection) -> None:
         """Configure bounded explicit tensor/gradient snapshots and opt-in Kineto profiling."""
-        if self._closed:
-            raise RuntimeError("vLLM workload handle is closed")
+        self._require_open()
         if self._runner is not None:
-            self._runner.trace.configure(selection)
+            self._runner.require_session().trace.configure(selection)
         else:
             self.command(BackendCommand.OBSERVE, encode_boundary(selection))
 
@@ -322,10 +304,6 @@ class VllmLlm(Generic[DataT, ResultT]):
         if self._pending_input is not None:
             self._pending_input.close()
             self._pending_input = None
-
-    def cache_policy(self) -> CachePolicy:
-        """Read the installed identity, including idle workload replacements."""
-        return self.worker_state().cache_policy
 
     def generate_feedback(
         self,
@@ -350,7 +328,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         Optional edits reuse StateTensorUpdate and require a signed activation workload;
         the feedback adapter returns original tensors, never a worker callback.
         """
-        if type(max_rounds) is not int or max_rounds < 1 or type(prompts) is not list or not prompts:
+        if max_rounds < 1 or not prompts:
             raise ValueError("feedback generation requires a nonempty prompt list and positive finite round bound")
         texts: list[str] = list(prompts)
         indices: tuple[int, ...] = (
@@ -374,32 +352,13 @@ class VllmLlm(Generic[DataT, ResultT]):
                 routes=None if route_values is None else tuple(route_values),
             )
             result = feedback(batch)
-            if result is None:
-                raise RuntimeError("completion feedback returned no settled control result")
+            assert result is not None
             entries, controls = batch.completions.entries, result.retry_controls
-            if len(controls) != len(entries) or any(
-                control.completion is not entry for control, entry in zip(controls, entries, strict=True)
-            ):
-                raise ValueError("feedback controls must reference the original ordered completions")
-            by_request = {entry.identity.request_id: entry for entry in entries}
-            covered: set[str] = set()
             ready: set[str] = set()
             for barrier in result.update_barriers:
                 members = set(barrier.request_ids)
-                if (
-                    not members
-                    or len(members) != len(barrier.request_ids)
-                    or covered.intersection(members)
-                    or not members.issubset(by_request)
-                    or not 0 <= barrier.ready_count <= len(members)
-                    or any(by_request[request].group_id != barrier.group_id for request in members)
-                ):
-                    raise ValueError("feedback barriers must partition original completion identities")
-                covered.update(members)
                 if barrier.state is BarrierState.READY and barrier.ready_count > 0 and result.update_count > 0:
                     ready.update(members)
-            if covered != by_request.keys():
-                raise ValueError("feedback barriers omitted a completion")
             retry = {
                 control.completion.identity.request_id
                 for control in controls
@@ -474,8 +433,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         completion_device: torch.device | None = None,
         routes: tuple[str, ...] | None = None,
     ) -> list[RequestOutput] | CompletionInput:
-        if self._closed:
-            raise RuntimeError("vLLM workload handle is closed")
+        self._require_open()
         if completion_device is not None and feedback_group is None:
             raise ValueError("completion device requires completion feedback")
         output_device = completion_device or (torch.device("cpu") if self._runner is None else self.runner.device)
@@ -486,40 +444,24 @@ class VllmLlm(Generic[DataT, ResultT]):
                 raise ValueError("completion IPC currently requires the model's CUDA device")
         elif output_device.type != "cpu":
             raise ValueError("completion output requires CPU or CUDA storage")
-        if (
-            type(prompts) not in (str, list)
-            or (type(prompts) is str and not prompts)
-            or (
-                type(prompts) is list
-                and (not prompts or any(type(prompt) is not str or not prompt for prompt in prompts))
-            )
-            or type(sampling_params) is not SamplingParams
-            or sampling_params.n != 1
-            or type(use_tqdm) is not bool
-            or type(sample_index) is not int
-            or sample_index < 0
-            or feedback_group is not None
-            and (type(feedback_group) is not str or not feedback_group)
-        ):
-            raise ValueError("vLLM workload generate requires non-empty text and n=1")
         texts = [prompts] if isinstance(prompts, str) else prompts
+        if not texts or any(not prompt for prompt in texts) or sampling_params.n != 1:
+            raise ValueError("provide non-empty prompts and set sampling n=1")
+        if sample_index < 0 or feedback_group is not None and not feedback_group:
+            raise ValueError("use a nonnegative sample index and a non-empty feedback group")
         indices = (
             tuple(range(self._next_prompt_index, self._next_prompt_index + len(texts)))
             if prompt_indices is None
             else prompt_indices
         )
-        if len(indices) != len(texts) or any(type(index) is not int or index < 0 for index in indices):
+        if len(indices) != len(texts) or any(index < 0 for index in indices):
             raise ValueError("prompt indices must align with the original input prompts")
         # A route value is user-computed (regex, discriminator, tenant); the signed
         # graph only declares whether any request state keys on it.
         signed_route = any(
             RequestKeyField.ROUTE in state.key_fields for state in self.attachment.inputs.plan.semantic_graph.states
         )
-        if routes is not None and (
-            not signed_route
-            or len(routes) != len(texts)
-            or any(type(route) is not str or not route for route in routes)
-        ):
+        if routes is not None and (not signed_route or len(routes) != len(texts) or any(not route for route in routes)):
             raise ValueError("routes require a signed route-keyed state and one value per prompt")
         if signed_route and routes is None:
             raise ValueError("a route-keyed request state requires per-prompt routes")
@@ -528,12 +470,12 @@ class VllmLlm(Generic[DataT, ResultT]):
             if groups.setdefault(index, prompt) != prompt:
                 raise ValueError("one prompt identity cannot name different input texts")
         validate_auxiliary(auxiliary, self.attachment.inputs.plan, SharedTensor.describe)
-        llm = self._require_llm()
+        llm = self._require_open()
         llm.sleep(level=0, mode="keep")
         request_ids: list[str] = []
         lifetime = ExitStack()
         try:
-            request_ids = llm.enqueue(prompts, self.cache_policy().sampling(sampling_params), use_tqdm=use_tqdm)
+            request_ids = llm.enqueue(prompts, self._cache_policy.sampling(sampling_params), use_tqdm=use_tqdm)
             identities = tuple(
                 RequestIdentity(request_id, index, sample_index, route)
                 for request_id, index, route in zip(
@@ -565,7 +507,7 @@ class VllmLlm(Generic[DataT, ResultT]):
                     BackendCommand.STAGE, encode_boundary(BackendStage(identities, auxiliary_wire, completion_wire))
                 )
             else:
-                self.runner.stage_workload_input(auxiliary, identities, destination)
+                self.runner.require_session().stage_input(auxiliary, identities, destination)
             self._next_prompt_index = max(self._next_prompt_index, max(indices) + 1)
             llm.wake_up(tags=["scheduling"])
             outputs = llm.wait_for_completion(RequestOutput, use_tqdm=use_tqdm)
@@ -574,12 +516,8 @@ class VllmLlm(Generic[DataT, ResultT]):
             if feedback_group is not None:
                 completions: dict[RequestIdentity, Completion] = {}
                 for output in outputs:
-                    if not output.finished or len(output.outputs) != 1:
-                        raise RuntimeError("completion feedback requires final n=1 outputs")
                     identity = external[output.request_id]
                     (completion,) = output.outputs
-                    if identity in completions:
-                        raise RuntimeError("duplicate completion for a submitted request")
                     completions[identity] = Completion(
                         identity,
                         completion.index,
@@ -588,18 +526,14 @@ class VllmLlm(Generic[DataT, ResultT]):
                         completion.text,
                         FinishReason(completion.finish_reason),
                     )
-                if len(completions) != len(identities):
-                    raise RuntimeError("completion feedback did not finish every submitted request")
                 batch = CompletionBatch(tuple(completions[identity] for identity in identities))
                 if self._runner is not None:
-                    capture = self.runner.completion_capture
-                    if capture is None:
-                        raise RuntimeError("completion capture was not started")
+                    capture = self.runner.require_session().completion_capture
+                    assert capture is not None
                     result = capture.finish(batch)
             self.command(BackendCommand.FINISH)
             if batch is not None and self._runner is None:
-                if destination is None:
-                    raise RuntimeError("completion output was not allocated")
+                assert destination is not None
                 result = CompletionInput(
                     batch,
                     destination,
@@ -638,24 +572,17 @@ def create_vllm_llm(
     offload = config.kv_offload
     if requirements.position_states and config.runner is RunnerKind.MRV1:
         raise ValueError("PositionState layer routes require runner=MRV2")
-    if config.enable_prefix_caching and (requirements.parameter_targets or requirements.activation_layers):
-        raise ValueError("parameter-version overlays do not support shared prefix caching")
     if _VLLM_VERSION != _SUPPORTED_VLLM_VERSION:
         raise RuntimeError("vLLM workload requires vLLM 0.27.1 exactly")
-    if config.cuda_graphs and requirements.activation_layers:
-        raise ValueError("parameter overlays and activation patches do not run under CUDA graphs yet")
     environment = {
         _MP_ENV: "1" if config.multiprocessing else "0",
         _V2_RUNNER_ENV: "1" if config.runner is RunnerKind.MRV2 else "0",
         TAPS_ENV: json.dumps([[source.layer, source.site.value] for source in requirements.hidden_inputs]),
-        POLICY_ENV: config.generated_kv,
         POSITION_ENV: encode_boundary(PositionAnnouncement(requirements.position_states)),
     }
     if config.multiprocessing:
         environment["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     previous_environment = {name: os.environ.get(name) for name in environment}
-    if config.multiprocessing and definition is None:
-        raise ValueError("EngineCore requires a closed mathematical definition from the public factory")
     if any(previous_environment[name] not in (None, value) for name, value in environment.items()):
         raise RuntimeError("vLLM workload conflicts with explicit MP, spawn or legacy-runner environment")
     os.environ.update(environment)
@@ -703,50 +630,23 @@ def create_vllm_llm(
                     encode_boundary(BackendProbe(requirements, config.execution.publish_lag)),
                 ),
             )
-            if len(replies) != 1:
-                raise RuntimeError("canonical probe requires the exact single-worker quorum")
             facts = workload.specialize(decode_boundary(replies[0], BackendCompileFacts), config.execution)
             attachment = workload.plan_backend(facts)
-            handle = VllmLlm[DataT, ResultT](llm, None, None, attachment, facts)
-            installed = decode_boundary(
-                handle.command(
-                    BackendCommand.INSTALL,
-                    encode_boundary(BackendInstall(attachment, definition or "")),
-                ),
-                BackendWorkerState,
+            policy = CachePolicy.for_attachment(attachment, config.generated_kv)
+            handle = VllmLlm[DataT, ResultT](llm, None, None, attachment, facts, policy)
+            handle.command(
+                BackendCommand.INSTALL, encode_boundary(BackendInstall(attachment, definition or "", policy))
             )
-            if installed.process_id == os.getpid():
-                raise RuntimeError("EngineCore did not install the original signed compilation in its child")
         else:
-            match llm.llm_engine.engine_core:
-                case InprocClient() as client:
-                    pass
-                case _:
-                    raise RuntimeError("vLLM workload did not construct an in-process client")
-            match client.engine_core.model_executor:
-                case UniProcExecutor() as executor:
-                    pass
-                case _:
-                    raise RuntimeError("vLLM workload did not construct a uni-process executor")
-            match executor.driver_worker.worker:
-                case Worker() as worker:
-                    pass
-                case _:
-                    raise RuntimeError("vLLM workload did not construct its worker")
-            from pllm.backends.vllm.mrv1 import Mrv1Runner
-
-            match worker.model_runner:
-                case WorkloadModelRunner() | Mrv1Runner() as runner:
-                    pass
-                case _:
-                    raise RuntimeError("vLLM workload did not construct its selected runner")
+            runner = llm.llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner
             facts = workload.specialize(
                 probe_backend(requirements, runner, publish_lag=config.execution.publish_lag),
                 config.execution,
             )
             deployment = workload.compile_backend(facts)
-            runner.attach_workload(deployment)
-            handle = VllmLlm(llm, runner, deployment, deployment.attachment, facts)
+            policy = CachePolicy.for_attachment(deployment.attachment, config.generated_kv)
+            runner.attach_workload(deployment, policy)
+            handle = VllmLlm(llm, runner, deployment, deployment.attachment, facts, policy)
         construction.pop_all()
         return handle
 
@@ -758,14 +658,7 @@ def probe_backend(
     *,
     publish_lag: int = 1,
 ) -> BackendCompileFacts:
-    _require_runner(runner)
-    if requirements.position_states != runner.position_states:
-        raise ValueError("PositionState schema differs from pre-allocation announcement; create a new engine")
-    match runner.model:
-        case Qwen2ForCausalLM() as model:
-            pass
-        case _:
-            raise RuntimeError("vLLM workload currently requires Qwen2")
+    model = runner.qwen2_model()
     if model.quant_config is not None:
         raise RuntimeError("vLLM workload requires an unquantized model")
     if requirements.model_source is not None and requirements.model_source != (
@@ -848,16 +741,6 @@ def probe_backend(
     observed = replace(observed, reserved_bytes=required)
     if timeline is None:
         timeline = observed
-    elif (
-        timeline.anchors != observed.anchors
-        or timeline.capabilities != observed.capabilities
-        or timeline.schema_version != observed.schema_version
-    ):
-        raise ValueError("worker timeline differs from the supported single-device anchors and capabilities")
-    elif len(timeline.reserved_bytes) != len(required) or any(
-        actual < minimum for actual, minimum in zip(timeline.reserved_bytes, required, strict=True)
-    ):
-        raise ValueError("worker timeline underfunds the backend input/sampler buffers")
     free_bytes, _total_bytes = torch.cuda.mem_get_info(runner.device)
     # Per scheduled request: the current root, the private root being written, and the root the GPU
     # may still read from the step before, because the host prepares a step while the GPU runs the last.
@@ -865,7 +748,7 @@ def probe_backend(
     # is hidden in this capacity: current + private + GPU reader + publish_lag retained roots.
     capacity = (3 + publish_lag) * runner.max_num_reqs + 2
     facts = BackendCompileFacts(
-        replace(probe, targets=targets),
+        replace(probe, targets=targets, position_states=requirements.position_states),
         timeline,
         (
             PageBundleProviderFacts(
@@ -884,22 +767,6 @@ def probe_backend(
     return facts
 
 
-def _require_runner(runner: WorkloadModelRunner | Mrv1Runner) -> None:
-    if (
-        _VLLM_VERSION != _SUPPORTED_VLLM_VERSION
-        or runner.parallel_config.tensor_parallel_size != 1
-        or runner.parallel_config.pipeline_parallel_size != 1
-        or runner.parallel_config.data_parallel_size != 1
-        or runner.parallel_config.decode_context_parallel_size != 1
-        or runner.speculative_config is not None
-        or runner.lora_config is not None
-        or runner.device.type != "cuda"
-        or runner.max_num_reqs < 1
-        or type(runner.sampler) is not (Sampler if runner.runner_kind is RunnerKind.MRV2 else Mrv1Sampler)
-    ):
-        raise RuntimeError("vLLM workload requires TP1/PP1/DP1 non-spec execution")
-
-
 def _base_probe(
     runner: WorkloadModelRunner | Mrv1Runner,
     *,
@@ -910,8 +777,7 @@ def _base_probe(
     capabilities: tuple[str, ...],
 ) -> BackendPlacementProbe:
     device_ordinal = runner.device.index
-    if type(device_ordinal) is not int or device_ordinal < 0:
-        raise RuntimeError("vLLM workload requires an ordinal CUDA device")
+    assert device_ordinal is not None
     return BackendPlacementProbe(
         adapter_id=f"canonical.vllm_{runner.runner_kind.value}@1",
         backend_abi_digest=_digest(

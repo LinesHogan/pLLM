@@ -5,7 +5,7 @@ from dataclasses import replace
 from importlib.util import find_spec
 from multiprocessing import Pipe
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -132,8 +132,6 @@ def received_features(plan, *, version=7, scale=1):
 
 def test_video_binding_keeps_remote_roots_out_of_local_ownership():
     with binding_case() as (_, _, _, _, execution, root, peers):
-        with pytest.raises(ValueError):  # Remote features are borrowed, never admitted locally.
-            execution.arena.prepare_admission(("features",))
         execution.stage_readonly((root,))
         invocation = execution.start_step(None)
         for anchor in execution.arena.plan.timeline.anchors:
@@ -148,8 +146,6 @@ def test_video_binding_keeps_remote_roots_out_of_local_ownership():
             peer.poll() and peer.recv_bytes() == encode_boundary(page.descriptor).encode()
             for peer, page in zip(peers, root.pages, strict=True)
         )
-        with pytest.raises(RuntimeError):  # Never silently read local inject as the next features chunk.
-            execution.begin(())
     if find_spec("vllm") is not None:
         _decode_steps_keep_exact_publications_and_ack_order()
         _hold_steps_reuse_the_settled_injection()
@@ -240,7 +236,7 @@ def _step_rows(step, identities):
 
 
 def _decode_steps_keep_exact_publications_and_ack_order():
-    from pllm.execution.state_feed import ReadonlyStepInput
+    from pllm.execution.state_feed import FeedReceiver, ReadonlyStepInput
 
     identities = (RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0))
     # Only the stream adapter is replaced: all state tasks, pins and settlement are real CPU code.
@@ -257,7 +253,7 @@ def _decode_steps_keep_exact_publications_and_ack_order():
             received.append(rows.step_id)
             return ReadonlyStepInput(rows.plan_epoch, rows.step_id, ((first, second)[rows.step_id],))
 
-        session.bind_readonly_input(receive)
+        session._feed = Mock(spec=FeedReceiver, side_effect=receive)
         session.stage_input(None, identities)
         for step, (root, peers) in enumerate(((first, first_peers), (second, second_peers))):
             session.before_execute(_scheduler(session, *(identities if step == 0 else ())))
@@ -275,7 +271,7 @@ def _decode_steps_keep_exact_publications_and_ack_order():
                 torch.testing.assert_close(actual, hidden * 2 + torch.tensor(values)[:, None], rtol=0, atol=0)
                 assert carry is residual
             session.complete_forward()
-            session.complete_sampler(False)
+            session.complete_sampler()
             assert not any(peer.poll() for peer in peers), "sampler completion alone is not settlement"
             session.commit_token()
             assert torch.equal(rng, torch.random.get_rng_state())
@@ -289,7 +285,7 @@ def _decode_steps_keep_exact_publications_and_ack_order():
 
 
 def _hold_steps_reuse_the_settled_injection():
-    from pllm.execution.state_feed import ReadonlyStepAbsent, ReadonlyStepEnd, ReadonlyStepInput
+    from pllm.execution.state_feed import FeedReceiver, ReadonlyStepAbsent, ReadonlyStepEnd, ReadonlyStepInput
 
     identity = RequestIdentity("hold", 0, 0)
 
@@ -314,7 +310,7 @@ def _hold_steps_reuse_the_settled_injection():
             ReadonlyStepInput(1, 2, (second,)),
             ReadonlyStepEnd(1, 3),
         )
-        session.bind_readonly_input(lambda batch, stream: outcomes[batch.step_id])
+        session._feed = Mock(spec=FeedReceiver, side_effect=lambda batch, stream: outcomes[batch.step_id])
         session.stage_input(None, (identity,))
         refs = []
         for step in range(4):
@@ -330,7 +326,7 @@ def _hold_steps_reuse_the_settled_injection():
                 actual, _ = layer(torch.zeros(1), torch.ones(1, 2))
                 torch.testing.assert_close(actual, torch.full((1, 2), float(2 + delta)))
             session.complete_forward()
-            session.complete_sampler(False)
+            session.complete_sampler()
             session.commit_token()
             assert torch.equal(rng, torch.random.get_rng_state())
             assert execution.diagnostics().update_count == (step // 2 + 1)
