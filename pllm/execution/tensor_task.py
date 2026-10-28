@@ -63,17 +63,15 @@ class FieldWriter:
             )
         )
         values = tuple(value.unsqueeze(0) for value in values) if instance and self.source is not None else values
-        if validate:
-            for view, value in zip(self.fields, values, strict=True):
-                target = view.read(batch.roots[selected[0]][view.field])
-                if (
-                    value.shape != (len(selected), *view.shape)
-                    or value.dtype != target.dtype
-                    or value.device != target.device
-                ):
-                    raise ValueError(
-                        f"write to {self.resource} needs fields with their declared shape, dtype, device and request axis"
-                    )
+        if validate and any(
+            value.shape != (len(selected), *view.shape)
+            or value.dtype != (target := view.read(batch.roots[selected[0]][view.field])).dtype
+            or value.device != target.device
+            for view, value in zip(self.fields, values, strict=True)
+        ):
+            raise ValueError(
+                f"write to {self.resource} needs fields with their declared shape, dtype, device and request axis"
+            )
         return values
 
     def select(self, data: TensorFrame, selection: RequestStateSelection) -> tuple[int, ...]:
@@ -114,22 +112,18 @@ class TensorTask:
                     ordered.update((task.symbol, task) for task in tasks[upstream].dependencies(tasks))
                 case _:
                     pass
-        ordered[self.symbol] = self
-        return tuple(ordered.values())
+        return (*ordered.values(), self)
 
     @property
     def domains(self) -> tuple[str, ...]:
         """Inputs that are boolean row masks (row selector, gradient rows, update states)."""
         policy = self.policy
         keys = (policy.forward_rows, policy.input_gradient_rows, policy.parameter_gradient_rows, policy.update_states)
-        result: list[str] = []
-        for key in dict.fromkeys(keys):
-            match self.sources.get(key):
-                case None | StateSelectionInputSource():
-                    pass
-                case _:
-                    result.append(key)
-        return tuple(result)
+        return tuple(
+            key
+            for key in dict.fromkeys(keys)
+            if key in self.sources and type(self.sources[key]) is not StateSelectionInputSource
+        )
 
     @property
     def differentiable(self) -> bool:
@@ -148,10 +142,8 @@ class TensorTask:
             batch = replace(batch, roots=LeafRoots(state_leaf(data, batch), batch.roots))
         domains = self.domains
         inputs = {key: self.ports[key].read(data, batch) for key in domains}
-        for key in domains:
-            mask = inputs[key]
-            if mask.dtype != torch.bool or mask.shape != (len(data.rows),):
-                raise ValueError("row domain must be a boolean mask over the operation rows")
+        if any(inputs[key].dtype != torch.bool or inputs[key].shape != (len(data.rows),) for key in domains):
+            raise ValueError("row domain must be a boolean mask over the operation rows")
         compacted = bool(policy.forward_rows) and compact
         rows = selected_rows(inputs[policy.forward_rows]) if compacted else tuple(range(len(data.rows)))
         selected = (

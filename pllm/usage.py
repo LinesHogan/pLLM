@@ -135,11 +135,13 @@ class Config:
     @staticmethod
     def resolve(value: object, owner: object) -> object:
         """Resolve an explicit configuration path against the snapshotted owner."""
-        if isinstance(value, Config):
-            for part in value.name.split("."):
-                owner = object.__getattribute__(owner, part)
-            return owner
-        return value
+        match value:
+            case Config(name=name):
+                for part in name.split("."):
+                    owner = object.__getattribute__(owner, part)
+                return owner
+            case _:
+                return value
 
 
 @dataclass(frozen=True)
@@ -223,8 +225,8 @@ class Capture:
 
     def declare(self, state: str, update: State | None) -> LayoutFieldId:
         """Validate a memory publication against the training state's fields."""
-        if update is None or self.state != state:
-            raise ValueError("memory captures target the task's own training state")
+        _reject(update is None or self.state != state, "memory captures target the task's own training state")
+        assert update is not None
         _reject(
             self.field not in {field.name for field in update.fields[update.optimizer_fields :]},
             f"{self.field}: captures name a declared memory field",
@@ -413,7 +415,7 @@ class InstanceState:
         )
         _reject(set(self.memory) & set(self.fields), "memory fields duplicate a parameter field")
         _reject(
-            any(isinstance(shape, Buffer) for shape in self.memory.values()),
+            any(type(shape) is Buffer for shape in self.memory.values()),
             "memory fields require tensor shapes, not overlay buffers",
             TypeError,
         )
@@ -432,9 +434,15 @@ class InstanceState:
         if self.feed is not None:
             _reject(context.binding.feeds, "declare one fed state per workload")
             context.binding.feeds = (FeedBinding(name, self.feed, tuple(self.fields)),)
-        shapes = {key: shape for key, shape in self.fields.items() if not isinstance(shape, Buffer)}
+        shapes: dict[str, Shape] = {}
+        for key, spec in self.fields.items():
+            match spec:
+                case Buffer():
+                    break
+                case shape:
+                    shapes[key] = shape
         if len(shapes) != len(self.fields) or any(
-            isinstance(value, Overlay) and value.state == name for value in context.values.values()
+            type(value) is Overlay and value.state == name for value in context.values.values()
         ):
             context.allocate_buffers(name, self)
             return
@@ -547,16 +555,16 @@ def _buffers(state: InstanceState) -> dict[str, Buffer]:
         "buffer effects update their state themselves; drop the optimizer",
     )
     _reject(state.alignment != 16, "buffer effect layouts use their original target alignment")
-    _reject(
-        any(callable(value) for value in state.fields.values()),
-        "operand-dependent shapes require Buffer(input_size, output_size)",
-        TypeError,
-    )
-    return {
-        key: value if isinstance(value, Buffer) else Buffer(value, state.dtype)
-        for key, value in state.fields.items()
-        if not callable(value)
-    }
+    buffers: dict[str, Buffer] = {}
+    for key, value in state.fields.items():
+        match value:
+            case Buffer():
+                buffers[key] = value
+            case tuple():
+                buffers[key] = Buffer(value, state.dtype)
+            case _:
+                raise TypeError("operand-dependent shapes require Buffer(input_size, output_size)")
+    return buffers
 
 
 class _Effect:
@@ -667,17 +675,20 @@ class _Train(_Effect):
         """Choose optimizer training or the explicit weighted SGD transition."""
         arguments, captures = operation.arguments()
         definition = operation.context.state_definition(self.state, "training requires a declared optimizer state")
-        if isinstance(definition.optimizer, SGD):
-            self.weighted(
-                replace(operation, phase=Phase.AFTER_SAMPLE) if operation.phase is Phase.AUTOMATIC else operation,
-                arguments,
-                captures,
-                definition,
-                definition.optimizer,
-            )
-        else:
-            _reject(self.reset or self.steps != 1, "multi-step/reset training requires explicit SGD batch parameters")
-            operation.context.train(operation.tensor(arguments, captures), self.state)
+        match definition.optimizer:
+            case SGD() as optimizer:
+                self.weighted(
+                    replace(operation, phase=Phase.AFTER_SAMPLE) if operation.phase is Phase.AUTOMATIC else operation,
+                    arguments,
+                    captures,
+                    definition,
+                    optimizer,
+                )
+            case _:
+                _reject(
+                    self.reset or self.steps != 1, "multi-step/reset training requires explicit SGD batch parameters"
+                )
+                operation.context.train(operation.tensor(arguments, captures), self.state)
 
     def weighted(
         self,
@@ -917,8 +928,7 @@ def export(
     overflow: Literal["drop", "block"] = "drop",
 ) -> Callable[[F], F]:
     """Deliver bounded observations to on_export; block only when explicitly requested."""
-    if overflow not in ("drop", "block"):
-        raise ValueError("export overflow must be 'drop' or 'block'")
+    _reject(overflow not in ("drop", "block"), "export overflow must be 'drop' or 'block'")
     return _mark(effect=_Export(name, every, max_rows, max_cols, enabled, overflow))
 
 
@@ -950,18 +960,19 @@ def train(
 
 def _setting(value: C | Config, config: object, expected: type[C]) -> C:
     resolved = Config.resolve(value, config)
-    if not isinstance(resolved, expected) or type(resolved) is not expected:
+    if (typed := _typed(resolved, expected)) is None or type(resolved) is not expected:
         raise TypeError(f"{value}: expected {expected.__name__}")
-    return resolved
+    return typed
 
 
 def _targets(value: tuple[object, ...]) -> tuple[ParameterTarget, ...]:
+    targets = tuple(target for item in value if (target := _typed(item, ParameterTarget)) is not None)
     _reject(
-        not all(isinstance(item, ParameterTarget) for item in value),
+        len(targets) != len(value),
         "overlay targets require typed parameter targets",
         TypeError,
     )
-    return tuple(item for item in value if isinstance(item, ParameterTarget))
+    return targets
 
 
 def layer_route(*, tokens: Tokens = "all", over: Over = "token") -> Callable[[F], F]:
@@ -971,11 +982,10 @@ def layer_route(*, tokens: Tokens = "all", over: Over = "token") -> Callable[[F]
     packs each request's contiguous scheduled tokens into [M, H] hidden tensors;
     position and generated flags have shape [M, 1]. Spans cannot load predecessors.
     """
-    if tokens not in ("prefill", "decode", "all"):
-        raise ValueError('set layer_route(tokens=) to "prefill", "decode" or "all"')
-
-    if over not in ("token", "span"):
-        raise ValueError("set layer_route(over=) to token or span")
+    _reject(
+        tokens not in ("prefill", "decode", "all") or over not in ("token", "span"),
+        'set layer_route(tokens="prefill" | "decode" | "all", over="token" | "span")',
+    )
     return _mark(tokens=tokens, over=over)
 
 
@@ -1129,14 +1139,17 @@ class _Operation:
 
 def _property(member: object) -> Callable[..., object] | None:
     """Find declaration getters without evaluating arbitrary owner properties."""
-    return (
-        member.fget
-        if isinstance(member, property)
-        and member.fget is not None
-        and signature(member.fget, eval_str=False).return_annotation
-        in (InstanceState, RequestState, Activation, Overlay, PositionState)
-        else None
-    )
+    match member:
+        case property(fget=fget) if fget is not None and signature(fget, eval_str=False).return_annotation in (
+            InstanceState,
+            RequestState,
+            Activation,
+            Overlay,
+            PositionState,
+        ):
+            return fget
+        case _:
+            return None
 
 
 def _candidates(owner: Workload, values: dict[str, object], members: dict[str, object]) -> dict[str, FunctionType]:
@@ -1185,11 +1198,9 @@ class _Declaration:
                 seeds.append(getter)
         for value in values.values():
             if (state := _typed(value, InstanceState)) is not None and state.initialize is not None:
+                method = _typed(state.initialize, MethodType)
                 if (
-                    function := _typed(
-                        state.initialize.__func__ if isinstance(state.initialize, MethodType) else state.initialize,
-                        FunctionType,
-                    )
+                    function := _typed(state.initialize if method is None else method.__func__, FunctionType)
                 ) is not None:
                     seeds.append(function)
         context.freeze_helpers(candidates, seeds)
@@ -1203,19 +1214,17 @@ class _Declaration:
         self, name: str, member: object, candidates: dict[str, FunctionType], seeds: list[FunctionType]
     ) -> None:
         """Read decorator attributes once; marker values never drive runtime reflection."""
-        tokens = getattr(member, "__pllm_tokens__", None)
-        if tokens is not None:
-            assert tokens in ("prefill", "decode", "all") and isinstance(member, FunctionType)
+        if (function := _typed(member, FunctionType)) is None:
+            return
+        markers = vars(function)
+        if (tokens := markers.get("__pllm_tokens__")) is not None:
             _reject(
-                tuple(signature(member).parameters) != ("self", "layers")
+                tuple(signature(function).parameters) != ("self", "layers")
                 or any(
-                    getattr(member, f"__pllm_{marker}__", None) is not None
-                    for marker in ("phase", "effect", "gradient", "rows")
+                    markers.get(f"__pllm_{marker}__") is not None for marker in ("phase", "effect", "gradient", "rows")
                 ),
                 "layer_route requires (self, layers) and no stacked markers; use layers.save inside the route instead of @write",
             )
-            over = getattr(member, "__pllm_over__")
-            assert over in ("token", "span")
             overlap = {
                 role
                 for _, selected, _ in self.routes
@@ -1223,27 +1232,26 @@ class _Declaration:
                 if selected in (role, "all") and tokens in (role, "all")
             }
             _reject(overlap, f"layer_route tokens overlap: {', '.join(sorted(overlap))}")
-            self.routes.append((name, tokens, over))
-            seeds.append(member)
+            self.routes.append((name, tokens, markers["__pllm_over__"]))
+            seeds.append(function)
             return
         phase, marked, gradient, rows = (
-            _typed(getattr(member, "__pllm_phase__", None), Phase),
-            _typed(getattr(member, "__pllm_effect__", None), _Effect),
-            getattr(member, "__pllm_gradient__", None),
-            _typed(getattr(member, "__pllm_rows__", ""), str),
+            _typed(markers.get("__pllm_phase__"), Phase),
+            _typed(markers.get("__pllm_effect__"), _Effect),
+            markers.get("__pllm_gradient__"),
+            _typed(markers.get("__pllm_rows__", ""), str),
         )
         if phase is None and marked is None:
             return
         effect = marked or _Effect()
         texts = (*vars(effect).values(), *vars(_typed(gradient, _Gradient) or _Gradient((), False)).values(), rows)
-        seeds.extend(candidates[text] for text in texts if isinstance(text, str) and text in candidates)
+        seeds.extend(candidates[text] for text in texts if type(text) is str and text in candidates)
         if (overlay := _typed(effect, _Overlay)) is not None:
             self.overlay_states.add(overlay.state)
         phase = phase or effect.phase or Phase.AFTER_SAMPLE
-        if (function := _typed(member, FunctionType)) is not None:
-            seeds.append(function)
-        if rows is None:
-            raise TypeError("operation row selector must name a method")
+        seeds.append(function)
+        _reject(rows is None, "operation row selector must name a method", TypeError)
+        assert rows is not None
         self.operations.append(_Operation(self, name, phase, effect, gradient, rows))
 
     def method(self, name: str) -> FunctionType | MethodType:
@@ -1263,8 +1271,8 @@ class _Declaration:
 
     def state_definition(self, name: str, error: str) -> InstanceState:
         definition = _typed(self.values.get(name), InstanceState)
-        if definition is None:
-            raise ValueError(error)
+        _reject(definition is None, error)
+        assert definition is not None
         return definition
 
     def allocate_buffers(self, name: str, definition: InstanceState) -> None:
@@ -1272,7 +1280,11 @@ class _Declaration:
         from pllm.execution.model_effect_binding import check_overlay_fields
 
         buffers = _buffers(replace(definition, optimizer=None))
-        consumers = tuple(value for value in self.values.values() if isinstance(value, Overlay) and value.state == name)
+        consumers = tuple(
+            consumer
+            for value in self.values.values()
+            if (consumer := _typed(value, Overlay)) is not None and consumer.state == name
+        )
         _reject(len(consumers) > 1, "a state needs one consistent target layout")
         if consumers:
             (consumer,) = consumers
@@ -1335,15 +1347,15 @@ class _Declaration:
                         self.binding.publish(update, allocated, when=When.BEFORE_MODEL, name=f"{name}.publish"),
                     )
 
-        for name, value in self.values.items():
-            if isinstance(value, (Activation, Overlay)):
-                self.definitions.append((name, fingerprint(value)))
+        self.definitions.extend(
+            (name, fingerprint(value)) for name, value in self.values.items() if type(value) in (Activation, Overlay)
+        )
 
     def attach_effects(self) -> None:
         """Connect publications before replay and missing-input branches."""
         for value in self.values.values():
-            if isinstance(value, (Activation, Overlay)):
-                value.declare(self)
+            if (effect := _typed(value, Activation) or _typed(value, Overlay)) is not None:
+                effect.declare(self)
         if self.routes:
             self.binding.layer_route(
                 tuple((tokens, over, self.method(name)) for name, tokens, over in self.routes), self.positions
@@ -1354,7 +1366,9 @@ class _Declaration:
     def position_states(self) -> tuple[tuple[str, float], ...]:
         """Resolve the pre-allocation schema without tracing tensors."""
         states = tuple(
-            (name, value.initial) for name, value in sorted(self.values.items()) if isinstance(value, PositionState)
+            (name, pos.initial)
+            for name, value in sorted(self.values.items())
+            if (pos := _typed(value, PositionState)) is not None
         )
         _reject(bool(states) and not self.routes, "PositionState requires layers.load/save inside a layer_route")
         return states
@@ -1370,8 +1384,8 @@ class _Declaration:
         """Validate gradients and pair the single prediction and training operations."""
         self.binding.validate_gradients(None if self.training is None else self.training[0])
         if self.prediction is not None:
-            if self.training is None:
-                raise ValueError("logits attachment requires a training operation")
+            _reject(self.training is None, "logits attachment requires a training operation")
+            assert self.training is not None
             call, sampler = self.prediction
             self.binding.logits(
                 call,
@@ -1414,11 +1428,11 @@ class _Declaration:
         frozen = {
             name
             for name, value in self.values.items()
-            if isinstance(value, InstanceState)
-            and value.module is not None
-            and value.optimizer is None
-            and not value.imported
-            and value.feed is None
+            if (state := _typed(value, InstanceState)) is not None
+            and state.module is not None
+            and state.optimizer is None
+            and not state.imported
+            and state.feed is None
             and not any(
                 effect.resource == name and effect.kind is not StateEffectKind.READ
                 for task in b.graph.tasks
@@ -1518,10 +1532,10 @@ class Workload(
         return BackendRequirements(
             tuple(
                 dict.fromkeys(
-                    value.source
+                    source
                     for task in b.graph.tasks
                     for value in task.inputs
-                    if isinstance(value.source, HiddenInputSource)
+                    if (source := _typed(value.source, HiddenInputSource)) is not None
                 )
             ),
             b.overlay_targets,
@@ -1532,7 +1546,9 @@ class Workload(
             if b.attachment is not None and b.attachment.guides_sampler
             else None,
             sampler_feedback=any(
-                isinstance(port.source, SamplerFeedbackInputSource) for task in b.graph.tasks for port in task.inputs
+                _typed(port.source, SamplerFeedbackInputSource) is not None
+                for task in b.graph.tasks
+                for port in task.inputs
             ),
             position_states=b.position_states,
         )
@@ -1592,7 +1608,7 @@ class Workload(
                     source.phase is HiddenPhase.PREFILL
                     for task in b.graph.tasks
                     for port in task.inputs
-                    if isinstance(source := port.source, HiddenInputSource)
+                    if (source := _typed(port.source, HiddenInputSource)) is not None
                 )
                 else value.rows.latest_decode_rows
             )
