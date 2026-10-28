@@ -347,7 +347,6 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         self.feeds = feeds
         self._pending_borrows: tuple[BorrowedStateRoot, ...] | None = None
         self._borrow_failed = False
-        self._pending_hold: HeldInput | None = None
         self._successful_inputs: dict[RequestIdentity, tuple[tuple[StateRef, ...], int]] = {}
         self._hold_count = 0
         self._last_hold: HeldInput | None = None
@@ -386,8 +385,8 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                 self._borrow_failed = True
                 raise
 
-    def stage_hold(self, identities: tuple[RequestIdentity, ...], reason: str, *, step_id: int) -> None:
-        """Internal signed branch handoff; exact versions come only from settlement."""
+    def stage_hold(self, identities: tuple[RequestIdentity, ...], reason: str, *, step_id: int) -> HeldInput:
+        """Return the signed HOLD branch with exact versions from successful settlement."""
         with self._lock:
             self._require_borrow_live()
             try:
@@ -396,7 +395,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                     and not self.arena.plan.semantic_graph.input_groups[0].allow_absent
                 ):
                     raise RuntimeError("missing activation input: signed STOP policy stops the instance")
-                self._pending_hold = HeldInput(
+                return HeldInput(
                     reason, step_id, tuple((identity, *self._successful_inputs[identity]) for identity in identities)
                 )
             except Exception:
@@ -462,6 +461,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         stream: torch.cuda.Stream | None = None,
         *,
         history: tuple[StateRefs, ...] = (),
+        held_input: HeldInput | None = None,
     ) -> TaskGraphInvocation[StateTaskContext[DataT]]:
         with self._lock:
             if self._borrowed_resources:
@@ -470,7 +470,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             selection = self.directory.select(rows, history)
             pin = self.arena.pin_exact(selection.refs, stream)
             context = StateTaskContext[DataT](selection, self.arena, pin, self.trace, self._next_invocation)
-            context.held_input, self._pending_hold = self._pending_hold, None
+            context.held_input = held_input
             invocation = TaskGraphInvocation(self._runner, context, self._next_invocation)
             self._next_invocation += 1
             self._active[invocation.invocation_id] = invocation
@@ -498,9 +498,10 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         stream: torch.cuda.Stream | None = None,
         *,
         history: tuple[StateRefs, ...] = (),
+        held_input: HeldInput | None = None,
     ) -> TaskGraphInvocation[StateTaskContext[DataT]]:
         with self._lock:
-            invocation = self.begin(self.math.rows(value), stream, history=history)
+            invocation = self.begin(self.math.rows(value), stream, history=history, held_input=held_input)
             self.submit_input(invocation, value)
             return invocation
 

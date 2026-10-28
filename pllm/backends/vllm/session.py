@@ -54,7 +54,7 @@ from pllm.execution.host_runtime import CompletionCapture
 from pllm.execution.overlay_task import ProjectionTask
 from pllm.execution.post_sample import PostSampleOverlap
 from pllm.execution.shared_tensor import SharedTensor
-from pllm.execution.state_execution import StateDiagnostics, StateTaskContext
+from pllm.execution.state_execution import HeldInput, StateDiagnostics, StateTaskContext
 from pllm.execution.state_feed import (
     Feed,
     FeedReceiver,
@@ -211,16 +211,17 @@ class VllmSession(Generic[DataT, ResultT]):
         if self._input_failed:
             raise RuntimeError("canonical step input is fail-stopped; received grants remain retained")
 
-    def _receive_readonly(self, rows: PackedSamplerRowBatch, stream: torch.cuda.Stream) -> None:
+    def _receive_readonly(self, rows: PackedSamplerRowBatch, stream: torch.cuda.Stream) -> HeldInput | None:
         if self._feed is None:
-            return
+            return None
         try:
             self._received_readonly = self._feed(rows, stream)
             received = self._received_readonly
             if (received.plan_epoch, received.step_id) != (rows.plan_epoch, rows.step_id):
                 raise ValueError("read-only input differs from the original epoch/step; grants retained")
+            held_input = None
             if isinstance(received, (ReadonlyStepAbsent, ReadonlyStepEnd)):
-                self._deployment.execution.stage_hold(
+                held_input = self._deployment.execution.stage_hold(
                     tuple(rows.identities),
                     "end" if isinstance(received, ReadonlyStepEnd) else "absent",
                     step_id=rows.step_id,
@@ -228,6 +229,7 @@ class VllmSession(Generic[DataT, ResultT]):
             else:
                 self._deployment.execution.stage_readonly(received.roots)
             self._received_readonly = None  # Ownership is now the original execution's pending/active borrow.
+            return held_input
         except BaseException:
             self._input_failed = True
             raise
@@ -320,9 +322,9 @@ class VllmSession(Generic[DataT, ResultT]):
         )
         stream = torch.cuda.current_stream(execution.device)
         if not self._in_forward_overlay:
-            self._receive_readonly(rows, stream)
+            held_input = self._receive_readonly(rows, stream)
             value = TensorStepInput(rows.row_batch, rows, auxiliary=self._auxiliary)
-            invocation = execution.start_step(value, stream)
+            invocation = execution.start_step(value, stream, held_input=held_input)
             if bool(execution.directory.instance_states) or not self._pending_identities:
                 self._auxiliary = None
             step.invocation = invocation
