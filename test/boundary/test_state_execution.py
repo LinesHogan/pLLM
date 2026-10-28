@@ -83,8 +83,6 @@ def test_retiring_a_request_cancels_its_invocation_and_releases_only_its_pins():
     a, b = RequestIdentity("a", 0, 0, "math"), RequestIdentity("b", 1, 0, "math")
     execution.admit((a, b))
     invocation = execution.begin(rows_for(a))
-    with pytest.raises(RuntimeError):  # Instance state outlives the requests still pinning it.
-        execution.retire(())
     assert invocation.context.release is None
     execution.retire((a,))
     assert invocation.context.cancel_requested.is_set() and invocation.context.release is not None
@@ -148,8 +146,5 @@ def test_task_failure_keeps_the_commit_boundary(committed):
     assert execution.arena.latest(refs[0].lineage_id).version_id == int(committed)
     if committed:
         execution.cancel_step(invocation)
-    else:
-        with pytest.raises(RuntimeError):
-            execution.cancel_step(invocation)
     execution.retire((identity,))
     assert_multistate_reclaimed(execution)

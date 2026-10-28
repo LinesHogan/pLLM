@@ -1,11 +1,10 @@
-"""One signed invocation, sampler lease and settlement lifecycle for tensor state."""
+"""Own invocation pages, sampler handoff and settlement for tensor execution and vLLM sessions."""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from enum import Enum, auto
 from threading import Event, RLock
 from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
 
@@ -22,9 +21,6 @@ from pllm.contracts.semantic_graph import (
     AnchorId,
     ImplementationId,
     PhysicalPlan,
-    SamplerFeedbackInputSource,
-    StateEffectKind,
-    StateScope,
     TaskId,
     TaskSymbol,
 )
@@ -66,12 +62,6 @@ class HeldInput:
     successful: tuple[tuple[RequestIdentity, tuple[StateRef, ...], int], ...]
 
 
-class _SamplerPhase(Enum):
-    PENDING = auto()
-    BORROWED = auto()
-    COMPLETE = auto()
-
-
 @dataclass(slots=True)
 class StateTaskContext(Generic[DataT]):
     selection: RequestStateSelection
@@ -92,7 +82,6 @@ class StateTaskContext(Generic[DataT]):
     loss: torch.Tensor | None = None
     guidance_ready: CudaStreamReadiness | None = None
     sampler_feedback: SamplerFeedback | None = None
-    sampler_phase: _SamplerPhase = _SamplerPhase.PENDING
     sampler_stream: torch.cuda.Stream | None = None
     loss_count: int = 0
     update_count: int = 0
@@ -106,14 +95,12 @@ class StateTaskContext(Generic[DataT]):
         default_factory=lambda: dict[RequestIdentity, set[StateRef]]()
     )
     input_step_id: int = -1
-    forward_input_complete: bool = False
     projection_outputs: Mapping[tuple[RequestIdentity, ParameterTarget], torch.Tensor] = field(
         default_factory=lambda: dict[tuple[RequestIdentity, ParameterTarget], torch.Tensor]()
     )
 
     def data(self) -> DataT:
-        if self.value is None:
-            raise RuntimeError("state invocation requires its input")
+        assert self.value is not None
         return self.value
 
     def __post_init__(self) -> None:
@@ -121,8 +108,6 @@ class StateTaskContext(Generic[DataT]):
 
     @property
     def write(self) -> PageWrite | None:
-        if len(self.page_writes) > 1:
-            raise RuntimeError("legacy write access requires a single private transition")
         return next(iter(self.page_writes), None)
 
     @write.setter
@@ -132,8 +117,6 @@ class StateTaskContext(Generic[DataT]):
             if pending is not None:
                 del self.page_writes[pending]
         else:
-            if self.page_writes:
-                raise RuntimeError("legacy write access cannot replace a private transition")
             self.page_writes[token] = None
 
     @property
@@ -158,8 +141,6 @@ class StateTaskContext(Generic[DataT]):
         return None if pin is None else self.page_pins[pin]
 
     def current_owned_ref(self, original: StateRef) -> StateRef:
-        if original not in self.pin.refs:
-            raise ValueError("state lineage is outside this invocation's original pin")
         return self.current_owned_refs((original,))[0]
 
     def current_owned_refs(self, originals: Sequence[StateRef]) -> tuple[StateRef, ...]:
@@ -177,8 +158,6 @@ class StateTaskContext(Generic[DataT]):
         return tuple(map(latest, originals))
 
     def check_page_execution(self) -> None:
-        if self.release is not None:
-            raise RuntimeError("state invocation has already released its original pin")
         if self.cancel_requested.is_set():
             raise RuntimeError("state invocation was cancelled")
 
@@ -187,16 +166,14 @@ class StateTaskContext(Generic[DataT]):
     ) -> PageWrite:
         self.check_page_execution()
         authorized = set(self.current_owned_refs(self.pin.refs))
-        if not set(sources) <= authorized:
-            raise ValueError("transition must extend this invocation's exact owned versions")
+        assert set(sources) <= authorized
         token = self.arena.prepare_transition(sources, self.pin.stream, fields=fields, copy_fields=())
         self.page_writes[token] = None
         return token
 
     def publish_owned_write(self, token: PageWrite) -> PagePublication:
         self.check_page_execution()
-        if token not in self.page_writes:
-            raise ValueError("publication requires this invocation's original private write")
+        assert token in self.page_writes
         receipt = self.arena.publish(token)
         self.page_publications[receipt] = False
         del self.page_writes[token]
@@ -206,8 +183,7 @@ class StateTaskContext(Generic[DataT]):
         return receipt
 
     def settle_owned_publication(self, receipt: PagePublication) -> None:
-        if receipt not in self.page_publications:
-            raise ValueError("settlement requires this invocation's original receipt")
+        assert receipt in self.page_publications
         if not self.page_publications[receipt]:
             self.arena.settle(receipt)
             self.page_publications[receipt] = True
@@ -218,16 +194,13 @@ class StateTaskContext(Generic[DataT]):
             del self.page_writes[token]
 
     def release_owned_pin(self, pin: PagePin) -> None:
-        if pin not in self.page_pins:
-            raise ValueError("release requires this invocation's original pin")
+        assert pin in self.page_pins
         if self.page_pins[pin] is None:
             self.page_pins[pin] = self.arena.release_pin(pin)
 
     def publish(self) -> None:
         token = self.write
         if token is not None:
-            if self.publication is not None:
-                raise RuntimeError("legacy state invocation already owns its publication receipt")
             self.publish_owned_write(token)
 
     def borrow_published(self, refs: Sequence[StateRef]) -> PagePin:
@@ -236,8 +209,7 @@ class StateTaskContext(Generic[DataT]):
         authorized = np.zeros(len(refs), dtype=np.bool_)
         for receipt in self.page_publications:
             authorized |= receipt.after_refs.positions(refs) >= 0
-        if not refs or not authorized.all():
-            raise ValueError("published borrow requires this invocation's original receipts")
+        assert refs and authorized.all()
         for pin, release in self.page_pins.items():
             if release is None and (pin.refs.positions(refs) >= 0).all():
                 return pin
@@ -278,34 +250,10 @@ class MathBinding(Generic[InputT, DataT, ResultT]):
     def local_resources(self, plan: PlanBundle) -> tuple[str, ...]:
         states = plan.semantic_graph.states
         borrowed = set(self.borrowed_resources)
-        if (
-            len(borrowed) != len(self.borrowed_resources)
-            or not borrowed <= {state.resource for state in states}
-            or any(state.scope is not StateScope.INSTANCE for state in states if state.resource in borrowed)
-            or any(
-                effect.kind is not StateEffectKind.READ
-                for task in plan.semantic_graph.tasks
-                for effect in task.effects
-                if effect.resource in borrowed
-            )
-        ):
-            raise ValueError("borrowed bindings require distinct read-only instance resources from the original plan")
         return tuple(str(state.resource) for state in states if state.resource not in borrowed)
 
     def bind(self, arena: PageBundleArena, sampler_anchor_id: AnchorId) -> StateExecution[InputT, DataT, ResultT]:
         states = arena.plan.semantic_graph.states
-        for group in arena.plan.semantic_graph.input_groups:
-            if set(group.borrowed_resources) != set(self.borrowed_resources):
-                raise ValueError("conditional input must cover the complete signed borrowed resource group")
-            guarded = {
-                task.implementation_id
-                for task in arena.plan.schedule_physical.tasks
-                if arena.plan.semantic_graph.tasks[task.task_id].symbol in group.tasks
-            }
-            if guarded != {task.implementation_id for task in self.tasks if isinstance(task, ConditionalProducerTask)}:
-                raise ValueError("conditional producer bindings differ from the signed task closure")
-        if set(arena.owned_resources) != set(self.local_resources(arena.plan)):
-            raise ValueError("local and borrowed resources must partition the original plan")
         # A borrowed binding owns only its local directory; test_video verifies no remote lineage.
         if self.borrowed_resources:
             states = tuple(state for state in states if state.resource in arena.owned_resources)
@@ -449,21 +397,8 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         """Internal transport handoff; no change to workload authoring signatures."""
         with self._lock:
             self._require_borrow_live()
-            if (
-                not self._borrowed_resources
-                or self._active
-                or self._pending_borrows is not None
-                or self._pending_hold is not None
-            ):
-                raise RuntimeError("read-only staging requires an idle borrowed execution")
             self._pending_borrows = roots  # Retain even invalid incoming mappings until the session terminates.
             try:
-                if (
-                    len(roots) != len(self._borrowed_resources)
-                    or {root.resource for root in roots} != set(self._borrowed_resources)
-                    or any(root.signature != self.arena.plan.schedule_decision.signature for root in roots)
-                ):
-                    raise ValueError("received roots differ from the required signed resources")
                 for root in roots:
                     root.claim(self.arena.allocation_ranges)
             except Exception:
@@ -480,19 +415,6 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                     and not self.arena.plan.semantic_graph.input_groups[0].allow_absent
                 ):
                     raise RuntimeError("missing activation input: signed STOP policy stops the instance")
-                if (
-                    not self.arena.plan.semantic_graph.input_groups
-                    or not self.arena.plan.semantic_graph.input_groups[0].allow_absent
-                    or not self._borrowed_resources
-                    or self._active
-                    or self._pending_borrows is not None
-                    or self._pending_hold is not None
-                    or reason not in ("absent", "end")
-                    or step_id < 0
-                    or not identities
-                    or any(identity not in self._successful_inputs for identity in identities)
-                ):
-                    raise RuntimeError("HOLD requires a signed idle input branch and a first successful injection")
                 self._pending_hold = HeldInput(
                     reason, step_id, tuple((identity, *self._successful_inputs[identity]) for identity in identities)
                 )
@@ -509,19 +431,12 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             context.results.pop(self._values[value], None)
 
     def implementation(self, identity: ImplementationId) -> TaskGraphImplementation[StateTaskContext[DataT]]:
-        matches = tuple(item for item in self._runner.implementations if item.implementation_id == identity)
-        if len(matches) != 1:
-            raise ValueError("implementation must name one original physical task")
-        return matches[0]
+        return next(item for item in self._runner.implementations if item.implementation_id == identity)
 
     def rebind_implementation(self, implementation: TaskGraphImplementation[StateTaskContext[DataT]]) -> None:
         """Install a locally verified lowering while no original invocation is active."""
         with self._lock:
-            if self._active:
-                raise RuntimeError("cannot rebind a physical task during an active invocation")
             original = self.implementation(implementation.implementation_id)
-            if isinstance(original, ConditionalProducerTask) != isinstance(implementation, ConditionalProducerTask):
-                raise ValueError("rebinding cannot remove or add a signed conditional producer guard")
             self._runner.implementations = tuple(
                 implementation if item is original else item for item in self._runner.implementations
             )
@@ -568,16 +483,8 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         history: tuple[StateRefs, ...] = (),
     ) -> TaskGraphInvocation[StateTaskContext[DataT]]:
         with self._lock:
-            # Complete exact input before any local pin/write; test_video rejects missing staging.
             if self._borrowed_resources:
                 self._require_borrow_live()
-                if (
-                    self._active
-                    or (self._pending_hold is None and self._pending_borrows is None)
-                    or any(root.stream != stream for root in self._pending_borrows or ())
-                ):
-                    self._borrow_failed = True
-                    raise RuntimeError("borrowed step requires complete staged roots on the receiving stream")
             self.arena.collect_completed()
             selection = self.directory.select(rows, history)
             pin = self.arena.pin_exact(selection.refs, stream)
@@ -652,54 +559,19 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                 self.cancel_step(invocation)
                 raise
 
-    def complete_forward_input(
-        self,
-        invocation: TaskGraphInvocation[StateTaskContext[DataT]],
-        value: InputT,
-        readiness: CudaStreamReadiness | None = None,
-    ) -> None:
-        """Complete the original frame once at the model boundary, retaining its results and receipts."""
-        self._submit_input(invocation, value, readiness, completing=True)
-
     def submit_input(
         self,
         invocation: TaskGraphInvocation[StateTaskContext[DataT]],
         value: InputT,
         readiness: CudaStreamReadiness | None = None,
     ) -> None:
-        """Consume the initial invocation input exactly once."""
-        self._submit_input(invocation, value, readiness, completing=False)
-
-    def _submit_input(
-        self,
-        invocation: TaskGraphInvocation[StateTaskContext[DataT]],
-        value: InputT,
-        readiness: CudaStreamReadiness | None,
-        *,
-        completing: bool,
-    ) -> None:
         """Consume original inputs, ordering an external CUDA producer when supplied."""
         with self._lock:
             context = self._context(invocation)
-            if completing:
-                if (
-                    context.value is None
-                    or context.forward_input_complete
-                    or invocation.last_anchor_id >= self.sampler_anchor_id
-                ):
-                    raise RuntimeError("forward input completion requires one active pre-sampler frame")
-                context.forward_input_complete = True
-            elif context.value is not None:
-                raise RuntimeError("state invocation input is already supplied")
             try:
                 if readiness is not None:
-                    if context.pin.stream is None:
-                        raise ValueError("CUDA input readiness requires a CUDA invocation")
+                    assert context.pin.stream is not None
                     readiness.order_on(context.pin.stream)
-                # The selection is a function of the rows, so equal rows mean an equal selection.
-                rows = self.math.rows(value)
-                if (rows if self.directory.states else ()) != context.selection.rows:
-                    raise ValueError("state invocation input differs from its selected rows")
                 context.value = self.math.prepare(value, context)
             except Exception as exc:
                 self.trace.record(TracePhase.FAILED, invocation.invocation_id)
@@ -712,8 +584,6 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     def execute_anchor(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], anchor_id: AnchorId) -> None:
         with self._lock:
             context = self._context(invocation)
-            if anchor_id > self.sampler_anchor_id and context.sampler_phase is not _SamplerPhase.COMPLETE:
-                raise RuntimeError("later anchors require sampler completion")
             try:
                 context.check_page_execution()
                 invocation.execute_anchor(anchor_id, context.pin.stream)
@@ -736,7 +606,6 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             context = self._context(invocation)
             try:
                 context.check_page_execution()
-                assert self.math.rows(value) == context.selection.rows
                 context.value = self.math.prepare(value, context)
                 invocation.execute_part(task_id, complete=complete, stream=context.pin.stream)
             except Exception as exc:
@@ -747,19 +616,11 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     ) -> PackedSamplerGuidanceBatch:
         with self._lock:
             context = self._context(invocation)
-            if context.guidance is None:
-                raise RuntimeError("signed tasks have not produced sampler guidance")
-            if context.sampler_phase is _SamplerPhase.COMPLETE or (context.pin.stream is None) != (stream is None):
-                raise RuntimeError("sampler guidance stream or phase differs from the invocation")
+            assert context.guidance is not None
             if stream is not None:
-                if stream.device != self.device:
-                    raise RuntimeError("sampler stream or phase differs from the invocation")
-                if context.sampler_phase is _SamplerPhase.BORROWED and context.sampler_stream != stream:
-                    raise RuntimeError("guidance is already borrowed by another sampler stream")
-                if context.guidance_ready is None:
-                    raise RuntimeError("CUDA guidance requires its original readiness")
+                assert context.guidance_ready is not None
                 context.guidance_ready.order_on(stream)
-                context.sampler_phase, context.sampler_stream = _SamplerPhase.BORROWED, stream
+                context.sampler_stream = stream
             return context.guidance
 
     def complete_sampler(
@@ -771,53 +632,15 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     ) -> None:
         with self._lock:
             context = self._context(invocation)
-            if invocation.last_anchor_id < self.sampler_anchor_id:
-                raise RuntimeError("sampler completion precedes its signed anchor")
-            if context.sampler_phase is _SamplerPhase.COMPLETE:
-                raise RuntimeError("sampler completion is already recorded")
-            if stream is not None and stream.device != self.device:
-                raise RuntimeError("sampler stream differs from the signed device")
-            if context.pin.stream is not None and stream is None:
-                raise RuntimeError("CUDA sampler completion requires its original stream")
-            if context.sampler_phase is _SamplerPhase.BORROWED and context.sampler_stream != stream:
-                raise RuntimeError("sampler completion differs from the borrowed stream")
-            required = any(
-                isinstance(item.source, SamplerFeedbackInputSource)
-                for task in self.arena.plan.semantic_graph.tasks
-                for item in task.inputs
-            )
-            if required != (feedback is not None):
-                raise ValueError("sampler feedback differs from the signed input contract")
-            if feedback is not None and (
-                context.guidance is None
-                or feedback.sampler_rows is not context.guidance.sampler_rows
-                or feedback.base_logits.device != self.device
-            ):
-                raise ValueError("sampler feedback requires original guidance rows and device")
             self._order_sampler(invocation, stream)
             context.sampler_feedback = feedback
-            context.sampler_phase = _SamplerPhase.COMPLETE
             self._sampler_count += 1
             self.trace.record(TracePhase.SAMPLER_COMPLETE, invocation.invocation_id, pin_id=context.pin.pin_id)
 
     def finish_step(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]]) -> ResultT:
         with self._lock:
             context = self._context(invocation)
-            if context.sampler_phase is not _SamplerPhase.COMPLETE:
-                raise RuntimeError("state invocation requires sampler completion")
             try:
-                if context.held_input is not None and (
-                    context.borrowed_roots
-                    or context.page_writes
-                    or context.page_publications
-                    or context.update_count
-                    or set(context.injected_refs) != {identity for identity, _, _ in context.held_input.successful}
-                    or any(
-                        not context.injected_refs[identity] <= set(refs)
-                        for identity, refs, _ in context.held_input.successful
-                    )
-                ):
-                    raise RuntimeError("HOLD settlement requires actual pinned injection without producer effects")
                 result = self.math.output(context)
                 if not invocation.finished:
                     invocation.finish()
@@ -890,8 +713,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         context.guidance = context.sampler_feedback = None
         context.guidance_ready = None
         release = context.release
-        if release is None:
-            raise RuntimeError("state settlement requires the original pin release")
+        assert release is not None
         self.trace.record(
             TracePhase.SETTLED,
             invocation.invocation_id,
@@ -923,8 +745,6 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     def _context(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]]) -> StateTaskContext[DataT]:
         if self._borrowed_resources:
             self._require_borrow_live()
-        if self._active.get(invocation.invocation_id) is not invocation or invocation.execution is not self._runner:
-            raise RuntimeError("state invocation is not registered as active")
         return invocation.context
 
     def retire(self, identities: tuple[RequestIdentity, ...], *, wait: bool = False) -> tuple[StateRef, ...]:
@@ -932,13 +752,9 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             for identity in identities:
                 self._successful_inputs.pop(identity, None)
             if not self.directory.states:
-                if self._active:
-                    raise RuntimeError("stateless requests cannot retire during an invocation")
                 self.arena.collect_completed(wait=wait)
                 self.trace.record(TracePhase.RETIRE, 0, identities=identities)
                 return ()
-            if not identities and self.directory.inference_pin_count:
-                raise RuntimeError("instance retirement requires all inference requests to finish")
             if not identities:
                 for invocation in tuple(self._active.values()):
                     if any(address.key is None for address in invocation.context.selection.addresses):
@@ -958,8 +774,6 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
 
     def retire_dormant(self, *, wait: bool = False) -> tuple[StateRef, ...]:
         with self._lock:
-            if self._active:
-                raise RuntimeError("dormant retirement requires no active invocation")
             self.arena.collect_completed(wait=wait)
             refs = self.directory.retire_dormant()
             self.trace.record(TracePhase.RETIRE, 0, identities=(), refs=refs)

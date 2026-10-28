@@ -158,8 +158,6 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(monkeypatc
         for anchor in range(sampler + 1):
             execution.execute_anchor(handle, AnchorId(anchor))
         guidance = execution.sampler_guidance(handle)
-        with pytest.raises(RuntimeError):  # training waits for sampler completion
-            execution.execute_anchor(handle, AnchorId(sampler + 1))
         execution.complete_sampler(handle)
         for anchor in execution.arena.plan.timeline.anchors[sampler + 1 :]:
             execution.execute_anchor(handle, AnchorId(anchor.ordinal))

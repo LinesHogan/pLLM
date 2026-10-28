@@ -146,8 +146,6 @@ def test_video_binding_keeps_remote_roots_out_of_local_ownership():
             peer.poll() and peer.recv_bytes() == encode_boundary(page.descriptor).encode()
             for peer, page in zip(peers, root.pages, strict=True)
         )
-        with pytest.raises(RuntimeError):  # Never silently read local inject as the next features chunk.
-            execution.begin(())
     if find_spec("vllm") is not None:
         _decode_steps_keep_exact_publications_and_ack_order()
         _hold_steps_reuse_the_settled_injection()

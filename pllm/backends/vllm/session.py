@@ -394,7 +394,7 @@ class VllmSession(Generic[DataT, ResultT]):
         elif step.invocation.context.value is None:
             execution.submit_input(step.invocation, value, CudaStreamReadiness(stream))
         elif self._hidden_resources or operands:
-            execution.complete_forward_input(step.invocation, value, CudaStreamReadiness(stream))
+            execution.submit_input(step.invocation, value, CudaStreamReadiness(stream))
         self._advance(step.invocation, "sampler.pre_draw")
         self._finish_effects()
 

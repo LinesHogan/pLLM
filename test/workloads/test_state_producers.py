@@ -112,7 +112,7 @@ def test_prompt_producers_publish_only_completed_requests(workload, device, leng
     refs = tuple(selected.refs)
     execution.execute_anchor(invocation, AnchorId(0))
     assert all(execution.arena.latest(ref.lineage_id) == ref for ref in refs)
-    execution.complete_forward_input(invocation, value)
+    execution.submit_input(invocation, value)
     for anchor in execution.arena.plan.timeline.anchors[1:]:
         execution.execute_anchor(invocation, AnchorId(anchor.ordinal))
         if anchor.ordinal == execution.sampler_anchor_id:
