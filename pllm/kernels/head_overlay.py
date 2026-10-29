@@ -5,6 +5,7 @@ import torch
 
 def head_correction(inputs: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     """Return an fp32 residual without materializing a dense block-diagonal matrix."""
-    heads, width, _ = weights.shape
-    rows = inputs.float().reshape(-1, heads, width).transpose(0, 1)
-    return torch.bmm(rows, weights.transpose(1, 2)).transpose(0, 1).reshape(inputs.shape)
+    *batch, heads, width, _ = weights.shape
+    rows = inputs.float().reshape(*batch, -1, heads, width).transpose(-3, -2)
+    result = torch.bmm(rows.reshape(-1, rows.shape[-2], width), weights.reshape(-1, width, width).transpose(1, 2))
+    return result.reshape(rows.shape).transpose(-3, -2).reshape(inputs.shape)

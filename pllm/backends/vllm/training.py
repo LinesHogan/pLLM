@@ -1,5 +1,7 @@
 """Causal training for the admitted vLLM decoders over borrowed weights and RoPE caches."""
 
+from collections.abc import Callable
+from functools import partial
 from math import sqrt
 from typing import NoReturn
 
@@ -11,10 +13,13 @@ from vllm.model_executor.models.qwen2 import Qwen2Attention
 from vllm.model_executor.models.qwen3 import Qwen3Attention
 
 from pllm.authoring import CausalAdapter, CausalTrainBatch
-from pllm.backends.vllm.architecture import CausalLM, DecoderLayer
+from pllm.backends.vllm.architecture import Decoder, DecoderLayer, Projection
 from pllm.contracts.codec import boundary_digest
-from pllm.contracts.parameter_overlay import ParameterTargetShape
+from pllm.contracts.parameter_overlay import ParameterOverlayOperator, ParameterTargetShape
 from pllm.contracts.tensor_layout import TensorDType
+from pllm.execution.parameter_projection import parameter_correction
+
+Project = Callable[[Projection, torch.Tensor], torch.Tensor]
 
 
 def norm(module: RMSNorm, hidden: torch.Tensor) -> torch.Tensor:
@@ -56,18 +61,14 @@ def attention_forward(
     hidden: torch.Tensor,
     positions: torch.Tensor,
     mask: torch.Tensor | None,
-    factors: tuple[torch.Tensor, ...] | None,
-    scale: float,
+    project: Project,
     qk_norms: tuple[RMSNorm, RMSNorm] | None,
 ) -> torch.Tensor:
-    """Apply Q/V corrections before per-head normalization, RoPE and causal attention."""
+    """Apply projection overlays before per-head normalization, RoPE and causal attention."""
     attention = layer.self_attn
     batch_size, length, _ = hidden.shape
-    packed = F.linear(hidden, attention.qkv_proj.weight, attention.qkv_proj.bias)
+    packed = project(attention.qkv_proj, hidden)
     query, key, value = torch.split(packed, [attention.q_size, attention.kv_size, attention.kv_size], dim=-1)
-    if factors is not None:
-        query = query + F.linear(F.linear(hidden, factors[0]), factors[1]) * scale
-        value = value + F.linear(F.linear(hidden, factors[2]), factors[3]) * scale
     if qk_norms is not None:
         query = norm(qk_norms[0], query.reshape(batch_size, length, -1, attention.head_dim)).reshape_as(query)
         key = norm(qk_norms[1], key.reshape(batch_size, length, -1, attention.head_dim)).reshape_as(key)
@@ -79,14 +80,14 @@ def attention_forward(
     key, value = key.repeat_interleave(groups, dim=1), value.repeat_interleave(groups, dim=1)
     hidden = F.scaled_dot_product_attention(query, key, value, attn_mask=mask, is_causal=mask is None)
     hidden = hidden.transpose(1, 2).reshape(batch_size, length, attention.q_size)
-    return F.linear(hidden, attention.o_proj.weight, attention.o_proj.bias)
+    return project(attention.o_proj, hidden)
 
 
-def mlp_forward(layer: DecoderLayer, hidden: torch.Tensor) -> torch.Tensor:
+def mlp_forward(layer: DecoderLayer, hidden: torch.Tensor, project: Project) -> torch.Tensor:
     """Keep fused SwiGLU projections and activation storage in the model dtype."""
-    hidden = F.linear(hidden, layer.mlp.gate_up_proj.weight, layer.mlp.gate_up_proj.bias)
+    hidden = project(layer.mlp.gate_up_proj, hidden)
     hidden = layer.mlp.act_fn.forward_native(hidden)
-    return F.linear(hidden, layer.mlp.down_proj.weight, layer.mlp.down_proj.bias)
+    return project(layer.mlp.down_proj, hidden)
 
 
 def bind_qk_norms(layer: DecoderLayer) -> tuple[RMSNorm, RMSNorm] | None:
@@ -107,9 +108,15 @@ class CausalTraining:
         tensor_dtype: TensorDType,
         seed: int,
         model_fingerprint: str,
-        model: CausalLM | None = None,
+        decoder: Decoder | None = None,
     ) -> None:
+        model = None if decoder is None else decoder.model
         self.model = model
+        self.projections: dict[Projection, list[tuple[int, int, int]]] = {}
+        if decoder is not None:
+            for index, target in enumerate(targets):
+                projection, offset, size, _ = decoder.projection(target.target)
+                self.projections.setdefault(projection, []).append((offset, size, index))
         self.qk_norms = () if model is None else tuple(bind_qk_norms(layer) for layer in model.model.layers)
         self.targets, self.tensor_dtype = targets, tensor_dtype
         self.scale = adapter.alpha / adapter.rank
@@ -132,6 +139,19 @@ class CausalTraining:
     def __reduce__(self) -> NoReturn:
         raise TypeError("transport CausalAdapter declarations; bind borrowed decoder weights in the worker")
 
+    def project(
+        self, projection: Projection, hidden: torch.Tensor, *, factors: tuple[torch.Tensor, ...] | None
+    ) -> torch.Tensor:
+        """Run the fused base GEMM once and correct its bound output slices."""
+        output = F.linear(hidden, projection.weight, projection.bias)
+        if factors is not None:
+            for offset, size, index in self.projections.get(projection, ()):
+                correction = parameter_correction(
+                    hidden, (factors[2 * index], factors[2 * index + 1]), ParameterOverlayOperator.LOW_RANK_ADD
+                )
+                output[..., offset : offset + size] += correction * self.scale
+        return output
+
     def logits(self, batch: CausalTrainBatch[torch.Tensor], factors: tuple[torch.Tensor, ...] | None) -> torch.Tensor:
         """Full sequence-local causal attention with vLLM component precision and PTTS factors."""
         assert self.model is not None
@@ -143,6 +163,7 @@ class CausalTraining:
             causal = torch.ones(length, length, device=tokens.device, dtype=torch.bool).tril()
             mask = causal[None, None] & batch.attention_mask[:, None, None, :].bool()
         hidden = F.embedding(tokens, self.model.model.embed_tokens.weight)
+        project = partial(self.project, factors=factors)
         residual = None
         for index, layer in enumerate(self.model.model.layers):
             if residual is None:
@@ -155,12 +176,11 @@ class CausalTraining:
                 hidden,
                 positions,
                 mask,
-                None if factors is None else factors[4 * index : 4 * index + 4],
-                self.scale,
+                project,
                 self.qk_norms[index],
             )
             hidden, residual = add_norm(layer.post_attention_layernorm, hidden, residual)
-            hidden = mlp_forward(layer, hidden)
+            hidden = mlp_forward(layer, hidden, project)
         assert residual is not None
         hidden, _ = add_norm(self.model.model.norm, hidden, residual)
         logits = F.linear(hidden, self.model.lm_head.weight)[:, :, : self.model.config.vocab_size]

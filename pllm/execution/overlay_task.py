@@ -21,12 +21,12 @@ from pllm.contracts.semantic_graph import TaskId, TaskSymbol
 from pllm.contracts.visibility import VisibilitySource
 from pllm.execution.chunk_tail import join_tail, save_tail
 from pllm.execution.cuda_stream import upload
+from pllm.execution.parameter_projection import parameter_correction
 from pllm.execution.scan import execute_scan, prepare_scan
 from pllm.execution.scan_execution import PreparedScan, Step
 from pllm.execution.tensor_frame import OverlayEntry, OverlayTargetResult, TensorFrame, Tensors, TensorUpdate
 from pllm.execution.tensor_program import PoolSGD, TaskOutput, TensorBatch
 from pllm.execution.torch_private import MemoryTrace
-from pllm.kernels.head_overlay import head_correction
 from pllm.kernels.page_copy import chunk_capacity, copy_pages
 
 DataT = TypeVar("DataT")
@@ -86,12 +86,7 @@ class ChunkUpdate:
 
 def overlay_apply(effect: ParameterEffect, hidden: torch.Tensor, values: Tensors) -> torch.Tensor:
     """Read the declared overlay operator for ordinary and chunk-exclusive projections."""
-    applied = effect.applied_fields
-    if effect.operator is ParameterOverlayOperator.HEAD_ADD:
-        return head_correction(hidden, values[applied[0]])
-    if effect.operator is ParameterOverlayOperator.LOW_RANK_ADD:
-        return (hidden @ values[applied[0]].T) @ values[applied[1]].T
-    return hidden @ values[applied[0]].T
+    return parameter_correction(hidden, tuple(values[name] for name in effect.applied_fields), effect.operator)
 
 
 Gradient = Callable[[Tensors, Tensors, Tensors, torch.Tensor], Tensors]

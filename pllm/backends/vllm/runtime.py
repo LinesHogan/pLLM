@@ -653,14 +653,13 @@ def bind_training(
     adapter = workload.backend_requirements().causal_adapter
     if adapter is None:
         return workload
-    base_model = None if runner is None else runner.decoder.model
     model = CausalTraining(
         adapter,
         facts.probe.targets,
         facts.probe.tensor_dtype,
         facts.initialization_seed,
         facts.probe.model_fingerprint,
-        base_model,
+        None if runner is None else runner.decoder,
     )
     return workload.bind_causal_model(model)
 

@@ -1,4 +1,4 @@
-"""Pinned projection tensor programs used by the eager and captured model adapters."""
+"""Overlay arithmetic shared by training and inference, and pinned projection gathers."""
 
 from collections.abc import Callable
 from functools import partial
@@ -8,8 +8,26 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator
 from pllm.execution.torch_private import disable_current_modes, measure
+from pllm.kernels.head_overlay import head_correction
 
 ROWS_PER_BLOCK = 32
+
+
+def parameter_correction(
+    hidden: torch.Tensor,
+    weights: tuple[torch.Tensor, ...],
+    operator: ParameterOverlayOperator,
+    *,
+    batched: bool = False,
+) -> torch.Tensor:
+    """Apply one operator while retaining each caller's GEMM or block BMM geometry."""
+    if operator is ParameterOverlayOperator.HEAD_ADD:
+        return head_correction(hidden, weights[0])
+    multiply = torch.bmm if batched else torch.matmul
+    result = multiply(hidden, weights[0].transpose(-1, -2))
+    if operator is ParameterOverlayOperator.LOW_RANK_ADD:
+        result = multiply(result, weights[1].transpose(-1, -2))
+    return result
 
 
 def uses_pinned_projection(*, in_forward: bool, graphs: bool) -> bool:
@@ -39,19 +57,7 @@ def projection_read(
     blocks, count = rows.shape
     inputs = hidden.index_select(0, rows.flatten()).view(blocks, count, hidden.shape[-1])
     weights = tuple(pool.index_select(0, slots[:, index]) for index, pool in enumerate(pools))
-    if operator is ParameterOverlayOperator.HEAD_ADD:
-        heads, width, _ = pools[0].shape[1:]
-        inputs = inputs.float().view(blocks, count, heads, width).transpose(1, 2)
-        result = torch.bmm(
-            inputs.reshape(blocks * heads, count, width),
-            weights[0].reshape(blocks * heads, width, width).transpose(1, 2),
-        )
-        result = result.view(blocks, heads, count, width).transpose(1, 2).reshape(blocks * count, heads * width)
-    else:
-        result = torch.bmm(inputs, weights[0].transpose(1, 2))
-        if operator is ParameterOverlayOperator.LOW_RANK_ADD:
-            result = torch.bmm(result, weights[1].transpose(1, 2))
-        result = result.flatten(0, 1)
+    result = parameter_correction(inputs, weights, operator, batched=True).flatten(0, 1)
     return (result.index_select(0, owners.clamp_min(0)).masked_fill((owners < 0)[:, None], 0),)
 
 
