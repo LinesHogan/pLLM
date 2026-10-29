@@ -110,8 +110,8 @@ notebook 和随手脚本都走这条路。上生产时，`ModelConfig(multiproce
 1. **类必须可导入**：写在 `.py` 模块里。`__main__`、notebook cell、函数
    局部定义的类都无法被 spawn 出来的 worker import，留在同进程模式即可。
 2. **可以被 pickle**：workload 用 pickle 送到 worker，类和模块级函数按导入路径传递。
-   字段里夹了 lambda 或闭包会报错；不该按字节传的对象（如 TLM 的 meta 模型模板）
-   用 `__reduce__` 只传配置，由 worker 自己加载。
+   字段里夹了 lambda 或闭包会报错。TLM 只传 `config/rank/alpha`；训练方法通过
+   `pllm.causal_model("adapter")` 使用 worker 已加载的模型，不把模型放进负载字段。
 
 最后一条隐性要求：模块必须 import-safe。spawn 会让 worker 重新导入你的模块，
 顶层不能有 GPU 工作——否则它在 import 阶段就炸了，而不是在你以为的初始化

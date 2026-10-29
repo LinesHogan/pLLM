@@ -685,8 +685,8 @@ dtype、混合参数组逐位核对原 batch 更新，并验证输入没有被�
 TTRL 原有的提交前故障、提交后结算、原 pin 保持与回收测试继续适用。
 
 这一步迁移的是 completion 优化器数学。loss/autograd、完整状态效果和控制
-仍待组合进同一源 Program；causal adapter、普通参数绑定以及 paged/captured
-优化器仍在迁移范围内。
+仍待组合进同一源 Program；普通参数绑定（含 TLM 的因果批训练）以及
+paged/captured 优化器仍在迁移范围内。
 
 ## 张量数学改写的首条规则
 

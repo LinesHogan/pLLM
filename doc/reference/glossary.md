@@ -13,6 +13,14 @@
 - **来源标记（Source marker）** —— 命名输入来源的 `Annotated[Tensor, ...]`
   参数：`Hidden`、`Samples`、`Batch`、`Parameter`、`StateIndex`、
   `StateVersion`、`Result`、`BaseLogits`、`SampledTokens`。
+- **因果批（Causal batch）** —— `pllm.authoring.CausalTrainBatch` 提供同形的
+  `input_ids`、`labels` 和可选 `attention_mask`，训练方法用 `pllm.batch(...)` 读取。
+- **因果模型端口（Causal model port）** —— `pllm.causal_model("adapter")` 注入
+  `pllm.model.CausalCall`；`model(...)` 应用命名 Overlay，`model.base(...)` 只用冻结基座。
+- **配置引用（Config）** —— `pllm.Config("phase")` 在绑定时读取负载属性；
+  `@pllm.on(...)` 可据此决定阶段，如 TLM 的在线/离线训练时机。
+- **张量结果（TensorResult）** —— 一次执行的报告值、loss、发布与观测；
+  `metrics` 保存算法提供的设备张量，TLM 的 `selected_count` 是选中的句子数。
 - **捕获标记（Capture marker）** —— 训练输入上的第三注解参数
   `Capture(state, field)`：发布时，每个 lineage 的 memory 字段收到该输入
   最后一个选中行的值。
@@ -44,7 +52,8 @@
 - **Pin** —— 对发布版本的精确持有。回收是精确的：页只在引用它的每个 pin 与
   发布都释放后才归还。
 - **发布（Publication）** —— 使私有迁移原子可见的动作，产出与 `before_refs`
-  配对的 `after_refs`。失败的发布保留根并允许重试。
+  配对的 `after_refs`。失败的发布保留根并允许重试。TLM 空选择仍发布新版本，
+  字段与优化器状态不变，逻辑更新计数不增加；缺少训练输入或 `lamb=0` 则不发布。
 - **迁移（Transition）** —— 一次调用的私有写作用域：一个写集，一次发布。
 - **Arena** —— 版本/代次/完成的唯一所有者（`PageBundleArena`）。不存在第二份
   状态真相。
@@ -55,7 +64,8 @@
 - **物理计划（Physical plan）** —— 图到锚点、页与缓冲的签名下沉。
 - **回退（Fallback）** —— 签名原语之外的执行。其计数永远断言为零。
 - **Overlay** —— 模型执行时从状态字段应用的签名参数效果（稠密或低秩），
-  与字段的生产方式无关。
+  与字段的生产方式无关。`ParameterTarget(layer=None, ...)` 表示所有层；
+  TLM 用一个 Overlay 让训练与推理读取同一组 q/v 因子。
 - **重放（Replay）** —— `layer_route` 定义逐 token 的层调用与返回 residual；
   `recirculation` 是使用该接口的负载。组合一个训练 overlay 时，
   `layers.apply_updates()` 消费捕获并改变本 token 后续读取的私有字段。

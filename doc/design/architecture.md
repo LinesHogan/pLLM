@@ -36,7 +36,8 @@
 额度检查与清理。内部基准是这个公共工厂与句柄的普通客户端。
 
 全部十一个内置负载使用构造同一张原始图的共享绑定。普通模型方法用
-`pllm.Workload`；TLM/TTRL 用因果/completion 学习绑定；FTTT/GTTA 用
+`pllm.Workload`，TLM 也通过这个接口声明因果批输入与模型端口；TTRL 用
+`CompletionWorkload`；FTTT/GTTA 用
 `transaction`。Output LoRA 用普通加权批量 SGD。旧的 `authoring.Workload` 和
 按负载的采样器 `build` 方法已移除。ESamp 用普通具名参数、预测与按状态 loss；
 其显式分页/捕获绑定在同一签名图上替换计算，原始 loss/Adam 对与五字段状态

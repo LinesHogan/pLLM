@@ -20,22 +20,24 @@ from vllm import SamplingParams
 import pllm
 from pllm.authoring import CausalTrainBatch
 from pllm.config import ModelConfig, VllmDType
-from pllm.kernels.adamw import AdamWConfig
 from pllm.workloads.tlm import TLMConfig, TLMMode, TLMWorkload
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
     parser.add_argument("--mode", choices=tuple(TLMMode), default=TLMMode.ONLINE)
-    mode = TLMMode(parser.parse_args().mode)
+    args = parser.parse_args()
     device = torch.device("cuda", 0)
     model_id = snapshot_download(
-        "Qwen/Qwen2.5-0.5B-Instruct",
+        args.model,
         local_files_only=True,
         allow_patterns=("*.json", "*.safetensors", "*.txt", "*.model"),
     )
-    workload = TLMWorkload(TLMConfig(mode, AdamWConfig(0.01, (0.9, 0.999), 1e-8, 0.01), threshold=0.0), rank=2, alpha=4)
-    handle = pllm.make_llm(workload=workload, config=ModelConfig(model_id, VllmDType.BFLOAT16, 64, 2, 64, 0.25, seed=7))
+    workload = TLMWorkload(
+        TLMConfig(TLMMode(args.mode), pllm.AdamW(0.01, (0.9, 0.999), 1e-8, 0.01), threshold=0.0), rank=2, alpha=4
+    )
+    handle = pllm.make_llm(workload=workload, config=ModelConfig(model_id, VllmDType.BFLOAT16, 64, 2, 64, 0.8, seed=7))
     execution = handle.runner.require_session()._deployment.execution
     tokens = torch.tensor([[1, 2, 3, 4]], device=device)
     batch = CausalTrainBatch(tokens, tokens)
@@ -54,7 +56,7 @@ def main() -> None:
         assert diagnostics.update_count == diagnostics.loss_count == 1
         assert diagnostics.active_lineages == 1 and diagnostics.inference_pins == 0
         assert diagnostics.pending_state_releases == 0
-        assert (handle.runner.require_session().updated_apply_count == 0) == (mode is TLMMode.ONLINE)
+        assert (handle.runner.require_session().updated_apply_count == 0) == (args.mode == TLMMode.ONLINE)
         (current,) = execution.directory.select(()).refs
         assert current.version_id == initial.version_id + 1
         fields = execution.snapshot(current, torch.cuda.current_stream(device))
@@ -94,7 +96,7 @@ def main() -> None:
         assert diagnostics.update_count == 1 and diagnostics.trained_rows > 0
         assert handle.runner.require_session().updated_apply_count > 0
         assert diagnostics.inference_pins == diagnostics.pending_state_releases == 0
-        print(f"TLM {mode}: updates={diagnostics.update_count} qkv_oracle_checks={checks[0]}")
+        print(f"TLM {args.model} {args.mode}: updates={diagnostics.update_count} qkv_oracle_checks={checks[0]}")
     finally:
         for hook in hooks:
             hook.remove()

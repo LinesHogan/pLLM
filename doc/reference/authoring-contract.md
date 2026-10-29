@@ -22,7 +22,7 @@
 | 外部加权批量训练、多步 SGD（Output LoRA 风格） | [加权批量训练](#加权批量训练) |
 | 自定义数据流、写原生数学、结构化宿主事务 | [高级数据流](#高级数据流)、[编写原生数学](#编写原生数学) |
 | completion / reward 驱动学习（TTRL） | [Completion 学习](#completion-学习) |
-| 因果适配器（TLM） | [因果适配器](#因果适配器) |
+| 因果批训练（TLM） | [因果批训练](#因果批训练) |
 | 改运行时、加原语、声明资源成本、排查有限准入失败 | [原语与资源契约](#原语与资源契约) |
 | 排查签名不匹配 / worker 重建失败 | [采样引导、logits 与导出](#采样引导logits-与导出)末尾的冷绑定器段落 |
 | 查某个内置负载用了哪些声明 | [全负载覆盖](#全负载覆盖) |
@@ -471,36 +471,58 @@ TTRL 的 `training_example` 给出可训练的最大形状元数据；FTTT 的 t
 
 ## 因果批训练
 
-TLM 是普通 `pllm.Workload`：`InstanceState` 声明由目标投影几何决定的 a/b `Buffer`，
-`Overlay(..., LOW_RANK_ADD, scale=alpha/rank)` 同时供推理和可微训练读取。
-`ParameterTarget(layer=None, ...)` 在探测模型后扩展为所有层；显式层目标仍须有序且唯一。
-`@pllm.on(pllm.Config("phase"))` 可以从负载配置解析阶段。
+[TLM](../../pllm/workloads/tlm/workload.py) 用普通 `pllm.Workload` 训练所有层的 q/v
+低秩因子，推理通过 `pllm.model.Overlay` 读取同一状态。使用时只提供配置与训练批：
 
-`pllm.batch("input_ids")`、`pllm.batch("labels")` 和 `pllm.batch("attention_mask")`
-通过既有 `CausalTrainBatch` / `AuxiliaryInput` 读取因果序列，mask 可为 `None`。
-`model: pllm.model.CausalCall = pllm.causal_model("adapter")` 注入当前调用的可微参数视图：
-`model(ids, attention_mask=mask)` 应用声明的 overlay，`model.base(...)` 只使用冻结基座。
-端口显式声明状态读取与参数梯度依赖，worker 通过已有绑定路径提供 decoder；活模型不进入
-负载、事实、指纹或跨进程传输。EngineCore 的父进程无需初始化 CUDA。
+```python
+import torch
+import pllm
+from vllm import SamplingParams
+from pllm.authoring import CausalTrainBatch
+from pllm.workloads.tlm import TLMConfig, TLMMode, TLMWorkload
 
-实例 AdamW 因果训练接受标量 loss，或带选择元数据的 `TensorUpdate`。每个因子保留独立的
-五字段 AdamW 组。初始化模板只保留参数；框架把其驻留计入时间线。
-基座借用 BF16、未量化、TP1 权重与 RoPE cache，训练沿用推理 overlay 的算术。
-框架在共同 autograd 任务边界编译 forward/loss 和 backward，不启用 Inductor CUDA graph。
-显式训练成本仍须包含 `update.input_shapes=((sequences, tokens),)`；两个轴都是容量界。
-默认无界模式不保证有限训练峰值；有限预算必须提供实测成本与这些界限，不会在 driver
-伪造借用模型的内存轨迹。
+workload = TLMWorkload(TLMConfig(mode=TLMMode.ONLINE), rank=8, alpha=16)
+ids = torch.tensor([[1, 2, 3, 4]], device="cuda")
+with pllm.make_llm(pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct"), workload=workload) as llm:
+    outputs = llm.generate(
+        ["The sky is"], SamplingParams(max_tokens=2),
+        auxiliary=CausalTrainBatch(ids, ids),
+    )
+```
 
-TLM 构造改为 `TLMWorkload(config, rank=8, alpha=16)`，不再接受 `model` 参数。
-`TLMData`、`TLMResult`、生命周期方法，以及 `pllm.host.CausalAdapterWorkload`、
-`pllm.host.CausalAdapter`、`pllm.host.CausalModel` 均已删除。
-`pllm.host.CausalTrainBatch` 和 `pllm.host.batch` 保留，`pllm.batch` 是同一声明入口。
-直接执行使用 `TensorStepInput(auxiliary=CausalTrainBatch(...))`，返回普通 `TensorResult`：
-`value` 是报告的目标，`loss` 是实际优化的 loss（跳过时为 `None`），
-`metrics["selected_count"]` 是设备张量，`publication` 保持原有含义；缺少输入时 `value=None`、
-metrics 为空。ONLINE 在 AFTER_SAMPLE 更新；OFFLINE 在 BEFORE_MODEL 更新，并用 no-grad
-基座选择句子。当前仍在图外读取选择计数；空选择或 `lamb=0` 不更新、不发布、不增加版本。
-设备侧跳过结算尚未实现。
+`pllm.batch("input_ids")`、`pllm.batch("labels")`、`pllm.batch("attention_mask")`
+把 `CausalTrainBatch` 的字段注入训练方法。ids 与 labels 是同形的 int64
+`[序列数, token 数]` 张量，至少一个序列、每个序列至少两个 token；可选 mask
+同形，省略时为 `None`。TLM 在 loss 内移动标签以预测下一个 token，忽略
+`ignore_index` 标记的标签。`generate(..., auxiliary=batch)` 每次调用只消费一次训练批。
+
+TLM 的 `InstanceState` 用 a/b `Buffer` 声明因子，形状回调接收目标投影的输入/输出
+宽度；`Overlay("factors", targets, operator=LOW_RANK_ADD, scale=alpha/rank)`
+声明如何应用它们。Overlay 的 `ParameterTarget(layer=None, ...)` 表示所有层，
+模型层数确定后展开；显式层目标须有序且唯一。
+
+训练方法声明 `model: pllm.model.CausalCall = pllm.causal_model("adapter")`，其中
+`"adapter"` 是 Overlay 声明的名称。`model(ids, attention_mask=mask)` 返回带该
+Overlay 的 logits，梯度流向其因子；`model.base(ids, attention_mask=mask)` 返回
+冻结基座的 logits。负载不持有或传输活模型。
+`@pllm.on(pllm.Config("phase"))` 在绑定时读取负载的 `phase` 属性并解析为 `Phase`；
+也可用 `Config("config.phase")` 读取嵌套配置。TLM 的 ONLINE 选择
+`AFTER_SAMPLE`，用适配后的 logits 选句；OFFLINE 选择 `BEFORE_MODEL`，用
+`torch.no_grad()` 下的基座 logits 选句，再训练选中的句子。
+
+因果训练当前要求实例 AdamW 状态、BF16 未量化基座、单设备（TP1），返回标量 loss
+或 `TensorUpdate`。直接执行可用 `TensorStepInput(auxiliary=batch)`；返回的
+`TensorResult.value` 是报告值，`loss` 是优化目标，`publication` 给出发布前后的版本，
+`metrics` 是算法自定义的设备张量映射。TLM 的 `metrics["selected_count"]` 是选中的
+句子数，执行时不把它同步到宿主。
+
+**空选择仍发布一个新版本**：参数、梯度、Adam 步数与动量保持原值；loss 计数增加一，
+逻辑 update 与 trained_rows 计数不增加，`selected_count` 为设备侧的零。
+这与没有训练输入、或 `lamb=0` 不同：后二者不运行训练、不发布，`value` 和 `loss`
+为 `None`，metrics 为空。不要用版本是否变化来判断这一步是否训练了句子。
+
+有限训练预算需要提供实测成本及 `update.input_shapes=((sequences, tokens),)`，
+两个轴都是容量上限；默认无界模式不保证有限训练峰值。
 
 关闭模型句柄会 detach 并关闭引擎，然后丢弃其 runner、执行与引擎引用。
 调用方自有的模型与返回的张量保留自己的生命周期。失败的关闭使句柄不再接受
@@ -646,7 +668,7 @@ vLLM 继续按真实容量预留 hidden 快照、采样反馈和效果/replay �
 | OverRIDE | 实例头；过滤前加法、真实采样反馈、条件 Adam 更新 |
 | ESamp | 请求键；两个 hidden 输入、版本感知引导、按状态均值 loss、eager/捕获更新 |
 | In-Place-TTT | 多 target 与尾部字段；直接迁移、发布、可选新版本 replay |
-| TLM | 检查点/模型事实、因果输入、分组 q/v 字段、原子发布、before-model 离线 vs after-sample 在线时机 |
+| TLM | 普通 Workload；因果批输入、可微模型端口、全层 q/v Overlay、设备侧选择与发布、在线/离线阶段 |
 | Output LoRA | 实例/请求作用域、原始键、外部加权 CE、独立训练/更新选择、SGD 与捕获 |
 | ReFT | 无优化器外部字段替换、发布、激活目标与选中行 |
 | Recirculation | 无状态逐 token replay；有序 prefill、原始 KV/RNG 与正常输出 |

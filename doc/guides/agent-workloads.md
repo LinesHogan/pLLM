@@ -90,7 +90,7 @@ PLLM 的加速技术（内置的 advanced 精细操作）；但自动页表总�
 | 参数 overlay、更新后条件 replay | [Request overlays](../reference/authoring-contract.md#请求-overlay) | [In-Place-TTT](../../pllm/workloads/inplace_ttt.py) |
 | 激活修改／外部字段发布 | [Activation checkpoints](../reference/authoring-contract.md#激活检查点) | [ReFT](../../pllm/workloads/reft.py) |
 | 逐 token prefill replay | [Tokenwise recurrence](../reference/authoring-contract.md#逐-token-循环) | [Recirculation](../../pllm/workloads/recirculation.py) |
-| 完整因果模型训练适配 | [Causal adapters](../reference/authoring-contract.md#因果适配器) | [TLM](../../pllm/workloads/tlm/workload.py) |
+| 完整因果模型训练适配 | [因果批训练](../reference/authoring-contract.md#因果批训练) | [TLM](../../pllm/workloads/tlm/workload.py) |
 | completion／reward 驱动训练 | [Completion learning](../reference/authoring-contract.md#completion-学习) | [TTRL](../../pllm/workloads/ttrl.py) |
 | judge、环境查询、队列与事务 | [Write mathematics：host 事务](../reference/authoring-contract.md#编写原生数学) | [FTTT](../../pllm/workloads/fttt/workload.py)、[GTTA](../../pllm/workloads/gtta/workload.py) |
 | 显式分页／反向／capture 优化 | [原语与资源契约](../reference/authoring-contract.md#原语与资源契约) | ESamp、Output LoRA 中的显式绑定 |

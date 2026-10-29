@@ -1879,6 +1879,7 @@ __all__ = [
     "sampled_tokens",
     "operand",
     "capture",
+    "causal_model",
     "batch",
     "InstanceState",
     "RequestState",

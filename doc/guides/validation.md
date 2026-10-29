@@ -62,6 +62,24 @@ python test/gpu/enginecore_smoke.py
 python test/gpu/enginecore_smoke.py --mrv1-captured
 ```
 
+TLM 的同一个 smoke 接受 `--model`，始终使用 BF16。默认仍为
+`Qwen/Qwen2.5-0.5B-Instruct`、ONLINE；常规完整验证只运行这个默认模型。
+显存利用率设为 0.8，以容纳 7B 基座。
+缓存好下列四个 checkpoint 后，可顺序覆盖两种训练时机：
+
+```bash
+for model in Qwen/Qwen2.5-0.5B-Instruct HuggingFaceTB/SmolLM2-360M-Instruct \
+             Qwen/Qwen3-0.6B NousResearch/Llama-2-7b-chat-hf; do
+  for mode in online offline; do
+    while [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; do sleep 10; done
+    taskset -c 0-15 python test/gpu/vllm_tlm_smoke.py --model "$model" --mode "$mode" || exit 1
+  done
+done
+```
+
+每次检查一次训练发布、版本递增、非零因子、后续生成使用已发布因子，以及关闭后
+状态释放；逐层融合 QKV 输出与独立 PyTorch 线性运算对照（`rtol=atol=0.02`）。
+
 这些场景验证的不是「进程没崩」，而是行为契约：第一个场景在一个进程内先跑
 纯推理再跑附着的 ESamp；训练路径必须有非零 loss/update 计数；结束时请求
 状态必须清理干净；回退计数必须为零。任何一个不满足，即使输出看起来正常
