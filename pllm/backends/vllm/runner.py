@@ -8,12 +8,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from functools import partial
 from typing import Any
 
 import torch
 from vllm.config import CacheConfig, ModelConfig as VllmModelConfig, VllmConfig
-from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -28,6 +26,7 @@ from pllm.authoring import (
     DataT,
     ResultT,
 )
+from pllm.backends.vllm.architecture import Decoder, bind_model
 from pllm.backends.vllm.hidden_capture import (
     CAPTURE_ENV,
     HiddenCaptureAnnouncement,
@@ -75,16 +74,13 @@ class Runner:
     position_states: tuple[tuple[str, float], ...] = ()
     position_layers: tuple[PositionCacheLayer, ...] = ()
 
-    def qwen2_model(self) -> Qwen2ForCausalLM:
-        """Return the model supported by workload taps, probing and sampling."""
-        if not isinstance(self.model, Qwen2ForCausalLM):
-            raise ValueError("choose a Qwen2 model for vLLM workloads")
-        return self.model
+    decoder: Decoder
 
     def _install_model_hooks(self) -> None:
         """Install the logits hook and announced hidden taps before vLLM compiles the model."""
-        model = self.qwen2_model()
-        model.compute_logits = partial(self._compute_logits, model)
+        self.decoder = bind_model(self.model)
+        model = self.decoder.model
+        model.compute_logits = self._compute_logits
         announcement = decode_boundary(os.environ.get(CAPTURE_ENV, "{}"), HiddenCaptureAnnouncement)
         hidden_size = model.lm_head.weight.shape[1]
         self.hidden_layouts = announcement.resolve(len(model.model.layers), hidden_size)
@@ -122,11 +118,10 @@ class Runner:
             and deployment.attachment.probe.graph_mode is not AttachmentGraphMode.CUDA_GRAPH
         ):
             raise ValueError("parameter overlays, activation patches and layer replay do not run under CUDA graphs yet")
-        model = self.qwen2_model()
         adapter = self._sampler_guidance if spec.guides_sampler else None
         session = VllmSession(
             deployment,
-            model,
+            self.decoder,
             adapter,
             self.max_num_reqs,
             self.hidden_taps,
@@ -156,11 +151,11 @@ class Runner:
         assert session is not None
         return session
 
-    def _compute_logits(self, model: Qwen2ForCausalLM, hidden_states: torch.Tensor) -> torch.Tensor | None:
+    def _compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         session = self._workload_session
         if session is None:
-            return Qwen2ForCausalLM.compute_logits(model, hidden_states)
-        return session.compute_logits(model, hidden_states)
+            return self.decoder.compute_logits(hidden_states)
+        return session.compute_logits(hidden_states)
 
 
 class WorkloadModelRunner(Runner, OverlayGraphRunner):

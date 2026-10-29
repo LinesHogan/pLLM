@@ -14,13 +14,13 @@ from typing import TypeVar
 import numpy as np
 import torch
 
+from pllm.backends.vllm.architecture import hidden_binding
 from pllm.contracts.auxiliary import AuxiliaryInput
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.packed_hidden import (
     HiddenRowBatch,
     HiddenRows,
     PackedHiddenResourceBinding,
-    hidden_binding,
 )
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
 from pllm.contracts.parameter_overlay import CapturedParameterOperand

@@ -53,15 +53,3 @@ __all__ = [
     "HiddenRows",
     "HiddenRowBatch",
 ]
-
-
-def hidden_binding(layer: int, site: HiddenSite, layer_count: int) -> PackedHiddenResourceBinding:
-    """The binding a Qwen2-style decoder exposes: block outputs by layer index, the final output as `model.norm`."""
-    if site is HiddenSite.MODEL_OUTPUT and layer == -1:
-        return PackedHiddenResourceBinding(str(layer), HiddenLayerKind.INDEX, site, "model.norm")
-    module_index = layer if layer >= 0 else layer_count + layer
-    if site is not HiddenSite.BLOCK_OUTPUT or not 0 <= module_index < layer_count:
-        raise ValueError(f"hidden layer {layer} at site {site.value} is outside 0..{layer_count - 1}")
-    return PackedHiddenResourceBinding(
-        str(layer), HiddenLayerKind.INDEX, HiddenSite.BLOCK_OUTPUT, f"model.layers.{module_index}"
-    )

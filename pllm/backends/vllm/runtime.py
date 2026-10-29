@@ -76,11 +76,11 @@ if TYPE_CHECKING:
     from pllm.backends.vllm.mrv1 import Mrv1Runner
 
 
+from pllm.backends.vllm.architecture import hidden_binding
 from pllm.backends.vllm.position_state import POSITION_ENV
 from pllm.backends.vllm.prefix_cache import CachePolicy
 from pllm.backends.vllm.runner import BackendWorkerState, WorkloadModelRunner
 from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.packed_hidden import hidden_binding
 from pllm.execution.position_state import PositionAnnouncement
 
 _MP_ENV = "VLLM_ENABLE_V1_MULTIPROCESSING"
@@ -658,7 +658,7 @@ def bind_training(
         facts.probe.targets,
         facts.probe.tensor_dtype,
         facts.initialization_seed,
-        None if runner is None else runner.qwen2_model(),
+        None if runner is None else runner.decoder.effect_model(),
     )
     return workload.bind_causal_model(model)
 
@@ -670,9 +670,10 @@ def probe_backend(
     *,
     publish_lag: int = 1,
 ) -> BackendCompileFacts:
-    model = runner.qwen2_model()
-    if model.quant_config is not None:
-        raise RuntimeError("vLLM workload requires an unquantized model")
+    decoder = runner.decoder
+    model = decoder.model
+    if requirements.activation_layers or requirements.position_states or requirements.causal_adapter is not None:
+        decoder.effect_model()
     layer_count = len(model.model.layers)
     if any(layer < 0 or layer >= layer_count for layer in requirements.activation_layers):
         raise ValueError("activation layer is outside the backend model")
@@ -697,7 +698,9 @@ def probe_backend(
             for role in (ParameterRole.QUERY_PROJECTION_WEIGHT, ParameterRole.VALUE_PROJECTION_WEIGHT)
         )
     )
-    targets = inspect_parameter_targets(model, requested_targets, runner.dtype)
+    targets = (
+        inspect_parameter_targets(decoder.effect_model(), requested_targets, runner.dtype) if requested_targets else ()
+    )
     replay_capabilities = (
         ("model/tokenwise_replay@1", TOKEN_CAPTURE_CAPABILITY)
         if runner.runner_kind is RunnerKind.MRV2 and graph_mode(runner.overlay_graph_bytes) is AttachmentGraphMode.EAGER
@@ -709,7 +712,7 @@ def probe_backend(
             (
                 f"model={runner.model_config.model}",
                 f"revision={runner.model_config.revision or ''}",
-                "class=vllm.model_executor.models.qwen2.Qwen2ForCausalLM",
+                f"class={decoder.identity}",
                 f"hidden_size={model.config.hidden_size}",
                 f"layers={layer_count}",
                 f"vocab_size={model.config.vocab_size}",

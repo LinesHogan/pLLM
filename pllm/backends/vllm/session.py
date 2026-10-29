@@ -10,11 +10,11 @@ from dataclasses import dataclass
 from typing import Generic
 
 import torch
-from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from pllm.authoring import AuxiliaryInput, BackendDeployment, DataT, ResultT
 from pllm.backends.vllm.activation import VllmActivationPatch
+from pllm.backends.vllm.architecture import Decoder
 from pllm.backends.vllm.hidden_capture import HiddenTaps
 from pllm.backends.vllm.overlay_graph import (
     HybridParameterOverlay,
@@ -78,7 +78,7 @@ class VllmSession(Generic[DataT, ResultT]):
     def __init__(
         self,
         deployment: BackendDeployment[DataT, ResultT],
-        model: Qwen2ForCausalLM,
+        decoder: Decoder,
         sampler: SamplerGuidance | None,
         max_sampler_rows: int,
         taps: HiddenTaps | None = None,
@@ -87,6 +87,7 @@ class VllmSession(Generic[DataT, ResultT]):
         *,
         cache_policy: CachePolicy,
     ) -> None:
+        self._compute_logits = decoder.compute_logits
         self._cache_envelope = encode_boundary(cache_policy)
         attachment = deployment.attachment
         plan = attachment.plan
@@ -107,10 +108,10 @@ class VllmSession(Generic[DataT, ResultT]):
         routed_overlay = bool(overlay_bindings) and any(task.replay is not None for task in plan.semantic_graph.tasks)
         self._in_forward_overlay = plan.semantic_graph.updates_in_forward
         if routed_overlay or self._in_forward_overlay:
-            validate_projection_sources(model, tuple(binding.target for binding in overlay_bindings))
+            validate_projection_sources(decoder.effect_model(), tuple(binding.target for binding in overlay_bindings))
         self._overlay = (
             parameter_overlay(
-                model,
+                decoder.effect_model(),
                 overlay_bindings,
                 deployment.execution.arena,
                 probe.max_packed_rows,
@@ -127,7 +128,7 @@ class VllmSession(Generic[DataT, ResultT]):
         tasks = tuple(task for task in attachment.plan.semantic_graph.tasks if task.replay is not None)
         self._activation = (
             VllmActivationPatch(
-                model,
+                decoder.effect_model(),
                 attachment.spec.activation_bindings,
                 attachment.spec.state_resource,
                 install=not tasks,
@@ -146,7 +147,7 @@ class VllmSession(Generic[DataT, ResultT]):
         if tasks:
             (task,) = tasks
             self._replay = VllmTokenwiseReplay(
-                model,
+                decoder.effect_model(),
                 task,
                 deployment.execution,
                 attachment.task_bindings[0].anchor_id,
@@ -403,32 +404,32 @@ class VllmSession(Generic[DataT, ResultT]):
                 effect.close()
 
     @torch.inference_mode()
-    def compute_logits(self, model: Qwen2ForCausalLM, hidden: torch.Tensor) -> torch.Tensor | None:
+    def compute_logits(self, hidden: torch.Tensor) -> torch.Tensor | None:
         """vLLM's LM head. Post-filter guidance projects its predicted hidden rows in the same call.
 
         Decode-time LM heads are bound by reading the [vocab, hidden] weight, so projecting the
         prediction alongside the model's rows costs about as much as the model's rows alone. A request
         for logits means the transformer forward is over on both runner ABIs.
         """
-        lm_head = Qwen2ForCausalLM.compute_logits
+        lm_head = self._compute_logits
         step = self._step
         # Prompt logprobs call the LM head again; capture and guidance run only for the sampling rows.
         if step is None or step.forward_done:
-            return lm_head(model, hidden)
+            return lm_head(hidden)
         # Forward completion can discard a prefill step that has no workload inputs.
         if self.completion_capture is not None:
             self.completion_capture.write(step.rows.identities, hidden)
         self.complete_forward()
         if self._step is None or self._sampler is None:
-            return lm_head(model, hidden)
+            return lm_head(hidden)
         guidance = self._sampler_guidance()
         if guidance.stage is SamplerStage.PACKED_POST_FILTER_EXACT:
-            logits = lm_head(model, torch.cat((hidden, guidance.values.to(hidden.dtype))))
+            logits = lm_head(torch.cat((hidden, guidance.values.to(hidden.dtype))))
             assert logits is not None
             predicted = logits[len(hidden) :]
             logits = logits[: len(hidden)]
         else:
-            logits = lm_head(model, hidden)
+            logits = lm_head(hidden)
             predicted = guidance.values
         self._sampler.begin_guidance(SignedSamplerGuidance(guidance, predicted, self._capture_feedback))
         return logits

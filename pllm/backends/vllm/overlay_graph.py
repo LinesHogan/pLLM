@@ -139,7 +139,8 @@ class OverlayGraphRunner(GPUModelRunner):
     def load_model(self, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights)  # pyright: ignore[reportUnknownMemberType]
         if graph_mode(self.overlay_graph_bytes) is AttachmentGraphMode.CUDA_GRAPH:
-            assert isinstance(self.model, Qwen2ForCausalLM)
+            if not isinstance(self.model, Qwen2ForCausalLM):
+                raise ValueError("workload model graphs still need a Qwen2 model; set cuda_graphs=False")
             self.projection_model = self.model.model
             self.projection_model.do_not_compile = True
 

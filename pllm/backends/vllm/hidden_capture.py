@@ -15,12 +15,12 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from pllm.backends.vllm.architecture import hidden_binding
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_hidden import (
     HiddenRowBatch,
     HiddenRows,
     PackedHiddenResourceBinding,
-    hidden_binding,
 )
 from pllm.contracts.packed_rows import PackedPhaseRowBatch
 from pllm.contracts.semantic_graph import HiddenInputSource
