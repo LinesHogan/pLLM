@@ -54,7 +54,7 @@ class TLMResult:
 class TLMData:
     batch: pllm.host.CausalTrainBatch[torch.Tensor] | None
     loss: torch.Tensor
-    selected_count: int = 0
+    selected_count: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,13 +85,17 @@ class TLMWorkload(pllm.host.CausalAdapterWorkload[TLMData, TLMResult]):
 
     def prepare(self, value: pllm.host.CausalTrainBatch[torch.Tensor] | None) -> TLMData:
         assert not isinstance(self.model, pllm.host.CausalAdapter)
-        return TLMData(value, torch.zeros((), device=self.model.device))
+        return TLMData(
+            value,
+            torch.zeros((), device=self.model.device),
+            torch.zeros((), device=self.model.device, dtype=torch.int64),
+        )
 
     def trained_rows(self, data: TLMData) -> int:
-        return data.selected_count
+        return int(data.selected_count.item())
 
     def output(self, data: TLMData, result: pllm.state.InvocationOutput) -> TLMResult:
-        return TLMResult(data.loss, data.selected_count, result.publication)
+        return TLMResult(data.loss, self.trained_rows(data), result.publication)
 
     def loss(self, data: TLMData, parameters: Mapping[str, torch.Tensor]) -> torch.Tensor | None:
         model, config = self.model, self.config
@@ -112,5 +116,5 @@ class TLMWorkload(pllm.host.CausalAdapterWorkload[TLMData, TLMResult]):
         weighted = sentence * (config.lamb * torch.exp(selection - config.threshold)) * selected.to(sentence.dtype)
         count = selected.sum()
         loss = torch.where(count == 0, weighted.mean(), weighted.sum() / count.clamp_min(1))
-        data.loss, data.selected_count = loss.detach(), int(count.item())
-        return loss if data.selected_count and config.lamb != 0 else None
+        data.loss, data.selected_count = loss.detach(), count
+        return loss if config.lamb != 0 else None

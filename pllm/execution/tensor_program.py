@@ -25,7 +25,7 @@ from pllm.execution.ptts.page_borrow import BorrowedStateRoot, borrowed_root
 from pllm.execution.ptts.page_bundle import PagePin, PagePublication, PageWrite, Slots
 from pllm.execution.ptts.request_state import RequestStateSelection, StateAddress
 from pllm.execution.state_execution import ProjectionResiduals, StateTaskContext
-from pllm.execution.torch_private import MemoryUsage, measure
+from pllm.execution.torch_private import MemoryTrace, MemoryUsage, measure
 from pllm.execution.trace import TracePhase
 from pllm.kernels.adamw import AdamWConfig, AdamWFields, paged_adamw
 from pllm.kernels.page_copy import copy_pages
@@ -116,17 +116,24 @@ def autograd_loss(
     names: tuple[str, ...],
     trained_rows: Callable[[D], int],
 ) -> Callable[[D, TensorBatch], TaskOutput]:
-    """Differentiate named Adam fields of one logical instance, without owning its update."""
+    """Compile tensor forward/loss and AOT backward; report and update outside the graph."""
+    compiled = torch.compile(  # pyright: ignore[reportUnknownMemberType]
+        function, fullgraph=True, dynamic=False, options={"triton.cudagraphs": False}
+    )
 
     def execute(data: D, batch: TensorBatch) -> TaskOutput:
         (root,) = batch.roots
         with torch.enable_grad():
             parameters = {name: root[5 * index].detach().requires_grad_(True) for index, name in enumerate(names)}
-            loss = function(data, parameters)
+            sample = root[0]
+            call = function if sample.device.type != "cuda" or MemoryTrace.active.get() is not None else compiled
+            loss = call(data, parameters)
             if loss is None:
                 return TaskOutput()
             count = trained_rows(data)
-            if loss.ndim != 0 or count < 1:
+            if count == 0:
+                return TaskOutput()
+            if loss.ndim != 0 or count < 0:
                 raise ValueError(
                     "optimizer functions must return a scalar loss with a positive effective row count (or None to skip)"
                 )
