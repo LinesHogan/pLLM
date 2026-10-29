@@ -38,6 +38,8 @@ pub(crate) enum InputSource {
     StateSelection {
         resource: String,
         phase: HiddenPhase,
+        #[serde(default)]
+        metadata: bool,
     },
     Result {
         task: String,
@@ -152,6 +154,8 @@ pub(crate) struct TokenProgramEffect {
     pub(crate) role_sensitive: bool,
     #[serde(default)]
     pub(crate) apply_updates: bool,
+    #[serde(default)]
+    pub(crate) span: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

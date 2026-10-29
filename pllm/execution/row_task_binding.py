@@ -420,7 +420,7 @@ def state_metadata(state: State, *, version: bool) -> TensorPort:
         index = row_index(frame, selected, selected.roots[0][0].device)
         return index.versions.device if version else index.states.device
 
-    return TensorPort(state.read(), read)
+    return TensorPort(replace(state.read(), metadata=True), read)
 
 
 def declare_tensor(

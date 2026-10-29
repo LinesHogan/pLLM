@@ -131,9 +131,12 @@ class VllmSession(Generic[DataT, ResultT]):
             if (attachment.spec.activation_bindings)
             else None
         )
-        # Recomputing history after preemption would rerun model-side effects on today's state, not the
-        # state each position originally saw, so these workloads need every token computed exactly once.
-        self._unbroken_history = bool(attachment.spec.overlay_bindings or attachment.spec.activation_bindings)
+        self._preemption_rejection = plan.schedule.prefix_replay_rejection
+        # Eligibility alone cannot reset advanced state. Keep the guard until replay is implemented.
+        if plan.schedule.prefix_replayable and (
+            attachment.spec.overlay_bindings or attachment.spec.activation_bindings
+        ):
+            self._preemption_rejection = "prefix replay for eligible request state is not implemented yet"
         self._token_frontiers: dict[RequestIdentity, int] = {}
         self._feed: FeedReceiver | None = None
         self._received_readonly: ReadonlyStepInput | ReadonlyStepAbsent | ReadonlyStepEnd | None = None
@@ -277,12 +280,12 @@ class VllmSession(Generic[DataT, ResultT]):
     @torch.enable_grad()
     def prepare_input(self, rows: PackedSamplerRowBatch) -> None:
         self._require_input_live()
-        if self._unbroken_history:
+        if self._preemption_rejection is not None:
             if any(row.token_offset < self._token_frontiers.get(row.identity, 0) for row in rows.row_batch.rows):
                 self._input_failed = True
                 raise RuntimeError(
-                    "vLLM preempted a request and would recompute its history, but this workload's parameter "
-                    "overlays or activation patches cannot replay past tokens; give vLLM more KV cache "
+                    "vLLM preempted a request and would recompute its history; "
+                    f"{self._preemption_rejection}. To avoid preemption, give vLLM more KV cache "
                     "(gpu_memory_utilization) or fewer concurrent sequences (max_num_seqs)"
                 )
             for row in rows.row_batch.rows:

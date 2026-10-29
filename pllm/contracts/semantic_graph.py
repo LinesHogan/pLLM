@@ -86,6 +86,7 @@ class HostServiceInputSource:
 class StateSelectionInputSource:
     resource: StateResource
     phase: HiddenPhase
+    metadata: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +159,7 @@ class TokenProgramEffect:
     digest: str = ""
     role_sensitive: bool = False
     apply_updates: bool = False
+    span: bool = False
 
 
 LossReduction = Literal[
@@ -289,6 +291,8 @@ class ScheduleDecision:
 
     tasks: tuple[PhysicalTask, ...]
     peak_memory_bytes: int
+    prefix_replayable: bool
+    prefix_replay_rejection: str | None
 
 
 __all__ = [

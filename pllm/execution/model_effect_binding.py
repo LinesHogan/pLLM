@@ -409,6 +409,7 @@ def declare_layer_route(
                         ),
                         len(routes) > 1 or any(program.role_sensitive for program in programs.values()),
                         any(isinstance(step, ApplyUpdates) for step in steps),
+                        any(program.over == "span" for program in programs.values()),
                     ),
                 )
                 if task.symbol == symbol

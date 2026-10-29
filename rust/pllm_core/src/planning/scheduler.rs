@@ -2,7 +2,8 @@
 
 use super::semantic_graph::{
     canonical_ascii_json, decode_graph, decode_timeline, validate_graph, validate_timeline,
-    ImplementationCandidate, InputSource, OutputKind, SemanticGraph, Timeline,
+    ImplementationCandidate, InputSource, OutputKind, RequestKeyField, SemanticGraph,
+    StateEffectKind, StateScope, Timeline, VisibilityKind,
 };
 use super::state_representation::{decode_decision as decode_state, StateRepresentationDecision};
 use super::version_hazards;
@@ -16,6 +17,8 @@ use std::collections::{BTreeSet, HashMap};
 pub(crate) struct ScheduleDecision {
     pub(crate) tasks: Vec<PhysicalTask>,
     peak_memory_bytes: u64,
+    prefix_replayable: bool,
+    prefix_replay_rejection: Option<String>,
 }
 
 impl ScheduleDecision {
@@ -684,7 +687,7 @@ pub(super) fn compile(
         if selected.len() == graph.tasks.len() {
             match place(graph, timeline, index, state, selected) {
                 Ok(solution) => {
-                    let decision = build_decision(selected, solution);
+                    let decision = build_decision(graph, selected, solution);
                     if best
                         .as_ref()
                         .is_none_or(|best| decision.score() < best.score())
@@ -725,11 +728,80 @@ pub(super) fn compile(
     })
 }
 
+// Torch transitions are assumed deterministic. Initialization and execution support are separate
+// from this structural eligibility fact; it does not enable preemption or prefix-cache hits.
+fn prefix_replay_rejection(
+    graph: &SemanticGraph,
+    planned: &[PhysicalTask],
+) -> Option<&'static str> {
+    if graph.states.iter().any(|state| match state.scope {
+        StateScope::Request => !state.key_fields.contains(&RequestKeyField::RequestId),
+        StateScope::Instance => !state.immutable,
+    }) {
+        return Some(
+            "use request-owned keys containing request_id and remove mutable instance state",
+        );
+    }
+    if !graph.input_groups.is_empty()
+        || graph
+            .tasks
+            .iter()
+            .flat_map(|task| &task.inputs)
+            .any(|input| matches!(&input.source, InputSource::HostService { service, .. } if service != "parameter.operands"))
+    {
+        return Some(
+            "remove external feeds, imports and host inputs from the request state computation",
+        );
+    }
+    for task in &graph.tasks {
+        for input in &task.inputs {
+            match input.source {
+                InputSource::SamplerFeedback => {
+                    return Some("remove sampler feedback dependencies")
+                }
+                InputSource::StepId | InputSource::StateSelection { metadata: true, .. } => {
+                    return Some("remove reads of step ids and PTTS versions or slot indices");
+                }
+                _ => {}
+            }
+        }
+        if task.replay.as_ref().is_some_and(|replay| replay.span) {
+            return Some("use tokenwise layer routes instead of span sweeps");
+        }
+    }
+    if graph
+        .tasks
+        .iter()
+        .filter_map(|task| task.visibility.as_ref())
+        .any(|visibility| {
+            visibility.lag != 0 || visibility.policy.kind == VisibilityKind::ForwardPinned
+        })
+        || planned.iter().any(|task| task.read_distance != 0)
+        || graph.edges.iter().any(|edge| edge.step_distance != 0)
+    {
+        return Some("use Exact visibility with zero publish lag and no cross-step dependencies");
+    }
+    if graph.tasks.iter().any(|task| {
+        task.visibility.is_none()
+            && task.effects.iter().any(|effect| {
+                effect.kind != StateEffectKind::Publish
+                    && graph
+                        .states
+                        .iter()
+                        .any(|state| state.resource == effect.resource && !state.immutable)
+            })
+    }) {
+        return Some("use Exact visibility for request state reads and transitions instead of forward_pinned execution");
+    }
+    None
+}
+
 fn build_decision(
+    graph: &SemanticGraph,
     implementations: &[&ImplementationCandidate],
     solution: Solution,
 ) -> ScheduleDecision {
-    let plans = solution
+    let plans: Vec<_> = solution
         .tasks
         .into_iter()
         .map(|mut task| {
@@ -739,9 +811,12 @@ fn build_decision(
             task
         })
         .collect();
+    let rejection = prefix_replay_rejection(graph, &plans);
     ScheduleDecision {
         tasks: plans,
         peak_memory_bytes: solution.peak,
+        prefix_replayable: rejection.is_none(),
+        prefix_replay_rejection: rejection.map(str::to_owned),
     }
 }
 
@@ -778,7 +853,7 @@ pub(crate) fn validate_decision(
         })
         .collect::<Result<Vec<_>, String>>()?;
     let solution = check_placement(graph, timeline, &index, state, &decision.tasks)?;
-    let expected = build_decision(&implementations, solution);
+    let expected = build_decision(graph, &implementations, solution);
     if decision != &expected {
         return Err(
             "canonical schedule decision differs from its selected placement witness".to_owned(),
@@ -1147,7 +1222,7 @@ mod tests {
             .map(|task| &task.implementations[0])
             .collect();
         let witness = check_placement(&graph, &roomy, &index, None, &later).unwrap();
-        let selected = build_decision(&implementations, witness);
+        let selected = build_decision(&graph, &implementations, witness);
         assert_ne!(selected, compile(&graph, &roomy, None).unwrap());
         validate_decision(&graph, &roomy, &selected, None).unwrap();
         for mutation in 0..5 {
