@@ -256,8 +256,8 @@ name = "tlm_matches_objective_online_offline_graph_and_qv_publication"
 group = "workload"
 path = "test/workloads/test_tlm.py"
 command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_tlm.py::test_tlm_matches_objective_online_offline_graph_and_qv_publication"
-environment = "Repository venv with transformers and peft; CPU float32/float64 and CUDA float32 when available; current checkpoint ran both CPU and CUDA"
-observable_contract = "Online adapted versus offline base selector and signed pre-model/post-token timing; no-selected branch does not publish; actual tiny Qwen2/PEFT q/v shape facts, loss, gradients and factors match an independently optimized PEFT model; CUDA uses a nondefault stream; template factors never update; shared instance retirement. Not public vLLM/global overlay support"
+environment = "Repository venv; CPU float64 objective oracle and borrowed BF16 vLLM Qwen2 GPU smoke"
+observable_contract = "Online adapted versus offline base selector and signed pre-model/post-token timing; no-selected branch does not publish; tiny causal objective and independently optimized factor AdamW oracle; input bounds, global publication, inference pin retention and shared instance retirement. Real borrowed Qwen2 execution is covered by vllm_tlm_smoke"
 replaces = "Canonical TLM cold-foundation test and historical TLM objective/consumer numerical tests without their owner assertions"
 
 [[evidence]]

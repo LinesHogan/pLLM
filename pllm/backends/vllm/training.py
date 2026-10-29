@@ -1,6 +1,7 @@
 """Qwen2 causal training arithmetic over vLLM's borrowed base weights and RoPE cache."""
 
 from math import sqrt
+from typing import NoReturn
 
 import torch
 from torch.nn import functional as F
@@ -9,7 +10,6 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM
 
 from pllm.authoring import CausalAdapter, CausalTrainBatch
-from pllm.backends.vllm.parameter_overlay import inspect_parameter_targets
 from pllm.contracts.codec import boundary_digest
 from pllm.contracts.parameter_overlay import ParameterTargetShape
 from pllm.contracts.tensor_layout import TensorDType
@@ -81,10 +81,6 @@ class Qwen2Training:
         self.targets, self.tensor_dtype = targets, tensor_dtype
         self.scale = adapter.alpha / adapter.rank
         self.device = torch.device("meta") if model is None else model.model.embed_tokens.weight.device
-        if model is not None:
-            if model.quant_config is not None or tensor_dtype is not TensorDType.BFLOAT16:
-                raise ValueError("Qwen2 training requires qualified unquantized BF16 TP1 weights")
-            inspect_parameter_targets(model, tuple(target.target for target in targets), tensor_dtype.torch)
         self.initial_factors = tuple(
             torch.empty(shape, device=self.device, dtype=tensor_dtype.torch)
             for target in targets
@@ -97,6 +93,9 @@ class Qwen2Training:
                 up.zero_()
         self.resident_bytes = sum(t.numel() * t.element_size() for t in self.initial_factors)
         self.fingerprint = boundary_digest(adapter, targets, tensor_dtype, seed, "vllm.qwen2.training@1")
+
+    def __reduce__(self) -> NoReturn:
+        raise TypeError("transport CausalAdapter declarations; bind borrowed Qwen2 weights in the worker")
 
     def logits(self, batch: CausalTrainBatch[torch.Tensor], factors: tuple[torch.Tensor, ...] | None) -> torch.Tensor:
         """Full sequence-local causal attention with vLLM component precision and PTTS factors."""

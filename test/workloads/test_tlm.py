@@ -33,7 +33,6 @@ class TinyCausalModel:
     tensor_dtype = TensorDType.FLOAT64
     fingerprint = "a" * 64
     scale = 1.0
-    model_source = ("tiny", "test")
     targets = tuple(
         ParameterTargetShape(ParameterTarget(0, ParameterModuleKind.ATTENTION, role), 3, 3)
         for role in (ParameterRole.QUERY_PROJECTION_WEIGHT, ParameterRole.VALUE_PROJECTION_WEIGHT)

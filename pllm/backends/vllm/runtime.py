@@ -686,6 +686,8 @@ def probe_backend(
         )
     )
     adapter = requirements.causal_adapter
+    if adapter is not None and runner.dtype is not torch.bfloat16:
+        raise ValueError("Qwen2 training requires qualified unquantized BF16 TP1 weights")
     requested_targets = (
         requirements.parameter_targets
         if adapter is None
