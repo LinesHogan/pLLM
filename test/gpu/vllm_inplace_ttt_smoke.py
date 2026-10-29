@@ -565,5 +565,41 @@ def main() -> int:
     return 0
 
 
+def preemption_replays():
+    """Real KV pressure replays an Exact recurrence and releases its request state."""
+    with (
+        patch(
+            "pllm.backends.vllm.runtime.LLM", partial(LLM, num_gpu_blocks_override=10, kv_cache_memory_bytes=64 << 20)
+        ),
+        pllm.make_llm(
+            workload=GatedDeltaWorkload(
+                GatedDeltaConfig(
+                    (ParameterTarget(0, ParameterModuleKind.ATTENTION, ParameterRole.QUERY_PROJECTION_WEIGHT),),
+                    chunk_size=7,
+                    update_decode=True,
+                )
+            ),
+            config=ModelConfig(
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                max_model_len=160,
+                max_num_seqs=8,
+                max_num_batched_tokens=64,
+                enable_chunked_prefill=True,
+                seed=7,
+                execution=pllm.ExecutionOptions(capture_memory_bytes=256 << 20),
+            ),
+        ) as handle,
+    ):
+        session = handle.runner.require_session()
+        with patch.object(session, "_preempt", wraps=session._preempt) as preempt:
+            outputs = handle.generate(
+                ["The number is"] * 8, SamplingParams(max_tokens=48, temperature=0, ignore_eos=True)
+            )
+        assert any(call.args[0] for call in preempt.call_args_list)
+        assert all(len(output.outputs[0].token_ids) == 48 for output in outputs)
+        assert handle.diagnostics().active_lineages == 0
+
+
 if __name__ == "__main__":
+    preemption_replays()
     raise SystemExit(main())

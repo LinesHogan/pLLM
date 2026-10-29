@@ -131,14 +131,6 @@ class VllmSession(Generic[DataT, ResultT]):
             if (attachment.spec.activation_bindings)
             else None
         )
-        # Recomputed history reruns model-side effects; only those workloads must replay their state exactly.
-        # Eligibility alone cannot reset advanced state, so eligible workloads stay guarded until replay exists.
-        self._preemption_rejection = (
-            plan.schedule.prefix_replay_rejection or "prefix replay for eligible request state is not implemented yet"
-            if attachment.spec.overlay_bindings or attachment.spec.activation_bindings
-            else None
-        )
-        self._token_frontiers: dict[RequestIdentity, int] = {}
         self._feed: FeedReceiver | None = None
         self._received_readonly: ReadonlyStepInput | ReadonlyStepAbsent | ReadonlyStepEnd | None = None
         self._input_failed = False
@@ -258,6 +250,12 @@ class VllmSession(Generic[DataT, ResultT]):
             for request_id in sorted(self._identities.keys() & scheduler_output.finished_req_ids)
         )
         self._retire(finished)
+        # Sampler/hidden-only workloads retain their current state and preemption behavior.
+        if self._overlay is not None or self._activation is not None:
+            for request_id in scheduler_output.finished_req_ids:
+                self._pending_identities.pop(request_id, None)
+            # Installed vLLM 0.27.1 emits this set for both runners, despite its MRv2-only field comment.
+            self._preempt(scheduler_output.preempted_req_ids or set())
         pending: list[RequestIdentity] = []
         for request in scheduler_output.scheduled_new_reqs:
             if request.req_id in self._identities:
@@ -266,12 +264,33 @@ class VllmSession(Generic[DataT, ResultT]):
             if params is None or (params.extra_args or {}).get(POLICY_KEY) != self._cache_envelope:
                 raise ValueError("request cache policy differs from installed workload; submit through its handle")
             pending.append(self._pending_identities[request.req_id])
+        # MRv2 sends resumed requests as new; MRv1 retains their cached request data.
+        pending.extend(
+            self._pending_identities[request_id]
+            for request_id in sorted(scheduler_output.scheduled_cached_reqs.resumed_req_ids)
+            if request_id not in self._identities
+        )
         if pending:
             if bool(execution.directory.request_states):
                 execution.admit(tuple(pending), torch.cuda.current_stream(execution.device))
             for identity in pending:
                 self._identities[identity.request_id] = identity
                 self._pending_identities.pop(identity.request_id)
+
+    def _preempt(self, request_ids: set[str]) -> None:
+        identities = tuple(self._identities[key] for key in sorted(self._identities.keys() & request_ids))
+        if not identities:
+            return
+        rejection = self.attachment.plan.schedule.prefix_replay_rejection
+        if rejection is not None:
+            self._input_failed = True
+            raise RuntimeError(
+                "vLLM preempted a request and would recompute its history; "
+                f"{rejection}. To avoid preemption, give vLLM more KV cache "
+                "(gpu_memory_utilization) or fewer concurrent sequences (max_num_seqs)"
+            )
+        self._retire(identities)
+        self._pending_identities.update((identity.request_id, identity) for identity in identities)
 
     @property
     def next_step_id(self) -> int:
@@ -281,18 +300,6 @@ class VllmSession(Generic[DataT, ResultT]):
     @torch.enable_grad()
     def prepare_input(self, rows: PackedSamplerRowBatch) -> None:
         self._require_input_live()
-        if self._preemption_rejection is not None:
-            if any(row.token_offset < self._token_frontiers.get(row.identity, 0) for row in rows.row_batch.rows):
-                self._input_failed = True
-                raise RuntimeError(
-                    "vLLM preempted a request and would recompute its history; "
-                    f"{self._preemption_rejection}. To avoid preemption, give vLLM more KV cache "
-                    "(gpu_memory_utilization) or fewer concurrent sequences (max_num_seqs)"
-                )
-            for row in rows.row_batch.rows:
-                self._token_frontiers[row.identity] = max(
-                    self._token_frontiers.get(row.identity, 0), row.token_offset + 1
-                )
         requests = rows.identities
         self._next_step_id += 1
         step = _PackedStep[DataT](rows)
@@ -486,7 +493,6 @@ class VllmSession(Generic[DataT, ResultT]):
             execution.retire(held)
         for identity in identities:
             self._identities.pop(identity.request_id)
-            self._token_frontiers.pop(identity, None)
 
     @torch.inference_mode(False)
     def retire_all(self, *, wait: bool = False) -> None:

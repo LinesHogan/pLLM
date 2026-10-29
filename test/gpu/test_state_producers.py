@@ -201,14 +201,14 @@ def test_composed_readers_replay_model_graphs(workload, monkeypatch):
             results.append([(o.outputs[0].token_ids, o.outputs[0].cumulative_logprob) for o in outputs])
             if isinstance(workload, PromptFactors):
                 session = handle.runner.require_session()
-                prepare, saved = session.prepare_input, []
+                before_execute = session.before_execute
 
-                def recompute(rows):
-                    saved.append(rows)
-                    return prepare(replace(saved[0], row_batch=replace(saved[0].row_batch, step_id=rows.step_id)))
+                def preempt(scheduler_output):
+                    scheduler_output.preempted_req_ids = set(session._identities)
+                    return before_execute(scheduler_output)
 
                 with monkeypatch.context() as replay:
-                    replay.setattr(session, "prepare_input", recompute)
+                    replay.setattr(session, "before_execute", preempt)
                     with pytest.raises(RuntimeError, match="would recompute"):
                         handle.generate(["Name a color."], SamplingParams(max_tokens=3, ignore_eos=True))
     assert results[0] == results[1]

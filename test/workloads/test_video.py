@@ -204,6 +204,8 @@ def _scheduler(session, *identities):
 
     return SimpleNamespace(
         finished_req_ids=set(),
+        preempted_req_ids=set(),
+        scheduled_cached_reqs=SimpleNamespace(resumed_req_ids=set()),
         scheduled_new_reqs=tuple(
             SimpleNamespace(
                 req_id=identity.request_id,
