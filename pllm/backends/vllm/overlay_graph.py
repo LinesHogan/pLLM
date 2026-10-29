@@ -1,12 +1,12 @@
 """Parameter projection integration for vLLM 0.27.1's deferred graph startup.
 
 Depends on GPUModelRunner.load_model/profile_run/capture_model, the capture call
-from Worker.compile_or_warm_up_model, Qwen2Model.do_not_compile,
+from Worker.compile_or_warm_up_model, the decoder body’s do_not_compile flag,
 ModelCudaGraphManager construction, VllmConfig.compute_hash and
-aot_compile_hash_factors at the first deferred Qwen2Model call, and
+aot_compile_hash_factors at the first deferred decoder body call, and
 EagerAdaptor.compile for source FX bodies inside the upstream CUDA graph wrappers.
 Hybrid dispatch uses GPUModelRunner.update_requests and ModelCudaGraphManager.dispatch
-before prepare_inputs, and Qwen2Model.do_not_compile to bypass compiled training bodies.
+before prepare_inputs, and the decoder body’s do_not_compile flag to bypass compiled training bodies.
 The upstream manager owns all capture/replay loops; PTTS owns every request version.
 """
 
@@ -18,14 +18,13 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode, VllmConfig
 from vllm.config.utils import SupportsHash
-from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM, Qwen2Model
 from vllm.platforms import current_platform
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor, ModelCudaGraphManager
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from pllm.authoring import BackendRequirements
-from pllm.backends.vllm.architecture import Decoder
+from pllm.backends.vllm.architecture import Decoder, DecoderBody, bind_model
 from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay
 from pllm.config import ModelConfig, RunnerKind
 from pllm.contracts.backend_attachment import AttachmentGraphMode, BackendAttachment
@@ -134,15 +133,14 @@ class OverlayGraphRunner(GPUModelRunner):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
         super().__init__(vllm_config, device)
-        self.projection_model: Qwen2Model | None = None
+        self.projection_model: DecoderBody | None = None
         self.overlay_graph_bytes = _graph_budget(vllm_config)
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights)  # pyright: ignore[reportUnknownMemberType]
+        self.decoder = bind_model(self.model)
         if graph_mode(self.overlay_graph_bytes) is AttachmentGraphMode.CUDA_GRAPH:
-            if not isinstance(self.model, Qwen2ForCausalLM):
-                raise ValueError("workload model graphs still need a Qwen2 model; set cuda_graphs=False")
-            self.projection_model = self.model.model
+            self.projection_model = self.decoder.model.model
             self.projection_model.do_not_compile = True
 
     def capture_model(self) -> int:

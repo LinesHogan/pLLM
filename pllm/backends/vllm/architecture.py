@@ -10,15 +10,17 @@ from typing import Protocol
 
 from torch import Tensor, nn
 from torch.nn import Parameter
-from vllm.model_executor.models.llama import LlamaForCausalLM
-from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
-from vllm.model_executor.models.qwen3 import Qwen3ForCausalLM
+from vllm.model_executor.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaModel
+from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM, Qwen2Model
+from vllm.model_executor.models.qwen3 import Qwen3DecoderLayer, Qwen3ForCausalLM, Qwen3Model
 
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
 
 CausalLM = Qwen2ForCausalLM | LlamaForCausalLM | Qwen3ForCausalLM
+DecoderBody = Qwen2Model | LlamaModel | Qwen3Model
+DecoderLayer = Qwen2DecoderLayer | LlamaDecoderLayer | Qwen3DecoderLayer
 Logits = Callable[[Tensor], Tensor | None]
 LinearOutput = Tensor | tuple[Tensor, Parameter | None]
 LinearForward = Callable[[Tensor], LinearOutput]
@@ -67,12 +69,6 @@ class Decoder:
             if target.role is ParameterRole.VALUE_PROJECTION_WEIGHT:
                 return attention.qkv_proj, attention.q_size + attention.kv_size, attention.kv_size, None
         raise ValueError("parameter overlay requires an MLP down or attention q/v projection")
-
-    def effect_model(self) -> Qwen2ForCausalLM:
-        """Qualify effects separately until their architecture-specific paths are supported."""
-        if not isinstance(self.model, Qwen2ForCausalLM):
-            raise ValueError("activation patches, replay and causal training still need a Qwen2 model")
-        return self.model
 
 
 # Reviewed invariant for these exact vLLM classes: qkv_proj splits into

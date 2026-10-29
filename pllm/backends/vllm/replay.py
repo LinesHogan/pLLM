@@ -8,12 +8,12 @@ from typing import Generic
 
 import torch
 from vllm.forward_context import get_forward_context, override_forward_context
-from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 
 from pllm.authoring import DataT, ResultT
 from pllm.backends.vllm.activation import VllmActivationPatch
+from pllm.backends.vllm.architecture import CausalLM
 from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay
 from pllm.backends.vllm.position_state import PositionCacheLayer, PositionCacheProvider
 from pllm.backends.vllm.region_attention import (
@@ -181,7 +181,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
 
     def __init__(
         self,
-        model: Qwen2ForCausalLM,
+        model: CausalLM,
         task: SemanticTask,
         execution: StateExecution[TensorStepInput, DataT, ResultT],
         anchor: AnchorId,

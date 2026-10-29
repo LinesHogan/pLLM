@@ -18,6 +18,7 @@ import torch
 from vllm import RequestOutput, SamplingParams, __version__ as _VLLM_VERSION
 from vllm.config import VllmConfig
 from vllm.entrypoints.llm import LLM
+from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
 
 from pllm.authoring import (
     AuxiliaryInput,
@@ -653,12 +654,15 @@ def bind_training(
     adapter = workload.backend_requirements().causal_adapter
     if adapter is None:
         return workload
+    base_model = None if runner is None else runner.decoder.model
+    if base_model is not None and not isinstance(base_model, Qwen2ForCausalLM):
+        raise ValueError("causal training still needs a Qwen2 model")
     model = Qwen2Training(
         adapter,
         facts.probe.targets,
         facts.probe.tensor_dtype,
         facts.initialization_seed,
-        None if runner is None else runner.decoder.effect_model(),
+        base_model,
     )
     return workload.bind_causal_model(model)
 
@@ -672,8 +676,6 @@ def probe_backend(
 ) -> BackendCompileFacts:
     decoder = runner.decoder
     model = decoder.model
-    if requirements.activation_layers or requirements.position_states or requirements.causal_adapter is not None:
-        decoder.effect_model()
     layer_count = len(model.model.layers)
     if any(layer < 0 or layer >= layer_count for layer in requirements.activation_layers):
         raise ValueError("activation layer is outside the backend model")

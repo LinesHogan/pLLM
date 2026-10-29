@@ -123,7 +123,7 @@ class VllmSession(Generic[DataT, ResultT]):
         tasks = tuple(task for task in attachment.plan.semantic_graph.tasks if task.replay is not None)
         self._activation = (
             VllmActivationPatch(
-                decoder.effect_model(),
+                decoder.model,
                 attachment.spec.activation_bindings,
                 attachment.spec.state_resource,
                 install=not tasks,
@@ -142,7 +142,7 @@ class VllmSession(Generic[DataT, ResultT]):
         if tasks:
             (task,) = tasks
             self._replay = VllmTokenwiseReplay(
-                decoder.effect_model(),
+                decoder.model,
                 task,
                 deployment.execution,
                 attachment.task_bindings[0].anchor_id,

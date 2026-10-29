@@ -1,17 +1,12 @@
 """vLLM Qwen2 components used by workload binding and qualified effects."""
 
-from collections.abc import Callable, Sequence
-from typing import Generic
-
 import torch
 from torch.nn import Module
 from transformers import Qwen2Config
 from typing_extensions import TypeVar
-from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.sequence import IntermediateTensors
+from vllm.model_executor.models._decoder import DecoderAttention, DecoderLayer, DecoderMLP, DecoderModel
 
 class _SiluAndMul(Module):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor: ...
@@ -21,47 +16,22 @@ class _RotaryEmbedding(Module):
         self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
-class Qwen2MLP(Module):
+class Qwen2MLP(DecoderMLP):
     gate_up_proj: LinearBase
     act_fn: _SiluAndMul
-    down_proj: LinearBase
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor: ...
-
-class Qwen2Attention(Module):
-    attn: Attention
-    qkv_proj: LinearBase
+class Qwen2Attention(DecoderAttention):
     o_proj: LinearBase
     rotary_emb: _RotaryEmbedding
     num_heads: int
     num_kv_heads: int
     head_dim: int
-    q_size: int
-    kv_size: int
 
-    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor: ...
-
-class Qwen2DecoderLayer(Module):
-    mlp: Qwen2MLP
-    self_attn: Qwen2Attention
-    input_layernorm: RMSNorm
-    post_attention_layernorm: RMSNorm
-    forward: Callable[[torch.Tensor, torch.Tensor, torch.Tensor | None], tuple[torch.Tensor, torch.Tensor]]
+class Qwen2DecoderLayer(DecoderLayer[Qwen2Attention, Qwen2MLP]): ...
 
 _Layer = TypeVar("_Layer", bound=Module, default=Qwen2DecoderLayer, covariant=True)
 
-class Qwen2Model(Module, Generic[_Layer]):
-    quant_config: object | None
-    embed_tokens: VocabParallelEmbedding
-    do_not_compile: bool
-    layers: Sequence[_Layer]
-    norm: RMSNorm
-    forward: Callable[
-        [torch.Tensor | None, torch.Tensor, IntermediateTensors | None, torch.Tensor | None],
-        torch.Tensor | IntermediateTensors,
-    ]
-
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor: ...
+class Qwen2Model(DecoderModel[_Layer]): ...
 
 class Qwen2ForCausalLM(Module):
     model: Qwen2Model

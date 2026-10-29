@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
-from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM
 
+from pllm.backends.vllm.architecture import CausalLM, DecoderLayer
 from pllm.contracts.backend_attachment import (
     ActivationPatchBinding,
     ActivationPatchOperator,
@@ -26,8 +25,6 @@ from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.state_execution import DataT, StateTaskContext
 
-_DecoderForward = Callable[[torch.Tensor, torch.Tensor, torch.Tensor | None], tuple[torch.Tensor, torch.Tensor]]
-
 
 @dataclass(frozen=True, slots=True)
 class _PatchRows:
@@ -41,9 +38,9 @@ class _PatchRows:
 
 
 class _ActivationLayer:
-    def __init__(self, layer: Qwen2DecoderLayer, binding: ActivationPatchBinding) -> None:
+    def __init__(self, layer: DecoderLayer, binding: ActivationPatchBinding) -> None:
         self.layer, self.binding = layer, binding
-        self.original: _DecoderForward = layer.forward
+        self.original = layer.forward
         self.prepared: tuple[_PatchRows, ...] = ()
         self.apply_count = 0
 
@@ -53,7 +50,7 @@ class _ActivationLayer:
         hidden, residual = self.original(positions, hidden_states, residual)
         if not self.prepared:
             return hidden, residual
-        # Qwen2 returns a fresh down-projection output, separate from its residual.
+        # Decoder layers return a fresh down-projection output, separate from its residual.
         for item in self.prepared:
             if self.binding.operator is ActivationPatchOperator.ADD:
                 (delta,) = item.fields
@@ -70,7 +67,7 @@ class _ActivationLayer:
 class VllmActivationPatch:
     def __init__(
         self,
-        model: Qwen2ForCausalLM,
+        model: CausalLM,
         bindings: tuple[ActivationPatchBinding, ...],
         resource: str,
         *,

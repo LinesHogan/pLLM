@@ -26,7 +26,7 @@ from pllm.authoring import (
     DataT,
     ResultT,
 )
-from pllm.backends.vllm.architecture import Decoder, bind_model
+from pllm.backends.vllm.architecture import Decoder
 from pllm.backends.vllm.hidden_capture import (
     CAPTURE_ENV,
     HiddenCaptureAnnouncement,
@@ -78,7 +78,6 @@ class Runner:
 
     def _install_model_hooks(self) -> None:
         """Install the logits hook and announced hidden taps before vLLM compiles the model."""
-        self.decoder = bind_model(self.model)
         model = self.decoder.model
         model.compute_logits = self._compute_logits
         announcement = decode_boundary(os.environ.get(CAPTURE_ENV, "{}"), HiddenCaptureAnnouncement)

@@ -10,6 +10,7 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput, SamplerOu
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from pllm.backends.vllm.architecture import bind_model
 from pllm.backends.vllm.packed_rows import encode_mrv1_rows
 from pllm.backends.vllm.runner import Runner
 from pllm.backends.vllm.sampler import Mrv1Sampler
@@ -36,6 +37,7 @@ class Mrv1Runner(Runner, GPUModelRunner):
         if self.speculative_config is not None:
             raise ValueError("disable speculative decoding for MRv1 workloads")
         super().load_model(load_dummy_weights)
+        self.decoder = bind_model(self.model)
         self._install_model_hooks()
 
     def _prepare_inputs(
