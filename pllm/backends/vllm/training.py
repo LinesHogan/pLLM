@@ -5,7 +5,6 @@ from typing import NoReturn
 
 import torch
 from torch.nn import functional as F
-from vllm.ir.ops.layernorm import fused_add_rms_norm, rms_norm
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.models.qwen2 import Qwen2Attention
@@ -17,19 +16,23 @@ from pllm.contracts.codec import boundary_digest
 from pllm.contracts.parameter_overlay import ParameterTargetShape
 from pllm.contracts.tensor_layout import TensorDType
 
-# forward_native dispatches an inference IR provider; these are its autograd-capable ATen bodies.
-native_norm = rms_norm.impls["native"].impl_fn
-native_add_norm = fused_add_rms_norm.impls["native"].impl_fn
-
 
 def norm(module: RMSNorm, hidden: torch.Tensor) -> torch.Tensor:
-    """Use vLLM's native RMSNorm arithmetic and dtype rounding."""
-    return native_norm(hidden, module.weight, module.variance_epsilon, module.variance_size_override)
+    """RMSNorm as vLLM's CUDA kernel computes it: FP32 through the weight multiply, one rounding.
+
+    vLLM's native ATen body rounds before the weight multiply; it disagrees with the inference kernel on
+    about a quarter of elements and roughly doubles training-vs-inference logit error.
+    """
+    value = hidden.float()
+    variance = value if module.variance_size_override is None else value[..., : module.variance_size_override]
+    value = value * torch.rsqrt(variance.square().mean(dim=-1, keepdim=True) + module.variance_epsilon)
+    return (value * module.weight.float()).to(hidden.dtype)
 
 
 def add_norm(module: RMSNorm, hidden: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Use vLLM's native fused sum and RMSNorm with model-dtype residual storage."""
-    return native_add_norm(hidden, residual, module.weight, module.variance_epsilon, module.variance_size_override)
+    """The fused kernel stores the model-dtype sum as the residual and normalizes that rounded sum."""
+    residual = hidden + residual
+    return norm(module, residual), residual
 
 
 def rotary(
