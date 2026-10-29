@@ -42,20 +42,17 @@ class Decoder:
 
 
 # These families share the decoder structure; logits dispatch remains native to each model.
-ARCHITECTURES = {
-    Qwen2ForCausalLM: Decoder,
-    LlamaForCausalLM: Decoder,
-    Qwen3ForCausalLM: Decoder,
-}
+ARCHITECTURES = (Qwen2ForCausalLM, LlamaForCausalLM, Qwen3ForCausalLM)
 
 
 def bind_model(model: nn.Module) -> Decoder:
     """Admit a concrete vLLM architecture at model load, before any instance wrapping."""
-    if not isinstance(model, tuple(ARCHITECTURES)) or type(model) not in ARCHITECTURES:
+    # Exact classes: vLLM subclasses such as Phi3 or TeleFLM change weights or logits scaling.
+    if type(model) not in ARCHITECTURES or not isinstance(model, ARCHITECTURES):
         raise ValueError("choose a Qwen2ForCausalLM, LlamaForCausalLM or Qwen3ForCausalLM model for vLLM workloads")
     if model.model.quant_config is not None:
         raise ValueError("vLLM workloads need an unquantized model")
-    return ARCHITECTURES[type(model)](model, model.compute_logits)
+    return Decoder(model, model.compute_logits)
 
 
 def hidden_binding(layer: int, site: HiddenSite, layer_count: int) -> PackedHiddenResourceBinding:
