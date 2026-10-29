@@ -158,47 +158,22 @@ def main():
             active_records.append((operands, tuple(value.clone() for value in result), current))
         return result
 
-    def check_layer(positions, hidden, residual, actual, actual_residual, observed_kv, metadata, lane):
-        attention = layer.self_attn
-        cache, length = attention.attn.kv_cache, int(metadata.seq_lens[lane])
-        block_table, block_size = metadata.block_table[lane], cache.shape[2]
-        prior = torch.stack(
-            [cache[int(block_table[p // block_size]), :, p % block_size].clone() for p in range(length)]
-        )
-        expected, residual_float, expected_kv, rounding_bound = layer_reference(
-            layer, positions, hidden, residual, prior
-        )
-        residual_error = (actual_residual.float() - residual_float.to(hidden.dtype).float()).abs()
-        assert torch.all(residual_error <= rounding_bound), (residual_error.max().item(), rounding_bound.max().item())
-        error = (actual.float() - expected.float()).abs()
-        assert error.square().sum().sqrt() / expected.float().square().sum().sqrt() < 0.015
-        block, offset = divmod(int(metadata.slot_mapping[lane]), int(block_size))
-        torch.testing.assert_close(observed_kv, expected_kv, rtol=0.02, atol=0.02)
-        for p in range(length - 1):
-            torch.testing.assert_close(
-                cache[int(block_table[p // block_size]), :, p % block_size], prior[p], rtol=0, atol=0
-            )
-        numerical.append(lane)
-        return actual, actual_residual
-
     def replay(graph):
         native_replay(graph)
         if graph not in recordings:
             return
         wave, records = recordings[graph]
         metadata = wave.attention.metadata[layer.self_attn.attn.layer_name]
+        cache = layer.self_attn.attn.kv_cache
+        slots = metadata.slot_mapping
         for operands, outputs, kv in records:
-            for lane in range(wave.seed.shape[0]):
-                check_layer(
-                    operands[0][lane : lane + 1],
-                    operands[1][lane : lane + 1],
-                    None if operands[2] is None else operands[2][lane : lane + 1],
-                    outputs[0][lane : lane + 1],
-                    outputs[1][lane : lane + 1],
-                    kv[lane],
-                    metadata,
-                    lane,
-                )
+            # Native vLLM must see the same physical batch width and paged history.
+            with override_forward_context(wave.attention.context):
+                expected = layer(operands[0], operands[1].clone(), None if operands[2] is None else operands[2].clone())
+            for actual, reference in zip(outputs, expected, strict=True):
+                torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+            torch.testing.assert_close(cache[slots // cache.shape[2], :, slots % cache.shape[2]], kv, rtol=0, atol=0)
+            numerical.extend(range(wave.seed.shape[0]))
         normal = primitive.model.norm(records[0][1][0] + records[0][1][1])
         torch.testing.assert_close(wave.output, normal, rtol=0, atol=0)
         checked.append(wave.seed.shape[0])
@@ -223,7 +198,7 @@ def main():
         assert 2 in checked and len(numerical) == 2 * sum(checked)
         diagnostics = handle.diagnostics()
         assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
-        print(f"recirculation waves={len(checked)} independent layer comparisons={len(numerical)}")
+        print(f"recirculation waves={len(checked)} same-width native layer comparisons={len(numerical)}")
     finally:
         handle.close()
 

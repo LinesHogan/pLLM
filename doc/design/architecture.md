@@ -121,9 +121,8 @@ vLLM 执行；这不是全模型捕获或自动区域融合。TLM 的训练与�
 对 q/v 因子与 AdamW 字段使用同一 StateExecution 与实例 arena，在线/离线时机
 在原始图中。
 
-Causal training reuses the loaded vLLM base weights and RoPE cache. Training and
-inference share the same q/v factors. Supported architectures and the exact-class admission rule
-are listed in [Supported models](implementation-status.md#supported-models).
+因果训练借用已加载的 vLLM 基座权重与 RoPE 缓存，训练和推理共享同一组 q/v
+因子。支持的架构及精确类准入规则见[支持的模型](implementation-status.md#支持的模型)。
 
 原始请求准入 pin 在
 全局发布后存活；推理与训练从不共享可变的 latest 缓存。`CausalTrainBatch` 被

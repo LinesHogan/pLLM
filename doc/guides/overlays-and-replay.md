@@ -124,12 +124,19 @@ OBSERVE 或 AFTER_SAMPLE。前向入口 pin 在整个 forward 内不变；prefil
 forward，不改变已完成的 prompt forward 或由它采样的第一个生成 token。
 
 These examples use eager execution with TP=PP=1. See
-[Supported models](../design/implementation-status.md#supported-models) for
+[Supported models](../design/implementation-status.md#支持的模型) for
 architectures and the exact-class admission rule. Q/V factor sizes come from
 the selected projections; query width need not equal hidden width. The AdamW
 example predicts the hidden row's mean at every projection output coordinate.
 GatedDelta input reconstruction needs equal input and output widths; on
 Qwen3-0.6B, its target is the value projection.
+
+Graph parity uses identical padded model shapes for eager execution and capture.
+Different prefill widths can change BF16 hidden inputs before a producer runs;
+subsequent factor updates and near-tied greedy tokens can therefore differ.
+Replay checks compare carry, normalization of the materialized tap and KV with native vLLM
+at the same shape and paged history. The FP32 diagnosis establishes the numerical
+error separately; cross-shape token equality is not the execution contract.
 
 Prefix reuse, preemption that recomputes history, and speculative decoding are
 unsupported here. Old KV retains the factors used when it was computed; updates

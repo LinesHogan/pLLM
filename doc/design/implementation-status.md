@@ -3,23 +3,31 @@
 日期：2026-10-04。本文是当前实现、验收和剩余工作的统一入口。设计推演与历史实验
 不等于当前功能承诺；它们的阶段性描述以本页状态为准。
 
-## Supported models
+## 支持的模型
 
-The vLLM backend supports Qwen2, Llama and Qwen3 through the exact classes
-`Qwen2ForCausalLM`, `LlamaForCausalLM` and `Qwen3ForCausalLM`. Admission checks
-`type(model)`, not inheritance. Subclasses such as Phi3 and Mistral are not
-admitted: related classes can change projection layout, attention or logits,
-and those implementations have not been verified.
+vLLM 后端通过 `Qwen2ForCausalLM`、`LlamaForCausalLM`、`Qwen3ForCausalLM`
+三个精确类支持 Qwen2、Llama 和 Qwen3。准入检查使用 `type(model)`，不接受子类：
+Phi3、Mistral 等相关类可能改变投影布局、注意力或 logits，尚未逐一验证。
 
-Use unquantized models with tensor and pipeline parallel sizes both set to 1;
-causal training requires BF16. Replay requires FlashAttention 2 and the other
-[overlay and replay limits](../guides/overlays-and-replay.md). Qwen2 checkpoints
-in examples remain examples, not a restriction on model choice.
+当前要求未量化模型，张量并行和流水线并行均为 1；因果训练要求 BF16。
+重放要求 FlashAttention 2，并遵守[overlay 与重放限制](../guides/overlays-and-replay.md)。
+示例使用 Qwen2 检查点，不代表后端只接受 Qwen2。
 
-Step loops that reuse prefix history still fail comparison checks on
-SmolLM2-360M and Qwen3-0.6B. Qwen3-0.6B recirculation also exceeds the tested
-native-vLLM numerical error bound, and its producer overlays fail eager-versus-
-CUDA-graph parity checks. These combinations are not yet qualified.
+本轮诊断将此前四个失败定位为 BF16 对批宽、填充及循环历史的数值敏感性，
+未发现步骤 4–5 引入的执行回归。SmolLM2 的热/冷前缀续写和 Qwen3 的
+DecodeFactors 分歧均发生在 FP32 间隔小于 BF16 误差的近似平局处；Qwen3
+再循环的原生对照错误地使用了单行批次。Qwen3 的因子差异则从模型填充改变
+隐藏输入开始，同形状运行的逐步因子、梯度和输出完全一致。
+
+验收现在要求同形状原生 vLLM 的 carry、已合并 tap 的归一化和 KV 精确相等，
+图比较保留原提示词与训练任务，并使 eager 使用相同填充。Qwen2.5-0.5B、
+SmolLM2-360M、Qwen3-0.6B 的相关执行路径通过此验收；不承诺不同批宽或
+前缀调度下的 BF16 逐 token 相等，也不把长循环相对 FP32 的误差解释为模型精度保证。
+
+Qwen3 的完整 StepLoop smoke 仍不能列为全绿：上述数值检查通过后，原有卸载用例的
+固定 8 MiB CPU 缓存只能容纳 4 个 Qwen3 页，两个压力请求把 donor 页逐出，随后
+“必须从 CPU 恢复”的断言失败。此项是尚未解决的用例容量前提，不是前缀交接或
+BF16 比较失败；本轮保留原容量与断言，未把它跳过或改成允许未命中。
 
 ## E1 跨进程只读页授权：完成（2026-10-04）
 
@@ -138,7 +146,7 @@ If 从 10 降为 2。存储归属推导拆为调度无关的 provenance（一次
 | 能力 | 当前状态 | 适用范围和限制 |
 | --- | --- | --- |
 | 原计算图导入 | 已实现 | 使用 Torch 的原图、输入输出签名、原字段和 guard；当前计算块要求受支持的静态张量布局。 |
-| Model independence | Backend boundary established | contracts/execution do not import vLLM/Transformers. Model admission follows [Supported models](#supported-models); arbitrary architectures are not supported. |
+| 中段与模型解耦 | 后端边界已建立 | contracts/execution 禁止导入 vLLM/Transformers；准入遵循[支持的模型](#支持的模型)，不支持任意架构。 |
 | 符号依赖与 ISL 调度 | 已实现并接入区域执行 | 保留参数域、值来源、RAW/WAR/WAW、动态效果边界；支持自动重排、分块、窗口及部分 wavefront。具体机会取决于真实依赖。 |
 | 计划执行和跨 stream 完成 | 已实现 | 使用既有执行器、原 owner 和完成协议；未知共享上下文不会被自动当作可并发。运行时不调用 ISL。 |
 | 数学与实现候选 | 已实现有界搜索及源重放 | 支持相邻调用 outlining、矩阵重结合、独立 GEMM 合批和受限 Torch 编译；不是任意数学等价证明器。 |
@@ -146,7 +154,7 @@ If 从 10 降为 2。存储归属推导拆为调度无关的 provenance（一次
 | 状态正确性 | 保留原 PTTS 机制 | pin、COW、版本发布、KV 恢复和资源权限仍由原所有者管理；没有新增状态 owner。 |
 | 内存依据 | 已有区域范围的上界与拒绝机制 | 覆盖模型化张量、保留对象及已声明临时空间；尚不是包含所有库工作区、allocator、模型权重和 KV 的整设备预算保证。 |
 | 成本选择 | 以访问、存储生存期和完成时间为依据 | FLOPs 是辅助事实。逻辑读写量不等于实际 HBM 流量，样本计时不证明全局最优。 |
-| Real model execution | Supports the models listed above | Single-device execution, overlays, causal training and replay; other architectures need separate verification. |
+| 真实模型接入 | 支持上列模型 | 单设备执行、overlay、因果训练与重放已接入；其他架构需单独验证。 |
 | 稳定吞吐收益 | **尚未证明** | 短请求和两 token smoke 的小幅差异不作为性能验收。 |
 | 新教程、notebook 和示意图 | 尚未交付本轮更新 | 继续排在架构、功能和真实性能验收之后。 |
 

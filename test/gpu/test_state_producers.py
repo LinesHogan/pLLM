@@ -145,6 +145,7 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
 
 @pytest.mark.parametrize("workload", [PromptFactors(), DecodeFactors()])
 def test_composed_readers_replay_model_graphs(workload, monkeypatch):
+    from pllm.backends.vllm.overlay_graph import capacities
     from pllm.execution.step_capture import StepCapture
 
     results = []
@@ -152,6 +153,14 @@ def test_composed_readers_replay_model_graphs(workload, monkeypatch):
         with open_llm(
             workload, cuda_graphs=graphs, capture_memory_bytes=256 << 20, memory_budget_bytes=1 << 30
         ) as handle:
+            if not graphs:
+                manager = handle.runner.cudagraph_manager
+                dispatch = manager.dispatch
+                # Capture pads prefill to a capacity class. Compare the same arithmetic shape.
+                manager.dispatch = lambda *args, **kwargs: replace(
+                    dispatch(*args, **kwargs),
+                    num_tokens=next(n for n in capacities(64) if n >= args[1]),
+                )
             if graphs:
                 attachment = handle.attachment
                 with pytest.raises(ValueError, match="Graph overlays"):
@@ -202,9 +211,7 @@ def test_composed_readers_replay_model_graphs(workload, monkeypatch):
                     replay.setattr(session, "prepare_input", recompute)
                     with pytest.raises(RuntimeError, match="would recompute"):
                         handle.generate(["Name a color."], SamplingParams(max_tokens=3, ignore_eos=True))
-    assert [tokens for tokens, _ in results[0]] == [tokens for tokens, _ in results[1]]
-    # vLLM's fused graph kernels and eager BF16 kernels round differently.
-    assert [score for _, score in results[0]] == pytest.approx([score for _, score in results[1]], abs=0.1)
+    assert results[0] == results[1]
 
 
 @pytest.mark.parametrize(
