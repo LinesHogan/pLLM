@@ -1,7 +1,7 @@
 """Request projection state produced by prompt networks or decode AdamW; examples for workload authors.
 
 Prompt producers publish after completed prefill for the next decode forward. Old KV keeps the
-factors used when it was computed. These examples target eager, unsharded Qwen2 q/v projections.
+factors used when it was computed. These examples target eager, unsharded q/v projections.
 """
 
 from collections.abc import Callable, Mapping
@@ -157,8 +157,9 @@ class DecodeFactors(ProjectionState):
         av: torch.Tensor = pllm.parameter("factors", "a_1"),
         bv: torch.Tensor = pllm.parameter("factors", "b_1"),
     ) -> torch.Tensor:
-        """Detached hidden targets train these factors without backpropagating through vLLM or KV."""
+        """Predict the detached hidden row's mean at every q/v output, without gradients through vLLM or KV."""
         row = x.to(aq).unsqueeze(1)
         q = ((row @ aq.transpose(-1, -2)) @ bq.transpose(-1, -2)).squeeze(1)
         v = ((row @ av.transpose(-1, -2)) @ bv.transpose(-1, -2)).squeeze(1)
-        return (q.float() - target).square().mean(-1) + (v.float() - target[:, : v.shape[-1]]).square().mean(-1)
+        target = target.mean(-1, keepdim=True)
+        return (q.float() - target).square().mean(-1) + (v.float() - target).square().mean(-1)

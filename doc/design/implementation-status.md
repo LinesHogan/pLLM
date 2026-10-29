@@ -3,6 +3,24 @@
 日期：2026-10-04。本文是当前实现、验收和剩余工作的统一入口。设计推演与历史实验
 不等于当前功能承诺；它们的阶段性描述以本页状态为准。
 
+## Supported models
+
+The vLLM backend supports Qwen2, Llama and Qwen3 through the exact classes
+`Qwen2ForCausalLM`, `LlamaForCausalLM` and `Qwen3ForCausalLM`. Admission checks
+`type(model)`, not inheritance. Subclasses such as Phi3 and Mistral are not
+admitted: related classes can change projection layout, attention or logits,
+and those implementations have not been verified.
+
+Use unquantized models with tensor and pipeline parallel sizes both set to 1;
+causal training requires BF16. Replay requires FlashAttention 2 and the other
+[overlay and replay limits](../guides/overlays-and-replay.md). Qwen2 checkpoints
+in examples remain examples, not a restriction on model choice.
+
+Step loops that reuse prefix history still fail comparison checks on
+SmolLM2-360M and Qwen3-0.6B. Qwen3-0.6B recirculation also exceeds the tested
+native-vLLM numerical error bound, and its producer overlays fail eager-versus-
+CUDA-graph parity checks. These combinations are not yet qualified.
+
 ## E1 跨进程只读页授权：完成（2026-10-04）
 
 删除、核心绑定、视频消费者三步已由 Claude 逐项审查并在本机验收，代码落在
@@ -120,7 +138,7 @@ If 从 10 降为 2。存储归属推导拆为调度无关的 provenance（一次
 | 能力 | 当前状态 | 适用范围和限制 |
 | --- | --- | --- |
 | 原计算图导入 | 已实现 | 使用 Torch 的原图、输入输出签名、原字段和 guard；当前计算块要求受支持的静态张量布局。 |
-| 中段与 modeling 分离 | 核心边界已建立，前端迁移未完成 | contracts/execution 禁止导入 vLLM/Transformers；vLLM 外层接入仍限制 Qwen2，不能宣称任意模型即插即用。 |
+| Model independence | Backend boundary established | contracts/execution do not import vLLM/Transformers. Model admission follows [Supported models](#supported-models); arbitrary architectures are not supported. |
 | 符号依赖与 ISL 调度 | 已实现并接入区域执行 | 保留参数域、值来源、RAW/WAR/WAW、动态效果边界；支持自动重排、分块、窗口及部分 wavefront。具体机会取决于真实依赖。 |
 | 计划执行和跨 stream 完成 | 已实现 | 使用既有执行器、原 owner 和完成协议；未知共享上下文不会被自动当作可并发。运行时不调用 ISL。 |
 | 数学与实现候选 | 已实现有界搜索及源重放 | 支持相邻调用 outlining、矩阵重结合、独立 GEMM 合批和受限 Torch 编译；不是任意数学等价证明器。 |
@@ -128,7 +146,7 @@ If 从 10 降为 2。存储归属推导拆为调度无关的 provenance（一次
 | 状态正确性 | 保留原 PTTS 机制 | pin、COW、版本发布、KV 恢复和资源权限仍由原所有者管理；没有新增状态 owner。 |
 | 内存依据 | 已有区域范围的上界与拒绝机制 | 覆盖模型化张量、保留对象及已声明临时空间；尚不是包含所有库工作区、allocator、模型权重和 KV 的整设备预算保证。 |
 | 成本选择 | 以访问、存储生存期和完成时间为依据 | FLOPs 是辅助事实。逻辑读写量不等于实际 HBM 流量，样本计时不证明全局最优。 |
-| 真实模型接入 | 支持已验收的 Qwen2/vLLM 路径 | 当前重点是单设备、eager、FA2、静态单 token 计算块及 recirculation；完整异构模型、其他模型族仍未验收。 |
+| Real model execution | Supports the models listed above | Single-device execution, overlays, causal training and replay; other architectures need separate verification. |
 | 稳定吞吐收益 | **尚未证明** | 短请求和两 token smoke 的小幅差异不作为性能验收。 |
 | 新教程、notebook 和示意图 | 尚未交付本轮更新 | 继续排在架构、功能和真实性能验收之后。 |
 

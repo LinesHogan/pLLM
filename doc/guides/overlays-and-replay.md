@@ -123,9 +123,19 @@ def produce(self, h=pllm.hidden(8, phase="prefill"), net=pllm.module("network"))
 OBSERVE 或 AFTER_SAMPLE。前向入口 pin 在整个 forward 内不变；prefill 结果只影响第一次 decode
 forward，不改变已完成的 prompt forward 或由它采样的第一个生成 token。
 
-这些组合当前支持 eager Qwen2、主流生产、TP=PP=1。前缀复用、历史重算抢占、speculative decoding
-不受支持。历史 KV 保留当时使用的因子，更新不会重算整个前缀。完整 SHINE 的独立 context pass、
-Qwen3 与 checkpoint/memory-token 适配仍需另外实现。有限值检查可能同步 CUDA；不能据此宣称零开销。
+These examples use eager execution with TP=PP=1. See
+[Supported models](../design/implementation-status.md#supported-models) for
+architectures and the exact-class admission rule. Q/V factor sizes come from
+the selected projections; query width need not equal hidden width. The AdamW
+example predicts the hidden row's mean at every projection output coordinate.
+GatedDelta input reconstruction needs equal input and output widths; on
+Qwen3-0.6B, its target is the value projection.
+
+Prefix reuse, preemption that recomputes history, and speculative decoding are
+unsupported here. Old KV retains the factors used when it was computed; updates
+do not recompute the prefix. A separate SHINE context pass and checkpoint or
+memory-token integration still need implementation. Finite-value checks may
+synchronize CUDA.
 
 ## 外部生产的 overlay（SHINE 式）
 

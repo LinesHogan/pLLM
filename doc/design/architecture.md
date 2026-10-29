@@ -119,9 +119,13 @@ TaskResourceFact 字节，区别于瞬态工作区。读/私有写用原始 Page
 ESamp 在原始任务中绑定 Rust 选出的定形 loss/AdamW 图，包括公开 eager 模型
 vLLM 执行；这不是全模型捕获或自动区域融合。TLM 的训练与公开 vLLM overlay
 对 q/v 因子与 AdamW 字段使用同一 StateExecution 与实例 arena，在线/离线时机
-在原始图中。Qwen2 训练前向借用已加载的 vLLM 基座与 RoPE cache，接收原始
-因子视图；共同任务边界编译 loss 与 backward。后端借用同样的 A/B 页做融合
-q/v 应用。原始请求准入 pin 在
+在原始图中。
+
+Causal training reuses the loaded vLLM base weights and RoPE cache. Training and
+inference share the same q/v factors. Supported architectures and the exact-class admission rule
+are listed in [Supported models](implementation-status.md#supported-models).
+
+原始请求准入 pin 在
 全局发布后存活；推理与训练从不共享可变的 latest 缓存。`CausalTrainBatch` 被
 独立与公开输入共享，不转换成另一种负载批次。公开输入每次 generate 消费一次；
 在线在 token 提交后发布，离线在新准入前发布。同 GPU IPC 的原始页授予仅支持

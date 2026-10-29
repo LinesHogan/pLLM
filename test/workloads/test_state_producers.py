@@ -166,7 +166,7 @@ def test_decode_adam_matches_independent_optimizer_and_keeps_entry_pin(device):
     aq, bq, av, bv = (
         t.reshape(shape) for t, shape in zip(flat.split((8, 8, 8, 4)), ((2, 4), (4, 2), (2, 4), (2, 2)), strict=True)
     )
-    loss = ((x @ aq.T @ bq.T - target) ** 2).mean() + ((x @ av.T @ bv.T - target[:, :2]) ** 2).mean()
+    loss = ((x @ aq.T @ bq.T - target.mean()) ** 2).mean() + ((x @ av.T @ bv.T - target.mean()) ** 2).mean()
     loss.backward()
     optimizer.step()
     hidden = {
