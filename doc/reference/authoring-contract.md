@@ -490,17 +490,15 @@ detach 的句子选择目标；负载中没有 TLM 专属的布局、梯度收�
 meta 模型可以对照 worker 的真实设备事实做声明，但可执行数学需要该设备上
 物化的模型。内置 TLM 定义支持封闭的 EngineCore 重建，无需初始化父 CUDA。
 这个接口是实例作用域的，不增加请求适配器、捕获或 replay。
-`CausalModel.resident_bytes` 声明 PTTS 之外的冻结参数/缓冲存储。`HfQvModel`
-从唯一张量存储推导它，包括 meta 模型：tied 权重与借用的因子模板不重复计数。
-原始后端探针把它加到每个 timeline 锚点，连同输入缓冲；worker 重建检查物化
-需求。这是张量驻留，不是分配器开销或 backward/库 scratch。HF 调用显式禁用
-KV、hidden 状态与注意力输出保留；因果目标只消费 logits。显式训练成本声明必须
-包含 `update.input_shapes=((sequences, tokens),)`。两个轴都是容量界，在传输前
-与因果数学前检查；与打包推理行无关。标准 HF/PEFT TLM 绑定仍没有完整的模型
-backward scratch 成本声明：其无界模式不是有限内存保证，Rust 在有限计划中拒绝
-缺失成本。离线 TLM 把冻结模型的 logits 归约为 detach 的句子 loss，再做适配
-前向。只有这个向量存活，不是完整的 batch/token/词表张量。该目标属于 TLM 数学，
-不属于共享原语目录。
+`CausalAdapter(rank, alpha)` 是加载前的 q/v 声明；后端探针提供全部层的切片几何，
+worker 加载 vLLM 后绑定 `CausalModel`。驱动进程只构造 meta 因子，不运输活模型。
+Qwen2 训练借用 BF16、未量化、TP1 的基座与 RoPE cache；新增驻留仅是因子初始化模板，
+`CausalModel.resident_bytes` 不重复收费借用存储。框架在共同 autograd 任务边界编译
+纯张量 forward/loss 和生成的 backward；选择计数、优化器及发布在图外，workload 没有编译开关。
+不同形状首次使用会编译；未启用 Inductor CUDA graph。显式训练成本声明仍须包含
+`update.input_shapes=((sequences, tokens),)`；两个轴都是容量界。默认无界模式不是有限
+训练峰值保证，完整 backward scratch 尚未声明，Rust 在有限计划中拒绝缺失成本。
+离线 TLM 先把冻结模型 logits 归约为 detach 的句子 loss，再做适配前向。
 
 关闭模型句柄会 detach 并关闭引擎，然后丢弃其 runner、执行与引擎引用。
 调用方自有的模型与返回的张量保留自己的生命周期。失败的关闭使句柄不再接受

@@ -30,7 +30,6 @@ from pllm.contracts.backend_attachment import (
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.semantic_graph import StateScope
-from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.trace import TracePhase, TraceSelection
 from pllm.host import HostRuntimeFacts
 from pllm.workloads.dummy import DummyConfig, DummyWorkload
@@ -47,7 +46,7 @@ from pllm.workloads.lora import OutputLoRAConfig, OutputLoRAWorkload
 from pllm.workloads.prefill_adapters import PrefillAdapters
 from pllm.workloads.recirculation import RecirculationWorkload
 from pllm.workloads.reft import ActivationConfig, ActivationWorkload
-from pllm.workloads.tlm import HfQvConfig, HfQvModel, TLMConfig, TLMWorkload
+from pllm.workloads.tlm import TLMConfig, TLMWorkload
 from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -283,10 +282,7 @@ def _tlm_shared_input(model_id: str = MODEL) -> None:
     if not Path(model_id).is_dir():
         patterns = ("*.json", "*.safetensors", "*.txt", "*.model")
         model_id = snapshot_download(model_id, local_files_only=True, allow_patterns=patterns)
-    # The frontend loads only meta tensors; the child rebuilds the model.
-    config = HfQvConfig(model_id, "main", True, False, 2, 4, 0.0, TensorDType.BFLOAT16)
-    model = HfQvModel.load(config, torch.device("meta"))
-    assert all(factor.device.type == "meta" for factor in model.initial_factors)
+    model = pllm.host.CausalAdapter(2, 4)
     assert not torch.cuda.is_initialized()
     handle = pllm.make_llm(workload=TLMWorkload(TLMConfig(threshold=0.0), model), config=engine(model_id))
     try:
@@ -305,7 +301,7 @@ def _tlm_shared_input(model_id: str = MODEL) -> None:
         # Without a training batch the next invocation does not update.
         handle.generate("A second invocation", SamplingParams(max_tokens=2, temperature=0.0))
         assert handle.worker_state().diagnostics.update_count == 1
-        print(f"TLM closed model reconstruction: loss/update=1, model bytes={model.resident_bytes}")
+        print("TLM borrowed worker model: loss/update=1, parent CUDA=off")
     finally:
         handle.close()
 

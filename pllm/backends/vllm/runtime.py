@@ -673,11 +673,6 @@ def probe_backend(
     model = runner.qwen2_model()
     if model.quant_config is not None:
         raise RuntimeError("vLLM workload requires an unquantized model")
-    if requirements.model_source is not None and requirements.model_source != (
-        runner.model_config.model,
-        runner.model_config.revision or "main",
-    ):
-        raise ValueError("causal training and inference must use the same model source and revision")
     layer_count = len(model.model.layers)
     if any(layer < 0 or layer >= layer_count for layer in requirements.activation_layers):
         raise ValueError("activation layer is outside the backend model")

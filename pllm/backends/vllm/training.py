@@ -80,7 +80,6 @@ class Qwen2Training:
         self.model = model
         self.targets, self.tensor_dtype = targets, tensor_dtype
         self.scale = adapter.alpha / adapter.rank
-        self.model_source = None
         self.device = torch.device("meta") if model is None else model.model.embed_tokens.weight.device
         if model is not None:
             if model.quant_config is not None or tensor_dtype is not TensorDType.BFLOAT16:

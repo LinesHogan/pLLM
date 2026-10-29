@@ -340,7 +340,6 @@ class CausalAdapterWorkload(
             return BackendRequirements(causal_adapter=self.model)
         return BackendRequirements(
             parameter_targets=tuple(target.target for target in self.model.targets),
-            model_source=self.model.model_source,
             resident_bytes=self.model.resident_bytes,
         )
 

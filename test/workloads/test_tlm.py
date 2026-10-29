@@ -1,6 +1,6 @@
 """TLM evidence 11/24: independent factor AdamW and causal objective semantics.
 
-The real HF/PEFT model path is covered by test/gpu/vllm_tlm_smoke.py.
+The borrowed vLLM model path is covered by test/gpu/vllm_tlm_smoke.py.
 """
 
 from dataclasses import replace

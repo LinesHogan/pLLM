@@ -20,9 +20,9 @@ from vllm import SamplingParams
 import pllm
 from pllm.authoring import CausalTrainBatch
 from pllm.config import ModelConfig, VllmDType
-from pllm.contracts.tensor_layout import TensorDType
+from pllm.host import CausalAdapter
 from pllm.kernels.adamw import AdamWConfig
-from pllm.workloads.tlm import HfQvConfig, HfQvModel, TLMConfig, TLMMode, TLMWorkload
+from pllm.workloads.tlm import TLMConfig, TLMMode, TLMWorkload
 
 
 def main() -> None:
@@ -35,7 +35,7 @@ def main() -> None:
         local_files_only=True,
         allow_patterns=("*.json", "*.safetensors", "*.txt", "*.model"),
     )
-    model = HfQvModel.load(HfQvConfig(model_id, "main", True, False, 2, 4, 0.0, TensorDType.BFLOAT16), device)
+    model = CausalAdapter(2, 4)
     workload = TLMWorkload(TLMConfig(mode, AdamWConfig(0.01, (0.9, 0.999), 1e-8, 0.01), threshold=0.0), model)
     handle = pllm.make_llm(workload=workload, config=ModelConfig(model_id, VllmDType.BFLOAT16, 64, 2, 64, 0.25, seed=7))
     execution = handle.runner.require_session()._deployment.execution
@@ -60,7 +60,9 @@ def main() -> None:
         (current,) = execution.directory.select(()).refs
         assert current.version_id == initial.version_id + 1
         fields = execution.snapshot(current, torch.cuda.current_stream(device))
-        assert any(torch.count_nonzero(fields[index * 10 + 5]) for index in range(len(model.targets)))
+        assert any(
+            torch.count_nonzero(fields[index * 10 + 5]) for index in range(2 * len(handle.runner.model.model.layers))
+        )
 
         # Real vLLM fused QKV, independently evaluated with dense PyTorch linear
         # arithmetic. Generation below has no training input, so this exact root
@@ -73,8 +75,10 @@ def main() -> None:
                 (hidden,) = args
                 actual, _ = output
                 expected = F.linear(hidden, module.weight, module.bias)
-                expected[:, :q_size] += F.linear(F.linear(hidden, factor[0]), factor[1]) * model.scale
-                expected[:, q_size + kv_size :] += F.linear(F.linear(hidden, factor[2]), factor[3]) * model.scale
+                expected[:, :q_size] += F.linear(F.linear(hidden, factor[0]), factor[1]) * (model.alpha / model.rank)
+                expected[:, q_size + kv_size :] += F.linear(F.linear(hidden, factor[2]), factor[3]) * (
+                    model.alpha / model.rank
+                )
                 torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
                 checks[0] += 1
 

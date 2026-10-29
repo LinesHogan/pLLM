@@ -118,7 +118,6 @@ class CausalAdapter:
 class BackendRequirements:
     hidden_inputs: tuple[HiddenInputSource, ...] = ()
     parameter_targets: tuple[ParameterTarget, ...] = ()
-    model_source: tuple[str, str] | None = None
     activation_layers: tuple[int, ...] = ()
     sampler_stage: SamplerStage | None = None
     sampler_feedback: bool = False
@@ -146,8 +145,6 @@ class CausalModel(Protocol):
     def fingerprint(self) -> str: ...
     @property
     def scale(self) -> float: ...
-    @property
-    def model_source(self) -> tuple[str, str] | None: ...
     @property
     def resident_bytes(self) -> int: ...
     def logits(

@@ -62,7 +62,7 @@ class TLMWorkload(pllm.host.CausalAdapterWorkload[TLMData, TLMResult]):
     name = "tlm.qv_lora"
     namespace = "canonical.qv_adamw@1"
     config: TLMConfig
-    model: pllm.host.CausalModel | pllm.host.CausalAdapter
+    model: pllm.host.CausalModel | pllm.host.CausalAdapter = pllm.host.CausalAdapter()
 
     def __post_init__(self) -> None:
         if isinstance(self.model, pllm.host.CausalAdapter):
