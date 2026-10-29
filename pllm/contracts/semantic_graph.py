@@ -291,7 +291,6 @@ class ScheduleDecision:
 
     tasks: tuple[PhysicalTask, ...]
     peak_memory_bytes: int
-    prefix_replayable: bool
     prefix_replay_rejection: str | None
 
 

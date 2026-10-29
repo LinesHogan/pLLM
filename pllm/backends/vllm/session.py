@@ -131,12 +131,13 @@ class VllmSession(Generic[DataT, ResultT]):
             if (attachment.spec.activation_bindings)
             else None
         )
-        self._preemption_rejection = plan.schedule.prefix_replay_rejection
-        # Eligibility alone cannot reset advanced state. Keep the guard until replay is implemented.
-        if plan.schedule.prefix_replayable and (
-            attachment.spec.overlay_bindings or attachment.spec.activation_bindings
-        ):
-            self._preemption_rejection = "prefix replay for eligible request state is not implemented yet"
+        # Recomputed history reruns model-side effects; only those workloads must replay their state exactly.
+        # Eligibility alone cannot reset advanced state, so eligible workloads stay guarded until replay exists.
+        self._preemption_rejection = (
+            plan.schedule.prefix_replay_rejection or "prefix replay for eligible request state is not implemented yet"
+            if attachment.spec.overlay_bindings or attachment.spec.activation_bindings
+            else None
+        )
         self._token_frontiers: dict[RequestIdentity, int] = {}
         self._feed: FeedReceiver | None = None
         self._received_readonly: ReadonlyStepInput | ReadonlyStepAbsent | ReadonlyStepEnd | None = None

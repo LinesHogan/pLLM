@@ -17,7 +17,6 @@ use std::collections::{BTreeSet, HashMap};
 pub(crate) struct ScheduleDecision {
     pub(crate) tasks: Vec<PhysicalTask>,
     peak_memory_bytes: u64,
-    prefix_replayable: bool,
     prefix_replay_rejection: Option<String>,
 }
 
@@ -815,7 +814,6 @@ fn build_decision(
     ScheduleDecision {
         tasks: plans,
         peak_memory_bytes: solution.peak,
-        prefix_replayable: rejection.is_none(),
         prefix_replay_rejection: rejection.map(str::to_owned),
     }
 }
