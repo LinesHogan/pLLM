@@ -381,3 +381,20 @@ def test_video_session_zero_copy_backpressure_and_ack_lifetime():
     with observe_replay(versions=(1, 1, 2, 2, 2)):
         diagnostics, _ = run_video(workload, ("publish", "missing", "publish"), 5, config)
     assert diagnostics.update_count == 2 and diagnostics.hold_count == 3
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="real LLM/CUDA IPC requires a GPU")
+def test_video_session_failure_retains_owner_without_fallback():
+    from pllm.backends.vllm.session import VllmSession
+
+    before_execute = VllmSession.before_execute
+
+    def preempt(session, scheduler_output):
+        if session.next_step_id == 1:
+            assert session.diagnostics().update_count == 1
+            scheduler_output.preempted_req_ids = set(session._identities)
+        return before_execute(session, scheduler_output)
+
+    with patch.object(VllmSession, "before_execute", preempt), pytest.raises(RuntimeError, match="preempt"):
+        run_video(VideoWorkload(grid_size=2), ("publish", "publish"), 2)
