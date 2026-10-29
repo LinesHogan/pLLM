@@ -25,6 +25,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor, ModelCu
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from pllm.authoring import BackendRequirements
+from pllm.backends.vllm.architecture import Decoder
 from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay
 from pllm.config import ModelConfig, RunnerKind
 from pllm.contracts.backend_attachment import AttachmentGraphMode, BackendAttachment
@@ -220,16 +221,14 @@ class _ProjectionReader:
 
     def __init__(
         self,
-        model: Qwen2ForCausalLM,
+        decoder: Decoder,
         binding: ParameterOverlayFieldBinding,
         arena: PageBundleArena,
         rows: int,
         requests: int,
         budget: int,
     ) -> None:
-        from pllm.backends.vllm.parameter_overlay import locate_parameter
-
-        self.module, self.offset, self.width, self.mlp = locate_parameter(model, binding.target)
+        self.module, self.offset, self.width, self.mlp = decoder.projection(binding.target)
         self.forward_base = self.module.forward
         self.mlp_base = None if self.mlp is None else self.mlp.forward
         self.binding, self.rows, self.requests = binding, rows, requests
@@ -343,7 +342,7 @@ class PinnedParameterOverlay:
 
     def __init__(
         self,
-        model: Qwen2ForCausalLM,
+        decoder: Decoder,
         bindings: tuple[ParameterOverlayFieldBinding, ...],
         arena: PageBundleArena,
         rows: int,
@@ -352,7 +351,7 @@ class PinnedParameterOverlay:
         *,
         phases: tuple[HiddenPhase, ...],
     ) -> None:
-        self.readers = tuple(_ProjectionReader(model, binding, arena, rows, requests, budget) for binding in bindings)
+        self.readers = tuple(_ProjectionReader(decoder, binding, arena, rows, requests, budget) for binding in bindings)
         self.phases = phases
         self.sources: tuple[PackedPhaseRow, ...] = ()
         self.starts: Slots = np.empty(0, dtype=np.int64)
@@ -500,7 +499,7 @@ class HybridParameterOverlay:
 
 
 def parameter_overlay(
-    model: Qwen2ForCausalLM,
+    decoder: Decoder,
     bindings: tuple[ParameterOverlayFieldBinding, ...],
     arena: PageBundleArena,
     rows: int,
@@ -514,6 +513,8 @@ def parameter_overlay(
 ) -> PinnedParameterOverlay | ExactParameterOverlay | HybridParameterOverlay:
     """Install each projection wrapper once, before compiling or capturing the model."""
     if routed or not uses_pinned_projection(in_forward=in_forward, graphs=graphs):
-        return ExactParameterOverlay(model, bindings)
-    pinned = PinnedParameterOverlay(model, bindings, arena, rows, requests, budget, phases=() if in_forward else phases)
-    return HybridParameterOverlay(pinned, ExactParameterOverlay(model, bindings), phases) if in_forward else pinned
+        return ExactParameterOverlay(decoder, bindings)
+    pinned = PinnedParameterOverlay(
+        decoder, bindings, arena, rows, requests, budget, phases=() if in_forward else phases
+    )
+    return HybridParameterOverlay(pinned, ExactParameterOverlay(decoder, bindings), phases) if in_forward else pinned

@@ -6,17 +6,39 @@ layer output, without its separately returned residual.
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Protocol
 
 from torch import Tensor, nn
+from torch.nn import Parameter
 from vllm.model_executor.models.llama import LlamaForCausalLM
 from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
 from vllm.model_executor.models.qwen3 import Qwen3ForCausalLM
 
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
+from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
 
 CausalLM = Qwen2ForCausalLM | LlamaForCausalLM | Qwen3ForCausalLM
 Logits = Callable[[Tensor], Tensor | None]
+LinearOutput = Tensor | tuple[Tensor, Parameter | None]
+LinearForward = Callable[[Tensor], LinearOutput]
+MlpForward = Callable[[Tensor], Tensor]
+
+
+class Projection(Protocol):
+    """Weight geometry and replaceable forward shared by the projection readers."""
+
+    weight: Parameter
+    bias: Parameter | None
+    tp_size: int
+    return_bias: bool
+    forward: LinearForward
+
+
+class Mlp(Protocol):
+    """MLP call whose input supplies the down-projection training target."""
+
+    forward: MlpForward
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,15 +54,31 @@ class Decoder:
         cls = type(self.model)
         return f"{cls.__module__}.{cls.__qualname__}"
 
+    def projection(self, target: ParameterTarget) -> tuple[Projection, int, int, Mlp | None]:
+        """Resolve the supported projection and its disjoint output slice."""
+        layer = self.model.model.layers[target.layer]
+        if target.module is ParameterModuleKind.MLP and target.role is ParameterRole.DOWN_PROJECTION_WEIGHT:
+            module = layer.mlp.down_proj
+            return module, 0, int(module.weight.shape[0]), layer.mlp
+        if target.module is ParameterModuleKind.ATTENTION:
+            attention = layer.self_attn
+            if target.role is ParameterRole.QUERY_PROJECTION_WEIGHT:
+                return attention.qkv_proj, 0, attention.q_size, None
+            if target.role is ParameterRole.VALUE_PROJECTION_WEIGHT:
+                return attention.qkv_proj, attention.q_size + attention.kv_size, attention.kv_size, None
+        raise ValueError("parameter overlay requires an MLP down or attention q/v projection")
+
     def effect_model(self) -> Qwen2ForCausalLM:
         """Qualify effects separately until their architecture-specific paths are supported."""
         if not isinstance(self.model, Qwen2ForCausalLM):
-            raise ValueError(
-                "parameter overlays, activation patches, replay and causal training still need a Qwen2 model"
-            )
+            raise ValueError("activation patches, replay and causal training still need a Qwen2 model")
         return self.model
 
 
+# Reviewed invariant for these exact vLLM classes: qkv_proj splits into
+# [q_size, kv_size, kv_size]. The query slice flows only through per-head q_norm
+# (Qwen3, or Qwen2 when enabled), RoPE and the attention query; it cannot write
+# same-layer K/V. Overlay corrections enter before that split.
 # These families share the decoder structure; logits dispatch remains native to each model.
 ARCHITECTURES = (Qwen2ForCausalLM, LlamaForCausalLM, Qwen3ForCausalLM)
 

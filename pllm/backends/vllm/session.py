@@ -21,10 +21,7 @@ from pllm.backends.vllm.overlay_graph import (
     PinnedParameterOverlay,
     parameter_overlay,
 )
-from pllm.backends.vllm.parameter_overlay import (
-    ExactParameterOverlay,
-    validate_projection_sources,
-)
+from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay
 from pllm.backends.vllm.position_state import PositionCacheLayer
 from pllm.backends.vllm.prefix_cache import POLICY_KEY, CachePolicy
 from pllm.backends.vllm.replay import VllmTokenwiseReplay
@@ -107,11 +104,9 @@ class VllmSession(Generic[DataT, ResultT]):
         overlay_bindings = attachment.spec.overlay_bindings
         routed_overlay = bool(overlay_bindings) and any(task.replay is not None for task in plan.semantic_graph.tasks)
         self._in_forward_overlay = plan.semantic_graph.updates_in_forward
-        if routed_overlay or self._in_forward_overlay:
-            validate_projection_sources(decoder.effect_model(), tuple(binding.target for binding in overlay_bindings))
         self._overlay = (
             parameter_overlay(
-                decoder.effect_model(),
+                decoder,
                 overlay_bindings,
                 deployment.execution.arena,
                 probe.max_packed_rows,

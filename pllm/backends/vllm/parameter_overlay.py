@@ -1,136 +1,34 @@
-"""Qwen2 target inspection for both readers, and the eager Exact projection-task driver."""
+"""Projection geometry checks at probing and the eager Exact projection-task driver."""
 
 from __future__ import annotations
 
-import operator
-from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol
 
 import torch
-from torch.nn import Parameter
-from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.models.qwen2 import Qwen2Attention, Qwen2DecoderLayer, Qwen2ForCausalLM
 
+from pllm.backends.vllm.architecture import Decoder, LinearOutput, Mlp, Projection
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import (
     CapturedParameterOperand,
-    ParameterModuleKind,
     ParameterOverlayFieldBinding,
     ParameterOverlayOperator,
-    ParameterRole,
     ParameterTarget,
     ParameterTargetShape,
 )
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.state_ref import StateRef
 from pllm.execution.cuda_stream import PinnedStaging
-from pllm.execution.module_graph import capture_module_calls, module_has_execution_hooks
 from pllm.execution.overlay_task import ProjectionTransition, RouteOverlay
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.state_execution import DataT, StateTaskContext
 
-_LAYER_FORWARD = Qwen2DecoderLayer.forward
-
-
-def original_layer(layer: Qwen2DecoderLayer) -> bool:
-    """Check the Qwen2 implementation and hooks covered by the native endpoint contract."""
-    if (
-        type(layer) is not Qwen2DecoderLayer
-        or type(layer.self_attn) is not Qwen2Attention
-        or type(layer.input_layernorm) is not RMSNorm
-        or layer.forward != _LAYER_FORWARD.__get__(layer, Qwen2DecoderLayer)
-    ):
-        return False
-    # Existing layer-level captures and parameter/activation adapters retain
-    # their whole-layer endpoint until their effects have explicit source bodies.
-    return all(
-        module.forward == type(module).forward.__get__(module, type(module)) and not module_has_execution_hooks(module)
-        for module in layer.modules()
-    )
-
-
-_LinearOutput = torch.Tensor | tuple[torch.Tensor, Parameter | None]
-_LinearForward = Callable[[torch.Tensor], _LinearOutput]
-_MlpForward = Callable[[torch.Tensor], torch.Tensor]
-
-
-class _Linear(Protocol):
-    weight: Parameter
-    bias: Parameter | None
-    tp_size: int
-    return_bias: bool
-    forward: _LinearForward
-
-
-class _Mlp(Protocol):
-    forward: _MlpForward
-
-
-def locate_parameter(model: Qwen2ForCausalLM, target: ParameterTarget) -> tuple[_Linear, int, int, _Mlp | None]:
-    """Resolve the supported projection and its disjoint output slice."""
-    layer = model.model.layers[target.layer]
-    if target.module is ParameterModuleKind.MLP and target.role is ParameterRole.DOWN_PROJECTION_WEIGHT:
-        module = layer.mlp.down_proj
-        return module, 0, int(module.weight.shape[0]), layer.mlp
-    if target.module is ParameterModuleKind.ATTENTION:
-        attention = layer.self_attn
-        if target.role is ParameterRole.QUERY_PROJECTION_WEIGHT:
-            return attention.qkv_proj, 0, attention.q_size, None
-        if target.role is ParameterRole.VALUE_PROJECTION_WEIGHT:
-            return attention.qkv_proj, attention.q_size + attention.kv_size, attention.kv_size, None
-    raise ValueError("Qwen2 overlay requires an MLP down or attention q/v projection")
-
-
-def validate_projection_sources(model: Qwen2ForCausalLM, targets: tuple[ParameterTarget, ...]) -> None:
-    """Bind Exact to original Qwen projections; the query slice cannot write same-layer K/V."""
-    for layer_index in dict.fromkeys(target.layer for target in targets):
-        layer = model.model.layers[layer_index]
-        if not original_layer(layer):
-            raise ValueError("Exact overlays need the original Qwen2 layer source without implicit hooks")
-        source = capture_module_calls(layer.self_attn)
-        nodes = tuple(source.graph.nodes)
-        projection = next(node for node in nodes if node.op == "call_module" and node.target == "qkv_proj")
-        packed = next(node for node in nodes if node.target is operator.getitem and node.args == (projection, 0))
-        split = next(node for node in nodes if node.op == "call_method" and node.target == "split")
-        attention = layer.self_attn
-        slices = tuple(node.args[1] for node in split.users if node.target is operator.getitem)
-        if (
-            split.args != (packed, [attention.q_size, attention.kv_size, attention.kv_size])
-            or split.kwargs != {"dim": -1}
-            or slices != (0, 1, 2)
-            or tuple(packed.users) != (split,)
-        ):
-            raise ValueError(
-                "Exact query overlays need disjoint query, key, and value slices from the original Qwen2 fused projection"
-            )
-        # Original Qwen2 independently normalizes Q/K and rotates each with the same positions.
-        # Only qkv[:q_size] is changed; K/V here retain history, while higher layers see corrected hidden.
-        query = next(node for node in split.users if node.args[1] == 0)
-        rotary = next(node for node in nodes if node.op == "call_module" and node.target == "rotary_emb")
-        consumer = next(node for node in nodes if node.op == "call_module" and node.target == "attn")
-        dependent: set[torch.fx.Node] = {query}
-        for node in nodes:
-            parents = node.all_input_nodes
-            if node.target is operator.getitem and node.args[0] is rotary:
-                # The original RoPE endpoint rotates Q and K independently with shared positions.
-                match node.args, rotary.args:
-                    case (_, int(output)), args if type(parent := args[1 + output]) is torch.fx.Node:
-                        parents = [parent]
-                    case _:
-                        assert False
-            if any(parent in dependent for parent in parents):
-                dependent.add(node)
-        if consumer.args[1] in dependent or consumer.args[2] in dependent:
-            raise ValueError("Exact query overlays need a Qwen2 source where the query correction cannot feed K/V")
-
 
 def inspect_parameter_targets(
-    model: Qwen2ForCausalLM, targets: tuple[ParameterTarget, ...], dtype: torch.dtype
+    decoder: Decoder, targets: tuple[ParameterTarget, ...], dtype: torch.dtype
 ) -> tuple[ParameterTargetShape, ...]:
     specs: list[ParameterTargetShape] = []
     for index, target in enumerate(targets):
-        module, offset, size, _ = locate_parameter(model, target)
+        module, offset, size, _ = decoder.projection(target)
         if (
             target in targets[:index]
             or module.tp_size != 1
@@ -138,7 +36,7 @@ def inspect_parameter_targets(
             or module.weight.dtype is not dtype
             or offset + size > module.weight.shape[0]
         ):
-            raise ValueError("Qwen2 overlay requires unique, exact unsharded projections matching model dtype")
+            raise ValueError("parameter overlay requires unique, exact unsharded projections matching model dtype")
         specs.append(ParameterTargetShape(target, int(module.weight.shape[1]), size))
     return tuple(specs)
 
@@ -155,7 +53,7 @@ class _PreparedRows:
 
 
 class _ExactProjection:
-    def __init__(self, module: _Linear, mlp: _Mlp | None) -> None:
+    def __init__(self, module: Projection, mlp: Mlp | None) -> None:
         self.module, self.mlp = module, mlp
         self.bindings: list[tuple[ParameterOverlayFieldBinding, int, int]] = []
         self.original_forward = module.forward
@@ -179,7 +77,7 @@ class _ExactProjection:
         finally:
             self.mlp_input = None
 
-    def forward(self, hidden: torch.Tensor) -> _LinearOutput:
+    def forward(self, hidden: torch.Tensor) -> LinearOutput:
         base = self.original_forward(hidden)
         if not self.prepared:
             return base
@@ -248,10 +146,10 @@ class _ExactProjection:
 class ExactParameterOverlay:
     """Eager Exact projection-task driver; pinned reads use the shared tensor op."""
 
-    def __init__(self, model: Qwen2ForCausalLM, bindings: tuple[ParameterOverlayFieldBinding, ...]) -> None:
+    def __init__(self, decoder: Decoder, bindings: tuple[ParameterOverlayFieldBinding, ...]) -> None:
         modules: dict[int, _ExactProjection] = {}
         for binding in bindings:
-            module, offset, size, mlp = locate_parameter(model, binding.target)
+            module, offset, size, mlp = decoder.projection(binding.target)
             if id(module) not in modules:
                 modules[id(module)] = _ExactProjection(module, mlp)
             modules[id(module)].bindings.append((binding, offset, size))

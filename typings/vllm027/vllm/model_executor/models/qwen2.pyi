@@ -4,22 +4,14 @@ from collections.abc import Callable, Sequence
 from typing import Generic
 
 import torch
-from torch.nn import Module, Parameter
+from torch.nn import Module
 from transformers import Qwen2Config
 from typing_extensions import TypeVar
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.sequence import IntermediateTensors
-
-_LinearOutput = torch.Tensor | tuple[torch.Tensor, Parameter | None]
-
-class Qwen2DownProjection(Module):
-    weight: Parameter
-    bias: Parameter | None
-    tp_size: int
-    return_bias: bool
-    forward: Callable[[Qwen2DownProjection, torch.Tensor], _LinearOutput]
 
 class _SiluAndMul(Module):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor: ...
@@ -30,16 +22,16 @@ class _RotaryEmbedding(Module):
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 class Qwen2MLP(Module):
-    gate_up_proj: Qwen2DownProjection
+    gate_up_proj: LinearBase
     act_fn: _SiluAndMul
-    down_proj: Qwen2DownProjection
+    down_proj: LinearBase
 
     def forward(self, x: torch.Tensor) -> torch.Tensor: ...
 
 class Qwen2Attention(Module):
     attn: Attention
-    qkv_proj: Qwen2DownProjection
-    o_proj: Qwen2DownProjection
+    qkv_proj: LinearBase
+    o_proj: LinearBase
     rotary_emb: _RotaryEmbedding
     num_heads: int
     num_kv_heads: int

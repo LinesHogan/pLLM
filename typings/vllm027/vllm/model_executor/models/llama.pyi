@@ -6,9 +6,22 @@ from torch import Tensor
 from torch.nn import Module
 from transformers import LlamaConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
+class LlamaAttention(Module):
+    qkv_proj: LinearBase
+    q_size: int
+    kv_size: int
+
+class LlamaMLP(Module):
+    down_proj: LinearBase
+
+    def forward(self, x: Tensor) -> Tensor: ...
+
 class LlamaDecoderLayer(Module):
+    self_attn: LlamaAttention
+    mlp: LlamaMLP
     input_layernorm: RMSNorm
     post_attention_layernorm: RMSNorm
     forward: Callable[[Tensor, Tensor, Tensor | None], tuple[Tensor, Tensor]]

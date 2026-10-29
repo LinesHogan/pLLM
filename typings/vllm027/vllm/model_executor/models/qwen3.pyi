@@ -6,10 +6,12 @@ from torch import Tensor
 from torch.nn import Module
 from transformers import Qwen3Config
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.models.qwen2 import Qwen2MLP, Qwen2Model
 
 class Qwen3Attention(Module):
+    qkv_proj: LinearBase
     q_norm: RMSNorm
     k_norm: RMSNorm
     num_heads: int

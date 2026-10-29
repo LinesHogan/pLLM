@@ -698,9 +698,7 @@ def probe_backend(
             for role in (ParameterRole.QUERY_PROJECTION_WEIGHT, ParameterRole.VALUE_PROJECTION_WEIGHT)
         )
     )
-    targets = (
-        inspect_parameter_targets(decoder.effect_model(), requested_targets, runner.dtype) if requested_targets else ()
-    )
+    targets = inspect_parameter_targets(decoder, requested_targets, runner.dtype) if requested_targets else ()
     replay_capabilities = (
         ("model/tokenwise_replay@1", TOKEN_CAPTURE_CAPABILITY)
         if runner.runner_kind is RunnerKind.MRV2 and graph_mode(runner.overlay_graph_bytes) is AttachmentGraphMode.EAGER
