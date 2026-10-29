@@ -54,8 +54,8 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
     initial = tuple(latest)
     held = execution.arena.pin_exact(StateRefs.of(initial), stream)
     originals = tuple(execution.snapshot(ref, stream) for ref in initial)
-    generator = torch.Generator(device=device).manual_seed(7)
-    parameters = [oracle.initialize(hidden, rank, generator, device) for _ in identities]
+    generator = torch.Generator(device=device)
+    parameters = [oracle.initialize(hidden, rank, generator.manual_seed(7), device) for _ in identities]
     optimizers = [oracle.optimizer(pair) for pair in parameters]
     for snapshot, pair in zip(originals, parameters, strict=True):
         torch.testing.assert_close(snapshot[0], torch.cat([p.flatten() for p in pair]), rtol=0, atol=0)

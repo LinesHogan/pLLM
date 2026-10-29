@@ -226,7 +226,7 @@ class ProjectionTransition(Protocol):
     """The output boundary consumed by a model projection."""
 
     def run(
-        self, operands: tuple[CapturedParameterOperand, ...]
+        self, operands: tuple[CapturedParameterOperand, ...], *, complete: bool = True
     ) -> Mapping[tuple[RequestIdentity, ParameterTarget], torch.Tensor]: ...
 
 
@@ -245,14 +245,15 @@ class ProjectionTask(Generic[DataT, ResultT]):
         self.pending = set(targets)
 
     def run(
-        self, operands: tuple[CapturedParameterOperand, ...]
+        self, operands: tuple[CapturedParameterOperand, ...], *, complete: bool = True
     ) -> Mapping[tuple[RequestIdentity, ParameterTarget], torch.Tensor]:
-        """Execute available target segments and hand their residuals to the model reader."""
+        """Execute target segments; complete=False keeps targets open across a prompt/decode split."""
         from pllm.execution.step_input import TensorStepInput
 
         targets = {operand.target for operand in operands}
         assert targets and targets <= self.pending
-        self.pending.difference_update(targets)
+        if complete:
+            self.pending.difference_update(targets)
         return self.execution.execute_part(
             self.context,
             TensorStepInput(self.rows.row_batch, self.rows, operands=operands),

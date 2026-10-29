@@ -385,6 +385,7 @@ def batch(field: Literal["hidden", "base_logits", "labels", "weights"]) -> Any:
 class InstanceState:
     fields: Mapping[str, Shape | Buffer] = field(default_factory=lambda: dict[str, Shape | Buffer]())
     optimizer: AdamWConfig | SGD | None = field(default=None, kw_only=True)
+    # Run once per resource when binding; every admission copies the same seeded initial tensors.
     initialize: Callable[[Tensors, torch.Generator], None] | None = None
     namespace: str = ""
     shape: Shape | None = None
@@ -1646,17 +1647,24 @@ class Workload(
     def _functions(
         self, b: TensorBinding, device: torch.device, seed: int
     ) -> FunctionMath[TensorStepInput, TensorFrame, TensorOutput]:
-        generator = torch.Generator(device=device).manual_seed(seed)
-
         def initializer(resource: str) -> Callable[[Roots, tuple[RequestStateKey | None, ...]], None]:
             init = b.initializers.get(resource)
             if resource in b.initial_values:
                 init = partial(copy_initial, b.initial_values[resource](b.dimensions, seed).to(device))
+            values: tuple[torch.Tensor, ...] = ()
+            if init is not None:
+                layout = next(item.layout for item in b.layouts.layouts if item.resource == resource)
+                values = tuple(
+                    torch.zeros(field.shape, dtype=field.dtype.torch, device=device) for field in layout.fields
+                )
+                # A resource's initial tensors are shared values, independent of admission history.
+                init(values, torch.Generator(device=device).manual_seed(seed))
 
             def initialize(roots: Roots, keys: tuple[RequestStateKey | None, ...]) -> None:
-                if init is not None:
+                if values:
                     for root in roots:
-                        init(root, generator)
+                        for target, value in zip(root, values, strict=True):
+                            target.copy_(value)
 
             return initialize
 

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import torch
 
 from pllm.backends.vllm.architecture import Decoder, LinearOutput, Mlp, Projection
+from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import (
     CapturedParameterOperand,
@@ -88,10 +89,25 @@ class _ExactProjection:
                 pass
             case output:
                 pass
-        inputs = tuple(hidden.index_select(0, item.rows) for item in self.prepared)
+        # A replay span can contain both phases of one request. Finish its prompt
+        # transition (including prompt-end flush) before reading its decode state.
+        phases = tuple(
+            phase
+            for phase in (HiddenPhase.PREFILL, HiddenPhase.DECODE)
+            if any(item.source.phase is phase for item in self.prepared)
+        )
+        for phase in phases:
+            prepared = tuple(item for item in self.prepared if item.source.phase is phase)
+            self.forward_segment(hidden, output, prepared, complete=phase is phases[-1])
+        return base
+
+    def forward_segment(
+        self, hidden: torch.Tensor, output: torch.Tensor, prepared: tuple[_PreparedRows, ...], *, complete: bool
+    ) -> None:
+        inputs = tuple(hidden.index_select(0, item.rows) for item in prepared)
         captures = tuple(
             self.capture(item, selected)
-            for item, selected in zip(self.prepared, inputs, strict=True)
+            for item, selected in zip(prepared, inputs, strict=True)
             if self.captures_binding(item.binding)
         )
         if self.routes:
@@ -108,16 +124,16 @@ class _ExactProjection:
             }
         else:
             assert self.transition is not None
-            residuals = self.transition.run(captures)
-        for item, selected in zip(self.prepared, inputs, strict=True):
+            residuals = self.transition.run(captures, complete=complete)
+        for item, selected in zip(prepared, inputs, strict=True):
             delta = (residuals[item.source.identity, item.binding.target] * item.binding.scale).to(output.dtype)
             columns = output[:, item.offset : item.offset + item.size]
             columns.index_add_(0, item.rows, delta)
             self.apply_count += selected.shape[0]
             if item.ref.version_id > 0:
                 self.updated_apply_count += selected.shape[0]
-        self.captures = () if self.routes else captures
-        return base
+        if not self.routes:
+            self.captures += captures
 
     def capture(self, item: _PreparedRows, selected: torch.Tensor) -> CapturedParameterOperand:
         if item.binding.operator is ParameterOverlayOperator.HEAD_ADD:
@@ -176,9 +192,9 @@ class ExactParameterOverlay:
         transition: ProjectionTransition | None = None,
     ) -> None:
         assert transition is not None
-        grouped: dict[RequestIdentity, list[PackedPhaseRow]] = {}
+        grouped: dict[tuple[RequestIdentity, HiddenPhase], list[PackedPhaseRow]] = {}
         for row in rows.rows:
-            grouped.setdefault(row.identity, []).append(row)
+            grouped.setdefault((row.identity, row.phase), []).append(row)
         table = self._modules[0].module.weight.new_empty((len(rows.rows) + len(grouped),), dtype=torch.long)
         host = self._staging.take(table.numel()).numpy()
         host[: len(rows.rows)] = [row.packed_row_index for source in grouped.values() for row in source]
@@ -190,7 +206,7 @@ class ExactParameterOverlay:
         prompt_ends = table[len(rows.rows) :].bool().unbind()
         requests = tuple(
             (source[0], context.selection.ref_for(identity), index, prompt_end)
-            for (identity, source), index, prompt_end in zip(grouped.items(), indices, prompt_ends, strict=True)
+            for ((identity, _), source), index, prompt_end in zip(grouped.items(), indices, prompt_ends, strict=True)
         )
         for handle in self._modules:
             handle.transition = transition
