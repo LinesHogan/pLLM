@@ -11,6 +11,7 @@ from torch.nn import functional as F
 
 from pllm.authoring import CausalTrainBatch
 from pllm.config import ExecutionOptions
+from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
     AttachmentTopology,
@@ -25,6 +26,7 @@ from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
+from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.step_input import TensorStepInput
 from pllm.kernels.adamw import AdamWConfig
 from pllm.workloads.tlm import TLMConfig, TLMMode, TLMWorkload
@@ -64,11 +66,10 @@ class TinyCausalPort:
         return torch.tanh((hidden @ weights[0].T) + (hidden @ weights[1].T)) @ self.head
 
 
-def _facts(model, *, reserved=None, task_resources=()) -> BackendCompileFacts:
-    """Single-device facts reserving the frozen model's resident bytes (or ``reserved``)."""
+def _facts(model, *, reserved=0, task_resources=()) -> BackendCompileFacts:
+    """Single-device facts before workload template reservations."""
     kind, ordinal = StateDeviceKind(model.device.type), model.device.index or 0
     timeline = model_timeline(model.device, ("optimizer/adamw@1", "transition/full_root@1"))
-    reserved = model.resident_bytes if reserved is None else reserved
     timeline = replace(timeline, reserved_bytes=(reserved,) * len(timeline.anchors), task_resources=task_resources)
     probe = BackendPlacementProbe(
         "test.tlm@1",
@@ -131,7 +132,10 @@ def test_global_multifactor_adamw_matches_oracle_and_publishes_one_version() -> 
     execution.admit((first,))
     old_pin = execution.directory.inference_pin(first)
     before = execution.arena.snapshot(old_pin, ref)
-    reference = tuple(torch.nn.Parameter(value.clone()) for value in before[::5])
+    reference = tuple(
+        torch.nn.Parameter(value.reshape(2, 3) if index % 2 == 0 else value.reshape(3, 2))
+        for index, value in enumerate(before[0].clone().split(6))
+    )
     optimizer = torch.optim.AdamW(reference, lr=0.01, betas=(0.8, 0.95), eps=1e-7, weight_decay=0.1, foreach=False)
     batch = CausalTrainBatch(torch.tensor([[0, 1, 2, 3], [2, 4, 1, 0]]), torch.tensor([[0, 1, -100, 3], [2, 4, 1, 0]]))
     for version in (1, 2):
@@ -149,7 +153,10 @@ def test_global_multifactor_adamw_matches_oracle_and_publishes_one_version() -> 
         assert tuple(old_pin.refs) == (ref,)
         actual = execution.snapshot(current)
         for index, parameter in enumerate(reference):
-            fields = actual[index * 5 : (index + 1) * 5]
+            fields = tuple(
+                value if field == 2 else value[index * 6 : (index + 1) * 6].reshape(parameter.shape)
+                for field, value in enumerate(actual)
+            )
             state = optimizer.state[parameter]
             for value, expected in zip(
                 fields, (parameter, parameter.grad, state["step"], state["exp_avg"], state["exp_avg_sq"]), strict=True
@@ -179,14 +186,20 @@ def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None
     for mode in TLMMode:
         config = TLMConfig(mode=mode, threshold=0.0)
         limits = (TaskResourceFact(TaskSymbol("update"), 4096, input_shapes=((1, 3),)),)
-        with pytest.raises(ValueError):  # The initialization templates must fit the reserved bytes.
-            TLMWorkload(config, 2, 2).plan_backend(_facts(model, reserved=model.resident_bytes - 1))
+        assert (
+            min(TLMWorkload(config, 2, 2).resource_facts(_facts(model, reserved=0), ExecutionOptions()).reserved_bytes)
+            == model.resident_bytes
+        )
         facts = _facts(model, task_resources=limits)
         execution = TLMWorkload(config, 2, 2).compile_backend(facts, causal=model.bind).execution
         (initial,) = execution.admit(())
         tokens = torch.zeros((2, 3), dtype=torch.int64)
         with pytest.raises(ValueError):  # Larger than the planned input shape.
-            execution.step(_input(CausalTrainBatch(tokens, tokens)))
+            validate_auxiliary(
+                CausalTrainBatch(tokens, tokens),
+                execution.arena.plan,
+                SharedTensor.describe,
+            )
         anchors = {
             execution.arena.plan.semantic_graph.tasks[task.task_id].symbol: task.anchor_id
             for task in execution.arena.plan.schedule.tasks
@@ -195,7 +208,15 @@ def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None
         assert anchors["update"] <= anchors["publish"]
         assert (anchors["publish"] < timeline["model.execute"]) == (mode is TLMMode.OFFLINE)
         assert (anchors["update"] >= timeline["token.commit"]) == (mode is TLMMode.ONLINE)
-        expected = _reference(model, execution.snapshot(initial)[::5], batch, config)
+        expected = _reference(
+            model,
+            tuple(
+                value.reshape(2, 3) if index % 2 == 0 else value.reshape(3, 2)
+                for index, value in enumerate(execution.snapshot(initial)[0].split(6))
+            ),
+            batch,
+            config,
+        )
         result = execution.step(_input(batch))
         torch.testing.assert_close(result.loss, expected)
         assert result.publication is not None and result.metrics["selected_count"] == 1

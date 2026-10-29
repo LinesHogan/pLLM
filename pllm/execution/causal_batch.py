@@ -13,7 +13,7 @@ from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding
 from pllm.contracts.semantic_graph import MathContract, SemanticInputSource, StateEffectKind, StateSelectionInputSource
 from pllm.execution.declaration import Call, State, When, native
 from pllm.execution.tensor_frame import TensorFrame, Tensors, TensorUpdate
-from pllm.execution.tensor_program import TaskOutput, TensorBatch, autograd_loss
+from pllm.execution.tensor_program import autograd_loss
 
 if TYPE_CHECKING:
     from pllm.execution.tensor_binding import TensorBinding
@@ -73,14 +73,6 @@ def declare_causal_train(
         for port in ports.values()
     ):
         raise ValueError("causal training must read the overlay's own optimizer state")
-    limit = next((item for item in b.resources if item.task == name), None)
-    if limit is not None and (
-        len(limit.input_shapes) != 1
-        or len(limit.input_shapes[0]) != 2
-        or limit.input_shapes[0][0] < 1
-        or limit.input_shapes[0][1] < 2
-    ):
-        raise ValueError("causal training costs require signed [sequences, tokens] input bounds")
     names = tuple(field.name.removesuffix(".parameters") for field in state.fields[: state.optimizer_fields : 5])
 
     def loss(data: TensorFrame, parameters: Tensors) -> torch.Tensor | None:
@@ -102,35 +94,10 @@ def declare_causal_train(
 
     compute = autograd_loss(loss, names, count)
 
-    def execute(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
-        value = data.step.auxiliary
-        if value is not None:
-            if not isinstance(value, CausalTrainBatch):
-                raise ValueError("causal training consumes CausalTrainBatch")
-            device = batch.roots[0][0].device
-            if (
-                value.input_ids.ndim != 2
-                or value.input_ids.shape != value.labels.shape
-                or value.input_ids.shape[0] < 1
-                or value.input_ids.shape[1] < 2
-                or value.input_ids.dtype != torch.int64
-                or value.labels.dtype != torch.int64
-                or value.input_ids.device != device
-                or value.labels.device != device
-                or value.attention_mask is not None
-                and (value.attention_mask.shape != value.input_ids.shape or value.attention_mask.device != device)
-                or limit is not None
-                and any(size > bound for size, bound in zip(value.input_ids.shape, limit.input_shapes[0], strict=True))
-            ):
-                raise ValueError(
-                    "causal batch must contain aligned int64 token/label tensors within signed input bounds"
-                )
-        return compute(data, batch)
-
     b.causal_state = str(state.declaration.resource)
     call = b.compute(
         name,
-        function=execute,
+        function=compute,
         inputs={key: port.source for key, port in ports.items()},
         outputs=("updated",),
         changes=state,

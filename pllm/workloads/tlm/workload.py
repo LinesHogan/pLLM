@@ -61,7 +61,7 @@ class TLMWorkload(pllm.Workload):
 
     @property
     def factors(self) -> pllm.InstanceState:
-        """Keep each projection's factors as separately shaped AdamW parameters."""
+        """Declare projection-shaped views of the packed AdamW state."""
         return pllm.InstanceState(
             {
                 "a": pllm.Buffer(lambda inputs, outputs: (self.rank, inputs)),
@@ -91,9 +91,10 @@ class TLMWorkload(pllm.Workload):
     def initialize(self, fields: Mapping[str, torch.Tensor], generator: torch.Generator) -> None:
         """Seed Kaiming-uniform A and zero B in target order, as in the original TLM."""
         for name, value in fields.items():
-            torch.nn.init.kaiming_uniform_(value, a=math.sqrt(5), generator=generator) if name.startswith(
-                "a_"
-            ) else value.zero_()
+            if name.startswith("a_"):
+                torch.nn.init.kaiming_uniform_(value, a=math.sqrt(5), generator=generator)
+            else:
+                value.zero_()
 
     @pllm.on(pllm.Config("phase"))
     @pllm.train(state="factors")

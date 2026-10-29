@@ -128,7 +128,7 @@ class TensorBinding(Builder[TensorFrame]):
 
     @property
     def initialization_bytes(self) -> int:
-        """Retained parameter templates for grouped batch optimizer states."""
+        """Retained parameter templates reserved for causal batch training."""
         return sum(
             prod(field.shape) * field.dtype.itemsize
             for layout in self.layouts.layouts

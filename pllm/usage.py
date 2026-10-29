@@ -246,10 +246,13 @@ class _CausalModel(_Source):
         if not isinstance(overlay, Overlay):
             raise ValueError("causal_model must name an Overlay declaration")
         state = context.states[overlay.state]
-        fields = tuple(f"{key}_{i}" for i in range(len(overlay.targets)) for key in overlay.applied_fields)
-        forward = None if context.binding.causal is None else context.binding.causal(overlay.bindings(context))
+        bindings = overlay.bindings(context)
+        forward = None if context.binding.causal is None else context.binding.causal(bindings)
         return CausalPort(
-            state.read(), lambda batch, parameters: CausalCall(forward, tuple(parameters[key] for key in fields))
+            state.read(),
+            lambda batch, parameters: CausalCall(
+                forward, tuple(view.read(parameters["parameters"]) for binding in bindings for view in binding.fields)
+            ),
         )
 
 
@@ -1483,25 +1486,7 @@ class _Declaration:
                 buffer_field(key, buffer, lambda m: (m.hidden_size, m.hidden_size)) for key, buffer in buffers.items()
             )
         shapes = {field.name: field.shape for field in fields}
-        if isinstance(definition.optimizer, AdamWConfig) and any(
-            isinstance(source, _CausalModel)
-            and isinstance(overlay := self.values[source.name], Overlay)
-            and overlay.state == name
-            for operation in self.operations
-            for source in operation.arguments()[0].values()
-        ):
-            state = self.binding.state(
-                name,
-                fields,
-                namespace=definition.namespace,
-                optimizer=definition.optimizer,
-                scope=definition.scope,
-                keys=definition.request_keys,
-            )
-            ports = parameter_ports(
-                self.binding, state, shapes, initialize=_frozen(definition.initialize), grouped=True
-            )
-        elif definition.optimizer is not None:
+        if definition.optimizer is not None:
             dtype = fields[0].dtype
             state, ports = declare_parameters(
                 self.binding,
@@ -1731,8 +1716,6 @@ class Workload(
 
     def declare(self, facts: BackendCompileFacts) -> tuple[SemanticGraph, TensorLayoutRequest, BackendAttachmentSpec]:
         binding = self.declaration(facts)
-        if binding.causal_state and min(facts.timeline.reserved_bytes, default=0) < binding.initialization_bytes:
-            raise ValueError("reserve the initialized parameter templates in the backend timeline")
         return binding.finish()
 
     def _functions(
