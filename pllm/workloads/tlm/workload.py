@@ -62,9 +62,11 @@ class TLMWorkload(pllm.host.CausalAdapterWorkload[TLMData, TLMResult]):
     name = "tlm.qv_lora"
     namespace = "canonical.qv_adamw@1"
     config: TLMConfig
-    model: pllm.host.CausalModel
+    model: pllm.host.CausalModel | pllm.host.CausalAdapter
 
     def __post_init__(self) -> None:
+        if isinstance(self.model, pllm.host.CausalAdapter):
+            return
         if any(
             item.target.module is not pllm.model.ParameterModuleKind.ATTENTION
             or item.target.role
@@ -82,6 +84,7 @@ class TLMWorkload(pllm.host.CausalAdapterWorkload[TLMData, TLMResult]):
         return pllm.Phase.BEFORE_MODEL if self.config.mode is TLMMode.OFFLINE else pllm.Phase.AFTER_SAMPLE
 
     def prepare(self, value: pllm.host.CausalTrainBatch[torch.Tensor] | None) -> TLMData:
+        assert not isinstance(self.model, pllm.host.CausalAdapter)
         return TLMData(value, torch.zeros((), device=self.model.device))
 
     def trained_rows(self, data: TLMData) -> int:
@@ -92,6 +95,7 @@ class TLMWorkload(pllm.host.CausalAdapterWorkload[TLMData, TLMResult]):
 
     def loss(self, data: TLMData, parameters: Mapping[str, torch.Tensor]) -> torch.Tensor | None:
         model, config = self.model, self.config
+        assert not isinstance(model, pllm.host.CausalAdapter)
         if data.batch is None:
             return None
         selection = None

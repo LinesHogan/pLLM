@@ -4,7 +4,7 @@ Pass `HostRuntimeFacts` to `pllm.make_llm` for host workloads. Completion, rewar
 are the feedback a host service exchanges with the framework.
 """
 
-from pllm.authoring import CausalModel as CausalModel
+from pllm.authoring import CausalAdapter as CausalAdapter, CausalModel as CausalModel
 from pllm.contracts.auxiliary import CausalTrainBatch as CausalTrainBatch, WeightedCEBatch as WeightedCEBatch
 from pllm.contracts.feedback import (
     BarrierState as BarrierState,
@@ -44,6 +44,7 @@ __all__ = [
     "CompletionWorkload",
     "CausalAdapterWorkload",
     "CausalModel",
+    "CausalAdapter",
     "CausalTrainBatch",
     "WeightedCEBatch",
     "batch",

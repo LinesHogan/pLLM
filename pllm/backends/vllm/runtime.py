@@ -36,6 +36,7 @@ from pllm.backends.vllm.overlay_graph import (
 from pllm.backends.vllm.parameter_overlay import (
     inspect_parameter_targets,
 )
+from pllm.backends.vllm.training import Qwen2Training
 from pllm.config import ModelConfig, RunnerKind, VllmDType
 from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import (
@@ -55,6 +56,7 @@ from pllm.contracts.feedback import (
     FinishReason,
     RetryAction,
 )
+from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import SchedulerTimeline, TaskId
@@ -620,7 +622,9 @@ def create_vllm_llm(
                     encode_boundary(BackendProbe(requirements, config.execution.publish_lag)),
                 ),
             )
-            facts = workload.specialize(decode_boundary(replies[0], BackendCompileFacts), config.execution)
+            facts = decode_boundary(replies[0], BackendCompileFacts)
+            workload = bind_training(workload, facts)
+            facts = workload.specialize(facts, config.execution)
             attachment = workload.plan_backend(facts)
             policy = CachePolicy.for_attachment(attachment, config.generated_kv)
             handle = VllmLlm[DataT, ResultT](llm, None, attachment, facts, policy)
@@ -629,16 +633,34 @@ def create_vllm_llm(
             )
         else:
             runner = llm.llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner
-            facts = workload.specialize(
-                probe_backend(requirements, runner, publish_lag=config.execution.publish_lag),
-                config.execution,
-            )
+            facts = probe_backend(requirements, runner, publish_lag=config.execution.publish_lag)
+            workload = bind_training(workload, facts, runner)
+            facts = workload.specialize(facts, config.execution)
             deployment = workload.compile_backend(facts)
             policy = CachePolicy.for_attachment(deployment.attachment, config.generated_kv)
             runner.attach_workload(deployment, policy)
             handle = VllmLlm[DataT, ResultT](llm, runner, deployment.attachment, facts, policy)
         construction.pop_all()
         return handle
+
+
+def bind_training(
+    workload: BackendWorkload[DataT, ResultT],
+    facts: BackendCompileFacts,
+    runner: WorkloadModelRunner | Mrv1Runner | None = None,
+) -> BackendWorkload[DataT, ResultT]:
+    """Bind meta geometry on the driver and borrowed tensors only in the model-owning worker."""
+    adapter = workload.backend_requirements().causal_adapter
+    if adapter is None:
+        return workload
+    model = Qwen2Training(
+        adapter,
+        facts.probe.targets,
+        facts.probe.tensor_dtype,
+        facts.initialization_seed,
+        None if runner is None else runner.qwen2_model(),
+    )
+    return workload.bind_causal_model(model)
 
 
 def probe_backend(
@@ -668,7 +690,17 @@ def probe_backend(
             key=lambda resource: (*resource.resource_key, resource.phase is HiddenPhase.DECODE),
         )
     )
-    targets = inspect_parameter_targets(model, requirements.parameter_targets, runner.dtype)
+    adapter = requirements.causal_adapter
+    requested_targets = (
+        requirements.parameter_targets
+        if adapter is None
+        else tuple(
+            ParameterTarget(index, ParameterModuleKind.ATTENTION, role)
+            for index in range(layer_count)
+            for role in (ParameterRole.QUERY_PROJECTION_WEIGHT, ParameterRole.VALUE_PROJECTION_WEIGHT)
+        )
+    )
+    targets = inspect_parameter_targets(model, requested_targets, runner.dtype)
     replay_capabilities = (
         ("model/tokenwise_replay@1", TOKEN_CAPTURE_CAPABILITY)
         if runner.runner_kind is RunnerKind.MRV2 and graph_mode(runner.overlay_graph_bytes) is AttachmentGraphMode.EAGER
@@ -729,7 +761,17 @@ def probe_backend(
         requirements.sampler_stage,
         requirements.sampler_feedback,
     )
-    required = tuple(value + requirements.resident_bytes + runner.overlay_graph_bytes for value in required)
+    resident = (
+        requirements.resident_bytes
+        if adapter is None
+        else sum(
+            adapter.rank
+            * (target.input_size + target.output_size)
+            * torch.tensor([], dtype=runner.dtype).element_size()
+            for target in targets
+        )
+    )
+    required = tuple(value + resident + runner.overlay_graph_bytes for value in required)
     observed = replace(observed, reserved_bytes=required)
     if timeline is None:
         timeline = observed

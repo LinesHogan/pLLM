@@ -10,12 +10,12 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import replace
-from typing import ClassVar, Generic, TypeVar
+from typing import ClassVar, Generic, Self, TypeVar
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from pllm.authoring import BackendRequirements, BackendWorkload, CausalModel, CausalTrainBatch
+from pllm.authoring import BackendRequirements, BackendWorkload, CausalAdapter, CausalModel, CausalTrainBatch
 from pllm.contracts.backend_attachment import BackendAttachmentSpec
 from pllm.contracts.codec import boundary_digest
 from pllm.contracts.compilation import PlanBundle
@@ -320,7 +320,7 @@ class CausalAdapterWorkload(
 
     name: ClassVar[str] = "causal.adapter"
     namespace: ClassVar[str] = ""
-    model: CausalModel
+    model: CausalModel | CausalAdapter
 
     @property
     @abstractmethod
@@ -330,7 +330,14 @@ class CausalAdapterWorkload(
     @abstractmethod
     def phase(self) -> Phase: ...
 
+    def bind_causal_model(self, model: CausalModel) -> Self:
+        owner = owner_snapshot(self, _MARKERS, (self.model,))
+        object.__setattr__(owner, "model", model)
+        return owner
+
     def backend_requirements(self) -> BackendRequirements:
+        if isinstance(self.model, CausalAdapter):
+            return BackendRequirements(causal_adapter=self.model)
         return BackendRequirements(
             parameter_targets=tuple(target.target for target in self.model.targets),
             model_source=self.model.model_source,
@@ -342,6 +349,7 @@ class CausalAdapterWorkload(
     ) -> tuple[Builder[ContextT], FunctionMath[CausalTrainBatch[torch.Tensor] | TensorStepInput, ContextT, ResultT]]:
         owner = owner_snapshot(self, _MARKERS, (self.model,))
         model = owner.model
+        assert not isinstance(model, CausalAdapter)
         targets = tuple(item.target for item in model.targets)
         expected_dtype = model.tensor_dtype.torch
         if (
@@ -507,6 +515,7 @@ class CausalAdapterWorkload(
         self, facts: BackendCompileFacts, plan: PlanBundle
     ) -> MathBinding[TensorStepInput, ContextT, ResultT]:
         builder, functions = self._binding(facts)
+        assert not isinstance(self.model, CausalAdapter)
         if (
             self.model.device != facts.device
             or builder.graph != plan.semantic_graph

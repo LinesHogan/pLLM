@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
-from typing import Generic, Protocol, TypeVar
+from typing import Generic, Protocol, Self, TypeVar
 
 import torch
 
@@ -124,6 +124,7 @@ class BackendRequirements:
     sampler_feedback: bool = False
     resident_bytes: int = 0
     position_states: tuple[tuple[str, float], ...] = ()
+    causal_adapter: CausalAdapter | None = None
 
     def __post_init__(self) -> None:
         if self.resident_bytes < 0:
@@ -267,6 +268,10 @@ class BackendAuthoring(ABC):
 
 
 class BackendWorkload(BackendAuthoring, Generic[DataT, ResultT]):
+    def bind_causal_model(self, model: CausalModel) -> Self:
+        """Resolve a declared causal dependency after backend model loading."""
+        raise NotImplementedError("declare a CausalAdapterWorkload to bind a causal model")
+
     @abstractmethod
     def bind_math(self, facts: BackendCompileFacts, plan: PlanBundle) -> MathBinding[TensorStepInput, DataT, ResultT]:
         """Bind mathematics to selected implementations; no storage or execution ownership."""

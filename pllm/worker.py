@@ -16,6 +16,7 @@ from pllm.backends.vllm.runtime import (
     BackendInstall,
     BackendProbe,
     BackendStage,
+    bind_training,
     probe_backend,
 )
 from pllm.contracts.auxiliary import validate_auxiliary
@@ -60,6 +61,7 @@ class GPUWorker(Worker):
             plan.timeline,
             publish_lag=0 if visibility is None else visibility.lag,
         )
+        workload = bind_training(workload, facts, runner)
         max_lineages = (
             facts.max_admitted_lineages
             if any(state.scope is StateScope.REQUEST for state in plan.semantic_graph.states)
