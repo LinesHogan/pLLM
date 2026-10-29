@@ -330,6 +330,12 @@ class CausalAdapterWorkload(
     @abstractmethod
     def phase(self) -> Phase: ...
 
+    @property
+    def causal_model(self) -> CausalModel:
+        """The backend dependency resolved before declaration and execution."""
+        assert not isinstance(self.model, CausalAdapter)
+        return self.model
+
     def bind_causal_model(self, model: CausalModel) -> Self:
         owner = owner_snapshot(self, _MARKERS, (self.model,))
         object.__setattr__(owner, "model", model)
@@ -347,8 +353,7 @@ class CausalAdapterWorkload(
         self, facts: BackendCompileFacts
     ) -> tuple[Builder[ContextT], FunctionMath[CausalTrainBatch[torch.Tensor] | TensorStepInput, ContextT, ResultT]]:
         owner = owner_snapshot(self, _MARKERS, (self.model,))
-        model = owner.model
-        assert not isinstance(model, CausalAdapter)
+        model = owner.causal_model
         targets = tuple(item.target for item in model.targets)
         expected_dtype = model.tensor_dtype.torch
         if (
@@ -514,9 +519,8 @@ class CausalAdapterWorkload(
         self, facts: BackendCompileFacts, plan: PlanBundle
     ) -> MathBinding[TensorStepInput, ContextT, ResultT]:
         builder, functions = self._binding(facts)
-        assert not isinstance(self.model, CausalAdapter)
         if (
-            self.model.device != facts.device
+            self.causal_model.device != facts.device
             or builder.graph != plan.semantic_graph
             or builder.layouts != plan.tensor_layout_request
         ):

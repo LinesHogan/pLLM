@@ -84,11 +84,11 @@ class TLMWorkload(pllm.host.CausalAdapterWorkload[TLMData, TLMResult]):
         return pllm.Phase.BEFORE_MODEL if self.config.mode is TLMMode.OFFLINE else pllm.Phase.AFTER_SAMPLE
 
     def prepare(self, value: pllm.host.CausalTrainBatch[torch.Tensor] | None) -> TLMData:
-        assert not isinstance(self.model, pllm.host.CausalAdapter)
+        device = self.causal_model.device
         return TLMData(
             value,
-            torch.zeros((), device=self.model.device),
-            torch.zeros((), device=self.model.device, dtype=torch.int64),
+            torch.zeros((), device=device),
+            torch.zeros((), device=device, dtype=torch.int64),
         )
 
     def trained_rows(self, data: TLMData) -> int:
@@ -98,8 +98,7 @@ class TLMWorkload(pllm.host.CausalAdapterWorkload[TLMData, TLMResult]):
         return TLMResult(data.loss, self.trained_rows(data), result.publication)
 
     def loss(self, data: TLMData, parameters: Mapping[str, torch.Tensor]) -> torch.Tensor | None:
-        model, config = self.model, self.config
-        assert not isinstance(model, pllm.host.CausalAdapter)
+        model, config = self.causal_model, self.config
         if data.batch is None:
             return None
         selection = None
