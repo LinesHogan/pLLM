@@ -5,7 +5,7 @@
 ## 创作
 
 - **负载（Workload）** —— 带类型张量方法与声明效果的冻结类（`pllm.Workload`、
-  `CompletionWorkload`、`CausalAdapterWorkload`）。编译一次；永远不是运行时钩子。
+  `CompletionWorkload`）。编译一次；永远不是运行时钩子。
 - **阶段 / 锚点窗口（Phase / anchor window）** —— 两个时间轴锚点
   （`request.prepare`、`model.execute`、`state.publish`、`sampler.pre_draw`、
   `token.commit`、`next.prepare`）之间的签名区间，操作在其中运行。

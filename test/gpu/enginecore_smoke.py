@@ -282,9 +282,8 @@ def _tlm_shared_input(model_id: str = MODEL) -> None:
     if not Path(model_id).is_dir():
         patterns = ("*.json", "*.safetensors", "*.txt", "*.model")
         model_id = snapshot_download(model_id, local_files_only=True, allow_patterns=patterns)
-    model = pllm.host.CausalAdapter(2, 4)
     assert not torch.cuda.is_initialized()
-    handle = pllm.make_llm(workload=TLMWorkload(TLMConfig(threshold=0.0), model), config=engine(model_id))
+    handle = pllm.make_llm(workload=TLMWorkload(TLMConfig(threshold=0.0), rank=2, alpha=4), config=engine(model_id))
     try:
         tokens = torch.tensor([[1, 2, 3, 4]])
         batch = handle.generate(

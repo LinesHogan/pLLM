@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Protocol
 
 import torch
@@ -90,7 +90,7 @@ def declare_causal_train(
         assert isinstance(batch, CausalTrainBatch)
         result = function(**{key: port.adapt(batch, parameters) for key, port in ports.items()})
         if isinstance(result, TensorUpdate):
-            data.training = result
+            data.training = replace(result, output=result.output.detach())
             return result.output
         data.trained_rows = batch.input_ids.shape[0]
         return result
@@ -127,7 +127,7 @@ def declare_causal_train(
                 )
         return compute(data, batch)
 
-    b.causal_training = True
+    b.causal_state = str(state.declaration.resource)
     call = b.compute(
         name,
         function=execute,

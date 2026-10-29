@@ -1,10 +1,9 @@
-"""Host-side learning: transactional host workloads and completion/causal-adapter training.
+"""Host-side learning: transactional host workloads and completion training.
 
 Pass `HostRuntimeFacts` to `pllm.make_llm` for host workloads. Completion, reward, retry and barrier types
 are the feedback a host service exchanges with the framework.
 """
 
-from pllm.authoring import CausalAdapter as CausalAdapter, CausalModel as CausalModel
 from pllm.contracts.auxiliary import CausalTrainBatch as CausalTrainBatch, WeightedCEBatch as WeightedCEBatch
 from pllm.contracts.feedback import (
     BarrierState as BarrierState,
@@ -27,7 +26,6 @@ from pllm.execution.host_runtime import (
     TransactionHostBinding as TransactionHostBinding,
 )
 from pllm.learning import (
-    CausalAdapterWorkload as CausalAdapterWorkload,
     CompletionWorkload as CompletionWorkload,
     transaction as transaction,
 )
@@ -42,9 +40,6 @@ __all__ = [
     "CompletionInput",
     "NoHostRequest",
     "CompletionWorkload",
-    "CausalAdapterWorkload",
-    "CausalModel",
-    "CausalAdapter",
     "CausalTrainBatch",
     "WeightedCEBatch",
     "batch",

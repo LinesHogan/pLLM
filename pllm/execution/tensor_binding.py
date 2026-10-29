@@ -116,7 +116,7 @@ class TensorBinding(Builder[TensorFrame]):
         self.initial_values: dict[str, Callable[[Dimensions, int], torch.Tensor]] = {}
         self.weighted_training = False
         self.causal: CausalBinder | None = None
-        self.causal_training = False
+        self.causal_state = ""
         self.probe: BackendPlacementProbe | None = None
         self.max_requests = 1
         self.sample_limit: int | None = None
@@ -132,7 +132,7 @@ class TensorBinding(Builder[TensorFrame]):
         return sum(
             prod(field.shape) * field.dtype.itemsize
             for layout in self.layouts.layouts
-            if layout.resource in self.initializers
+            if layout.resource == self.causal_state and layout.resource in self.initializers
             for field in layout.layout.fields[::5]
         )
 

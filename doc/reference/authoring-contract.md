@@ -34,7 +34,7 @@
 和 [ReFT](../../pllm/workloads/reft.py) 使用这个接口；[Recirculation](../../pllm/workloads/recirculation.py)
 使用普通的 `Recurrence` 声明；[TTRL](../../pllm/workloads/ttrl.py) 使用
 `CompletionWorkload`；FTTT 和 GTTA 使用结构化的 `transaction` 绑定；
-[TLM](../../pllm/workloads/tlm/workload.py) 使用 `CausalAdapterWorkload`；
+[TLM](../../pllm/workloads/tlm/workload.py) 使用普通 `Workload` 的因果批输入与模型端口；
 [ESamp](../../pllm/workloads/esamp_request.py) 使用普通具名参数、预测与 loss，
 并在同一张图上做显式分页/捕获替换；Output LoRA 使用普通 `Batch` 输入与多步 SGD。
 全部十一个内置负载都使用各自适用的共享创作入口，构造同一张原始图，
@@ -469,36 +469,38 @@ TTRL 的 `training_example` 给出可训练的最大形状元数据；FTTT 的 t
 `example` 给出上下文与回滚快照。框架执行实际 loss/update/query 路径来推导资源，
 不要求负载申报字节。使用 `binding.compile()` 保留同一组事实与用户预算。
 
-## 因果适配器
+## 因果批训练
 
-本节约束 `CausalAdapterWorkload`（TLM）：冻结的因果模型 + 有序低秩 A/B 因子 +
-声明阶段的优化器更新。数学契约与 [Completion 学习](#completion-学习) 相同，
-差别在模型事实与资源声明：基座模型与初始化模板必须不可变、按身份保留；
-`resident_bytes` 与 `update.input_shapes` 决定有限计划能否准入。
-模型句柄的关闭语义也在本节末尾。
+TLM 是普通 `pllm.Workload`：`InstanceState` 声明由目标投影几何决定的 a/b `Buffer`，
+`Overlay(..., LOW_RANK_ADD, scale=alpha/rank)` 同时供推理和可微训练读取。
+`ParameterTarget(layer=None, ...)` 在探测模型后扩展为所有层；显式层目标仍须有序且唯一。
+`@pllm.on(pllm.Config("phase"))` 可以从负载配置解析阶段。
 
-继承 `pllm.host.CausalAdapterWorkload[Data, Result]`，带冻结的 `pllm.host.CausalModel`、
-优化器和设为 `BEFORE_MODEL` 或 `AFTER_SAMPLE` 的 `phase`。它使用与 completion
-学习相同的 prepare/loss/trained_rows/output 数学契约。`prepare` 接收原始
-`CausalTrainBatch`，未提供训练输入时为 `None`。具名 loss 参数按模型的有序
-A/B 因子对排列。共享绑定推导 Adam 字段与 LOW_RANK_ADD 附着，校验目标
-形状/设备/dtype 与因果输入，并在声明的阶段原子发布。TLM 保留其 q/v 限制与
-detach 的句子选择目标；负载中没有 TLM 专属的布局、梯度收集或发布实现。
+`pllm.batch("input_ids")`、`pllm.batch("labels")` 和 `pllm.batch("attention_mask")`
+通过既有 `CausalTrainBatch` / `AuxiliaryInput` 读取因果序列，mask 可为 `None`。
+`model: pllm.model.CausalCall = pllm.causal_model("adapter")` 注入当前调用的可微参数视图：
+`model(ids, attention_mask=mask)` 应用声明的 overlay，`model.base(...)` 只使用冻结基座。
+端口显式声明状态读取与参数梯度依赖，worker 通过已有绑定路径提供 decoder；活模型不进入
+负载、事实、指纹或跨进程传输。EngineCore 的父进程无需初始化 CUDA。
 
-基座模型与初始化模板必须保持不可变。它们按身份保留，不与负载配置一起深拷贝；
-活跃因子是原始 PTTS 视图。模型指纹、解析出的优化器/scale 与 loss 进入签名声明。
-meta 模型可以对照 worker 的真实设备事实做声明，但可执行数学需要该设备上
-物化的模型。内置 TLM 定义支持封闭的 EngineCore 重建，无需初始化父 CUDA。
-这个接口是实例作用域的，不增加请求适配器、捕获或 replay。
-`CausalAdapter(rank, alpha)` 是加载前的 q/v 声明；后端探针提供全部层的切片几何，
-worker 加载 vLLM 后绑定 `CausalModel`。驱动进程只构造 meta 因子，不运输活模型。
-Qwen2 训练借用 BF16、未量化、TP1 的基座与 RoPE cache；新增驻留仅是因子初始化模板，
-`CausalModel.resident_bytes` 不重复收费借用存储。框架在共同 autograd 任务边界编译
-纯张量 forward/loss 和生成的 backward；选择计数、优化器及发布在图外，workload 没有编译开关。
-不同形状首次使用会编译；未启用 Inductor CUDA graph。显式训练成本声明仍须包含
-`update.input_shapes=((sequences, tokens),)`；两个轴都是容量界。默认无界模式不是有限
-训练峰值保证，完整 backward scratch 尚未声明，Rust 在有限计划中拒绝缺失成本。
-离线 TLM 先把冻结模型 logits 归约为 detach 的句子 loss，再做适配前向。
+实例 AdamW 因果训练接受标量 loss，或带选择元数据的 `TensorUpdate`。每个因子保留独立的
+五字段 AdamW 组。初始化模板只保留参数；框架把其驻留计入时间线。
+基座借用 BF16、未量化、TP1 权重与 RoPE cache，训练沿用推理 overlay 的算术。
+框架在共同 autograd 任务边界编译 forward/loss 和 backward，不启用 Inductor CUDA graph。
+显式训练成本仍须包含 `update.input_shapes=((sequences, tokens),)`；两个轴都是容量界。
+默认无界模式不保证有限训练峰值；有限预算必须提供实测成本与这些界限，不会在 driver
+伪造借用模型的内存轨迹。
+
+TLM 构造改为 `TLMWorkload(config, rank=8, alpha=16)`，不再接受 `model` 参数。
+`TLMData`、`TLMResult`、生命周期方法，以及 `pllm.host.CausalAdapterWorkload`、
+`pllm.host.CausalAdapter`、`pllm.host.CausalModel` 均已删除。
+`pllm.host.CausalTrainBatch` 和 `pllm.host.batch` 保留，`pllm.batch` 是同一声明入口。
+直接执行使用 `TensorStepInput(auxiliary=CausalTrainBatch(...))`，返回普通 `TensorResult`：
+`value` 是报告的目标，`loss` 是实际优化的 loss（跳过时为 `None`），
+`metrics["selected_count"]` 是设备张量，`publication` 保持原有含义；缺少输入时 `value=None`、
+metrics 为空。ONLINE 在 AFTER_SAMPLE 更新；OFFLINE 在 BEFORE_MODEL 更新，并用 no-grad
+基座选择句子。当前仍在图外读取选择计数；空选择或 `lamb=0` 不更新、不发布、不增加版本。
+设备侧跳过结算尚未实现。
 
 关闭模型句柄会 detach 并关闭引擎，然后丢弃其 runner、执行与引擎引用。
 调用方自有的模型与返回的张量保留自己的生命周期。失败的关闭使句柄不再接受

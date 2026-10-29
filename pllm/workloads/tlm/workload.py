@@ -1,7 +1,6 @@
-"""TLM selection mathematics on the shared causal low-rank adapter binding."""
+"""TLM sequence selection and loss over ordinary instance buffers and a causal model port."""
 
-from __future__ import annotations
-
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -43,77 +42,81 @@ class TLMConfig:
             raise ValueError("TLMConfig needs finite threshold and finite, nonnegative lamb")
 
 
-@dataclass(frozen=True, slots=True)
-class TLMResult:
-    loss: torch.Tensor
-    selected_count: int
-    publication: pllm.state.PagePublication | None
+@dataclass(frozen=True)
+class TLMWorkload(pllm.Workload):
+    """All-layer q/v LoRA trained from host-supplied causal sequence batches."""
 
-
-@dataclass(slots=True)
-class TLMData:
-    batch: pllm.host.CausalTrainBatch[torch.Tensor] | None
-    loss: torch.Tensor
-    selected_count: torch.Tensor
-
-
-@dataclass(frozen=True, slots=True)
-class TLMWorkload(pllm.host.CausalAdapterWorkload[TLMData, TLMResult]):
     name = "tlm.qv_lora"
-    namespace = "canonical.qv_adamw@1"
     config: TLMConfig
-    model: pllm.host.CausalModel | pllm.host.CausalAdapter = pllm.host.CausalAdapter()
+    rank: int = 8
+    alpha: int = 16
 
     def __post_init__(self) -> None:
-        if isinstance(self.model, pllm.host.CausalAdapter):
-            return
-        if any(
-            item.target.module is not pllm.model.ParameterModuleKind.ATTENTION
-            or item.target.role
-            not in (pllm.model.ParameterRole.QUERY_PROJECTION_WEIGHT, pllm.model.ParameterRole.VALUE_PROJECTION_WEIGHT)
-            for item in self.model.targets
-        ):
-            raise ValueError("TLM factor topology must name q/v targets")
-
-    @property
-    def optimizer(self) -> pllm.AdamW:
-        return self.config.optimizer
+        if self.rank < 1 or self.alpha < 1:
+            raise ValueError("TLM requires positive rank and alpha")
 
     @property
     def phase(self) -> pllm.Phase:
         return pllm.Phase.BEFORE_MODEL if self.config.mode is TLMMode.OFFLINE else pllm.Phase.AFTER_SAMPLE
 
-    def prepare(self, value: pllm.host.CausalTrainBatch[torch.Tensor] | None) -> TLMData:
-        device = self.causal_model.device
-        return TLMData(
-            value,
-            torch.zeros((), device=device),
-            torch.zeros((), device=device, dtype=torch.int64),
+    @property
+    def factors(self) -> pllm.InstanceState:
+        """Keep each projection's factors as separately shaped AdamW parameters."""
+        return pllm.InstanceState(
+            {
+                "a": pllm.Buffer(lambda inputs, outputs: (self.rank, inputs)),
+                "b": pllm.Buffer(lambda inputs, outputs: (outputs, self.rank)),
+            },
+            optimizer=self.config.optimizer,
+            initialize=self.initialize,
+            namespace="canonical.qv_adamw@1",
         )
 
-    def trained_rows(self, data: TLMData) -> int:
-        return int(data.selected_count.item())
+    @property
+    def adapter(self) -> pllm.model.Overlay:
+        """Resolve all-layer q/v geometry after probing the model."""
+        return pllm.model.Overlay(
+            "factors",
+            tuple(
+                pllm.model.ParameterTarget(None, pllm.model.ParameterModuleKind.ATTENTION, role)
+                for role in (
+                    pllm.model.ParameterRole.QUERY_PROJECTION_WEIGHT,
+                    pllm.model.ParameterRole.VALUE_PROJECTION_WEIGHT,
+                )
+            ),
+            operator=pllm.model.ParameterOverlayOperator.LOW_RANK_ADD,
+            scale=self.alpha / self.rank,
+        )
 
-    def output(self, data: TLMData, result: pllm.state.InvocationOutput) -> TLMResult:
-        return TLMResult(data.loss, self.trained_rows(data), result.publication)
+    def initialize(self, fields: Mapping[str, torch.Tensor], generator: torch.Generator) -> None:
+        """Seed Kaiming-uniform A and zero B in target order, as in the original TLM."""
+        for name, value in fields.items():
+            torch.nn.init.kaiming_uniform_(value, a=math.sqrt(5), generator=generator) if name.startswith(
+                "a_"
+            ) else value.zero_()
 
-    def loss(self, data: TLMData, parameters: Mapping[str, torch.Tensor]) -> torch.Tensor | None:
-        model, config = self.causal_model, self.config
-        if data.batch is None:
-            return None
+    @pllm.on(pllm.Config("phase"))
+    @pllm.train(state="factors")
+    def update(
+        self,
+        input_ids: torch.Tensor = pllm.batch("input_ids"),
+        labels: torch.Tensor = pllm.batch("labels"),
+        attention_mask: torch.Tensor | None = pllm.batch("attention_mask"),
+        model: pllm.model.CausalCall = pllm.causal_model("adapter"),
+    ) -> pllm.TensorUpdate:
+        """Select with the adapted model online, or the no-grad base offline."""
+        config = self.config
         selection = None
         if config.mode.value == "offline":
             with torch.no_grad():
                 selection = _sentence_cross_entropy(
-                    model.logits(data.batch, None), data.batch.labels, config.ignore_index
+                    model.base(input_ids, attention_mask=attention_mask), labels, config.ignore_index
                 )
-        sentence = _sentence_cross_entropy(
-            model.logits(data.batch, tuple(parameters.values())), data.batch.labels, config.ignore_index
-        )
+        sentence = _sentence_cross_entropy(model(input_ids, attention_mask=attention_mask), labels, config.ignore_index)
         selection = sentence.detach() if selection is None else selection
         selected = selection > config.threshold
         weighted = sentence * (config.lamb * torch.exp(selection - config.threshold)) * selected.to(sentence.dtype)
         count = selected.sum()
         loss = torch.where(count == 0, weighted.mean(), weighted.sum() / count.clamp_min(1))
-        data.loss, data.selected_count = loss.detach(), count
-        return loss if config.lamb != 0 else None
+        changed = (count > 0) & (config.lamb != 0)
+        return pllm.TensorUpdate(loss, changed, changed.to(torch.int64), count, {"selected_count": count})

@@ -2,8 +2,6 @@
 
 from collections.abc import Callable
 from functools import partial
-from math import sqrt
-from typing import NoReturn
 
 import torch
 from torch.nn import functional as F
@@ -12,11 +10,8 @@ from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.models.qwen2 import Qwen2Attention
 from vllm.model_executor.models.qwen3 import Qwen3Attention
 
-from pllm.authoring import CausalAdapter, CausalTrainBatch
 from pllm.backends.vllm.architecture import Decoder, DecoderLayer, Projection
-from pllm.contracts.codec import boundary_digest
-from pllm.contracts.parameter_overlay import ParameterOverlayOperator, ParameterTargetShape
-from pllm.contracts.tensor_layout import TensorDType
+from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding
 from pllm.execution.parameter_projection import parameter_correction
 
 Project = Callable[[Projection, torch.Tensor], torch.Tensor]
@@ -99,45 +94,20 @@ def bind_qk_norms(layer: DecoderLayer) -> tuple[RMSNorm, RMSNorm] | None:
 
 
 class CausalTraining:
-    """Backend causal capability; meta factors describe the driver plan without loading weights."""
+    """Frozen decoder arithmetic with projection views bound once by the worker."""
 
-    def __init__(
-        self,
-        adapter: CausalAdapter,
-        targets: tuple[ParameterTargetShape, ...],
-        tensor_dtype: TensorDType,
-        seed: int,
-        model_fingerprint: str,
-        decoder: Decoder | None = None,
-    ) -> None:
-        model = None if decoder is None else decoder.model
-        self.model = model
-        self.projections: dict[Projection, list[tuple[int, int, int]]] = {}
-        if decoder is not None:
-            for index, target in enumerate(targets):
-                projection, offset, size, _ = decoder.projection(target.target)
-                self.projections.setdefault(projection, []).append((offset, size, index))
-        self.qk_norms = () if model is None else tuple(bind_qk_norms(layer) for layer in model.model.layers)
-        self.targets, self.tensor_dtype = targets, tensor_dtype
-        self.scale = adapter.alpha / adapter.rank
-        self.device = torch.device("meta") if model is None else model.model.embed_tokens.weight.device
-        self.initial_factors = tuple(
-            torch.empty(shape, device=self.device, dtype=tensor_dtype.torch)
-            for target in targets
-            for shape in ((adapter.rank, target.input_size), (target.output_size, adapter.rank))
-        )
-        if model is not None:
-            generator = torch.Generator(device=self.device).manual_seed(seed)
-            for down, up in zip(self.initial_factors[::2], self.initial_factors[1::2], strict=True):
-                torch.nn.init.kaiming_uniform_(down, a=sqrt(5), generator=generator)
-                up.zero_()
-        self.resident_bytes = sum(t.numel() * t.element_size() for t in self.initial_factors)
-        self.fingerprint = boundary_digest(
-            adapter, targets, tensor_dtype, seed, "vllm.causal.training@2", model_fingerprint
-        )
-
-    def __reduce__(self) -> NoReturn:
-        raise TypeError("transport CausalAdapter declarations; bind borrowed decoder weights in the worker")
+    def __init__(self, decoder: Decoder, bindings: tuple[ParameterOverlayFieldBinding, ...]) -> None:
+        self.model = decoder.model
+        if self.model.model.embed_tokens.weight.dtype is not torch.bfloat16:
+            raise ValueError("causal training requires qualified unquantized BF16 TP1 weights")
+        self.projections: dict[Projection, list[tuple[int, int, ParameterOverlayFieldBinding, slice]]] = {}
+        start = 0
+        for binding in bindings:
+            projection, offset, size, _ = decoder.projection(binding.target)
+            end = start + len(binding.fields)
+            self.projections.setdefault(projection, []).append((offset, size, binding, slice(start, end)))
+            start = end
+        self.qk_norms = tuple(bind_qk_norms(layer) for layer in self.model.model.layers)
 
     def project(
         self, projection: Projection, hidden: torch.Tensor, *, factors: tuple[torch.Tensor, ...] | None
@@ -145,23 +115,22 @@ class CausalTraining:
         """Run the fused base GEMM once and correct its bound output slices."""
         output = F.linear(hidden, projection.weight, projection.bias)
         if factors is not None:
-            for offset, size, index in self.projections.get(projection, ()):
-                correction = parameter_correction(
-                    hidden, (factors[2 * index], factors[2 * index + 1]), ParameterOverlayOperator.LOW_RANK_ADD
-                )
-                output[..., offset : offset + size] += correction * self.scale
+            for offset, size, binding, fields in self.projections.get(projection, ()):
+                correction = parameter_correction(hidden, factors[fields], binding.operator)
+                output[..., offset : offset + size] += correction * binding.scale
         return output
 
-    def logits(self, batch: CausalTrainBatch[torch.Tensor], factors: tuple[torch.Tensor, ...] | None) -> torch.Tensor:
+    def __call__(
+        self, ids: torch.Tensor, attention_mask: torch.Tensor | None, factors: tuple[torch.Tensor, ...] | None
+    ) -> torch.Tensor:
         """Full sequence-local causal attention with vLLM component precision and PTTS factors."""
-        assert self.model is not None
-        tokens = batch.input_ids
+        tokens = ids
         length = tokens.shape[1]
         positions = torch.arange(length, device=tokens.device).expand_as(tokens)
         mask = None
-        if batch.attention_mask is not None:
+        if attention_mask is not None:
             causal = torch.ones(length, length, device=tokens.device, dtype=torch.bool).tril()
-            mask = causal[None, None] & batch.attention_mask[:, None, None, :].bool()
+            mask = causal[None, None] & attention_mask[:, None, None, :].bool()
         hidden = F.embedding(tokens, self.model.model.embed_tokens.weight)
         project = partial(self.project, factors=factors)
         residual = None

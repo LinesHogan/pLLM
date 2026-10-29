@@ -1490,7 +1490,14 @@ class _Declaration:
             for operation in self.operations
             for source in operation.arguments()[0].values()
         ):
-            state = self.binding.state(name, fields, namespace=definition.namespace, optimizer=definition.optimizer)
+            state = self.binding.state(
+                name,
+                fields,
+                namespace=definition.namespace,
+                optimizer=definition.optimizer,
+                scope=definition.scope,
+                keys=definition.request_keys,
+            )
             ports = parameter_ports(
                 self.binding, state, shapes, initialize=_frozen(definition.initialize), grouped=True
             )
@@ -1668,6 +1675,8 @@ class Workload(
         b.causal = causal
         b.max_requests = facts.max_admitted_lineages
         self._build(b)
+        # Executable ports retain their dependencies; an unused factory must not pin the decoder.
+        b.causal = None
         b.configure_scans(facts)
         b.graph = replace(
             b.graph,
@@ -1722,7 +1731,7 @@ class Workload(
 
     def declare(self, facts: BackendCompileFacts) -> tuple[SemanticGraph, TensorLayoutRequest, BackendAttachmentSpec]:
         binding = self.declaration(facts)
-        if binding.causal_training and min(facts.timeline.reserved_bytes, default=0) < binding.initialization_bytes:
+        if binding.causal_state and min(facts.timeline.reserved_bytes, default=0) < binding.initialization_bytes:
             raise ValueError("reserve the initialized parameter templates in the backend timeline")
         return binding.finish()
 
@@ -1738,7 +1747,7 @@ class Workload(
                 layout = next(item.layout for item in b.layouts.layouts if item.resource == resource)
                 tensors = tuple(
                     torch.zeros(
-                        field.shape if not b.causal_training or i % 5 == 0 else (0,),
+                        field.shape if resource != b.causal_state or i % 5 == 0 else (0,),
                         dtype=field.dtype.torch,
                         device=device,
                     )
@@ -1746,7 +1755,7 @@ class Workload(
                 )
                 # A resource's initial tensors are shared values, independent of admission history.
                 init(tensors, torch.Generator(device=device).manual_seed(seed))
-                values = {i: value for i, value in enumerate(tensors) if not b.causal_training or i % 5 == 0}
+                values = {i: value for i, value in enumerate(tensors) if resource != b.causal_state or i % 5 == 0}
 
             def initialize(roots: Roots, keys: tuple[RequestStateKey | None, ...]) -> None:
                 if values:
@@ -1775,7 +1784,9 @@ class Workload(
             rows,
             b.bind_prepare(),
             output,
-            lambda previous, incoming: replace(previous, step=incoming.step, rows=incoming.rows, index=None, plan=None),
+            lambda previous, incoming: replace(
+                previous, step=incoming.step, rows=incoming.rows, index=None, plan=None, training=None
+            ),
             parameter_phases=b.parameter_phases,
         )
 
@@ -1803,7 +1814,7 @@ class Workload(
             raise ValueError("this workload has no explicit tensor implementation")
         with FakeTensorMode():
             binding = self.declaration(facts)
-        if binding.causal_training:
+        if binding.causal_state:
             if options.memory_budget_bytes is not None and not facts.timeline.task_resources:
                 raise ValueError(
                     "causal training needs measured costs and signed [sequences, tokens] bounds for a finite budget"

@@ -1,4 +1,4 @@
-"""Structured learning surfaces: host transactions, completion learning and causal adapters.
+"""Structured learning surfaces: host transactions and completion learning.
 
 These classes compose the ordinary declaration/binding machinery for learning-shaped
 workloads whose mathematics arrives as frozen user functions with a signed optimizer
@@ -10,32 +10,24 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import replace
-from typing import ClassVar, Generic, Self, TypeVar
+from typing import ClassVar, Generic, TypeVar
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from pllm.authoring import BackendRequirements, BackendWorkload, CausalAdapter, CausalModel, CausalTrainBatch
-from pllm.contracts.backend_attachment import BackendAttachmentSpec
 from pllm.contracts.codec import boundary_digest
-from pllm.contracts.compilation import PlanBundle
-from pllm.contracts.packed_rows import PackedPhaseRow
-from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding, ParameterOverlayOperator
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.semantic_graph import (
     AnchorSymbol,
     MathContract,
     SchedulerTimeline,
-    SemanticGraph,
     StateEffectKind,
     TaskResourceFact,
     TaskSymbol,
     ValueResourceFact,
 )
-from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
+from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.binding_base import Buffer
-from pllm.execution.causal_batch import CausalBinder
-from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import Builder, Call, Dimensions, Field, HostOperation, Shape, When, native
 from pllm.execution.freeze import fingerprint, freeze, owner_snapshot, owner_values
 from pllm.execution.host_runtime import (
@@ -49,12 +41,11 @@ from pllm.execution.host_runtime import (
 )
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.state_execution import MathBinding, StateExecution
-from pllm.execution.step_input import TensorStepInput
 from pllm.execution.tensor_frame import Tensors
 from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots, TensorAdamW, TensorBatch, autograd_loss
 from pllm.execution.torch_private import MemoryTrace, MemoryUsage
 from pllm.kernels.adamw import AdamWConfig
-from pllm.usage import Activation, InstanceState, Overlay, Phase, RequestState
+from pllm.usage import Activation, InstanceState, Overlay, RequestState
 
 ContextT = TypeVar("ContextT")
 ResultT = TypeVar("ResultT")
@@ -312,218 +303,3 @@ class CompletionWorkload(
             AnchorSymbol("host.compute.end"),
             timeline,
         )
-
-
-class CausalAdapterWorkload(
-    _LearningMath[CausalTrainBatch[torch.Tensor] | None, ContextT, ResultT], BackendWorkload[ContextT, ResultT]
-):
-    """Instance low-rank overlays with an explicit frozen causal-model dependency."""
-
-    name: ClassVar[str] = "causal.adapter"
-    namespace: ClassVar[str] = ""
-    model: CausalModel | CausalAdapter
-
-    @property
-    @abstractmethod
-    def optimizer(self) -> AdamWConfig: ...
-
-    @property
-    @abstractmethod
-    def phase(self) -> Phase: ...
-
-    @property
-    def causal_model(self) -> CausalModel:
-        """The backend dependency resolved before declaration and execution."""
-        assert not isinstance(self.model, CausalAdapter)
-        return self.model
-
-    def bind_causal_model(self, model: CausalModel) -> Self:
-        owner = owner_snapshot(self, _MARKERS, (self.model,))
-        object.__setattr__(owner, "model", model)
-        return owner
-
-    def backend_requirements(self) -> BackendRequirements:
-        if isinstance(self.model, CausalAdapter):
-            return BackendRequirements(causal_adapter=self.model)
-        return BackendRequirements(
-            parameter_targets=tuple(target.target for target in self.model.targets),
-            resident_bytes=self.model.resident_bytes,
-        )
-
-    def _binding(
-        self, facts: BackendCompileFacts
-    ) -> tuple[Builder[ContextT], FunctionMath[CausalTrainBatch[torch.Tensor] | TensorStepInput, ContextT, ResultT]]:
-        owner = owner_snapshot(self, _MARKERS, (self.model,))
-        model = owner.causal_model
-        targets = tuple(item.target for item in model.targets)
-        expected_dtype = model.tensor_dtype.torch
-        if (
-            model.resident_bytes < 0
-            or model.resident_bytes
-            and (
-                len(facts.timeline.reserved_bytes) != len(facts.timeline.anchors)
-                or any(reserved < model.resident_bytes for reserved in facts.timeline.reserved_bytes)
-            )
-            or facts.probe.targets != model.targets
-            or facts.probe.tensor_dtype != model.tensor_dtype
-            or (model.device.type != "meta" and facts.device != model.device)
-            or owner.phase not in (Phase.BEFORE_MODEL, Phase.AFTER_SAMPLE)
-            or not targets
-            or targets != tuple(sorted(set(targets)))
-            or len(model.initial_factors) != 2 * len(targets)
-            or any(
-                down.ndim != 2
-                or up.ndim != 2
-                or down.shape[0] < 1
-                or down.shape[0] != up.shape[1]
-                or down.shape[1] != target.input_size
-                or up.shape[0] != target.output_size
-                or down.device != model.device
-                or up.device != model.device
-                or down.dtype != expected_dtype
-                or up.dtype != down.dtype
-                for target, down, up in zip(
-                    model.targets, model.initial_factors[::2], model.initial_factors[1::2], strict=True
-                )
-            )
-        ):
-            raise ValueError(
-                "causal adapter model, phase, targets, or factors do not match the signed backend facts and timeline reservation"
-            )
-        identity = fingerprint(owner.loss)
-        values = {key: value for key, value in owner_values(owner, _MARKERS).items() if key != "model"}
-        b = Builder[ContextT](
-            owner.name,
-            boundary_digest(
-                fingerprint(values),
-                model.fingerprint,
-                model.scale,
-                owner.optimizer,
-                identity,
-                fingerprint(owner.trained_rows),
-            ),
-        )
-        names = tuple(f"factor_{index}" for index in range(len(model.initial_factors)))
-        state = b.state(
-            "factors",
-            tuple(
-                Field(name, tuple(factor.shape), model.tensor_dtype)
-                for name, factor in zip(names, model.initial_factors, strict=True)
-            ),
-            namespace=owner.namespace,
-            optimizer=owner.optimizer,
-        )
-        update = b.compute(
-            "update",
-            function=autograd_loss(freeze(owner.loss), names, freeze(owner.trained_rows)),
-            inputs={"batch": b.input("training", "batch", CausalTrainBatch.schema), "state": state.read()},
-            outputs=("updated",),
-            changes=state,
-            effect=StateEffectKind.TRANSITION_MAYBE,
-            when=owner.phase.value,
-            implementations=(
-                native(
-                    f"python:{identity}",
-                    f"compute/{facts.device.type}@1",
-                    "optimizer/adamw@1",
-                    "transition/full_root@1",
-                ),
-            ),
-            math=MathContract(
-                parameter_gradients=(state.declaration.resource,),
-                detached_inputs=("batch",),
-                forward_rows="batch",
-                parameter_gradient_rows="batch",
-                update_states="state",
-                reduction="custom",
-            ),
-        )
-        b.publish(update, state, when=owner.phase.value, schema=f"{owner.name}.result@1")
-        b.overlay(
-            state,
-            None,
-            tuple(
-                ParameterOverlayFieldBinding(
-                    target.target,
-                    ParameterOverlayOperator.LOW_RANK_ADD,
-                    (
-                        state.view(f"factor_{2 * index}.parameters", b.dimensions),
-                        state.view(f"factor_{2 * index + 1}.parameters", b.dimensions),
-                    ),
-                    str(state.declaration.resource),
-                    model.scale,
-                )
-                for index, target in enumerate(model.targets)
-            ),
-        )
-
-        def initialize(roots: Roots, keys: tuple[RequestStateKey | None, ...]) -> None:
-            (root,) = roots
-            for index, factor in enumerate(model.initial_factors):
-                root[5 * index].copy_(factor)
-
-        prepare_data, output_data = freeze(owner.prepare), freeze(owner.output)
-        limit = next((item for item in facts.timeline.task_resources if item.task == update.symbol), None)
-        if limit is not None and (
-            len(limit.input_shapes) != 1
-            or len(limit.input_shapes[0]) != 2
-            or limit.input_shapes[0][0] < 1
-            or limit.input_shapes[0][1] < 2
-        ):
-            raise ValueError("causal training costs require signed [sequences, tokens] input bounds")
-
-        def prepare(value: CausalTrainBatch[torch.Tensor] | TensorStepInput, batch: TensorBatch) -> ContextT:
-            match value:
-                case TensorStepInput(auxiliary=auxiliary):
-                    if auxiliary is None:
-                        return prepare_data(None)
-                    match auxiliary:
-                        case CausalTrainBatch() as train_batch:
-                            value = train_batch
-                        case _:
-                            raise ValueError("causal adapter auxiliary input must be a CausalTrainBatch")
-                case _:
-                    pass
-            if (
-                value.input_ids.ndim != 2
-                or value.input_ids.shape != value.labels.shape
-                or value.input_ids.shape[0] < 1
-                or value.input_ids.shape[1] < 2
-                or value.input_ids.dtype != torch.int64
-                or value.labels.dtype != torch.int64
-                or value.input_ids.device != model.device
-                or value.labels.device != model.device
-                or value.attention_mask is not None
-                and (value.attention_mask.shape != value.input_ids.shape or value.attention_mask.device != model.device)
-                or limit is not None
-                and any(size > bound for size, bound in zip(value.input_ids.shape, limit.input_shapes[0], strict=True))
-            ):
-                raise ValueError(
-                    "causal batch must contain aligned int64 token/label tensors within signed input bounds"
-                )
-            return prepare_data(value)
-
-        def rows(value: CausalTrainBatch[torch.Tensor] | TensorStepInput) -> tuple[PackedPhaseRow, ...]:
-            match value:
-                case TensorStepInput(rows=step_rows) if step_rows.total_rows > facts.probe.max_packed_rows:
-                    raise ValueError("packed input exceeds the signed backend row capacity")
-                case _:
-                    return ()
-
-        return b, FunctionMath({str(state.declaration.resource): initialize}, rows, prepare, output_data)
-
-    def declare(self, facts: BackendCompileFacts) -> tuple[SemanticGraph, TensorLayoutRequest, BackendAttachmentSpec]:
-        builder, _ = self._binding(facts)
-        return builder.finish()
-
-    def bind_math(
-        self, facts: BackendCompileFacts, plan: PlanBundle, *, causal: CausalBinder | None = None
-    ) -> MathBinding[TensorStepInput, ContextT, ResultT]:
-        builder, functions = self._binding(facts)
-        if (
-            self.causal_model.device != facts.device
-            or builder.graph != plan.semantic_graph
-            or builder.layouts != plan.tensor_layout_request
-        ):
-            raise ValueError("causal mathematics must match the execution device and signed declaration")
-        return MathBinding(functions, builder.bind_all(plan, operations=builder.operations))

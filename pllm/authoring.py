@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
-from typing import Generic, Protocol, Self, TypeVar
+from typing import Generic, TypeVar
 
 import torch
 
@@ -19,7 +19,7 @@ from pllm.contracts.auxiliary import (
 from pllm.contracts.backend_attachment import BackendAttachment, BackendAttachmentSpec
 from pllm.contracts.compilation import PlanBundle as PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase as HiddenPhase, HiddenSite as HiddenSite
-from pllm.contracts.parameter_overlay import ParameterTarget, ParameterTargetShape
+from pllm.contracts.parameter_overlay import ParameterTarget
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage as SamplerStage
 from pllm.contracts.semantic_graph import (
     HiddenInputSource,
@@ -28,7 +28,7 @@ from pllm.contracts.semantic_graph import (
     SemanticGraph,
     StateScope,
 )
-from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
+from pllm.contracts.tensor_layout import TensorLayoutRequest
 from pllm.contracts.visibility import VisibilitySource
 from pllm.execution.backend_attachment import (
     attachment_buffer_bytes,
@@ -104,53 +104,13 @@ __all__ = [
 
 
 @dataclass(frozen=True, slots=True)
-class CausalAdapter:
-    """Cold all-layer q/v factor geometry, resolved against the loaded backend."""
-
-    rank: int = 8
-    alpha: int = 16
-
-    def __post_init__(self) -> None:
-        if self.rank < 1 or self.alpha < 1:
-            raise ValueError("causal adapters require positive rank and alpha")
-
-
-@dataclass(frozen=True, slots=True)
 class BackendRequirements:
     hidden_inputs: tuple[HiddenInputSource, ...] = ()
     parameter_targets: tuple[ParameterTarget, ...] = ()
     activation_layers: tuple[int, ...] = ()
     sampler_stage: SamplerStage | None = None
     sampler_feedback: bool = False
-    resident_bytes: int = 0
     position_states: tuple[tuple[str, float], ...] = ()
-    causal_adapter: CausalAdapter | None = None
-
-    def __post_init__(self) -> None:
-        if self.resident_bytes < 0:
-            raise ValueError("frozen dependency residency must be nonnegative")
-
-
-class CausalModel(Protocol):
-    """Frozen base mathematics and factor templates; live factors belong to PTTS."""
-
-    @property
-    def targets(self) -> tuple[ParameterTargetShape, ...]: ...
-    @property
-    def initial_factors(self) -> tuple[torch.Tensor, ...]: ...
-    @property
-    def tensor_dtype(self) -> TensorDType: ...
-    @property
-    def device(self) -> torch.device: ...
-    @property
-    def fingerprint(self) -> str: ...
-    @property
-    def scale(self) -> float: ...
-    @property
-    def resident_bytes(self) -> int: ...
-    def logits(
-        self, batch: CausalTrainBatch[torch.Tensor], factors: tuple[torch.Tensor, ...] | None
-    ) -> torch.Tensor: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,10 +226,6 @@ class BackendAuthoring(ABC):
 
 
 class BackendWorkload(BackendAuthoring, Generic[DataT, ResultT]):
-    def bind_causal_model(self, model: CausalModel) -> Self:
-        """Resolve a declared causal dependency after backend model loading."""
-        raise NotImplementedError("declare a CausalAdapterWorkload to bind a causal model")
-
     @abstractmethod
     def bind_math(
         self, facts: BackendCompileFacts, plan: PlanBundle, *, causal: CausalBinder | None = None

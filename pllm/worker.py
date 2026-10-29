@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from functools import partial
 
 import torch
 from vllm.v1.worker.gpu_worker import Worker
@@ -16,9 +17,9 @@ from pllm.backends.vllm.runtime import (
     BackendInstall,
     BackendProbe,
     BackendStage,
-    bind_training,
     probe_backend,
 )
+from pllm.backends.vllm.training import CausalTraining
 from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import AttachmentTopology, BackendAttachment
 from pllm.contracts.codec import decode_boundary, encode_boundary
@@ -61,7 +62,6 @@ class GPUWorker(Worker):
             plan.timeline,
             publish_lag=0 if visibility is None else visibility.lag,
         )
-        workload = bind_training(workload, facts, runner)
         max_lineages = (
             facts.max_admitted_lineages
             if any(state.scope is StateScope.REQUEST for state in plan.semantic_graph.states)
@@ -86,7 +86,9 @@ class GPUWorker(Worker):
         )
         if (facts.probe, candidates) != (attachment.probe, plan.states.plans):
             raise ValueError("worker backend facts changed; compile the workload against the current backend")
-        runner.attach_workload(workload.bind_backend(facts, attachment), cache_policy)
+        runner.attach_workload(
+            workload.bind_backend(facts, attachment, causal=partial(CausalTraining, runner.decoder)), cache_policy
+        )
 
     def workload_command(self, command: str, payload: str) -> str:
         runner = self.workload_runner

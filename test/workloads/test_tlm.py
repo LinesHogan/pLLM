@@ -16,6 +16,7 @@ from pllm.contracts.backend_attachment import (
     AttachmentTopology,
     BackendPlacementProbe,
 )
+from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget, ParameterTargetShape
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import TaskResourceFact, TaskSymbol
@@ -24,15 +25,14 @@ from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
+from pllm.execution.step_input import TensorStepInput
 from pllm.kernels.adamw import AdamWConfig
 from pllm.workloads.tlm import TLMConfig, TLMMode, TLMWorkload
 
 
-class TinyCausalModel:
+class TinyCausalPort:
     device = torch.device("cpu")
     tensor_dtype = TensorDType.FLOAT64
-    fingerprint = "a" * 64
-    scale = 1.0
     targets = tuple(
         ParameterTargetShape(ParameterTarget(0, ParameterModuleKind.ATTENTION, role), 3, 3)
         for role in (ParameterRole.QUERY_PROJECTION_WEIGHT, ParameterRole.VALUE_PROJECTION_WEIGHT)
@@ -40,10 +40,6 @@ class TinyCausalModel:
 
     def __init__(self) -> None:
         generator = torch.Generator().manual_seed(23)
-        self.initial_factors = tuple(
-            torch.randn(shape, generator=generator, dtype=torch.float64) * 0.1
-            for shape in ((2, 3), (3, 2), (2, 3), (3, 2))
-        )
         self.embedding = torch.randn(5, 3, generator=generator, dtype=torch.float64)
         self.base = torch.randn(2, 3, 3, generator=generator, dtype=torch.float64)
         self.head = torch.randn(3, 5, generator=generator, dtype=torch.float64)
@@ -51,15 +47,13 @@ class TinyCausalModel:
     def __deepcopy__(self, memo):
         raise AssertionError("binding must retain the original frozen causal model")
 
-    @property
-    def resident_bytes(self) -> int:
-        return sum(
-            tensor.numel() * tensor.element_size()
-            for tensor in (*self.initial_factors, self.embedding, self.base, self.head)
-        )
+    resident_bytes = 4 * 2 * 3 * 8  # Only factor templates are owned by the workload.
 
-    def logits(self, batch: CausalTrainBatch, factors: tuple[torch.Tensor, ...] | None) -> torch.Tensor:
-        hidden = self.embedding[batch.input_ids]
+    def bind(self, bindings):
+        return self
+
+    def __call__(self, ids, attention_mask, factors) -> torch.Tensor:
+        hidden = self.embedding[ids]
         weights = (
             self.base
             if factors is None
@@ -94,11 +88,16 @@ def _facts(model, *, reserved=None, task_resources=()) -> BackendCompileFacts:
         (),
     )
     provider = PageBundleProviderFacts("test.tlm@1", 4, kind, ordinal)
-    return BackendCompileFacts(replace(probe, targets=model.targets), timeline, (provider,), 2, 32768, 7)
+    return BackendCompileFacts(replace(probe, targets=model.targets), timeline, (provider,), 2, 32768, 7, layer_count=1)
 
 
 def _compile(model, config: TLMConfig):
-    return TLMWorkload(config, model).compile_backend(_facts(model)).execution
+    return TLMWorkload(config, 2, 2).compile_backend(_facts(model), causal=model.bind).execution
+
+
+def _input(batch):
+    rows = PackedPhaseRowBatch(0, 0, ())
+    return TensorStepInput(rows, PackedSamplerRowBatch(rows, ()), auxiliary=batch)
 
 
 def _reference(model, parameters, batch, config):
@@ -124,7 +123,7 @@ def _reference(model, parameters, batch, config):
 
 
 def test_global_multifactor_adamw_matches_oracle_and_publishes_one_version() -> None:
-    model = TinyCausalModel()
+    model = TinyCausalPort()
     config = TLMConfig(optimizer=AdamWConfig(0.01, (0.8, 0.95), 1e-7, 0.1), threshold=0.0)
     execution = _compile(model, config)
     (ref,) = execution.admit(())
@@ -132,7 +131,7 @@ def test_global_multifactor_adamw_matches_oracle_and_publishes_one_version() -> 
     execution.admit((first,))
     old_pin = execution.directory.inference_pin(first)
     before = execution.arena.snapshot(old_pin, ref)
-    reference = tuple(torch.nn.Parameter(value.clone()) for value in model.initial_factors)
+    reference = tuple(torch.nn.Parameter(value.clone()) for value in before[::5])
     optimizer = torch.optim.AdamW(reference, lr=0.01, betas=(0.8, 0.95), eps=1e-7, weight_decay=0.1, foreach=False)
     batch = CausalTrainBatch(torch.tensor([[0, 1, 2, 3], [2, 4, 1, 0]]), torch.tensor([[0, 1, -100, 3], [2, 4, 1, 0]]))
     for version in (1, 2):
@@ -140,9 +139,9 @@ def test_global_multifactor_adamw_matches_oracle_and_publishes_one_version() -> 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        result = execution.step(batch)
+        result = execution.step(_input(batch))
         (current,) = result.publication.after_refs
-        assert current.version_id == version and result.selected_count == 2
+        assert current.version_id == version and result.metrics["selected_count"] == 2
         if version == 1:
             execution.admit((second,))
             second_pin = execution.directory.inference_pin(second)
@@ -168,12 +167,11 @@ def test_global_multifactor_adamw_matches_oracle_and_publishes_one_version() -> 
 
 
 def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None:
-    model = TinyCausalModel()
+    model = TinyCausalPort()
     if torch.cuda.is_available():
-        gpu_model = TinyCausalModel()
+        gpu_model = TinyCausalPort()
         gpu_model.device = torch.device("cuda", 0)
-        gpu_model.initial_factors = tuple(t.to(gpu_model.device) for t in gpu_model.initial_factors)
-        online = TLMWorkload(TLMConfig(mode=TLMMode.ONLINE), gpu_model)
+        online = TLMWorkload(TLMConfig(mode=TLMMode.ONLINE), 2, 2)
         attachment = online.plan_backend(online.specialize(_facts(gpu_model), ExecutionOptions()))
         assert attachment.spec.overlay_bindings
         assert all(task.lane == "main" for task in attachment.plan.schedule.tasks)
@@ -181,14 +179,14 @@ def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None
     for mode in TLMMode:
         config = TLMConfig(mode=mode, threshold=0.0)
         limits = (TaskResourceFact(TaskSymbol("update"), 4096, input_shapes=((1, 3),)),)
-        with pytest.raises(ValueError):  # The frozen model must fit the reserved bytes.
-            TLMWorkload(config, model).plan_backend(_facts(model, reserved=model.resident_bytes - 1))
+        with pytest.raises(ValueError):  # The initialization templates must fit the reserved bytes.
+            TLMWorkload(config, 2, 2).plan_backend(_facts(model, reserved=model.resident_bytes - 1))
         facts = _facts(model, task_resources=limits)
-        execution = TLMWorkload(config, model).compile_backend(facts).execution
-        execution.admit(())
+        execution = TLMWorkload(config, 2, 2).compile_backend(facts, causal=model.bind).execution
+        (initial,) = execution.admit(())
         tokens = torch.zeros((2, 3), dtype=torch.int64)
         with pytest.raises(ValueError):  # Larger than the planned input shape.
-            execution.step(CausalTrainBatch(tokens, tokens))
+            execution.step(_input(CausalTrainBatch(tokens, tokens)))
         anchors = {
             execution.arena.plan.semantic_graph.tasks[task.task_id].symbol: task.anchor_id
             for task in execution.arena.plan.schedule.tasks
@@ -197,14 +195,14 @@ def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None
         assert anchors["update"] <= anchors["publish"]
         assert (anchors["publish"] < timeline["model.execute"]) == (mode is TLMMode.OFFLINE)
         assert (anchors["update"] >= timeline["token.commit"]) == (mode is TLMMode.ONLINE)
-        expected = _reference(model, model.initial_factors, batch, config)
-        result = execution.step(batch)
+        expected = _reference(model, execution.snapshot(initial)[::5], batch, config)
+        result = execution.step(_input(batch))
         torch.testing.assert_close(result.loss, expected)
-        assert result.publication is not None and result.selected_count == 1
+        assert result.publication is not None and result.metrics["selected_count"] == 1
         execution.retire(())
         skipped = _compile(model, replace(config, threshold=1e6))
         (initial,) = skipped.admit(())
-        result = skipped.step(batch)
-        assert result.publication is None and result.selected_count == 0
+        result = skipped.step(_input(batch))
+        assert result.publication is None and result.metrics["selected_count"] == 0
         assert skipped.arena.latest(initial.lineage_id) == initial
         skipped.retire(())
