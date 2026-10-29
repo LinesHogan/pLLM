@@ -189,7 +189,7 @@ def _session(b, execution):
     return (
         VllmSession(
             deployment,
-            SimpleNamespace(compute_logits=lambda hidden: hidden, effect_model=lambda: model),
+            SimpleNamespace(compute_logits=lambda hidden: hidden, model=model),
             None,
             2,
             cache_policy=CachePolicy.for_attachment(deployment.attachment, "isolate"),
