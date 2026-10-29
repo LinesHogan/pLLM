@@ -18,7 +18,17 @@ class Qwen2DownProjection(Module):
     forward: Callable[[Qwen2DownProjection, torch.Tensor], _LinearOutput]
 
 
+class _SiluAndMul(Module):
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor: ...
+
+
+class _RotaryEmbedding(Module):
+    def forward_native(self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+
 class Qwen2MLP(Module):
+    gate_up_proj: Qwen2DownProjection
+    act_fn: _SiluAndMul
     down_proj: Qwen2DownProjection
 
     def forward(self, x: torch.Tensor) -> torch.Tensor: ...
@@ -27,6 +37,11 @@ class Qwen2MLP(Module):
 class Qwen2Attention(Module):
     attn: Attention
     qkv_proj: Qwen2DownProjection
+    o_proj: Qwen2DownProjection
+    rotary_emb: _RotaryEmbedding
+    num_heads: int
+    num_kv_heads: int
+    head_dim: int
     q_size: int
     kv_size: int
 
@@ -42,6 +57,7 @@ class Qwen2DecoderLayer(Module):
 
 
 class Qwen2Model(Module):
+    embed_tokens: Qwen2LMHead
     do_not_compile: bool
     layers: Sequence[Qwen2DecoderLayer]
     norm: RMSNorm

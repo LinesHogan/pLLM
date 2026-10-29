@@ -103,6 +103,18 @@ __all__ = [
 
 
 @dataclass(frozen=True, slots=True)
+class CausalAdapter:
+    """Cold all-layer q/v factor geometry, resolved against the loaded backend."""
+
+    rank: int = 8
+    alpha: int = 16
+
+    def __post_init__(self) -> None:
+        if self.rank < 1 or self.alpha < 1:
+            raise ValueError("causal adapters require positive rank and alpha")
+
+
+@dataclass(frozen=True, slots=True)
 class BackendRequirements:
     hidden_inputs: tuple[HiddenInputSource, ...] = ()
     parameter_targets: tuple[ParameterTarget, ...] = ()
@@ -134,7 +146,7 @@ class CausalModel(Protocol):
     @property
     def scale(self) -> float: ...
     @property
-    def model_source(self) -> tuple[str, str]: ...
+    def model_source(self) -> tuple[str, str] | None: ...
     @property
     def resident_bytes(self) -> int: ...
     def logits(
