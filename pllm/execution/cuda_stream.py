@@ -106,6 +106,8 @@ class DeviceCounters:
 
     def add(self, values: torch.Tensor, stream: torch.cuda.Stream | None) -> None:
         """Order GPU writes to the snapshot; CPU reads only after the latest event."""
+        if stream is None and self.device.is_cuda:
+            stream = torch.cuda.current_stream(self.device.device)
         if stream is None:
             self.device.add_(values)
             self.host.copy_(self.device)

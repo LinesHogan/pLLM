@@ -224,6 +224,6 @@ def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None
         skipped = _compile(model, replace(config, threshold=1e6))
         (initial,) = skipped.admit(())
         result = skipped.step(_input(batch))
-        assert result.publication is None and result.metrics["selected_count"] == 0
-        assert skipped.arena.latest(initial.lineage_id) == initial
+        assert result.publication is not None and result.metrics["selected_count"] == 0
+        assert skipped.arena.latest(initial.lineage_id).version_id == initial.version_id + 1
         skipped.retire(())

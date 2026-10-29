@@ -117,7 +117,7 @@ from pllm.execution.token_program import Over, Tokens
 from pllm.execution.trace import TraceEvent
 from pllm.kernels.adamw import AdamWConfig
 
-F = TypeVar("F", bound=Callable[..., torch.Tensor | tuple[torch.Tensor, ...] | TensorUpdate])
+F = TypeVar("F", bound=Callable[..., torch.Tensor | tuple[torch.Tensor, ...] | TensorUpdate | None])
 Initializer = Callable[[Tensors, torch.Generator], None]
 C = TypeVar("C")
 
@@ -1180,7 +1180,9 @@ def _typed(value: object, expected: type[C]) -> C | None:
     return value if isinstance(value, expected) else None
 
 
-def _arguments(function: Callable[..., torch.Tensor | tuple[torch.Tensor, ...] | TensorUpdate]) -> dict[str, _Source]:
+def _arguments(
+    function: Callable[..., torch.Tensor | tuple[torch.Tensor, ...] | TensorUpdate | None],
+) -> dict[str, _Source]:
     """Read each parameter's source from its default value, e.g. `h: torch.Tensor = pllm.hidden(0)`."""
     result: dict[str, _Source] = {}
     for name, parameter in signature(function, eval_str=False).parameters.items():

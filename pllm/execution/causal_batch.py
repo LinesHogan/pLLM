@@ -13,7 +13,7 @@ from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding
 from pllm.contracts.semantic_graph import MathContract, SemanticInputSource, StateEffectKind, StateSelectionInputSource
 from pllm.execution.declaration import Call, State, When, native
 from pllm.execution.tensor_frame import TensorFrame, Tensors, TensorUpdate
-from pllm.execution.tensor_program import autograd_loss
+from pllm.execution.tensor_program import TaskOutput, autograd_loss
 
 if TYPE_CHECKING:
     from pllm.execution.tensor_binding import TensorBinding
@@ -61,7 +61,7 @@ def declare_causal_train(
     state: State,
     *,
     ports: Mapping[str, CausalPort],
-    function: Callable[..., torch.Tensor | TensorUpdate],
+    function: Callable[..., torch.Tensor | TensorUpdate | None],
     identity: str,
     when: When,
 ) -> Call:
@@ -87,12 +87,17 @@ def declare_causal_train(
         data.trained_rows = batch.input_ids.shape[0]
         return result
 
-    def count(data: TensorFrame) -> int:
-        if data.training is None:
-            return data.trained_rows
-        return int(torch.where(data.training.changed, data.training.trained_rows, 0).item())
+    def summary(data: TensorFrame) -> TaskOutput:
+        training = data.training
+        if training is None:
+            return TaskOutput(loss_count=1, update_count=1, trained_rows=data.trained_rows)
+        return TaskOutput(
+            loss_count=1,
+            update_mask=training.changed,
+            counters=torch.stack((training.update_count, torch.where(training.changed, training.trained_rows, 0))),
+        )
 
-    compute = autograd_loss(loss, names, count)
+    compute = autograd_loss(loss, names, summary)
 
     b.causal_state = str(state.declaration.resource)
     call = b.compute(

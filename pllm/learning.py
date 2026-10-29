@@ -42,7 +42,15 @@ from pllm.execution.host_runtime import (
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.tensor_frame import Tensors
-from pllm.execution.tensor_program import FunctionMath, InvocationOutput, Roots, TensorAdamW, TensorBatch, autograd_loss
+from pllm.execution.tensor_program import (
+    FunctionMath,
+    InvocationOutput,
+    Roots,
+    TaskOutput,
+    TensorAdamW,
+    TensorBatch,
+    autograd_loss,
+)
 from pllm.execution.torch_private import MemoryTrace, MemoryUsage
 from pllm.kernels.adamw import AdamWConfig
 from pllm.usage import Activation, InstanceState, Overlay, RequestState
@@ -222,9 +230,14 @@ class CompletionWorkload(
         )
         (layout,) = b.layouts.layouts
         optimizer = TensorAdamW(definition.optimizer, len(layout.layout.fields) // 5)
+        trained_rows = freeze(owner.trained_rows)
         update = b.compute(
             "train",
-            function=autograd_loss(freeze(owner.loss), tuple(shapes), freeze(owner.trained_rows)),
+            function=autograd_loss(
+                freeze(owner.loss),
+                tuple(shapes),
+                lambda data: TaskOutput(loss_count=1, update_count=1, trained_rows=trained_rows(data)),
+            ),
             inputs={"batch": b.input("input", "completions", f"{self.name}.training@1"), "state": state.read()},
             outputs=("control",),
             changes=state,

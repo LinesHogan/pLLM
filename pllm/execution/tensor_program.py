@@ -114,7 +114,7 @@ class TaskOutput:
 def autograd_loss(
     function: Callable[[D, Mapping[str, torch.Tensor]], torch.Tensor | None],
     names: tuple[str, ...],
-    trained_rows: Callable[[D], int],
+    summary: Callable[[D], TaskOutput],
 ) -> Callable[[D, TensorBatch], TaskOutput]:
     """Compile tensor forward/loss and AOT backward; report and update outside the graph."""
     compiled = torch.compile(  # pyright: ignore[reportUnknownMemberType]
@@ -130,15 +130,15 @@ def autograd_loss(
             loss = call(data, parameters)
             if loss is None:
                 return TaskOutput()
-            count = trained_rows(data)
-            if count == 0:
+            output = summary(data)
+            if output.update_mask is None and output.trained_rows == 0:
                 return TaskOutput()
-            if loss.ndim != 0 or count < 0:
+            if loss.ndim != 0 or output.trained_rows < 0:
                 raise ValueError(
                     "optimizer functions must return a scalar loss with a positive effective row count (or None to skip)"
                 )
             gradients = torch.autograd.grad(loss, tuple(parameters.values()))
-        return TaskOutput(loss=loss.detach(), gradients=gradients, loss_count=1, update_count=1, trained_rows=count)
+        return replace(output, loss=loss.detach(), gradients=gradients)
 
     return execute
 
@@ -419,10 +419,25 @@ class TensorOperation(Generic[D]):
         def run() -> TaskOutput:
             output = self.body(data, batch, None)
             if self.optimizer is not None and output.gradients:
-                self.optimizer.update(batch.roots, batch.field_slots, output.gradients)
+                self.apply_gradients(batch.roots, batch.field_slots, batch.roots, output)
             return output
 
         return measure(run)
+
+    def apply_gradients(
+        self,
+        roots: Sequence[tuple[torch.Tensor, ...]],
+        slots: FieldSlots,
+        before: Sequence[tuple[torch.Tensor, ...]],
+        output: TaskOutput,
+    ) -> None:
+        """Settle optimizer fields on-device, preserving every field on a skipped update."""
+        assert self.optimizer is not None
+        self.optimizer.update(roots, slots, output.gradients)
+        if output.update_mask is not None:
+            for root, source in zip(roots, before, strict=True):
+                for value, previous in zip(root[: 5 * self.optimizer.groups], source, strict=False):
+                    torch.where(output.update_mask, value, previous, out=value)
 
     def execute(self, context: StateTaskContext[D]) -> ProjectionResiduals:
         data, stream = context.data(), context.pin.stream
@@ -451,7 +466,7 @@ class TensorOperation(Generic[D]):
                 )
                 write = context.prepare_owned_write(context.pin.refs.take(selected), copy_fields=self.copy_fields)
                 roots = context.arena.lazy_roots((write,) * len(selected), write.after_refs)
-                self.optimizer.update(roots, roots.field_slots, output.gradients)
+                self.apply_gradients(roots, roots.field_slots, tuple(batch.roots[index] for index in selected), output)
             if write is None:
                 write = context.sole_write()
             if output.field_writes:

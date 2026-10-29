@@ -403,7 +403,8 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         self._overlay_counters = (
             DeviceCounters(self.device)
             if any(
-                task.visibility is not None and task.visibility.scope == "overlay"
+                (task.visibility is not None and task.visibility.scope == "overlay")
+                or (task.math is not None and task.math.parameter_gradients)
                 for task in arena.plan.semantic_graph.tasks
             )
             else None

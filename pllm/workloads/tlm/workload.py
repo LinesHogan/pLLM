@@ -104,9 +104,15 @@ class TLMWorkload(pllm.Workload):
         labels: torch.Tensor = pllm.batch("labels"),
         attention_mask: torch.Tensor | None = pllm.batch("attention_mask"),
         model: pllm.model.CausalCall = pllm.causal_model("adapter"),
-    ) -> pllm.TensorUpdate:
-        """Select with the adapted model online, or the no-grad base offline."""
+    ) -> pllm.TensorUpdate | None:
+        """Select online with adapted logits, offline with base logits.
+
+        Empty selections publish unchanged fields; selected_count remains a device tensor.
+        A disabled loss skips the forward and produces no selection metric.
+        """
         config = self.config
+        if config.lamb == 0:
+            return None
         selection = None
         if config.mode.value == "offline":
             with torch.no_grad():
@@ -119,5 +125,5 @@ class TLMWorkload(pllm.Workload):
         weighted = sentence * (config.lamb * torch.exp(selection - config.threshold)) * selected.to(sentence.dtype)
         count = selected.sum()
         loss = torch.where(count == 0, weighted.mean(), weighted.sum() / count.clamp_min(1))
-        changed = (count > 0) & (config.lamb != 0)
+        changed = count > 0
         return pllm.TensorUpdate(loss, changed, changed.to(torch.int64), count, {"selected_count": count})
