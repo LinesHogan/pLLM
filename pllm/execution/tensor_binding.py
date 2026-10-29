@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from functools import partial
+from math import prod
 from typing import TYPE_CHECKING
 
 import torch
@@ -32,6 +33,7 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.state_feed import FeedBinding
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
+from pllm.execution.causal_batch import CausalBinder
 from pllm.execution.declaration import Builder, Dimensions
 from pllm.execution.overlay_batch import OverlayBatch
 from pllm.execution.ptts.page_bundle import PagePublication
@@ -68,6 +70,8 @@ class TensorResult:
     parameter_gradient_fields: Mapping[StateRef, tuple[torch.Tensor, ...]] = field(
         default_factory=lambda: dict[StateRef, tuple[torch.Tensor, ...]]()
     )
+
+    metrics: Mapping[str, torch.Tensor] = field(default_factory=lambda: dict[str, torch.Tensor]())
 
     @property
     def parameter_gradients(self) -> Mapping[StateRef, torch.Tensor]:
@@ -111,6 +115,8 @@ class TensorBinding(Builder[TensorFrame]):
         # Module states: their flat initial values, built once at bind from the model dimensions and seed.
         self.initial_values: dict[str, Callable[[Dimensions, int], torch.Tensor]] = {}
         self.weighted_training = False
+        self.causal: CausalBinder | None = None
+        self.causal_training = False
         self.probe: BackendPlacementProbe | None = None
         self.max_requests = 1
         self.sample_limit: int | None = None
@@ -119,6 +125,16 @@ class TensorBinding(Builder[TensorFrame]):
         self.field_views: dict[tuple[str, str], FieldView] = {}
         self.imports: dict[str, tuple[FieldView, ...]] = {}
         self.position_states: tuple[tuple[str, float], ...] = ()
+
+    @property
+    def initialization_bytes(self) -> int:
+        """Retained parameter templates for grouped batch optimizer states."""
+        return sum(
+            prod(field.shape) * field.dtype.itemsize
+            for layout in self.layouts.layouts
+            if layout.resource in self.initializers
+            for field in layout.layout.fields[::5]
+        )
 
     @property
     def has_exports(self) -> bool:
@@ -322,5 +338,10 @@ class TensorBinding(Builder[TensorFrame]):
     @staticmethod
     def result(data: TensorFrame, invocation: InvocationOutput) -> TensorResult:
         return TensorResult(
-            invocation.value, invocation, tuple(data.entries), data.input_gradients, data.parameter_gradient_fields
+            invocation.value if data.training is None else data.training.output.detach(),
+            invocation,
+            tuple(data.entries),
+            data.input_gradients,
+            data.parameter_gradient_fields,
+            {} if data.training is None else data.training.metrics,
         )

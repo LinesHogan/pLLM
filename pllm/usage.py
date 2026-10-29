@@ -32,6 +32,7 @@ from pllm.contracts.parameter_overlay import (
     ParameterOverlayFieldBinding,
     ParameterOverlayOperator,
     ParameterTarget,
+    expand_targets,
 )
 from pllm.contracts.request_identity import RequestKeyField, canonical_request_key_fields
 from pllm.contracts.request_state import RequestStateKey
@@ -52,6 +53,7 @@ from pllm.contracts.state_feed import FeedBinding, FeedOrder
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorLayoutRequest
 from pllm.contracts.visibility import Exact as Exact, Visibility as Visibility
 from pllm.execution.binding_base import SGD as SGD, Buffer as Buffer, buffer_field, overlay_fields
+from pllm.execution.causal_batch import CausalBinder, CausalCall, CausalPort, declare_causal_train
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import Call, Dimensions, Shape, State, When, native
 from pllm.execution.freeze import (
@@ -137,6 +139,9 @@ class _Source:
     def port(self, context: _Declaration) -> TensorPort:
         raise TypeError(f"unsupported tensor source: {type(self).__name__}")
 
+    def training_port(self, context: _Declaration) -> CausalPort:
+        raise ValueError("causal training inputs must name Batch, Parameter or causal_model ports")
+
     def overlay(self, state: str, buffers: Mapping[str, Buffer]) -> str:
         raise TypeError("overlay inputs must name captured operands or its own state buffers")
 
@@ -190,6 +195,20 @@ class Samples(_Source):
 class Batch(_Source):
     field: str
 
+    def training_port(self, context: _Declaration) -> CausalPort:
+        from pllm.contracts.auxiliary import CausalTrainBatch
+
+        if self.field not in ("input_ids", "labels", "attention_mask"):
+            raise ValueError("causal batches provide input_ids, labels and optional attention_mask")
+        return CausalPort(
+            context.binding.input("training", self.field, CausalTrainBatch.schema),
+            lambda batch, parameters: {
+                "input_ids": batch.input_ids,
+                "labels": batch.labels,
+                "attention_mask": batch.attention_mask,
+            }[self.field],
+        )
+
     def batch(self, state: str, definition: InstanceState) -> tuple[str, str]:
         return "batch", self.field
 
@@ -199,6 +218,9 @@ class Parameter(_Source):
     state: str
     field: str
     per_row: bool = False
+
+    def training_port(self, context: _Declaration) -> CausalPort:
+        return CausalPort(context.states[self.state].read(), lambda batch, parameters: parameters[self.field])
 
     def port(self, context: _Declaration) -> TensorPort:
         parameter = context.parameters[self.state, self.field]
@@ -211,6 +233,24 @@ class Parameter(_Source):
         if self.state != state or self.field not in definition.fields or self.per_row:
             return super().batch(state, definition)
         return "parameter", self.field
+
+
+@dataclass(frozen=True)
+class _CausalModel(_Source):
+    """An overlay's differentiable views adapted to a worker-local model callable."""
+
+    name: str
+
+    def training_port(self, context: _Declaration) -> CausalPort:
+        overlay = context.values[self.name]
+        if not isinstance(overlay, Overlay):
+            raise ValueError("causal_model must name an Overlay declaration")
+        state = context.states[overlay.state]
+        fields = tuple(f"{key}_{i}" for i in range(len(overlay.targets)) for key in overlay.applied_fields)
+        forward = None if context.binding.causal is None else context.binding.causal(overlay.bindings(context))
+        return CausalPort(
+            state.read(), lambda batch, parameters: CausalCall(forward, tuple(parameters[key] for key in fields))
+        )
 
 
 @dataclass(frozen=True)
@@ -328,6 +368,11 @@ def parameter(state: str, field: str, *, per_row: bool = False) -> Any:
     return Parameter(state, field, per_row)
 
 
+def causal_model(overlay: str) -> Any:
+    """A borrowed causal decoder using this invocation's overlay; .base bypasses it."""
+    return _CausalModel(overlay)
+
+
 def module(state: str) -> Any:
     """A state declared with `module=`, called like the module; request state uses each row's own parameters."""
     return _Module(state)
@@ -376,8 +421,8 @@ def capture(source: _Source, *, state: str, field: str) -> Any:
     return _Captured(source, Capture(state, field))
 
 
-def batch(field: Literal["hidden", "base_logits", "labels", "weights"]) -> Any:
-    """One tensor of the host-supplied `WeightedCEBatch` an SGD training step consumes."""
+def batch(field: Literal["hidden", "base_logits", "labels", "weights", "input_ids", "attention_mask"]) -> Any:
+    """One field of a host-supplied WeightedCEBatch or CausalTrainBatch."""
     return Batch(field)
 
 
@@ -527,20 +572,19 @@ class Overlay(ParameterEffect):
 
     def declare(self, context: _Declaration) -> None:
         """Bind logical parameter views to the model's targets."""
-        state = context.states[self.state]
-        context.binding.overlay(
-            state,
-            None,
-            tuple(
-                ParameterOverlayFieldBinding(
-                    target,
-                    self.operator,
-                    tuple(context.binding.field_views[self.state, f"{key}_{i}"] for key in self.applied_fields),
-                    self.state,
-                    self.scale,
-                )
-                for i, target in enumerate(self.targets)
-            ),
+        context.binding.overlay(context.states[self.state], None, self.bindings(context))
+
+    def bindings(self, context: _Declaration) -> tuple[ParameterOverlayFieldBinding, ...]:
+        """The same logical views consumed by inference and differentiable model calls."""
+        return tuple(
+            ParameterOverlayFieldBinding(
+                target,
+                self.operator,
+                tuple(context.binding.field_views[self.state, f"{key}_{i}"] for key in self.applied_fields),
+                self.state,
+                self.scale,
+            )
+            for i, target in enumerate(self.targets)
         )
 
 
@@ -665,6 +709,23 @@ class _Train(_Effect):
         """Choose optimizer training or the explicit weighted SGD transition."""
         arguments, captures = operation.arguments()
         definition = operation.context.state_definition(self.state, "training requires a declared optimizer state")
+        if any(isinstance(source, _CausalModel) for source in arguments.values()):
+            context = operation.context
+            if captures or operation.gradient or operation.rows or self.update or self.reset or self.steps != 1:
+                raise ValueError("causal batch training uses one optimizer step without inference-row selectors")
+            context.train(
+                declare_causal_train(
+                    context.binding,
+                    operation.name,
+                    context.states[self.state],
+                    ports={key: source.training_port(context) for key, source in arguments.items()},
+                    function=freeze(operation.function),
+                    identity=f"python:{fingerprint(operation.function)}",
+                    when=operation.phase.value,
+                ),
+                self.state,
+            )
+            return
         match definition.optimizer:
             case SGD() as optimizer:
                 self.weighted(
@@ -1031,7 +1092,7 @@ def overlay(
     )
 
 
-def on(phase: Phase) -> Callable[[F], F]:
+def on(phase: Phase | Config) -> Callable[[F], F]:
     """Run the method in `phase`; needed for methods without an effect or to move an effect's phase."""
     return _mark(phase=phase)
 
@@ -1367,7 +1428,7 @@ class _Declaration:
             seeds.append(function)
             return
         phase, marked, gradient, rows = (
-            _typed(markers.get("__pllm_phase__"), Phase),
+            _typed(Config.resolve(markers.get("__pllm_phase__"), self.owner), Phase),
             _typed(markers.get("__pllm_effect__"), _Effect),
             _typed(markers.get("__pllm_gradient__"), _Gradient),
             _typed(markers.get("__pllm_rows__", ""), str),
@@ -1422,7 +1483,18 @@ class _Declaration:
                 buffer_field(key, buffer, lambda m: (m.hidden_size, m.hidden_size)) for key, buffer in buffers.items()
             )
         shapes = {field.name: field.shape for field in fields}
-        if definition.optimizer is not None:
+        if isinstance(definition.optimizer, AdamWConfig) and any(
+            isinstance(source, _CausalModel)
+            and isinstance(overlay := self.values[source.name], Overlay)
+            and overlay.state == name
+            for operation in self.operations
+            for source in operation.arguments()[0].values()
+        ):
+            state = self.binding.state(name, fields, namespace=definition.namespace, optimizer=definition.optimizer)
+            ports = parameter_ports(
+                self.binding, state, shapes, initialize=_frozen(definition.initialize), grouped=True
+            )
+        elif definition.optimizer is not None:
             dtype = fields[0].dtype
             state, ports = declare_parameters(
                 self.binding,
@@ -1564,6 +1636,12 @@ class Workload(
         """Declare owner values and operations, then compose and sign their graph."""
         context = _Declaration.read(self)
         context.binding = b
+        context.values = {
+            key: replace(value, targets=expand_targets(value.targets, b.dimensions.layer_count))
+            if isinstance(value, Overlay)
+            else value
+            for key, value in context.values.items()
+        }
         context.declare_values()
         for operation in sorted(context.operations, key=lambda operation: operation.name):
             operation.effect.declare(operation)
@@ -1571,7 +1649,7 @@ class Workload(
         context.attach_training()
         context.sign_composition()
 
-    def declaration(self, facts: BackendCompileFacts) -> TensorBinding:
+    def declaration(self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None) -> TensorBinding:
         """Build the graph and tensor tasks against the backend's model dimensions."""
         dimensions = Dimensions(
             facts.probe.hidden_size,
@@ -1587,6 +1665,7 @@ class Workload(
             resources=facts.timeline.task_resources,
         )
         b.probe = facts.probe
+        b.causal = causal
         b.max_requests = facts.max_admitted_lineages
         self._build(b)
         b.configure_scans(facts)
@@ -1642,7 +1721,10 @@ class Workload(
         )
 
     def declare(self, facts: BackendCompileFacts) -> tuple[SemanticGraph, TensorLayoutRequest, BackendAttachmentSpec]:
-        return self.declaration(facts).finish()
+        binding = self.declaration(facts)
+        if binding.causal_training and min(facts.timeline.reserved_bytes, default=0) < binding.initialization_bytes:
+            raise ValueError("reserve the initialized parameter templates in the backend timeline")
+        return binding.finish()
 
     def _functions(
         self, b: TensorBinding, device: torch.device, seed: int
@@ -1651,20 +1733,26 @@ class Workload(
             init = b.initializers.get(resource)
             if resource in b.initial_values:
                 init = partial(copy_initial, b.initial_values[resource](b.dimensions, seed).to(device))
-            values: tuple[torch.Tensor, ...] = ()
+            values: dict[int, torch.Tensor] = {}
             if init is not None:
                 layout = next(item.layout for item in b.layouts.layouts if item.resource == resource)
-                values = tuple(
-                    torch.zeros(field.shape, dtype=field.dtype.torch, device=device) for field in layout.fields
+                tensors = tuple(
+                    torch.zeros(
+                        field.shape if not b.causal_training or i % 5 == 0 else (0,),
+                        dtype=field.dtype.torch,
+                        device=device,
+                    )
+                    for i, field in enumerate(layout.fields)
                 )
                 # A resource's initial tensors are shared values, independent of admission history.
-                init(values, torch.Generator(device=device).manual_seed(seed))
+                init(tensors, torch.Generator(device=device).manual_seed(seed))
+                values = {i: value for i, value in enumerate(tensors) if not b.causal_training or i % 5 == 0}
 
             def initialize(roots: Roots, keys: tuple[RequestStateKey | None, ...]) -> None:
                 if values:
                     for root in roots:
-                        for target, value in zip(root, values, strict=True):
-                            target.copy_(value)
+                        for index, value in values.items():
+                            root[index].copy_(value)
 
             return initialize
 
@@ -1692,10 +1780,10 @@ class Workload(
         )
 
     def bind_math(
-        self, facts: BackendCompileFacts, plan: PlanBundle
+        self, facts: BackendCompileFacts, plan: PlanBundle, *, causal: CausalBinder | None = None
     ) -> MathBinding[TensorStepInput, TensorFrame, TensorOutput]:
         owner = _snapshot(self)
-        b = owner.declaration(facts)
+        b = owner.declaration(facts, causal=causal)
         if b.graph != plan.semantic_graph or b.layouts != plan.tensor_layout_request:
             raise ValueError("tensor mathematics differ from the original signed declaration")
         return owner.operations(facts, plan, b)
@@ -1715,6 +1803,18 @@ class Workload(
             raise ValueError("this workload has no explicit tensor implementation")
         with FakeTensorMode():
             binding = self.declaration(facts)
+        if binding.causal_training:
+            if options.memory_budget_bytes is not None and not facts.timeline.task_resources:
+                raise ValueError(
+                    "causal training needs measured costs and signed [sequences, tokens] bounds for a finite budget"
+                )
+            resident = binding.initialization_bytes
+            return replace(
+                facts.timeline,
+                reserved_bytes=tuple(
+                    value + resident for value in (facts.timeline.reserved_bytes or (0,) * len(facts.timeline.anchors))
+                ),
+            )
         return derive_resources(binding, facts, options)
 
     def operations(

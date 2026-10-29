@@ -58,6 +58,7 @@ class Decoder:
 
     def projection(self, target: ParameterTarget) -> tuple[Projection, int, int, Mlp | None]:
         """Resolve the supported projection and its disjoint output slice."""
+        assert target.layer is not None
         layer = self.model.model.layers[target.layer]
         if target.module is ParameterModuleKind.MLP and target.role is ParameterRole.DOWN_PROJECTION_WEIGHT:
             module = layer.mlp.down_proj

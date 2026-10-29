@@ -34,6 +34,7 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
 from pllm.execution.binding_base import Buffer
+from pllm.execution.causal_batch import CausalBinder
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import Builder, Call, Dimensions, Field, HostOperation, Shape, When, native
 from pllm.execution.freeze import fingerprint, freeze, owner_snapshot, owner_values
@@ -516,7 +517,7 @@ class CausalAdapterWorkload(
         return builder.finish()
 
     def bind_math(
-        self, facts: BackendCompileFacts, plan: PlanBundle
+        self, facts: BackendCompileFacts, plan: PlanBundle, *, causal: CausalBinder | None = None
     ) -> MathBinding[TensorStepInput, ContextT, ResultT]:
         builder, functions = self._binding(facts)
         if (

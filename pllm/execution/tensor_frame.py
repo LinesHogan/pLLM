@@ -377,6 +377,7 @@ class TensorFrame:
     batch_inputs: tuple[torch.Tensor, ...] = ()
     selected: tuple[int, ...] = ()
     trained_rows: int = 0
+    training: TensorUpdate | None = None
     replacements: tuple[tuple[int, tuple[torch.Tensor, ...]], ...] = ()
     index: RowIndex | None = None
     plan: RowPlan | None = None

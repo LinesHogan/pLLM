@@ -35,6 +35,7 @@ from pllm.execution.backend_attachment import (
     bind_backend_attachment,
     derive_attachment_resources,
 )
+from pllm.execution.causal_batch import CausalBinder
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import (
     Builder as Builder,
@@ -270,15 +271,17 @@ class BackendWorkload(BackendAuthoring, Generic[DataT, ResultT]):
         raise NotImplementedError("declare a CausalAdapterWorkload to bind a causal model")
 
     @abstractmethod
-    def bind_math(self, facts: BackendCompileFacts, plan: PlanBundle) -> MathBinding[TensorStepInput, DataT, ResultT]:
+    def bind_math(
+        self, facts: BackendCompileFacts, plan: PlanBundle, *, causal: CausalBinder | None = None
+    ) -> MathBinding[TensorStepInput, DataT, ResultT]:
         """Bind mathematics to selected implementations; no storage or execution ownership."""
         ...
 
     def bind_backend(
-        self, facts: BackendCompileFacts, attachment: BackendAttachment
+        self, facts: BackendCompileFacts, attachment: BackendAttachment, *, causal: CausalBinder | None = None
     ) -> BackendDeployment[DataT, ResultT]:
         plan = attachment.plan
-        math = self.bind_math(facts, plan)
+        math = self.bind_math(facts, plan, causal=causal)
         device = (
             torch.device("cpu")
             if facts.probe.device_kind.value == "cpu"
@@ -287,5 +290,7 @@ class BackendWorkload(BackendAuthoring, Generic[DataT, ResultT]):
         arena = PageBundleArena(plan, device=device, _owned_resources=math.local_resources(plan))
         return BackendDeployment(math.bind(arena, attachment.sampler_anchor_id), attachment)
 
-    def compile_backend(self, facts: BackendCompileFacts) -> BackendDeployment[DataT, ResultT]:
-        return self.bind_backend(facts, self.plan_backend(facts))
+    def compile_backend(
+        self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None
+    ) -> BackendDeployment[DataT, ResultT]:
+        return self.bind_backend(facts, self.plan_backend(facts), causal=causal)

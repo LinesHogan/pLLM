@@ -16,6 +16,7 @@ from pllm.contracts.parameter_overlay import (
     ParameterRole as ParameterRole,
     ParameterTarget as ParameterTarget,
 )
+from pllm.execution.causal_batch import CausalCall as CausalCall
 from pllm.usage import (
     Activation as Activation,
     Overlay as Overlay,
@@ -23,6 +24,7 @@ from pllm.usage import (
 )
 
 __all__ = [
+    "CausalCall",
     "ParameterEffect",
     "ParameterTarget",
     "ParameterModuleKind",

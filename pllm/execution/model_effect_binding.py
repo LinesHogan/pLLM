@@ -363,7 +363,10 @@ def declare_layer_route(
             pending = False
             for step in program.steps:
                 if isinstance(step, Segment):
-                    pending |= any(step.start <= target.layer < step.stop for target in b.overlay_targets)
+                    pending |= any(
+                        target.layer is not None and step.start <= target.layer < step.stop
+                        for target in b.overlay_targets
+                    )
                 elif isinstance(step, ApplyUpdates):
                     b.route_updates |= pending
                     pending = False

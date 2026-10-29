@@ -32,13 +32,26 @@ class ParameterOverlayOperator(StrEnum):
 
 @dataclass(frozen=True, slots=True, order=True)
 class ParameterTarget:
-    layer: int
+    layer: int | None
     module: ParameterModuleKind
     role: ParameterRole
 
     def __post_init__(self) -> None:
-        if self.layer < 0:
+        if self.layer is not None and self.layer < 0:
             raise ValueError("parameter target layer must be resolved and non-negative")
+
+
+def expand_targets(targets: tuple[ParameterTarget, ...], layers: int) -> tuple[ParameterTarget, ...]:
+    """Resolve layer=None declarations against the loaded model, in projection order."""
+    if all(target.layer is not None for target in targets):
+        return targets
+    return tuple(
+        sorted(
+            ParameterTarget(layer, target.module, target.role)
+            for target in targets
+            for layer in (range(layers) if target.layer is None else (target.layer,))
+        )
+    )
 
 
 @dataclass(frozen=True, slots=True)

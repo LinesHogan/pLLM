@@ -244,6 +244,7 @@ def parameter_ports(
     *,
     initialize: Callable[[Tensors, torch.Generator], None] | None = None,
     memory: Mapping[str, Shape] = {},
+    grouped: bool = False,
 ) -> dict[str, TensorPort]:
     """Bind named views of an allocated state without creating another root."""
     dimensions = b.dimensions
@@ -252,7 +253,9 @@ def parameter_ports(
     views: dict[str, FieldView] = {}
     offset = 0
     for index, (key, shape) in enumerate(zip(shapes, sizes, strict=True)):
-        views[key] = FieldView(LayoutFieldId(index if raw else 0), 0 if raw else offset, shape)
+        views[key] = FieldView(
+            LayoutFieldId(index if raw else 5 * index if grouped else 0), 0 if raw or grouped else offset, shape
+        )
         offset += prod(shape)
     base = len(shapes) if raw else 5
     for index, (key, shape) in enumerate(memory.items()):
