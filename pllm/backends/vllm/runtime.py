@@ -18,7 +18,6 @@ import torch
 from vllm import RequestOutput, SamplingParams, __version__ as _VLLM_VERSION
 from vllm.config import VllmConfig
 from vllm.entrypoints.llm import LLM
-from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
 
 from pllm.authoring import (
     AuxiliaryInput,
@@ -37,7 +36,7 @@ from pllm.backends.vllm.overlay_graph import (
 from pllm.backends.vllm.parameter_overlay import (
     inspect_parameter_targets,
 )
-from pllm.backends.vllm.training import Qwen2Training
+from pllm.backends.vllm.training import CausalTraining
 from pllm.config import ModelConfig, RunnerKind, VllmDType
 from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import (
@@ -655,13 +654,12 @@ def bind_training(
     if adapter is None:
         return workload
     base_model = None if runner is None else runner.decoder.model
-    if base_model is not None and not isinstance(base_model, Qwen2ForCausalLM):
-        raise ValueError("causal training still needs a Qwen2 model")
-    model = Qwen2Training(
+    model = CausalTraining(
         adapter,
         facts.probe.targets,
         facts.probe.tensor_dtype,
         facts.initialization_seed,
+        facts.probe.model_fingerprint,
         base_model,
     )
     return workload.bind_causal_model(model)
@@ -690,7 +688,7 @@ def probe_backend(
     )
     adapter = requirements.causal_adapter
     if adapter is not None and runner.dtype is not torch.bfloat16:
-        raise ValueError("Qwen2 training requires qualified unquantized BF16 TP1 weights")
+        raise ValueError("causal training requires qualified unquantized BF16 TP1 weights")
     requested_targets = (
         requirements.parameter_targets
         if adapter is None

@@ -4,28 +4,17 @@ import torch
 from torch.nn import Module
 from transformers import Qwen2Config
 from typing_extensions import TypeVar
-from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.models._decoder import DecoderAttention, DecoderLayer, DecoderMLP, DecoderModel
 
-class _SiluAndMul(Module):
-    def forward_native(self, x: torch.Tensor) -> torch.Tensor: ...
-
-class _RotaryEmbedding(Module):
-    def forward_native(
-        self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]: ...
-
-class Qwen2MLP(DecoderMLP):
-    gate_up_proj: LinearBase
-    act_fn: _SiluAndMul
+class Qwen2MLP(DecoderMLP): ...
 
 class Qwen2Attention(DecoderAttention):
-    o_proj: LinearBase
-    rotary_emb: _RotaryEmbedding
-    num_heads: int
-    num_kv_heads: int
-    head_dim: int
+    qk_norm: bool
+    q_norm: RMSNorm
+    k_norm: RMSNorm
 
 class Qwen2DecoderLayer(DecoderLayer[Qwen2Attention, Qwen2MLP]): ...
 
@@ -35,6 +24,7 @@ class Qwen2Model(DecoderModel[_Layer]): ...
 
 class Qwen2ForCausalLM(Module):
     model: Qwen2Model
+    logits_processor: LogitsProcessor
     lm_head: VocabParallelEmbedding
     config: Qwen2Config
     quant_config: object | None

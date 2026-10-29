@@ -8,10 +8,19 @@ from torch.nn import Module
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.sequence import IntermediateTensors
 
+class SiluAndMul(Module):
+    def forward_native(self, x: Tensor) -> Tensor: ...
+
 class DecoderAttention(Module):
+    o_proj: LinearBase
+    rotary_emb: RotaryEmbedding
+    num_heads: int
+    num_kv_heads: int
+    head_dim: int
     attn: Attention
     qkv_proj: LinearBase
     q_size: int
@@ -20,6 +29,8 @@ class DecoderAttention(Module):
     def forward(self, positions: Tensor, hidden_states: Tensor) -> Tensor: ...
 
 class DecoderMLP(Module):
+    gate_up_proj: LinearBase
+    act_fn: SiluAndMul
     down_proj: LinearBase
 
     def forward(self, x: Tensor) -> Tensor: ...
@@ -41,8 +52,6 @@ class DecoderModel(Module, Generic[_Layer]):
     layers: Sequence[_Layer]
     norm: RMSNorm
     do_not_compile: bool
-    forward: Callable[
-        [Tensor | None, Tensor, IntermediateTensors | None, Tensor | None], Tensor | IntermediateTensors
-    ]
+    forward: Callable[[Tensor | None, Tensor, IntermediateTensors | None, Tensor | None], Tensor | IntermediateTensors]
 
     def embed_input_ids(self, input_ids: Tensor) -> Tensor: ...
