@@ -1,4 +1,4 @@
-"""Effect buffer facts and the Python-Rust input check used by attachment planning."""
+"""Effect buffer facts and the declaration checks that turn a planned workload into its attachment."""
 
 from __future__ import annotations
 
@@ -7,25 +7,35 @@ from math import prod
 
 import torch
 
-from pllm import _core
 from pllm.contracts.backend_attachment import (
     TOKEN_CAPTURE_CAPABILITY,
     AttachmentGraphMode,
+    AttachmentKind,
     AttachmentTaskBinding,
     AttachmentTaskRole,
     BackendAttachment,
     BackendAttachmentSpec,
     BackendPlacementProbe,
 )
-from pllm.contracts.codec import encode_boundary
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator
+from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
     AnchorId,
+    AnchorSymbol,
+    HiddenInputSource,
+    SamplerFeedbackInputSource,
     SchedulerTimeline,
     SemanticGraph,
+    SemanticOutputKind,
+    SemanticTask,
+    StateEffectKind,
+    StateScope,
+    StateSelectionInputSource,
+    StepIdInputSource,
     TaskResourceFact,
     TaskSymbol,
+    TimingConstraint,
     TokenProgramEffect,
     ValueResourceFact,
 )
@@ -152,9 +162,84 @@ def derive_attachment_resources(
     )
 
 
-def check_backend_attachment(attachment: BackendAttachment) -> None:
-    """Reject, in Rust, attachments a workload can declare but the backend cannot run."""
-    _core.check_backend_attachment(encode_boundary(attachment))
+def _check_attachment(attachment: BackendAttachment) -> None:
+    """Reject attachments a workload author can declare but the backend cannot run.
+
+    Only mistakes reachable from a declaration are checked: export and training inputs, the
+    trained state's scope, sampled-token readers and CUDA-graph overlay state. Buffer shapes and
+    dtypes are checked earlier, where the declaration resolves them against the model.
+    """
+    if attachment.spec.kind is AttachmentKind.OBSERVATION:
+        _check_exports(attachment)
+    elif attachment.spec.kind is AttachmentKind.REQUEST_TRAINING:
+        _check_training(attachment)
+    if attachment.probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH:
+        graph = attachment.plan.semantic_graph
+        for state in graph.states:
+            if state.resource in graph.model_reads and state.scope is not StateScope.REQUEST:
+                raise ValueError(
+                    f"CUDA-graph overlays read request state; declare {state.resource!r} as "
+                    "pllm.RequestState or set cuda_graphs=False"
+                )
+
+
+def _check_exports(attachment: BackendAttachment) -> None:
+    """The observation path runs only bound export tasks between publication and sampling."""
+    if not attachment.probe.hidden_resources:
+        raise ValueError("exports need a hidden input, e.g. `h: torch.Tensor = pllm.hidden(0)`")
+    exports = {symbol for _, symbol in attachment.spec.tasks}
+    for task in attachment.plan.semantic_graph.tasks:
+        if task.symbol not in exports or not _observes(task):
+            raise ValueError(
+                f"{task.symbol}: a workload with exports runs only exports in Phase.OBSERVE that read hidden "
+                "rows and state; remove its other operations, state writes and phase overrides"
+            )
+
+
+def _observes(task: SemanticTask) -> bool:
+    return (
+        all(effect.kind is StateEffectKind.READ for effect in task.effects)
+        and all(output.kind is SemanticOutputKind.HOST for output in task.outputs)
+        and task.timing == TimingConstraint(AnchorSymbol("state.publish"), AnchorSymbol("sampler.pre_draw"))
+        and all(
+            isinstance(port.source, HiddenInputSource | StepIdInputSource | StateSelectionInputSource)
+            for port in task.inputs
+        )
+    )
+
+
+def _check_training(attachment: BackendAttachment) -> None:
+    """Training reads hidden rows; sampler feedback reaches only the update and its helpers."""
+    if not attachment.probe.hidden_resources:
+        raise ValueError("train and sampler operations need a hidden input, e.g. `h: torch.Tensor = pllm.hidden(0)`")
+    spec, graph = attachment.spec, attachment.plan.semantic_graph
+    (state,) = (state for state in graph.states if state.resource == spec.state_resource)
+    adds_logits = spec.sampler_stage is SamplerStage.PACKED_PRE_FILTER_ADD
+    if state.scope is not StateScope.REQUEST and not adds_logits:
+        raise ValueError(
+            f"declare the trained state {state.resource!r} as pllm.RequestState; only workloads with "
+            "@pllm.add_logits train an InstanceState"
+        )
+    # Planning already places every feedback reader after the draw; what remains is who may read it.
+    transition = attachment.task_bindings[-1].task_id
+    updated = False
+    for scheduled in attachment.plan.schedule.tasks:
+        task = graph.tasks[scheduled.task_id]
+        feeds_update = not updated and (scheduled.task_id == transition or _read_only_helper(task))
+        if any(isinstance(port.source, SamplerFeedbackInputSource) for port in task.inputs) and not (
+            adds_logits and feeds_update
+        ):
+            raise ValueError(
+                f"{task.symbol}: sampled tokens are readable only beside @pllm.add_logits, by the train "
+                "operation or by read-only operations that feed it"
+            )
+        updated |= scheduled.task_id == transition
+
+
+def _read_only_helper(task: SemanticTask) -> bool:
+    return all(effect.kind is StateEffectKind.READ for effect in task.effects) and all(
+        output.kind is SemanticOutputKind.TEMPORARY for output in task.outputs
+    )
 
 
 def bind_attachment_tasks(
@@ -193,12 +278,11 @@ def bind_backend_attachment(
         probe=probe,
         plan=plan,
     )
-    check_backend_attachment(attachment)
+    _check_attachment(attachment)
     return attachment
 
 
 __all__ = [
     "bind_attachment_tasks",
     "bind_backend_attachment",
-    "check_backend_attachment",
 ]

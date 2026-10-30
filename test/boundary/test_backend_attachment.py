@@ -29,7 +29,6 @@ from pllm.contracts.parameter_overlay import (
 )
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
-from pllm.execution.backend_attachment import check_backend_attachment
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
@@ -94,7 +93,6 @@ def test_attachment_inputs_cross_the_wire() -> None:
     for attachment in (workload.compile_backend(facts).attachment, sampler_deployment(probe, facts).attachment):
         reconstructed = decode_boundary(encode_boundary(attachment), BackendAttachment)
         assert reconstructed == attachment
-        check_backend_attachment(reconstructed)
 
 
 @pytest.mark.parametrize("multiprocessing", (False, True))

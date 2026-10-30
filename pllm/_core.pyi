@@ -38,7 +38,6 @@ def validate_schedule(
     decision_json: str,
     state_json: str | None = None,
 ) -> None: ...
-def check_backend_attachment(attachment_json: str) -> None: ...
 def compile_state_schedule(
     graph_json: str,
     timeline_json: str,

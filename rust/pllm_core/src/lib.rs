@@ -11,7 +11,6 @@ mod workload_frontend;
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     planning::register(m)?;
-    planning::backend_attachment::register(m)?;
     planning::scheduler::register(m)?;
     planning::tensor_layout::register(m)?;
     prefill_row_plan::register(m)?;

@@ -2,24 +2,12 @@
 
 use pyo3::prelude::*;
 
-pub(crate) mod backend_attachment;
 pub(crate) mod scheduler;
 pub(crate) mod semantic_graph;
 pub(crate) mod state_representation;
 pub(crate) mod tensor_layout;
 mod tensor_policy;
 mod version_hazards;
-
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PlanBundle {
-    pub(crate) semantic_graph: semantic_graph::SemanticGraph,
-    pub(crate) timeline: semantic_graph::Timeline,
-    pub(crate) schedule: scheduler::ScheduleDecision,
-    pub(crate) states: state_representation::StateRepresentationDecision,
-    pub(crate) tensor_layout_request: tensor_layout::TensorLayoutRequest,
-    pub(crate) tensor_layout_decision: tensor_layout::TensorLayoutDecision,
-}
 
 #[pyfunction]
 fn compile_state_schedule(
