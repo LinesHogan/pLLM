@@ -89,7 +89,6 @@ def _worker(connection: Connection) -> None:
                 write = arena.prepare_admission((resource.resource,))
                 arena.write_field(write, 0, LayoutFieldId(0)).fill_(3)
                 receipt = arena.publish(write)
-                arena.settle(receipt)
                 (ref,) = receipt.after_refs
                 pin = arena.pin_exact(StateRefs.of((ref,)))
                 assert torch.all(arena.borrow_field(pin, ref, LayoutFieldId(0)) == 3)

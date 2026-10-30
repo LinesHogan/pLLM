@@ -199,7 +199,6 @@ class Feed:
         if self._arena is None:
             self._arena = PageBundleArena(self._plan, _owned_resources=(self._binding.resource,))
             publication = self._arena.publish(self._arena.prepare_admission((self._binding.resource,), stream))
-            self._arena.settle(publication)
             (self._current,) = publication.after_refs
         return self._arena
 
@@ -235,7 +234,6 @@ class Feed:
             for name, field in self._fields.items():
                 arena.write_field(write, 0, field.field_id).copy_(fields[name])
             publication = arena.publish(write)
-            arena.settle(publication)
             (self._current,) = publication.after_refs
             pin = arena.pin_exact(publication.after_refs, stream)
             try:

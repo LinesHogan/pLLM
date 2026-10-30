@@ -206,12 +206,6 @@ class _Write:
 
 
 @dataclass(slots=True)
-class _Publication:
-    write: _Write
-    settled: bool = False
-
-
-@dataclass(slots=True)
 class _Pin:
     pages: tuple[_Pages, ...]
     remote: list[RemoteCompletion] = dataclass_field(default_factory=lambda: list[RemoteCompletion]())
@@ -424,7 +418,7 @@ class PageBundleArena:
                 self._tables[selected.resource] = _Table(selected, self._pools[selected.resource])
         self._writes: dict[PageWrite, _Write] = {}
         self._pins: dict[PagePin, _Pin] = {}
-        self._publications: dict[PagePublication, _Publication] = {}
+        self._publications: dict[PagePublication, _Write] = {}
         self._releases: dict[PageRelease, _Pin] = {}
         self._recycled: set[PagePublication | PageRelease] = set()
         self._storage_streams: set[int] = set()
@@ -541,9 +535,9 @@ class PageBundleArena:
             )
             + tuple(
                 group
-                for receipt, publication in self._publications.items()
+                for receipt, write in self._publications.items()
                 if receipt not in self._recycled
-                for group in (*publication.write.sources, *publication.write.targets)
+                for group in (*write.sources, *write.targets)
             )
             + tuple(group for write in self._writes.values() for group in write.sources)
         )
@@ -839,14 +833,9 @@ class PageBundleArena:
             # The writer's source hold now protects the old table pages until completion.
             source.release()
         self._writes.pop(token)
-        self._publications[receipt] = _Publication(write)
+        self._publications[receipt] = write
         self._queue_completion(receipt, token.stream)
         return receipt
-
-    def settle(self, receipt: PagePublication) -> None:
-        publication = self._publications.get(receipt)
-        assert publication is not None and not publication.settled
-        publication.settled = True
 
     def abort(self, token: PageWrite) -> None:
         """End logical ownership now; future physical reuse waits for the queued writes."""
@@ -864,10 +853,7 @@ class PageBundleArena:
         for receipt in (*self._publications, *self._releases):
             if receipt in self._recycled:
                 continue
-            if isinstance(receipt, PagePublication):
-                if not self._publications[receipt].settled:
-                    continue
-            elif not all(read.query() for read in receipt.remote_reads):
+            if isinstance(receipt, PageRelease) and not all(read.query() for read in receipt.remote_reads):
                 continue
             for group in self._receipt_pages(receipt):
                 group.release(receipt.completion)
@@ -1088,7 +1074,7 @@ class PageBundleArena:
     def _receipt_pages(self, receipt: PagePublication | PageRelease) -> tuple[_Pages, ...]:
         if isinstance(receipt, PageRelease):
             return self._releases[receipt].pages
-        write = self._publications[receipt].write
+        write = self._publications[receipt]
         return (*write.sources, *write.targets)
 
     def _poll_completions(self, wait: bool, resources: set[str] | None) -> None:
@@ -1117,10 +1103,7 @@ class PageBundleArena:
         completed: list[_Pages] = []
         receipts: list[PagePublication | PageRelease] = []
         for receipt in self._ready_receipts:
-            if isinstance(receipt, PagePublication):
-                if not self._publications[receipt].settled:
-                    continue
-            else:
+            if isinstance(receipt, PageRelease):
                 groups = self._releases[receipt].pages
                 relevant = resources is None or any(group.table.resource in resources for group in groups)
                 if wait and relevant and (resources is None or all(read.query() for read in receipt.remote_reads)):

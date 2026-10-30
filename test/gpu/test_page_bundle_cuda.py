@@ -61,7 +61,6 @@ def test_cuda_ptts_waits_for_exact_fence_before_reclaim() -> None:
         for root, value in zip(roots, initial, strict=True):
             root[0].copy_(value)
     admitted = arena.publish(write)
-    arena.settle(admitted)
     pin = arena.pin_exact(admitted.after_refs, reader)
     borrowed = arena.borrow_field(pin, admitted.after_refs[0], LayoutFieldId(0))
     original = arena.snapshot(pin, admitted.after_refs[0])
@@ -73,7 +72,6 @@ def test_cuda_ptts_waits_for_exact_fence_before_reclaim() -> None:
         )
         apply_adamw(arena.writable_roots(update), fields, AdamWConfig(0.01, (0.9, 0.999), 1e-8, 0.0), gradients)
     publication = arena.publish(update)
-    arena.settle(publication)
     updated = arena.pin_exact(publication.after_refs, reader)
     result = arena.snapshot(updated, publication.after_refs[0])
     # Old roots must remain live while their original consumer stream still runs.
@@ -85,7 +83,6 @@ def test_cuda_ptts_waits_for_exact_fence_before_reclaim() -> None:
     with pytest.raises(AssertionError):  # a released pin admits no new reads
         arena.snapshot(pin, admitted.after_refs[0])
     pressure = arena.publish(arena.prepare_transition(publication.after_refs, writer))
-    arena.settle(pressure)
     # Reusing the released reader's pages does not wait on the host: the writer's stream waits for the reader's
     # fence on the GPU, so the reader still sees the old value (checked below).
     update = arena.prepare_transition(pressure.after_refs, writer)
@@ -98,7 +95,6 @@ def test_cuda_ptts_waits_for_exact_fence_before_reclaim() -> None:
     assert result[2].item() == 1
     arena.retire(pressure.after_refs)
     replacement = arena.publish(arena.prepare_admission(("distiller",) * 2, writer))
-    arena.settle(replacement)
     torch.testing.assert_close(arena.snapshot(updated, publication.after_refs[0])[0], result[0])
     arena.wait_release(arena.release_pin(updated))
     arena.retire(replacement.after_refs)
@@ -162,7 +158,6 @@ def _cuda_ipc_lifecycle():
             field.copy_(expected)
             del field
         initial = arena.publish(initial)
-        arena.settle(initial)
         (ref,) = initial.after_refs
         pin = arena.pin_exact(StateRefs.of((ref,)), stream)
         control, child_control = context.Pipe()
@@ -190,7 +185,6 @@ def _cuda_ipc_lifecycle():
             with torch.cuda.stream(stream):
                 arena.write_field(write, 0, LayoutFieldId(0)).add_(99)
             publication = arena.publish(write)
-            arena.settle(publication)
             released = arena.release_pin(pin)
             arena.retire(publication.after_refs)
             assert not arena.release_complete(released)

@@ -59,7 +59,7 @@ DataT = TypeVar("DataT")
 ResultT = TypeVar("ResultT")
 ResultCo = TypeVar("ResultCo", covariant=True)
 ProjectionResiduals = Mapping[tuple[RequestIdentity, ParameterTarget], torch.Tensor]
-_PagePhase = Literal["abort", "release", "settle"]
+_PagePhase = Literal["abort", "release"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,15 +80,6 @@ class _PinRelease:
         return arena.release_pin(self.pin)
 
 
-@dataclass(frozen=True, slots=True)
-class _PublicationSettlement:
-    receipt: PagePublication
-    phase: ClassVar[_PagePhase] = "settle"
-
-    def complete(self, arena: PageBundleArena) -> None:
-        arena.settle(self.receipt)
-
-
 @dataclass(frozen=True, slots=True, eq=False)
 class _SlotRelease:
     allocations: tuple[tuple[SlotPools, Slots], ...]
@@ -104,7 +95,7 @@ class _SlotRelease:
             pools.release(slots, completion)
 
 
-_PageObligation = _WriteAbort | _PinRelease | _PublicationSettlement | _SlotRelease
+_PageObligation = _WriteAbort | _PinRelease | _SlotRelease
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,13 +219,12 @@ class StateTaskContext(Generic[DataT]):
         receipt = self.arena.publish(token)
         self.publications.append(receipt)
         self._obligations.remove(obligation)
-        self._obligations.append(_PublicationSettlement(receipt))
         self.trace.record(
             TracePhase.PUBLISH, self.invocation_id, refs=receipt.after_refs, operation_id=receipt.operation_id
         )
         return receipt
 
-    def finish_pages(self, phases: tuple[_PagePhase, ...] = ("abort", "release", "settle")) -> None:
+    def finish_pages(self, phases: tuple[_PagePhase, ...] = ("abort", "release")) -> None:
         """Discharge each phase in registration order, retaining failures for retry."""
         for phase in phases:
             for obligation in tuple(self._obligations):

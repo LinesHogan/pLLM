@@ -210,8 +210,6 @@ class RequestStateDirectory:
         for identity, key in holds:
             self._identity_holds[key.resource, identity] = key
         self._inference_pins.update(pins)
-        if receipt is not None:
-            self.arena.settle(receipt)
         return receipt
 
     def latest_refs(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateRef, ...]:
