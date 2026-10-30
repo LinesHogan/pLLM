@@ -24,7 +24,7 @@ from pllm.execution.state_execution import StateExecution
 from pllm.host import HostRuntimeFacts
 from pllm.workloads.fttt import FTTTWorkload
 from pllm.workloads.override import OverRIDEConfig, OverRIDEWorkload
-from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload
+from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload, ttrl_rewards
 
 
 def main() -> None:
@@ -152,12 +152,12 @@ def main() -> None:
         feedback = pllm.make_llm(workload=FTTTWorkload(), config=facts)
         edited = feedback.run(batch)
         assert edited is not None and edited.update_count == 1
+        ttrl = TTRLConfig(rank=2, votes_per_prompt=3, samples_per_prompt=2)
         reward = pllm.make_llm(
-            workload=TTRLWorkload(TTRLConfig(rank=2, votes_per_prompt=3, samples_per_prompt=2)),
-            config=replace(facts, max_input_rows=3, memory_budget_bytes=1 << 20),
+            workload=TTRLWorkload(ttrl), config=replace(facts, max_input_rows=3, memory_budget_bytes=1 << 20)
         )
         reward.admit((), stream)
-        trained = reward.step(batch, stream)
+        trained = reward.step(ttrl_rewards(batch, ttrl, stream).step, stream)
         assert trained.loss is not None and reward.diagnostics().update_count == 1
         reward.retire(())
         print(f"OverRIDE: updates={diagnostics.update_count} sampler_checks={len(observed)}; FTTT/TTRL updates=1/1")

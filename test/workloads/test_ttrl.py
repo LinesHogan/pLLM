@@ -4,15 +4,13 @@ Also covers settlement retry after a post-publication failure, blocked vote grou
 the disabled workload and a zero-loss update.
 """
 
-from collections.abc import Mapping
 from dataclasses import replace
 
 import pytest
 import torch
 
-import pllm
 from pllm import make_llm
-from pllm.authoring import FunctionMath
+from pllm.authoring import FunctionMath, TensorStepInput, WeightedRowBatch
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId
 from pllm.execution.ptts.state_refs import StateRefs
@@ -26,18 +24,11 @@ from pllm.host import (
     HostRuntimeFacts,
     RetryAction,
 )
-from pllm.workloads.ttrl import TTRLConfig, TTRLData, TTRLWorkload, boxed_label
+from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload, boxed_label, ttrl_rewards
 
 
 def fail_output(self, context):
     raise RuntimeError("injected output failure")
-
-
-class ZeroLoss(TTRLWorkload):
-    def loss(self, data: TTRLData, parameters: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        loss = parameters["head"].square().sum() * 0.0
-        data.loss = loss.detach()
-        return loss
 
 
 def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -78,6 +69,7 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         batch = CompletionInput.capture(completions, source, producer)
         source.zero_()
         assert batch.completions is completions and torch.count_nonzero(batch.hidden) > 0
+        rewards = ttrl_rewards(batch, config, stream)
         if stream is not None:
             stream.synchronize()
         down = torch.nn.Parameter(original[0][:8].reshape(2, 4).clone())
@@ -86,22 +78,19 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         selected = [0, 1, 3, 4]
         expected_rewards = [1.0, 0.0, None, 0.0, 1.0, 1.0]
         latest = initial
-        extra = replace(completions.entries[0], identity=RequestIdentity("excess", 2, 0))
-        excess = CompletionInput.capture(
-            CompletionBatch((*completions.entries, extra)), torch.ones(7, 4, device=device), producer
-        )
-        with pytest.raises(ValueError):  # seven completions exceed max_input_rows
+        ones = torch.ones(7, device=device)
+        excess = TensorStepInput.of_batch(WeightedRowBatch(torch.ones(7, 4, device=device), ones, ones))
+        with pytest.raises(ValueError):  # seven rows exceed max_input_rows
             execution.step(excess, stream)
         assert execution.arena.latest(initial.lineage_id) == initial
         for _ in range(2):
-            result = execution.step(batch, stream)
+            result = execution.step(rewards.step, stream)
             if stream is not None:
                 stream.synchronize()
             assert result.publication is not None and tuple(result.publication.before_refs) == (latest,)
             (latest,) = result.publication.after_refs
-            assert result.state_ref is latest
-            assert [item.reward for item in result.reward_outcomes] == expected_rewards
-            assert [item.action for item in result.retry_controls] == [
+            assert [item.reward for item in rewards.reward_outcomes] == expected_rewards
+            assert [item.action for item in rewards.retry_controls] == [
                 RetryAction.ACCEPT,
                 RetryAction.RETRY,
                 RetryAction.RETRY,
@@ -109,7 +98,7 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
                 RetryAction.ACCEPT,
                 RetryAction.ACCEPT,
             ]
-            assert [item.retry_after_update for item in result.retry_controls] == [
+            assert [item.retry_after_update for item in rewards.retry_controls] == [
                 False,
                 True,
                 False,
@@ -117,9 +106,9 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
                 False,
                 False,
             ]
-            assert all(item.state is BarrierState.READY and item.ready_count == 2 for item in result.update_barriers)
+            assert all(item.state is BarrierState.READY and item.ready_count == 2 for item in rewards.update_barriers)
             for completion, reward, control in zip(
-                completions.entries, result.reward_outcomes, result.retry_controls, strict=True
+                completions.entries, rewards.reward_outcomes, rewards.retry_controls, strict=True
             ):
                 assert reward.completion is control.completion is completion
             optimizer.zero_grad()
@@ -144,7 +133,7 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         for value, reference in zip(execution.arena.snapshot(old_pin, initial), original, strict=True):
             torch.testing.assert_close(value, reference, rtol=0, atol=0)
         execution.arena.wait_release(execution.arena.release_pin(old_pin))
-        pending = execution.start_step(batch, stream)
+        pending = execution.start_step(rewards.step, stream)
         execution.execute_anchor(pending, AnchorId(0))
         execution.cancel_step(pending)
         assert execution.arena.latest(initial.lineage_id) == latest
@@ -153,46 +142,46 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
             # Fail result conversion after the update is published (workload code is signed, so inject here).
             fault.setattr(FunctionMath, "output", fail_output)
             with pytest.raises(StateSettlementError) as failure:
-                execution.step(batch, stream)
+                execution.step(rewards.step, stream)
         # Settlement can be retried: it returns the publication that already happened.
         retry = execution.finish_step(failure.value.context)
         assert retry.publication is failure.value.receipt
+        (latest,) = retry.publication.after_refs
         assert execution.diagnostics().update_count == 3
         with pytest.raises(RuntimeError):
             execution.finish_step(failure.value.context)
         missing = replace(
             batch, completions=CompletionBatch(tuple(replace(c, text="missing") for c in completions.entries))
         )
-        result = execution.step(missing, stream)
-        assert result.loss is result.publication is None
-        assert all(item.reward is None for item in result.reward_outcomes)
-        assert all(item.state is BarrierState.BLOCKED and item.ready_count == 0 for item in result.update_barriers)
+        blocked = ttrl_rewards(missing, config, stream)
+        assert all(item.reward is None for item in blocked.reward_outcomes)
+        assert all(item.state is BarrierState.BLOCKED and item.ready_count == 0 for item in blocked.update_barriers)
+        # Nothing selected: the step publishes the same values and leaves every optimizer field untouched.
+        before = execution.snapshot(latest, stream)
+        result = execution.step(blocked.step, stream)
+        (published,) = result.publication.after_refs
+        for value, reference in zip(execution.snapshot(published, stream), before, strict=True):
+            torch.testing.assert_close(value, reference, rtol=0, atol=0)
         with pytest.raises(ValueError):  # an incomplete vote group
-            execution.step(
-                replace(batch, completions=CompletionBatch((completions.entries[0],)), hidden=batch.hidden[:1]), stream
+            ttrl_rewards(
+                replace(batch, completions=CompletionBatch((completions.entries[0],)), hidden=batch.hidden[:1]), config
             )
         execution.retire((), wait=True)
         diagnostics = execution.diagnostics()
         assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
 
-    disabled = make_llm(
-        workload=TTRLWorkload(replace(config, enabled=False)),
-        config=HostRuntimeFacts(torch.device("cpu"), hidden_size=4, state_memory_budget_bytes=65536),
-    )
-    disabled.admit(())
-    result = disabled.step(CompletionInput.capture(completions, torch.zeros(6, 4)))
-    assert result.loss is result.publication is None
-    assert all(item.state is BarrierState.BLOCKED for item in result.update_barriers)
-    disabled.retire(())
+    disabled = ttrl_rewards(CompletionInput.capture(completions, torch.zeros(6, 4)), replace(config, enabled=False))
+    assert all(item.state is BarrierState.BLOCKED for item in disabled.update_barriers)
 
-    facts = pllm.host.HostRuntimeFacts(torch.device("cpu"), hidden_size=4, initialization_seed=11)
-    execution = ZeroLoss(config).declare_host(facts).compile()
+    facts = HostRuntimeFacts(torch.device("cpu"), hidden_size=4, initialization_seed=11)
+    execution = TTRLWorkload(config).compile_host(facts)
     (initial,) = execution.admit(())
     before = execution.snapshot(initial)
-    result = execution.step(CompletionInput.capture(completions, torch.ones(6, 4)))
+    zeros = torch.zeros(6, 4)
+    result = execution.step(TensorStepInput.of_batch(WeightedRowBatch(zeros, zeros[:, 0], torch.ones(6))))
     # A zero loss still publishes: the step count advances with zero gradients and unchanged weights.
-    assert result.loss.item() == 0 and result.publication is not None and result.update_count == 1
-    after = execution.snapshot(result.state_ref)
+    assert result.loss.item() == 0 and result.publication is not None
+    after = execution.snapshot(result.publication.after_refs[0])
     torch.testing.assert_close(after[0], before[0], rtol=0, atol=0)
     assert after[2].item() == 1 and torch.count_nonzero(after[1]) == 0
     execution.retire(())

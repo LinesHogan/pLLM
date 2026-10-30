@@ -1,4 +1,4 @@
-"""Host-side learning: transactional host workloads and completion training.
+"""Host-side surfaces: transactional host workloads, completion feedback and weighted batches.
 
 Pass `HostRuntimeFacts` to `pllm.make_llm` for host workloads. Completion, reward, retry and barrier types
 are the feedback a host service exchanges with the framework.
@@ -26,7 +26,6 @@ from pllm.execution.host_runtime import (
     TransactionHostBinding as TransactionHostBinding,
     transaction as transaction,
 )
-from pllm.learning import CompletionWorkload as CompletionWorkload
 
 __all__ = [
     "transaction",
@@ -36,7 +35,6 @@ __all__ = [
     "HostRuntimeFacts",
     "CompletionInput",
     "NoHostRequest",
-    "CompletionWorkload",
     "WeightedCEBatch",
     "BarrierState",
     "Completion",

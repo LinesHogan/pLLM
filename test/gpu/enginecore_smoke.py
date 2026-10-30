@@ -47,7 +47,7 @@ from pllm.workloads.prefill_adapters import PrefillAdapters
 from pllm.workloads.recirculation import RecirculationWorkload
 from pllm.workloads.reft import ActivationConfig, ActivationWorkload
 from pllm.workloads.tlm import TLMConfig, TLMWorkload
-from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload
+from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload, ttrl_rewards
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 PROMPTS = ["The sky is", "Water freezes at"]
@@ -516,12 +516,10 @@ def main() -> int:
         facts = HostRuntimeFacts(torch.device("cpu"), hidden_size=batch.hidden.shape[1])
         edited = pllm.make_llm(workload=FTTTWorkload(), config=facts).run(batch)
         assert edited is not None and edited.update_count == 1
-        reward = pllm.make_llm(
-            workload=TTRLWorkload(TTRLConfig(rank=2, votes_per_prompt=3, samples_per_prompt=2)),
-            config=facts,
-        )
+        ttrl = TTRLConfig(rank=2, votes_per_prompt=3, samples_per_prompt=2)
+        reward = pllm.make_llm(workload=TTRLWorkload(ttrl), config=facts)
         reward.admit(())
-        trained = reward.step(batch)
+        trained = reward.step(ttrl_rewards(batch, ttrl).step)
         assert trained.loss is not None and reward.diagnostics().update_count == 1
         reward.retire(())
         assert not torch.cuda.is_initialized()

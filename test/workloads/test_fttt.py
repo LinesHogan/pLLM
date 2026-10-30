@@ -109,7 +109,7 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
     from vllm import SamplingParams
 
     from pllm.backends.vllm.runtime import VllmLlm
-    from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload
+    from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload, ttrl_feedback
 
     class Generation:
         """Scripted generation: prompt 7 answers correctly; with votes, two of three agree."""
@@ -191,18 +191,17 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
         == 1
     )
 
-    reward = make_llm(
-        workload=TTRLWorkload(TTRLConfig(rank=2, votes_per_prompt=3, samples_per_prompt=3)),
-        config=HostRuntimeFacts(torch.device("cpu"), hidden_size=4),
-    )
+    ttrl = TTRLConfig(rank=2, votes_per_prompt=3, samples_per_prompt=3)
+    reward = make_llm(workload=TTRLWorkload(ttrl), config=HostRuntimeFacts(torch.device("cpu"), hidden_size=4))
     reward.admit(())
+
     votes = Generation(votes=True)
     # A vote group retries as a whole after its quorum update.
     rounds = list(
         votes.generate_feedback(
             ["vote"] * 3,
             SamplingParams(max_tokens=1),
-            feedback=reward.step,
+            feedback=ttrl_feedback(reward, ttrl),
             feedback_group="votes",
             max_rounds=2,
             prompt_indices=(11, 11, 11),

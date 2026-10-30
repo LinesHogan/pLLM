@@ -1,10 +1,9 @@
-"""Majority reward learning on the original instance arena and execution receipt."""
-
-from __future__ import annotations
+"""TTRL: majority-vote rewards computed on the host, and a reward head trained on them as an ordinary workload."""
 
 import re
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from math import isfinite
 
@@ -12,7 +11,19 @@ import torch
 from torch.nn import functional as F
 
 import pllm
-from pllm.host import BarrierState, ControlReason, RetryAction, RetryControl, RewardOutcome, UpdateBarrier
+from pllm.authoring import TensorStepInput, WeightedRowBatch
+from pllm.execution.state_execution import StateExecution
+from pllm.execution.tensor_binding import TensorOutput
+from pllm.execution.tensor_frame import TensorFrame
+from pllm.host import (
+    BarrierState,
+    CompletionInput,
+    ControlReason,
+    RetryAction,
+    RetryControl,
+    RewardOutcome,
+    UpdateBarrier,
+)
 
 
 def boxed_label(text: str) -> str:
@@ -53,139 +64,148 @@ class TTRLConfig:
             raise ValueError("TTRL requires positive rank/rate and paired vote/sample counts")
 
 
-@dataclass(slots=True)
-class TTRLData:
-    batch: pllm.host.CompletionInput
-    reward_outcomes: tuple[RewardOutcome, ...]
-    retry_controls: tuple[RetryControl, ...]
-    update_barriers: tuple[UpdateBarrier, ...]
-    selected_rows: tuple[int, ...]
-    loss: torch.Tensor | None = None
-
-
 @dataclass(frozen=True, slots=True)
-class TTRLResult:
+class TTRLRewards:
+    """Host feedback for one completion batch, and the training step that learns from it."""
+
     reward_outcomes: tuple[RewardOutcome, ...]
     retry_controls: tuple[RetryControl, ...]
     update_barriers: tuple[UpdateBarrier, ...]
-    loss: torch.Tensor | None
-    state_ref: pllm.state.StateRef
-    publication: pllm.state.PagePublication | None
+    step: TensorStepInput
 
     @property
     def update_count(self) -> int:
-        return int(self.publication is not None)
+        """1 when any row trains, else 0: an empty step publishes unchanged values."""
+        return int(any(barrier.ready_count for barrier in self.update_barriers))
 
 
-@dataclass(frozen=True, slots=True)
-class TTRLWorkload(pllm.host.CompletionWorkload[TTRLData, TTRLResult]):
+def ttrl_rewards(value: CompletionInput, config: TTRLConfig, stream: torch.cuda.Stream | None = None) -> TTRLRewards:
+    """Vote each prompt's boxed answers; rows matching the majority train the head toward reward 1.
+
+    Pass the CUDA `stream` you give to `execution.step`: the step input is built and ordered on it.
+    """
+    entries = value.completions.entries
+    groups: dict[int, list[int]] = {}
+    for index, completion in enumerate(entries):
+        groups.setdefault(completion.identity.prompt_idx, []).append(index)
+    labels = tuple(boxed_label(completion.text) for completion in entries)
+    majority: dict[int, str] = {}
+    selected: list[int] = []
+    barriers: list[UpdateBarrier] = []
+    for prompt, indices in groups.items():
+        group_id = entries[indices[0]].group_id
+        if (
+            any(entries[i].group_id != group_id for i in indices)
+            or config.votes_per_prompt
+            and len(indices) != config.votes_per_prompt
+        ):
+            raise ValueError("TTRL requires one complete declared vote group per prompt")
+        counts = Counter(labels[i] for i in indices if labels[i])
+        majority[prompt] = max(counts, key=lambda label: counts[label]) if counts else ""
+        eligible = indices[: config.samples_per_prompt] if config.samples_per_prompt else indices
+        trainable = [i for i in eligible if labels[i]] if config.enabled else []
+        selected.extend(trainable)
+        barriers.append(
+            UpdateBarrier(
+                f"ttrl:{group_id}:{prompt}",
+                group_id,
+                BarrierState.READY if trainable else BarrierState.BLOCKED,
+                tuple(entries[i].identity.request_id for i in indices),
+                len(trainable),
+                ControlReason.REWARD_READY if trainable else ControlReason.NO_REWARD,
+            )
+        )
+    rewards: list[RewardOutcome] = []
+    controls: list[RetryControl] = []
+    for completion, label in zip(entries, labels, strict=True):
+        correct = label == majority[completion.identity.prompt_idx] if label else None
+        rewards.append(
+            RewardOutcome(
+                completion,
+                float(correct) if correct is not None else None,
+                correct,
+                "",
+                "ttrl_majority:boxed_normalized_exact",
+                label,
+                "" if label else ControlReason.MISSING_ANSWER.value,
+            )
+        )
+        controls.append(
+            RetryControl(
+                completion,
+                RetryAction.ACCEPT if correct else RetryAction.RETRY,
+                ControlReason.MAJORITY_ANSWER
+                if correct
+                else ControlReason.NON_MAJORITY_ANSWER
+                if label
+                else ControlReason.MISSING_ANSWER,
+                correct is False,
+            )
+        )
+    hidden = value.hidden
+    with nullcontext() if stream is None else torch.cuda.stream(stream):
+        if value.readiness is not None:
+            value.readiness.order_on(torch.cuda.current_stream(hidden.device))
+            hidden.record_stream(torch.cuda.current_stream(hidden.device))
+        chosen = set(selected)
+        batch = WeightedRowBatch(
+            hidden,
+            hidden.new_tensor([reward.reward or 0.0 for reward in rewards]),
+            hidden.new_tensor([float(index in chosen) for index in range(len(entries))]),
+        )
+    return TTRLRewards(tuple(rewards), tuple(controls), tuple(barriers), TensorStepInput.of_batch(batch))
+
+
+def ttrl_feedback(
+    execution: StateExecution[TensorStepInput, TensorFrame, TensorOutput],
+    config: TTRLConfig,
+    stream: torch.cuda.Stream | None = None,
+) -> Callable[[CompletionInput], TTRLRewards]:
+    """A `generate_feedback` callback: vote, step the reward head on the votes, return the rewards."""
+
+    def feedback(value: CompletionInput) -> TTRLRewards:
+        rewards = ttrl_rewards(value, config, stream)
+        execution.step(rewards.step, stream)
+        return rewards
+
+    return feedback
+
+
+@dataclass(frozen=True)
+class TTRLWorkload(pllm.Workload):
+    """A rank-r reward head, fit by AdamW to the 0/1 majority rewards of `ttrl_rewards` steps."""
+
     name = "ttrl"
     config: TTRLConfig = TTRLConfig()
 
-    def training_example(self, facts: pllm.host.HostRuntimeFacts) -> TTRLData:
-        # Reward metadata cannot be inferred from tensor shapes. Select every admitted row
-        # so the loss trace covers the maximum training batch, including partial vote groups.
-        batch = pllm.host.CompletionInput.example(facts)
-        rewards = tuple(RewardOutcome(entry, 1.0, True, "", "shape", "0", "") for entry in batch.completions.entries)
-        return TTRLData(batch, rewards, (), (), tuple(range(len(batch.hidden))))
-
     @property
-    def parameters(self) -> pllm.InstanceState:
-        config = self.config
-
-        def initialize(parameters: Mapping[str, torch.Tensor], generator: torch.Generator) -> None:
-            head = parameters["head"]
-            hidden = head.numel() // config.rank - 1
-            head[: config.rank * hidden].normal_(std=hidden**-0.5, generator=generator)
-
+    def head(self) -> pllm.InstanceState:
+        rank = self.config.rank
         return pllm.InstanceState(
-            {"head": lambda m: (config.rank * (m.hidden_size + 1),)},
+            {"head": lambda m: (rank * (m.hidden_size + 1),)},
             namespace="canonical.reward_head@1",
-            optimizer=pllm.AdamW(lr=config.learning_rate),
-            initialize=initialize,
+            optimizer=pllm.AdamW(lr=self.config.learning_rate),
+            initialize=self.initialize,
         )
 
-    def trained_rows(self, data: TTRLData) -> int:
-        return len(data.selected_rows)
-
-    def loss(self, data: TTRLData, parameters: Mapping[str, torch.Tensor]) -> torch.Tensor | None:
-        if not data.selected_rows:
-            return None
-        hidden = data.batch.hidden.index_select(0, torch.tensor(data.selected_rows, device=data.batch.hidden.device))
-        target = hidden.new_tensor([data.reward_outcomes[i].reward for i in data.selected_rows]).reshape(-1, 1)
+    def initialize(self, parameters: Mapping[str, torch.Tensor], generator: torch.Generator) -> None:
         head = parameters["head"]
-        split = self.config.rank * hidden.shape[1]
-        prediction = F.linear(
-            F.linear(hidden, head[:split].view(self.config.rank, hidden.shape[1])),
-            head[split:].view(1, self.config.rank),
-        )
-        loss = F.mse_loss(prediction, target)
-        data.loss = loss.detach()
-        return loss
+        hidden = head.numel() // self.config.rank - 1
+        head[: self.config.rank * hidden].normal_(std=hidden**-0.5, generator=generator)
 
-    def prepare(self, value: pllm.host.CompletionInput) -> TTRLData:
-        entries = value.completions.entries
-        groups: dict[int, list[int]] = {}
-        for index, completion in enumerate(entries):
-            groups.setdefault(completion.identity.prompt_idx, []).append(index)
-        labels = tuple(boxed_label(completion.text) for completion in entries)
-        majority: dict[int, str] = {}
-        selected: list[int] = []
-        barriers: list[UpdateBarrier] = []
-        for prompt, indices in groups.items():
-            group_id = entries[indices[0]].group_id
-            if (
-                any(entries[i].group_id != group_id for i in indices)
-                or self.config.votes_per_prompt
-                and len(indices) != self.config.votes_per_prompt
-            ):
-                raise ValueError("TTRL requires one complete declared vote group per prompt")
-            counts = Counter(labels[i] for i in indices if labels[i])
-            majority[prompt] = max(counts, key=lambda label: counts[label]) if counts else ""
-            eligible = indices[: self.config.samples_per_prompt] if self.config.samples_per_prompt else indices
-            trainable = [i for i in eligible if labels[i]] if self.config.enabled else []
-            selected.extend(trainable)
-            barriers.append(
-                UpdateBarrier(
-                    f"ttrl:{group_id}:{prompt}",
-                    group_id,
-                    BarrierState.READY if trainable else BarrierState.BLOCKED,
-                    tuple(entries[i].identity.request_id for i in indices),
-                    len(trainable),
-                    ControlReason.REWARD_READY if trainable else ControlReason.NO_REWARD,
-                )
-            )
-        rewards: list[RewardOutcome] = []
-        controls: list[RetryControl] = []
-        for completion, label in zip(entries, labels, strict=True):
-            correct = label == majority[completion.identity.prompt_idx] if label else None
-            rewards.append(
-                RewardOutcome(
-                    completion,
-                    float(correct) if correct is not None else None,
-                    correct,
-                    "",
-                    "ttrl_majority:boxed_normalized_exact",
-                    label,
-                    "" if label else ControlReason.MISSING_ANSWER.value,
-                )
-            )
-            controls.append(
-                RetryControl(
-                    completion,
-                    RetryAction.ACCEPT if correct else RetryAction.RETRY,
-                    ControlReason.MAJORITY_ANSWER
-                    if correct
-                    else ControlReason.NON_MAJORITY_ANSWER
-                    if label
-                    else ControlReason.MISSING_ANSWER,
-                    correct is False,
-                )
-            )
-        return TTRLData(value, tuple(rewards), tuple(controls), tuple(barriers), tuple(selected))
-
-    def output(self, data: TTRLData, result: pllm.state.InvocationOutput) -> TTRLResult:
-        refs = result.publication.after_refs if result.publication is not None else result.selection.refs
-        return TTRLResult(
-            data.reward_outcomes, data.retry_controls, data.update_barriers, data.loss, refs[0], result.publication
-        )
+    @pllm.train(state="head")
+    def update(
+        self,
+        hidden: torch.Tensor = pllm.batch("hidden"),
+        targets: torch.Tensor = pllm.batch("targets"),
+        weights: torch.Tensor = pllm.batch("weights"),
+        head: torch.Tensor = pllm.parameter("head", "head"),
+    ) -> pllm.TensorUpdate:
+        """Weighted mean squared error; an empty selection has zero loss and leaves the head unchanged."""
+        rank, width = self.config.rank, hidden.shape[1]
+        split = rank * width
+        prediction = F.linear(F.linear(hidden, head[:split].view(rank, width)), head[split:].view(1, rank))
+        total = weights.sum()
+        loss = (weights * (prediction.squeeze(-1) - targets).square()).sum() / torch.where(total > 0, total, 1)
+        changed = total > 0
+        return pllm.TensorUpdate(loss, changed, changed.to(torch.int64), (weights > 0).sum(), {})

@@ -1,44 +1,44 @@
-"""A completion workload with two parameter groups matches torch AdamW bitwise, on CPU and CUDA."""
+"""An ordinary host workload with two parameter views matches torch AdamW: bitwise on CPU, to rounding on CUDA."""
 
-from dataclasses import replace
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
 
 import pytest
 import torch
 
 import pllm
-from pllm.contracts.request_identity import RequestIdentity
-from pllm.execution.tensor_program import InvocationOutput
-from pllm.host import Completion, CompletionBatch, CompletionInput, FinishReason, HostRuntimeFacts
+from pllm.authoring import TensorStepInput, WeightedRowBatch
+from pllm.host import HostRuntimeFacts
 
 
-class TwoGroups(pllm.host.CompletionWorkload[CompletionInput, InvocationOutput]):
+@dataclass(frozen=True)
+class TwoGroups(pllm.Workload):
     name = "test.completion.two_groups"
 
     @property
-    def parameters(self):
-        def initialize(parameters, generator):
-            for value in parameters.values():
-                value.normal_(generator=generator)
-
+    def parameters(self) -> pllm.InstanceState:
         return pllm.InstanceState(
             {"matrix": (2, 3), "bias": (3,)},
             optimizer=pllm.AdamW(lr=0.017, betas=(0.83, 0.96), eps=1e-5, weight_decay=0.09),
-            initialize=initialize,
+            initialize=self.initialize,
         )
 
-    def prepare(self, value):
-        return value
+    def initialize(self, parameters, generator):
+        for value in parameters.values():
+            value.normal_(generator=generator)
 
-    def loss(self, data, parameters):
-        if data.completions.entries[0].text == "skip":
+    @pllm.train(state="parameters")
+    def update(
+        self,
+        hidden: torch.Tensor = pllm.batch("hidden"),
+        matrix: torch.Tensor = pllm.parameter("parameters", "matrix"),
+        bias: torch.Tensor = pllm.parameter("parameters", "bias"),
+    ) -> pllm.TensorUpdate | None:
+        if hidden.shape[0] > 1:  # a batch of several rows is this test's way to skip the update
             return None
-        return (data.hidden @ parameters["matrix"] + parameters["bias"]).square().mean()
-
-    def trained_rows(self, data):
-        return len(data.hidden)
-
-    def output(self, data, result):
-        return result
+        loss = (hidden @ matrix + bias).square().mean()
+        one = torch.ones((), dtype=torch.int64, device=loss.device)
+        return pllm.TensorUpdate(loss, one.bool(), one, one, {})
 
 
 @pytest.mark.parametrize("device", ("cpu", "cuda:0"))
@@ -65,8 +65,13 @@ def test_default_completion_region_keeps_multigroup_adamw_and_publication(device
     original = execution.snapshot(initial, stream)
     if stream is not None:
         stream.synchronize()
-    parameters = [torch.nn.Parameter(original[i].clone()) for i in (0, 5)]
+    # The two views share one packed AdamW group; AdamW is elementwise, so each matches its own torch parameter.
+    parameters = [
+        torch.nn.Parameter(original[0][:6].reshape(2, 3).clone()),
+        torch.nn.Parameter(original[0][6:].clone()),
+    ]
     config = workload.parameters.optimizer
+    context = nullcontext() if stream is None else torch.cuda.stream(stream)
     oracle = torch.optim.AdamW(
         parameters,
         lr=config.lr,
@@ -76,16 +81,13 @@ def test_default_completion_region_keeps_multigroup_adamw_and_publication(device
         foreach=device.type == "cuda",
         capturable=device.type == "cuda",
     )
-    entry = Completion(RequestIdentity("a", 0, 0), 0, "g", (1,), "train", FinishReason.STOP)
-    batch = CompletionInput.capture(
-        CompletionBatch((entry,)),
-        torch.tensor([[0.4, -0.7]], device=device),
-        torch.cuda.current_stream(device) if stream is not None else None,
-    )
+    with context:
+        hidden = torch.tensor([[0.4, -0.7]], device=device)
+        batch = TensorStepInput.of_batch(WeightedRowBatch(hidden, hidden[:, 0], hidden[:, 0]))
     latest = initial
     for round_ in range(1, 4):
         oracle.zero_grad(set_to_none=True)
-        loss = (batch.hidden @ parameters[0] + parameters[1]).square().mean()
+        loss = (hidden @ parameters[0] + parameters[1]).square().mean()
         loss.backward()
         oracle.step()
         result = execution.step(batch, stream)
@@ -97,13 +99,22 @@ def test_default_completion_region_keeps_multigroup_adamw_and_publication(device
         actual = execution.snapshot(latest, stream)
         if stream is not None:
             stream.synchronize()
-        for index, parameter in enumerate(parameters):
-            state = oracle.state[parameter]
-            expected = (parameter, parameter.grad, state["step"], state["exp_avg"], state["exp_avg_sq"])
-            for got, want in zip(actual[5 * index : 5 * index + 5], expected, strict=True):
-                torch.testing.assert_close(got, want, rtol=0, atol=0)
+        states = [oracle.state[parameter] for parameter in parameters]
+
+        expected = (
+            torch.cat([parameter.flatten() for parameter in parameters]),
+            torch.cat([parameter.grad.flatten() for parameter in parameters]),
+            states[0]["step"],
+            torch.cat([state["exp_avg"].flatten() for state in states]),
+            torch.cat([state["exp_avg_sq"].flatten() for state in states]),
+        )
+        for got, want in zip(actual, expected, strict=True):
+            # The CUDA page kernel and torch's foreach AdamW round the last bit differently.
+            torch.testing.assert_close(got, want, **({"rtol": 0, "atol": 0} if device.type == "cpu" else {}))
     # A None loss skips the update: no publication, the latest version stays.
-    skipped = replace(batch, completions=CompletionBatch((replace(entry, text="skip"),)))
+    with context:
+        pair = hidden.expand(2, 2)
+        skipped = TensorStepInput.of_batch(WeightedRowBatch(pair, pair[:, 0], pair[:, 0]))
     result = execution.step(skipped, stream)
     assert result.publication is None
     assert execution.arena.latest(initial.lineage_id) == latest

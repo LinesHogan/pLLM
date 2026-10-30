@@ -67,16 +67,14 @@ class TensorHostBinding(Generic[InputT, DataT, ResultT]):
     layouts: TensorLayoutRequest
     math: MathBinding[InputT, DataT, ResultT]
     facts: HostRuntimeFacts
-    sampler_anchor: AnchorSymbol = AnchorSymbol("host.next")
-    timeline: SchedulerTimeline | None = None
+    timeline: SchedulerTimeline
 
     def compile(self) -> StateExecution[InputT, DataT, ResultT]:
         facts = self.facts
-        timeline = facts.timeline() if self.timeline is None else self.timeline
         limits = tuple(
-            value for value in (timeline.memory_budget_bytes, facts.memory_budget_bytes) if value is not None
+            value for value in (self.timeline.memory_budget_bytes, facts.memory_budget_bytes) if value is not None
         )
-        timeline = replace(timeline, memory_budget_bytes=min(limits, default=None))
+        timeline = replace(self.timeline, memory_budget_bytes=min(limits, default=None))
         providers = (
             (
                 PageBundleProviderFacts(
@@ -97,7 +95,7 @@ class TensorHostBinding(Generic[InputT, DataT, ResultT]):
             facts.state_memory_budget_bytes,
             facts.device,
         )
-        (anchor,) = (AnchorId(item.ordinal) for item in timeline.anchors if item.symbol == self.sampler_anchor)
+        (anchor,) = (AnchorId(item.ordinal) for item in timeline.anchors if item.symbol == "host.next")
         return self.math.bind(PageBundleArena(plan, device=facts.device), anchor)
 
 

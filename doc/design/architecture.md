@@ -36,8 +36,8 @@
 额度检查与清理。内部基准是这个公共工厂与句柄的普通客户端。
 
 全部十一个内置负载使用构造同一张原始图的共享绑定。普通模型方法用
-`pllm.Workload`，TLM 也通过这个接口声明因果批输入与模型端口；TTRL 用
-`CompletionWorkload`；FTTT/GTTA 用
+`pllm.Workload`，TLM 也通过这个接口声明因果批输入与模型端口；TTRL 也用
+`pllm.Workload`（宿主路径，奖励由 `ttrl_rewards` 先算好）；FTTT/GTTA 用
 `transaction`。Output LoRA 用普通加权批量 SGD。旧的 `authoring.Workload` 和
 按负载的采样器 `build` 方法已移除。ESamp 用普通具名参数、预测与按状态 loss；
 其显式分页/捕获绑定在同一签名图上替换计算，原始 loss/Adam 对与五字段状态
@@ -88,7 +88,7 @@ Python 在 FFI 边界序列化同样的不可变描述符，只加封闭的输�
 
 宿主事务保留其原始可逆快照直到 commit/abort；队列与算法历史存储属于宿主
 服务，不在 GPU arena 预算内。宿主绑定保留原始不可变事实，不在编译期接受
-另一套。Completion 学习可以声明其原始任务/值 timeline；有界 TTRL 提供
+另一套。宿主 `Workload` 的成本由框架按最大形状测量；有界 TTRL 提供
 head/MSE/Adam 成本与 hidden 行预留，带准备前行准入与消费流寿命。文本与
 Python 元数据在该张量预算之外。FTTT 在原始宿主 timeline 上声明其参数/动量
 存储、回滚快照、活跃输入与训练/查询/结果成本。执行器在调用状态构造函数前

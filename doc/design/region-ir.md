@@ -662,7 +662,7 @@ prefill/decode、更新计数和页版本，与原方法逐位一致；测试还
 
 ## Completion 训练的优化器迁移
 
-`CompletionWorkload`（包括 TTRL）默认把 AdamW 数学更新 lower 到
+（已删除的）`CompletionWorkload`（包括 TTRL，现为普通宿主 `Workload`）默认把 AdamW 数学更新 lower 到
 [AdamWRegion](../../pllm/execution/region_adamw.py)。源参数显式包含每组参数、
 step、一阶与二阶矩、新梯度；结果是原布局中的五个更新字段。旧 gradient
 槽只是待覆写的存储，不作为数学输入。不同形状、dtype 的参数保留原排列，

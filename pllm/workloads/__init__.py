@@ -22,4 +22,10 @@ from pllm.workloads.state_producers import (
     PromptMixture as PromptMixture,
 )
 from pllm.workloads.tlm import TLMConfig as TLMConfig, TLMWorkload as TLMWorkload
-from pllm.workloads.ttrl import TTRLConfig as TTRLConfig, TTRLWorkload as TTRLWorkload
+from pllm.workloads.ttrl import (
+    TTRLConfig as TTRLConfig,
+    TTRLRewards as TTRLRewards,
+    TTRLWorkload as TTRLWorkload,
+    ttrl_feedback as ttrl_feedback,
+    ttrl_rewards as ttrl_rewards,
+)

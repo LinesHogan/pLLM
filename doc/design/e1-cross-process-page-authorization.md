@@ -148,4 +148,4 @@ snapshot clone 是每步真实拷贝。
 | CUDA 消费测试 | `test/gpu/test_page_bundle_cuda.py:397,460` |
 | worker 重建协议 | `test/boundary/test_worker_reconstruction.py`（transport_payload / transport_rebuild / 签名校验） |
 | EngineCore 集成 | `pllm/backends/vllm/runtime.py:926,1259`；冒烟 `test/gpu/enginecore_smoke.py`（fallback=0）、`test/gpu/vllm_recirculation_smoke.py`（fallback=0、issued_streams=2） |
-| 候选负载 | `pllm/workloads/inplace_ttt.py`、`pllm/learning.py` |
+| 候选负载 | `pllm/workloads/inplace_ttt.py`、`pllm/workloads/ttrl.py` |
