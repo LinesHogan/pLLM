@@ -44,11 +44,9 @@ class GPUWorker(Worker):
 
     @property
     def workload_runner(self) -> WorkloadModelRunner | Mrv1Runner:
-        match self.model_runner:
-            case WorkloadModelRunner() | Mrv1Runner() as runner:
-                return runner
-            case _:
-                raise RuntimeError("canonical worker has not initialized its runner")
+        runner = self.model_runner
+        assert isinstance(runner, (WorkloadModelRunner, Mrv1Runner))
+        return runner
 
     def _install(
         self, workload: BackendWorkload[DataT, ResultT], attachment: BackendAttachment, cache_policy: CachePolicy
@@ -93,18 +91,13 @@ class GPUWorker(Worker):
     def workload_command(self, command: str, payload: str) -> str:
         runner = self.workload_runner
         operation = BackendCommand(command)
-        if (
-            operation
-            not in (
-                BackendCommand.PROBE,
-                BackendCommand.INSTALL,
-                BackendCommand.STAGE,
-                BackendCommand.PROFILE,
-                BackendCommand.OBSERVE,
-            )
-            and payload
-        ):
-            raise ValueError("this canonical command has no payload")
+        assert not payload or operation in (
+            BackendCommand.PROBE,
+            BackendCommand.INSTALL,
+            BackendCommand.STAGE,
+            BackendCommand.PROFILE,
+            BackendCommand.OBSERVE,
+        )
         with torch.inference_mode(False):
             match operation:
                 case BackendCommand.PROBE:

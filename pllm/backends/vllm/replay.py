@@ -514,7 +514,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
             cache.kv_cache.view(-1, hidden.shape[1])[slots] = values
 
     def begin(self, row: PackedPhaseRow) -> tuple[torch.Tensor, torch.Tensor]:
-        raise AssertionError("CUDA routes use batched waves")
+        raise NotImplementedError("CUDA routes run batched waves in run(), never the serial begin()")
 
     def layer(
         self,

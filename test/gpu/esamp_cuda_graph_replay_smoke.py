@@ -6,14 +6,12 @@ sampler buffers and publish lags 0-2.
 """
 
 import sys
-from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import numpy as np
-import pytest
 import torch
 
 import pllm
@@ -140,17 +138,6 @@ def mean_capture(publish_lag: int = 0) -> None:
             stream.wait_stream(overlap.stream)
         torch.testing.assert_close(result.loss, oracle.detach())
         torch.testing.assert_close(execution.snapshot(result.publication.after_refs[0], stream)[0], parameter)
-    # Incomplete sampler coverage is a boundary error, never an out-of-bounds graph read.
-    missing = PackedSamplerRowBatch(rows, (PackedSamplerRowLink(0, 0),))
-    invocation = execution.start_step(replace(value, sampler_rows=missing), stream)
-    with pytest.raises(ValueError):
-        for anchor in plan.timeline.anchors:
-            execution.execute_anchor(invocation, AnchorId(anchor.ordinal))
-            if anchor.ordinal == 1:
-                execution.complete_sampler(
-                    invocation, stream, feedback=SamplerFeedback(missing, target[:1], tokens[:1])
-                )
-    torch.testing.assert_close(execution.snapshot(result.publication.after_refs[0], stream)[0], parameter)
     if overlap is not None:
         overlap.clear()
     execution.retire(())

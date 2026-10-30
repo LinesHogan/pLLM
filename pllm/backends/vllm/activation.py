@@ -88,11 +88,11 @@ class VllmActivationPatch:
     def prepare(
         self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT], directory: RequestStateDirectory
     ) -> None:
-        if context.held_input is not None and (
-            context.held_input.step_id != rows.step_id
-            or {identity for identity, _, _ in context.held_input.successful} != {row.identity for row in rows.rows}
-        ):
-            raise RuntimeError("HOLD input differs from its original step and request identities")
+        held = context.held_input
+        assert held is None or (
+            held.step_id == rows.step_id
+            and {identity for identity, _, _ in held.successful} == {row.identity for row in rows.rows}
+        )
         context.input_step_id = rows.step_id
         versions: dict[tuple[RequestIdentity, bool], tuple[PagePin, StateRef]] = {}
         self.row_count = rows.total_rows
@@ -122,11 +122,9 @@ class VllmActivationPatch:
                             pin = context.pin_for(StateRefs.of((ref,)))
                         versions[key] = pin, ref
                     pin, ref = versions[key]
-                    if context.held_input is not None and not any(
-                        identity == held_identity and ref in refs
-                        for held_identity, refs, _ in context.held_input.successful
-                    ):
-                        raise RuntimeError("HOLD injection differs from the last successful exact ref")
+                    assert held is None or any(
+                        identity == held_identity and ref in refs for held_identity, refs, _ in held.successful
+                    )
                     prepared.append(
                         _PatchRows(
                             upload(selected, context.arena.device),

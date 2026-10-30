@@ -25,15 +25,8 @@ class AdamWFields:
     exp_avg_sq: LayoutFieldId
 
     def __post_init__(self) -> None:
-        field_ids = (
-            int(self.parameter),
-            int(self.gradient),
-            int(self.step),
-            int(self.exp_avg),
-            int(self.exp_avg_sq),
-        )
-        if any(field_id < 0 for field_id in field_ids) or len(set(field_ids)) != len(field_ids):
-            raise ValueError("dense-page AdamW fields must be distinct IDs")
+        field_ids = {self.parameter, self.gradient, self.step, self.exp_avg, self.exp_avg_sq}
+        assert len(field_ids) == 5 and min(field_ids) >= 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,17 +56,12 @@ def apply_adamw(
     gradients: tuple[torch.Tensor, ...],
 ) -> None:
     """Apply the bound optimizer to validated page views and matching gradients."""
-    # PTTS and tensor input binding already validate page fields; gradients enter here from math.
-    if (
-        not roots
-        or len(roots) != len(gradients)
-        or any(
-            (gradient.shape, gradient.dtype, gradient.device)
-            != (root[fields.parameter].shape, root[fields.parameter].dtype, root[fields.parameter].device)
-            for root, gradient in zip(roots, gradients, strict=True)
-        )
-    ):
-        raise ValueError("AdamW gradients must match the parameter pages")
+    assert roots and len(roots) == len(gradients)
+    assert all(
+        (gradient.shape, gradient.dtype, gradient.device)
+        == (root[fields.parameter].shape, root[fields.parameter].dtype, root[fields.parameter].device)
+        for root, gradient in zip(roots, gradients, strict=True)
+    )
     with torch.no_grad():
         for root, gradient in zip(roots, gradients, strict=True):
             root[fields.gradient].copy_(gradient)
@@ -178,14 +166,8 @@ def paged_adamw(
     sources: torch.Tensor | None = None,
 ) -> None:
     """Five original FP32 fields, authorized slot prefixes, no field packing."""
-    if (
-        gradients.shape != (slots.shape[1], pools[0][0].numel())
-        or gradients.dtype != torch.float32
-        or gradients.device != slots.device
-        or not gradients.is_contiguous()
-        or gradients.requires_grad
-    ):
-        raise ValueError("paged AdamW gradients must match the selected parameter pages")
+    assert gradients.shape == (slots.shape[1], pools[0][0].numel()) and gradients.dtype == torch.float32
+    assert gradients.device == slots.device and gradients.is_contiguous() and not gradients.requires_grad
     sources = slots if sources is None else sources
     corrections = gradients.new_empty((len(gradients), 2))
     _paged_update(

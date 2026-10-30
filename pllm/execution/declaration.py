@@ -307,7 +307,6 @@ class Builder(Generic[D]):
         source: Call | None = None,
         result_schema: str = "",
         output_kind: SemanticOutputKind = SemanticOutputKind.TEMPORARY,
-        output_schemas: Mapping[str, str] | None = None,
         replay: TokenProgramEffect | None = None,
         math: MathContract | None = None,
         function: Callable[[D, TensorBatch], TaskOutput] | None = None,
@@ -318,11 +317,7 @@ class Builder(Generic[D]):
     ) -> Call:
         if any(task.symbol == name for task in self.graph.tasks):
             raise ValueError(f"duplicate operation {name}")
-        if function is not None and host_function is not None:
-            raise ValueError(f"{name}: choose tensor or host mathematics")
-        schemas = dict.fromkeys(outputs, result_schema) if output_schemas is None else output_schemas
-        if any(output not in outputs for output in schemas):
-            raise ValueError(f"{name}: schema references an unknown output")
+        assert function is None or host_function is None
         implementations = implementations or (native(f"{self.graph.workload_id}:{name}@1"),)
         effects = (
             reads
@@ -339,8 +334,8 @@ class Builder(Generic[D]):
             tuple(
                 SemanticOutput(
                     output,
-                    SemanticOutputKind.HOST if schemas.get(output) else output_kind,
-                    HostPayloadSchemaId(schemas.get(output, "")),
+                    SemanticOutputKind.HOST if result_schema else output_kind,
+                    HostPayloadSchemaId(result_schema),
                 )
                 for output in outputs
             ),
@@ -372,14 +367,12 @@ class Builder(Generic[D]):
                 copy_fields=copy_fields,
             )
         if host_function is not None:
-            if len(implementations) != 1:
-                raise ValueError("host function requires one explicit implementation")
+            assert len(implementations) == 1
             self.host_operations[task.symbol] = HostOperation(implementations[0].implementation_id, host_function)
         return Call(task.symbol, outputs)
 
     def bind_host(self) -> tuple[HostOperation[D], ...]:
-        if set(self.host_operations) != {task.symbol for task in self.graph.tasks}:
-            raise ValueError("host graph requires a function for every operation")
+        assert set(self.host_operations) == {task.symbol for task in self.graph.tasks}
         return tuple(self.host_operations[task.symbol] for task in self.graph.tasks)
 
     def bind(

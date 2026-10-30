@@ -33,22 +33,13 @@ class TaskGraphExecution(Generic[ExecutionContextT, ExecutionResultT]):
 
     def __post_init__(self) -> None:
         bindings = {implementation.implementation_id: implementation for implementation in self.implementations}
-        if len(bindings) != len(self.implementations) or set(bindings) != {
-            task.implementation_id for task in self.plan.tasks
-        }:
-            raise ValueError("native bindings must name exactly the Rust-selected implementations")
+        assert len(bindings) == len(self.implementations)
+        assert set(bindings) == {task.implementation_id for task in self.plan.tasks}
+        assert self.trace.plan is self.plan
+        # Rust numbers tasks densely, so position i holds the implementation of task i.
         self.implementations = tuple(
             bindings[task.implementation_id] for task in sorted(self.plan.tasks, key=lambda task: task.task_id)
         )
-        if (
-            self.trace.plan is not self.plan
-            or len(self.plan.tasks) != len(self.implementations)
-            or any(
-                self.implementations[int(task.task_id)].implementation_id != task.implementation_id
-                for task in self.plan.tasks
-            )
-        ):
-            raise ValueError("task-graph implementation differs from the Rust physical plan")
 
     def run(self, context: ExecutionContextT, invocation_id: int) -> ExecutionContextT:
         """Run every planned host task synchronously and return its context."""

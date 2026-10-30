@@ -633,10 +633,8 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                 context.check_page_execution()
                 plan = self.plan
                 dense_anchor = int(anchor_id)
-                if context.finished or dense_anchor < 0 or dense_anchor < context.last_anchor_id:
-                    raise RuntimeError("task invocation anchor progression is invalid")
-                if context.next_task < len(plan.tasks) and int(plan.tasks[context.next_task].anchor_id) < dense_anchor:
-                    raise RuntimeError("task invocation skipped a signed execution anchor")
+                assert not context.finished and 0 <= dense_anchor and context.last_anchor_id <= dense_anchor
+                assert context.next_task == len(plan.tasks) or dense_anchor <= plan.tasks[context.next_task].anchor_id
                 while (
                     context.next_task < len(plan.tasks) and int(plan.tasks[context.next_task].anchor_id) == dense_anchor
                 ):
@@ -720,8 +718,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             try:
                 result = self.math.output(context)
                 if not context.finished:
-                    if context.next_task != len(self.plan.tasks):
-                        raise RuntimeError("task invocation has unfinished signed tasks")
+                    assert context.next_task == len(self.plan.tasks)
                     context.finished = True
                 self._release(context)
             except Exception as exc:

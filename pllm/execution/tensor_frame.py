@@ -209,8 +209,7 @@ class CompactRows:
 
     def take(self, values: torch.Tensor) -> torch.Tensor:
         """Borrow eager views where row order permits them."""
-        if -1 in self.rows:
-            raise ValueError("some operation rows have no corresponding input row")
+        assert -1 not in self.rows
         return take_rows(values, self.rows, self.device)
 
     def select(self, rows: tuple[int, ...]) -> "CompactRows":
@@ -409,8 +408,7 @@ def feedback_port(name: Literal["base_logits", "sampled_tokens"]) -> TensorPort:
         if data.feedback_inputs is not None:
             return data.feedback_inputs[name]
         feedback = batch.feedback
-        if feedback is None:
-            raise RuntimeError("tensor function requires completed sampler feedback")
+        assert feedback is not None
         values = feedback.base_logits if name == "base_logits" else feedback.sampled_tokens
         return row_index(data, batch, values.device).sampler.take(values)
 

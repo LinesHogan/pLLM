@@ -23,21 +23,14 @@ class TensorStepInput:
     hidden_readiness: CudaStreamReadiness | None = None
 
     def __post_init__(self) -> None:
-        if self.sampler_rows.row_batch is not self.rows:
-            raise ValueError("tensor input requires the original packed row provenance")
+        assert self.sampler_rows.row_batch is self.rows
         if self.hidden is None:
-            if self.hidden_readiness is not None:
-                raise ValueError("hidden readiness requires its original captures")
+            assert self.hidden_readiness is None
         else:
-            if self.hidden.row_batch is not self.rows:
-                raise ValueError("hidden input belongs to another packed step")
+            assert self.hidden.row_batch is self.rows
             device = self.hidden.captures[0].storage.device
-            if (
-                (device.type == "cuda") != (self.hidden_readiness is not None)
-                or self.hidden_readiness is not None
-                and self.hidden_readiness.device != device
-            ):
-                raise ValueError("hidden captures require readiness from their original device")
+            readiness = None if self.hidden_readiness is None else self.hidden_readiness.device
+            assert readiness == (device if device.type == "cuda" else None)
 
     def hidden_batch(self, stream: torch.cuda.Stream | None) -> HiddenRowBatch:
         if self.hidden is None or (self.hidden_readiness is None) != (stream is None):

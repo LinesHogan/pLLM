@@ -44,26 +44,22 @@ class BorrowedStateRoot:
         self._pin: PagePin | None = None
 
     def claim(self, protected: tuple[tuple[str, int, int], ...]) -> None:
-        if self._claimed or self._view is None:
-            raise RuntimeError("borrowed root is closed or already staged")
+        assert not self._claimed and self._view is not None
         validate_readonly_views((self._view,), protected)
         self._claimed = True
 
     def bind(self, pin: PagePin) -> None:
-        if not self._claimed or self._pin is not None or pin.stream != self.stream:
-            raise RuntimeError("borrowed root requires one invocation on its receiving stream")
+        assert self._claimed and self._pin is None and pin.stream == self.stream
         self._pin = pin
 
     def tensors(self, pin: PagePin) -> tuple[torch.Tensor, ...]:
-        if self._view is None or self._pin is not pin:
-            raise RuntimeError("borrowed root is closed or belongs to another invocation")
+        assert self._view is not None and self._pin is pin
         for page in self.pages:
             page.tensor  # Recheck original receiving stream and the live BorrowedPage.
         return tuple(self._view.tensor((), index) for index in range(len(self.pages)))
 
     def check_output(self, tensor: torch.Tensor) -> None:
-        if self._view is None:
-            raise RuntimeError("borrowed root is closed")
+        assert self._view is not None
         storage = tensor.untyped_storage()
         validate_readonly_views((self._view,), ((str(tensor.device), storage.data_ptr(), storage.nbytes()),))
 
@@ -74,8 +70,7 @@ class BorrowedStateRoot:
             page.discard()
 
     def close(self) -> None:
-        if self._view is None:
-            raise RuntimeError("borrowed root is already closed")
+        assert self._view is not None
         self._view = None
         for page in self.pages:
             page.close()

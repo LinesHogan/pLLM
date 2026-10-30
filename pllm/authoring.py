@@ -119,8 +119,7 @@ class BackendDeployment(Generic[DataT, ResultT]):
     attachment: BackendAttachment
 
     def __post_init__(self) -> None:
-        if self.attachment.plan is not self.execution.arena.plan:
-            raise ValueError("backend deployment requires the original execution plan")
+        assert self.attachment.plan is self.execution.arena.plan
 
 
 class BackendAuthoring(ABC):

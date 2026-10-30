@@ -128,11 +128,10 @@ class TensorExecutor:
         self.feedback_names = tuple(
             sorted({port.feedback for task in dependencies for port in task.ports.values() if port.feedback})
         )
-        if (
-            self.capture is not None
-            and 8 * (5 * self.rows + self.state_count + 1) > self.capture.entitlement.resident_bytes
-        ):
-            raise ValueError("capture index table exceeds the task resident bytes")
+        assert (
+            self.capture is None
+            or 8 * (5 * self.rows + self.state_count + 1) <= self.capture.entitlement.resident_bytes
+        )
 
     @property
     def rows(self) -> int:
@@ -155,8 +154,7 @@ class TensorExecutor:
         """Stage a RowPlan and feedback addresses into the zeroed fixed table."""
         rows, counts, last, sources, destinations, feedback = layout.split(host)
         count = len(plan.packed)
-        if layout.feedback and -1 in plan.sampler:
-            raise ValueError("sampler feedback must cover every operation row")
+        assert not layout.feedback or -1 not in plan.sampler
         rows[2] = layout.states
         rows[:4, :count] = plan.columns
         rows[0, :count] = np.maximum(rows[0, :count], 0)
