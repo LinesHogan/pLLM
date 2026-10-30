@@ -34,6 +34,7 @@ from pllm.contracts.semantic_graph import (
     StateSelectionInputSource,
     StepIdInputSource,
     TaskResourceFact,
+    TaskResultInputSource,
     TaskSymbol,
     TimingConstraint,
     TokenProgramEffect,
@@ -184,25 +185,30 @@ def _check_attachment(attachment: BackendAttachment) -> None:
 
 
 def _check_exports(attachment: BackendAttachment) -> None:
-    """The observation path runs only bound export tasks between publication and sampling."""
+    """Exports and the read-only helpers feeding them run between publication and sampling."""
     if not attachment.probe.hidden_resources:
         raise ValueError("exports need a hidden input, e.g. `h: torch.Tensor = pllm.hidden(0)`")
     exports = {symbol for _, symbol in attachment.spec.tasks}
     for task in attachment.plan.semantic_graph.tasks:
-        if task.symbol not in exports or not _observes(task):
+        output = SemanticOutputKind.HOST if task.symbol in exports else SemanticOutputKind.TEMPORARY
+        if not _observes(task, output):
             raise ValueError(
-                f"{task.symbol}: a workload with exports runs only exports in Phase.OBSERVE that read hidden "
-                "rows and state; remove its other operations, state writes and phase overrides"
+                f"{task.symbol}: a workload with exports runs only exports and read-only helpers in Phase.OBSERVE "
+                "that read hidden rows, state and results; remove its other operations, state writes and phase "
+                "overrides"
             )
 
 
-def _observes(task: SemanticTask) -> bool:
+def _observes(task: SemanticTask, output: SemanticOutputKind) -> bool:
     return (
         all(effect.kind is StateEffectKind.READ for effect in task.effects)
-        and all(output.kind is SemanticOutputKind.HOST for output in task.outputs)
+        and all(port.kind is output for port in task.outputs)
         and task.timing == TimingConstraint(AnchorSymbol("state.publish"), AnchorSymbol("sampler.pre_draw"))
         and all(
-            isinstance(port.source, HiddenInputSource | StepIdInputSource | StateSelectionInputSource)
+            isinstance(
+                port.source,
+                HiddenInputSource | StepIdInputSource | StateSelectionInputSource | TaskResultInputSource,
+            )
             for port in task.inputs
         )
     )

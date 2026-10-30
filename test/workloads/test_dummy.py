@@ -101,7 +101,12 @@ def test_dummy_runs_graph_sign_plan_execute() -> None:
         def export_hidden(self, x: torch.Tensor = pllm.result("shift")) -> torch.Tensor:
             return x * 2
 
-    torch.testing.assert_close(exported(make_llm(CPU, workload=Chained()), value(2)), (expected + 1) * 2)
+    chained = Chained()
+    for execution in (
+        make_llm(CPU, workload=chained),
+        chained.compile_backend(assert_finite_resources(chained, facts)).execution,
+    ):
+        torch.testing.assert_close(exported(execution, value(2)), (expected + 1) * 2)
 
     # A transform's closure values are frozen when the workload compiles.
     scale = [2.0]

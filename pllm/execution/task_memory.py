@@ -19,9 +19,11 @@ from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import SamplerFeedback
 from pllm.contracts.semantic_graph import (
     SchedulerTimeline,
+    SemanticGraph,
     StateResource,
     StateScope,
     TaskResourceFact,
+    TaskResultInputSource,
     TaskSymbol,
     ValueResourceFact,
 )
@@ -176,6 +178,28 @@ def example(
     return data, batch
 
 
+def producers_first(graph: SemanticGraph, symbols: tuple[TaskSymbol, ...]) -> tuple[TaskSymbol, ...]:
+    """Keep the declaration order, but move each result producer before its readers.
+
+    Measured operations share one example batch, so a reader of pllm.result finds its producer's
+    output only if the producer ran first; operations are declared by name, not by dependency.
+    """
+    producers = {
+        task.symbol: tuple(port.source.task for port in task.inputs if isinstance(port.source, TaskResultInputSource))
+        for task in graph.tasks
+    }
+    ordered: dict[TaskSymbol, None] = {}
+
+    def visit(symbol: TaskSymbol) -> None:
+        for producer in producers[symbol]:
+            visit(producer)
+        ordered[symbol] = None
+
+    for symbol in symbols:
+        visit(symbol)
+    return tuple(symbol for symbol in ordered if symbol in symbols)
+
+
 def derive_resources(
     binding: TensorBinding, facts: BackendCompileFacts, options: ExecutionOptions
 ) -> SchedulerTimeline:
@@ -192,7 +216,8 @@ def derive_resources(
         **binding.executables(facts, resources),
         **binding.publications,
     }
-    for symbol, operation in operations.items():
+    for symbol in producers_first(binding.graph, tuple(operations)):
+        operation = operations[symbol]
         task = binding.tensor_tasks.get(symbol)
         phase = None if task is None else task.phase
         if phase is not None:
