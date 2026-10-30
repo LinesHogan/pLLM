@@ -158,6 +158,7 @@ def main() -> None:
         )
         reward.admit((), stream)
         trained = reward.step(ttrl_rewards(batch, ttrl, stream).step, stream)
+        stream.synchronize()  # device-side update counts are exact once the stream has drained
         assert trained.loss is not None and reward.diagnostics().update_count == 1
         reward.retire(())
         print(f"OverRIDE: updates={diagnostics.update_count} sampler_checks={len(observed)}; FTTT/TTRL updates=1/1")
