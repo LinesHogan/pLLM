@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+from torch.nn import functional as F
 
 from pllm.backends.vllm.architecture import CausalLM, DecoderLayer
 from pllm.contracts.backend_attachment import (
@@ -18,12 +19,18 @@ from pllm.contracts.packed_rows import PackedPhaseRowBatch
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import StateEffectKind, StateResource
 from pllm.contracts.state_ref import StateRef
-from pllm.execution.activation import low_rank_affine_delta
 from pllm.execution.cuda_stream import upload
 from pllm.execution.ptts.page_bundle import PagePin
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.state_execution import DataT, StateTaskContext
+
+
+def low_rank_affine_delta(
+    rows: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, rotation: torch.Tensor
+) -> torch.Tensor:
+    """Low-rank affine activation edit; pure tensor math shared with tokenwise replay."""
+    return (F.linear(rows, weight, bias) - rows @ rotation) @ rotation.T
 
 
 @dataclass(frozen=True, slots=True)

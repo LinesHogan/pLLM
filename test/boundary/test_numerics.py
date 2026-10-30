@@ -2,7 +2,7 @@
 
 import warnings
 
-from pllm.execution.numerics import NumericalTransformWarning, warn_numerical_transforms
+from pllm.execution.scan import NumericalTransformWarning, warn_numerical_transforms
 
 
 def test_numerical_warning_requires_selected_changes_and_describes_opt_out():

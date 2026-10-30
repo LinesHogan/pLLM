@@ -12,7 +12,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 
 from pllm.authoring import DataT, ResultT
-from pllm.backends.vllm.activation import VllmActivationPatch
+from pllm.backends.vllm.activation import VllmActivationPatch, low_rank_affine_delta
 from pllm.backends.vllm.architecture import CausalLM
 from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay
 from pllm.backends.vllm.position_state import PositionCacheLayer, PositionCacheProvider
@@ -25,7 +25,6 @@ from pllm.backends.vllm.region_attention import (
 )
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.semantic_graph import AnchorId, SemanticTask, TokenProgramEffect
-from pllm.execution.activation import low_rank_affine_delta
 from pllm.execution.cuda_stream import PinnedStaging, upload
 from pllm.execution.overlay_task import RouteOperand, RouteOverlay
 from pllm.execution.replay import TokenwiseReplayPrimitive, TokenwiseReplayTask

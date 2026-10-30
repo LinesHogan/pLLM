@@ -19,7 +19,7 @@ from pllm import scan
 from pllm.execution.parameter_projection import prepare_projection_read
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator
 from torch._subclasses.fake_tensor import FakeTensorMode
-from pllm.execution.memory import apply_adamw_or_reserve
+from pllm.execution.tensor_program import apply_adamw_or_reserve
 from pllm.kernels.adamw import AdamWConfig, AdamWFields
 with patch.object(torch.cuda, '_lazy_init', forbidden):
     roots = ((torch.empty(32, device='meta'),) * 2 + (torch.empty((), device='meta'),) + (torch.empty(32, device='meta'),) * 2,)

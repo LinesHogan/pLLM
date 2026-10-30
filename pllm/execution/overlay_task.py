@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Generic, NamedTuple, Protocol, TypeVar
 
@@ -19,7 +19,6 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import PackedSamplerRowBatch
 from pllm.contracts.semantic_graph import TaskId, TaskSymbol
 from pllm.contracts.visibility import VisibilitySource
-from pllm.execution.chunk_tail import join_tail, save_tail
 from pllm.execution.cuda_stream import upload
 from pllm.execution.parameter_projection import parameter_correction
 from pllm.execution.scan import execute_scan, prepare_scan
@@ -27,7 +26,7 @@ from pllm.execution.scan_execution import PreparedScan, Step
 from pllm.execution.tensor_frame import OverlayEntry, OverlayTargetResult, TensorFrame, Tensors, TensorUpdate
 from pllm.execution.tensor_program import PoolSGD, TaskOutput, TensorBatch
 from pllm.execution.torch_private import MemoryTrace
-from pllm.kernels.page_copy import chunk_capacity, copy_pages
+from pllm.kernels.page_copy import chunk_capacity, copy_pages, prepend_rows
 
 DataT = TypeVar("DataT")
 ResultT = TypeVar("ResultT")
@@ -35,6 +34,33 @@ if TYPE_CHECKING:
     from pllm.execution.overlay_batch import OverlayBatch
     from pllm.execution.state_execution import StateExecution, StateTaskContext
     from pllm.execution.step_input import TensorStepInput
+
+
+def join_tail(
+    tails: tuple[torch.Tensor, ...],
+    rows: tuple[torch.Tensor, ...],
+    length: torch.Tensor,
+    chunk: int,
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    """Return bounded columns and their device-resident valid row count."""
+    return prepend_rows(tails, rows, length, chunk), length + len(rows[0])
+
+
+def save_tail(
+    tails: tuple[torch.Tensor, ...],
+    rows: tuple[torch.Tensor, ...],
+    length: torch.Tensor,
+    valid: torch.Tensor,
+    trained: torch.Tensor,
+) -> torch.Tensor:
+    """Save unfinished valid rows; capacity padding never becomes retained history."""
+    remaining = valid - trained
+    for tail, values in zip(tails, rows, strict=True):
+        positions = torch.arange(len(tail), device=length.device)
+        selected = values.index_select(0, (positions + trained).clamp_max(len(values) - 1))
+        tail.copy_(selected.masked_fill((positions >= remaining).view(-1, *((1,) * (tail.ndim - 1))), 0))
+    length.copy_(remaining)
+    return remaining
 
 
 @dataclass(frozen=True)
@@ -415,6 +441,24 @@ class RouteOperand(NamedTuple):
     weight: torch.Tensor
 
 
+def join_encounters(
+    operands: Sequence[CapturedParameterOperand], key: Callable[[CapturedParameterOperand], Hashable]
+) -> tuple[CapturedParameterOperand, ...]:
+    """Concatenate the rows of operands sharing a key, in first-seen order; the last encounter's prompt end wins."""
+    groups: dict[Hashable, list[CapturedParameterOperand]] = {}
+    for operand in operands:
+        groups.setdefault(key(operand), []).append(operand)
+    return tuple(
+        replace(
+            records[0],
+            hidden=torch.cat(tuple(record.hidden for record in records)),
+            desired=torch.cat(tuple(record.desired for record in records)),
+            prompt_end=records[-1].prompt_end,
+        )
+        for records in groups.values()
+    )
+
+
 class RouteOverlay:
     """Read and capture at projections; apply grouped operands within one owned transition."""
 
@@ -500,16 +544,9 @@ class RouteOverlay:
 
     def apply_updates(self) -> None:
         """Concatenate every encounter at a target before invoking the author's batch math."""
-        for target in dict.fromkeys(operand.target for operand in self.pending):
-            records = tuple(operand for operand in self.pending if operand.target == target)
-            operand = replace(
-                records[0],
-                hidden=torch.cat(tuple(record.hidden for record in records)),
-                desired=torch.cat(tuple(record.desired for record in records)),
-                prompt_end=records[-1].prompt_end,
-            )
-            result = self.math.result(operand, self.values(target, True))
-            self.results.append(OverlayTargetResult(target, result))
+        for operand in join_encounters(self.pending, lambda operand: operand.target):
+            result = self.math.result(operand, self.values(operand.target, True))
+            self.results.append(OverlayTargetResult(operand.target, result))
         if self.pending:
             self.private = True
             self.gate.fill_(1.0)
@@ -565,20 +602,8 @@ class RouteOverlay:
 
     def finish(self) -> TaskOutput:
         """Apply ordinary pinned rows once as a batch; routed trailing captures are discarded."""
-        grouped: list[CapturedParameterOperand] = []
-        for identity, target in dict.fromkeys((operand.identity, operand.target) for operand in self.ordinary):
-            records = tuple(
-                operand for operand in self.ordinary if (operand.identity, operand.target) == (identity, target)
-            )
-            grouped.append(
-                replace(
-                    records[0],
-                    hidden=torch.cat(tuple(record.hidden for record in records)),
-                    desired=torch.cat(tuple(record.desired for record in records)),
-                    prompt_end=records[-1].prompt_end,
-                )
-            )
-        self.math(replace(self.data, step=replace(self.data.step, operands=tuple(grouped))), self.batch)
+        grouped = join_encounters(self.ordinary, lambda operand: (operand.identity, operand.target))
+        self.math(replace(self.data, step=replace(self.data.step, operands=grouped)), self.batch)
         return TaskOutput(
             counters=None
             if not self.data.entries

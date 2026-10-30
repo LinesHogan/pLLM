@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, replace
 from typing import Generic, Literal, Never, Protocol, TypeVar
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.optim.sgd import sgd
 
 from pllm.contracts.hidden_locator import HiddenPhase
@@ -20,14 +21,13 @@ from pllm.contracts.semantic_graph import ImplementationId, SemanticOutputKind, 
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.cuda_stream import CudaStreamReadiness, upload
-from pllm.execution.memory import apply_adamw_or_reserve
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot, borrowed_root
 from pllm.execution.ptts.page_bundle import PagePin, PagePublication, PageWrite, Slots
 from pllm.execution.ptts.request_state import RequestStateSelection, StateAddress
 from pllm.execution.state_execution import ProjectionResiduals, StateTaskContext
 from pllm.execution.torch_private import MemoryTrace, MemoryUsage, measure
 from pllm.execution.trace import TracePhase
-from pllm.kernels.adamw import AdamWConfig, AdamWFields, paged_adamw
+from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw, paged_adamw
 from pllm.kernels.page_copy import copy_pages
 
 I = TypeVar("I")
@@ -294,6 +294,28 @@ class PoolSGD:
             maximize=False,
             foreach=False,
         )
+
+
+def apply_adamw_or_reserve(
+    roots: Sequence[tuple[torch.Tensor, ...]],
+    fields: AdamWFields,
+    config: AdamWConfig,
+    gradients: tuple[torch.Tensor, ...],
+) -> None:
+    """Apply AdamW, or, on meta pages while planning, reserve the scratch the CUDA kernel would allocate."""
+    if not (roots and roots[0][0].is_meta):
+        apply_adamw(roots, fields, config, gradients)
+        return
+    # Torch's capturable implementation requires a CUDA tag; the storage stays meta.
+    with FakeTensorMode() as mode:
+
+        def operand(value: torch.Tensor) -> torch.Tensor:
+            return FakeTensor(mode, value, torch.device("cuda:0"))
+
+        pages = tuple(tuple(operand(value) for value in root) for root in roots)
+        values = tuple(operand(value) for value in gradients)
+        scratch = measure(lambda: apply_adamw(pages, fields, config, values))
+    MemoryTrace.reserve(scratch.workspace)
 
 
 @dataclass(frozen=True, slots=True)

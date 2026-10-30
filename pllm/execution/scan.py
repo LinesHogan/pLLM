@@ -1,9 +1,12 @@
-"""Public chunk recurrences and execution-owned, budgeted FX preparation."""
+"""Public chunk recurrences, execution-owned budgeted FX preparation, and the one-time warning when a
+selected plan may change floating-point rounding."""
 
+import warnings
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import replace
 from functools import lru_cache
+from threading import Lock
 from time import perf_counter
 from typing import ParamSpec, TypeVar
 
@@ -11,13 +14,35 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from pllm.contracts.tensor_policy import ScanForm, TensorPolicy
-from pllm.execution.numerics import warn_numerical_transforms
 from pllm.execution.scan_analysis import Specs, analyze
 from pllm.execution.scan_execution import PreparedScan, Step, associative_prefix, competitive
 from pllm.execution.torch_private import MemoryTrace, disable_current_modes, measure
 
 R = TypeVar("R")
 P = ParamSpec("P")
+_warned: set[str] = set()
+_warning_lock = Lock()
+
+
+class NumericalTransformWarning(UserWarning):
+    """The selected plan may change floating-point rounding, not algorithm semantics."""
+
+
+def warn_numerical_transforms(signature: str, transformations: tuple[str, ...]) -> None:
+    if not transformations:
+        return
+    with _warning_lock:
+        if signature in _warned:
+            return
+        _warned.add(signature)
+    warnings.warn(
+        "pLLM selected "
+        + ", ".join(transformations)
+        + "; these transformations may change floating-point results, including rounding and overflow. "
+        "Set ExecutionOptions(allow_numerical_transforms=False) to retain the original numerical path.",
+        NumericalTransformWarning,
+        stacklevel=3,
+    )
 
 
 class ScanContext:

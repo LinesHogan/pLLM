@@ -10,6 +10,7 @@ import torch
 
 import pllm
 from pllm.authoring import StateTensorUpdate
+from pllm.backends.vllm.activation import low_rank_affine_delta
 from pllm.contracts.backend_attachment import (
     ActivationPatchOperator,
     AttachmentGraphMode,
@@ -27,7 +28,6 @@ from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.semantic_graph import AnchorId, StateScope
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
-from pllm.execution.activation import low_rank_affine_delta
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.state_refs import StateRefs
