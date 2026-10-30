@@ -124,9 +124,7 @@ def mean_capture(publish_lag: int = 0) -> None:
                 # Sampler outputs may be overwritten after the handoff copy.
                 target.fill_(999)
                 tokens.fill_(999)
-            result = execution.finish_step(invocation)
-        if overlap is not None:
-            stream.wait_stream(overlap.stream)
+            result = execution.finish_step(invocation, stream)
         torch.testing.assert_close(result.loss, oracle.detach())
         torch.testing.assert_close(execution.snapshot(result.publication.after_refs[0], stream)[0], parameter)
     if overlap is not None:

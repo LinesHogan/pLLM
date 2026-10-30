@@ -105,7 +105,7 @@ def run_guided_step(
             guidance = execution.sampler_guidance(context, stream)
             execution.complete_sampler(context, stream, feedback=feedback)
     assert guidance is not None
-    return guidance, execution.finish_step(context)
+    return guidance, execution.finish_step(context, stream)
 
 
 __all__ = [

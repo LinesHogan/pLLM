@@ -580,7 +580,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                 self.advance_to(context, anchor.symbol)
                 if anchor.ordinal == self.sampler_anchor_id:
                     self.complete_sampler(context, stream, feedback=feedback)
-            return self.finish_step(context)
+            return self.finish_step(context, stream)
         except WindowBackpressure:
             # The convenience call exposes no cursor; staged callers keep it through execute_anchor.
             self.cancel_step(context)
@@ -684,7 +684,11 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         self._sampler_count += 1
         self.trace.record(TracePhase.SAMPLER_COMPLETE, context.invocation_id, pin_id=context.pin.pin_id)
 
-    def finish_step(self, context: StateTaskContext[DataT]) -> ResultT:
+    def finish_step(self, context: StateTaskContext[DataT], stream: torch.cuda.Stream | None = None) -> ResultT:
+        """Complete the step; pass the stream that will read the result so it is ordered after the writer lane.
+
+        The vLLM session passes none: it discards results, and waiting would serialize the overlap.
+        """
         self._require_borrow_live()
         try:
             result = self.math.output(context)
@@ -695,6 +699,8 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         except Exception as exc:
             self._failed(context, exc)
             raise
+        if self.post_sample is not None and stream is not None:
+            CudaStreamReadiness(self.post_sample.stream).order_on(stream)
         return result
 
     def cancel_step(self, context: StateTaskContext[DataT]) -> None:
