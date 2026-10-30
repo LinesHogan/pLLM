@@ -78,6 +78,7 @@ def weighted_training_output(
             for target, value in zip(batch.roots[state], parameters, strict=True):
                 target.copy_(value[index])
         data.parameter_gradient_fields[batch.selection.refs[state]] = tuple(value[index] for value in gradients)
+    assert data.valid_rows is not None
     observations = (
         tuple(
             Observation(
@@ -107,19 +108,10 @@ def weighted_training_output(
         loss=losses,
         loss_count=len(data.selected) * steps,
         update_count=len(data.selected),
-        trained_rows=data.trained_rows,
+        counters=torch.stack((torch.zeros_like(data.valid_rows), data.valid_rows)),
         changed=data.selected,
         observations=observations,
     )
-
-
-def weighted_rows(valid: torch.Tensor) -> tuple[int, bool]:
-    """Count training rows for accounting; meta traces the partial-batch masking path."""
-    counts = valid.sum(-1)
-    if valid.is_meta:
-        return valid.numel(), True
-    count = int(counts.sum().item())
-    return count, count != valid.numel()
 
 
 def weighted_selection(batch: WeightedCEBatch[torch.Tensor], selection: RequestStateSelection) -> tuple[int, ...]:
@@ -165,10 +157,9 @@ def prepare_weighted_batch(
     root = view.roots[selected[0]]
     valid = (labels >= 0) & (labels < dimensions.vocab_size) & (weights > 0)
     data.selected = selected
-    data.trained_rows, incomplete = weighted_rows(valid)
-    if incomplete:
-        hidden, logits = (tensor.masked_fill(~valid.unsqueeze(-1), 0) for tensor in (hidden, logits))
-        labels, weights = (tensor.masked_fill(~valid, 0) for tensor in (labels, weights))
+    data.valid_rows = valid.sum()
+    hidden, logits = (tensor.masked_fill(~valid.unsqueeze(-1), 0) for tensor in (hidden, logits))
+    labels, weights = (tensor.masked_fill(~valid, 0) for tensor in (labels, weights))
     data.batch_inputs = tuple(
         tensor.clone() if torch.is_inference(tensor) else tensor for tensor in (hidden, logits, labels, weights)
     )

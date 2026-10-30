@@ -376,6 +376,8 @@ class TensorFrame:
     batch_inputs: tuple[torch.Tensor, ...] = ()
     selected: tuple[int, ...] = ()
     trained_rows: int = 0
+    # Weighted training counts its valid rows on device; reading them would sync the host.
+    valid_rows: torch.Tensor | None = None
     training: TensorUpdate | None = None
     replacements: tuple[tuple[int, tuple[torch.Tensor, ...]], ...] = ()
     index: RowIndex | None = None
