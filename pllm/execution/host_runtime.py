@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Hashable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Generic, Protocol, TypeVar
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
+from pllm.contracts.codec import boundary_digest
 from pllm.contracts.feedback import Completion, CompletionBatch, FinishReason
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import (
@@ -17,16 +19,21 @@ from pllm.contracts.semantic_graph import (
     AnchorSymbol,
     SchedulerTimeline,
     SemanticGraph,
+    TaskResourceFact,
+    TaskSymbol,
     TimelineAnchor,
+    ValueResourceFact,
 )
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorLayoutRequest
 from pllm.execution.cuda_stream import CudaStreamReadiness
+from pllm.execution.declaration import Builder, Call, HostOperation, When, native
 from pllm.execution.execution import TaskGraphExecution, TaskGraphImplementation
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
 from pllm.execution.scheduler import compile_schedule
 from pllm.execution.state_execution import MathBinding, StateExecution
+from pllm.execution.torch_private import MemoryTrace, MemoryUsage
 from pllm.execution.trace import ExecutionTrace, TracePhase
 
 RequestT = TypeVar("RequestT")
@@ -430,8 +437,101 @@ class HostRuntimeFacts:
         )
 
 
+def transaction(
+    name: str,
+    facts: HostRuntimeFacts,
+    *,
+    config: Hashable,
+    state_factory: Callable[[], HostTaskState[TransactionT, ContextT, SnapshotT, ResultT]],
+    service: HostTransactionService[RequestT, TransactionT, ResultT],
+    update: Callable[[ContextT], None],
+    query: Callable[[ContextT], None],
+    publish: Callable[[ContextT], None],
+    example: Callable[[HostRuntimeFacts], tuple[ContextT, SnapshotT]] | None = None,
+) -> TransactionHostBinding[RequestT, TransactionT, ContextT, SnapshotT, ResultT]:
+    """Bind native structured math; retain the original state, service and context."""
+    b = Builder[ContextT](name, boundary_digest(config, facts))
+    resource = b.state("state")
+    changed = b.compute(
+        "update",
+        host_function=update,
+        inputs={"context": b.input(name, "transaction", f"{name}.transaction@1")},
+        outputs=("context",),
+        changes=resource,
+        when=When.HOST_COMPUTE,
+        implementations=(native(f"{name}:update@1", f"compute/{facts.device.type}@1"),),
+    )
+    queried = b.compute(
+        "query",
+        host_function=query,
+        inputs={"context": changed["context"]},
+        outputs=("context",),
+        reads=(resource.version(changed),),
+        when=When.HOST_OUTPUT,
+        implementations=(native(f"{name}:query@1", f"compute/{facts.device.type}@1"),),
+    )
+    published = b.compute(
+        "publish",
+        host_function=publish,
+        inputs={"context": queried["context"]},
+        outputs=("result",),
+        result_schema=f"{name}.result@1",
+        reads=(resource.version(changed),),
+        when=When.HOST_COMMIT,
+        implementations=(native(f"{name}:publish@1", "host/service@1", host=True),),
+    )
+    timeline = None
+    if example is not None:
+        timeline = _transaction_timeline(facts, example, b.host_operations, (changed, queried, published))
+    return TransactionHostBinding(b.graph, state_factory, b.bind_host(), service, facts, timeline)
+
+
+def _transaction_timeline(
+    facts: HostRuntimeFacts,
+    example: Callable[[HostRuntimeFacts], tuple[ContextT, SnapshotT]],
+    operations: Mapping[TaskSymbol, HostOperation[ContextT]],
+    calls: tuple[Call, ...],
+) -> SchedulerTimeline:
+    """Run the transaction calls in order on fake tensors, with the live context and its rollback snapshot."""
+    if facts.memory_budget_bytes is None:
+        return facts.timeline()
+    if facts.max_input_rows is None:
+        raise ValueError("finite transaction costs require max_input_rows")
+    costs: list[tuple[Call, MemoryUsage]] = []
+    with FakeTensorMode(), MemoryTrace() as lifetime:
+        context, snapshot = example(facts)
+        resident = lifetime.live
+        for call in calls:
+            usage = operations[call.symbol].memory(context)
+            # The context carries every output forward, so a call's output is all growth since the example.
+            costs.append((call, MemoryUsage(usage.workspace, max(0, lifetime.live - resident))))
+        del snapshot
+    return measured_timeline(facts, resident, costs, ((facts.max_input_rows, facts.hidden_size),))
+
+
+def measured_timeline(
+    facts: HostRuntimeFacts,
+    reserved_bytes: int,
+    costs: list[tuple[Call, MemoryUsage]],
+    input_shapes: tuple[tuple[int, ...], ...] = (),
+) -> SchedulerTimeline:
+    """The host timeline with each call's measured workspace and the bytes its one output keeps."""
+    timeline = facts.timeline()
+    costs = sorted(costs, key=lambda cost: cost[0].symbol)
+    return replace(
+        timeline,
+        reserved_bytes=(reserved_bytes,) * len(timeline.anchors),
+        task_resources=tuple(
+            TaskResourceFact(call.symbol, usage.workspace, input_shapes=input_shapes) for call, usage in costs
+        ),
+        value_resources=tuple(ValueResourceFact(call.symbol, call.outputs[0], usage.output) for call, usage in costs),
+    )
+
+
 __all__ = [
     "HostRuntimeFacts",
+    "measured_timeline",
+    "transaction",
     "CompletionInput",
     "HostWorkload",
     "HostExecution",

@@ -24,11 +24,9 @@ from pllm.execution.host_runtime import (
     HostWorkload as HostWorkload,
     NoHostRequest as NoHostRequest,
     TransactionHostBinding as TransactionHostBinding,
-)
-from pllm.learning import (
-    CompletionWorkload as CompletionWorkload,
     transaction as transaction,
 )
+from pllm.learning import CompletionWorkload as CompletionWorkload
 
 __all__ = [
     "transaction",
