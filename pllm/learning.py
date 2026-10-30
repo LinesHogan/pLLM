@@ -7,10 +7,10 @@ transition. They are ordinary clients of the DSL, not a second authoring stack.
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import replace
-from typing import ClassVar, Generic, TypeVar
+from typing import ClassVar, TypeVar
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -57,7 +57,6 @@ from pllm.usage import Activation, InstanceState, Overlay, RequestState
 
 ContextT = TypeVar("ContextT")
 ResultT = TypeVar("ResultT")
-InputT = TypeVar("InputT")
 TransactionT = TypeVar("TransactionT")
 SnapshotT = TypeVar("SnapshotT")
 RequestT = TypeVar("RequestT")
@@ -156,9 +155,17 @@ def _measured_timeline(
     )
 
 
-class _LearningMath(ABC, Generic[InputT, ContextT, ResultT]):
+class CompletionWorkload(HostWorkload[StateExecution[CompletionInput, ContextT, ResultT]]):
+    """Structured completion math with named parameters and one original instance root."""
+
+    name: ClassVar[str] = "completion.learning"
+
+    @property
     @abstractmethod
-    def prepare(self, value: InputT) -> ContextT: ...
+    def parameters(self) -> InstanceState: ...
+
+    @abstractmethod
+    def prepare(self, value: CompletionInput) -> ContextT: ...
 
     @abstractmethod
     def loss(self, data: ContextT, parameters: Tensors) -> torch.Tensor | None: ...
@@ -168,19 +175,6 @@ class _LearningMath(ABC, Generic[InputT, ContextT, ResultT]):
 
     @abstractmethod
     def output(self, data: ContextT, result: InvocationOutput) -> ResultT: ...
-
-
-class CompletionWorkload(
-    _LearningMath[CompletionInput, ContextT, ResultT],
-    HostWorkload[StateExecution[CompletionInput, ContextT, ResultT]],
-):
-    """Structured completion math with named parameters and one original instance root."""
-
-    name: ClassVar[str] = "completion.learning"
-
-    @property
-    @abstractmethod
-    def parameters(self) -> InstanceState: ...
 
     def training_example(self, facts: HostRuntimeFacts) -> ContextT:
         """Maximum-shape host input; override when host metadata selects training rows."""
@@ -281,12 +275,8 @@ class CompletionWorkload(
                 or value.hidden.device != facts.device
                 or facts.max_input_rows is not None
                 and len(value.hidden) > facts.max_input_rows
-                or value.readiness is not None
-                and batch.stream is None
             ):
-                raise ValueError(
-                    "completion input shape, device, row count, or CUDA stream differs from specialization"
-                )
+                raise ValueError("completion input shape, device or row count differs from specialization")
             if value.readiness is not None:
                 assert batch.stream is not None
                 value.readiness.order_on(batch.stream)
