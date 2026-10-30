@@ -60,12 +60,8 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
         return str(value)
     if isinstance(value, Enum):
         return boundary_digest(type(value).__qualname__, fingerprint(value.value, seen))
-    from pllm.execution.tensor_frame import TensorUpdate
-
-    if value is TensorUpdate:
-        return TensorUpdate.__qualname__
     if isinstance(value, type):
-        if value.__module__.partition(".")[0] == "torch":
+        if value.__module__.partition(".")[0] in ("torch", "pllm"):
             return boundary_digest(value.__module__, value.__qualname__, torch.__version__)
         if issubclass(value, torch.nn.Module):
             # A user module (module state) is signed by the code of its own methods.
@@ -174,10 +170,8 @@ def freeze(function: G) -> G:
 
 
 def members(owner: object) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for cls in reversed(type(owner).__mro__):
-        result.update(vars(cls))
-    return result
+    """Every class attribute of the owner's MRO, base classes first and subclasses overriding."""
+    return {name: item for cls in reversed(type(owner).__mro__) for name, item in vars(cls).items()}
 
 
 def owner_values(owner: object, marker_types: tuple[type, ...]) -> dict[str, object]:
