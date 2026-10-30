@@ -115,8 +115,8 @@ def derive_attachment_resources(
     if len(tasks) != 1:
         raise ValueError("tokenwise attachment costs require one model replay task")
     (task,) = tasks
-    # Builder._attach composes the replay with its publication and Rust validation checks it; a
-    # conditional input group keeps all producer facts, so the complete DAG funds the worst case.
+    # Builder._attach composes the replay with its publication; a conditional input group keeps
+    # all producer facts, so the complete DAG funds the worst case.
     resident = capture_memory_bytes if TOKEN_CAPTURE_CAPABILITY in probe.capabilities else 0
     workspace = probe.max_packed_rows * probe.hidden_size * 8
     existing = next((fact for fact in timeline.task_resources if fact.task == task.symbol), None)
@@ -153,7 +153,7 @@ def derive_attachment_resources(
 
 
 def check_backend_attachment(attachment: BackendAttachment) -> None:
-    """Check declared attachment inputs against their plan and backend facts in Rust."""
+    """Reject, in Rust, attachments a workload can declare but the backend cannot run."""
     _core.check_backend_attachment(encode_boundary(attachment))
 
 

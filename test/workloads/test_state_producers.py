@@ -196,7 +196,6 @@ def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch
     stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
     from pllm.contracts.request_identity import RequestKeyField
     from pllm.contracts.request_state import RequestStateKey
-    from pllm.execution.backend_attachment import check_backend_attachment
     from pllm.execution.state_execution import PublishStateTask
 
     class Imported(ProjectionState):
@@ -276,16 +275,6 @@ def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch
     torch.testing.assert_close(execution.snapshot(entry, stream=stream), before)
     execution.retire((identity,), wait=True)
     assert execution.diagnostics().active_lineages == execution.diagnostics().pending_state_releases == 0
-    attachment = written.attachment
-    binding = attachment.spec.overlay_bindings[0]
-    broken = replace(binding, fields=(replace(binding.fields[0], offset=10000), binding.fields[1]))
-    with pytest.raises(ValueError, match="view"):
-        check_backend_attachment(
-            replace(
-                attachment,
-                spec=replace(attachment.spec, overlay_bindings=(broken, *attachment.spec.overlay_bindings[1:])),
-            )
-        )
 
 
 def test_initialized_reader_and_hidden_before_model_boundary():

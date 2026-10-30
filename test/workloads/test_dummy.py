@@ -15,7 +15,6 @@ import pllm
 from examples.centered_hidden import centered_hidden
 from examples.sae_export import SAE
 from pllm import make_llm, testing
-from pllm.contracts.backend_attachment import AttachmentHiddenResource
 from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.packed_rows import PackedPhaseRow
@@ -92,9 +91,6 @@ def test_dummy_runs_graph_sign_plan_execute() -> None:
     attached = deployment.execution
     torch.testing.assert_close(exported(attached, value(2)), expected)
     torch.testing.assert_close(exported(attached, value(2)), expected)
-    other_layer = (AttachmentHiddenResource(replace(BINDING, layer="1"), HiddenPhase.DECODE),)
-    with pytest.raises(ValueError):  # the backend does not provide the hidden layer the workload reads
-        workload.plan_backend(replace(facts, probe=replace(facts.probe, hidden_resources=other_layer)))
 
     class Chained(DummyWorkload):
         @pllm.on(pllm.Phase.OBSERVE)

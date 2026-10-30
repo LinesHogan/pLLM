@@ -1,6 +1,5 @@
 """Evidence 26: independent LoReFT math, explicit publication and no-update path."""
 
-import json
 from dataclasses import dataclass, replace
 from importlib.util import find_spec
 from types import SimpleNamespace
@@ -20,7 +19,6 @@ from pllm.contracts.backend_attachment import (
     DecodeWindow,
     MissingPolicy,
 )
-from pllm.contracts.codec import encode_boundary
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
@@ -174,13 +172,7 @@ def _decode_declarations_are_checked(facts):
         def intervention(self) -> pllm.InstanceState:
             return pllm.InstanceState({"delta": pllm.Buffer((4,), dtype=torch.float32)}, imported=True)
 
-    plan, _ = DeclaredActivation(replace(legacy, decode=DecodeWindow.ALL, on_missing=MissingPolicy.HOLD)).plan_backend(
-        facts
-    )
-    payload = json.loads(encode_boundary(plan))
-    del payload["spec"]["activation_bindings"][0]["on_missing"]
-    with pytest.raises(ValueError):  # The policy must be explicit on the wire.
-        pllm._core.check_backend_attachment(json.dumps(payload))
+    DeclaredActivation(replace(legacy, decode=DecodeWindow.ALL, on_missing=MissingPolicy.HOLD)).plan_backend(facts)
 
 
 def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:

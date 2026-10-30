@@ -26,6 +26,7 @@ from pllm.contracts.backend_attachment import (
 from pllm.contracts.codec import boundary_digest
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
+    FieldView,
     ParameterEffect,
     ParameterOverlayFieldBinding,
 )
@@ -39,6 +40,7 @@ from pllm.contracts.semantic_graph import (
     TaskSymbol,
     TokenProgramEffect,
 )
+from pllm.contracts.tensor_layout import TensorDType
 from pllm.contracts.visibility import Exact, Visibility, VisibilitySource
 from pllm.execution.binding_base import Buffer, overlay_fields
 from pllm.execution.declaration import Call, State, When, native
@@ -84,7 +86,7 @@ def declare_parameter_overlay(
     """Declare a parameter overlay and its request-state transition."""
     if b.graph.tasks or b.graph.states or b.host:
         raise ValueError("ordinary overlay requires a sole request state and model transition")
-    fields = overlay_fields(buffers, effect)
+    fields = overlay_fields(buffers, effect, b.dimensions)
     targets, applied = effect.targets, effect.applied_fields
     b.overlay_targets = targets
     b.parameter_phases = phases
@@ -254,6 +256,8 @@ def declare_activation_patch(
         or len(views) != len(layers) * width
     ):
         raise ValueError("activation fields must cover each ordered layer and operator")
+    for start in range(0, len(views), width):
+        _check_activation_fields(b, state, operator, views[start : start + width])
     b.overlay(
         state,
         producer,
@@ -271,6 +275,29 @@ def declare_activation_patch(
             for index, layer in enumerate(layers)
         ),
     )
+
+
+def _check_activation_fields(
+    b: TensorBinding, state: State, operator: ActivationPatchOperator, views: tuple[FieldView, ...]
+) -> None:
+    """Reject one layer's activation fields the operator cannot apply, naming the fields to fix."""
+    hidden, names = b.dimensions.hidden_size, tuple(state.fields[view.field].name for view in views)
+    shapes = tuple(view.shape for view in views)
+    if operator is ActivationPatchOperator.ADD:
+        rule, valid, required = f"({hidden},)", shapes == ((hidden,),), TensorDType.FLOAT32
+    else:
+        rank = shapes[0][0] if shapes[0] else 0
+        rule = f"(rank, {hidden}), (rank,) and ({hidden}, rank) with 0 < rank <= {hidden}"
+        valid = 0 < rank <= hidden and shapes == ((rank, hidden), (rank,), (hidden, rank))
+        required = b.dimensions.dtype
+    if not valid:
+        raise ValueError(f"activation fields {names} must be shaped {rule} for {operator}; got {shapes}")
+    (layout,) = (entry.layout for entry in b.layouts.layouts if entry.resource == state.declaration.resource)
+    for name, view in zip(names, views, strict=True):
+        if layout.fields[view.field].dtype is not required:
+            raise ValueError(
+                f"activation field {name!r} must hold {required} for {operator}; set dtype=torch.{required}"
+            )
 
 
 def declare_layer_route(

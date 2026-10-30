@@ -41,10 +41,6 @@ fn compile_state_schedule(
 }
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(
-        semantic_graph::explain_state_visibility,
-        module
-    )?)?;
     module.add_function(wrap_pyfunction!(compile_state_schedule, module)?)?;
     Ok(())
 }

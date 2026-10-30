@@ -912,21 +912,6 @@ fn validate_visibility(source: &VisibilitySource) -> Result<(), String> {
     }
 }
 
-#[pyo3::pyfunction]
-pub(crate) fn explain_state_visibility(source_json: &str) -> pyo3::PyResult<String> {
-    let run = || -> Result<String, String> {
-        let source: VisibilitySource =
-            serde_json::from_str(source_json).map_err(|e| e.to_string())?;
-        validate_visibility(&source)?;
-        Ok(match source.policy.kind {
-            VisibilityKind::StepLag => format!("reader[t,q]: entry snapshot, or boundary[max(0,t-{}),q] when retained; writer[t,q]: latest", source.lag),
-            VisibilityKind::ForwardPinned => "model[r,t,c]: entry[r,t]; update[r,t,0]: entry[r,t]".into(),
-            VisibilityKind::Exact => "model[r,t,0], update[r,t,0]: entry[r,t]; model[r,t,c], update[r,t,c]: update[r,t,c-1] for c > 0; tail carries the last update".into(),
-        })
-    };
-    run().map_err(pyo3::exceptions::PyValueError::new_err)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{canonical_ascii_json, decode_graph, validate_graph};

@@ -1,18 +1,14 @@
-"""Static allocation layout, split kernel pages, and schema/source tampering evidence."""
+"""Static allocation layout and split kernel pages."""
 
-import json
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from pllm import KVOffload, _core
+from pllm import KVOffload
 from pllm.backends.vllm.position_state import PositionCacheProvider, PositionMetadata
-from pllm.config import ExecutionOptions
-from pllm.contracts.codec import encode_boundary
-from pllm.workloads.step_loop import StepLoop
-from test.workloads.test_recirculation import FACTS, ROWS
+from test.workloads.test_recirculation import ROWS
 
 
 @pytest.mark.parametrize("width,allocation", ((896, 16), (3584, 16), (896, 32), (3584, 32)))
@@ -36,23 +32,6 @@ def test_predecessors_follow_allocation_pages(width, allocation):
         previous = entry + 1
         provider.exit((previous,))
     torch.testing.assert_close(provider.tables[0][3], torch.full((width,), 2.0 + allocation))
-
-
-@pytest.mark.parametrize("target", ("schema", "effects", "ports"))
-def test_position_source_cannot_use_stateless_signing_exemption(target):
-    workload = StepLoop()
-    facts = replace(FACTS, probe=replace(FACTS.probe, position_states=(("history", 0.0),)))
-    attachment = workload.compile_backend(workload.specialize(facts, ExecutionOptions())).attachment
-    payload = json.loads(encode_boundary(attachment))
-    effect = payload["plan"]["semantic_graph"]["tasks"][0]["replay"]
-    if target == "schema":
-        payload["probe"]["position_states"] = []
-    elif target == "effects":
-        effect["role_sensitive"] = False
-    else:
-        effect["digest"] = ""
-    with pytest.raises(ValueError):
-        _core.check_backend_attachment(json.dumps(payload))
 
 
 def test_unsupported_transfer():

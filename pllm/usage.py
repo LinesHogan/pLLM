@@ -1479,7 +1479,7 @@ class _Declaration:
         )
         if consumers:
             (consumer,) = consumers
-            fields = overlay_fields(buffers, consumer)
+            fields = overlay_fields(buffers, consumer, self.binding.dimensions)
             self.binding.overlay_targets = consumer.targets
         else:
             fields = tuple(

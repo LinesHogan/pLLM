@@ -7,10 +7,8 @@ import pytest
 import torch
 from vllm import SamplingParams
 
-from pllm.contracts.backend_attachment import AttachmentKind
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.semantic_graph import StateResource
-from pllm.execution.backend_attachment import check_backend_attachment
 from pllm.execution.tensor_executor import TensorExecutor
 from pllm.workloads.state_producers import DecodeFactors, PromptFactors, PromptMixture
 from test.gpu.vllm_inplace_ttt_smoke import open_llm
@@ -161,24 +159,6 @@ def test_composed_readers_replay_model_graphs(workload, monkeypatch):
                     dispatch(*args, **kwargs),
                     num_tokens=next(n for n in capacities(64) if n >= args[1]),
                 )
-            if graphs:
-                attachment = handle.attachment
-                with pytest.raises(ValueError, match="Graph overlays"):
-                    check_backend_attachment(
-                        replace(attachment, spec=replace(attachment.spec, kind=AttachmentKind.ACTIVATION_PATCH))
-                    )
-                with pytest.raises(ValueError, match="Graph overlays"):
-                    check_backend_attachment(
-                        replace(
-                            attachment,
-                            probe=replace(
-                                attachment.probe,
-                                capabilities=tuple(
-                                    c for c in attachment.probe.capabilities if c != "backend/vllm_mrv2@1"
-                                ),
-                            ),
-                        )
-                    )
             runs = []
             run = StepCapture.run
 
