@@ -211,7 +211,6 @@ def _check_cancelled_projection(handle):
         execution.cancel_step(invocation)
         overlay.clear()
         execution.retire((identity,))
-        assert execution.arena.pending_pin_releases > 0
         other = RequestIdentity("replacement-projection", 42, 0)
         (replacement,) = execution.admit((other,), stream)
         pin = execution.arena.pin_exact(StateRefs.of((replacement,)), stream)

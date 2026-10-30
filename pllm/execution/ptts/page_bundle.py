@@ -5,7 +5,6 @@ A PageBundleArena is owned by the single thread that runs the model step and has
 
 from __future__ import annotations
 
-from collections import deque
 from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field as dataclass_field
@@ -418,12 +417,9 @@ class PageBundleArena:
                 self._tables[selected.resource] = _Table(selected, self._pools[selected.resource])
         self._writes: dict[PageWrite, _Write] = {}
         self._pins: dict[PagePin, _Pin] = {}
-        self._publications: dict[PagePublication, _Write] = {}
+        # Pins with remote readers keep their pages until every remote read is acknowledged.
         self._releases: dict[PageRelease, _Pin] = {}
-        self._recycled: set[PagePublication | PageRelease] = set()
         self._storage_streams: set[int] = set()
-        self._pending_events: dict[torch.cuda.Stream, deque[PagePublication | PageRelease]] = {}
-        self._ready_receipts: dict[PagePublication | PageRelease, None] = {}
         self._next_lineage = 1
         self._next_operation = 1
         self._next_pin = 1
@@ -523,22 +519,14 @@ class PageBundleArena:
             len(private),
             len(retiring),
             len(held),
-            len(self._publications) + len(self._releases),
+            len(self._releases),
             self._admission_capacity_failures,
         )
 
     def _held_pages(self) -> Sequence[_Pages]:
         return (
             tuple(group for pin in self._pins.values() for group in pin.pages)
-            + tuple(
-                group for receipt, pin in self._releases.items() if receipt not in self._recycled for group in pin.pages
-            )
-            + tuple(
-                group
-                for receipt, write in self._publications.items()
-                if receipt not in self._recycled
-                for group in (*write.sources, *write.targets)
-            )
+            + tuple(group for pin in self._releases.values() for group in pin.pages)
             + tuple(group for write in self._writes.values() for group in write.sources)
         )
 
@@ -708,8 +696,7 @@ class PageBundleArena:
             if any(self._pools[resource].free_count(field) < count for field, count in enumerate(counts))
         }
         if exhausted:
-            self.collect_completed(resources=exhausted)
-            self._recycle_pending()
+            self.collect_completed()
         if any(
             self._pools[resource].free_count(field) < count
             for resource, counts in demand.items()
@@ -829,12 +816,10 @@ class PageBundleArena:
             table.status[rows] = 2
             table.writing[rows] = False
             target.readiness = (completion,) * len(rows)
-        for source in write.sources:
-            # The writer's source hold now protects the old table pages until completion.
-            source.release()
         self._writes.pop(token)
-        self._publications[receipt] = write
-        self._queue_completion(receipt, token.stream)
+        # Each source page loses the writer's hold and the table's hold on the replaced version.
+        for group in (*write.targets, *write.sources, *write.sources):
+            group.release(completion)
         return receipt
 
     def abort(self, token: PageWrite) -> None:
@@ -845,19 +830,6 @@ class PageBundleArena:
             group.table.writing[group.rows] = False
             group.release(completion)
         self._writes.pop(token)
-
-    def _recycle_pending(self) -> None:
-        # Closed local readers and settled publications can transfer their
-        # physical lifetime to the next writer's device wait. Remote leases
-        # keep their holders until their own completion proofs are available.
-        for receipt in (*self._publications, *self._releases):
-            if receipt in self._recycled:
-                continue
-            if isinstance(receipt, PageRelease) and not all(read.query() for read in receipt.remote_reads):
-                continue
-            for group in self._receipt_pages(receipt):
-                group.release(receipt.completion)
-            self._recycled.add(receipt)
 
     def pin_exact(self, refs: StateRefs, stream: torch.cuda.Stream | None = None) -> PagePin:
         self._require_stream(stream)
@@ -1039,8 +1011,10 @@ class PageBundleArena:
         receipt = PageRelease(self._next_release, pin, self._record(pin.stream), tuple(held.remote))
         self._next_release += 1
         self._pins.pop(pin)
-        self._releases[receipt] = held
-        self._queue_completion(receipt, pin.stream)
+        if receipt.remote_reads:
+            self._releases[receipt] = held
+        else:
+            self._release_pages(held, receipt.completion)
         return receipt
 
     def wait_release(self, receipt: PageRelease) -> None:
@@ -1065,71 +1039,21 @@ class PageBundleArena:
             group.release()
         self.collect_completed()
 
-    def _queue_completion(self, receipt: PagePublication | PageRelease, stream: torch.cuda.Stream | None) -> None:
-        if stream is None:
-            self._ready_receipts[receipt] = None
-        else:
-            self._pending_events.setdefault(stream, deque()).append(receipt)
+    def _release_pages(self, pin: _Pin, completion: torch.cuda.Event | None) -> None:
+        for group in pin.pages:
+            group.release(completion)
 
-    def _receipt_pages(self, receipt: PagePublication | PageRelease) -> tuple[_Pages, ...]:
-        if isinstance(receipt, PageRelease):
-            return self._releases[receipt].pages
-        write = self._publications[receipt]
-        return (*write.sources, *write.targets)
-
-    def _poll_completions(self, wait: bool, resources: set[str] | None) -> None:
-        for stream, queue in tuple(self._pending_events.items()):
-            # Under allocation pressure, an earlier event on this stream must finish
-            # before a relevant later receipt can release any pages.
-            waiting = wait and (
-                resources is None
-                or any(group.table.resource in resources for receipt in queue for group in self._receipt_pages(receipt))
-            )
-            while queue:
-                receipt = queue[0]
-                assert receipt.completion is not None
-                if not receipt.completion.query():
-                    if not waiting:
-                        break
-                    receipt.completion.synchronize()
-                queue.popleft()
-                self._ready_receipts[receipt] = None
-            if not queue:
-                del self._pending_events[stream]
-
-    def collect_completed(self, *, wait: bool = False, resources: set[str] | None = None) -> None:
+    def collect_completed(self, *, wait: bool = False) -> None:
+        """Release pins whose remote readers have finished; local releases already happened behind their fence."""
         self._require_live()
-        self._poll_completions(wait, resources)
-        completed: list[_Pages] = []
-        receipts: list[PagePublication | PageRelease] = []
-        for receipt in self._ready_receipts:
-            if isinstance(receipt, PageRelease):
-                groups = self._releases[receipt].pages
-                relevant = resources is None or any(group.table.resource in resources for group in groups)
-                if wait and relevant and (resources is None or all(read.query() for read in receipt.remote_reads)):
-                    for read in receipt.remote_reads:
-                        read.synchronize()
-                if not all(read.query() for read in receipt.remote_reads):
-                    continue
-            if receipt not in self._recycled:
-                completed.extend(self._receipt_pages(receipt))
-            receipts.append(receipt)
-        # A failed remote proof leaves every owner recorded, including locally ready receipts.
-        for table in self._tables.values():
-            groups = [group for group in completed if group.table is table]
-            if groups:
-                table.pools.release(np.concatenate([group.slots for group in groups]))
-                table.owners -= np.bincount(
-                    np.concatenate([group.rows for group in groups]), minlength=len(table.owners)
-                )
-                table.reclaim()
-        for receipt in receipts:
-            self._recycled.discard(receipt)
-            del self._ready_receipts[receipt]
-            if isinstance(receipt, PagePublication):
-                del self._publications[receipt]
-            else:
-                del self._releases[receipt]
+        for receipt, held in tuple(self._releases.items()):
+            if wait:
+                for read in receipt.remote_reads:
+                    read.synchronize()
+            elif not all(read.query() for read in receipt.remote_reads):
+                continue
+            self._release_pages(held, receipt.completion)
+            del self._releases[receipt]
 
     def _issued_write(self, token: PageWrite) -> _Write:
         self._require_live()
@@ -1149,6 +1073,8 @@ class PageBundleArena:
 
     def _require_stream(self, stream: torch.cuda.Stream | None) -> None:
         self._require_live()
+        if stream is None and self.device.type == "cuda":
+            raise ValueError("A CUDA PageBundleArena needs a stream; pass torch.cuda.current_stream()")
         self._order(self._initialization, stream)
         if stream is not None and stream.cuda_stream not in self._storage_streams:
             # The arena may be destroyed after asynchronous cancellation. CUDA's
