@@ -1,4 +1,7 @@
-"""Map session request keys to resource-qualified lineages in the PageBundle arena."""
+"""Map session request keys to resource-qualified lineages in the PageBundle arena.
+
+Request state is touched only by the thread that owns the arena and has no lock; see StateExecution.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +9,6 @@ from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from functools import cached_property
-from threading import RLock
 from types import MappingProxyType
 from typing import NamedTuple
 
@@ -113,7 +115,6 @@ class RequestStateDirectory:
         self._identity_holds: dict[tuple[StateResource, RequestIdentity], StateAddress] = {}
         self._inference_pins: dict[RequestIdentity, PagePin] = {}
         self._projection: tuple[tuple[RequestIdentity, ...], tuple[_Projection, ...]] | None = None
-        self._lock = RLock()
 
     @property
     def state(self) -> SemanticState | None:
@@ -145,8 +146,7 @@ class RequestStateDirectory:
         return len(self._inference_pins)
 
     def inference_pin(self, identity: RequestIdentity) -> PagePin:
-        with self._lock:
-            return self._inference_pins[identity]
+        return self._inference_pins[identity]
 
     def has_inference_pin(self, identity: RequestIdentity) -> bool:
         return identity in self._inference_pins
@@ -171,67 +171,64 @@ class RequestStateDirectory:
         initialize: Callable[[tuple[tuple[torch.Tensor, ...], ...], tuple[StateAddress, ...]], None],
     ) -> PagePublication | None:
         """Initialize and publish new lineages, then install their holders and inference pins."""
-        with self._lock:
-            addresses = self._addresses(identities)
-            if not identities:
-                new = tuple(key for key in addresses if key.key is None)
-                holds: tuple[tuple[RequestIdentity, StateAddress], ...] = ()
-                instances = StateRefs.of(())
-            else:
-                new = tuple(key for key in addresses if key.key is not None and key not in self._lineages)
-                holds = tuple(
-                    (identity, StateAddress(s.resource, RequestStateKey.project(identity, s.key_fields)))
-                    for s in self.request_states
-                    for identity in identities
-                )
-                instances = StateRefs.of(
-                    tuple(self.arena.latest(self._lineages[key]) for key in addresses if key.key is None)
-                )
-            write = self.arena.prepare_admission(tuple(str(key.resource) for key in new), stream) if new else None
-            pins: list[tuple[RequestIdentity, PagePin]] = []
-            receipt = None
-            try:
-                for identity in identities if instances else ():
-                    pins.append((identity, self.arena.pin_exact(instances, stream)))
-                if write is not None:
-                    with nullcontext() if stream is None else torch.cuda.stream(stream):
-                        initialize(self.arena.writable_roots(write), new)
-                    lineages = dict(self._lineages)
-                    for key, ref in zip(new, write.after_refs, strict=True):
-                        lineages[key] = ref.lineage_id
-                    receipt = self.arena.publish(write)
-                    self._lineages = lineages
-                    self._projection = None
-            except Exception:
-                for _, pin in pins:
-                    self.arena.release_pin(pin)
-                if write is not None:
-                    self.arena.abort(write)
-                raise
-            for identity, key in holds:
-                self._identity_holds[key.resource, identity] = key
-            self._inference_pins.update(pins)
-            if receipt is not None:
-                self.arena.settle(receipt)
-            return receipt
+        addresses = self._addresses(identities)
+        if not identities:
+            new = tuple(key for key in addresses if key.key is None)
+            holds: tuple[tuple[RequestIdentity, StateAddress], ...] = ()
+            instances = StateRefs.of(())
+        else:
+            new = tuple(key for key in addresses if key.key is not None and key not in self._lineages)
+            holds = tuple(
+                (identity, StateAddress(s.resource, RequestStateKey.project(identity, s.key_fields)))
+                for s in self.request_states
+                for identity in identities
+            )
+            instances = StateRefs.of(
+                tuple(self.arena.latest(self._lineages[key]) for key in addresses if key.key is None)
+            )
+        write = self.arena.prepare_admission(tuple(str(key.resource) for key in new), stream) if new else None
+        pins: list[tuple[RequestIdentity, PagePin]] = []
+        receipt = None
+        try:
+            for identity in identities if instances else ():
+                pins.append((identity, self.arena.pin_exact(instances, stream)))
+            if write is not None:
+                with nullcontext() if stream is None else torch.cuda.stream(stream):
+                    initialize(self.arena.writable_roots(write), new)
+                lineages = dict(self._lineages)
+                for key, ref in zip(new, write.after_refs, strict=True):
+                    lineages[key] = ref.lineage_id
+                receipt = self.arena.publish(write)
+                self._lineages = lineages
+                self._projection = None
+        except Exception:
+            for _, pin in pins:
+                self.arena.release_pin(pin)
+            if write is not None:
+                self.arena.abort(write)
+            raise
+        for identity, key in holds:
+            self._identity_holds[key.resource, identity] = key
+        self._inference_pins.update(pins)
+        if receipt is not None:
+            self.arena.settle(receipt)
+        return receipt
 
     def latest_refs(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateRef, ...]:
-        with self._lock:
-            return tuple(self.arena.latest(self._lineages[key]) for key in self._addresses(identities))
+        return tuple(self.arena.latest(self._lineages[key]) for key in self._addresses(identities))
 
     def select(self, rows: tuple[PackedPhaseRow, ...], history: tuple[StateRefs, ...] = ()) -> RequestStateSelection:
         """Select exact versions, rewinding recent step inputs newest first when lag is requested."""
-        with self._lock:
-            identities = tuple(row.identity for row in rows)
-            if self._projection is None or self._projection[0] != identities:
-                self._projection = identities, self._project(rows)
-            groups = tuple(
-                ResourceSelection(resource, keys, self.arena.latest_batch(resource, lineages), positions)
-                for resource, keys, lineages, positions in self._projection[1]
-            )
-            if history:
-                groups = tuple(replace(group, refs=self._rewind(group.refs, history)) for group in groups)
-            return RequestStateSelection(rows if self.states else (), groups)
+        identities = tuple(row.identity for row in rows)
+        if self._projection is None or self._projection[0] != identities:
+            self._projection = identities, self._project(rows)
+        groups = tuple(
+            ResourceSelection(resource, keys, self.arena.latest_batch(resource, lineages), positions)
+            for resource, keys, lineages, positions in self._projection[1]
+        )
+        if history:
+            groups = tuple(replace(group, refs=self._rewind(group.refs, history)) for group in groups)
+        return RequestStateSelection(rows if self.states else (), groups)
 
     @staticmethod
     def _rewind(refs: StateRefs, history: tuple[StateRefs, ...]) -> StateRefs:
@@ -266,47 +263,43 @@ class RequestStateDirectory:
         return tuple(projections)
 
     def retire(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateRef, ...]:
-        with self._lock:
-            addresses = self._addresses(identities)
-            if not identities:
-                releasing = tuple(key for key in addresses if key.key is None)
-                pins: tuple[PagePin, ...] = ()
-                leaving: tuple[StateAddress, ...] = ()
-            else:
-                pins = tuple(self._inference_pins[identity] for identity in identities) if self.instance_states else ()
-                leaving = tuple(key for key in addresses if key.key is not None)
-                releasing = tuple(
-                    key
-                    for key in leaving
-                    if all(
-                        identity in identities for (_, identity), held in self._identity_holds.items() if held == key
-                    )
-                    and key.key is not None
-                    and RequestKeyField.ROUTE not in key.key.fields
-                )
-            refs = tuple(self.arena.latest(self._lineages[key]) for key in releasing)
-            if refs:
-                self.arena.retire(StateRefs.of(refs))
-            if pins:
-                for identity, pin in zip(identities, pins, strict=True):
-                    self.arena.release_pin(pin)
-                    self._inference_pins.pop(identity)
-            for state in self.request_states:
-                for identity in identities:
-                    self._identity_holds.pop((state.resource, identity))
-            for key in releasing:
-                self._lineages.pop(key)
-                self._projection = None
-            return tuple(dict.fromkeys((*refs, *(ref for pin in pins for ref in pin.refs))))
+        addresses = self._addresses(identities)
+        if not identities:
+            releasing = tuple(key for key in addresses if key.key is None)
+            pins: tuple[PagePin, ...] = ()
+            leaving: tuple[StateAddress, ...] = ()
+        else:
+            pins = tuple(self._inference_pins[identity] for identity in identities) if self.instance_states else ()
+            leaving = tuple(key for key in addresses if key.key is not None)
+            releasing = tuple(
+                key
+                for key in leaving
+                if all(identity in identities for (_, identity), held in self._identity_holds.items() if held == key)
+                and key.key is not None
+                and RequestKeyField.ROUTE not in key.key.fields
+            )
+        refs = tuple(self.arena.latest(self._lineages[key]) for key in releasing)
+        if refs:
+            self.arena.retire(StateRefs.of(refs))
+        if pins:
+            for identity, pin in zip(identities, pins, strict=True):
+                self.arena.release_pin(pin)
+                self._inference_pins.pop(identity)
+        for state in self.request_states:
+            for identity in identities:
+                self._identity_holds.pop((state.resource, identity))
+        for key in releasing:
+            self._lineages.pop(key)
+            self._projection = None
+        return tuple(dict.fromkeys((*refs, *(ref for pin in pins for ref in pin.refs))))
 
     def retire_dormant(self) -> tuple[StateRef, ...]:
-        with self._lock:
-            held = set(self._identity_holds.values())
-            dormant = tuple(key for key in self._lineages if key.key is not None and key not in held)
-            refs = tuple(self.arena.latest(self._lineages[key]) for key in dormant)
-            if refs:
-                self.arena.retire(StateRefs.of(refs))
-            for key in dormant:
-                self._lineages.pop(key)
-                self._projection = None
-            return refs
+        held = set(self._identity_holds.values())
+        dormant = tuple(key for key in self._lineages if key.key is not None and key not in held)
+        refs = tuple(self.arena.latest(self._lineages[key]) for key in dormant)
+        if refs:
+            self.arena.retire(StateRefs.of(refs))
+        for key in dormant:
+            self._lineages.pop(key)
+            self._projection = None
+        return refs

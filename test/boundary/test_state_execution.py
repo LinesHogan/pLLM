@@ -85,7 +85,7 @@ def test_retiring_a_request_cancels_its_invocation_and_releases_only_its_pins():
     invocation = execution.begin(rows_for(a))
     assert not invocation.releases
     execution.retire((a,))
-    assert invocation.cancel_requested.is_set() and invocation.releases[0].pin is invocation.pin
+    assert invocation.cancel_requested and invocation.releases[0].pin is invocation.pin
     assert not execution.directory.has_inference_pin(a)
     assert tuple(execution.directory.inference_pin(b).refs) == (global_ref,)
     execution.cancel_step(execution.begin(rows_for(b)))
@@ -111,7 +111,7 @@ def test_cancellation_inside_a_loop_keeps_the_first_commit_and_stops():
         for _ in range(6):
             calls.append(1)
             if len(calls) == 2:
-                context.cancel_requested.set()
+                context.cancel_requested = True
             increment_resources(context)
 
     task.update = update

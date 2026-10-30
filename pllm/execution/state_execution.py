@@ -1,10 +1,14 @@
-"""Own invocation pages, sampler handoff and settlement for tensor execution and vLLM sessions."""
+"""Own invocation pages, sampler handoff and settlement for tensor execution and vLLM sessions.
+
+A StateExecution belongs to the one thread that runs the model step; it has no lock. The trace export thread
+reads only ExecutionTrace, which has its own Condition. Calling diagnostics()/command() from another thread
+while generate is running is unsupported.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from threading import Event, RLock
 from typing import TYPE_CHECKING, ClassVar, Generic, Literal, NoReturn, Protocol, TypeVar
 
 import numpy as np
@@ -138,7 +142,7 @@ class StateTaskContext(Generic[DataT]):
     update_count: int = 0
     trained_rows: int = 0
     overlay_counters: torch.Tensor | None = None
-    cancel_requested: Event = field(default_factory=Event)
+    cancel_requested: bool = False
     borrowed_roots: tuple[BorrowedStateRoot, ...] = ()
     held_input: HeldInput | None = None
     injected_refs: dict[RequestIdentity, set[StateRef]] = field(
@@ -197,7 +201,7 @@ class StateTaskContext(Generic[DataT]):
         return tuple(map(latest, originals))
 
     def check_page_execution(self) -> None:
-        if self.cancel_requested.is_set():
+        if self.cancel_requested:
             raise RuntimeError("state invocation was cancelled")
 
     def prepare_owned_write(
@@ -406,7 +410,6 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             )
             else None
         )
-        self._lock = RLock()
         self.feeds = feeds
         self._pending_borrows: tuple[BorrowedStateRoot, ...] | None = None
         self._borrow_failed = False
@@ -439,32 +442,30 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
 
     def stage_readonly(self, roots: tuple[BorrowedStateRoot, ...]) -> None:
         """Internal transport handoff; no change to workload authoring signatures."""
-        with self._lock:
-            self._require_borrow_live()
-            self._pending_borrows = roots  # Retain even invalid incoming mappings until the session terminates.
-            try:
-                for root in roots:
-                    root.claim(self.arena.allocation_ranges)
-            except Exception:
-                self._borrow_failed = True
-                raise
+        self._require_borrow_live()
+        self._pending_borrows = roots  # Retain even invalid incoming mappings until the session terminates.
+        try:
+            for root in roots:
+                root.claim(self.arena.allocation_ranges)
+        except Exception:
+            self._borrow_failed = True
+            raise
 
     def stage_hold(self, identities: tuple[RequestIdentity, ...], reason: str, *, step_id: int) -> HeldInput:
         """Return the signed HOLD branch with exact versions from successful settlement."""
-        with self._lock:
-            self._require_borrow_live()
-            try:
-                if (
-                    self.arena.plan.semantic_graph.input_groups
-                    and not self.arena.plan.semantic_graph.input_groups[0].allow_absent
-                ):
-                    raise RuntimeError("missing activation input: signed STOP policy stops the instance")
-                return HeldInput(
-                    reason, step_id, tuple((identity, *self._successful_inputs[identity]) for identity in identities)
-                )
-            except Exception:
-                self._borrow_failed = True
-                raise
+        self._require_borrow_live()
+        try:
+            if (
+                self.arena.plan.semantic_graph.input_groups
+                and not self.arena.plan.semantic_graph.input_groups[0].allow_absent
+            ):
+                raise RuntimeError("missing activation input: signed STOP policy stops the instance")
+            return HeldInput(
+                reason, step_id, tuple((identity, *self._successful_inputs[identity]) for identity in identities)
+            )
+        except Exception:
+            self._borrow_failed = True
+            raise
 
     @property
     def plan(self) -> ScheduleDecision:
@@ -483,11 +484,10 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         self, implementation: TaskGraphImplementation[StateTaskContext[DataT], ProjectionResiduals]
     ) -> None:
         """Install a locally verified lowering while no original invocation is active."""
-        with self._lock:
-            original = self.implementation(implementation.implementation_id)
-            self._runner.implementations = tuple(
-                implementation if item is original else item for item in self._runner.implementations
-            )
+        original = self.implementation(implementation.implementation_id)
+        self._runner.implementations = tuple(
+            implementation if item is original else item for item in self._runner.implementations
+        )
 
     @property
     def device(self) -> torch.device:
@@ -496,20 +496,17 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     def admit(
         self, identities: tuple[RequestIdentity, ...], stream: torch.cuda.Stream | None = None
     ) -> tuple[StateRef, ...]:
-        with self._lock:
-            self._require_borrow_live()
-            if not self.directory.states:
-                return ()
-            receipt = self.directory.admit(identities, stream, self.math.initialize)
-            # One visible ref per unique admitted key, whether created or joined.
-            refs = self.directory.latest_refs(identities)
-            if receipt is None:
-                self.trace.record(TracePhase.ADMIT, 0, identities=identities, refs=refs)
-            else:
-                self.trace.record(
-                    TracePhase.ADMIT, 0, identities=identities, refs=refs, operation_id=receipt.operation_id
-                )
-            return refs
+        self._require_borrow_live()
+        if not self.directory.states:
+            return ()
+        receipt = self.directory.admit(identities, stream, self.math.initialize)
+        # One visible ref per unique admitted key, whether created or joined.
+        refs = self.directory.latest_refs(identities)
+        if receipt is None:
+            self.trace.record(TracePhase.ADMIT, 0, identities=identities, refs=refs)
+        else:
+            self.trace.record(TracePhase.ADMIT, 0, identities=identities, refs=refs, operation_id=receipt.operation_id)
+        return refs
 
     def begin(
         self,
@@ -519,32 +516,31 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         history: tuple[StateRefs, ...] = (),
         held_input: HeldInput | None = None,
     ) -> StateTaskContext[DataT]:
-        with self._lock:
-            self._require_borrow_live()
-            self.arena.collect_completed()
-            selection = self.directory.select(rows, history)
-            pin = self.arena.pin_exact(selection.refs, stream)
-            context = StateTaskContext[DataT](selection, self.arena, pin, self.trace, self._next_invocation)
-            context.held_input = held_input
-            self._next_invocation += 1
-            self._active[context.invocation_id] = context
-            if self.feeds and context.held_input is None:
-                assert self._pending_borrows is not None
-                context.borrowed_roots = self._pending_borrows
-                self._pending_borrows = None
-                try:
-                    for root in context.borrowed_roots:
-                        root.bind(pin)
-                except Exception as exc:
-                    self._failed(context, exc)
-            self.trace.record(
-                TracePhase.BEGIN,
-                context.invocation_id,
-                refs=pin.refs,
-                pin_id=pin.pin_id,
-                identities=tuple(row.identity for row in selection.rows),
-            )
-            return context
+        self._require_borrow_live()
+        self.arena.collect_completed()
+        selection = self.directory.select(rows, history)
+        pin = self.arena.pin_exact(selection.refs, stream)
+        context = StateTaskContext[DataT](selection, self.arena, pin, self.trace, self._next_invocation)
+        context.held_input = held_input
+        self._next_invocation += 1
+        self._active[context.invocation_id] = context
+        if self.feeds and context.held_input is None:
+            assert self._pending_borrows is not None
+            context.borrowed_roots = self._pending_borrows
+            self._pending_borrows = None
+            try:
+                for root in context.borrowed_roots:
+                    root.bind(pin)
+            except Exception as exc:
+                self._failed(context, exc)
+        self.trace.record(
+            TracePhase.BEGIN,
+            context.invocation_id,
+            refs=pin.refs,
+            pin_id=pin.pin_id,
+            identities=tuple(row.identity for row in selection.rows),
+        )
+        return context
 
     def start_step(
         self,
@@ -554,10 +550,9 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         history: tuple[StateRefs, ...] = (),
         held_input: HeldInput | None = None,
     ) -> StateTaskContext[DataT]:
-        with self._lock:
-            context = self.begin(self.math.rows(value), stream, history=history, held_input=held_input)
-            self.submit_input(context, value)
-            return context
+        context = self.begin(self.math.rows(value), stream, history=history, held_input=held_input)
+        self.submit_input(context, value)
+        return context
 
     def resume_latest(self, context: StateTaskContext[DataT], stream: torch.cuda.Stream) -> None:
         """Move an invocation to its signed writer stream without losing exact read holds.
@@ -566,33 +561,31 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         pinned on the new stream until settlement, including aliases consumed by later tasks.
         Equal reader and writer refs share the new pin; retained history owns its own hold.
         """
-        with self._lock:
-            self._require_borrow_live()
-            assert context.sole_write() is None and not context.publications and not context.borrowed_roots
-            reader = context.pin
-            context.selection = self.directory.select(context.selection.rows)
-            context.pin = self.arena.pin_exact(context.selection.refs, stream)
-            context.register_pin(context.pin)
-            context.move_slots()
-            if reader.refs != context.pin.refs:
-                held = self.arena.pin_exact(reader.refs, stream)
-                context.register_pin(held)
-            context.release_owned_pin(reader)
+        self._require_borrow_live()
+        assert context.sole_write() is None and not context.publications and not context.borrowed_roots
+        reader = context.pin
+        context.selection = self.directory.select(context.selection.rows)
+        context.pin = self.arena.pin_exact(context.selection.refs, stream)
+        context.register_pin(context.pin)
+        context.move_slots()
+        if reader.refs != context.pin.refs:
+            held = self.arena.pin_exact(reader.refs, stream)
+            context.register_pin(held)
+        context.release_owned_pin(reader)
 
     def step(self, value: InputT, stream: torch.cuda.Stream | None = None) -> ResultT:
         """Run without an external sampler borrower using the same staged lifecycle."""
-        with self._lock:
-            context = self.start_step(value, stream)
-            try:
-                for anchor in self.arena.plan.timeline.anchors:
-                    self.execute_anchor(context, AnchorId(anchor.ordinal))
-                    if anchor.ordinal == self.sampler_anchor_id:
-                        self.complete_sampler(context, stream)
-                return self.finish_step(context)
-            except WindowBackpressure:
-                # The convenience call exposes no cursor; staged callers keep it through execute_anchor.
-                self.cancel_step(context)
-                raise
+        context = self.start_step(value, stream)
+        try:
+            for anchor in self.arena.plan.timeline.anchors:
+                self.execute_anchor(context, AnchorId(anchor.ordinal))
+                if anchor.ordinal == self.sampler_anchor_id:
+                    self.complete_sampler(context, stream)
+            return self.finish_step(context)
+        except WindowBackpressure:
+            # The convenience call exposes no cursor; staged callers keep it through execute_anchor.
+            self.cancel_step(context)
+            raise
 
     def submit_input(
         self,
@@ -601,46 +594,42 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         readiness: CudaStreamReadiness | None = None,
     ) -> None:
         """Consume original inputs, ordering an external CUDA producer when supplied."""
-        with self._lock:
-            self._require_borrow_live()
-            try:
-                if readiness is not None:
-                    assert context.pin.stream is not None
-                    readiness.order_on(context.pin.stream)
-                context.value = self.math.prepare(value, context)
-            except Exception as exc:
-                self.trace.record(TracePhase.FAILED, context.invocation_id)
-                # Failed preparation can leave aliases in traceback frames; test_video retains grants.
-                if context.borrowed_roots:
-                    self._failed(context, exc)
-                self.cancel_step(context)
-                raise
+        self._require_borrow_live()
+        try:
+            if readiness is not None:
+                assert context.pin.stream is not None
+                readiness.order_on(context.pin.stream)
+            context.value = self.math.prepare(value, context)
+        except Exception as exc:
+            self.trace.record(TracePhase.FAILED, context.invocation_id)
+            # Failed preparation can leave aliases in traceback frames; test_video retains grants.
+            if context.borrowed_roots:
+                self._failed(context, exc)
+            self.cancel_step(context)
+            raise
 
     def execute_anchor(self, context: StateTaskContext[DataT], anchor_id: AnchorId) -> None:
         """Advance the step through every task at this anchor, retaining its cursor on backpressure."""
-        with self._lock:
-            self._require_borrow_live()
-            try:
-                context.check_page_execution()
-                plan = self.plan
-                dense_anchor = int(anchor_id)
-                assert not context.finished and 0 <= dense_anchor and context.last_anchor_id <= dense_anchor
-                assert context.next_task == len(plan.tasks) or dense_anchor <= plan.tasks[context.next_task].anchor_id
-                while (
-                    context.next_task < len(plan.tasks) and int(plan.tasks[context.next_task].anchor_id) == dense_anchor
-                ):
-                    task = plan.tasks[context.next_task]
-                    with self.trace.task(context.invocation_id, task.task_id, context.pin.stream):
-                        self._runner.implementations[int(task.task_id)].execute(context)
-                        if task.release_values:
-                            self._release_values(context, task.release_values)
-                    context.next_task += 1
-                context.last_anchor_id = dense_anchor
-            except WindowBackpressure:
-                # No cell of the pending task issued; its original cursor and pins remain usable.
-                raise
-            except Exception as exc:
-                self._failed(context, exc)
+        self._require_borrow_live()
+        try:
+            context.check_page_execution()
+            plan = self.plan
+            dense_anchor = int(anchor_id)
+            assert not context.finished and 0 <= dense_anchor and context.last_anchor_id <= dense_anchor
+            assert context.next_task == len(plan.tasks) or dense_anchor <= plan.tasks[context.next_task].anchor_id
+            while context.next_task < len(plan.tasks) and int(plan.tasks[context.next_task].anchor_id) == dense_anchor:
+                task = plan.tasks[context.next_task]
+                with self.trace.task(context.invocation_id, task.task_id, context.pin.stream):
+                    self._runner.implementations[int(task.task_id)].execute(context)
+                    if task.release_values:
+                        self._release_values(context, task.release_values)
+                context.next_task += 1
+            context.last_anchor_id = dense_anchor
+        except WindowBackpressure:
+            # No cell of the pending task issued; its original cursor and pins remain usable.
+            raise
+        except Exception as exc:
+            self._failed(context, exc)
 
     def execute_part(
         self,
@@ -651,39 +640,37 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         complete: bool,
     ) -> ProjectionResiduals:
         """Supply actual projection operands to one segment of a bound in-forward task."""
-        with self._lock:
-            self._require_borrow_live()
-            try:
-                context.check_page_execution()
-                context.value = self.math.prepare(value, context)
-                plan = self.plan
-                assert not context.finished and context.next_task < len(plan.tasks)
-                task = plan.tasks[context.next_task]
-                assert task.task_id == task_id and task.anchor_id >= context.last_anchor_id
-                with self.trace.task(context.invocation_id, task_id, context.pin.stream):
-                    result = self._runner.implementations[int(task_id)].execute(context)
-                context.last_anchor_id = int(task.anchor_id)
-                if complete:
-                    if task.release_values:
-                        self._release_values(context, task.release_values)
-                    context.next_task += 1
-                return result
-            except Exception as exc:
-                self._failed(context, exc)
+        self._require_borrow_live()
+        try:
+            context.check_page_execution()
+            context.value = self.math.prepare(value, context)
+            plan = self.plan
+            assert not context.finished and context.next_task < len(plan.tasks)
+            task = plan.tasks[context.next_task]
+            assert task.task_id == task_id and task.anchor_id >= context.last_anchor_id
+            with self.trace.task(context.invocation_id, task_id, context.pin.stream):
+                result = self._runner.implementations[int(task_id)].execute(context)
+            context.last_anchor_id = int(task.anchor_id)
+            if complete:
+                if task.release_values:
+                    self._release_values(context, task.release_values)
+                context.next_task += 1
+            return result
+        except Exception as exc:
+            self._failed(context, exc)
 
     def sampler_guidance(
         self,
         context: StateTaskContext[DataT],
         stream: torch.cuda.Stream | None = None,
     ) -> PackedSamplerGuidanceBatch:
-        with self._lock:
-            self._require_borrow_live()
-            assert context.guidance is not None
-            if stream is not None:
-                assert context.guidance_ready is not None
-                context.guidance_ready.order_on(stream)
-                context.sampler_stream = stream
-            return context.guidance
+        self._require_borrow_live()
+        assert context.guidance is not None
+        if stream is not None:
+            assert context.guidance_ready is not None
+            context.guidance_ready.order_on(stream)
+            context.sampler_stream = stream
+        return context.guidance
 
     def complete_sampler(
         self,
@@ -692,46 +679,42 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         *,
         feedback: SamplerFeedback | None = None,
     ) -> None:
-        with self._lock:
-            self._require_borrow_live()
-            self._order_sampler(context, stream)
-            context.sampler_feedback = feedback
-            self._sampler_count += 1
-            self.trace.record(TracePhase.SAMPLER_COMPLETE, context.invocation_id, pin_id=context.pin.pin_id)
+        self._require_borrow_live()
+        self._order_sampler(context, stream)
+        context.sampler_feedback = feedback
+        self._sampler_count += 1
+        self.trace.record(TracePhase.SAMPLER_COMPLETE, context.invocation_id, pin_id=context.pin.pin_id)
 
     def finish_step(self, context: StateTaskContext[DataT]) -> ResultT:
-        with self._lock:
-            self._require_borrow_live()
-            try:
-                result = self.math.output(context)
-                if not context.finished:
-                    assert context.next_task == len(self.plan.tasks)
-                    context.finished = True
-                self._release(context)
-            except Exception as exc:
-                self._failed(context, exc)
-                raise
-            return result
+        self._require_borrow_live()
+        try:
+            result = self.math.output(context)
+            if not context.finished:
+                assert context.next_task == len(self.plan.tasks)
+                context.finished = True
+            self._release(context)
+        except Exception as exc:
+            self._failed(context, exc)
+            raise
+        return result
 
     def cancel_step(self, context: StateTaskContext[DataT]) -> None:
-        context.cancel_requested.set()
-        with self._lock:
-            self._require_borrow_live()
-            # Cancellation cannot prove that remote aliases were discarded; test_video checks no ACK.
-            if context.borrowed_roots or context.held_input is not None:
-                self._failed(context, RuntimeError("borrowed invocation cancelled; resources retained"))
-            self._order_sampler(context, context.sampler_stream)
-            context.finish_pages(("abort",))
-            self.trace.record(TracePhase.ABORT, context.invocation_id)
-            self._release(context)
+        context.cancel_requested = True
+        self._require_borrow_live()
+        # Cancellation cannot prove that remote aliases were discarded; test_video checks no ACK.
+        if context.borrowed_roots or context.held_input is not None:
+            self._failed(context, RuntimeError("borrowed invocation cancelled; resources retained"))
+        self._order_sampler(context, context.sampler_stream)
+        context.finish_pages(("abort",))
+        self.trace.record(TracePhase.ABORT, context.invocation_id)
+        self._release(context)
 
     def cancel_active(self) -> None:
-        with self._lock:
-            for context in tuple(self._active.values()):
-                self.cancel_step(context)
+        for context in tuple(self._active.values()):
+            self.cancel_step(context)
 
     def _failed(self, context: StateTaskContext[DataT], exc: Exception) -> NoReturn:
-        context.cancel_requested.set()
+        context.cancel_requested = True
         self.trace.record(
             TracePhase.FAILED,
             context.invocation_id,
@@ -794,58 +777,54 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             CudaStreamReadiness(stream).order_on(consumer)
 
     def retire(self, identities: tuple[RequestIdentity, ...], *, wait: bool = False) -> tuple[StateRef, ...]:
-        with self._lock:
-            for identity in identities:
-                self._successful_inputs.pop(identity, None)
-            if not self.directory.states:
-                self.arena.collect_completed(wait=wait)
-                self.trace.record(TracePhase.RETIRE, 0, identities=identities)
-                return ()
-            if not identities:
-                for context in tuple(self._active.values()):
-                    if any(address.key is None for address in context.selection.addresses):
-                        self.cancel_step(context)
-            elif self.directory.request_states:
-                retiring = set(identities)
-                # Only the retiring requests' own steps cancel; requests sharing a
-                # route lineage keep running, and the lineage outlives the last
-                # holder until dormant retirement.
-                for context in tuple(self._active.values()):
-                    if any(row.identity in retiring for row in context.selection.rows):
-                        self.cancel_step(context)
+        for identity in identities:
+            self._successful_inputs.pop(identity, None)
+        if not self.directory.states:
             self.arena.collect_completed(wait=wait)
-            refs = self.directory.retire(identities)
-            self.trace.record(TracePhase.RETIRE, 0, identities=identities, refs=refs)
-            return refs
+            self.trace.record(TracePhase.RETIRE, 0, identities=identities)
+            return ()
+        if not identities:
+            for context in tuple(self._active.values()):
+                if any(address.key is None for address in context.selection.addresses):
+                    self.cancel_step(context)
+        elif self.directory.request_states:
+            retiring = set(identities)
+            # Only the retiring requests' own steps cancel; requests sharing a
+            # route lineage keep running, and the lineage outlives the last
+            # holder until dormant retirement.
+            for context in tuple(self._active.values()):
+                if any(row.identity in retiring for row in context.selection.rows):
+                    self.cancel_step(context)
+        self.arena.collect_completed(wait=wait)
+        refs = self.directory.retire(identities)
+        self.trace.record(TracePhase.RETIRE, 0, identities=identities, refs=refs)
+        return refs
 
     def retire_dormant(self, *, wait: bool = False) -> tuple[StateRef, ...]:
-        with self._lock:
-            self.arena.collect_completed(wait=wait)
-            refs = self.directory.retire_dormant()
-            self.trace.record(TracePhase.RETIRE, 0, identities=(), refs=refs)
-            return refs
+        self.arena.collect_completed(wait=wait)
+        refs = self.directory.retire_dormant()
+        self.trace.record(TracePhase.RETIRE, 0, identities=(), refs=refs)
+        return refs
 
     def snapshot(self, ref: StateRef, stream: torch.cuda.Stream | None = None) -> tuple[torch.Tensor, ...]:
-        with self._lock:
-            pin = self.arena.pin_exact(StateRefs.of((ref,)), stream)
-            try:
-                return self.arena.snapshot(pin, ref)
-            finally:
-                self.arena.wait_release(self.arena.release_pin(pin))
+        pin = self.arena.pin_exact(StateRefs.of((ref,)), stream)
+        try:
+            return self.arena.snapshot(pin, ref)
+        finally:
+            self.arena.wait_release(self.arena.release_pin(pin))
 
     def diagnostics(self) -> StateDiagnostics:
-        with self._lock:
-            self.arena.collect_completed()
-            updates, rows = (0, 0) if self._overlay_counters is None else self._overlay_counters.read()
-            return StateDiagnostics(
-                self.directory.active_count,
-                self.directory.inference_pin_count,
-                self._loss_count,
-                self._update_count + updates,
-                self._trained_rows + rows,
-                self._sampler_count,
-                self.arena.pending_pin_releases,
-                self.arena.usage(),
-                self._hold_count,
-                self._last_hold,
-            )
+        self.arena.collect_completed()
+        updates, rows = (0, 0) if self._overlay_counters is None else self._overlay_counters.read()
+        return StateDiagnostics(
+            self.directory.active_count,
+            self.directory.inference_pin_count,
+            self._loss_count,
+            self._update_count + updates,
+            self._trained_rows + rows,
+            self._sampler_count,
+            self.arena.pending_pin_releases,
+            self.arena.usage(),
+            self._hold_count,
+            self._last_hold,
+        )
