@@ -146,13 +146,12 @@ def weighted_selection(batch: WeightedCEBatch[torch.Tensor], selection: RequestS
 
 def prepare_weighted_batch(
     dimensions: Dimensions,
-    shape: tuple[int, ...] | None,
     fields: tuple[str, ...],
     reset: Callable[[Tensors, torch.Generator], None],
     data: TensorFrame,
     view: TensorBatch,
 ) -> TaskOutput:
-    """Validate imported weighted-CE metadata and initialize the selected parameters."""
+    """Mask invalid rows of the generate-validated batch and initialize the selected parameters."""
     match data.step.auxiliary:
         case WeightedCEBatch() as batch:
             pass
@@ -164,20 +163,6 @@ def prepare_weighted_batch(
         tensor.detach().unsqueeze(0) if view.selection.keys == (None,) else tensor.detach() for tensor in tensors
     )
     root = view.roots[selected[0]]
-    if (
-        hidden.ndim != 3
-        or hidden.shape[0] != len(selected)
-        or hidden.shape[2] != dimensions.hidden_size
-        or logits.shape != (*hidden.shape[:2], dimensions.vocab_size)
-        or labels.shape != hidden.shape[:2]
-        or weights.shape != labels.shape
-        or labels.dtype != torch.long
-        or any(tensor.device != root[0].device for tensor in tensors)
-        or any(tensor.dtype != root[0].dtype for tensor in (hidden, logits, weights))
-        or shape is not None
-        and any(actual > bound for actual, bound in zip(hidden.shape, shape, strict=True))
-    ):
-        raise ValueError("align weighted-CE tensors with the parameter shape, dtype, device and input bounds")
     valid = (labels >= 0) & (labels < dimensions.vocab_size) & (weights > 0)
     data.selected = selected
     data.trained_rows, incomplete = weighted_rows(valid)
@@ -318,11 +303,7 @@ def declare_weighted_train(
     b.weighted_training = True
     fields = tuple(field.name for field in state.fields)
     application = PoolSGD(optimizer.lr, len(fields))
-    dimensions = b.dimensions
-    limit = next((fact for fact in b.resources if fact.task == name), None)
-    # Resource derivation builds the graph before the batch bound exists; execution always has it.
-    shape = None if limit is None or not limit.input_shapes else limit.input_shapes[0]
-    prepare_function = partial(prepare_weighted_batch, dimensions, shape, fields, reset)
+    prepare_function = partial(prepare_weighted_batch, b.dimensions, fields, reset)
     prepared = b.compute(
         f"__{name}_prepare",
         inputs={"state": state.read(), "batch": b.input("training", "batch", WeightedCEBatch.schema)},

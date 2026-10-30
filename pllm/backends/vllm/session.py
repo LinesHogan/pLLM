@@ -29,7 +29,6 @@ from pllm.backends.vllm.sampler import (
     SamplerGuidance,
     SignedSamplerGuidance,
 )
-from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
     AttachmentTaskRole,
@@ -49,7 +48,6 @@ from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.host_runtime import CompletionCapture
 from pllm.execution.overlay_task import ProjectionTask
 from pllm.execution.post_sample import PostSampleOverlap
-from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.state_execution import HeldInput, StateDiagnostics, StateTaskContext
 from pllm.execution.state_feed import (
     Feed,
@@ -182,9 +180,8 @@ class VllmSession(Generic[DataT, ResultT]):
         identities: tuple[RequestIdentity, ...],
         completion: torch.Tensor | None = None,
     ) -> None:
-        """Stage request inputs and their optional owned completion destination."""
+        """Stage request inputs, already validated by generate, and their optional completion destination."""
         self._require_input_live()
-        validate_auxiliary(batch, self._deployment.attachment.plan, SharedTensor.describe)
         self.completion_capture = None if completion is None else CompletionCapture(identities, completion)
         self._auxiliary = batch
         self._pending_identities = {identity.request_id: identity for identity in identities}

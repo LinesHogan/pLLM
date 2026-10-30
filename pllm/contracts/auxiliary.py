@@ -62,9 +62,14 @@ AuxiliaryInput = CausalTrainBatch[T] | StateTensorUpdate[T] | WeightedCEBatch[T]
 
 
 def validate_auxiliary(
-    value: AuxiliaryInput[T] | None, plan: PlanBundle, describe: Callable[[T], TensorFieldSpec]
+    value: AuxiliaryInput[T] | None,
+    plan: PlanBundle,
+    describe: Callable[[T], TensorFieldSpec],
+    *,
+    hidden_size: int,
+    vocab_size: int,
 ) -> None:
-    """Preflight original storage metadata before export, mapping or device copies."""
+    """Check a generate call's auxiliary input once, before export, mapping or device copies; tasks trust it."""
     if value is None:
         return
     consumers = tuple(
@@ -105,9 +110,10 @@ def validate_auxiliary(
             if (
                 len(hidden_shape) != 3
                 or min(hidden_shape) < 1
+                or hidden_shape[2] != hidden_size
                 or len(logits_shape) != 3
                 or logits_shape[:2] != rows
-                or logits_shape[2] < 1
+                or logits_shape[2] != vocab_size
                 or prefix + shape(labels) != rows
                 or prefix + shape(weights) != rows
                 or hidden_shape[0] != (len(keys) if keys else 1)
@@ -115,7 +121,11 @@ def validate_auxiliary(
                 or describe(labels).dtype is not TensorDType.INT64
                 or any(describe(tensor).dtype is not dtype for tensor in (hidden, logits, weights))
             ):
-                raise ValueError("weighted-CE batch requires aligned states, rows and tensors")
+                raise ValueError(
+                    f"WeightedCEBatch needs {dtype} hidden [..., tokens, {hidden_size}] and base_logits "
+                    f"[..., tokens, {vocab_size}], int64 labels and {dtype} weights [..., tokens], and one leading "
+                    "row per distinct key when keys are given"
+                )
             actual = (hidden_shape, logits_shape)
         case StateTensorUpdate():
             # The bound import validates logical field views, including optimizer slices,

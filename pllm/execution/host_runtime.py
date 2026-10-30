@@ -400,7 +400,10 @@ class HostRuntimeFacts:
             or self.memory_budget_bytes is not None
             and self.memory_budget_bytes < 0
         ):
-            raise ValueError("canonical host runtime facts are not closed")
+            raise ValueError(
+                "HostRuntimeFacts needs a cpu or cuda device and nonnegative hidden_size, initialization_seed, "
+                f"state_memory_budget_bytes, max_input_rows and memory_budget_bytes; got {self}"
+            )
 
     def timeline(
         self,

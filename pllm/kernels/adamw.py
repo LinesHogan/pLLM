@@ -46,7 +46,9 @@ class AdamWConfig:
             or self.eps <= 0.0
             or self.weight_decay < 0.0
         ):
-            raise ValueError("dense-page AdamW configuration is invalid")
+            raise ValueError(
+                f"AdamW needs finite values with lr > 0, eps > 0, weight_decay >= 0 and betas in [0, 1); got {self}"
+            )
 
 
 def apply_adamw(

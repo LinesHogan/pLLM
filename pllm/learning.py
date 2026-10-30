@@ -197,16 +197,18 @@ class CompletionWorkload(
                 case shape:
                     shapes[name] = shape
         if (
-            facts.hidden_size < 1
-            or type(definition) is RequestState
+            type(definition) is RequestState
             or type(definition.optimizer) is not AdamWConfig
             or len(shapes) != len(definition.fields)
-            or facts.memory_budget_bytes is not None
-            and facts.max_input_rows is None
         ):
             raise ValueError(
-                "completion learning requires hidden_size >= 1, instance tensor parameters with an AdamW optimizer, and max_input_rows when memory_budget_bytes is set"
+                f"{type(self).__name__}.parameters must be a pllm.InstanceState of tensor shapes (no Buffer fields) "
+                "with optimizer=pllm.AdamW(...)"
             )
+        if facts.hidden_size < 1:
+            raise ValueError("completion learning needs HostRuntimeFacts.hidden_size >= 1")
+        if facts.memory_budget_bytes is not None and facts.max_input_rows is None:
+            raise ValueError("set HostRuntimeFacts.max_input_rows when memory_budget_bytes is set")
         identity = fingerprint(owner.loss)
         b = Builder[ContextT](
             self.name,

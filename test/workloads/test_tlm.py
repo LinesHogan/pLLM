@@ -199,6 +199,8 @@ def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None
                 CausalTrainBatch(tokens, tokens),
                 execution.arena.plan,
                 SharedTensor.describe,
+                hidden_size=0,
+                vocab_size=0,
             )
         anchors = {
             execution.arena.plan.semantic_graph.tasks[task.task_id].symbol: task.anchor_id

@@ -423,7 +423,13 @@ class VllmLlm(Generic[DataT, ResultT]):
             raise ValueError("routes require a signed route-keyed state and one value per prompt")
         if signed_route and routes is None:
             raise ValueError("a route-keyed request state requires per-prompt routes")
-        validate_auxiliary(auxiliary, self.attachment.plan, SharedTensor.describe)
+        validate_auxiliary(
+            auxiliary,
+            self.attachment.plan,
+            SharedTensor.describe,
+            hidden_size=self.hidden_size,
+            vocab_size=self.vocab_size,
+        )
         llm = self._require_open()
         llm.sleep(level=0, mode="keep")
         request_ids: list[str] = []

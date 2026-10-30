@@ -20,7 +20,6 @@ from pllm.backends.vllm.runtime import (
     probe_backend,
 )
 from pllm.backends.vllm.training import CausalTraining
-from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import AttachmentTopology, BackendAttachment
 from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.semantic_graph import StateScope, TaskId
@@ -110,9 +109,6 @@ class GPUWorker(Worker):
                     return encode_boundary(BackendWorkerState(os.getpid(), runner.require_session().diagnostics()))
                 case BackendCommand.STAGE:
                     stage = decode_boundary(payload, BackendStage)
-                    validate_auxiliary(
-                        stage.auxiliary, runner.require_session().attachment.plan, lambda tensor: tensor.field
-                    )
                     peer = os.getppid()
                     stream = torch.cuda.current_stream(runner.device)
                     auxiliary = map_auxiliary(
