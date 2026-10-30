@@ -4,11 +4,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import ClassVar, Generic, TypeVar
 
-from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
-from pllm.contracts.semantic_graph import HostServiceInputSource
-from pllm.contracts.tensor_layout import TensorDType, TensorFieldSpec
+from pllm.contracts.semantic_graph import HostServiceInputSource, SchedulerTimeline, SemanticGraph
+from pllm.contracts.tensor_layout import TensorDType, TensorFieldSpec, TensorLayoutRequest
 
 T = TypeVar("T")
 U = TypeVar("U")
@@ -17,9 +16,27 @@ U = TypeVar("U")
 @dataclass(frozen=True, slots=True)
 class CausalTrainBatch(Generic[T]):
     schema: ClassVar[str] = "canonical.causal_tokens@1"
+    names: ClassVar[tuple[str, ...]] = ("input_ids", "labels", "attention_mask")
     input_ids: T
     labels: T
     attention_mask: T | None = None
+
+    def tensor(self, name: str) -> T | None:
+        return {"input_ids": self.input_ids, "labels": self.labels, "attention_mask": self.attention_mask}[name]
+
+
+@dataclass(frozen=True, slots=True)
+class WeightedRowBatch(Generic[T]):
+    """[rows, hidden_size] features with one target and one weight per row; weight 0 skips a row."""
+
+    schema: ClassVar[str] = "canonical.weighted_rows@1"
+    names: ClassVar[tuple[str, ...]] = ("hidden", "targets", "weights")
+    hidden: T
+    targets: T
+    weights: T
+
+    def tensor(self, name: str) -> T | None:
+        return {"hidden": self.hidden, "targets": self.targets, "weights": self.weights}[name]
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,12 +75,14 @@ class WeightedCEBatch(Generic[T]):
         return WeightedCEBatch(hidden, base_logits, labels, weights, keys)
 
 
-AuxiliaryInput = CausalTrainBatch[T] | StateTensorUpdate[T] | WeightedCEBatch[T]
+AuxiliaryInput = CausalTrainBatch[T] | StateTensorUpdate[T] | WeightedCEBatch[T] | WeightedRowBatch[T]
 
 
 def validate_auxiliary(
     value: AuxiliaryInput[T] | None,
-    plan: PlanBundle,
+    graph: SemanticGraph,
+    layouts: TensorLayoutRequest,
+    timeline: SchedulerTimeline,
     describe: Callable[[T], TensorFieldSpec],
     *,
     hidden_size: int,
@@ -74,7 +93,7 @@ def validate_auxiliary(
         return
     consumers = tuple(
         task
-        for task in plan.semantic_graph.tasks
+        for task in graph.tasks
         if any(
             isinstance(port.source, HostServiceInputSource) and port.source.schema == value.schema
             for port in task.inputs
@@ -103,7 +122,7 @@ def validate_auxiliary(
             actual = (tokens,)
         case WeightedCEBatch(hidden=hidden, base_logits=logits, labels=labels, weights=weights, keys=keys):
             prefix = () if keys else (1,)
-            (layout,) = plan.tensor_layout_request.layouts
+            (layout,) = layouts.layouts
             dtype = layout.layout.fields[0].dtype
             hidden_shape, logits_shape = prefix + shape(hidden), prefix + shape(logits)
             rows = hidden_shape[:2]
@@ -127,12 +146,27 @@ def validate_auxiliary(
                     "row per distinct key when keys are given"
                 )
             actual = (hidden_shape, logits_shape)
+        case WeightedRowBatch(hidden=hidden, targets=targets, weights=weights):
+            features = shape(hidden)
+            if (
+                len(features) != 2
+                or features[0] < 1
+                or features[1] != hidden_size
+                or shape(targets) != features[:1]
+                or shape(weights) != features[:1]
+                or describe(targets).dtype is not describe(hidden).dtype
+                or describe(weights).dtype is not describe(hidden).dtype
+            ):
+                raise ValueError(
+                    f"weighted rows need hidden [rows, {hidden_size}] with targets and weights [rows] of one dtype"
+                )
+            actual = (features,)
         case StateTensorUpdate():
             # The bound import validates logical field views, including optimizer slices,
             # against local roots before allocating or publishing any writes.
             return
     for task in consumers:
-        limit = next((fact for fact in plan.timeline.task_resources if fact.task == task.symbol), None)
+        limit = next((fact for fact in timeline.task_resources if fact.task == task.symbol), None)
         if limit is None:
             continue  # No cost declaration: the original unbounded execution contract.
         if len(limit.input_shapes) != len(actual) or any(
@@ -153,3 +187,5 @@ def map_auxiliary(value: AuxiliaryInput[T] | None, convert: Callable[[T], U]) ->
             return StateTensorUpdate(tuple(convert(item) for item in values), keys)
         case WeightedCEBatch(hidden=hidden, base_logits=logits, labels=labels, weights=weights, keys=keys):
             return WeightedCEBatch(convert(hidden), convert(logits), convert(labels), convert(weights), keys)
+        case WeightedRowBatch(hidden=hidden, targets=targets, weights=weights):
+            return WeightedRowBatch(convert(hidden), convert(targets), convert(weights))

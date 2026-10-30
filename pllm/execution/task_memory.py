@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from pllm.config import ExecutionOptions
-from pllm.contracts.auxiliary import WeightedCEBatch
+from pllm.contracts.auxiliary import WeightedCEBatch, WeightedRowBatch
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_hidden import HiddenRowBatch, HiddenRows
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
@@ -29,6 +29,8 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.state_ref import LayoutId, LineageId, StateRef, VersionId
 from pllm.execution.compile_facts import BackendCompileFacts
+from pllm.execution.declaration import Call
+from pllm.execution.host_runtime import HostRuntimeFacts, measured_timeline
 from pllm.execution.ptts.request_state import RequestStateSelection, ResourceSelection
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.step_input import TensorStepInput
@@ -261,3 +263,38 @@ def derive_resources(
         task_resources=tuple(sorted(tasks, key=lambda value: value.task)),
         value_resources=tuple(sorted(values, key=lambda value: (value.task, value.output))),
     )
+
+
+def derive_host_resources(binding: TensorBinding, facts: HostRuntimeFacts) -> SchedulerTimeline:
+    """Measure a rowless host step over the workload's one instance state at the maximum input rows."""
+    if facts.max_input_rows is None:
+        raise ValueError("set HostRuntimeFacts.max_input_rows when memory_budget_bytes is set")
+    rows = facts.max_input_rows
+    auxiliary = WeightedRowBatch(meta(rows, facts.hidden_size), meta(rows), meta(rows))
+    (layout,) = binding.layouts.layouts
+    refs = StateRefs.of((StateRef(LayoutId(1), LineageId(1), VersionId(1)),))
+    selection = RequestStateSelection((), (ResourceSelection(StateResource(layout.resource), (None,), refs, ()),))
+    pools = tuple(meta(1, *field.shape, dtype=field.dtype.torch) for field in layout.layout.fields)
+    batch = TensorBatch(
+        selection,
+        (tuple(pool[0] for pool in pools),),
+        refs,
+        None,
+        field_slots=lambda field: (pools[field], (0,)),
+    )
+    data = TensorFrame(TensorStepInput.of_batch(auxiliary), ())
+    operations: dict[TaskSymbol, MemoryOperation[TensorFrame]] = {
+        **binding.executables(None, ()),
+        **binding.publications,
+    }
+    tasks = {
+        task.symbol: Call(task.symbol, tuple(output.name for output in task.outputs)) for task in binding.graph.tasks
+    }
+    costs = [
+        (tasks[symbol], operations[symbol].memory(data, batch))
+        for symbol in producers_first(binding.graph, tuple(operations))
+    ]
+    held = sum(
+        tensor.numel() * tensor.element_size() for tensor in (auxiliary.hidden, auxiliary.targets, auxiliary.weights)
+    )
+    return measured_timeline(facts, held, costs, ((rows, facts.hidden_size),))

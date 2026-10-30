@@ -1,4 +1,4 @@
-"""Sequence batch ports and ordinary training transitions over worker-bound causal forwards."""
+"""Training-batch ports and the ordinary AdamW transition over them, with worker-bound causal forwards."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 
-from pllm.contracts.auxiliary import CausalTrainBatch
+from pllm.contracts.auxiliary import CausalTrainBatch, WeightedRowBatch
 from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding
 from pllm.contracts.semantic_graph import MathContract, SemanticInputSource, StateEffectKind, StateSelectionInputSource
 from pllm.execution.declaration import Call, State, When, native
@@ -47,50 +47,57 @@ class CausalCall:
         return self.forward(ids, attention_mask, None)
 
 
+TrainingBatch = CausalTrainBatch[torch.Tensor] | WeightedRowBatch[torch.Tensor]
+
+
 @dataclass(frozen=True)
 class CausalPort:
     """A signed batch/state read and its invocation-local argument adapter."""
 
     source: SemanticInputSource
-    adapt: Callable[[CausalTrainBatch[torch.Tensor], Tensors], torch.Tensor | CausalCall | None]
+    adapt: Callable[[TrainingBatch, Tensors], torch.Tensor | CausalCall | None]
 
 
-def declare_causal_train(
+_TRAINING_WINDOWS = (When.BEFORE_MODEL, When.AFTER_SAMPLE, When.HOST_COMPUTE)
+
+
+def declare_batch_train(
     b: TensorBinding,
     name: str,
     state: State,
     *,
     ports: Mapping[str, CausalPort],
-    function: Callable[..., torch.Tensor | TensorUpdate | None],
+    function: Callable[..., TensorUpdate | None],
     identity: str,
     when: When,
 ) -> Call:
-    """Bind sequence inputs, explicit parameter gradients and the shared AdamW transition."""
-    if state.optimizer is None or state.declaration.key_fields or when not in (When.BEFORE_MODEL, When.AFTER_SAMPLE):
-        raise ValueError("causal training needs an instance AdamW state and BEFORE_MODEL or AFTER_SAMPLE")
+    """Bind batch inputs, explicit parameter gradients and the shared AdamW transition.
+
+    The method returns a TensorUpdate whose `changed` flag is a device tensor, or None to skip the step.
+    """
+    if state.optimizer is None or state.declaration.key_fields or when not in _TRAINING_WINDOWS:
+        raise ValueError("batch training needs an instance AdamW state and BEFORE_MODEL, AFTER_SAMPLE or HOST_COMPUTE")
     if any(
         isinstance(port.source, StateSelectionInputSource) and port.source.resource != state.declaration.resource
         for port in ports.values()
     ):
-        raise ValueError("causal training must read the overlay's own optimizer state")
+        raise ValueError("batch training must read its own optimizer state")
     names = tuple(field.name.removesuffix(".parameters") for field in state.fields[: state.optimizer_fields : 5])
 
     def loss(data: TensorFrame, parameters: Tensors) -> torch.Tensor | None:
         batch = data.step.auxiliary
         if batch is None:
             return None
-        assert isinstance(batch, CausalTrainBatch)
+        assert isinstance(batch, (CausalTrainBatch, WeightedRowBatch))
         result = function(**{key: port.adapt(batch, parameters) for key, port in ports.items()})
-        if isinstance(result, TensorUpdate):
-            data.training = replace(result, output=result.output.detach())
-            return result.output
-        data.trained_rows = batch.input_ids.shape[0]
-        return result
+        if result is None:
+            return None
+        data.training = replace(result, output=result.output.detach())
+        return result.output
 
     def summary(data: TensorFrame) -> TaskOutput:
         training = data.training
-        if training is None:
-            return TaskOutput(loss_count=1, update_count=1, trained_rows=data.trained_rows)
+        assert training is not None
         return TaskOutput(
             loss_count=1,
             update_mask=training.changed,
@@ -98,7 +105,7 @@ def declare_causal_train(
         )
 
     compute = autograd_loss(loss, names, summary)
-    b.trains_causally = True
+    b.trains_on_batch = True
 
     call = b.compute(
         name,
@@ -117,5 +124,6 @@ def declare_causal_train(
             reduction="custom",
         ),
     )
-    b.publish(call, state, when=when)
+    # A host step publishes only after its compute window closes, so an abandoned step publishes nothing.
+    b.publish(call, state, when=When.HOST_COMMIT if when is When.HOST_COMPUTE else when)
     return call

@@ -15,6 +15,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 from pllm.authoring import BackendRequirements, BackendWorkload
 from pllm.config import ExecutionOptions
+from pllm.contracts.auxiliary import CausalTrainBatch, WeightedRowBatch, validate_auxiliary
 from pllm.contracts.backend_attachment import (
     ActivationPatchOperator,
     DecodeRefresh,
@@ -48,7 +49,7 @@ from pllm.contracts.state_feed import FeedBinding, FeedOrder
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 from pllm.contracts.visibility import Exact as Exact, Visibility as Visibility
 from pllm.execution.binding_base import SGD as SGD, Buffer as Buffer, buffer_field, overlay_fields
-from pllm.execution.causal_batch import CausalBinder, CausalCall, CausalPort, declare_causal_train
+from pllm.execution.causal_batch import CausalBinder, CausalCall, CausalPort, declare_batch_train
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import Call, Dimensions, Shape, State, When, native
 from pllm.execution.freeze import (
@@ -91,9 +92,10 @@ from pllm.execution.row_task_binding import (
     state_metadata,
     validate_gradients,
 )
+from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.step_input import TensorStepInput
-from pllm.execution.task_memory import derive_resources
+from pllm.execution.task_memory import derive_host_resources, derive_resources
 from pllm.execution.tensor_binding import TensorBinding, TensorOutput as TensorOutput
 from pllm.execution.tensor_frame import (
     TensorFrame,
@@ -105,7 +107,7 @@ from pllm.execution.tensor_frame import (
     result_port,
     samples_port,
 )
-from pllm.execution.tensor_program import PoolSGD, TaskOutput
+from pllm.execution.tensor_program import PoolSGD, TaskOutput, TensorBatch
 from pllm.execution.tensor_task import TensorExport
 from pllm.execution.token_program import Over, Tokens
 from pllm.execution.trace import TraceEvent
@@ -190,17 +192,17 @@ class Batch(_Source):
     field: str
 
     def training_port(self, context: _Declaration) -> CausalPort:
-        from pllm.contracts.auxiliary import CausalTrainBatch
-
-        if self.field not in ("input_ids", "labels", "attention_mask"):
-            raise ValueError("causal batches provide input_ids, labels and optional attention_mask")
+        variant = next(
+            (variant for variant in (CausalTrainBatch, WeightedRowBatch) if self.field in variant.names), None
+        )
+        if variant is None:
+            raise ValueError(
+                "training batches provide input_ids, labels, attention_mask or hidden, targets, weights; "
+                f"got {self.field!r}"
+            )
         return CausalPort(
-            context.binding.input("training", self.field, CausalTrainBatch.schema),
-            lambda batch, parameters: {
-                "input_ids": batch.input_ids,
-                "labels": batch.labels,
-                "attention_mask": batch.attention_mask,
-            }[self.field],
+            context.binding.input("training", self.field, variant.schema),
+            lambda batch, parameters: batch.tensor(self.field),
         )
 
     def batch(self, state: str, definition: InstanceState) -> tuple[str, str]:
@@ -214,7 +216,10 @@ class Parameter(_Source):
     per_row: bool = False
 
     def training_port(self, context: _Declaration) -> CausalPort:
-        return CausalPort(context.states[self.state].read(), lambda batch, parameters: parameters[self.field])
+        view = context.binding.field_views[self.state, self.field]
+        return CausalPort(
+            context.states[self.state].read(), lambda batch, parameters: view.read(parameters["parameters"])
+        )
 
     def port(self, context: _Declaration) -> TensorPort:
         parameter = context.parameters[self.state, self.field]
@@ -418,8 +423,10 @@ def capture(source: _Source, *, state: str, field: str) -> Any:
     return _Captured(source, Capture(state, field))
 
 
-def batch(field: Literal["hidden", "base_logits", "labels", "weights", "input_ids", "attention_mask"]) -> Any:
-    """One field of a host-supplied WeightedCEBatch or CausalTrainBatch."""
+def batch(
+    field: Literal["hidden", "base_logits", "labels", "weights", "targets", "input_ids", "attention_mask"],
+) -> Any:
+    """One field of a host-supplied WeightedCEBatch, WeightedRowBatch or CausalTrainBatch."""
     return Batch(field)
 
 
@@ -706,19 +713,21 @@ class _Train(_Effect):
         """Choose optimizer training or the explicit weighted SGD transition."""
         arguments, captures = operation.arguments()
         definition = operation.context.state_definition(self.state, "training requires a declared optimizer state")
-        if any(isinstance(source, _CausalModel) for source in arguments.values()):
+        if isinstance(definition.optimizer, AdamWConfig) and any(
+            isinstance(source, (Batch, _CausalModel)) for source in arguments.values()
+        ):
             context = operation.context
             if captures or operation.gradient or operation.rows or self.update or self.reset or self.steps != 1:
-                raise ValueError("causal batch training uses one optimizer step without inference-row selectors")
+                raise ValueError("batch training uses one optimizer step without inference-row selectors")
             context.train(
-                declare_causal_train(
+                declare_batch_train(
                     context.binding,
                     operation.name,
                     context.states[self.state],
                     ports={key: source.training_port(context) for key, source in arguments.items()},
                     function=freeze(operation.function),
                     identity=f"python:{fingerprint(operation.function)}",
-                    when=operation.phase.value,
+                    when=When.HOST_COMPUTE if context.binding.host else operation.phase.value,
                 ),
                 self.state,
             )
@@ -1723,11 +1732,9 @@ class Workload(
             raise ValueError("this workload has no explicit tensor implementation")
         with FakeTensorMode():
             binding = self.declaration(facts)
-        if binding.trains_causally:
+        if binding.trains_on_batch:
             if options.memory_budget_bytes is not None and not facts.timeline.task_resources:
-                raise ValueError(
-                    "causal training needs measured costs and signed [sequences, tokens] bounds for a finite budget"
-                )
+                raise ValueError("batch training needs measured costs and signed input bounds for a finite budget")
             timeline = facts.timeline
         else:
             timeline = derive_resources(binding, facts, options)
@@ -1760,17 +1767,34 @@ class Workload(
             host=True,
         )
         self._build(b)
-        if b.graph.states:
-            raise ValueError("ordinary host tensor authoring currently supports stateless observations")
+        timeline = facts.timeline()
+        if facts.memory_budget_bytes is not None and b.graph.states:
+            timeline = derive_host_resources(b, facts)
+        math = b.function_math(facts.device, facts.initialization_seed)
+        prepare = b.bind_prepare()
+
+        def checked_prepare(value: TensorStepInput, batch: TensorBatch) -> TensorFrame:
+            validate_auxiliary(
+                value.auxiliary,
+                b.graph,
+                b.layouts,
+                timeline,
+                SharedTensor.describe,
+                hidden_size=facts.hidden_size,
+                vocab_size=0,
+            )
+            return prepare(value, batch)
+
         return TensorHostBinding(
             b.graph,
             b.layouts,
             MathBinding(
-                b.function_math(facts.device, facts.initialization_seed),
+                replace(math, prepare_data=checked_prepare),
                 b.bind_all(operations=b.executables(None, ())),
                 on_export=self.on_export if b.has_exports else None,
             ),
             facts,
+            timeline=timeline,
         )
 
 

@@ -412,10 +412,7 @@ class HostRuntimeFacts:
                 f"state_memory_budget_bytes, max_input_rows and memory_budget_bytes; got {self}"
             )
 
-    def timeline(
-        self,
-        extra_capabilities: tuple[str, ...] = (),
-    ) -> SchedulerTimeline:
+    def timeline(self) -> SchedulerTimeline:
         compute_capability = "compute/cpu@1" if self.device.type == "cpu" else "compute/cuda@1"
         return SchedulerTimeline(
             memory_budget_bytes=self.memory_budget_bytes,
@@ -430,7 +427,8 @@ class HostRuntimeFacts:
                     (
                         compute_capability,
                         "host/service@1",
-                        *extra_capabilities,
+                        "optimizer/adamw@1",
+                        "transition/full_root@1",
                     )
                 )
             ),

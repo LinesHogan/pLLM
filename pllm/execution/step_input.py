@@ -32,6 +32,12 @@ class TensorStepInput:
             readiness = None if self.hidden_readiness is None else self.hidden_readiness.device
             assert readiness == (device if device.type == "cuda" else None)
 
+    @classmethod
+    def of_batch(cls, auxiliary: AuxiliaryInput[torch.Tensor]) -> TensorStepInput:
+        """A host step without request rows, carrying only one auxiliary batch."""
+        rows = PackedPhaseRowBatch(0, 0, ())
+        return cls(rows, PackedSamplerRowBatch(rows, ()), auxiliary=auxiliary)
+
     def hidden_batch(self, stream: torch.cuda.Stream | None) -> HiddenRowBatch:
         if self.hidden is None or (self.hidden_readiness is None) != (stream is None):
             raise ValueError("hidden captures differ from the input device")

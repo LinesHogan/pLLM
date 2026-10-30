@@ -14,6 +14,7 @@ from pllm.contracts.auxiliary import (
     CausalTrainBatch as CausalTrainBatch,
     StateTensorUpdate as StateTensorUpdate,
     WeightedCEBatch as WeightedCEBatch,
+    WeightedRowBatch as WeightedRowBatch,
     map_auxiliary as map_auxiliary,
 )
 from pllm.contracts.backend_attachment import BackendAttachment
@@ -56,6 +57,7 @@ __all__ = [
     "TensorResult",
     "TensorStepInput",
     "WeightedCEBatch",
+    "WeightedRowBatch",
     "map_auxiliary",
 ]
 

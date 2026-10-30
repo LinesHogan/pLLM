@@ -428,7 +428,9 @@ class VllmLlm(Generic[DataT, ResultT]):
             raise ValueError("a route-keyed request state requires per-prompt routes")
         validate_auxiliary(
             auxiliary,
-            self.attachment.plan,
+            self.attachment.plan.semantic_graph,
+            self.attachment.plan.tensor_layout_request,
+            self.attachment.plan.timeline,
             SharedTensor.describe,
             hidden_size=self.hidden_size,
             vocab_size=self.vocab_size,

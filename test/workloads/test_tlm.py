@@ -197,7 +197,9 @@ def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None
         with pytest.raises(ValueError):  # Larger than the planned input shape.
             validate_auxiliary(
                 CausalTrainBatch(tokens, tokens),
-                execution.arena.plan,
+                execution.arena.plan.semantic_graph,
+                execution.arena.plan.tensor_layout_request,
+                execution.arena.plan.timeline,
                 SharedTensor.describe,
                 hidden_size=0,
                 vocab_size=0,

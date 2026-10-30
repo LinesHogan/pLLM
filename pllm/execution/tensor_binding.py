@@ -120,8 +120,8 @@ class TensorBinding(Builder[TensorFrame]):
         self.initial_values: dict[str, Callable[[Dimensions, int], torch.Tensor]] = {}
         self.weighted_training = False
         self.causal: CausalBinder | None = None
-        # Causal training measures its costs from signed [sequences, tokens] bounds, not from example rows.
-        self.trains_causally = False
+        # Batch training measures its costs from signed input bounds, not from example rows.
+        self.trains_on_batch = False
         self.probe: BackendPlacementProbe | None = None
         self.max_requests = 1
         self.sample_limit: int | None = None
