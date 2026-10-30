@@ -510,11 +510,19 @@ class Builder(Generic[D]):
         stage: SamplerStage = SamplerStage.PACKED_POST_FILTER_EXACT,
     ) -> None:
         prediction[output]
+        # The sampler attachment keeps an earlier pllm.model.Overlay's bindings; an activation patch would need
+        # this attachment's state_resource, which names the trained state.
+        previous = self.attachment
+        if previous is not None and previous.activation_bindings:
+            raise ValueError(
+                "@pllm.add_logits and @pllm.guide_sampling do not combine with pllm.model.Activation; remove one of them"
+            )
         self.attachment = BackendAttachmentSpec(
             AttachmentKind.REQUEST_TRAINING,
             ((AttachmentTaskRole.COMPUTE, prediction.symbol), (AttachmentTaskRole.TRANSITION, transition.symbol)),
             AnchorSymbol("sampler.pre_draw"),
             state.declaration.resource,
+            () if previous is None else previous.overlay_bindings,
             sampler_stage=stage,
         )
 

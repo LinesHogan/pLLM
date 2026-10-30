@@ -423,7 +423,7 @@ class VllmSession(Generic[DataT, ResultT]):
         if self.completion_capture is not None:
             self.completion_capture.write(step.rows.identities, hidden)
         self.complete_forward()
-        if self._step is None or self._sampler is None:
+        if self._step is None or self._sampler is None or self._context().guidance is None:
             return lm_head(hidden)
         guidance = self._sampler_guidance()
         if guidance.stage is SamplerStage.PACKED_POST_FILTER_EXACT:

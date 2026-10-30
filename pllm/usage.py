@@ -1704,9 +1704,7 @@ class Workload(
         return BackendRequirements(
             tuple(dict.fromkeys(source.resolve(context.owner) for source in inputs if isinstance(source, Hidden))),
             targets,
-            activation_layers=()
-            if sampler is not None
-            else tuple(
+            activation_layers=tuple(
                 layer for value in context.values.values() if isinstance(value, Activation) for layer in value.layers
             ),
             sampler_stage=None if sampler is None else sampler.stage,

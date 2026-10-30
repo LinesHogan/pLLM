@@ -65,6 +65,8 @@ class SamplerGuidance:
             case _SampledGuidance(feedback=feedback):
                 self._active_guidance = None
                 return feedback
+            case None:  # A step without sampler hidden rows draws without guidance.
+                return None
             case _:
                 assert False
 
