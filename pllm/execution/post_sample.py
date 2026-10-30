@@ -5,23 +5,33 @@ the last L step inputs (new lineages keep their admission version); writers alwa
 the latest version. CUDA completion never determines which version a reader selects.
 """
 
+from __future__ import annotations
+
 from collections import deque
 from dataclasses import replace
+from typing import TYPE_CHECKING, TypeVar
 
 import torch
 
 from pllm.contracts.auxiliary import map_auxiliary
 from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin
+from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.execution.state_execution import DataT, StateTaskContext
 from pllm.execution.tensor_frame import TensorFrame
+
+if TYPE_CHECKING:
+    from pllm.execution.state_execution import StateTaskContext
+
+_DataT = TypeVar("_DataT")
 
 
 class PostSampleOverlap:
     """One serial writer lane and a bounded history of exact pins."""
 
-    def __init__(self, arena: PageBundleArena, lag: int, stream: torch.cuda.Stream) -> None:
-        self.arena, self.lag, self.stream = arena, lag, stream
+    def __init__(
+        self, arena: PageBundleArena, directory: RequestStateDirectory, lag: int, stream: torch.cuda.Stream
+    ) -> None:
+        self.arena, self.directory, self.lag, self.stream = arena, directory, lag, stream
         self._history: deque[PagePin] = deque()
 
     @property
@@ -29,7 +39,39 @@ class PostSampleOverlap:
         """Writer inputs, oldest first, retained independently of GPU completion."""
         return tuple(pin.refs for pin in self._history)
 
-    def copy_inputs(self, context: StateTaskContext[DataT]) -> None:
+    def hand_off(self, context: StateTaskContext[_DataT]) -> None:
+        """Protect reusable inputs and move the step to the writer stream, once per step."""
+        if context.handed_off:
+            return
+        self._copy_inputs(context)
+        if self.lag or context.pin.stream != self.stream:
+            with torch.cuda.stream(self.stream):
+                self._resume_latest(context)
+                if self.lag:
+                    # Expired history is released on the writer stream that owns it.
+                    self._history.append(self.arena.pin_exact(context.pin.refs, self.stream))
+                    while len(self._history) > self.lag:
+                        self.arena.release_pin(self._history.popleft())
+        context.handed_off = True
+
+    def _resume_latest(self, context: StateTaskContext[_DataT]) -> None:
+        """Move the step's pin to the writer stream without losing exact read holds.
+
+        Old reader pages stay pinned on the writer stream until settlement, including aliases
+        consumed by later tasks. Equal reader and writer refs share the new pin; retained
+        history owns its own hold.
+        """
+        assert context.sole_write() is None and not context.publications and not context.borrowed_roots
+        reader = context.pin
+        context.selection = self.directory.select(context.selection.rows)
+        context.pin = self.arena.pin_exact(context.selection.refs, self.stream)
+        context.register_pin(context.pin)
+        context.move_slots()
+        if reader.refs != context.pin.refs:
+            context.register_pin(self.arena.pin_exact(reader.refs, self.stream))
+        context.release_owned_pin(reader)
+
+    def _copy_inputs(self, context: StateTaskContext[_DataT]) -> None:
         """Own sampler feedback and results before the writer consumes them.
 
         Hidden rows stay in held slots. Only copies of reusable feedback and result
@@ -66,15 +108,7 @@ class PostSampleOverlap:
             tensor.record_stream(self.stream)
         return tensor
 
-    def retain(self, refs: StateRefs) -> None:
-        """Retain this transition's input; release expired history on its owning stream."""
-        if not self.lag:
-            return
-        self._history.append(self.arena.pin_exact(refs, self.stream))
-        while len(self._history) > self.lag:
-            self.arena.release_pin(self._history.popleft())
-
-    def clear(self) -> None:
+    def release_history(self) -> None:
         """Release history before retirement/drain, also on cancellation."""
         while self._history:
             self.arena.release_pin(self._history.popleft())

@@ -40,14 +40,12 @@ from pllm.contracts.packed_rows import PackedSamplerRowBatch
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
 from pllm.contracts.semantic_graph import (
-    AnchorId,
     SamplerFeedbackInputSource,
 )
 from pllm.execution.backend_attachment import attachment_buffer_bytes
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.host_runtime import CompletionCapture
 from pllm.execution.overlay_task import ProjectionTask
-from pllm.execution.post_sample import PostSampleOverlap
 from pllm.execution.state_execution import HeldInput, StateDiagnostics, StateTaskContext
 from pllm.execution.state_feed import (
     Feed,
@@ -64,7 +62,6 @@ class _PackedStep(Generic[DataT]):
     rows: PackedSamplerRowBatch
     context: StateTaskContext[DataT] | None = None
     forward_done: bool = False
-    handed_off: bool = False
 
 
 class VllmSession(Generic[DataT, ResultT]):
@@ -153,16 +150,6 @@ class VllmSession(Generic[DataT, ResultT]):
         self._auxiliary: AuxiliaryInput[torch.Tensor] | None = None
         self.completion_capture: CompletionCapture | None = None
         execution = deployment.execution
-        self._post_sample = None
-        tasks = plan.schedule.tasks
-        if any(task.read_origin == "latest" for task in tasks):
-            self._post_sample = PostSampleOverlap(
-                execution.arena,
-                max(task.read_distance for task in tasks),
-                torch.cuda.Stream(device=execution.device)
-                if any(task.lane == "side" for task in tasks)
-                else torch.cuda.current_stream(execution.device),
-            )
         if bool(execution.directory.instance_states):
             execution.admit((), torch.cuda.current_stream(execution.device))
         if execution.feeds:
@@ -309,7 +296,7 @@ class VllmSession(Generic[DataT, ResultT]):
                 TensorStepInput(rows.row_batch, rows), torch.cuda.current_stream(execution.device)
             )
             step.context = context
-            self._advance(context, "request.prepare")
+            execution.advance_to(context, "request.prepare")
             self._replay.prepare(rows.row_batch, context)
             return
         adapter = self._overlay
@@ -329,7 +316,7 @@ class VllmSession(Generic[DataT, ResultT]):
             if bool(execution.directory.instance_states) or not self._pending_identities:
                 self._auxiliary = None
             step.context = context
-            self._advance(context, "request.prepare")
+            execution.advance_to(context, "request.prepare")
             # Offline publication precedes admission; existing request pins remain unchanged.
             pending = tuple(
                 identity
@@ -344,7 +331,7 @@ class VllmSession(Generic[DataT, ResultT]):
         if adapter is not None:
             projection = None
             if self._in_forward_overlay:
-                self._advance(context, "request.prepare")
+                execution.advance_to(context, "request.prepare")
                 binding = next(
                     item for item in self.attachment.task_bindings if item.role is AttachmentTaskRole.TRANSITION
                 )
@@ -380,11 +367,10 @@ class VllmSession(Generic[DataT, ResultT]):
             self._step = None
             return
         if step.context is None:
-            if self._post_sample is not None and not self._post_sample.lag:
-                stream = self._post_sample.stream
-            step.context = execution.start_step(
-                value, stream, history=() if self._post_sample is None else self._post_sample.history
-            )
+            overlap = execution.post_sample
+            if overlap is not None and not overlap.lag:
+                stream = overlap.stream
+            step.context = execution.start_step(value, stream, history=() if overlap is None else overlap.history)
             self._auxiliary = None
         elif step.context.value is None:
             execution.submit_input(step.context, value, CudaStreamReadiness(stream))
@@ -392,7 +378,7 @@ class VllmSession(Generic[DataT, ResultT]):
             execution.submit_input(step.context, value, CudaStreamReadiness(stream))
         if self._taps is not None and self._hidden_resources:
             self._taps.hold(step.context)
-        self._advance(step.context, "sampler.pre_draw")
+        execution.advance_to(step.context, "sampler.pre_draw")
         self._finish_effects()
 
     def _finish_effects(self) -> None:
@@ -461,7 +447,7 @@ class VllmSession(Generic[DataT, ResultT]):
             return
         execution = self._deployment.execution
         context = self._context()
-        self._advance(context, "next.prepare")
+        execution.advance_to(context, "next.prepare")
         execution.finish_step(context)
         self._step = None
         execution.arena.collect_completed()
@@ -472,8 +458,6 @@ class VllmSession(Generic[DataT, ResultT]):
             self._sampler.abort_guidance()
         self._finish_effects()
         self._deployment.execution.cancel_active()
-        if self._post_sample is not None:
-            self._post_sample.clear()
         self._auxiliary = None
         self._step = None
 
@@ -495,8 +479,7 @@ class VllmSession(Generic[DataT, ResultT]):
     def retire_all(self, *, wait: bool = False) -> None:
         if self.completion_capture is not None:
             self.completion_capture.synchronize()
-        if self._post_sample is not None:
-            self._post_sample.clear()
+        self._deployment.execution.release_history()
         self._retire(tuple(self._identities[request_id] for request_id in sorted(self._identities)))
         self._pending_identities.clear()
         self._deployment.execution.arena.collect_completed(wait=wait)
@@ -536,38 +519,3 @@ class VllmSession(Generic[DataT, ResultT]):
     def _context(self) -> StateTaskContext[DataT]:
         assert self._step is not None and self._step.context is not None
         return self._step.context
-
-    def _handoff(self, context: StateTaskContext[DataT]) -> None:
-        """Protect reusable inputs and move ownership before the first signed side task."""
-        overlap = self._post_sample
-        assert overlap is not None
-        assert self._step is not None
-        if not self._step.handed_off:
-            overlap.copy_inputs(context)
-            if overlap.lag or context.pin.stream != overlap.stream:
-                with torch.cuda.stream(overlap.stream):
-                    self._deployment.execution.resume_latest(context, overlap.stream)
-                    overlap.retain(context.pin.refs)
-            self._step.handed_off = True
-
-    def _advance(self, context: StateTaskContext[DataT], symbol: str) -> None:
-        execution = self._deployment.execution
-        target = next(anchor.ordinal for anchor in execution.arena.plan.timeline.anchors if anchor.symbol == symbol)
-        points = dict.fromkeys(
-            (
-                *[
-                    task.anchor_id
-                    for task in execution.arena.plan.schedule.tasks
-                    if context.last_anchor_id < task.anchor_id <= target
-                ],
-                AnchorId(target),
-            )
-        )
-        for point in points:
-            if point > context.last_anchor_id:
-                if any(
-                    task.anchor_id == point and task.read_origin == "latest"
-                    for task in execution.arena.plan.schedule.tasks
-                ):
-                    self._handoff(context)
-                execution.execute_anchor(context, AnchorId(point))

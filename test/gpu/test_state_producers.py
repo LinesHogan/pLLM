@@ -37,7 +37,7 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
             tasks = tuple(task for task in plan.schedule.tasks if task.anchor_id == anchor)
             if tasks:
                 assert all(task.lane == "side" and task.read_origin == "latest" for task in tasks)
-                assert invocation.pin.stream == session._post_sample.stream
+                assert invocation.pin.stream == execution.post_sample.stream
                 with torch.cuda.stream(invocation.pin.stream):
                     torch.cuda._sleep(1_000_000)
                 launches.append(plan.timeline.anchors[anchor].symbol)

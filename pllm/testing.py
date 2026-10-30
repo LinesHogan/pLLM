@@ -86,12 +86,7 @@ def run_step(
     stream: torch.cuda.Stream | None = None,
 ) -> ResultT:
     """Execute every anchor of one step, completing the sampler with `feedback` when the workload reads it."""
-    context = execution.start_step(value, stream)
-    for anchor in execution.arena.plan.timeline.anchors:
-        execution.execute_anchor(context, AnchorId(anchor.ordinal))
-        if anchor.ordinal == execution.sampler_anchor_id:
-            execution.complete_sampler(context, stream, feedback=feedback)
-    return execution.finish_step(context)
+    return execution.step(value, stream, feedback=feedback)
 
 
 def run_guided_step(

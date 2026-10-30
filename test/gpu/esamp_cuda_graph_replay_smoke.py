@@ -20,12 +20,12 @@ from pllm.contracts.packed_hidden import HiddenRowBatch, HiddenRows, PackedHidde
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import SamplerFeedback
-from pllm.contracts.semantic_graph import AnchorId, AnchorSymbol, SchedulerTimeline, TimelineAnchor
+from pllm.contracts.semantic_graph import AnchorId
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.cuda_stream import CudaStreamReadiness
-from pllm.execution.post_sample import PostSampleOverlap
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
+from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.step_input import TensorStepInput
 from pllm.execution.tensor_task import TensorTask
 from test.backend_facts import backend_facts
@@ -61,13 +61,7 @@ def mean_capture(publish_lag: int = 0) -> None:
     device = torch.device("cuda", 0)
     stream = torch.cuda.current_stream(device)
     resource = PackedHiddenResourceBinding("0", HiddenLayerKind.INDEX, HiddenSite.BLOCK_OUTPUT, "model.layers[0]")
-    timeline = SchedulerTimeline(
-        tuple(
-            TimelineAnchor(AnchorSymbol(name), i)
-            for i, name in enumerate(("model.execute", "sampler.pre_draw", "token.commit", "next.prepare"))
-        ),
-        ("compute/cuda@1", "state/dense_page_cuda@1"),
-    )
+    timeline = model_timeline(device)
     workload = MeanFit()
     provider = PageBundleProviderFacts("test.mean@1", 6, StateDeviceKind.CUDA)
     facts = backend_facts(4, (resource,), timeline, provider, max_lineages=3)
@@ -84,9 +78,9 @@ def mean_capture(publish_lag: int = 0) -> None:
         facts.state_memory_budget_bytes,
         device,
     )
-    execution = workload.bind_math(facts, plan, declaration).bind(PageBundleArena(plan), AnchorId(1))
+    execution = workload.bind_math(facts, plan, declaration).bind(PageBundleArena(plan), AnchorId(3))
     assert plan.timeline.visibility is not None
-    overlap = PostSampleOverlap(execution.arena, publish_lag, torch.cuda.Stream(device=device)) if publish_lag else None
+    overlap = execution.post_sample
     execution.admit((), stream)
     parameter = torch.nn.Parameter(torch.zeros(4, device=device, dtype=torch.float64))
     optimizer = torch.optim.AdamW((parameter,), lr=0.03, weight_decay=0, capturable=True, foreach=True)
@@ -123,23 +117,20 @@ def mean_capture(publish_lag: int = 0) -> None:
             invocation = execution.start_step(value, stream, history=() if overlap is None else overlap.history)
             assert invocation.pin.refs[0].version_id == max(0, step - publish_lag)
             for anchor in plan.timeline.anchors:
-                execution.execute_anchor(invocation, AnchorId(anchor.ordinal))
-                if anchor.ordinal == 1:
+                execution.advance_to(invocation, anchor.symbol)
+                if anchor.symbol == "sampler.pre_draw":
                     execution.complete_sampler(invocation, stream, feedback=SamplerFeedback(sampler, target, tokens))
-                    if overlap is not None:
-                        overlap.copy_inputs(invocation)
-                        execution.resume_latest(invocation, overlap.stream)
-                        overlap.retain(invocation.pin.refs)
-                        # Sampler outputs may be overwritten after the handoff copy.
-                        target.fill_(999)
-                        tokens.fill_(999)
+            if overlap is not None:
+                # Sampler outputs may be overwritten after the handoff copy.
+                target.fill_(999)
+                tokens.fill_(999)
             result = execution.finish_step(invocation)
         if overlap is not None:
             stream.wait_stream(overlap.stream)
         torch.testing.assert_close(result.loss, oracle.detach())
         torch.testing.assert_close(execution.snapshot(result.publication.after_refs[0], stream)[0], parameter)
     if overlap is not None:
-        overlap.clear()
+        execution.release_history()
     execution.retire(())
 
 

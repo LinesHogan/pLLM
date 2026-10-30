@@ -50,6 +50,7 @@ from pllm.execution.torch_private import MemoryUsage
 from pllm.execution.trace import ExecutionTrace, TraceEvent, TracePhase
 
 if TYPE_CHECKING:
+    from pllm.execution.post_sample import PostSampleOverlap
     from pllm.execution.tensor_program import TensorBatch
 
 InputT = TypeVar("InputT", contravariant=True)
@@ -125,6 +126,7 @@ class StateTaskContext(Generic[DataT]):
     next_task: int = 0
     last_anchor_id: int = -1
     finished: bool = False
+    handed_off: bool = False
     value: DataT | None = None
     results: dict[tuple[TaskSymbol, str], torch.Tensor] = field(
         default_factory=lambda: dict[tuple[TaskSymbol, str], torch.Tensor]()
@@ -411,11 +413,26 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             else None
         )
         self.feeds = feeds
+        self.post_sample = self._post_sample_overlap()
         self._pending_borrows: tuple[BorrowedStateRoot, ...] | None = None
         self._borrow_failed = False
         self._successful_inputs: dict[RequestIdentity, tuple[tuple[StateRef, ...], int]] = {}
         self._hold_count = 0
         self._last_hold: HeldInput | None = None
+
+    def _post_sample_overlap(self) -> PostSampleOverlap | None:
+        """Tasks that read the latest version need sampler outputs handed off; side-lane tasks need a stream."""
+        from pllm.execution.post_sample import PostSampleOverlap  # tensor_frame imports this module
+
+        tasks = self.plan.tasks
+        if not any(task.read_origin == "latest" for task in tasks):
+            return None
+        stream = (
+            torch.cuda.Stream(device=self.device)
+            if any(task.lane == "side" for task in tasks)
+            else torch.cuda.current_stream(self.device)
+        )
+        return PostSampleOverlap(self.arena, self.directory, max(task.read_distance for task in tasks), stream)
 
     def close(self) -> None:
         """Finish asynchronous exports when direct ownership or a backend session ends."""
@@ -554,33 +571,26 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         self.submit_input(context, value)
         return context
 
-    def resume_latest(self, context: StateTaskContext[DataT], stream: torch.cuda.Stream) -> None:
-        """Move an invocation to its signed writer stream without losing exact read holds.
+    def advance_to(self, context: StateTaskContext[DataT], symbol: str) -> None:
+        """Run every anchor up to `symbol`, handing the step to the post-sample overlap before its first latest read."""
+        target = next(anchor.ordinal for anchor in self.arena.plan.timeline.anchors if anchor.symbol == symbol)
+        for ordinal in range(context.last_anchor_id + 1, target + 1):
+            if self.post_sample is not None and any(
+                task.anchor_id == ordinal and task.read_origin == "latest" for task in self.plan.tasks
+            ):
+                self.post_sample.hand_off(context)
+            self.execute_anchor(context, AnchorId(ordinal))
 
-        The caller orders producers and copies reusable inputs first. Old reader pages remain
-        pinned on the new stream until settlement, including aliases consumed by later tasks.
-        Equal reader and writer refs share the new pin; retained history owns its own hold.
-        """
-        self._require_borrow_live()
-        assert context.sole_write() is None and not context.publications and not context.borrowed_roots
-        reader = context.pin
-        context.selection = self.directory.select(context.selection.rows)
-        context.pin = self.arena.pin_exact(context.selection.refs, stream)
-        context.register_pin(context.pin)
-        context.move_slots()
-        if reader.refs != context.pin.refs:
-            held = self.arena.pin_exact(reader.refs, stream)
-            context.register_pin(held)
-        context.release_owned_pin(reader)
-
-    def step(self, value: InputT, stream: torch.cuda.Stream | None = None) -> ResultT:
+    def step(
+        self, value: InputT, stream: torch.cuda.Stream | None = None, *, feedback: SamplerFeedback | None = None
+    ) -> ResultT:
         """Run without an external sampler borrower using the same staged lifecycle."""
         context = self.start_step(value, stream)
         try:
             for anchor in self.arena.plan.timeline.anchors:
-                self.execute_anchor(context, AnchorId(anchor.ordinal))
+                self.advance_to(context, anchor.symbol)
                 if anchor.ordinal == self.sampler_anchor_id:
-                    self.complete_sampler(context, stream)
+                    self.complete_sampler(context, stream, feedback=feedback)
             return self.finish_step(context)
         except WindowBackpressure:
             # The convenience call exposes no cursor; staged callers keep it through execute_anchor.
@@ -712,6 +722,12 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     def cancel_active(self) -> None:
         for context in tuple(self._active.values()):
             self.cancel_step(context)
+        self.release_history()
+
+    def release_history(self) -> None:
+        """Release retained reader versions before retirement or drain, also after cancellation."""
+        if self.post_sample is not None:
+            self.post_sample.release_history()
 
     def _failed(self, context: StateTaskContext[DataT], exc: Exception) -> NoReturn:
         context.cancel_requested = True
