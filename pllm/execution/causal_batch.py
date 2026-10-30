@@ -67,13 +67,14 @@ def declare_batch_train(
     state: State,
     *,
     ports: Mapping[str, CausalPort],
-    function: Callable[..., TensorUpdate | None],
+    function: Callable[..., torch.Tensor | TensorUpdate | None],
     identity: str,
     when: When,
 ) -> Call:
     """Bind batch inputs, explicit parameter gradients and the shared AdamW transition.
 
-    The method returns a TensorUpdate whose `changed` flag is a device tensor, or None to skip the step.
+    The method returns a scalar loss (every row trains), a TensorUpdate whose `changed` flag is a device
+    tensor, or None to skip the step.
     """
     if state.optimizer is None or state.declaration.key_fields or when not in _TRAINING_WINDOWS:
         raise ValueError("batch training needs an instance AdamW state and BEFORE_MODEL, AFTER_SAMPLE or HOST_COMPUTE")
@@ -92,6 +93,10 @@ def declare_batch_train(
         result = function(**{key: port.adapt(batch, parameters) for key, port in ports.items()})
         if result is None:
             return None
+        if not isinstance(result, TensorUpdate):
+            rows = (batch.input_ids if isinstance(batch, CausalTrainBatch) else batch.hidden).shape[0]
+            one = torch.ones((), dtype=torch.int64, device=result.device)
+            result = TensorUpdate(result, one.bool(), one, one * rows)
         data.training = replace(result, output=result.output.detach())
         return result.output
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, NamedTuple, overload
 
 import numpy as np
@@ -61,6 +62,10 @@ def gradient_rows(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return result
 
 
+# An immutable default that torch.compile can trace, unlike a default_factory.
+_NO_METRICS: Mapping[str, torch.Tensor] = MappingProxyType({})
+
+
 @dataclass(frozen=True)
 class TensorUpdate:
     """Private overlay updates and their unscaled residual, excluding the base projection."""
@@ -69,7 +74,7 @@ class TensorUpdate:
     changed: torch.Tensor
     update_count: torch.Tensor
     trained_rows: torch.Tensor
-    metrics: Mapping[str, torch.Tensor] = field(default_factory=lambda: dict[str, torch.Tensor]())
+    metrics: Mapping[str, torch.Tensor] = field(default_factory=lambda: _NO_METRICS)
 
     @classmethod
     def unchanged(cls, output: torch.Tensor) -> "TensorUpdate":

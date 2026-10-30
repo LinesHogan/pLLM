@@ -33,12 +33,10 @@ class TwoGroups(pllm.Workload):
         hidden: torch.Tensor = pllm.batch("hidden"),
         matrix: torch.Tensor = pllm.parameter("parameters", "matrix"),
         bias: torch.Tensor = pllm.parameter("parameters", "bias"),
-    ) -> pllm.TensorUpdate | None:
+    ) -> torch.Tensor | None:
         if hidden.shape[0] > 1:  # a batch of several rows is this test's way to skip the update
             return None
-        loss = (hidden @ matrix + bias).square().mean()
-        one = torch.ones((), dtype=torch.int64, device=loss.device)
-        return pllm.TensorUpdate(loss, one.bool(), one, one, {})
+        return (hidden @ matrix + bias).square().mean()
 
 
 @pytest.mark.parametrize("device", ("cpu", "cuda:0"))

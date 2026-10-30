@@ -208,4 +208,4 @@ class TTRLWorkload(pllm.Workload):
         total = weights.sum()
         loss = (weights * (prediction.squeeze(-1) - targets).square()).sum() / torch.where(total > 0, total, 1)
         changed = total > 0
-        return pllm.TensorUpdate(loss, changed, changed.to(torch.int64), (weights > 0).sum(), {})
+        return pllm.TensorUpdate(loss, changed, changed.to(torch.int64), (weights > 0).sum())

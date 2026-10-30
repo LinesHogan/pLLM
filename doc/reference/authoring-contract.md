@@ -457,9 +457,9 @@ Python 堆成本声明。
 `[行数, hidden_size]`，`targets` 与 `weights` 是同 dtype 的 `[行数]`，权重为 0 的行不参与。
 训练方法用 `@pllm.train(state=...)`，通过 `pllm.batch("hidden")`、`pllm.batch("targets")`、
 `pllm.batch("weights")` 与 `pllm.parameter(state, field)` 取输入，返回
-`pllm.TensorUpdate(loss, changed, update_count, trained_rows, {})`，或返回 `None` 跳过整个
+`pllm.TensorUpdate(loss, changed, update_count, trained_rows)`、标量 loss（每行都训练），或返回 `None` 跳过整个
 更新。`changed` 是设备张量：空选择（权重全 0）时发布不变的值，优化器字段保持原样，
-训练路径没有主机同步。`TensorUpdate` 的 `metrics` 要显式传 `{}`（默认值不能被 `torch.compile` 追踪）。
+训练路径没有主机同步。
 
 参数是带 `pllm.AdamW` 的普通 `InstanceState`；具名形状只是同一个打包 AdamW 组的视图
 （AdamW 逐元素，所以与独立参数逐位一致）。标量配置在绑定时快照（包括类属性），
