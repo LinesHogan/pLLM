@@ -1830,7 +1830,6 @@ class Workload(
         return MathBinding(
             self._functions(b, facts.device, facts.initialization_seed),
             b.bind_all(plan, model_probe=facts.probe, operations=operations),
-            borrowed_resources=tuple(feed.resource for feed in b.feeds),
             feeds=b.feeds,
             on_export=self.on_export if b.has_exports else None,
         )

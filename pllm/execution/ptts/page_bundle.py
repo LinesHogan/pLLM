@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Generator, Sequence
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from collections.abc import Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field as dataclass_field
 from math import prod
 from multiprocessing.connection import Connection
@@ -282,7 +282,6 @@ class SlotPools:
                 .view(capacity, *field.shape)
             )
         self.tensors = tuple(tensors)
-        self.addresses = tuple(pool.data_ptr() for pool in self.tensors)
         # Per field and slot: how many owners share the page (0 = free), and how often it was reused.
         self.holders = np.zeros((len(layout.fields), capacity), dtype=np.int32)
         self.generations = np.zeros((len(layout.fields), capacity), dtype=np.int64)
@@ -426,8 +425,6 @@ class PageBundleArena:
         self._publications: dict[PagePublication, _Publication] = {}
         self._releases: dict[PageRelease, _Pin] = {}
         self._recycled: set[PagePublication | PageRelease] = set()
-        self._window_active = False
-        self._window_completion: torch.cuda.Event | None = None
         self._storage_streams: set[int] = set()
         self._pending_events: dict[torch.cuda.Stream, deque[PagePublication | PageRelease]] = {}
         self._ready_receipts: dict[PagePublication | PageRelease, None] = {}
@@ -462,10 +459,6 @@ class PageBundleArena:
     @property
     def pending_pin_releases(self) -> int:
         return len(self._releases)
-
-    @property
-    def pool_addresses(self) -> tuple[int, ...]:
-        return tuple(address for pools in self._pools.values() for address in pools.addresses)
 
     @property
     def allocation_ranges(self) -> tuple[tuple[str, int, int], ...]:
@@ -738,8 +731,7 @@ class PageBundleArena:
             if not sources:
                 self._admission_capacity_failures += 1
                 raise WindowBackpressure("page capacity is held by live owners; retry admission asynchronously")
-            assert not self._window_active
-            raise RuntimeError("page capacity is unavailable without waiting; reserve an execution window")
+            raise RuntimeError("page capacity is unavailable without waiting")
 
     def prepare_transition(
         self,
@@ -877,53 +869,6 @@ class PageBundleArena:
                 group.table.writing[group.rows] = False
                 group.release(completion)
             self._writes.pop(token)
-
-    @contextmanager
-    def reserve_window(
-        self,
-        refs: StateRefs,
-        fields: tuple[tuple[LayoutFieldId, ...], ...],
-        roots: tuple[int, ...],
-        stream: torch.cuda.Stream | None,
-    ) -> Generator[None, None, None]:
-        """Reserve COW headroom atomically, before any source cell or input copy issues."""
-        if not self._lock.acquire(blocking=False):
-            raise WindowBackpressure("page owner is reserving another window; retry admission asynchronously")
-        try:
-            if self._window_active:
-                raise WindowBackpressure("page window is already reserved; retry admission asynchronously")
-            if self._window_completion is not None and not self._window_completion.query():
-                raise WindowBackpressure("previous page window is still pending; retry admission asynchronously")
-            self.collect_completed()
-            self._recycle_pending()
-            demand: dict[tuple[str, int], int] = {}
-            for ref, selected, bound in zip(refs, fields, roots, strict=True):
-                root = self.root(ref)
-                table = self._tables[root.resource]
-                if bound:
-                    if self.latest(ref.lineage_id) != ref:
-                        raise ValueError("refresh the owned state selection before reserving a writable window")
-                    if table.writing[table.row_of[ref.lineage_id]]:
-                        raise WindowBackpressure("window target has a pending writer; retry after settlement")
-                pools = table.pools
-                for field in selected:
-                    slot = root.slots[field]
-                    needed = max(0, bound - int(pools.holders[field, slot] == 1))
-                    key = root.resource, int(field)
-                    demand[key] = demand.get(key, 0) + needed
-            if any(self._pools[resource].free_count(field) < needed for (resource, field), needed in demand.items()):
-                raise WindowBackpressure("page capacity cannot reserve the complete window before execution")
-            self._require_stream(stream)
-            self._window_active = True
-            try:
-                yield
-            finally:
-                # One in-flight page window bounds receipt metadata by the
-                # signed source domain as well as bounding physical COW pages.
-                self._window_completion = self._record(stream)
-                self._window_active = False
-        finally:
-            self._lock.release()
 
     def _recycle_pending(self) -> None:
         # Closed local readers and settled publications can transfer their

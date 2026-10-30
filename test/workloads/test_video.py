@@ -23,6 +23,7 @@ from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId, StateEffectKind
+from pllm.contracts.state_feed import FeedBinding, FeedOrder
 from pllm.contracts.state_ref import LineageId, StateRef, VersionId
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.backend_attachment import attachment_buffer_bytes, bind_backend_attachment
@@ -105,7 +106,11 @@ def binding_case(*, alias=False, write_failure=False, runtime=False, missing=Non
         lambda value, batch: TensorFrame(value, () if value is None else value.rows.rows),
         lambda data, result: result.publication,
     )
-    binding = MathBinding(math, b.bind_all(plan, operations=b.executables(None, ())), borrowed_resources=("features",))
+    binding = MathBinding(
+        math,
+        b.bind_all(plan, operations=b.executables(None, ())),
+        feeds=(FeedBinding("features", FeedOrder.ORDERED, ("qp", "residual", "mv", "segmentation")),),
+    )
     arena = PageBundleArena(plan, _owned_resources=("inject",))
     execution = binding.bind(arena, AnchorId(4))
     if not runtime:

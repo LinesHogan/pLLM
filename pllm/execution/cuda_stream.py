@@ -1,7 +1,8 @@
-"""Small CUDA helpers: stream readiness between producer and consumer, and non-blocking uploads.
+"""Small CUDA helpers: stream readiness between producer and consumer, non-blocking uploads and device counters.
 
 The PTTS arena and the tensor executor upload small index lists with `upload`; step capture reuses
-`PinnedStaging` for its per-step index table. Neither makes the host wait for the stream.
+`PinnedStaging` for its per-step index table; state execution keeps diagnostics in `DeviceCounters`.
+None of them makes the host wait for the stream.
 """
 
 from __future__ import annotations
@@ -69,6 +70,11 @@ class PinnedStaging:
 
 
 class CudaStreamReadiness:
+    """A point on a producer stream that consumers on other streams wait for without blocking the host.
+
+    Created right after the producer queues its work; `order_on` makes a consumer stream wait for it.
+    """
+
     __slots__ = ("_producer_stream", "_event")
 
     def __init__(self, producer_stream: torch.cuda.Stream) -> None:
@@ -87,9 +93,6 @@ class CudaStreamReadiness:
 
     def synchronize(self) -> None:
         self._event.synchronize()
-
-
-__all__ = ["CudaStreamReadiness", "PinnedStaging", "upload"]
 
 
 class DeviceCounters:
@@ -124,3 +127,6 @@ class DeviceCounters:
         if self.ready is None or self.ready.query():
             self.values = (int(self.host[0]), int(self.host[1]))
         return self.values
+
+
+__all__ = ["CudaStreamReadiness", "DeviceCounters", "PinnedStaging", "upload"]

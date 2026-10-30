@@ -290,19 +290,18 @@ class MathBinding(Generic[InputT, DataT, ResultT]):
 
     math: StateMath[InputT, DataT, ResultT]
     tasks: tuple[TaskGraphImplementation[StateTaskContext[DataT], ProjectionResiduals], ...]
-    borrowed_resources: tuple[str, ...] = ()
     feeds: tuple[FeedBinding, ...] = ()
     on_export: Callable[[TraceEvent], None] | None = None
 
     def local_resources(self, plan: PlanBundle) -> tuple[str, ...]:
-        states = plan.semantic_graph.states
-        borrowed = set(self.borrowed_resources)
-        return tuple(str(state.resource) for state in states if state.resource not in borrowed)
+        """States this process owns; a fed resource is borrowed from its producer."""
+        borrowed = {feed.resource for feed in self.feeds}
+        return tuple(str(state.resource) for state in plan.semantic_graph.states if state.resource not in borrowed)
 
     def bind(self, arena: PageBundleArena, sampler_anchor_id: AnchorId) -> StateExecution[InputT, DataT, ResultT]:
         states = arena.plan.semantic_graph.states
         # A borrowed binding owns only its local directory; test_video verifies no remote lineage.
-        if self.borrowed_resources:
+        if self.feeds:
             states = tuple(state for state in states if state.resource in arena.owned_resources)
         execution = StateExecution(
             arena,
@@ -310,7 +309,6 @@ class MathBinding(Generic[InputT, DataT, ResultT]):
             self.math,
             self.tasks,
             sampler_anchor_id,
-            _borrowed_resources=self.borrowed_resources,
             feeds=self.feeds,
             on_export=self.on_export,
         )
@@ -386,7 +384,6 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         implementations: tuple[TaskGraphImplementation[StateTaskContext[DataT], ProjectionResiduals], ...],
         sampler_anchor_id: AnchorId,
         *,
-        _borrowed_resources: tuple[str, ...] = (),
         feeds: tuple[FeedBinding, ...] = (),
         on_export: Callable[[TraceEvent], None] | None = None,
     ) -> None:
@@ -410,7 +407,6 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             else None
         )
         self._lock = RLock()
-        self._borrowed_resources = _borrowed_resources
         self.feeds = feeds
         self._pending_borrows: tuple[BorrowedStateRoot, ...] | None = None
         self._borrow_failed = False
@@ -437,6 +433,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         self._borrow_failed = True
 
     def _require_borrow_live(self) -> None:
+        # Only feed (borrowing) paths set _borrow_failed; test_video covers the fail-stop.
         if self._borrow_failed:
             raise RuntimeError("borrowed execution is fail-stopped with resources retained")
 
@@ -500,9 +497,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         self, identities: tuple[RequestIdentity, ...], stream: torch.cuda.Stream | None = None
     ) -> tuple[StateRef, ...]:
         with self._lock:
-            # Only borrowing executions have a terminal transport state; test_video covers it.
-            if self._borrowed_resources:
-                self._require_borrow_live()
+            self._require_borrow_live()
             if not self.directory.states:
                 return ()
             receipt = self.directory.admit(identities, stream, self.math.initialize)
@@ -525,8 +520,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         held_input: HeldInput | None = None,
     ) -> StateTaskContext[DataT]:
         with self._lock:
-            if self._borrowed_resources:
-                self._require_borrow_live()
+            self._require_borrow_live()
             self.arena.collect_completed()
             selection = self.directory.select(rows, history)
             pin = self.arena.pin_exact(selection.refs, stream)
@@ -534,7 +528,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             context.held_input = held_input
             self._next_invocation += 1
             self._active[context.invocation_id] = context
-            if self._borrowed_resources and context.held_input is None:
+            if self.feeds and context.held_input is None:
                 assert self._pending_borrows is not None
                 context.borrowed_roots = self._pending_borrows
                 self._pending_borrows = None
@@ -573,8 +567,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         Equal reader and writer refs share the new pin; retained history owns its own hold.
         """
         with self._lock:
-            if self._borrowed_resources:
-                self._require_borrow_live()
+            self._require_borrow_live()
             assert context.sole_write() is None and not context.publications and not context.borrowed_roots
             reader = context.pin
             context.selection = self.directory.select(context.selection.rows)
@@ -609,8 +602,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     ) -> None:
         """Consume original inputs, ordering an external CUDA producer when supplied."""
         with self._lock:
-            if self._borrowed_resources:
-                self._require_borrow_live()
+            self._require_borrow_live()
             try:
                 if readiness is not None:
                     assert context.pin.stream is not None
@@ -627,8 +619,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     def execute_anchor(self, context: StateTaskContext[DataT], anchor_id: AnchorId) -> None:
         """Advance the step through every task at this anchor, retaining its cursor on backpressure."""
         with self._lock:
-            if self._borrowed_resources:
-                self._require_borrow_live()
+            self._require_borrow_live()
             try:
                 context.check_page_execution()
                 plan = self.plan
@@ -661,8 +652,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     ) -> ProjectionResiduals:
         """Supply actual projection operands to one segment of a bound in-forward task."""
         with self._lock:
-            if self._borrowed_resources:
-                self._require_borrow_live()
+            self._require_borrow_live()
             try:
                 context.check_page_execution()
                 context.value = self.math.prepare(value, context)
@@ -687,8 +677,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         stream: torch.cuda.Stream | None = None,
     ) -> PackedSamplerGuidanceBatch:
         with self._lock:
-            if self._borrowed_resources:
-                self._require_borrow_live()
+            self._require_borrow_live()
             assert context.guidance is not None
             if stream is not None:
                 assert context.guidance_ready is not None
@@ -704,8 +693,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         feedback: SamplerFeedback | None = None,
     ) -> None:
         with self._lock:
-            if self._borrowed_resources:
-                self._require_borrow_live()
+            self._require_borrow_live()
             self._order_sampler(context, stream)
             context.sampler_feedback = feedback
             self._sampler_count += 1
@@ -713,8 +701,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
 
     def finish_step(self, context: StateTaskContext[DataT]) -> ResultT:
         with self._lock:
-            if self._borrowed_resources:
-                self._require_borrow_live()
+            self._require_borrow_live()
             try:
                 result = self.math.output(context)
                 if not context.finished:
@@ -729,8 +716,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     def cancel_step(self, context: StateTaskContext[DataT]) -> None:
         context.cancel_requested.set()
         with self._lock:
-            if self._borrowed_resources:
-                self._require_borrow_live()
+            self._require_borrow_live()
             # Cancellation cannot prove that remote aliases were discarded; test_video checks no ACK.
             if context.borrowed_roots or context.held_input is not None:
                 self._failed(context, RuntimeError("borrowed invocation cancelled; resources retained"))
