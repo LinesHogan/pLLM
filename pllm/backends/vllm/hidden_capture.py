@@ -26,7 +26,7 @@ from pllm.contracts.packed_rows import PackedPhaseRowBatch
 from pllm.contracts.semantic_graph import HiddenInputSource
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorFieldSpec, TensorLayoutSpec
 from pllm.execution.cuda_stream import CudaStreamReadiness, PinnedStaging
-from pllm.execution.ptts.page_bundle import SlotPools, Slots
+from pllm.execution.ptts.slot_pools import SlotPools, Slots
 from pllm.execution.state_execution import DataT, StateTaskContext
 from pllm.execution.step_input import TensorStepInput
 

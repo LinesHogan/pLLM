@@ -28,9 +28,10 @@ from pllm.contracts.state_ref import LineageId, StateRef, VersionId
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.backend_attachment import attachment_buffer_bytes, bind_backend_attachment
 from pllm.execution.declaration import Dimensions, Field, When
-from pllm.execution.ptts.page_borrow import BorrowedStateRoot
-from pllm.execution.ptts.page_bundle import BorrowedPage, PageBundleArena, PageFieldTransfer, PageSlot
+from pllm.execution.ptts.page_borrow import BorrowedPage, BorrowedStateRoot, PageFieldTransfer
+from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
+from pllm.execution.ptts.slot_pools import PageSlot
 from pllm.execution.row_task_binding import (
     declare_parameters,
     declare_tensor,

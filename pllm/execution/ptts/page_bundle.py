@@ -16,27 +16,18 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
-from pllm.contracts.codec import boundary_digest, decode_boundary, encode_boundary
+from pllm.contracts.codec import boundary_digest, encode_boundary
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.semantic_graph import StateEffectKind
 from pllm.contracts.state_ref import LineageId, StateRef, VersionId
 from pllm.contracts.state_representation import StateDeviceKind, StateProviderPlan
-from pllm.contracts.tensor_layout import LayoutFieldId, TensorLayoutSpec
+from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.admission import WindowBackpressure
 from pllm.execution.cuda_stream import upload
-from pllm.execution.ptts.page_bundle_planning import page_stride_bytes
+from pllm.execution.ptts.page_borrow import PageFieldTransfer
+from pllm.execution.ptts.slot_pools import PageSlot, SlotPools, Slots
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.shared_tensor import CudaIpcStorage, RemoteCompletion
-from pllm.kernels.page_copy import copy_pages
-
-
-@dataclass(frozen=True, slots=True)
-class PageSlot:
-    slot_id: int
-    generation: int
-
-
-Slots = npt.NDArray[np.int64]
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -85,46 +76,6 @@ class PageRelease:
     remote_reads: tuple[RemoteCompletion, ...] = ()
 
 
-@dataclass(frozen=True, slots=True)
-class PageFieldTransfer:
-    plan_digest: str
-    owner_id: int  # Original PagePin.pin_id; all remote grants are read-only.
-    ref: StateRef
-    resource: str
-    field_id: LayoutFieldId
-    page: PageSlot
-    storage_offset: int
-    cuda_storage: CudaIpcStorage | None = None
-
-
-@dataclass(slots=True)
-class BorrowedPage:
-    """Read-only native alias; discard all aliases before close (not OS-enforced)."""
-
-    descriptor: PageFieldTransfer
-    _tensor: torch.Tensor | None
-    _connection: Connection
-    stream: torch.cuda.Stream | None = None
-
-    @property
-    def tensor(self) -> torch.Tensor:
-        if self._tensor is None:
-            raise RuntimeError("remote page borrow is closed")
-        return self._tensor
-
-    def discard(self) -> None:
-        """Drop an import after consumer teardown, without fabricating a read ACK."""
-        if self.stream is not None:
-            self.stream.synchronize()
-        self._tensor = None
-
-    def close(self) -> None:
-        if self.stream is not None:
-            self.stream.synchronize()
-        self._tensor = None
-        self._connection.send_bytes(encode_boundary(self.descriptor).encode())
-
-
 class _Table:
     """Latest versions and lineage ownership for one resource; rows survive retirement until the last hold."""
 
@@ -163,7 +114,7 @@ class _Table:
 
 @dataclass(slots=True)
 class _Pages:
-    """An exact batch of pages, owned by a pin, writer, or completion receipt."""
+    """An exact batch of pages, owned by a pin or a writer."""
 
     table: _Table
     refs: StateRefs
@@ -248,118 +199,6 @@ class LazyRoots(Sequence[tuple[torch.Tensor, ...]]):
         if index not in self._views:
             self._views[index] = self._arena.borrow_roots((self._access[index],), self._refs.take((index,)))[0]
         return self._views[index]
-
-
-class SlotPools:
-    """Stable field storage shared by versioned state and transient hidden rows.
-
-    Allocate each producer batch from free slots; allocation owns the first hold
-    and orders the writer after prior releases. Readers add holds before the
-    producer releases, wait for producer completion, and release with their own
-    completion events. Hold/release take [rows, fields] slot matrices; tensor/views
-    check allocation generations. Callers serialize ownership changes and keep
-    storage alive until GPU work completes.
-    """
-
-    def __init__(self, layout: TensorLayoutSpec, capacity: int, device: torch.device) -> None:
-        self.layout = layout
-        tensors: list[torch.Tensor] = []
-        for field in layout.fields:
-            size = field.dtype.itemsize
-            stride = page_stride_bytes(field) // size
-            alignment = max(field.alignment_bytes // size, 1)
-            count = capacity * stride + alignment - 1
-            pool = torch.zeros(count, dtype=field.dtype.torch, device=device)
-            offset = (-pool.data_ptr() // size) % alignment
-            tensors.append(
-                pool[offset : offset + capacity * stride]
-                .view(capacity, stride)[:, : prod(field.shape)]
-                .view(capacity, *field.shape)
-            )
-        self.tensors = tuple(tensors)
-        # Per field and slot: how many owners share the page (0 = free), and how often it was reused.
-        self.holders = np.zeros((len(layout.fields), capacity), dtype=np.int32)
-        self.generations = np.zeros((len(layout.fields), capacity), dtype=np.int64)
-        self._field_offsets = np.arange(len(layout.fields), dtype=np.int64) * capacity
-        # Each completion fences a batch of field-offset slot IDs, independent of current holders.
-        self._readiness: dict[torch.cuda.Event, Slots] = {}
-
-    def free_count(self, field: int) -> int:
-        """Slots available for allocation, possibly still awaiting GPU completion."""
-        return int(np.count_nonzero(self.holders[field] == 0))
-
-    def allocate(self, field: int, count: int, stream: torch.cuda.Stream | None) -> tuple[Slots, Slots]:
-        """Lease free pages, preferring ready slots before ordering reuse behind pending readers."""
-        free = np.flatnonzero(self.holders[field] == 0)
-        if len(free) < count:
-            raise WindowBackpressure("Slot capacity is exhausted; release current holders before retrying")
-        self._collect_completed()
-        slots = free[:count]
-        if self._readiness:
-            fenced = np.isin(free + self._field_offsets[field], np.concatenate(tuple(self._readiness.values())))
-            ready = free[~fenced][:count]
-            reuse = free[fenced][: count - len(ready)]
-            slots = np.concatenate((ready, reuse))
-            if reuse.size:
-                allocated = reuse + self._field_offsets[field]
-                for event, pending in tuple(self._readiness.items()):
-                    overlap = np.isin(pending, allocated, assume_unique=True, kind="sort")
-                    if overlap.any():
-                        assert stream is not None
-                        stream.wait_event(event)
-                        # Other slots may be reused on another stream and still need this fence.
-                        remaining = pending[~overlap]
-                        if remaining.size:
-                            self._readiness[event] = remaining
-                        else:
-                            del self._readiness[event]
-        self.holders[field, slots] = 1
-        return slots, self.generations[field, slots]
-
-    def share(self, field: int, slots: Slots) -> None:
-        """Let more versions hold these pages (fields a transition does not write)."""
-        np.add.at(self.holders[field], slots, 1)
-
-    def tensor(self, field: int, page: PageSlot) -> torch.Tensor:
-        """Borrow one live allocation; the caller retains its hold while using the view."""
-        assert self.generations[field, page.slot_id] == page.generation and self.holders[field, page.slot_id] >= 1
-        return self.tensors[field][page.slot_id]
-
-    def copy_from(self, field: int, source: torch.Tensor, rows: torch.Tensor, slots: torch.Tensor) -> None:
-        """Copy selected source rows into leased slots; negative destinations disable padded entries."""
-        copy_pages(source, self.tensors[field], rows, slots)
-
-    def views(self, slots: Slots, generations: Slots) -> tuple[torch.Tensor, ...]:
-        """One tensor view per field of a version, after checking none of its pages was reclaimed."""
-        fields = np.arange(len(slots))
-        assert (self.generations[fields, slots] == generations).all() and (self.holders[fields, slots] >= 1).all()
-        return tuple(tensor[slot] for tensor, slot in zip(self.tensors, slots.tolist()))
-
-    def _counts(self, slots: Slots) -> Slots:
-        return np.bincount((slots + self._field_offsets).ravel(), minlength=self.holders.size).reshape(
-            self.holders.shape
-        )
-
-    def _collect_completed(self) -> None:
-        for event in tuple(self._readiness):
-            if event.query():
-                del self._readiness[event]
-
-    def hold(self, slots: Slots) -> None:
-        """Add a batch of holders, including repeated shared pages."""
-        self.holders += self._counts(slots)
-
-    def release(self, slots: Slots, completion: torch.cuda.Event | None = None) -> None:
-        """Drop a batch of holders; only the last holder advances the allocation generation."""
-        counts = self._counts(slots)
-        if completion is not None:
-            self._collect_completed()
-            pending = np.flatnonzero(counts)
-            if completion in self._readiness:
-                pending = np.union1d(self._readiness[completion], pending)
-            self._readiness[completion] = pending
-        self.holders -= counts
-        self.generations += (counts != 0) & (self.holders == 0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -459,7 +298,7 @@ class PageBundleArena:
         )
 
     def usage(self) -> PageBundleUsage:
-        """Read original owners without waiting, collecting or retaining tensors/receipts.
+        """Read original owners without waiting, collecting or retaining tensors.
 
         Field-page categories are disjoint: latest roots, then private targets,
         then old/retired roots. Shared fields count once physically, once per
@@ -969,36 +808,6 @@ class PageBundleArena:
             CudaIpcStorage.export(value, stream) if value.numel() else None,
         )
         return descriptor, RemoteCompletion(connection, encode_boundary(descriptor).encode())
-
-    def receive_field(self, connection: Connection, *, stream: torch.cuda.Stream | None = None) -> BorrowedPage:
-        """Map a producer grant only when it belongs to this arena's plan."""
-        descriptor = decode_boundary(connection.recv_bytes(65536).decode(), PageFieldTransfer)
-        if descriptor.plan_digest != self.plan_digest:
-            raise ValueError("the page producer was built for another compilation; restart it from this model's plan")
-        ((entry, provider),) = (
-            (entry, provider)
-            for entry in self.plan.tensor_layout_request.layouts
-            for provider in self.plan.states.plans
-            if entry.resource == provider.resource == descriptor.resource
-        )
-        assert stream is not None
-        spec = entry.layout.fields[descriptor.field_id]
-        size = spec.dtype.itemsize
-        stride = page_stride_bytes(spec) // size
-        alignment = max(spec.alignment_bytes // size, 1)
-        storage = descriptor.cuda_storage
-        tensor = (
-            storage.map(
-                (provider.page_capacity * stride + alignment - 1) * size,
-                spec.dtype.torch,
-                descriptor.storage_offset,
-                spec.shape,
-                stream,
-            )
-            if storage is not None
-            else torch.empty(spec.shape, dtype=spec.dtype.torch, device=stream.device)
-        )
-        return BorrowedPage(descriptor, tensor, connection, stream)
 
     def snapshot(self, pin: PagePin, ref: StateRef) -> tuple[torch.Tensor, ...]:
         ((root, _),) = self._held_roots((pin,), StateRefs.of((ref,)))

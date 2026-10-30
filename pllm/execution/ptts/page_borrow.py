@@ -1,13 +1,103 @@
-"""Invocation bindings for already received pages; never a second state owner."""
+"""Pages received from another process and their invocation bindings; never a second state owner.
+
+PageBundleArena exports pages with `PageFieldTransfer`; the consuming process maps them with
+`receive_field`, groups them in `BorrowedStateRoot`, and state_feed/state_execution use those roots.
+"""
+
+from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
+from multiprocessing.connection import Connection
+from typing import TYPE_CHECKING
 
 import torch
 
+from pllm.contracts.codec import decode_boundary, encode_boundary
+from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_borrow import BorrowedResource
-from pllm.execution.ptts.page_bundle import BorrowedPage, PageBundleArena, PagePin
+from pllm.contracts.tensor_layout import LayoutFieldId
+from pllm.execution.ptts.page_bundle_planning import page_stride_bytes
+from pllm.execution.ptts.slot_pools import PageSlot
+from pllm.execution.shared_tensor import CudaIpcStorage
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView, validate_readonly_views
+
+if TYPE_CHECKING:
+    from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin
+
+
+@dataclass(frozen=True, slots=True)
+class PageFieldTransfer:
+    plan_digest: str
+    owner_id: int  # Original PagePin.pin_id; all remote grants are read-only.
+    ref: StateRef
+    resource: str
+    field_id: LayoutFieldId
+    page: PageSlot
+    storage_offset: int
+    cuda_storage: CudaIpcStorage | None = None
+
+
+@dataclass(slots=True)
+class BorrowedPage:
+    """Read-only native alias; discard all aliases before close (not OS-enforced)."""
+
+    descriptor: PageFieldTransfer
+    _tensor: torch.Tensor | None
+    _connection: Connection
+    stream: torch.cuda.Stream | None = None
+
+    @property
+    def tensor(self) -> torch.Tensor:
+        if self._tensor is None:
+            raise RuntimeError("remote page borrow is closed")
+        return self._tensor
+
+    def discard(self) -> None:
+        """Drop an import after consumer teardown, without fabricating a read ACK."""
+        if self.stream is not None:
+            self.stream.synchronize()
+        self._tensor = None
+
+    def close(self) -> None:
+        if self.stream is not None:
+            self.stream.synchronize()
+        self._tensor = None
+        self._connection.send_bytes(encode_boundary(self.descriptor).encode())
+
+
+def receive_field(
+    plan: PlanBundle, plan_digest: str, connection: Connection, *, stream: torch.cuda.Stream | None = None
+) -> BorrowedPage:
+    """Map a producer grant only when it belongs to this plan."""
+    descriptor = decode_boundary(connection.recv_bytes(65536).decode(), PageFieldTransfer)
+    if descriptor.plan_digest != plan_digest:
+        raise ValueError("the page producer was built for another compilation; restart it from this model's plan")
+    ((entry, provider),) = (
+        (entry, provider)
+        for entry in plan.tensor_layout_request.layouts
+        for provider in plan.states.plans
+        if entry.resource == provider.resource == descriptor.resource
+    )
+    assert stream is not None
+    spec = entry.layout.fields[descriptor.field_id]
+    size = spec.dtype.itemsize
+    stride = page_stride_bytes(spec) // size
+    alignment = max(spec.alignment_bytes // size, 1)
+    storage = descriptor.cuda_storage
+    tensor = (
+        storage.map(
+            (provider.page_capacity * stride + alignment - 1) * size,
+            spec.dtype.torch,
+            descriptor.storage_offset,
+            spec.shape,
+            stream,
+        )
+        if storage is not None
+        else torch.empty(spec.shape, dtype=spec.dtype.torch, device=stream.device)
+    )
+    return BorrowedPage(descriptor, tensor, connection, stream)
 
 
 class BorrowedStateRoot:

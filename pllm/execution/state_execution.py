@@ -41,10 +41,9 @@ from pllm.execution.ptts.page_bundle import (
     PagePublication,
     PageRelease,
     PageWrite,
-    SlotPools,
-    Slots,
 )
 from pllm.execution.ptts.request_state import RequestStateDirectory, RequestStateSelection, StateAddress
+from pllm.execution.ptts.slot_pools import SlotPools, Slots
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.torch_private import MemoryUsage
 from pllm.execution.trace import ExecutionTrace, TraceEvent, TracePhase

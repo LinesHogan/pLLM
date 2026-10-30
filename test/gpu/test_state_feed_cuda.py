@@ -10,8 +10,7 @@ import torch
 
 import pllm
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
-from pllm.execution.ptts.page_bundle import PageBundleArena
-from pllm.execution.state_feed import FeedReceiver, ReadonlyStepEnd
+from pllm.execution.state_feed import FeedReceiver, ReadonlyStepEnd, receive_field
 from pllm.execution.step_input import TensorStepInput
 from test.workloads.test_state_feed import FeedWorkload, facts_for
 
@@ -146,7 +145,6 @@ def test_feed_partial_receive_is_fail_stopped_and_owner_waits_for_teardown():
     process = context.Process(target=retained_producer, args=(receiver.take("source"), child))
     process.start()
     child.close()
-    receive = PageBundleArena.receive_field
     count = 0
 
     def partial_receive(*args, **kwargs):
@@ -154,12 +152,12 @@ def test_feed_partial_receive_is_fail_stopped_and_owner_waits_for_teardown():
         count += 1
         if count == 2:
             raise ValueError("injected descriptor failure")
-        return receive(*args, **kwargs)
+        return receive_field(*args, **kwargs)
 
     try:
         assert probe.poll(30) and probe.recv() == "retained"
         with (
-            patch.object(PageBundleArena, "receive_field", partial_receive),
+            patch("pllm.execution.state_feed.receive_field", partial_receive),
             pytest.raises(ValueError, match="descriptor"),
         ):
             receiver(step_rows(0), torch.cuda.current_stream())

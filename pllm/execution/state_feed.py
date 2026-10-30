@@ -20,8 +20,8 @@ from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.packed_rows import PackedSamplerRowBatch
 from pllm.contracts.state_feed import FeedBinding, FeedOrder
 from pllm.contracts.state_ref import StateRef
-from pllm.execution.ptts.page_borrow import BorrowedStateRoot
-from pllm.execution.ptts.page_bundle import BorrowedPage, PageBundleArena, PageRelease
+from pllm.execution.ptts.page_borrow import BorrowedPage, BorrowedStateRoot, receive_field
+from pllm.execution.ptts.page_bundle import PageBundleArena, PageRelease
 from pllm.execution.ptts.state_refs import StateRefs
 
 
@@ -342,7 +342,7 @@ class FeedReceiver:
     def _receive(self, record: FeedRecord, stream: torch.cuda.Stream) -> BorrowedStateRoot:
         assert record.ref is not None and 0 <= record.slot < len(self.channels) and not self.partial
         for channel in self.channels[record.slot]:
-            self.partial.append(self.arena.receive_field(channel, stream=stream))
+            self.partial.append(receive_field(self.arena.plan, self.arena.plan_digest, channel, stream=stream))
         root = BorrowedStateRoot(self.arena, self.binding.resource, record.ref, tuple(self.partial))
         self.partial.clear()
         self.current = root

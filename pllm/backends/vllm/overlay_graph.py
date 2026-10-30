@@ -42,8 +42,9 @@ from pllm.execution.parameter_projection import (
     projection_blocks,
     uses_pinned_projection,
 )
-from pllm.execution.ptts.page_bundle import PageBundleArena, Slots
+from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.request_state import RequestStateDirectory
+from pllm.execution.ptts.slot_pools import Slots
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.state_execution import DataT, StateTaskContext
 from pllm.execution.torch_private import cuda_graph_pool_bytes

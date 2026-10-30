@@ -51,7 +51,7 @@ from pllm.contracts.backend_attachment import (
 )
 from pllm.contracts.codec import decode_boundary
 from pllm.execution.position_state import PositionAnnouncement
-from pllm.execution.ptts.page_bundle import SlotPools
+from pllm.execution.ptts.slot_pools import SlotPools
 from pllm.execution.state_execution import StateDiagnostics
 
 

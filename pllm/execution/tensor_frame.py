@@ -28,7 +28,7 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.state_ref import StateRef
 from pllm.execution.cuda_stream import upload
 from pllm.execution.module_graph import ModuleCall
-from pllm.execution.ptts.page_bundle import Slots
+from pllm.execution.ptts.slot_pools import Slots
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.tensor_program import Observation, TensorBatch
 from pllm.execution.torch_private import register_gradient_hook

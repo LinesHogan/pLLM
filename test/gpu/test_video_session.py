@@ -17,9 +17,9 @@ from pllm.config import ExecutionOptions, ModelConfig
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.contracts.state_ref import LineageId, StateRef, VersionId
 from pllm.contracts.tensor_layout import LayoutFieldId
-from pllm.execution.ptts.page_borrow import BorrowedStateRoot
-from pllm.execution.ptts.page_bundle import BorrowedPage, PageFieldTransfer, PageSlot
+from pllm.execution.ptts.page_borrow import BorrowedPage, BorrowedStateRoot, PageFieldTransfer
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
+from pllm.execution.ptts.slot_pools import PageSlot
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.runtime_facts import model_timeline
 from pllm.workloads.recirculation import RecirculationWorkload

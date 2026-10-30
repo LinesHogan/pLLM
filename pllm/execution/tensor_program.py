@@ -22,8 +22,9 @@ from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.cuda_stream import CudaStreamReadiness, upload
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot, borrowed_root
-from pllm.execution.ptts.page_bundle import PagePin, PagePublication, PageWrite, Slots
+from pllm.execution.ptts.page_bundle import PagePin, PagePublication, PageWrite
 from pllm.execution.ptts.request_state import RequestStateSelection, StateAddress
+from pllm.execution.ptts.slot_pools import Slots
 from pllm.execution.state_execution import ProjectionResiduals, StateTaskContext
 from pllm.execution.torch_private import MemoryTrace, MemoryUsage, measure
 from pllm.execution.trace import TracePhase

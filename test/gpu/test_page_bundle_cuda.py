@@ -17,6 +17,7 @@ from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from pllm.contracts.semantic_graph import AnchorSymbol, SchedulerTimeline, TimelineAnchor
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import LayoutFieldId
+from pllm.execution.ptts.page_borrow import receive_field
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.state_refs import StateRefs
@@ -108,7 +109,7 @@ def _cuda_ipc_worker(control, read_channel, wire, outcome):
         arena = PageBundleArena(decode_boundary(wire, PlanBundle), _owned_resources=())
         stream = torch.cuda.Stream(device=torch.device("cuda", 0))
         with torch.cuda.stream(stream):
-            read = arena.receive_field(read_channel, stream=stream)
+            read = receive_field(arena.plan, arena.plan_digest, read_channel, stream=stream)
             storage = read.descriptor.cuda_storage
             assert storage is not None and read.tensor.is_cuda
             with pytest.raises(ValueError):  # a descriptor for another GPU cannot be mapped
@@ -176,7 +177,7 @@ def _cuda_ipc_lifecycle():
             try:  # a descriptor for a different compiled plan is rejected
                 sender.send_bytes(encode_boundary(replace(descriptor, plan_digest="b" * 64)).encode())
                 with pytest.raises(ValueError):
-                    arena.receive_field(receiver, stream=stream)
+                    receive_field(arena.plan, arena.plan_digest, receiver, stream=stream)
             finally:
                 sender.close()
                 receiver.close()
