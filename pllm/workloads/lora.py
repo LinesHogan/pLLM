@@ -104,10 +104,10 @@ class OutputLoRAWorkload(pllm.Workload):
     )
     def train(
         self,
-        hidden: torch.Tensor = pllm.host.batch("hidden"),
-        logits: torch.Tensor = pllm.host.batch("base_logits"),
-        labels: torch.Tensor = pllm.host.batch("labels"),
-        weights: torch.Tensor = pllm.host.batch("weights"),
+        hidden: torch.Tensor = pllm.batch("hidden"),
+        logits: torch.Tensor = pllm.batch("base_logits"),
+        labels: torch.Tensor = pllm.batch("labels"),
+        weights: torch.Tensor = pllm.batch("weights"),
         down: torch.Tensor = pllm.parameter("output_factors", "a"),
         up: torch.Tensor = pllm.parameter("output_factors", "b"),
     ) -> torch.Tensor:

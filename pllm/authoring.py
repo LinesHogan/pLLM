@@ -17,17 +17,11 @@ from pllm.contracts.auxiliary import (
     map_auxiliary as map_auxiliary,
 )
 from pllm.contracts.backend_attachment import BackendAttachment, BackendAttachmentSpec
-from pllm.contracts.compilation import PlanBundle as PlanBundle
-from pllm.contracts.hidden_locator import HiddenPhase as HiddenPhase, HiddenSite as HiddenSite
+from pllm.contracts.compilation import PlanBundle
+from pllm.contracts.hidden_locator import HiddenSite as HiddenSite
 from pllm.contracts.parameter_overlay import ParameterTarget
-from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage as SamplerStage
-from pllm.contracts.semantic_graph import (
-    HiddenInputSource,
-    MathContract as MathContract,
-    SchedulerTimeline,
-    SemanticGraph,
-    StateScope,
-)
+from pllm.contracts.sampler import SamplerStage
+from pllm.contracts.semantic_graph import HiddenInputSource, SchedulerTimeline, SemanticGraph, StateScope
 from pllm.contracts.tensor_layout import TensorLayoutRequest
 from pllm.contracts.visibility import VisibilitySource
 from pllm.execution.backend_attachment import (
@@ -37,69 +31,33 @@ from pllm.execution.backend_attachment import (
 )
 from pllm.execution.causal_batch import CausalBinder
 from pllm.execution.compile_facts import BackendCompileFacts
-from pllm.execution.declaration import (
-    Builder as Builder,
-    Call as Call,
-    Dimensions as Dimensions,
-    Field as Field,
-    State as State,
-    When as When,
-    adam_fields as adam_fields,
-    native as native,
-)
+from pllm.execution.declaration import Dimensions as Dimensions
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import compile_page_bundle_plan
-from pllm.execution.state_execution import (
-    MathBinding as MathBinding,
-    StateExecution,
-    StateTaskContext as StateTaskContext,
-)
-from pllm.execution.step_input import TensorStepInput
+from pllm.execution.state_execution import MathBinding, StateExecution
+from pllm.execution.step_input import TensorStepInput as TensorStepInput
 from pllm.execution.tensor_binding import TensorResult as TensorResult
-from pllm.execution.tensor_program import (
-    FunctionMath as FunctionMath,
-    InvocationOutput as InvocationOutput,
-    Observation as Observation,
-    Roots as Roots,
-    TaskOutput as TaskOutput,
-    TensorBatch as TensorBatch,
-    TensorOperation as TensorOperation,
-)
-from pllm.execution.trace import MAX_SNAPSHOT_BYTES as MAX_SNAPSHOT_BYTES
+from pllm.execution.tensor_program import FunctionMath as FunctionMath
 from pllm.kernels.adamw import AdamWConfig
 
 DataT = TypeVar("DataT")
 ResultT = TypeVar("ResultT")
 AdamW = AdamWConfig
-Guidance = PackedSamplerGuidanceBatch
 __all__ = [
     "AdamW",
-    "Guidance",
-    "Builder",
-    "When",
-    "Field",
-    "State",
-    "Call",
-    "Dimensions",
-    "MathContract",
-    "FunctionMath",
-    "TensorBatch",
-    "TaskOutput",
-    "InvocationOutput",
-    "Observation",
-    "MathBinding",
-    "PlanBundle",
-    "Roots",
-    "HiddenPhase",
-    "HiddenSite",
-    "SamplerStage",
+    "AuxiliaryInput",
+    "BackendDeployment",
+    "BackendRequirements",
+    "BackendWorkload",
     "CausalTrainBatch",
+    "Dimensions",
+    "FunctionMath",
+    "HiddenSite",
     "StateTensorUpdate",
-    "WeightedCEBatch",
-    "native",
-    "adam_fields",
     "TensorResult",
-    "MAX_SNAPSHOT_BYTES",
+    "TensorStepInput",
+    "WeightedCEBatch",
+    "map_auxiliary",
 ]
 
 
@@ -122,7 +80,9 @@ class BackendDeployment(Generic[DataT, ResultT]):
         assert self.attachment.plan is self.execution.arena.plan
 
 
-class BackendAuthoring(ABC):
+class BackendWorkload(ABC, Generic[DataT, ResultT]):
+    """A workload compiled against a model backend: declare, plan, bind math, then deploy."""
+
     @abstractmethod
     def backend_requirements(self) -> BackendRequirements: ...
 
@@ -215,8 +175,6 @@ class BackendAuthoring(ABC):
         )
         return bind_backend_attachment(plan, facts.probe, attachment)
 
-
-class BackendWorkload(BackendAuthoring, Generic[DataT, ResultT]):
     @abstractmethod
     def bind_math(
         self, facts: BackendCompileFacts, plan: PlanBundle, *, causal: CausalBinder | None = None

@@ -29,7 +29,6 @@ from pllm.learning import (
     CompletionWorkload as CompletionWorkload,
     transaction as transaction,
 )
-from pllm.usage import batch as batch
 
 __all__ = [
     "transaction",
@@ -41,7 +40,6 @@ __all__ = [
     "NoHostRequest",
     "CompletionWorkload",
     "WeightedCEBatch",
-    "batch",
     "BarrierState",
     "Completion",
     "CompletionBatch",
