@@ -122,8 +122,10 @@ class DeviceCounters:
                     self.ready = torch.cuda.Event()
                 self.ready.record(stream)
 
-    def read(self) -> tuple[int, int]:
-        """Return the last complete snapshot without waiting for GPU work."""
+    def read(self, *, wait: bool = False) -> tuple[int, int]:
+        """Return the last complete snapshot; `wait` first blocks on the latest copy so no step is missing."""
+        if wait and self.ready is not None:
+            self.ready.synchronize()
         if self.ready is None or self.ready.query():
             self.values = (int(self.host[0]), int(self.host[1]))
         return self.values
