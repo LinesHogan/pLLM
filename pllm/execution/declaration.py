@@ -204,6 +204,9 @@ class Builder(Generic[D]):
         self.publications: dict[TaskSymbol, PublishStateTask[D]] = {}
         self.host_operations: dict[TaskSymbol, HostOperation[D]] = {}
         self.resources = resources
+        # Fields that start at zero in a fresh page pool, so admission need not write them (AdamW state other than
+        # the parameters). Request-scoped pages are recycled and dirty, so only instance states qualify.
+        self.zero_start_fields: dict[str, frozenset[int]] = {}
         self.route_program: dict[str, TokenProgram] | None = None
         self.overlay_math: OverlayTransition | None = None
         self.route_updates = False
@@ -275,6 +278,8 @@ class Builder(Generic[D]):
                     sorted((*self.layouts.layouts, StateTensorLayout(name, layout)), key=lambda entry: entry.resource)
                 )
             )
+        if optimizer is not None and scope is StateScope.INSTANCE:
+            self.zero_start_fields[name] = frozenset(i for i in range(optimizer_fields) if i % 5)
         return State(declaration, fields, optimizer, optimizer_fields)
 
     @staticmethod

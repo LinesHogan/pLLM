@@ -15,7 +15,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from pllm.contracts.auxiliary import StateTensorUpdate
-from pllm.contracts.backend_attachment import BackendPlacementProbe
+from pllm.contracts.backend_attachment import AttachmentKind, BackendPlacementProbe
+from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import FieldView, ParameterTarget
@@ -32,9 +33,10 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.state_feed import FeedBinding
 from pllm.contracts.state_ref import StateRef
-from pllm.contracts.tensor_layout import LayoutFieldId
+from pllm.contracts.tensor_layout import LayoutFieldId, TensorFieldSpec
 from pllm.execution.causal_batch import CausalBinder
 from pllm.execution.declaration import Builder, Dimensions
+from pllm.execution.module_state import copy_initial
 from pllm.execution.overlay_batch import OverlayBatch
 from pllm.execution.ptts.page_bundle import PagePublication
 from pllm.execution.scan import ScanContext
@@ -46,8 +48,10 @@ from pllm.execution.tensor_frame import (
     flat_gradient,
 )
 from pllm.execution.tensor_program import (
+    FunctionMath,
     InvocationOutput,
     PageUpdate,
+    Roots,
     TensorBatch,
     TensorOperation,
     native_body,
@@ -116,7 +120,8 @@ class TensorBinding(Builder[TensorFrame]):
         self.initial_values: dict[str, Callable[[Dimensions, int], torch.Tensor]] = {}
         self.weighted_training = False
         self.causal: CausalBinder | None = None
-        self.causal_state = ""
+        # Causal training measures its costs from signed [sequences, tokens] bounds, not from example rows.
+        self.trains_causally = False
         self.probe: BackendPlacementProbe | None = None
         self.max_requests = 1
         self.sample_limit: int | None = None
@@ -126,14 +131,81 @@ class TensorBinding(Builder[TensorFrame]):
         self.imports: dict[str, tuple[FieldView, ...]] = {}
         self.position_states: tuple[tuple[str, float], ...] = ()
 
+    def retained_fields(self, resource: str) -> dict[int, TensorFieldSpec]:
+        """Layout fields whose initial values admission copies; zero-start fields are left alone."""
+        layout = next(item.layout for item in self.layouts.layouts if item.resource == resource)
+        zero = self.zero_start_fields.get(resource, frozenset())
+        return {i: field for i, field in enumerate(layout.fields) if i not in zero}
+
     @property
-    def initialization_bytes(self) -> int:
-        """Retained parameter templates reserved for causal batch training."""
+    def template_bytes(self) -> int:
+        """Device memory held by the retained initial values of every initialized state."""
         return sum(
             prod(field.shape) * field.dtype.itemsize
-            for layout in self.layouts.layouts
-            if layout.resource == self.causal_state and layout.resource in self.initializers
-            for field in layout.layout.fields[::5]
+            for resource in {*self.initializers, *self.initial_values}
+            for field in self.retained_fields(resource).values()
+        )
+
+    def initializer(
+        self, resource: str, device: torch.device, seed: int
+    ) -> Callable[[Roots, tuple[RequestStateKey | None, ...]], None]:
+        """Copy one resource's shared initial tensors into each newly admitted root."""
+        init = self.initializers.get(resource)
+        if resource in self.initial_values:
+            init = partial(copy_initial, self.initial_values[resource](self.dimensions, seed).to(device))
+        if init is None:
+            return lambda roots, keys: None
+        layout = next(item.layout for item in self.layouts.layouts if item.resource == resource)
+        tensors = tuple(torch.zeros(field.shape, dtype=field.dtype.torch, device=device) for field in layout.fields)
+        # A resource's initial tensors are shared values, independent of admission history.
+        init(tensors, torch.Generator(device=device).manual_seed(seed))
+        values = {i: tensors[i] for i in self.retained_fields(resource)}
+
+        def initialize(roots: Roots, keys: tuple[RequestStateKey | None, ...]) -> None:
+            for root in roots:
+                for index, value in values.items():
+                    root[index].copy_(value)
+
+        return initialize
+
+    def require_resident_side_tasks(
+        self, plan: PlanBundle, operations: Mapping[TaskSymbol, TensorOperation[TensorFrame]]
+    ) -> None:
+        """Side-lane tensor tasks run concurrently with the model, so their inputs must be fixed-size."""
+        if not plan.timeline.task_resources:
+            return
+        for task in plan.schedule.tasks:
+            symbol = plan.semantic_graph.tasks[task.task_id].symbol
+            if task.lane == "side" and symbol in self.tensor_tasks and not operations[symbol].resident(1):
+                raise ValueError(
+                    "side tensor tasks need fixed row inputs; declare row inputs or move the task before the model"
+                )
+
+    def step_rows(self, value: TensorStepInput) -> tuple[PackedPhaseRow, ...]:
+        """Rows that open the step's state context; model-replay and activation steps differ from read_rows."""
+        if self.attachment is not None and (
+            self.attachment.activation_bindings
+            or any(task.replay is not None for task in self.graph.tasks)
+            and self.overlay_targets
+        ):
+            return value.rows.rows if self.graph.states[0].scope is StateScope.REQUEST else ()
+        if self.attachment is not None and self.attachment.kind is AttachmentKind.MODEL_REPLAY:
+            return ()
+        return self.read_rows(value.rows)
+
+    def function_math(
+        self, device: torch.device, seed: int
+    ) -> FunctionMath[TensorStepInput, TensorFrame, TensorOutput]:
+        """Bind state initialization, step rows and frame preparation for execution."""
+        return FunctionMath(
+            {str(state.resource): self.initializer(str(state.resource), device, seed) for state in self.graph.states},
+            self.step_rows,
+            self.bind_prepare(),
+            lambda data, invocation: self.result(data, invocation) if self.graph.states else invocation.value,
+            lambda previous, incoming: replace(
+                previous, step=incoming.step, rows=incoming.rows, index=None, plan=None, training=None
+            ),
+            parameter_phases=self.parameter_phases,
         )
 
     @property

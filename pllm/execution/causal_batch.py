@@ -98,8 +98,8 @@ def declare_causal_train(
         )
 
     compute = autograd_loss(loss, names, summary)
+    b.trains_causally = True
 
-    b.causal_state = str(state.declaration.resource)
     call = b.compute(
         name,
         function=compute,

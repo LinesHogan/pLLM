@@ -17,7 +17,6 @@ from pllm.authoring import BackendRequirements, BackendWorkload
 from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import (
     ActivationPatchOperator,
-    AttachmentKind,
     DecodeRefresh,
     DecodeWindow,
     MissingPolicy,
@@ -25,7 +24,6 @@ from pllm.contracts.backend_attachment import (
 from pllm.contracts.codec import boundary_digest
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
-from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.parameter_overlay import (
     ParameterEffect as ParameterEffect,
     ParameterOverlayFieldBinding,
@@ -34,7 +32,6 @@ from pllm.contracts.parameter_overlay import (
     expand_targets,
 )
 from pllm.contracts.request_identity import RequestKeyField, canonical_request_key_fields
-from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
     HiddenInputSource,
@@ -77,7 +74,6 @@ from pllm.execution.model_effect_binding import (
 from pllm.execution.module_graph import ModuleCall
 from pllm.execution.module_state import (
     ModuleFactory,
-    copy_initial,
     initial_values,
     parameter_count,
     skeleton,
@@ -109,7 +105,7 @@ from pllm.execution.tensor_frame import (
     result_port,
     samples_port,
 )
-from pllm.execution.tensor_program import FunctionMath, InvocationOutput, PoolSGD, Roots, TaskOutput
+from pllm.execution.tensor_program import PoolSGD, TaskOutput
 from pllm.execution.tensor_task import TensorExport
 from pllm.execution.token_program import Over, Tokens
 from pllm.execution.trace import TraceEvent
@@ -1712,61 +1708,6 @@ class Workload(
             position_states=context.position_states(),
         )
 
-    def _functions(
-        self, b: TensorBinding, device: torch.device, seed: int
-    ) -> FunctionMath[TensorStepInput, TensorFrame, TensorOutput]:
-        def initializer(resource: str) -> Callable[[Roots, tuple[RequestStateKey | None, ...]], None]:
-            init = b.initializers.get(resource)
-            if resource in b.initial_values:
-                init = partial(copy_initial, b.initial_values[resource](b.dimensions, seed).to(device))
-            values: dict[int, torch.Tensor] = {}
-            if init is not None:
-                layout = next(item.layout for item in b.layouts.layouts if item.resource == resource)
-                tensors = tuple(
-                    torch.zeros(
-                        field.shape if resource != b.causal_state or i % 5 == 0 else (0,),
-                        dtype=field.dtype.torch,
-                        device=device,
-                    )
-                    for i, field in enumerate(layout.fields)
-                )
-                # A resource's initial tensors are shared values, independent of admission history.
-                init(tensors, torch.Generator(device=device).manual_seed(seed))
-                values = {i: value for i, value in enumerate(tensors) if resource != b.causal_state or i % 5 == 0}
-
-            def initialize(roots: Roots, keys: tuple[RequestStateKey | None, ...]) -> None:
-                if values:
-                    for root in roots:
-                        for index, value in values.items():
-                            root[index].copy_(value)
-
-            return initialize
-
-        def output(data: TensorFrame, invocation: InvocationOutput) -> TensorOutput:
-            return b.result(data, invocation) if b.graph.states else invocation.value
-
-        def rows(value: TensorStepInput) -> tuple[PackedPhaseRow, ...]:
-            if b.attachment is not None and (
-                b.attachment.activation_bindings
-                or any(task.replay is not None for task in b.graph.tasks)
-                and b.overlay_targets
-            ):
-                return value.rows.rows if b.graph.states[0].scope is StateScope.REQUEST else ()
-            if b.attachment is not None and b.attachment.kind is AttachmentKind.MODEL_REPLAY:
-                return ()
-            return b.read_rows(value.rows)
-
-        return FunctionMath(
-            {str(state.resource): initializer(str(state.resource)) for state in b.graph.states},
-            rows,
-            b.bind_prepare(),
-            output,
-            lambda previous, incoming: replace(
-                previous, step=incoming.step, rows=incoming.rows, index=None, plan=None, training=None
-            ),
-            parameter_phases=b.parameter_phases,
-        )
-
     def specialize(self, facts: BackendCompileFacts, options: ExecutionOptions) -> BackendCompileFacts:
         """Fund shared page storage for declared feeds before compiling the plan."""
         if any(state.feed is not None for value in _values(self).values() if (state := _typed(value, InstanceState))):
@@ -1782,37 +1723,30 @@ class Workload(
             raise ValueError("this workload has no explicit tensor implementation")
         with FakeTensorMode():
             binding = self.declaration(facts)
-        if binding.causal_state:
+        if binding.trains_causally:
             if options.memory_budget_bytes is not None and not facts.timeline.task_resources:
                 raise ValueError(
                     "causal training needs measured costs and signed [sequences, tokens] bounds for a finite budget"
                 )
-            resident = binding.initialization_bytes
-            return replace(
-                facts.timeline,
-                reserved_bytes=tuple(
-                    value + resident for value in (facts.timeline.reserved_bytes or (0,) * len(facts.timeline.anchors))
-                ),
-            )
-        return derive_resources(binding, facts, options)
+            timeline = facts.timeline
+        else:
+            timeline = derive_resources(binding, facts, options)
+        resident = binding.template_bytes
+        return replace(
+            timeline,
+            reserved_bytes=tuple(
+                value + resident for value in (timeline.reserved_bytes or (0,) * len(timeline.anchors))
+            ),
+        )
 
     def bind_math(
         self, facts: BackendCompileFacts, plan: PlanBundle, declaration: TensorBinding
     ) -> MathBinding[TensorStepInput, TensorFrame, TensorOutput]:
         """Bind the planned declaration's tensor tasks to the implementations the plan selected."""
         operations = declaration.executables(facts, plan.timeline.task_resources)
-        if plan.timeline.task_resources:
-            if any(
-                task.lane == "side"
-                and plan.semantic_graph.tasks[task.task_id].symbol in declaration.tensor_tasks
-                and not operations[plan.semantic_graph.tasks[task.task_id].symbol].resident(1)
-                for task in plan.schedule.tasks
-            ):
-                raise ValueError(
-                    "side tensor tasks need fixed row inputs; declare row inputs or move the task before the model"
-                )
+        declaration.require_resident_side_tasks(plan, operations)
         return MathBinding(
-            self._functions(declaration, facts.device, facts.initialization_seed),
+            declaration.function_math(facts.device, facts.initialization_seed),
             declaration.bind_all(plan, model_probe=facts.probe, operations=operations),
             feeds=declaration.feeds,
             on_export=self.on_export if declaration.has_exports else None,
@@ -1832,7 +1766,7 @@ class Workload(
             b.graph,
             b.layouts,
             MathBinding(
-                self._functions(b, facts.device, facts.initialization_seed),
+                b.function_math(facts.device, facts.initialization_seed),
                 b.bind_all(operations=b.executables(None, ())),
                 on_export=self.on_export if b.has_exports else None,
             ),
