@@ -147,6 +147,8 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         retry = execution.finish_step(failure.value.context)
         assert retry.publication is failure.value.receipt
         (latest,) = retry.publication.after_refs
+        if stream is not None:
+            stream.synchronize()  # device-side update counts are exact once the stream has drained
         assert execution.diagnostics().update_count == 3
         with pytest.raises(RuntimeError):
             execution.finish_step(failure.value.context)

@@ -830,6 +830,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             self.arena.wait_release(self.arena.release_pin(pin))
 
     def diagnostics(self) -> StateDiagnostics:
+        """Never waits for the GPU: device-side update and row counts lag until the step's stream has drained."""
         self.arena.collect_completed()
         updates, rows = (0, 0) if self._overlay_counters is None else self._overlay_counters.read()
         return StateDiagnostics(
