@@ -1,8 +1,10 @@
-"""Concrete MRv2 ABI checks followed by the original Rust row plan."""
+"""Label vLLM MRv1/MRv2 input batches as packed phase rows through the Rust row plan; used by the runners.
+
+create_vllm_llm pins the vLLM version, so the batch layout asserted here is the one this version produces.
+"""
 
 import numpy as np
 import torch
-from vllm import __version__ as _VLLM_VERSION
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu_input_batch import InputBatch as Mrv1InputBatch
@@ -26,53 +28,33 @@ def encode_mrv2_rows(
     step_id: int,
 ) -> PackedSamplerRowBatch:
     """Label rows against each request's prompt; vLLM's prefill length also covers recomputed output history."""
-    if _VLLM_VERSION != "0.27.1":
-        raise RuntimeError("canonical MRv2 packed rows require vLLM 0.27.1 exactly")
-    if type(input_batch) is not InputBatch:
-        raise TypeError("MRv2 packed rows require concrete signed inputs")
     count = input_batch.num_reqs
-    if (
-        count < 1
-        or len(input_batch.req_ids) != count
-        or input_batch.num_reqs_after_padding < count
-        or input_batch.num_tokens_after_padding < input_batch.num_tokens
-        or input_batch.num_draft_tokens != 0
-        or input_batch.num_draft_tokens_per_req is not None
-        or any(
-            len(column) != count
-            for column in (
-                input_batch.num_scheduled_tokens,
-                input_batch.prefill_len_np,
-                input_batch.num_computed_tokens_np,
-                input_batch.is_prefilling_np,
-                prompt_lengths,
-            )
-        )
-        or len(input_batch.cu_num_logits_np) != count + 1
-        or input_batch.logits_indices.ndim != 1
-        or input_batch.logits_indices.device.type != "cuda"
-        or input_batch.logits_indices.numel() != count
-    ):
-        raise RuntimeError("vLLM MRv2 InputBatch is not an n=1 non-speculative batch")
+    # An n=1, non-speculative batch: one logits row per request, no draft tokens.
+    assert count >= 1 and input_batch.num_reqs_after_padding >= count
+    assert input_batch.num_tokens_after_padding >= input_batch.num_tokens
+    assert input_batch.num_draft_tokens == 0 and input_batch.num_draft_tokens_per_req is None
+    columns = (
+        input_batch.num_scheduled_tokens,
+        input_batch.prefill_len_np,
+        input_batch.num_computed_tokens_np,
+        input_batch.is_prefilling_np,
+        prompt_lengths,
+    )
+    assert all(len(column) == count for column in columns)
+    assert [int(value) for value in input_batch.cu_num_logits_np] == list(range(count + 1))
+    logits = input_batch.logits_indices
+    assert logits.ndim == 1 and logits.device.type == "cuda" and logits.numel() == count
     request_ids = tuple(identity.request_id for identity in identities)
-    if (
-        tuple(input_batch.req_ids) != request_ids
-        or any(not value for value in request_ids)
-        or len(set(request_ids)) != count
-    ):
-        raise RuntimeError("canonical request identities differ from the active MRv2 InputBatch")
-    if any(int(value) != index for index, value in enumerate(input_batch.cu_num_logits_np)):
-        raise RuntimeError("canonical MRv2 adapter requires exactly one sampler row per request")
+    assert tuple(input_batch.req_ids) == request_ids and all(request_ids) and len(set(request_ids)) == count
     scheduled = [int(value) for value in input_batch.num_scheduled_tokens]
     prompt = [int(value) for value in prompt_lengths]
     computed = [int(value) for value in input_batch.num_computed_tokens_np]
-    if any(
-        tokens < 1 or bool(prefilling) != (done < length)
+    assert all(
+        tokens >= 1 and bool(prefilling) == (done < length)
         for tokens, length, done, prefilling in zip(
             scheduled, input_batch.prefill_len_np, computed, input_batch.is_prefilling_np, strict=True
         )
-    ):
-        raise RuntimeError("vLLM MRv2 InputBatch request columns do not match the signed ABI")
+    )
     return _planned_rows(
         identities, scheduled, prompt, computed, input_batch.logits_indices, input_batch.num_tokens, step_id
     )
@@ -86,21 +68,12 @@ def encode_mrv1_rows(
     *,
     step_id: int,
 ) -> PackedSamplerRowBatch:
-    if (
-        type(batch) is not Mrv1InputBatch
-        or _VLLM_VERSION != "0.27.1"
-        or batch.num_reqs < 1
-        or tuple(batch.req_ids) != tuple(identity.request_id for identity in identities)
-        or len(set(batch.req_ids)) != batch.num_reqs
-        or len(identities) != batch.num_reqs
-        or scheduler.scheduled_spec_decode_tokens
-        or logits_indices.shape != (batch.num_reqs,)
-        or logits_indices.device.type != "cuda"
-    ):
-        raise ValueError("MRv1 rows require the exact non-speculative persistent input batch")
+    count = batch.num_reqs
+    assert count >= 1 and tuple(batch.req_ids) == tuple(identity.request_id for identity in identities)
+    assert len(set(batch.req_ids)) == count == len(identities) and not scheduler.scheduled_spec_decode_tokens
+    assert logits_indices.shape == (count,) and logits_indices.device.type == "cuda"
     scheduled = [scheduler.num_scheduled_tokens[key] for key in batch.req_ids]
-    if any(count < 1 for count in scheduled):
-        raise ValueError("MRv1 input batch contains an unscheduled request")
+    assert min(scheduled) >= 1
     return _planned_rows(
         identities,
         scheduled,

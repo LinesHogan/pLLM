@@ -193,8 +193,6 @@ class BackendAuthoring(ABC):
             facts.probe,
             graph,
             replace(timeline, reserved_bytes=reserved),
-            layouts=layouts,
-            attachment=attachment,
             capture_memory_bytes=options.capture_memory_bytes,
         )
         return replace(facts, timeline=timeline)
@@ -206,13 +204,7 @@ class BackendAuthoring(ABC):
 
     def plan_backend(self, facts: BackendCompileFacts) -> BackendAttachment:
         graph, layouts, attachment = self.declare(facts)
-        timeline = derive_attachment_resources(
-            facts.probe,
-            graph,
-            facts.timeline,
-            layouts=layouts,
-            attachment=attachment,
-        )
+        timeline = derive_attachment_resources(facts.probe, graph, facts.timeline)
         plan = compile_page_bundle_plan(
             (graph, layouts),
             timeline,

@@ -24,9 +24,7 @@ from pllm.contracts.semantic_graph import (
     AnchorId,
     SchedulerTimeline,
     SemanticGraph,
-    StateEffectKind,
     TaskResourceFact,
-    TaskResultInputSource,
     TaskSymbol,
     TokenProgramEffect,
     ValueResourceFact,
@@ -103,8 +101,6 @@ def derive_attachment_resources(
     graph: SemanticGraph,
     timeline: SchedulerTimeline,
     *,
-    layouts: TensorLayoutRequest | None = None,
-    attachment: BackendAttachmentSpec | None = None,
     capture_memory_bytes: int = 0,
 ) -> SchedulerTimeline:
     """Fund the tokenwise reference plan through its task and value resource facts.
@@ -119,43 +115,8 @@ def derive_attachment_resources(
     if len(tasks) != 1:
         raise ValueError("tokenwise attachment costs require one model replay task")
     (task,) = tasks
-    for group in graph.input_groups:
-        if (
-            attachment is None
-            or group.resource != attachment.state_resource
-            or group.readers != (task.symbol,)
-            or group.held_version != "input"
-        ):
-            raise ValueError("conditional tokenwise costs require a pinned READ of the activation publication")
-        # Both branches use this same model source. Retain all producer facts:
-        # the complete DAG funds the worst case, including the fresh encoding.
-    if (
-        (len(graph.tasks) != 1 or graph.states)
-        and task.effects[0].kind is StateEffectKind.READ
-        and task.effects[0].version is not None
-    ):
-        if len(task.effects) != 1 or task.effects[0].kind is not StateEffectKind.READ:
-            raise ValueError("composed tokenwise costs require an exact publication read")
-        (read,) = task.effects
-        publication = next((candidate for candidate in graph.tasks if candidate.symbol == read.version), None)
-        if (
-            publication is None
-            or not any(state.resource == read.resource for state in graph.states)
-            or not any(
-                effect.resource == read.resource and effect.kind is StateEffectKind.PUBLISH
-                for effect in publication.effects
-            )
-            or not any(
-                isinstance(port.source, TaskResultInputSource)
-                and port.source.task == publication.symbol
-                and any(output.name == port.source.output for output in publication.outputs)
-                for port in task.inputs
-            )
-        ):
-            raise ValueError("composed tokenwise costs require their declared publication dependency")
-    effect = task.replay
-    if not isinstance(effect, TokenProgramEffect) or probe.causal_domain is None:
-        raise ValueError("tokenwise attachment requires its original model domain")
+    # Builder._attach composes the replay with its publication and Rust validation checks it; a
+    # conditional input group keeps all producer facts, so the complete DAG funds the worst case.
     resident = capture_memory_bytes if TOKEN_CAPTURE_CAPABILITY in probe.capabilities else 0
     workspace = probe.max_packed_rows * probe.hidden_size * 8
     existing = next((fact for fact in timeline.task_resources if fact.task == task.symbol), None)

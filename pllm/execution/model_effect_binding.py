@@ -86,9 +86,6 @@ def declare_parameter_overlay(
         raise ValueError("ordinary overlay requires a sole request state and model transition")
     fields = overlay_fields(buffers, effect)
     targets, applied = effect.targets, effect.applied_fields
-    dimensions = b.dimensions
-    if len(dimensions.target_shapes) != len(targets):
-        raise ValueError("overlay targets differ from backend specialization")
     b.overlay_targets = targets
     b.parameter_phases = phases
     state = b.state(
