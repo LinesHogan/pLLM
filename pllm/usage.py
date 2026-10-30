@@ -18,7 +18,6 @@ from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import (
     ActivationPatchOperator,
     AttachmentKind,
-    BackendAttachmentSpec,
     DecodeRefresh,
     DecodeWindow,
     MissingPolicy,
@@ -42,7 +41,6 @@ from pllm.contracts.semantic_graph import (
     LossReduction,
     MathContract,
     SchedulerTimeline,
-    SemanticGraph,
     SemanticOutputKind,
     StateEffectKind,
     StateScope,
@@ -50,7 +48,7 @@ from pllm.contracts.semantic_graph import (
     TaskSymbol,
 )
 from pllm.contracts.state_feed import FeedBinding, FeedOrder
-from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorLayoutRequest
+from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 from pllm.contracts.visibility import Exact as Exact, Visibility as Visibility
 from pllm.execution.binding_base import SGD as SGD, Buffer as Buffer, buffer_field, overlay_fields
 from pllm.execution.causal_batch import CausalBinder, CausalCall, CausalPort, declare_causal_train
@@ -1716,10 +1714,6 @@ class Workload(
             position_states=context.position_states(),
         )
 
-    def declare(self, facts: BackendCompileFacts) -> tuple[SemanticGraph, TensorLayoutRequest, BackendAttachmentSpec]:
-        binding = self.declaration(facts)
-        return binding.finish()
-
     def _functions(
         self, b: TensorBinding, device: torch.device, seed: int
     ) -> FunctionMath[TensorStepInput, TensorFrame, TensorOutput]:
@@ -1775,15 +1769,6 @@ class Workload(
             parameter_phases=b.parameter_phases,
         )
 
-    def bind_math(
-        self, facts: BackendCompileFacts, plan: PlanBundle, *, causal: CausalBinder | None = None
-    ) -> MathBinding[TensorStepInput, TensorFrame, TensorOutput]:
-        owner = _snapshot(self)
-        b = owner.declaration(facts, causal=causal)
-        if b.graph != plan.semantic_graph or b.layouts != plan.tensor_layout_request:
-            raise ValueError("tensor mathematics differ from the original signed declaration")
-        return owner.operations(facts, plan, b)
-
     def specialize(self, facts: BackendCompileFacts, options: ExecutionOptions) -> BackendCompileFacts:
         """Fund shared page storage for declared feeds before compiling the plan."""
         if any(state.feed is not None for value in _values(self).values() if (state := _typed(value, InstanceState))):
@@ -1813,14 +1798,15 @@ class Workload(
             )
         return derive_resources(binding, facts, options)
 
-    def operations(
-        self, facts: BackendCompileFacts, plan: PlanBundle, b: TensorBinding
+    def bind_math(
+        self, facts: BackendCompileFacts, plan: PlanBundle, declaration: TensorBinding
     ) -> MathBinding[TensorStepInput, TensorFrame, TensorOutput]:
-        operations = b.executables(facts, plan.timeline.task_resources)
+        """Bind the planned declaration's tensor tasks to the implementations the plan selected."""
+        operations = declaration.executables(facts, plan.timeline.task_resources)
         if plan.timeline.task_resources:
             if any(
                 task.lane == "side"
-                and plan.semantic_graph.tasks[task.task_id].symbol in b.tensor_tasks
+                and plan.semantic_graph.tasks[task.task_id].symbol in declaration.tensor_tasks
                 and not operations[plan.semantic_graph.tasks[task.task_id].symbol].resident(1)
                 for task in plan.schedule.tasks
             ):
@@ -1828,10 +1814,10 @@ class Workload(
                     "side tensor tasks need fixed row inputs; declare row inputs or move the task before the model"
                 )
         return MathBinding(
-            self._functions(b, facts.device, facts.initialization_seed),
-            b.bind_all(plan, model_probe=facts.probe, operations=operations),
-            feeds=b.feeds,
-            on_export=self.on_export if b.has_exports else None,
+            self._functions(declaration, facts.device, facts.initialization_seed),
+            declaration.bind_all(plan, model_probe=facts.probe, operations=operations),
+            feeds=declaration.feeds,
+            on_export=self.on_export if declaration.has_exports else None,
         )
 
     def declare_host(self, facts: HostRuntimeFacts) -> TensorHostBinding[TensorStepInput, TensorFrame, TensorOutput]:

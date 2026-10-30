@@ -2,7 +2,7 @@
 
 Pickle carries classes and module-level functions by import path, so the worker imports the same sources the
 driver uses. An object that must not travel as bytes, such as a template model, defines `__reduce__` to rebuild
-itself in the worker. The driver later compares the worker's compiled plan with its own, so source drift fails there.
+itself in the worker. The worker compares its declaration with the driver's plan, so source drift fails at install.
 """
 
 import pickle

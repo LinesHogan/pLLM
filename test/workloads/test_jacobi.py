@@ -24,7 +24,7 @@ def test_overlapping_routes_rejected(tokens):
             return layers()[-1]
 
     with pytest.raises(ValueError, match="tokens overlap:.*" + ("decode" if tokens == "all" else tokens)):
-        Overlap().declare(FACTS)
+        Overlap().declaration(FACTS)
 
 
 @pytest.mark.parametrize(

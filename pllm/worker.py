@@ -10,7 +10,6 @@ from vllm.v1.worker.gpu_worker import Worker
 
 from pllm.authoring import BackendWorkload, DataT, ResultT, map_auxiliary
 from pllm.backends.vllm.mrv1 import Mrv1Runner
-from pllm.backends.vllm.prefix_cache import CachePolicy
 from pllm.backends.vllm.runner import BackendWorkerState, WorkloadModelRunner
 from pllm.backends.vllm.runtime import (
     BackendCommand,
@@ -20,9 +19,9 @@ from pllm.backends.vllm.runtime import (
     probe_backend,
 )
 from pllm.backends.vllm.training import CausalTraining
-from pllm.contracts.backend_attachment import AttachmentTopology, BackendAttachment
+from pllm.contracts.backend_attachment import AttachmentTopology
 from pllm.contracts.codec import decode_boundary, encode_boundary
-from pllm.contracts.semantic_graph import StateScope, TaskId
+from pllm.contracts.semantic_graph import TaskId
 from pllm.execution.trace import TraceSelection
 from pllm.workload_transport import decode_workload as decode_workload, encode_workload as encode_workload
 
@@ -47,44 +46,18 @@ class GPUWorker(Worker):
         assert isinstance(runner, (WorkloadModelRunner, Mrv1Runner))
         return runner
 
-    def _install(
-        self, workload: BackendWorkload[DataT, ResultT], attachment: BackendAttachment, cache_policy: CachePolicy
-    ) -> None:
+    def _install(self, workload: BackendWorkload[DataT, ResultT], install: BackendInstall) -> None:
+        """Bind the driver's plan to the workload this process imported, refusing drifted sources."""
         runner = self.workload_runner
-        plan = attachment.plan
-        visibility = plan.timeline.visibility
-        facts = probe_backend(
-            workload.backend_requirements(),
-            runner,
-            plan.timeline,
-            publish_lag=0 if visibility is None else visibility.lag,
-        )
-        max_lineages = (
-            facts.max_admitted_lineages
-            if any(state.scope is StateScope.REQUEST for state in plan.semantic_graph.states)
-            else 1
-        )
-        candidates = tuple(
-            provider.materialize_plan(
-                resource=entry.resource,
-                layout=entry.layout,
-                binding=binding,
-                max_admitted_lineages=max_lineages,
-                graph=plan.semantic_graph,
+        plan = install.attachment.plan
+        declaration = workload.declaration(install.facts, causal=partial(CausalTraining, runner.decoder))
+        if (declaration.graph, declaration.layouts) != (plan.semantic_graph, plan.tensor_layout_request):
+            raise ValueError(
+                "the EngineCore worker imported workload code that differs from the driver's; "
+                "run both processes from the same installed sources"
             )
-            for entry, binding in zip(
-                plan.tensor_layout_request.layouts, plan.tensor_layout_decision.bindings, strict=True
-            )
-            for provider in facts.providers
-            if any(
-                selected.resource == entry.resource and selected.provider_id == provider.provider_id
-                for selected in plan.states.plans
-            )
-        )
-        if (facts.probe, candidates) != (attachment.probe, plan.states.plans):
-            raise ValueError("worker backend facts changed; compile the workload against the current backend")
         runner.attach_workload(
-            workload.bind_backend(facts, attachment, causal=partial(CausalTraining, runner.decoder)), cache_policy
+            workload.bind_backend(install.facts, install.attachment, declaration), install.cache_policy
         )
 
     def workload_command(self, command: str, payload: str) -> str:
@@ -104,8 +77,7 @@ class GPUWorker(Worker):
                     return encode_boundary(probe_backend(probe.requirements, runner, publish_lag=probe.publish_lag))
                 case BackendCommand.INSTALL:
                     install = decode_boundary(payload, BackendInstall)
-                    # The driver compares the rebuilt compilation signature against its own plan.
-                    self._install(decode_workload(install.definition), install.attachment, install.cache_policy)
+                    self._install(decode_workload(install.definition), install)
                     return encode_boundary(BackendWorkerState(os.getpid(), runner.require_session().diagnostics()))
                 case BackendCommand.STAGE:
                     stage = decode_boundary(payload, BackendStage)

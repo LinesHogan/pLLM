@@ -211,7 +211,7 @@ def test_updates_match_independent_private_version_oracle(boundaries, visits, em
 
 def test_marker_source_roundtrip_and_while_rejection():
     assert_finite_resources(Updating(), ROUTE_FACTS)
-    graph, _, _ = Updating(empty=True).declare(ROUTE_FACTS)
+    graph = Updating(empty=True).declaration(ROUTE_FACTS).graph
     assert decode_boundary(encode_boundary(graph), type(graph)) == graph
     assert next(task.replay for task in graph.tasks if task.replay is not None).apply_updates
 
@@ -221,7 +221,7 @@ def test_marker_source_roundtrip_and_while_rejection():
             return torch.while_loop(lambda hidden: hidden.sum() > 0, lambda hidden: (hidden * 0.5,), (layers.seed,))[0]
 
     with pytest.raises(ValueError, match="use a bounded for-loop"):
-        TracedWhile().declare(ROUTE_FACTS)
+        TracedWhile().declaration(ROUTE_FACTS)
 
     class Unowned(pllm.Workload):
         @pllm.layer_route()
@@ -230,7 +230,7 @@ def test_marker_source_roundtrip_and_while_rejection():
             return layers()[-1]
 
     with pytest.raises(ValueError, match="one trained parameter overlay"):
-        Unowned().declare(ROUTE_FACTS)
+        Unowned().declaration(ROUTE_FACTS)
 
     class Second(Updating):
         @pllm.overlay(state="weights", targets=(TARGET,), weight="delta")
@@ -244,7 +244,7 @@ def test_marker_source_roundtrip_and_while_rejection():
             return self.transition(hidden, desired, delta, tail)
 
     with pytest.raises(ValueError, match="sole request state"):
-        Second().declare(ROUTE_FACTS)
+        Second().declaration(ROUTE_FACTS)
 
 
 @pytest.mark.parametrize("published", (False, True))

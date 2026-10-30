@@ -39,7 +39,7 @@ def _plan(shared=False):
     )
     provider = PageBundleProviderFacts("test.page_bundle@1", 6, StateDeviceKind.CUDA, 0, shared_memory=shared)
     facts = backend_facts(4, bindings, timeline, provider)
-    return ESampRequestWorkload(ESampRequestConfig(rank=2)).plan_backend(facts).plan
+    return ESampRequestWorkload(ESampRequestConfig(rank=2)).plan_backend(facts)[0].plan
 
 
 @pytest.mark.slow

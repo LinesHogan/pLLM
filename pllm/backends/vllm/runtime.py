@@ -162,7 +162,7 @@ class BackendCommand(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class BackendProbe:
-    """Worker probe policy, shared with installation so capacity and input reservations agree."""
+    """What the driver asks the worker to probe; the publish lag sizes page capacity."""
 
     requirements: BackendRequirements
     publish_lag: int = 1
@@ -170,6 +170,9 @@ class BackendProbe:
 
 @dataclass(frozen=True, slots=True)
 class BackendInstall:
+    """The driver's specialized facts and plan; the worker binds them without probing again."""
+
+    facts: BackendCompileFacts
     attachment: BackendAttachment
     definition: str
     cache_policy: CachePolicy
@@ -631,11 +634,11 @@ def create_vllm_llm(
             )
             facts = decode_boundary(replies[0], BackendCompileFacts)
             facts = workload.specialize(facts, config.execution)
-            attachment = workload.plan_backend(facts)
+            attachment, _ = workload.plan_backend(facts)
             policy = CachePolicy.for_attachment(attachment, config.generated_kv)
             handle = VllmLlm[DataT, ResultT](llm, None, attachment, facts, policy)
             handle.command(
-                BackendCommand.INSTALL, encode_boundary(BackendInstall(attachment, definition or "", policy))
+                BackendCommand.INSTALL, encode_boundary(BackendInstall(facts, attachment, definition or "", policy))
             )
         else:
             runner = llm.llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner
@@ -652,7 +655,6 @@ def create_vllm_llm(
 def probe_backend(
     requirements: BackendRequirements,
     runner: WorkloadModelRunner | Mrv1Runner,
-    timeline: SchedulerTimeline | None = None,
     *,
     publish_lag: int = 1,
 ) -> BackendCompileFacts:
@@ -716,11 +718,6 @@ def probe_backend(
             "transition/full_root@1",
             "optimizer/adamw@1",
             *replay_capabilities,
-            *(
-                ("compute/cuda_graph@1",)
-                if timeline is not None and "compute/cuda_graph@1" in timeline.capabilities
-                else ()
-            ),
         ),
     )
     required = input_reservations(
@@ -733,9 +730,6 @@ def probe_backend(
         requirements.sampler_feedback,
     )
     required = tuple(value + runner.overlay_graph_bytes for value in required)
-    observed = replace(observed, reserved_bytes=required)
-    if timeline is None:
-        timeline = observed
     free_bytes, _total_bytes = torch.cuda.mem_get_info(runner.device)
     # Per scheduled request: the current root, the private root being written, and the root the GPU
     # may still read from the step before, because the host prepares a step while the GPU runs the last.
@@ -744,7 +738,7 @@ def probe_backend(
     capacity = (3 + publish_lag) * runner.max_num_reqs + 2
     facts = BackendCompileFacts(
         replace(probe, targets=targets, position_states=requirements.position_states),
-        timeline,
+        replace(observed, reserved_bytes=required),
         (
             PageBundleProviderFacts(
                 "canonical.page_bundle_cuda@1",

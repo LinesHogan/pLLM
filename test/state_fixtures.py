@@ -82,7 +82,7 @@ def inplace_plan(device: torch.device, provider: PageBundleProviderFacts, capabi
     facts = BackendCompileFacts(
         replace(probe, targets=(ParameterTargetShape(target, 3, 2),)), timeline, (provider,), 2, 4096, 0
     )
-    return InPlaceTTTWorkload(InPlaceTTTConfig((target,), chunk_size=2)).plan_backend(facts).plan
+    return InPlaceTTTWorkload(InPlaceTTTConfig((target,), chunk_size=2)).plan_backend(facts)[0].plan
 
 
 def page_arena(*, heterogeneous: bool = False) -> PageBundleArena:

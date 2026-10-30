@@ -173,7 +173,10 @@ def test_recirculation_declaration_fits_reference_budget_and_crosses_the_wire() 
     with pytest.raises(ValueError):
         workload.specialize(FACTS, ExecutionOptions(memory_budget_bytes=reference_budget - 1))
     restored = decode_workload(encode_workload(workload))
-    assert isinstance(restored, RecirculationWorkload) and restored.declare(FACTS) == workload.declare(FACTS)
+    assert (
+        isinstance(restored, RecirculationWorkload)
+        and restored.declaration(FACTS).finish() == workload.declaration(FACTS).finish()
+    )
     with pytest.raises(ValueError):
         replace(WORKLOAD, destination=3).compile_backend(FACTS)
 

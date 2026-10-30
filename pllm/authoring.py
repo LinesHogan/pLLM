@@ -16,13 +16,12 @@ from pllm.contracts.auxiliary import (
     WeightedCEBatch as WeightedCEBatch,
     map_auxiliary as map_auxiliary,
 )
-from pllm.contracts.backend_attachment import BackendAttachment, BackendAttachmentSpec
+from pllm.contracts.backend_attachment import BackendAttachment
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenSite as HiddenSite
 from pllm.contracts.parameter_overlay import ParameterTarget
 from pllm.contracts.sampler import SamplerStage
-from pllm.contracts.semantic_graph import HiddenInputSource, SchedulerTimeline, SemanticGraph, StateScope
-from pllm.contracts.tensor_layout import TensorLayoutRequest
+from pllm.contracts.semantic_graph import HiddenInputSource, SchedulerTimeline, StateScope
 from pllm.contracts.visibility import VisibilitySource
 from pllm.execution.backend_attachment import (
     attachment_buffer_bytes,
@@ -36,7 +35,7 @@ from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import compile_page_bundle_plan
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.step_input import TensorStepInput as TensorStepInput
-from pllm.execution.tensor_binding import TensorResult as TensorResult
+from pllm.execution.tensor_binding import TensorBinding, TensorResult as TensorResult
 from pllm.execution.tensor_program import FunctionMath as FunctionMath
 from pllm.kernels.adamw import AdamWConfig
 
@@ -142,7 +141,7 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
             tensor_policy=facts.timeline.tensor_policy,
             visibility=VisibilitySource.post_sampler(options.publish_lag),
         )
-        graph, layouts, attachment = self.declare(replace(facts, timeline=timeline))
+        graph, layouts, attachment = self.declaration(replace(facts, timeline=timeline)).finish()
         buffers = attachment_buffer_bytes(facts.probe, graph, layouts, attachment)
         reserved = (
             tuple(value + buffers for value in (timeline.reserved_bytes or (0,) * len(timeline.anchors)))
@@ -158,12 +157,16 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
         return replace(facts, timeline=timeline)
 
     @abstractmethod
-    def declare(self, facts: BackendCompileFacts) -> tuple[SemanticGraph, TensorLayoutRequest, BackendAttachmentSpec]:
-        """Return original graph, logical layouts and effects, never a physical plan."""
+    def declaration(self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None) -> TensorBinding:
+        """Declare the graph, logical layouts, effects and tensor tasks; never a physical plan."""
         ...
 
-    def plan_backend(self, facts: BackendCompileFacts) -> BackendAttachment:
-        graph, layouts, attachment = self.declare(facts)
+    def plan_backend(
+        self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None
+    ) -> tuple[BackendAttachment, TensorBinding]:
+        """Plan one declaration and return it with the attachment, so binding reuses what was planned."""
+        declaration = self.declaration(facts, causal=causal)
+        graph, layouts, attachment = declaration.finish()
         timeline = derive_attachment_resources(facts.probe, graph, facts.timeline)
         plan = compile_page_bundle_plan(
             (graph, layouts),
@@ -173,20 +176,20 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
             facts.state_memory_budget_bytes,
             facts.device,
         )
-        return bind_backend_attachment(plan, facts.probe, attachment)
+        return bind_backend_attachment(plan, facts.probe, attachment), declaration
 
     @abstractmethod
     def bind_math(
-        self, facts: BackendCompileFacts, plan: PlanBundle, *, causal: CausalBinder | None = None
+        self, facts: BackendCompileFacts, plan: PlanBundle, declaration: TensorBinding
     ) -> MathBinding[TensorStepInput, DataT, ResultT]:
-        """Bind mathematics to selected implementations; no storage or execution ownership."""
+        """Bind the planned declaration to selected implementations; no storage or execution ownership."""
         ...
 
     def bind_backend(
-        self, facts: BackendCompileFacts, attachment: BackendAttachment, *, causal: CausalBinder | None = None
+        self, facts: BackendCompileFacts, attachment: BackendAttachment, declaration: TensorBinding
     ) -> BackendDeployment[DataT, ResultT]:
         plan = attachment.plan
-        math = self.bind_math(facts, plan, causal=causal)
+        math = self.bind_math(facts, plan, declaration)
         device = (
             torch.device("cpu")
             if facts.probe.device_kind.value == "cpu"
@@ -198,4 +201,4 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
     def compile_backend(
         self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None
     ) -> BackendDeployment[DataT, ResultT]:
-        return self.bind_backend(facts, self.plan_backend(facts), causal=causal)
+        return self.bind_backend(facts, *self.plan_backend(facts, causal=causal))

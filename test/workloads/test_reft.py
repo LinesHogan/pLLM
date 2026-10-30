@@ -174,7 +174,7 @@ def _decode_declarations_are_checked(facts):
         def intervention(self) -> pllm.InstanceState:
             return pllm.InstanceState({"delta": pllm.Buffer((4,), dtype=torch.float32)}, imported=True)
 
-    plan = DeclaredActivation(replace(legacy, decode=DecodeWindow.ALL, on_missing=MissingPolicy.HOLD)).plan_backend(
+    plan, _ = DeclaredActivation(replace(legacy, decode=DecodeWindow.ALL, on_missing=MissingPolicy.HOLD)).plan_backend(
         facts
     )
     payload = json.loads(encode_boundary(plan))

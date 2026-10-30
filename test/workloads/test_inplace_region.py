@@ -122,9 +122,9 @@ def test_production_tuning_policy_is_signed_into_worker_facts():
     assert facts.timeline.tensor_policy == policy
     # The policy crosses the process boundary inside the facts the worker binds with.
     facts = decode_boundary(encode_boundary(facts), BackendCompileFacts)
-    attachment = workload.plan_backend(facts)
+    attachment, declaration = workload.plan_backend(facts)
     rng = torch.get_rng_state().clone()
-    workload.bind_backend(facts, attachment)
+    workload.bind_backend(facts, attachment, declaration)
     assert torch.equal(rng, torch.get_rng_state())  # measurement does not consume the global RNG
     assert attachment.plan.timeline.tensor_policy == policy
 

@@ -84,7 +84,7 @@ def mean_capture(publish_lag: int = 0) -> None:
         facts.state_memory_budget_bytes,
         device,
     )
-    execution = workload.bind_math(facts, plan).bind(PageBundleArena(plan), AnchorId(1))
+    execution = workload.bind_math(facts, plan, declaration).bind(PageBundleArena(plan), AnchorId(1))
     assert plan.timeline.visibility is not None
     overlap = PostSampleOverlap(execution.arena, publish_lag, torch.cuda.Stream(device=device)) if publish_lag else None
     execution.admit((), stream)

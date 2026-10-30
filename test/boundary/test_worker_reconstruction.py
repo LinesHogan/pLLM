@@ -11,7 +11,7 @@ import torch
 from examples.huber import HuberWorkload
 from pllm import make_llm
 from pllm.backends.vllm.prefix_cache import CachePolicy
-from pllm.contracts.backend_attachment import AttachmentTopology, BackendAttachment
+from pllm.backends.vllm.runtime import BackendInstall
 from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.state_ref import StateRef
@@ -77,22 +77,13 @@ def test_plan_bundle_codec_round_trips_and_rejects_injected_fields() -> None:
 
 def _worker(connection: Connection) -> None:
     try:
-        workload, probe, facts = overlay_facts()
-        for local_facts in (
-            facts,
-            replace(facts, providers=(replace(facts.providers[0], page_capacity=5),)),
-            replace(facts, probe=replace(probe, topology=AttachmentTopology.ENGINE_CORE)),
-        ):
-            attachment = decode_boundary(connection.recv_bytes().decode(), BackendAttachment)
+        workload, _, _ = overlay_facts()
+        for imported in (workload, replace(workload, config=replace(workload.config, learning_rate=0.5))):
+            install = decode_boundary(connection.recv_bytes().decode(), BackendInstall)
             runner = Mock()
             try:
-                with (
-                    patch.object(GPUWorker, "workload_runner", new_callable=PropertyMock, return_value=runner),
-                    patch("pllm.worker.probe_backend", return_value=local_facts),
-                ):
-                    GPUWorker._install(
-                        object.__new__(GPUWorker), workload, attachment, CachePolicy.for_attachment(attachment, "reuse")
-                    )
+                with patch.object(GPUWorker, "workload_runner", new_callable=PropertyMock, return_value=runner):
+                    GPUWorker._install(object.__new__(GPUWorker), imported, install)
                 arena = runner.attach_workload.call_args.args[0].execution.arena
                 (resource,) = arena.plan.semantic_graph.states
                 write = arena.prepare_admission((resource.resource,))
@@ -104,29 +95,31 @@ def _worker(connection: Connection) -> None:
                 assert torch.all(arena.borrow_field(pin, ref, LayoutFieldId(0)) == 3)
                 connection.send_bytes(encode_boundary(ref).encode())
             except ValueError as error:
-                assert "worker backend facts changed" in str(error)
+                assert "differs from the driver's" in str(error)
                 connection.send_bytes(b"rejected")
     finally:
         connection.close()
 
 
 @pytest.mark.slow
-def test_worker_reconstructs_the_shipped_plan_and_rejects_local_drift() -> None:
+def test_worker_reconstructs_the_shipped_plan_and_rejects_source_drift() -> None:
     workload, _, facts = overlay_facts()
-    wire = encode_boundary(workload.plan_backend(facts)).encode()
+    attachment, _ = workload.plan_backend(facts)
+    policy = CachePolicy.for_attachment(attachment, "reuse")
+    wire = encode_boundary(BackendInstall(facts, attachment, "", policy)).encode()
     context = mp.get_context("spawn")
     parent, child = context.Pipe()
     worker = context.Process(target=_worker, args=(child,))
     worker.start()
     child.close()
     try:
-        # Provider capacity and backend probe drift are rejected before attaching.
+        # A worker whose imported workload declares different math is rejected before attaching.
         answers = []
-        for _ in range(3):
+        for _ in range(2):
             parent.send_bytes(wire)
             assert parent.poll(20), "worker did not finish reconstruction"
             answers.append(parent.recv_bytes().decode())
-        assert decode_boundary(answers[0], StateRef).version_id == 0 and answers[1:] == ["rejected", "rejected"]
+        assert decode_boundary(answers[0], StateRef).version_id == 0 and answers[1] == "rejected"
         worker.join(10)
         assert worker.exitcode == 0
     finally:

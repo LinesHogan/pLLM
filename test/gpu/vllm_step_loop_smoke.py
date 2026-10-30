@@ -311,16 +311,20 @@ def isolated_multiturn():
             handle._llm.collective_rpc("end_native_steps")
             namespace = handle._cache_policy.namespace
             workload = ImportedStepLoop()
-            handle.attachment = workload.plan_backend(handle._facts)
+            handle.attachment, declaration = workload.plan_backend(handle._facts)
             handle._cache_policy = CachePolicy.for_attachment(handle.attachment, "isolate")
             handle.command(BackendCommand.DETACH)
             if multiprocessing:
                 handle.command(
                     BackendCommand.INSTALL,
-                    encode_boundary(BackendInstall(handle.attachment, encode_workload(workload), handle._cache_policy)),
+                    encode_boundary(
+                        BackendInstall(
+                            handle._facts, handle.attachment, encode_workload(workload), handle._cache_policy
+                        )
+                    ),
                 )
             else:
-                deployment = workload.bind_backend(handle._facts, handle.attachment)
+                deployment = workload.bind_backend(handle._facts, handle.attachment, declaration)
                 handle.runner.attach_workload(deployment, handle._cache_policy)
             assert handle._cache_policy.namespace != namespace
             (changed,) = generate_ids(handle, [receiver])

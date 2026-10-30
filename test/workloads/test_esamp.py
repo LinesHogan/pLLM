@@ -218,7 +218,7 @@ def _esamp_native_oracle(device, normalized):
     assert any(task.lane == "side" for task in plan.schedule.tasks) == (stream is not None)
     if stream is not None and normalized:
         for lag in (0, 1, 2):
-            attachment = workload.plan_backend(
+            attachment, _ = workload.plan_backend(
                 replace(facts, timeline=replace(facts.timeline, visibility=VisibilitySource.post_sampler(lag)))
             )
             assert any(task.lane == "side" for task in attachment.plan.schedule.tasks) == bool(lag)

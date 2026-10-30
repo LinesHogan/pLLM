@@ -92,8 +92,6 @@ def test_dummy_runs_graph_sign_plan_execute() -> None:
     attached = deployment.execution
     torch.testing.assert_close(exported(attached, value(2)), expected)
     torch.testing.assert_close(exported(attached, value(2)), expected)
-    with pytest.raises(ValueError):  # a changed declaration cannot reuse the signed attachment
-        DummyWorkload(replace(workload.config, export_every_n_steps=1)).bind_backend(bounded, deployment.attachment)
     other_layer = (AttachmentHiddenResource(replace(BINDING, layer="1"), HiddenPhase.DECODE),)
     with pytest.raises(ValueError):  # the backend does not provide the hidden layer the workload reads
         workload.plan_backend(replace(facts, probe=replace(facts.probe, hidden_resources=other_layer)))

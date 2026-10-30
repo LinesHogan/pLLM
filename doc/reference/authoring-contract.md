@@ -375,8 +375,8 @@ loss；绑定在每个 SGD 步微分它们的**均值**。这不是 ESamp 的独
 `When` 命名依赖与时机窗口，绑定不做函数体检查也不自动追踪——所以声明必须
 描述数学函数的真实访问，撒谎不会被当场发现，但会产生错误的计划。
 
-自定义高级数据流：继承 `a.BackendWorkload[Data, Result]`，从 `declare` 返回原始
-图/布局/附着，带原生 `bind_math` 与 `backend_requirements`。旧的 `a.Workload`
+自定义高级数据流：继承 `a.BackendWorkload[Data, Result]`，从 `declaration` 返回持有原始
+图/布局/附着的 `TensorBinding`，带原生 `bind_math` 与 `backend_requirements`。旧的 `a.Workload`
 build 包装已移除。新的局部操作获得基于负载/名字的 ID，除非绑定了显式实现。
 持久布局命名空间与实现标识不做机械重命名。
 
@@ -397,7 +397,7 @@ Hidden 需求从声明推导。形状/dtype 回调只在模型事实可用后运
 授权的迁移根。空梯度与零梯度的区别、预算与成本声明的失败模式都在这里。
 给 FTTT / GTTA 这类宿主事务、或 ESamp / LoRA 的捕获内核写数学时读本节。
 
-高级 `BackendWorkload.bind_math(facts, plan)` 返回原始 `MathBinding`。其
+高级 `BackendWorkload.bind_math(facts, plan, declaration)` 把规划过的声明绑成原始 `MathBinding`。其
 `FunctionMath` 提供初始化、输入行选择、准备与结果构造；负载不构造执行器。
 结构化创作入口自己组装这个绑定。
 

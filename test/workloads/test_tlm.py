@@ -179,7 +179,7 @@ def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None
         gpu_model = TinyCausalPort()
         gpu_model.device = torch.device("cuda", 0)
         online = TLMWorkload(TLMConfig(mode=TLMMode.ONLINE), 2, 2)
-        attachment = online.plan_backend(online.specialize(_facts(gpu_model), ExecutionOptions()))
+        attachment, _ = online.plan_backend(online.specialize(_facts(gpu_model), ExecutionOptions()))
         assert attachment.spec.overlay_bindings
         assert all(task.lane == "main" for task in attachment.plan.schedule.tasks)
     batch = CausalTrainBatch(torch.tensor([[0, 2, 3]]), torch.tensor([[0, 2, 3]]))
