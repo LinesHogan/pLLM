@@ -25,6 +25,7 @@ from pllm.contracts.semantic_graph import (
     AnchorId,
     ImplementationId,
     ScheduleDecision,
+    StateResource,
     TaskId,
     TaskSymbol,
 )
@@ -241,6 +242,44 @@ class StateTaskContext(Generic[DataT]):
     def release_owned_pin(self, pin: PagePin) -> None:
         """Discharge an early release through the same operation as terminal cleanup."""
         self._discharge(_PinRelease(pin))
+
+    def read_versions(
+        self,
+        identities: Sequence[RequestIdentity],
+        resource: StateResource,
+        directory: RequestStateDirectory,
+        *,
+        latest: bool = False,
+    ) -> tuple[tuple[PagePin, StateRef], ...]:
+        """Per request, the version of `resource` a model-side read sees and the pin that keeps it readable.
+
+        Without `latest`, an unkeyed (instance) resource is read at each request's admitted inference pin.
+        Otherwise a read sees the newest version this invocation published from the selected ref, under one
+        pin borrowing every such publication, or the selected ref itself under the invocation pin.
+        """
+        group = self.selection.for_resource(resource)
+        if group.keys == (None,) and not latest:
+            pins = tuple(directory.inference_pin(identity) for identity in identities)
+            return tuple(
+                (pin, next(ref for ref in pin.refs if self.arena.root(ref).resource == resource)) for pin in pins
+            )
+        if group.keys == (None,):
+            (instance,) = group.refs
+            entry = (instance,) * len(identities)
+        else:
+            # One index for the whole batch: decode replays resolve every request before each graph launch.
+            index = dict(zip((row.identity for row in self.selection.rows), group.state_indices, strict=True))
+            entry = tuple(self.selection.refs[index[identity]] for identity in identities)
+        refs = self.current_owned_refs(entry)
+        updated = tuple(
+            ref
+            for ref, selected in zip(self.current_owned_refs(group.refs), group.refs, strict=True)
+            if ref != selected
+        )
+        borrowed = self.borrow_published(StateRefs.of(updated)) if updated else self.pin
+        return tuple(
+            (self.pin if ref == selected else borrowed, ref) for ref, selected in zip(refs, entry, strict=True)
+        )
 
     def borrow_published(self, refs: StateRefs) -> PagePin:
         self.check_page_execution()

@@ -476,25 +476,11 @@ class PinnedParameterOverlay:
         self.sources = tuple(rows.rows[int(index)] for index in self.starts)
         self.total_rows = rows.total_rows
         for reader in self.readers:
-            resource = StateResource(reader.binding.resource)
-            selection = context.selection.for_resource(resource)
-            if selection.keys == (None,):
-                pins = tuple(directory.inference_pin(row.identity) for row in self.sources)
-                refs = StateRefs.of(
-                    tuple(next(ref for ref in pin.refs if context.arena.root(ref).resource == resource) for pin in pins)
-                )
-            else:
-                # Resolve every request at once: decode replays prepare this table before each graph launch.
-                index = dict(
-                    zip((row.identity for row in context.selection.rows), selection.state_indices, strict=True)
-                )
-                entry = tuple(context.selection.refs[index[row.identity]] for row in self.sources)
-                refs = StateRefs.of(context.current_owned_refs(entry))
-                published = tuple(ref for ref, original in zip(refs, entry, strict=True) if ref != original)
-                borrowed = context.borrow_published(StateRefs.of(published)) if published else context.pin
-                pins = tuple(
-                    context.pin if ref == original else borrowed for ref, original in zip(refs, entry, strict=True)
-                )
+            versions = context.read_versions(
+                tuple(row.identity for row in self.sources), StateResource(reader.binding.resource), directory
+            )
+            pins = tuple(pin for pin, _ in versions)
+            refs = StateRefs.of(tuple(ref for _, ref in versions))
             _, slots = context.arena.slots(pins, refs)
             self.updated_apply_count += int(np.diff(np.append(self.starts, rows.total_rows)) @ (refs.versions > 0))
             for value in (*reader.pools, reader.table, reader.captured, reader.desired):

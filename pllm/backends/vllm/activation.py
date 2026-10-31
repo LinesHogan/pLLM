@@ -169,18 +169,10 @@ class VllmActivationPatch:
         context: StateTaskContext[DataT],
         directory: RequestStateDirectory,
     ) -> tuple[PagePin, StateRef]:
-        if context.selection.for_resource(self.resource).keys == (None,) and not refresh:
-            pin = directory.inference_pin(identity)
-            (ref,) = (ref for ref in pin.refs if context.arena.root(ref).resource == self.resource)
-            return pin, ref
-        if context.selection.for_resource(self.resource).keys == (None,):
-            (original,) = context.selection.for_resource(self.resource).refs
-        else:
-            original = context.selection.ref_for(identity, self.resource)
-        ref = context.current_owned_ref(original)
+        ((pin, ref),) = context.read_versions((identity,), self.resource, directory, latest=refresh)
         if (
             refresh
-            and ref == original
+            and ref in context.selection.for_resource(self.resource).refs
             and context.held_input is None
             and any(
                 task.timing.after == "request.prepare"
@@ -193,14 +185,7 @@ class VllmActivationPatch:
         ):
             # No implicit HOLD: its signed no-input branch is a separate lifecycle.
             raise RuntimeError("decode STEP requires a new publication; missing-input handling is not enabled")
-        if ref == original:
-            return context.pin, ref
-        updated = tuple(
-            context.current_owned_ref(candidate)
-            for candidate in context.selection.for_resource(self.resource).refs
-            if context.current_owned_ref(candidate) != candidate
-        )
-        return context.borrow_published(StateRefs.of(updated)), ref
+        return pin, ref
 
     def clear(self) -> None:
         self.row_count = 0
