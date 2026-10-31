@@ -1306,19 +1306,23 @@ class _Operation:
         return math
 
 
-def _property(member: object) -> Callable[..., object] | None:
+def _return_type(getter: FunctionType) -> type | None:
+    """The class the getter is annotated to return. A string annotation (`from __future__ import annotations`) is
+    looked up as a dotted name in the getter's globals, never evaluated."""
+    annotation = signature(getter, eval_str=False).return_annotation
+    if type(annotation) is str:
+        head, *path = annotation.split(".")
+        annotation = getter.__globals__.get(head)
+        for name in path:
+            annotation = getattr(annotation, name, None)
+    return _typed(annotation, type)
+
+
+def _property(member: object) -> FunctionType | None:
     """Find declaration getters without evaluating arbitrary owner properties."""
-    match member:
-        case property(fget=fget) if fget is not None and signature(fget, eval_str=False).return_annotation in (
-            InstanceState,
-            RequestState,
-            Activation,
-            Overlay,
-            PositionState,
-        ):
-            return fget
-        case _:
-            return None
+    getter = _typed(member.fget, FunctionType) if isinstance(member, property) else None
+    declared = (InstanceState, RequestState, Activation, Overlay, PositionState)
+    return getter if getter is not None and _return_type(getter) in declared else None
 
 
 def _candidates(owner: Workload, values: dict[str, object], members: dict[str, object]) -> dict[str, FunctionType]:
@@ -1384,7 +1388,7 @@ class _Declaration:
         seeds: list[FunctionType] = []
         for name, member in members.items():
             context.read_operation(name, member, candidates, seeds)
-            if (getter := _typed(_property(member), FunctionType)) is not None:
+            if (getter := _property(member)) is not None:
                 seeds.append(getter)
         for value in values.values():
             if (state := _typed(value, InstanceState)) is not None and state.initialize is not None:
@@ -1461,7 +1465,11 @@ class _Declaration:
     def state_definition(self, name: str, error: str) -> InstanceState:
         definition = _typed(self.values.get(name), InstanceState)
         if definition is None:
-            raise ValueError(error)
+            declared = ", ".join(key for key, value in self.values.items() if isinstance(value, InstanceState))
+            raise ValueError(
+                f"{error}: {name!r} is not a declared state of {type(self.owner).__name__} (declared: {declared or 'none'}); "
+                "declare a state as a property annotated `-> pllm.RequestState` or `-> pllm.InstanceState`"
+            )
         return definition
 
     def allocate_buffers(self, name: str, definition: InstanceState) -> None:
