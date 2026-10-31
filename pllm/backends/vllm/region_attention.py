@@ -17,6 +17,7 @@ from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl, FlashAtten
 from vllm.vllm_flash_attn import flash_attn_varlen_func
 
 from pllm.contracts.packed_rows import PackedPhaseRow
+from pllm.execution.cuda_stream import upload
 from pllm.execution.paged_access import PagedAccessPlan, PagedLayer, bind_paged_access
 from pllm.execution.token_program import KV
 
@@ -106,13 +107,7 @@ class BatchAttentionBuffers:
                 prefix_scheduler_metadata=None,
             )
             self.metadata[attention.layer_name] = selected
-        self.context = replace(
-            context,
-            attn_metadata=self.metadata,
-            slot_mapping={name: item.slot_mapping for name, item in self.metadata.items()},
-            batch_descriptor=None,
-            is_padding=None,
-        )
+        self.context = _replay_context(context, self.metadata)
 
     @staticmethod
     def mapping_groups(context: ForwardContext, attentions: tuple[Attention, ...]) -> tuple[int, ...]:
@@ -150,6 +145,51 @@ class BatchAttentionBuffers:
             metadata.seq_lens.copy_(lengths.index_select(0, rows))
             width = min(tables.shape[1], metadata.block_table.shape[1])
             metadata.block_table[:, :width].copy_(tables.index_select(0, requests)[:, :width])
+
+
+def _replay_context(context: ForwardContext, metadata: dict[str, FlashAttentionMetadata]) -> ForwardContext:
+    return replace(
+        context,
+        attn_metadata=metadata,
+        slot_mapping={name: item.slot_mapping for name, item in metadata.items()},
+        batch_descriptor=None,
+        is_padding=None,
+    )
+
+
+def span_context(
+    context: ForwardContext,
+    attentions: tuple[Attention, ...],
+    groups: tuple[tuple[PackedPhaseRow, ...], ...],
+    packed: torch.Tensor,
+    requests: torch.Tensor,
+    starts: list[int],
+) -> ForwardContext:
+    """FA2 metadata for one native varlen pass over a subset of the step's packed rows.
+
+    Each request's contiguous rows form one prefill query that ends at its last row's position.
+    """
+    query_start_loc = upload(starts, packed.device, torch.int32)
+    seq_lens = upload(tuple(group[-1].token_offset + 1 for group in groups), packed.device, torch.int32)
+    metadata: dict[str, FlashAttentionMetadata] = {}
+    for attention in attentions:
+        source, _, slots = attention_metadata(context, attention)
+        metadata[attention.layer_name] = replace(
+            source,
+            num_actual_tokens=starts[-1],
+            max_query_len=max(len(group) for group in groups),
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            block_table=source.block_table.index_select(0, requests),
+            slot_mapping=slots.index_select(0, packed),
+            num_decode_reqs=0,
+            num_decode_tokens=0,
+            num_prefill_reqs=len(groups),
+            num_prefill_tokens=starts[-1],
+            scheduler_metadata=None,
+            prefix_scheduler_metadata=None,
+        )
+    return _replay_context(context, metadata)
 
 
 def merge_diagonal(

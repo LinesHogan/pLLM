@@ -9,18 +9,17 @@ from typing import Generic
 import torch
 from vllm.forward_context import get_forward_context, override_forward_context
 from vllm.sequence import IntermediateTensors
-from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 
 from pllm.authoring import DataT, ResultT
-from pllm.backends.vllm.activation import VllmActivationPatch, low_rank_affine_delta
+from pllm.backends.vllm.activation import VllmActivationPatch, activation_delta
 from pllm.backends.vllm.architecture import CausalLM
 from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay
 from pllm.backends.vllm.position_state import PositionCacheLayer, PositionCacheProvider
 from pllm.backends.vllm.region_attention import (
     BatchAttentionBuffers,
-    attention_metadata,
     attention_mode,
     attention_paged_access,
+    span_context,
     validate_attention_resources,
 )
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
@@ -108,17 +107,8 @@ class RouteWave(Generic[DataT, ResultT]):
         """Call the intact native layer and apply any declared post-layer patch."""
         with attention_mode(self.replay.attentions[ordinal], self.positions, kv):
             hidden, residual = self.replay.model.layers[ordinal](self.positions, hidden, residual)
-        fields = self.fields.get(ordinal, ())
-        if fields:
-            if len(fields) == 1:
-                hidden = hidden + fields[0].to(hidden.dtype)
-            else:
-                weight, bias, rotation = fields
-                inputs = hidden.unsqueeze(1)
-                delta = (
-                    torch.bmm(inputs, weight.transpose(1, 2)).squeeze(1) + bias - torch.bmm(inputs, rotation).squeeze(1)
-                )
-                hidden = hidden + torch.bmm(delta.unsqueeze(1), rotation.transpose(1, 2)).squeeze(1)
+        if ordinal in self.fields:
+            hidden = hidden + activation_delta(hidden, self.fields[ordinal])
         assert residual is not None
         return hidden, residual
 
@@ -206,12 +196,6 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
             fact.resident_bytes for fact in execution.arena.plan.timeline.task_resources if fact.task == task.symbol
         )
         self.position_layers, self.allocation = position_layers, allocation_block_size
-        self.position = PositionCacheProvider(
-            position_layers,
-            tuple(value for _, value in self.effect.position_states),
-            self.allocation,
-            self.model.norm.weight.reshape(1, -1),
-        )
         self.attentions = tuple(layer.self_attn.attn for layer in self.model.layers)
         validate_attention_resources(self.attentions, hidden_size=model.config.hidden_size)
         self.original = self.model.forward
@@ -348,38 +332,11 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
             for request in dict.fromkeys(row.request_ordinal for row in rows)
         )
         requests = upload(tuple(group[0].request_ordinal for group in groups), self.hidden.device)
-        lengths = tuple(len(group) for group in groups)
         starts = [0]
-        for length in lengths:
-            starts.append(starts[-1] + length)
+        for group in groups:
+            starts.append(starts[-1] + len(group))
         if rows != self.rows:
-            metadata: dict[str, FlashAttentionMetadata] = {}
-            for attention in self.attentions:
-                source, _, slots = attention_metadata(context, attention)
-                metadata[attention.layer_name] = replace(
-                    source,
-                    num_actual_tokens=len(rows),
-                    max_query_len=max(lengths),
-                    query_start_loc=upload(starts, self.hidden.device, torch.int32),
-                    seq_lens=upload(
-                        tuple(group[-1].token_offset + 1 for group in groups), self.hidden.device, torch.int32
-                    ),
-                    block_table=source.block_table.index_select(0, requests),
-                    slot_mapping=slots.index_select(0, packed),
-                    num_decode_reqs=0,
-                    num_decode_tokens=0,
-                    num_prefill_reqs=len(groups),
-                    num_prefill_tokens=len(rows),
-                    scheduler_metadata=None,
-                    prefix_scheduler_metadata=None,
-                )
-            context = replace(
-                context,
-                attn_metadata=metadata,
-                slot_mapping={name: item.slot_mapping for name, item in metadata.items()},
-                batch_descriptor=None,
-                is_padding=None,
-            )
+            context = span_context(context, self.attentions, groups, packed, requests, starts)
         routes: tuple[RouteOverlay, ...] = ()
         if self.overlay is not None:
             parent = self.overlay
@@ -394,24 +351,16 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
                 tuple(upload(tuple(range(start, stop)), self.hidden.device) for start, stop in zip(starts, starts[1:])),
             )
         positions = self.positions.index_select(0, packed)
+        patches = self.span_patches(rows)
 
         def layer(
             ordinal: int, hidden: torch.Tensor, residual: torch.Tensor | None, kv: KV
         ) -> tuple[torch.Tensor, torch.Tensor]:
             with attention_mode(self.attentions[ordinal], positions, kv):
                 hidden, residual = self.model.layers[ordinal](positions, hidden, residual)
-            if self.activation is not None:
-                for index, handle in enumerate(self.activation.layers):
-                    if handle.binding.layer == ordinal:
-                        for lane, row in enumerate(rows):
-                            fields = self.activation_rows[row.packed_row_index][index]
-                            if fields:
-                                delta = (
-                                    fields[0].to(hidden.dtype)
-                                    if len(fields) == 1
-                                    else low_rank_affine_delta(hidden[lane : lane + 1], *fields)
-                                )
-                                hidden[lane : lane + 1].add_(delta)
+            if ordinal in patches:
+                lanes, fields = patches[ordinal]
+                hidden.index_add_(0, lanes, activation_delta(hidden.index_select(0, lanes), fields))
             assert residual is not None
             return hidden, residual
 
@@ -452,6 +401,22 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
                 if program is not None and any(isinstance(step, Save) and step.name == name for step in program.steps)
             },
         )
+
+    def span_patches(
+        self, rows: tuple[PackedPhaseRow, ...]
+    ) -> dict[int, tuple[torch.Tensor, tuple[torch.Tensor, ...]]]:
+        """Per patched layer, the span lanes that carry fields and those fields stacked per lane."""
+        assert self.hidden is not None
+        patches: dict[int, tuple[torch.Tensor, tuple[torch.Tensor, ...]]] = {}
+        for index, handle in enumerate(() if self.activation is None else self.activation.layers):
+            lanes = tuple(lane for lane, row in enumerate(rows) if self.activation_rows[row.packed_row_index][index])
+            if lanes:
+                columns = zip(*(self.activation_rows[rows[lane].packed_row_index][index] for lane in lanes))
+                patches[handle.binding.layer] = (
+                    upload(lanes, self.hidden.device),
+                    tuple(torch.stack(column) for column in columns),
+                )
+        return patches
 
     def save_span(
         self,
@@ -511,30 +476,6 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
             if name in saved_values:
                 values = saved_values[name].index_select(0, upload(tuple(tails.values()), hidden.device))
             cache.kv_cache.view(-1, hidden.shape[1])[slots] = values
-
-    def begin(self, row: PackedPhaseRow) -> tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError("CUDA routes run batched waves in run(), never the serial begin()")
-
-    def layer(
-        self,
-        row: PackedPhaseRow,
-        ordinal: int,
-        positions: torch.Tensor,
-        hidden: torch.Tensor,
-        residual: torch.Tensor | None,
-        kv: KV = "commit",
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        with attention_mode(self.attentions[ordinal], positions, kv):
-            return self.model.layers[ordinal](positions, hidden, residual)
-
-    def normalize(self, row: PackedPhaseRow, hidden: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
-        return self.model.norm(hidden + residual)
-
-    def commit(self, row: PackedPhaseRow, record: Callable[[], None]) -> None:
-        record()
-
-    def finish(self, outputs: tuple[torch.Tensor, ...]) -> None:
-        self.output = torch.cat(outputs)
 
     def clear(self) -> None:
         self._rows, self.context = (), None

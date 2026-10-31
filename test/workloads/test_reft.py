@@ -9,7 +9,7 @@ import torch
 
 import pllm
 from pllm.authoring import StateTensorUpdate
-from pllm.backends.vllm.activation import low_rank_affine_delta
+from pllm.backends.vllm.activation import activation_delta
 from pllm.contracts.backend_attachment import (
     ActivationPatchOperator,
     AttachmentGraphMode,
@@ -101,7 +101,7 @@ def test_reft_matches_loreft_math_and_publish_skip_semantics(tmp_path) -> None:
             for row in hidden
         )
     )
-    torch.testing.assert_close(low_rank_affine_delta(hidden, *fields), expected)
+    torch.testing.assert_close(activation_delta(hidden, fields), expected)
     if find_spec("vllm") is not None:
         _decode_low_rank_keeps_parameters_and_recomputes_delta(
             deployment, value, update, identity, hidden, expected, bias, rotation

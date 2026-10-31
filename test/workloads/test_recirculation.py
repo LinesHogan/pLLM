@@ -23,7 +23,7 @@ from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.replay import (
-    TokenwiseReplayPrimitive,
+    SerialTokenwiseReplay,
     TokenwiseReplayTask,
 )
 from pllm.execution.runtime_facts import model_timeline
@@ -72,7 +72,7 @@ VALUE = TensorStepInput(ROWS, PackedSamplerRowBatch(ROWS, (PackedSamplerRowLink(
 INPUTS = torch.tensor([[0.4, -0.1, 0.3, 0.7], [0.2, 0.9, -0.3, 0.8], [-0.2, 0.1, 0.8, 0.4], [0.7, 0.2, -0.1, 0.3]])
 
 
-class Decoder(TokenwiseReplayPrimitive):
+class Decoder(SerialTokenwiseReplay):
     def __init__(self):
         self.batch = ROWS
         self.cache = torch.zeros(2, 3, 3, 4)

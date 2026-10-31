@@ -5,12 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from torch.nn import functional as F
 
 from pllm.backends.vllm.architecture import CausalLM, DecoderLayer
 from pllm.contracts.backend_attachment import (
     ActivationPatchBinding,
-    ActivationPatchOperator,
     DecodeRefresh,
     DecodeWindow,
 )
@@ -26,11 +24,18 @@ from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.state_execution import DataT, StateTaskContext
 
 
-def low_rank_affine_delta(
-    rows: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, rotation: torch.Tensor
-) -> torch.Tensor:
-    """Low-rank affine activation edit; pure tensor math shared with tokenwise replay."""
-    return (F.linear(rows, weight, bias) - rows @ rotation) @ rotation.T
+def activation_delta(hidden: torch.Tensor, fields: tuple[torch.Tensor, ...]) -> torch.Tensor:
+    """The activation edit of `hidden` rows: an added vector, or the low-rank affine edit R (W h + b - R^T h).
+
+    Fields are either shared by every row or stacked per row along dim 0; the forward patch, route waves
+    and native spans all apply this one function.
+    """
+    if len(fields) == 1:
+        return fields[0].to(hidden.dtype)
+    weight, bias, rotation = fields
+    rows = hidden.unsqueeze(-2)
+    coefficients = rows @ weight.transpose(-1, -2) + bias.unsqueeze(-2) - rows @ rotation
+    return (coefficients @ rotation.transpose(-1, -2)).squeeze(-2)
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,13 +64,9 @@ class _ActivationLayer:
             return hidden, residual
         # Decoder layers return a fresh down-projection output, separate from its residual.
         for item in self.prepared:
-            if self.binding.operator is ActivationPatchOperator.ADD:
-                (delta,) = item.fields
-                delta = delta.to(hidden.dtype).expand(item.rows.numel(), -1)
-            else:
-                weight, bias, rotation = item.fields
-                delta = low_rank_affine_delta(hidden.index_select(0, item.rows), weight, bias, rotation)
-            hidden.index_add_(0, item.rows, delta)
+            # An added vector needs no gather of the patched rows.
+            rows = hidden if len(item.fields) == 1 else hidden.index_select(0, item.rows)
+            hidden.index_add_(0, item.rows, activation_delta(rows, item.fields).expand(item.rows.numel(), -1))
             item.used.setdefault(item.identity, set()).add(item.ref)
             self.apply_count += item.rows.numel()
         return hidden, residual

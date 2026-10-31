@@ -223,12 +223,12 @@ def donor_loss():
             frontiers.append((rows[0], rows[-1]))
         result = native_forward(primitive, *args, **kwargs)
         if rows:
-            provider = primitive.position
+            layer = primitive.position_layers[0]
             last = next(row for row in primitive.rows if row.identity.prompt_idx == 2 and row.token_offset == rows[-1])
-            slot = get_forward_context().slot_mapping[provider.layers[0].layer_name][
+            slot = get_forward_context().slot_mapping[layer.layer_name][
                 last.packed_row_index : last.packed_row_index + 1
             ]
-            saved.append(provider.tables[0][slot // provider.allocation].clone())
+            saved.append(layer.kv_cache.view(-1, 896)[slot // primitive.allocation].clone())
         return result
 
     try:
@@ -359,7 +359,7 @@ def main():
     def permuted(primitive, *args, **kwargs):
         context = get_forward_context()
         metadata = {name: copy(item) for name, item in context.attn_metadata.items()}
-        blocks, allocation = primitive.position.tables[0].shape[0], primitive.position.allocation
+        blocks, allocation = primitive.position_layers[0].kv_cache.view(-1, 896).shape[0], primitive.allocation
 
         def page(ids):
             return torch.where(ids == 0, 0, 1 + ids % (blocks - 1))
@@ -407,7 +407,8 @@ def main():
                 entered[external(row)] = previous.clone()
 
     def span_saved(self, rows, groups, requests, hidden, saved_values):
-        provider = self.position
+        initial = tuple(value for _, value in self.effect.position_states)
+        provider = PositionCacheProvider(self.position_layers, initial, self.allocation, self.model.norm.weight[None])
         for group in groups:
             row = group[0]
             if external(row) not in entered:
@@ -464,7 +465,10 @@ def main():
             )
         assert frozenset(("prefill", "decode")) in roles
         assert len(handle.runner.kv_cache_config.kv_cache_groups) == 1
-        assert primitive.position.tables[0].shape == (handle.runner.kv_cache_config.num_blocks, 896)
+        assert primitive.position_layers[0].kv_cache.view(-1, 896).shape == (
+            handle.runner.kv_cache_config.num_blocks,
+            896,
+        )
         print("Native vLLM pre-norm carry, materialized-tap normalization and KV match exactly")
         assert {width for width, _ in primitive.captures} <= {1, 2}
         donor = outputs[0]

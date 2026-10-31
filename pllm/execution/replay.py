@@ -30,14 +30,24 @@ TOKENWISE_REPLAY_IMPLEMENTATION = ImplementationId("canonical.tokenwise_layer_re
 
 
 class TokenwiseReplayPrimitive(ABC):
-    """Model-owned layer calls; CPU models execute the same direct route steps."""
+    """A backend's executor of a step's route programs over its packed rows."""
 
     overlay: RouteOverlay | None = None
-    position: PositionBuffers | None = None
 
     @property
     @abstractmethod
     def rows(self) -> tuple[PackedPhaseRow, ...]: ...
+
+    @abstractmethod
+    def run(
+        self, program: dict[str, TokenProgram], effect: TokenProgramEffect, observe: Callable[[int, torch.Tensor], None]
+    ) -> None: ...
+
+
+class SerialTokenwiseReplay(TokenwiseReplayPrimitive):
+    """Serial reference executor: one row at a time through model-owned layer calls (CPU test models)."""
+
+    position: PositionBuffers | None = None
 
     @abstractmethod
     def begin(self, row: PackedPhaseRow) -> tuple[torch.Tensor, torch.Tensor]: ...
@@ -65,7 +75,7 @@ class TokenwiseReplayPrimitive(ABC):
     def run(
         self, program: dict[str, TokenProgram], effect: TokenProgramEffect, observe: Callable[[int, torch.Tensor], None]
     ) -> None:
-        """Serial CPU reference; span-capable backends override this method."""
+        """Run every row's route, or its ordinary pass when the route skips its phase."""
         assert all(route.over == "token" for route in program.values()), "span routes need a backend span executor"
         outputs: list[torch.Tensor] = []
         for index, row in enumerate(self.rows):
