@@ -473,7 +473,7 @@ class HybridParameterOverlay:
         directory: RequestStateDirectory,
         transition: ProjectionTransition | None = None,
     ) -> None:
-        """Select the same eligibility used by dispatch from Rust-planned row facts."""
+        """Select the same eligibility used by dispatch from the labelled row facts."""
         training = any(row.phase in self.phases for row in rows.rows)
         for reader in self.pinned.readers:
             reader.enabled = not training

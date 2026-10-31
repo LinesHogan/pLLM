@@ -10,7 +10,7 @@ from pllm.contracts.request_identity import RequestIdentity
 
 @dataclass(frozen=True, slots=True)
 class PackedPhaseRow:
-    """One Rust-planned packed row with its stable request identity."""
+    """One packed row with its stable request identity."""
 
     packed_row_index: int
     request_ordinal: int

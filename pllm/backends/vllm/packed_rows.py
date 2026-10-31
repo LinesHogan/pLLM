@@ -1,4 +1,4 @@
-"""Label vLLM MRv1/MRv2 input batches as packed phase rows through the Rust row plan; used by the runners.
+"""Label vLLM MRv1/MRv2 input batches as packed phase rows; used by the runners.
 
 create_vllm_llm pins the vLLM version, so the batch layout asserted here is the one this version produces.
 """
@@ -9,7 +9,6 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu_input_batch import InputBatch as Mrv1InputBatch
 
-from pllm import _core
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import (
     PackedPhaseRow,
@@ -55,9 +54,8 @@ def encode_mrv2_rows(
             scheduled, input_batch.prefill_len_np, computed, input_batch.is_prefilling_np, strict=True
         )
     )
-    return _planned_rows(
-        identities, scheduled, prompt, computed, input_batch.logits_indices, input_batch.num_tokens, step_id
-    )
+    assert sum(scheduled) == input_batch.num_tokens
+    return label_rows(identities, scheduled, prompt, computed, step_id)
 
 
 def encode_mrv1_rows(
@@ -73,35 +71,30 @@ def encode_mrv1_rows(
     assert len(set(batch.req_ids)) == count == len(identities) and not scheduler.scheduled_spec_decode_tokens
     assert logits_indices.shape == (count,) and logits_indices.device.type == "cuda"
     scheduled = [scheduler.num_scheduled_tokens[key] for key in batch.req_ids]
-    assert min(scheduled) >= 1
-    return _planned_rows(
+    assert min(scheduled) >= 1 and sum(scheduled) == scheduler.total_num_scheduled_tokens
+    return label_rows(
         identities,
         scheduled,
         [int(value) for value in batch.num_prompt_tokens[: batch.num_reqs]],
         [int(value) for value in batch.num_computed_tokens_cpu[: batch.num_reqs]],
-        logits_indices,
-        scheduler.total_num_scheduled_tokens,
         step_id,
     )
 
 
-def _planned_rows(
+def label_rows(
     identities: tuple[RequestIdentity, ...],
     scheduled: list[int],
     prompt: list[int],
     computed: list[int],
-    logits_indices: torch.Tensor,
-    total: int,
     step_id: int,
 ) -> PackedSamplerRowBatch:
-    plan = _core.plan_packed_prefill_rows(scheduled, prompt, computed, total)
+    """One row per scheduled token in request order; token positions below the prompt length are prefill."""
     rows: list[PackedPhaseRow] = []
-    for request, packed, offset, raw_phase in zip(
-        plan.request_ordinals, plan.packed_row_indices, plan.token_offsets, plan.phases, strict=True
-    ):
-        phase = HiddenPhase(raw_phase)
-        rows.append(PackedPhaseRow(packed, request, offset, phase, identities[request], plan.prompt_lengths[packed]))
-    phase_rows = PackedPhaseRowBatch(step_id, plan.total_rows, tuple(rows))
-    # vLLM samples each request's last scheduled token, which is the last packed row of its span.
-    links = tuple(PackedSamplerRowLink(span.request_ordinal, span.packed_row_end - 1) for span in plan.request_spans)
-    return PackedSamplerRowBatch(phase_rows, links)
+    links: list[PackedSamplerRowLink] = []
+    for request, (count, length, done) in enumerate(zip(scheduled, prompt, computed, strict=True)):
+        for offset in range(done, done + count):
+            phase = HiddenPhase.PREFILL if offset < length else HiddenPhase.DECODE
+            rows.append(PackedPhaseRow(len(rows), request, offset, phase, identities[request], length))
+        # vLLM samples each request's last scheduled token, which is the last packed row of its span.
+        links.append(PackedSamplerRowLink(request, len(rows) - 1))
+    return PackedSamplerRowBatch(PackedPhaseRowBatch(step_id, len(rows), tuple(rows)), tuple(links))
