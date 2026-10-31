@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, ClassVar, Generic, Literal, NoReturn, Protocol, TypeVar
+from types import TracebackType
+from typing import TYPE_CHECKING, ClassVar, Generic, Literal, NoReturn, Protocol, Self, TypeVar
 
 import numpy as np
 import torch
@@ -424,8 +425,16 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         return PostSampleOverlap(self.arena, self.directory, max(task.read_distance for task in tasks), stream)
 
     def close(self) -> None:
-        """Finish asynchronous exports when direct ownership or a backend session ends."""
+        """Finish asynchronous exports when direct ownership or a backend session ends; idempotent."""
         self.trace.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, traceback: TracebackType | None
+    ) -> None:
+        self.close()
 
     def discard_borrows(self) -> None:
         """Retain failed grants until all GPU work ends, then discard their aliases."""

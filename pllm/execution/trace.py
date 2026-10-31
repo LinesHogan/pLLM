@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import os
 from base64 import b64decode, b64encode
 from collections import deque
@@ -215,6 +216,8 @@ class ExecutionTrace:
         )
         if self._thread is not None:
             self._thread.start()
+            # A daemon delivery thread still alive at interpreter exit aborts the process.
+            atexit.register(self.close)
 
     def configure(self, selection: TraceSelection) -> None:
         if not set(selection.tasks).issubset(task.task_id for task in self.plan.tasks):
@@ -525,7 +528,10 @@ class ExecutionTrace:
                 entry.payload[1].synchronize()
 
     def close(self) -> None:
-        """Stop admission, finish copies and delivery, and release the bounded history."""
+        """Stop admission, finish copies and delivery, and release the bounded history; idempotent."""
+        if self._closed:
+            return
+        atexit.unregister(self.close)
         with self._lock:
             self._closed = True
             self._lock.notify_all()
