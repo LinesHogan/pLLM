@@ -52,9 +52,6 @@ pub(crate) struct PhysicalTask {
     pub(crate) lane: Lane,
     pub(crate) read_origin: ReadOrigin,
     pub(crate) read_distance: u64,
-    pub(crate) earliest: u32,
-    pub(crate) deadline: u32,
-    pub(crate) wait_for: Vec<u32>,
 }
 
 fn error(message: impl Into<String>) -> PyErr {
@@ -70,7 +67,6 @@ fn task_index(graph: &SemanticGraph, symbol: &str) -> Result<usize, String> {
 
 pub(super) struct GraphIndex {
     pub(super) order: Vec<usize>,
-    pub(super) predecessors: Vec<BTreeSet<usize>>,
     pub(super) windows: Vec<(u32, u32)>,
 }
 
@@ -191,11 +187,7 @@ fn graph_index(
         }
     }
     windows = propagate(&windows, &dependencies)?;
-    Ok(GraphIndex {
-        order,
-        predecessors,
-        windows,
-    })
+    Ok(GraphIndex { order, windows })
 }
 
 /// Reduced uniform dependence graph: u(t) -> v(t+k) has weight d-k*M.
@@ -286,25 +278,24 @@ fn place(
             lane: Lane::Main,
             read_origin: ReadOrigin::Entry,
             read_distance: 0,
-            earliest: index.windows[id].0,
-            deadline: index.windows[id].1 - 1,
-            wait_for: index.predecessors[id].iter().map(|&p| p as u32).collect(),
         })
         .collect();
-    select_lanes(graph, timeline, &mut tasks);
-    match check_placement(graph, timeline, index, state, &tasks) {
-        Ok(solution) => Ok(solution),
-        Err(_) => {
-            // Memory fallback preserves the selected logical read boundaries.
-            for task in &mut tasks {
-                task.lane = Lane::Main;
-            }
-            check_placement(graph, timeline, index, state, &tasks)
+    select_lanes(graph, timeline, &index.windows, &mut tasks);
+    plan_memory(graph, timeline, index, state, &tasks).or_else(|_| {
+        // Memory fallback preserves the selected logical read boundaries.
+        for task in &mut tasks {
+            task.lane = Lane::Main;
         }
-    }
+        plan_memory(graph, timeline, index, state, &tasks)
+    })
 }
 
-fn select_lanes(graph: &SemanticGraph, timeline: &Timeline, tasks: &mut [PhysicalTask]) {
+fn select_lanes(
+    graph: &SemanticGraph,
+    timeline: &Timeline,
+    windows: &[(u32, u32)],
+    tasks: &mut [PhysicalTask],
+) {
     use super::semantic_graph::StateEffectKind;
     let Some(source) = &timeline.visibility else {
         return;
@@ -353,7 +344,7 @@ fn select_lanes(graph: &SemanticGraph, timeline: &Timeline, tasks: &mut [Physica
                     .outputs
                     .iter()
                     .any(|o| o.kind == OutputKind::Sampler)
-                || t.anchor_id >= t.deadline
+                || t.anchor_id + 1 >= windows[t.task_id as usize].1
         })
         || tasks[..first].iter().any(|t| {
             graph.tasks[t.task_id as usize]
@@ -364,17 +355,20 @@ fn select_lanes(graph: &SemanticGraph, timeline: &Timeline, tasks: &mut [Physica
     {
         return;
     }
-    let captured = tasks[first..].iter().all(|task| {
-        let semantic = &graph.tasks[task.task_id as usize];
-        semantic.math.is_none()
-            || semantic.implementations.iter().any(|candidate| {
-                candidate.implementation_id == task.implementation_id
-                    && candidate
-                        .required_capabilities
-                        .iter()
-                        .any(|cap| cap == "compute/cuda_graph@1")
-            })
-    });
+    // Explicit cross-step task events keep every task on the main lane on this backend.
+    let cross_step = graph.edges.iter().any(|edge| edge.step_distance != 0);
+    let captured = !cross_step
+        && tasks[first..].iter().all(|task| {
+            let semantic = &graph.tasks[task.task_id as usize];
+            semantic.math.is_none()
+                || semantic.implementations.iter().any(|candidate| {
+                    candidate.implementation_id == task.implementation_id
+                        && candidate
+                            .required_capabilities
+                            .iter()
+                            .any(|cap| cap == "compute/cuda_graph@1")
+                })
+        });
     for (position, task) in tasks.iter_mut().enumerate() {
         if position >= first {
             task.lane = if captured { Lane::Side } else { Lane::Main };
@@ -386,99 +380,18 @@ fn select_lanes(graph: &SemanticGraph, timeline: &Timeline, tasks: &mut [Physica
     }
 }
 
-/// Check the supplied witness without selecting another implementation or placement.
-fn check_placement(
+/// Size every value, workspace and reservation of the placed tasks, release temporaries after their last
+/// use, and check the peak against the memory budget.
+fn plan_memory(
     graph: &SemanticGraph,
     timeline: &Timeline,
     index: &GraphIndex,
     state: Option<&StateRepresentationDecision>,
     tasks: &[PhysicalTask],
 ) -> Result<Solution, String> {
-    if tasks.len() != graph.tasks.len() {
-        return Err("placement must cover every task exactly once".into());
-    }
-    if tasks.iter().any(|t| {
-        t.task_id as usize >= graph.tasks.len() || t.anchor_id as usize >= timeline.anchors.len()
-    }) {
-        return Err("placement references an unknown task or anchor".into());
-    }
-    if graph.edges.iter().any(|e| e.step_distance != 0)
-        && tasks.iter().any(|t| t.lane == Lane::Side)
-    {
-        return Err("explicit cross-step task events require the main lane on this backend".into());
-    }
-    for edge in &graph.edges {
-        let point = |name: &str| {
-            tasks
-                .iter()
-                .find(|t| {
-                    graph
-                        .tasks
-                        .get(t.task_id as usize)
-                        .is_some_and(|s| s.symbol == name)
-                })
-                .map(|t| i64::from(t.anchor_id))
-        };
-        let shift = edge
-            .step_distance
-            .checked_mul(timeline.anchors.len() as i64)
-            .and_then(|d| i64::from(edge.separation).checked_sub(d))
-            .ok_or("step distance overflows i64")?;
-        let bound = point(&edge.source)
-            .and_then(|p| p.checked_add(shift))
-            .ok_or("placement omits an edge source")?;
-        if point(&edge.target).is_none_or(|p| p < bound) {
-            return Err("placement violates a shifted dependency".into());
-        }
-    }
-    let mut expected = tasks.to_vec();
-    for task in &mut expected {
-        task.lane = Lane::Main;
-        task.read_origin = ReadOrigin::Entry;
-        task.read_distance = 0;
-    }
-    select_lanes(graph, timeline, &mut expected);
-    for (task, eligible) in tasks.iter().zip(&expected) {
-        let id = task.task_id as usize;
-        if id >= tasks.len()
-            || tasks.iter().any(|t| t.lane == Lane::Side) && task.lane != eligible.lane
-            || task.read_origin != eligible.read_origin
-            || task.read_distance != eligible.read_distance
-            || task.earliest != index.windows[id].0
-            || task.deadline < task.anchor_id
-            || task.deadline >= index.windows[id].1
-            || task.wait_for
-                != index.predecessors[id]
-                    .iter()
-                    .map(|&p| p as u32)
-                    .collect::<Vec<_>>()
-        {
-            return Err(
-                "placement lane, read origin, event edge or deadline differs from its dependencies"
-                    .into(),
-            );
-        }
-    }
-    let mut positions = vec![usize::MAX; tasks.len()];
+    let mut positions = vec![0; tasks.len()];
     for (position, task) in tasks.iter().enumerate() {
-        let id = task.task_id as usize;
-        if id >= tasks.len()
-            || positions[id] != usize::MAX
-            || task.anchor_id < index.windows[id].0
-            || task.anchor_id >= index.windows[id].1
-            || position > 0 && tasks[position - 1].anchor_id > task.anchor_id
-        {
-            return Err("placement has an invalid task identity, order or window".into());
-        }
-        positions[id] = position;
-    }
-    for (id, parents) in index.predecessors.iter().enumerate() {
-        if parents
-            .iter()
-            .any(|&parent| positions[parent] >= positions[id])
-        {
-            return Err("placement violates a result or exact-version dependency".into());
-        }
+        positions[task.task_id as usize] = position;
     }
     if (!timeline.reserved_bytes.is_empty()
         && timeline.reserved_bytes.len() != timeline.anchors.len())

@@ -279,9 +279,6 @@ class PhysicalTask:
     lane: Literal["main", "side"] = "main"
     read_origin: Literal["entry", "boundary", "latest"] = "entry"
     read_distance: int = 0
-    earliest: int = 0
-    deadline: int = 0
-    wait_for: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
