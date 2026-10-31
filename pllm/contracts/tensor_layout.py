@@ -58,7 +58,6 @@ class TensorFieldSpec:
 class TensorLayoutSpec:
     namespace: str
     fields: tuple[TensorFieldSpec, ...]
-    schema_version: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +69,6 @@ class StateTensorLayout:
 @dataclass(frozen=True, slots=True)
 class TensorLayoutRequest:
     layouts: tuple[StateTensorLayout, ...]
-    schema_version: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,7 +80,6 @@ class TensorLayoutBinding:
 @dataclass(frozen=True, slots=True)
 class TensorLayoutDecision:
     bindings: tuple[TensorLayoutBinding, ...]
-    schema_version: int = 1
 
 
 __all__ = [

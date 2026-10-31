@@ -1,4 +1,4 @@
-"""Shared immutable graph/plan data; Rust owns semantic validation at compilation."""
+"""Shared immutable graph/plan data; Rust checks the declaration facts a user can get wrong at compilation."""
 
 from __future__ import annotations
 
@@ -225,7 +225,6 @@ class SemanticGraph:
     execution_parameters_digest: str
     states: tuple[SemanticState, ...] = ()
     edges: tuple[SemanticEdge, ...] = ()
-    schema_version: int = 1
     input_groups: tuple[ConditionalInputGroup, ...] = ()
     model_reads: tuple[StateResource, ...] = ()
 
@@ -261,7 +260,6 @@ class TaskResourceFact:
 class SchedulerTimeline:
     anchors: tuple[TimelineAnchor, ...]
     capabilities: tuple[str, ...] = ()
-    schema_version: int = 1
     value_resources: tuple[ValueResourceFact, ...] = ()
     task_resources: tuple[TaskResourceFact, ...] = ()
     memory_budget_bytes: int | None = None

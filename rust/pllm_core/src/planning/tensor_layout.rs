@@ -4,13 +4,11 @@
 //! canonical descriptor bytes, so equal layouts share an ID independently of
 //! request or graph ordering.
 
-use super::semantic_graph::{canonical_ascii_json, require_text};
+use super::semantic_graph::canonical_ascii_json;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-
-const SCHEMA_VERSION: u64 = 1;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) enum TensorDType {
@@ -32,6 +30,8 @@ pub(crate) enum TensorDType {
     Float64,
 }
 
+// Layout specs stay closed: their re-serialization is the identity that dense IDs intern, so a field
+// Rust did not decode would silently merge distinct layouts.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TensorFieldSpec {
@@ -46,80 +46,49 @@ pub(crate) struct TensorFieldSpec {
 pub(crate) struct TensorLayoutSpec {
     pub(crate) namespace: String,
     pub(crate) fields: Vec<TensorFieldSpec>,
-    schema_version: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub(crate) struct StateTensorLayout {
     pub(crate) resource: String,
     pub(crate) layout: TensorLayoutSpec,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub(crate) struct TensorLayoutRequest {
     pub(crate) layouts: Vec<StateTensorLayout>,
-    schema_version: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct TensorLayoutBinding {
     pub(crate) resource: String,
     pub(crate) layout_id: u32,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct TensorLayoutDecision {
     pub(crate) bindings: Vec<TensorLayoutBinding>,
-    schema_version: u64,
 }
 
 fn decode_request(payload: &str) -> Result<TensorLayoutRequest, String> {
     serde_json::from_str(payload).map_err(|source| format!("invalid TensorLayoutRequest: {source}"))
 }
 
-fn validate_layout(layout: &TensorLayoutSpec) -> Result<(), String> {
-    if layout.schema_version != SCHEMA_VERSION {
-        return Err(format!(
-            "unsupported tensor layout schema_version: {}",
-            layout.schema_version
-        ));
-    }
-    require_text(&layout.namespace, "layout.namespace")?;
-    if layout.fields.is_empty() {
-        return Err("tensor layout fields must be non-empty".to_owned());
-    }
-    for (expected_id, field) in layout.fields.iter().enumerate() {
-        if field.field_id != expected_id as u64 {
-            return Err("tensor layout field IDs must be dense and ordered".to_owned());
-        }
-        if field.alignment_bytes == 0 || !field.alignment_bytes.is_power_of_two() {
-            return Err("tensor field alignment must be a power of two".to_owned());
-        }
-    }
-    Ok(())
-}
-
+/// Check the layout facts a user declares on InstanceState/RequestState; field IDs and order are pllm's.
 fn validate_request(request: &TensorLayoutRequest) -> Result<(), String> {
-    if request.schema_version != SCHEMA_VERSION {
-        return Err(format!(
-            "unsupported TensorLayoutRequest schema_version: {}",
-            request.schema_version
-        ));
-    }
     for item in &request.layouts {
-        require_text(&item.resource, "layouts.resource")?;
-        validate_layout(&item.layout)?;
-    }
-    if request
-        .layouts
-        .windows(2)
-        .any(|pair| pair[0].resource >= pair[1].resource)
-    {
-        return Err("tensor layout request resources must be sorted unique".to_owned());
+        if item.layout.fields.is_empty() {
+            return Err(format!(
+                "state {:?} declares no tensor fields; give it at least one field",
+                item.resource
+            ));
+        }
+        if !(item.layout.fields.iter()).all(|field| field.alignment_bytes.is_power_of_two()) {
+            return Err(format!(
+                "state {:?}: set alignment= to a power of two",
+                item.resource
+            ));
+        }
     }
     Ok(())
 }
@@ -141,10 +110,7 @@ fn compile(request: &TensorLayoutRequest) -> Result<TensorLayoutDecision, String
             layout_id: distinct.iter().position(|d| *d == descriptor).unwrap() as u32,
         })
         .collect();
-    Ok(TensorLayoutDecision {
-        bindings,
-        schema_version: SCHEMA_VERSION,
-    })
+    Ok(TensorLayoutDecision { bindings })
 }
 
 #[pyfunction]
@@ -163,7 +129,7 @@ mod tests {
     use super::{compile, TensorLayoutRequest};
 
     fn request_json() -> String {
-        r#"{"layouts":[{"resource":"alpha","layout":{"namespace":"adapter","fields":[{"field_id":0,"shape":[2,4],"dtype":"float32","alignment_bytes":16}],"schema_version":1}},{"resource":"beta","layout":{"namespace":"adapter","fields":[{"field_id":0,"shape":[2,4],"dtype":"float32","alignment_bytes":16}],"schema_version":1}},{"resource":"gamma","layout":{"namespace":"adapter","fields":[{"field_id":0,"shape":[1],"dtype":"float32","alignment_bytes":16},{"field_id":1,"shape":[],"dtype":"float32","alignment_bytes":16}],"schema_version":1}}],"schema_version":1}"#.to_owned()
+        r#"{"layouts":[{"resource":"alpha","layout":{"namespace":"adapter","fields":[{"field_id":0,"shape":[2,4],"dtype":"float32","alignment_bytes":16}]}},{"resource":"beta","layout":{"namespace":"adapter","fields":[{"field_id":0,"shape":[2,4],"dtype":"float32","alignment_bytes":16}]}},{"resource":"gamma","layout":{"namespace":"adapter","fields":[{"field_id":0,"shape":[1],"dtype":"float32","alignment_bytes":16},{"field_id":1,"shape":[],"dtype":"float32","alignment_bytes":16}]}}]}"#.to_owned()
     }
 
     #[test]
@@ -171,7 +137,7 @@ mod tests {
         let request: TensorLayoutRequest = serde_json::from_str(&request_json()).unwrap();
         let decision = compile(&request).unwrap();
         let base_request: TensorLayoutRequest = serde_json::from_str(
-            r#"{"layouts":[{"resource":"alpha","layout":{"namespace":"adapter","fields":[{"field_id":0,"shape":[2,4],"dtype":"float32","alignment_bytes":16}],"schema_version":1}}],"schema_version":1}"#,
+            r#"{"layouts":[{"resource":"alpha","layout":{"namespace":"adapter","fields":[{"field_id":0,"shape":[2,4],"dtype":"float32","alignment_bytes":16}]}}]}"#,
         )
         .unwrap();
         let base_decision = compile(&base_request).unwrap();

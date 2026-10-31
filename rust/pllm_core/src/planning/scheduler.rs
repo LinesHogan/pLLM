@@ -1,9 +1,9 @@
-//! Select task points and lanes and check placement and memory witnesses.
+//! Select task points and lanes, and account the memory of the placed tasks.
 
 use super::semantic_graph::{
-    canonical_ascii_json, decode_graph, decode_timeline, validate_graph, validate_timeline,
-    ImplementationCandidate, InputSource, OutputKind, RequestKeyField, SemanticGraph,
-    StateEffectKind, StateScope, Timeline, VisibilityKind,
+    canonical_ascii_json, decode_graph, decode_timeline, validate_graph, ImplementationCandidate,
+    InputSource, OutputKind, RequestKeyField, SemanticGraph, StateEffectKind, StateScope, Timeline,
+    VisibilityKind,
 };
 use super::state_representation::{decode_decision as decode_state, StateRepresentationDecision};
 use super::version_hazards;
@@ -75,23 +75,21 @@ fn graph_index(
     timeline: &Timeline,
     state: Option<&StateRepresentationDecision>,
 ) -> Result<GraphIndex, String> {
-    let anchors = anchor_ids(timeline)?;
+    let anchors: HashMap<_, _> = (timeline.anchors.iter())
+        .enumerate()
+        .map(|(index, anchor)| (anchor.symbol.as_str(), index as u32))
+        .collect();
+    // Declared phases name backend anchors in order, so every window is non-empty.
     let mut windows: Vec<_> = graph
         .tasks
         .iter()
         .map(|task| {
-            let after = *anchors
-                .get(task.timing.after.as_str())
-                .ok_or_else(|| "task timing.after references an unknown anchor".to_owned())?;
-            let before = *anchors
-                .get(task.timing.before.as_str())
-                .ok_or_else(|| "task timing.before references an unknown anchor".to_owned())?;
-            if after >= before {
-                return Err("task timing window is empty".to_owned());
-            }
-            Ok((after, before))
+            (
+                anchors[task.timing.after.as_str()],
+                anchors[task.timing.before.as_str()],
+            )
         })
-        .collect::<Result<_, String>>()?;
+        .collect();
     let mut predecessors = vec![BTreeSet::new(); graph.tasks.len()];
     for edge in graph.edges.iter().filter(|e| e.step_distance == 0) {
         predecessors[task_index(graph, &edge.target)?].insert(task_index(graph, &edge.source)?);
@@ -195,7 +193,9 @@ fn propagate(
         }
         if lo.iter().zip(&hi).any(|(a, b)| a > b) {
             return Err(
-                "input availability and consumer deadline leave an empty task window".into(),
+                "a task reads a value (sampled tokens, hidden states or another task's \
+                 result) that exists only after its phase ends; declare it in a later phase"
+                    .into(),
             );
         }
         if !changed {
@@ -210,19 +210,6 @@ fn propagate(
         }
     }
     unreachable!()
-}
-
-fn anchor_ids(timeline: &Timeline) -> Result<HashMap<&str, u32>, String> {
-    timeline
-        .anchors
-        .iter()
-        .enumerate()
-        .map(|(index, anchor)| {
-            let dense = u32::try_from(index)
-                .map_err(|_| "canonical schedule anchor IDs exhausted u32".to_owned())?;
-            Ok((anchor.symbol.as_str(), dense))
-        })
-        .collect()
 }
 
 struct ValueUse {
@@ -371,28 +358,12 @@ fn plan_memory(
     for (position, task) in tasks.iter().enumerate() {
         positions[task.task_id as usize] = position;
     }
-    if (!timeline.reserved_bytes.is_empty()
-        && timeline.reserved_bytes.len() != timeline.anchors.len())
-        || timeline
-            .task_resources
-            .windows(2)
-            .any(|pair| pair[0].task >= pair[1].task)
-        || timeline
-            .value_resources
-            .windows(2)
-            .any(|pair| (&pair[0].task, &pair[0].output) >= (&pair[1].task, &pair[1].output))
-    {
-        return Err(
-            "placement resource facts require exact anchor coverage and sorted unique identities"
-                .into(),
-        );
-    }
     let mut workspace = vec![0; graph.tasks.len()];
     for fact in &timeline.task_resources {
         let task = graph
             .tasks
             .binary_search_by(|task| task.symbol.cmp(&fact.task))
-            .map_err(|_| "placement workspace references an unknown task")?;
+            .expect("workspace facts name declared tasks");
         workspace[task] = fact.workspace_bytes;
     }
     let mut values = Vec::new();
@@ -402,9 +373,6 @@ fn plan_memory(
                 .value_resources
                 .iter()
                 .find(|fact| fact.task == task.symbol && fact.output == output.name);
-            if timeline.memory_budget_bytes.is_some() && fact.is_none() {
-                return Err("memory-constrained placement requires every output size, including explicit zero-byte values".into());
-            }
             let mut users: BTreeSet<_> = graph.tasks.iter().enumerate().filter_map(|(user, task)|
                 task.inputs.iter().any(|input| matches!(&input.source,
                     InputSource::Result { task, output: name } if task == &graph.tasks[producer].symbol && name == &output.name))
@@ -429,31 +397,6 @@ fn plan_memory(
             });
         }
     }
-    if timeline.memory_budget_bytes.is_some() && timeline.task_resources.len() != graph.tasks.len()
-    {
-        return Err("memory-constrained placement requires every task workspace size".into());
-    }
-    for fact in &timeline.value_resources {
-        if !graph.tasks.iter().any(|task| {
-            task.symbol == fact.task && task.outputs.iter().any(|output| output.name == fact.output)
-        }) {
-            return Err("placement value size references an unknown output".into());
-        }
-    }
-    values
-        .iter()
-        .map(|value| value.bytes)
-        .chain(workspace.iter().copied())
-        .chain(
-            timeline
-                .task_resources
-                .iter()
-                .map(|fact| fact.resident_bytes),
-        )
-        .chain(timeline.reserved_bytes.iter().copied())
-        .chain(state.map(|plan| plan.reserved_bytes))
-        .try_fold(0_u64, |sum, bytes| sum.checked_add(bytes))
-        .ok_or("placement resource envelope overflows u64")?;
     let mut planned = tasks.to_vec();
     for task in &mut planned {
         task.release_values.clear();
@@ -559,7 +502,13 @@ pub(super) fn compile(
     state: Option<&StateRepresentationDecision>,
 ) -> Result<ScheduleDecision, String> {
     validate_graph(graph)?;
-    validate_timeline(timeline)?;
+    debug_assert!(
+        timeline
+            .capabilities
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]),
+        "capabilities are sorted for binary search"
+    );
     let index = graph_index(graph, timeline, state)?;
     fn choose<'a>(
         graph: &'a SemanticGraph,
@@ -759,7 +708,7 @@ mod tests {
             }
         }
         let mut timeline = decode_timeline(&json!({
-            "schema_version":1, "capabilities":["compute/cuda@1"],
+            "capabilities":["compute/cuda@1"],
             "anchors":vec!["request.prepare","model.execute","state.publish","sampler.pre_draw","sampler.complete","token.commit","request.finish","next.prepare"]
                 .into_iter().enumerate().map(|(i,s)| json!({"symbol":s,"ordinal":i})).collect::<Vec<_>>(),
             "visibility":{"policy":{"kind":"step_lag"},"scope":"post_sampler","equations_digest":"retained-step-inputs@1","resources":[],"chunk_size":0,"tail":"transition","lag":2},
@@ -853,7 +802,7 @@ mod tests {
                 })).unwrap());
             }
             let mut timeline = decode_timeline(&json!({
-                "schema_version":1, "capabilities":[], "reserved_bytes":[9,0,0,0],
+                "capabilities":[], "reserved_bytes":[9,0,0,0],
                 "anchors":(0..4).map(|i| json!({"symbol":format!("a{i}"),"ordinal":i})).collect::<Vec<_>>(),
                 "value_resources":(0..3).map(|i| json!({"task":format!("t{i}"),"output":"value","bytes":sizes[i]})).collect::<Vec<_>>(),
                 "task_resources":(0..3).map(|i| json!({"task":format!("t{i}"),"workspace_bytes":scratch[i],"resident_bytes":1})).collect::<Vec<_>>()
@@ -889,7 +838,7 @@ mod tests {
     #[test]
     fn versioned_state_hazards_and_timing_match_oracle() {
         let timeline = decode_timeline(&json!({
-            "schema_version": 1, "capabilities": [],
+            "capabilities": [],
             "anchors": (0..4).map(|i| json!({"symbol": format!("a{i}"), "ordinal": i})).collect::<Vec<_>>()
         }).to_string()).unwrap();
         let state = super::decode_state(&json!({
@@ -1013,7 +962,7 @@ mod tests {
             }])).unwrap();
         }
         let timeline = decode_timeline(&json!({
-            "schema_version": 1, "capabilities": [], "memory_budget_bytes": 100,
+            "capabilities": [], "memory_budget_bytes": 100,
             "reserved_bytes": [0, 0, 24, 0],
             "anchors": (0..4).map(|anchor| json!({"symbol": format!("a{anchor}"), "ordinal": anchor})).collect::<Vec<_>>(),
             "value_resources": (0..3).map(|task| json!({"task": format!("t{task}"), "output": "value", "bytes": if task == 0 {8} else {32}})).collect::<Vec<_>>(),
@@ -1033,7 +982,6 @@ mod tests {
         graph.tasks[1].timing.before = "a2".into();
         graph.tasks[2].timing.after = "a2".into();
         graph.tasks[2].outputs[0].kind = super::super::semantic_graph::OutputKind::Host;
-        graph.tasks[2].outputs[0].schema = "test.result@1".into();
         let ordinary = compile(&graph, &roomy, None).unwrap();
         assert_eq!(ordinary.peak_memory_bytes, 104);
         for task in &mut graph.tasks[1..] {
@@ -1060,7 +1008,7 @@ mod tests {
     fn graph_fixture() -> crate::planning::semantic_graph::SemanticGraph {
         decode_graph(&json!({
             "workload_id": "oracle", "execution_parameters_digest": "a".repeat(64),
-            "schema_version": 1, "input_groups": [], "edges": [], "states": [],
+            "input_groups": [], "edges": [], "states": [],
             "tasks": (0..3).map(|i| json!({
                 "symbol": format!("t{i}"), "timing": {"after": "a0", "before": "a3"},
                 "inputs": [], "outputs": [{"name": "value", "kind": "temporary", "schema": ""}],
@@ -1072,7 +1020,7 @@ mod tests {
     fn check_exhaustive_graphs() {
         use crate::planning::semantic_graph::{InputSource, SemanticEdge, TypedInput};
         let timeline = decode_timeline(&json!({
-            "schema_version": 1, "capabilities": [],
+            "capabilities": [],
             "anchors": (0..4).map(|i| json!({"symbol": format!("a{i}"), "ordinal": i})).collect::<Vec<_>>()
         }).to_string()).unwrap();
         let windows = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
@@ -1177,11 +1125,11 @@ mod tests {
     fn scheduler_matches_exhaustive_small_dag_oracle() {
         check_exhaustive_graphs();
         let graph = decode_graph(
-            r#"{"workload_id":"esamp.request","execution_parameters_digest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","tasks":[{"symbol":"predict","timing":{"after":"begin","before":"decode"},"inputs":[{"name":"hidden","source":{"kind":"hidden","layer":0,"site":"block_output","phase":"decode"}},{"name":"rows","source":{"kind":"packed_rows"}},{"name":"sampler_rows","source":{"kind":"packed_sampler_rows"}},{"name":"selection","source":{"kind":"state_selection","resource":"request_distiller","phase":"decode"}}],"outputs":[{"name":"guidance","kind":"sampler","schema":""},{"name":"loss_batch","kind":"temporary","schema":""}],"effects":[{"resource":"request_distiller","kind":"read"}],"implementations":[{"implementation_id":"esamp:cpu@1","execution_kind":"native_task","required_capabilities":["cpu"]},{"implementation_id":"esamp:gpu@1","execution_kind":"native_task","required_capabilities":["cuda"]}]},{"symbol":"train","timing":{"after":"decode","before":"end"},"inputs":[{"name":"loss_batch","source":{"kind":"result","task":"predict","output":"loss_batch"}},{"name":"selection","source":{"kind":"state_selection","resource":"request_distiller","phase":"decode"}}],"outputs":[],"effects":[{"resource":"request_distiller","kind":"update"}],"implementations":[{"implementation_id":"esamp:train@1","execution_kind":"native_task","required_capabilities":[]}]}],"input_groups": [], "edges":[{"source":"predict","target":"train"}],"states":[{"resource":"request_distiller","scope":"request","key_fields":["request_id"]}],"schema_version":1}"#,
+            r#"{"workload_id":"esamp.request","execution_parameters_digest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","tasks":[{"symbol":"predict","timing":{"after":"begin","before":"decode"},"inputs":[{"name":"hidden","source":{"kind":"hidden","layer":0,"site":"block_output","phase":"decode"}},{"name":"rows","source":{"kind":"packed_rows"}},{"name":"sampler_rows","source":{"kind":"packed_sampler_rows"}},{"name":"selection","source":{"kind":"state_selection","resource":"request_distiller","phase":"decode"}}],"outputs":[{"name":"guidance","kind":"sampler","schema":""},{"name":"loss_batch","kind":"temporary","schema":""}],"effects":[{"resource":"request_distiller","kind":"read"}],"implementations":[{"implementation_id":"esamp:cpu@1","execution_kind":"native_task","required_capabilities":["cpu"]},{"implementation_id":"esamp:gpu@1","execution_kind":"native_task","required_capabilities":["cuda"]}]},{"symbol":"train","timing":{"after":"decode","before":"end"},"inputs":[{"name":"loss_batch","source":{"kind":"result","task":"predict","output":"loss_batch"}},{"name":"selection","source":{"kind":"state_selection","resource":"request_distiller","phase":"decode"}}],"outputs":[],"effects":[{"resource":"request_distiller","kind":"update"}],"implementations":[{"implementation_id":"esamp:train@1","execution_kind":"native_task","required_capabilities":[]}]}],"input_groups": [], "edges":[{"source":"predict","target":"train"}],"states":[{"resource":"request_distiller","scope":"request","key_fields":["request_id"]}]}"#,
         )
         .unwrap();
         let timeline = decode_timeline(
-            r#"{"anchors":[{"symbol":"begin","ordinal":0},{"symbol":"decode","ordinal":1},{"symbol":"end","ordinal":2}],"capabilities":["cpu"],"schema_version":1}"#,
+            r#"{"anchors":[{"symbol":"begin","ordinal":0},{"symbol":"decode","ordinal":1},{"symbol":"end","ordinal":2}],"capabilities":["cpu"]}"#,
         )
         .unwrap();
         let decision = compile(&graph, &timeline, None).unwrap();

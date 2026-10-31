@@ -4,13 +4,8 @@
 //! no workload names, Tensor objects, Python callbacks, or runtime handles.
 
 use super::scheduler::{self, ScheduleDecision};
-use super::semantic_graph::{
-    require_sorted_unique_text, require_text, validate_graph, validate_timeline, SemanticGraph,
-    Timeline,
-};
+use super::semantic_graph::{validate_graph, SemanticGraph, Timeline};
 use serde::{Deserialize, Serialize};
-
-const SCHEMA_VERSION: u64 = 1;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -50,7 +45,6 @@ pub(crate) struct StateRepresentationRequest {
     memory_budget_bytes: u64,
     states: Vec<StateLayoutRequirement>,
     pub(crate) candidates: Vec<StateProviderPlan>,
-    schema_version: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -70,62 +64,7 @@ pub(crate) fn decode_decision(payload: &str) -> Result<StateRepresentationDecisi
         .map_err(|source| format!("invalid StateRepresentationDecision: {source}"))
 }
 
-fn validate_requirement(requirement: &StateLayoutRequirement) -> Result<(), String> {
-    require_text(&requirement.resource, "states.resource")?;
-    if requirement.max_admitted_lineages == 0 {
-        return Err("states.max_admitted_lineages must be positive".to_owned());
-    }
-    require_sorted_unique_text(
-        &requirement.required_capabilities,
-        "states.required_capabilities",
-    )
-}
-
-fn validate_candidate(candidate: &StateProviderPlan) -> Result<(), String> {
-    require_text(&candidate.resource, "candidates.resource")?;
-    require_text(&candidate.provider_id, "candidates.provider_id")?;
-    if candidate.device_kind == StateDeviceKind::Cpu && candidate.device_ordinal != 0 {
-        return Err("CPU state provider device ordinal must be zero".to_owned());
-    }
-    if candidate.max_admitted_lineages == 0
-        || candidate.page_capacity < candidate.max_admitted_lineages
-        || candidate.root_page_count == 0
-    {
-        return Err("state provider capacity facts must be positive".to_owned());
-    }
-    require_sorted_unique_text(&candidate.capabilities, "candidates.capabilities")
-}
-
 fn validate_request(request: &StateRepresentationRequest) -> Result<(), String> {
-    if request.schema_version != SCHEMA_VERSION {
-        return Err(format!(
-            "unsupported StateRepresentationRequest schema_version: {}",
-            request.schema_version
-        ));
-    }
-    for requirement in &request.states {
-        validate_requirement(requirement)?;
-    }
-    if request
-        .states
-        .windows(2)
-        .any(|pair| pair[0].resource >= pair[1].resource)
-    {
-        return Err("request states must be sorted by unique resource".to_owned());
-    }
-
-    for candidate in &request.candidates {
-        validate_candidate(candidate)?;
-    }
-    if request.candidates.windows(2).any(|pair| {
-        (pair[0].resource.as_str(), pair[0].provider_id.as_str())
-            >= (pair[1].resource.as_str(), pair[1].provider_id.as_str())
-    }) {
-        return Err(
-            "state provider candidates must be sorted by unique resource/provider_id".to_owned(),
-        );
-    }
-
     for candidate in &request.candidates {
         let requirement = request
             .states
@@ -186,7 +125,6 @@ pub(super) fn compile(
 ) -> Result<(StateRepresentationDecision, ScheduleDecision), String> {
     validate_request(request)?;
     validate_graph(graph)?;
-    validate_timeline(timeline)?;
     // Candidate catalogs are sorted. Strict score improvement therefore also
     // gives a stable provider-key tie-break without another decision ledger.
     fn choose(
@@ -286,7 +224,6 @@ mod tests {
         undersized["page_capacity"] = json!(1);
         for late_read in [false, true] {
             let graph = decode_graph(&json!({
-                "schema_version": 1, "workload_id": "joint", "execution_parameters_digest": "c".repeat(64),
                 "input_groups": [], "edges": [], "states": (["state", "unused"].map(|resource| json!({
                     "resource": resource, "scope": "instance", "key_fields": []}))),
                 "tasks": (["read", "update"].iter().enumerate().map(|(task, kind)| {
@@ -298,14 +235,14 @@ mod tests {
             }).to_string()).unwrap();
             for arena_budget in [0, 8, 16, 24, 32] {
                 let request = decode_request(&json!({
-                    "schema_version": 1, "memory_budget_bytes": arena_budget,
+                    "memory_budget_bytes": arena_budget,
                     "states": [requirement("state"), requirement("unused")],
                     "candidates": [undersized, candidate("state", "cow", 16, true), candidate("state", "mutable", 8, false),
                         candidate("unused", "large", 5, false), candidate("unused", "small", 3, false)]
                 }).to_string()).unwrap();
                 for memory_budget in [8, 16, 20, 24, 28, 32, 40] {
                     let timeline = decode_timeline(&json!({
-                        "schema_version": 1, "capabilities": [], "memory_budget_bytes": memory_budget,
+                        "capabilities": [], "memory_budget_bytes": memory_budget,
                         "anchors": (0..3).map(|i| json!({"symbol": format!("a{i}"), "ordinal": i})).collect::<Vec<_>>(),
                         "task_resources": (["read", "update"].map(|task| json!({"task": task, "workspace_bytes": 4}))),
                         "reserved_bytes": [5, 0, 0]

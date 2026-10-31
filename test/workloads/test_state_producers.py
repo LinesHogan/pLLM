@@ -304,7 +304,7 @@ def test_initialized_reader_and_hidden_before_model_boundary():
         )
 
 
-def test_backend_points_and_compile_rejects_unknown_anchor():
+def test_tasks_run_at_backend_points():
     from pllm.contracts.semantic_graph import AnchorSymbol, TimingConstraint
     from pllm.execution.scheduler import compile_schedule
 
@@ -320,12 +320,3 @@ def test_backend_points_and_compile_rejects_unknown_anchor():
     )
     decision = compile_schedule(constrained, plan.timeline, state=plan.states)
     assert all(plan.timeline.anchors[task.anchor_id].symbol == "state.publish" for task in decision.tasks)
-    undeclared = replace(
-        constrained,
-        tasks=tuple(
-            replace(task, timing=TimingConstraint(AnchorSymbol("model.layer.8"), AnchorSymbol("sampler.pre_draw")))
-            for task in constrained.tasks
-        ),
-    )
-    with pytest.raises(ValueError, match="unknown anchor"):
-        compile_schedule(undeclared, plan.timeline, state=plan.states)

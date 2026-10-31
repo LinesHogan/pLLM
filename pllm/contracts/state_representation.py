@@ -45,7 +45,6 @@ class StateRepresentationRequest:
     memory_budget_bytes: int
     states: tuple[StateLayoutRequirement, ...]
     candidates: tuple[StateProviderPlan, ...]
-    schema_version: int = 1
 
 
 @dataclass(frozen=True, slots=True)

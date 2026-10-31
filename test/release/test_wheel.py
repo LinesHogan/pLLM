@@ -84,8 +84,8 @@ distribution = importlib.metadata.Distribution.at(installed / sys.argv[2])
 assert not any(e.group == 'vllm.general_plugins' for e in distribution.entry_points)
 requirements = [Requirement(value) for value in distribution.requires or ()]
 assert any(req.name == 'torch' and req.marker is None for req in requirements)
-request = json.dumps({'schema_version': 1, 'layouts': [{
-    'resource': 'wheel', 'layout': {'namespace': 'wheel', 'schema_version': 1,
+request = json.dumps({'layouts': [{
+    'resource': 'wheel', 'layout': {'namespace': 'wheel',
     'fields': [{'field_id': 0, 'shape': [2, 4], 'dtype': 'float32',
     'alignment_bytes': 16}]}}]})
 decision = _core.intern_tensor_layouts(request)
