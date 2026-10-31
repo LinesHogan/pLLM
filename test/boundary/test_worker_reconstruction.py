@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from examples.huber import HuberWorkload
-from pllm import ExecutionOptions, make_llm
+from pllm import ExecutionOptions
 from pllm.backends.vllm.prefix_cache import CachePolicy
 from pllm.backends.vllm.runtime import BackendInstall
 from pllm.contracts.codec import decode_boundary, encode_boundary
@@ -17,7 +17,7 @@ from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.host import HostRuntimeFacts
+from pllm.host import HostConfig, make_host
 from pllm.worker import GPUWorker
 from pllm.workload_transport import decode_workload, encode_workload
 from pllm.workloads.dummy import DummyWorkload
@@ -64,8 +64,8 @@ def test_workload_transport_round_trips_workloads_and_rejects_what_the_worker_ca
 
 
 def _plan() -> PlanBundle:
-    config = HostRuntimeFacts(torch.device("cpu"), hidden_size=4)
-    return make_llm(workload=TTRLWorkload(TTRLConfig(rank=2)), config=config).arena.plan
+    config = HostConfig(torch.device("cpu"), hidden_size=4)
+    return make_host(config, TTRLWorkload(TTRLConfig(rank=2))).arena.plan
 
 
 def test_plan_bundle_codec_round_trips_and_rejects_injected_fields() -> None:

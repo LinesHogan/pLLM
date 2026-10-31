@@ -1,4 +1,4 @@
-"""Public factory for model-backed and host workloads."""
+"""Workload authoring vocabulary and the model entry point; host loops start from pllm.host.make_host."""
 
 from __future__ import annotations
 
@@ -10,10 +10,6 @@ from pllm.config import (
     ExecutionOptions as ExecutionOptions,
     KVOffload as KVOffload,
     ModelConfig as ModelConfig,
-)
-from pllm.execution.host_runtime import (
-    HostRuntimeFacts,
-    HostWorkload,
 )
 from pllm.execution.scan import scan as scan
 from pllm.execution.token_program import Layers as Layers, Taps as Taps
@@ -62,11 +58,6 @@ if TYPE_CHECKING:
 
 D = TypeVar("D")
 R = TypeVar("R")
-C = TypeVar("C")
-
-
-@overload
-def make_llm(config: HostRuntimeFacts, *, workload: HostWorkload[C]) -> C: ...
 
 
 @overload
@@ -77,24 +68,14 @@ def make_llm(config: ModelConfig, *, workload: BackendWorkload[D, R]) -> VllmLlm
 def make_llm(config: ModelConfig, *, workload: None = None) -> LLM: ...
 
 
-def make_llm(
-    config: ModelConfig | HostRuntimeFacts, *, workload: BackendWorkload[D, R] | HostWorkload[C] | None = None
-) -> LLM | VllmLlm[D, R] | C:
-    from pllm.authoring import BackendWorkload
-    from pllm.execution.host_runtime import HostWorkload
-
-    if isinstance(config, HostRuntimeFacts):
-        if not isinstance(workload, HostWorkload):
-            raise TypeError("host execution requires a host workload")
-        return workload.compile_host(config)
+def make_llm(config: ModelConfig, *, workload: BackendWorkload[D, R] | None = None) -> LLM | VllmLlm[D, R]:
+    """A vLLM engine for `config`, running `workload` inside it; plain vLLM `LLM` without a workload."""
     if workload is None:
         if config.execution != ExecutionOptions():
             raise ValueError("workload execution options require a workload")
         from pllm.backends.vllm.runtime import vllm_engine
 
         return vllm_engine(config, {"worker_cls": "auto"})
-    if not isinstance(workload, BackendWorkload):
-        raise TypeError("model execution requires a backend workload")
     from pllm.backends.vllm.runtime import create_vllm_llm
 
     definition = None

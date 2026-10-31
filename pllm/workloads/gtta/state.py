@@ -1,4 +1,4 @@
-"""Deterministic instance-owned GTTA dynamics memory."""
+"""GTTA's dynamics memory: EMA scores per (task, state, action) and the event history queries rank from."""
 
 from __future__ import annotations
 
@@ -9,10 +9,8 @@ from itertools import islice
 from pllm.workloads.gtta.types import (
     DynamicsEvent,
     GTTAConfig,
-    GTTAHostTransaction,
     GTTAQuery,
     GTTAQueryResult,
-    GTTAResult,
     GTTATrajectoryBatch,
     GTTAUpdateReceipt,
     PromptContext,
@@ -40,13 +38,6 @@ class GTTADynamicsState:
     @property
     def version(self) -> int:
         return self._version
-
-    def prepare(self, transaction: GTTAHostTransaction) -> GTTAStepContext:
-        return GTTAStepContext(transaction, self)
-
-    def output(self, context: GTTAStepContext) -> GTTAResult:
-        assert context.result is not None
-        return context.result
 
     def snapshot(self) -> GTTADynamicsSnapshot:
         return GTTADynamicsSnapshot(
@@ -122,25 +113,3 @@ class GTTADynamicsState:
             records,
             PromptContext(query.prompt_idx, context, query.position),
         )
-
-
-@dataclass(slots=True)
-class GTTAStepContext:
-    transaction: GTTAHostTransaction
-    dynamics: GTTADynamicsState
-    update: GTTAUpdateReceipt | None = None
-    queried: GTTAQueryResult | None = None
-    result: GTTAResult | None = None
-
-
-def update(config: GTTAConfig, context: GTTAStepContext) -> None:
-    context.update = context.dynamics.update(context.transaction.trajectories, config)
-
-
-def query(context: GTTAStepContext) -> None:
-    context.queried = context.dynamics.query(context.transaction.query)
-
-
-def publish(context: GTTAStepContext) -> None:
-    assert context.update is not None and context.queried is not None
-    context.result = GTTAResult(context.transaction.transaction_id, context.update, context.queried)

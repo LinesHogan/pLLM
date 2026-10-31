@@ -1,4 +1,4 @@
-"""Closed values for the clean-room FTTT host-service vertical."""
+"""FTTT's values: configuration, judge results, queued feedback, settlement intent and the per-step result."""
 
 from __future__ import annotations
 
@@ -115,7 +115,9 @@ class FTTTClosedLoopIntent:
 
 
 @dataclass(frozen=True, slots=True)
-class FTTTHostTransaction:
+class FTTTQueuedFeedback:
+    """One judged completion batch waiting for its edit step: the rows to train and what settles afterwards."""
+
     batch: CompletionInput
     selected_rows: tuple[int, ...]
     intent: FTTTClosedLoopIntent
@@ -125,7 +127,7 @@ __all__ = [
     "FTTTClosedLoopIntent",
     "FTTTConfig",
     "FTTTFeedbackRecord",
-    "FTTTHostTransaction",
+    "FTTTQueuedFeedback",
     "FTTTInstanceState",
     "FTTTJudgeResult",
     "FTTTLifecycleTransition",

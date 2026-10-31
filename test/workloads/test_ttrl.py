@@ -9,7 +9,6 @@ from dataclasses import replace
 import pytest
 import torch
 
-from pllm import make_llm
 from pllm.authoring import FunctionMath, TensorStepInput, WeightedRowBatch
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId
@@ -21,8 +20,9 @@ from pllm.host import (
     CompletionBatch,
     CompletionInput,
     FinishReason,
-    HostRuntimeFacts,
+    HostConfig,
     RetryAction,
+    make_host,
 )
 from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload, boxed_label, ttrl_rewards
 
@@ -47,7 +47,7 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
     for device in (torch.device("cpu"), *((torch.device("cuda", 0),) if torch.cuda.is_available() else ())):
         stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
         workload = TTRLWorkload(config)
-        facts = HostRuntimeFacts(
+        facts = HostConfig(
             device,
             hidden_size=4,
             initialization_seed=11,
@@ -55,11 +55,11 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
             max_input_rows=6,
             memory_budget_bytes=1 << 20,
         )
-        execution = make_llm(workload=workload, config=facts)
+        execution = make_host(facts, workload)
         plan = execution.arena.plan
         peak = plan.schedule.peak_memory_bytes
         with pytest.raises(ValueError):
-            make_llm(workload=workload, config=replace(facts, memory_budget_bytes=peak - 1))
+            make_host(replace(facts, memory_budget_bytes=peak - 1), workload)
         execution = workload.declare_host(replace(facts, memory_budget_bytes=peak)).compile()
         (initial,) = execution.admit((), stream)
         old_pin = execution.arena.pin_exact(StateRefs.of((initial,)), stream)
@@ -173,8 +173,8 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
     disabled = ttrl_rewards(CompletionInput.capture(completions, torch.zeros(6, 4)), replace(config, enabled=False))
     assert all(item.state is BarrierState.BLOCKED for item in disabled.update_barriers)
 
-    facts = HostRuntimeFacts(torch.device("cpu"), hidden_size=4, initialization_seed=11)
-    execution = TTRLWorkload(config).compile_host(facts)
+    facts = HostConfig(torch.device("cpu"), hidden_size=4, initialization_seed=11)
+    execution = make_host(facts, TTRLWorkload(config))
     (initial,) = execution.admit(())
     before = execution.snapshot(initial)
     zeros = torch.zeros(6, 4)

@@ -79,7 +79,6 @@ from pllm.execution.tensor_program import (
     native_body,
 )
 from pllm.execution.token_program import TokenProgram
-from pllm.execution.torch_private import MemoryUsage, measure
 from pllm.kernels.adamw import AdamWConfig
 
 D = TypeVar("D")
@@ -210,23 +209,8 @@ class Call:
         return TaskResultInputSource(self.symbol, name)
 
 
-def native(identity: str, *capabilities: str, host: bool = False) -> TaskImplementationSpec:
-    return TaskImplementationSpec(
-        ImplementationId(identity), ExecutionKind.HOST_SERVICE if host else ExecutionKind.NATIVE_TASK, capabilities
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class HostOperation(Generic[D]):
-    implementation_id: ImplementationId
-    function: Callable[[D], None]
-
-    def memory(self, context: D) -> MemoryUsage:
-        """Trace the same host entry point used by the executor."""
-        return measure(lambda: self.execute(context))
-
-    def execute(self, context: D) -> None:
-        self.function(context)
+def native(identity: str, *capabilities: str) -> TaskImplementationSpec:
+    return TaskImplementationSpec(ImplementationId(identity), ExecutionKind.NATIVE_TASK, capabilities)
 
 
 class Builder(Generic[D]):
@@ -239,7 +223,6 @@ class Builder(Generic[D]):
         self.dimensions = dimensions
         self.operations: dict[TaskSymbol, TensorOperation[D]] = {}
         self.publications: dict[TaskSymbol, PublishStateTask[D]] = {}
-        self.host_operations: dict[TaskSymbol, HostOperation[D]] = {}
         # Fields that start at zero in a fresh page pool, so admission need not write them (AdamW state other than
         # the parameters). Request-scoped pages are recycled and dirty, so only instance states qualify.
         self.zero_start_fields: dict[str, frozenset[int]] = {}
@@ -345,14 +328,12 @@ class Builder(Generic[D]):
         replay: TokenProgramEffect | None = None,
         math: MathContract | None = None,
         function: Callable[[D, TensorBatch], TaskOutput] | None = None,
-        host_function: Callable[[D], None] | None = None,
         operation_type: type[TensorOperation[D]] = TensorOperation,
         select: Callable[[D, RequestStateSelection], tuple[int, ...]] | None = None,
         optimizer: Optimizer | None = None,
     ) -> Call:
         if any(task.symbol == name for task in self.graph.tasks):
             raise ValueError(f"duplicate operation {name}")
-        assert function is None or host_function is None
         implementations = implementations or (native(f"{self.graph.workload_id}:{name}@1"),)
         effects = (
             reads
@@ -396,9 +377,6 @@ class Builder(Generic[D]):
                 optimizer=optimizer,
                 copy_fields=copy_fields,
             )
-        if host_function is not None:
-            assert len(implementations) == 1
-            self.host_operations[task.symbol] = HostOperation(implementations[0].implementation_id, host_function)
         return Call(task.symbol, outputs)
 
     def update_task(self, symbol: TaskSymbol, change: Callable[[SemanticTask], SemanticTask]) -> None:
@@ -406,10 +384,6 @@ class Builder(Generic[D]):
         self.graph = replace(
             self.graph, tasks=tuple(change(task) if task.symbol == symbol else task for task in self.graph.tasks)
         )
-
-    def bind_host(self) -> tuple[HostOperation[D], ...]:
-        assert set(self.host_operations) == {task.symbol for task in self.graph.tasks}
-        return tuple(self.host_operations[task.symbol] for task in self.graph.tasks)
 
     def bind(
         self, plan: PlanBundle | None = None, *, operations: Mapping[TaskSymbol, TensorOperation[D]]

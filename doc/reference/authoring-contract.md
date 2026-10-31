@@ -33,7 +33,7 @@
 [OverRIDE](../../pllm/workloads/override.py)、[In-Place-TTT](../../pllm/workloads/inplace_ttt.py)
 和 [ReFT](../../pllm/workloads/reft.py) 使用这个接口；[Recirculation](../../pllm/workloads/recirculation.py)
 使用普通的 `Recurrence` 声明；[TTRL](../../pllm/workloads/ttrl.py) 使用普通 `Workload`
-的宿主路径（奖励投票是宿主函数 `ttrl_rewards`）；FTTT 和 GTTA 使用结构化的 `transaction` 绑定；
+的宿主路径（奖励投票是宿主函数 `ttrl_rewards`）；FTTT 和 GTTA 是普通宿主类，其 `run` 作反馈回调；
 [TLM](../../pllm/workloads/tlm/workload.py) 使用普通 `Workload` 的因果批输入与模型端口；
 [ESamp](../../pllm/workloads/esamp_request.py) 使用普通具名参数、预测与 loss，
 并在同一张图上做显式分页/捕获替换；Output LoRA 使用普通 `Batch` 输入与多步 SGD。
@@ -401,11 +401,10 @@ Hidden 需求从声明推导。形状/dtype 回调只在模型事实可用后运
 
 ## 编写原生数学
 
-本节约束原生数学绑定（`bind_math` / `FunctionMath` / `TaskOutput`）与结构化
-宿主事务（`pllm.host.transaction`）。这是负载数学与执行层的接缝：流排序、捕获、
-私有分配、回滚与发布仍留在原始执行层，原生函数只拿到借来的操作数与显式
-授权的迁移根。空梯度与零梯度的区别、预算与成本声明的失败模式都在这里。
-给 FTTT / GTTA 这类宿主事务、或 ESamp / LoRA 的捕获内核写数学时读本节。
+本节约束原生数学绑定（`bind_math` / `FunctionMath` / `TaskOutput`）。这是负载数学与
+执行层的接缝：流排序、捕获、私有分配、回滚与发布仍留在原始执行层，原生函数只拿到
+借来的操作数与显式授权的迁移根。空梯度与零梯度的区别、预算与成本声明的失败模式
+都在这里。给 ESamp / LoRA 的捕获内核写数学时读本节。
 
 高级 `BackendWorkload.bind_math(facts, plan, declaration)` 把规划过的声明绑成原始 `MathBinding`。其
 `FunctionMath` 提供初始化、输入行选择、准备与结果构造；负载不构造执行器。
@@ -425,27 +424,15 @@ Hidden 需求从声明推导。形状/dtype 回调只在模型事实可用后运
 
 `InvocationOutput` 暴露原始引导与发布，允许在不拥有生命周期的情况下构造结果。
 `FunctionMath` 对输入/数据/结果类型泛型：完成与宿主负载不转换成纯张量 DTO。
-宿主事务继续使用既有宿主服务与 receipt 协议，不是第二个状态数据库或模型推理
-回调。
 
-结构化宿主事务用 `pllm.host.transaction(name, facts, config=config,
-state_factory=make_state, service=service, update=update, query=query,
-publish=publish)`。三个普通带类型函数接收同一原始上下文。共享绑定声明
-update-before-query-before-result 依赖与宿主时机窗口；调度仍由 Rust 完成。
-`publish` 只构造结果：原始协调器独自调用服务 commit 并结算其 receipt。
-状态与服务对象按身份保留，保持其既有 prepare/snapshot/restore/output 与
-begin/commit/abort 契约。不引入 TensorFrame 转换、拷贝的队列或第二个状态
-所有者。这些是显式原生函数绑定，不是自动微分或冻结的 Tensor 方法；改动其
-原生辅助实现需要重新绑定。见 [FTTT](../../pllm/workloads/fttt/workload.py) 与
-[GTTA](../../pllm/workloads/gtta/workload.py)，它们不再手写图、端口/模式字典或
-实现 ID。`declare_host` 仍提供设备检查与状态工厂。更一般的宿主数据流可用高级
-构建器。原始宿主执行器只在 Rust 准入后调用 `state_factory`，所以有限预算拒绝
-不会先分配状态。高级声明可以传其原始 `timeline`；它不能放松
-`HostRuntimeFacts.memory_budget_bytes`。FTTT 以 `max_input_rows` 与
-`memory_budget_bytes` 提供有限张量成本：参数/动量、回滚快照、活跃 hidden 输入、
-反馈特征、训练/查询工作区与结果存储。输入基数在快照前检查。队列存储、
-文本/judge/Python 分配与库 scratch 在这个按执行张量预算之外；GTTA 没有完整的
-Python 堆成本声明。
+宿主循环只有一种写法：反馈回调 `CompletionInput -> 反馈`（带 `retry_controls`、
+`update_barriers`、`update_count`）传给 `generate_feedback(feedback=...)`。需要框架管理的
+张量状态写成普通 `pllm.Workload`，用 `pllm.host.make_host(HostConfig(...), workload)` 编译，
+回调里 `step`。[FTTT](../../pllm/workloads/fttt/workload.py) 与
+[GTTA](../../pllm/workloads/gtta/workload.py) 是普通宿主类：`FTTTWorkload.run(batch)`
+评判、入队并训练一步低秩编辑（`step()` 只处理已排队的反馈），失败时恢复编辑并清空
+队列；`GTTAWorkload.run(request)` 把排队的环境事件并入动力学记忆再回答查询，失败时
+恢复记忆并把事件放回队首。旧的 `pllm.host.transaction`、receipt 与两阶段结算已移除。
 
 `Observation` 把选中行或身份出处带到既有 trace。显式有界导出用 `export=True`；
 可选的数学观测仍遵循原始 trace 选择。两者都不需要访问执行器或 arena。
@@ -453,7 +440,7 @@ Python 堆成本声明。
 ## Completion 学习
 
 本节说明 TTRL 这类“宿主侧算奖励、框架做优化器更新”的负载。它们是普通
-`pllm.Workload`，只是走宿主路径：`make_llm(workload=..., config=HostRuntimeFacts(...))`。
+`pllm.Workload`，只是走宿主路径：`pllm.host.make_host(HostConfig(...), workload)`。
 没有请求状态、没有跨调用反向、没有自动捕获。
 
 奖励投票是宿主字符串逻辑，不是张量数学，所以是一个普通函数：
@@ -476,10 +463,9 @@ Python 堆成本声明。
 之后的 monkey patch 只影响新绑定的执行。TTRL 是维护中的范例：多数投票、
 平局规则、采样限制与重试/栅栏构造是 `ttrl_rewards` 的数学，原始 completion 对象保留。
 
-有界宿主执行使用 `HostRuntimeFacts(max_input_rows=..., memory_budget_bytes=...)`。框架用
+有界宿主执行使用 `HostConfig(max_input_rows=..., memory_budget_bytes=...)`。框架用
 最大形状的 `WeightedRowBatch` 执行实际 loss/update 路径来推导资源，不要求负载申报字节；
-超过 `max_input_rows` 的输入在 `step` 前被拒绝。FTTT 的 transaction `example` 给出上下文
-与回滚快照。使用 `binding.compile()` 保留同一组事实与用户预算。
+超过 `max_input_rows` 的输入在 `step` 前被拒绝。
 
 ## 因果批训练
 

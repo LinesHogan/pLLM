@@ -1,4 +1,4 @@
-"""Closed values for the canonical GTTA environment-service vertical."""
+"""GTTA's values: configuration, environment feedback, queries and the per-run result."""
 
 from __future__ import annotations
 
@@ -108,18 +108,10 @@ class GTTAHostRequest:
             raise ValueError("GTTAHostRequest limit must be nonnegative")
 
 
-@dataclass(frozen=True, slots=True)
-class GTTAHostTransaction:
-    transaction_id: int
-    trajectories: GTTATrajectoryBatch
-    query: GTTAQuery
-
-
 __all__ = [
     "DynamicsEvent",
     "GTTAConfig",
     "GTTAHostRequest",
-    "GTTAHostTransaction",
     "GTTAPromptPosition",
     "GTTAQuery",
     "GTTAQueryResult",

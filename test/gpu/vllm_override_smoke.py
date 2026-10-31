@@ -21,8 +21,8 @@ from pllm.backends.vllm.runner import WorkloadModelRunner
 from pllm.backends.vllm.sampler import Vllm027Sampler
 from pllm.config import ModelConfig
 from pllm.execution.state_execution import StateExecution
-from pllm.host import HostRuntimeFacts
-from pllm.workloads.fttt import FTTTWorkload
+from pllm.host import HostConfig, make_host
+from pllm.workloads.fttt import FTTTConfig, FTTTDefaultJudge, FTTTFeedbackService, FTTTWorkload
 from pllm.workloads.override import OverRIDEConfig, OverRIDEWorkload
 from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload, ttrl_rewards
 
@@ -149,14 +149,14 @@ def main() -> None:
         for completion, row in zip(batch.completions.entries, batch.hidden, strict=True):
             assert completion.identity.prompt_idx == 100
             torch.testing.assert_close(row, expected_hidden[completion.identity.request_id], rtol=0, atol=0)
-        facts = HostRuntimeFacts(execution.device, hidden_size=batch.hidden.shape[1])
-        feedback = pllm.make_llm(workload=FTTTWorkload(), config=facts)
+        facts = HostConfig(execution.device, hidden_size=batch.hidden.shape[1])
+        feedback = FTTTWorkload(
+            FTTTFeedbackService(FTTTConfig(), FTTTDefaultJudge()), hidden_size=facts.hidden_size, device=facts.device
+        )
         edited = feedback.run(batch)
         assert edited is not None and edited.update_count == 1
         ttrl = TTRLConfig(rank=2, votes_per_prompt=3, samples_per_prompt=2)
-        reward = pllm.make_llm(
-            workload=TTRLWorkload(ttrl), config=replace(facts, max_input_rows=3, memory_budget_bytes=1 << 20)
-        )
+        reward = make_host(replace(facts, max_input_rows=3, memory_budget_bytes=1 << 20), TTRLWorkload(ttrl))
         reward.admit((), stream)
         trained = reward.step(ttrl_rewards(batch, ttrl).step, stream)
         assert trained.loss is not None and reward.diagnostics().update_count == 1

@@ -1,4 +1,4 @@
-"""Canonical FTTT workload and typed host-service boundary."""
+"""FTTT: feedback test-time training of a low-rank edit, run as a host feedback callback."""
 
 from pllm.workloads.fttt.host_service import FTTTFeedbackService
 from pllm.workloads.fttt.judge import (
@@ -8,7 +8,6 @@ from pllm.workloads.fttt.judge import (
 from pllm.workloads.fttt.types import (
     FTTTClosedLoopIntent,
     FTTTConfig,
-    FTTTHostTransaction,
     FTTTInstanceState,
     FTTTJudgeResult,
 )
@@ -19,7 +18,6 @@ __all__ = [
     "FTTTConfig",
     "FTTTDefaultJudge",
     "FTTTFeedbackService",
-    "FTTTHostTransaction",
     "FTTTInstanceState",
     "FTTTJudgeResult",
     "FTTTJudgeService",

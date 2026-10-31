@@ -1,16 +1,12 @@
-"""Transactional bounded FIFO for canonical GTTA environment events."""
+"""GTTA's bounded FIFO of environment events waiting to be folded into the dynamics memory."""
 
 from __future__ import annotations
 
 from collections import deque
 
-from pllm.host import HostReceipt
 from pllm.workloads.gtta.types import (
     DynamicsEvent,
     GTTAConfig,
-    GTTAHostRequest,
-    GTTAHostTransaction,
-    GTTAResult,
     GTTATrajectoryBatch,
     TrajectoryFeedback,
     canonical_state_signature,
@@ -18,21 +14,13 @@ from pllm.workloads.gtta.types import (
 
 
 class GTTAEnvironmentService:
-    """Own one bounded event queue and its exact active host transaction."""
+    """One bounded event queue; events past max_queue_size are dropped and counted."""
 
-    __slots__ = (
-        "_active",
-        "_config",
-        "_dropped_trajectories",
-        "_next_transaction_id",
-        "_queue",
-    )
+    __slots__ = ("_config", "_dropped_trajectories", "_queue")
 
     def __init__(self, config: GTTAConfig) -> None:
         self._config = config
         self._queue: deque[DynamicsEvent] = deque()
-        self._active: GTTAHostTransaction | None = None
-        self._next_transaction_id = 1
         self._dropped_trajectories = 0
 
     @property
@@ -64,32 +52,14 @@ class GTTAEnvironmentService:
         )
         return True
 
-    def begin(self, request: GTTAHostRequest) -> GTTAHostTransaction:
-        assert self._active is None
-        count = len(self._queue) if request.limit == 0 else min(request.limit, len(self._queue))
-        transaction = GTTAHostTransaction(
-            self._next_transaction_id,
-            GTTATrajectoryBatch(tuple(self._queue.popleft() for _ in range(count))),
-            request.query,
-        )
-        self._next_transaction_id += 1
-        self._active = transaction
-        return transaction
+    def take(self, limit: int) -> GTTATrajectoryBatch:
+        """Remove the oldest `limit` queued events (all of them for 0)."""
+        count = len(self._queue) if limit == 0 else min(limit, len(self._queue))
+        return GTTATrajectoryBatch(tuple(self._queue.popleft() for _ in range(count)))
 
-    def commit(
-        self,
-        transaction: GTTAHostTransaction,
-        receipt: HostReceipt[GTTAResult],
-    ) -> None:
-        del receipt
-        assert self._active is transaction
-        self._active = None
-
-    def abort(self, transaction: GTTAHostTransaction) -> None:
-        assert self._active is transaction
-        for event in reversed(transaction.trajectories.entries):
-            self._queue.appendleft(event)
-        self._active = None
+    def requeue(self, trajectories: GTTATrajectoryBatch) -> None:
+        """Put events taken by a failed run back at the front, in their order."""
+        self._queue.extendleft(reversed(trajectories.entries))
 
 
 __all__ = ["GTTAEnvironmentService"]

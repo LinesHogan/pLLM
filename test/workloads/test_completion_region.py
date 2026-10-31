@@ -8,7 +8,7 @@ import torch
 
 import pllm
 from pllm.authoring import TensorStepInput, WeightedRowBatch
-from pllm.host import HostRuntimeFacts
+from pllm.host import HostConfig, make_host
 
 
 @dataclass(frozen=True)
@@ -45,7 +45,7 @@ def test_default_completion_region_keeps_multigroup_adamw_and_publication(device
         pytest.skip("requires CUDA")
     device = torch.device(device)
     stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
-    facts = HostRuntimeFacts(
+    facts = HostConfig(
         device,
         hidden_size=2,
         initialization_seed=23,
@@ -58,7 +58,7 @@ def test_default_completion_region_keeps_multigroup_adamw_and_publication(device
     execution = binding.compile()
     peak = execution.arena.plan.schedule.peak_memory_bytes
     with pytest.raises(ValueError):
-        workload.compile_host(replace(facts, memory_budget_bytes=peak - 1))
+        make_host(replace(facts, memory_budget_bytes=peak - 1), workload)
     (initial,) = execution.admit((), stream)
     original = execution.snapshot(initial, stream)
     if stream is not None:

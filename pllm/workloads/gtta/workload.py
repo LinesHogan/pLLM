@@ -1,50 +1,37 @@
-"""GTTA dataflow over the original CPU host transaction."""
+"""GTTA on the host: fold queued environment feedback into the dynamics memory, then rank a query's actions."""
 
 from __future__ import annotations
 
-from functools import partial
-
-import pllm
-from pllm.workloads.gtta import state as math
 from pllm.workloads.gtta.environment import GTTAEnvironmentService
-from pllm.workloads.gtta.types import GTTAConfig, GTTAHostRequest, GTTAHostTransaction, GTTAResult
+from pllm.workloads.gtta.state import GTTADynamicsState
+from pllm.workloads.gtta.types import GTTAConfig, GTTAHostRequest, GTTAResult
 
 
-class GTTAWorkload(
-    pllm.host.HostWorkload[
-        pllm.host.HostTransactionCoordinator[
-            GTTAHostRequest, GTTAHostTransaction, math.GTTAStepContext, math.GTTADynamicsSnapshot, GTTAResult
-        ]
-    ]
-):
+class GTTAWorkload:
+    """One environment queue and the dynamics memory its events update."""
+
     def __init__(self, environment: GTTAEnvironmentService | None = None) -> None:
         self.environment = environment if environment is not None else GTTAEnvironmentService(GTTAConfig())
+        self.dynamics = GTTADynamicsState()
+        self._runs = 0
 
     @property
     def config(self) -> GTTAConfig:
         return self.environment.config
 
-    def declare_host(
-        self, facts: pllm.host.HostRuntimeFacts
-    ) -> pllm.host.TransactionHostBinding[
-        GTTAHostRequest,
-        GTTAHostTransaction,
-        math.GTTAStepContext,
-        math.GTTADynamicsSnapshot,
-        GTTAResult,
-    ]:
-        if facts.device.type != "cpu":
-            raise ValueError("GTTA environment execution requires CPU placement")
-        return pllm.host.transaction(
-            "gtta.dynamics",
-            facts,
-            config=self.config,
-            state_factory=math.GTTADynamicsState,
-            service=self.environment,
-            update=partial(math.update, self.config),
-            query=math.query,
-            publish=math.publish,
-        )
+    def run(self, request: GTTAHostRequest) -> GTTAResult:
+        """Update the memory with up to `request.limit` queued events, then answer `request.query`. A failure restores
+        the memory and requeues the events."""
+        self._runs += 1
+        trajectories = self.environment.take(request.limit)
+        snapshot = self.dynamics.snapshot()
+        try:
+            update = self.dynamics.update(trajectories, self.config)
+            return GTTAResult(self._runs, update, self.dynamics.query(request.query))
+        except BaseException:
+            self.dynamics.restore(snapshot)
+            self.environment.requeue(trajectories)
+            raise
 
 
 __all__ = ["GTTAWorkload"]

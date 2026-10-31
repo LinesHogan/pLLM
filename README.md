@@ -28,8 +28,10 @@ with make_llm(config, workload=ESampRequestWorkload(ESampRequestConfig(rank=2)))
     print(llm.diagnostics())
 ```
 
-省略 `workload` 就是普通的 vLLM 推理。宿主机算法用同一工厂函数配合
-`HostRuntimeFacts(device, hidden_size=...)`，无需构造模型。
+省略 `workload` 就是普通的 vLLM 推理。宿主机算法（generate → 打分 → 反馈）是传给
+`llm.generate_feedback(feedback=...)` 的普通回调；需要框架训练的张量状态写成普通
+`pllm.Workload`，用 `pllm.host.make_host(pllm.host.HostConfig(device, hidden_size=...), workload)`
+编译，无需构造模型。
 
 > 迁移说明：Python 导入与发行名现在是 `pllm`，不再安装 `tllm` 兼容包；
 > 旧的模块路径与 `canonical_config` 不是兼容 API。既有调用方请迁移到

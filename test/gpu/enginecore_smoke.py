@@ -30,11 +30,12 @@ from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.semantic_graph import StateScope
 from pllm.execution.trace import TracePhase, TraceSelection
-from pllm.host import HostRuntimeFacts
+from pllm.host import HostConfig, make_host
 from pllm.workloads.dummy import DummyConfig, DummyWorkload
 from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
 from pllm.workloads.fttt import (
     FTTTConfig,
+    FTTTDefaultJudge,
     FTTTFeedbackService,
     FTTTJudgeResult,
     FTTTJudgeService,
@@ -332,10 +333,7 @@ def _output_lora_shared_input() -> None:
         assert handle.worker_state().diagnostics.update_count == 1
 
         service = FTTTFeedbackService(FTTTConfig(rank=2, max_retries=3), RetryOnce())
-        processor = pllm.make_llm(
-            workload=FTTTWorkload(service),
-            config=HostRuntimeFacts(torch.device("cpu"), hidden_size=captured.hidden.shape[1]),
-        )
+        processor = FTTTWorkload(service, hidden_size=captured.hidden.shape[1])
         rounds = list(
             handle.generate_feedback(
                 PROMPTS,
@@ -436,10 +434,7 @@ def _fttt_activation_retry() -> None:
     handle = pllm.make_llm(workload=ActivationWorkload(config), config=engine(seqs=1))
     try:
         service = FTTTFeedbackService(FTTTConfig(rank=2, learning_rate=0.1, max_retries=3), RetryOnce())
-        processor = pllm.make_llm(
-            workload=FTTTWorkload(service),
-            config=HostRuntimeFacts(torch.device("cpu"), hidden_size=896),
-        )
+        processor = FTTTWorkload(service, hidden_size=896)
         rounds = list(
             handle.generate_feedback(
                 ["The sky is", "Water freezes at", "The sea is"],
@@ -503,11 +498,12 @@ def main() -> int:
         assert batch.hidden.device.type == "cpu" and batch.readiness is None
         assert batch.hidden.shape == (3, handle.attachment.probe.hidden_size)
         assert torch.isfinite(batch.hidden).all() and torch.count_nonzero(batch.hidden) > 0
-        facts = HostRuntimeFacts(torch.device("cpu"), hidden_size=batch.hidden.shape[1])
-        edited = pllm.make_llm(workload=FTTTWorkload(), config=facts).run(batch)
+        facts = HostConfig(torch.device("cpu"), hidden_size=batch.hidden.shape[1])
+        feedback = FTTTFeedbackService(FTTTConfig(), FTTTDefaultJudge())
+        edited = FTTTWorkload(feedback, hidden_size=facts.hidden_size).run(batch)
         assert edited is not None and edited.update_count == 1
         ttrl = TTRLConfig(rank=2, votes_per_prompt=3, samples_per_prompt=2)
-        reward = pllm.make_llm(workload=TTRLWorkload(ttrl), config=facts)
+        reward = make_host(facts, TTRLWorkload(ttrl))
         reward.admit(())
         trained = reward.step(ttrl_rewards(batch, ttrl).step)
         assert trained.loss is not None and reward.diagnostics().update_count == 1

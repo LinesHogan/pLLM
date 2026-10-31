@@ -14,7 +14,7 @@ import torch
 import pllm
 from examples.centered_hidden import centered_hidden
 from examples.sae_export import SAE
-from pllm import make_llm, testing
+from pllm import testing
 from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.packed_rows import PackedPhaseRow
@@ -22,13 +22,13 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.tensor_task import TensorTask
 from pllm.execution.trace import ExecutionTrace, TracePhase, TraceSelection, TraceSnapshot
-from pllm.host import HostRuntimeFacts
+from pllm.host import HostConfig, make_host
 from pllm.testing import backend_facts
 from pllm.workloads.dummy import DummyConfig, DummyWorkload
 from test.backend_facts import assert_finite_resources
 
 BINDING = testing.hidden_binding(0, HiddenSite.BLOCK_OUTPUT, 1)
-CPU = HostRuntimeFacts(torch.device("cpu"))
+CPU = HostConfig(torch.device("cpu"))
 
 
 def step_input(step, hidden, count=3):
@@ -47,7 +47,7 @@ def exported(execution, value):
 
 def test_dummy_runs_graph_sign_plan_execute() -> None:
     workload = DummyWorkload(DummyConfig(export_every_n_steps=2, export_max_rows=2, export_max_cols=3))
-    execution = make_llm(workload=workload, config=CPU)
+    execution = make_host(CPU, workload)
     hidden = torch.arange(15, dtype=torch.float32).reshape(3, 5)
     expected = hidden[1:3, :3].clone()
     value = lambda step: step_input(step, hidden)
@@ -61,9 +61,9 @@ def test_dummy_runs_graph_sign_plan_execute() -> None:
     hidden.fill_(-1)
     torch.testing.assert_close(result, expected)
     hidden.copy_(torch.arange(15, dtype=torch.float32).reshape(3, 5))
-    variant = make_llm(CPU, workload=centered_hidden(workload.config))
+    variant = make_host(CPU, centered_hidden(workload.config))
     torch.testing.assert_close(exported(variant, value(2)), expected - hidden[1:3].mean(dim=-1, keepdim=True))
-    disabled = DummyWorkload(replace(workload.config, enabled=False)).compile_host(CPU)
+    disabled = make_host(CPU, DummyWorkload(replace(workload.config, enabled=False)))
     with patch.object(TensorTask, "read", autospec=True, side_effect=TensorTask.read) as reads:
         assert disabled.step(value(2)) is None
         reads.assert_not_called()
@@ -101,7 +101,7 @@ def test_dummy_runs_graph_sign_plan_execute() -> None:
 
     chained = Chained()
     for execution in (
-        make_llm(CPU, workload=chained),
+        make_host(CPU, chained),
         assert_finite_resources(chained, facts).execution,
     ):
         torch.testing.assert_close(exported(execution, value(2)), (expected + 1) * 2)
@@ -109,10 +109,10 @@ def test_dummy_runs_graph_sign_plan_execute() -> None:
     # A transform's closure values are frozen when the workload compiles.
     scale = [2.0]
     custom = replace(workload, transform=lambda rows: rows * scale[0])
-    frozen = custom.compile_host(CPU)
+    frozen = make_host(CPU, custom)
     scale[0] = 3.0
     torch.testing.assert_close(exported(frozen, value(2)), expected * 2)
-    torch.testing.assert_close(exported(custom.compile_host(CPU), value(2)), expected * 3)
+    torch.testing.assert_close(exported(make_host(CPU, custom), value(2)), expected * 3)
 
     class Unsourced(DummyWorkload):
         @pllm.export()
@@ -234,7 +234,7 @@ def test_export_queue_delivery_and_lifecycle(device, overflow) -> None:
         assert release.wait(10)
         delivered.append(event)
 
-    execution = DummyWorkload().compile_host(CPU)
+    execution = make_host(CPU, DummyWorkload())
     trace = ExecutionTrace(execution.plan, capacity=1, on_export=consume)
     value = torch.ones((2, 3), device=device)
     record = lambda policy: trace.record(
@@ -286,7 +286,7 @@ def test_export_failure_and_meta() -> None:
         def on_export(self):
             pass
 
-    execution = InvalidConsumer().compile_host(CPU)
+    execution = make_host(CPU, InvalidConsumer())
     trace = execution.trace
     record = lambda device: trace.record(
         TracePhase.TENSOR,

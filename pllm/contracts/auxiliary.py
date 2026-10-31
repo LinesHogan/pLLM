@@ -177,7 +177,7 @@ def validate_auxiliary(
             raise ValueError(
                 f"{task.symbol}: auxiliary input shapes {list(actual)} exceed the planned {list(limit.input_shapes)}; "
                 "raise ExecutionOptions(training_rows=N) for more training rows per state, or "
-                "HostRuntimeFacts(max_input_rows=N) for a host workload"
+                "HostConfig(max_input_rows=N) for a host workload"
             )
 
 

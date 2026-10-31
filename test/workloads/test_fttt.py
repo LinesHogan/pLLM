@@ -12,10 +12,8 @@ from importlib.util import find_spec
 import pytest
 import torch
 
-from pllm import make_llm
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.execution.host_runtime import NO_HOST_REQUEST
-from pllm.host import Completion, CompletionBatch, CompletionInput, FinishReason, HostRuntimeFacts, RetryAction
+from pllm.host import Completion, CompletionBatch, CompletionInput, FinishReason, HostConfig, RetryAction, make_host
 from pllm.workloads.fttt import FTTTConfig, FTTTFeedbackService, FTTTJudgeResult, FTTTJudgeService, FTTTWorkload
 
 
@@ -32,36 +30,15 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry() -> None:
         FTTTConfig(edit_scale=float("nan"))
     config = FTTTConfig(rank=2, learning_rate=0.05, feedback_feature_size=3, max_retries=2)
     service = FTTTFeedbackService(config, ArithmeticJudge())
-    workload = FTTTWorkload(service)
-    facts = HostRuntimeFacts(
-        torch.device("cpu"), hidden_size=4, initialization_seed=7, max_input_rows=1, memory_budget_bytes=1 << 20
-    )
-    coordinator = make_llm(workload=workload, config=facts)
-    peak = coordinator.execution.decision.peak_memory_bytes
-    with pytest.raises(ValueError):
-        make_llm(workload=workload, config=replace(facts, memory_budget_bytes=peak - 1))
-    with pytest.raises(ValueError):  # host workloads need a finite input row bound
-        workload.declare_host(replace(facts, max_input_rows=None))
-    coordinator = make_llm(workload=workload, config=replace(facts, memory_budget_bytes=peak))
-    execution = coordinator.execution
+    workload = FTTTWorkload(service, hidden_size=4, initialization_seed=7, max_input_rows=1)
     identity = RequestIdentity("arithmetic", 0, 0)
     hidden = torch.tensor([[-1.0, -0.25, 0.5, 1.0]])
     wrong = Completion(identity, 0, "round", (1, 2), "3", FinishReason.STOP)
-    batch = CompletionBatch((wrong,))
-    service.enqueue(CompletionInput.capture(batch, hidden))
-    # An aborted transaction leaves the edit state at version 0.
-    transaction = service.begin(NO_HOST_REQUEST)
-    execution.abort(execution.execute(transaction))
-    service.abort(transaction)
-    assert execution.diagnostics().state_version == 0
-    overflow = FTTTFeedbackService(config, ArithmeticJudge())
+    # A failed step (two completions exceed max_input_rows=1) leaves the edit at version 0 and drops the queue.
     extra = replace(wrong, identity=RequestIdentity("excess", 1, 0))
-    overflow.enqueue(CompletionInput.capture(CompletionBatch((wrong, extra)), hidden.expand(2, -1)))
-    oversized = overflow.begin(NO_HOST_REQUEST)
-    with pytest.raises(ValueError):  # two completions exceed max_input_rows=1
-        execution.execute(oversized)
-    overflow.abort(oversized)
-    assert execution.diagnostics().state_version == 0 and overflow.queued_feedback == 0
+    with pytest.raises(ValueError):
+        workload.run(CompletionInput.capture(CompletionBatch((wrong, extra)), hidden.expand(2, -1)))
+    assert workload.edit.version == 0 and service.queued_feedback == 0
 
     # Spell out the feature projection and use PyTorch Adam, not production helpers.
     feature = torch.zeros(3)
@@ -87,7 +64,7 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry() -> None:
         loss.backward()
         optimizer.step()
         retry_batch = CompletionBatch((replace(wrong, identity=RequestIdentity(f"attempt-{version}", 0, version)),))
-        result = coordinator.run(CompletionInput.capture(retry_batch, hidden))
+        result = workload.run(CompletionInput.capture(retry_batch, hidden))
         assert result.update_count == 1
         torch.testing.assert_close(result.losses[0], loss.detach())
         torch.testing.assert_close(result.edit_delta, (inputs @ down.T @ up.T).detach())
@@ -97,7 +74,7 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry() -> None:
         assert state.retries == state.adapter_version == version
     accepted = Completion(identity, 0, "round", (4,), "4", FinishReason.STOP)
     assert not service.enqueue(CompletionInput.capture(CompletionBatch((accepted,)), hidden))
-    result = coordinator.run(NO_HOST_REQUEST)
+    result = workload.step()
     assert result.update_count == 0 and result.losses == () and result.state_version == 2
     assert result.intent.retry_controls[0].action is RetryAction.ACCEPT
     assert service.queued_transactions == service.queued_feedback == 0
@@ -150,7 +127,7 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
             return CompletionInput.capture(CompletionBatch(entries), torch.ones(len(entries), 4))
 
     service = FTTTFeedbackService(FTTTConfig(rank=2, max_retries=2), ArithmeticJudge())
-    processor = make_llm(workload=FTTTWorkload(service), config=HostRuntimeFacts(torch.device("cpu"), hidden_size=4))
+    processor = FTTTWorkload(service, hidden_size=4)
     generator = Generation()
     rounds = list(
         generator.generate_feedback(
@@ -203,7 +180,7 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
     assert list(feedback) == [] and len(idle.calls) == 1
 
     ttrl = TTRLConfig(rank=2, votes_per_prompt=3, samples_per_prompt=3)
-    reward = make_llm(workload=TTRLWorkload(ttrl), config=HostRuntimeFacts(torch.device("cpu"), hidden_size=4))
+    reward = make_host(HostConfig(torch.device("cpu"), hidden_size=4), TTRLWorkload(ttrl))
     reward.admit(())
 
     votes = Generation(votes=True)

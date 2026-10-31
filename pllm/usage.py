@@ -58,11 +58,7 @@ from pllm.execution.freeze import (
     owner_values,
     reachable_functions,
 )
-from pllm.execution.host_runtime import (
-    HostRuntimeFacts,
-    HostWorkload,
-    TensorHostBinding,
-)
+from pllm.execution.host_runtime import HostConfig, TensorHostBinding
 from pllm.execution.model_effect_binding import (
     declare_activation_patch,
     declare_layer_route,
@@ -90,7 +86,7 @@ from pllm.execution.row_task_binding import (
     validate_gradients,
 )
 from pllm.execution.shared_tensor import SharedTensor
-from pllm.execution.state_execution import MathBinding, StateExecution
+from pllm.execution.state_execution import MathBinding
 from pllm.execution.step_input import TensorStepInput
 from pllm.execution.task_memory import derive_host_resources, derive_resources
 from pllm.execution.tensor_binding import TensorBinding, TensorOutput as TensorOutput
@@ -1693,10 +1689,7 @@ class _Declaration:
         )
 
 
-class Workload(
-    BackendWorkload[TensorFrame, TensorOutput],
-    HostWorkload[StateExecution[TensorStepInput, TensorFrame, TensorOutput]],
-):
+class Workload(BackendWorkload[TensorFrame, TensorOutput]):
     """Python methods and effects compiled once, not runtime hooks or a second IR."""
 
     name: ClassVar[str] = "python.workload"
@@ -1817,7 +1810,8 @@ class Workload(
             on_export=self.on_export if declaration.has_exports else None,
         )
 
-    def declare_host(self, facts: HostRuntimeFacts) -> TensorHostBinding[TensorStepInput, TensorFrame, TensorOutput]:
+    def declare_host(self, facts: HostConfig) -> TensorHostBinding[TensorStepInput, TensorFrame, TensorOutput]:
+        """Build the graph without a model (see pllm.host.make_host); training reads host batches."""
         b = TensorBinding(
             self.name,
             boundary_digest(facts.hidden_size, facts.initialization_seed),

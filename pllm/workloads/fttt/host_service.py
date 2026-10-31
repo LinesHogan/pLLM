@@ -1,4 +1,4 @@
-"""Transactional typed judge/feedback service for canonical FTTT."""
+"""FTTT's judge, bounded feedback queue and retry lifecycle; FTTTWorkload trains the edit between begin and commit."""
 
 from __future__ import annotations
 
@@ -11,8 +11,6 @@ from pllm.host import (
     BarrierState,
     CompletionInput,
     ControlReason,
-    HostReceipt,
-    NoHostRequest,
     RetryAction,
     RetryControl,
     RewardOutcome,
@@ -23,10 +21,9 @@ from pllm.workloads.fttt.types import (
     FTTTClosedLoopIntent,
     FTTTConfig,
     FTTTFeedbackRecord,
-    FTTTHostTransaction,
     FTTTInstanceState,
     FTTTLifecycleTransition,
-    FTTTResult,
+    FTTTQueuedFeedback,
 )
 
 
@@ -58,8 +55,8 @@ class FTTTFeedbackService:
         self._judge = judge
         self._instances: dict[tuple[str, int], FTTTInstanceState] = {}
         self._projected_instances: dict[tuple[str, int], FTTTInstanceState] = {}
-        self._queue: deque[FTTTHostTransaction] = deque()
-        self._active: FTTTHostTransaction | None = None
+        self._queue: deque[FTTTQueuedFeedback] = deque()
+        self._active: FTTTQueuedFeedback | None = None
         self._next_transaction_id = 1
         self._queued_feedback = 0
         self._dropped_feedback = 0
@@ -179,37 +176,27 @@ class FTTTFeedbackService:
             tuple(records),
             tuple(transitions),
         )
-        transaction = FTTTHostTransaction(
-            batch,
-            tuple(selected_rows),
-            intent,
-        )
-        self._queue.append(transaction)
+        self._queue.append(FTTTQueuedFeedback(batch, tuple(selected_rows), intent))
         self._projected_instances = projected_instances
         self._dropped_feedback = dropped_feedback
         self._next_transaction_id += 1
         self._queued_feedback += len(records)
         return bool(records)
 
-    def begin(self, request: CompletionInput | NoHostRequest) -> FTTTHostTransaction | None:
+    def begin(self) -> FTTTQueuedFeedback | None:
+        """Take the oldest queued feedback for an edit step; None when the queue is empty."""
         assert self._active is None
-        if isinstance(request, CompletionInput):
-            self.enqueue(request)
         if not self._queue:
             return None
-        transaction = self._queue.popleft()
-        self._queued_feedback -= len(transaction.intent.feedback_records)
-        self._active = transaction
-        return transaction
+        queued = self._queue.popleft()
+        self._queued_feedback -= len(queued.intent.feedback_records)
+        self._active = queued
+        return queued
 
-    def commit(
-        self,
-        transaction: FTTTHostTransaction,
-        receipt: HostReceipt[FTTTResult],
-    ) -> None:
-        intent = receipt.result.intent
-        assert self._active is transaction
-        assert intent == replace(transaction.intent, adapter_version=intent.adapter_version)
+    def commit(self, queued: FTTTQueuedFeedback, intent: FTTTClosedLoopIntent) -> None:
+        """Settle each completion's lifecycle with the adapter version its edit step published."""
+        assert self._active is queued
+        assert intent == replace(queued.intent, adapter_version=intent.adapter_version)
         settled = dict(self._instances)
         for transition in intent.transitions:
             current = settled.get(transition.key, FTTTInstanceState())
@@ -224,8 +211,9 @@ class FTTTFeedbackService:
         self._active = None
         self._projected_instances = projected
 
-    def abort(self, transaction: FTTTHostTransaction) -> None:
-        assert self._active is transaction
+    def abort(self, queued: FTTTQueuedFeedback) -> None:
+        """A failed edit step drops the whole queue; lifecycles stay as last settled."""
+        assert self._active is queued
         self._active = None
         self._queue.clear()
         self._queued_feedback = 0

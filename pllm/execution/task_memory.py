@@ -30,7 +30,7 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.state_ref import LayoutId, LineageId, StateRef, VersionId
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import Call
-from pllm.execution.host_runtime import HostRuntimeFacts, measured_timeline
+from pllm.execution.host_runtime import HostConfig, measured_timeline
 from pllm.execution.ptts.request_state import RequestStateSelection, ResourceSelection
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.step_input import TensorStepInput
@@ -265,10 +265,10 @@ def derive_resources(
     )
 
 
-def derive_host_resources(binding: TensorBinding, facts: HostRuntimeFacts) -> SchedulerTimeline:
+def derive_host_resources(binding: TensorBinding, facts: HostConfig) -> SchedulerTimeline:
     """Measure a rowless host step over the workload's one instance state at the maximum input rows."""
     if facts.max_input_rows is None:
-        raise ValueError("set HostRuntimeFacts.max_input_rows when memory_budget_bytes is set")
+        raise ValueError("set HostConfig.max_input_rows when memory_budget_bytes is set")
     rows = facts.max_input_rows
     auxiliary = WeightedRowBatch(meta(rows, facts.hidden_size), meta(rows), meta(rows))
     (layout,) = binding.layouts.layouts
