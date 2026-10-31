@@ -173,7 +173,11 @@ def validate_auxiliary(
             len(dims) != len(bounds) or any(size > bound for size, bound in zip(dims, bounds))
             for dims, bounds in zip(actual, limit.input_shapes)
         ):
-            raise ValueError(f"{task.symbol}: auxiliary input exceeds its signed input bounds")
+            raise ValueError(
+                f"{task.symbol}: auxiliary input shapes {list(actual)} exceed the planned {list(limit.input_shapes)}; "
+                "raise ExecutionOptions(training_rows=N) for more training rows per state, or "
+                "HostRuntimeFacts(max_input_rows=N) for a host workload"
+            )
 
 
 def map_auxiliary(value: AuxiliaryInput[T] | None, convert: Callable[[T], U]) -> AuxiliaryInput[U] | None:
