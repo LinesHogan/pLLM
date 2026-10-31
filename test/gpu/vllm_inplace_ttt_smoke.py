@@ -21,7 +21,7 @@ from vllm import LLM, SamplingParams
 import pllm
 from pllm import TensorUpdate
 from pllm.backends.vllm.runtime import VllmLlm
-from pllm.config import ModelConfig, RunnerKind, VllmDType
+from pllm.config import ModelConfig
 from pllm.contracts.parameter_overlay import (
     ParameterModuleKind,
     ParameterOverlayOperator,
@@ -118,13 +118,13 @@ def open_llm(
     *,
     cuda_graphs=False,
     chunked=False,
-    runner=RunnerKind.MRV2,
+    runner="mrv2",
     **execution,
 ) -> VllmLlm[object, object]:
     options = {"execution": pllm.ExecutionOptions(**execution)} if execution else {}
     config = ModelConfig(
         model="Qwen/Qwen2.5-0.5B-Instruct",
-        dtype=VllmDType.BFLOAT16,
+        dtype="bfloat16",
         max_model_len=model_length,
         max_num_seqs=seqs,
         max_num_batched_tokens=tokens,

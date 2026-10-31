@@ -26,7 +26,7 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from pllm.authoring import BackendRequirements
 from pllm.backends.vllm.architecture import Decoder, DecoderBody, bind_model
 from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay
-from pllm.config import ModelConfig, RunnerKind
+from pllm.config import ModelConfig
 from pllm.contracts.backend_attachment import AttachmentGraphMode, BackendAttachment
 from pllm.contracts.codec import boundary_digest, decode_boundary, encode_boundary
 from pllm.contracts.hidden_locator import HiddenPhase
@@ -85,8 +85,8 @@ def graph_options(config: ModelConfig, requirements: BackendRequirements) -> Gra
         return {
             "compilation_config": CompilationConfig(max_cudagraph_capture_size=config.max_num_batched_tokens),
         }
-    if config.runner is not RunnerKind.MRV2:
-        raise ValueError("Graph overlays need the MRv2 runner")
+    if config.runner != "mrv2":
+        raise ValueError('Graph overlays need runner="mrv2"')
     return {
         "additional_config": {_BUDGET: config.execution.capture_memory_bytes},
         "compilation_config": CompilationConfig(

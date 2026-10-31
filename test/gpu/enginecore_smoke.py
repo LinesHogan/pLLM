@@ -22,7 +22,7 @@ from vllm.sampling_params import StructuredOutputsParams
 
 import pllm
 from pllm.authoring import CausalTrainBatch, StateTensorUpdate, WeightedCEBatch
-from pllm.config import ExecutionOptions, ModelConfig, RunnerKind, VllmDType
+from pllm.config import ExecutionOptions, ModelConfig, RunnerName
 from pllm.contracts.backend_attachment import (
     ActivationPatchOperator,
     AttachmentTopology,
@@ -57,7 +57,7 @@ def engine(model=MODEL, seqs=2, tokens=128, memory=0.25, **options) -> ModelConf
     """A small EngineCore deployment: max_model_len 64, bfloat16, seed 7."""
     return ModelConfig(
         model,
-        VllmDType.BFLOAT16,
+        "bfloat16",
         64,
         seqs,
         tokens,
@@ -243,7 +243,7 @@ def _graph_overlay(*, exact: bool = False) -> None:
     print(f"Multi-target source graphs: exact={exact}; EngineCore replay; parent CUDA=off")
 
 
-def _captured_esamp(runner: RunnerKind = RunnerKind.MRV2) -> None:
+def _captured_esamp(runner: RunnerName = "mrv2") -> None:
     assert not torch.cuda.is_initialized()
     options = ExecutionOptions(capture_memory_bytes=16 * 1024**2)
     handle = pllm.make_llm(
@@ -569,7 +569,7 @@ MODES = {
     "--captured-only": _captured_esamp,
     "--pinned-graph-only": _graph_overlay,
     "--hybrid-graph-only": lambda: _graph_overlay(exact=True),
-    "--mrv1-captured": lambda: _captured_esamp(RunnerKind.MRV1),
+    "--mrv1-captured": lambda: _captured_esamp("mrv1"),
     "--gpu-io-only": _gpu_shared_input,
     "--lora-only": lambda: (_output_lora_shared_input(), _independent_lora_input()),
     "--edit-only": _fttt_activation_retry,

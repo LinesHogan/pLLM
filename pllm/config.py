@@ -1,19 +1,12 @@
 """User limits and model configuration, before backend specialization."""
 
 from dataclasses import dataclass
-from enum import StrEnum
-from typing import Literal
+from typing import Literal, get_args
 
-
-class VllmDType(StrEnum):
-    BFLOAT16 = "bfloat16"
-    FLOAT16 = "float16"
-    FLOAT32 = "float32"
-
-
-class RunnerKind(StrEnum):
-    MRV1 = "mrv1"
-    MRV2 = "mrv2"
+# vLLM's names for the weight dtype; its aliases "half" and "float" are not accepted.
+ModelDType = Literal["bfloat16", "float16", "float32"]
+# vLLM model runner: "mrv2" is the V2 runner with async scheduling, "mrv1" the GPUModelRunner.
+RunnerName = Literal["mrv1", "mrv2"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,7 +72,7 @@ class ExecutionOptions:
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
     model: str
-    dtype: VllmDType = VllmDType.BFLOAT16
+    dtype: ModelDType = "bfloat16"
     max_model_len: int = 512
     max_num_seqs: int = 8
     max_num_batched_tokens: int = 512
@@ -91,12 +84,16 @@ class ModelConfig:
     generated_kv: Literal["reuse", "isolate"] = "isolate"
     revision: str | None = None
     multiprocessing: bool = False
-    runner: RunnerKind = RunnerKind.MRV2
+    runner: RunnerName = "mrv2"
     execution: ExecutionOptions = ExecutionOptions()
     # Use vLLM model graphs; in-model effects need a supported graph binding.
     cuda_graphs: bool = False
     kv_offload: KVOffload | None = None
 
     def __post_init__(self) -> None:
+        if self.dtype not in get_args(ModelDType):
+            raise ValueError(f'dtype must be "bfloat16", "float16" or "float32"; got {self.dtype!r}')
+        if self.runner not in get_args(RunnerName):
+            raise ValueError(f'runner must be "mrv2" or "mrv1"; got {self.runner!r}')
         if self.generated_kv not in ("reuse", "isolate"):
             raise ValueError('generated_kv must be "reuse" or "isolate"')

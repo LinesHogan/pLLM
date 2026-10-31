@@ -19,7 +19,7 @@ from vllm.sampling_params import StructuredOutputsParams
 import pllm
 from pllm.backends.vllm.runner import WorkloadModelRunner
 from pllm.backends.vllm.sampler import Vllm027Sampler
-from pllm.config import ModelConfig, VllmDType
+from pllm.config import ModelConfig
 from pllm.execution.state_execution import StateExecution
 from pllm.host import HostRuntimeFacts
 from pllm.workloads.fttt import FTTTWorkload
@@ -33,7 +33,7 @@ def main() -> None:
         workload=OverRIDEWorkload(config),
         config=ModelConfig(
             "Qwen/Qwen2.5-0.5B-Instruct",
-            VllmDType.BFLOAT16,
+            "bfloat16",
             64,
             2,
             64,

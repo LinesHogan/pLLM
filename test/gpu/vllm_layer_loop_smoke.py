@@ -7,7 +7,7 @@ from vllm import SamplingParams
 from vllm.forward_context import override_forward_context
 
 import pllm
-from pllm.config import ModelConfig, VllmDType
+from pllm.config import ModelConfig
 
 
 class LayerLoop(pllm.Workload):
@@ -24,7 +24,7 @@ class LayerLoop(pllm.Workload):
 def main():
     handle = pllm.make_llm(
         workload=LayerLoop(),
-        config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", VllmDType.BFLOAT16, 64, 1, 64, 0.25, seed=7),
+        config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", "bfloat16", 64, 1, 64, 0.25, seed=7),
     )
     primitive = handle.runner.require_session()._replay
     native_replay, checked = torch.cuda.CUDAGraph.replay, []

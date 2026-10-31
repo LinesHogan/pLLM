@@ -18,7 +18,7 @@ from vllm.forward_context import get_forward_context, override_forward_context
 import pllm
 from pllm.backends.vllm import runtime
 from pllm.backends.vllm.replay import RouteWave, VllmTokenwiseReplay
-from pllm.config import ModelConfig, VllmDType
+from pllm.config import ModelConfig
 from pllm.workloads.recirculation import JacobiRecirculation, RecirculationWorkload
 
 
@@ -43,7 +43,7 @@ def replay_handle(
             workload=workload,
             config=ModelConfig(
                 "Qwen/Qwen2.5-0.5B-Instruct",
-                VllmDType.BFLOAT16,
+                "bfloat16",
                 length,
                 batch,
                 length if budget is None else budget,

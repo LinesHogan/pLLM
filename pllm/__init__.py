@@ -94,7 +94,7 @@ def make_llm(
 
         return LLM(
             model=config.model,
-            dtype=config.dtype.value,
+            dtype=config.dtype,
             tensor_parallel_size=1,
             pipeline_parallel_size=1,
             data_parallel_size=1,

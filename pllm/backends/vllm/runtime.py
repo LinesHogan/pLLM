@@ -13,7 +13,7 @@ from enum import StrEnum
 from functools import partial
 from hashlib import sha256
 from types import TracebackType
-from typing import TYPE_CHECKING, Generic, Literal, TypeVar, overload
+from typing import TYPE_CHECKING, Generic, TypeVar, overload
 
 import torch
 from vllm import RequestOutput, SamplingParams, __version__ as _VLLM_VERSION
@@ -38,7 +38,7 @@ from pllm.backends.vllm.parameter_overlay import (
     inspect_parameter_targets,
 )
 from pllm.backends.vllm.training import CausalTraining
-from pllm.config import ModelConfig, RunnerKind, VllmDType
+from pllm.config import ModelConfig
 from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import (
     TOKEN_CAPTURE_CAPABILITY,
@@ -135,16 +135,6 @@ def _tensor_dtype(dtype: torch.dtype) -> TensorDType:
         torch.bfloat16: TensorDType.BFLOAT16,
         torch.float32: TensorDType.FLOAT32,
     }[dtype]
-
-
-def _model_dtype(dtype: VllmDType) -> Literal["bfloat16", "float16", "float32"]:
-    match dtype:
-        case VllmDType.BFLOAT16:
-            return "bfloat16"
-        case VllmDType.FLOAT16:
-            return "float16"
-        case VllmDType.FLOAT32:
-            return "float32"
 
 
 class BackendCommand(StrEnum):
@@ -575,15 +565,15 @@ def create_vllm_llm(
 ) -> VllmLlm[DataT, ResultT]:
     requirements = workload.backend_requirements()
     offload = config.kv_offload
-    if requirements.position_states and config.runner is RunnerKind.MRV1:
-        raise ValueError("PositionState layer routes require runner=MRV2")
+    if requirements.position_states and config.runner == "mrv1":
+        raise ValueError('PositionState layer routes need runner="mrv2"')
     if _VLLM_VERSION != _SUPPORTED_VLLM_VERSION:
         raise RuntimeError("vLLM workload requires vLLM 0.27.1 exactly")
     environment = {
         _MP_ENV: "1" if config.multiprocessing else "0",
-        _V2_RUNNER_ENV: "1" if config.runner is RunnerKind.MRV2 else "0",
+        _V2_RUNNER_ENV: "1" if config.runner == "mrv2" else "0",
         CAPTURE_ENV: encode_boundary(
-            HiddenCaptureAnnouncement(requirements.hidden_inputs, config.max_num_seqs, TensorDType(config.dtype.value))
+            HiddenCaptureAnnouncement(requirements.hidden_inputs, config.max_num_seqs, TensorDType(config.dtype))
         ),
         POSITION_ENV: encode_boundary(PositionAnnouncement(requirements.position_states)),
     }
@@ -598,7 +588,7 @@ def create_vllm_llm(
             **graph_options(config, requirements),
             model=config.model,
             revision=config.revision,
-            dtype=_model_dtype(config.dtype),
+            dtype=config.dtype,
             tensor_parallel_size=1,
             pipeline_parallel_size=1,
             data_parallel_size=1,
@@ -614,9 +604,9 @@ def create_vllm_llm(
             enable_prefix_caching=config.enable_prefix_caching,
             enable_chunked_prefill=config.enable_chunked_prefill,
             # The supported uni-process, non-speculative decoder enables async by default.
-            async_scheduling=config.runner is RunnerKind.MRV2,
+            async_scheduling=config.runner == "mrv2",
             scheduler_cls="pllm.backends.vllm.prefix_cache."
-            + ("WorkloadAsyncScheduler" if config.runner is RunnerKind.MRV2 else "WorkloadScheduler"),
+            + ("WorkloadAsyncScheduler" if config.runner == "mrv2" else "WorkloadScheduler"),
             kv_transfer_config=None if offload is None else offload.options(),
         )
     finally:
@@ -681,7 +671,7 @@ def probe_backend(
     targets = inspect_parameter_targets(decoder, requested_targets, runner.dtype) if requested_targets else ()
     replay_capabilities = (
         ("model/tokenwise_replay@1", TOKEN_CAPTURE_CAPABILITY)
-        if runner.runner_kind is RunnerKind.MRV2 and graph_mode(runner.overlay_graph_bytes) is AttachmentGraphMode.EAGER
+        if runner.runner_kind == "mrv2" and graph_mode(runner.overlay_graph_bytes) is AttachmentGraphMode.EAGER
         else ()
     )
     probe = _base_probe(
@@ -709,7 +699,7 @@ def probe_backend(
                         *_REQUEST_CAPABILITIES,
                         *_OVERLAY_CAPABILITIES,
                         *replay_capabilities,
-                        f"backend/vllm_{runner.runner_kind.value}@1",
+                        f"backend/vllm_{runner.runner_kind}@1",
                     )
                 )
             )
@@ -773,17 +763,17 @@ def _base_probe(
     device_ordinal = runner.device.index
     assert device_ordinal is not None
     return BackendPlacementProbe(
-        adapter_id=f"canonical.vllm_{runner.runner_kind.value}@1",
+        adapter_id=f"canonical.vllm_{runner.runner_kind}@1",
         backend_abi_digest=_digest(
             (
                 *_BACKEND_ABI_FIELDS,
-                f"runner={runner.runner_kind.value}",
+                f"runner={runner.runner_kind}",
                 f"cuda_graphs={not runner.model_config.enforce_eager}",
             )
         ),
         runner_fingerprint=_digest(
             (
-                runner.runner_kind.value,
+                runner.runner_kind,
                 f"device=cuda:{device_ordinal}",
                 f"max_num_tokens={runner.max_num_tokens}",
                 f"max_num_reqs={runner.max_num_reqs}",
@@ -810,7 +800,6 @@ def _base_probe(
 
 __all__ = [
     "VllmConfig",
-    "VllmDType",
     "VllmLlm",
     "create_vllm_llm",
 ]

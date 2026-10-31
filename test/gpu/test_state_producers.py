@@ -200,7 +200,6 @@ def test_composed_readers_replay_model_graphs(workload, monkeypatch):
     + [(runner, 128, 128) for runner in ("mrv1", "mrv2")],
 )
 def test_chunked_runners_discard_partial_prompt_feedback(runner, budget, seqs):
-    from pllm.config import RunnerKind
     from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
 
     tokens = []
@@ -208,7 +207,7 @@ def test_chunked_runners_discard_partial_prompt_feedback(runner, budget, seqs):
     for chunked in (False, True):
         with open_llm(
             ESampRequestWorkload(ESampRequestConfig(rank=2)),
-            runner=RunnerKind(runner),
+            runner=runner,
             seqs=seqs,
             chunked=chunked,
             tokens=budget if chunked else 2176,

@@ -44,7 +44,7 @@ from pllm.backends.vllm.sampler import (
     Vllm027Sampler,
 )
 from pllm.backends.vllm.session import VllmSession
-from pllm.config import RunnerKind
+from pllm.config import RunnerName
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
     AttachmentTopology,
@@ -65,7 +65,7 @@ class Runner:
     model_config: VllmModelConfig
     device: torch.device
     max_num_tokens: int
-    runner_kind: RunnerKind
+    runner_kind: RunnerName
     max_num_reqs: int
 
     hidden_taps: HiddenTaps | None = None
@@ -158,7 +158,7 @@ class Runner:
 
 
 class WorkloadModelRunner(Runner, OverlayGraphRunner):
-    runner_kind = RunnerKind.MRV2
+    runner_kind: RunnerName = "mrv2"
 
     def __init__(
         self,

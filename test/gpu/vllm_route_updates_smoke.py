@@ -9,7 +9,7 @@ from vllm import SamplingParams
 from vllm.forward_context import override_forward_context
 
 import pllm
-from pllm.config import ModelConfig, VllmDType
+from pllm.config import ModelConfig
 from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
 
@@ -35,7 +35,7 @@ def run(chunk):
     )
     workload = SettledInPlaceTTT(InPlaceTTTConfig(targets, chunk_size=chunk, learning_rate=1e-6, update_decode=True))
     handle = pllm.make_llm(
-        workload=workload, config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", VllmDType.BFLOAT16, 64, 2, 64, 0.25, seed=7)
+        workload=workload, config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", "bfloat16", 64, 2, 64, 0.25, seed=7)
     )
     primitive = handle.runner.require_session()._replay
     native, checked, errors = torch.cuda.CUDAGraph.replay, [], []

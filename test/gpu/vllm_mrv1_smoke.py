@@ -16,16 +16,14 @@ from vllm import SamplingParams
 from pllm import make_llm
 from pllm.backends.vllm import mrv1
 from pllm.backends.vllm.sampler import SamplerGuidance
-from pllm.config import ModelConfig, RunnerKind, VllmDType
+from pllm.config import ModelConfig
 from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
 
 
 def main() -> None:
     handle = make_llm(
         workload=ESampRequestWorkload(ESampRequestConfig(rank=2, intervention_beta=0.2)),
-        config=ModelConfig(
-            "Qwen/Qwen2.5-0.5B-Instruct", VllmDType.BFLOAT16, 64, 2, 128, 0.25, seed=7, runner=RunnerKind.MRV1
-        ),
+        config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", "bfloat16", 64, 2, 128, 0.25, seed=7, runner="mrv1"),
     )
     native_rows, native_reweight = mrv1.encode_mrv1_rows, SamplerGuidance._reweight_finite_survivors
     widths, phases, identities_seen = set(), set(), set()

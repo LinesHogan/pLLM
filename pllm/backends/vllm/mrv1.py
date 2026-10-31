@@ -14,12 +14,12 @@ from pllm.backends.vllm.architecture import bind_model
 from pllm.backends.vllm.packed_rows import encode_mrv1_rows
 from pllm.backends.vllm.runner import Runner
 from pllm.backends.vllm.sampler import Mrv1Sampler
-from pllm.config import RunnerKind
+from pllm.config import RunnerName
 from pllm.contracts.backend_attachment import AttachmentTopology
 
 
 class Mrv1Runner(Runner, GPUModelRunner):
-    runner_kind = RunnerKind.MRV1
+    runner_kind: RunnerName = "mrv1"
 
     def __init__(
         self,

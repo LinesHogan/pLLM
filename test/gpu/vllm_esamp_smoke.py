@@ -19,7 +19,7 @@ from vllm import SamplingParams
 
 import pllm
 from pllm.backends.vllm.runtime import VllmLlm
-from pllm.config import ExecutionOptions, ModelConfig, VllmDType
+from pllm.config import ExecutionOptions, ModelConfig
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
@@ -83,7 +83,7 @@ def main() -> int:
     plain = pllm.make_llm(
         ModelConfig(
             model="Qwen/Qwen2.5-0.5B-Instruct",
-            dtype=VllmDType.BFLOAT16,
+            dtype="bfloat16",
             gpu_memory_utilization=0.25,
             max_model_len=64,
             enable_prefix_caching=False,
@@ -110,7 +110,7 @@ def main() -> int:
         workload=workload,
         config=ModelConfig(
             model="Qwen/Qwen2.5-0.5B-Instruct",
-            dtype=VllmDType.BFLOAT16,
+            dtype="bfloat16",
             max_model_len=64,
             max_num_seqs=1,
             max_num_batched_tokens=64,
