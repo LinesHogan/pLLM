@@ -257,8 +257,8 @@ pub(crate) struct TaskResourceFact {
     pub(crate) input_shapes: Vec<Vec<u64>>,
 }
 
+// Not deny_unknown_fields: the Python timeline also carries the tensor policy, which only Python reads.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct Timeline {
     pub(crate) anchors: Vec<TimelineAnchor>,
     pub(crate) capabilities: Vec<String>,
@@ -271,8 +271,6 @@ pub(crate) struct Timeline {
     pub(crate) memory_budget_bytes: Option<u64>,
     #[serde(default)]
     pub(crate) reserved_bytes: Vec<u64>,
-    #[serde(default)]
-    pub(crate) tensor_policy: super::tensor_policy::Policy,
     #[serde(default)]
     pub(super) visibility: Option<VisibilitySource>,
 }

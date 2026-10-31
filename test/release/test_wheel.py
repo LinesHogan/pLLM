@@ -89,7 +89,6 @@ request = json.dumps({'schema_version': 1, 'layouts': [{
     'fields': [{'field_id': 0, 'shape': [2, 4], 'dtype': 'float32',
     'alignment_bytes': 16}]}}]})
 decision = _core.intern_tensor_layouts(request)
-_core.validate_tensor_layouts(request, decision)
 assert json.loads(decision)['bindings'][0]['layout_id'] == 0
 assert callable(pllm.make_llm)
 for workload in ('dummy', 'esamp_request', 'fttt', 'gtta', 'inplace_ttt', 'tlm',

@@ -4,7 +4,10 @@
 //! no workload names, Tensor objects, Python callbacks, or runtime handles.
 
 use super::scheduler::{self, ScheduleDecision};
-use super::semantic_graph::{validate_graph, validate_timeline, SemanticGraph, Timeline};
+use super::semantic_graph::{
+    require_sorted_unique_text, require_text, validate_graph, validate_timeline, SemanticGraph,
+    Timeline,
+};
 use serde::{Deserialize, Serialize};
 
 const SCHEMA_VERSION: u64 = 1;
@@ -71,13 +74,6 @@ pub(crate) fn decode_decision(payload: &str) -> Result<StateRepresentationDecisi
         .map_err(|source| format!("invalid StateRepresentationDecision: {source}"))
 }
 
-fn require_text(value: &str, label: &str) -> Result<(), String> {
-    if value.is_empty() {
-        return Err(format!("{label} must be a non-empty string"));
-    }
-    Ok(())
-}
-
 fn require_digest(value: &str, label: &str) -> Result<(), String> {
     if value.len() != 64
         || !value
@@ -85,16 +81,6 @@ fn require_digest(value: &str, label: &str) -> Result<(), String> {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         return Err(format!("{label} must be a lowercase SHA-256 digest"));
-    }
-    Ok(())
-}
-
-fn require_sorted_unique_text(values: &[String], label: &str) -> Result<(), String> {
-    for value in values {
-        require_text(value, label)?;
-    }
-    if values.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(format!("{label} must be sorted unique names"));
     }
     Ok(())
 }

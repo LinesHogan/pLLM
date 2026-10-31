@@ -61,10 +61,6 @@ fn error(message: impl Into<String>) -> PyErr {
     PyValueError::new_err(message.into())
 }
 
-pub(crate) fn decode_decision(payload: &str) -> Result<ScheduleDecision, String> {
-    serde_json::from_str(payload).map_err(|source| format!("invalid ScheduleDecision: {source}"))
-}
-
 fn task_index(graph: &SemanticGraph, symbol: &str) -> Result<usize, String> {
     graph
         .tasks
@@ -818,48 +814,6 @@ fn build_decision(
     }
 }
 
-pub(crate) fn validate_decision(
-    graph: &SemanticGraph,
-    timeline: &Timeline,
-    decision: &ScheduleDecision,
-    state: Option<&StateRepresentationDecision>,
-) -> Result<(), String> {
-    validate_graph(graph)?;
-    validate_timeline(timeline)?;
-    let index = graph_index(graph, timeline, state)?;
-    let implementations = graph
-        .tasks
-        .iter()
-        .enumerate()
-        .map(|(id, task)| {
-            let selected = decision
-                .tasks
-                .iter()
-                .find(|selected| selected.task_id as usize == id)
-                .ok_or("canonical schedule is missing a task")?;
-            task.implementations
-                .iter()
-                .find(|candidate| {
-                    candidate.implementation_id == selected.implementation_id
-                        && candidate.required_capabilities.iter().all(|capability| {
-                            timeline.capabilities.binary_search(capability).is_ok()
-                        })
-                })
-                .ok_or_else(|| {
-                    "selected implementation is not available in the original timeline".to_owned()
-                })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let solution = check_placement(graph, timeline, &index, state, &decision.tasks)?;
-    let expected = build_decision(graph, &implementations, solution);
-    if decision != &expected {
-        return Err(
-            "canonical schedule decision differs from its selected placement witness".to_owned(),
-        );
-    }
-    Ok(())
-}
-
 #[pyfunction]
 #[pyo3(signature = (graph_json, timeline_json, state_json=None))]
 fn compile_schedule(
@@ -874,31 +828,14 @@ fn compile_schedule(
     canonical_ascii_json(&decision).map_err(error)
 }
 
-#[pyfunction]
-#[pyo3(signature = (graph_json, timeline_json, decision_json, state_json=None))]
-fn validate_schedule(
-    graph_json: &str,
-    timeline_json: &str,
-    decision_json: &str,
-    state_json: Option<&str>,
-) -> PyResult<()> {
-    let graph = decode_graph(graph_json).map_err(error)?;
-    let timeline = decode_timeline(timeline_json).map_err(error)?;
-    let decision = decode_decision(decision_json).map_err(error)?;
-    let state = state_json.map(decode_state).transpose().map_err(error)?;
-    validate_decision(&graph, &timeline, &decision, state.as_ref()).map_err(error)
-}
-
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(compile_schedule, module)?)?;
-    module.add_function(wrap_pyfunction!(validate_schedule, module)?)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_decision, check_placement, graph_index};
-    use super::{compile, validate_decision, ScheduleDecision};
+    use super::compile;
     use crate::planning::semantic_graph::{decode_graph, decode_timeline};
     use serde_json::json;
 
@@ -946,16 +883,13 @@ mod tests {
         assert_eq!(inline.tasks[0].read_distance, 2);
         assert_eq!(inline.tasks[0].read_origin, super::ReadOrigin::Boundary);
         assert_eq!(inline.tasks[1].read_origin, super::ReadOrigin::Latest);
-        validate_decision(&graph, &timeline, &inline, None).unwrap();
         timeline.memory_budget_bytes = Some(inline.peak_memory_bytes - 1);
         assert!(compile(&graph, &timeline, None).is_err());
         timeline.memory_budget_bytes = None;
         graph.tasks[1].math = Some(serde_json::from_value(json!({"input_gradients":[],"parameter_gradients":[],"detached_inputs":[],"forward_rows":"","input_gradient_rows":"","parameter_gradient_rows":"","update_states":"","reduction":"none"})).unwrap());
-        let mut main = compile(&graph, &timeline, None).unwrap();
+        let main = compile(&graph, &timeline, None).unwrap();
         assert!(main.tasks.iter().all(|t| t.lane == super::Lane::Main));
         assert_eq!(main.tasks[0].read_distance, 2);
-        main.tasks[1].lane = super::Lane::Side;
-        assert!(validate_decision(&graph, &timeline, &main, None).is_err());
         graph.tasks[1].implementations[0]
             .required_capabilities
             .push("compute/cuda_graph@1".into());
@@ -1147,8 +1081,6 @@ mod tests {
                 }
             }
         }
-        let decision = compile(&valid, &timeline, Some(&state)).unwrap();
-        assert!(validate_decision(&valid, &timeline, &decision, None).is_err());
         for mutation in 0..7 {
             let mut graph = valid.clone();
             match mutation {
@@ -1206,34 +1138,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![vec![], vec![0], vec![1, 2]]
         );
-        // A worker checks this exact legal witness, not the optimizer's preferred
-        // alternative. Compilation remains the only placement-selection path.
         let mut roomy = timeline.clone();
         roomy.memory_budget_bytes = Some(200);
-        let mut later = decision.tasks.clone();
-        later[1].anchor_id = 2;
-        later[2].anchor_id = 2;
-        let index = graph_index(&graph, &roomy, None).unwrap();
-        let implementations: Vec<_> = graph
-            .tasks
-            .iter()
-            .map(|task| &task.implementations[0])
-            .collect();
-        let witness = check_placement(&graph, &roomy, &index, None, &later).unwrap();
-        let selected = build_decision(&graph, &implementations, witness);
-        assert_ne!(selected, compile(&graph, &roomy, None).unwrap());
-        validate_decision(&graph, &roomy, &selected, None).unwrap();
-        for mutation in 0..5 {
-            let mut changed = selected.clone();
-            match mutation {
-                0 => changed.tasks[0].anchor_id = 3,
-                1 => changed.tasks[1].task_id = changed.tasks[0].task_id,
-                2 => changed.tasks.swap(1, 2),
-                3 => changed.peak_memory_bytes = 1,
-                _ => changed.tasks[1].release_values.clear(),
-            }
-            assert!(validate_decision(&graph, &roomy, &changed, None).is_err());
-        }
         graph.tasks[1].timing.before = "a2".into();
         graph.tasks[2].timing.after = "a2".into();
         graph.tasks[2].outputs[0].kind = super::super::semantic_graph::OutputKind::Host;
@@ -1402,9 +1308,5 @@ mod tests {
         assert_eq!(decision.tasks[1].task_id, 1);
         assert_eq!(decision.tasks[0].implementation_id, "esamp:cpu@1");
         assert_eq!(decision.tasks[1].anchor_id, 1);
-        validate_decision(&graph, &timeline, &decision, None).unwrap();
-        let mut tampered: ScheduleDecision = decision.clone();
-        tampered.tasks[1].anchor_id = 0;
-        assert!(validate_decision(&graph, &timeline, &tampered, None).is_err());
     }
 }

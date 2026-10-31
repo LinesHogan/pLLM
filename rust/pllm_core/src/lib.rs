@@ -6,7 +6,6 @@ use pyo3::prelude::*;
 
 mod planning;
 mod prefill_row_plan;
-mod workload_frontend;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -14,6 +13,5 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     planning::scheduler::register(m)?;
     planning::tensor_layout::register(m)?;
     prefill_row_plan::register(m)?;
-    workload_frontend::register(m)?;
     Ok(())
 }

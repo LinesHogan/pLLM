@@ -4,12 +4,12 @@
 //! canonical descriptor bytes, so equal layouts share an ID independently of
 //! request or graph ordering.
 
+use super::semantic_graph::{canonical_ascii_json, require_text};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fmt::Write;
 
 const SCHEMA_VERSION: u64 = 1;
 
@@ -83,35 +83,8 @@ pub(crate) struct TensorLayoutDecision {
     schema_version: u64,
 }
 
-fn error(message: impl Into<String>) -> PyErr {
-    PyValueError::new_err(message.into())
-}
-
 fn decode_request(payload: &str) -> Result<TensorLayoutRequest, String> {
     serde_json::from_str(payload).map_err(|source| format!("invalid TensorLayoutRequest: {source}"))
-}
-
-fn decode_decision(payload: &str) -> Result<TensorLayoutDecision, String> {
-    serde_json::from_str(payload)
-        .map_err(|source| format!("invalid TensorLayoutDecision: {source}"))
-}
-
-fn require_text(value: &str, label: &str) -> Result<(), String> {
-    if value.is_empty() {
-        return Err(format!("{label} must be a non-empty string"));
-    }
-    Ok(())
-}
-
-fn require_digest(value: &str, label: &str) -> Result<(), String> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(format!("{label} must be a lowercase SHA-256 digest"));
-    }
-    Ok(())
 }
 
 fn validate_layout(layout: &TensorLayoutSpec) -> Result<(), String> {
@@ -155,32 +128,6 @@ fn validate_request(request: &TensorLayoutRequest) -> Result<(), String> {
         return Err("tensor layout request resources must be sorted unique".to_owned());
     }
     Ok(())
-}
-
-// serde_json maps retain lexicographic object-key ordering.  Normalize to the
-// ASCII JSON convention used by the Python contract before hashing or output.
-fn canonical_ascii_json<T: Serialize>(value: &T) -> Result<String, String> {
-    let value = serde_json::to_value(value)
-        .map_err(|source| format!("failed to encode canonical JSON: {source}"))?;
-    let encoded = serde_json::to_string(&value)
-        .map_err(|source| format!("failed to serialize canonical JSON: {source}"))?;
-    let mut canonical = String::with_capacity(encoded.len());
-    for character in encoded.chars() {
-        if character.is_ascii() {
-            canonical.push(character);
-            continue;
-        }
-        let scalar = character as u32;
-        if scalar <= 0xffff {
-            write!(&mut canonical, "\\u{scalar:04x}").expect("writing to String cannot fail");
-            continue;
-        }
-        let surrogate = scalar - 0x1_0000;
-        let high = 0xd800 + (surrogate >> 10);
-        let low = 0xdc00 + (surrogate & 0x3ff);
-        write!(&mut canonical, "\\u{high:04x}\\u{low:04x}").expect("writing to String cannot fail");
-    }
-    Ok(canonical)
 }
 
 fn digest(payload: &str) -> String {
@@ -245,76 +192,27 @@ fn compile(request: &TensorLayoutRequest) -> Result<TensorLayoutDecision, String
     Ok(decision)
 }
 
-fn validate_decision_shape(decision: &TensorLayoutDecision) -> Result<(), String> {
-    if decision.schema_version != SCHEMA_VERSION {
-        return Err(format!(
-            "unsupported TensorLayoutDecision schema_version: {}",
-            decision.schema_version
-        ));
-    }
-    require_digest(&decision.request_digest, "decision.request_digest")?;
-    require_digest(&decision.layout_namespace, "decision.layout_namespace")?;
-    require_digest(&decision.signature, "decision.signature")?;
-    for binding in &decision.bindings {
-        require_text(&binding.resource, "bindings.resource")?;
-        require_digest(&binding.layout_digest, "bindings.layout_digest")?;
-        require_digest(&binding.layout_namespace, "bindings.layout_namespace")?;
-        if binding.layout_namespace != decision.layout_namespace {
-            return Err("tensor layout binding namespace differs from its decision".to_owned());
-        }
-    }
-    if decision
-        .bindings
-        .windows(2)
-        .any(|pair| pair[0].resource >= pair[1].resource)
-    {
-        return Err("tensor layout decision bindings must be sorted unique".to_owned());
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_decision(
-    request: &TensorLayoutRequest,
-    decision: &TensorLayoutDecision,
-) -> Result<(), String> {
-    validate_decision_shape(decision)?;
-    let expected = compile(request)?;
-    if decision != &expected {
-        return Err("tensor layout decision differs from Rust recomputation".to_owned());
-    }
-    Ok(())
-}
-
 #[pyfunction]
 fn intern_tensor_layouts(request_json: &str) -> PyResult<String> {
-    let request = decode_request(request_json).map_err(error)?;
-    let decision = compile(&request).map_err(error)?;
-    canonical_ascii_json(&decision).map_err(error)
-}
-
-#[pyfunction]
-fn validate_tensor_layouts(request_json: &str, decision_json: &str) -> PyResult<()> {
-    let request = decode_request(request_json).map_err(error)?;
-    let decision = decode_decision(decision_json).map_err(error)?;
-    validate_decision(&request, &decision).map_err(error)
+    let intern = || canonical_ascii_json(&compile(&decode_request(request_json)?)?);
+    intern().map_err(PyValueError::new_err)
 }
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(intern_tensor_layouts, module)?)?;
-    module.add_function(wrap_pyfunction!(validate_tensor_layouts, module)?)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{compile, validate_decision, TensorLayoutDecision, TensorLayoutRequest};
+    use super::{compile, TensorLayoutRequest};
 
     fn request_json() -> String {
         r#"{"layouts":[{"resource":"alpha","layout":{"namespace":"adapter","fields":[{"field_id":0,"shape":[2,4],"dtype":"float32","alignment_bytes":16}],"schema_version":1}},{"resource":"beta","layout":{"namespace":"adapter","fields":[{"field_id":0,"shape":[2,4],"dtype":"float32","alignment_bytes":16}],"schema_version":1}},{"resource":"gamma","layout":{"namespace":"adapter","fields":[{"field_id":0,"shape":[1],"dtype":"float32","alignment_bytes":16},{"field_id":1,"shape":[],"dtype":"float32","alignment_bytes":16}],"schema_version":1}}],"schema_version":1}"#.to_owned()
     }
 
     #[test]
-    fn equal_descriptors_share_dense_ids_and_tampering_is_rejected() {
+    fn equal_descriptors_share_dense_ids() {
         let request: TensorLayoutRequest = serde_json::from_str(&request_json()).unwrap();
         let decision = compile(&request).unwrap();
         let base_request: TensorLayoutRequest = serde_json::from_str(
@@ -347,10 +245,5 @@ mod tests {
             decision.bindings[0].layout_digest,
             base_decision.bindings[0].layout_digest
         );
-        validate_decision(&request, &decision).unwrap();
-
-        let mut tampered: TensorLayoutDecision = decision.clone();
-        tampered.bindings[0].layout_id = 99;
-        assert!(validate_decision(&request, &tampered).is_err());
     }
 }

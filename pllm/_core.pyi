@@ -27,17 +27,7 @@ def plan_packed_prefill_rows(
     expected_total_rows: int | None = None,
 ) -> PackedPrefillRowPlan: ...
 def intern_tensor_layouts(request_json: str) -> str: ...
-def validate_tensor_layouts(
-    request_json: str,
-    decision_json: str,
-) -> None: ...
 def compile_schedule(graph_json: str, timeline_json: str, state_json: str | None = None) -> str: ...
-def validate_schedule(
-    graph_json: str,
-    timeline_json: str,
-    decision_json: str,
-    state_json: str | None = None,
-) -> None: ...
 def compile_state_schedule(
     graph_json: str,
     timeline_json: str,
