@@ -114,11 +114,9 @@ def test_bound_scan_matches_original_chunk_math_bitwise(device, dtype, numerics)
 
 def test_production_tuning_policy_is_signed_into_worker_facts():
     workload = InPlaceTTTWorkload(InPlaceTTTConfig((TARGET,), chunk_size=3))
-    options = pllm.ExecutionOptions(
-        allow_numerical_transforms=False, schedule_policy="serial", tuning="measured", memory_budget_bytes=1 << 20
-    )
+    options = pllm.ExecutionOptions(allow_numerical_transforms=False, tuning="measured", memory_budget_bytes=1 << 20)
     facts, _ = workload.specialize(facts_for(torch.device("cpu"), torch.float32), options)
-    policy = TensorPolicy(False, "serial", "measured")
+    policy = TensorPolicy(False, "measured")
     assert facts.timeline.tensor_policy == policy
     # The policy crosses the process boundary inside the facts the worker binds with.
     facts = decode_boundary(encode_boundary(facts), BackendCompileFacts)

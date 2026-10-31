@@ -51,7 +51,6 @@ class ExecutionOptions:
     state_memory_bytes: int = 0  # Zero uses the backend's observed available capacity.
     memory_budget_bytes: int | None = None  # Original AER declared-memory limit, not total CUDA residency.
     allow_numerical_transforms: bool = True
-    schedule_policy: Literal["auto", "serial"] = "auto"
     # Deterministic preparation and funded stream overlap by default.
     # Only "measured" searches and times additional implementations.
     tuning: Literal["heuristic", "measured"] = "heuristic"

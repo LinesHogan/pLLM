@@ -172,7 +172,7 @@ def _apply_options(facts: BackendCompileFacts, options: ExecutionOptions) -> Bac
             (n for n in (facts.timeline.memory_budget_bytes, options.memory_budget_bytes) if n is not None),
             default=None,
         ),
-        tensor_policy=TensorPolicy(options.allow_numerical_transforms, options.schedule_policy, options.tuning),
+        tensor_policy=TensorPolicy(options.allow_numerical_transforms, options.tuning),
         visibility=VisibilitySource.post_sampler(options.publish_lag),
     )
     return replace(

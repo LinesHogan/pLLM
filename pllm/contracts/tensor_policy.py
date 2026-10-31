@@ -10,7 +10,6 @@ class TensorPolicy:
     """Preparation policy serialized with the signed worker timeline."""
 
     allow_numerical_transforms: bool = True
-    schedule_policy: Literal["auto", "serial"] = "auto"
     tuning: Literal["heuristic", "measured"] = "heuristic"
 
 

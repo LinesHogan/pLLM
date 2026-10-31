@@ -160,12 +160,12 @@ def run_step(execution, value, decoder):
 
 def test_recirculation_declaration_fits_reference_budget_and_crosses_the_wire() -> None:
     workload = WORKLOAD
-    # The exact serial reference budget admits the plan; one byte less does not.
-    serial_facts, _ = workload.specialize(FACTS, ExecutionOptions(schedule_policy="serial"))
+    # The exact reference budget, every reservation and task resource at once, admits the plan; one byte less does not.
+    reference, _ = workload.specialize(FACTS, ExecutionOptions())
     reference_budget = (
-        max(serial_facts.timeline.reserved_bytes)
-        + sum(f.workspace_bytes + f.resident_bytes for f in serial_facts.timeline.task_resources)
-        + sum(f.bytes for f in serial_facts.timeline.value_resources)
+        max(reference.timeline.reserved_bytes)
+        + sum(f.workspace_bytes + f.resident_bytes for f in reference.timeline.task_resources)
+        + sum(f.bytes for f in reference.timeline.value_resources)
     )
     tight = workload.compile_backend(FACTS, ExecutionOptions(memory_budget_bytes=reference_budget, tuning="measured"))
     assert tight.attachment.plan.timeline.memory_budget_bytes == reference_budget
