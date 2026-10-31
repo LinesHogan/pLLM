@@ -303,7 +303,7 @@ class VllmLlm(Generic[DataT, ResultT]):
                 use_tqdm=use_tqdm,
                 feedback_group=feedback_group,
                 prompt_indices=indices,
-                sample_index=attempt,
+                sample_index=attempt * sampling_params.n,
                 auxiliary=auxiliary,
                 completion_device=completion_device,
                 routes=None if route_values is None else tuple(route_values),
@@ -392,14 +392,16 @@ class VllmLlm(Generic[DataT, ResultT]):
         if completion_device is not None and feedback_group is None:
             raise ValueError("completion device requires completion feedback")
         texts = [prompts] if isinstance(prompts, str) else prompts
-        if not texts or any(not prompt for prompt in texts) or sampling_params.n != 1:
-            raise ValueError("provide non-empty prompts and set sampling n=1")
+        if not texts or any(not prompt for prompt in texts):
+            raise ValueError("provide non-empty prompts")
         if sample_index < 0 or feedback_group is not None and not feedback_group:
             raise ValueError("use a nonnegative sample index and a non-empty feedback group")
-        if self._sample_limit is not None and sample_index >= self._sample_limit:
+        n = sampling_params.n
+        if self._sample_limit is not None and sample_index + n > self._sample_limit:
             raise ValueError(
-                f"sample_index={sample_index}: this workload reads pllm.samples(limit={self._sample_limit}); "
-                f"use a sample index below {self._sample_limit} or raise the workload's limit"
+                f"sample indices {sample_index}..{sample_index + n - 1}: this workload reads "
+                f"pllm.samples(limit={self._sample_limit}); keep sample_index + n at most {self._sample_limit} or "
+                "raise the workload's limit"
             )
         indices = self._prompt_indices(texts, prompt_indices)
         # A route value is user-computed (regex, discriminator, tenant); the signed
@@ -425,8 +427,13 @@ class VllmLlm(Generic[DataT, ResultT]):
         request_ids: list[str] = []
         lifetime = ExitStack()
         try:
-            request_ids = llm.enqueue(prompts, self._cache_policy.sampling(sampling_params), use_tqdm=use_tqdm)
-            identities = self._request_identities(request_ids, indices, sample_index, routes)
+            # Each of a prompt's n samples is its own request, with its own sample index and request state.
+            request_ids = llm.enqueue(
+                [prompt for prompt in texts for _ in range(n)],
+                [self._cache_policy.sampling(sample) for _ in texts for sample in _one_per_sample(sampling_params)],
+                use_tqdm=use_tqdm,
+            )
+            identities = self._request_identities(request_ids, indices, sample_index, n, routes)
             # Borrow vLLM's exact frontend mapping before completed entries are removed.
             external = {
                 llm.llm_engine.output_processor.request_states[identity.request_id].external_req_id: identity
@@ -436,7 +443,7 @@ class VllmLlm(Generic[DataT, ResultT]):
             self._next_prompt_index = max(self._next_prompt_index, max(indices) + 1)
             llm.wake_up(tags=["scheduling"])
             outputs = llm.wait_for_completion(RequestOutput, use_tqdm=use_tqdm)
-            return self._collect(outputs, identities, external, feedback_group, destination)
+            return self._collect(outputs, identities, external, feedback_group, destination, n)
         except Exception as original:
             try:
                 llm.llm_engine.abort_request(request_ids, internal=True)
@@ -471,13 +478,22 @@ class VllmLlm(Generic[DataT, ResultT]):
         return indices
 
     def _request_identities(
-        self, request_ids: list[str], indices: tuple[int, ...], sample_index: int, routes: tuple[str, ...] | None
+        self,
+        request_ids: list[str],
+        indices: tuple[int, ...],
+        sample_index: int,
+        n: int,
+        routes: tuple[str, ...] | None,
     ) -> tuple[RequestIdentity, ...]:
+        """Sample j of each prompt gets sample index `sample_index + j`."""
+        samples = (
+            (index, sample_index + j, route)
+            for index, route in zip(indices, routes if routes is not None else ("",) * len(indices), strict=True)
+            for j in range(n)
+        )
         return tuple(
-            RequestIdentity(request_id, index, sample_index, route)
-            for request_id, index, route in zip(
-                request_ids, indices, routes if routes is not None else ("",) * len(indices), strict=True
-            )
+            RequestIdentity(request_id, index, sample, route)
+            for request_id, (index, sample, route) in zip(request_ids, samples, strict=True)
         )
 
     def _stage(
@@ -522,11 +538,12 @@ class VllmLlm(Generic[DataT, ResultT]):
         external: dict[str, RequestIdentity],
         feedback_group: str | None,
         destination: torch.Tensor | None,
+        n: int,
     ) -> list[RequestOutput] | CompletionInput:
         # FINISH validates and synchronizes the staged rows before releasing requests.
         self.command(BackendCommand.FINISH)
         if feedback_group is None:
-            return outputs
+            return _per_prompt(outputs, n)
         completions: dict[RequestIdentity, Completion] = {}
         for output in outputs:
             identity = external[output.request_id]
@@ -547,6 +564,26 @@ class VllmLlm(Generic[DataT, ResultT]):
             if destination.device.type == "cuda"
             else None,
         )
+
+
+def _one_per_sample(params: SamplingParams) -> list[SamplingParams]:
+    """vLLM's own split of n samples into requests: n=1 each, and seed + j for sample j when a seed is set."""
+    samples: list[SamplingParams] = []
+    for j in range(params.n):
+        sample = params.clone()
+        sample.n = 1
+        if params.seed is not None:
+            sample.seed = params.seed + j
+        samples.append(sample)
+    return samples
+
+
+def _per_prompt(outputs: list[RequestOutput], n: int) -> list[RequestOutput]:
+    """One RequestOutput per prompt holding its n completions, as vLLM returns for SamplingParams(n=...)."""
+    merged = outputs[::n]
+    for start, output in zip(range(0, len(outputs), n), merged, strict=True):
+        output.outputs = [replace(sample.outputs[0], index=j) for j, sample in enumerate(outputs[start : start + n])]
+    return merged
 
 
 def vllm_engine(config: ModelConfig, workload_options: dict[str, Any]) -> LLM:

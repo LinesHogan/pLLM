@@ -162,7 +162,7 @@ class _Requests:
 
     def rates(self, round_seconds: tuple[float, ...]) -> tuple[float, ...]:
         """Output tokens per second of each round; every round generates all tokens (ignore_eos)."""
-        tokens = len(self.prompts) * (self.sampling.max_tokens or 0)
+        tokens = len(self.prompts) * self.sampling.n * (self.sampling.max_tokens or 0)
         return tuple(tokens / seconds for seconds in round_seconds)
 
 
@@ -459,9 +459,7 @@ def compare(
 ) -> tuple[BenchmarkResult, ...]:
     """Measure ordinary model workloads; optimized arms and nonzero training are opt-in."""
     indices = tuple(range(options.batch)) if prompt_indices is None else prompt_indices
-    # Workload generate takes n=1, so each prompt is repeated sampling_n times for every arm,
-    # vanilla included; without prefix caching vLLM prefills each completion of n>1 anyway.
-    indices = tuple(index for index in indices for _ in range(options.sampling_n))
+    # Each prompt's sampling_n completions are independent samples with their own sample index (and request state).
     prompts = [f"Explain the mathematical idea numbered {index}:" for index in indices]
     sampling = SamplingParams(
         max_tokens=options.tokens,
@@ -470,7 +468,7 @@ def compare(
         top_k=-1,
         ignore_eos=True,
         seed=7,
-        n=1,
+        n=options.sampling_n,
     )
     print(
         json.dumps(

@@ -489,12 +489,17 @@ def main() -> int:
         # One shared completion batch feeds both host workloads.
         regex = StructuredOutputsParams(regex=r"\\boxed\{[12]\}")
         batch = handle.generate(
-            ["Choose 1 or 2, boxed: "] * 3,
-            SamplingParams(max_tokens=16, temperature=0.8, structured_outputs=regex),
+            ["Choose 1 or 2, boxed: "],
+            SamplingParams(n=3, max_tokens=16, temperature=0.8, structured_outputs=regex),
             feedback_group="vote",
-            prompt_indices=(100, 100, 100),
+            prompt_indices=(100,),
             sample_index=2,
         )
+        assert [(entry.identity.prompt_idx, entry.identity.sample_idx) for entry in batch.completions.entries] == [
+            (100, 2),
+            (100, 3),
+            (100, 4),
+        ]
         assert batch.hidden.device.type == "cpu" and batch.readiness is None
         assert batch.hidden.shape == (3, handle.attachment.probe.hidden_size)
         assert torch.isfinite(batch.hidden).all() and torch.count_nonzero(batch.hidden) > 0
