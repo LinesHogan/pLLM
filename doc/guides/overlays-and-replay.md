@@ -47,6 +47,12 @@ class MyLoRA(pllm.Workload):
 私有的因子存储。基座权重只是被借用来计算有效权重，补丁落在私有页上，按版本
 发布。
 
+**想让框架替你求梯度？** 给状态声明 `optimizer=pllm.SGD(lr)` 并传 `chunk=`：
+方法改为返回每行一个 loss，框架在每个 chunk 结束时用 SGD 更新补丁
+（`flush="prompt_end"` 让 prompt 末尾不满一个 chunk 的行也参与）。优化器只写在
+状态上，`@pllm.overlay` 本身不带优化器，参见
+[Prefill adapters](../../pllm/workloads/prefill_adapters.py)。
+
 `initialize=` 可以初始化逻辑字段。普通 LoRA 训练通常随机初始化 A、将 B 置零，
 这样初始模型增量为零，第一次优化器更新仍能学习 B。
 

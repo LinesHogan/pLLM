@@ -45,12 +45,9 @@ class PrefillAdapters(pllm.Workload):
             },
             dtype=self.dtype,
             initialize=initialize,
+            # Apply the mean reconstruction gradient once per prompt chunk.
+            optimizer=pllm.SGD(self.learning_rate),
         )
-
-    @property
-    def optimizer(self) -> pllm.SGD:
-        """Apply the mean reconstruction gradient once per prompt chunk."""
-        return pllm.SGD(self.learning_rate)
 
     @pllm.overlay(
         state="adapters",
@@ -58,7 +55,6 @@ class PrefillAdapters(pllm.Workload):
         operator=pllm.model.ParameterOverlayOperator.LOW_RANK_ADD,
         visibility=pllm.Exact(),
         chunk=pllm.Config("chunk_size"),
-        optimizer=pllm.Config("optimizer"),
         flush="prompt_end",
     )
     def learn(

@@ -32,6 +32,12 @@ def learn(self, h: Annotated[torch.Tensor, pllm.Hidden(0)],
 `@pllm.train(state="head", ...)` 声明它训练名为 `"head"` 的状态。函数体只写
 前向数学——这是第一个值得记住的约定。
 
+优化器写在状态上（这里是 `pllm.AdamW`），装饰器只说训练哪个状态。训练什么
+由方法的输入决定：像上面这样读运行中的行（hidden、参数），就是逐请求训练；
+读 `pllm.batch(...)` 字段，就是在宿主送来的批次上训练（`WeightedRowBatch`、
+`CausalTrainBatch` 用 AdamW，`WeightedCEBatch` 用 `pllm.SGD` 加 `reset=`）。
+优化器与输入对不上时，声明期就会告诉你该换成哪种优化器。
+
 为什么只写前向就够了？绑定器从你返回的标量出发自动微分到 `Parameter` 输入，
 `@train(state=...)` 本身就是对该状态的更新授权，Adam 的步数、动量与衰减语义
 都随状态走。你不需要写 `backward()`，也不需要自己管优化器。

@@ -76,8 +76,11 @@ def declare_batch_train(
     The method returns a scalar loss (every row trains), a TensorUpdate whose `changed` flag is a device
     tensor, or None to skip the step.
     """
-    if state.optimizer is None or state.declaration.key_fields or when not in _TRAINING_WINDOWS:
-        raise ValueError("batch training needs an instance AdamW state and BEFORE_MODEL, AFTER_SAMPLE or HOST_COMPUTE")
+    if state.declaration.key_fields or when not in _TRAINING_WINDOWS:
+        raise ValueError(
+            "training on WeightedRowBatch or CausalTrainBatch fields updates one pllm.InstanceState in "
+            "Phase.BEFORE_MODEL or Phase.AFTER_SAMPLE"
+        )
     if any(
         isinstance(port.source, StateSelectionInputSource) and port.source.resource != state.declaration.resource
         for port in ports.values()

@@ -15,7 +15,7 @@ import torch
 
 from pllm.authoring import BackendRequirements, BackendWorkload
 from pllm.config import ExecutionOptions
-from pllm.contracts.auxiliary import CausalTrainBatch, WeightedRowBatch, validate_auxiliary
+from pllm.contracts.auxiliary import CausalTrainBatch, WeightedCEBatch, WeightedRowBatch, validate_auxiliary
 from pllm.contracts.backend_attachment import (
     ActivationPatchOperator,
     DecodeRefresh,
@@ -115,6 +115,9 @@ Initializer = Callable[[Tensors, torch.Generator], None]
 C = TypeVar("C")
 # How @pllm.train averages per-row losses: over all rows, or per state and then summed over states.
 TrainReduction = Literal["mean", "state_mean"]
+# What a @pllm.train method trains on, read from its inputs: the rows of running requests, a host batch with one
+# AdamW step, or a WeightedCEBatch with SGD steps per state.
+TrainingMode = Literal["request", "batch", "weighted_batch"]
 
 
 class Phase(Enum):
@@ -432,13 +435,20 @@ def capture(source: _Source, *, state: str, field: str) -> Any:
 def batch(
     field: Literal["hidden", "base_logits", "labels", "weights", "targets", "input_ids", "attention_mask"],
 ) -> Any:
-    """One field of a host-supplied WeightedCEBatch, WeightedRowBatch or CausalTrainBatch."""
+    """One field of the host batch passed to generate.
+
+    The fields a @pllm.train method reads pick its batch: WeightedRowBatch (hidden, targets, weights) or
+    CausalTrainBatch (input_ids, labels, attention_mask) take one AdamW step; WeightedCEBatch (hidden, base_logits,
+    labels, weights) runs SGD steps per state.
+    """
     return Batch(field)
 
 
 @dataclass(frozen=True)
 class InstanceState:
     fields: Mapping[str, Shape | Buffer] = field(default_factory=lambda: dict[str, Shape | Buffer]())
+    # How @pllm.train or @pllm.overlay updates the state. Training on request rows or on WeightedRowBatch and
+    # CausalTrainBatch fields takes pllm.AdamW; WeightedCEBatch training and training overlays take pllm.SGD.
     optimizer: AdamWConfig | SGD | None = field(default=None, kw_only=True)
     # Run once per resource when binding; every admission copies the same seeded initial tensors.
     initialize: Callable[[Tensors, torch.Generator], None] | None = None
@@ -698,6 +708,29 @@ class _Export(_Effect):
         operation.context.binding.model_effect(call)
 
 
+_TRAINING_INPUTS: dict[TrainingMode, str] = {
+    "request": "rows of running requests (no pllm.batch fields)",
+    "batch": "WeightedRowBatch or CausalTrainBatch fields (or a causal model)",
+    "weighted_batch": "WeightedCEBatch fields (base_logits or labels with hidden rows)",
+}
+
+
+def _training_mode(arguments: Mapping[str, _Source]) -> TrainingMode:
+    """The batch is the first of WeightedRowBatch, CausalTrainBatch and WeightedCEBatch that has every pllm.batch
+    field the method reads; without batch fields or a causal model it trains on request rows."""
+    fields = {source.field for source in arguments.values() if isinstance(source, Batch)}
+    if not fields:
+        return "batch" if any(isinstance(source, _CausalModel) for source in arguments.values()) else "request"
+    if any(fields <= set(batch.names) for batch in (WeightedRowBatch, CausalTrainBatch)):
+        return "batch"
+    if fields <= set(WeightedCEBatch.names):
+        return "weighted_batch"
+    raise ValueError(
+        f"pllm.batch fields {sorted(fields)} must all come from one batch: WeightedRowBatch {WeightedRowBatch.names}, "
+        f"CausalTrainBatch {CausalTrainBatch.names} or WeightedCEBatch {WeightedCEBatch.names}"
+    )
+
+
 @dataclass(frozen=True, kw_only=True)
 class _Train(_Effect):
     state: str
@@ -710,23 +743,32 @@ class _Train(_Effect):
     phase: ClassVar[Phase | None] = Phase.AUTOMATIC
 
     def declare(self, operation: _Operation) -> None:
-        """Train on host batches (any SGD state, or an AdamW state read through pllm.batch or pllm.causal_model)
-        or on each request's rows."""
+        """Train on what the method reads (see `_training_mode`); the state's optimizer must suit it."""
         arguments, captures = operation.arguments()
-        definition = operation.context.state_definition(self.state, "training requires a declared optimizer state")
-        match definition.optimizer:
-            case SGD() as optimizer:
+        definition = operation.context.state_definition(self.state, "@pllm.train needs a declared state")
+        mode = _training_mode(arguments)
+        match mode, definition.optimizer:
+            case "weighted_batch", SGD() as optimizer:
                 self.weighted(operation, arguments, captures, definition, optimizer)
-            case AdamWConfig() if any(isinstance(source, (Batch, _CausalModel)) for source in arguments.values()):
+            case "batch", AdamWConfig():
                 self.batch(operation, arguments, captures)
-            case _:
+            case "request", AdamWConfig():
                 self.request(operation, arguments, captures)
+            case _:
+                expected = "pllm.SGD(lr)" if mode == "weighted_batch" else "pllm.AdamW(lr)"
+                raise ValueError(
+                    f"@pllm.train reads {_TRAINING_INPUTS[mode]}, which trains with {expected}; declare "
+                    f"{self.state!r} with optimizer={expected}"
+                )
 
     def batch(self, operation: _Operation, arguments: dict[str, _Source], captures: dict[str, Capture]) -> None:
         """One AdamW step on a host CausalTrainBatch or WeightedRowBatch."""
         context = operation.context
         if captures or operation.gradient or operation.rows or self.update or self.reset or self.steps != 1:
-            raise ValueError("batch training uses one optimizer step without inference-row selectors")
+            raise ValueError(
+                "training on WeightedRowBatch or CausalTrainBatch fields takes one AdamW step over the whole batch: "
+                "remove rows=, update=, steps=, reset=, @pllm.differentiate and pllm.capture"
+            )
         context.train(
             declare_batch_train(
                 context.binding,
@@ -743,7 +785,10 @@ class _Train(_Effect):
     def request(self, operation: _Operation, arguments: dict[str, _Source], captures: dict[str, Capture]) -> None:
         """Train each request's state on its rows; token commit owns the step unless a model effect does."""
         if self.reset or self.steps != 1:
-            raise ValueError("multi-step/reset training requires explicit SGD batch parameters")
+            raise ValueError(
+                "steps= and reset= apply to training on WeightedCEBatch fields (pllm.batch); remove them to train on "
+                "request rows"
+            )
         context = operation.context
         sampler = context.sampler
         request_training = sampler is not None or not context.has_model_effect
@@ -779,13 +824,13 @@ class _Train(_Effect):
             raise ValueError("SGD batch training manages its own state writes")
         if not self.reset:
             raise ValueError(
-                "a state with an SGD optimizer trains on host batches (pllm.batch) and needs @pllm.train(reset=...) "
-                "naming a method that sets its starting values; give the state pllm.AdamW to train per request"
+                "training on WeightedCEBatch fields restarts each state before its SGD steps: give "
+                "@pllm.train(reset=...) naming a method that sets the starting values"
             )
         if operation.gradient is not None or operation.rows or self.update or operation.phase is not Phase.AFTER_SAMPLE:
             raise ValueError(
-                "SGD batch training uses the whole batch after sampling: remove rows=, update=, @pllm.differentiate "
-                "and @pllm.on"
+                "training on WeightedCEBatch fields uses the whole batch after sampling: remove rows=, update=, "
+                "@pllm.differentiate and @pllm.on"
             )
         context = operation.context
         sources = {key: source.batch(self.state, definition) for key, source in arguments.items()}
@@ -969,17 +1014,14 @@ class _Overlay(_Effect):
     decode: bool | Config
     visibility: Visibility | Config
     chunk: int | Config | None
-    optimizer: SGD | Config | None
     flush: Literal["prompt_end"] | None
 
     phase: ClassVar[Phase | None] = Phase.MODEL_UPDATE
     model_effect: ClassVar[bool] = True
 
     def __post_init__(self) -> None:
-        if self.flush not in (None, "prompt_end") or (self.flush is not None and self.optimizer is None):
-            raise ValueError("flush='prompt_end' requires an autograd overlay optimizer")
-        if self.optimizer is not None and self.chunk is None:
-            raise ValueError("autograd overlays require a chunk size")
+        if self.flush not in (None, "prompt_end"):
+            raise ValueError("@pllm.overlay(flush=...) takes 'prompt_end' or None")
 
     def parameter_effect(self, owner: Workload, layers: int) -> ParameterEffect:
         """The configured projection effect, with all-layer targets resolved against the model."""
@@ -1002,8 +1044,16 @@ class _Overlay(_Effect):
         definition = context.state_definition(self.state, "parameter overlays require a declared request state")
         if definition.scope is not StateScope.REQUEST:
             raise ValueError("parameter overlays require a declared request state")
-        if definition.optimizer is not None:
-            raise ValueError("@pllm.overlay updates its state itself; drop the state's optimizer")
+        optimizer = definition.optimizer
+        if isinstance(optimizer, AdamWConfig):
+            raise ValueError(
+                f"@pllm.overlay trains {self.state!r} with SGD once per chunk; declare it with optimizer=pllm.SGD(lr), "
+                "or with no optimizer when the method returns the next carry itself"
+            )
+        if optimizer is not None and self.chunk is None:
+            raise ValueError(f"{self.state!r} has an optimizer, so @pllm.overlay trains it per chunk; give chunk=")
+        if self.flush is not None and optimizer is None:
+            raise ValueError(f"flush='prompt_end' trains a short final chunk; declare {self.state!r} with an optimizer")
         buffers = _buffers(definition)
         bindings = {key: source.overlay(self.state, buffers) for key, source in _arguments(operation.function).items()}
         if set(buffers) & {source.value for source in Operand}:
@@ -1020,7 +1070,7 @@ class _Overlay(_Effect):
                 buffers,
                 effect,
                 _setting(self.chunk, context.owner, int),
-                None if self.optimizer is None else _setting(self.optimizer, context.owner, SGD),
+                optimizer,
                 self.flush,
             )
         declare_parameter_overlay(
@@ -1040,9 +1090,7 @@ class _Overlay(_Effect):
             function=function,
             arguments=bindings,
             visibility=_setting(self.visibility, context.owner, Visibility),
-            equations_digest=boundary_digest(
-                context.signature, context.bindings, self.chunk, self.optimizer, self.flush
-            ),
+            equations_digest=boundary_digest(context.signature, context.bindings, self.chunk, self.flush),
         )
         context.signature.append(
             (
@@ -1055,7 +1103,6 @@ class _Overlay(_Effect):
                     effect.applied_fields,
                     self.visibility,
                     self.chunk,
-                    self.optimizer,
                     self.flush,
                 ),
             )
@@ -1074,15 +1121,15 @@ def overlay(
     decode: bool | Config = False,
     visibility: Visibility | Config = Visibility.forward_pinned(),
     chunk: int | Config | None = None,
-    optimizer: SGD | Config | None = None,
     flush: Literal["prompt_end"] | None = None,
 ) -> Callable[[F], F]:
     """Apply residuals using the declared state visibility at each target projection.
 
     With ``chunk``, the function takes the weight carry followed by input/target row
     operands and returns (next carry, readouts). Pending rows belong to the framework.
-    With ``optimizer``, return one loss per row instead; gradients accumulate until
-    a chunk completes, including a short final chunk with ``flush="prompt_end"``.
+    When ``state`` declares ``optimizer=pllm.SGD(lr)``, return one loss per row instead;
+    gradients accumulate until a chunk completes, including a short final chunk with
+    ``flush="prompt_end"``.
     """
 
     return _mark(
@@ -1097,7 +1144,6 @@ def overlay(
             decode=decode,
             visibility=visibility,
             chunk=chunk,
-            optimizer=optimizer,
             flush=flush,
         )
     )
@@ -1145,10 +1191,15 @@ def train(
     reset: str = "",
     rows: str = "",
 ) -> Callable[[F], F]:
-    """Minimize the returned per-row loss with `state`'s optimizer; runs after sampling by default.
+    """Minimize the returned loss with `state`'s optimizer; runs after sampling by default.
+
+    The method's inputs say what it trains on. Without pllm.batch fields it trains each request's state on that
+    request's rows (pllm.AdamW). WeightedRowBatch or CausalTrainBatch fields, or a causal model, take one AdamW
+    step on the host batch. WeightedCEBatch fields run `steps` SGD steps per state, each state first restored by
+    the `reset` method (pllm.SGD).
 
     `reduction="mean"` averages the loss over all rows; `"state_mean"` averages each state's rows, then sums over
-    states. SGD batch training ignores it: its loss is weighted per state, then averaged.
+    states. WeightedCEBatch training ignores it: its loss is weighted per state, then averaged.
     """
     if reduction not in ("mean", "state_mean"):
         raise ValueError(f"@pllm.train(reduction={reduction!r}): use 'mean' or 'state_mean'")

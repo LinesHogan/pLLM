@@ -53,6 +53,7 @@ class WeightedCEBatch(Generic[T]):
     """Shared [rows, ...] or independently keyed [adapters, rows, ...] weighted CE."""
 
     schema: ClassVar[str] = "canonical.weighted_ce@2"
+    names: ClassVar[tuple[str, ...]] = ("hidden", "base_logits", "labels", "weights")
     hidden: T
     base_logits: T
     labels: T

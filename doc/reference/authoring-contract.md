@@ -94,6 +94,15 @@ class CenteredHidden(pllm.Workload):
 
 ### `@train`：状态资格与更新掩码
 
+优化器只声明在状态上（`RequestState`/`InstanceState(optimizer=...)`），装饰器不带
+优化器。训练方式由方法读取的输入决定，不由优化器类型决定：没有 `pllm.batch(...)`
+字段时，按请求在运行中的行上训练（`pllm.AdamW`）；读取 `WeightedRowBatch` 或
+`CausalTrainBatch` 的字段（或 `pllm.causal_model`）时，对宿主批次做一次 AdamW 步；
+读取 `WeightedCEBatch` 的字段（`base_logits`，或 `labels` 与 `hidden` 同用）时，
+按状态从 `reset` 起做 `steps` 次 SGD（`pllm.SGD`）。字段属于第一个包含全部所读字段的
+批次类型，顺序为 `WeightedRowBatch`、`CausalTrainBatch`、`WeightedCEBatch`。
+状态的优化器与输入不符时，声明期报错并说明应声明哪种优化器。
+
 `@train(state=..., update=...)` 绑定一个标量 loss 和一个可选的状态资格选择器；
 `@on(phase, rows=...)` 独立选择它的前向行。选择器是具名 Tensor 方法，
 只使用该操作已注解输入的子集，返回其原始行轴上的布尔掩码，并成为同一签名图中的
@@ -210,8 +219,10 @@ worker 重新导入并重建，安装时其编译签名必须与驱动端签名�
 写 In-Place-TTT 风格负载时读本节。
 
 `@on(Phase.MODEL_UPDATE)` 和 `@overlay(state=..., targets=..., weight=...)` 把
-一个加性参数 overlay 与它的发布绑定在一起。声明不带优化器的 `RequestState`：
-固定 `shape=` 使用默认的 `value` 字段；具名 `Buffer` 字段可以按每个 target
+一个加性参数 overlay 与它的发布绑定在一起。状态不带优化器时，方法自己算出下一个
+值；状态声明 `optimizer=pllm.SGD(lr)` 时，方法返回每行一个 loss，框架按 `chunk=`
+累积梯度并做 SGD（`flush="prompt_end"` 让 prompt 末尾的短 chunk 也训练）。
+`@overlay` 不再接受 `optimizer=`。固定 `shape=` 使用默认的 `value` 字段；具名 `Buffer` 字段可以按每个 target
 解析 `(input_size, output_size)`。Buffer dtype 默认取目标模型 dtype；显式整数
 buffer 保留自己的 dtype。`Operand.INPUT/TARGET/WEIGHT` 命名捕获的张量；
 `Parameter(state, field)` 命名私有 buffer 视图。只有这些被授权的 buffer 可以
@@ -337,9 +348,8 @@ reset 与多步训练。这条路径把「外部数据喂入 + 实例/请求共�
 先读本节末尾的原生替换规则。
 
 [Output LoRA](../../pllm/workloads/lora.py) 声明具名字段状态（`SGD(lr)` 与
-初始化器）、一个普通的 `@add_logits` 预测，以及一个 `AFTER_SAMPLE` 方法（
-`@train(state=..., reset="reset", steps=Config(...),
-reduction="weighted_state_mean_then_mean")`）。reset 方法接收具名局部参数张量和
+初始化器）、一个普通的 `@add_logits` 预测，以及一个读取 `WeightedCEBatch` 字段的
+`AFTER_SAMPLE` 方法（`@train(state=..., reset="reset", steps=Config(...))`）。reset 方法接收具名局部参数张量和
 一个生成器。reset 按训练批次进行，区别于准入初始化；两个函数都被冻结并与普通
 数学一起签名。SGD 保留原始状态字段，没有 Adam 槽。
 
