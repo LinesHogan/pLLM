@@ -70,6 +70,8 @@ class BackendRequirements:
     sampler_stage: SamplerStage | None = None
     sampler_feedback: bool = False
     position_states: tuple[tuple[str, float], ...] = ()
+    # The smallest pllm.samples(limit=); requests must use a lower sample index.
+    sample_limit: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

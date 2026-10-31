@@ -181,8 +181,6 @@ class Samples(_Source):
     differentiable: ClassVar[bool] = False
 
     def port(self, context: _Declaration) -> TensorPort:
-        if self.limit is not None:
-            context.binding.sample_limit = _setting(self.limit, context.owner, int)
         return samples_port(context.binding.sampler_rows())
 
 
@@ -390,7 +388,10 @@ def index(state: str) -> Any:
 
 
 def samples(limit: int | Config | None = None) -> Any:
-    """How many samples each request has drawn so far."""
+    """The sample index of each row's request: 0 for a prompt's first sample.
+
+    With `limit`, generate rejects requests whose sample index is `limit` or more.
+    """
     return Samples(limit)
 
 
@@ -1710,6 +1711,14 @@ class Workload(
             ),
             sampler_stage=None if sampler is None else sampler.stage,
             sampler_feedback=any(isinstance(source, (BaseLogits, SampledTokens)) for source in inputs),
+            sample_limit=min(
+                (
+                    _setting(source.limit, context.owner, int)
+                    for source in inputs
+                    if isinstance(source, Samples) and source.limit is not None
+                ),
+                default=None,
+            ),
             position_states=context.position_states(),
         )
 

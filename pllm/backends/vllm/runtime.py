@@ -187,6 +187,7 @@ class VllmLlm(Generic[DataT, ResultT]):
     attachment: BackendAttachment
     _facts: BackendCompileFacts
     _cache_policy: CachePolicy
+    _sample_limit: int | None
     _closed: bool = False
     _next_prompt_index: int = 0
     _pending_input: ExitStack | None = None
@@ -409,6 +410,11 @@ class VllmLlm(Generic[DataT, ResultT]):
             raise ValueError("provide non-empty prompts and set sampling n=1")
         if sample_index < 0 or feedback_group is not None and not feedback_group:
             raise ValueError("use a nonnegative sample index and a non-empty feedback group")
+        if self._sample_limit is not None and sample_index >= self._sample_limit:
+            raise ValueError(
+                f"sample_index={sample_index}: this workload reads pllm.samples(limit={self._sample_limit}); "
+                f"use a sample index below {self._sample_limit} or raise the workload's limit"
+            )
         indices = self._prompt_indices(texts, prompt_indices)
         # A route value is user-computed (regex, discriminator, tenant); the signed
         # graph only declares whether any request state keys on it.
@@ -631,7 +637,7 @@ def create_vllm_llm(
             facts = workload.specialize(facts, config.execution)
             attachment, _ = workload.plan_backend(facts)
             policy = CachePolicy.for_attachment(attachment, config.generated_kv)
-            handle = VllmLlm[DataT, ResultT](llm, None, attachment, facts, policy)
+            handle = VllmLlm[DataT, ResultT](llm, None, attachment, facts, policy, requirements.sample_limit)
             handle.command(
                 BackendCommand.INSTALL, encode_boundary(BackendInstall(facts, attachment, definition or "", policy))
             )
@@ -642,7 +648,9 @@ def create_vllm_llm(
             deployment = workload.compile_backend(facts, causal=partial(CausalTraining, runner.decoder))
             policy = CachePolicy.for_attachment(deployment.attachment, config.generated_kv)
             runner.attach_workload(deployment, policy)
-            handle = VllmLlm[DataT, ResultT](llm, runner, deployment.attachment, facts, policy)
+            handle = VllmLlm[DataT, ResultT](
+                llm, runner, deployment.attachment, facts, policy, requirements.sample_limit
+            )
         construction.pop_all()
         return handle
 

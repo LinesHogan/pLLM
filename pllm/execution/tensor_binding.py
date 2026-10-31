@@ -124,7 +124,6 @@ class TensorBinding(Builder[TensorFrame]):
         self.trains_on_batch = False
         self.probe: BackendPlacementProbe | None = None
         self.max_requests = 1
-        self.sample_limit: int | None = None
         self.overlay_targets: tuple[ParameterTarget, ...] = ()
         self.parameter_phases: tuple[HiddenPhase, ...] = ()
         self.field_views: dict[tuple[str, str], FieldView] = {}
