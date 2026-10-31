@@ -1302,6 +1302,14 @@ class _Operation:
             "update_states": self.effect.update,
         }
 
+    def sources(self) -> dict[str, dict[str, _Source]]:
+        """Each task this operation declares, by name, with the sources it reads: the method and its row selectors."""
+        tasks = {self.name: self.arguments()[0]}
+        for method in self.domains.values():
+            if method:
+                tasks[f"__{self.name}_{method}"] = _arguments(self.context.method(method))
+        return tasks
+
     def selectors(
         self,
         arguments: dict[str, _Source],
@@ -1310,12 +1318,12 @@ class _Operation:
     ) -> MathContract:
         """Declare each selector once and connect its row-domain result; selectors read their own inputs."""
         selectors: dict[str, Call] = {}
+        sources = self.sources()
         for domain, method in self.domains.items():
             if not method:
                 continue
-            selector = self.context.method(method)
-            selected_args = _arguments(selector)
             if method not in selectors:
+                selector = self.context.method(method)
                 identity = fingerprint(selector)
                 self.context.signature.append((method, identity))
                 selectors[method] = declare_tensor(
@@ -1325,7 +1333,7 @@ class _Operation:
                     identity=f"python:{identity}:{self.name}:{method}",
                     inputs={
                         key: inputs[key] if arguments.get(key) == source else source.port(self.context)
-                        for key, source in selected_args.items()
+                        for key, source in sources[f"__{self.name}_{method}"].items()
                     },
                 )(freeze(selector))
             key = f"__{domain}"
@@ -1692,10 +1700,7 @@ class Workload(
             if isinstance(effect, _Sampler) and not effect.enabled(context.owner):
                 continue
             with context.declaring(operation.name):
-                sources[operation.name] = tuple(operation.arguments()[0].values())
-                for method in operation.domains.values():
-                    if method:
-                        sources[f"__{operation.name}_{method}"] = tuple(_arguments(context.method(method)).values())
+                sources.update((name, tuple(arguments.values())) for name, arguments in operation.sources().items())
         inputs = tuple(source for name in sorted(sources) for source in sources[name])
         sampler = context.sampler
         return BackendRequirements(
