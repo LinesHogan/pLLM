@@ -48,7 +48,6 @@ class ExecutionOptions:
 
     training_rows: int = 1
     capture_memory_bytes: int = 64 * 1024**2
-    explicit_math: bool = False
     state_memory_bytes: int = 0  # Zero uses the backend's observed available capacity.
     memory_budget_bytes: int | None = None  # Original AER declared-memory limit, not total CUDA residency.
     allow_numerical_transforms: bool = True

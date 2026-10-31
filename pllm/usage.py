@@ -614,7 +614,6 @@ class _Effect:
     """An operation effect owns its declaration and attachment policy."""
 
     training: ClassVar[bool] = False
-    bounded: ClassVar[bool] = False
     tuple_output: ClassVar[bool] = False
     # The phase the effect runs in when no `@pllm.on` names one; None means the author must name it.
     phase: ClassVar[Phase | None] = None
@@ -677,7 +676,6 @@ class _Export(_Effect):
     enabled: bool | Config
     overflow: Literal["drop", "block"]
 
-    bounded: ClassVar[bool] = True
     phase: ClassVar[Phase | None] = Phase.OBSERVE
 
     def declare(self, operation: _Operation) -> None:
@@ -1697,13 +1695,12 @@ class Workload(
         )
         b = TensorBinding(
             self.name,
-            boundary_digest(_values(self).get("config", ()), dimensions, facts.initialization_seed),
+            boundary_digest(dimensions, facts.initialization_seed),
             dimensions,
             resources=facts.timeline.task_resources,
         )
         b.probe = facts.probe
         b.causal = causal
-        b.max_requests = facts.max_admitted_lineages
         self._build(b)
         # Executable ports retain their dependencies; an unused factory must not pin the decoder.
         b.causal = None
@@ -1777,8 +1774,6 @@ class Workload(
 
     def resource_facts(self, facts: BackendCompileFacts, options: ExecutionOptions) -> SchedulerTimeline:
         """Reserve ordinary tensor scratch and each requested graph's private pool."""
-        if options.explicit_math:
-            raise ValueError("this workload has no explicit tensor implementation")
         with FakeTensorMode():
             binding = self.declaration(facts)
         if binding.trains_on_batch:
@@ -1811,7 +1806,7 @@ class Workload(
     def declare_host(self, facts: HostRuntimeFacts) -> TensorHostBinding[TensorStepInput, TensorFrame, TensorOutput]:
         b = TensorBinding(
             self.name,
-            boundary_digest(_values(self).get("config", ()), facts.hidden_size, facts.initialization_seed),
+            boundary_digest(facts.hidden_size, facts.initialization_seed),
             Dimensions(facts.hidden_size, 0),
             host=True,
         )

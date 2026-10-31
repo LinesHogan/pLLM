@@ -123,7 +123,6 @@ class TensorBinding(Builder[TensorFrame]):
         # Batch training measures its costs from signed input bounds, not from example rows.
         self.trains_on_batch = False
         self.probe: BackendPlacementProbe | None = None
-        self.max_requests = 1
         self.overlay_targets: tuple[ParameterTarget, ...] = ()
         self.parameter_phases: tuple[HiddenPhase, ...] = ()
         self.field_views: dict[tuple[str, str], FieldView] = {}

@@ -17,7 +17,7 @@ from pllm.contracts.backend_attachment import (
     MissingPolicy,
 )
 from pllm.contracts.compilation import PlanBundle
-from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import FieldView, ParameterOverlayFieldBinding
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.sampler import SamplerStage
@@ -25,7 +25,6 @@ from pllm.contracts.semantic_graph import (
     AnchorSymbol,
     ConditionalInputGroup,
     ExecutionKind,
-    HiddenInputSource,
     HostPayloadSchemaId,
     HostServiceId,
     HostServiceInputSource,
@@ -34,7 +33,6 @@ from pllm.contracts.semantic_graph import (
     MathContract,
     PackedRowsInputSource,
     PackedSamplerRowsInputSource,
-    SamplerFeedbackInputSource,
     SemanticEffect,
     SemanticGraph,
     SemanticInput,
@@ -47,7 +45,6 @@ from pllm.contracts.semantic_graph import (
     StateResource,
     StateScope,
     StateSelectionInputSource,
-    StepIdInputSource,
     TaskImplementationSpec,
     TaskResourceFact,
     TaskResultInputSource,
@@ -283,19 +280,11 @@ class Builder(Generic[D]):
         return State(declaration, fields, optimizer, optimizer_fields)
 
     @staticmethod
-    def hidden(
-        layer: int, *, site: HiddenSite = HiddenSite.BLOCK_OUTPUT, phase: HiddenPhase = HiddenPhase.DECODE
-    ) -> HiddenInputSource:
-        return HiddenInputSource(layer, site, phase)
-
-    @staticmethod
     def input(service: str, port: str, schema: str) -> HostServiceInputSource:
         return HostServiceInputSource(HostServiceId(service), HostServicePort(port), HostPayloadSchemaId(schema))
 
     rows = staticmethod(PackedRowsInputSource)
     sampler_rows = staticmethod(PackedSamplerRowsInputSource)
-    feedback = staticmethod(SamplerFeedbackInputSource)
-    step_id = staticmethod(StepIdInputSource)
 
     def compute(
         self,
@@ -351,7 +340,6 @@ class Builder(Generic[D]):
         )
         self.graph = replace(self.graph, tasks=tuple(sorted((*self.graph.tasks, task), key=lambda item: item.symbol)))
         if function is not None:
-            groups = changes.optimizer_fields // 5 if changes is not None and changes.optimizer is not None else 1
             copy_fields: tuple[LayoutFieldId, ...] | None = None
             if changes is not None and changes.optimizer is not None and optimizer is None:
                 config, groups = changes.optimizer, changes.optimizer_fields // 5

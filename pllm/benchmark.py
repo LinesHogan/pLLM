@@ -133,7 +133,6 @@ class BenchmarkResult:
     peak_allocated_bytes: int
     baseline_allocated_bytes: int
     plan_digest: str
-    explicit_math: bool
     task_implementations: tuple[tuple[str, str], ...]
     planned_peak_memory_bytes: int
     round_process_cpu_seconds: tuple[float, ...]
@@ -171,7 +170,6 @@ class _Requests:
 class _Arm(Generic[D, R]):
     name: str
     workload: BackendWorkload[D, R]
-    explicit: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,7 +238,6 @@ def _measure_arm(
         execution=ExecutionOptions(
             setup.training_rows,
             capture_memory_bytes=options.capture_memory_bytes,
-            explicit_math=arm.explicit,
             state_memory_bytes=options.state_memory_bytes,
             memory_budget_bytes=options.memory_budget_bytes,
         ),
@@ -278,7 +275,6 @@ def _measure_arm(
             torch.cuda.max_memory_allocated(),
             baseline,
             boundary_digest(plan),
-            arm.explicit,
             tuple(
                 (str(plan.semantic_graph.tasks[task.task_id].symbol), str(task.implementation_id))
                 for task in plan.schedule.tasks
@@ -457,7 +453,6 @@ def compare(
     *,
     prepare: Callable[[VllmLlm[D, R]], AuxiliaryInput[torch.Tensor]] | None = None,
     training_rows: int = 1,
-    explicit_math: bool = False,
     require_training: bool = False,
     prompt_indices: tuple[int, ...] | None = None,
     alternatives: tuple[tuple[str, BackendWorkload[D, R]], ...] = (),
@@ -492,9 +487,8 @@ def compare(
         )
     )
     arms = (
-        _Arm("tensor", workload, False),
-        *((_Arm("tensor_explicit", workload, True),) if explicit_math else ()),
-        *(_Arm(name, implementation, False) for name, implementation in alternatives),
+        _Arm("tensor", workload),
+        *(_Arm(name, implementation) for name, implementation in alternatives),
     )
     if options.profile is not None:
         options.profile.mkdir(parents=True, exist_ok=True)

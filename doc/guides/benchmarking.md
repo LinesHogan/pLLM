@@ -59,8 +59,7 @@ from pllm.benchmark import BenchmarkOptions, compare
 results = compare(my_workload, BenchmarkOptions(batch=4, tokens=64, rounds=1))
 ```
 
-这测量普通实现；CUDA 张量任务自动捕获。`explicit_math=True` 加一个
-显式张量臂。不支持的请求在正常绑定边界失败。`require_training=True` 要求
+这测量普通实现；CUDA 张量任务自动捕获。`require_training=True` 要求
 正的 loss、update 与训练行计数——观测或仅激活算法不要开，否则会误报失败。
 无论开不开，所有运行都检查 token 数、清理、回退与等效工作量。
 

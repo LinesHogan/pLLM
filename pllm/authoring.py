@@ -89,10 +89,8 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
     @abstractmethod
     def backend_requirements(self) -> BackendRequirements: ...
 
-    def resource_facts(self, facts: BackendCompileFacts, options: ExecutionOptions) -> SchedulerTimeline:
-        if options.explicit_math:
-            raise ValueError("this workload has no explicit tensor/capture implementation")
-        return facts.timeline
+    @abstractmethod
+    def resource_facts(self, facts: BackendCompileFacts, options: ExecutionOptions) -> SchedulerTimeline: ...
 
     def specialize(self, facts: BackendCompileFacts, options: ExecutionOptions) -> BackendCompileFacts:
         from pllm.contracts.tensor_policy import TensorPolicy
@@ -128,19 +126,8 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
             for value in (facts.timeline.memory_budget_bytes, timeline.memory_budget_bytes, options.memory_budget_bytes)
             if value is not None
         )
-        capabilities = tuple(
-            sorted(
-                set(
-                    (
-                        *timeline.capabilities,
-                        *(("compute/explicit_math@1",) if options.explicit_math else ()),
-                    )
-                )
-            )
-        )
         timeline = replace(
             timeline,
-            capabilities=capabilities,
             memory_budget_bytes=min(budgets, default=None),
             tensor_policy=facts.timeline.tensor_policy,
             visibility=VisibilitySource.post_sampler(options.publish_lag),
