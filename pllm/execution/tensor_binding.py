@@ -195,17 +195,21 @@ class TensorBinding(Builder[TensorFrame]):
                     "side tensor tasks need fixed row inputs; declare row inputs or move the task before the model"
                 )
 
-    def step_rows(self, value: TensorStepInput) -> tuple[PackedPhaseRow, ...]:
-        """Rows that open the step's state context; model-replay and activation steps differ from read_rows."""
+    def step_row_reader(self) -> Callable[[TensorStepInput], tuple[PackedPhaseRow, ...]]:
+        """The rows that open a step's state context, chosen once at bind; model-replay and activation steps
+        differ from the rows tasks read."""
         if self.attachment is not None and (
             self.attachment.activation_bindings
             or any(task.replay is not None for task in self.graph.tasks)
             and self.overlay_targets
         ):
-            return value.rows.rows if self.graph.states[0].scope is StateScope.REQUEST else ()
+            if self.graph.states[0].scope is StateScope.REQUEST:
+                return lambda value: value.rows.rows
+            return lambda value: ()
         if self.attachment is not None and self.attachment.kind is AttachmentKind.MODEL_REPLAY:
-            return ()
-        return self.read_rows(value.rows)
+            return lambda value: ()
+        read = self.row_reader()
+        return lambda value: read(value.rows)
 
     def function_math(
         self, device: torch.device, seed: int
@@ -213,7 +217,7 @@ class TensorBinding(Builder[TensorFrame]):
         """Bind state initialization, step rows and frame preparation for execution."""
         return FunctionMath(
             {str(state.resource): self.initializer(str(state.resource), device, seed) for state in self.graph.states},
-            self.step_rows,
+            self.step_row_reader(),
             self.bind_prepare(),
             lambda data, invocation: self.result(data, invocation) if self.graph.states else invocation.value,
             lambda previous, incoming: replace(
@@ -372,31 +376,34 @@ class TensorBinding(Builder[TensorFrame]):
             ):
                 raise ValueError("replacement tensors must match the declared layout shape, dtype and device")
 
-    def read_rows(self, rows: PackedPhaseRowBatch) -> tuple[PackedPhaseRow, ...]:
-        """Rows the tensor tasks read: every request's final row for overlays, activation patches and prefill
-        inputs, otherwise each request's latest decode row."""
-        return (
-            rows.request_rows
-            if self.overlay_targets
+    def row_reader(self) -> Callable[[PackedPhaseRowBatch], tuple[PackedPhaseRow, ...]]:
+        """The rows the tensor tasks read, chosen once at bind: every request's final row for overlays, activation
+        patches and prefill inputs, otherwise each request's latest decode row."""
+        if (
+            self.overlay_targets
             or (self.attachment is not None and self.attachment.activation_bindings)
             or any(
                 isinstance(port.source, HiddenInputSource) and port.source.phase is HiddenPhase.PREFILL
                 for task in self.graph.tasks
                 for port in task.inputs
             )
-            else rows.latest_decode_rows
-        )
+        ):
+            return lambda rows: rows.request_rows
+        return lambda rows: rows.latest_decode_rows
 
     def bind_prepare(self) -> Callable[[TensorStepInput, TensorBatch], TensorFrame]:
         """Prepare independent input channels into the same invocation frame."""
+        read = self.row_reader()
+        # Additive logits read the decode rows the sampler draws from, in sampler order.
+        sampled = (
+            self.attachment is not None
+            and self.attachment.guides_sampler
+            and self.attachment.sampler_stage is SamplerStage.PACKED_PRE_FILTER_ADD
+        )
 
         def prepare(value: TensorStepInput, batch: TensorBatch) -> TensorFrame:
-            rows = self.read_rows(value.rows)
-            if (
-                self.attachment is not None
-                and self.attachment.guides_sampler
-                and self.attachment.sampler_stage is SamplerStage.PACKED_PRE_FILTER_ADD
-            ):
+            rows = read(value.rows)
+            if sampled:
                 rows = tuple(
                     value.rows.rows[link.packed_row_index]
                     for link in value.sampler_rows.links
