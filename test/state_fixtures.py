@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from pllm import testing
 from pllm.contracts.backend_attachment import AttachmentGraphMode, AttachmentTopology, BackendPlacementProbe
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
@@ -208,8 +209,8 @@ def multistate(*, route=False, instance=True, failing=()):
             str(state.resource): initializer(state.resource, value)
             for state, value in zip(arena.plan.semantic_graph.states, (1, 10, 100))
         },
-        lambda rows: rows,
-        lambda rows, batch: rows,
+        lambda step: step.rows.rows,
+        lambda step, batch: step.rows.rows,
         lambda rows, output: output.selection,
     )
     tasks = tuple(ResourceTask(task.implementation_id) for task in arena.plan.schedule.tasks)
@@ -217,9 +218,9 @@ def multistate(*, route=False, instance=True, failing=()):
     return execution, tasks[0]
 
 
-def rows_for(*identities):
-    """Select one prefill row per request identity."""
-    return tuple(PackedPhaseRow(i, i, 0, HiddenPhase.PREFILL, identity) for i, identity in enumerate(identities))
+def step_for(*identities):
+    """A step with one prefill row per request identity."""
+    return testing.step_input(identities, phases=(HiddenPhase.PREFILL,) * len(identities), sampler_order=())
 
 
 def assert_multistate_reclaimed(execution):

@@ -157,7 +157,7 @@ def main() -> None:
             workload=TTRLWorkload(ttrl), config=replace(facts, max_input_rows=3, memory_budget_bytes=1 << 20)
         )
         reward.admit((), stream)
-        trained = reward.step(ttrl_rewards(batch, ttrl, stream).step, stream)
+        trained = reward.step(ttrl_rewards(batch, ttrl).step, stream)
         assert trained.loss is not None and reward.diagnostics().update_count == 1
         reward.retire(())
         print(f"OverRIDE: updates={diagnostics.update_count} sampler_checks={len(observed)}; FTTT/TTRL updates=1/1")

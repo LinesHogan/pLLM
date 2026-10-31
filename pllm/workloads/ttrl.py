@@ -3,7 +3,6 @@
 import re
 from collections import Counter
 from collections.abc import Callable, Mapping
-from contextlib import nullcontext
 from dataclasses import dataclass
 from math import isfinite
 
@@ -79,11 +78,8 @@ class TTRLRewards:
         return int(any(barrier.ready_count for barrier in self.update_barriers))
 
 
-def ttrl_rewards(value: CompletionInput, config: TTRLConfig, stream: torch.cuda.Stream | None = None) -> TTRLRewards:
-    """Vote each prompt's boxed answers; rows matching the majority train the head toward reward 1.
-
-    Pass the CUDA `stream` you give to `execution.step`: the step input is built and ordered on it.
-    """
+def ttrl_rewards(value: CompletionInput, config: TTRLConfig) -> TTRLRewards:
+    """Vote each prompt's boxed answers; rows matching the majority train the head toward reward 1."""
     entries = value.completions.entries
     groups: dict[int, list[int]] = {}
     for index, completion in enumerate(entries):
@@ -143,17 +139,14 @@ def ttrl_rewards(value: CompletionInput, config: TTRLConfig, stream: torch.cuda.
             )
         )
     hidden = value.hidden
-    with nullcontext() if stream is None else torch.cuda.stream(stream):
-        if value.readiness is not None:
-            value.readiness.order_on(torch.cuda.current_stream(hidden.device))
-            hidden.record_stream(torch.cuda.current_stream(hidden.device))
-        chosen = set(selected)
-        batch = WeightedRowBatch(
-            hidden,
-            hidden.new_tensor([reward.reward or 0.0 for reward in rewards]),
-            hidden.new_tensor([float(index in chosen) for index in range(len(entries))]),
-        )
-    return TTRLRewards(tuple(rewards), tuple(controls), tuple(barriers), TensorStepInput.of_batch(batch))
+    chosen = set(selected)
+    batch = WeightedRowBatch(
+        hidden,
+        hidden.new_tensor([reward.reward or 0.0 for reward in rewards]),
+        hidden.new_tensor([float(index in chosen) for index in range(len(entries))]),
+    )
+    step = TensorStepInput.of_batch(batch, value.readiness)
+    return TTRLRewards(tuple(rewards), tuple(controls), tuple(barriers), step)
 
 
 def ttrl_feedback(
@@ -164,7 +157,7 @@ def ttrl_feedback(
     """A `generate_feedback` callback: vote, step the reward head on the votes, return the rewards."""
 
     def feedback(value: CompletionInput) -> TTRLRewards:
-        rewards = ttrl_rewards(value, config, stream)
+        rewards = ttrl_rewards(value, config)
         execution.step(rewards.step, stream)
         return rewards
 

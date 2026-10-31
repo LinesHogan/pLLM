@@ -26,12 +26,13 @@ from pllm.execution.ptts.page_bundle import PagePin, PagePublication, PageWrite
 from pllm.execution.ptts.request_state import RequestStateSelection, StateAddress
 from pllm.execution.ptts.slot_pools import Slots
 from pllm.execution.state_execution import ProjectionResiduals, StateTaskContext
+from pllm.execution.step_input import TensorStepInput
 from pllm.execution.torch_private import MemoryTrace, MemoryUsage, measure
 from pllm.execution.trace import TracePhase
 from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw, paged_adamw
 from pllm.kernels.page_copy import copy_pages
 
-I = TypeVar("I")
+I = TypeVar("I", bound=TensorStepInput)
 D = TypeVar("D")
 R = TypeVar("R")
 Roots = tuple[tuple[torch.Tensor, ...], ...]
@@ -227,6 +228,7 @@ class FunctionMath(Generic[I, D, R]):
             nullcontext() if context.pin.stream is None else torch.cuda.stream(context.pin.stream),
             torch.inference_mode(False),
         ):
+            value.order_auxiliary()
             data = self.prepare_data(value, read_batch(context))
             return data if context.value is None or self.resume_data is None else self.resume_data(context.value, data)
 

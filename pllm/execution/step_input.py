@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
-from pllm.contracts.auxiliary import AuxiliaryInput
+from pllm.contracts.auxiliary import AuxiliaryInput, map_auxiliary
 from pllm.contracts.packed_hidden import HiddenRowBatch
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.contracts.parameter_overlay import CapturedParameterOperand
@@ -21,6 +21,7 @@ class TensorStepInput:
     operands: tuple[CapturedParameterOperand, ...] = ()
     auxiliary: AuxiliaryInput[torch.Tensor] | None = None
     hidden_readiness: CudaStreamReadiness | None = None
+    auxiliary_readiness: CudaStreamReadiness | None = None
 
     def __post_init__(self) -> None:
         assert self.sampler_rows.row_batch is self.rows
@@ -33,10 +34,20 @@ class TensorStepInput:
             assert readiness == (device if device.type == "cuda" else None)
 
     @classmethod
-    def of_batch(cls, auxiliary: AuxiliaryInput[torch.Tensor]) -> TensorStepInput:
-        """A host step without request rows, carrying only one auxiliary batch."""
+    def of_batch(
+        cls, auxiliary: AuxiliaryInput[torch.Tensor], readiness: CudaStreamReadiness | None = None
+    ) -> TensorStepInput:
+        """A host step without request rows, carrying one auxiliary batch its CUDA producer readies at `readiness`."""
         rows = PackedPhaseRowBatch(0, 0, ())
-        return cls(rows, PackedSamplerRowBatch(rows, ()), auxiliary=auxiliary)
+        return cls(rows, PackedSamplerRowBatch(rows, ()), auxiliary=auxiliary, auxiliary_readiness=readiness)
+
+    def order_auxiliary(self) -> None:
+        """Order the current stream after the auxiliary producer and keep its tensors alive for that stream."""
+        if self.auxiliary is None or self.auxiliary_readiness is None:
+            return
+        stream = torch.cuda.current_stream(self.auxiliary_readiness.device)
+        self.auxiliary_readiness.order_on(stream)
+        map_auxiliary(self.auxiliary, lambda tensor: tensor.record_stream(stream))
 
     def hidden_batch(self, stream: torch.cuda.Stream | None) -> HiddenRowBatch:
         if self.hidden is None or (self.hidden_readiness is None) != (stream is None):

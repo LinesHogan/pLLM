@@ -12,7 +12,7 @@ from test.state_fixtures import (
     assert_multistate_reclaimed,
     increment_resources,
     multistate,
-    rows_for,
+    step_for,
 )
 
 
@@ -21,11 +21,11 @@ def test_heterogeneous_resources_admit_publish_and_pin_in_one_invocation():
     (global_ref,) = execution.admit(())
     a, b = RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0)
     refs = execution.admit((a, b))
-    rows = rows_for(a, b)
-    selected = execution.directory.select(rows)
+    step = step_for(a, b)
+    selected = execution.directory.select(step.rows.rows)
     assert selected.ref_for(b, AUX) == refs[3] and selected.ref_for(a, GLOBAL) == global_ref
     task.update = increment_resources
-    execution.step(rows)
+    execution.step(step)
     context = task.context
     for old, expected in zip(refs, (2, 2, 11, 11, 101), strict=True):
         current = context.current_owned_ref(old)
@@ -60,11 +60,11 @@ def test_shared_route_state_persists_until_dormant_retirement():
     a, b = RequestIdentity("a", 0, 0, "math"), RequestIdentity("b", 1, 0, "math")
     execution.admit((a,))
     joined = execution.admit((b,))
-    left, right = execution.directory.select(rows_for(a)), execution.directory.select(rows_for(b))
+    left, right = execution.directory.select(step_for(a).rows.rows), execution.directory.select(step_for(b).rows.rows)
     assert left.ref_for(a, AUX) == right.ref_for(b, AUX) == joined[-1]
-    invocation = execution.begin(rows_for(a))
+    invocation = execution.begin(step_for(a).rows.rows)
     execution.cancel_step(invocation)
-    invocation = execution.begin(rows_for(b))
+    invocation = execution.begin(step_for(b).rows.rows)
     execution.retire((a,))
     assert not invocation.releases
     execution.cancel_step(invocation)
@@ -82,13 +82,13 @@ def test_retiring_a_request_cancels_its_invocation_and_releases_only_its_pins():
     (global_ref,) = execution.admit(())
     a, b = RequestIdentity("a", 0, 0, "math"), RequestIdentity("b", 1, 0, "math")
     execution.admit((a, b))
-    invocation = execution.begin(rows_for(a))
+    invocation = execution.begin(step_for(a).rows.rows)
     assert not invocation.releases
     execution.retire((a,))
     assert invocation.cancel_requested and invocation.releases[0].pin is invocation.pin
     assert not execution.directory.has_inference_pin(a)
     assert tuple(execution.directory.inference_pin(b).refs) == (global_ref,)
-    execution.cancel_step(execution.begin(rows_for(b)))
+    execution.cancel_step(execution.begin(step_for(b).rows.rows))
     execution.retire((b,))
     # An offline instance invocation has no request roots, even in a mixed directory.
     invocation = execution.begin(())
@@ -104,7 +104,7 @@ def test_cancellation_inside_a_loop_keeps_the_first_commit_and_stops():
     execution, task = multistate(instance=False)
     identities = (RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0))
     refs = execution.admit(identities)
-    rows = rows_for(*identities)
+    step = step_for(*identities)
     calls = []
 
     def update(context):
@@ -115,7 +115,7 @@ def test_cancellation_inside_a_loop_keeps_the_first_commit_and_stops():
             increment_resources(context)
 
     task.update = update
-    invocation = execution.start_step(rows)
+    invocation = execution.start_step(step)
     with pytest.raises(StateSettlementError):
         execution.execute_anchor(invocation, execution.plan.tasks[0].anchor_id)
     assert len(calls) == 2 and execution.arena.latest(refs[0].lineage_id).version_id == 1
@@ -139,7 +139,7 @@ def test_task_failure_keeps_the_commit_boundary(committed):
         raise RuntimeError("injected failure after publication")
 
     task.update = fail
-    invocation = execution.start_step(rows_for(identity))
+    invocation = execution.start_step(step_for(identity))
     with pytest.raises(StateSettlementError if committed else ValueError):
         execution.execute_anchor(invocation, execution.plan.tasks[0].anchor_id)
     assert len(calls) == 1

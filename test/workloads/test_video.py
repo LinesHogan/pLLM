@@ -41,6 +41,7 @@ from pllm.execution.state_execution import MathBinding, StateSettlementError
 from pllm.execution.tensor_binding import TensorBinding
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import FunctionMath, TaskOutput
+from pllm.testing import step_input
 from test.backend_facts import backend_facts
 
 
@@ -103,8 +104,8 @@ def binding_case(*, alias=False, write_failure=False, runtime=False, missing=Non
     )
     math = FunctionMath(
         {"inject": lambda roots, keys: None},
-        lambda value: () if value is None else value.rows.request_rows,
-        lambda value, batch: TensorFrame(value, () if value is None else value.rows.rows),
+        lambda value: value.rows.request_rows,
+        lambda value, batch: TensorFrame(value, value.rows.rows),
         lambda data, result: result.publication,
     )
     binding = MathBinding(
@@ -143,7 +144,7 @@ def received_features(arena, *, version=7, scale=1):
 def test_video_binding_keeps_remote_roots_out_of_local_ownership():
     with binding_case() as (_, _, _, _, execution, root, peers):
         execution.stage_readonly((root,))
-        invocation = execution.start_step(None)
+        invocation = execution.start_step(step_input(()))
         for anchor in execution.arena.plan.timeline.anchors:
             execution.execute_anchor(invocation, AnchorId(anchor.ordinal))
             if anchor.ordinal == execution.sampler_anchor_id:
@@ -169,7 +170,7 @@ def test_video_binding_failure_retains_grants_and_stops_execution():
             if failure == "close":
                 peers[0].close()  # The producer vanished: the read ACK cannot be delivered.
             with pytest.raises(StateSettlementError if failure == "close" else (ValueError, ArithmeticError)):
-                execution.step(None)
+                execution.step(step_input(()))
             if failure != "close":
                 assert execution.directory.latest_refs(()) == before and not any(peer.poll() for peer in peers)
             with pytest.raises(RuntimeError):

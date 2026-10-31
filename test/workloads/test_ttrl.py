@@ -69,7 +69,7 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         batch = CompletionInput.capture(completions, source, producer)
         source.zero_()
         assert batch.completions is completions and torch.count_nonzero(batch.hidden) > 0
-        rewards = ttrl_rewards(batch, config, stream)
+        rewards = ttrl_rewards(batch, config)
         if stream is not None:
             stream.synchronize()
         down = torch.nn.Parameter(original[0][:8].reshape(2, 4).clone())
@@ -153,7 +153,7 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         missing = replace(
             batch, completions=CompletionBatch(tuple(replace(c, text="missing") for c in completions.entries))
         )
-        blocked = ttrl_rewards(missing, config, stream)
+        blocked = ttrl_rewards(missing, config)
         assert all(item.reward is None for item in blocked.reward_outcomes)
         assert all(item.state is BarrierState.BLOCKED and item.ready_count == 0 for item in blocked.update_barriers)
         # Nothing selected: the step publishes the same values and leaves every optimizer field untouched.
