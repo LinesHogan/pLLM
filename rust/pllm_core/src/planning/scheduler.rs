@@ -918,7 +918,6 @@ mod tests {
             "reserved_bytes": 32,
             "plans": [{"resource": "state", "provider_id": "pages",
                 "device_kind": "cpu", "device_ordinal": 0, "layout_id": 0,
-                "layout_digest": "c".repeat(64), "layout_namespace": "d".repeat(64),
                 "max_admitted_lineages": 1, "page_capacity": 3, "root_page_count": 1,
                 "reserved_bytes": 32, "capture_stable": false, "capabilities": ["state/exact_versions@1"]}]
         }).to_string()).unwrap();

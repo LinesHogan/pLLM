@@ -53,8 +53,6 @@ def compile_page_bundle_plan(
             StateLayoutRequirement(
                 binding.resource,
                 binding.layout_id,
-                binding.layout_namespace,
-                binding.layout_digest,
                 next(
                     candidate.max_admitted_lineages
                     for candidate in candidates
@@ -110,8 +108,6 @@ class PageBundleProviderFacts:
             device_kind=self.device_kind,
             device_ordinal=self.device_ordinal,
             layout_id=binding.layout_id,
-            layout_namespace=binding.layout_namespace,
-            layout_digest=binding.layout_digest,
             max_admitted_lineages=1 if immutable_instance else max_admitted_lineages,
             page_capacity=capacity,
             root_page_count=len(layout.fields),

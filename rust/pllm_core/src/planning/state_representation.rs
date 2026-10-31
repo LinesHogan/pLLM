@@ -27,8 +27,6 @@ pub(crate) struct StateProviderPlan {
     pub(crate) device_kind: StateDeviceKind,
     pub(crate) device_ordinal: u64,
     pub(crate) layout_id: u64,
-    pub(crate) layout_digest: String,
-    pub(crate) layout_namespace: String,
     pub(crate) max_admitted_lineages: u64,
     pub(crate) page_capacity: u64,
     root_page_count: u64,
@@ -42,8 +40,6 @@ pub(crate) struct StateProviderPlan {
 struct StateLayoutRequirement {
     resource: String,
     layout_id: u64,
-    layout_digest: String,
-    layout_namespace: String,
     max_admitted_lineages: u64,
     required_capabilities: Vec<String>,
 }
@@ -74,21 +70,8 @@ pub(crate) fn decode_decision(payload: &str) -> Result<StateRepresentationDecisi
         .map_err(|source| format!("invalid StateRepresentationDecision: {source}"))
 }
 
-fn require_digest(value: &str, label: &str) -> Result<(), String> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(format!("{label} must be a lowercase SHA-256 digest"));
-    }
-    Ok(())
-}
-
 fn validate_requirement(requirement: &StateLayoutRequirement) -> Result<(), String> {
     require_text(&requirement.resource, "states.resource")?;
-    require_digest(&requirement.layout_digest, "states.layout_digest")?;
-    require_digest(&requirement.layout_namespace, "states.layout_namespace")?;
     if requirement.max_admitted_lineages == 0 {
         return Err("states.max_admitted_lineages must be positive".to_owned());
     }
@@ -101,8 +84,6 @@ fn validate_requirement(requirement: &StateLayoutRequirement) -> Result<(), Stri
 fn validate_candidate(candidate: &StateProviderPlan) -> Result<(), String> {
     require_text(&candidate.resource, "candidates.resource")?;
     require_text(&candidate.provider_id, "candidates.provider_id")?;
-    require_digest(&candidate.layout_digest, "candidates.layout_digest")?;
-    require_digest(&candidate.layout_namespace, "candidates.layout_namespace")?;
     if candidate.device_kind == StateDeviceKind::Cpu && candidate.device_ordinal != 0 {
         return Err("CPU state provider device ordinal must be zero".to_owned());
     }
@@ -178,8 +159,6 @@ fn validate_candidate_matches(
     candidate: &StateProviderPlan,
 ) -> Result<(), String> {
     if candidate.layout_id != requirement.layout_id
-        || candidate.layout_digest != requirement.layout_digest
-        || candidate.layout_namespace != requirement.layout_namespace
         || candidate.max_admitted_lineages != requirement.max_admitted_lineages
     {
         return Err(format!(
@@ -292,14 +271,12 @@ mod tests {
     fn representation_selection_and_capacity_match_oracle() {
         let requirement = |resource| {
             json!({"resource": resource, "layout_id": 0,
-            "layout_digest": "a".repeat(64), "layout_namespace": "b".repeat(64),
             "max_admitted_lineages": 1, "required_capabilities": []})
         };
         let candidate = |resource, provider, bytes, retained| {
             json!({
                 "resource": resource, "provider_id": provider,
                 "device_kind": "cpu", "device_ordinal": 0, "layout_id": 0,
-                "layout_digest": "a".repeat(64), "layout_namespace": "b".repeat(64),
                 "max_admitted_lineages": 1, "page_capacity": 3,
                 "root_page_count": 1, "reserved_bytes": bytes, "capture_stable": false,
                 "capabilities": if retained {vec!["state/exact_versions@1"]} else {vec![]}

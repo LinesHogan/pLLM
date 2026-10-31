@@ -77,16 +77,11 @@ class TensorLayoutRequest:
 class TensorLayoutBinding:
     resource: str
     layout_id: LayoutId
-    layout_namespace: str
-    layout_digest: str
 
 
 @dataclass(frozen=True, slots=True)
 class TensorLayoutDecision:
-    request_digest: str
-    layout_namespace: str
     bindings: tuple[TensorLayoutBinding, ...]
-    signature: str
     schema_version: int = 1
 
 

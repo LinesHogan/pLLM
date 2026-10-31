@@ -22,8 +22,6 @@ class StateProviderPlan:
     device_kind: StateDeviceKind
     device_ordinal: int
     layout_id: LayoutId
-    layout_namespace: str
-    layout_digest: str
     max_admitted_lineages: int
     page_capacity: int
     root_page_count: int
@@ -38,8 +36,6 @@ class StateLayoutRequirement:
 
     resource: str
     layout_id: LayoutId
-    layout_namespace: str
-    layout_digest: str
     max_admitted_lineages: int
     required_capabilities: tuple[str, ...] = ()
 

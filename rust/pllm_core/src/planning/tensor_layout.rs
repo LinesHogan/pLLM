@@ -8,8 +8,7 @@ use super::semantic_graph::{canonical_ascii_json, require_text};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 const SCHEMA_VERSION: u64 = 1;
 
@@ -69,17 +68,12 @@ pub(crate) struct TensorLayoutRequest {
 pub(crate) struct TensorLayoutBinding {
     pub(crate) resource: String,
     pub(crate) layout_id: u32,
-    pub(crate) layout_digest: String,
-    pub(crate) layout_namespace: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TensorLayoutDecision {
-    request_digest: String,
     pub(crate) bindings: Vec<TensorLayoutBinding>,
-    layout_namespace: String,
-    signature: String,
     schema_version: u64,
 }
 
@@ -130,66 +124,27 @@ fn validate_request(request: &TensorLayoutRequest) -> Result<(), String> {
     Ok(())
 }
 
-fn digest(payload: &str) -> String {
-    format!("{:x}", Sha256::digest(payload.as_bytes()))
-}
-
-fn decision_unsigned(decision: &TensorLayoutDecision) -> TensorLayoutDecision {
-    let mut unsigned = decision.clone();
-    unsigned.signature.clear();
-    unsigned
-}
-
-fn decision_signature(decision: &TensorLayoutDecision) -> Result<String, String> {
-    Ok(digest(&canonical_ascii_json(&decision_unsigned(decision))?))
-}
-
 fn compile(request: &TensorLayoutRequest) -> Result<TensorLayoutDecision, String> {
     validate_request(request)?;
-    let mut descriptors = BTreeMap::<String, TensorLayoutSpec>::new();
-    let mut resource_descriptors = Vec::with_capacity(request.layouts.len());
-    for item in &request.layouts {
-        let descriptor = canonical_ascii_json(&item.layout)?;
-        descriptors
-            .entry(descriptor.clone())
-            .or_insert_with(|| item.layout.clone());
-        resource_descriptors.push((item.resource.as_str(), descriptor));
-    }
-    let layout_namespace = digest(&canonical_ascii_json(
-        &descriptors.values().cloned().collect::<Vec<_>>(),
-    )?);
-    let layout_ids = descriptors
-        .keys()
-        .enumerate()
-        .map(|(position, descriptor)| {
-            let layout_id = u32::try_from(position)
-                .map_err(|_| "canonical tensor layout IDs exhausted u32".to_owned())?;
-            Ok((descriptor.as_str(), layout_id))
-        })
-        .collect::<Result<BTreeMap<_, _>, String>>()?;
-    let bindings = resource_descriptors
-        .into_iter()
-        .map(|(resource, descriptor)| {
-            let layout_id = *layout_ids
-                .get(descriptor.as_str())
-                .expect("canonical descriptor must have an interned layout ID");
-            TensorLayoutBinding {
-                resource: resource.to_owned(),
-                layout_id,
-                layout_digest: digest(&descriptor),
-                layout_namespace: layout_namespace.clone(),
-            }
+    let descriptors = request
+        .layouts
+        .iter()
+        .map(|item| canonical_ascii_json(&item.layout))
+        .collect::<Result<Vec<_>, String>>()?;
+    let distinct: BTreeSet<_> = descriptors.iter().collect();
+    let bindings = request
+        .layouts
+        .iter()
+        .zip(&descriptors)
+        .map(|(item, descriptor)| TensorLayoutBinding {
+            resource: item.resource.clone(),
+            layout_id: distinct.iter().position(|d| *d == descriptor).unwrap() as u32,
         })
         .collect();
-    let mut decision = TensorLayoutDecision {
-        request_digest: digest(&canonical_ascii_json(request)?),
+    Ok(TensorLayoutDecision {
         bindings,
-        layout_namespace,
-        signature: String::new(),
         schema_version: SCHEMA_VERSION,
-    };
-    decision.signature = decision_signature(&decision)?;
-    Ok(decision)
+    })
 }
 
 #[pyfunction]
@@ -236,14 +191,9 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>(),
             std::collections::BTreeSet::from([0, 1])
         );
-        assert_ne!(decision.layout_namespace, base_decision.layout_namespace);
         assert_ne!(
             decision.bindings[0].layout_id,
             base_decision.bindings[0].layout_id
-        );
-        assert_eq!(
-            decision.bindings[0].layout_digest,
-            base_decision.bindings[0].layout_digest
         );
     }
 }

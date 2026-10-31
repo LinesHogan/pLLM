@@ -102,10 +102,7 @@ def replan_states(plan, graph, layouts: TensorLayoutRequest, memory_bytes: int):
     )
     request = StateRepresentationRequest(
         memory_bytes,
-        tuple(
-            StateLayoutRequirement(b.resource, b.layout_id, b.layout_namespace, b.layout_digest, 2)
-            for b in bindings.bindings
-        ),
+        tuple(StateLayoutRequirement(b.resource, b.layout_id, 2) for b in bindings.bindings),
         candidates,
     )
     states, schedule = compile_state_schedule(graph, plan.timeline, request)
