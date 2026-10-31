@@ -245,9 +245,9 @@ class _CausalModel(_Source):
     name: str
 
     def training_port(self, context: _Declaration) -> CausalPort:
-        overlay = context.values[self.name]
-        if not isinstance(overlay, Overlay):
-            raise ValueError("causal_model must name an Overlay declaration")
+        overlay = context.overlays.get(self.name)
+        if overlay is None:
+            raise ValueError(f"pllm.causal_model({self.name!r}) must name a pllm.model.Overlay of the workload")
         state = context.states[overlay.state]
         bindings = overlay.bindings(context)
         forward = None if context.binding.causal is None else context.binding.causal(bindings)
@@ -485,7 +485,7 @@ class InstanceState:
 
     def declare(self, name: str, context: _Declaration) -> None:
         """Allocate tensor parameters; buffer layouts belong to their effects."""
-        context.definitions.append((name, boundary_digest(fingerprint(self), tuple(self.fields))))
+        context.signature.append((name, boundary_digest(fingerprint(self), tuple(self.fields))))
         if name in context.overlay_states or name in context.states:
             return
         if self.feed is not None:
@@ -499,9 +499,7 @@ class InstanceState:
                     break
                 case shape:
                     shapes[key] = shape
-        if len(shapes) != len(self.fields) or any(
-            type(value) is Overlay and value.state == name for value in context.values.values()
-        ):
+        if len(shapes) != len(self.fields) or any(overlay.state == name for overlay in context.overlays.values()):
             context.allocate_buffers(name, self)
             return
         context.states[name], ports = declare_parameters(
@@ -613,6 +611,8 @@ class _Effect:
     """An operation effect owns its declaration and attachment policy."""
 
     training: ClassVar[bool] = False
+    # Whether the effect acts inside the model forward, so it owns request training unless a sampler pairs with it.
+    model_effect: ClassVar[bool] = False
     tuple_output: ClassVar[bool] = False
     # The phase the effect runs in when no `@pllm.on` names one; None means the author must name it.
     phase: ClassVar[Phase | None] = None
@@ -647,7 +647,7 @@ class _Write(_Effect):
             raise ValueError("@pllm.write needs distinct field names and no rows=; it writes every row")
         for key in self.fields:
             context.parameter(self.state, key)
-        context.definitions.append((operation.name, fingerprint(self)))
+        context.signature.append((operation.name, fingerprint(self)))
         call = operation.tensor()
         state = context.states[self.state]
         update = write_result(context.binding, call, state, self.fields, operation.phase.value)
@@ -676,6 +676,7 @@ class _Export(_Effect):
     overflow: Literal["drop", "block"]
 
     phase: ClassVar[Phase | None] = Phase.OBSERVE
+    model_effect: ClassVar[bool] = True
 
     def declare(self, operation: _Operation) -> None:
         """Publish bounded tensor observations to the host."""
@@ -789,7 +790,7 @@ class _Train(_Effect):
         sources = {key: source.batch(self.state, definition) for key, source in arguments.items()}
         reset = context.method(self.reset)
         identity = boundary_digest(fingerprint(operation.function), fingerprint(reset), sources, self)
-        context.definitions.append((operation.name, identity))
+        context.signature.append((operation.name, identity))
         context.train(
             declare_weighted_train(
                 context.binding,
@@ -961,6 +962,7 @@ class _Overlay(_Effect):
     flush: Literal["prompt_end"] | None
 
     phase: ClassVar[Phase | None] = Phase.MODEL_UPDATE
+    model_effect: ClassVar[bool] = True
 
     def declare(self, operation: _Operation) -> None:
         """Declare a request buffer transition and its parameter overlay attachment."""
@@ -1029,10 +1031,10 @@ class _Overlay(_Effect):
             arguments=bindings,
             visibility=visibility,
             equations_digest=boundary_digest(
-                context.definitions, context.bindings, self.chunk, self.optimizer, self.flush
+                context.signature, context.bindings, self.chunk, self.optimizer, self.flush
             ),
         )
-        context.definitions.append(
+        context.signature.append(
             (
                 operation.name,
                 boundary_digest(
@@ -1179,6 +1181,11 @@ def _snapshot(owner: C, borrowed: tuple[object, ...] = ()) -> C:
     return owner_snapshot(owner, (InstanceState, Activation, Overlay, PositionState), borrowed)
 
 
+def _of_type(values: dict[str, object], expected: type[C]) -> dict[str, C]:
+    """The values of one declared type, in declaration order."""
+    return {key: typed for key, value in values.items() if (typed := _typed(value, expected)) is not None}
+
+
 def _typed(value: object, expected: type[C]) -> C | None:
     """Narrow an untrusted boundary marker to its declared type."""
     return value if isinstance(value, expected) else None
@@ -1240,7 +1247,7 @@ class _Operation:
             arguments, captures = self.arguments()
         context, effect = self.context, self.effect
         inputs, identity = {key: source.port(context) for key, source in arguments.items()}, fingerprint(self.function)
-        context.definitions.append(
+        context.signature.append(
             (
                 self.name,
                 boundary_digest(
@@ -1300,7 +1307,7 @@ class _Operation:
             selected_args = _arguments(selector)
             if method not in selectors:
                 identity = fingerprint(selector)
-                self.context.definitions.append((method, identity))
+                self.context.signature.append((method, identity))
                 selectors[method] = declare_tensor(
                     self.context.binding,
                     f"__{self.name}_{method}",
@@ -1356,9 +1363,14 @@ class _Declaration:
 
     owner: Workload
     binding: TensorBinding = field(init=False)
-    values: dict[str, object]
-    bindings: tuple[tuple[str, str], ...]
-    definitions: list[tuple[str, str]] = field(default_factory=lambda: [])
+    # The owner's values, signed; the declared states and model values among them, by type.
+    bindings: tuple[tuple[str, str], ...] = ()
+    state_definitions: dict[str, InstanceState] = field(default_factory=lambda: {})
+    overlays: dict[str, Overlay] = field(default_factory=lambda: {})
+    activations: dict[str, Activation] = field(default_factory=lambda: {})
+    position_definitions: dict[str, PositionState] = field(default_factory=lambda: {})
+    # Ordered (name, digest) entries folded into the graph's execution parameters digest.
+    signature: list[tuple[str, str]] = field(default_factory=lambda: [])
     operations: list[_Operation] = field(default_factory=lambda: [])
     routes: list[tuple[str, Tokens, Over]] = field(default_factory=lambda: [])
     positions: tuple[tuple[str, float], ...] = ()
@@ -1384,18 +1396,21 @@ class _Declaration:
     @property
     def has_model_effect(self) -> bool:
         """Model effects own training unless a sampler pairs with it."""
-        return (
-            bool(self.routes)
-            or any(isinstance(value, (Activation, Overlay)) for value in self.values.values())
-            or any(isinstance(operation.effect, (_Export, _Overlay)) for operation in self.operations)
+        return bool(self.routes or self.overlays or self.activations) or any(
+            operation.effect.model_effect for operation in self.operations
         )
+
+    @property
+    def model_values(self) -> dict[str, Activation | Overlay]:
+        """The values that act inside the model forward; a workload declares at most one."""
+        return {**self.activations, **self.overlays}
 
     @classmethod
     def read(cls, workload: Workload) -> _Declaration:
         """Snapshot and sign reachable mathematics before evaluating state properties."""
         owner = _snapshot(workload)
         values, members = _values(owner), _members(owner)
-        context, candidates = cls(owner, values, ()), _candidates(owner, values, members)
+        context, candidates = cls(owner), _candidates(owner, values, members)
         seeds: list[FunctionType] = []
         for name, member in members.items():
             context.read_operation(name, member, candidates, seeds)
@@ -1413,6 +1428,10 @@ class _Declaration:
         for name, member in members.items():
             if _property(member):
                 values[name] = object.__getattribute__(owner, name)
+        context.state_definitions = _of_type(values, InstanceState)
+        context.overlays = _of_type(values, Overlay)
+        context.activations = _of_type(values, Activation)
+        context.position_definitions = _of_type(values, PositionState)
         return context
 
     def read_operation(
@@ -1474,7 +1493,7 @@ class _Declaration:
             if name in reachable:
                 function = self.method(name)
                 with self.declaring(name):
-                    self.definitions.append((name, fingerprint(function)))
+                    self.signature.append((name, fingerprint(function)))
                 object.__setattr__(self.owner, name, freeze(function))
 
     @contextmanager
@@ -1487,9 +1506,9 @@ class _Declaration:
             raise
 
     def state_definition(self, name: str, error: str) -> InstanceState:
-        definition = _typed(self.values.get(name), InstanceState)
+        definition = self.state_definitions.get(name)
         if definition is None:
-            declared = ", ".join(key for key, value in self.values.items() if isinstance(value, InstanceState))
+            declared = ", ".join(self.state_definitions)
             raise ValueError(
                 f"{error}: {name!r} is not a declared state of {type(self.owner).__name__} (declared: {declared or 'none'}); "
                 "declare a state as a property annotated `-> pllm.RequestState` or `-> pllm.InstanceState`"
@@ -1511,11 +1530,7 @@ class _Declaration:
     def allocate_buffers(self, name: str, definition: InstanceState) -> None:
         """Register buffer fields as ordinary readable state ports."""
         buffers = _buffers(replace(definition, optimizer=None))
-        consumers = tuple(
-            consumer
-            for value in self.values.values()
-            if (consumer := _typed(value, Overlay)) is not None and consumer.state == name
-        )
+        consumers = tuple(consumer for consumer in self.overlays.values() if consumer.state == name)
         if consumers:
             (consumer,) = consumers
             fields = overlay_fields(buffers, consumer, self.binding.dimensions)
@@ -1549,31 +1564,26 @@ class _Declaration:
     def declare_values(self) -> None:
         """Allocate ordinary state before effects and operations consume its ports."""
         self.positions = self.position_states()
-        for name, value in self.values.items():
-            if (state := _typed(value, InstanceState)) is not None:
-                with self.declaring(name):
-                    state.declare(name, self)
-                if state.imported:
-                    allocated = self.states[name]
-                    self.binding.imports[name] = tuple(
-                        view for (resource, _), view in self.binding.field_views.items() if resource == name
-                    )
-                    update = import_update(self.binding, allocated, f"{name}:import@1")
-                    self.writes[name] = (
-                        update,
-                        self.binding.publish(update, allocated, when=When.BEFORE_MODEL, name=f"{name}.publish"),
-                    )
-
-        self.definitions.extend(
-            (name, fingerprint(value)) for name, value in self.values.items() if type(value) in (Activation, Overlay)
-        )
+        for name, state in self.state_definitions.items():
+            with self.declaring(name):
+                state.declare(name, self)
+            if state.imported:
+                allocated = self.states[name]
+                self.binding.imports[name] = tuple(
+                    view for (resource, _), view in self.binding.field_views.items() if resource == name
+                )
+                update = import_update(self.binding, allocated, f"{name}:import@1")
+                self.writes[name] = (
+                    update,
+                    self.binding.publish(update, allocated, when=When.BEFORE_MODEL, name=f"{name}.publish"),
+                )
+        self.signature.extend((name, fingerprint(value)) for name, value in self.model_values.items())
 
     def attach_effects(self) -> None:
         """Connect publications before replay and missing-input branches."""
-        for name, value in self.values.items():
-            if (effect := _typed(value, Activation) or _typed(value, Overlay)) is not None:
-                with self.declaring(name):
-                    effect.declare(self)
+        for name, value in self.model_values.items():
+            with self.declaring(name):
+                value.declare(self)
         if self.routes:
             declare_layer_route(
                 self.binding,
@@ -1585,11 +1595,7 @@ class _Declaration:
 
     def position_states(self) -> tuple[tuple[str, float], ...]:
         """Resolve the pre-allocation schema without tracing tensors."""
-        states = tuple(
-            (name, pos.initial)
-            for name, value in sorted(self.values.items())
-            if (pos := _typed(value, PositionState)) is not None
-        )
+        states = tuple((name, value.initial) for name, value in sorted(self.position_definitions.items()))
         if states and not self.routes:
             raise ValueError("PositionState requires layers.load/save inside a layer_route")
         return states
@@ -1632,9 +1638,8 @@ class _Declaration:
 
         frozen = {
             name
-            for name, value in self.values.items()
-            if (state := _typed(value, InstanceState)) is not None
-            and state.module is not None
+            for name, state in self.state_definitions.items()
+            if state.module is not None
             and state.optimizer is None
             and not state.imported
             and state.feed is None
@@ -1648,7 +1653,7 @@ class _Declaration:
             b.graph,
             states=tuple(replace(state, immutable=state.resource in frozen) for state in b.graph.states),
             execution_parameters_digest=boundary_digest(
-                b.graph.execution_parameters_digest, self.definitions, self.bindings
+                b.graph.execution_parameters_digest, self.signature, self.bindings
             ),
         )
 
@@ -1671,10 +1676,7 @@ class Workload(
         """Declare owner values and operations, then compose and sign their graph."""
         context = _Declaration.read(self)
         context.binding = b
-        context.values = {
-            key: value.expand(b.dimensions.layer_count) if isinstance(value, Overlay) else value
-            for key, value in context.values.items()
-        }
+        context.overlays = {key: value.expand(b.dimensions.layer_count) for key, value in context.overlays.items()}
         context.declare_values()
         for operation in sorted(context.operations, key=lambda operation: operation.name):
             with context.declaring(operation.name):
@@ -1705,9 +1707,7 @@ class Workload(
         """Read model dependencies from markers before dimensions or tensor readers exist."""
         context = _Declaration.read(self)
         sources: dict[str, tuple[_Source, ...]] = {}
-        targets = tuple(
-            target for value in context.values.values() if isinstance(value, Overlay) for target in value.targets
-        )
+        targets = tuple(target for value in context.overlays.values() for target in value.targets)
         for operation in sorted(context.operations, key=lambda operation: operation.name):
             effect = operation.effect
             if isinstance(effect, _Overlay):
@@ -1725,9 +1725,7 @@ class Workload(
         return BackendRequirements(
             tuple(dict.fromkeys(source.resolve(context.owner) for source in inputs if isinstance(source, Hidden))),
             targets,
-            activation_layers=tuple(
-                layer for value in context.values.values() if isinstance(value, Activation) for layer in value.layers
-            ),
+            activation_layers=tuple(layer for value in context.activations.values() for layer in value.layers),
             sampler_stage=None if sampler is None else sampler.stage,
             sampler_feedback=any(isinstance(source, (BaseLogits, SampledTokens)) for source in inputs),
             sample_limit=min(
