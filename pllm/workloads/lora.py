@@ -100,7 +100,6 @@ class OutputLoRAWorkload(pllm.Workload):
         state="output_factors",
         steps=pllm.Config("config.steps"),
         reset="reset",
-        reduction="weighted_state_mean_then_mean",
     )
     def train(
         self,

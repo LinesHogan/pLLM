@@ -35,7 +35,6 @@ from pllm.contracts.request_identity import RequestKeyField, canonical_request_k
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
     HiddenInputSource,
-    LossReduction,
     MathContract,
     SchedulerTimeline,
     SemanticOutputKind,
@@ -115,6 +114,8 @@ from pllm.kernels.adamw import AdamWConfig
 F = TypeVar("F", bound=Callable[..., torch.Tensor | tuple[torch.Tensor, ...] | TensorUpdate | None])
 Initializer = Callable[[Tensors, torch.Generator], None]
 C = TypeVar("C")
+# How @pllm.train averages per-row losses: over all rows, or per state and then summed over states.
+TrainReduction = Literal["mean", "state_mean"]
 
 
 class Phase(Enum):
@@ -613,7 +614,7 @@ class _Effect:
 
     state: str = ""
     update: str = ""
-    reduction: LossReduction = "mean"
+    reduction: TrainReduction = "mean"
 
     def declare(self, operation: _Operation) -> None:
         operation.tensor()
@@ -693,7 +694,7 @@ class _Export(_Effect):
 class _Train(_Effect):
     state: str
     update: str
-    reduction: LossReduction
+    reduction: TrainReduction
     steps: int | Config
     reset: str
 
@@ -777,12 +778,9 @@ class _Train(_Effect):
             or operation.rows
             or self.update
             or not self.reset
-            or self.reduction != "weighted_state_mean_then_mean"
             or operation.phase is not Phase.AFTER_SAMPLE
         ):
-            raise ValueError(
-                "SGD batch training requires reset, weighted reduction and AFTER_SAMPLE without inference-row selectors"
-            )
+            raise ValueError("SGD batch training requires reset and AFTER_SAMPLE without inference-row selectors")
         context = operation.context
         sources = {key: source.batch(self.state, definition) for key, source in arguments.items()}
         reset = context.method(self.reset)
@@ -1126,12 +1124,18 @@ def train(
     *,
     state: str,
     update: str = "",
-    reduction: LossReduction = "mean",
+    reduction: TrainReduction = "mean",
     steps: int | Config = 1,
     reset: str = "",
     rows: str = "",
 ) -> Callable[[F], F]:
-    """Minimize the returned per-row loss with `state`'s optimizer; runs after sampling by default."""
+    """Minimize the returned per-row loss with `state`'s optimizer; runs after sampling by default.
+
+    `reduction="mean"` averages the loss over all rows; `"state_mean"` averages each state's rows, then sums over
+    states. SGD batch training ignores it: its loss is weighted per state, then averaged.
+    """
+    if reduction not in ("mean", "state_mean"):
+        raise ValueError(f"@pllm.train(reduction={reduction!r}): use 'mean' or 'state_mean'")
     return _mark(effect=_Train(state=state, update=update, reduction=reduction, steps=steps, reset=reset), rows=rows)
 
 

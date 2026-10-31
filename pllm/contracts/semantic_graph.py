@@ -162,9 +162,8 @@ class TokenProgramEffect:
     span: bool = False
 
 
-LossReduction = Literal[
-    "none", "sum", "mean", "state_mean", "weighted_state_mean", "weighted_state_mean_then_mean", "custom"
-]
+# "mean" and "state_mean" are the author's @pllm.train choices; the other values are set by pllm's own paths.
+LossReduction = Literal["none", "mean", "state_mean", "weighted_state_mean_then_mean", "custom"]
 
 
 @dataclass(frozen=True, slots=True)
