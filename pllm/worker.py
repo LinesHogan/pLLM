@@ -19,25 +19,19 @@ from pllm.backends.vllm.runtime import (
     probe_backend,
 )
 from pllm.backends.vllm.training import CausalTraining
-from pllm.contracts.backend_attachment import AttachmentTopology
 from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.semantic_graph import TaskId
 from pllm.execution.trace import TraceSelection
-from pllm.workload_transport import decode_workload as decode_workload, encode_workload as encode_workload
+from pllm.workload_transport import decode_workload
 
 
 class GPUWorker(Worker):
     def init_device(self) -> None:
         super().init_device()
-        topology = (
-            AttachmentTopology.ENGINE_CORE
-            if os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING") == "1"
-            else AttachmentTopology.IN_PROCESS
-        )
         self.model_runner = (
-            WorkloadModelRunner(self.vllm_config, self.device, topology)
+            WorkloadModelRunner(self.vllm_config, self.device)
             if self.use_v2_model_runner
-            else Mrv1Runner(self.vllm_config, self.device, topology)
+            else Mrv1Runner(self.vllm_config, self.device)
         )
 
     @property

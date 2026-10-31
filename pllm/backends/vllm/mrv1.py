@@ -15,23 +15,16 @@ from pllm.backends.vllm.packed_rows import encode_mrv1_rows
 from pllm.backends.vllm.runner import Runner
 from pllm.backends.vllm.sampler import Mrv1Sampler
 from pllm.config import RunnerName
-from pllm.contracts.backend_attachment import AttachmentTopology
 
 
 class Mrv1Runner(Runner, GPUModelRunner):
     runner_kind: RunnerName = "mrv1"
 
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        device: torch.device,
-        topology: AttachmentTopology = AttachmentTopology.IN_PROCESS,
-    ) -> None:
+    def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
         super().__init__(vllm_config, device)
         if self.use_async_scheduling:
             raise ValueError("MRv1 workload requires synchronous persistent batch metadata")
         self.sampler = self._sampler_guidance = Mrv1Sampler(self.sampler)
-        self._initialize_workload(topology)
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         if self.speculative_config is not None:

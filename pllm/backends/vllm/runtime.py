@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Any, Generic, TypeVar, overload
 
 import torch
 from vllm import RequestOutput, SamplingParams, __version__ as _VLLM_VERSION
-from vllm.config import VllmConfig
 from vllm.entrypoints.llm import LLM
 
 from pllm.authoring import (
@@ -94,19 +93,6 @@ _WORKER_CLASS = "pllm.worker.GPUWorker"
 
 
 _SUPPORTED_VLLM_VERSION = "0.27.1"
-
-
-_BACKEND_ABI_FIELDS = (
-    "vllm=0.27.1",
-    "mode=in_process|engine_core/tp1/pp1/dp1/non_spec",
-    "rows=one_logit_per_request",
-    "attachment=shared_plan_v8",
-    "attachments=request_training|parameter_overlay|activation_patch",
-    "parameter=head_add_fp32/input_reconstruction@1",
-    "activation=phase_windows/exact_step_pins/source_readonly@2",
-    "model=causal_indexed_layer@5",
-    "tensor=fx_affine_scan/aten_projection@1",
-)
 
 
 _REQUEST_CAPABILITIES = (
@@ -783,31 +769,10 @@ def _base_probe(
     device_ordinal = runner.device.index
     assert device_ordinal is not None
     return BackendPlacementProbe(
-        adapter_id=f"canonical.vllm_{runner.runner_kind}@1",
-        backend_abi_digest=_digest(
-            (
-                *_BACKEND_ABI_FIELDS,
-                f"runner={runner.runner_kind}",
-                f"cuda_graphs={not runner.model_config.enforce_eager}",
-            )
-        ),
-        runner_fingerprint=_digest(
-            (
-                runner.runner_kind,
-                f"device=cuda:{device_ordinal}",
-                f"max_num_tokens={runner.max_num_tokens}",
-                f"max_num_reqs={runner.max_num_reqs}",
-                f"dtype={runner.dtype}",
-                f"seed={runner.model_config.seed}",
-            )
-        ),
         model_fingerprint=model_fingerprint,
-        topology=runner.workload_topology,
         graph_mode=graph_mode(runner.overlay_graph_bytes),
         device_kind=StateDeviceKind.CUDA,
         device_ordinal=device_ordinal,
-        tensor_parallel_size=1,
-        pipeline_parallel_size=1,
         tensor_dtype=_tensor_dtype(runner.dtype),
         hidden_size=hidden_size,
         max_packed_rows=runner.max_num_tokens,
@@ -819,7 +784,6 @@ def _base_probe(
 
 
 __all__ = [
-    "VllmConfig",
     "VllmLlm",
     "create_vllm_llm",
 ]

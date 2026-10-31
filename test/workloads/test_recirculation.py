@@ -9,7 +9,6 @@ import pllm
 from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
-    AttachmentTopology,
     BackendPlacementProbe,
     CausalModelDomain,
 )
@@ -32,16 +31,10 @@ from pllm.workload_transport import decode_workload, encode_workload
 from pllm.workloads.recirculation import RecirculationWorkload
 
 PROBE = BackendPlacementProbe(
-    "test.replay@1",
-    "a" * 64,
-    "b" * 64,
     "c" * 64,
-    AttachmentTopology.IN_PROCESS,
     AttachmentGraphMode.EAGER,
     StateDeviceKind.CPU,
     0,
-    1,
-    1,
     TensorDType.FLOAT32,
     4,
     4,

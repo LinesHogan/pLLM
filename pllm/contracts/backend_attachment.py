@@ -24,11 +24,6 @@ from pllm.contracts.state_representation import (
 from pllm.contracts.tensor_layout import TensorDType
 
 
-class AttachmentTopology(StrEnum):
-    IN_PROCESS = "in_process"
-    ENGINE_CORE = "engine_core"
-
-
 class AttachmentKind(StrEnum):
     OBSERVATION = "observation"
     MODEL_REPLAY = "model_replay"
@@ -75,22 +70,15 @@ class CausalModelDomain:
 
 @dataclass(frozen=True, slots=True)
 class BackendPlacementProbe:
-    adapter_id: str
-    backend_abi_digest: str
-    runner_fingerprint: str
     model_fingerprint: str
-    topology: AttachmentTopology
     graph_mode: AttachmentGraphMode
     device_kind: StateDeviceKind
     device_ordinal: int
-    tensor_parallel_size: int
-    pipeline_parallel_size: int
     tensor_dtype: TensorDType
     hidden_size: int
     max_packed_rows: int
     hidden_resources: tuple[AttachmentHiddenResource, ...]
     capabilities: tuple[str, ...]
-    schema_version: int = 3
     targets: tuple[ParameterTargetShape, ...] = ()
     causal_domain: CausalModelDomain | None = None
     position_states: tuple[tuple[str, float], ...] = ()
@@ -172,7 +160,6 @@ __all__ = [
     "SamplerStage",
     "AttachmentTaskBinding",
     "AttachmentTaskRole",
-    "AttachmentTopology",
     "BackendPlacementProbe",
 ]
 

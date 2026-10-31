@@ -25,7 +25,6 @@ from pllm.authoring import CausalTrainBatch, StateTensorUpdate, WeightedCEBatch
 from pllm.config import ExecutionOptions, ModelConfig, RunnerName
 from pllm.contracts.backend_attachment import (
     ActivationPatchOperator,
-    AttachmentTopology,
 )
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
@@ -480,7 +479,6 @@ def main() -> int:
     handle = pllm.make_llm(workload=workload, config=engine(memory=0.35))
     try:
         assert not torch.cuda.is_initialized(), "frontend allocated a second GPU execution"
-        assert handle.attachment.probe.topology is AttachmentTopology.ENGINE_CORE
         child = handle.worker_state().process_id
         assert child != os.getpid()
         outputs = handle.generate(

@@ -13,7 +13,6 @@ from pllm.backends.vllm.activation import activation_delta
 from pllm.contracts.backend_attachment import (
     ActivationPatchOperator,
     AttachmentGraphMode,
-    AttachmentTopology,
     BackendPlacementProbe,
     DecodeRefresh,
     DecodeWindow,
@@ -38,16 +37,10 @@ def test_reft_matches_loreft_math_and_publish_skip_semantics(tmp_path) -> None:
     device = torch.device("cpu")
     facts = BackendCompileFacts(
         BackendPlacementProbe(
-            "test.activation@1",
-            "a" * 64,
-            "b" * 64,
             "c" * 64,
-            AttachmentTopology.IN_PROCESS,
             AttachmentGraphMode.EAGER,
             StateDeviceKind.CPU,
             0,
-            1,
-            1,
             TensorDType.FLOAT64,
             4,
             8,

@@ -14,7 +14,6 @@ from pllm.config import ExecutionOptions
 from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
-    AttachmentTopology,
     BackendPlacementProbe,
 )
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
@@ -72,16 +71,10 @@ def _facts(model, *, reserved=0, task_resources=()) -> BackendCompileFacts:
     timeline = model_timeline(model.device, ("optimizer/adamw@1", "transition/full_root@1"))
     timeline = replace(timeline, reserved_bytes=(reserved,) * len(timeline.anchors), task_resources=task_resources)
     probe = BackendPlacementProbe(
-        "test.tlm@1",
-        "a" * 64,
-        "b" * 64,
         "c" * 64,
-        AttachmentTopology.IN_PROCESS,
         AttachmentGraphMode.EAGER,
         kind,
         ordinal,
-        1,
-        1,
         model.tensor_dtype,
         model.targets[0].input_size,
         8,

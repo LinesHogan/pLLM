@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from vllm.config import CacheConfig, ModelConfig as VllmModelConfig, VllmConfig
+from vllm.config import CacheConfig, ModelConfig as VllmModelConfig
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -45,10 +45,7 @@ from pllm.backends.vllm.sampler import (
 )
 from pllm.backends.vllm.session import VllmSession
 from pllm.config import RunnerName
-from pllm.contracts.backend_attachment import (
-    AttachmentGraphMode,
-    AttachmentTopology,
-)
+from pllm.contracts.backend_attachment import AttachmentGraphMode
 from pllm.contracts.codec import decode_boundary
 from pllm.execution.position_state import PositionAnnouncement
 from pllm.execution.ptts.slot_pools import SlotPools
@@ -89,10 +86,7 @@ class Runner:
         self.hidden_taps = HiddenTaps(model, self.hidden_layouts, self.hidden_pools, self.device)
 
     overlay_graph_bytes: int = 0
-
-    def _initialize_workload(self, topology: AttachmentTopology) -> None:
-        self.workload_topology = topology
-        self._workload_session: VllmSession[Any, Any] | None = None
+    _workload_session: VllmSession[Any, Any] | None = None
 
     def attach_workload(
         self,
@@ -159,15 +153,6 @@ class Runner:
 
 class WorkloadModelRunner(Runner, OverlayGraphRunner):
     runner_kind: RunnerName = "mrv2"
-
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        device: torch.device,
-        topology: AttachmentTopology = AttachmentTopology.IN_PROCESS,
-    ) -> None:
-        super().__init__(vllm_config, device)
-        self._initialize_workload(topology)
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights)

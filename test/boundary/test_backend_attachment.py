@@ -14,7 +14,6 @@ import pllm
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
     AttachmentHiddenResource,
-    AttachmentTopology,
     BackendAttachment,
     BackendPlacementProbe,
 )
@@ -43,16 +42,10 @@ def overlay_facts():
     target = ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT)
     workload = InPlaceTTTWorkload(InPlaceTTTConfig((target,), chunk_size=2))
     probe = BackendPlacementProbe(
-        "test.backend@1",
-        "a" * 64,
-        "b" * 64,
         "c" * 64,
-        AttachmentTopology.IN_PROCESS,
         AttachmentGraphMode.EAGER,
         StateDeviceKind.CPU,
         0,
-        1,
-        1,
         TensorDType.FLOAT32,
         3,
         8,

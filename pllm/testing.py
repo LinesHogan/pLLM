@@ -27,7 +27,6 @@ from pllm.contracts.auxiliary import AuxiliaryInput
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
     AttachmentHiddenResource,
-    AttachmentTopology,
     BackendPlacementProbe,
     ParameterTargetShape,
 )
@@ -83,16 +82,10 @@ def backend_facts(
     """
     return BackendCompileFacts(
         BackendPlacementProbe(
-            "testing.native@1",
-            "a" * 64,
-            "b" * 64,
             "c" * 64,
-            AttachmentTopology.IN_PROCESS,
             AttachmentGraphMode.EAGER,
             _CPU_PAGES.device_kind if provider is None else provider.device_kind,
             0 if provider is None else provider.device_ordinal,
-            1,
-            1,
             dtype,
             hidden_size,
             max_lineages * 2 if max_rows is None else max_rows,
