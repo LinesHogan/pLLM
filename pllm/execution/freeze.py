@@ -19,7 +19,7 @@ from inspect import getclosurevars
 from itertools import pairwise
 from marshal import dumps
 from types import CellType, CodeType, FunctionType, MethodType, ModuleType
-from typing import TypeVar, cast
+from typing import TypeGuard, TypeVar, cast
 
 import torch
 
@@ -66,7 +66,7 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
         return str(value)
     if isinstance(value, Enum):
         return boundary_digest(type(value).__qualname__, fingerprint(value.value, seen))
-    if isinstance(value, type):
+    if _is_class(value):
         if value.__module__.partition(".")[0] in ("torch", "pllm"):
             return boundary_digest(value.__module__, value.__qualname__, torch.__version__)
         if issubclass(value, torch.nn.Module):
@@ -80,10 +80,13 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
                     if isinstance(item, FunctionType)
                 )
             )
+        if issubclass(value, Enum) or is_dataclass(value):
+            return _structure(value, seen)
         raise ValueError(
-            f"{value.__qualname__}: workload methods may reference only torch and pllm classes and nn.Module subclasses"
+            f"{value.__qualname__}: workload methods may reference torch and pllm classes and the author's "
+            "nn.Module subclasses, enums and dataclasses"
         )
-    if is_dataclass(value) and not isinstance(value, type):
+    if is_dataclass(value):
         return boundary_digest(
             type(value).__qualname__,
             tuple((field.name, fingerprint(getattr(value, field.name), seen)) for field in fields(value)),
@@ -99,6 +102,23 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
         raise ValueError(
             f"{value!r}: workload methods may depend only on torch, math, pllm, plain values, enums and dataclasses"
         ) from error
+
+
+def _is_class(value: object) -> TypeGuard[type[object]]:
+    """Narrow a dependency to a class with known members (isinstance alone gives type[Unknown])."""
+    return isinstance(value, type)
+
+
+def _structure(cls: type[object], seen: frozenset[int]) -> str:
+    """Sign an author's enum or dataclass by its members or field names and the code of its own methods."""
+    members = tuple((member.name, fingerprint(member.value, seen)) for member in cls) if issubclass(cls, Enum) else ()
+    names = tuple(field.name for field in fields(cls)) if is_dataclass(cls) else ()
+    methods = tuple(
+        (key, fingerprint(item, seen))
+        for key, item in sorted(vars(cls).items())
+        if isinstance(item, FunctionType) and not key.startswith("__")
+    )
+    return boundary_digest(cls.__module__, cls.__qualname__, members, names, methods)
 
 
 def _code(code: CodeType) -> CodeType:

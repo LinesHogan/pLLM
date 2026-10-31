@@ -114,7 +114,7 @@ class TLMWorkload(pllm.Workload):
         if config.lamb == 0:
             return None
         selection = None
-        if config.mode.value == "offline":
+        if config.mode is TLMMode.OFFLINE:
             with torch.no_grad():
                 selection = _sentence_cross_entropy(
                     model.base(input_ids, attention_mask=attention_mask), labels, config.ignore_index
