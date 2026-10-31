@@ -109,7 +109,7 @@ class Runner:
         in_model = (
             spec.overlay_bindings
             or spec.activation_bindings
-            or any(task.replay is not None for task in deployment.attachment.plan.semantic_graph.tasks)
+            or deployment.attachment.plan.semantic_graph.replay_task is not None
         )
         if (
             in_model

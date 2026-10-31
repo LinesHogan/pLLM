@@ -29,11 +29,11 @@ class CachePolicy:
     def for_attachment(cls, attachment: BackendAttachment, policy: Literal["reuse", "isolate"]) -> "CachePolicy":
         """Conservatively derive role dependence and stable mathematical identity from backend facts."""
         graph = attachment.plan.semantic_graph
+        replay = None if graph.replay_task is None else graph.replay_task.replay
         sensitive = (
             bool(attachment.spec.activation_bindings or attachment.spec.overlay_bindings)
-            or any(task.replay is not None and task.replay.rows != "all" for task in graph.tasks)
             # Reading `layers.generated` or PositionState adds the position resource to the route source.
-            or any(task.replay is not None and task.replay.role_sensitive for task in graph.tasks)
+            or (replay is not None and (replay.rows != "all" or replay.role_sensitive))
         )
         return cls(
             boundary_digest((attachment.probe.model_fingerprint, graph, attachment.probe.position_states)),

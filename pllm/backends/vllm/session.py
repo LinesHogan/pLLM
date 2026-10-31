@@ -16,12 +16,7 @@ from pllm.authoring import AuxiliaryInput, BackendDeployment, DataT, ResultT
 from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.architecture import Decoder
 from pllm.backends.vllm.hidden_capture import HiddenTaps
-from pllm.backends.vllm.parameter_overlay import (
-    ExactParameterOverlay,
-    HybridParameterOverlay,
-    PinnedParameterOverlay,
-    parameter_overlay,
-)
+from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay, parameter_overlay
 from pllm.backends.vllm.position_state import PositionCacheLayer
 from pllm.backends.vllm.prefix_cache import POLICY_KEY, CachePolicy
 from pllm.backends.vllm.replay import VllmTokenwiseReplay
@@ -97,8 +92,8 @@ class VllmSession(Generic[DataT, ResultT]):
         self._hidden_resources = tuple(dict.fromkeys(resource.binding for resource in probe.hidden_resources))
         self._taps = taps
         overlay_bindings = attachment.spec.overlay_bindings
-        routed_overlay = bool(overlay_bindings) and any(task.replay is not None for task in plan.semantic_graph.tasks)
-        self._in_forward_overlay = plan.semantic_graph.updates_in_forward
+        replay_task = plan.semantic_graph.replay_task
+        routed_overlay = bool(overlay_bindings) and replay_task is not None
         self._overlay = (
             parameter_overlay(
                 decoder,
@@ -108,20 +103,25 @@ class VllmSession(Generic[DataT, ResultT]):
                 max_sampler_rows,
                 buffers,
                 phases=deployment.execution.math.parameter_phases,
-                in_forward=self._in_forward_overlay,
+                in_forward=plan.semantic_graph.updates_in_forward,
                 graphs=probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH,
                 routed=routed_overlay,
             )
             if overlay_bindings
             else None
         )
-        tasks = tuple(task for task in attachment.plan.semantic_graph.tasks if task.replay is not None)
+        # The overlay prepared for each model forward; the replay drives a routed overlay itself.
+        self._forward_overlay = None if routed_overlay else self._overlay
+        self._in_forward_overlay = plan.semantic_graph.updates_in_forward and not routed_overlay
+        self._transition_task = next(
+            (item.task_id for item in attachment.task_bindings if item.role is AttachmentTaskRole.TRANSITION), None
+        )
         self._activation = (
             VllmActivationPatch(
                 decoder.model,
                 attachment.spec.activation_bindings,
                 attachment.spec.state_resource,
-                install=not tasks,
+                install=replay_task is None,
             )
             if (attachment.spec.activation_bindings)
             else None
@@ -130,11 +130,10 @@ class VllmSession(Generic[DataT, ResultT]):
         self._received_readonly: ReadonlyStepInput | ReadonlyStepAbsent | ReadonlyStepEnd | None = None
         self._input_failed = False
         self._replay: VllmTokenwiseReplay[DataT, ResultT] | None = None
-        if tasks:
-            (task,) = tasks
+        if replay_task is not None:
             self._replay = VllmTokenwiseReplay(
                 decoder.model,
-                task,
+                replay_task,
                 deployment.execution,
                 attachment.task_bindings[0].anchor_id,
                 activation=self._activation,
@@ -289,19 +288,10 @@ class VllmSession(Generic[DataT, ResultT]):
         self._step = step
         if self._taps is not None:
             self._taps.prepare(rows.row_batch)
-        if self._replay is not None and self._activation is None:
-            execution = self._deployment.execution
-            context = execution.start_step(
-                TensorStepInput(rows.row_batch, rows), torch.cuda.current_stream(execution.device)
-            )
-            step.context = context
-            execution.advance_to(context, "request.prepare")
-            self._replay.prepare(rows.row_batch, context)
+        adapter = self._forward_overlay
+        if adapter is None and self._activation is None and self._replay is None:
             return
-        adapter = self._overlay
-        if adapter is None and self._activation is None:
-            return
-        if isinstance(adapter, (PinnedParameterOverlay, HybridParameterOverlay)):
+        if adapter is not None:
             adapter.reserve()
         execution = self._deployment.execution
         identities = tuple(
@@ -312,7 +302,8 @@ class VllmSession(Generic[DataT, ResultT]):
             held_input = self._receive_readonly(rows, stream)
             value = TensorStepInput(rows.row_batch, rows, auxiliary=self._auxiliary)
             context = execution.start_step(value, stream, held_input=held_input)
-            if bool(execution.directory.instance_states) or not self._pending_identities:
+            instance_states = bool(execution.directory.instance_states)
+            if instance_states or not self._pending_identities:
                 self._auxiliary = None
             step.context = context
             execution.advance_to(context, "request.prepare")
@@ -320,7 +311,7 @@ class VllmSession(Generic[DataT, ResultT]):
             pending = tuple(
                 identity
                 for identity in identities
-                if bool(execution.directory.instance_states) and not execution.directory.has_inference_pin(identity)
+                if instance_states and not execution.directory.has_inference_pin(identity)
             )
             if pending:
                 execution.admit(pending, stream)
@@ -330,15 +321,13 @@ class VllmSession(Generic[DataT, ResultT]):
         if adapter is not None:
             projection = None
             if self._in_forward_overlay:
+                assert self._transition_task is not None
                 execution.advance_to(context, "request.prepare")
-                binding = next(
-                    item for item in self.attachment.task_bindings if item.role is AttachmentTaskRole.TRANSITION
-                )
                 projection = ProjectionTask(
                     execution,
                     context,
                     rows,
-                    binding.task_id,
+                    self._transition_task,
                     tuple(item.target for item in self.attachment.spec.overlay_bindings),
                 )
             adapter.prepare(rows.row_batch, context, execution.directory, projection)
@@ -371,9 +360,7 @@ class VllmSession(Generic[DataT, ResultT]):
                 stream = overlap.stream
             step.context = execution.start_step(value, stream, history=() if overlap is None else overlap.history)
             self._auxiliary = None
-        elif step.context.value is None:
-            execution.submit_input(step.context, value, CudaStreamReadiness(stream))
-        elif self._hidden_resources or operands:
+        elif step.context.value is None or self._hidden_resources or operands:
             execution.submit_input(step.context, value, CudaStreamReadiness(stream))
         if self._taps is not None and self._hidden_resources:
             self._taps.hold(step.context)

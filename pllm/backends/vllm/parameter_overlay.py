@@ -200,6 +200,9 @@ class ExactParameterOverlay:
     def updated_apply_count(self) -> int:
         return sum(handle.updated_apply_count for handle in self._modules)
 
+    def reserve(self) -> None:
+        """Exact reads stage nothing ahead of the invocation."""
+
     def prepare(
         self,
         rows: PackedPhaseRowBatch,

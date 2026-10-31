@@ -229,6 +229,11 @@ class SemanticGraph:
     model_reads: tuple[StateResource, ...] = ()
 
     @property
+    def replay_task(self) -> SemanticTask | None:
+        """The layer-route task; a graph declares at most one."""
+        return next((task for task in self.tasks if task.replay is not None), None)
+
+    @property
     def updates_in_forward(self) -> bool:
         """Some task applies state updates inside the model forward (an Exact overlay)."""
         return any(task.visibility is not None and task.visibility.in_forward for task in self.tasks)
