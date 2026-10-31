@@ -259,16 +259,20 @@ class TensorBinding(Builder[TensorFrame]):
     ) -> dict[TaskSymbol, TensorOperation[TensorFrame]]:
         """Build each tensor operation once, with the same scan scope for eager and captured math."""
         capture = facts is not None and "compute/cuda_graph@1" in facts.timeline.capabilities
-        fixed = {
-            symbol: task
-            for symbol, task in self.tensor_tasks.items()
-            if (task.writer is not None or reads_rows(task, self.tensor_tasks)) and task.export is None
+        # Training that selects its rows on the host runs compact together with the tasks it differentiates.
+        selecting = {
+            item.symbol
+            for task in self.tensor_tasks.values()
+            if task.policy.update_states in task.domains or (task.training is not None and task.policy.forward_rows)
+            for item in task.dependencies(self.tensor_tasks)
         }
-        if not resources or any(
-            task.policy.update_states in task.domains or (task.training is not None and task.policy.forward_rows)
-            for task in fixed.values()
-        ):
-            fixed.clear()
+        fixed = {
+            symbol
+            for symbol, task in self.tensor_tasks.items()
+            if (task.writer is not None or reads_rows(task, self.tensor_tasks))
+            and task.export is None
+            and symbol not in selecting
+        }
         limits = {fact.task: fact for fact in resources}
         operations: dict[TaskSymbol, TensorOperation[TensorFrame]] = {}
         declarations = {task.symbol: task for task in self.graph.tasks}
@@ -316,7 +320,7 @@ class TensorBinding(Builder[TensorFrame]):
                     )
                     else 1,
                 )
-                if capture and symbol in fixed and facts is not None
+                if capture and symbol in fixed and symbol in limits and facts is not None
                 else None,
                 device=torch.device("cpu") if facts is None else facts.device,
             )
