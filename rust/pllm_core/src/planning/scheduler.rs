@@ -152,37 +152,15 @@ fn graph_index(
     for (id, task) in graph.tasks.iter().enumerate() {
         for input in &task.inputs {
             let point = match &input.source {
-                // A hidden input is available right after its layer when the backend declares that point
-                // (e.g. a captured in-graph layer boundary); otherwise once the completed forward is published.
-                InputSource::Hidden { layer, site, .. } => {
-                    let layers = timeline
-                        .anchors
-                        .iter()
-                        .filter(|a| a.symbol.starts_with("model.layer."))
-                        .count() as i64;
-                    let point = if *site == super::semantic_graph::HiddenSite::ModelOutput {
-                        "model.norm".to_owned()
-                    } else {
-                        format!(
-                            "model.layer.{}",
-                            if *layer < 0 { layers + layer } else { *layer }
-                        )
-                    };
-                    anchors
-                        .get(point.as_str())
-                        .or_else(|| anchors.get("state.publish"))
-                        .or_else(|| anchors.get("model.execute"))
-                }
+                // A hidden input is available once the completed forward is published.
+                InputSource::Hidden { .. } => anchors
+                    .get("state.publish")
+                    .or_else(|| anchors.get("model.execute")),
                 InputSource::SamplerFeedback => anchors.get("sampler.complete"),
                 _ => None,
             };
             if let Some(&point) = point {
                 windows[id].0 = windows[id].0.max(point);
-            }
-        }
-        if task.outputs.iter().any(|o| o.kind == OutputKind::Sampler) {
-            if let Some(&point) = anchors.get("sampler.pre_draw") {
-                windows[id].1 = windows[id].1.min(point);
             }
         }
     }
