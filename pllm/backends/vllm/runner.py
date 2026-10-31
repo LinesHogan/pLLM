@@ -45,7 +45,6 @@ from pllm.backends.vllm.sampler import (
 )
 from pllm.backends.vllm.session import VllmSession
 from pllm.config import RunnerName
-from pllm.contracts.backend_attachment import AttachmentGraphMode
 from pllm.contracts.codec import decode_boundary
 from pllm.execution.position_state import PositionAnnouncement
 from pllm.execution.ptts.slot_pools import SlotPools
@@ -100,17 +99,6 @@ class Runner:
         if deployment.attachment.probe.position_states != self.position_states:
             raise ValueError("PositionState schema changed; create a new engine with this workload")
         spec = deployment.attachment.spec
-        in_model = (
-            spec.overlay_bindings
-            or spec.activation_bindings
-            or deployment.attachment.plan.semantic_graph.replay_task is not None
-        )
-        if (
-            in_model
-            and not self.model_config.enforce_eager
-            and deployment.attachment.probe.graph_mode is not AttachmentGraphMode.CUDA_GRAPH
-        ):
-            raise ValueError("parameter overlays, activation patches and layer replay do not run under CUDA graphs yet")
         adapter = self._sampler_guidance if spec.guides_sampler else None
         session = VllmSession(
             deployment,

@@ -582,6 +582,11 @@ def create_vllm_llm(
     requirements = workload.backend_requirements()
     if requirements.position_states and config.runner == "mrv1":
         raise ValueError('PositionState layer routes need runner="mrv2"')
+    if config.cuda_graphs and (config.runner == "mrv1" or requirements.activation_layers or requirements.layer_routes):
+        raise ValueError(
+            'activation patches, @pllm.layer_route and runner="mrv1" run the model without CUDA graphs; '
+            "set ModelConfig(cuda_graphs=False)"
+        )
     if _VLLM_VERSION != _SUPPORTED_VLLM_VERSION:
         raise RuntimeError("vLLM workload requires vLLM 0.27.1 exactly")
     environment = {
@@ -598,11 +603,16 @@ def create_vllm_llm(
     if any(previous_environment[name] not in (None, value) for name, value in environment.items()):
         raise RuntimeError("vLLM workload conflicts with explicit MP, spawn or legacy-runner environment")
     os.environ.update(environment)
+    options = graph_options(config, requirements)
+    # vLLM keys its compiled-model cache by its own config; the hidden taps and position states pllm adds to the
+    # forward must enter that key, or an engine loads a model compiled for another workload.
+    forward = sha256((environment[CAPTURE_ENV] + environment[POSITION_ENV]).encode()).hexdigest()
+    options["additional_config"] = {**options.get("additional_config", {}), "pllm_forward": int(forward[:15], 16)}
     try:
         llm = vllm_engine(
             config,
             {
-                **graph_options(config, requirements),
+                **options,
                 "worker_cls": _WORKER_CLASS,
                 # The supported uni-process, non-speculative decoder enables async by default.
                 "async_scheduling": config.runner == "mrv2",

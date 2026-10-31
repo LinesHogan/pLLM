@@ -1769,6 +1769,7 @@ class Workload(
                 default=None,
             ),
             position_states=context.position_states(),
+            layer_routes=bool(context.routes),
         )
 
     def specialize(

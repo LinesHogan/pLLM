@@ -52,18 +52,10 @@ MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 PROMPTS = ["The sky is", "Water freezes at"]
 
 
-def engine(model=MODEL, seqs=2, tokens=128, memory=0.25, **options) -> ModelConfig:
-    """A small EngineCore deployment: max_model_len 64, bfloat16, seed 7."""
+def engine(model=MODEL, seqs=2, tokens=128, memory=0.25, cuda_graphs=False, **options) -> ModelConfig:
+    """A small EngineCore deployment: max_model_len 64, bfloat16, seed 7; eager unless an arm asks for graphs."""
     return ModelConfig(
-        model,
-        "bfloat16",
-        64,
-        seqs,
-        tokens,
-        memory,
-        seed=7,
-        multiprocessing=True,
-        **options,
+        model, "bfloat16", 64, seqs, tokens, memory, seed=7, multiprocessing=True, cuda_graphs=cuda_graphs, **options
     )
 
 

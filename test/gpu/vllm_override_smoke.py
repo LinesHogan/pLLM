@@ -40,6 +40,7 @@ def main() -> None:
             0.25,
             seed=7,
             execution=pllm.ExecutionOptions(memory_budget_bytes=1 << 30),
+            cuda_graphs=False,  # the checks below hook the model norm, which a captured graph does not call
         ),
     )
     execution = handle.runner.require_session()._deployment.execution

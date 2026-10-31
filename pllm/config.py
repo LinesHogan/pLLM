@@ -84,8 +84,9 @@ class ModelConfig:
     multiprocessing: bool = False
     runner: RunnerName = "mrv2"
     execution: ExecutionOptions = ExecutionOptions()
-    # Use vLLM model graphs; in-model effects need a supported graph binding.
-    cuda_graphs: bool = False
+    # Run the model through vLLM's CUDA graphs. Workloads whose in-model effects have no graph binding are rejected
+    # before the engine starts, with a message to set cuda_graphs=False.
+    cuda_graphs: bool = True
     kv_offload: KVOffload | None = None
 
     def __post_init__(self) -> None:

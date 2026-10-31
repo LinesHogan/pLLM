@@ -70,6 +70,8 @@ class BackendRequirements:
     sampler_stage: SamplerStage | None = None
     sampler_feedback: bool = False
     position_states: tuple[tuple[str, float], ...] = ()
+    # Whether a @pllm.layer_route reruns model layers, which vLLM's CUDA graphs cannot capture.
+    layer_routes: bool = False
     # The smallest pllm.samples(limit=); requests must use a lower sample index.
     sample_limit: int | None = None
 

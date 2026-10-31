@@ -146,6 +146,9 @@ Region 默认采用静态安排：在合法且预算足够时使用复用的双 
 模型维度与有界资源事实在签名前完成特化；`training_rows` 限制每个状态的
 外部训练行数，`capture_memory_bytes` 是每个任务的驻留上限。容量不足是
 错误，不是静默退回 eager。Overlay 不能使用共享前缀缓存。
+`ModelConfig(cuda_graphs=True)` 是默认值：模型走 vLLM 的 CUDA graph。激活补丁、
+`@pllm.layer_route`、`runner="mrv1"` 以及读取 `InstanceState` 的模型内 overlay 不能在 CUDA graph
+下运行，`make_llm` 会报错并提示设置 `cuda_graphs=False`。
 
 ## 基准
 

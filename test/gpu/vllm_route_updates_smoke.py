@@ -35,7 +35,8 @@ def run(chunk):
     )
     workload = SettledInPlaceTTT(InPlaceTTTConfig(targets, chunk_size=chunk, learning_rate=1e-6, update_decode=True))
     handle = pllm.make_llm(
-        workload=workload, config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", "bfloat16", 64, 2, 64, 0.25, seed=7)
+        workload=workload,
+        config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", "bfloat16", 64, 2, 64, 0.25, seed=7, cuda_graphs=False),
     )
     primitive = handle.runner.require_session()._replay
     native, checked, errors = torch.cuda.CUDAGraph.replay, [], []
