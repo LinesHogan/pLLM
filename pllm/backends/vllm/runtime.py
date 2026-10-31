@@ -310,6 +310,8 @@ class VllmLlm(Generic[DataT, ResultT]):
         vote group. Closing the iterator leaves no pending generation or transaction.
         Optional edits reuse StateTensorUpdate and require a signed activation workload;
         the feedback adapter returns original tensors, never a worker callback.
+        A callback that returns None has nothing to feed back for its round: the round
+        is not yielded (the callback already saw its completions) and nothing retries.
         """
         if max_rounds < 1 or not prompts:
             raise ValueError("feedback generation requires a nonempty prompt list and positive finite round bound")
@@ -330,7 +332,8 @@ class VllmLlm(Generic[DataT, ResultT]):
                 routes=None if route_values is None else tuple(route_values),
             )
             result = feedback(batch)
-            assert result is not None
+            if result is None:
+                return
             entries, controls = batch.completions.entries, result.retry_controls
             ready: set[str] = set()
             for barrier in result.update_barriers:

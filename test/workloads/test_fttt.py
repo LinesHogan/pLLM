@@ -190,6 +190,17 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
         )
         == 1
     )
+    # A callback with nothing to feed back ends the loop after its first round.
+    idle = Generation()
+    feedback = idle.generate_feedback(
+        ["retry"],
+        SamplingParams(max_tokens=1),
+        feedback=lambda batch: None,
+        feedback_group="idle",
+        max_rounds=5,
+        prompt_indices=(9,),
+    )
+    assert list(feedback) == [] and len(idle.calls) == 1
 
     ttrl = TTRLConfig(rank=2, votes_per_prompt=3, samples_per_prompt=3)
     reward = make_llm(workload=TTRLWorkload(ttrl), config=HostRuntimeFacts(torch.device("cpu"), hidden_size=4))
