@@ -16,12 +16,12 @@ from pllm.authoring import AuxiliaryInput, BackendDeployment, DataT, ResultT
 from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.architecture import Decoder
 from pllm.backends.vllm.hidden_capture import HiddenTaps
-from pllm.backends.vllm.overlay_graph import (
+from pllm.backends.vllm.parameter_overlay import (
+    ExactParameterOverlay,
     HybridParameterOverlay,
     PinnedParameterOverlay,
     parameter_overlay,
 )
-from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay
 from pllm.backends.vllm.position_state import PositionCacheLayer
 from pllm.backends.vllm.prefix_cache import POLICY_KEY, CachePolicy
 from pllm.backends.vllm.replay import VllmTokenwiseReplay

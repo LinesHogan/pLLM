@@ -1,10 +1,15 @@
-"""Projection geometry checks at probing and the eager Exact projection-task driver."""
+"""Parameter overlays: projection geometry checks at probing, the eager Exact projection-task driver,
+the pinned reader (the custom op that reads PTTS pools inside captured graphs) and the hybrid of both.
+"""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
+import numpy as np
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from pllm.backends.vllm.architecture import Decoder, LinearOutput, Mlp, Projection
 from pllm.contracts.hidden_locator import HiddenPhase
@@ -17,10 +22,21 @@ from pllm.contracts.parameter_overlay import (
     ParameterTargetShape,
 )
 from pllm.contracts.request_identity import RequestIdentity
+from pllm.contracts.semantic_graph import StateResource
 from pllm.contracts.state_ref import StateRef
-from pllm.execution.cuda_stream import PinnedStaging
+from pllm.execution.cuda_stream import CudaStreamReadiness, PinnedStaging
 from pllm.execution.overlay_task import ProjectionTransition, RouteOverlay
+from pllm.execution.parameter_projection import (
+    ROWS_PER_BLOCK,
+    prepare_projection_read,
+    projection_block_rows,
+    projection_blocks,
+    uses_pinned_projection,
+)
+from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.request_state import RequestStateDirectory
+from pllm.execution.ptts.slot_pools import Slots
+from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.state_execution import DataT, StateTaskContext
 
 
@@ -259,3 +275,340 @@ class ExactParameterOverlay:
             handle.module.forward = handle.original_forward
             if handle.mlp is not None and handle.original_mlp_forward is not None:
                 handle.mlp.forward = handle.original_mlp_forward
+
+
+def capacities(maximum: int) -> tuple[int, ...]:
+    """Finite power-of-two capacity classes, ending at the declared bound."""
+    return tuple(sorted({min(1 << i, maximum) for i in range(maximum.bit_length() + 1)}))
+
+
+_READERS: dict[int, "_ProjectionReader"] = {}
+
+
+@torch.library.custom_op("pllm::pinned_projection", mutates_args={"output", "captured"})
+def pinned_projection(
+    hidden: torch.Tensor,
+    pools: list[torch.Tensor],
+    table: torch.Tensor,
+    output: torch.Tensor,
+    captured: torch.Tensor,
+) -> None:
+    """Execute the same prepared tensor callable eagerly or during upstream capture."""
+    _READERS[table.data_ptr()].emit(hidden, pools, table, output, captured)
+
+
+def _projection_meta(
+    hidden: torch.Tensor,
+    pools: list[torch.Tensor],
+    table: torch.Tensor,
+    output: torch.Tensor,
+    captured: torch.Tensor,
+) -> None:
+    return None
+
+
+pinned_projection.register_fake(_projection_meta)  # pyright: ignore[reportUnknownMemberType]
+
+
+class _ProjectionReader:
+    """A target's stable tensor ports; the invocation supplies all pin-authorized indices."""
+
+    def __init__(
+        self,
+        decoder: Decoder,
+        binding: ParameterOverlayFieldBinding,
+        arena: PageBundleArena,
+        rows: int,
+        requests: int,
+        budget: int,
+    ) -> None:
+        self.module, self.offset, self.width, self.mlp = decoder.projection(binding.target)
+        self.forward_base = self.module.forward
+        self.mlp_base = None if self.mlp is None else self.mlp.forward
+        self.binding, self.rows, self.requests = binding, rows, requests
+        self.enabled = True
+        self.pools = [view.read(arena.field_pool(binding.resource, view.field), pooled=True) for view in binding.fields]
+        self.table = torch.zeros(
+            projection_blocks(rows, requests) * (ROWS_PER_BLOCK + len(binding.fields)) + rows,
+            device=self.pools[0].device,
+            dtype=torch.long,
+        )
+        self.table[-rows:].fill_(-1)
+        self.captured = self.module.weight.new_zeros((rows, self.module.weight.shape[1]))
+        self.desired = self.module.weight.new_empty((rows, self.width)) if self.mlp is not None else self.captured
+        self.staging = PinnedStaging(capacity=self.table.numel(), slots=2)
+        self.host = torch.empty(0, dtype=torch.long)
+        self.programs: dict[int, Callable[..., tuple[torch.Tensor, ...]]] = {}
+        for count in capacities(rows):
+            with torch.inference_mode(False), FakeTensorMode(allow_non_fake_inputs=True):
+                examples = (
+                    self.captured.new_empty((count, self.captured.shape[1])),
+                    *self.ports(self.table, count),
+                    *self.pools,
+                )
+            self.programs[count] = prepare_projection_read(examples, binding.operator, budget)
+            # Warm every row bucket against the actual readonly pools before graph capture.
+            self.read(self.captured[:count], self.pools, self.table, count)
+        _READERS[self.table.data_ptr()] = self
+        self.module.forward = self.forward
+        if self.mlp is not None:
+            self.mlp.forward = self.forward_mlp
+
+    def reserve(self) -> None:
+        self.host = self.staging.take(self.table.numel())
+
+    def ports(self, table: torch.Tensor, count: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        blocks = projection_blocks(count, min(count, self.requests))
+        width = projection_block_rows(count, self.requests)
+        maximum = projection_blocks(self.rows, self.requests)
+        return (
+            table[: maximum * len(self.pools)].view(maximum, len(self.pools))[:blocks],
+            table[maximum * len(self.pools) : maximum * len(self.pools) + blocks * ROWS_PER_BLOCK].view(
+                blocks, ROWS_PER_BLOCK
+            )[:, :width],
+            table[-self.rows :][:count],
+        )
+
+    def forward_mlp(self, value: torch.Tensor) -> torch.Tensor:
+        assert self.mlp_base is not None
+        if self.enabled:
+            self.desired[: value.shape[0]].copy_(value)
+        return self.mlp_base(value)
+
+    def forward(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.nn.Parameter | None]:
+        base = self.forward_base(hidden)
+        assert isinstance(base, tuple)
+        if self.enabled:
+            pinned_projection(hidden, self.pools, self.table, base[0], self.captured)
+        return base
+
+    def emit(
+        self,
+        hidden: torch.Tensor,
+        pools: list[torch.Tensor],
+        table: torch.Tensor,
+        output: torch.Tensor,
+        captured: torch.Tensor,
+    ) -> None:
+        count = next(size for size in capacities(self.rows) if size >= hidden.shape[0])
+        padded = torch.nn.functional.pad(hidden, (0, 0, 0, count - hidden.shape[0]))
+        result = self.read(padded, pools, table, count)
+        output[:, self.offset : self.offset + self.width].add_(
+            (result[: hidden.shape[0]] * self.binding.scale).to(output.dtype)
+        )
+        captured[: hidden.shape[0]].copy_(hidden)
+
+    def read(self, hidden: torch.Tensor, pools: list[torch.Tensor], table: torch.Tensor, count: int) -> torch.Tensor:
+        values = (hidden, *self.ports(table, count), *pools)
+        return self.programs[count](*values)[0]
+
+    def prepare(self, field_slots: Slots, starts: Slots, total: int) -> None:
+        host = self.host.numpy()
+        maximum = projection_blocks(self.rows, self.requests)
+        slots = host[: maximum * len(self.pools)].reshape(maximum, len(self.pools))
+        positions = host[maximum * len(self.pools) : -self.rows].reshape(maximum, ROWS_PER_BLOCK)
+        owners = host[-self.rows :]
+        owners.fill(-1)
+        count = next(size for size in capacities(self.rows) if size >= total)
+        width = projection_block_rows(count, self.requests)
+        lengths = np.diff(np.append(starts, total))
+        blocks = (lengths + width - 1) // width
+        first_blocks = np.cumsum(blocks) - blocks
+        requests = np.repeat(np.arange(len(starts)), lengths)
+        offsets = np.arange(total) - starts[requests]
+        block_rows = first_blocks[requests] + offsets // width
+        selected = field_slots[:, tuple(view.field for view in self.binding.fields)]
+        slots[:] = selected[0]
+        slots[: int(blocks.sum())] = np.repeat(selected, blocks, axis=0)
+        positions[block_rows, offsets % width] = np.arange(total)
+        owners[:total] = block_rows * width + offsets % width
+        self.staging.copy_to(self.table)
+
+    def close(self) -> None:
+        self.module.forward = self.forward_base
+        if self.mlp is not None and self.mlp_base is not None:
+            self.mlp.forward = self.mlp_base
+        _READERS.pop(self.table.data_ptr())
+
+
+class PinnedParameterOverlay:
+    """The sole pinned reader and capture path, for eager, replay and graph placement."""
+
+    def __init__(
+        self,
+        decoder: Decoder,
+        bindings: tuple[ParameterOverlayFieldBinding, ...],
+        arena: PageBundleArena,
+        rows: int,
+        requests: int,
+        budget: int,
+        *,
+        phases: tuple[HiddenPhase, ...],
+    ) -> None:
+        self.readers = tuple(_ProjectionReader(decoder, binding, arena, rows, requests, budget) for binding in bindings)
+        self.phases = phases
+        self.sources: tuple[PackedPhaseRow, ...] = ()
+        self.starts: Slots = np.empty(0, dtype=np.int64)
+        self.total_rows = 0
+        self.stream: torch.cuda.Stream | None = None
+        self.readiness: CudaStreamReadiness | None = None
+        self.apply_count = self.updated_apply_count = 0
+
+    def reserve(self) -> None:
+        """Acquire every host table before the invocation issues any GPU work."""
+        for reader in self.readers:
+            reader.reserve()
+
+    def prepare(
+        self,
+        rows: PackedPhaseRowBatch,
+        context: StateTaskContext[DataT],
+        directory: RequestStateDirectory,
+        transition: ProjectionTransition | None = None,
+    ) -> None:
+        assert transition is None
+        self.stream = context.pin.stream
+        assert self.stream is not None
+        if self.readiness is not None:
+            self.readiness.order_on(self.stream)
+        ordinals = np.fromiter((row.request_ordinal for row in rows.rows), np.int64, rows.total_rows)
+        self.starts = np.flatnonzero(np.append(True, ordinals[1:] != ordinals[:-1]))
+        self.sources = tuple(rows.rows[int(index)] for index in self.starts)
+        self.total_rows = rows.total_rows
+        for reader in self.readers:
+            resource = StateResource(reader.binding.resource)
+            selection = context.selection.for_resource(resource)
+            if selection.keys == (None,):
+                pins = tuple(directory.inference_pin(row.identity) for row in self.sources)
+                refs = StateRefs.of(
+                    tuple(next(ref for ref in pin.refs if context.arena.root(ref).resource == resource) for pin in pins)
+                )
+            else:
+                # Resolve every request at once: decode replays prepare this table before each graph launch.
+                index = dict(
+                    zip((row.identity for row in context.selection.rows), selection.state_indices, strict=True)
+                )
+                entry = tuple(context.selection.refs[index[row.identity]] for row in self.sources)
+                refs = StateRefs.of(context.current_owned_refs(entry))
+                published = tuple(ref for ref, original in zip(refs, entry, strict=True) if ref != original)
+                borrowed = context.borrow_published(StateRefs.of(published)) if published else context.pin
+                pins = tuple(
+                    context.pin if ref == original else borrowed for ref, original in zip(refs, entry, strict=True)
+                )
+            _, slots = context.arena.slots(pins, refs)
+            self.updated_apply_count += int(np.diff(np.append(self.starts, rows.total_rows)) @ (refs.versions > 0))
+            for value in (*reader.pools, reader.table, reader.captured, reader.desired):
+                value.record_stream(self.stream)
+            reader.prepare(slots, self.starts, rows.total_rows)
+        self.apply_count += len(rows.rows) * len(self.readers)
+
+    def take_captures(self) -> tuple[CapturedParameterOperand, ...]:
+        if not self.sources or not self.phases:
+            return ()
+        spans = tuple(
+            (row, first, last)
+            for row, first, last in zip(
+                self.sources, self.starts.tolist(), np.append(self.starts[1:], self.total_rows).tolist(), strict=True
+            )
+            if row.phase in self.phases
+        )
+        results: list[CapturedParameterOperand] = []
+        for reader in self.readers if spans else ():
+            weight = reader.module.weight[reader.offset : reader.offset + reader.width].detach()
+            for row, first, last in spans:
+                hidden = reader.captured[first:last].clone()
+                results.append(
+                    CapturedParameterOperand(
+                        row.identity,
+                        reader.binding.target,
+                        row.phase,
+                        hidden,
+                        hidden if reader.mlp is None else reader.desired[first:last].clone(),
+                        weight,
+                        hidden.new_full((), row.token_offset + last - first == row.prompt_length, dtype=torch.bool),
+                    )
+                )
+        return tuple(results)
+
+    def clear(self) -> None:
+        if self.sources:
+            assert self.stream is not None
+            self.readiness = CudaStreamReadiness(self.stream)
+        self.sources = ()
+
+    def close(self) -> None:
+        for reader in reversed(self.readers):
+            reader.close()
+
+
+class HybridParameterOverlay:
+    """Exact training uses its eager driver; inactive batches read through the pinned op."""
+
+    def __init__(
+        self, pinned: PinnedParameterOverlay, exact: ExactParameterOverlay, phases: tuple[HiddenPhase, ...]
+    ) -> None:
+        self.pinned, self.exact, self.phases = pinned, exact, phases
+
+    @property
+    def apply_count(self) -> int:
+        return self.pinned.apply_count + self.exact.apply_count
+
+    @property
+    def updated_apply_count(self) -> int:
+        return self.pinned.updated_apply_count + self.exact.updated_apply_count
+
+    def reserve(self) -> None:
+        """Reserve bounded staging before the invocation issues GPU work."""
+        self.pinned.reserve()
+
+    def prepare(
+        self,
+        rows: PackedPhaseRowBatch,
+        context: StateTaskContext[DataT],
+        directory: RequestStateDirectory,
+        transition: ProjectionTransition | None = None,
+    ) -> None:
+        """Select the same eligibility used by dispatch from the labelled row facts."""
+        training = any(row.phase in self.phases for row in rows.rows)
+        for reader in self.pinned.readers:
+            reader.enabled = not training
+        if training:
+            self.exact.prepare(rows, context, directory, transition)
+        else:
+            self.pinned.prepare(rows, context, directory)
+
+    def take_captures(self) -> tuple[CapturedParameterOperand, ...]:
+        """Exact consumed training operands in forward; inactive reads produce no task operands."""
+        return self.exact.take_captures()
+
+    def clear(self) -> None:
+        """Release invocation views through their existing owners."""
+        self.exact.clear()
+        self.pinned.clear()
+
+    def close(self) -> None:
+        """Unwind the stable wrappers in reverse installation order."""
+        self.exact.close()
+        self.pinned.close()
+
+
+def parameter_overlay(
+    decoder: Decoder,
+    bindings: tuple[ParameterOverlayFieldBinding, ...],
+    arena: PageBundleArena,
+    rows: int,
+    requests: int,
+    budget: int,
+    phases: tuple[HiddenPhase, ...],
+    *,
+    in_forward: bool,
+    graphs: bool,
+    routed: bool = False,
+) -> PinnedParameterOverlay | ExactParameterOverlay | HybridParameterOverlay:
+    """Install each projection wrapper once, before compiling or capturing the model."""
+    if routed or not uses_pinned_projection(in_forward=in_forward, graphs=graphs):
+        return ExactParameterOverlay(decoder, bindings)
+    pinned = PinnedParameterOverlay(
+        decoder, bindings, arena, rows, requests, budget, phases=() if in_forward else phases
+    )
+    return HybridParameterOverlay(pinned, ExactParameterOverlay(decoder, bindings), phases) if in_forward else pinned

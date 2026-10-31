@@ -143,7 +143,7 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
 
 @pytest.mark.parametrize("workload", [PromptFactors(), DecodeFactors()])
 def test_composed_readers_replay_model_graphs(workload, monkeypatch):
-    from pllm.backends.vllm.overlay_graph import capacities
+    from pllm.backends.vllm.parameter_overlay import capacities
     from pllm.execution.step_capture import StepCapture
 
     results = []

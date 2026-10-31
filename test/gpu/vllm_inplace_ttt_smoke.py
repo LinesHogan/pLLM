@@ -184,7 +184,7 @@ def _check_cancelled_projection(handle):
     from pllm.contracts.request_identity import RequestIdentity
 
     execution = handle.runner.require_session()._deployment.execution
-    from pllm.backends.vllm.overlay_graph import HybridParameterOverlay
+    from pllm.backends.vllm.parameter_overlay import HybridParameterOverlay
 
     overlay = handle.runner.require_session()._overlay
     if isinstance(overlay, HybridParameterOverlay):
@@ -228,7 +228,7 @@ def _check_cancelled_projection(handle):
 
 def _check_graph(handle):
     """Pinned graph operands reach training as row counts and request order change."""
-    from pllm.backends.vllm.overlay_graph import PinnedParameterOverlay, _ProjectionReader
+    from pllm.backends.vllm.parameter_overlay import PinnedParameterOverlay, _ProjectionReader
 
     overlay = handle.runner.require_session()._overlay
     assert isinstance(overlay, PinnedParameterOverlay)
@@ -256,7 +256,7 @@ def _check_hybrid(handle):
     """Exact eligibility selects source execution; inactive decode never calls Python projections."""
     from vllm.config import CUDAGraphMode
 
-    from pllm.backends.vllm.overlay_graph import HybridParameterOverlay, _ProjectionReader
+    from pllm.backends.vllm.parameter_overlay import HybridParameterOverlay, _ProjectionReader
     from pllm.contracts.hidden_locator import HiddenPhase
 
     overlay = handle.runner.require_session()._overlay
