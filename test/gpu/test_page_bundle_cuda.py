@@ -10,6 +10,7 @@ from dataclasses import replace
 import pytest
 import torch
 
+from pllm.config import ExecutionOptions
 from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
@@ -40,7 +41,8 @@ def _plan(shared=False):
     )
     provider = PageBundleProviderFacts("test.page_bundle@1", 6, StateDeviceKind.CUDA, 0, shared_memory=shared)
     facts = backend_facts(4, bindings, timeline, provider)
-    return ESampRequestWorkload(ESampRequestConfig(rank=2)).plan_backend(facts)[0].plan
+    workload = ESampRequestWorkload(ESampRequestConfig(rank=2))
+    return workload.plan_backend(*workload.specialize(facts, ExecutionOptions())).plan
 
 
 @pytest.mark.slow

@@ -210,16 +210,17 @@ def _esamp_native_oracle(device, normalized):
     )
     workload = ESampRequestWorkload(config)
     facts = facts_for(device, 8, 8, lineages=3, memory_bytes=100000)
-    facts = workload.specialize(facts, ExecutionOptions(capture_memory_bytes=16 * 1024**2))
-    deployment = workload.compile_backend(facts)
+    facts, declaration = workload.specialize(facts, ExecutionOptions(capture_memory_bytes=16 * 1024**2))
+    deployment = workload.bind_backend(facts, workload.plan_backend(facts, declaration), declaration)
     execution = deployment.execution
     plan = execution.arena.plan
     assert plan.timeline.visibility == VisibilitySource.post_sampler(1)
     assert any(task.lane == "side" for task in plan.schedule.tasks) == (stream is not None)
     if stream is not None and normalized:
         for lag in (0, 1, 2):
-            attachment, _ = workload.plan_backend(
-                replace(facts, timeline=replace(facts.timeline, visibility=VisibilitySource.post_sampler(lag)))
+            attachment = workload.plan_backend(
+                replace(facts, timeline=replace(facts.timeline, visibility=VisibilitySource.post_sampler(lag))),
+                declaration,
             )
             assert any(task.lane == "side" for task in attachment.plan.schedule.tasks) == bool(lag)
     identities = tuple(RequestIdentity(str(i), i, 0) for i in range(3))
@@ -301,7 +302,7 @@ def _ordinary_request_distillation() -> None:
         stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
         workload = Distillation()
         options = ExecutionOptions(capture_memory_bytes=16 * 1024**2)
-        execution = workload.compile_backend(workload.specialize(facts_for(device, 4, 9, lineages=3), options))
+        execution = workload.compile_backend(facts_for(device, 4, 9, lineages=3), options)
         execution = execution.execution
         # Same request id, different samples: the keys keep three separate lineages.
         identities = tuple(RequestIdentity("same-id", 0, index) for index in range(3))
@@ -374,9 +375,8 @@ def test_sampler_adapts_step_results_in_memory_trace_and_runtime(monkeypatch: py
     monkeypatch.setattr(TensorTask, "evaluate", dependency)
     monkeypatch.setattr(TensorTask, "sampler_output", output)
     workload = ESampRequestWorkload(ESampRequestConfig(rank=2, intervention_beta=0.2))
-    facts = workload.specialize(facts_for(torch.device("cpu"), 4, 8), ExecutionOptions())
+    execution = workload.compile_backend(facts_for(torch.device("cpu"), 4, 8), ExecutionOptions()).execution
     assert "meta" in devices
-    execution = workload.compile_backend(facts).execution
     identities = (RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0))
     latest = execution.admit(identities)
     source = torch.linspace(-0.3, 0.7, 8).reshape(2, 4)
@@ -430,8 +430,8 @@ def _module_request_distillation() -> None:
         device = torch.device(device_name)
         stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
         options = ExecutionOptions(capture_memory_bytes=16 * 1024**2)
-        facts = ModuleDistillation().specialize(facts_for(device, 4, 9, lineages=2), options)
-        execution = ModuleDistillation().compile_backend(facts).execution
+        facts = facts_for(device, 4, 9, lineages=2)
+        execution = ModuleDistillation().compile_backend(facts, options).execution
         identities = tuple(RequestIdentity(f"r{index}", 0, 0) for index in range(2))
         latest = list(execution.admit(identities, stream))
         start = initial_values(

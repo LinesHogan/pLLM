@@ -35,7 +35,7 @@ from pllm.contracts.state_feed import FeedBinding
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorFieldSpec
 from pllm.execution.causal_batch import CausalBinder
-from pllm.execution.declaration import Builder, Dimensions
+from pllm.execution.declaration import Builder, Dimensions, native
 from pllm.execution.module_state import copy_initial
 from pllm.execution.overlay_batch import OverlayBatch
 from pllm.execution.ptts.page_bundle import PagePublication
@@ -108,9 +108,8 @@ class TensorBinding(Builder[TensorFrame]):
         dimensions: Dimensions,
         *,
         host: bool = False,
-        resources: tuple[TaskResourceFact, ...] = (),
     ) -> None:
-        super().__init__(name, digest, dimensions, resources)
+        super().__init__(name, digest, dimensions)
         self.dimensions = dimensions
         self.host = host
         self.feeds: tuple[FeedBinding, ...] = ()
@@ -165,6 +164,24 @@ class TensorBinding(Builder[TensorFrame]):
                     root[index].copy_(value)
 
         return initialize
+
+    def select_capture(self, resources: tuple[TaskResourceFact, ...]) -> None:
+        """Run each tensor task that was funded resident memory as a captured CUDA graph."""
+        captured = {fact.task for fact in resources if fact.resident_bytes}
+        self.graph = replace(
+            self.graph,
+            tasks=tuple(
+                replace(
+                    task,
+                    implementations=(
+                        native(f"python.cuda_graph:{self.graph.workload_id}:{task.symbol}@1", "compute/cuda_graph@1"),
+                    ),
+                )
+                if task.symbol in self.tensor_tasks and task.symbol in captured
+                else task
+                for task in self.graph.tasks
+            ),
+        )
 
     def require_resident_side_tasks(
         self, plan: PlanBundle, operations: Mapping[TaskSymbol, TensorOperation[TensorFrame]]

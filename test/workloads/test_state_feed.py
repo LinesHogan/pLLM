@@ -61,8 +61,7 @@ def test_feed_declaration_derives_ownership():
     for order in pllm.state.FeedOrder:
         workload = FeedWorkload(order)
         assert workload.backend_requirements().activation_layers == (0,)
-        facts = workload.specialize(facts_for(), pllm.ExecutionOptions())
-        deployment = workload.compile_backend(facts)
+        deployment = workload.compile_backend(facts_for(), pllm.ExecutionOptions())
         assert deployment.execution.arena.owned_resources == ("target",)
         assert deployment.execution.feeds[0].fields == ("value",)
         plan = deployment.execution.arena.plan
@@ -83,8 +82,7 @@ def test_feed_declaration_derives_ownership():
 
 def test_conditional_input_allows_local_reads_but_rejects_an_extra_writer():
     workload = FeedWorkload()
-    facts = workload.specialize(facts_for(), pllm.ExecutionOptions())
-    binding = workload.declaration(facts)
+    facts, binding = workload.specialize(facts_for(), pllm.ExecutionOptions())
     binding.graph = replace(
         binding.graph,
         tasks=tuple(
@@ -176,8 +174,7 @@ def test_ordinary_state_ports_and_write_do_not_depend_on_declaration_order():
             return (torch.ones_like(value) + previous,)
 
     workload = LocalWorkload()
-    facts = workload.specialize(facts_for(), pllm.ExecutionOptions())
-    execution = workload.compile_backend(facts).execution
+    execution = workload.compile_backend(facts_for(), pllm.ExecutionOptions()).execution
     execution.admit(())
     rows = PackedPhaseRowBatch(0, 0, ())
     execution.step(TensorStepInput(rows, PackedSamplerRowBatch(rows, ())))
@@ -219,7 +216,6 @@ def test_fed_buffer_fields_use_the_same_declared_ports():
             return pllm.InstanceState({"value": pllm.Buffer((2,), dtype=torch.float32)}, feed=self.order)
 
     workload = BufferFeed()
-    facts = workload.specialize(facts_for(), pllm.ExecutionOptions())
-    execution = workload.compile_backend(facts).execution
+    execution = workload.compile_backend(facts_for(), pllm.ExecutionOptions()).execution
     assert execution.arena.owned_resources == ("target",)
     assert execution.feeds[0].fields == ("value",)

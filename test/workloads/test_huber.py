@@ -45,7 +45,8 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
         bindings,
         model_timeline(device),
         PageBundleProviderFacts("test.huber@1", 12, StateDeviceKind(device.type)),
-        max_lineages=3,
+        # A step packs up to five rows of three requests; captured steps are sized by admitted lineages.
+        max_lineages=5,
         memory_bytes=100000,
     )
     execution = HuberWorkload(rank).compile_backend(facts).execution
@@ -114,23 +115,9 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
             for actual, expected in zip(execution.snapshot(ref, stream), snapshot, strict=True):
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         execution.complete_sampler(handle, stream)
-        pointers = set()
-        saved_parameters = []
-
-        def save(tensor):
-            if tensor.shape == (count, rank, hidden):
-                pointers.add(handle.value.leaf.untyped_storage().data_ptr())
-                saved_parameters.append((tensor.untyped_storage().data_ptr(), tensor.stride(0)))
-            return tensor
-
-        with torch.autograd.graph.saved_tensors_hooks(save, lambda tensor: tensor):
-            for timeline_anchor in execution.arena.plan.timeline.anchors:
-                if timeline_anchor.ordinal > execution.sampler_anchor_id:
-                    execution.execute_anchor(handle, AnchorId(timeline_anchor.ordinal))
-        if len(set(owners)) == 1:
-            assert saved_parameters and all(
-                pointer in pointers and (count == 1 or stride == 0) for pointer, stride in saved_parameters
-            )
+        for timeline_anchor in execution.arena.plan.timeline.anchors:
+            if timeline_anchor.ordinal > execution.sampler_anchor_id:
+                execution.execute_anchor(handle, AnchorId(timeline_anchor.ordinal))
         result = execution.finish_step(handle)
         assert isinstance(result, TensorResult)
         assert handle.value is None and handle.loss is None

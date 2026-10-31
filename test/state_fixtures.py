@@ -9,6 +9,7 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from pllm import testing
+from pllm.config import ExecutionOptions
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget, ParameterTargetShape
@@ -64,7 +65,8 @@ def inplace_plan(device: torch.device, provider: PageBundleProviderFacts, capabi
     facts = testing.backend_facts(
         3, (), timeline, provider, memory_bytes=4096, max_rows=8, targets=(ParameterTargetShape(target, 3, 2),)
     )
-    return InPlaceTTTWorkload(InPlaceTTTConfig((target,), chunk_size=2)).plan_backend(facts)[0].plan
+    workload = InPlaceTTTWorkload(InPlaceTTTConfig((target,), chunk_size=2))
+    return workload.plan_backend(*workload.specialize(facts, ExecutionOptions())).plan
 
 
 def page_arena(*, heterogeneous: bool = False) -> PageBundleArena:

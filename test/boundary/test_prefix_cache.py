@@ -114,7 +114,7 @@ class DecodeRoute(pllm.Workload):
 )
 def test_signed_sensitivity(workload, sensitive):
     facts = replace(FACTS, probe=replace(FACTS.probe, position_states=workload.backend_requirements().position_states))
-    attachment = workload.compile_backend(workload.specialize(facts, ExecutionOptions())).attachment
+    attachment = workload.compile_backend(facts, ExecutionOptions()).attachment
     policy = CachePolicy.for_attachment(attachment, "isolate")
     assert policy.role_sensitive is sensitive
     assert CachePolicy.for_attachment(attachment, "isolate") == policy

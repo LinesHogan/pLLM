@@ -51,6 +51,7 @@ class GPUWorker(Worker):
         runner = self.workload_runner
         plan = install.attachment.plan
         declaration = workload.declaration(install.facts, causal=partial(CausalTraining, runner.decoder))
+        declaration.select_capture(install.facts.timeline.task_resources)
         if (declaration.graph, declaration.layouts) != (plan.semantic_graph, plan.tensor_layout_request):
             raise ValueError(
                 "the EngineCore worker imported workload code that differs from the driver's; "

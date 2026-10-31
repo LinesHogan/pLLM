@@ -12,7 +12,6 @@ from types import FunctionType, MethodType
 from typing import Any, ClassVar, Literal, TypeVar
 
 import torch
-from torch._subclasses.fake_tensor import FakeTensorMode
 
 from pllm.authoring import BackendRequirements, BackendWorkload
 from pllm.config import ExecutionOptions
@@ -50,7 +49,7 @@ from pllm.contracts.visibility import Exact as Exact, Visibility as Visibility
 from pllm.execution.binding_base import SGD as SGD, Buffer as Buffer, buffer_field, overlay_fields
 from pllm.execution.causal_batch import CausalBinder, CausalCall, CausalPort, declare_batch_train
 from pllm.execution.compile_facts import BackendCompileFacts
-from pllm.execution.declaration import Call, Dimensions, Shape, State, When, native
+from pllm.execution.declaration import Call, Dimensions, Shape, State, When
 from pllm.execution.freeze import (
     fingerprint,
     freeze,
@@ -1693,34 +1692,13 @@ class Workload(
             facts.probe.tensor_dtype,
             facts.layer_count,
         )
-        b = TensorBinding(
-            self.name,
-            boundary_digest(dimensions, facts.initialization_seed),
-            dimensions,
-            resources=facts.timeline.task_resources,
-        )
+        b = TensorBinding(self.name, boundary_digest(dimensions, facts.initialization_seed), dimensions)
         b.probe = facts.probe
         b.causal = causal
         self._build(b)
         # Executable ports retain their dependencies; an unused factory must not pin the decoder.
         b.causal = None
         b.configure_scans(facts)
-        b.graph = replace(
-            b.graph,
-            tasks=tuple(
-                replace(
-                    task,
-                    implementations=(
-                        (native(f"python.cuda_graph:{self.name}:{task.symbol}@1", "compute/cuda_graph@1"),)
-                        if any(fact.task == str(task.symbol) and fact.resident_bytes for fact in b.resources)
-                        else task.implementations
-                    ),
-                )
-                if task.symbol in b.tensor_tasks
-                else task
-                for task in b.graph.tasks
-            ),
-        )
         return b
 
     def backend_requirements(self) -> BackendRequirements:
@@ -1763,26 +1741,28 @@ class Workload(
             position_states=context.position_states(),
         )
 
-    def specialize(self, facts: BackendCompileFacts, options: ExecutionOptions) -> BackendCompileFacts:
+    def specialize(
+        self, facts: BackendCompileFacts, options: ExecutionOptions, *, causal: CausalBinder | None = None
+    ) -> tuple[BackendCompileFacts, TensorBinding]:
         """Fund shared page storage for declared feeds before compiling the plan."""
         if any(state.feed is not None for value in _values(self).values() if (state := _typed(value, InstanceState))):
             facts = replace(
                 facts,
                 providers=tuple(replace(provider, page_capacity=3, shared_memory=True) for provider in facts.providers),
             )
-        return super().specialize(facts, options)
+        return super().specialize(facts, options, causal=causal)
 
-    def resource_facts(self, facts: BackendCompileFacts, options: ExecutionOptions) -> SchedulerTimeline:
+    def resource_facts(
+        self, declaration: TensorBinding, facts: BackendCompileFacts, options: ExecutionOptions
+    ) -> SchedulerTimeline:
         """Reserve ordinary tensor scratch and each requested graph's private pool."""
-        with FakeTensorMode():
-            binding = self.declaration(facts)
-        if binding.trains_on_batch:
+        if declaration.trains_on_batch:
             if options.memory_budget_bytes is not None and not facts.timeline.task_resources:
                 raise ValueError("batch training needs measured costs and signed input bounds for a finite budget")
             timeline = facts.timeline
         else:
-            timeline = derive_resources(binding, facts, options)
-        resident = binding.template_bytes
+            timeline = derive_resources(declaration, facts, options)
+        resident = declaration.template_bytes
         return replace(
             timeline,
             reserved_bytes=tuple(

@@ -117,12 +117,13 @@ def test_production_tuning_policy_is_signed_into_worker_facts():
     options = pllm.ExecutionOptions(
         allow_numerical_transforms=False, schedule_policy="serial", tuning="measured", memory_budget_bytes=1 << 20
     )
-    facts = workload.specialize(facts_for(torch.device("cpu"), torch.float32), options)
+    facts, _ = workload.specialize(facts_for(torch.device("cpu"), torch.float32), options)
     policy = TensorPolicy(False, "serial", "measured")
     assert facts.timeline.tensor_policy == policy
     # The policy crosses the process boundary inside the facts the worker binds with.
     facts = decode_boundary(encode_boundary(facts), BackendCompileFacts)
-    attachment, declaration = workload.plan_backend(facts)
+    declaration = workload.declaration(facts)
+    attachment = workload.plan_backend(facts, declaration)
     rng = torch.get_rng_state().clone()
     workload.bind_backend(facts, attachment, declaration)
     assert torch.equal(rng, torch.get_rng_state())  # measurement does not consume the global RNG

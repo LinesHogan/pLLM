@@ -161,14 +161,13 @@ def run_step(execution, value, decoder):
 def test_recirculation_declaration_fits_reference_budget_and_crosses_the_wire() -> None:
     workload = WORKLOAD
     # The exact serial reference budget admits the plan; one byte less does not.
-    serial_facts = workload.specialize(FACTS, ExecutionOptions(schedule_policy="serial"))
+    serial_facts, _ = workload.specialize(FACTS, ExecutionOptions(schedule_policy="serial"))
     reference_budget = (
         max(serial_facts.timeline.reserved_bytes)
         + sum(f.workspace_bytes + f.resident_bytes for f in serial_facts.timeline.task_resources)
         + sum(f.bytes for f in serial_facts.timeline.value_resources)
     )
-    tight_facts = workload.specialize(FACTS, ExecutionOptions(memory_budget_bytes=reference_budget, tuning="measured"))
-    tight = workload.compile_backend(tight_facts)
+    tight = workload.compile_backend(FACTS, ExecutionOptions(memory_budget_bytes=reference_budget, tuning="measured"))
     assert tight.attachment.plan.timeline.memory_budget_bytes == reference_budget
     with pytest.raises(ValueError):
         workload.specialize(FACTS, ExecutionOptions(memory_budget_bytes=reference_budget - 1))
@@ -183,7 +182,7 @@ def test_recirculation_declaration_fits_reference_budget_and_crosses_the_wire() 
 
 def test_recirculation_replay_matches_serial_oracle() -> None:
     workload = WORKLOAD
-    execution = workload.compile_backend(workload.specialize(FACTS, ExecutionOptions(tuning="measured"))).execution
+    execution = workload.compile_backend(FACTS, ExecutionOptions(tuning="measured")).execution
     expected_cache, expected_output = serial_oracle()
     assert execution.admit(IDENTITIES) == ()
     rng = torch.random.get_rng_state().clone()

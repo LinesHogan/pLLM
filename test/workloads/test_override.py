@@ -88,8 +88,7 @@ def head_logits(down, up, row, sample):
 def test_override_matches_reweight_adam_and_final_noop() -> None:
     facts = facts_for(torch.device("cpu"))
     config = OverRIDEConfig(rank=2, num_iterations=3, learning_rate=0.03)
-    execution = OverRIDEWorkload(config).compile_backend(assert_finite_resources(OverRIDEWorkload(config), facts))
-    execution = execution.execution
+    execution = assert_finite_resources(OverRIDEWorkload(config), facts).execution
     (initial,) = execution.admit(())
     original = execution.snapshot(initial)
     held = execution.arena.pin_exact(StateRefs.of((initial,)))
@@ -345,13 +344,9 @@ def _independent_domains() -> None:
     cpu = facts_for(torch.device("cpu"), lineages=4, pages=16)
     with pytest.raises(ValueError):  # sampled tokens do not exist before sampling
         EarlyFeedback(False).compile_backend(cpu)
+    with pytest.raises(ValueError, match="boolean mask"):  # compile traces the selector with maximum-shape rows
+        IntegerRows(False).compile_backend(cpu)
     identities = tuple(RequestIdentity(str(i), i, 0) for i in range(4))
-    rejected = IntegerRows(False).compile_backend(cpu).execution
-    (ref,) = rejected.admit(())
-    with pytest.raises(ValueError):  # a row selector must return a boolean mask
-        run(rejected, step_input(identities, torch.zeros((4, 4)), 0), torch.zeros(4, 7), torch.zeros(4).long())
-    assert rejected.arena.latest(ref.lineage_id) == ref
-    rejected.retire(())
     for device_name in ("cpu", "cuda:0") if torch.cuda.is_available() else ("cpu",):
         for request in (False, True):
             _domains_oracle(torch.device(device_name), request, identities)

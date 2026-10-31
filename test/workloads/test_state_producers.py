@@ -52,7 +52,7 @@ def deployment(workload, device=torch.device("cpu")):
             ),
         ),
     )
-    return workload.compile_backend(assert_finite_resources(workload, facts, main_fallback=True))
+    return assert_finite_resources(workload, facts, main_fallback=True)
 
 
 def packed(identities, hidden, phases, lengths=(1, 1), *, offset=0, stream=None):

@@ -311,7 +311,10 @@ def isolated_multiturn():
             handle._llm.collective_rpc("end_native_steps")
             namespace = handle._cache_policy.namespace
             workload = ImportedStepLoop()
-            handle.attachment, declaration = workload.plan_backend(handle._facts)
+            # The worker's install path: build against the driver's specialized facts.
+            declaration = workload.declaration(handle._facts)
+            declaration.select_capture(handle._facts.timeline.task_resources)
+            handle.attachment = workload.plan_backend(handle._facts, declaration)
             handle._cache_policy = CachePolicy.for_attachment(handle.attachment, "isolate")
             handle.command(BackendCommand.DETACH)
             if multiprocessing:

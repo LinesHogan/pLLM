@@ -634,8 +634,8 @@ def create_vllm_llm(
                 ),
             )
             facts = decode_boundary(replies[0], BackendCompileFacts)
-            facts = workload.specialize(facts, config.execution)
-            attachment, _ = workload.plan_backend(facts)
+            facts, declaration = workload.specialize(facts, config.execution)
+            attachment = workload.plan_backend(facts, declaration)
             policy = CachePolicy.for_attachment(attachment, config.generated_kv)
             handle = VllmLlm[DataT, ResultT](llm, None, attachment, facts, policy, requirements.sample_limit)
             handle.command(
@@ -643,9 +643,12 @@ def create_vllm_llm(
             )
         else:
             runner = llm.llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner
-            facts = probe_backend(requirements, runner, publish_lag=config.execution.publish_lag)
-            facts = workload.specialize(facts, config.execution)
-            deployment = workload.compile_backend(facts, causal=partial(CausalTraining, runner.decoder))
+            facts, declaration = workload.specialize(
+                probe_backend(requirements, runner, publish_lag=config.execution.publish_lag),
+                config.execution,
+                causal=partial(CausalTraining, runner.decoder),
+            )
+            deployment = workload.bind_backend(facts, workload.plan_backend(facts, declaration), declaration)
             policy = CachePolicy.for_attachment(deployment.attachment, config.generated_kv)
             runner.attach_workload(deployment, policy)
             handle = VllmLlm[DataT, ResultT](

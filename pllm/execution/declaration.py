@@ -46,7 +46,6 @@ from pllm.contracts.semantic_graph import (
     StateScope,
     StateSelectionInputSource,
     TaskImplementationSpec,
-    TaskResourceFact,
     TaskResultInputSource,
     TaskSymbol,
     TimingConstraint,
@@ -190,9 +189,7 @@ class HostOperation(Generic[D]):
 class Builder(Generic[D]):
     """One original graph; references only name its inputs, states and outputs."""
 
-    def __init__(
-        self, name: str, digest: str, dimensions: Dimensions | None = None, resources: tuple[TaskResourceFact, ...] = ()
-    ) -> None:
+    def __init__(self, name: str, digest: str, dimensions: Dimensions | None = None) -> None:
         self.graph = SemanticGraph(WorkloadId(name), (), digest)
         self.layouts = TensorLayoutRequest(())
         self.attachment: BackendAttachmentSpec | None = None
@@ -200,7 +197,6 @@ class Builder(Generic[D]):
         self.operations: dict[TaskSymbol, TensorOperation[D]] = {}
         self.publications: dict[TaskSymbol, PublishStateTask[D]] = {}
         self.host_operations: dict[TaskSymbol, HostOperation[D]] = {}
-        self.resources = resources
         # Fields that start at zero in a fresh page pool, so admission need not write them (AdamW state other than
         # the parameters). Request-scoped pages are recycled and dirty, so only instance states qualify.
         self.zero_start_fields: dict[str, frozenset[int]] = {}

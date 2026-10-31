@@ -58,7 +58,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
         dtype=TensorDType.FLOAT64,
         targets=tuple(ParameterTargetShape(target, 3, 2) for target in targets),
     )
-    execution = workload.compile_backend(assert_finite_resources(workload, facts)).execution
+    execution = assert_finite_resources(workload, facts).execution
     visibility = next(
         task.visibility for task in execution.arena.plan.semantic_graph.tasks if task.visibility is not None
     )
@@ -244,15 +244,9 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
         torch.tensor([[0.3, -0.1, 0.2], [0.05, 0.4, -0.6]], dtype=torch.float64),
         torch.tensor([[0.7, -0.2], [0.1, 0.5]], dtype=torch.float64),
     )
-    imported = (
-        ImportedOverlay()
-        .compile_backend(
-            assert_finite_resources(
-                ImportedOverlay(), replace(facts, probe=replace(facts.probe, targets=facts.probe.targets[:1]))
-            )
-        )
-        .execution
-    )
+    imported = assert_finite_resources(
+        ImportedOverlay(), replace(facts, probe=replace(facts.probe, targets=facts.probe.targets[:1]))
+    ).execution
     prompts = (RequestIdentity("first", 0, 0), RequestIdentity("second", 1, 0))
     initial = imported.admit(prompts)
     keys = tuple(RequestStateKey.project(identity, (RequestKeyField.PROMPT_IDX,)) for identity in prompts)
@@ -344,7 +338,7 @@ def _check_exact_projection_lifecycle():
         max_rows=16,
         targets=tuple(ParameterTargetShape(target, 1, 1) for target in targets),
     )
-    deployment = workload.compile_backend(workload.specialize(facts, pllm.ExecutionOptions()))
+    deployment = workload.compile_backend(facts, pllm.ExecutionOptions())
     execution = deployment.execution
     requests = (RequestIdentity("exact-a", 0, 0), RequestIdentity("exact-b", 0, 1))
     refs = execution.admit(requests)
@@ -574,7 +568,7 @@ def test_prefill_adapters_keep_prompt_chunks_across_scheduler_spans(span):
         layer_count=10,
         targets=tuple(ParameterTargetShape(target, 3, 2) for target in TARGETS),
     )
-    deployed = workload.compile_backend(assert_finite_resources(workload, facts))
+    deployed = assert_finite_resources(workload, facts)
     execution = deployed.execution
     ids = (RequestIdentity("prompt", 0, 0), RequestIdentity("decode", 1, 0))
     refs = execution.admit(ids)

@@ -172,7 +172,8 @@ def _decode_declarations_are_checked(facts):
         def intervention(self) -> pllm.InstanceState:
             return pllm.InstanceState({"delta": pllm.Buffer((4,), dtype=torch.float32)}, imported=True)
 
-    DeclaredActivation(replace(legacy, decode=DecodeWindow.ALL, on_missing=MissingPolicy.HOLD)).plan_backend(facts)
+    workload = DeclaredActivation(replace(legacy, decode=DecodeWindow.ALL, on_missing=MissingPolicy.HOLD))
+    workload.plan_backend(*workload.specialize(facts, pllm.ExecutionOptions()))
 
 
 def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:

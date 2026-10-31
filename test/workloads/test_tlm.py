@@ -179,19 +179,17 @@ def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None
         gpu_model = TinyCausalPort()
         gpu_model.device = torch.device("cuda", 0)
         online = TLMWorkload(TLMConfig(mode=TLMMode.ONLINE), 2, 2)
-        attachment, _ = online.plan_backend(online.specialize(_facts(gpu_model), ExecutionOptions()))
+        attachment = online.plan_backend(*online.specialize(_facts(gpu_model), ExecutionOptions()))
         assert attachment.spec.overlay_bindings
         assert all(task.lane == "main" for task in attachment.plan.schedule.tasks)
     batch = CausalTrainBatch(torch.tensor([[0, 2, 3]]), torch.tensor([[0, 2, 3]]))
     for mode in TLMMode:
         config = TLMConfig(mode=mode, threshold=0.0)
         limits = (TaskResourceFact(TaskSymbol("update"), 4096, input_shapes=((1, 3),)),)
-        assert (
-            min(TLMWorkload(config, 2, 2).resource_facts(_facts(model, reserved=0), ExecutionOptions()).reserved_bytes)
-            == model.resident_bytes
-        )
-        facts = _facts(model, task_resources=limits)
-        execution = TLMWorkload(config, 2, 2).compile_backend(facts, causal=model.bind).execution
+        workload, facts = TLMWorkload(config, 2, 2), _facts(model)
+        timeline = workload.resource_facts(workload.declaration(facts), facts, ExecutionOptions())
+        assert min(timeline.reserved_bytes) == model.resident_bytes
+        execution = workload.compile_backend(_facts(model, task_resources=limits), causal=model.bind).execution
         (initial,) = execution.admit(())
         tokens = torch.zeros((2, 3), dtype=torch.int64)
         with pytest.raises(ValueError):  # Larger than the planned input shape.

@@ -17,7 +17,7 @@ from pllm.contracts.auxiliary import (
     WeightedRowBatch as WeightedRowBatch,
     map_auxiliary as map_auxiliary,
 )
-from pllm.contracts.backend_attachment import BackendAttachment
+from pllm.contracts.backend_attachment import BackendAttachment, BackendPlacementProbe
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenSite as HiddenSite
 from pllm.contracts.parameter_overlay import ParameterTarget
@@ -90,84 +90,39 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
     def backend_requirements(self) -> BackendRequirements: ...
 
     @abstractmethod
-    def resource_facts(self, facts: BackendCompileFacts, options: ExecutionOptions) -> SchedulerTimeline: ...
+    def resource_facts(
+        self, declaration: TensorBinding, facts: BackendCompileFacts, options: ExecutionOptions
+    ) -> SchedulerTimeline:
+        """Measure the declaration's task resources and reserve its retained state templates."""
+        ...
 
-    def specialize(self, facts: BackendCompileFacts, options: ExecutionOptions) -> BackendCompileFacts:
-        from pllm.contracts.tensor_policy import TensorPolicy
-
-        facts = replace(
-            facts,
-            timeline=replace(
-                facts.timeline,
-                capabilities=tuple(
-                    sorted(
-                        set(
-                            (
-                                *facts.timeline.capabilities,
-                                *(("compute/cuda_graph@1",) if "compute/cuda@1" in facts.timeline.capabilities else ()),
-                            )
-                        )
-                    )
-                ),
-                memory_budget_bytes=min(
-                    (n for n in (facts.timeline.memory_budget_bytes, options.memory_budget_bytes) if n is not None),
-                    default=None,
-                ),
-                tensor_policy=TensorPolicy(options.allow_numerical_transforms, options.schedule_policy, options.tuning),
-            ),
-        )
-        if options.state_memory_bytes:
-            if options.state_memory_bytes > facts.state_memory_budget_bytes:
-                raise ValueError("requested state capacity exceeds available backend memory")
-            facts = replace(facts, state_memory_budget_bytes=options.state_memory_bytes)
-        timeline = self.resource_facts(facts, options)
-        budgets = tuple(
-            value
-            for value in (facts.timeline.memory_budget_bytes, timeline.memory_budget_bytes, options.memory_budget_bytes)
-            if value is not None
-        )
-        timeline = replace(
-            timeline,
-            memory_budget_bytes=min(budgets, default=None),
-            tensor_policy=facts.timeline.tensor_policy,
-            visibility=VisibilitySource.post_sampler(options.publish_lag),
-        )
-        graph, layouts, attachment = self.declaration(replace(facts, timeline=timeline)).finish()
-        buffers = attachment_buffer_bytes(facts.probe, graph, layouts, attachment)
-        reserved = (
-            tuple(value + buffers for value in (timeline.reserved_bytes or (0,) * len(timeline.anchors)))
-            if buffers
-            else timeline.reserved_bytes
-        )
-        timeline = derive_attachment_resources(
-            facts.probe,
-            graph,
-            replace(timeline, reserved_bytes=reserved),
-            capture_memory_bytes=options.capture_memory_bytes,
-        )
-        return replace(facts, timeline=timeline)
+    def specialize(
+        self, facts: BackendCompileFacts, options: ExecutionOptions, *, causal: CausalBinder | None = None
+    ) -> tuple[BackendCompileFacts, TensorBinding]:
+        """Build the declaration once and fund it on this backend; planning and binding reuse both."""
+        facts = _apply_options(facts, options)
+        declaration = self.declaration(facts, causal=causal)
+        timeline = self.resource_facts(declaration, facts, options)
+        declaration.select_capture(timeline.task_resources)
+        return replace(facts, timeline=_fund_attachment(declaration, facts.probe, timeline, options)), declaration
 
     @abstractmethod
     def declaration(self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None) -> TensorBinding:
         """Declare the graph, logical layouts, effects and tensor tasks; never a physical plan."""
         ...
 
-    def plan_backend(
-        self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None
-    ) -> tuple[BackendAttachment, TensorBinding]:
-        """Plan one declaration and return it with the attachment, so binding reuses what was planned."""
-        declaration = self.declaration(facts, causal=causal)
+    def plan_backend(self, facts: BackendCompileFacts, declaration: TensorBinding) -> BackendAttachment:
+        """Plan the specialized declaration; binding reuses the same declaration."""
         graph, layouts, attachment = declaration.finish()
-        timeline = derive_attachment_resources(facts.probe, graph, facts.timeline)
         plan = compile_page_bundle_plan(
             (graph, layouts),
-            timeline,
+            facts.timeline,
             facts.providers,
             facts.max_admitted_lineages if any(state.scope is StateScope.REQUEST for state in graph.states) else 1,
             facts.state_memory_budget_bytes,
             facts.device,
         )
-        return bind_backend_attachment(plan, facts.probe, attachment), declaration
+        return bind_backend_attachment(plan, facts.probe, attachment)
 
     @abstractmethod
     def bind_math(
@@ -190,6 +145,54 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
         return BackendDeployment(math.bind(arena, attachment.sampler_anchor_id), attachment)
 
     def compile_backend(
-        self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None
+        self,
+        facts: BackendCompileFacts,
+        options: ExecutionOptions = ExecutionOptions(),
+        *,
+        causal: CausalBinder | None = None,
     ) -> BackendDeployment[DataT, ResultT]:
-        return self.bind_backend(facts, *self.plan_backend(facts, causal=causal))
+        """Specialize, plan and bind: the whole compile on probed backend facts."""
+        facts, declaration = self.specialize(facts, options, causal=causal)
+        return self.bind_backend(facts, self.plan_backend(facts, declaration), declaration)
+
+
+def _apply_options(facts: BackendCompileFacts, options: ExecutionOptions) -> BackendCompileFacts:
+    """The execution options the declaration and plan depend on: capabilities, budgets, tensor policy, visibility."""
+    from pllm.contracts.tensor_policy import TensorPolicy
+
+    if options.state_memory_bytes > facts.state_memory_budget_bytes:
+        raise ValueError("requested state capacity exceeds available backend memory")
+    capabilities = set(facts.timeline.capabilities)
+    if "compute/cuda@1" in capabilities:
+        capabilities.add("compute/cuda_graph@1")
+    timeline = replace(
+        facts.timeline,
+        capabilities=tuple(sorted(capabilities)),
+        memory_budget_bytes=min(
+            (n for n in (facts.timeline.memory_budget_bytes, options.memory_budget_bytes) if n is not None),
+            default=None,
+        ),
+        tensor_policy=TensorPolicy(options.allow_numerical_transforms, options.schedule_policy, options.tuning),
+        visibility=VisibilitySource.post_sampler(options.publish_lag),
+    )
+    return replace(
+        facts,
+        timeline=timeline,
+        state_memory_budget_bytes=options.state_memory_bytes or facts.state_memory_budget_bytes,
+    )
+
+
+def _fund_attachment(
+    declaration: TensorBinding, probe: BackendPlacementProbe, timeline: SchedulerTimeline, options: ExecutionOptions
+) -> SchedulerTimeline:
+    """Reserve the attachment's effect buffers and fund the model-replay task."""
+    graph, layouts, attachment = declaration.finish()
+    buffers = attachment_buffer_bytes(probe, graph, layouts, attachment)
+    if buffers:
+        timeline = replace(
+            timeline,
+            reserved_bytes=tuple(
+                value + buffers for value in (timeline.reserved_bytes or (0,) * len(timeline.anchors))
+            ),
+        )
+    return derive_attachment_resources(probe, graph, timeline, capture_memory_bytes=options.capture_memory_bytes)

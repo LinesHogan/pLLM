@@ -85,8 +85,7 @@ def test_dummy_runs_graph_sign_plan_execute() -> None:
         max_rows=3,
         layer_count=1,
     )
-    bounded = assert_finite_resources(workload, facts)
-    deployment = workload.compile_backend(bounded)
+    deployment = assert_finite_resources(workload, facts)
     attached = deployment.execution
     torch.testing.assert_close(exported(attached, value(2)), expected)
     torch.testing.assert_close(exported(attached, value(2)), expected)
@@ -103,7 +102,7 @@ def test_dummy_runs_graph_sign_plan_execute() -> None:
     chained = Chained()
     for execution in (
         make_llm(CPU, workload=chained),
-        chained.compile_backend(assert_finite_resources(chained, facts)).execution,
+        assert_finite_resources(chained, facts).execution,
     ):
         torch.testing.assert_close(exported(execution, value(2)), (expected + 1) * 2)
 

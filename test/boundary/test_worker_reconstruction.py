@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from examples.huber import HuberWorkload
-from pllm import make_llm
+from pllm import ExecutionOptions, make_llm
 from pllm.backends.vllm.prefix_cache import CachePolicy
 from pllm.backends.vllm.runtime import BackendInstall
 from pllm.contracts.codec import decode_boundary, encode_boundary
@@ -103,7 +103,8 @@ def _worker(connection: Connection) -> None:
 @pytest.mark.slow
 def test_worker_reconstructs_the_shipped_plan_and_rejects_source_drift() -> None:
     workload, _, facts = overlay_facts()
-    attachment, _ = workload.plan_backend(facts)
+    facts, declaration = workload.specialize(facts, ExecutionOptions())
+    attachment = workload.plan_backend(facts, declaration)
     policy = CachePolicy.for_attachment(attachment, "reuse")
     wire = encode_boundary(BackendInstall(facts, attachment, "", policy)).encode()
     context = mp.get_context("spawn")
