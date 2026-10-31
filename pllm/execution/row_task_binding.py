@@ -6,7 +6,7 @@ Module functions declare packed-row tasks on the TensorBinding supplied by workl
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import partial
 from math import prod
 from typing import TYPE_CHECKING
@@ -63,22 +63,33 @@ if TYPE_CHECKING:
     from pllm.execution.tensor_binding import TensorBinding
 
 
+@dataclass(frozen=True, slots=True)
+class WeightedBatch:
+    """One step's prepared weighted CE batch: the selected states, their reset parameters and the masked inputs.
+
+    `valid_rows` stays on the device; reading it would sync the host.
+    """
+
+    selected: tuple[int, ...]
+    parameters: tuple[torch.Tensor, ...]
+    inputs: tuple[torch.Tensor, ...]
+    valid_rows: torch.Tensor
+
+
 @torch.no_grad()
 def weighted_training_output(
+    weighted: WeightedBatch,
     data: TensorFrame,
     batch: TensorBatch,
     losses: torch.Tensor,
     gradients: tuple[torch.Tensor, ...],
     fields: tuple[str, ...],
     steps: int,
-    parameters: tuple[torch.Tensor, ...] = (),
 ) -> TaskOutput:
-    for index, state in enumerate(data.selected):
-        if parameters:
-            for target, value in zip(batch.roots[state], parameters, strict=True):
-                target.copy_(value[index])
+    for index, state in enumerate(weighted.selected):
+        for target, value in zip(batch.roots[state], weighted.parameters, strict=True):
+            target.copy_(value[index])
         data.parameter_gradient_fields[batch.selection.refs[state]] = tuple(value[index] for value in gradients)
-    assert data.valid_rows is not None
     observations = (
         tuple(
             Observation(
@@ -93,7 +104,7 @@ def weighted_training_output(
                 ),
                 gradient=name.endswith(".grad"),
             )
-            for index, state in enumerate(data.selected)
+            for index, state in enumerate(weighted.selected)
             for ref in (batch.selection.refs[state],)
             for name, value in (
                 ("loss", losses[index]),
@@ -103,13 +114,13 @@ def weighted_training_output(
         if batch.observing
         else ()
     )
-    data.batch_inputs = data.parameters = ()
+    data.weighted = None
     return TaskOutput(
         loss=losses,
-        loss_count=len(data.selected) * steps,
-        update_count=len(data.selected),
-        counters=torch.stack((torch.zeros_like(data.valid_rows), data.valid_rows)),
-        changed=data.selected,
+        loss_count=len(weighted.selected) * steps,
+        update_count=len(weighted.selected),
+        counters=torch.stack((torch.zeros_like(weighted.valid_rows), weighted.valid_rows)),
+        changed=weighted.selected,
         observations=observations,
     )
 
@@ -156,17 +167,18 @@ def prepare_weighted_batch(
     )
     root = view.roots[selected[0]]
     valid = (labels >= 0) & (labels < dimensions.vocab_size) & (weights > 0)
-    data.selected = selected
-    data.valid_rows = valid.sum()
     hidden, logits = (tensor.masked_fill(~valid.unsqueeze(-1), 0) for tensor in (hidden, logits))
     labels, weights = (tensor.masked_fill(~valid, 0) for tensor in (labels, weights))
-    data.batch_inputs = tuple(
-        tensor.clone() if torch.is_inference(tensor) else tensor for tensor in (hidden, logits, labels, weights)
+    parameters = tuple(tensor.new_empty((len(selected), *tensor.shape)) for tensor in root)
+    data.weighted = WeightedBatch(
+        selected,
+        parameters,
+        tuple(tensor.clone() if torch.is_inference(tensor) else tensor for tensor in (hidden, logits, labels, weights)),
+        valid.sum(),
     )
-    data.parameters = tuple(tensor.new_empty((len(selected), *tensor.shape)) for tensor in root)
     with torch.no_grad():
         reset(
-            dict(zip(fields, data.parameters, strict=True)),
+            dict(zip(fields, parameters, strict=True)),
             torch.Generator(device="cpu" if root[0].is_meta else root[0].device),
         )
     return TaskOutput()
@@ -312,14 +324,15 @@ def declare_weighted_train(
     )
 
     def execute(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
-        if not data.selected:
+        weighted = data.weighted
+        if weighted is None:
             return TaskOutput()
         with torch.enable_grad():
             parameters = {
-                key: tensor.detach().requires_grad_() for key, tensor in zip(fields, data.parameters, strict=True)
+                key: tensor.detach().requires_grad_() for key, tensor in zip(fields, weighted.parameters, strict=True)
             }
             external: dict[str, torch.Tensor] = dict(
-                zip(("hidden", "base_logits", "labels", "weights"), data.batch_inputs, strict=True)
+                zip(("hidden", "base_logits", "labels", "weights"), weighted.inputs, strict=True)
             )
             inputs = {
                 key: (parameters if kind == "parameter" else external)[field]
@@ -339,7 +352,7 @@ def declare_weighted_train(
             losses, gradients = step()
             for _ in range(steps - 1):
                 losses, gradients = step()
-        return weighted_training_output(data, batch, losses, gradients, fields, steps, data.parameters)
+        return weighted_training_output(weighted, data, batch, losses, gradients, fields, steps)
 
     transition = b.compute(
         name,
@@ -358,7 +371,7 @@ def declare_weighted_train(
         ),
         function=execute,
         operation_type=BatchOperation,
-        select=lambda data, selection: data.selected,
+        select=lambda data, selection: () if data.weighted is None else data.weighted.selected,
         implementations=(native(identity),),
     )
     b.operations[transition.symbol] = replace(

@@ -34,6 +34,7 @@ from pllm.execution.tensor_program import Observation, TensorBatch
 from pllm.execution.torch_private import register_gradient_hook
 
 if TYPE_CHECKING:
+    from pllm.execution.row_task_binding import WeightedBatch
     from pllm.execution.step_input import TensorStepInput
 
 
@@ -265,10 +266,10 @@ def row_index(data: "TensorFrame", batch: TensorBatch, device: torch.device) -> 
 
 def field_rows(data: "TensorFrame", batch: TensorBatch, field: int, start: int, size: int) -> torch.Tensor:
     """`field[start:start+size]` of each row's state, `[rows, size]`; copies only that slice."""
-    pool = data.fields[field] if data.fields else batch.field_slots(field)[0]
+    pool = data.fixed.fields[field] if data.fixed is not None else batch.field_slots(field)[0]
     view = pool.reshape(len(pool), -1).narrow(1, start, size)
     index = row_index(data, batch, pool.device)
-    if data.fields:
+    if data.fixed is not None:
         return index.states.take(view)
     plan = row_plan(data, batch)
     return take_rows(view, tuple(int(plan.sources[state, field]) for state in plan.states))
@@ -370,12 +371,25 @@ class ParameterGradients(MutableMapping[StateRef, tuple[torch.Tensor, ...]]):
         return len(self._materialize())
 
 
+@dataclass(frozen=True, slots=True)
+class FixedRows:
+    """The gathered inputs of one fixed-table body, built by TensorExecutor: per-field state pages
+    (index S is the padding sink), row weights (1 active, 0 padding), per-state row counts, hidden
+    rows by locator, sampler feedback rows and the frames of other resources the task reads."""
+
+    fields: tuple[torch.Tensor, ...]
+    weights: torch.Tensor | None
+    counts: torch.Tensor
+    hidden: Mapping[tuple[str, str, str], tuple[torch.Tensor, torch.Tensor]]
+    feedback: Mapping[str, torch.Tensor]
+    resources: Mapping[StateResource, TensorFrame] = field(default_factory=lambda: dict[StateResource, TensorFrame]())
+
+
 @dataclass(slots=True)
 class TensorFrame:
     step: TensorStepInput
     rows: tuple[PackedPhaseRow, ...]
     entries: list[OverlayEntry] = field(default_factory=lambda: list[OverlayEntry]())
-    parameters: tuple[torch.Tensor, ...] = ()
     derivative_sources: dict[tuple[str, str], torch.Tensor] = field(
         default_factory=lambda: dict[tuple[str, str], torch.Tensor]()
     )
@@ -385,11 +399,6 @@ class TensorFrame:
     parameter_gradient_fields: MutableMapping[StateRef, tuple[torch.Tensor, ...]] = field(
         default_factory=lambda: dict[StateRef, tuple[torch.Tensor, ...]]()
     )
-    batch_inputs: tuple[torch.Tensor, ...] = ()
-    selected: tuple[int, ...] = ()
-    trained_rows: int = 0
-    # Weighted training counts its valid rows on device; reading them would sync the host.
-    valid_rows: torch.Tensor | None = None
     training: TensorUpdate | None = None
     replacements: tuple[tuple[int, tuple[torch.Tensor, ...]], ...] = ()
     index: RowIndex | None = None
@@ -397,30 +406,26 @@ class TensorFrame:
     # Differentiable [states, parameters] copy of the flat optimizer field, shared by the
     # invocation's differentiable tasks and cleared by the training task that consumes it.
     leaf: torch.Tensor | None = None
-    fields: tuple[torch.Tensor, ...] = ()
-    weights: torch.Tensor | None = None
-    counts: torch.Tensor | None = None
-    hidden_inputs: Mapping[tuple[str, str, str], tuple[torch.Tensor, torch.Tensor]] | None = None
-    feedback_inputs: Mapping[str, torch.Tensor] | None = None
-    resource_frames: Mapping[StateResource, TensorFrame] = field(
-        default_factory=lambda: dict[StateResource, TensorFrame]()
-    )
+    fixed: FixedRows | None = None
+    # Owned by row_task_binding's weighted batch training.
+    weighted: WeightedBatch | None = None
+
+    @property
+    def weights(self) -> torch.Tensor | None:
+        """Row weights of a masked fixed body; None evaluates the rows as given."""
+        return None if self.fixed is None else self.fixed.weights
 
     def for_resource(self, resource: StateResource, batch: TensorBatch) -> TensorFrame:
         """Read the resource's fixed table, or build its compact row selection."""
-        if resource in self.resource_frames:
-            return self.resource_frames[resource]
-        return (
-            self
-            if batch.for_resource(resource) is batch
-            else replace(self, index=None, plan=None, leaf=None, fields=())
-        )
+        if self.fixed is not None and resource in self.fixed.resources:
+            return self.fixed.resources[resource]
+        return self if batch.for_resource(resource) is batch else replace(self, index=None, plan=None, leaf=None)
 
 
 def feedback_port(name: Literal["base_logits", "sampled_tokens"]) -> TensorPort:
     def resolve(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
-        if data.feedback_inputs is not None:
-            return data.feedback_inputs[name]
+        if data.fixed is not None:
+            return data.fixed.feedback[name]
         feedback = batch.feedback
         assert feedback is not None
         values = feedback.base_logits if name == "base_logits" else feedback.sampled_tokens
@@ -452,8 +457,8 @@ def hidden_port(source: HiddenInputSource) -> TensorPort:
 
     def hidden(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
         key = (str(source.layer), "index", source.site.value)
-        if data.hidden_inputs is not None:
-            value, slots = data.hidden_inputs[key]
+        if data.fixed is not None:
+            value, slots = data.fixed.hidden[key]
             result = value.index_select(0, slots)
         else:
             (capture,) = (

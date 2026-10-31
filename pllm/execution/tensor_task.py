@@ -362,11 +362,12 @@ class TensorTask:
         if self.policy.reduction == "state_mean":
             if loss.shape != (len(rows),):
                 raise ValueError("state_mean training returns one loss per row; pllm averages them per state")
-            if data.weights is not None:
-                assert data.index is not None and data.counts is not None
-                loss = loss.new_zeros(len(data.counts)).index_add(
-                    0, data.index.states.device, loss * data.weights
-                ) / data.counts.clamp_min(1)
+            if data.fixed is not None and data.fixed.weights is not None:
+                assert data.index is not None
+                counts = data.fixed.counts
+                loss = loss.new_zeros(len(counts)).index_add(
+                    0, data.index.states.device, loss * data.fixed.weights
+                ) / counts.clamp_min(1)
             else:
                 loss = state_means(loss, row_plan(data, batch).select(rows))
             return loss, loss.sum()

@@ -18,6 +18,7 @@ from pllm.execution.state_execution import StateTaskContext
 from pllm.execution.step_capture import StepCapture
 from pllm.execution.tensor_frame import (
     FieldRoots,
+    FixedRows,
     MaskedRows,
     ParameterGradients,
     RowIndex,
@@ -198,7 +199,10 @@ class TensorExecutor:
             )
             offset += layout.size
         frame = frames[self.task.resource]
-        frame.resource_frames = {resource: item for resource, item in frames.items() if item is not frame}
+        assert frame.fixed is not None
+        frame.fixed = replace(
+            frame.fixed, resources={resource: item for resource, item in frames.items() if item is not frame}
+        )
         return frame, replace(batches[self.task.resource], select_resource=batches.__getitem__)
 
     def _resource_frame(
@@ -232,19 +236,21 @@ class TensorExecutor:
             data,
             rows=(data.rows[0],) * self.rows,
             index=RowIndex(*(MaskedRows(column) for column in columns[:4])),
-            fields=fields,
-            hidden_inputs={
-                key: (pool, slots)
-                for (key, pool), slots in zip(
-                    (self.hidden_inputs or {}).items(),
-                    self.table[sum(item.size for item in self.layouts.values()) :].view(-1, self.rows),
-                    strict=True,
-                )
-            },
-            feedback_inputs=self._feedback(columns[0]),
+            fixed=FixedRows(
+                fields,
+                columns[4] if self.capture is not None or self.task.policy.reduction == "state_mean" else None,
+                counts,
+                {
+                    key: (pool, slots)
+                    for (key, pool), slots in zip(
+                        (self.hidden_inputs or {}).items(),
+                        self.table[sum(item.size for item in self.layouts.values()) :].view(-1, self.rows),
+                        strict=True,
+                    )
+                },
+                self._feedback(columns[0]),
+            ),
             leaf=None,
-            weights=columns[4] if self.capture is not None or self.task.policy.reduction == "state_mean" else None,
-            counts=counts,
             derivative_sources={},
             input_gradients={},
             parameter_gradient_fields={},
@@ -304,11 +310,11 @@ class TensorExecutor:
                 self.gradients = torch.zeros_like(state_leaf(frame, operands))
         if not self.compact:
             self.gradients = self.gradients[: self.state_count].contiguous()
-            assert self.table is not None
+            assert self.table is not None and frame.fixed is not None
             _, _, last, sources, destinations, _ = self.layout.split(self.table[: self.layout.size])
             self.optimizer.staged(
                 self.pools,
-                frame.fields,
+                frame.fixed.fields,
                 sources,
                 destinations,
                 self.gradients,

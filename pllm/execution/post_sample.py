@@ -101,7 +101,7 @@ class PostSampleOverlap:
             if feedback is not None or context.results:
                 main.wait_stream(self.stream)
             # Cached row versions and parameter leaves belong to the reader's selection.
-            context.value = replace(data, step=value, index=None, plan=None, leaf=None, fields=(), hidden_inputs=None)
+            context.value = replace(data, step=value, index=None, plan=None, leaf=None)
 
     def _record_input(self, tensor: torch.Tensor) -> torch.Tensor:
         if tensor.is_cuda:
