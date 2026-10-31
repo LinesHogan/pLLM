@@ -34,7 +34,7 @@ from pllm.contracts.semantic_graph import (
     TaskResultInputSource,
     TaskSymbol,
 )
-from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
+from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.binding_base import SGD
 from pllm.execution.declaration import Call, Dimensions, Field, Shape, State, When, native
 from pllm.execution.ptts.page_borrow import borrowed_root
@@ -180,37 +180,41 @@ def sampled_token_port() -> TensorPort:
 def declare_parameters(
     b: TensorBinding,
     name: str,
-    shapes: Mapping[str, Shape],
+    fields: tuple[Field, ...],
     *,
     optimizer: AdamWConfig | SGD | None,
     namespace: str = "",
     initialize: Callable[[Tensors, torch.Generator], None] | None = None,
     scope: StateScope = StateScope.INSTANCE,
-    dtype: TensorDType = TensorDType.FLOAT32,
-    alignment: int = 16,
     keys: tuple[RequestKeyField, ...] = (RequestKeyField.REQUEST_ID,),
-    memory: Mapping[str, Shape] = {},
+    memory: tuple[Field, ...] = (),
 ) -> tuple[State, dict[str, TensorPort]]:
-    """Allocate parameter state and expose its named tensor ports."""
+    """Allocate a state and expose a tensor port per field.
 
-    def sizes(model: Dimensions) -> tuple[tuple[int, ...], ...]:
-        return tuple(shape(model) if callable(shape) else shape for shape in shapes.values())
+    Without AdamW the fields are the layout directly: readable, importable, updated only by their effects. AdamW
+    packs them into one flat parameters field that its optimizer fields mirror.
+    """
+    shapes = {field.name: field.shape for field in fields}
+    if isinstance(optimizer, AdamWConfig):
+        first = fields[0]
+        dtype = first.dtype(b.dimensions) if callable(first.dtype) else first.dtype
 
-    # Without an optimizer the fields are the layout directly: readable, importable, never updated.
-    raw = not isinstance(optimizer, AdamWConfig)
-    memory_fields = tuple(Field(key, shape, dtype, alignment) for key, shape in memory.items())
+        def size(model: Dimensions) -> tuple[int]:
+            return (sum(prod(shape(model) if callable(shape) else shape) for shape in shapes.values()),)
+
+        fields = (Field("parameters", size, dtype, first.alignment),)
     state = b.state(
         name,
-        tuple(Field(key, shape, dtype, alignment) for key, shape in shapes.items())
-        if raw
-        else (Field("parameters", lambda m: (sum(prod(shape) for shape in sizes(m)),), dtype, alignment),),
+        fields,
         namespace=namespace,
         optimizer=optimizer if isinstance(optimizer, AdamWConfig) else None,
         scope=scope,
         keys=keys if scope is StateScope.REQUEST else (),
-        memory=memory_fields,
+        memory=memory,
     )
-    return state, parameter_ports(b, state, shapes, initialize=initialize, memory=memory)
+    return state, parameter_ports(
+        b, state, shapes, initialize=initialize, memory={field.name: field.shape for field in memory}
+    )
 
 
 def parameter_ports(

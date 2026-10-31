@@ -49,7 +49,7 @@ from pllm.contracts.visibility import Exact as Exact, Visibility as Visibility
 from pllm.execution.binding_base import SGD as SGD, Buffer as Buffer, buffer_field, overlay_fields
 from pllm.execution.causal_batch import CausalBinder, CausalCall, CausalPort, declare_batch_train
 from pllm.execution.compile_facts import BackendCompileFacts
-from pllm.execution.declaration import Call, Dimensions, Shape, State, When
+from pllm.execution.declaration import Call, Dimensions, Field, Shape, State, When
 from pllm.execution.freeze import (
     fingerprint,
     freeze,
@@ -84,7 +84,6 @@ from pllm.execution.row_task_binding import (
     declare_parameters,
     declare_tensor,
     declare_weighted_train,
-    parameter_ports,
     parameter_rows,
     sampled_token_port,
     state_metadata,
@@ -483,6 +482,10 @@ class InstanceState:
     def request_keys(self) -> tuple[RequestKeyField, ...]:
         return ()
 
+    @property
+    def tensor_dtype(self) -> TensorDType:
+        return TensorDType(str(self.dtype).removeprefix("torch."))
+
     def declare(self, name: str, context: _Declaration) -> None:
         """Allocate tensor parameters; buffer layouts belong to their effects."""
         context.signature.append((name, boundary_digest(fingerprint(self), tuple(self.fields))))
@@ -492,32 +495,35 @@ class InstanceState:
             if context.binding.feeds:
                 raise ValueError("declare one fed state per workload")
             context.binding.feeds = (FeedBinding(name, self.feed, tuple(self.fields)),)
-        shapes: dict[str, Shape] = {}
-        for key, spec in self.fields.items():
-            match spec:
-                case Buffer():
-                    break
-                case shape:
-                    shapes[key] = shape
-        if len(shapes) != len(self.fields) or any(overlay.state == name for overlay in context.overlays.values()):
-            context.allocate_buffers(name, self)
-            return
         context.states[name], ports = declare_parameters(
             context.binding,
             name,
-            shapes,
+            self.layout_fields(name, context),
             optimizer=self.optimizer,
             namespace=self.namespace,
             initialize=_frozen(self.initialize),
             scope=self.scope,
-            dtype=TensorDType(str(self.dtype).removeprefix("torch.")),
-            alignment=self.alignment,
             keys=self.request_keys,
-            memory=self.memory,
+            memory=tuple(Field(key, shape, self.tensor_dtype, self.alignment) for key, shape in self.memory.items()),
         )
         context.parameters.update({(name, field): port for field, port in ports.items()})
         if self.module is not None:
             context.binding.initial_values[name] = partial(initial_values, self.module, dtype=self.dtype)
+
+    def layout_fields(self, name: str, context: _Declaration) -> tuple[Field, ...]:
+        """The allocated fields: plain shapes in the state's dtype, or Buffers sized by the hidden width or, when a
+        pllm.model.Overlay reads the state, once per overlay target."""
+        consumer = next((overlay for overlay in context.overlays.values() if overlay.state == name), None)
+        shapes = {key: spec for key, spec in self.fields.items() if not isinstance(spec, Buffer)}
+        if consumer is None and len(shapes) == len(self.fields):
+            return tuple(Field(key, shape, self.tensor_dtype, self.alignment) for key, shape in shapes.items())
+        buffers = _buffers(self)
+        if consumer is None:
+            return tuple(
+                buffer_field(key, buffer, lambda m: (m.hidden_size, m.hidden_size)) for key, buffer in buffers.items()
+            )
+        context.binding.overlay_targets = consumer.targets
+        return overlay_fields(buffers, consumer, context.binding.dimensions)
 
 
 @dataclass(frozen=True)
@@ -593,8 +599,7 @@ def _frozen(initialize: Initializer | None) -> Initializer | None:
 
 
 def _buffers(state: InstanceState) -> dict[str, Buffer]:
-    if state.optimizer is not None:
-        raise ValueError("buffer effects update their state themselves; drop the optimizer")
+    """The state's fields as Buffers; a fixed shape takes the state's dtype."""
     buffers: dict[str, Buffer] = {}
     for key, value in state.fields.items():
         match value:
@@ -974,6 +979,8 @@ class _Overlay(_Effect):
         definition = context.state_definition(self.state, "parameter overlays require a declared request state")
         if definition.scope is not StateScope.REQUEST:
             raise ValueError("parameter overlays require a declared request state")
+        if definition.optimizer is not None:
+            raise ValueError("@pllm.overlay updates its state itself; drop the state's optimizer")
         buffers = _buffers(definition)
         bindings = {key: source.overlay(self.state, buffers) for key, source in _arguments(operation.function).items()}
         if set(buffers) & {source.value for source in Operand}:
@@ -1526,40 +1533,6 @@ class _Declaration:
             declared = ", ".join(f"{resource}.{key}" for resource, key in self.parameters)
             raise ValueError(f"pllm.parameter({state!r}, {field!r}) names no declared field; declared: {declared}")
         return self.parameters[state, field]
-
-    def allocate_buffers(self, name: str, definition: InstanceState) -> None:
-        """Register buffer fields as ordinary readable state ports."""
-        buffers = _buffers(replace(definition, optimizer=None))
-        consumers = tuple(consumer for consumer in self.overlays.values() if consumer.state == name)
-        if consumers:
-            (consumer,) = consumers
-            fields = overlay_fields(buffers, consumer, self.binding.dimensions)
-            self.binding.overlay_targets = consumer.targets
-        else:
-            fields = tuple(
-                buffer_field(key, buffer, lambda m: (m.hidden_size, m.hidden_size)) for key, buffer in buffers.items()
-            )
-        shapes = {field.name: field.shape for field in fields}
-        if definition.optimizer is not None:
-            dtype = fields[0].dtype
-            state, ports = declare_parameters(
-                self.binding,
-                name,
-                shapes,
-                optimizer=definition.optimizer,
-                namespace=definition.namespace,
-                initialize=_frozen(definition.initialize),
-                scope=definition.scope,
-                dtype=dtype(self.binding.dimensions) if callable(dtype) else dtype,
-                keys=definition.request_keys,
-            )
-        else:
-            state = self.binding.state(
-                name, fields, namespace=definition.namespace, scope=definition.scope, keys=definition.request_keys
-            )
-            ports = parameter_ports(self.binding, state, shapes, initialize=_frozen(definition.initialize))
-        self.states[name] = state
-        self.parameters.update({(name, field): port for field, port in ports.items()})
 
     def declare_values(self) -> None:
         """Allocate ordinary state before effects and operations consume its ports."""

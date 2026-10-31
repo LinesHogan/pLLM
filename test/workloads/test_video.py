@@ -48,7 +48,7 @@ from pllm.testing import backend_facts, step_input
 def binding_case(*, alias=False, write_failure=False, runtime=False, missing=None):
     b = TensorBinding("video.binding", "a" * 64, Dimensions(2, 0))
     features, ports = declare_parameters(
-        b, "features", {name: (2,) for name in ("qp", "residual", "mv", "segmentation")}, optimizer=None
+        b, "features", tuple(Field(name, (2,)) for name in ("qp", "residual", "mv", "segmentation")), optimizer=None
     )
     encoded = declare_tensor(b, "encode", inputs=ports, when=When.BEFORE_MODEL)(
         lambda **values: values["qp"] if alias else sum(values.values())
