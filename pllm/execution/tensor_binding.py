@@ -33,9 +33,9 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.state_feed import FeedBinding
 from pllm.contracts.state_ref import StateRef
-from pllm.contracts.tensor_layout import LayoutFieldId, TensorFieldSpec
+from pllm.contracts.tensor_layout import TensorFieldSpec
 from pllm.execution.causal_batch import CausalBinder
-from pllm.execution.declaration import Builder, Dimensions, native
+from pllm.execution.declaration import Builder, Dimensions, native, operation_mode
 from pllm.execution.module_state import copy_initial
 from pllm.execution.overlay_batch import OverlayBatch
 from pllm.execution.ptts.page_bundle import PagePublication
@@ -50,7 +50,6 @@ from pllm.execution.tensor_frame import (
 from pllm.execution.tensor_program import (
     FunctionMath,
     InvocationOutput,
-    PageUpdate,
     Roots,
     TensorBatch,
     TensorOperation,
@@ -288,10 +287,7 @@ class TensorBinding(Builder[TensorFrame]):
                 continue
             task = self.tensor_tasks[symbol]
             state = task.training
-            optimizer = None
-            if state is not None:
-                assert state.optimizer is not None
-                optimizer = PageUpdate(state.optimizer, state.optimizer_fields // 5)
+            optimizer = None if state is None else state.page_update()
             executor = TensorExecutor(
                 task,
                 self.tensor_tasks,
@@ -313,20 +309,16 @@ class TensorBinding(Builder[TensorFrame]):
             operations[symbol] = TensorOperation(
                 declaration.implementations[0].implementation_id,
                 executor if scans is None else scans.bind(executor),
-                "read"
-                if state is None
-                else "gradient"
-                if any(
-                    effect.kind in (StateEffectKind.TRANSITION, StateEffectKind.TRANSITION_MAYBE)
-                    for effect in declaration.effects
-                )
-                else "update",
-                optimizer=optimizer,
-                copy_fields=None
-                if state is None
-                else tuple(
-                    LayoutFieldId(i) for i in range(len(state.fields)) if i >= state.optimizer_fields or i % 5 != 1
+                operation_mode(
+                    state,
+                    transition=any(
+                        effect.kind in (StateEffectKind.TRANSITION, StateEffectKind.TRANSITION_MAYBE)
+                        for effect in declaration.effects
+                    ),
+                    optimizer=True,
                 ),
+                optimizer=optimizer,
+                copy_fields=None if state is None else state.copy_fields,
                 capture_resident=executor.resident,
             )
         return operations

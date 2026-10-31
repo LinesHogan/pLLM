@@ -234,7 +234,8 @@ def parameter_ports(
     for index, (key, shape) in enumerate(zip(shapes, sizes, strict=True)):
         views[key] = FieldView(LayoutFieldId(index if raw else 0), 0 if raw else offset, shape)
         offset += prod(shape)
-    base = len(shapes) if raw else 5
+    # Memory fields follow the parameter (or AdamW) fields.
+    base = len(state.fields) - len(memory)
     for index, (key, shape) in enumerate(memory.items()):
         views[key] = FieldView(LayoutFieldId(base + index), 0, shape(dimensions) if callable(shape) else shape)
     b.field_views.update({(str(state.declaration.resource), key): view for key, view in views.items()})

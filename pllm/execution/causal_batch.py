@@ -83,7 +83,7 @@ def declare_batch_train(
         for port in ports.values()
     ):
         raise ValueError("batch training must read its own optimizer state")
-    names = tuple(field.name.removesuffix(".parameters") for field in state.fields[: state.optimizer_fields : 5])
+    names = state.parameter_names
 
     def loss(data: TensorFrame, parameters: Tensors) -> torch.Tensor | None:
         batch = data.step.auxiliary

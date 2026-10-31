@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
 from functools import partial
-from typing import Generic, TypeVar
+from typing import Generic, Literal, TypeVar
 
 from pllm.contracts.backend_attachment import (
     ActivationPatchBinding,
@@ -83,6 +83,7 @@ from pllm.execution.torch_private import MemoryUsage, measure
 from pllm.kernels.adamw import AdamWConfig
 
 D = TypeVar("D")
+OperationMode = Literal["read", "transition", "update", "gradient"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,10 +120,14 @@ class Field:
     alignment: int = 16
 
 
+# The fields AdamW keeps per parameter field, in layout order.
+ADAM_FIELDS = ("parameters", "gradient", "step", "exp_avg", "exp_avg_sq")
+
+
 def adam_fields(shape: Shape, *, dtype: TensorDType = TensorDType.FLOAT32, alignment: int = 16) -> tuple[Field, ...]:
     return tuple(
         Field(name, () if name == "step" else shape, TensorDType.FLOAT32 if name == "step" else dtype, alignment)
-        for name in ("parameters", "gradient", "step", "exp_avg", "exp_avg_sq")
+        for name in ADAM_FIELDS
     )
 
 
@@ -154,6 +159,44 @@ class State:
         return SemanticEffect(
             self.declaration.resource, StateEffectKind.READ, None if producer is None else producer.symbol
         )
+
+    def page_update(self) -> PageUpdate:
+        """The AdamW update over each parameter's optimizer fields."""
+        assert self.optimizer is not None
+        return PageUpdate(self.optimizer, self.optimizer_fields // len(ADAM_FIELDS))
+
+    @property
+    def copy_fields(self) -> tuple[LayoutFieldId, ...]:
+        """The fields an optimizer update carries into the next version: all but each parameter's gradient."""
+        return tuple(
+            LayoutFieldId(i)
+            for i in range(len(self.fields))
+            if i >= self.optimizer_fields or ADAM_FIELDS[i % len(ADAM_FIELDS)] != "gradient"
+        )
+
+    @property
+    def parameter_names(self) -> tuple[str, ...]:
+        """The parameter field names AdamW was expanded from."""
+        return tuple(
+            field.name.removesuffix(".parameters") for field in self.fields[: self.optimizer_fields : len(ADAM_FIELDS)]
+        )
+
+
+def operation_mode(changes: State | None, *, transition: bool, optimizer: bool) -> OperationMode:
+    """How an operation changes its state: not at all, in place, or through a private transition that an optimizer
+    applies gradients to or the operation writes itself."""
+    if changes is None:
+        return "read"
+    return ("gradient" if optimizer else "transition") if transition else "update"
+
+
+def planned_implementation(task: SemanticTask, plan: PlanBundle | None) -> ImplementationId:
+    """The implementation the plan selected for `task`, or its declared one when binding without a plan."""
+    if plan is None:
+        return task.implementations[0].implementation_id
+    return next(
+        item.implementation_id for item in plan.schedule.tasks if plan.semantic_graph.tasks[item.task_id] is task
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,7 +315,9 @@ class Builder(Generic[D]):
                 )
             )
         if optimizer is not None and scope is StateScope.INSTANCE:
-            self.zero_start_fields[name] = frozenset(i for i in range(optimizer_fields) if i % 5)
+            self.zero_start_fields[name] = frozenset(
+                i for i in range(optimizer_fields) if ADAM_FIELDS[i % len(ADAM_FIELDS)] != "parameters"
+            )
         return State(declaration, fields, optimizer, optimizer_fields)
 
     @staticmethod
@@ -338,19 +383,15 @@ class Builder(Generic[D]):
         if function is not None:
             copy_fields: tuple[LayoutFieldId, ...] | None = None
             if changes is not None and changes.optimizer is not None and optimizer is None:
-                config, groups = changes.optimizer, changes.optimizer_fields // 5
-                copy_fields = tuple(
-                    LayoutFieldId(i) for i in range(len(changes.fields)) if i >= changes.optimizer_fields or i % 5 != 1
-                )
-                optimizer = PageUpdate(config, groups)
+                copy_fields, optimizer = changes.copy_fields, changes.page_update()
             self.operations[task.symbol] = operation_type(
                 implementations[0].implementation_id,
                 partial(native_body, function),
-                "read"
-                if changes is None
-                else ("gradient" if optimizer is not None else "transition")
-                if effect in (StateEffectKind.TRANSITION, StateEffectKind.TRANSITION_MAYBE)
-                else "update",
+                operation_mode(
+                    changes,
+                    transition=effect in (StateEffectKind.TRANSITION, StateEffectKind.TRANSITION_MAYBE),
+                    optimizer=optimizer is not None,
+                ),
                 select=select,
                 optimizer=optimizer,
                 copy_fields=copy_fields,
@@ -372,11 +413,7 @@ class Builder(Generic[D]):
         for task in graph.tasks:
             if task.symbol not in operations:
                 continue
-            identity = (
-                task.implementations[0].implementation_id
-                if plan is None
-                else next(item.implementation_id for item in plan.schedule.tasks if graph.tasks[item.task_id] is task)
-            )
+            identity = planned_implementation(task, plan)
             versions = tuple(
                 effect.version
                 for effect in task.effects
@@ -411,11 +448,7 @@ class Builder(Generic[D]):
         for task in graph.tasks:
             if task.symbol in operations and task.replay is None:
                 continue
-            identity = (
-                task.implementations[0].implementation_id
-                if plan is None
-                else next(item.implementation_id for item in plan.schedule.tasks if graph.tasks[item.task_id] is task)
-            )
+            identity = planned_implementation(task, plan)
             if task.replay is not None:
                 assert model_probe is not None and model_probe.causal_domain is not None
                 assert self.route_program is not None
