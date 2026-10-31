@@ -710,65 +710,59 @@ class _Train(_Effect):
     phase: ClassVar[Phase | None] = Phase.AUTOMATIC
 
     def declare(self, operation: _Operation) -> None:
-        """Choose optimizer training or the explicit weighted SGD transition."""
+        """Train on host batches (any SGD state, or an AdamW state read through pllm.batch or pllm.causal_model)
+        or on each request's rows."""
         arguments, captures = operation.arguments()
         definition = operation.context.state_definition(self.state, "training requires a declared optimizer state")
-        if isinstance(definition.optimizer, AdamWConfig) and any(
-            isinstance(source, (Batch, _CausalModel)) for source in arguments.values()
-        ):
-            context = operation.context
-            if captures or operation.gradient or operation.rows or self.update or self.reset or self.steps != 1:
-                raise ValueError("batch training uses one optimizer step without inference-row selectors")
-            context.train(
-                declare_batch_train(
-                    context.binding,
-                    operation.name,
-                    context.states[self.state],
-                    ports={key: source.training_port(context) for key, source in arguments.items()},
-                    function=freeze(operation.function),
-                    identity=f"python:{fingerprint(operation.function)}",
-                    when=When.HOST_COMPUTE if context.binding.host else operation.phase.value,
-                ),
-                self.state,
-            )
-            return
         match definition.optimizer:
             case SGD() as optimizer:
-                self.weighted(
-                    replace(operation, phase=Phase.AFTER_SAMPLE) if operation.phase is Phase.AUTOMATIC else operation,
-                    arguments,
-                    captures,
-                    definition,
-                    optimizer,
-                )
+                self.weighted(operation, arguments, captures, definition, optimizer)
+            case AdamWConfig() if any(isinstance(source, (Batch, _CausalModel)) for source in arguments.values()):
+                self.batch(operation, arguments, captures)
             case _:
-                if self.reset or self.steps != 1:
-                    raise ValueError("multi-step/reset training requires explicit SGD batch parameters")
-                context = operation.context
-                sampler = context.sampler
-                request_training = sampler is not None or not context.has_model_effect
-                unconditional = request_training and (
-                    sampler is None or sampler.stage is SamplerStage.PACKED_POST_FILTER_EXACT
-                )
-                if unconditional and (operation.rows or self.update):
-                    raise ValueError(
-                        "request training updates every selected state: remove rows= and custom update_states from @pllm.train"
-                    )
-                # Token commit owns request training; selectors keep their declared phase.
-                when = (
-                    When.AFTER_SAMPLE
-                    if request_training and operation.phase is Phase.AUTOMATIC
-                    else operation.phase.value
-                )
-                context.train(
-                    operation.tensor(
-                        arguments,
-                        captures,
-                        when=when,
-                        update_kind=StateEffectKind.UPDATE if unconditional else StateEffectKind.UPDATE_MAYBE,
-                    ),
-                    self.state,
-                )
+                self.request(operation, arguments, captures)
+
+    def batch(self, operation: _Operation, arguments: dict[str, _Source], captures: dict[str, Capture]) -> None:
+        """One AdamW step on a host CausalTrainBatch or WeightedRowBatch."""
+        context = operation.context
+        if captures or operation.gradient or operation.rows or self.update or self.reset or self.steps != 1:
+            raise ValueError("batch training uses one optimizer step without inference-row selectors")
+        context.train(
+            declare_batch_train(
+                context.binding,
+                operation.name,
+                context.states[self.state],
+                ports={key: source.training_port(context) for key, source in arguments.items()},
+                function=freeze(operation.function),
+                identity=f"python:{fingerprint(operation.function)}",
+                when=When.HOST_COMPUTE if context.binding.host else operation.phase.value,
+            ),
+            self.state,
+        )
+
+    def request(self, operation: _Operation, arguments: dict[str, _Source], captures: dict[str, Capture]) -> None:
+        """Train each request's state on its rows; token commit owns the step unless a model effect does."""
+        if self.reset or self.steps != 1:
+            raise ValueError("multi-step/reset training requires explicit SGD batch parameters")
+        context = operation.context
+        sampler = context.sampler
+        request_training = sampler is not None or not context.has_model_effect
+        unconditional = request_training and (sampler is None or sampler.stage is SamplerStage.PACKED_POST_FILTER_EXACT)
+        if unconditional and (operation.rows or self.update):
+            raise ValueError(
+                "request training updates every selected state: remove rows= and custom update_states from @pllm.train"
+            )
+        # Selectors keep their declared phase.
+        when = When.AFTER_SAMPLE if request_training and operation.phase is Phase.AUTOMATIC else operation.phase.value
+        context.train(
+            operation.tensor(
+                arguments,
+                captures,
+                when=when,
+                update_kind=StateEffectKind.UPDATE if unconditional else StateEffectKind.UPDATE_MAYBE,
+            ),
+            self.state,
+        )
 
     def weighted(
         self,
@@ -778,7 +772,9 @@ class _Train(_Effect):
         definition: InstanceState,
         optimizer: SGD,
     ) -> None:
-        """Declare the batch transition, including its reset and input bindings."""
+        """Declare the weighted SGD batch transition, including its reset and input bindings."""
+        if operation.phase is Phase.AUTOMATIC:
+            operation = replace(operation, phase=Phase.AFTER_SAMPLE)
         if captures:
             raise ValueError("SGD batch training manages its own state writes")
         if not self.reset:
@@ -891,16 +887,26 @@ def differentiate(
     return _mark(gradient=_Gradient(inputs, parameters, input_rows, parameter_rows))
 
 
+def _author_buffers(
+    initialize: Initializer, names: tuple[str, ...], values: Tensors, generator: torch.Generator
+) -> None:
+    """Run the author's initializer on the buffers it declared, not on the generated pending ones."""
+    initialize({name: values[name] for name in names}, generator)
+
+
 def _chunked_overlay(
     function: Callable[..., Any],
+    initialize: Initializer | None,
     bindings: dict[str, str],
     buffers: dict[str, Buffer],
     effect: ParameterEffect,
     chunk: int,
     optimizer: SGD | None,
     flush: str | None,
-) -> Callable[..., TensorUpdate]:
+) -> tuple[Callable[..., TensorUpdate], Initializer | None]:
     """Generate pending state before layout interning and bind the existing chunk executor."""
+    if initialize is not None:
+        initialize = partial(_author_buffers, initialize, tuple(buffers))
     arguments = tuple(bindings)
     sources = tuple(bindings.values())
     if chunk < 1:
@@ -948,7 +954,7 @@ def _chunked_overlay(
     bindings.update((name, name) for name in pending)
     if optimizer is not None:
         bindings["_prompt_end"] = "prompt_end"
-    return update
+    return update, initialize
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -969,6 +975,23 @@ class _Overlay(_Effect):
     phase: ClassVar[Phase | None] = Phase.MODEL_UPDATE
     model_effect: ClassVar[bool] = True
 
+    def __post_init__(self) -> None:
+        if self.flush not in (None, "prompt_end") or (self.flush is not None and self.optimizer is None):
+            raise ValueError("flush='prompt_end' requires an autograd overlay optimizer")
+        if self.optimizer is not None and self.chunk is None:
+            raise ValueError("autograd overlays require a chunk size")
+
+    def parameter_effect(self, owner: Workload, layers: int) -> ParameterEffect:
+        """The configured projection effect, with all-layer targets resolved against the model."""
+        return ParameterEffect(
+            self.state,
+            _targets(_setting(self.targets, owner, tuple)),
+            self.weight,
+            _setting(self.operator, owner, ParameterOverlayOperator),
+            _setting(self.factors, owner, tuple),
+            _setting(self.scale, owner, float),
+        ).expand(layers)
+
     def declare(self, operation: _Operation) -> None:
         """Declare a request buffer transition and its parameter overlay attachment."""
         if operation.gradient is not None or operation.rows:
@@ -985,34 +1008,14 @@ class _Overlay(_Effect):
         bindings = {key: source.overlay(self.state, buffers) for key, source in _arguments(operation.function).items()}
         if set(buffers) & {source.value for source in Operand}:
             raise ValueError("overlay buffers conflict with reserved operand names")
-        targets, operator, scale = (
-            _targets(_setting(self.targets, context.owner, tuple)),
-            _setting(self.operator, context.owner, ParameterOverlayOperator),
-            _setting(self.scale, context.owner, float),
-        )
-        effect = ParameterEffect(
-            self.state, targets, self.weight, operator, _setting(self.factors, context.owner, tuple), scale
-        ).expand(context.binding.dimensions.layer_count)
-        applied = effect.applied_fields
-        visibility = _setting(self.visibility, context.owner, Visibility)
+        effect = self.parameter_effect(context.owner, context.binding.dimensions.layer_count)
         identity = fingerprint(operation.function)
-        function = freeze(operation.function)
+        function: Callable[..., TensorUpdate] = freeze(operation.function)
         initialize = _frozen(definition.initialize)
-        if self.flush not in (None, "prompt_end") or (self.flush is not None and self.optimizer is None):
-            raise ValueError("flush='prompt_end' requires an autograd overlay optimizer")
-        if self.optimizer is not None and self.chunk is None:
-            raise ValueError("autograd overlays require a chunk size")
         if self.chunk is not None:
-            if initialize is not None:
-                author_initialize, author_buffers = initialize, tuple(buffers)
-
-                def initialize_author(values: Tensors, generator: torch.Generator) -> None:
-                    author_initialize({name: values[name] for name in author_buffers}, generator)
-
-                initialize = initialize_author
-
-            function = _chunked_overlay(
+            function, initialize = _chunked_overlay(
                 function,
+                initialize,
                 bindings,
                 buffers,
                 effect,
@@ -1036,7 +1039,7 @@ class _Overlay(_Effect):
             identity=f"python:{identity}",
             function=function,
             arguments=bindings,
-            visibility=visibility,
+            visibility=_setting(self.visibility, context.owner, Visibility),
             equations_digest=boundary_digest(
                 context.signature, context.bindings, self.chunk, self.optimizer, self.flush
             ),
@@ -1047,9 +1050,9 @@ class _Overlay(_Effect):
                 boundary_digest(
                     identity,
                     bindings,
-                    operator,
-                    scale,
-                    applied,
+                    effect.operator,
+                    effect.scale,
+                    effect.applied_fields,
                     self.visibility,
                     self.chunk,
                     self.optimizer,

@@ -401,6 +401,12 @@ class Builder(Generic[D]):
             self.host_operations[task.symbol] = HostOperation(implementations[0].implementation_id, host_function)
         return Call(task.symbol, outputs)
 
+    def update_task(self, symbol: TaskSymbol, change: Callable[[SemanticTask], SemanticTask]) -> None:
+        """Replace one declared task by `change(task)`."""
+        self.graph = replace(
+            self.graph, tasks=tuple(change(task) if task.symbol == symbol else task for task in self.graph.tasks)
+        )
+
     def bind_host(self) -> tuple[HostOperation[D], ...]:
         assert set(self.host_operations) == {task.symbol for task in self.graph.tasks}
         return tuple(self.host_operations[task.symbol] for task in self.graph.tasks)
@@ -637,9 +643,7 @@ class Builder(Generic[D]):
             inputs=(*forward.inputs, *dependency),
             effects=(SemanticEffect(activation.state_resource, StateEffectKind.READ, publication_symbol),),
         )
-        self.graph = replace(
-            self.graph, tasks=tuple(forward if task.symbol == forward_symbol else task for task in self.graph.tasks)
-        )
+        self.update_task(forward_symbol, lambda _: forward)
         self.attachment = replace(
             replay,
             tasks=(*replay.tasks, *activation.tasks),
