@@ -294,9 +294,10 @@ def declare_weighted_train(
     arguments: Mapping[str, tuple[str, str]],
 ) -> Call:
     """Declare weighted batch preparation and its optimizer transition."""
-    if steps < 1 or b.weighted_training or b.host:
-        raise ValueError("weighted training requires one model training sink and positive steps")
-    b.weighted_training = True
+    if steps < 1:
+        raise ValueError(f"@pllm.train(steps={steps}): use at least one step")
+    if b.host:
+        raise ValueError("SGD batch training needs a model backend; host workloads train a pllm.AdamW state")
     fields = tuple(field.name for field in state.fields)
     application = PoolSGD(optimizer.lr, len(fields))
     prepare_function = partial(prepare_weighted_batch, b.dimensions, fields, reset)

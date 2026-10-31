@@ -110,7 +110,6 @@ def declare_batch_train(
         )
 
     compute = autograd_loss(loss, names, summary)
-    b.trains_on_batch = True
 
     call = b.compute(
         name,

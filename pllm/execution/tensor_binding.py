@@ -116,10 +116,7 @@ class TensorBinding(Builder[TensorFrame]):
         self.initializers: dict[str, Callable[[tuple[torch.Tensor, ...], torch.Generator], None]] = {}
         # Module states: their flat initial values, built once at bind from the model dimensions and seed.
         self.initial_values: dict[str, Callable[[Dimensions, int], torch.Tensor]] = {}
-        self.weighted_training = False
         self.causal: CausalBinder | None = None
-        # Batch training measures its costs from signed input bounds, not from example rows.
-        self.trains_on_batch = False
         self.probe: BackendPlacementProbe | None = None
         self.overlay_targets: tuple[ParameterTarget, ...] = ()
         self.parameter_phases: tuple[HiddenPhase, ...] = ()
@@ -224,6 +221,19 @@ class TensorBinding(Builder[TensorFrame]):
                 previous, step=incoming.step, rows=incoming.rows, index=None, plan=None, training=None
             ),
             parameter_phases=self.parameter_phases,
+        )
+
+    @property
+    def trains_on_batch(self) -> bool:
+        """Whether a task trains on a host CausalTrainBatch or WeightedRowBatch (declare_batch_train)."""
+        return any(task.math is not None and task.math.reduction == "custom" for task in self.graph.tasks)
+
+    @property
+    def weighted_training(self) -> bool:
+        """Whether a task trains on a host WeightedCEBatch (declare_weighted_train)."""
+        return any(
+            task.math is not None and task.math.reduction == "weighted_state_mean_then_mean"
+            for task in self.graph.tasks
         )
 
     @property
