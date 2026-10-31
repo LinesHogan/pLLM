@@ -12,7 +12,6 @@ import torch
 from torch.nn import functional as F
 
 import pllm
-from pllm import authoring as a
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,7 +55,7 @@ class OutputLoRAWorkload(pllm.Workload):
             parameters["a"].normal_(std=0.01, generator=generator.manual_seed(seed))
             parameters["b"].zero_()
 
-        fields: dict[str, Callable[[a.Dimensions], tuple[int, ...]]] = {
+        fields: dict[str, Callable[[pllm.Dimensions], tuple[int, ...]]] = {
             "a": lambda m: (m.hidden_size, rank),
             "b": lambda m: (rank, m.vocab_size),
         }

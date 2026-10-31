@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, TypeVar, overload
 
 from pllm import host as host, model as model, state as state  # noqa: E402
-from pllm.authoring import AdamW as AdamW
+from pllm.authoring import AdamW as AdamW, Dimensions as Dimensions
 from pllm.config import (
     ExecutionOptions as ExecutionOptions,
     KVOffload as KVOffload,
@@ -146,6 +146,7 @@ __all__ = [
     "PositionState",
     "AdamW",
     "SGD",
+    "Dimensions",
     "Buffer",
     "TensorUpdate",
     "host",

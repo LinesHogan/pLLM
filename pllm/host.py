@@ -1,10 +1,14 @@
-"""Host-side surfaces: transactional host workloads, completion feedback and weighted batches.
+"""Host-side surfaces: transactional host workloads, completion feedback and host-supplied training batches.
 
 Pass `HostRuntimeFacts` to `pllm.make_llm` for host workloads. Completion, reward, retry and barrier types
 are the feedback a host service exchanges with the framework.
 """
 
-from pllm.contracts.auxiliary import WeightedCEBatch as WeightedCEBatch
+from pllm.contracts.auxiliary import (
+    CausalTrainBatch as CausalTrainBatch,
+    WeightedCEBatch as WeightedCEBatch,
+    WeightedRowBatch as WeightedRowBatch,
+)
 from pllm.contracts.feedback import (
     BarrierState as BarrierState,
     Completion as Completion,
@@ -36,6 +40,8 @@ __all__ = [
     "CompletionInput",
     "NoHostRequest",
     "WeightedCEBatch",
+    "WeightedRowBatch",
+    "CausalTrainBatch",
     "BarrierState",
     "Completion",
     "CompletionBatch",

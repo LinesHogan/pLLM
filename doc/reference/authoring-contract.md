@@ -453,7 +453,7 @@ Python 堆成本声明。
 `generate_feedback` 的 `feedback` 回调可以先 `step` 再返回 `rewards`，它带
 `update_count`。
 
-训练步携带 `WeightedRowBatch(hidden, targets, weights)`（`pllm.authoring`）：`hidden` 是
+训练步携带 `WeightedRowBatch(hidden, targets, weights)`（`pllm.host`）：`hidden` 是
 `[行数, hidden_size]`，`targets` 与 `weights` 是同 dtype 的 `[行数]`，权重为 0 的行不参与。
 训练方法用 `@pllm.train(state=...)`，通过 `pllm.batch("hidden")`、`pllm.batch("targets")`、
 `pllm.batch("weights")` 与 `pllm.parameter(state, field)` 取输入，返回
@@ -480,7 +480,7 @@ Python 堆成本声明。
 import torch
 import pllm
 from vllm import SamplingParams
-from pllm.authoring import CausalTrainBatch
+from pllm.host import CausalTrainBatch
 from pllm.workloads.tlm import TLMConfig, TLMMode, TLMWorkload
 
 workload = TLMWorkload(TLMConfig(mode=TLMMode.ONLINE), rank=8, alpha=16)

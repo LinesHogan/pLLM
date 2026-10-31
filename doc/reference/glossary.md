@@ -12,7 +12,7 @@
 - **来源标记（Source marker）** —— 命名输入来源的 `Annotated[Tensor, ...]`
   参数：`Hidden`、`Samples`、`Batch`、`Parameter`、`StateIndex`、
   `StateVersion`、`Result`、`BaseLogits`、`SampledTokens`。
-- **因果批（Causal batch）** —— `pllm.authoring.CausalTrainBatch` 提供同形的
+- **因果批（Causal batch）** —— `pllm.host.CausalTrainBatch` 提供同形的
   `input_ids`、`labels` 和可选 `attention_mask`，训练方法用 `pllm.batch(...)` 读取。
 - **因果模型端口（Causal model port）** —— `pllm.causal_model("adapter")` 注入
   `pllm.model.CausalCall`；`model(...)` 应用命名 Overlay，`model.base(...)` 只用冻结基座。
