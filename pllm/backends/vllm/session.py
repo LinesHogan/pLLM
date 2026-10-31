@@ -150,8 +150,7 @@ class VllmSession(Generic[DataT, ResultT]):
         self._auxiliary: AuxiliaryInput[torch.Tensor] | None = None
         self.completion_capture: CompletionCapture | None = None
         execution = deployment.execution
-        if bool(execution.directory.instance_states):
-            execution.admit((), torch.cuda.current_stream(execution.device))
+        execution.admit_instances(torch.cuda.current_stream(execution.device))
         if execution.feeds:
             (binding,) = execution.feeds
             self._feed = FeedReceiver(execution.arena, binding)

@@ -32,8 +32,8 @@ from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.scan import ScanContext, ScanTemplate
 from pllm.execution.scan_analysis import analyze
+from pllm.testing import backend_facts
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
-from test.backend_facts import backend_facts
 from test.workloads.test_inplace_ttt import _input
 
 TARGET = ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT)

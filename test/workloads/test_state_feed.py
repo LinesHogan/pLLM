@@ -11,7 +11,7 @@ from pllm.contracts.semantic_graph import SemanticEffect, StateEffectKind, State
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.state_feed import FeedEvent, FeedRecord, select_publications
-from test.backend_facts import backend_facts
+from pllm.testing import backend_facts
 
 SOURCE = pllm.parameter("source", "value")
 TARGET = pllm.parameter("target", "value")

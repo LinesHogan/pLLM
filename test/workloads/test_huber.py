@@ -13,8 +13,8 @@ from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.runtime_facts import model_timeline
+from pllm.testing import backend_facts
 from test import reference_huber as oracle
-from test.backend_facts import backend_facts
 
 
 def effective(guidance):

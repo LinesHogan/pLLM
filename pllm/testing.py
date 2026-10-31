@@ -1,21 +1,36 @@
-"""Drive a compiled workload step by step with hand-chosen rows, for unit tests and notebooks.
+"""Compile and step a workload without vLLM, with hand-chosen rows, for unit tests and notebooks.
 
-`step_input` builds one packed step (one row per request) the way the vLLM runner would hand it to the
+`backend_facts` describes an in-process model (hidden size, hidden taps, state pages) in place of the facts
+the vLLM runner probes; `compile_execution` compiles a workload against them and admits its instance state.
+`step_input` builds one packed step (one row per request) the way the runner would hand it to the
 workload; `run_step` and `run_guided_step` execute every anchor of that step, delivering sampler feedback
 when the workload reads it. `hidden_binding` names a hidden tap exactly as the runner does, so the same
-bindings can be signed into backend facts.
+bindings serve the facts and the step input.
+
+    binding = testing.hidden_binding(0, testing.HiddenSite.BLOCK_OUTPUT, layer_count=1)
+    execution = testing.compile_execution(workload, testing.backend_facts(4, (binding,), layer_count=1))
+    rows = (testing.RequestIdentity("a", 0, 0),)
+    execution.admit(rows)
+    testing.run_step(execution, testing.step_input(rows, {binding: torch.randn(1, 4)}))
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 import numpy as np
 import torch
 
 from pllm.backends.vllm.architecture import hidden_binding
 from pllm.contracts.auxiliary import AuxiliaryInput
+from pllm.contracts.backend_attachment import (
+    AttachmentGraphMode,
+    AttachmentHiddenResource,
+    AttachmentTopology,
+    BackendPlacementProbe,
+    ParameterTargetShape,
+)
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.packed_hidden import (
     HiddenRowBatch,
@@ -26,13 +41,88 @@ from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, Pack
 from pllm.contracts.parameter_overlay import CapturedParameterOperand
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
-from pllm.contracts.semantic_graph import AnchorId
+from pllm.contracts.semantic_graph import AnchorId, SchedulerTimeline
+from pllm.contracts.tensor_layout import TensorDType
+from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.cuda_stream import CudaStreamReadiness
+from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
+from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.state_execution import StateExecution
 from pllm.execution.step_input import TensorStepInput
 
+if TYPE_CHECKING:
+    from pllm.authoring import BackendWorkload
+
 DataT = TypeVar("DataT")
 ResultT = TypeVar("ResultT")
+
+_CPU_TIMELINE = model_timeline(torch.device("cpu"))
+_CPU_PAGES = PageBundleProviderFacts("testing.cpu@1", 16)
+
+
+def backend_facts(
+    hidden_size: int,
+    hidden: tuple[PackedHiddenResourceBinding, ...] = (),
+    timeline: SchedulerTimeline = _CPU_TIMELINE,
+    provider: PageBundleProviderFacts | None = _CPU_PAGES,
+    *,
+    max_lineages: int = 2,
+    memory_bytes: int = 10000,
+    max_rows: int | None = None,
+    dtype: TensorDType = TensorDType.FLOAT32,
+    vocab_size: int = 0,
+    layer_count: int = 0,
+    targets: tuple[ParameterTargetShape, ...] = (),
+) -> BackendCompileFacts:
+    """Facts for an eager in-process model, in place of what the vLLM runner probes.
+
+    `hidden` lists the taps the workload reads (see `hidden_binding`); `provider` holds state pages, None for
+    a workload without state. `max_lineages` bounds admitted requests, `memory_bytes` the state budget, and
+    `max_rows` the packed rows per step (twice `max_lineages` by default). `targets` declares parameter
+    shapes for overlays; `vocab_size` and `layer_count` are needed by workloads that read logits or layers.
+    """
+    return BackendCompileFacts(
+        BackendPlacementProbe(
+            "testing.native@1",
+            "a" * 64,
+            "b" * 64,
+            "c" * 64,
+            AttachmentTopology.IN_PROCESS,
+            AttachmentGraphMode.EAGER,
+            _CPU_PAGES.device_kind if provider is None else provider.device_kind,
+            0 if provider is None else provider.device_ordinal,
+            1,
+            1,
+            dtype,
+            hidden_size,
+            max_lineages * 2 if max_rows is None else max_rows,
+            tuple(
+                AttachmentHiddenResource(binding, HiddenPhase.DECODE)
+                for binding in sorted(hidden, key=lambda item: item.locator_key)
+            ),
+            (),
+            targets=targets,
+        ),
+        timeline,
+        () if provider is None else (provider,),
+        max_lineages,
+        memory_bytes,
+        7,
+        vocab_size,
+        layer_count,
+    )
+
+
+def compile_execution(
+    workload: BackendWorkload[DataT, ResultT], facts: BackendCompileFacts, stream: torch.cuda.Stream | None = None
+) -> StateExecution[TensorStepInput, DataT, ResultT]:
+    """Compile `workload` against `facts` and admit its instance state, as the vLLM runner does on install.
+
+    Request state is admitted per request with `execution.admit(identities)`.
+    """
+    execution = workload.compile_backend(facts).execution
+    execution.admit_instances(stream)
+    return execution
 
 
 def step_input(
@@ -113,6 +203,8 @@ __all__ = [
     "HiddenSite",
     "RequestIdentity",
     "SamplerFeedback",
+    "backend_facts",
+    "compile_execution",
     "hidden_binding",
     "run_guided_step",
     "run_step",

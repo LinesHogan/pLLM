@@ -9,15 +9,13 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from pllm import testing
-from pllm.contracts.backend_attachment import AttachmentGraphMode, AttachmentTopology, BackendPlacementProbe
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget, ParameterTargetShape
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.semantic_graph import AnchorId, SemanticState, StateResource, StateScope
 from pllm.contracts.state_representation import StateDeviceKind, StateLayoutRequirement, StateRepresentationRequest
-from pllm.contracts.tensor_layout import LayoutFieldId, StateTensorLayout, TensorDType, TensorLayoutRequest
-from pllm.execution.compile_facts import BackendCompileFacts
+from pllm.contracts.tensor_layout import LayoutFieldId, StateTensorLayout, TensorLayoutRequest
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.state_refs import StateRefs
@@ -62,26 +60,9 @@ def paged_rows(positions=(4, 5, 4, 5)) -> tuple[PackedPhaseRow, ...]:
 def inplace_plan(device: torch.device, provider: PageBundleProviderFacts, capabilities: tuple[str, ...]):
     """The InPlaceTTT plan for one request-scoped dense resource on ``device``."""
     target = ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT)
-    probe = BackendPlacementProbe(
-        provider.provider_id,
-        "a" * 64,
-        "b" * 64,
-        "c" * 64,
-        AttachmentTopology.IN_PROCESS,
-        AttachmentGraphMode.EAGER,
-        provider.device_kind,
-        0,
-        1,
-        1,
-        TensorDType.FLOAT32,
-        3,
-        8,
-        (),
-        (),
-    )
     timeline = model_timeline(device, capabilities)
-    facts = BackendCompileFacts(
-        replace(probe, targets=(ParameterTargetShape(target, 3, 2),)), timeline, (provider,), 2, 4096, 0
+    facts = testing.backend_facts(
+        3, (), timeline, provider, memory_bytes=4096, max_rows=8, targets=(ParameterTargetShape(target, 3, 2),)
     )
     return InPlaceTTTWorkload(InPlaceTTTConfig((target,), chunk_size=2)).plan_backend(facts)[0].plan
 

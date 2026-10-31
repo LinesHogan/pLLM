@@ -21,8 +21,9 @@ from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.runtime_facts import model_timeline
+from pllm.testing import backend_facts
 from pllm.workloads.override import OverRIDEConfig, OverRIDEWorkload
-from test.backend_facts import assert_finite_resources, backend_facts
+from test.backend_facts import assert_finite_resources
 
 BINDING = testing.hidden_binding(-1, HiddenSite.MODEL_OUTPUT, 1)
 HIDDEN = torch.tensor([[0.2, -0.1, 0.4, 0.3], [-0.5, 0.7, 0.1, -0.2], [0.1, 0.3, -0.2, 0.8]])

@@ -28,7 +28,7 @@ from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, co
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.step_input import TensorStepInput
 from pllm.execution.tensor_task import TensorTask
-from test.backend_facts import backend_facts
+from pllm.testing import backend_facts
 from test.workloads.test_esamp import _esamp_native_oracle, _ordinary_request_distillation
 
 

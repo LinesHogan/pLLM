@@ -32,8 +32,8 @@ from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.tensor_frame import CompactRows, RowIndex, RowPlan, TensorFrame, state_means
 from pllm.execution.tensor_program import TaskOutput, TensorBatch
 from pllm.execution.tensor_task import TensorTask
+from pllm.testing import backend_facts
 from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
-from test.backend_facts import backend_facts
 
 BINDINGS = tuple(
     PackedHiddenResourceBinding(str(layer), HiddenLayerKind.INDEX, HiddenSite.BLOCK_OUTPUT, f"model.layers[{layer}]")

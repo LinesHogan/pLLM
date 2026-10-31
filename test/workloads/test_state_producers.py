@@ -16,8 +16,9 @@ from pllm.contracts.semantic_graph import AnchorId, StateResource
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
+from pllm.testing import backend_facts
 from pllm.workloads.state_producers import TARGETS, DecodeFactors, ProjectionState, PromptFactors, PromptMixture
-from test.backend_facts import assert_finite_resources, backend_facts
+from test.backend_facts import assert_finite_resources
 
 
 @pytest.fixture(params=("cpu", "cuda:0") if torch.cuda.is_available() else ("cpu",))

@@ -28,8 +28,9 @@ from pllm.execution.overlay_task import ChunkUpdate
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.step_input import TensorStepInput
+from pllm.testing import backend_facts
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
-from test.backend_facts import assert_finite_resources, backend_facts
+from test.backend_facts import assert_finite_resources
 
 
 def _input(operands: tuple[CapturedParameterOperand, ...]) -> TensorStepInput:

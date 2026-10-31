@@ -19,8 +19,8 @@ from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.runtime_facts import model_timeline
+from pllm.testing import backend_facts
 from pllm.workloads.lora import OutputLoRAConfig, OutputLoRAWorkload
-from test.backend_facts import backend_facts
 
 BINDING = testing.hidden_binding(-1, HiddenSite.MODEL_OUTPUT, 1)
 

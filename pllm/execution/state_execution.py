@@ -523,6 +523,11 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             self.trace.record(TracePhase.ADMIT, 0, identities=identities, refs=refs, operation_id=receipt.operation_id)
         return refs
 
+    def admit_instances(self, stream: torch.cuda.Stream | None = None) -> None:
+        """Admit instance-scoped state once, when the execution is installed; requests admit their own state."""
+        if self.directory.instance_states:
+            self.admit((), stream)
+
     def begin(
         self,
         rows: tuple[PackedPhaseRow, ...],

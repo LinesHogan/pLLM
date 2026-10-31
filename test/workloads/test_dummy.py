@@ -19,14 +19,13 @@ from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.contracts.state_representation import StateDeviceKind
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.tensor_task import TensorTask
 from pllm.execution.trace import ExecutionTrace, TracePhase, TraceSelection, TraceSnapshot
 from pllm.host import HostRuntimeFacts
+from pllm.testing import backend_facts
 from pllm.workloads.dummy import DummyConfig, DummyWorkload
-from test.backend_facts import assert_finite_resources, backend_facts
+from test.backend_facts import assert_finite_resources
 
 BINDING = testing.hidden_binding(0, HiddenSite.BLOCK_OUTPUT, 1)
 CPU = HostRuntimeFacts(torch.device("cpu"))
@@ -200,13 +199,8 @@ def _frozen_state_is_readable_by_an_observation() -> None:
         encoder = pllm.InstanceState(module=lambda model: Encoder(model.hidden_size))
 
     bindings = tuple(testing.hidden_binding(layer, HiddenSite.BLOCK_OUTPUT, 18) for layer in (3, 5, 17))
-    timeline = model_timeline(torch.device("cpu"))
-    provider = PageBundleProviderFacts("test.plain@1", 4, StateDeviceKind.CPU)
-    execution = (
-        FrozenEncoder().compile_backend(backend_facts(32, bindings, timeline, provider, layer_count=18)).execution
-    )
+    execution = testing.compile_execution(FrozenEncoder(), backend_facts(32, bindings, layer_count=18))
     identity = RequestIdentity("req", 0, 0)
-    execution.admit(())
     execution.admit((identity,))
     source = (torch.arange(32, dtype=torch.float32) + 1).unsqueeze(0)
     execution.step(

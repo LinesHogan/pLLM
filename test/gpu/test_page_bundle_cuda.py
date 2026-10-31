@@ -22,8 +22,8 @@ from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw
+from pllm.testing import backend_facts
 from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
-from test.backend_facts import backend_facts
 
 
 def _plan(shared=False):
