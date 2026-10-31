@@ -13,7 +13,7 @@ from enum import StrEnum
 from functools import partial
 from hashlib import sha256
 from types import TracebackType
-from typing import TYPE_CHECKING, Generic, TypeVar, overload
+from typing import TYPE_CHECKING, Any, Generic, TypeVar, overload
 
 import torch
 from vllm import RequestOutput, SamplingParams, __version__ as _VLLM_VERSION
@@ -563,6 +563,30 @@ class VllmLlm(Generic[DataT, ResultT]):
         )
 
 
+def vllm_engine(config: ModelConfig, workload_options: dict[str, Any]) -> LLM:
+    """The single-device vLLM engine `config` describes; a workload adds its worker, scheduler and graph options."""
+    return LLM(
+        model=config.model,
+        revision=config.revision,
+        dtype=config.dtype,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        data_parallel_size=1,
+        distributed_executor_backend="uni",
+        enforce_eager=not config.cuda_graphs,
+        max_model_len=config.max_model_len,
+        max_num_seqs=config.max_num_seqs,
+        max_num_batched_tokens=config.max_num_batched_tokens,
+        gpu_memory_utilization=config.gpu_memory_utilization,
+        seed=config.seed,
+        trust_remote_code=config.trust_remote_code,
+        enable_prefix_caching=config.enable_prefix_caching,
+        enable_chunked_prefill=config.enable_chunked_prefill,
+        kv_transfer_config=None if config.kv_offload is None else config.kv_offload.options(),
+        **workload_options,
+    )
+
+
 def create_vllm_llm(
     workload: BackendWorkload[DataT, ResultT],
     config: ModelConfig,
@@ -570,7 +594,6 @@ def create_vllm_llm(
     definition: str | None = None,
 ) -> VllmLlm[DataT, ResultT]:
     requirements = workload.backend_requirements()
-    offload = config.kv_offload
     if requirements.position_states and config.runner == "mrv1":
         raise ValueError('PositionState layer routes need runner="mrv2"')
     if _VLLM_VERSION != _SUPPORTED_VLLM_VERSION:
@@ -590,30 +613,16 @@ def create_vllm_llm(
         raise RuntimeError("vLLM workload conflicts with explicit MP, spawn or legacy-runner environment")
     os.environ.update(environment)
     try:
-        llm = LLM(
-            **graph_options(config, requirements),
-            model=config.model,
-            revision=config.revision,
-            dtype=config.dtype,
-            tensor_parallel_size=1,
-            pipeline_parallel_size=1,
-            data_parallel_size=1,
-            distributed_executor_backend="uni",
-            worker_cls=_WORKER_CLASS,
-            enforce_eager=not config.cuda_graphs,
-            max_model_len=config.max_model_len,
-            max_num_seqs=config.max_num_seqs,
-            max_num_batched_tokens=config.max_num_batched_tokens,
-            gpu_memory_utilization=config.gpu_memory_utilization,
-            seed=config.seed,
-            trust_remote_code=config.trust_remote_code,
-            enable_prefix_caching=config.enable_prefix_caching,
-            enable_chunked_prefill=config.enable_chunked_prefill,
-            # The supported uni-process, non-speculative decoder enables async by default.
-            async_scheduling=config.runner == "mrv2",
-            scheduler_cls="pllm.backends.vllm.prefix_cache."
-            + ("WorkloadAsyncScheduler" if config.runner == "mrv2" else "WorkloadScheduler"),
-            kv_transfer_config=None if offload is None else offload.options(),
+        llm = vllm_engine(
+            config,
+            {
+                **graph_options(config, requirements),
+                "worker_cls": _WORKER_CLASS,
+                # The supported uni-process, non-speculative decoder enables async by default.
+                "async_scheduling": config.runner == "mrv2",
+                "scheduler_cls": "pllm.backends.vllm.prefix_cache."
+                + ("WorkloadAsyncScheduler" if config.runner == "mrv2" else "WorkloadScheduler"),
+            },
         )
     finally:
         for name, value in previous_environment.items():

@@ -90,28 +90,9 @@ def make_llm(
     if workload is None:
         if config.execution != ExecutionOptions():
             raise ValueError("workload execution options require a workload")
-        from vllm import LLM
+        from pllm.backends.vllm.runtime import vllm_engine
 
-        return LLM(
-            model=config.model,
-            dtype=config.dtype,
-            tensor_parallel_size=1,
-            pipeline_parallel_size=1,
-            data_parallel_size=1,
-            distributed_executor_backend="uni",
-            worker_cls="auto",
-            enable_chunked_prefill=config.enable_chunked_prefill,
-            max_model_len=config.max_model_len,
-            max_num_seqs=config.max_num_seqs,
-            max_num_batched_tokens=config.max_num_batched_tokens,
-            gpu_memory_utilization=config.gpu_memory_utilization,
-            seed=config.seed,
-            enable_prefix_caching=config.enable_prefix_caching,
-            enforce_eager=not config.cuda_graphs,
-            trust_remote_code=config.trust_remote_code,
-            revision=config.revision,
-            kv_transfer_config=None if config.kv_offload is None else config.kv_offload.options(),
-        )
+        return vllm_engine(config, {"worker_cls": "auto"})
     if not isinstance(workload, BackendWorkload):
         raise TypeError("model execution requires a backend workload")
     from pllm.backends.vllm.runtime import create_vllm_llm
