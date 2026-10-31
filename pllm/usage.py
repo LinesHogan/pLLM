@@ -30,7 +30,6 @@ from pllm.contracts.parameter_overlay import (
     ParameterOverlayFieldBinding,
     ParameterOverlayOperator,
     ParameterTarget,
-    expand_targets,
 )
 from pllm.contracts.request_identity import RequestKeyField, canonical_request_key_fields
 from pllm.contracts.sampler import SamplerStage
@@ -580,16 +579,7 @@ class Overlay(ParameterEffect):
 
     def bindings(self, context: _Declaration) -> tuple[ParameterOverlayFieldBinding, ...]:
         """The same logical views consumed by inference and differentiable model calls."""
-        return tuple(
-            ParameterOverlayFieldBinding(
-                target,
-                self.operator,
-                tuple(context.binding.field_views[self.state, f"{key}_{i}"] for key in self.applied_fields),
-                self.state,
-                self.scale,
-            )
-            for i, target in enumerate(self.targets)
-        )
+        return self.field_bindings(lambda name: context.binding.field_views[self.state, name])
 
 
 def _frozen(initialize: Initializer | None) -> Initializer | None:
@@ -990,7 +980,7 @@ class _Overlay(_Effect):
         )
         effect = ParameterEffect(
             self.state, targets, self.weight, operator, _setting(self.factors, context.owner, tuple), scale
-        )
+        ).expand(context.binding.dimensions.layer_count)
         applied = effect.applied_fields
         visibility = _setting(self.visibility, context.owner, Visibility)
         identity = fingerprint(operation.function)
@@ -1634,9 +1624,7 @@ class Workload(
         context = _Declaration.read(self)
         context.binding = b
         context.values = {
-            key: replace(value, targets=expand_targets(value.targets, b.dimensions.layer_count))
-            if isinstance(value, Overlay)
-            else value
+            key: value.expand(b.dimensions.layer_count) if isinstance(value, Overlay) else value
             for key, value in context.values.items()
         }
         context.declare_values()

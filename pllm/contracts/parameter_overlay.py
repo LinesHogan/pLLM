@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from math import prod
+from typing import Self
 
 import torch
 
@@ -114,6 +116,23 @@ class ParameterEffect:
     def applied_fields(self) -> tuple[str, ...]:
         """The fields consumed by the declared projection operator."""
         return self.factors if self.operator is ParameterOverlayOperator.LOW_RANK_ADD else (self.weight,)
+
+    def expand(self, layers: int) -> Self:
+        """The same effect with layer=None targets resolved against a model of `layers` layers."""
+        return replace(self, targets=expand_targets(self.targets, layers))
+
+    def field_bindings(self, view: Callable[[str], FieldView]) -> tuple[ParameterOverlayFieldBinding, ...]:
+        """One binding per target; `view` finds each applied field's copy for target i, named `{field}_{i}`."""
+        return tuple(
+            ParameterOverlayFieldBinding(
+                target,
+                self.operator,
+                tuple(view(f"{key}_{i}") for key in self.applied_fields),
+                self.state,
+                self.scale,
+            )
+            for i, target in enumerate(self.targets)
+        )
 
 
 __all__ = [

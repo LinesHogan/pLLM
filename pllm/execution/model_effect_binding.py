@@ -28,7 +28,6 @@ from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
     FieldView,
     ParameterEffect,
-    ParameterOverlayFieldBinding,
 )
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.semantic_graph import (
@@ -87,7 +86,7 @@ def declare_parameter_overlay(
     if b.graph.tasks or b.graph.states or b.host:
         raise ValueError("ordinary overlay requires a sole request state and model transition")
     fields = overlay_fields(buffers, effect, b.dimensions)
-    targets, applied = effect.targets, effect.applied_fields
+    targets = effect.targets
     b.overlay_targets = targets
     b.parameter_phases = phases
     state = b.state(
@@ -171,20 +170,7 @@ def declare_parameter_overlay(
             native("canonical.state:publish_parameter_overlay@1", "compute/cpu@1", "transition/full_root@1"),
         ),
     )
-    b.overlay(
-        state,
-        (transition, publication),
-        tuple(
-            ParameterOverlayFieldBinding(
-                target,
-                effect.operator,
-                tuple(state.view(f"{key}_{i}", b.dimensions) for key in applied),
-                str(state.declaration.resource),
-                effect.scale,
-            )
-            for i, target in enumerate(targets)
-        ),
-    )
+    b.overlay(state, (transition, publication), effect.field_bindings(lambda name: state.view(name, b.dimensions)))
 
 
 def write_result(b: TensorBinding, source: Call, state: State, fields: tuple[str, ...], when: When) -> Call:
