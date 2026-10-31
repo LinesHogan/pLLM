@@ -566,7 +566,10 @@ class Builder(Generic[D]):
 
     def finish(self) -> tuple[SemanticGraph, TensorLayoutRequest, BackendAttachmentSpec]:
         if self.attachment is None:
-            raise ValueError("model workload has no declared backend effect")
+            raise ValueError(
+                "the workload has no effect on the model: add @pllm.train, @pllm.add_logits, @pllm.guide_sampling, "
+                "@pllm.export, @pllm.overlay, a layer_route or a pllm.model.Activation/Overlay"
+            )
         return self.graph, self.layouts, self.attachment
 
     def model_effect(self, call: Call, kind: AttachmentKind = AttachmentKind.OBSERVATION) -> None:

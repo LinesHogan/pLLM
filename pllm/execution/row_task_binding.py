@@ -554,7 +554,9 @@ def validate_gradients(b: TensorBinding, training: Call | None) -> None:
     if retained - visited or resources != {
         effect.resource for effect in tasks[training.symbol].effects if effect.kind is not StateEffectKind.READ
     }:
-        raise ValueError("training must consume differentiable paths for its one optimizer state")
+        raise ValueError(
+            "the @pllm.train loss must use every @pllm.differentiate result and differentiate only its own state"
+        )
 
 
 def declare_logits(

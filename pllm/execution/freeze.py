@@ -32,7 +32,7 @@ C = TypeVar("C")
 def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
     """Sign cold code/config dependencies, never eval annotations or execute code to trace it."""
     if id(value) in seen:
-        raise ValueError("recursive authoring dependencies require an explicit native binding")
+        raise ValueError(f"{type(value).__name__}: workload methods cannot depend on a value that contains itself")
     seen = seen | {id(value)}
     if isinstance(value, MethodType):
         return fingerprint(value.__func__, seen)
@@ -40,7 +40,10 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
         closure = getclosurevars(value)
         globals_used = _global_names(value.__code__)
         if globals_used & {"getattr", "setattr", "hasattr", "globals", "locals", "vars", "eval", "exec", "__import__"}:
-            raise ValueError("reflective mathematics requires an explicit native binding")
+            raise ValueError(
+                f"{value.__qualname__}: workload methods cannot call getattr, setattr, hasattr, globals, locals, "
+                "vars, eval, exec or __import__; pllm signs code by its bytecode and cannot follow dynamic lookups"
+            )
         dependencies = {
             **{key: value.__globals__[key] for key in globals_used if key in value.__globals__},
             # `__class__` is zero-argument `super()`'s cell: the class being signed, not a dependency.
@@ -54,7 +57,10 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
         )
     if isinstance(value, ModuleType):
         if value.__name__ != "pllm" and not value.__name__.startswith(("torch", "math")):
-            raise ValueError(f"{value.__name__}: module dependencies require an explicit native binding")
+            raise ValueError(
+                f"{value.__name__}: workload methods may use only the torch, math and pllm modules; "
+                "compute other values outside the workload and pass them in its config"
+            )
         return boundary_digest(value.__name__, torch.__version__)
     if isinstance(value, torch.dtype):
         return str(value)
@@ -74,7 +80,9 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
                     if isinstance(item, FunctionType)
                 )
             )
-        raise ValueError("dynamic type dependencies require an explicit native binding")
+        raise ValueError(
+            f"{value.__qualname__}: workload methods may reference only torch and pllm classes and nn.Module subclasses"
+        )
     if is_dataclass(value) and not isinstance(value, type):
         return boundary_digest(
             type(value).__qualname__,
@@ -85,7 +93,12 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
         return boundary_digest(tuple((key, fingerprint(item, seen)) for key, item in sorted(items.items())))
     if isinstance(value, (tuple, list)):
         return boundary_digest(tuple(fingerprint(item, seen) for item in cast(tuple[object, ...], value)))
-    return boundary_digest(value)
+    try:
+        return boundary_digest(value)
+    except ValueError as error:
+        raise ValueError(
+            f"{value!r}: workload methods may depend only on torch, math, pllm, plain values, enums and dataclasses"
+        ) from error
 
 
 def _code(code: CodeType) -> CodeType:
@@ -138,7 +151,7 @@ def freeze(function: G) -> G:
     if isinstance(function, MethodType):
         return cast(G, MethodType(freeze(function.__func__), function.__self__))
     if not isinstance(function, FunctionType):
-        raise TypeError("ordinary operations require a Python function; use an explicit native binding")
+        raise TypeError(f"{function!r}: workload operations must be Python functions")
     globals_used = _global_names(function.__code__)
     global_values = dict(function.__globals__)
     for key in globals_used & global_values.keys():

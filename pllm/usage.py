@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Generator, Mapping
+from contextlib import contextmanager
 from dataclasses import KW_ONLY, dataclass, field, replace
 from enum import Enum
 from functools import partial
@@ -155,7 +156,12 @@ class Config:
         match value:
             case Config(name=name):
                 for part in name.split("."):
-                    owner = object.__getattribute__(owner, part)
+                    try:
+                        owner = object.__getattribute__(owner, part)
+                    except AttributeError:
+                        raise ValueError(
+                            f"pllm.Config({name!r}): {type(owner).__name__} has no attribute {part!r}"
+                        ) from None
                 return owner
             case _:
                 return value
@@ -214,13 +220,14 @@ class Parameter(_Source):
     per_row: bool = False
 
     def training_port(self, context: _Declaration) -> CausalPort:
+        context.parameter(self.state, self.field)
         view = context.binding.field_views[self.state, self.field]
         return CausalPort(
             context.states[self.state].read(), lambda batch, parameters: view.read(parameters["parameters"])
         )
 
     def port(self, context: _Declaration) -> TensorPort:
-        parameter = context.parameters[self.state, self.field]
+        parameter = context.parameter(self.state, self.field)
         return parameter_rows(parameter) if self.per_row else parameter
 
     def overlay(self, state: str, buffers: Mapping[str, Buffer]) -> str:
@@ -296,7 +303,7 @@ class StateIndex(_Source):
     differentiable: ClassVar[bool] = False
 
     def port(self, context: _Declaration) -> TensorPort:
-        return state_metadata(context.states[self.state], version=False)
+        return state_metadata(context.state(self.state, "pllm.index needs a declared state"), version=False)
 
 
 @dataclass(frozen=True)
@@ -306,7 +313,7 @@ class StateVersion(_Source):
     differentiable: ClassVar[bool] = False
 
     def port(self, context: _Declaration) -> TensorPort:
-        return state_metadata(context.states[self.state], version=True)
+        return state_metadata(context.state(self.state, "pllm.version needs a declared state"), version=True)
 
 
 @dataclass(frozen=True)
@@ -636,14 +643,12 @@ class _Write(_Effect):
     def declare(self, operation: _Operation) -> None:
         context = operation.context
         definition = context.state_definition(self.state, "write needs a declared state")
-        if (
-            definition.feed is not None
-            or not self.fields
-            or len(set(self.fields)) != len(self.fields)
-            or any((self.state, key) not in context.parameters for key in self.fields)
-            or operation.rows
-        ):
-            raise ValueError("write needs an unfed state, distinct declared fields and no row mask")
+        if definition.feed is not None:
+            raise ValueError(f"@pllm.write: {self.state!r} is filled by its feed; write a state without feed=")
+        if not self.fields or len(set(self.fields)) != len(self.fields) or operation.rows:
+            raise ValueError("@pllm.write needs distinct field names and no rows=; it writes every row")
+        for key in self.fields:
+            context.parameter(self.state, key)
         context.definitions.append((operation.name, fingerprint(self)))
         call = operation.tensor()
         state = context.states[self.state]
@@ -773,20 +778,22 @@ class _Train(_Effect):
         """Declare the batch transition, including its reset and input bindings."""
         if captures:
             raise ValueError("SGD batch training manages its own state writes")
-        if (
-            operation.gradient is not None
-            or operation.rows
-            or self.update
-            or not self.reset
-            or operation.phase is not Phase.AFTER_SAMPLE
-        ):
-            raise ValueError("SGD batch training requires reset and AFTER_SAMPLE without inference-row selectors")
+        if not self.reset:
+            raise ValueError(
+                "a state with an SGD optimizer trains on host batches (pllm.batch) and needs @pllm.train(reset=...) "
+                "naming a method that sets its starting values; give the state pllm.AdamW to train per request"
+            )
+        if operation.gradient is not None or operation.rows or self.update or operation.phase is not Phase.AFTER_SAMPLE:
+            raise ValueError(
+                "SGD batch training uses the whole batch after sampling: remove rows=, update=, @pllm.differentiate "
+                "and @pllm.on"
+            )
         context = operation.context
         sources = {key: source.batch(self.state, definition) for key, source in arguments.items()}
         reset = context.method(self.reset)
         identity = boundary_digest(fingerprint(operation.function), fingerprint(reset), sources, self)
         context.definitions.append((operation.name, identity))
-        context.training = (
+        context.train(
             declare_weighted_train(
                 context.binding,
                 operation.name,
@@ -798,7 +805,7 @@ class _Train(_Effect):
                 function=freeze(operation.function),
                 arguments=sources,
             ),
-            context.states[self.state],
+            self.state,
         )
 
 
@@ -822,7 +829,7 @@ class _Sampler(_Effect):
                 sampler_beta=0.0 if self.beta is None else _setting(self.beta, operation.context.owner, float),
             )
             if operation.context.prediction is not None:
-                raise ValueError("tensor sampler attachment requires one logits operation")
+                raise ValueError("declare at most one @pllm.add_logits or @pllm.guide_sampling method")
             operation.context.prediction = call, self
 
 
@@ -1141,8 +1148,10 @@ def train(
 
 def _setting(value: C | Config, config: Workload, expected: type[C]) -> C:
     resolved = Config.resolve(value, config)
+    if expected is float and type(resolved) is int:
+        resolved = float(resolved)
     if (typed := _typed(resolved, expected)) is None or type(resolved) is not expected:
-        raise TypeError(f"{value}: expected {expected.__name__}")
+        raise TypeError(f"{value!r} is {type(resolved).__name__}; expected {expected.__name__}")
     return typed
 
 
@@ -1454,7 +1463,10 @@ class _Declaration:
 
     def method(self, name: str) -> FunctionType | MethodType:
         """Bind a named authoring method, including an instance-local replacement."""
-        return object.__getattribute__(self.owner, name)
+        try:
+            return object.__getattribute__(self.owner, name)
+        except AttributeError:
+            raise ValueError(f"{name!r} names no method of {type(self.owner).__name__}") from None
 
     def freeze_helpers(self, candidates: dict[str, FunctionType], seeds: list[FunctionType]) -> None:
         """Freeze only helpers reachable from operations, state properties or markers."""
@@ -1464,8 +1476,18 @@ class _Declaration:
         for name in candidates:
             if name in reachable:
                 function = self.method(name)
-                self.definitions.append((name, fingerprint(function)))
+                with self.declaring(name):
+                    self.definitions.append((name, fingerprint(function)))
                 object.__setattr__(self.owner, name, freeze(function))
+
+    @contextmanager
+    def declaring(self, member: str) -> Generator[None]:
+        """Name the workload member whose declaration failed; the exception keeps its type."""
+        try:
+            yield
+        except (ValueError, TypeError) as error:
+            error.add_note(f"while declaring {type(self.owner).__name__}.{member}")
+            raise
 
     def state_definition(self, name: str, error: str) -> InstanceState:
         definition = _typed(self.values.get(name), InstanceState)
@@ -1476,6 +1498,18 @@ class _Declaration:
                 "declare a state as a property annotated `-> pllm.RequestState` or `-> pllm.InstanceState`"
             )
         return definition
+
+    def state(self, name: str, error: str) -> State:
+        """The allocated state `name`; a missing one lists the declared states."""
+        self.state_definition(name, error)
+        return self.states[name]
+
+    def parameter(self, state: str, field: str) -> TensorPort:
+        """The port of one declared state field; a missing one lists the declared fields."""
+        if (state, field) not in self.parameters:
+            declared = ", ".join(f"{resource}.{key}" for resource, key in self.parameters)
+            raise ValueError(f"pllm.parameter({state!r}, {field!r}) names no declared field; declared: {declared}")
+        return self.parameters[state, field]
 
     def allocate_buffers(self, name: str, definition: InstanceState) -> None:
         """Register buffer fields as ordinary readable state ports."""
@@ -1520,7 +1554,8 @@ class _Declaration:
         self.positions = self.position_states()
         for name, value in self.values.items():
             if (state := _typed(value, InstanceState)) is not None:
-                state.declare(name, self)
+                with self.declaring(name):
+                    state.declare(name, self)
                 if state.imported:
                     allocated = self.states[name]
                     self.binding.imports[name] = tuple(
@@ -1538,9 +1573,10 @@ class _Declaration:
 
     def attach_effects(self) -> None:
         """Connect publications before replay and missing-input branches."""
-        for value in self.values.values():
+        for name, value in self.values.items():
             if (effect := _typed(value, Activation) or _typed(value, Overlay)) is not None:
-                effect.declare(self)
+                with self.declaring(name):
+                    effect.declare(self)
         if self.routes:
             declare_layer_route(
                 self.binding,
@@ -1562,6 +1598,8 @@ class _Declaration:
         return states
 
     def train(self, call: Call, state: str) -> None:
+        if self.training is not None:
+            raise ValueError(f"declare one @pllm.train method per workload; {self.training[0].symbol} already trains")
         self.training = call, self.states[state]
 
     def attach_training(self) -> None:
@@ -1569,7 +1607,7 @@ class _Declaration:
         validate_gradients(self.binding, None if self.training is None else self.training[0])
         if self.prediction is not None:
             if self.training is None:
-                raise ValueError("logits attachment requires a training operation")
+                raise ValueError("@pllm.add_logits and @pllm.guide_sampling need a @pllm.train method for their state")
             call, sampler = self.prediction
             declare_logits(
                 self.binding,
@@ -1642,7 +1680,8 @@ class Workload(
         }
         context.declare_values()
         for operation in sorted(context.operations, key=lambda operation: operation.name):
-            operation.effect.declare(operation)
+            with context.declaring(operation.name):
+                operation.effect.declare(operation)
         context.attach_effects()
         context.attach_training()
         context.sign_composition()
@@ -1701,10 +1740,11 @@ class Workload(
                 continue
             if isinstance(effect, _Sampler) and not effect.enabled(context.owner):
                 continue
-            sources[operation.name] = tuple(operation.arguments()[0].values())
-            for method in operation.domains.values():
-                if method:
-                    sources[f"__{operation.name}_{method}"] = tuple(_arguments(context.method(method)).values())
+            with context.declaring(operation.name):
+                sources[operation.name] = tuple(operation.arguments()[0].values())
+                for method in operation.domains.values():
+                    if method:
+                        sources[f"__{operation.name}_{method}"] = tuple(_arguments(context.method(method)).values())
         inputs = tuple(source for name in sorted(sources) for source in sources[name])
         sampler = context.sampler
         return BackendRequirements(

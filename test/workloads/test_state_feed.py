@@ -142,7 +142,7 @@ def test_feed_rejects_local_writers_and_request_scopes():
         def transform(self, value: torch.Tensor = SOURCE, previous: torch.Tensor = TARGET) -> tuple[torch.Tensor, ...]:
             return (value + previous,)
 
-    with pytest.raises(ValueError, match="unfed state"):
+    with pytest.raises(ValueError, match="filled by its feed"):
         WritesSource().declaration(facts_for())
 
 
