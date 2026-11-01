@@ -399,6 +399,8 @@ def rewrite_config(
         config = dict(mapping(source["text_config"]))
         config["tie_word_embeddings"] = source.get("tie_word_embeddings", False)
         architecture = architecture.replace("ForConditionalGeneration", "ForCausalLM")
+        if architecture == "KimiK25ForCausalLM":
+            architecture = "DeepseekV3ForCausalLM"
         for key in ("quantization_config", "transformers_version"):
             if key in source:
                 config[key] = source[key]
@@ -410,14 +412,24 @@ def rewrite_config(
     layers = select_layers(integer(config["num_hidden_layers"]), layers_arg)
     FAMILIES[architecture](config, layers)
     config["num_hidden_layers"] = len(layers)
+    if "quantization_config" in config:
+        quantization = dict(mapping(config["quantization_config"]))
+        if "ignore" in quantization:
+            quantization["ignore"] = [text_name(string(p)) for p in sequence(quantization["ignore"])]
+        config["quantization_config"] = quantization
     return config, layers
+
+
+def text_name(name: str) -> str:
+    """Flatten the Qwen and Kimi text prefixes, including quantization exclusions."""
+    return name.replace("model.language_model.", "model.", 1).replace("language_model.", "", 1)
 
 
 def selected_names(weights: dict[str, JSON], layers: list[int]) -> dict[str, str]:
     """Keep complete selected layers and the text embedding, final norm and head."""
     result: dict[str, str] = {}
     for source in weights:
-        name = source.replace("model.language_model.", "model.", 1)
+        name = text_name(source)
         match = re.fullmatch(r"model\.layers\.(\d+)\.(.+)", name)
         if match is not None:
             layer = int(match[1])
@@ -470,19 +482,66 @@ def dependency_problems(
     if quantization is None:
         if any(t.dtype.startswith("F8") or "scale_inv" in t.name or "weight_packed" in t.name for t in tensors):
             problems.append("Tensors look quantized but the config has no quantization_config")
-    elif mapping(quantization).get("quant_method") != "mxfp4":
-        # MXFP4 keeps its blocks and scales in per-layer tensors next to each weight; other formats are unchecked.
-        problems.append(
-            f"Only MXFP4 tensors are validated to slice as stored, not {mapping(quantization).get('quant_method')}"
-        )
-    elif re.search(r"layers\.\d", json.dumps(quantization)):
-        problems.append("quantization_config names source layer indices; remapping them is not implemented")
+    else:
+        quant = mapping(quantization)
+        if quant.get("quant_method") == "compressed-tensors":
+            problems.extend(int4_problems(quant, tensors))
+        elif quant.get("quant_method") != "mxfp4":
+            problems.append(f"Unsupported stored quantization: {quant.get('quant_method')}")
+        if re.search(r"layers(?:\\\\)?\.\d", json.dumps(quantization)):
+            problems.append("quantization_config names source layer indices; remapping them is not implemented")
     if dequantize is not None:
         problems.append(
             "--dequantize bf16 is a stub: no conversion formats are implemented; omit it for native BF16 weights"
         )
     if include_mtp:
         problems.append("--include-mtp is not implemented; omit it for ordinary decoding")
+    return problems
+
+
+def int4_problems(quant: dict[str, JSON], tensors: list[Tensor]) -> list[str]:
+    """Check the symmetric group-32 INT4 packing used by Kimi K2 Thinking and K2.5–K2.7."""
+    groups = mapping(quant["config_groups"])
+    for value in groups.values():
+        group = mapping(value)
+        weight = mapping(group["weights"])
+        if (
+            quant.get("format") != "pack-quantized"
+            or group.get("input_activations") is not None
+            or group.get("output_activations") is not None
+            or any(
+                weight.get(k) != v
+                for k, v in {
+                    "num_bits": 4,
+                    "group_size": 32,
+                    "symmetric": True,
+                    "type": "int",
+                    "strategy": "group",
+                    "dynamic": False,
+                    "actorder": None,
+                }.items()
+            )
+        ):
+            return ["Only symmetric, static INT4 group-32 weight-only packing is supported"]
+    inventory = {t.name: t for t in tensors}
+    problems: list[str] = []
+    for tensor in tensors:
+        if not tensor.name.endswith(".weight_packed"):
+            continue
+        prefix = tensor.name.removesuffix("weight_packed")
+        scale = inventory.get(prefix + "weight_scale")
+        shape = inventory.get(prefix + "weight_shape")
+        if (
+            tensor.dtype != "I32"
+            or len(tensor.shape) != 2
+            or scale is None
+            or shape is None
+            or scale.dtype not in ("BF16", "F16", "F32")
+            or scale.shape != [tensor.shape[0], tensor.shape[1] // 4]
+            or shape.dtype not in ("I32", "I64")
+            or shape.shape != [2]
+        ):
+            problems.append(f"Missing or inconsistent INT4 packing/scale/shape: {tensor.name}")
     return problems
 
 
@@ -537,7 +596,7 @@ def write_json(path: Path, value: JSON) -> None:
 
 
 def assets(remote: Source) -> dict[str, bytes]:
-    """Fetch only a fixed allowlist of tokenizer/decoding files, never model code."""
+    """Fetch tokenizer assets; Kimi code stays beside the slice, never imported by pllm."""
     result: dict[str, bytes] = {}
     for name in (
         "tokenizer.json",
@@ -553,7 +612,17 @@ def assets(remote: Source) -> dict[str, bytes]:
             result[name] = remote.metadata(name)
         except FileNotFoundError:
             pass
-    if "tokenizer_config.json" not in result or not ({"tokenizer.json", "vocab.json"} & result.keys()):
+    if (
+        "tokenizer_config.json" in result
+        and decode(result["tokenizer_config.json"]).get("tokenizer_class") == "TikTokenTokenizer"
+    ):
+        for name in ("tokenization_kimi.py", "tiktoken.model", "LICENSE"):
+            result[name] = remote.metadata(name)
+        if b"from .tool_declaration_ts import" in result["tokenization_kimi.py"]:
+            result["tool_declaration_ts.py"] = remote.metadata("tool_declaration_ts.py")
+    if "tokenizer_config.json" not in result or not (
+        {"tokenizer.json", "vocab.json", "tiktoken.model"} & result.keys()
+    ):
         raise ValueError("Checkpoint lacks supported tokenizer assets")
     return result
 
