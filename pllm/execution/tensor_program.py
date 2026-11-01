@@ -1,7 +1,7 @@
 """Tensor operations and their settlement.
 
 Owns the operands a body borrows (TensorBatch, read_batch), what a body returns (TaskOutput), the optimizers
-(PoolSGD, TensorAdamW, PageUpdate) and TensorOperation, which runs one body and turns its output into private
+(PoolSGD, PageUpdate) and TensorOperation, which runs one body and turns its output into private
 writes, publications, counters and trace records. TensorBinding and the other bindings build TensorOperations;
 StateExecution runs them.
 """
@@ -42,6 +42,9 @@ I = TypeVar("I", bound=TensorStepInput)
 D = TypeVar("D")
 R = TypeVar("R")
 Roots = tuple[tuple[torch.Tensor, ...], ...]
+# An AdamW state's leading fields, in layout order: one flat parameter field and its optimizer fields.
+ADAM_FIELDS = ("parameters", "gradient", "step", "exp_avg", "exp_avg_sq")
+ADAM = len(ADAM_FIELDS)
 
 
 def _unwired(*_args: int | StateResource) -> Never:
@@ -130,7 +133,8 @@ def autograd_loss(
     def execute(data: D, batch: TensorBatch) -> TaskOutput:
         (root,) = batch.roots
         with torch.enable_grad():
-            parameters = {name: root[5 * index].detach().requires_grad_(True) for index, name in enumerate(names)}
+            (name,) = names
+            parameters = {name: root[0].detach().requires_grad_(True)}
             sample = root[0]
             call = function if sample.device.type != "cuda" or MemoryTrace.active.get() is not None else compiled
             loss = call(data, parameters)
@@ -263,21 +267,11 @@ class FunctionMath(Generic[I, D, R]):
 FieldSlots = Callable[[int], tuple[torch.Tensor, tuple[int, ...]]]
 
 
-class Optimizer(Protocol):
-    @property
-    def groups(self) -> int: ...
-
-    def update(
-        self, roots: Sequence[tuple[torch.Tensor, ...]], slots: FieldSlots, gradients: tuple[torch.Tensor, ...]
-    ) -> None: ...
-
-
 @dataclass(frozen=True, slots=True)
 class PoolSGD:
     """Apply ordinary SGD to private parameter views, shared by batch and region training."""
 
     lr: float
-    groups: int
 
     @torch.no_grad()
     def update(
@@ -326,41 +320,30 @@ def apply_adamw_or_reserve(
 
 
 @dataclass(frozen=True, slots=True)
-class TensorAdamW:
-    """Apply one Torch AdamW batch to the caller's already-private five-field groups."""
+class PageUpdate:
+    """AdamW over the ADAM_FIELDS of private roots: Torch's update on tensor views, the paged kernel on FP32 CUDA
+    page pools. The invocation retains publication and page ownership."""
 
     config: AdamWConfig
-    groups: int
-
-    def update(
-        self, roots: Sequence[tuple[torch.Tensor, ...]], slots: FieldSlots, gradients: tuple[torch.Tensor, ...]
-    ) -> None:
-        """Update in place; the invocation retains publication and page ownership."""
-        self.tensors(roots, gradients)
 
     def tensors(self, roots: Sequence[tuple[torch.Tensor, ...]], gradients: tuple[torch.Tensor, ...]) -> None:
-        """Apply the same grouped Torch update to ordinary or gathered private fields."""
+        """Apply Torch's update to ordinary or gathered private fields."""
         apply_adamw_or_reserve(
-            tuple(root[5 * group : 5 * group + 5] for root in roots for group in range(self.groups)),
-            AdamWFields(*(LayoutFieldId(i) for i in range(5))),
+            tuple(root[:ADAM] for root in roots),
+            AdamWFields(*(LayoutFieldId(i) for i in range(ADAM))),
             self.config,
             gradients,
         )
-
-
-@dataclass(frozen=True, slots=True)
-class PageUpdate(TensorAdamW):
-    """One update entry point for grouped tensor views and FP32 CUDA page pools."""
 
     def update(
         self, roots: Sequence[tuple[torch.Tensor, ...]], slots: FieldSlots, gradients: tuple[torch.Tensor, ...]
     ) -> None:
         """Update the borrowed parameter views; meta executes the same paged tensor path."""
         parameter = roots[0][0]
-        if self.groups != 1 or parameter.device.type == "cpu" or parameter.dtype != torch.float32:
+        if parameter.device.type == "cpu" or parameter.dtype != torch.float32:
             self.tensors(roots, gradients)
             return
-        fields = tuple(slots(i) for i in range(5))
+        fields = tuple(slots(i) for i in range(ADAM))
         pools = tuple(pool.reshape(len(pool), -1) if index != 2 else pool for index, (pool, _) in enumerate(fields))
         table = upload([rows for _, rows in fields], parameter.device)
         paged_adamw(pools, table, torch.stack(gradients).reshape(len(gradients), -1), self.config)
@@ -387,20 +370,20 @@ class PageUpdate(TensorAdamW):
         count = gradients.shape[0]
         stepped = torch.where(updates, destinations, -1)
         if paged:
-            paged_adamw(pools[:5], stepped[:5], gradients, self.config, sources[:5, :count].contiguous())
+            paged_adamw(pools[:ADAM], stepped[:ADAM], gradients, self.config, sources[:ADAM, :count].contiguous())
         else:
             self.tensors(
-                tuple(tuple(value[row] for value in fields[:5]) for row in range(count)), tuple(gradients.unbind())
+                tuple(tuple(value[row] for value in fields[:ADAM]) for row in range(count)), tuple(gradients.unbind())
             )
             rows = torch.arange(count, device=destinations.device)
-            for field in range(5):
+            for field in range(ADAM):
                 copy_pages(fields[field], pools[field], rows, stepped[field])
         captured = torch.where(updates & (last >= 0), destinations, -1)
         for field, value in captures.items():
             assert value.shape[1:] == pools[field].shape[1:] and value.dtype == pools[field].dtype
             copy_pages(value.detach(), pools[field], last.clamp_min(0), captured[field])
         for field in range(len(pools)):
-            written = stepped if field < 5 else captured if field in captures else None
+            written = stepped if field < ADAM else captured if field in captures else None
             copy_pages(
                 pools[field],
                 pools[field],
@@ -441,7 +424,7 @@ class TensorOperation(Generic[D]):
     body: Callable[[D, TensorBatch, StateTaskContext[D] | None], TaskOutput]
     mode: Literal["read", "transition", "update", "gradient"] = "read"
     select: Callable[[D, RequestStateSelection], tuple[int, ...]] | None = None
-    optimizer: Optimizer | None = None
+    optimizer: PageUpdate | None = None
     publish: bool = False
     version: Literal["input", "private", "published"] = "input"
     copy_fields: tuple[LayoutFieldId, ...] | None = None
@@ -478,7 +461,7 @@ class TensorOperation(Generic[D]):
         self.optimizer.update(roots, slots, output.gradients)
         if output.update_mask is not None:
             for root, source in zip(roots, before, strict=True):
-                for value, previous in zip(root[: 5 * self.optimizer.groups], source, strict=False):
+                for value, previous in zip(root[:ADAM], source, strict=False):
                     torch.where(output.update_mask, value, previous, out=value)
 
     def execute(self, context: StateTaskContext[D]) -> ProjectionResiduals:
@@ -503,7 +486,7 @@ class TensorOperation(Generic[D]):
                 assert (
                     self.mode in ("update", "gradient")
                     and self.optimizer is not None
-                    and len(output.gradients) == len(selected) * self.optimizer.groups
+                    and len(output.gradients) == len(selected)
                 )
                 write = context.prepare_owned_write(context.pin.refs.take(selected), copy_fields=self.copy_fields)
                 roots = context.arena.lazy_roots((write,) * len(selected), write.after_refs)

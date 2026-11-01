@@ -71,7 +71,8 @@ from pllm.execution.state_execution import (
     StateTaskContext,
 )
 from pllm.execution.tensor_program import (
-    Optimizer,
+    ADAM,
+    ADAM_FIELDS,
     PageUpdate,
     TaskOutput,
     TensorBatch,
@@ -119,24 +120,12 @@ class Field:
     alignment: int = 16
 
 
-# The fields AdamW keeps per parameter field, in layout order.
-ADAM_FIELDS = ("parameters", "gradient", "step", "exp_avg", "exp_avg_sq")
-
-
-def adam_fields(shape: Shape, *, dtype: TensorDType = TensorDType.FLOAT32, alignment: int = 16) -> tuple[Field, ...]:
-    return tuple(
-        Field(name, () if name == "step" else shape, TensorDType.FLOAT32 if name == "step" else dtype, alignment)
-        for name in ADAM_FIELDS
-    )
-
-
 @dataclass(frozen=True, slots=True)
 class State:
     declaration: SemanticState
     fields: tuple[Field, ...]
+    # With AdamW, the first ADAM fields are one flat parameter field and its optimizer fields.
     optimizer: AdamWConfig | None = None
-    # Count of leading optimizer-expanded fields; trailing fields are plain memory.
-    optimizer_fields: int = 0
 
     def read(self, phase: HiddenPhase = HiddenPhase.DECODE) -> StateSelectionInputSource:
         return StateSelectionInputSource(self.declaration.resource, phase)
@@ -160,25 +149,25 @@ class State:
         )
 
     def page_update(self) -> PageUpdate:
-        """The AdamW update over each parameter's optimizer fields."""
+        """The AdamW update over this state's optimizer fields."""
         assert self.optimizer is not None
-        return PageUpdate(self.optimizer, self.optimizer_fields // len(ADAM_FIELDS))
+        return PageUpdate(self.optimizer)
+
+    @property
+    def memory_fields(self) -> tuple[Field, ...]:
+        """The plain memory fields that follow the AdamW fields."""
+        return self.fields[0 if self.optimizer is None else ADAM :]
 
     @property
     def copy_fields(self) -> tuple[LayoutFieldId, ...]:
-        """The fields an optimizer update carries into the next version: all but each parameter's gradient."""
-        return tuple(
-            LayoutFieldId(i)
-            for i in range(len(self.fields))
-            if i >= self.optimizer_fields or ADAM_FIELDS[i % len(ADAM_FIELDS)] != "gradient"
-        )
+        """The fields an optimizer update carries into the next version: all but the gradient."""
+        gradient = ADAM_FIELDS.index("gradient")
+        return tuple(LayoutFieldId(i) for i in range(len(self.fields)) if self.optimizer is None or i != gradient)
 
     @property
     def parameter_names(self) -> tuple[str, ...]:
-        """The parameter field names AdamW was expanded from."""
-        return tuple(
-            field.name.removesuffix(".parameters") for field in self.fields[: self.optimizer_fields : len(ADAM_FIELDS)]
-        )
+        """The flat AdamW parameter field's name."""
+        return (self.fields[0].name.removesuffix(".parameters"),)
 
 
 def operation_mode(changes: State | None, *, transition: bool, optimizer: bool) -> OperationMode:
@@ -249,18 +238,17 @@ class Builder(Generic[D]):
                 self.graph, states=tuple(sorted((*self.graph.states, declaration), key=lambda state: state.resource))
             )
             return State(declaration, ())
-        optimizer_fields = 0
         if optimizer is not None:
+            (parameters,) = fields  # declare_parameters packs AdamW parameters into one flat field
             fields = tuple(
                 replace(
-                    part,
-                    name=f"{field.name}.{part.name}",
-                    dtype=TensorDType.FLOAT32 if part.name == "step" else field.dtype,
+                    parameters,
+                    name=f"{parameters.name}.{name}",
+                    shape=() if name == "step" else parameters.shape,
+                    dtype=TensorDType.FLOAT32 if name == "step" else parameters.dtype,
                 )
-                for field in fields
-                for part in adam_fields(field.shape, alignment=field.alignment)
+                for name in ADAM_FIELDS
             )
-            optimizer_fields = len(fields)
         fields = (*fields, *memory)
         if len({field.name for field in fields}) != len(fields):
             raise ValueError(f"{name}: duplicate field name")
@@ -298,10 +286,8 @@ class Builder(Generic[D]):
                 )
             )
         if optimizer is not None and scope is StateScope.INSTANCE:
-            self.zero_start_fields[name] = frozenset(
-                i for i in range(optimizer_fields) if ADAM_FIELDS[i % len(ADAM_FIELDS)] != "parameters"
-            )
-        return State(declaration, fields, optimizer, optimizer_fields)
+            self.zero_start_fields[name] = frozenset(range(1, ADAM))  # every AdamW field after the parameters
+        return State(declaration, fields, optimizer)
 
     @staticmethod
     def input(service: str, port: str, schema: str) -> HostServiceInputSource:
@@ -330,7 +316,6 @@ class Builder(Generic[D]):
         function: Callable[[D, TensorBatch], TaskOutput] | None = None,
         operation_type: type[TensorOperation[D]] = TensorOperation,
         select: Callable[[D, RequestStateSelection], tuple[int, ...]] | None = None,
-        optimizer: Optimizer | None = None,
     ) -> Call:
         if any(task.symbol == name for task in self.graph.tasks):
             raise ValueError(f"duplicate operation {name}")
@@ -362,9 +347,9 @@ class Builder(Generic[D]):
         )
         self.graph = replace(self.graph, tasks=tuple(sorted((*self.graph.tasks, task), key=lambda item: item.symbol)))
         if function is not None:
-            copy_fields: tuple[LayoutFieldId, ...] | None = None
-            if changes is not None and changes.optimizer is not None and optimizer is None:
-                copy_fields, optimizer = changes.copy_fields, changes.page_update()
+            optimizer, copy_fields = None, None
+            if changes is not None and changes.optimizer is not None:
+                optimizer, copy_fields = changes.page_update(), changes.copy_fields
             self.operations[task.symbol] = operation_type(
                 implementations[0].implementation_id,
                 partial(native_body, function),

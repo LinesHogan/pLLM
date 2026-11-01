@@ -288,7 +288,7 @@ class Capture:
         if self.state != state:
             raise ValueError("memory captures target the task's own training state")
         assert update is not None
-        if self.field not in {field.name for field in update.fields[update.optimizer_fields :]}:
+        if self.field not in {field.name for field in update.memory_fields}:
             raise ValueError(f"{self.field}: captures name a declared memory field")
         return update.field(self.field)
 
@@ -982,7 +982,7 @@ def _chunked_overlay(
         update = GradientUpdate(
             overlay_gradient(function),
             overlay_gradient(function, batched=True),
-            PoolSGD(optimizer.lr, len(effect.applied_fields)),
+            PoolSGD(optimizer.lr),
             effect,
             chunk,
             flush == "prompt_end",

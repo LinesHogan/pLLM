@@ -29,7 +29,7 @@ from pllm.execution.tensor_frame import (
     row_plan,
     training_observations,
 )
-from pllm.execution.tensor_program import PageUpdate, TaskOutput, TensorBatch
+from pllm.execution.tensor_program import ADAM, PageUpdate, TaskOutput, TensorBatch
 from pllm.execution.tensor_task import FieldWriter, TensorTask
 from pllm.kernels.page_copy import copy_pages, gather_rows
 
@@ -225,7 +225,7 @@ class TensorExecutor:
     ) -> tuple[FixedRows, TensorBatch]:
         columns, sources = views[0], views[1]
         # The eager optimizer updates gathered copies of its fields in place.
-        copied = frozenset(range(5)) if self.optimizer is not None and not self.paged else frozenset[int]()
+        copied = frozenset(range(ADAM)) if self.optimizer is not None and not self.paged else frozenset[int]()
         reads = self.read_fields | copied
         instance = batch.selection.keys == (None,)
         # A single-page instance has no alternate slot; borrow its pool instead of copying the network.

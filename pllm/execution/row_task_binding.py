@@ -307,7 +307,7 @@ def declare_weighted_train(
     if b.host:
         raise ValueError("SGD batch training needs a model backend; host workloads train a pllm.AdamW state")
     fields = tuple(field.name for field in state.fields)
-    application = PoolSGD(optimizer.lr, len(fields))
+    application = PoolSGD(optimizer.lr)
     prepare_function = partial(prepare_weighted_batch, b.dimensions, fields, reset)
     prepared = b.compute(
         f"__{name}_prepare",
