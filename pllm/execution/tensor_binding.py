@@ -249,83 +249,87 @@ class TensorBinding(Builder[TensorFrame]):
         """Build each tensor operation once, with the same scan scope for eager and captured math."""
         capture = facts is not None and "compute/cuda_graph@1" in facts.timeline.capabilities
         limits = {fact.task: fact for fact in resources}
-        operations: dict[TaskSymbol, TensorOperation[TensorFrame]] = {}
-        declarations = {task.symbol: task for task in self.graph.tasks}
-        for symbol in (*self.operations, *self.tensor_tasks):
-            declaration = declarations[symbol]
-            scans = (
-                None
-                if facts is None
-                else ScanContext(
-                    facts.timeline.tensor_policy,
-                    facts.probe.max_packed_rows,
-                    facts.device,
-                    None
-                    if facts.timeline.memory_budget_bytes is None
-                    else facts.timeline.memory_budget_bytes // max(1, facts.max_admitted_lineages),
-                    replay=capture,
-                )
+        operations = {
+            symbol: self._operation(symbol, capture, limits)
+            for symbol in self.operations
+            if symbol not in self.tensor_tasks
+        }
+        operations.update(
+            (symbol, self._tensor_operation(task, facts, limits if capture else {}))
+            for symbol, task in self.tensor_tasks.items()
+        )
+        if facts is None:
+            return operations
+        scans = ScanContext(
+            facts.timeline.tensor_policy,
+            facts.probe.max_packed_rows,
+            facts.device,
+            None
+            if facts.timeline.memory_budget_bytes is None
+            else facts.timeline.memory_budget_bytes // max(1, facts.max_admitted_lineages),
+            replay=capture,
+        )
+        return {symbol: replace(operation, body=scans.bind(operation.body)) for symbol, operation in operations.items()}
+
+    def _operation(
+        self, symbol: TaskSymbol, capture: bool, limits: Mapping[TaskSymbol, TaskResourceFact]
+    ) -> TensorOperation[TensorFrame]:
+        """A declared operation; a chunked overlay transition runs through its OverlayBatch."""
+        operation, math = self.operations[symbol], self.overlay_math
+        if math is None or math.chunk is None or symbol != math.task:
+            return operation
+        overlay = OverlayBatch(math, limits.get(symbol) if capture else None)
+        return replace(
+            operation, body=partial(native_body, replace(math, executor=overlay)), capture_resident=overlay.resident
+        )
+
+    def _tensor_operation(
+        self, task: TensorTask, facts: BackendCompileFacts | None, limits: Mapping[TaskSymbol, TaskResourceFact]
+    ) -> TensorOperation[TensorFrame]:
+        """A tensor task's executor: a field writer or a body over masked tables, captured when `limits` funds it."""
+        declaration = next(item for item in self.graph.tasks if item.symbol == task.symbol)
+        state = task.training
+        optimizer = None if state is None else state.page_update()
+        step_capture = self._step_capture(task, facts, limits)
+        executor = (
+            TensorExecutor(
+                task,
+                self.tensor_tasks,
+                optimizer,
+                capture=step_capture,
+                device=torch.device("cpu") if facts is None else facts.device,
             )
-            if symbol not in self.tensor_tasks:
-                operation = self.operations[symbol]
-                math = self.overlay_math
-                if math is not None and math.chunk is not None and symbol == math.task:
-                    overlay = OverlayBatch(math, limits.get(symbol) if capture else None)
-                    operation = replace(
-                        operation,
-                        body=partial(native_body, replace(math, executor=overlay)),
-                        capture_resident=overlay.resident,
-                    )
-                operations[symbol] = operation if scans is None else replace(operation, body=scans.bind(operation.body))
-                continue
-            task = self.tensor_tasks[symbol]
-            state = task.training
-            optimizer = None if state is None else state.page_update()
-            step_capture = (
-                StepCapture(
-                    limits[symbol],
-                    facts.max_admitted_lineages
-                    # A task without its own resource reads every state of the invocation.
-                    if any(
-                        task.resource in ("", state.resource) and state.scope is StateScope.REQUEST
-                        for state in self.graph.states
-                    )
-                    else 1,
-                )
-                if capture
-                and symbol in limits
-                and task.export is None
-                and (task.writer is not None or reads_rows(task, self.tensor_tasks))
-                and facts is not None
-                else None
-            )
-            executor = (
-                TensorExecutor(
-                    task,
-                    self.tensor_tasks,
-                    optimizer,
-                    capture=step_capture,
-                    device=torch.device("cpu") if facts is None else facts.device,
-                )
-                if task.writer is None
-                else FieldWriteExecutor(task.writer, step_capture)
-            )
-            operations[symbol] = TensorOperation(
-                declaration.implementations[0].implementation_id,
-                executor if scans is None else scans.bind(executor),
-                operation_mode(
-                    state,
-                    transition=any(
-                        effect.kind in (StateEffectKind.TRANSITION, StateEffectKind.TRANSITION_MAYBE)
-                        for effect in declaration.effects
-                    ),
-                    optimizer=True,
+            if task.writer is None
+            else FieldWriteExecutor(task.writer, step_capture)
+        )
+        return TensorOperation(
+            declaration.implementations[0].implementation_id,
+            executor,
+            operation_mode(
+                state,
+                transition=any(
+                    effect.kind in (StateEffectKind.TRANSITION, StateEffectKind.TRANSITION_MAYBE)
+                    for effect in declaration.effects
                 ),
-                optimizer=optimizer,
-                copy_fields=None if state is None else state.copy_fields,
-                capture_resident=executor.resident,
-            )
-        return operations
+            ),
+            optimizer=optimizer,
+            copy_fields=None if state is None else state.copy_fields,
+            capture_resident=executor.resident,
+        )
+
+    def _step_capture(
+        self, task: TensorTask, facts: BackendCompileFacts | None, limits: Mapping[TaskSymbol, TaskResourceFact]
+    ) -> StepCapture | None:
+        """Capture a funded writer or row-reading task; exports run eagerly."""
+        if facts is None or task.symbol not in limits or task.export is not None:
+            return None
+        if task.writer is None and not reads_rows(task, self.tensor_tasks):
+            return None
+        # A task without its own resource reads every state of the invocation.
+        request = any(
+            task.resource in ("", state.resource) and state.scope is StateScope.REQUEST for state in self.graph.states
+        )
+        return StepCapture(limits[task.symbol], facts.max_admitted_lineages if request else 1)
 
     def prepare_import(self, update: StateTensorUpdate[torch.Tensor], batch: TensorBatch, data: TensorFrame) -> None:
         """Validate imported fields and map them onto resource-specific private roots."""

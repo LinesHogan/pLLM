@@ -168,12 +168,12 @@ class State:
         return (self.fields[0].name.removesuffix(".parameters"),)
 
 
-def operation_mode(changes: State | None, *, transition: bool, optimizer: bool) -> OperationMode:
-    """How an operation changes its state: not at all, in place, or through a private transition that an optimizer
-    applies gradients to or the operation writes itself."""
+def operation_mode(changes: State | None, *, transition: bool) -> OperationMode:
+    """How an operation changes its state: not at all, in place, or through a private transition that the state's
+    optimizer applies gradients to or the operation writes itself."""
     if changes is None:
         return "read"
-    return ("gradient" if optimizer else "transition") if transition else "update"
+    return ("gradient" if changes.optimizer is not None else "transition") if transition else "update"
 
 
 def planned_implementation(task: SemanticTask, plan: PlanBundle | None) -> ImplementationId:
@@ -354,7 +354,6 @@ class Builder(Generic[D]):
                 operation_mode(
                     changes,
                     transition=effect in (StateEffectKind.TRANSITION, StateEffectKind.TRANSITION_MAYBE),
-                    optimizer=optimizer is not None,
                 ),
                 select=select,
                 optimizer=optimizer,
