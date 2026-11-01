@@ -3,7 +3,7 @@
 import multiprocessing as mp
 from dataclasses import dataclass, replace
 from multiprocessing.connection import Connection
-from unittest.mock import Mock, PropertyMock, patch
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -82,8 +82,7 @@ def _worker(connection: Connection) -> None:
             install = decode_boundary(connection.recv_bytes().decode(), BackendInstall)
             runner = Mock()
             try:
-                with patch.object(GPUWorker, "workload_runner", new_callable=PropertyMock, return_value=runner):
-                    GPUWorker._install(object.__new__(GPUWorker), imported, install)
+                GPUWorker._install(Mock(rank=0, workload_runner=runner), imported, install)
                 arena = runner.attach_workload.call_args.args[0].execution.arena
                 (resource,) = arena.plan.semantic_graph.states
                 write = arena.prepare_admission((resource.resource,))
