@@ -297,8 +297,13 @@ def declare_layer_route(
         and b.attachment.kind is AttachmentKind.PARAMETER_OVERLAY
         and b.overlay_math is not None
     )
-    if b.host or (not activation and not composed and (b.attachment is not None or b.graph.tasks or b.graph.states)):
-        raise ValueError("layer_route requires a standalone effect, Activation or one trained parameter overlay")
+    if b.host:
+        raise ValueError("layer routes run inside a model; compile this workload with make_llm, not make_host")
+    if not activation and not composed and (b.attachment is not None or b.graph.tasks or b.graph.states):
+        raise ValueError(
+            "a layer_route combines only with one Activation or one trained @pllm.overlay; move other states and "
+            "methods to a separate workload"
+        )
     if position_states and (activation or composed):
         raise ValueError("use PositionState on a pure route without learned overlays or activations")
     b.position_states = position_states

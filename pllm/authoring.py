@@ -158,7 +158,11 @@ def _apply_options(facts: BackendCompileFacts, options: ExecutionOptions) -> Bac
     from pllm.contracts.tensor_policy import TensorPolicy
 
     if options.state_memory_bytes > facts.state_memory_budget_bytes:
-        raise ValueError("requested state capacity exceeds available backend memory")
+        raise ValueError(
+            f"ExecutionOptions.state_memory_bytes={options.state_memory_bytes} exceeds the "
+            f"{facts.state_memory_budget_bytes} bytes free on the device; lower it, or lower gpu_memory_utilization "
+            "so vLLM leaves more memory free"
+        )
     capabilities = set(facts.timeline.capabilities)
     if "compute/cuda@1" in capabilities:
         capabilities.add("compute/cuda_graph@1")

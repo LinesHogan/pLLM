@@ -1779,7 +1779,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         if declaration.graph.trains_on_batch:
             if options.memory_budget_bytes is not None and not facts.timeline.task_resources:
                 raise ValueError(
-                    "training on CausalTrainBatch/WeightedRowBatch inputs (e.g. TLM) cannot be funded under "
+                    "training on CausalTrainBatch/WeightedRowBatch inputs cannot be funded under "
                     "ExecutionOptions.memory_budget_bytes yet; leave memory_budget_bytes unset"
                 )
             timeline = facts.timeline

@@ -25,15 +25,25 @@ from pllm.execution.token_program import KV
 def validate_attention_resources(attentions: tuple[Attention, ...], *, hidden_size: int) -> None:
     """Check the backend ABI before attaching a replay resource provider."""
     for attention in attentions:
-        if (
-            not isinstance(attention.impl, FlashAttentionImpl)
-            or attention.impl.vllm_flash_attn_version != 2
-            or attention.impl.sliding_window != (-1, -1)
-            or attention.kv_cache_dtype != "auto"
-            or attention.kv_sharing_target_layer_name is not None
-            or attention.num_kv_heads * attention.head_size > hidden_size
-        ):
-            raise ValueError("replay requires FlashAttention2 and unquantized nonshared full-attention GQA/MHA KV")
+        layer, impl = attention.layer_name, attention.impl
+        if not isinstance(impl, FlashAttentionImpl) or impl.vllm_flash_attn_version != 2:
+            raise ValueError(
+                f"layer routes replay vLLM's FlashAttention 2 kernels, but {layer} runs another attention backend "
+                "on this GPU and vLLM build; use a setup where vLLM selects FlashAttention 2"
+            )
+        if impl.sliding_window != (-1, -1):
+            raise ValueError(f"layer routes need full attention; {layer} uses a sliding window, so pick another model")
+        if attention.kv_cache_dtype != "auto":
+            raise ValueError(f"layer routes need an unquantized KV cache; {layer} stores {attention.kv_cache_dtype}")
+        if attention.kv_sharing_target_layer_name is not None:
+            raise ValueError(
+                f"layer routes need each layer to own its KV cache; {layer} shares "
+                f"{attention.kv_sharing_target_layer_name}'s, so pick a model without cross-layer KV sharing"
+            )
+        if attention.num_kv_heads * attention.head_size > hidden_size:
+            raise ValueError(
+                f"layer routes need GQA/MHA attention whose KV width fits the hidden size; {layer} does not"
+            )
 
 
 def attention_metadata(
