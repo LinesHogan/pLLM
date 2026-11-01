@@ -486,7 +486,6 @@ class TensorOperation(Generic[D]):
         with nullcontext() if stream is None else torch.cuda.stream(stream), torch.inference_mode(False):
             batch = read_batch(context, self.version)
             selected = tuple(range(len(batch.roots))) if self.select is None else self.select(data, context.selection)
-            assert len(set(selected)) == len(selected) and all(0 <= i < len(batch.roots) for i in selected)
             write: PageWrite | None = None
             if self.mode == "transition" and selected:
                 if self.version == "input" or context.sole_write() is None:

@@ -117,6 +117,11 @@ class TensorExecutor:
         default_factory=lambda: dict[StateResource, TableLayout]()
     )
     staging: PinnedStaging = dataclass_field(default_factory=PinnedStaging)
+    # Named segments of `table`, split once per call.
+    views: dict[StateResource, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = dataclass_field(
+        default_factory=lambda: dict[StateResource, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]()
+    )
+    hidden_slots: torch.Tensor = dataclass_field(default_factory=lambda: torch.empty((0, 0), dtype=torch.long))
     # Fixed by the task at construction: whether it reads rows through the table, and whether its body
     # differentiates the flat parameter field.
     rowwise: bool = dataclass_field(init=False, default=False)
@@ -156,10 +161,6 @@ class TensorExecutor:
         return self.device.type == "cuda" and self.pools[0].dtype == torch.float32
 
     @property
-    def layout(self) -> TableLayout:
-        return TableLayout(self.rows, self.state_count, len(self.pools), len(self.feedback_names))
-
-    @property
     def table_size(self) -> int:
         """Resource tables followed by one hidden slot column per bound locator."""
         return sum(layout.size for layout in self.layouts.values()) + len(self.hidden_inputs or {}) * self.rows
@@ -181,14 +182,17 @@ class TensorExecutor:
         for row, value in zip(feedback, self.feedback_values[: layout.feedback], strict=True):
             row[:] = (value.data_ptr(), value.stride(0), value.stride(1) if value.ndim > 1 else 1)
 
-    def _views(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def _split(self) -> None:
+        """Name the table's segments once per call: each resource's views, then the hidden slot columns."""
         assert self.table is not None
-        _, sources, destinations, _ = self.layout.split(self.table[: self.layout.size])
-        return sources, destinations
+        offset = 0
+        for resource, layout in self.layouts.items():
+            self.views[resource] = layout.split(self.table[offset : offset + layout.size])
+            offset += layout.size
+        self.hidden_slots = self.table[offset:].view(-1, self.rows)
 
     def _feedback(self, rows: torch.Tensor) -> dict[str, torch.Tensor]:
-        assert self.table is not None
-        locations = self.layout.split(self.table[: self.layout.size])[3]
+        locations = self.views[self.task.resource][3]
         return {
             name: gather_rows(location, rows, value)
             for name, location, value in zip(self.feedback_names, locations, self.feedback_values, strict=True)
@@ -197,14 +201,11 @@ class TensorExecutor:
     def _frame(self, data: TensorFrame, batch: TensorBatch) -> tuple[TensorFrame, TensorBatch]:
         tables: dict[StateResource, FixedRows] = {}
         batches: dict[StateResource, TensorBatch] = {}
-        assert self.table is not None
-        offset = 0
         for resource, layout in self.layouts.items():
             selected = batch.for_resource(resource) if resource else batch
             tables[resource], batches[resource] = self._resource_rows(
-                selected, layout, self.table[offset : offset + layout.size], self.resource_pools[resource]
+                selected, layout, self.views[resource], self.resource_pools[resource]
             )
-            offset += layout.size
         table = tables.pop(self.task.resource)
         frame = replace(
             data,
@@ -216,10 +217,13 @@ class TensorExecutor:
         return frame, replace(batches[self.task.resource], select_resource=batches.__getitem__)
 
     def _resource_rows(
-        self, batch: TensorBatch, layout: TableLayout, table: torch.Tensor, pools: tuple[torch.Tensor, ...]
+        self,
+        batch: TensorBatch,
+        layout: TableLayout,
+        views: tuple[torch.Tensor, ...],
+        pools: tuple[torch.Tensor, ...],
     ) -> tuple[FixedRows, TensorBatch]:
-        assert self.table is not None
-        columns, sources, _, _ = layout.split(table)
+        columns, sources = views[0], views[1]
         # The eager optimizer updates gathered copies of its fields in place.
         copied = frozenset(range(5)) if self.optimizer is not None and not self.paged else frozenset[int]()
         reads = self.read_fields | copied
@@ -244,11 +248,7 @@ class TensorExecutor:
             columns[4] > 0,
             {
                 key: (pool, slots)
-                for (key, pool), slots in zip(
-                    (self.hidden_inputs or {}).items(),
-                    self.table[sum(item.size for item in self.layouts.values()) :].view(-1, self.rows),
-                    strict=True,
-                )
+                for (key, pool), slots in zip((self.hidden_inputs or {}).items(), self.hidden_slots, strict=True)
             },
             self._feedback(columns[0]),
             fields[0].detach().requires_grad_(True) if self.differentiates else None,
@@ -281,7 +281,7 @@ class TensorExecutor:
         self.input_gradients = dict(zip(sources, (value.detach() for value in derivatives[1:]), strict=True))
         self.gradients = derivatives[0].detach()[: self.state_count].contiguous()
         self.counters = torch.stack((updates.sum(), trained.sum()))
-        slots, destinations = self._views()
+        _, slots, destinations, _ = self.views[self.task.resource]
         self.optimizer.staged(
             self.pools,
             frame.table.fields,
@@ -323,8 +323,10 @@ class TensorExecutor:
         parent, frame = batch, data
         if self.task.resource and any(group.resource == self.task.resource for group in batch.selection.groups):
             batch = batch.for_resource(self.task.resource)
-        eligible = set(data.rows) if self.task.phase is None else set(data.step.rows.producer_rows(self.task.phase))
-        rows = tuple(row for row in data.rows if row in eligible) if self.task.phase is not None else data.rows
+        rows = data.rows
+        if self.task.phase is not None:
+            eligible = set(data.step.rows.producer_rows(self.task.phase))
+            rows = tuple(row for row in rows if row in eligible)
         if rows != data.rows or batch.selection is not parent.selection:
             data = replace(data, rows=rows, plan=None)
         if not data.rows and self.task.phase is not None:
@@ -346,6 +348,7 @@ class TensorExecutor:
                 self.table = torch.empty(self.table_size, device="meta", dtype=torch.long)
             else:
                 self._prepare(plan, data, batch)
+            self._split()
         if self.capture is None or context is None:
             self._body(data, batch)
         else:
@@ -354,7 +357,7 @@ class TensorExecutor:
             self.capture.run(
                 lambda: self._body(data, batch),
                 self.table,
-                self._views()[1],
+                self.views[self.task.resource][2],
                 addresses,
                 batch.stream,
                 lambda: self.staging.copy_to(table),

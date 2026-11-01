@@ -26,12 +26,18 @@ _DataT = TypeVar("_DataT")
 
 
 class PostSampleOverlap:
-    """One serial writer lane and a bounded history of exact pins."""
+    """One serial writer lane and a bounded history of exact pins; the step hands off before `anchor`, the first
+    anchor with a task that reads the latest version."""
 
     def __init__(
-        self, arena: PageBundleArena, directory: RequestStateDirectory, lag: int, stream: torch.cuda.Stream
+        self,
+        arena: PageBundleArena,
+        directory: RequestStateDirectory,
+        lag: int,
+        stream: torch.cuda.Stream,
+        anchor: int,
     ) -> None:
-        self.arena, self.directory, self.lag, self.stream = arena, directory, lag, stream
+        self.arena, self.directory, self.lag, self.stream, self.anchor = arena, directory, lag, stream, anchor
         self._history: deque[PagePin] = deque()
 
     @property

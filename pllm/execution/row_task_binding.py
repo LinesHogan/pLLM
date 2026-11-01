@@ -463,8 +463,6 @@ def declare_tensor(
         if "__update_state" in sources:
             raise ValueError("__update_state is reserved for the optimizer's state selection")
         sources["__update_state"] = update.read()
-    if update is not None and update.optimizer is None:
-        raise ValueError("training requires an optimizer on its declared state")
     policy = MathContract() if math is None else math
     reads = tuple(
         SemanticEffect(resource, StateEffectKind.READ)

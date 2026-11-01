@@ -242,9 +242,10 @@ class TensorBinding(Builder[TensorFrame]):
         return any(task.export is not None for task in self.tensor_tasks.values())
 
     def configure_scans(self, facts: BackendCompileFacts) -> None:
-        """Scope model-route scans; ordinary task scopes are built in executables."""
+        """Scope model-route scans and give a chunked route overlay its eager batched executor; ordinary task
+        scopes and executors are built in executables."""
         if self.overlay_math is not None and any(task.replay is not None for task in self.graph.tasks):
-            self.overlay_math = replace(
+            math = replace(
                 self.overlay_math,
                 function=ScanContext(
                     facts.timeline.tensor_policy,
@@ -253,6 +254,7 @@ class TensorBinding(Builder[TensorFrame]):
                     replay="compute/cuda_graph@1" in facts.timeline.capabilities,
                 ).bind(self.overlay_math.function),
             )
+            self.overlay_math = math if math.chunk is None else replace(math, executor=OverlayBatch(math))
 
     def executables(
         self, facts: BackendCompileFacts | None, resources: tuple[TaskResourceFact, ...]

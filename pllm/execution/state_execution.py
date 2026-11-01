@@ -461,7 +461,8 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             if any(task.lane == "side" for task in tasks)
             else torch.cuda.current_stream(self.device)
         )
-        return PostSampleOverlap(self.arena, self.directory, max(task.read_distance for task in tasks), stream)
+        anchor = min(task.anchor_id for task in tasks if task.read_origin == "latest")
+        return PostSampleOverlap(self.arena, self.directory, max(task.read_distance for task in tasks), stream, anchor)
 
     def close(self) -> None:
         """Finish asynchronous exports when direct ownership or a backend session ends; idempotent."""
@@ -617,9 +618,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         """Run every anchor up to `symbol`, handing the step to the post-sample overlap before its first latest read."""
         target = next(anchor.ordinal for anchor in self.arena.plan.timeline.anchors if anchor.symbol == symbol)
         for ordinal in range(context.last_anchor_id + 1, target + 1):
-            if self.post_sample is not None and any(
-                task.anchor_id == ordinal and task.read_origin == "latest" for task in self.plan.tasks
-            ):
+            if self.post_sample is not None and ordinal == self.post_sample.anchor:
                 self.post_sample.hand_off(context)
             self.execute_anchor(context, AnchorId(ordinal))
 

@@ -373,9 +373,9 @@ class OverlayTransition:
     ) -> tuple[tuple[TensorUpdate, ...], torch.Tensor]:
         """Gather issued slots once per target/phase; settlement still belongs to the task."""
         if self.chunk is not None:
-            from pllm.execution.overlay_batch import OverlayBatch
-
-            return (self.executor or OverlayBatch(self)).run(operands, target, indices, batch)
+            # TensorBinding installs the batched executor for every chunked overlay (configure_scans for routes).
+            assert self.executor is not None
+            return self.executor.run(operands, target, indices, batch)
         return self.serial(operands, target, indices, batch)
 
     def serial(
