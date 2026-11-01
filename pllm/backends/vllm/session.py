@@ -389,8 +389,12 @@ class VllmSession(Generic[DataT, ResultT]):
         """vLLM's LM head. Post-filter guidance projects its predicted hidden rows in the same call.
 
         Decode-time LM heads are bound by reading the [vocab, hidden] weight, so projecting the
-        prediction alongside the model's rows costs about as much as the model's rows alone. A request
-        for logits means the transformer forward is over on both runner ABIs.
+        prediction alongside the model's rows costs about as much as the model's rows alone. The extra
+        rows change the model rows' logits only as a larger batch would (cuBLAS picks kernels by row
+        count); on Qwen2.5-0.5B and a DeepSeek-V2-Lite slice that never exceeded plain vLLM's own
+        batch-size sensitivity (0.0625 and 0.5). Steps without guided rows append none, and zero-strength
+        guidance declares no sampler. A request for logits means the transformer forward is over on both
+        runner ABIs.
         """
         lm_head = self._compute_logits
         step = self._step
