@@ -1,6 +1,7 @@
 """Causal chunk mathematics over request-owned, per-target buffers."""
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 
@@ -15,8 +16,7 @@ class InPlaceTTTConfig:
     targets: tuple[ParameterTarget, ...]
     chunk_size: int = 4096
     learning_rate: float = 1e-3
-    update_prefill: bool = True
-    update_decode: bool = False
+    tokens: Literal["prefill", "decode", "all"] = "prefill"  # whose projection operands train the state
     visibility: pllm.Visibility = pllm.Visibility.forward_pinned()
 
     def __post_init__(self) -> None:
@@ -49,14 +49,13 @@ class InPlaceTTTWorkload(pllm.Workload):
             ),
         )
 
-    @pllm.overlay(
+    @pllm.train_in_forward(
         visibility=pllm.Config("config.visibility"),
         state="dense_fast_weights",
         targets=pllm.Config("config.targets"),
         weight="delta",
         chunk=pllm.Config("config.chunk_size"),
-        prefill=pllm.Config("config.update_prefill"),
-        decode=pllm.Config("config.update_decode"),
+        tokens=pllm.Config("config.tokens"),
     )
     def step(
         self,

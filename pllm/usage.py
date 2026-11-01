@@ -26,10 +26,10 @@ from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.host_batch import CausalTrainBatch, WeightedCEBatch, WeightedRowBatch, validate_host_batch
 from pllm.contracts.parameter_overlay import (
-    ParameterEffect as ParameterEffect,
     ParameterOverlayFieldBinding,
     ParameterOverlayOperator,
     ParameterTarget,
+    ProjectionDelta,
 )
 from pllm.contracts.request_identity import RequestKeyField, canonical_request_key_fields
 from pllm.contracts.sampler import SamplerStage
@@ -52,7 +52,7 @@ from pllm.contracts.state_feed import FeedBinding, FeedOrder
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 from pllm.contracts.visibility import Exact as Exact, Visibility as Visibility
 from pllm.execution.binding_base import SGD as SGD, Buffer as Buffer, buffer_field, overlay_fields
-from pllm.execution.causal_batch import CausalBinder, CausalCall, CausalPort, declare_batch_train
+from pllm.execution.causal_batch import CausalBinder, CausalModel, CausalPort, declare_batch_train
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import Call, Dimensions, Field, Shape, State, When
 from pllm.execution.freeze import (
@@ -116,6 +116,12 @@ Initializer = Callable[[Tensors, torch.Generator], None]
 C = TypeVar("C")
 # How @pllm.train averages per-row losses: over all rows, or per state and then summed over states.
 TrainReduction = Literal["mean", "state_mean"]
+# The tokens whose projection operands train a @pllm.train_in_forward state.
+_TOKEN_PHASES: dict[str, tuple[HiddenPhase, ...]] = {
+    "prefill": (HiddenPhase.PREFILL,),
+    "decode": (HiddenPhase.DECODE,),
+    "all": (HiddenPhase.PREFILL, HiddenPhase.DECODE),
+}
 
 
 class Phase(Enum):
@@ -138,8 +144,8 @@ class _Source:
     def training_port(self, context: _Declaration) -> CausalPort:
         raise ValueError("causal training inputs must name Batch, Parameter or causal_model ports")
 
-    def overlay(self, state: str, buffers: Mapping[str, Buffer]) -> str:
-        raise TypeError("overlay inputs must name captured operands or its own state buffers")
+    def in_forward_binding(self, state: str, buffers: Mapping[str, Buffer]) -> str:
+        raise TypeError("@pllm.train_in_forward inputs are pllm.operand(...) or pllm.parameter fields of its own state")
 
     def batch(self, state: str, definition: InstanceState) -> tuple[str, str]:
         raise ValueError("batch training inputs must name its batch tensors or own parameters")
@@ -229,8 +235,10 @@ class Parameter(_Source):
         parameter = context.parameter(self.state, self.field)
         return parameter_rows(parameter) if self.per_row else parameter
 
-    def overlay(self, state: str, buffers: Mapping[str, Buffer]) -> str:
-        return self.field if self.state == state and self.field in buffers else super().overlay(state, buffers)
+    def in_forward_binding(self, state: str, buffers: Mapping[str, Buffer]) -> str:
+        if self.state == state and self.field in buffers:
+            return self.field
+        return super().in_forward_binding(state, buffers)
 
     def batch(self, state: str, definition: InstanceState) -> tuple[str, str]:
         if self.state != state or self.field not in definition.fields or self.per_row:
@@ -239,21 +247,21 @@ class Parameter(_Source):
 
 
 @dataclass(frozen=True)
-class _CausalModel(_Source):
-    """An overlay's differentiable views adapted to a worker-local model callable."""
+class _CausalModelMarker(_Source):
+    """An adapter's differentiable views adapted to a worker-local model callable."""
 
     name: str
 
     def training_port(self, context: _Declaration) -> CausalPort:
-        overlay = context.overlays.get(self.name)
-        if overlay is None:
-            raise ValueError(f"pllm.causal_model({self.name!r}) must name a pllm.model.Overlay of the workload")
-        state = context.states[overlay.state]
-        bindings = overlay.bindings(context)
+        adapter = context.adapters.get(self.name)
+        if adapter is None:
+            raise ValueError(f"pllm.causal_model({self.name!r}) must name a pllm.model.Adapter of the workload")
+        state = context.states[adapter.state]
+        bindings = adapter.bindings(context)
         forward = None if context.binding.causal is None else context.binding.causal(bindings)
         return CausalPort(
             state.read(),
-            lambda batch, parameters: CausalCall(
+            lambda batch, parameters: CausalModel(
                 forward, tuple(view.read(parameters["parameters"]) for binding in bindings for view in binding.fields)
             ),
         )
@@ -342,7 +350,7 @@ class Operand(_Source, Enum):
     WEIGHT = "weight"
     PROMPT_END = "prompt_end"
 
-    def overlay(self, state: str, buffers: Mapping[str, Buffer]) -> str:
+    def in_forward_binding(self, state: str, buffers: Mapping[str, Buffer]) -> str:
         return self.value
 
 
@@ -374,9 +382,9 @@ def parameter(state: str, field: str, *, per_row: bool = False) -> Any:
     return Parameter(state, field, per_row)
 
 
-def causal_model(overlay: str) -> Any:
-    """A borrowed causal decoder using this invocation's overlay; .base bypasses it."""
-    return _CausalModel(overlay)
+def causal_model(adapter: str) -> Any:
+    """The causal LM with the named pllm.model.Adapter applied, as a pllm.model.CausalModel; .base skips it."""
+    return _CausalModelMarker(adapter)
 
 
 def module(state: str) -> Any:
@@ -445,8 +453,8 @@ def batch(
 @dataclass(frozen=True)
 class InstanceState:
     fields: Mapping[str, Shape | Buffer] = field(default_factory=lambda: dict[str, Shape | Buffer]())
-    # How @pllm.train or @pllm.overlay updates the state. Training on request rows or on WeightedRowBatch and
-    # CausalTrainBatch fields takes pllm.AdamW; WeightedCEBatch training and training overlays take pllm.SGD.
+    # How @pllm.train or @pllm.train_in_forward updates the state. Training on request rows or on WeightedRowBatch
+    # and CausalTrainBatch fields takes pllm.AdamW; WeightedCEBatch training and @pllm.train_in_forward take pllm.SGD.
     optimizer: AdamWConfig | SGD | None = field(default=None, kw_only=True)
     # Run once per resource when binding; every admission copies the same seeded initial tensors.
     initialize: Callable[[Tensors, torch.Generator], None] | None = None
@@ -496,7 +504,7 @@ class InstanceState:
     def declare(self, name: str, context: _Declaration) -> None:
         """Allocate tensor parameters; buffer layouts belong to their effects."""
         context.signature.append((name, boundary_digest(fingerprint(self), tuple(self.fields))))
-        if name in context.overlay_states or name in context.states:
+        if name in context.in_forward_states or name in context.states:
             return
         if self.feed is not None:
             if context.binding.feeds:
@@ -518,8 +526,8 @@ class InstanceState:
 
     def layout_fields(self, name: str, context: _Declaration) -> tuple[Field, ...]:
         """The allocated fields: plain shapes in the state's dtype, or Buffers sized by the hidden width or, when a
-        pllm.model.Overlay reads the state, once per overlay target."""
-        consumer = next((overlay for overlay in context.overlays.values() if overlay.state == name), None)
+        pllm.model.Adapter reads the state, once per adapter target."""
+        consumer = next((adapter for adapter in context.adapters.values() if adapter.state == name), None)
         shapes = {key: spec for key, spec in self.fields.items() if not isinstance(spec, Buffer)}
         if consumer is None and len(shapes) == len(self.fields):
             return tuple(Field(key, shape, self.tensor_dtype, self.alignment) for key, shape in shapes.items())
@@ -550,7 +558,7 @@ class RequestState(InstanceState):
 
 
 @dataclass(frozen=True)
-class Activation:
+class ActivationPatch:
     state: str
     layers: tuple[int, ...]
     first_tokens: int = 0
@@ -569,9 +577,11 @@ class Activation:
 
     def declare(self, context: _Declaration) -> None:
         """Read local state, preserving replay/HOLD publication dependencies when declared."""
-        definition = context.state_definition(self.state, "Activation needs a declared state")
+        definition = context.state_definition(self.state, "pllm.model.ActivationPatch needs a declared state")
         if definition.feed is not None:
-            raise ValueError("Activation needs local state written from fed inputs")
+            raise ValueError(
+                "pllm.model.ActivationPatch reads a state the workload writes; it cannot read a fed state directly"
+            )
         state = context.states[self.state]
         declare_activation_patch(
             context.binding,
@@ -588,7 +598,7 @@ class Activation:
 
 
 @dataclass(frozen=True)
-class Overlay(ParameterEffect):
+class Adapter(ProjectionDelta):
     """Read declared state at internal model projections, independently of its producer."""
 
     def declare(self, context: _Declaration) -> None:
@@ -718,7 +728,7 @@ def _training_mode(arguments: Mapping[str, _Source]) -> TrainingMode:
     field the method reads; without batch fields or a causal model it trains on request rows."""
     fields = {source.field for source in arguments.values() if isinstance(source, Batch)}
     if not fields:
-        return "batch" if any(isinstance(source, _CausalModel) for source in arguments.values()) else "request"
+        return "batch" if any(isinstance(source, _CausalModelMarker) for source in arguments.values()) else "request"
     if any(fields <= set(batch.names) for batch in (WeightedRowBatch, CausalTrainBatch)):
         return "batch"
     if fields <= set(WeightedCEBatch.names):
@@ -950,12 +960,12 @@ def _author_buffers(
     initialize({name: values[name] for name in names}, generator)
 
 
-def _chunked_overlay(
+def _chunked_in_forward(
     function: Callable[..., Any],
     initialize: Initializer | None,
     bindings: dict[str, str],
     buffers: dict[str, Buffer],
-    effect: ParameterEffect,
+    effect: ProjectionDelta,
     chunk: int,
     optimizer: SGD | None,
     flush: str | None,
@@ -966,10 +976,10 @@ def _chunked_overlay(
     arguments = tuple(bindings)
     sources = tuple(bindings.values())
     if chunk < 1:
-        raise ValueError("overlay chunk must be positive")
+        raise ValueError("@pllm.train_in_forward(chunk=) must be positive")
     if optimizer is None:
         if len(sources) < 2 or sources[0] != effect.weight or any(s not in ("input", "target") for s in sources[1:]):
-            raise ValueError("chunk overlays need the weight carry followed by input/target operands")
+            raise ValueError("a chunked update without an optimizer takes the weight carry, then input/target operands")
         pending = {
             f"_pending_rows_{name}": Buffer(
                 lambda inputs, outputs, source=source: (max(1, chunk - 1), inputs if source == "input" else outputs),
@@ -984,7 +994,7 @@ def _chunked_overlay(
             or any(source not in (*effect.applied_fields, "input", "target", "weight") for source in sources)
             or any(sources.count(name) != 1 for name in effect.applied_fields)
         ):
-            raise ValueError("loss overlays need input rows and each applied parameter exactly once")
+            raise ValueError('a chunked loss reads pllm.operand("input") and each applied state field exactly once')
         pending = {
             f"_pending_grad_{name}": replace(
                 buffers[source],
@@ -1006,7 +1016,7 @@ def _chunked_overlay(
         )
     pending["_pending_length"] = Buffer((), dtype=torch.int64)
     if (pending.keys() | {"_prompt_end"}) & (buffers.keys() | bindings.keys()):
-        raise ValueError("rename overlay buffers/arguments that conflict with generated _pending_ fields")
+        raise ValueError("rename the state fields or arguments that start with _pending_; pllm reserves them")
     buffers.update(pending)
     bindings.update((name, name) for name in pending)
     if optimizer is not None:
@@ -1015,15 +1025,14 @@ def _chunked_overlay(
 
 
 @dataclass(frozen=True, kw_only=True)
-class _Overlay(_Effect):
+class _TrainInForward(_Effect):
     state: str
     targets: tuple[ParameterTarget, ...] | Config
     weight: str
     operator: ParameterOverlayOperator | Config
     factors: tuple[str, str] | Config
     scale: float | Config
-    prefill: bool | Config
-    decode: bool | Config
+    tokens: Tokens | Config
     visibility: Visibility | Config
     chunk: int | Config | None
     flush: Literal["prompt_end"] | None
@@ -1033,11 +1042,11 @@ class _Overlay(_Effect):
 
     def __post_init__(self) -> None:
         if self.flush not in (None, "prompt_end"):
-            raise ValueError("@pllm.overlay(flush=...) takes 'prompt_end' or None")
+            raise ValueError("@pllm.train_in_forward(flush=...) takes 'prompt_end' or None")
 
-    def parameter_effect(self, owner: Workload, layers: int) -> ParameterEffect:
-        """The configured projection effect, with all-layer targets resolved against the model."""
-        return ParameterEffect(
+    def projection_delta(self, owner: Workload, layers: int) -> ProjectionDelta:
+        """The configured projection delta, with all-layer targets resolved against the model."""
+        return ProjectionDelta(
             self.state,
             _targets(_setting(self.targets, owner, tuple)),
             self.weight,
@@ -1047,35 +1056,40 @@ class _Overlay(_Effect):
         ).expand(layers)
 
     def declare(self, operation: _Operation) -> None:
-        """Declare a request buffer transition and its parameter overlay attachment."""
+        """Declare the request state's in-forward transition and the delta it applies at the target projections."""
         if operation.gradient is not None or operation.rows:
-            raise ValueError("ordinary overlays update private buffers without cross-operation autograd")
+            raise ValueError("@pllm.train_in_forward updates its own state: remove rows= and @pllm.differentiate")
         if operation.phase is not Phase.IN_FORWARD:
-            raise ValueError("parameter overlays require IN_FORWARD")
+            raise ValueError("@pllm.train_in_forward runs in Phase.IN_FORWARD; remove @pllm.on")
         context = operation.context
-        definition = context.state_definition(self.state, "parameter overlays require a declared request state")
+        definition = context.state_definition(self.state, "@pllm.train_in_forward needs a declared request state")
         if definition.scope is not StateScope.REQUEST:
-            raise ValueError("parameter overlays require a declared request state")
+            raise ValueError(f"@pllm.train_in_forward trains per request; declare {self.state!r} as pllm.RequestState")
         optimizer = definition.optimizer
         if isinstance(optimizer, AdamWConfig):
             raise ValueError(
-                f"@pllm.overlay trains {self.state!r} with SGD once per chunk; declare it with optimizer=pllm.SGD(lr), "
+                f"@pllm.train_in_forward trains {self.state!r} with SGD once per chunk; declare it with optimizer=pllm.SGD(lr), "
                 "or with no optimizer when the method returns the next carry itself"
             )
         if optimizer is not None and self.chunk is None:
-            raise ValueError(f"{self.state!r} has an optimizer, so @pllm.overlay trains it per chunk; give chunk=")
+            raise ValueError(
+                f"{self.state!r} has an optimizer, so @pllm.train_in_forward trains it per chunk; give chunk="
+            )
         if self.flush is not None and optimizer is None:
             raise ValueError(f"flush='prompt_end' trains a short final chunk; declare {self.state!r} with an optimizer")
         buffers = _buffers(definition, context.binding.dimensions.dtype)
-        bindings = {key: source.overlay(self.state, buffers) for key, source in _arguments(operation.function).items()}
+        bindings = {
+            key: source.in_forward_binding(self.state, buffers)
+            for key, source in _arguments(operation.function).items()
+        }
         if set(buffers) & {source.value for source in Operand}:
-            raise ValueError("overlay buffers conflict with reserved operand names")
-        effect = self.parameter_effect(context.owner, context.binding.dimensions.layer_count)
+            raise ValueError("rename the state fields that repeat an operand name (input, target, weight, prompt_end)")
+        effect = self.projection_delta(context.owner, context.binding.dimensions.layer_count)
         identity = fingerprint(operation.function)
         function: Callable[..., UpdateOutput] = freeze(operation.function)
         initialize = _frozen(definition.initialize)
         if self.chunk is not None:
-            function, initialize = _chunked_overlay(
+            function, initialize = _chunked_in_forward(
                 function,
                 initialize,
                 bindings,
@@ -1092,11 +1106,7 @@ class _Overlay(_Effect):
             buffers,
             initialize=initialize,
             keys=definition.request_keys,
-            phases=tuple(
-                p
-                for p, enabled in ((HiddenPhase.PREFILL, self.prefill), (HiddenPhase.DECODE, self.decode))
-                if _setting(enabled, context.owner, bool)
-            ),
+            phases=_TOKEN_PHASES[_setting(self.tokens, context.owner, str)],
             identity=f"python:{identity}",
             function=function,
             arguments=bindings,
@@ -1120,7 +1130,7 @@ class _Overlay(_Effect):
         )
 
 
-def overlay(
+def train_in_forward(
     *,
     state: str,
     targets: tuple[ParameterTarget, ...] | Config,
@@ -1128,31 +1138,31 @@ def overlay(
     operator: ParameterOverlayOperator | Config = ParameterOverlayOperator.DENSE_ADD,
     factors: tuple[str, str] | Config = ("a", "b"),
     scale: float | Config = 1.0,
-    prefill: bool | Config = True,
-    decode: bool | Config = False,
+    tokens: Tokens | Config = "prefill",
     visibility: Visibility | Config = Visibility.forward_pinned(),
     chunk: int | Config | None = None,
     flush: Literal["prompt_end"] | None = None,
 ) -> Callable[[F], F]:
-    """Apply residuals using the declared state visibility at each target projection.
+    """Train a request state inside the forward and add its residual at each target projection.
 
-    With ``chunk``, the function takes the weight carry followed by input/target row
+    `tokens` picks the tokens whose projection operands train the state: "prefill", "decode" or "all". With ``chunk``, the function takes the weight carry followed by input/target row
     operands and returns (next carry, readouts). Pending rows belong to the framework.
     When ``state`` declares ``optimizer=pllm.SGD(lr)``, return one loss per row instead;
     gradients accumulate until a chunk completes, including a short final chunk with
     ``flush="prompt_end"``.
     """
 
+    if type(tokens) is str and tokens not in _TOKEN_PHASES:
+        raise ValueError(f'@pllm.train_in_forward(tokens={tokens!r}): use "prefill", "decode" or "all"')
     return _mark(
-        effect=_Overlay(
+        effect=_TrainInForward(
             state=state,
             targets=targets,
             weight=weight,
             operator=operator,
             factors=factors,
             scale=scale,
-            prefill=prefill,
-            decode=decode,
+            tokens=tokens,
             visibility=visibility,
             chunk=chunk,
             flush=flush,
@@ -1236,7 +1246,7 @@ def _setting(value: C | Config, config: Workload, expected: type[C]) -> C:
 def _targets(value: tuple[object, ...]) -> tuple[ParameterTarget, ...]:
     targets = tuple(target for item in value if (target := _typed(item, ParameterTarget)) is not None)
     if len(targets) != len(value):
-        raise TypeError("overlay targets require typed parameter targets")
+        raise TypeError("targets must be pllm.model.ParameterTarget values")
     return targets
 
 
@@ -1255,11 +1265,11 @@ def layer_route(*, tokens: Tokens = "all", over: Over = "token") -> Callable[[F]
 
 
 def _values(owner: object) -> dict[str, object]:
-    return owner_values(owner, (InstanceState, Activation, Overlay, PositionState))
+    return owner_values(owner, (InstanceState, ActivationPatch, Adapter, PositionState))
 
 
 def _snapshot(owner: C, borrowed: tuple[object, ...] = ()) -> C:
-    return owner_snapshot(owner, (InstanceState, Activation, Overlay, PositionState), borrowed)
+    return owner_snapshot(owner, (InstanceState, ActivationPatch, Adapter, PositionState), borrowed)
 
 
 def _of_type(values: dict[str, object], expected: type[C]) -> dict[str, C]:
@@ -1433,7 +1443,7 @@ def _return_type(getter: FunctionType) -> type | None:
 def _property(member: object) -> FunctionType | None:
     """Find declaration getters without evaluating arbitrary owner properties."""
     getter = _typed(member.fget, FunctionType) if isinstance(member, property) else None
-    declared = (InstanceState, RequestState, Activation, Overlay, PositionState)
+    declared = (InstanceState, RequestState, ActivationPatch, Adapter, PositionState)
     return getter if getter is not None and _return_type(getter) in declared else None
 
 
@@ -1460,15 +1470,15 @@ class _Declaration:
     # The owner's values, signed; the declared states and model values among them, by type.
     bindings: tuple[tuple[str, str], ...] = ()
     state_definitions: dict[str, InstanceState] = field(default_factory=lambda: {})
-    overlays: dict[str, Overlay] = field(default_factory=lambda: {})
-    activations: dict[str, Activation] = field(default_factory=lambda: {})
+    adapters: dict[str, Adapter] = field(default_factory=lambda: {})
+    activations: dict[str, ActivationPatch] = field(default_factory=lambda: {})
     position_definitions: dict[str, PositionState] = field(default_factory=lambda: {})
     # Ordered (name, digest) entries folded into the graph's execution parameters digest.
     signature: list[tuple[str, str]] = field(default_factory=lambda: [])
     operations: list[_Operation] = field(default_factory=lambda: [])
     routes: list[tuple[str, Tokens, Over]] = field(default_factory=lambda: [])
     positions: tuple[tuple[str, float], ...] = ()
-    overlay_states: set[str] = field(default_factory=lambda: set[str]())
+    in_forward_states: set[str] = field(default_factory=lambda: set[str]())
     states: dict[str, State] = field(default_factory=lambda: {})
     parameters: dict[tuple[str, str], TensorPort] = field(default_factory=lambda: {})
     writes: dict[str, tuple[Call, Call]] = field(default_factory=lambda: {})
@@ -1490,14 +1500,14 @@ class _Declaration:
     @property
     def has_model_effect(self) -> bool:
         """Model effects own training unless a sampler pairs with it."""
-        return bool(self.routes or self.overlays or self.activations) or any(
+        return bool(self.routes or self.adapters or self.activations) or any(
             operation.effect.model_effect for operation in self.operations
         )
 
     @property
-    def model_values(self) -> dict[str, Activation | Overlay]:
+    def model_values(self) -> dict[str, ActivationPatch | Adapter]:
         """The values that act inside the model forward; a workload declares at most one."""
-        return {**self.activations, **self.overlays}
+        return {**self.activations, **self.adapters}
 
     @classmethod
     def read(cls, workload: Workload) -> _Declaration:
@@ -1523,8 +1533,8 @@ class _Declaration:
             if _property(member):
                 values[name] = object.__getattribute__(owner, name)
         context.state_definitions = _of_type(values, InstanceState)
-        context.overlays = _of_type(values, Overlay)
-        context.activations = _of_type(values, Activation)
+        context.adapters = _of_type(values, Adapter)
+        context.activations = _of_type(values, ActivationPatch)
         context.position_definitions = _of_type(values, PositionState)
         return context
 
@@ -1564,8 +1574,8 @@ class _Declaration:
         effect = marked or _Effect()
         texts = (*vars(effect).values(), *vars(gradient or _Gradient((), False)).values(), rows)
         seeds.extend(candidates[text] for text in texts if type(text) is str and text in candidates)
-        if (overlay := _typed(effect, _Overlay)) is not None:
-            self.overlay_states.add(overlay.state)
+        if (trained := _typed(effect, _TrainInForward)) is not None:
+            self.in_forward_states.add(trained.state)
         phase = phase or effect.phase or Phase.AFTER_SAMPLE
         seeds.append(function)
         assert rows is not None
@@ -1625,7 +1635,7 @@ class _Declaration:
         """Allocate ordinary state before effects and operations consume its ports."""
         if self.binding.host and (self.routes or self.model_values):
             raise ValueError(
-                "pllm.model.Overlay, pllm.model.Activation and layer routes act inside a model forward; compile this "
+                "pllm.model.Adapter, pllm.model.ActivationPatch and layer routes act inside a model forward; compile this "
                 "workload with make_llm, not make_host"
             )
         self.positions = self.position_states()
@@ -1777,7 +1787,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         """Declare owner values and operations, then compose and sign their graph."""
         context = _Declaration.read(self)
         context.binding = b
-        context.overlays = {key: value.expand(b.dimensions.layer_count) for key, value in context.overlays.items()}
+        context.adapters = {key: value.expand(b.dimensions.layer_count) for key, value in context.adapters.items()}
         context.declare_values()
         for operation in sorted(context.operations, key=lambda operation: operation.name):
             with context.declaring(operation.name):
@@ -1813,10 +1823,10 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         """Read model dependencies from markers before dimensions or tensor readers exist."""
         context = _Declaration.read(self)
         sources: dict[str, tuple[_Source, ...]] = {}
-        targets = tuple(target for value in context.overlays.values() for target in value.targets)
+        targets = tuple(target for value in context.adapters.values() for target in value.targets)
         for operation in sorted(context.operations, key=lambda operation: operation.name):
             effect = operation.effect
-            if isinstance(effect, _Overlay):
+            if isinstance(effect, _TrainInForward):
                 targets = _targets(_setting(effect.targets, context.owner, tuple))
                 continue
             if isinstance(effect, _Sampler) and not effect.enabled(context.owner):
@@ -1841,12 +1851,12 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             ),
             position_states=context.position_states(),
             layer_routes=bool(context.routes),
-            instance_overlay=any(
+            instance_adapter=any(
                 context.state_definitions[value.state].scope is StateScope.INSTANCE
-                for value in context.overlays.values()
+                for value in context.adapters.values()
                 if value.state in context.state_definitions
             ),
-            causal_training=any(isinstance(source, _CausalModel) for source in inputs),
+            causal_training=any(isinstance(source, _CausalModelMarker) for source in inputs),
             feeds=any(state.feed is not None for state in context.state_definitions.values()),
         )
 
@@ -1951,13 +1961,12 @@ __all__ = [
     "batch",
     "InstanceState",
     "RequestState",
-    "overlay",
+    "train_in_forward",
     "Buffer",
     "UpdateOutput",
     "differentiate",
-    "Activation",
-    "Overlay",
-    "ParameterEffect",
+    "ActivationPatch",
+    "Adapter",
     "Exact",
     "Visibility",
     "SGD",

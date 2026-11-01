@@ -199,4 +199,6 @@ class OverlayGraphRunner(compat.ModelRunner):
         self.capture_model()
         used = cuda_graph_pool_bytes(current_platform.get_global_graph_pool(), self.device.index or 0)
         if used > self.overlay_graph_bytes:
-            raise ValueError(f"Overlay model graphs need {used} bytes; increase execution.capture_memory_bytes")
+            raise ValueError(
+                f"CUDA graphs of the adapted projections need {used} bytes; raise ExecutionOptions.capture_memory_bytes"
+            )

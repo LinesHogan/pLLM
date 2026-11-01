@@ -56,7 +56,7 @@ class RequestLowRankTTT(pllm.Workload):
     def factors(self) -> pllm.RequestState:
         return low_rank_factors()
 
-    @pllm.overlay(
+    @pllm.train_in_forward(
         visibility=pllm.Visibility.forward_pinned(),
         state="factors",
         targets=(TARGET,),
@@ -104,8 +104,8 @@ class ImportedLowRank(pllm.Workload):
         return replace(low_rank_factors(), imported=True)
 
     @property
-    def adapter(self) -> pllm.model.Overlay:
-        return pllm.model.Overlay(
+    def adapter(self) -> pllm.model.Adapter:
+        return pllm.model.Adapter(
             "factors", (TARGET,), operator=ParameterOverlayOperator.LOW_RANK_ADD, factors=("a", "b"), scale=0.5
         )
 
@@ -365,9 +365,7 @@ def main() -> int:
             assert diagnostics.trained_rows == 5 * sum(len(output.prompt_token_ids) for output in outputs)
             assert diagnostics.active_states == diagnostics.pending_state_releases == 0
     assert adapter_tokens[0] == adapter_tokens[1]
-    dense = InPlaceTTTWorkload(
-        InPlaceTTTConfig((TARGET,), chunk_size=1, learning_rate=1e-4, update_prefill=True, update_decode=False)
-    )
+    dense = InPlaceTTTWorkload(InPlaceTTTConfig((TARGET,), chunk_size=1, learning_rate=1e-4, tokens="prefill"))
     headwise = GatedDeltaWorkload(
         GatedDeltaConfig(
             (ParameterTarget(0, ParameterModuleKind.ATTENTION, ParameterRole.QUERY_PROJECTION_WEIGHT),), chunk_size=64
@@ -468,7 +466,7 @@ def main() -> int:
         (
             "hybrid_decode_training",
             lambda: open_llm(
-                replace(headwise, config=replace(headwise.config, chunk_size=16, update_decode=True)),
+                replace(headwise, config=replace(headwise.config, chunk_size=16, tokens="all")),
                 tokens=128,
                 model_length=128,
                 cuda_graphs=True,
@@ -577,7 +575,7 @@ def preemption_replays():
                 GatedDeltaConfig(
                     (ParameterTarget(0, ParameterModuleKind.ATTENTION, ParameterRole.QUERY_PROJECTION_WEIGHT),),
                     chunk_size=7,
-                    update_decode=True,
+                    tokens="all",
                 )
             ),
             config=ModelConfig(

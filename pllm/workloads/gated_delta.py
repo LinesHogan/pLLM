@@ -1,6 +1,7 @@
 """Input reconstruction with per-request, gated delta-rule head weights."""
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 from torch.nn import functional as F
@@ -17,7 +18,7 @@ class GatedDeltaConfig:
     chunk_size: int = 64
     alpha: float = 0.99
     beta: float = 0.1
-    update_decode: bool = False
+    tokens: Literal["prefill", "decode", "all"] = "prefill"  # whose projection operands train the state
     visibility: pllm.Visibility = pllm.Exact()
 
     def __post_init__(self) -> None:
@@ -55,14 +56,14 @@ class GatedDeltaWorkload(pllm.Workload):
             },
         )
 
-    @pllm.overlay(
+    @pllm.train_in_forward(
         visibility=pllm.Config("config.visibility"),
         state="fast_weights",
         targets=pllm.Config("config.targets"),
         weight="weights",
         chunk=pllm.Config("config.chunk_size"),
         operator=pllm.model.ParameterOverlayOperator.HEAD_ADD,
-        decode=pllm.Config("config.update_decode"),
+        tokens=pllm.Config("config.tokens"),
     )
     def step(
         self,

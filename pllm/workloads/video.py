@@ -42,15 +42,15 @@ class VideoWorkload(pllm.Workload):
 
     @property
     def inject(self) -> pllm.InstanceState:
-        """Declare the local state written by the encoder and read by Activation."""
+        """Declare the local state written by the encoder and read by the ActivationPatch."""
         return pllm.InstanceState(
             {"delta": pllm.Buffer(injection_shape, dtype=torch.float32)},
         )
 
     @property
-    def activation(self) -> pllm.model.Activation:
+    def activation(self) -> pllm.model.ActivationPatch:
         """Apply the latest settled injection to the selected prefill/decode rows."""
-        return pllm.model.Activation(
+        return pllm.model.ActivationPatch(
             "inject",
             (self.layer,),
             first_tokens=1,

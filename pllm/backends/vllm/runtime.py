@@ -663,8 +663,8 @@ def _eager_reason(config: ModelConfig, requirements: BackendRequirements) -> str
         return "activation patches run outside CUDA graphs"
     if requirements.layer_routes:
         return "@pllm.layer_route reruns model layers outside CUDA graphs"
-    if requirements.instance_overlay:
-        return "CUDA-graph overlays read request state only; declare the pllm.model.Overlay state as pllm.RequestState"
+    if requirements.instance_adapter:
+        return "CUDA-graph overlays read request state only; declare the pllm.model.Adapter state as pllm.RequestState"
     return ""
 
 

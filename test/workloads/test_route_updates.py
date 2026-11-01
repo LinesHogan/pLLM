@@ -47,7 +47,9 @@ class Updating(pllm.Workload):
     def weights(self) -> pllm.RequestState:
         return pllm.RequestState({"delta": pllm.Buffer((4, 4)), "tail": pllm.Buffer((), dtype=torch.int64)})
 
-    @pllm.overlay(state="weights", targets=(TARGET,), weight="delta", decode=True, visibility=pllm.Config("visibility"))
+    @pllm.train_in_forward(
+        state="weights", targets=(TARGET,), weight="delta", tokens="all", visibility=pllm.Config("visibility")
+    )
     def transition(
         self,
         hidden=pllm.operand("input"),
@@ -235,7 +237,7 @@ def test_marker_source_roundtrip_and_while_rejection():
         Unowned().declaration(ROUTE_FACTS)
 
     class Second(Updating):
-        @pllm.overlay(state="weights", targets=(TARGET,), weight="delta")
+        @pllm.train_in_forward(state="weights", targets=(TARGET,), weight="delta")
         def extra(
             self,
             hidden=pllm.operand("input"),

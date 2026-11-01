@@ -9,8 +9,8 @@ from math import isfinite
 import torch
 
 from pllm.contracts.parameter_overlay import (
-    ParameterEffect,
     ParameterOverlayOperator,
+    ProjectionDelta,
 )
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.declaration import Dimensions, Field
@@ -52,7 +52,7 @@ def buffer_field(name: str, buffer: Buffer, dimensions: Callable[[Dimensions], t
     )
 
 
-def overlay_fields(buffers: Mapping[str, Buffer], effect: ParameterEffect, dimensions: Dimensions) -> tuple[Field, ...]:
+def overlay_fields(buffers: Mapping[str, Buffer], effect: ProjectionDelta, dimensions: Dimensions) -> tuple[Field, ...]:
     """One copy of the buffers per overlay target, laid out target by target and shaped by that target."""
     arity = 2 if effect.operator is ParameterOverlayOperator.LOW_RANK_ADD else 1
     applied = effect.applied_fields
@@ -77,7 +77,7 @@ def overlay_fields(buffers: Mapping[str, Buffer], effect: ParameterEffect, dimen
 
 
 def _check_target_buffers(
-    effect: ParameterEffect,
+    effect: ProjectionDelta,
     buffers: Mapping[str, Buffer],
     projection: str,
     inputs: int,

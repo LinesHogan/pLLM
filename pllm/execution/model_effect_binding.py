@@ -28,7 +28,7 @@ from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.host_batch import StateImport
 from pllm.contracts.parameter_overlay import (
     FieldView,
-    ParameterEffect,
+    ProjectionDelta,
 )
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.semantic_graph import (
@@ -67,7 +67,7 @@ def _bind_visibility(b: TensorBinding, call: Call, source: VisibilitySource) -> 
 def declare_parameter_overlay(
     b: TensorBinding,
     name: str,
-    effect: ParameterEffect,
+    effect: ProjectionDelta,
     buffers: Mapping[str, Buffer],
     *,
     initialize: Callable[[Tensors, torch.Generator], None] | None,
@@ -299,7 +299,7 @@ def declare_layer_route(
     )
     if not activation and not composed and (b.attachment is not None or b.graph.tasks or b.graph.states):
         raise ValueError(
-            "a layer_route combines only with one Activation or one trained @pllm.overlay; move other states and "
+            "a layer_route combines only with one pllm.model.ActivationPatch or one @pllm.train_in_forward; move other states and "
             "methods to a separate workload"
         )
     if position_states and (activation or composed):

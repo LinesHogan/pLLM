@@ -73,7 +73,7 @@ class ReFTWorkload(pllm.Workload):
         )
 
     @property
-    def patch(self) -> pllm.model.Activation:
-        return pllm.model.Activation(
+    def patch(self) -> pllm.model.ActivationPatch:
+        return pllm.model.ActivationPatch(
             "intervention", self.config.layers, self.config.first_tokens, self.config.last_tokens, self.config.operator
         )

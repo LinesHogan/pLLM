@@ -16,9 +16,9 @@ import torch
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
     CapturedParameterOperand,
-    ParameterEffect,
     ParameterOverlayOperator,
     ParameterTarget,
+    ProjectionDelta,
 )
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import PackedSamplerRowBatch
@@ -115,7 +115,7 @@ class ChunkUpdate:
         )
 
 
-def overlay_apply(effect: ParameterEffect, hidden: torch.Tensor, values: Tensors) -> torch.Tensor:
+def overlay_apply(effect: ProjectionDelta, hidden: torch.Tensor, values: Tensors) -> torch.Tensor:
     """Read the declared overlay operator for ordinary and chunk-exclusive projections."""
     return parameter_correction(hidden, tuple(values[name] for name in effect.applied_fields), effect.operator)
 
@@ -156,7 +156,7 @@ class GradientUpdate:
     gradient: Gradient
     mapped_gradient: Gradient
     optimizer: PoolSGD
-    effect: ParameterEffect
+    effect: ProjectionDelta
     chunk: int
     flush: bool
     bindings: Mapping[str, str]

@@ -33,8 +33,8 @@ class FeedWorkload(pllm.Workload):
         return pllm.InstanceState({"value": (2,)})
 
     @property
-    def activation(self) -> pllm.model.Activation:
-        return pllm.model.Activation(
+    def activation(self) -> pllm.model.ActivationPatch:
+        return pllm.model.ActivationPatch(
             "target",
             (0,),
             operator=pllm.model.ActivationPatchOperator.ADD,
@@ -192,8 +192,8 @@ def test_write_field_and_feed_field_order_are_signed():
             return pllm.InstanceState({"value": (2,), "second": (2,)})
 
         @property
-        def activation(self) -> pllm.model.Activation:
-            return pllm.model.Activation("target", (0, 1), operator=pllm.model.ActivationPatchOperator.ADD)
+        def activation(self) -> pllm.model.ActivationPatch:
+            return pllm.model.ActivationPatch("target", (0, 1), operator=pllm.model.ActivationPatchOperator.ADD)
 
         @pllm.write(state="target", fields=("value",))
         def transform(self, value: torch.Tensor = SOURCE, previous: torch.Tensor = TARGET) -> tuple[torch.Tensor, ...]:

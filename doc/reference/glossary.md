@@ -15,7 +15,7 @@
 - **因果批（Causal batch）** —— `pllm.host.CausalTrainBatch` 提供同形的
   `input_ids`、`labels` 和可选 `attention_mask`，训练方法用 `pllm.batch(...)` 读取。
 - **因果模型端口（Causal model port）** —— `pllm.causal_model("adapter")` 注入
-  `pllm.model.CausalCall`；`model(...)` 应用命名 Overlay，`model.base(...)` 只用冻结基座。
+  `pllm.model.CausalModel`；`model(...)` 应用命名 Adapter，`model.base(...)` 只用冻结基座。
 - **配置引用（Config）** —— `pllm.Config("phase")` 在绑定时读取负载属性；
   `@pllm.on(...)` 可据此决定阶段，如 TLM 的在线/离线训练时机。
 - **张量结果（StepResult）** —— 一次执行的报告值、loss、发布与观测；
@@ -63,9 +63,9 @@
 - **语义图（Semantic graph）** —— 签名的任务/状态/效果声明；规划器的唯一输入。
 - **物理计划（Physical plan）** —— 图到锚点、页与缓冲的签名下沉。
 - **回退（Fallback）** —— 签名原语之外的执行。其计数永远断言为零。
-- **Overlay** —— 模型执行时从状态字段应用的签名参数效果（稠密或低秩），
+- **Adapter** —— 模型执行时从状态字段应用的签名参数效果（稠密或低秩），
   与字段的生产方式无关。`ParameterTarget(layer=None, ...)` 表示所有层；
-  TLM 用一个 Overlay 让训练与推理读取同一组 q/v 因子。
+  TLM 用一个 Adapter 让训练与推理读取同一组 q/v 因子。
 - **重放（Replay）** —— `layer_route` 定义逐 token 的层调用与返回 residual；
   `recirculation` 是使用该接口的负载。组合一个训练 overlay 时，
   `layers.apply_updates()` 消费捕获并改变本 token 后续读取的私有字段。

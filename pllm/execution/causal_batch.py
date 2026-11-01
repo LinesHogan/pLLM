@@ -32,7 +32,7 @@ CausalBinder = Callable[[tuple[ParameterOverlayFieldBinding, ...]], CausalForwar
 
 
 @dataclass(frozen=True)
-class CausalCall:
+class CausalModel:
     """The method's callable model argument and its overlay-free base forward."""
 
     forward: CausalForward | None
@@ -56,7 +56,7 @@ class CausalPort:
     """A signed batch/state read and its invocation-local argument adapter."""
 
     source: SemanticInputSource
-    adapt: Callable[[TrainingBatch, Tensors], torch.Tensor | CausalCall | None]
+    adapt: Callable[[TrainingBatch, Tensors], torch.Tensor | CausalModel | None]
 
 
 _TRAINING_WINDOWS = (When.BEFORE_FORWARD, When.AFTER_SAMPLE, When.HOST_COMPUTE)

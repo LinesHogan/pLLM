@@ -23,8 +23,7 @@ workload = InPlaceTTTWorkload(InPlaceTTTConfig(
     ),),
     chunk_size=4096,
     learning_rate=1e-3,
-    update_prefill=True,
-    update_decode=False,
+    tokens="prefill",
 ))
 with pllm.make_llm(ModelConfig("Qwen/Qwen2.5-0.5B-Instruct"), workload=workload) as llm:
     outputs = llm.generate(["Explain matrix multiplication:"], SamplingParams(max_tokens=32))

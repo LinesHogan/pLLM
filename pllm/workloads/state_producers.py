@@ -53,9 +53,9 @@ class FactorAdapterWorkload(pllm.Workload):
         )
 
     @property
-    def consume(self) -> pllm.model.Overlay:
+    def consume(self) -> pllm.model.Adapter:
         """Read each request's pinned factors inside the q/v projections."""
-        return pllm.model.Overlay("factors", TARGETS, operator=pllm.model.ParameterOverlayOperator.LOW_RANK_ADD)
+        return pllm.model.Adapter("factors", TARGETS, operator=pllm.model.ParameterOverlayOperator.LOW_RANK_ADD)
 
 
 class PromptFactorsWorkload(FactorAdapterWorkload):

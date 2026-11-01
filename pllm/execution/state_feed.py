@@ -256,7 +256,7 @@ class Feed:
             self._send(FeedRecord(FeedEvent.PUBLISH, slot, self._current))
 
     def missing(self) -> None:
-        """Submit one explicit absent-input step using the Activation missing policy."""
+        """Submit one explicit absent-input step using the ActivationPatch on_missing policy."""
         with self._live():
             self._send(FeedRecord(FeedEvent.MISSING))
 

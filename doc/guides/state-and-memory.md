@@ -198,7 +198,7 @@ stream 上 `close()`；它同步该 stream 后发回精确完成凭证。其他 
 worker 只拥有 inject。本地与借用集合必须互斥且覆盖全部所需资源；worker 没有
 features 的本地准入、lineage 或副本，普通 `pllm.parameter("features", field)` 直接
 读取映射根。最终 hidden 写入 worker 的私有 inject 页并原子发布，属于计算
-结果物化。四字段 Parameter 数学签名不变；Activation 的 decode 策略使用
+结果物化。四字段 Parameter 数学签名不变；ActivationPatch 的 decode 策略使用
 keyword-only 字段，变更声明必须重新编译签署定义并重建 worker。
 
 一次 chunk 的时序如下：

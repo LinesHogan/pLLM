@@ -62,7 +62,7 @@ _NO_METRICS: Mapping[str, torch.Tensor] = MappingProxyType({})
 class UpdateOutput:
     """What a training or overlay method returns: its output and 0-d device counters.
 
-    `output` is the loss for `@pllm.train` methods; for `@pllm.overlay` it is the unscaled residual
+    `output` is the loss for `@pllm.train` methods; for `@pllm.train_in_forward` it is the unscaled residual
     the overlay adds, excluding the base projection. `changed` (bool) says whether state changed,
     `update_count` (int64) counts applied updates and `trained_rows` (int64) the rows that trained.
     All three are 0-d tensors on the output's device, never Python scalars, so the step needs no host sync.

@@ -216,7 +216,7 @@ worker 重新导入并重建，安装时其编译签名必须与驱动端签名�
 操作数永远不行。一个训练 overlay 可以与同一 workload 的一个 `layer_route` 组合。
 写 In-Place-TTT 风格负载时读本节。
 
-`@on(Phase.IN_FORWARD)` 和 `@overlay(state=..., targets=..., weight=...)` 把
+`@on(Phase.IN_FORWARD)` 和 `@train_in_forward(state=..., targets=..., weight=...)` 把
 一个加性参数 overlay 与它的发布绑定在一起。状态不带优化器时，方法自己算出下一个
 值；状态声明 `optimizer=pllm.SGD(lr)` 时，方法返回每行一个 loss，框架按 `chunk=`
 累积梯度并做 SGD（`flush="prompt_end"` 让 prompt 末尾的短 chunk 也训练）。
@@ -253,7 +253,7 @@ traced while_loop，并提示使用 bounded for-loop。
 
 ## 外部 Overlay
 
-`pllm.model.Overlay` 消费状态，不指定生产者。普通 `@pllm.train`、tuple-valued
+`pllm.model.Adapter` 消费状态，不指定生产者。普通 `@pllm.train`、tuple-valued
 `@pllm.write(state=..., fields=(...))`、初始化及 `imported=True` 均可独立生产字段。
 `hidden(layer, tokens="prefill")` 读取完整 prompt 的最后一行，默认 tokens 为 decode。
 写入默认 BEFORE_FORWARD；当前 forward 的 hidden 只能用于 AFTER_FORWARD/AFTER_SAMPLE。
@@ -266,7 +266,7 @@ prompt 索引作键；之后混合批次中的每一行读到的是自己请求�
 
 overlay 的字段值不必来自引擎内更新：任何宿主计算 —— 读请求上下文的
 超网络、加载的 checkpoint —— 都可以产出它们。声明同样的 `RequestState`
-（或 `InstanceState`）buffer 和一个 `Overlay` property，命名状态、targets、
+（或 `InstanceState`）buffer 和一个 `Adapter` property，命名状态、targets、
 算子、因子与 scale：
 
 ```python
@@ -280,8 +280,8 @@ class ShineStyleLoRA(pllm.Workload):
         }, imported=True)
 
     @property
-    def adapter(self) -> pllm.model.Overlay:
-        return pllm.model.Overlay("factors", targets, operator=ParameterOverlayOperator.LOW_RANK_ADD,
+    def adapter(self) -> pllm.model.Adapter:
+        return pllm.model.Adapter("factors", targets, operator=ParameterOverlayOperator.LOW_RANK_ADD,
                             factors=("a", "b"), scale=0.5)
 ```
 
@@ -317,7 +317,7 @@ lineage。缺少 route 值的请求在准入时被拒。辅助批输入（`Weigh
 拷贝私有字段并在模型执行前发布；缺失的更新不发布，既有推理 pin 继续看到
 它们精确的旧版本。
 
-声明普通的 `InstanceState` 或 `RequestState` buffer 和一个 `Activation`
+声明普通的 `InstanceState` 或 `RequestState` buffer 和一个 `ActivationPatch`
 property，命名状态、层、首个/末个 prefill token 与支持的算子。
 `LOW_RANK_AFFINE` 每层使用 weight/bias/rotation 字段；`ADD` 使用一个 FP32 向量。
 Buffer 形状回调收到激活的输入/输出宽度。以原始 `pllm.state.StateImport` 作为
@@ -477,7 +477,7 @@ Hidden 需求从声明推导。形状/dtype 回调只在模型事实可用后运
 ## 因果批训练
 
 [TLM](../../pllm/workloads/tlm/workload.py) 用普通 `pllm.Workload` 训练所有层的 q/v
-低秩因子，推理通过 `pllm.model.Overlay` 读取同一状态。使用时只提供配置与训练批：
+低秩因子，推理通过 `pllm.model.Adapter` 读取同一状态。使用时只提供配置与训练批：
 
 ```python
 import torch
@@ -504,13 +504,13 @@ with pllm.make_llm(config, workload=workload) as llm:
 `ignore_index` 标记的标签。`generate(..., batch=batch)` 每次调用只消费一次训练批。
 
 TLM 的 `InstanceState` 用 a/b `Buffer` 声明因子，形状回调接收目标投影的输入/输出
-宽度；`Overlay("factors", targets, operator=LOW_RANK_ADD, scale=alpha/rank)`
-声明如何应用它们。Overlay 的 `ParameterTarget(layer=None, ...)` 表示所有层，
+宽度；`Adapter("factors", targets, operator=LOW_RANK_ADD, scale=alpha/rank)`
+声明如何应用它们。Adapter 的 `ParameterTarget(layer=None, ...)` 表示所有层，
 模型层数确定后展开；显式层目标须有序且唯一。
 
-训练方法声明 `model: pllm.model.CausalCall = pllm.causal_model("adapter")`，其中
-`"adapter"` 是 Overlay 声明的名称。`model(ids, attention_mask=mask)` 返回带该
-Overlay 的 logits，梯度流向其因子；`model.base(ids, attention_mask=mask)` 返回
+训练方法声明 `model: pllm.model.CausalModel = pllm.causal_model("adapter")`，其中
+`"adapter"` 是 Adapter 声明的名称。`model(ids, attention_mask=mask)` 返回带该
+Adapter 的 logits，梯度流向其因子；`model.base(ids, attention_mask=mask)` 返回
 冻结基座的 logits。负载不持有或传输活模型。
 `@pllm.on(pllm.Config("phase"))` 在绑定时读取负载的 `phase` 属性并解析为 `Phase`；
 也可用 `Config("config.phase")` 读取嵌套配置。TLM 的 ONLINE 选择
@@ -675,7 +675,7 @@ vLLM 继续按真实容量预留 hidden 快照、采样反馈和效果/replay �
 | OverRIDE | 实例头；过滤前加法、真实采样反馈、条件 Adam 更新 |
 | ESamp | 请求键；两个 hidden 输入、版本感知引导、按状态均值 loss、eager/捕获更新 |
 | In-Place-TTT | 多 target 与尾部字段；直接迁移、发布、可选新版本 replay |
-| TLM | 普通 Workload；因果批输入、可微模型端口、全层 q/v Overlay、设备侧选择与发布、在线/离线阶段 |
+| TLM | 普通 Workload；因果批输入、可微模型端口、全层 q/v Adapter、设备侧选择与发布、在线/离线阶段 |
 | Output LoRA | 实例/请求作用域、原始键、外部加权 CE、独立训练/更新选择、SGD 与捕获 |
 | ReFT | 无优化器外部字段替换、发布、激活目标与选中行 |
 | Recirculation | 无状态逐 token replay；有序 prefill、原始 KV/RNG 与正常输出 |
@@ -684,7 +684,7 @@ vLLM 继续按真实容量预留 hidden 快照、采样反馈和效果/replay �
 | TTRL | 宿主 `ttrl_rewards` 投票、`WeightedRowBatch` 加权梯度、空选择不变发布与重试/栅栏结果 |
 
 `Builder.input` 命名既有带类型服务端口；无字段的 `state` 描述不分配张量 arena
-的宿主状态。宿主图由 `make_host`（`Workload.compile_host`）规划并绑定。Overlay/激活绑定与两种原始 replay 效果保持彼此独立。
+的宿主状态。宿主图由 `make_host`（`Workload.compile_host`）规划并绑定。Adapter/激活绑定与两种原始 replay 效果保持彼此独立。
 可表达不等于支持任意组合：后端能力检查仍拒绝不支持的组合。表中所有条目都执行
 通过这个接口构造的声明。它们既有的数学 oracle 独立于构建器；本次迁移不蕴含
 任意跨负载组合。

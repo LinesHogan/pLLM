@@ -33,7 +33,7 @@ def run(chunk):
     targets = tuple(
         ParameterTarget(layer, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT) for layer in (22, 23)
     )
-    workload = SettledInPlaceTTT(InPlaceTTTConfig(targets, chunk_size=chunk, learning_rate=1e-6, update_decode=True))
+    workload = SettledInPlaceTTT(InPlaceTTTConfig(targets, chunk_size=chunk, learning_rate=1e-6, tokens="all"))
     handle = pllm.make_llm(
         workload=workload,
         config=ModelConfig(

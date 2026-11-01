@@ -106,7 +106,7 @@ class CapturedParameterOperand:
 
 
 @dataclass(frozen=True)
-class ParameterEffect:
+class ProjectionDelta:
     """Apply request state at original model projections."""
 
     state: str
@@ -143,7 +143,7 @@ class ParameterEffect:
 
 
 __all__ = [
-    "ParameterEffect",
+    "ProjectionDelta",
     "ParameterModuleKind",
     "ParameterOverlayFieldBinding",
     "ParameterOverlayOperator",

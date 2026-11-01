@@ -1,6 +1,6 @@
-"""In-model interventions and their targets: parameter overlays, activation patches, replay.
+"""In-model interventions and their targets: adapters, activation patches and the causal model.
 
-Workloads use these together with `pllm.overlay`, `pllm.on` and the Visibility presets.
+Workloads use these together with `pllm.train_in_forward`, `pllm.on` and the Visibility presets.
 """
 
 from pllm.authoring import HiddenSite as HiddenSite
@@ -16,23 +16,18 @@ from pllm.contracts.parameter_overlay import (
     ParameterRole as ParameterRole,
     ParameterTarget as ParameterTarget,
 )
-from pllm.execution.causal_batch import CausalCall as CausalCall
-from pllm.usage import (
-    Activation as Activation,
-    Overlay as Overlay,
-    ParameterEffect as ParameterEffect,
-)
+from pllm.execution.causal_batch import CausalModel as CausalModel
+from pllm.usage import ActivationPatch as ActivationPatch, Adapter as Adapter
 
 __all__ = [
-    "CausalCall",
-    "ParameterEffect",
+    "CausalModel",
     "ParameterTarget",
     "ParameterModuleKind",
     "ParameterRole",
     "ParameterOverlayOperator",
     "HiddenSite",
-    "Activation",
-    "Overlay",
+    "ActivationPatch",
+    "Adapter",
     "ActivationPatchOperator",
     "DecodeWindow",
     "DecodeRefresh",

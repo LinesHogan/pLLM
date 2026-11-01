@@ -64,7 +64,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     )
     assert visibility.policy == pllm.Visibility.forward_pinned()
     assert visibility.tail == "transition" and visibility.chunk_size == 0
-    pllm.overlay(state="dense_fast_weights", targets=targets, visibility=pllm.Exact())
+    pllm.train_in_forward(state="dense_fast_weights", targets=targets, visibility=pllm.Exact())
     declaration = workload.declaration(facts).graph
     assert next(task.visibility for task in declaration.tasks if task.visibility is not None) == visibility
     changed = InPlaceTTTWorkload(replace(config, chunk_size=3)).declaration(facts).graph
@@ -143,7 +143,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
             dtype=torch.float64,
         )
 
-        @pllm.overlay(
+        @pllm.train_in_forward(
             visibility=pllm.Visibility.forward_pinned(),
             state="factors",
             targets=(targets[0],),
@@ -231,8 +231,8 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
         )
 
         @property
-        def adapter(self) -> pllm.model.Overlay:
-            return pllm.model.Overlay(
+        def adapter(self) -> pllm.model.Adapter:
+            return pllm.model.Adapter(
                 "factors",
                 (targets[0],),
                 operator=pllm.model.ParameterOverlayOperator.LOW_RANK_ADD,

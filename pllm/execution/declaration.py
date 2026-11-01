@@ -499,12 +499,12 @@ class Builder(Generic[D]):
         stage: SamplerStage = SamplerStage.PACKED_POST_FILTER_EXACT,
     ) -> None:
         prediction[output]
-        # The sampler attachment keeps an earlier pllm.model.Overlay's bindings; an activation patch would need
+        # The sampler attachment keeps an earlier pllm.model.Adapter's bindings; an activation patch would need
         # this attachment's state_resource, which names the trained state.
         previous = self.attachment
         if previous is not None and previous.activation_bindings:
             raise ValueError(
-                "@pllm.add_logits and @pllm.guide_sampling do not combine with pllm.model.Activation; remove one of them"
+                "@pllm.add_logits and @pllm.guide_sampling do not combine with pllm.model.ActivationPatch; remove one of them"
             )
         self.attachment = BackendAttachmentSpec(
             AttachmentKind.REQUEST_TRAINING,
@@ -552,7 +552,7 @@ class Builder(Generic[D]):
         if self.attachment is None:
             raise ValueError(
                 "the workload has no effect on the model: add @pllm.train, @pllm.add_logits, @pllm.guide_sampling, "
-                "@pllm.export, @pllm.overlay, a layer_route or a pllm.model.Activation/Overlay"
+                "@pllm.export, @pllm.train_in_forward, a layer_route or a pllm.model.ActivationPatch/Adapter"
             )
         return self.graph, self.layouts, self.attachment
 

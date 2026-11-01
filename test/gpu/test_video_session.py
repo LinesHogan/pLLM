@@ -365,7 +365,7 @@ def run_video(workload, events, steps, config=None):
 
 @dataclass(frozen=True)
 class RecirculatingVideo(VideoWorkload, RecirculationWorkload):
-    """Compose the video Activation and an ordinary user-authored layer route."""
+    """Compose the video ActivationPatch and an ordinary user-authored layer route."""
 
 
 @pytest.mark.slow

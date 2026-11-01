@@ -19,7 +19,7 @@ HEAD_ADD 保持 FP32。`pllm.Buffer(shape, dtype=torch.bfloat16)` 可显式节�
 **要解决的问题**：请求在生成的同时，根据它自己的推理轨迹更新一副私有补丁，
 后续 token 立刻在"基座权重 + 补丁"的有效权重下运行——且不碰共享的基座权重。
 
-`@pllm.overlay` 把一个 `IN_FORWARD` 任务变成"读操作数 → 写私有因子 →
+`@pllm.train_in_forward` 把一个 `IN_FORWARD` 任务变成"读操作数 → 写私有因子 →
 应用有效权重"的完整循环：
 
 ```python
@@ -36,9 +36,9 @@ class MyLoRA(pllm.Workload):
         "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2)),   # (输出宽, rank)
     })
 
-    @pllm.overlay(state="factors", targets=targets,
+    @pllm.train_in_forward(state="factors", targets=targets,
                   operator=pllm.model.ParameterOverlayOperator.LOW_RANK_ADD,
-                  factors=("a", "b"), scale=1.0, decode=True)
+                  factors=("a", "b"), scale=1.0, tokens="all")
     def update(
         self,
         x: torch.Tensor = pllm.operand("input"),
@@ -70,13 +70,13 @@ class MyLoRA(pllm.Workload):
 **想让框架替你求梯度？** 给状态声明 `optimizer=pllm.SGD(lr)` 并传 `chunk=`：
 方法改为返回每行一个 loss，框架在每个 chunk 结束时用 SGD 更新补丁
 （`flush="prompt_end"` 让 prompt 末尾不满一个 chunk 的行也参与）。优化器只写在
-状态上，`@pllm.overlay` 本身不带优化器，参见
+状态上，`@pllm.train_in_forward` 本身不带优化器，参见
 [Prefill adapters](../../pllm/workloads/prefill_adapters.py)。
 
 `initialize=` 可以初始化逻辑字段。普通 LoRA 训练通常随机初始化 A、将 B 置零，
 这样初始模型增量为零，第一次优化器更新仍能学习 B。
 
-**`prefill`/`decode` 控制什么？** 更新资格（默认 `prefill=True、decode=False`）。
+**`tokens` 控制什么？** 更新资格（默认 `tokens="prefill"`，可选 `"decode"`、`"all"`）。
 被禁用的阶段不更新，但仍会应用既有 overlay——它读的是已发布的版本。
 
 **稠密还是低秩？** 稠密补丁用默认的 `DENSE_ADD` 和一个固定 `shape=` 的
@@ -112,7 +112,7 @@ def settle(self, layers: pllm.Layers) -> torch.Tensor:
 
 ## 独立声明状态生产者与模型消费者
 
-`pllm.model.Overlay` 只读 `state=` 指定的状态。`initialize=`、普通 `@pllm.train`、
+`pllm.model.Adapter` 只读 `state=` 指定的状态。`initialize=`、普通 `@pllm.train`、
 `@pllm.write` 和显式 `imported=True` 可以生产同一份状态，消费声明不用改变。
 作用域可以是 request 或 instance；一个资源每次 invocation 只允许一个修改生产者。
 没有生产者时读取初始化的版本。AdamW 因子是其扁平参数字段的视图，不复制一份模型因子。
@@ -179,15 +179,15 @@ synchronize CUDA.
 **要解决的问题**：补丁字段不想在引擎里训练——它来自超网络、加载的
 checkpoint，或任何一段宿主计算。
 
-声明状态时设置 `imported=True`，例如 `pllm.RequestState(fields, imported=True)`；再声明一个 `Overlay` property
+声明状态时设置 `imported=True`，例如 `pllm.RequestState(fields, imported=True)`；再声明一个 `Adapter` property
 命名状态、targets、算子、因子与 scale；把产出的张量经
 `generate(..., batch=pllm.state.StateImport(values, keys), prompt_indices=...)`
 送入：
 
 ```python
 @property
-def adapter(self) -> pllm.model.Overlay:
-    return pllm.model.Overlay("factors", targets,
+def adapter(self) -> pllm.model.Adapter:
+    return pllm.model.Adapter("factors", targets,
                         operator=pllm.model.ParameterOverlayOperator.LOW_RANK_ADD,
                         factors=("a", "b"), scale=0.5)
 ```
@@ -202,7 +202,7 @@ def adapter(self) -> pllm.model.Overlay:
 
 **要解决的问题**：要改的不是权重，而是激活。
 
-声明 `imported=True` 的 buffer 状态加一个 `pllm.model.Activation` property（命名状态、层、首/末 prefill
+声明 `imported=True` 的 buffer 状态加一个 `pllm.model.ActivationPatch` property（命名状态、层、首/末 prefill
 token、算子），同样经 `batch=` 送入。`LOW_RANK_AFFINE` 每层用
 weight/bias/rotation 字段，`ADD` 用一个 FP32 向量。见维护中的
 [ReFT](../../pllm/workloads/reft.py)。
@@ -216,7 +216,7 @@ INHERIT 保留原作用域的版本选择，STEP 每步读取本 invocation 新�
 单独声明 HOLD 不会给任意缺根图添加保持能力，完整生命周期见
 [状态与记忆](state-and-memory.md#没有新特征时签署的-hold--stop)。
 
-Activation 可与 `layer_route` 组合：注入在 DecoderSource 层输出之后、tap 之前，
+ActivationPatch 可与 `layer_route` 组合：注入在 DecoderSource 层输出之后、tap 之前，
 normal/replay 使用同一 ref 和选择位；低秩算子用 replay 新 hidden 重算 delta，
 ADD 不在已注入的结果上重复累加。HOLD 的 source 数学与正常输入相同，只改变
 签署的版本来源；borrowed 输入生产组全部关闭，模型 READ 仍精确绑定 inject。
@@ -226,12 +226,12 @@ ADD 不在已注入的结果上重复累加。HOLD 的 source 数学与正常输
 
 干预遵循 forward-only KV：层后注入不改变该层自身已计算的 KV，可能影响更深层
 和后续 token；旧 token 的 KV 不回改。同 invocation replay 仍重放本步版本，
-不能换成较新版本。逐 decode 注入与 vLLM 抢占/历史重算互斥，Activation 与
+不能换成较新版本。逐 decode 注入与 vLLM 抢占/历史重算互斥，ActivationPatch 与
 prefix caching 仍拒绝组合；没有按注入版本 cache_salt 键控或历史版本重建。
 
 ## 组合边界：失败关闭
 
-一个 `layer_route` 可以独立执行，或与一个训练 overlay、一个 Activation 分别
+一个 `layer_route` 可以独立执行，或与一个训练 overlay、一个 ActivationPatch 分别
 组合。多个 overlay、外部导入 overlay 加路由、三方组合不在当前支持范围内。
 后端在绑定或安装时拒绝不支持的组合。共享前缀缓存仍与 overlay/层路由不兼容。
 

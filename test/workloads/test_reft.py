@@ -147,7 +147,7 @@ def _decode_low_rank_keeps_parameters_and_recomputes_delta(
 
 
 def _decode_declarations_are_checked(facts):
-    legacy = pllm.model.Activation("intervention", (0,), 1, 1, ActivationPatchOperator.ADD)
+    legacy = pllm.model.ActivationPatch("intervention", (0,), 1, 1, ActivationPatchOperator.ADD)
     assert (legacy.decode, legacy.decode_refresh, legacy.on_missing) == (
         DecodeWindow.NONE,
         DecodeRefresh.INHERIT,
@@ -158,7 +158,7 @@ def _decode_declarations_are_checked(facts):
 
     @dataclass(frozen=True)
     class DeclaredActivation(pllm.Workload):
-        patch: pllm.model.Activation
+        patch: pllm.model.ActivationPatch
 
         @property
         def intervention(self) -> pllm.InstanceState:

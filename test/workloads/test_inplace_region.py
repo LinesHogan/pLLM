@@ -60,7 +60,7 @@ def test_bound_scan_matches_original_chunk_math_bitwise(device, dtype, numerics)
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("CUDA required")
     device = torch.device(device)
-    workload = InPlaceTTTWorkload(InPlaceTTTConfig((TARGET,), chunk_size=3, learning_rate=0.017, update_decode=True))
+    workload = InPlaceTTTWorkload(InPlaceTTTConfig((TARGET,), chunk_size=3, learning_rate=0.017, tokens="all"))
     facts = facts_for(device, dtype)
     facts = replace(facts, timeline=replace(facts.timeline, tensor_policy=TensorPolicy(numerics)))
     execution = workload.compile_backend(facts).execution

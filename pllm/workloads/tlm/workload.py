@@ -71,9 +71,9 @@ class TLMWorkload(pllm.Workload):
         )
 
     @property
-    def adapter(self) -> pllm.model.Overlay:
+    def adapter(self) -> pllm.model.Adapter:
         """Resolve all-layer q/v geometry after probing the model."""
-        return pllm.model.Overlay(
+        return pllm.model.Adapter(
             "factors",
             tuple(
                 pllm.model.ParameterTarget(None, pllm.model.ParameterModuleKind.ATTENTION, role)
@@ -101,7 +101,7 @@ class TLMWorkload(pllm.Workload):
         input_ids: torch.Tensor = pllm.batch("input_ids"),
         labels: torch.Tensor = pllm.batch("labels"),
         attention_mask: torch.Tensor | None = pllm.batch("attention_mask"),
-        model: pllm.model.CausalCall = pllm.causal_model("adapter"),
+        model: pllm.model.CausalModel = pllm.causal_model("adapter"),
     ) -> pllm.UpdateOutput | None:
         """Select online with adapted logits, offline with base logits.
 

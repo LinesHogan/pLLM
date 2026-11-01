@@ -47,7 +47,7 @@ class PrefillAdaptersWorkload(pllm.Workload):
             optimizer=pllm.SGD(self.learning_rate),
         )
 
-    @pllm.overlay(
+    @pllm.train_in_forward(
         state="adapters",
         targets=TARGETS,
         operator=pllm.model.ParameterOverlayOperator.LOW_RANK_ADD,
