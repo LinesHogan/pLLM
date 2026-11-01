@@ -41,7 +41,7 @@ from pllm.execution.overlay_batch import OverlayBatch
 from pllm.execution.ptts.page_bundle import PagePublication
 from pllm.execution.scan import ScanContext
 from pllm.execution.step_capture import StepCapture
-from pllm.execution.tensor_executor import TensorExecutor, reads_rows
+from pllm.execution.tensor_executor import FieldWriteExecutor, TensorExecutor, reads_rows
 from pllm.execution.tensor_frame import (
     OverlayEntry,
     TensorFrame,
@@ -292,11 +292,8 @@ class TensorBinding(Builder[TensorFrame]):
             task = self.tensor_tasks[symbol]
             state = task.training
             optimizer = None if state is None else state.page_update()
-            executor = TensorExecutor(
-                task,
-                self.tensor_tasks,
-                optimizer,
-                capture=StepCapture(
+            step_capture = (
+                StepCapture(
                     limits[symbol],
                     facts.max_admitted_lineages
                     # A task without its own resource reads every state of the invocation.
@@ -311,8 +308,18 @@ class TensorBinding(Builder[TensorFrame]):
                 and task.export is None
                 and (task.writer is not None or reads_rows(task, self.tensor_tasks))
                 and facts is not None
-                else None,
-                device=torch.device("cpu") if facts is None else facts.device,
+                else None
+            )
+            executor = (
+                TensorExecutor(
+                    task,
+                    self.tensor_tasks,
+                    optimizer,
+                    capture=step_capture,
+                    device=torch.device("cpu") if facts is None else facts.device,
+                )
+                if task.writer is None
+                else FieldWriteExecutor(task.writer, step_capture)
             )
             operations[symbol] = TensorOperation(
                 declaration.implementations[0].implementation_id,
