@@ -513,7 +513,7 @@ Overlay 的 logits，梯度流向其因子；`model.base(ids, attention_mask=mas
 `AFTER_SAMPLE`，用适配后的 logits 选句；OFFLINE 选择 `BEFORE_MODEL`，用
 `torch.no_grad()` 下的基座 logits 选句，再训练选中的句子。
 
-因果训练当前要求实例 AdamW 状态、BF16 未量化基座、单设备（TP1），返回标量 loss
+因果训练当前要求实例 AdamW 状态、BF16 基座（投影可量化，嵌入与 LM head 不可）、单设备（TP1），返回标量 loss
 或 `TensorUpdate`。直接执行可用 `TensorStepInput(auxiliary=batch)`；返回的
 `TensorResult.value` 是报告值，`loss` 是优化目标，`publication` 给出发布前后的版本，
 `metrics` 是算法自定义的设备张量映射。TLM 的 `metrics["selected_count"]` 是选中的

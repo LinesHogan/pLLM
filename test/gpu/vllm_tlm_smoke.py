@@ -1,7 +1,7 @@
 """TLM on a real vLLM model: one training batch publishes q/v LoRA factors used by every later token.
 
-The fused QKV projection of every layer is checked against dense PyTorch linear
-arithmetic with the published factors.
+The fused QKV projection of every layer is checked against the layer's own kernel (dense or quantized)
+plus dense PyTorch linear arithmetic with the published factors. --model takes a Hub id or a local directory.
 """
 
 from __future__ import annotations
@@ -29,10 +29,14 @@ def main() -> None:
     parser.add_argument("--mode", choices=tuple(TLMMode), default=TLMMode.ONLINE)
     args = parser.parse_args()
     device = torch.device("cuda", 0)
-    model_id = snapshot_download(
-        args.model,
-        local_files_only=True,
-        allow_patterns=("*.json", "*.safetensors", "*.txt", "*.model"),
+    model_id = (
+        args.model
+        if Path(args.model).is_dir()
+        else snapshot_download(
+            args.model,
+            local_files_only=True,
+            allow_patterns=("*.json", "*.safetensors", "*.txt", "*.model"),
+        )
     )
     workload = TLMWorkload(
         TLMConfig(TLMMode(args.mode), pllm.AdamW(0.01, (0.9, 0.999), 1e-8, 0.01), threshold=0.0), rank=2, alpha=4
@@ -78,7 +82,7 @@ def main() -> None:
             def check(module, args, output, factor=factor, q_size=q_size, kv_size=kv_size):
                 (hidden,) = args
                 actual, _ = output
-                expected = F.linear(hidden, module.weight, module.bias)
+                expected = module.quant_method.apply(module, hidden, module.bias)
                 expected[:, :q_size] += F.linear(F.linear(hidden, factor[0]), factor[1]) * (
                     workload.alpha / workload.rank
                 )

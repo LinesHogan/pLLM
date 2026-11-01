@@ -1,21 +1,54 @@
-"""Causal training for the dense vLLM decoders (Qwen2, Llama, Qwen3) over borrowed weights and RoPE caches."""
+"""Causal training for the dense vLLM decoders (Qwen2, Llama, Qwen3) over borrowed weights and RoPE caches.
+
+Quantized checkpoints train like QLoRA: each frozen projection runs its own inference kernel forward, and its
+input gradient uses the dense weight vLLM dequantizes for that one backward step.
+"""
 
 from collections.abc import Callable
 from functools import partial
+from typing import Protocol
 
 import torch
 from torch.nn import functional as F
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod
 from vllm.model_executor.models.qwen2 import Qwen2Attention
 from vllm.model_executor.models.qwen3 import Qwen3Attention
 
-from pllm.backends.vllm.architecture import DENSE_ARCHITECTURES, Decoder, DenseLayer
+from pllm.backends.vllm.architecture import DENSE_ARCHITECTURES, Decoder, DenseLayer, frozen_weight
 from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding
 from pllm.execution.parameter_projection import parameter_correction
 
 Project = Callable[[LinearBase, torch.Tensor], torch.Tensor]
+
+
+class _ProjectionContext(Protocol):
+    projection: LinearBase
+
+
+class FrozenProjection(torch.autograd.Function):
+    """A frozen projection exactly as inference runs it, differentiable with respect to its input only.
+
+    No dense copy of a quantized weight is kept: backward asks vLLM to dequantize it again, and the copy
+    is freed when that layer's backward step ends.
+    """
+
+    @staticmethod
+    def forward(ctx: _ProjectionContext, hidden: torch.Tensor, projection: LinearBase) -> torch.Tensor:
+        ctx.projection = projection
+        return projection.quant_method.apply(projection, hidden, projection.bias)
+
+    @staticmethod
+    def backward(ctx: _ProjectionContext, *grads: torch.Tensor) -> tuple[torch.Tensor, None]:
+        (grad,) = grads
+        return grad @ frozen_weight(ctx.projection), None
+
+
+def frozen_projection(hidden: torch.Tensor, projection: LinearBase) -> torch.Tensor:
+    """Apply `FrozenProjection`; torch types Function.apply as returning Any."""
+    return FrozenProjection.apply(hidden, projection)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
 
 
 def norm(module: RMSNorm, hidden: torch.Tensor) -> torch.Tensor:
@@ -105,13 +138,12 @@ class CausalTraining:
                 f"instead of {type(model).__name__}"
             )
         self.model = model
-        if decoder.quantization is not None:
-            raise ValueError(
-                f"causal training differentiates dense weights, but this model is {decoder.quantization}-quantized; "
-                "use an unquantized checkpoint"
-            )
-        if model.model.embed_tokens.weight.dtype is not torch.bfloat16:
-            raise ValueError("causal training requires qualified unquantized BF16 TP1 weights")
+        embeddings = (model.model.embed_tokens, model.lm_head)
+        if (
+            not all(isinstance(module.quant_method, UnquantizedEmbeddingMethod) for module in embeddings)
+            or model.model.embed_tokens.weight.dtype is not torch.bfloat16
+        ):
+            raise ValueError("causal training needs a BF16 model whose embedding and LM head are not quantized")
         self.projections: dict[LinearBase, list[tuple[int, int, ParameterOverlayFieldBinding, slice]]] = {}
         start = 0
         for binding in bindings:
@@ -124,12 +156,14 @@ class CausalTraining:
     def project(
         self, projection: LinearBase, hidden: torch.Tensor, *, factors: tuple[torch.Tensor, ...] | None
     ) -> torch.Tensor:
-        """Run the fused base GEMM once and correct its bound output slices."""
-        output = F.linear(hidden, projection.weight, projection.bias)
+        """Run the fused base projection once and correct its bound output slices."""
+        output = frozen_projection(hidden, projection)
         if factors is not None:
             for offset, size, binding, fields in self.projections.get(projection, ()):
-                correction = parameter_correction(hidden, factors[fields], binding.operator)
-                output[..., offset : offset + size] += correction * binding.scale
+                correction = parameter_correction(hidden, factors[fields], binding.operator) * binding.scale
+                # Out of place: the base output belongs to FrozenProjection's autograd node.
+                corrected = output[..., offset : offset + size] + correction
+                output = output.slice_scatter(corrected, dim=-1, start=offset, end=offset + size)
         return output
 
     def __call__(

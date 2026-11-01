@@ -30,7 +30,7 @@ class Mrv1Runner(Runner, GPUModelRunner):
         if self.speculative_config is not None:
             raise ValueError("disable speculative decoding for MRv1 workloads")
         super().load_model(load_dummy_weights)
-        self.decoder = bind_model(self.model, self.model_config.quantization)
+        self.decoder = bind_model(self.model)
         self._install_model_hooks()
 
     def _prepare_inputs(

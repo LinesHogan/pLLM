@@ -128,7 +128,7 @@ class OverlayGraphRunner(compat.ModelRunner):
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights)  # pyright: ignore[reportUnknownMemberType]
-        self.decoder = bind_model(self.model, self.model_config.quantization)
+        self.decoder = bind_model(self.model)
         if graph_mode(self.overlay_graph_bytes) is AttachmentGraphMode.CUDA_GRAPH:
             self.projection_model = self.decoder.model.model
             self.projection_model.do_not_compile = True

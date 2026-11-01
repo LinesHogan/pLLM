@@ -15,7 +15,6 @@ class LinearMethodBase:
     def apply(self, layer: LinearBase, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor: ...
 
 class LinearBase(Module):
-    weight: Parameter
     bias: Parameter | None
     input_size_per_partition: int
     output_size_per_partition: int

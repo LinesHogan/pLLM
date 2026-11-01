@@ -1,10 +1,10 @@
 """Shared decoder structure and native logits bound once by the vLLM runners.
 
 All admitted families expose the same hidden sites. Block taps keep the fresh
-layer output, without its separately returned residual. Unquantized dense Qwen2,
-Llama and Qwen3 models support every feature; quantized ones rerun layers through
-vLLM's own quantized modules and correct projection outputs, but causal training
-still differentiates dense weights. Qwen3-MoE keeps Qwen3 attention and
+layer output, without its separately returned residual. Dense Qwen2, Llama and
+Qwen3 models support every feature, quantized or not: layer reruns call vLLM's own
+quantized modules, overlays correct projection outputs, and training differentiates
+through dequantized weights (see `frozen_weight`). Qwen3-MoE keeps Qwen3 attention and
 KV but routes its MLP through experts; the Qwen3.5 hybrids interleave Gated
 DeltaNet layers, whose recurrent state is not KV, with gated full attention.
 `Decoder.projection` and `Decoder.kv_writable` decide which projections and layer
@@ -91,8 +91,6 @@ class Decoder:
     compute_logits: Logits
     # Why only read-only workloads run on this model; None when every workload does.
     read_only: str | None
-    # vLLM's quantization method name; projection weights are packed, so causal training rejects it.
-    quantization: str | None
 
     def writable(self, feature: str) -> WritableLM:
         """The model for `feature`, which rewrites weights or reruns layers; read-only models reject it."""
@@ -172,7 +170,7 @@ READ_ONLY_ARCHITECTURES: dict[type[CausalLM], str] = {
 }
 
 
-def bind_model(model: nn.Module, quantization: str | None) -> Decoder:
+def bind_model(model: nn.Module) -> Decoder:
     """Admit a concrete vLLM architecture at model load, before any instance wrapping."""
     from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM
 
@@ -191,12 +189,12 @@ def bind_model(model: nn.Module, quantization: str | None) -> Decoder:
         )
     family = READ_ONLY_ARCHITECTURES.get(type(model))
     if family is None:
-        return Decoder(model, model.compute_logits, None, quantization)
+        return Decoder(model, model.compute_logits, None)
     read_only = (
         f"needs a Qwen2, Llama, Qwen3, Qwen3-MoE or Qwen3.5 model ({type(model).__name__} {family}); "
         "hidden taps, ESamp, sampler stages and activation patches still run on this model"
     )
-    return Decoder(model, model.compute_logits, read_only, quantization)
+    return Decoder(model, model.compute_logits, read_only)
 
 
 def hidden_binding(layer: int, site: HiddenSite, layer_count: int) -> PackedHiddenResourceBinding:

@@ -154,8 +154,8 @@ forward 重叠。采样前只读的任务固定读取延迟版本：步 N+1 可�
 
 - **模型**：准入按 vLLM 的精确类判断，不接受子类：Phi3、Mistral 等相近架构可能改变投影布局、
   注意力或 logits，尚未逐一验证。示例用 Qwen2.5 检查点只是为了方便。
-  - 未量化的 `Qwen2ForCausalLM`、`LlamaForCausalLM`、`Qwen3ForCausalLM` 支持全部功能。
-  - 未量化的 Qwen3-MoE 与 Qwen3.5 混合模型支持所有只读功能（见下一条），改写类功能按结构取舍：
+  - `Qwen2ForCausalLM`、`LlamaForCausalLM`、`Qwen3ForCausalLM` 支持全部功能，量化与否均可（见下文）。
+  - Qwen3-MoE 与 Qwen3.5 混合模型支持所有只读功能（见下一条），改写类功能按结构取舍：
 
     | 家族（vLLM 类） | q/v overlay | MLP down overlay | 层路由、PositionState | 因果训练（TLM） |
     |---|---|---|---|---|
@@ -170,12 +170,15 @@ forward 重叠。采样前只读的任务固定读取延迟版本：步 N+1 可�
     （`Qwen3_5ForConditionalGeneration`），需先做成纯文本模型：把 `text_config` 展开为顶层配置，
     `architectures` 改为 `Qwen3_5ForCausalLM`，只保留 `model.language_model.*` 权重并改名为 `model.*`。
   - 量化检查点按上面同一家族的规则准入：层路由与 PositionState 只重跑 vLLM 自己的层模块，量化的
-    投影照常执行（已验证 GPTQ-Int4 的 Qwen2.5-14B：路由输出、全部层 KV 与 StepLoop 波次和原生 vLLM
-    逐位相等）。参数 overlay 和 vLLM 对量化模型做 LoRA 一样，在量化 kernel 的输出上加一份由输入 x
-    算出的 BF16/FP32 修正，不需要稠密权重；零修正时输出与原生 vLLM 逐位相等，CUDA graph 路径同样可用。
+    投影照常执行（已验证 GPTQ-Int4 的 Qwen2.5-14B、AWQ 的 Qwen2.5-32B 与 vLLM 在线 FP8：路由输出与
+    全部层 KV 和原生 vLLM 逐位相等；GPTQ 上 StepLoop 波次也逐位相等）。参数 overlay 和 vLLM 对量化
+    模型做 LoRA 一样，在量化 kernel 的输出上加一份由输入 x 算出的 BF16/FP32 修正，不需要稠密权重；零修正时输出与原生 vLLM 逐位相等，CUDA graph 路径同样可用。
     overlay 函数读取 `pllm.operand("weight")` 时，pllm 用 vLLM 自己的反量化工具为该投影生成一份
     稠密副本并常驻（例如 14B 的一个 down 投影约 135 MiB），不读取则没有这份内存。
-    因果训练（TLM）暂时仍需未量化的检查点。
+    因果训练（TLM）按 QLoRA 的方式进行：前向直接调用量化 kernel（与推理完全一致），反向时逐个投影请
+    vLLM 反量化出稠密权重来求输入梯度，用完即释放，不常驻；嵌入与 LM head 须未量化。代价是每个训练步
+    多一次全模型反量化：Qwen2.5-14B-GPTQ 在 A100 上每步约多 1 秒（与 token 数无关；常驻一份 BF16
+    副本可省掉这 1 秒，但要多占 24.6 GiB）。
   - `DeepseekV2ForCausalLM`、`DeepseekV3ForCausalLM`（MLA 注意力 + MoE）、`GptOssForCausalLM`
     （sink 注意力 + MXFP4 MoE）只支持只读功能：
     hidden tap 与导出、ESamp、采样器引导与反馈、`add_logits`、激活补丁。它们只读取或改写层输出与 logits，
@@ -188,7 +191,7 @@ forward 重叠。采样前只读的任务固定读取延迟版本：步 N+1 可�
     会在模型加载后、工作负载绑定前报错并说明原因。
 - **vLLM**：0.32.0 或 0.27.1，其他版本启动即报错。默认 MRv2，张量、流水线与数据并行都为 1，
   不支持投机解码。MRv1 支持共享附着路径，但不支持 KV 重放。
-- **训练与重放**：因果训练（如 TLM）要求 BF16 权重；层间重放要求 FlashAttention 2，
+- **训练与重放**：因果训练（如 TLM）要求 BF16 模型（投影可以量化）；层间重放要求 FlashAttention 2，
   其余组合限制见[Overlay 与重放](doc/guides/overlays-and-replay.md)。
 - **多样本**：`SamplingParams(n=k)` 把每个 prompt 的 k 个样本作为独立请求运行，样本序号依次为
   `sample_index, …, sample_index+k-1`，按 `(PROMPT_IDX, SAMPLE_IDX)` 键的请求状态互不共享。

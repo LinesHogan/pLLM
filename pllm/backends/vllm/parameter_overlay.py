@@ -363,8 +363,8 @@ class _ProjectionReader:
             dtype=torch.long,
         )
         self.table[-rows:].fill_(-1)
-        width = self.module.input_size_per_partition
-        self.captured = self.pools[0].new_zeros((rows, width), dtype=self.module.params_dtype)
+        inputs = self.module.input_size_per_partition
+        self.captured = self.pools[0].new_zeros((rows, inputs), dtype=self.module.params_dtype)
         self.desired = self.captured.new_empty((rows, self.width)) if self.mlp is not None else self.captured
         (self.weight,) = base_weights(self.module, ((binding, self.offset, self.width),), self.captured.device)
         self.staging = PinnedStaging(capacity=self.table.numel(), slots=2)
