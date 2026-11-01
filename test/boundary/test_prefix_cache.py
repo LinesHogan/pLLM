@@ -61,7 +61,13 @@ def test_admission_rehashes_before_connector(scheduler_type, enabled):
         4,
         SimpleNamespace(prefix_caching_hash_algo="sha256", enable_prefix_caching=enabled),
     )
-    scheduler.requests, scheduler.waiting, scheduler.log_stats = {}, FCFSRequestQueue(), False
+    # vLLM 0.32's add_request also reads spec_decode_metrics_level.
+    scheduler.requests, scheduler.waiting, scheduler.log_stats, scheduler.spec_decode_metrics_level = (
+        {},
+        FCFSRequestQueue(),
+        False,
+        "none",
+    )
     scheduler.connector = Mock() if enabled else None
     incoming = Request(
         "test",

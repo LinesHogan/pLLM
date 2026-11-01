@@ -11,15 +11,11 @@ from vllm.v1.outputs import SamplerOutput as Mrv1SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, random_sample
 from vllm.v1.sample.sampler import Sampler as UpstreamMrv1Sampler
-from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
-from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
-from vllm.v1.worker.gpu.sample.logprob import LogprobTokenIdsState
-from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
-from vllm.v1.worker.gpu.sample.sampler import Sampler
-from vllm.v1.worker.gpu.sample.states import SamplingStates
-from vllm.v1.worker.gpu.states import RequestState
+from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
+from vllm.v1.worker.gpu.sample.sampler import Sampler as VllmSampler
 
+from pllm.backends.vllm import compat
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback, SamplerStage
 from pllm.execution.cuda_stream import upload
 
@@ -108,139 +104,69 @@ class SamplerGuidance:
         return output
 
 
-class Vllm027Sampler(Sampler, SamplerGuidance):
-    """vLLM 0.27.1 GPU sampler with one explicit signed guidance lifecycle.
+class GuidedSampler(compat.Sampler, SamplerGuidance):
+    """vLLM's MRv2 sampler with one explicit signed guidance lifecycle.
 
-    Post-filter guidance preserves the finite top-k/top-p support. Pre-filter
-    addition uses the stock draw and returns owned logits/tokens to the same
-    invocation. Inactive steps delegate directly to the upstream sampler.
+    Pre-filter addition draws from the guided logits with the stock sampler, as the MRv1 sampler does.
+    Post-filter guidance reweights the finite top-k/top-p survivors before the stock Gumbel draw.
+    Inactive steps delegate directly to the upstream sampler.
     """
 
     __slots__ = ("_active_guidance",)
 
-    def __init__(self, upstream: Sampler) -> None:
-        assert type(upstream) is Sampler
-
-        # Explicit state adoption is the only bridge from the loaded vLLM
-        # instance.  These fields are precisely the state read by inherited
-        # apply/logprob methods and by the active gumbel draw below.
-        match upstream.logprobs_mode:
-            case ("raw_logits" | "raw_logprobs" | "processed_logits" | "processed_logprobs") as logprobs_mode if (
-                upstream.num_speculative_tokens == 1
-            ):
-                self.logprobs_mode: LogprobsMode = logprobs_mode
-            case _:
-                raise ValueError(
-                    "canonical sampler requires non-speculative decoding (num_speculative_tokens == 1) and a supported logprobs mode"
-                )
-        self.compute_nans: bool = upstream.compute_nans
-        self.use_fp64_gumbel: bool = upstream.use_fp64_gumbel
-        self.req_states: RequestState = upstream.req_states
-        self.sampling_states: SamplingStates = upstream.sampling_states
-        self.penalties_state: PenaltiesState = upstream.penalties_state
-        self.logit_bias_state: LogitBiasState = upstream.logit_bias_state
-        self.bad_words_state: BadWordsState = upstream.bad_words_state
-        self.logprob_token_ids_state: LogprobTokenIdsState = upstream.logprob_token_ids_state
-        self.num_speculative_tokens: int = upstream.num_speculative_tokens
-        self.use_flashinfer: bool = upstream.use_flashinfer
+    def __init__(self, upstream: VllmSampler) -> None:
+        assert type(upstream) is VllmSampler
+        if upstream.num_speculative_tokens != 1:
+            raise ValueError("pllm workloads need non-speculative decoding; disable speculative decoding")
+        # The loaded vLLM instance's whole state: the inherited apply, draw and logprob methods read it.
+        vars(self).update(vars(upstream))
         self._active_guidance: SignedSamplerGuidance | _SampledGuidance | None = None
 
-    def sample(
-        self,
-        logits: torch.Tensor,
-        expanded_idx_mapping: torch.Tensor,
-        idx_mapping_np: np.ndarray,
-        pos: torch.Tensor,
-        input_ids: torch.Tensor,
-        expanded_local_pos: torch.Tensor,
-        return_logprobs: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def __call__(self, logits: torch.Tensor, input_batch: InputBatch) -> SamplerOutput:
         match self._active_guidance:
             case None:
-                return super().sample(
-                    logits,
-                    expanded_idx_mapping,
-                    idx_mapping_np,
-                    pos,
-                    input_ids,
-                    expanded_local_pos,
-                    return_logprobs=return_logprobs,
-                )
+                return super().__call__(logits, input_batch)
             case SignedSamplerGuidance() as guidance:
                 feedback = None
                 if guidance.guidance.stage is SamplerStage.PACKED_PRE_FILTER_ADD:
                     with torch.inference_mode(False):
                         base_logits = logits.detach().clone() if guidance.capture_feedback else None
-                    reweighted = self._add_logits(logits, guidance)
-                    sampled = super().sample(
-                        reweighted,
-                        expanded_idx_mapping,
-                        idx_mapping_np,
-                        pos,
-                        input_ids,
-                        expanded_local_pos,
-                        return_logprobs=return_logprobs,
-                    )
+                    output = super().__call__(self._add_logits(logits, guidance), input_batch)
                     if base_logits is not None:
                         with torch.inference_mode(False):
                             feedback = SamplerFeedback(
-                                guidance.guidance.sampler_rows, base_logits, sampled[0].detach().reshape(-1).clone()
+                                guidance.guidance.sampler_rows,
+                                base_logits,
+                                output.sampled_token_ids.detach().reshape(-1).clone(),
                             )
                 else:
-                    sampled = self._sample_signed_guidance(
-                        logits,
-                        expanded_idx_mapping,
-                        idx_mapping_np,
-                        pos,
-                        input_ids,
-                        expanded_local_pos,
-                        return_logprobs,
-                        guidance,
-                    )
+                    output = super().__call__(logits, input_batch)
                 self._active_guidance = _SampledGuidance(feedback)
-                return sampled
+                return output
             case _SampledGuidance():
                 assert False
 
-    def _sample_signed_guidance(
+    def _sample_random(
         self,
-        logits: torch.Tensor,
+        processed_logits: torch.Tensor,
         expanded_idx_mapping: torch.Tensor,
         idx_mapping_np: np.ndarray,
         pos: torch.Tensor,
-        input_ids: torch.Tensor,
-        expanded_local_pos: torch.Tensor,
-        return_logprobs: bool,
-        guidance: SignedSamplerGuidance,
+        top_k: torch.Tensor | None,
+        top_p: torch.Tensor | None,
+        use_fused_sampler: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        processed_logits = self.apply_sampling_params(
-            logits,
-            expanded_idx_mapping,
-            idx_mapping_np,
-            pos,
-            input_ids,
-            expanded_local_pos,
-            skip_top_k_top_p=True,
-        )
-        top_k, top_p = self.sampling_states.get_top_k_top_p(
-            expanded_idx_mapping,
-            idx_mapping_np,
-        )
-        processed_logits = apply_top_k_top_p(processed_logits, top_k, top_p)
-        reweighted_logits = self._reweight_finite_survivors(
-            processed_logits,
-            guidance,
-        )
-        sampled = gumbel_sample(
-            reweighted_logits,
-            expanded_idx_mapping,
-            self.sampling_states.temperature.gpu,
-            self.sampling_states.seeds.gpu,
-            pos,
-            apply_temperature=False,
-            use_fp64=self.use_fp64_gumbel,
-        )
-        return sampled, reweighted_logits
+        match self._active_guidance:
+            case SignedSamplerGuidance() as guidance if (
+                guidance.guidance.stage is not SamplerStage.PACKED_PRE_FILTER_ADD
+            ):
+                survivors = apply_top_k_top_p(processed_logits, top_k, top_p)
+                reweighted = self._reweight_finite_survivors(survivors, guidance)
+                return super()._sample_random(reweighted, expanded_idx_mapping, idx_mapping_np, pos, None, None, False)
+            case _:
+                return super()._sample_random(
+                    processed_logits, expanded_idx_mapping, idx_mapping_np, pos, top_k, top_p, use_fused_sampler
+                )
 
 
 class Mrv1Sampler(UpstreamMrv1Sampler, SamplerGuidance):
@@ -318,6 +244,6 @@ class Mrv1Sampler(UpstreamMrv1Sampler, SamplerGuidance):
 
 
 __all__ = [
-    "Vllm027Sampler",
+    "GuidedSampler",
     "SignedSamplerGuidance",
 ]

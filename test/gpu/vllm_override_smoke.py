@@ -18,7 +18,7 @@ from vllm.sampling_params import StructuredOutputsParams
 
 import pllm
 from pllm.backends.vllm.runner import WorkloadModelRunner
-from pllm.backends.vllm.sampler import Vllm027Sampler
+from pllm.backends.vllm.sampler import GuidedSampler
 from pllm.config import ModelConfig
 from pllm.execution.state_execution import StateExecution
 from pllm.host import HostConfig, make_host
@@ -51,7 +51,7 @@ def main() -> None:
     hook = None
     reader_ref = None
     native_guidance = StateExecution.sampler_guidance
-    native_add, native_complete = Vllm027Sampler._add_logits, StateExecution.complete_sampler
+    native_add, native_complete = GuidedSampler._add_logits, StateExecution.complete_sampler
     try:
 
         def capture(module, args, output):
@@ -100,7 +100,7 @@ def main() -> None:
                 drawn.setdefault((identity.prompt_idx, identity.sample_idx), []).append(token)
 
         with (
-            patch.object(Vllm027Sampler, "_add_logits", staticmethod(inspect_add)),
+            patch.object(GuidedSampler, "_add_logits", staticmethod(inspect_add)),
             patch.object(StateExecution, "sampler_guidance", inspect_guidance),
             patch.object(StateExecution, "complete_sampler", inspect_feedback),
         ):

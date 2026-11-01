@@ -6,9 +6,9 @@ import os
 from functools import partial
 
 import torch
-from vllm.v1.worker.gpu_worker import Worker
 
 from pllm.authoring import BackendWorkload, DataT, ResultT, map_auxiliary
+from pllm.backends.vllm import compat
 from pllm.backends.vllm.mrv1 import Mrv1Runner
 from pllm.backends.vllm.runner import BackendWorkerState, WorkloadModelRunner
 from pllm.backends.vllm.runtime import (
@@ -25,10 +25,9 @@ from pllm.execution.trace import TraceSelection
 from pllm.workload_transport import decode_workload
 
 
-class GPUWorker(Worker):
-    def init_device(self) -> None:
-        super().init_device()
-        self.model_runner = (
+class GPUWorker(compat.Worker):
+    def _make_model_runner(self) -> WorkloadModelRunner | Mrv1Runner:
+        return (
             WorkloadModelRunner(self.vllm_config, self.device)
             if self.use_v2_model_runner
             else Mrv1Runner(self.vllm_config, self.device)

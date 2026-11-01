@@ -16,7 +16,7 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, overload
 
 import torch
-from vllm import RequestOutput, SamplingParams, __version__ as _VLLM_VERSION
+from vllm import RequestOutput, SamplingParams
 from vllm.entrypoints.llm import LLM
 
 from pllm.authoring import (
@@ -90,9 +90,6 @@ _V2_RUNNER_ENV = "VLLM_USE_V2_MODEL_RUNNER"
 
 
 _WORKER_CLASS = "pllm.worker.GPUWorker"
-
-
-_SUPPORTED_VLLM_VERSION = "0.27.1"
 
 
 _REQUEST_CAPABILITIES = (
@@ -624,8 +621,6 @@ def create_vllm_llm(
             'activation patches, @pllm.layer_route and runner="mrv1" run the model without CUDA graphs; '
             "set ModelConfig(cuda_graphs=False)"
         )
-    if _VLLM_VERSION != _SUPPORTED_VLLM_VERSION:
-        raise RuntimeError("vLLM workload requires vLLM 0.27.1 exactly")
     environment = {
         _MP_ENV: "1" if config.multiprocessing else "0",
         _V2_RUNNER_ENV: "1" if config.runner == "mrv2" else "0",

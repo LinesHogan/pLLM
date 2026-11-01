@@ -265,8 +265,8 @@ def _check_hybrid(handle):
     dispatch = manager.dispatch
     modes = []
 
-    def record(num_reqs, num_tokens, uniform_token_count, num_active_loras):
-        result = dispatch(num_reqs, num_tokens, uniform_token_count, num_active_loras)
+    def record(*args, **kwargs):
+        result = dispatch(*args, **kwargs)
         modes.append((manager.eager, result.cg_mode))
         return result
 
@@ -580,7 +580,8 @@ def preemption_replays():
             ),
             config=ModelConfig(
                 "Qwen/Qwen2.5-0.5B-Instruct",
-                max_model_len=160,
+                # One of the ten blocks is vLLM's null block; vLLM 0.32 refuses a max_model_len beyond the others.
+                max_model_len=144,
                 max_num_seqs=8,
                 max_num_batched_tokens=64,
                 enable_chunked_prefill=True,

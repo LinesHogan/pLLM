@@ -116,14 +116,14 @@ class CenteredHidden(pllm.Workload):
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install -e ".[vllm027,test]"
+python -m pip install -e ".[vllm032,test]"   # 或 ".[vllm027,test]"
 ```
 
-当前后端面向未量化的 Qwen2 模型与 vLLM 0.27.1：默认 MRv2，TP1/PP1/DP1，
+当前后端面向未量化的 Qwen2 模型与 vLLM 0.32.0 或 0.27.1（其他版本启动即报错）：默认 MRv2，TP1/PP1/DP1，
 非投机执行。`SamplingParams(n=k)` 把每个 prompt 的 k 个样本作为独立请求运行，样本序号
 依次为 `sample_index, …, sample_index+k-1`，按 `(PROMPT_IDX, SAMPLE_IDX)` 键的请求状态互不共享。
 MRv1 支持共享附着路径但不支持 KV 重放。
-本仓库的本地环境是 PyTorch 2.13/CUDA 12.9 与 vLLM 0.27.1+cu129——请选择
+本仓库的本地环境是 PyTorch 2.13/CUDA 12.9 与 vLLM 0.27.1+cu129（`.venv`）、0.32.0+cu129（`.venv-vllm032`）——请选择
 相互匹配的 wheel，不要假设任意上游 CUDA 变体都兼容。仅 CPU 开发可安装
 `.[test]`。不安装任何全局 vLLM 插件。
 

@@ -35,7 +35,7 @@ class Mrv1Runner(Runner, GPUModelRunner):
 
     def _prepare_inputs(
         self, scheduler_output: SchedulerOutput, num_scheduled_tokens: npt.NDArray[np.int32]
-    ) -> tuple[torch.Tensor, SpecDecodeMetadata | None]:
+    ) -> tuple[torch.Tensor, SpecDecodeMetadata | None, *tuple[int, ...]]:
         result = super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
         session = self._workload_session
         if session is not None:

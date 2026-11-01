@@ -47,7 +47,6 @@ def native_span(primitive, rows):
             num_prefill_reqs=len(groups),
             num_prefill_tokens=len(rows),
             scheduler_metadata=None,
-            prefix_scheduler_metadata=None,
         )
         for attention in primitive.attentions
     }

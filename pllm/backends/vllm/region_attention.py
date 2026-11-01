@@ -28,11 +28,12 @@ def validate_attention_resources(attentions: tuple[Attention, ...], *, hidden_si
         if (
             not isinstance(attention.impl, FlashAttentionImpl)
             or attention.impl.vllm_flash_attn_version != 2
+            or attention.impl.sliding_window != (-1, -1)
             or attention.kv_cache_dtype != "auto"
             or attention.kv_sharing_target_layer_name is not None
             or attention.num_kv_heads * attention.head_size > hidden_size
         ):
-            raise ValueError("replay requires FlashAttention2 and unquantized nonshared GQA/MHA KV")
+            raise ValueError("replay requires FlashAttention2 and unquantized nonshared full-attention GQA/MHA KV")
 
 
 def attention_metadata(
@@ -49,11 +50,8 @@ def attention_metadata(
     metadata = context.attn_metadata[attention.layer_name]
     if (
         not isinstance(metadata, FlashAttentionMetadata)
-        or metadata.use_cascade
         or metadata.causal is not True
         or metadata.max_dcp_context_kv_len not in (None, 0)
-        or metadata.sliding_window not in (None, (-1, -1))
-        or metadata.mm_prefix_range_tensor is not None
         or metadata.rswa_prefix_lens is not None
     ):
         raise ValueError("replay requires ordinary causal FlashAttention metadata")
@@ -104,7 +102,6 @@ class BatchAttentionBuffers:
                 num_decode_tokens=width,
                 num_prefill_tokens=0,
                 scheduler_metadata=None,
-                prefix_scheduler_metadata=None,
             )
             self.metadata[attention.layer_name] = selected
         self.context = _replay_context(context, self.metadata)
@@ -187,7 +184,6 @@ def span_context(
             num_prefill_reqs=len(groups),
             num_prefill_tokens=starts[-1],
             scheduler_metadata=None,
-            prefix_scheduler_metadata=None,
         )
     return _replay_context(context, metadata)
 

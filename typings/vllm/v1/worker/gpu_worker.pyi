@@ -1,4 +1,7 @@
-"""Strict tLLM view of the vLLM 0.27.1 MRv2 worker construction seam."""
+"""Strict pllm view of the vLLM worker's runner construction seam.
+
+0.32.0 builds the runner through _make_model_runner; on 0.27.1 pllm.backends.vllm.compat.Worker adds that factory.
+"""
 
 import torch
 
@@ -15,3 +18,4 @@ class Worker(WorkerBase):
     model_runner: GPUModelRunner | Mrv1GPUModelRunner
 
     def init_device(self) -> None: ...
+    def _make_model_runner(self) -> GPUModelRunner | Mrv1GPUModelRunner: ...

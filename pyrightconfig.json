@@ -5,10 +5,11 @@
   "exclude": ["**/__pycache__"],
   "reportMissingImports": true,
   "reportMissingTypeStubs": false,
-  "stubPath": "typings/vllm027",
+  "stubPath": "typings",
   "reportUnnecessaryIsInstance": "error",
   "reportUnnecessaryComparison": "error",
   "reportUnnecessaryCast": "error",
+  "defineConstant": {"VLLM_027": true},
   "venvPath": ".",
   "venv": ".venv",
   "pythonVersion": "3.11"

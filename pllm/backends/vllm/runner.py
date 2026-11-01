@@ -7,6 +7,7 @@ worker instantiates. Used by runtime.py (construction) and pllm.worker.
 from __future__ import annotations
 
 import os
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,7 +18,6 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.gpu.async_utils import AsyncOutput
-from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
@@ -39,10 +39,7 @@ from pllm.backends.vllm.overlay_graph import (
 from pllm.backends.vllm.packed_rows import encode_mrv2_rows
 from pllm.backends.vllm.position_state import POSITION_ENV, PositionCacheLayer
 from pllm.backends.vllm.prefix_cache import CachePolicy
-from pllm.backends.vllm.sampler import (
-    SamplerGuidance,
-    Vllm027Sampler,
-)
+from pllm.backends.vllm.sampler import GuidedSampler, SamplerGuidance
 from pllm.backends.vllm.session import VllmSession
 from pllm.config import RunnerName
 from pllm.contracts.codec import decode_boundary
@@ -145,7 +142,7 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
     def load_model(self, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights)
         assert self.sampler is not None
-        self.sampler = self._sampler_guidance = Vllm027Sampler(self.sampler)
+        self.sampler = self._sampler_guidance = GuidedSampler(self.sampler)
         self._install_model_hooks()
         self.position_states = decode_boundary(
             os.environ.get(POSITION_ENV, '{"states": []}'), PositionAnnouncement
@@ -159,7 +156,12 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
             )
         )
 
-    def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+    def initialize_kv_cache(
+        self,
+        kv_cache_config: KVCacheConfig,
+        is_profiling: bool = False,
+        kv_cache_allocation_context: AbstractContextManager[Any, bool | None] | None = None,
+    ) -> None:
         """Validate the admitted allocation layout once before binding route state."""
         if self.position_states:
             transfer = self.vllm_config.kv_transfer_config
@@ -175,23 +177,23 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
                 self.cache_config.block_size,
             ):
                 raise ValueError("PositionState requires one KV group with whole allocation-block prefix hits")
-        super().initialize_kv_cache(kv_cache_config)
+        super().initialize_kv_cache(kv_cache_config, is_profiling, kv_cache_allocation_context)
 
     def _finish_model_binding(self) -> None:
         self.finish_overlay_graphs(self.require_session().attachment, self.require_session().parameter_phases)
 
-    def capture_model(self) -> int:
+    def capture_model(self, *, profile_only: bool = False) -> int:
         """Capture and warm up with no hidden-slot destinations, including deferred capture."""
         if self.hidden_taps is not None:
             self.hidden_taps.clear()
-        return super().capture_model()
+        return super().capture_model(profile_only=profile_only)
 
-    def prepare_inputs(
-        self,
-        scheduler_output: SchedulerOutput,
-        batch_desc: BatchExecutionDescriptor,
-    ) -> InputBatch:
-        input_batch = super().prepare_inputs(scheduler_output, batch_desc)
+    def prepare_attn(self, input_batch: InputBatch) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        """Publish the step's rows to the session.
+
+        vLLM calls this once per real step, right after prepare_inputs built the InputBatch; unlike
+        prepare_inputs its signature is the same on every supported vLLM release.
+        """
         session = self._workload_session
         if session is not None:
             session.prepare_input(
@@ -202,7 +204,7 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
                     step_id=session.next_step_id,
                 )
             )
-        return input_batch
+        return super().prepare_attn(input_batch)
 
     def execute_model(
         self,
@@ -211,27 +213,28 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
+        context_len: int = 0,
+        valid_dummy_state_slots: bool = False,
+        randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        arguments = (
+            scheduler_output,
+            intermediate_tensors,
+            dummy_run,
+            skip_attn_for_dummy_run,
+            is_profile,
+            context_len,
+            valid_dummy_state_slots,
+            randomize_inputs,
+        )
         session = self._workload_session
         if session is None or dummy_run or is_profile:
             if self.hidden_taps is not None:
                 self.hidden_taps.clear()
-            return super().execute_model(
-                scheduler_output,
-                intermediate_tensors,
-                dummy_run,
-                skip_attn_for_dummy_run,
-                is_profile,
-            )
+            return super().execute_model(*arguments)
         try:
             session.before_execute(scheduler_output)
-            return super().execute_model(
-                scheduler_output,
-                intermediate_tensors,
-                dummy_run,
-                skip_attn_for_dummy_run,
-                is_profile,
-            )
+            return super().execute_model(*arguments)
         except Exception:
             session.abort_active()
             raise

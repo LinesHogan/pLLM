@@ -4,6 +4,7 @@ import ast
 import re
 import subprocess
 import sys
+from importlib.metadata import version
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +19,8 @@ UNTYPED_BOUNDARIES = {
     ROOT / "pllm/workload_transport.py",
 }
 KERNELS = ROOT / "pllm/kernels"
+# Pyright follows the compat module's VLLM_027 branch per release, so each vLLM release has its own config.
+PROJECT = "pyrightconfig.json" if version("vllm").startswith("0.27.1") else "pyrightconfig.vllm032.json"
 FORBIDDEN = {"Any", "object", "cast", "getattr", "setattr", "hasattr"}
 
 
@@ -71,7 +74,7 @@ def main() -> int:
             sys.executable,
             "--warnings",
             "--project",
-            "pyrightconfig.json",
+            PROJECT,
         ],
         cwd=ROOT,
     ).returncode

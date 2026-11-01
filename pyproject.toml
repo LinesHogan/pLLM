@@ -17,8 +17,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Both concrete runner adapters target this exact vLLM release.
+# pllm runs on exactly these vLLM releases; pllm/backends/vllm/compat.py holds their differences.
 vllm027 = ["vllm==0.27.1"]
+vllm032 = ["vllm==0.32.0"]
 test = ["pytest==9.0.3", "maturin>=1.14,<2.0", "pyright==1.1.411", "ruff==0.17.1"]
 
 [tool.maturin]

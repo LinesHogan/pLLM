@@ -114,7 +114,10 @@ def forced_preemption():
                 hits.append((events[request.request_id], tuple(result[0].get_block_ids()[0]), result[1]))
             return result
 
-        handle = replay_handle(StepLoop(), length=64, prefix=True, generated_kv=policy, blocks=capacity)
+        # One block is vLLM's null block; vLLM 0.32 refuses a max_model_len beyond the others.
+        handle = replay_handle(
+            StepLoop(), length=16 * (capacity - 1), prefix=True, generated_kv=policy, blocks=capacity
+        )
         try:
             with (
                 record_steps(handle) as (records, samples),
@@ -378,10 +381,11 @@ def main():
 
     def mixed(scheduler, *args, **kwargs):
         nonlocal admitted
-        scheduler.max_num_running_reqs = 2 if admitted else 1
+        # vLLM 0.32 admits up to max_num_active_reqs, 0.27.1 up to max_num_running_reqs.
+        scheduler.max_num_running_reqs = scheduler.max_num_active_reqs = 2 if admitted else 1
         result = schedule(scheduler, *args, **kwargs)
         admitted = True
-        scheduler.max_num_running_reqs = 2
+        scheduler.max_num_running_reqs = scheduler.max_num_active_reqs = 2
         return result
 
     def external(row):

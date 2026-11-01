@@ -17,6 +17,14 @@ from pllm.execution.position_state import PositionBuffers
 POSITION_ENV = "PLLM_POSITION_STATES"
 
 
+def _kernel_pages(cache: torch.Tensor) -> torch.Tensor:
+    """The single-head cache as [kernel blocks, kernel block size, H / allocation].
+
+    vLLM 0.32 places the head axis before the block axis and 0.27.1 after it; with one head both merge alike.
+    """
+    return cache.flatten(1, 2)
+
+
 class PositionMetadata(CacheOnlyAttentionMetadata):
     """Keep the cache-only group's own predecessor table in the forward context."""
 
@@ -69,12 +77,11 @@ class PositionCacheProvider(PositionBuffers):
         self.layers, self.allocation = layers, allocation
         if any(
             not layer.kv_cache.is_contiguous()
-            or allocation % layer.kv_cache.shape[1]
-            or layer.kv_cache.shape[0] % (allocation // layer.kv_cache.shape[1])
-            or layer.kv_cache.untyped_storage().nbytes() != layer.kv_cache.numel() * layer.kv_cache.element_size()
+            or allocation % pages.shape[1]
+            or pages.shape[0] % (allocation // pages.shape[1])
             or layer.kv_cache.dtype != tensor.dtype
-            or layer.kv_cache.shape[1:] != (layer.kv_cache.shape[1], 1, tensor.shape[1] // allocation)
-            for layer in layers
+            or pages.shape[2] != tensor.shape[1] // allocation
+            for layer, pages in ((layer, _kernel_pages(layer.kv_cache)) for layer in layers)
         ):
             raise ValueError(
                 "PositionState requires contiguous unpadded model-dtype cache pages and integral allocation/kernel blocks"
@@ -97,7 +104,7 @@ class PositionCacheProvider(PositionBuffers):
             metadata = context.attn_metadata[layer.layer_name]
             assert isinstance(metadata, PositionMetadata)
             current = context.slot_mapping[layer.layer_name].index_select(0, rows) // self.allocation
-            kernel = layer.kv_cache.shape[1]
+            kernel = _kernel_pages(layer.kv_cache).shape[1]
             previous = metadata.block_table[requests, (positions - 1).clamp_min(0) // kernel] // (
                 self.allocation // kernel
             )

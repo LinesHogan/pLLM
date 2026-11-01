@@ -1,0 +1,5 @@
+{
+  "extends": "./pyrightconfig.json",
+  "defineConstant": {"VLLM_027": false},
+  "venv": ".venv-vllm032"
+}
