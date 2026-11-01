@@ -229,7 +229,7 @@ mod tests {
                     let at = usize::from((task == 0) == late_read);
                     json!({"symbol": kind, "timing": {"after": format!("a{at}"), "before": format!("a{}", at + 1)},
                         "inputs": [], "outputs": [], "effects": [{"resource": "state", "kind": kind}],
-                        "implementations": [{"implementation_id": "cpu", "execution_kind": "native_task", "required_capabilities": []}]})
+                        "implementations": [{"implementation_id": "cpu", "required_capabilities": []}]})
                 }).collect::<Vec<_>>())
             }).to_string()).unwrap();
             for arena_budget in [0, 8, 16, 24, 32] {

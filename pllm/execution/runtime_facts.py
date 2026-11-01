@@ -27,7 +27,7 @@ def model_timeline(device: torch.device, capabilities: tuple[str, ...] = ()) -> 
             TimelineAnchor(AnchorSymbol("request.finish"), 6),
             TimelineAnchor(AnchorSymbol("next.prepare"), 7),
         ),
-        capabilities=tuple(sorted((compute, "host/service@1", *capabilities))),
+        capabilities=tuple(sorted((compute, *capabilities))),
     )
 
 

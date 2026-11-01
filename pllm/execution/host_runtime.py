@@ -184,14 +184,12 @@ class HostConfig:
             anchors=(
                 TimelineAnchor(AnchorSymbol("host.input.ready"), 0),
                 TimelineAnchor(AnchorSymbol("host.compute.end"), 1),
-                TimelineAnchor(AnchorSymbol("host.output.publish"), 2),
-                TimelineAnchor(AnchorSymbol("host.next"), 3),
+                TimelineAnchor(AnchorSymbol("host.next"), 2),
             ),
             capabilities=tuple(
                 sorted(
                     (
                         compute_capability,
-                        "host/service@1",
                         "optimizer/adamw@1",
                         "transition/full_root@1",
                     )

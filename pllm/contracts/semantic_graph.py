@@ -23,11 +23,6 @@ HostServicePort = NewType("HostServicePort", str)
 HostPayloadSchemaId = NewType("HostPayloadSchemaId", str)
 
 
-class ExecutionKind(StrEnum):
-    HOST_SERVICE = "host_service"
-    NATIVE_TASK = "native_task"
-
-
 class StateScope(StrEnum):
     REQUEST = "request"
     INSTANCE = "instance"
@@ -145,7 +140,6 @@ class TimingConstraint:
 @dataclass(frozen=True, slots=True)
 class TaskImplementationSpec:
     implementation_id: ImplementationId
-    execution_kind: ExecutionKind
     required_capabilities: tuple[str, ...] = ()
 
 
@@ -303,7 +297,6 @@ __all__ = [
     "ValueResourceFact",
     "AnchorId",
     "AnchorSymbol",
-    "ExecutionKind",
     "HiddenInputSource",
     "HostServiceId",
     "HostServiceInputSource",

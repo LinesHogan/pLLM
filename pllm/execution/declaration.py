@@ -24,7 +24,6 @@ from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
     AnchorSymbol,
     ConditionalInputGroup,
-    ExecutionKind,
     HostPayloadSchemaId,
     HostServiceId,
     HostServiceInputSource,
@@ -106,8 +105,7 @@ class When(Enum):
     MODEL_UPDATE = ("model.execute", "state.publish")
     PUBLISH = ("state.publish", "next.prepare")
     HOST_COMPUTE = ("host.input.ready", "host.compute.end")
-    HOST_OUTPUT = ("host.compute.end", "host.output.publish")
-    HOST_COMMIT = ("host.output.publish", "host.next")
+    HOST_COMMIT = ("host.compute.end", "host.next")
     HOST = ("host.input.ready", "host.next")
     OBSERVE = ("state.publish", "sampler.pre_draw")
 
@@ -199,7 +197,7 @@ class Call:
 
 
 def native(identity: str, *capabilities: str) -> TaskImplementationSpec:
-    return TaskImplementationSpec(ImplementationId(identity), ExecutionKind.NATIVE_TASK, capabilities)
+    return TaskImplementationSpec(ImplementationId(identity), capabilities)
 
 
 class Builder(Generic[D]):
