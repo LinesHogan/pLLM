@@ -55,7 +55,7 @@ session = pllm.RequestState({"proj": lambda m: (m.hidden_size, m.hidden_size)},
                             optimizer=pllm.AdamW(lr=1e-3),
                             keys=(pllm.state.RequestKeyField.ROUTE,))
 
-llm.generate(prompts, params, routes=(route_of(p) for p in prompts))
+llm.generate(prompts, params, routes=tuple(route_of(p) for p in prompts))
 ```
 
 注意第二行：路由值由**你的宿主代码**给每个 prompt 计算。框架从不解释它——
@@ -74,7 +74,7 @@ route 完全隔离。
 
 ## 我想读参数：实例字段与请求行
 
-读取 `RequestState` 的 `Parameter("state", "field")` 带**领先的行轴**——
+读取 `RequestState` 的 `pllm.parameter("state", "field")` 带**领先的行轴**——
 混合批次里每行拿到自己 lineage 的版本。请求参数的矩阵运算使用按行形式：
 
 ```python
@@ -82,11 +82,11 @@ torch.bmm(h.unsqueeze(1), w).squeeze(1)     # (rows, H) @ (rows, H, H) → (rows
 ```
 
 读取 `InstanceState` 默认保持字段声明的形状；需要广播到当前操作行时，使用
-已有的 `Parameter("state", "field", per_row=True)`。视频消费者的实例特征字段
+`pllm.parameter("state", "field", per_row=True)`。视频消费者的实例特征字段
 直接保持网格形状，编码器自己组织计算输入。冻结状态也遵循其作用域的读取规则。
 
 读到的是哪个版本？**输入版本**：一步之内的所有读取看到的都是步开始时
-pin 住的版本，永远不是「最新值」。`StateVersion` 输入给出该版本号，常用
+pin 住的版本，永远不是「最新值」。`pllm.version(state)` 输入给出该版本号，常用
 作「是否训练过」的门（`versions > 0`）。
 
 ## 我想跨步记点东西：memory 字段与 Capture
@@ -102,8 +102,9 @@ head = pllm.RequestState(
 )
 ```
 
-写：在训练输入上加第三个注解标记 `pllm.Capture("head", "carry")`——发布时
-把该输入每个 lineage 最后一行的值写进 memory。读：`Parameter("head",
+写：把训练方法的输入包一层 `pllm.capture`，例如
+`h: torch.Tensor = pllm.capture(pllm.hidden(0), state="head", field="carry")`——发布时
+把该输入每个 lineage 最后一行的值写进 memory。读：`pllm.parameter("head",
 "carry")`，读到的是**上一步发布**的值（输入版本）。
 
 **第一步读到什么？** 零。memory 页在准入时零初始化，这不是 bug——正是
@@ -114,7 +115,7 @@ head = pllm.RequestState(
 - **跨步**：每步捕获、下步读取（教程 05 的「下一步目标」）；
 - **跨请求**：route 键让 lineage 跨请求存活，memory 随之留存
   （教程 04 的会话循环、教程 05 的「上一请求终态」）；
-- **步内多层**：不需要 memory——`Recurrence` 或 overlay replay 直接声明
+- **步内多层**：不需要 memory——`@pllm.layer_route` 直接声明
   （见 [Overlay 与重放](overlays-and-replay.md)）。
 
 ## 状态会不会爆显存：state_memory_bytes 预算
@@ -141,7 +142,7 @@ head = pllm.RequestState(
 路由用户特别注意：休眠 lineage 仍占准入容量（见上文路由键一节），所以
 「route 基数 × 每 lineage 字节」才是你的稳态占用，不是并发请求数。
 
-`ExecutionOptions.memory_budget_bytes` 约束任务与结果的 AER 峰值。框架在 meta/fake
+`ExecutionOptions.memory_budget_bytes` 约束任务与结果的峰值内存。框架在 meta/fake
 输入上执行实际张量步及前后向，按 512 字节追踪存储，不初始化 CUDA；负载不维护
 字节公式。捕获池另用 `capture_memory_bytes`。宿主有限训练声明 `max_input_rows`，
 并为奖励等宿主选择提供最大形状样例；详见[资源事实](../reference/authoring-contract.md#资源事实与内存预算)。
@@ -192,7 +193,7 @@ stream 上 `close()`；它同步该 stream 后发回精确完成凭证。其他 
 
 两进程持有并验证同一完整计划，按资源拥有关系分配池：摄取方只拥有 features，
 worker 只拥有 inject。本地与借用集合必须互斥且覆盖全部所需资源；worker 没有
-features 的本地准入、lineage 或副本，普通 `Parameter("features", field)` 直接
+features 的本地准入、lineage 或副本，普通 `pllm.parameter("features", field)` 直接
 读取映射根。最终 hidden 写入 worker 的私有 inject 页并原子发布，属于计算
 结果物化。四字段 Parameter 数学签名不变；Activation 的 decode 策略使用
 keyword-only 字段，变更声明必须重新编译签署定义并重建 worker。
@@ -228,7 +229,7 @@ HOLD 也必须已有成功首版：只有模型实际使用过、sampler 完成�
 同 ref 再发新 grant 是一次新消费和本地更新，不能记作 HOLD。
 
 `hold_count` 只在保持步成功收束时增加，`last_hold` 给出缺席原因、当前步号、
-held refs 与各请求的最后成功输入步；`update_count` 只计真实写入，fallback 不变。
+held refs 与各请求的最后成功输入步；`update_count` 只计真实写入。
 保持步的本地 pin 仍持有到 sampler/收束后，没有远端根便不产生 ACK。例子每步
 独立报告，保持步的 feature ref 为 `None`，不会把上一帧结果冒充新消费。
 

@@ -19,13 +19,14 @@
 ```python
 @pllm.on(pllm.Phase.AFTER_SAMPLE)
 @pllm.train(state="head", reduction="state_mean")
-def learn(self, h: Annotated[torch.Tensor, pllm.Hidden(0)],
-          target: Annotated[torch.Tensor, pllm.Hidden(-1)],
-          w: Annotated[torch.Tensor, pllm.Parameter("head", "w")],
-          groups: Annotated[torch.Tensor, pllm.StateIndex("head")]) -> torch.Tensor:
-    losses = ((h.float() @ w) - target.float()).square().mean(1)   # 每行一个 loss
-    counts = torch.bincount(groups).to(losses)
-    return losses.new_zeros(counts.shape).index_add(0, groups, losses) / counts
+def learn(
+    self,
+    h: torch.Tensor = pllm.hidden(0),
+    target: torch.Tensor = pllm.hidden(-1),
+    w: torch.Tensor = pllm.parameter("head", "w"),
+) -> torch.Tensor:
+    prediction = torch.bmm(h.float().unsqueeze(1), w).squeeze(1)
+    return (prediction - target.float()).square().mean(1)   # 每行一个 loss
 ```
 
 `@pllm.on(pllm.Phase.AFTER_SAMPLE)` 把这个任务放进采样后的相位窗口，
@@ -42,15 +43,15 @@ def learn(self, h: Annotated[torch.Tensor, pllm.Hidden(0)],
 `@train(state=...)` 本身就是对该状态的更新授权，Adam 的步数、动量与衰减语义
 都随状态走。你不需要写 `backward()`，也不需要自己管优化器。
 
-第二个约定在返回值上：**每个状态一个标量**，而不是把所有行压成一个数。
-`StateIndex` 告诉你每行属于哪个状态；上面的 `index_add + bincount` 就是
-`reduction="state_mean"` 的标准写法——先按状态把行级 loss 加起来，再除以
-行数。注意绑定器随后微分的是这些标量的**和**，不是跨状态均值；跨状态的加权
-方式由你自己在函数体里决定。
+第二个约定在返回值上：逐请求训练的方法**每行返回一个 loss**，不要自己把行
+压成一个数，归约交给框架。`reduction="mean"` 对所有行取均值；
+`reduction="state_mean"` 先对每个状态的行取均值，再把各状态的均值**相加**后
+微分——每个请求的状态各自按自己的行数归一，不被别的请求稀释。在宿主批次
+（`WeightedRowBatch`、`CausalTrainBatch`）上训练的方法则返回一个标量 loss。
 
 第三个约定容易踩坑：**零梯度不等于不更新**。被授权的状态即使梯度为零，也会
 推进优化器的步数、动量与衰减。如果你真的想跳过某些行的更新，不要靠让梯度
-变零，而要在选择器层面把行排除——`@on(phase, rows=...)` 或
+变零，而要在选择器层面把行排除——`@train(state=..., rows=...)` 或
 `@train(state=..., update=...)` 的选择器就是干这个的。
 
 最后，如果你想让训练影响采样本身：加一个 `BEFORE_SAMPLE` 相位的任务并声明
@@ -60,16 +61,18 @@ def learn(self, h: Annotated[torch.Tensor, pllm.Hidden(0)],
 
 ## 一阶梯度边：`differentiate`
 
-上一个例子的训练任务直接从 `Hidden` 读输入。但更常见的情况是：`@train`
-任务消费的是上游另一个操作的 `Result`——比如先有一个操作产出特征，训练任务
+上一个例子的训练任务直接从 `pllm.hidden` 读输入。但更常见的情况是：`@train`
+任务消费的是上游另一个操作的结果（`pllm.result`）——比如先有一个操作产出特征，训练任务
 拿这个特征算 loss。这时上游操作必须显式声明保留哪些导数边，否则梯度到不了
 它：
 
 ```python
 @pllm.differentiate(inputs=("features",), parameters=False)   # 输入可微、参数冻结
+def encode(self, features: torch.Tensor = pllm.result("extract")) -> torch.Tensor:
+    return torch.tanh(features)
 ```
 
-这行声明的意思是：这个操作保留 `features` 输入的导数边，参数导数冻结。有几
+这段声明的意思是：这个操作保留 `features` 输入的导数边，参数导数冻结。有几
 个边界值得提前说清楚，免得日后误判它的能力：
 
 - 这是**单次调用内的一阶 autograd**：一个优化器状态、一个训练终点。它不是
@@ -91,7 +94,12 @@ def learn(self, h: Annotated[torch.Tensor, pllm.Hidden(0)],
 
 ```python
 @pllm.export(name="features", every=2, max_rows=4, max_cols=896)
+def features(self, h: torch.Tensor = pllm.hidden(0)) -> torch.Tensor:
+    return h
 ```
+
+导出值送到负载的 `on_export(event)` 方法，按顺序、在执行进程里调用；在这里打印、
+落盘或累积（见 [SAE 导出示例](../../examples/sae_export.py)）。
 
 这条通道是方法自带的输出效果：有界、按步长门控、给出 CPU 自持副本。三个
 数字约束需要记住：
@@ -107,8 +115,8 @@ def learn(self, h: Annotated[torch.Tensor, pllm.Hidden(0)],
 ```python
 from pllm.execution.trace import TraceSelection
 
-llm.observe(TraceSelection(tasks=(task_id,), tensors=True, max_tensor_bytes=32768))
-... generate ...
+llm.observe(TraceSelection(names=("loss",), tensors=True, max_tensor_bytes=32768))
+llm.generate(prompts, params)
 snapshot = llm.trace_snapshot()          # 含 tensors=False 时的 loss/梯度元数据
 llm.observe(TraceSelection())            # 关掉
 ```
@@ -123,21 +131,21 @@ generate 重置。所以要拿"这一次"的新鲜事件，用游标切片：
 ```python
 before = llm.trace_snapshot()
 cursor = before.dropped + len(before.events)          # 绝对事件索引
-... generate ...
-fresh = llm.trace_snapshot().events[max(0, cursor - snapshot.dropped):]
+llm.generate(prompts, params)
+after = llm.trace_snapshot()
+fresh = after.events[max(0, cursor - after.dropped):]
 ```
 
 `dropped` 补偿了队列溢出丢弃的最旧事件，让游标始终是绝对索引。
 
-消费 trace 的正确姿势是用后台线程 drain（教程 01 的模式），不要在采样路径
-上同步等。
+`trace_snapshot()` 只在两次 `generate` 之间调用，不要在 `generate` 运行时从
+另一个线程调用。要持续消费导出值，用上面的 `on_export`。
 
 ## 诊断与自检
 
-最后一块拼图是运行时自检。`llm.worker_state().diagnostics` 给出
-`loss_count`、`update_count`、`fallback_count` 等计数，其中
-**`fallback_count` 必须始终为零**——任何非零都说明执行逃出了签名原语，
-这是需要立刻排查的信号。
+最后一块拼图是运行时自检。`llm.diagnostics()` 给出 `loss_count`、
+`update_count`、`trained_rows` 等计数：训练跑了几步、更新了几次、多少行参与，
+一眼就能看出训练有没有真的发生。
 
 另一个便宜的自检是零状态确定性：两个全新 route 的首步 loss 应当完全相等。
 这是验证记忆通道最省事的检查，教程 05 有完整示范。
@@ -156,7 +164,7 @@ AdamW reads source slots and writes destination slots, so the five optimizer fie
 no preceding COW copy. Other written fields are copied inside the graph.
 
 Captured methods must compute independently along their first (row) axis. They see the
-signed maximum operation row count, including padding. Return **one loss per row** for
+maximum operation row count, including padding. Return **one loss per row** for
 both `reduction="mean"` and `reduction="state_mean"`; do not reduce the row axis in Python
 or mix rows with batch normalization, attention, or another cross-row operation. The
 framework gives padding zero weight and a sink parameter row that is never optimized.
@@ -187,6 +195,3 @@ import allocations are copied into fixed staging before replay. External imports
 checked for finite values at intake. Computed writes check finiteness inside the graph;
 a nonfinite CUDA result fails the worker, rather than raising a recoverable Python
 validation error. Private stores are disabled during warmup and capture.
-
-OutputLoRA still uses its native `KernelCapture` implementation. Its staged loss/update
-binding and the corresponding page-capture API remain until that workload is migrated.

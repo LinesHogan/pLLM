@@ -15,7 +15,7 @@ def initialize(parameters: Mapping[str, torch.Tensor], generator: torch.Generato
 
 @dataclass(frozen=True)
 class HuberWorkload(pllm.Workload):
-    """Best-practice user workload: a frozen dataclass, so EngineCore transports it by reference."""
+    """Best-practice user workload: an importable frozen dataclass that EngineCore receives by pickle."""
 
     rank: int = 2
 

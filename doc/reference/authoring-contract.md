@@ -55,19 +55,16 @@ import torch
 import pllm
 
 class CenteredHidden(pllm.Workload):
-    @pllm.on(pllm.Phase.OBSERVE)
-    @pllm.hook(0)
     @pllm.export(name="centered_hidden", max_rows=2, max_cols=16)
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden: torch.Tensor = pllm.hidden(0)) -> torch.Tensor:
         return hidden - hidden.mean(dim=-1, keepdim=True)
 ```
 
-`hook` 声明的是受支持的块/模型输出捕获，不是任意的 eager PyTorch 钩子。
-单个普通 Tensor 参数继承该来源；多个来源用 `Annotated[Tensor, ...]` 标注，
-来源标记有 `Hidden`、`Samples`、`BaseLogits`、`SampledTokens`、
-`Parameter(state, field)`、`StateIndex(state)`、`StateVersion(state)` 和
-`Result(operation)`。输入歧义在绑定时报错；参数名不做猜测。
-注解必须是求值后的真实类型，绑定器从不求值字符串注解。
+`pllm.hidden(layer)` 声明的是受支持的块/模型输出捕获，不是任意的 eager PyTorch 钩子。
+每个输入的来源写成参数默认值：`pllm.hidden`、`pllm.samples`、`pllm.base_logits`、
+`pllm.sampled_tokens`、`pllm.parameter(state, field)`、`pllm.module(state)`、
+`pllm.index(state)`、`pllm.version(state)`、`pllm.result(operation)` 与
+`pllm.batch(field)`；参数名不做猜测。
 
 `InstanceState` 和 `RequestState` 声明单个 `shape=` 或具名字段、dtype、
 优化器和可选初始化器。它们可以声明在类上、实例上，或形状依赖配置/模型维度时

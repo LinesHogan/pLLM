@@ -18,8 +18,12 @@
 应用有效权重"的完整循环：
 
 ```python
+import torch
+import pllm
+from pllm.model import ParameterModuleKind, ParameterRole
+
 targets = (pllm.model.ParameterTarget(9, ParameterModuleKind.MLP,
-                                ParameterRole.DOWN_PROJECTION_WEIGHT),)
+                                      ParameterRole.DOWN_PROJECTION_WEIGHT),)
 
 class MyLoRA(pllm.Workload):
     factors = pllm.RequestState({
@@ -27,24 +31,34 @@ class MyLoRA(pllm.Workload):
         "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2)),   # (输出宽, rank)
     }, dtype=torch.bfloat16)
 
-    @pllm.on(pllm.Phase.MODEL_UPDATE)
     @pllm.overlay(state="factors", targets=targets,
                   operator=pllm.model.ParameterOverlayOperator.LOW_RANK_ADD,
                   factors=("a", "b"), scale=1.0, decode=True)
-    def update(self, x: Annotated[torch.Tensor, pllm.Operand.INPUT],
-               y: Annotated[torch.Tensor, pllm.Operand.TARGET],
-               base: Annotated[torch.Tensor, pllm.Operand.WEIGHT],
-               a: Annotated[torch.Tensor, pllm.Parameter("factors", "a")],
-               b: Annotated[torch.Tensor, pllm.Parameter("factors", "b")]) -> TensorUpdate:
-        output = x @ (base + b @ a).T                    # 有效权重 = 基座 + scale·b@a
+    def update(
+        self,
+        x: torch.Tensor = pllm.operand("input"),
+        y: torch.Tensor = pllm.operand("target"),
+        a: torch.Tensor = pllm.parameter("factors", "a"),
+        b: torch.Tensor = pllm.parameter("factors", "b"),
+    ) -> pllm.TensorUpdate:
+        residual = x @ (b @ a).T                         # 只返回补丁的增量，不含基座投影
         a.add_((0.1 * y[:, :a.shape[0]].T @ x).to(a))    # 只有 a/b 可原地写
         b.add_((0.1 * (y.T @ y)[:, :b.shape[1]]).to(b))
-        return TensorUpdate(output, changed=True, update_count=1, trained_rows=x.shape[0])
+        return pllm.TensorUpdate(
+            residual,
+            residual.new_ones((), dtype=torch.bool),                     # changed
+            residual.new_ones((), dtype=torch.int64),                    # update_count
+            residual.new_full((), x.shape[0], dtype=torch.int64),        # trained_rows
+        )
 ```
 
-**overlay 会不会改到共享权重？** 不会。`Operand.INPUT/TARGET/WEIGHT` 是捕获的
-张量，永远只读；能原地修改的只有 `Parameter` 命名的 buffer——那是这条 lineage
-私有的因子存储。基座权重只是被借用来计算有效权重，补丁落在私有页上，按版本
+返回的 `TensorUpdate` 里，`residual` 是补丁在基座投影之上**加上**的那部分（框架再乘
+`scale` 并加到基座输出上）；三个计数都是与输出同设备的 0 维张量，不是 Python
+数字，这样一步之内不需要主机同步。默认在 `MODEL_UPDATE` 时机运行。
+
+**overlay 会不会改到共享权重？** 不会。`pllm.operand("input"/"target"/"weight")`
+是捕获的张量，永远只读；能原地修改的只有 `pllm.parameter` 命名的 buffer——那是
+这条 lineage 私有的因子存储。基座权重只是被借用来计算有效权重，补丁落在私有页上，按版本
 发布。
 
 **想让框架替你求梯度？** 给状态声明 `optimizer=pllm.SGD(lr)` 并传 `chunk=`：
@@ -144,8 +158,11 @@ Replay checks compare carry, normalization of the materialized tap and KV with n
 at the same shape and paged history. The FP32 diagnosis establishes the numerical
 error separately; cross-shape token equality is not the execution contract.
 
-Prefix reuse, preemption that recomputes history, and speculative decoding are
-unsupported here. Old KV retains the factors used when it was computed; updates
+Prefix reuse and speculative decoding are unsupported here. When vLLM preempts a
+request and recomputes its history, a workload whose request state is keyed by request id,
+with no mutable instance state and no external feeds, imports or host inputs, simply
+recomputes; any other overlay or activation workload raises and asks for more KV cache
+(`gpu_memory_utilization`) or fewer concurrent sequences (`max_num_seqs`). Old KV retains the factors used when it was computed; updates
 do not recompute the prefix. A separate SHINE context pass and checkpoint or
 memory-token integration still need implementation. Finite-value checks may
 synchronize CUDA.

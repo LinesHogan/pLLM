@@ -58,15 +58,14 @@ import torch
 import pllm
 
 class CenteredHidden(pllm.Workload):
-    @pllm.on(pllm.Phase.OBSERVE)
-    @pllm.hook(0)
     @pllm.export(name="centered_hidden", every=256, max_cols=16)
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden: torch.Tensor = pllm.hidden(0)) -> torch.Tensor:
         return hidden - hidden.mean(dim=-1, keepdim=True)
 ```
 
-这段代码声明的是捕获与一个输出效果。完整的
-[负载创作契约](doc/reference/authoring-contract.md) 涵盖参数作用域、注解输入、
+这段代码声明了一个输入（参数默认值 `pllm.hidden(0)`：第 0 层的 hidden）和一个输出效果
+（有界导出，在负载的 `on_export` 里收到）。完整的
+[负载创作契约](doc/reference/authoring-contract.md) 涵盖参数作用域、输入来源、
 选择、一阶梯度边、激活检查点与带条件重放的请求 overlay；按任务的写法见
 [使用指南](doc/README.md#使用指南任务导向)。
 
@@ -109,25 +108,25 @@ python -m pip install -e ".[vllm032,test]"   # 或 ".[vllm027,test]"
 相互匹配的 wheel，不要假设任意上游 CUDA 变体都兼容。仅 CPU 开发可安装
 `.[test]`。不安装任何全局 vLLM 插件。
 
-`multiprocessing=True` 是 EngineCore 生产部署路径：负载按**引用**传输——
-类坐标（模块 + 限定名）、模块摘要与冻结字段值，从不序列化函数体——worker
-进程重新导入、重建并重新绑定，安装时其编译签名必须与驱动端签名计划逐字节
-相等。内置负载与用户负载走同一条路（内置即最佳实践参考）。代价是一条纪律：
-workload 类必须可导入（不能是 `__main__`/notebook 里的临时类）、是冻结
-dataclass、字段可封闭传输（原始配置值、typed contract、模块级函数引用或
-WorkerTransportable）。默认 `multiprocessing=False` 进程内执行没有这些要求。
+`multiprocessing=True` 是 EngineCore 生产部署路径：负载经 pickle 送进 worker 进程，
+类和模块级函数按导入路径传递，worker 导入同一份源码重建负载；安装时 worker 的声明
+必须与驱动端的计划一致，源码不一致会在安装时报错。内置负载与用户负载走同一条路。
+代价是两条纪律：workload 类必须可导入（不能是 `__main__`/notebook 里的临时类），
+字段必须能被 pickle（引用模块级函数，不要放 lambda 或闭包）。默认
+`multiprocessing=False` 进程内执行没有这些要求。
 
 CUDA 后端自动将普通逐行预测、训练和字段写入捕获为 CUDA graph，包含 autograd、
-私有页写入和 AdamW；ESamp 使用此通用路径。训练方法返回逐行 loss，由框架屏蔽填充行
-并执行 `mean` 或 `state_mean`，不能在用户方法中混合行。详见
+私有页写入和 AdamW；ESamp 使用此通用路径。逐请求训练的方法返回逐行 loss，由框架屏蔽填充行
+并执行 `mean` 或 `state_mean`，不能在用户方法中混合行；在宿主批次（`WeightedRowBatch`、
+`CausalTrainBatch`）上训练的方法返回一个标量 loss。详见
 [训练与观测](doc/guides/training-and-observation.md#capture-an-ordinary-tensor-step)。
 `ExecutionOptions(publish_lag=1)` 默认让采样后的任务在框架 side stream 上执行，与下一次
 forward 重叠。采样前只读的任务固定读取延迟版本：步 N+1 可读到步 N-1 的训练结果，
 训练本身始终从最新版本继续；版本选择不取决于 GPU 完成时机。需要严格顺序的算法使用
 `publish_lag=0`，非负整数可配置更长延迟。框架先保存 hidden/feedback，再允许后端复用
 这些缓冲区；模型内修改、replay、借用 activation 和跨采样阶段的梯度链仍保持原有顺序。
-Region 默认采用静态安排：在合法且预算足够时使用复用的双 stream，不运行私有调优请求。
-`ExecutionOptions(tuning="measured")` 才启用有界候选实测。计算分析与分块沿用现有实现，
+分块递推（`pllm.scan`，如 In-Place-TTT 的 chunk 递推）默认使用预算内的固定实现；
+`ExecutionOptions(tuning="measured")` 让它在首次运行时实测各候选实现并选最快的。
 调度层不按算法名字分派。
 模型维度与有界资源事实在签名前完成特化；`training_rows` 限制每个状态的
 外部训练行数，`capture_memory_bytes` 是每个任务的驻留上限。容量不足是
