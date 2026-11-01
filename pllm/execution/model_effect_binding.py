@@ -168,7 +168,10 @@ def declare_parameter_overlay(
             native("canonical.state:publish_parameter_overlay@1", "compute/cpu@1", "transition/full_root@1"),
         ),
     )
-    b.overlay(state, (transition, publication), effect.field_bindings(lambda name: state.view(name, b.dimensions)))
+    views = effect.field_bindings(
+        lambda name: state.view(name, b.dimensions), reads_weight="weight" in arguments.values()
+    )
+    b.overlay(state, (transition, publication), views)
 
 
 def write_result(b: TensorBinding, source: Call, state: State, fields: tuple[str, ...], when: When) -> Call:

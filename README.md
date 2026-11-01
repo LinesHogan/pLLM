@@ -171,7 +171,11 @@ forward 重叠。采样前只读的任务固定读取延迟版本：步 N+1 可�
     `architectures` 改为 `Qwen3_5ForCausalLM`，只保留 `model.language_model.*` 权重并改名为 `model.*`。
   - 量化检查点按上面同一家族的规则准入：层路由与 PositionState 只重跑 vLLM 自己的层模块，量化的
     投影照常执行（已验证 GPTQ-Int4 的 Qwen2.5-14B：路由输出、全部层 KV 与 StepLoop 波次和原生 vLLM
-    逐位相等）。参数 overlay 与因果训练（TLM）暂时仍需未量化的检查点。
+    逐位相等）。参数 overlay 和 vLLM 对量化模型做 LoRA 一样，在量化 kernel 的输出上加一份由输入 x
+    算出的 BF16/FP32 修正，不需要稠密权重；零修正时输出与原生 vLLM 逐位相等，CUDA graph 路径同样可用。
+    overlay 函数读取 `pllm.operand("weight")` 时，pllm 用 vLLM 自己的反量化工具为该投影生成一份
+    稠密副本并常驻（例如 14B 的一个 down 投影约 135 MiB），不读取则没有这份内存。
+    因果训练（TLM）暂时仍需未量化的检查点。
   - `DeepseekV2ForCausalLM`、`DeepseekV3ForCausalLM`（MLA 注意力 + MoE）、`GptOssForCausalLM`
     （sink 注意力 + MXFP4 MoE）只支持只读功能：
     hidden tap 与导出、ESamp、采样器引导与反馈、`add_logits`、激活补丁。它们只读取或改写层输出与 logits，

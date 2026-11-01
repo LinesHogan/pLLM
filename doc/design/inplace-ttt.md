@@ -44,7 +44,7 @@ pin 与写入栅栏完成后才退役根。
 当前真实运行时证据为 Qwen2、vLLM 0.27.1 MRv2、eager 进程内、TP1/PP1/DP1、
 非投机 decode。一次两请求运行观察到六次更新、六个训练行、八次稠密应用行
 （两次来自 V0 以上的版本）、零活跃根、零待释放与零回退。MRv1、
-EngineCore-MP、TP/PP>1、量化 target、投机 decode 与 CUDA Graph 未被声称；
+EngineCore-MP、TP/PP>1、投机 decode 与 CUDA Graph 未被声称（量化 target 另见 README）；
 后端适配器与负载调度保持分离。
 
 发布刻意是模型步粒度的：一次模型调用 pin 一个版本，为之后的调用发布其后继。

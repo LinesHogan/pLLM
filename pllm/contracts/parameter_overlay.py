@@ -88,6 +88,8 @@ class ParameterOverlayFieldBinding:
     fields: tuple[FieldView, ...]
     resource: str
     scale: float = 1.0
+    # The overlay function reads operand("weight"): only then does a quantized projection get a dense copy.
+    reads_weight: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,7 +125,9 @@ class ParameterEffect:
         """The same effect with layer=None targets resolved against a model of `layers` layers."""
         return replace(self, targets=expand_targets(self.targets, layers))
 
-    def field_bindings(self, view: Callable[[str], FieldView]) -> tuple[ParameterOverlayFieldBinding, ...]:
+    def field_bindings(
+        self, view: Callable[[str], FieldView], *, reads_weight: bool = False
+    ) -> tuple[ParameterOverlayFieldBinding, ...]:
         """One binding per target; `view` finds each applied field's copy for target i, named `{field}_{i}`."""
         return tuple(
             ParameterOverlayFieldBinding(
@@ -132,6 +136,7 @@ class ParameterEffect:
                 tuple(view(f"{key}_{i}") for key in self.applied_fields),
                 self.state,
                 self.scale,
+                reads_weight,
             )
             for i, target in enumerate(self.targets)
         )

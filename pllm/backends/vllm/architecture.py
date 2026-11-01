@@ -3,8 +3,8 @@
 All admitted families expose the same hidden sites. Block taps keep the fresh
 layer output, without its separately returned residual. Unquantized dense Qwen2,
 Llama and Qwen3 models support every feature; quantized ones rerun layers through
-vLLM's own quantized modules but have no dense weights to overlay or differentiate
-yet. Qwen3-MoE keeps Qwen3 attention and
+vLLM's own quantized modules and correct projection outputs, but causal training
+still differentiates dense weights. Qwen3-MoE keeps Qwen3 attention and
 KV but routes its MLP through experts; the Qwen3.5 hybrids interleave Gated
 DeltaNet layers, whose recurrent state is not KV, with gated full attention.
 `Decoder.projection` and `Decoder.kv_writable` decide which projections and layer
@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING, Protocol, TypeAlias
 
 from torch import Tensor, nn
 from torch.nn import Parameter
+from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.layers.quantization.utils.quant_utils import get_and_maybe_dequant_weights
 from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2DecoderLayer,
     DeepseekV2ForCausalLM,
@@ -63,18 +65,16 @@ DecoderLayer: TypeAlias = (
 )
 Logits = Callable[[Tensor], Tensor | None]
 LinearOutput = Tensor | tuple[Tensor, Parameter | None]
-LinearForward = Callable[[Tensor], LinearOutput]
 MlpForward = Callable[[Tensor], Tensor]
 
 
-class Projection(Protocol):
-    """Weight geometry and replaceable forward shared by the projection readers."""
+def frozen_weight(projection: LinearBase) -> Tensor:
+    """The dense [output, input] weight the inference kernel applies, in the model dtype.
 
-    weight: Parameter
-    bias: Parameter | None
-    tp_size: int
-    return_bias: bool
-    forward: LinearForward
+    An unquantized weight is borrowed; vLLM dequantizes a quantized one into a new dense copy
+    (applying the layer's own kernel to an identity matrix when the method has no direct inverse).
+    """
+    return get_and_maybe_dequant_weights(projection, projection.params_dtype)
 
 
 class Mlp(Protocol):
@@ -91,7 +91,7 @@ class Decoder:
     compute_logits: Logits
     # Why only read-only workloads run on this model; None when every workload does.
     read_only: str | None
-    # vLLM's quantization method name; layer reruns work as is, projection weights are packed.
+    # vLLM's quantization method name; projection weights are packed, so causal training rejects it.
     quantization: str | None
 
     def writable(self, feature: str) -> WritableLM:
@@ -119,18 +119,13 @@ class Decoder:
         cls = type(self.model)
         return f"{cls.__module__}.{cls.__qualname__}"
 
-    def projection(self, target: ParameterTarget) -> tuple[Projection, int, int, Mlp | None]:
+    def projection(self, target: ParameterTarget) -> tuple[LinearBase, int, int, Mlp | None]:
         """Resolve the supported projection and its disjoint output slice; reject layouts pllm cannot slice."""
         from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer
         from vllm.model_executor.models.qwen3_next import Qwen3NextAttention, Qwen3NextSparseMoeBlock
 
         assert target.layer is not None
         layer = self.writable("a parameter overlay").model.layers[target.layer]
-        if self.quantization is not None:
-            raise ValueError(
-                f"a parameter overlay reads dense projection weights, but this model is {self.quantization}-quantized; "
-                "use an unquantized checkpoint"
-            )
         if target.module is ParameterModuleKind.MLP and target.role is ParameterRole.DOWN_PROJECTION_WEIGHT:
             mlp = layer.mlp
             if isinstance(mlp, (Qwen3MoeSparseMoeBlock, Qwen3NextSparseMoeBlock)):
@@ -138,7 +133,7 @@ class Decoder:
                     f"layer {target.layer} routes tokens to experts; MLP down overlays need a dense MLP, "
                     "so overlay the attention query or value projection instead"
                 )
-            return mlp.down_proj, 0, int(mlp.down_proj.weight.shape[0]), mlp
+            return mlp.down_proj, 0, mlp.down_proj.output_size_per_partition, mlp
         if target.module is ParameterModuleKind.ATTENTION:
             if isinstance(layer, Qwen3_5DecoderLayer) and layer.layer_type != "full_attention":
                 raise ValueError(

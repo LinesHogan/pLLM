@@ -59,7 +59,8 @@ class MyLoRA(pllm.Workload):
 **overlay 会不会改到共享权重？** 不会。`pllm.operand("input"/"target"/"weight")`
 是捕获的张量，永远只读；能原地修改的只有 `pllm.parameter` 命名的 buffer——那是
 这条 lineage 私有的因子存储。基座权重只是被借用来计算有效权重，补丁落在私有页上，按版本
-发布。
+发布。量化模型上，`pllm.operand("weight")` 是 vLLM 反量化出的稠密副本：只有读取它的 overlay
+才会让该投影多常驻一份模型精度的权重。
 
 **想让框架替你求梯度？** 给状态声明 `optimizer=pllm.SGD(lr)` 并传 `chunk=`：
 方法改为返回每行一个 loss，框架在每个 chunk 结束时用 SGD 更新补丁
@@ -145,8 +146,8 @@ forward，不改变已完成的 prompt forward 或由它采样的第一个生成
 
 These examples use eager execution with TP=PP=1. See
 [Supported models](../../README.md#支持的模型与限制) for
-architectures and the exact-class admission rule: overlays need an unquantized
-Qwen2, Llama or Qwen3 model; replay also runs on their quantized checkpoints. Q/V factor sizes come from
+architectures and the exact-class admission rule: overlays and replay need a
+Qwen2, Llama or Qwen3 model, quantized or not. Q/V factor sizes come from
 the selected projections; query width need not equal hidden width. The AdamW
 example predicts the hidden row's mean at every projection output coordinate.
 GatedDelta input reconstruction needs equal input and output widths; on

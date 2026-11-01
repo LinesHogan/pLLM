@@ -6,15 +6,16 @@ from functools import partial
 import torch
 from torch.nn import functional as F
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.models.qwen2 import Qwen2Attention
 from vllm.model_executor.models.qwen3 import Qwen3Attention
 
-from pllm.backends.vllm.architecture import DENSE_ARCHITECTURES, Decoder, DenseLayer, Projection
+from pllm.backends.vllm.architecture import DENSE_ARCHITECTURES, Decoder, DenseLayer
 from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding
 from pllm.execution.parameter_projection import parameter_correction
 
-Project = Callable[[Projection, torch.Tensor], torch.Tensor]
+Project = Callable[[LinearBase, torch.Tensor], torch.Tensor]
 
 
 def norm(module: RMSNorm, hidden: torch.Tensor) -> torch.Tensor:
@@ -111,7 +112,7 @@ class CausalTraining:
             )
         if model.model.embed_tokens.weight.dtype is not torch.bfloat16:
             raise ValueError("causal training requires qualified unquantized BF16 TP1 weights")
-        self.projections: dict[Projection, list[tuple[int, int, ParameterOverlayFieldBinding, slice]]] = {}
+        self.projections: dict[LinearBase, list[tuple[int, int, ParameterOverlayFieldBinding, slice]]] = {}
         start = 0
         for binding in bindings:
             projection, offset, size, _ = decoder.projection(binding.target)
@@ -121,7 +122,7 @@ class CausalTraining:
         self.qk_norms = tuple(bind_qk_norms(layer) for layer in self.model.model.layers)
 
     def project(
-        self, projection: Projection, hidden: torch.Tensor, *, factors: tuple[torch.Tensor, ...] | None
+        self, projection: LinearBase, hidden: torch.Tensor, *, factors: tuple[torch.Tensor, ...] | None
     ) -> torch.Tensor:
         """Run the fused base GEMM once and correct its bound output slices."""
         output = F.linear(hidden, projection.weight, projection.bias)
