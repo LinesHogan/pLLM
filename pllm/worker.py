@@ -27,6 +27,11 @@ from pllm.workload_transport import decode_workload
 
 class GPUWorker(compat.Worker):
     def _make_model_runner(self) -> WorkloadModelRunner | Mrv1Runner:
+        if self.parallel_config.tensor_parallel_size > 1:
+            # Prioritize TP collectives over the replicated training lane, whose stream has priority 0.
+            stream = torch.cuda.Stream(device=self.device, priority=-1)
+            stream.wait_stream(torch.cuda.current_stream(self.device))
+            torch.cuda.set_stream(stream)
         return (
             WorkloadModelRunner(self.vllm_config, self.device)
             if self.use_v2_model_runner

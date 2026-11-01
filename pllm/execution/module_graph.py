@@ -9,7 +9,7 @@ from torch.func import functional_call, vmap
 def _views(module: torch.nn.Module, flat: torch.Tensor) -> Iterator[tuple[str, torch.Tensor]]:
     parameters = tuple(module.named_parameters())
     # Split joins disjoint gradients once; separate narrows each build and add a full zero-padded gradient.
-    views = flat.split([parameter.numel() for _, parameter in parameters], dim=-1)
+    views = torch.split(flat, [parameter.numel() for _, parameter in parameters], dim=-1)
     for (name, parameter), view in zip(parameters, views, strict=True):
         yield name, view.view(*flat.shape[:-1], *parameter.shape)
 

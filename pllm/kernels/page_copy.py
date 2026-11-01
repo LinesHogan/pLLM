@@ -38,7 +38,7 @@ def copy_pages(
     if width:
         # Larger tiles avoid thousands of idle blocks in masked optimizer fallback copies.
         block = 2048
-        _copy_pages[(len(destinations) * triton.cdiv(width, block),)](
+        _copy_pages[(len(destinations) * ((width + block - 1) // block),)](
             source, destination, sources, destinations, source.stride(0), destination.stride(0), width, block
         )
 

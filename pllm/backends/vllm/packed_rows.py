@@ -40,7 +40,7 @@ def encode_mrv2_rows(
         prompt_lengths,
     )
     assert all(len(column) == count for column in columns)
-    assert [int(value) for value in input_batch.cu_num_logits_np] == list(range(count + 1))
+    assert np.array_equal(input_batch.cu_num_logits_np, np.arange(count + 1))
     logits = input_batch.logits_indices
     assert logits.ndim == 1 and logits.device.type == "cuda" and logits.numel() == count
     request_ids = tuple(identity.request_id for identity in identities)

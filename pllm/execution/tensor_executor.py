@@ -7,7 +7,7 @@ table and mask unselected rows on the device; tasks without row inputs evaluate 
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field as dataclass_field, replace
 from typing import TypeVar
 
@@ -34,6 +34,18 @@ from pllm.execution.tensor_task import FieldWriter, TensorTask
 from pllm.kernels.page_copy import copy_pages, gather_rows
 
 Table = TypeVar("Table", torch.Tensor, npt.NDArray[np.int64])
+
+
+def _gather_field(pool: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
+    """Gather one field's state pages, filling padding slots with zero."""
+    return pool.index_select(0, slots.clamp_min(0)).masked_fill(
+        (slots < 0).reshape(-1, *(1 for _ in pool.shape[1:])), 0
+    )
+
+
+_cuda_gather: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = torch.compile(  # pyright: ignore[reportUnknownMemberType]
+    _gather_field, dynamic=True, fullgraph=True
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,14 +240,13 @@ class TensorExecutor:
         copied = frozenset(range(ADAM)) if self.optimizer is not None and not self.paged else frozenset[int]()
         reads = self.read_fields | copied
         instance = batch.selection.keys == (None,)
+        gather = _cuda_gather if pools and pools[0].is_cuda else _gather_field
         # A single-page instance has no alternate slot; borrow its pool instead of copying the network.
         fields = tuple(
             (
                 (pool if len(pool) == 1 and field not in copied else pool.index_select(0, slots[:1]))
                 if instance
-                else pool.index_select(0, slots.clamp_min(0)).masked_fill(
-                    (slots < 0).reshape(-1, *(1 for _ in pool.shape[1:])), 0
-                )
+                else gather(pool, slots)
             )
             if field in reads
             else pool.new_empty((layout.states + 1, 0))
