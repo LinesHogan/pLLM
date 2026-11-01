@@ -235,8 +235,7 @@ def declare_activation_patch(
     width = 1 if operator is ActivationPatchOperator.ADD else 3
     views = tuple(view for (resource, _), view in b.field_views.items() if resource == state.declaration.resource)
     if (
-        b.host
-        or not layers
+        not layers
         or tuple(sorted(set(layers))) != layers
         or layers[0] < 0
         or min(first_tokens, last_tokens) < 0
@@ -300,8 +299,6 @@ def declare_layer_route(
         and b.attachment.kind is AttachmentKind.PARAMETER_OVERLAY
         and b.overlay_math is not None
     )
-    if b.host:
-        raise ValueError("layer routes run inside a model; compile this workload with make_llm, not make_host")
     if not activation and not composed and (b.attachment is not None or b.graph.tasks or b.graph.states):
         raise ValueError(
             "a layer_route combines only with one Activation or one trained @pllm.overlay; move other states and "

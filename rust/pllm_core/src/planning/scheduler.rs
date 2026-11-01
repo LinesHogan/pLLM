@@ -2,8 +2,8 @@
 
 use super::semantic_graph::{
     canonical_ascii_json, decode_graph, decode_timeline, validate_graph, ImplementationCandidate,
-    InputSource, OutputKind, RequestKeyField, SemanticGraph, StateEffectKind, StateScope, Timeline,
-    VisibilityKind,
+    InputSource, OutputKind, RequestKeyField, SemanticGraph, SemanticTask, StateEffectKind,
+    StateScope, Timeline, VisibilityKind,
 };
 use super::state_representation::{decode_decision as decode_state, StateRepresentationDecision};
 use super::version_hazards;
@@ -79,17 +79,26 @@ fn graph_index(
         .enumerate()
         .map(|(index, anchor)| (anchor.symbol.as_str(), index as u32))
         .collect();
+    let anchor = |task: &SemanticTask, symbol: &str| {
+        anchors.get(symbol).copied().ok_or_else(|| {
+            format!(
+                "task {} runs at anchor {symbol}, which this backend does not provide; \
+                 move the operation to a phase the backend supports",
+                task.symbol
+            )
+        })
+    };
     // Declared phases name backend anchors in order, so every window is non-empty.
-    let mut windows: Vec<_> = graph
+    let mut windows = graph
         .tasks
         .iter()
         .map(|task| {
-            (
-                anchors[task.timing.after.as_str()],
-                anchors[task.timing.before.as_str()],
-            )
+            Ok((
+                anchor(task, &task.timing.after)?,
+                anchor(task, &task.timing.before)?,
+            ))
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
     let mut predecessors = vec![BTreeSet::new(); graph.tasks.len()];
     for edge in graph.edges.iter().filter(|e| e.step_distance == 0) {
         predecessors[task_index(graph, &edge.target)?].insert(task_index(graph, &edge.source)?);

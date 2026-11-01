@@ -16,6 +16,7 @@ import torch
 
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import FieldView
+from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
 from pllm.contracts.semantic_graph import (
     MathContract,
@@ -25,6 +26,7 @@ from pllm.contracts.semantic_graph import (
     TaskResultInputSource,
     TaskSymbol,
 )
+from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.declaration import Call, State
 from pllm.execution.module_graph import ModuleCall
@@ -39,6 +41,13 @@ from pllm.execution.tensor_frame import (
 )
 from pllm.execution.tensor_program import Observation, TaskOutput, TensorBatch
 from pllm.execution.trace import MAX_SNAPSHOT_BYTES
+
+
+def _row_ref(selection: RequestStateSelection, identity: RequestIdentity) -> StateRef | None:
+    """The state version a row's guidance came from; a prediction that reads no state has none."""
+    if not selection.groups:
+        return None
+    return selection.refs[0] if selection.keys == (None,) else selection.ref_for(identity)
 
 
 @dataclass(frozen=True)
@@ -167,9 +176,7 @@ class TensorTask:
                     "guidance",
                     result[index],
                     data.step.rows.rows[link.packed_row_index],
-                    batch.selection.refs[0]
-                    if batch.selection.keys == (None,)
-                    else batch.selection.ref_for(data.step.rows.rows[link.packed_row_index].identity),
+                    _row_ref(batch.selection, data.step.rows.rows[link.packed_row_index].identity),
                     data.step.rows.step_id,
                 )
                 for index, link in enumerate(links)

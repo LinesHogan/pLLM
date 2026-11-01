@@ -109,6 +109,12 @@ class When(Enum):
     HOST = ("host.input.ready", "host.next")
     OBSERVE = ("state.publish", "sampler.pre_draw")
 
+    @property
+    def publication(self) -> When:
+        """Where a transition computed in this window publishes; a host step publishes only after its compute
+        window closes, so an abandoned step publishes nothing."""
+        return When.HOST_COMMIT if self is When.HOST_COMPUTE else self
+
 
 @dataclass(frozen=True, slots=True)
 class Field:

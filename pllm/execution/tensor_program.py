@@ -79,6 +79,10 @@ class TensorBatch:
             else self.select_resource(resource)
         )
 
+    def state_free(self) -> TensorBatch:
+        """The view of a task that reads no state, whatever the step selected; other states stay reachable."""
+        return replace(self, selection=RequestStateSelection(self.selection.rows, ()), roots=(), after_refs=())
+
     def parameter_root(self, resource: str) -> tuple[torch.Tensor, ...]:
         borrowed = borrowed_root(self.borrowed_roots, resource)
         if borrowed is not None:

@@ -663,10 +663,12 @@ class _Write(_Effect):
         context.signature.append((operation.name, fingerprint(self)))
         call = operation.tensor()
         state = context.states[self.state]
-        update = write_result(context.binding, call, state, self.fields, operation.phase.value)
+        update = write_result(context.binding, call, state, self.fields, operation.transition_window)
         context.writes[self.state] = (
             update,
-            context.binding.publish(update, state, when=operation.phase.value, name=f"{self.state}.publish"),
+            context.binding.publish(
+                update, state, when=operation.transition_window.publication, name=f"{self.state}.publish"
+            ),
         )
 
     @property
@@ -777,7 +779,7 @@ class _Train(_Effect):
                 ports={key: source.training_port(context) for key, source in arguments.items()},
                 function=freeze(operation.function),
                 identity=f"python:{fingerprint(operation.function)}",
-                when=When.HOST_COMPUTE if context.binding.host else operation.phase.value,
+                when=operation.transition_window,
             ),
             self.state,
             "batch",
@@ -919,6 +921,11 @@ def _mark(**markers: object) -> Callable[[F], F]:
     """Attach authoring markers; reflection consumes them once during declaration."""
 
     def decorate(function: F) -> F:
+        # A second marker of one kind would silently replace the first, e.g. @export over @train never trains.
+        if any(f"__pllm_{name}__" in vars(function) for name in markers):
+            raise ValueError(
+                "a method takes one pllm decorator of each kind; split stacked effects into one method per effect"
+            )
         for name, marker in markers.items():
             setattr(function, f"__pllm_{name}__", marker)
         return function
@@ -1290,6 +1297,11 @@ class _Operation:
     def function(self) -> FunctionType | MethodType:
         return self.context.method(self.name)
 
+    @property
+    def transition_window(self) -> When:
+        """Where this method's state transition runs; host workloads have their own step anchors."""
+        return When.HOST_COMPUTE if self.context.binding.host else self.phase.value
+
     def arguments(self) -> tuple[dict[str, _Source], dict[str, Capture]]:
         """Split captured inputs into their read source and the memory field the update writes."""
         sources, captures = _arguments(self.function), dict[str, Capture]()
@@ -1606,6 +1618,11 @@ class _Declaration:
 
     def declare_values(self) -> None:
         """Allocate ordinary state before effects and operations consume its ports."""
+        if self.binding.host and (self.routes or self.model_values):
+            raise ValueError(
+                "pllm.model.Overlay, pllm.model.Activation and layer routes act inside a model forward; compile this "
+                "workload with make_llm, not make_host"
+            )
         self.positions = self.position_states()
         for name, state in self.state_definitions.items():
             with self.declaring(name):

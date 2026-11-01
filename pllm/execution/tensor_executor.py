@@ -332,7 +332,9 @@ class TensorExecutor:
             return TaskOutput()
         data = prepared
         parent, frame = batch, data
-        if self.task.resource and any(group.resource == self.task.resource for group in batch.selection.groups):
+        if not self.task.resource:
+            batch = batch.state_free()
+        elif any(group.resource == self.task.resource for group in batch.selection.groups):
             batch = batch.for_resource(self.task.resource)
         rows = data.rows
         if self.task.phase is not None:

@@ -200,6 +200,7 @@ def test_write_field_and_feed_field_order_are_signed():
             return (value + previous,)
 
     first = Fields().declaration(facts_for()).graph.execution_parameters_digest
+    vars(Fields.transform).pop("__pllm_effect__")  # re-declare the same method with another field
     pllm.write(state="target", fields=("second",))(Fields.transform)
     assert Fields().declaration(facts_for()).graph.execution_parameters_digest != first
     Fields.source = pllm.InstanceState({"value": (2,), "extra": (2,)}, feed=pllm.state.FeedOrder.ORDERED)

@@ -132,8 +132,7 @@ def declare_batch_train(
             reduction="custom",
         ),
     )
-    # A host step publishes only after its compute window closes, so an abandoned step publishes nothing.
-    b.publish(call, state, when=When.HOST_COMMIT if when is When.HOST_COMPUTE else when)
+    b.publish(call, state, when=when.publication)
     if when is When.HOST_COMPUTE:
         resource = str(state.declaration.resource)
         views = {key: view for (owner, key), view in b.field_views.items() if owner == resource}
