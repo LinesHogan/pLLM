@@ -9,6 +9,8 @@ from dataclasses import replace
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 from pllm.config import ExecutionOptions
 from pllm.contracts.codec import decode_boundary, encode_boundary
@@ -216,6 +218,15 @@ def _cuda_ipc_lifecycle():
             process.close()
 
 
+@triton.jit
+def _wait_for_gate(gate, expired, budget):
+    """Hold the launching stream until the host sets the pinned `gate`, or give up after `budget` reads."""
+    spins = 0
+    while (tl.load(gate, volatile=True) == 0) & (spins < budget):
+        spins += 1
+    tl.store(expired, spins == budget)
+
+
 def test_bounded_staging_and_diagnostics_wait_for_completion_without_host_waits():
     """Busy host storage backpressures admission; a device snapshot never exposes partial counters."""
     from unittest.mock import patch
@@ -228,22 +239,31 @@ def test_bounded_staging_and_diagnostics_wait_for_completion_without_host_waits(
     destination = torch.empty(8, dtype=torch.int64, device="cuda")
     counters = DeviceCounters(destination.device)
     increments = torch.tensor([3, 17], device="cuda")
+    # The copy and the counter update stay queued behind the gate until the checks below have run. Their kernels
+    # are loaded first: a lazy CUDA module load while the gate kernel spins would block the host until it ends.
+    gate = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+    expired = torch.zeros(1, dtype=torch.bool, device="cuda")
+    DeviceCounters(destination.device).add(increments, stream)
     torch.cuda.synchronize()
     with torch.cuda.stream(stream):
         host = staging.take(8)
         address = host.data_ptr()
         host.fill_(23)
-        torch.cuda._sleep(100_000_000)
+        _wait_for_gate[(1,)](gate, expired, 5_000_000)  # each read of host memory takes ~2 us: ~10 s
         staging.copy_to(destination)
         counters.add(increments, stream)
-    with (
-        patch.object(torch.cuda.Event, "synchronize", side_effect=AssertionError("host wait")),
-        patch.object(torch.cuda.Stream, "synchronize", side_effect=AssertionError("host wait")),
-    ):
-        with pytest.raises(WindowBackpressure):
-            staging.take(8)
-        assert counters.read() == (0, 0)
-    stream.synchronize()
+    try:
+        with (
+            patch.object(torch.cuda.Event, "synchronize", side_effect=AssertionError("host wait")),
+            patch.object(torch.cuda.Stream, "synchronize", side_effect=AssertionError("host wait")),
+        ):
+            with pytest.raises(WindowBackpressure):
+                staging.take(8)
+            assert counters.read() == (0, 0)
+    finally:
+        gate[0] = 1
+        stream.synchronize()
+        assert not expired.item(), "the gate expired: a kernel launched behind it was not loaded beforehand"
     torch.testing.assert_close(destination, torch.full_like(destination, 23))
     assert staging.take(8).data_ptr() == address
     assert counters.read() == (3, 17)
