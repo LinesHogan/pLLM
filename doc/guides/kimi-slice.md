@@ -11,7 +11,7 @@
 python tools/model_slice.py \
   --repo moonshotai/Kimi-K2.5 \
   --revision 4d01dfe0332d63057c186e0b262165819efb6611 \
-  --text-only --output /scratch/mas/zengdeveloper/model-slices/moonshotai/Kimi-K2.5@4d01dfe0332d63057c186e0b262165819efb6611
+  --text-only --output /home/zengdeveloper/pllm/model-slices/moonshotai/Kimi-K2.5@4d01dfe0332d63057c186e0b262165819efb6611
 ```
 
 张量 payload 为 54,735,407,616 bytes（50.98 GiB），另有元数据与 tokenizer。
