@@ -221,8 +221,12 @@ worker 重新导入并重建，安装时其编译签名必须与驱动端签名�
 值；状态声明 `optimizer=pllm.SGD(lr)` 时，方法返回每行一个 loss，框架按 `chunk=`
 累积梯度并做 SGD（`flush="prompt_end"` 让 prompt 末尾的短 chunk 也训练）。
 `@overlay` 不再接受 `optimizer=`。固定 `shape=` 使用默认的 `value` 字段；具名 `Buffer` 字段可以按每个 target
-解析 `(input_size, output_size)`。Buffer dtype 默认取目标模型 dtype；显式整数
-buffer 保留自己的 dtype。`Operand.INPUT/TARGET/WEIGHT` 命名捕获的张量；
+解析 `(input_size, output_size)`。`Buffer` 默认以 FP32 存储并累积状态，独立于
+模型 dtype；字段自身的 `dtype=` 覆盖默认值（不会继承 `RequestState.dtype`）。
+`dtype=None` 显式选择模型 dtype，整数 buffer 保留自己的 dtype。
+Dense / low-rank overlay 在投影读取时转换到输入 dtype，HEAD_ADD 始终要求 FP32；
+FP64 可用于数值 oracle。SGD 的梯度累积至少使用 FP32，显式选择模型 dtype 时也一样。
+自定义更新函数也必须在自己的投影运算中显式转换操作数。`Operand.INPUT/TARGET/WEIGHT` 命名捕获的张量；
 `Parameter(state, field)` 命名私有 buffer 视图。只有这些被授权的 buffer 可以
 被原地修改，操作数永远不行。方法返回
 `TensorUpdate(output, changed=..., update_count=..., trained_rows=...)`。

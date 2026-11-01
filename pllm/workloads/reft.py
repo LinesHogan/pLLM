@@ -61,9 +61,9 @@ class ActivationWorkload(pllm.Workload):
     def intervention(self) -> pllm.InstanceState:
         rank = self.config.rank
         fields = (
-            pllm.Buffer(lambda inputs, outputs: (rank, inputs)),
-            pllm.Buffer((rank,)),
-            pllm.Buffer(lambda inputs, outputs: (outputs, rank)),
+            pllm.Buffer(lambda inputs, outputs: (rank, inputs), dtype=None),
+            pllm.Buffer((rank,), dtype=None),
+            pllm.Buffer(lambda inputs, outputs: (outputs, rank), dtype=None),
         )
         if self.config.operator is pllm.model.ActivationPatchOperator.ADD:
             fields = (pllm.Buffer(lambda inputs, outputs: (inputs,), dtype=torch.float32),)

@@ -37,6 +37,7 @@ from pllm.execution.cuda_stream import CudaStreamReadiness, DeviceCounters
 from pllm.execution.execution import TaskGraphExecution, TaskGraphImplementation
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle import (
+    FieldNumericHealth,
     PageBundleArena,
     PageBundleUsage,
     PagePin,
@@ -398,6 +399,7 @@ class StateDiagnostics:
     last_hold: HeldInput | None = None
     # Why the model runs without CUDA graphs (ModelConfig.cuda_graphs); empty when it uses them.
     eager_reason: str = ""
+    numeric_health: tuple[FieldNumericHealth, ...] = ()
 
     def logical_counts(self) -> tuple[int, ...]:
         """Rank-invariant progress, excluding allocator/event timing and device identities."""
@@ -896,4 +898,5 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             self.arena.usage(),
             self._hold_count,
             self._last_hold,
+            numeric_health=self.arena.numeric_health(),
         )

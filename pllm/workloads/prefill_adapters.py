@@ -34,16 +34,15 @@ class PrefillAdapters(pllm.Workload):
     chunk_size: int = 128
     rank: int = 8
     learning_rate: float = 1e-3
-    dtype: torch.dtype = torch.bfloat16
+    dtype: torch.dtype = torch.float32
 
     @property
     def adapters(self) -> pllm.RequestState:
         return pllm.RequestState(
             {
-                "a": pllm.Buffer(lambda inputs, outputs: (self.rank, inputs), self.dtype),
-                "b": pllm.Buffer(lambda inputs, outputs: (outputs, self.rank), self.dtype),
+                "a": pllm.Buffer(lambda inputs, outputs: (self.rank, inputs), dtype=self.dtype),
+                "b": pllm.Buffer(lambda inputs, outputs: (outputs, self.rank), dtype=self.dtype),
             },
-            dtype=self.dtype,
             initialize=initialize,
             # Apply the mean reconstruction gradient once per prompt chunk.
             optimizer=pllm.SGD(self.learning_rate),
@@ -66,6 +65,6 @@ class PrefillAdapters(pllm.Workload):
         b: torch.Tensor = pllm.parameter("adapters", "b"),
     ) -> torch.Tensor:
         """Return each row's reconstruction error with FP32 (or wider) error math."""
-        prediction = x @ base.T + (x @ a.T) @ b.T
+        prediction = x @ base.T + (x @ a.to(x.dtype).T) @ b.to(x.dtype).T
         dtype = torch.promote_types(prediction.dtype, torch.float32)
         return (prediction.to(dtype) - target.to(dtype)).square().mean(-1)

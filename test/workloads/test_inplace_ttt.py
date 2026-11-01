@@ -47,7 +47,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
         ParameterTarget(layer, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT) for layer in (0, 1)
     )
     config = InPlaceTTTConfig(targets, chunk_size=2, learning_rate=0.3)
-    workload = InPlaceTTTWorkload(config)
+    workload = InPlaceTTTWorkload(config, dtype=torch.float64)
     facts = backend_facts(
         3,
         (),
@@ -137,8 +137,8 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     class LowRankOverlay(pllm.Workload):
         factors = pllm.RequestState(
             {
-                "a": pllm.Buffer(lambda inputs, outputs: (2, inputs)),
-                "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2)),
+                "a": pllm.Buffer(lambda inputs, outputs: (2, inputs), dtype=torch.float64),
+                "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2), dtype=torch.float64),
             },
             dtype=torch.float64,
         )
@@ -223,8 +223,8 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     class ImportedOverlay(pllm.Workload):
         factors = pllm.RequestState(
             {
-                "a": pllm.Buffer(lambda inputs, outputs: (2, inputs)),
-                "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2)),
+                "a": pllm.Buffer(lambda inputs, outputs: (2, inputs), dtype=torch.float64),
+                "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2), dtype=torch.float64),
             },
             imported=True,
             dtype=torch.float64,

@@ -35,12 +35,13 @@ class InPlaceTTTWorkload(pllm.Workload):
 
     name = "inplace_ttt.dense_fast_weight"
     config: InPlaceTTTConfig
+    dtype: torch.dtype = torch.float32
 
     @property
     def dense_fast_weights(self) -> pllm.RequestState:
         return pllm.RequestState(
             {
-                "delta": pllm.Buffer(lambda inputs, outputs: (outputs, inputs)),
+                "delta": pllm.Buffer(lambda inputs, outputs: (outputs, inputs), dtype=self.dtype),
             },
             namespace="canonical.dense_fast_weight.state@1",
             keys=(
@@ -66,7 +67,7 @@ class InPlaceTTTWorkload(pllm.Workload):
         targets: torch.Tensor = pllm.operand("target"),
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Read the incoming residual and advance one additive chunk."""
-        output = torch.mm(inputs, delta.T)
+        output = torch.mm(inputs, delta.to(inputs.dtype).T)
         return delta + (self.config.learning_rate * torch.mm(targets.T, inputs)).to(delta), output
 
 

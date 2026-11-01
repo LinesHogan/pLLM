@@ -36,7 +36,16 @@ def run(chunk):
     workload = SettledInPlaceTTT(InPlaceTTTConfig(targets, chunk_size=chunk, learning_rate=1e-6, update_decode=True))
     handle = pllm.make_llm(
         workload=workload,
-        config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", "bfloat16", 64, 2, 64, 0.25, seed=7),
+        config=ModelConfig(
+            "Qwen/Qwen2.5-0.5B-Instruct",
+            "bfloat16",
+            64,
+            2,
+            64,
+            0.25,
+            seed=7,
+            execution=pllm.ExecutionOptions(capture_memory_bytes=128 << 20),
+        ),
     )
     primitive = handle.runner.require_session()._replay
     native, checked, errors = torch.cuda.CUDAGraph.replay, [], []
@@ -95,7 +104,7 @@ def run(chunk):
         gate, up = F.linear(hidden, layer.mlp.gate_up_proj.weight, layer.mlp.gate_up_proj.bias).chunk(2, -1)
         hidden = (F.silu(gate.float()) * up.float()).to(hidden_in.dtype)
         expected = F.linear(hidden, layer.mlp.down_proj.weight, layer.mlp.down_proj.bias)
-        expected += F.linear(hidden, delta)
+        expected += F.linear(hidden, delta.to(hidden.dtype))
         # Isolate KV projection/RoPE from the RMSNorm rounding checked by the full-layer oracle.
         _, reference_key, reference_value = F.linear(
             qkv_input, attention.qkv_proj.weight, attention.qkv_proj.bias

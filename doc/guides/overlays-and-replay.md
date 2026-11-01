@@ -9,6 +9,11 @@
 声明这两件事，以及一个常见的后续问题：补丁的字段值不来自引擎内训练行不行？
 （行，见下文「外部生产的 overlay」。）
 
+Buffer 默认使用 FP32 保存累积状态。Dense / low-rank 投影读取时转换到模型输入 dtype；
+HEAD_ADD 保持 FP32。`pllm.Buffer(shape, dtype=torch.bfloat16)` 可显式节省一半字段显存，
+代价是小更新可能被舍入掉；`dtype=None` 显式跟随模型 dtype。
+`InPlaceTTTWorkload(..., dtype=...)` 与 `PrefillAdapters(dtype=...)` 均可配置状态精度，默认 FP32。
+
 ## 引擎内训练的 overlay
 
 **要解决的问题**：请求在生成的同时，根据它自己的推理轨迹更新一副私有补丁，
@@ -29,7 +34,7 @@ class MyLoRA(pllm.Workload):
     factors = pllm.RequestState({
         "a": pllm.Buffer(lambda inputs, outputs: (2, inputs)),    # (rank, 输入宽)
         "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2)),   # (输出宽, rank)
-    }, dtype=torch.bfloat16)
+    })
 
     @pllm.overlay(state="factors", targets=targets,
                   operator=pllm.model.ParameterOverlayOperator.LOW_RANK_ADD,
@@ -41,7 +46,7 @@ class MyLoRA(pllm.Workload):
         a: torch.Tensor = pllm.parameter("factors", "a"),
         b: torch.Tensor = pllm.parameter("factors", "b"),
     ) -> pllm.TensorUpdate:
-        residual = x @ (b @ a).T                         # 只返回补丁的增量，不含基座投影
+        residual = (x @ a.to(x.dtype).T) @ b.to(x.dtype).T                         # 只返回补丁的增量，不含基座投影
         a.add_((0.1 * y[:, :a.shape[0]].T @ x).to(a))    # 只有 a/b 可原地写
         b.add_((0.1 * (y.T @ y)[:, :b.shape[1]]).to(b))
         return pllm.TensorUpdate(

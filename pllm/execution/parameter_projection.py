@@ -24,9 +24,9 @@ def parameter_correction(
     if operator is ParameterOverlayOperator.HEAD_ADD:
         return head_correction(hidden, weights[0])
     multiply = torch.bmm if batched else torch.matmul
-    result = multiply(hidden, weights[0].transpose(-1, -2))
+    result = multiply(hidden, weights[0].to(hidden.dtype).transpose(-1, -2))
     if operator is ParameterOverlayOperator.LOW_RANK_ADD:
-        result = multiply(result, weights[1].transpose(-1, -2))
+        result = multiply(result, weights[1].to(hidden.dtype).transpose(-1, -2))
     return result
 
 

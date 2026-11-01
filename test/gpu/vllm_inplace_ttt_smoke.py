@@ -72,10 +72,10 @@ class RequestLowRankTTT(pllm.Workload):
         a: torch.Tensor = pllm.parameter("factors", "a"),
         b: torch.Tensor = pllm.parameter("factors", "b"),
     ) -> TensorUpdate:
-        output = hidden @ (b @ a).T
+        output = (hidden @ a.to(hidden.dtype).T) @ b.to(hidden.dtype).T
         error = hidden @ base.T + 0.5 * output - desired
-        gradient_b = 2 * error.T @ (hidden @ a.T) / hidden.shape[0]
-        gradient_a = 2 * (error @ b).T @ hidden / hidden.shape[0]
+        gradient_b = 2 * error.T @ (hidden @ a.to(hidden.dtype).T) / hidden.shape[0]
+        gradient_a = 2 * (error @ b.to(hidden.dtype)).T @ hidden / hidden.shape[0]
         a.add_(-1e-3 * gradient_a)
         b.add_(-1e-3 * gradient_b)
         return TensorUpdate(
@@ -305,16 +305,16 @@ def _check_imported(handle: VllmLlm[object, object]) -> tuple[str, ...]:
         raise RuntimeError("imported overlay baseline generation is incomplete")
     # One batch, one imported request: the second row must keep the exact base outputs.
     generator = torch.Generator().manual_seed(11)
-    down = torch.randn(down_shape, generator=generator).to(device=device, dtype=torch.bfloat16)
-    up = torch.randn(up_shape, generator=generator).to(device=device, dtype=torch.bfloat16)
+    down = torch.randn(down_shape, generator=generator).to(device=device, dtype=torch.float32)
+    up = torch.randn(up_shape, generator=generator).to(device=device, dtype=torch.float32)
     update = pllm.state.StateTensorUpdate((down.unsqueeze(0), up.unsqueeze(0)), (_key(2),))
     mixed = texts(handle.generate(PROMPTS, SAMPLING, prompt_indices=(2, 3), auxiliary=update))
     if mixed[0] == baseline[0] or mixed[1] != baseline[1]:
         raise RuntimeError("imported factors must move exactly their own request's outputs")
     # Imported zero factors are an exact no-op on fresh requests.
     zeros = (
-        torch.zeros((2, *down_shape), device=device, dtype=torch.bfloat16),
-        torch.zeros((2, *up_shape), device=device, dtype=torch.bfloat16),
+        torch.zeros((2, *down_shape), device=device, dtype=torch.float32),
+        torch.zeros((2, *up_shape), device=device, dtype=torch.float32),
     )
     update = pllm.state.StateTensorUpdate(zeros, (_key(4), _key(5)))
     if texts(handle.generate(PROMPTS, SAMPLING, prompt_indices=(4, 5), auxiliary=update)) != baseline:
@@ -378,8 +378,8 @@ def main() -> int:
             lambda h: _check(h, "dense strict"),
         ),
         (
-            "dense_512",
-            lambda: open_llm(dense, memory_budget_bytes=512 << 20),
+            "dense_768",
+            lambda: open_llm(dense, memory_budget_bytes=768 << 20),
             lambda h: _check(h, "dense window"),
         ),
         (
@@ -447,7 +447,7 @@ def main() -> int:
                 model_length=128,
                 cuda_graphs=True,
                 capture_memory_bytes=512 << 20,
-                memory_budget_bytes=2 << 30,
+                memory_budget_bytes=3 << 30,
             ),
             _check_graph,
         ),
@@ -483,7 +483,7 @@ def main() -> int:
                 model_length=128,
                 cuda_graphs=True,
                 capture_memory_bytes=512 << 20,
-                memory_budget_bytes=2 << 30,
+                memory_budget_bytes=3 << 30,
             ),
             _check_hybrid,
         ),

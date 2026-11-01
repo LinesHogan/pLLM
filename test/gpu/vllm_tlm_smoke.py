@@ -75,7 +75,10 @@ def main() -> None:
         # must remain selected throughout every request and every token.
         for layer_index, layer in enumerate(handle.runner.model.model.layers):
             q_size, kv_size = layer.self_attn.q_size, layer.self_attn.kv_size
-            factor = (*factors[2 * layer_index], *factors[2 * layer_index + 1])
+            factor = tuple(
+                value.to(layer.self_attn.qkv_proj.weight.dtype)
+                for value in (*factors[2 * layer_index], *factors[2 * layer_index + 1])
+            )
 
             def check(module, args, output, factor=factor, q_size=q_size, kv_size=kv_size):
                 (hidden,) = args

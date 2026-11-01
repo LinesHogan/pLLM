@@ -48,7 +48,7 @@ class TinyCausalPort:
     def __deepcopy__(self, memo):
         raise AssertionError("binding must retain the original frozen causal model")
 
-    resident_bytes = 4 * 2 * 3 * 8  # Only factor templates are owned by the workload.
+    resident_bytes = 4 * 2 * 3 * 4  # Only factor templates are owned by the workload.
 
     def bind(self, bindings):
         return self

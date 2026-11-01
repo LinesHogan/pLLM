@@ -27,8 +27,10 @@ class SGD:
 
 @dataclass(frozen=True)
 class Buffer:
+    """A shaped state field, stored in FP32 by default; explicit None follows the model."""
+
     shape: tuple[int, ...] | Callable[[int, int], tuple[int, ...]]
-    dtype: torch.dtype | None = None
+    dtype: torch.dtype | None = torch.float32
 
     def size(self, inputs: int, outputs: int) -> tuple[int, ...]:
         """The shape for one overlay target's widths, or for the hidden width outside overlays."""
@@ -36,7 +38,7 @@ class Buffer:
 
     @property
     def tensor_dtype(self) -> TensorDType | None:
-        """The declared dtype; None follows the model."""
+        """The declared storage dtype; None follows the model."""
         return None if self.dtype is None else TensorDType(str(self.dtype).removeprefix("torch."))
 
 
@@ -102,9 +104,13 @@ def _check_target_buffers(
             f"overlay Buffers {keys} must be shaped {rule} for the {projection} (inputs={inputs}, outputs={outputs}); "
             f"got {shapes}"
         )
-    required = TensorDType.FLOAT32 if effect.operator is ParameterOverlayOperator.HEAD_ADD else model
+    allowed = (
+        (TensorDType.FLOAT32,)
+        if effect.operator is ParameterOverlayOperator.HEAD_ADD
+        else (model, TensorDType.FLOAT32, TensorDType.FLOAT64)
+    )
     for key in keys:
-        if (buffers[key].tensor_dtype or model) is not required:
+        if (buffers[key].tensor_dtype or model) not in allowed:
             raise ValueError(
-                f"overlay Buffer {key!r} must hold {required} for {effect.operator}; set dtype=torch.{required}"
+                f"overlay Buffer {key!r} must hold one of {allowed} for {effect.operator}; set dtype=torch.float32"
             )

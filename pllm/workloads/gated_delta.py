@@ -51,7 +51,6 @@ class GatedDeltaWorkload(pllm.Workload):
                         self.config.head_width,
                         self.config.head_width,
                     ),
-                    dtype=torch.float32,
                 ),
             },
             namespace="gated_delta.fast_weight.state@1",
@@ -72,7 +71,7 @@ class GatedDeltaWorkload(pllm.Workload):
         hidden: torch.Tensor = pllm.operand("input"),
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One gated MSE update; read each chunk using its incoming state."""
-        inputs = hidden.float().reshape(-1, *state.shape[:2])
+        inputs = hidden.to(state.dtype).reshape(-1, *state.shape[:2])
         keys = F.normalize(inputs, dim=-1)
         values, keys = inputs.transpose(0, 1), keys.transpose(0, 1)
         decayed = state * self.config.alpha

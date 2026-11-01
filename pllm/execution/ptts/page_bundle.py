@@ -8,7 +8,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field as dataclass_field
-from math import prod
+from math import isfinite, prod
 from multiprocessing.connection import Connection
 from typing import overload
 
@@ -199,6 +199,34 @@ class LazyRoots(Sequence[tuple[torch.Tensor, ...]]):
         if index not in self._views:
             self._views[index] = self._arena.borrow_roots((self._access[index],), self._refs.take((index,)))[0]
         return self._views[index]
+
+
+@dataclass(frozen=True, slots=True)
+class FieldNumericHealth:
+    """One live published field; undefined or overflowing norms/maxima are None."""
+
+    resource: str
+    ref: StateRef
+    field: LayoutFieldId
+    norm: float | None
+    max_abs: float | None
+    nonfinite_count: int
+
+    @classmethod
+    def read(cls, resource: str, ref: StateRef, field: LayoutFieldId, value: torch.Tensor) -> FieldNumericHealth:
+        """Reduce a device snapshot, then read its scalars only for an explicit diagnostic query."""
+        value = value.detach().double().flatten()
+        stats = torch.stack(
+            (
+                value.square().sum().sqrt(),
+                value.abs().amax() if value.numel() else value.new_zeros(()),
+                (~value.isfinite()).sum(),
+            )
+        ).cpu()
+        norm, maximum, count = (float(stat.item()) for stat in stats)
+        return cls(
+            resource, ref, field, norm if isfinite(norm) else None, maximum if isfinite(maximum) else None, int(count)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -809,6 +837,23 @@ class PageBundleArena:
         pools = self._pools[root.resource]
         with self._scope(pin.stream):
             return tuple(pools.tensor(field, page).detach().clone() for field, page in enumerate(root.pages))
+
+    def numeric_health(self) -> tuple[FieldNumericHealth, ...]:
+        """Inspect current published roots via their exact snapshots; no work runs on the publish/step path."""
+        stream = torch.cuda.current_stream(self.device) if self.device.type == "cuda" else None
+        result: list[FieldNumericHealth] = []
+        for table in self._tables.values():
+            for row in np.flatnonzero(table.status == 2):
+                ref = table.ref(int(row))
+                pin = self.pin_exact(StateRefs.of((ref,)), stream)
+                try:
+                    result.extend(
+                        FieldNumericHealth.read(table.resource, ref, LayoutFieldId(field), value)
+                        for field, value in enumerate(self.snapshot(pin, ref))
+                    )
+                finally:
+                    self.wait_release(self.release_pin(pin))
+        return tuple(result)
 
     def release_pin(self, pin: PagePin) -> PageRelease:
         held = self._issued_pin(pin)

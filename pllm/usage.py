@@ -525,7 +525,7 @@ class InstanceState:
         shapes = {key: spec for key, spec in self.fields.items() if not isinstance(spec, Buffer)}
         if consumer is None and len(shapes) == len(self.fields):
             return tuple(Field(key, shape, self.tensor_dtype, self.alignment) for key, shape in shapes.items())
-        buffers = _buffers(self)
+        buffers = _buffers(self, context.binding.dimensions.dtype)
         if consumer is None:
             return tuple(
                 buffer_field(key, buffer, lambda m: (m.hidden_size, m.hidden_size)) for key, buffer in buffers.items()
@@ -606,13 +606,13 @@ def _frozen(initialize: Initializer | None) -> Initializer | None:
     return None if initialize is None else freeze(initialize)
 
 
-def _buffers(state: InstanceState) -> dict[str, Buffer]:
-    """The state's fields as Buffers; a fixed shape takes the state's dtype."""
+def _buffers(state: InstanceState, model: TensorDType) -> dict[str, Buffer]:
+    """Resolve model precision before optimizer fields are derived; plain shapes use the state's dtype."""
     buffers: dict[str, Buffer] = {}
     for key, value in state.fields.items():
         match value:
             case Buffer():
-                buffers[key] = value
+                buffers[key] = replace(value, dtype=value.dtype or model.torch)
             case tuple():
                 buffers[key] = Buffer(value, state.dtype)
             case _:
@@ -969,7 +969,8 @@ def _chunked_overlay(
             raise ValueError("chunk overlays need the weight carry followed by input/target operands")
         pending = {
             f"_pending_rows_{name}": Buffer(
-                lambda inputs, outputs, source=source: (max(1, chunk - 1), inputs if source == "input" else outputs)
+                lambda inputs, outputs, source=source: (max(1, chunk - 1), inputs if source == "input" else outputs),
+                dtype=None,
             )
             for name, source in zip(arguments[1:], sources[1:], strict=True)
         }
@@ -1062,7 +1063,7 @@ class _Overlay(_Effect):
             raise ValueError(f"{self.state!r} has an optimizer, so @pllm.overlay trains it per chunk; give chunk=")
         if self.flush is not None and optimizer is None:
             raise ValueError(f"flush='prompt_end' trains a short final chunk; declare {self.state!r} with an optimizer")
-        buffers = _buffers(definition)
+        buffers = _buffers(definition, context.binding.dimensions.dtype)
         bindings = {key: source.overlay(self.state, buffers) for key, source in _arguments(operation.function).items()}
         if set(buffers) & {source.value for source in Operand}:
             raise ValueError("overlay buffers conflict with reserved operand names")

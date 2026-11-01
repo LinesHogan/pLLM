@@ -42,7 +42,10 @@ class Probe(pllm.Workload):
 
 形状可以是 lambda（拿模型事实 `m`），也可以是 `pllm.Buffer(...)`（overlay
 场景按目标输入/输出宽度解析）。声明可以写在类上、实例上；形状依赖配置时，
-写成带类型的 property。
+写成带类型的 property。`Buffer` 与普通状态字段都默认 FP32；Buffer 自己的
+`dtype=` 决定存储精度，`dtype=None` 显式跟随模型。`RequestState.dtype` 只作用于普通形状字段。
+FP32 相对 BF16 使该字段的 payload 翻倍，也增加投影读取的转换工作区。旧的紧预算
+可能在规划或图捕获时报错；提高 state / capture / execution 预算，或显式选择 BF16。
 
 ## 我想让一组请求共享训练成果：路由键
 
@@ -259,3 +262,8 @@ CudaIPCTypes 警告，这是未获完成证明的诊断，不能用强制回收�
 
 精确边界（零梯度语义、empty 选择、捕获 detach、外部导入通道）见
 [创作契约](../reference/authoring-contract.md#训练与梯度)。
+
+`llm.diagnostics().numeric_health` 返回当前存活的已发布字段的精确统计：resource、
+版本 ref、field ID、L2 norm、max-abs 和 nonfinite_count。归约在设备上的现有快照进行，
+只有查询时才读取主机标量，不增加每步或发布路径的同步。非有限的 norm/max-abs 为 `None`，
+空字段二者为零。退役字段不保留历史统计；需在请求存活时查询。
