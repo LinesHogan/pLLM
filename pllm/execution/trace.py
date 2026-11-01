@@ -180,20 +180,23 @@ class TraceSelection:
 @dataclass(slots=True, eq=False)
 class _TraceEntry:
     event: TraceEvent
+    # Producers pass immutable tuples or StateRefs columns; only snapshots need individual objects.
+    refs: Sequence[StateRef]
     timing: tuple[torch.cuda.Event, torch.cuda.Event] | None
     payload: tuple[torch.Tensor, torch.cuda.Event | None] | None
     pending: bool
 
     def snapshot(self) -> TraceEvent:
-        """Encode an owned host value after its copy completes."""
-        if self.payload is None:
+        """Materialize retained immutable refs and encode a completed owned host value on inspection."""
+        if self.payload is None and not self.refs:
             return self.event
-        host, ready = self.payload
-        if ready is not None:
-            ready.synchronize()
-        return replace(
-            self.event, tensor_data=b64encode(host.reshape(-1).view(torch.uint8).numpy().tobytes()).decode("ascii")
-        )
+        payload = None
+        if self.payload is not None:
+            host, ready = self.payload
+            if ready is not None:
+                ready.synchronize()
+            payload = b64encode(host.reshape(-1).view(torch.uint8).numpy().tobytes()).decode("ascii")
+        return replace(self.event, refs=tuple(self.refs), tensor_data=payload)
 
 
 class ExecutionTrace:
@@ -470,7 +473,7 @@ class ExecutionTrace:
                         invocation_id,
                         task_id,
                         identities,
-                        tuple(refs),
+                        (),
                         operation_id,
                         pin_id,
                         release_id,
@@ -486,6 +489,7 @@ class ExecutionTrace:
                         kernel_name=kernel_name,
                         device_duration_ns=device_duration_ns,
                     ),
+                    refs,
                     timing,
                     payload,
                     export is not None and self._on_export is not None,

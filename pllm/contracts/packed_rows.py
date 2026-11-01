@@ -65,7 +65,7 @@ class PackedPhaseRowBatch:
     def latest_decode_rows(self) -> tuple[PackedPhaseRow, ...]:
         """Each request's final decode row; earlier ones in its span recompute output history after preemption."""
         last = {row.request_ordinal: row for row in self.rows}
-        return tuple(row for row in self.decode_rows if last[row.request_ordinal] is row)
+        return tuple(row for row in self.rows if row.phase is HiddenPhase.DECODE and last[row.request_ordinal] is row)
 
 
 @dataclass(frozen=True, slots=True)

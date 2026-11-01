@@ -45,17 +45,16 @@ def encode_mrv2_rows(
     assert logits.ndim == 1 and logits.device.type == "cuda" and logits.numel() == count
     request_ids = tuple(identity.request_id for identity in identities)
     assert tuple(input_batch.req_ids) == request_ids and all(request_ids) and len(set(request_ids)) == count
-    scheduled = [int(value) for value in input_batch.num_scheduled_tokens]
-    prompt = [int(value) for value in prompt_lengths]
-    computed = [int(value) for value in input_batch.num_computed_tokens_np]
-    assert all(
-        tokens >= 1 and bool(prefilling) == (done < length)
-        for tokens, length, done, prefilling in zip(
-            scheduled, input_batch.prefill_len_np, computed, input_batch.is_prefilling_np, strict=True
-        )
+    assert (input_batch.num_scheduled_tokens >= 1).all()
+    assert np.array_equal(input_batch.is_prefilling_np, input_batch.num_computed_tokens_np < input_batch.prefill_len_np)
+    assert input_batch.num_scheduled_tokens.sum() == input_batch.num_tokens
+    return label_rows(
+        identities,
+        input_batch.num_scheduled_tokens.tolist(),
+        prompt_lengths.tolist(),
+        input_batch.num_computed_tokens_np.tolist(),
+        step_id,
     )
-    assert sum(scheduled) == input_batch.num_tokens
-    return label_rows(identities, scheduled, prompt, computed, step_id)
 
 
 def encode_mrv1_rows(

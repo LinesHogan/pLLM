@@ -325,8 +325,8 @@ class TensorExecutor:
             batch = batch.for_resource(self.task.resource)
         rows = data.rows
         if self.task.phase is not None:
-            eligible = set(data.step.rows.producer_rows(self.task.phase))
-            rows = tuple(row for row in rows if row in eligible)
+            eligible = {row.packed_row_index for row in data.step.rows.producer_rows(self.task.phase)}
+            rows = tuple(row for row in rows if row.packed_row_index in eligible)
         if rows != data.rows or batch.selection is not parent.selection:
             data = replace(data, rows=rows, plan=None)
         if not data.rows and self.task.phase is not None:

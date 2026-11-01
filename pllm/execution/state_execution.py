@@ -178,21 +178,13 @@ class StateTaskContext(Generic[DataT]):
         return next(reversed(self.publications), None)
 
     def current_owned_ref(self, original: StateRef) -> StateRef:
-        return self.current_owned_refs((original,))[0]
+        return self.current_owned_refs(StateRefs.of((original,)))[0]
 
-    def current_owned_refs(self, originals: Sequence[StateRef]) -> tuple[StateRef, ...]:
-        """Follow this invocation's publications from each ref, walking the receipts once for the whole batch."""
-        successor: dict[StateRef, StateRef] = {}
+    def current_owned_refs(self, refs: StateRefs) -> StateRefs:
+        """Follow this invocation's publications in order without materializing individual identities."""
         for receipt in self.publications:
-            for before, after in zip(receipt.before_refs, receipt.after_refs, strict=True):
-                successor.setdefault(before, after)
-
-        def latest(ref: StateRef) -> StateRef:
-            while ref in successor:
-                ref = successor[ref]
-            return ref
-
-        return tuple(map(latest, originals))
+            refs = refs.replace_versions(receipt.before_refs, receipt.after_refs)
+        return refs
 
     def check_page_execution(self) -> None:
         if self.cancel_requested:
@@ -207,8 +199,8 @@ class StateTaskContext(Generic[DataT]):
     ) -> PageWrite:
         """Prepare and retain a private transition, returning its explicit write token."""
         self.check_page_execution()
-        authorized = set(self.current_owned_refs(self.pin.refs))
-        assert set(sources) <= authorized
+        authorized = self.current_owned_refs(self.pin.refs)
+        assert authorized == sources or (authorized.positions(sources) >= 0).all()
         token = self.arena.prepare_transition(sources, self.pin.stream, fields=fields, copy_fields=copy_fields)
         self._obligations.append(_WriteAbort(token))
         return token
@@ -270,7 +262,7 @@ class StateTaskContext(Generic[DataT]):
             # One index for the whole batch: decode replays resolve every request before each graph launch.
             index = dict(zip((row.identity for row in self.selection.rows), group.state_indices, strict=True))
             entry = tuple(self.selection.refs[index[identity]] for identity in identities)
-        refs = self.current_owned_refs(entry)
+        refs = self.current_owned_refs(StateRefs.of(entry))
         updated = tuple(
             ref
             for ref, selected in zip(self.current_owned_refs(group.refs), group.refs, strict=True)
@@ -436,6 +428,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     ) -> None:
         self.arena, self.directory, self.math = arena, directory, math
         self.sampler_anchor_id = sampler_anchor_id
+        self._anchors: dict[str, int] = {anchor.symbol: anchor.ordinal for anchor in arena.plan.timeline.anchors}
         self.trace = ExecutionTrace(arena.plan.schedule, on_export=on_export)
         self._values = tuple(
             (task.symbol, output.name) for task in arena.plan.semantic_graph.tasks for output in task.outputs
@@ -628,7 +621,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
 
     def advance_to(self, context: StateTaskContext[DataT], symbol: str) -> None:
         """Run every anchor up to `symbol`, handing the step to the post-sample overlap before its first latest read."""
-        target = next(anchor.ordinal for anchor in self.arena.plan.timeline.anchors if anchor.symbol == symbol)
+        target = self._anchors[symbol]
         for ordinal in range(context.last_anchor_id + 1, target + 1):
             if self.post_sample is not None and ordinal == self.post_sample.anchor:
                 self.post_sample.hand_off(context)

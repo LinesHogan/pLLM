@@ -159,7 +159,7 @@ class ResourceTask:
 
 def increment_resources(context):
     """Publish one increment of the first field of every selected resource."""
-    refs = StateRefs.of(context.current_owned_refs(context.pin.refs))
+    refs = context.current_owned_refs(context.pin.refs)
     pin = context.arena.pin_exact(refs, context.pin.stream)
     context.register_pin(pin)
     for ref in refs:

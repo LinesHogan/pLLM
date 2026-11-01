@@ -90,6 +90,8 @@ class VllmSession(Generic[DataT, ResultT]):
         self.trace = deployment.execution.trace
         probe = attachment.probe
         self._hidden_resources = tuple(dict.fromkeys(resource.binding for resource in probe.hidden_resources))
+        self._hidden_phases = frozenset(resource.phase for resource in probe.hidden_resources)
+        self._trains_on_batch = plan.semantic_graph.trains_on_batch
         self._taps = taps
         overlay_bindings = attachment.spec.overlay_bindings
         replay_task = plan.semantic_graph.replay_task
@@ -282,25 +284,21 @@ class VllmSession(Generic[DataT, ResultT]):
     @torch.enable_grad()
     def prepare_input(self, rows: PackedSamplerRowBatch) -> None:
         self._require_input_live()
-        requests = rows.identities
         self._next_step_id += 1
         step = _PackedStep[DataT](rows)
         self._step = step
         if self._taps is not None:
             self._taps.prepare(rows.row_batch)
         adapter = self._forward_overlay
-        if (
-            adapter is None
-            and self._activation is None
-            and self._replay is None
-            and not self.attachment.plan.semantic_graph.trains_on_batch
-        ):
+        if adapter is None and self._activation is None and self._replay is None and not self._trains_on_batch:
             return
         if adapter is not None:
             adapter.reserve()
         execution = self._deployment.execution
         identities = tuple(
-            sorted(requests, key=lambda identity: (identity.request_id, identity.prompt_idx, identity.sample_idx))
+            sorted(
+                rows.identities, key=lambda identity: (identity.request_id, identity.prompt_idx, identity.sample_idx)
+            )
         )
         stream = torch.cuda.current_stream(execution.device)
         if not self._in_forward_overlay:
@@ -354,8 +352,11 @@ class VllmSession(Generic[DataT, ResultT]):
         value = TensorStepInput(step.rows.row_batch, step.rows, operands=operands, auxiliary=self._auxiliary)
         if self._taps is not None and self._hidden_resources:
             value = self._taps.publish(value, self._hidden_resources)
-        phases = {resource.phase for resource in self._deployment.attachment.probe.hidden_resources}
-        if step.context is None and not operands and not any(row.phase in phases for row in step.rows.row_batch.rows):
+        if (
+            step.context is None
+            and not operands
+            and not any(row.phase in self._hidden_phases for row in step.rows.row_batch.rows)
+        ):
             self._finish_effects()
             self._step = None
             return
