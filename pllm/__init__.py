@@ -1,10 +1,17 @@
-"""Workload authoring vocabulary and the model entry point; host loops start from pllm.host.make_host."""
+"""pllm: write a workload, then run it inside vLLM.
+
+Membership rule: the top level holds the vocabulary for writing a workload (Workload, every decorator and input
+marker, state types and pllm.Field, optimizers, Phase, Attr, UpdateOutput, pllm.scan) and the entry point
+make_llm with ModelConfig and ExecutionOptions. Domain objects live in sub-namespaces: pllm.model (a place in,
+or a change to, the base model's computation), pllm.host (host loops between generate calls), pllm.io (data
+crossing pllm's boundary outside generate's arguments) and pllm.testing (stepping workloads without GPU/vLLM).
+"""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, TypeVar, overload
 
-from pllm import host as host, model as model, state as state  # noqa: E402
+from pllm import host as host, io as io, model as model  # noqa: E402
 from pllm.authoring import AdamW as AdamW, Dimensions as Dimensions
 from pllm.config import (
     ExecutionOptions as ExecutionOptions,
@@ -12,8 +19,6 @@ from pllm.config import (
     ModelConfig as ModelConfig,
 )
 from pllm.execution.scan import scan as scan
-from pllm.execution.token_program import LayerOutputs as LayerOutputs, Layers as Layers
-from pllm.execution.trace import TraceEvent as TraceEvent
 from pllm.usage import (
     SGD as SGD,
     Attr as Attr,
@@ -90,8 +95,6 @@ def make_llm(config: ModelConfig, *, workload: BackendWorkload[D, R] | None = No
 __all__ = [
     "make_llm",
     "scan",
-    "Layers",
-    "LayerOutputs",
     "custom_forward",
     "ModelConfig",
     "ExecutionOptions",
@@ -101,7 +104,6 @@ __all__ = [
     "on",
     "write",
     "export",
-    "TraceEvent",
     "add_logits",
     "guide_sampling",
     "train",
@@ -132,5 +134,5 @@ __all__ = [
     "UpdateOutput",
     "host",
     "model",
-    "state",
+    "io",
 ]

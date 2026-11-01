@@ -4,7 +4,7 @@ The state is shared by all requests (instance scope) or kept per request key (re
 batches arrive as `pllm.host.WeightedCEBatch` inputs; pllm runs the SGD steps and publishes the new factors.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from math import isfinite
 from typing import Literal
@@ -52,7 +52,7 @@ class OutputLoRAWorkload(pllm.Workload):
     def output_factors(self) -> pllm.InstanceState:
         rank, seed = self.config.rank, self.config.seed
 
-        def initialize(parameters: pllm.state.Tensors, generator: torch.Generator) -> None:
+        def initialize(parameters: Mapping[str, torch.Tensor], generator: torch.Generator) -> None:
             parameters["a"].normal_(std=0.01, generator=generator.manual_seed(seed))
             parameters["b"].zero_()
 
@@ -73,7 +73,7 @@ class OutputLoRAWorkload(pllm.Workload):
             initialize=initialize,
         )
 
-    def reset(self, parameters: pllm.state.Tensors, generator: torch.Generator) -> None:
+    def reset(self, parameters: Mapping[str, torch.Tensor], generator: torch.Generator) -> None:
         down = parameters["a"]
         down.copy_(
             torch.randn(

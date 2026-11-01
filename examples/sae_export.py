@@ -19,7 +19,7 @@ class SAE(pllm.Workload):
 
     encoder = pllm.InstanceState(module=lambda m: torch.nn.Linear(m.hidden_size, 16, bias=False))
 
-    def on_export(self, event: pllm.TraceEvent) -> None:
+    def on_export(self, event: pllm.io.TraceEvent) -> None:
         """Print and persist the same sequence, layers, request identities and CPU value."""
         record = (event.sequence, event.step_id, event.tensor_name, event.identities, event.tensor())
         print(record, flush=True)

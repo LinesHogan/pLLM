@@ -235,7 +235,7 @@ def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch
         torch.full((1, *shape), index + 1.0, device=device)
         for index, shape in enumerate(((2, 4), (4, 2), (2, 4), (2, 2)))
     )
-    for deployed, payload in ((imported, pllm.state.StateImport(values, (key,))), (written, None)):
+    for deployed, payload in ((imported, pllm.io.StateImport(values, (key,))), (written, None)):
         execution = deployed.execution
         execution.admit((identity,), stream=stream)
         result = testing.run_step(execution, testing.step_input((identity,), batch=payload), stream=stream)

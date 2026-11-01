@@ -21,7 +21,7 @@ class SettledInPlaceTTT(InPlaceTTTWorkload):
     iterations: int = 2
 
     @pllm.custom_forward(tokens="decode")
-    def settle(self, layers: pllm.Layers) -> torch.Tensor:
+    def settle(self, layers: pllm.model.Layers) -> torch.Tensor:
         taps = layers()
         layers.apply_updates()
         for _ in range(self.iterations):

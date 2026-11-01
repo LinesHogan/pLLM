@@ -14,7 +14,7 @@ class StepLoopWorkload(pllm.Workload):
     history = pllm.PositionState()
 
     @pllm.custom_forward(tokens="all")
-    def loop(self, layers: pllm.Layers) -> torch.Tensor:
+    def loop(self, layers: pllm.model.Layers) -> torch.Tensor:
         """Save every token so cached prompt blocks also carry the boundary state."""
         previous = layers.load("history", offset=-1)
         taps = layers(hidden=torch.where(layers.generated, previous, layers.embeddings))

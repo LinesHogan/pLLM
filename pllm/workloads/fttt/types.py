@@ -7,10 +7,11 @@ from math import isfinite
 
 import torch
 
-from pllm.authoring import AdamW, StateImport
+from pllm.authoring import AdamW
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
 from pllm.host import Completion, CompletionInput, RetryControl, RewardOutcome, UpdateBarrier
+from pllm.io import StateImport
 
 
 @dataclass(frozen=True, slots=True)

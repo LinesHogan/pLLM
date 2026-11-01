@@ -29,11 +29,11 @@ class RecirculationWorkload(pllm.Workload):
     beta: float | None = None
     ramp_tokens: int = 0
 
-    def destination_layer(self, layers: pllm.Layers) -> int:
+    def destination_layer(self, layers: pllm.model.Layers) -> int:
         """Resolve the destination against the model's layer count."""
         return self.destination if self.destination >= 0 else layers.layer_count + self.destination
 
-    def mix(self, taps: pllm.LayerOutputs, destination: torch.Tensor, position: torch.Tensor) -> torch.Tensor:
+    def mix(self, taps: pllm.model.LayerOutputs, destination: torch.Tensor, position: torch.Tensor) -> torch.Tensor:
         """Mix source and destination streams with the position-dependent ramp."""
         a = (
             self.alpha * (position.float().clamp(max=self.ramp_tokens) / self.ramp_tokens)
@@ -43,14 +43,14 @@ class RecirculationWorkload(pllm.Workload):
         b = 1 - a if self.beta is None else self.beta
         return norm_match(taps[self.source], destination, a, b)
 
-    def step(self, layers: pllm.Layers) -> torch.Tensor:
+    def step(self, layers: pllm.model.Layers) -> torch.Tensor:
         """Run the normal stack, then rerun the layers above the mixed destination tap."""
         taps = layers()
         layers(start=self.destination_layer(layers) + 1, hidden=self.mix(taps, taps[self.destination], layers.position))
         return taps[-1]
 
     @pllm.custom_forward(tokens="all")
-    def recirculate(self, layers: pllm.Layers) -> torch.Tensor:
+    def recirculate(self, layers: pllm.model.Layers) -> torch.Tensor:
         """Apply exact recirculation to every token."""
         return self.step(layers)
 
@@ -66,12 +66,12 @@ class JacobiRecirculationWorkload(RecirculationWorkload):
             raise ValueError("set rounds to at least 1 for Jacobi prefill")
 
     @pllm.custom_forward(tokens="decode")
-    def recirculate(self, layers: pllm.Layers) -> torch.Tensor:
+    def recirculate(self, layers: pllm.model.Layers) -> torch.Tensor:
         """Keep exact per-token recirculation during decoding."""
         return self.step(layers)
 
     @pllm.custom_forward(tokens="prefill", over="span")
-    def prefill(self, layers: pllm.Layers) -> torch.Tensor:
+    def prefill(self, layers: pllm.model.Layers) -> torch.Tensor:
         """Commit a seed pass, then read prior sweeps without overwriting their KV."""
         d = self.destination_layer(layers)
         taps = layers()

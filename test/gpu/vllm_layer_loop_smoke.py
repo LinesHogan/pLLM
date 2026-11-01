@@ -14,7 +14,7 @@ class LayerLoop(pllm.Workload):
     """A decode token traverses 0..8, 5..8, then the rest of the model."""
 
     @pllm.custom_forward(tokens="decode")
-    def loop(self, layers: pllm.Layers) -> torch.Tensor:
+    def loop(self, layers: pllm.model.Layers) -> torch.Tensor:
         """Feed the first layer-8 output back into layer 5."""
         first = layers(stop=9)
         second = layers(start=5, stop=9, hidden=first[8])

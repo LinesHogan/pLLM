@@ -94,7 +94,7 @@ class MyLoRA(pllm.Workload):
 
 ```python
 @pllm.custom_forward(tokens="decode")
-def settle(self, layers: pllm.Layers) -> torch.Tensor:
+def settle(self, layers: pllm.model.Layers) -> torch.Tensor:
     taps = layers()
     layers.apply_updates()
     for _ in range(2):
@@ -179,7 +179,7 @@ checkpoint，或任何一段宿主计算。
 
 声明状态时设置 `imported=True`，例如 `pllm.RequestState(fields, imported=True)`；再声明一个 `Adapter` property
 命名状态、targets、算子、因子与 scale；把产出的张量经
-`generate(..., batch=pllm.state.StateImport(values, keys), prompt_indices=...)`
+`generate(..., batch=pllm.io.StateImport(values, keys), prompt_indices=...)`
 送入：
 
 ```python

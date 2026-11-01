@@ -190,7 +190,7 @@ def test_recirculation_replay_matches_serial_oracle() -> None:
 def test_route_selects_its_declared_rows(tokens, expected) -> None:
     class Prefill(RecirculationWorkload):
         @pllm.custom_forward(tokens=tokens)
-        def recirculate(self, layers: pllm.Layers) -> torch.Tensor:
+        def recirculate(self, layers: pllm.model.Layers) -> torch.Tensor:
             return super().recirculate(layers)
 
     decoder = Decoder()
@@ -203,7 +203,7 @@ def test_route_selects_its_declared_rows(tokens, expected) -> None:
 def test_route_must_return_a_residual_stream() -> None:
     class MissingOutput(pllm.Workload):
         @pllm.custom_forward()
-        def route(self, layers: pllm.Layers):
+        def route(self, layers: pllm.model.Layers):
             layers()
 
     with pytest.raises(ValueError, match="return.*residual"):

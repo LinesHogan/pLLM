@@ -12,7 +12,7 @@ import pllm
 
 def load_loreft_interventions(
     directory: str | Path, layers: tuple[int, ...], device: torch.device, dtype: torch.dtype
-) -> pllm.state.StateImport[torch.Tensor]:
+) -> pllm.io.StateImport[torch.Tensor]:
     """Read pyreft checkpoints once into the original shared publication input."""
     loaded: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
     for path in sorted(Path(directory).glob("intkey_*.bin")):
@@ -22,7 +22,7 @@ def load_loreft_interventions(
         layer = int(match[1])
         if layer in loaded:
             raise ValueError(f"multiple intervention checkpoints for layer {layer}")
-        weight, bias, rotation = pllm.state.load_tensor_fields(path, ("weight", "bias", "rotate_layer"))
+        weight, bias, rotation = pllm.io.load_tensor_fields(path, ("weight", "bias", "rotate_layer"))
         loaded[layer] = (
             weight.to(device=device, dtype=dtype),
             bias.to(device=device, dtype=dtype),
@@ -30,7 +30,7 @@ def load_loreft_interventions(
         )
     if set(loaded) != set(layers):
         raise FileNotFoundError("missing requested LoReFT layer checkpoints")
-    return pllm.state.StateImport(tuple(value for layer in layers for value in loaded[layer]))
+    return pllm.io.StateImport(tuple(value for layer in layers for value in loaded[layer]))
 
 
 @dataclass(frozen=True, slots=True)

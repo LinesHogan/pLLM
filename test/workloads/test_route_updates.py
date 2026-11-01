@@ -63,7 +63,7 @@ class Updating(pllm.Workload):
         return pllm.UpdateOutput(output, count == 2, count, count * len(hidden), {"tail": tail.clone()})
 
     @pllm.custom_forward(tokens="all")
-    def route(self, layers: pllm.Layers) -> torch.Tensor:
+    def route(self, layers: pllm.model.Layers) -> torch.Tensor:
         if self.empty:
             layers.apply_updates()
         first = layers()
@@ -160,7 +160,7 @@ def oracle(workload):
 def test_updates_match_independent_private_version_oracle(boundaries, visits, empty, visibility, tokens):
     class Selected(Updating):
         @pllm.custom_forward(tokens=tokens)
-        def route(self, layers: pllm.Layers) -> torch.Tensor:
+        def route(self, layers: pllm.model.Layers) -> torch.Tensor:
             return super().route(layers)
 
     workload = Selected(visibility, boundaries, visits, empty, tokens=tokens)
@@ -218,7 +218,7 @@ def test_marker_source_roundtrip_and_while_rejection():
 
     class TracedWhile(Updating):
         @pllm.custom_forward()
-        def route(self, layers: pllm.Layers) -> torch.Tensor:
+        def route(self, layers: pllm.model.Layers) -> torch.Tensor:
             return torch.while_loop(
                 lambda hidden: hidden.sum() > 0, lambda hidden: (hidden * 0.5,), (layers.embeddings,)
             )[0]
@@ -228,7 +228,7 @@ def test_marker_source_roundtrip_and_while_rejection():
 
     class Unowned(pllm.Workload):
         @pllm.custom_forward()
-        def route(self, layers: pllm.Layers) -> torch.Tensor:
+        def route(self, layers: pllm.model.Layers) -> torch.Tensor:
             layers.apply_updates()
             return layers()[-1]
 
@@ -294,7 +294,7 @@ def test_route_failure_aborts_private_fields():
 def test_untargeted_route_boundary_allocates_and_publishes_nothing():
     class Untargeted(Updating):
         @pllm.custom_forward()
-        def route(self, layers: pllm.Layers) -> torch.Tensor:
+        def route(self, layers: pllm.model.Layers) -> torch.Tensor:
             first = layers(stop=1)
             layers.apply_updates()
             return first[0]

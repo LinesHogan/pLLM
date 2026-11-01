@@ -165,7 +165,7 @@ def _prefill_adapter_reconstruction() -> None:
 
 
 class ExportProbe(DummyWorkload):
-    def on_export(self, event: pllm.TraceEvent) -> None:
+    def on_export(self, event: pllm.io.TraceEvent) -> None:
         with open("build/worker_exports.pkl", "ab") as output:
             pickle.dump((event.sequence, event.step_id, event.tensor()), output)
 

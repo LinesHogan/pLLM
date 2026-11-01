@@ -320,7 +320,7 @@ lineage。缺少 route 值的请求在准入时被拒。辅助批输入（`Weigh
 声明普通的 `InstanceState` 或 `RequestState` buffer 和一个 `ActivationPatch`
 property，命名状态、层、首个/末个 prefill token 与支持的算子。
 `LOW_RANK_AFFINE` 每层使用 weight/bias/rotation 字段；`ADD` 使用一个 FP32 向量。
-Field 形状回调收到激活的输入/输出宽度。以原始 `pllm.state.StateImport` 作为
+Field 形状回调收到激活的输入/输出宽度。以原始 `pllm.io.StateImport` 作为
 `batch=` 提供。共享绑定校验检查点、选择根、拷贝私有字段并在模型执行前发布。
 实例替换可重复；请求替换使用原始 prompt 键，只导入到版本零的请求状态。
 缺失的更新不发布，既有推理 pin 继续看到它们精确的旧版本。见维护中的 ReFT

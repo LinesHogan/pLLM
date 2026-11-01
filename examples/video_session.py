@@ -52,7 +52,7 @@ def video_frames(path: Path, grid_size: int, limit: int) -> Iterator[torch.Tenso
                 decoder.wait()
 
 
-def produce(feed: pllm.state.Feed, path: Path, grid: int, chunks: int, device: torch.device) -> None:
+def produce(feed: pllm.io.Feed, path: Path, grid: int, chunks: int, device: torch.device) -> None:
     """Publish the same frame features and mark normal iterator exhaustion explicitly."""
     previous: torch.Tensor | None = None
     try:
