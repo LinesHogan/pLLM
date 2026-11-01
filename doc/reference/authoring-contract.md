@@ -674,8 +674,7 @@ vLLM 继续按真实容量预留 hidden 快照、采样反馈和效果/replay �
 | TTRL | 宿主 `ttrl_rewards` 投票、`WeightedRowBatch` 加权梯度、空选择不变发布与重试/栅栏结果 |
 
 `Builder.input` 命名既有带类型服务端口；无字段的 `state` 描述不分配张量 arena
-的宿主状态。宿主图声明继续进入既有 `TensorHostBinding` 或
-`TransactionHostBinding`。Overlay/激活绑定与两种原始 replay 效果保持彼此独立。
+的宿主状态。宿主图由 `make_host`（`Workload.compile_host`）规划并绑定。Overlay/激活绑定与两种原始 replay 效果保持彼此独立。
 可表达不等于支持任意组合：后端能力检查仍拒绝不支持的组合。表中所有条目都执行
 通过这个接口构造的声明。它们既有的数学 oracle 独立于构建器；本次迁移不蕴含
 任意跨负载组合。

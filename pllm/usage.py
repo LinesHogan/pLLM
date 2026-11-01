@@ -59,7 +59,7 @@ from pllm.execution.freeze import (
     owner_values,
     reachable_functions,
 )
-from pllm.execution.host_runtime import HostConfig, TensorHostBinding
+from pllm.execution.host_runtime import HostConfig, bind_host
 from pllm.execution.model_effect_binding import (
     declare_activation_patch,
     declare_layer_route,
@@ -87,7 +87,7 @@ from pllm.execution.row_task_binding import (
     validate_gradients,
 )
 from pllm.execution.shared_tensor import SharedTensor
-from pllm.execution.state_execution import MathBinding
+from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.step_input import TensorStepInput
 from pllm.execution.task_memory import derive_host_resources, derive_resources
 from pllm.execution.tensor_binding import TensorBinding, TensorOutput as TensorOutput
@@ -1806,8 +1806,8 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             on_export=self.on_export if declaration.has_exports else None,
         )
 
-    def declare_host(self, facts: HostConfig) -> TensorHostBinding[TensorStepInput, TensorFrame, TensorOutput]:
-        """Build the graph without a model (see pllm.host.make_host); training reads host batches."""
+    def compile_host(self, facts: HostConfig) -> StateExecution[TensorStepInput, TensorFrame, TensorOutput]:
+        """Build, plan and bind the graph without a model (see pllm.host.make_host); training reads host batches."""
         b = TensorBinding(
             self.name,
             boundary_digest(facts.hidden_size, facts.initialization_seed),
@@ -1819,7 +1819,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         if facts.memory_budget_bytes is not None and b.graph.states:
             timeline = derive_host_resources(b, facts)
         math = b.function_math(facts.device, facts.initialization_seed)
-        prepare = b.bind_prepare()
+        prepare = math.prepare_data
 
         def checked_prepare(value: TensorStepInput, batch: TensorBatch) -> TensorFrame:
             validate_auxiliary(
@@ -1833,7 +1833,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             )
             return prepare(value, batch)
 
-        return TensorHostBinding(
+        return bind_host(
             b.graph,
             b.layouts,
             MathBinding(
@@ -1842,7 +1842,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
                 on_export=self.on_export if b.has_exports else None,
             ),
             facts,
-            timeline=timeline,
+            timeline,
         )
 
 

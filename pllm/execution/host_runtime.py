@@ -1,5 +1,5 @@
-"""Host execution without a model: the facts a host workload compiles against (HostConfig), its compiled binding,
-and the completion rows a generate call hands to host feedback (CompletionInput).
+"""Host execution without a model: the facts a host workload compiles against (HostConfig), planning and binding
+its graph (bind_host), and the completion rows a generate call hands to host feedback (CompletionInput).
 
 pllm.host.make_host compiles a pllm.Workload with these facts; the vLLM session writes CompletionInput rows.
 """
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from typing import Generic, TypeVar
+from typing import TypeVar
 
 import torch
 
@@ -37,41 +37,30 @@ InputT = TypeVar("InputT")
 DataT = TypeVar("DataT")
 
 
-@dataclass(frozen=True, slots=True)
-class TensorHostBinding(Generic[InputT, DataT, ResultT]):
-    graph: SemanticGraph
-    layouts: TensorLayoutRequest
-    math: MathBinding[InputT, DataT, ResultT]
-    facts: HostConfig
-    timeline: SchedulerTimeline
-
-    def compile(self) -> StateExecution[InputT, DataT, ResultT]:
-        facts = self.facts
-        limits = tuple(
-            value for value in (self.timeline.memory_budget_bytes, facts.memory_budget_bytes) if value is not None
+def bind_host(
+    graph: SemanticGraph,
+    layouts: TensorLayoutRequest,
+    math: MathBinding[InputT, DataT, ResultT],
+    facts: HostConfig,
+    timeline: SchedulerTimeline,
+) -> StateExecution[InputT, DataT, ResultT]:
+    """Plan a host graph against `timeline` and bind its math to a page arena on `facts.device`."""
+    providers = (
+        (
+            PageBundleProviderFacts(
+                f"canonical.page_bundle_{facts.device.type}@1",
+                3,
+                StateDeviceKind(facts.device.type),
+            ),
         )
-        timeline = replace(self.timeline, memory_budget_bytes=min(limits, default=None))
-        providers = (
-            (
-                PageBundleProviderFacts(
-                    f"canonical.page_bundle_{facts.device.type}@1",
-                    3,
-                    StateDeviceKind(facts.device.type),
-                ),
-            )
-            if self.layouts.layouts
-            else ()
-        )
-        plan = compile_page_bundle_plan(
-            (self.graph, self.layouts),
-            timeline,
-            providers,
-            1,
-            facts.state_memory_budget_bytes,
-            facts.device,
-        )
-        (anchor,) = (AnchorId(item.ordinal) for item in timeline.anchors if item.symbol == "host.next")
-        return self.math.bind(PageBundleArena(plan, device=facts.device), anchor)
+        if layouts.layouts
+        else ()
+    )
+    plan = compile_page_bundle_plan(
+        (graph, layouts), timeline, providers, 1, facts.state_memory_budget_bytes, facts.device
+    )
+    (anchor,) = (AnchorId(item.ordinal) for item in timeline.anchors if item.symbol == "host.next")
+    return math.bind(PageBundleArena(plan, device=facts.device), anchor)
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +209,6 @@ def measured_timeline(
 __all__ = [
     "CompletionInput",
     "HostConfig",
-    "TensorHostBinding",
+    "bind_host",
     "measured_timeline",
 ]

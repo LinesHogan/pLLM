@@ -41,7 +41,7 @@ def make_host(config: HostConfig, workload: Workload) -> StateExecution[TensorSt
 
     Admit the instance state with `admit(())` before the first step and release it with `retire(())`.
     """
-    return workload.declare_host(config).compile()
+    return workload.compile_host(config)
 
 
 __all__ = [

@@ -60,7 +60,7 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         peak = plan.schedule.peak_memory_bytes
         with pytest.raises(ValueError):
             make_host(replace(facts, memory_budget_bytes=peak - 1), workload)
-        execution = workload.declare_host(replace(facts, memory_budget_bytes=peak)).compile()
+        execution = make_host(replace(facts, memory_budget_bytes=peak), workload)
         (initial,) = execution.admit((), stream)
         old_pin = execution.arena.pin_exact(StateRefs.of((initial,)), stream)
         original = execution.snapshot(initial, stream)
