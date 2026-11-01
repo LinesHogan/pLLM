@@ -1766,17 +1766,6 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             layer_routes=bool(context.routes),
         )
 
-    def specialize(
-        self, facts: BackendCompileFacts, options: ExecutionOptions, *, causal: CausalBinder | None = None
-    ) -> tuple[BackendCompileFacts, TensorBinding]:
-        """Fund shared page storage for declared feeds before compiling the plan."""
-        if any(state.feed is not None for value in _values(self).values() if (state := _typed(value, InstanceState))):
-            facts = replace(
-                facts,
-                providers=tuple(replace(provider, page_capacity=3, shared_memory=True) for provider in facts.providers),
-            )
-        return super().specialize(facts, options, causal=causal)
-
     def resource_facts(
         self, declaration: TensorBinding, facts: BackendCompileFacts, options: ExecutionOptions
     ) -> SchedulerTimeline:

@@ -83,7 +83,6 @@ class PageBundleProviderFacts:
     page_capacity: int
     device_kind: StateDeviceKind = StateDeviceKind.CPU
     device_ordinal: int = 0
-    shared_memory: bool = False
 
     def materialize_plan(
         self,
@@ -121,11 +120,6 @@ class PageBundleProviderFacts:
                         "state/exact_versions@1",
                         "transition/full_root@1",
                         *(("state/fenced_reclaim@1",) if self.device_kind is StateDeviceKind.CUDA else ()),
-                        *(
-                            ("state/shared_cuda@1",)
-                            if self.shared_memory and self.device_kind is StateDeviceKind.CUDA
-                            else ()
-                        ),
                     )
                 )
             ),

@@ -29,7 +29,7 @@ from pllm.testing import backend_facts
 from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
 
 
-def _plan(shared=False):
+def _plan():
     bindings = tuple(
         PackedHiddenResourceBinding(
             str(layer), HiddenLayerKind.INDEX, HiddenSite.BLOCK_OUTPUT, f"model.layers[{layer}]"
@@ -41,7 +41,7 @@ def _plan(shared=False):
         tuple(TimelineAnchor(AnchorSymbol(name), index) for index, name in enumerate(anchors)),
         ("compute/cuda@1", "state/dense_page_cuda@1"),
     )
-    provider = PageBundleProviderFacts("test.page_bundle@1", 6, StateDeviceKind.CUDA, 0, shared_memory=shared)
+    provider = PageBundleProviderFacts("test.page_bundle@1", 6, StateDeviceKind.CUDA, 0)
     facts = backend_facts(4, bindings, timeline, provider)
     workload = ESampRequestWorkload(ESampRequestConfig(rank=2))
     return workload.plan_backend(*workload.specialize(facts, ExecutionOptions())).plan
@@ -152,7 +152,7 @@ def _cuda_ipc_worker(control, read_channel, wire, outcome):
 
 def _cuda_ipc_lifecycle():
     context = mp.get_context("spawn")
-    plan = _plan(shared=True)
+    plan = _plan()
     for outcome in ("complete", "bad_ack", "eof"):
         arena = PageBundleArena(plan)
         stream = torch.cuda.Stream(device=arena.device)

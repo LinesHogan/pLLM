@@ -45,6 +45,9 @@ class ReadonlyStepEnd:
 
 Channels = tuple[tuple[Connection, ...], ...]
 
+# Versions in flight per feed: the engine reads one, one waits in the queue, and the producer writes the next.
+FEED_SLOTS = 3
+
 
 class FeedEvent(StrEnum):
     """What one control record tells the consumer."""
@@ -306,11 +309,10 @@ class FeedReceiver:
 
     def __init__(self, arena: PageBundleArena, binding: FeedBinding) -> None:
         self.arena, self.binding = arena, binding
-        (provider,) = (p for p in arena.plan.states.plans if p.resource == binding.resource)
         (layout,) = (e.layout for e in arena.plan.tensor_layout_request.layouts if e.resource == binding.resource)
         context = get_context("spawn")
         self.control, writer = context.Pipe()
-        pipes = tuple(tuple(context.Pipe() for _ in layout.fields) for _ in range(provider.page_capacity))
+        pipes = tuple(tuple(context.Pipe() for _ in layout.fields) for _ in range(FEED_SLOTS))
         self.channels = tuple(tuple(pair[0] for pair in row) for row in pipes)
         self.writer: Feed | None = Feed(
             arena.plan, binding, writer, tuple(tuple(pair[1] for pair in row) for row in pipes), os.getpid()
