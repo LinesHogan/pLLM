@@ -10,6 +10,7 @@ import torch
 
 import pllm
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
+from pllm.execution.ptts.page_borrow import BorrowedPage
 from pllm.execution.state_feed import FeedReceiver, ReadonlyStepEnd, receive_field
 from pllm.execution.step_input import TensorStepInput
 from test.workloads.test_state_feed import FeedWorkload, facts_for
@@ -83,30 +84,41 @@ def test_feed_selects_complete_versions_and_reclaims_only_after_completion(order
         assert kind == "ready"
         assert not probe.poll(0.1), "fourth publication must block while all three slots are in flight"
         stream = torch.cuda.current_stream()
-        for step, version in enumerate(versions):
-            rows = step_rows(step)
-            incoming = receiver(rows, stream)
-            (root,) = incoming.roots
-            assert root.ref.version_id == version
-            assert root.pages[0].descriptor.page == pages[version - 1][0] if version <= 3 else True
-            tensor = root.pages[0].tensor
-            torch.testing.assert_close(tensor, torch.full_like(tensor, float(version)))
-            assert tensor.storage_offset() == root.pages[0].descriptor.storage_offset
-            assert tensor.untyped_storage().nbytes() == root.pages[0].descriptor.cuda_storage.size_bytes
-            del tensor
-            execution.stage_readonly(incoming.roots)
-            event = torch.cuda.Event()
-            torch.cuda._sleep(100_000_000)
-            event.record(stream)
-            receipt = execution.step(TensorStepInput(rows.row_batch, rows), stream)
-            assert event.query(), "read ACK must follow CUDA completion"
-            torch.testing.assert_close(
-                execution.snapshot(receipt.publication.after_refs[0], stream)[0],
-                torch.full((2,), float(version * 2), device="cuda"),
-            )
+        fourth = []
+        close = BorrowedPage.close
+
+        def close_after_fourth(page):
+            # Version 2's read ACK waits until version 4 is placed, so only version 1's page can be free then;
+            # otherwise the producer may see both ACKs (LATEST closes 1 and 2 together) and take version 2's page.
+            if page.descriptor.ref.version_id == 2 and not fourth:
+                assert probe.poll(30), "the producer did not publish version 4 after version 1's ACK"
+                fourth.append(probe.recv())
+            close(page)
+
+        with patch.object(BorrowedPage, "close", close_after_fourth):
+            for step, version in enumerate(versions):
+                rows = step_rows(step)
+                incoming = receiver(rows, stream)
+                (root,) = incoming.roots
+                assert root.ref.version_id == version
+                assert root.pages[0].descriptor.page == pages[version - 1][0] if version <= 3 else True
+                tensor = root.pages[0].tensor
+                torch.testing.assert_close(tensor, torch.full_like(tensor, float(version)))
+                assert tensor.storage_offset() == root.pages[0].descriptor.storage_offset
+                assert tensor.untyped_storage().nbytes() == root.pages[0].descriptor.cuda_storage.size_bytes
+                del tensor
+                execution.stage_readonly(incoming.roots)
+                event = torch.cuda.Event()
+                torch.cuda._sleep(100_000_000)
+                event.record(stream)
+                receipt = execution.step(TensorStepInput(rows.row_batch, rows), stream)
+                assert event.query(), "read ACK must follow CUDA completion"
+                torch.testing.assert_close(
+                    execution.snapshot(receipt.publication.after_refs[0], stream)[0],
+                    torch.full((2,), float(version * 2), device="cuda"),
+                )
         assert isinstance(receiver(step_rows(len(versions)), stream), ReadonlyStepEnd)
-        assert probe.poll(30)
-        kind, reused = probe.recv()
+        ((kind, reused),) = fourth
         assert kind == "fourth" and reused[0].slot_id == pages[0][0].slot_id
         assert reused[0].generation == pages[0][0].generation + 1
         assert probe.poll(30) and probe.recv()[0] == "closed"
