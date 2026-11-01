@@ -258,7 +258,6 @@ class OverlayTile:
                 self.table,
                 self.table[width : 2 * width],
                 (*tuple(pool.data_ptr() for pool in pools), self.base.data_ptr()),
-                stream,
                 partial(self.staging.copy_to, self.table),
                 self.buffers,
             )

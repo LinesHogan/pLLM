@@ -332,6 +332,8 @@ class TensorExecutor:
         if not data.rows and self.task.phase is not None:
             return TaskOutput()
         addresses: tuple[int, ...] = ()
+        if self.capture is not None and context is not None:
+            self.capture.order(batch.stream)
         if self.rowwise:
             if not data.rows:
                 return TaskOutput()
@@ -359,7 +361,6 @@ class TensorExecutor:
                 self.table,
                 self.views[self.task.resource][2],
                 addresses,
-                batch.stream,
                 lambda: self.staging.copy_to(table),
             )
         output = self.settle_rows(data, batch)
@@ -511,6 +512,8 @@ class FieldWriteExecutor:
         if not selected:
             return TaskOutput()
         values = writer.values(data, batch, selected, validate=context is None)
+        if self.capture is not None and context is not None:
+            self.capture.order(batch.stream)
         parent = batch
         if any(group.resource == writer.resource for group in batch.selection.groups):
             batch = batch.for_resource(writer.resource)
@@ -538,9 +541,7 @@ class FieldWriteExecutor:
         if self.capture is None or context is None:
             self._store()
         else:
-            self.capture.run(
-                self._store, table, table, (), batch.stream, lambda: self.staging.copy_to(table), self.buffers
-            )
+            self.capture.run(self._store, table, table, (), lambda: self.staging.copy_to(table), self.buffers)
         return TaskOutput(changed=selected, update_count=len(selected))
 
 

@@ -79,12 +79,11 @@ class StepCapture:
         table: torch.Tensor,
         destinations: torch.Tensor,
         addresses: tuple[int, ...],
-        stream: torch.cuda.Stream | None,
         refill: Callable[[], None],
         buffers: tuple[torch.Tensor, ...] = (),
     ) -> None:
-        """Capture when addresses change; warmup never writes live destinations."""
-        self.order(stream)
+        """Capture when addresses change; warmup never writes live destinations. The caller has called `order`
+        before refilling the table and buffers."""
         if self.graph is None or self.addresses != addresses:
             self._capture(body, table, destinations, buffers)
             refill()
@@ -93,7 +92,7 @@ class StepCapture:
         self.graph.replay()
 
     def order(self, stream: torch.cuda.Stream | None) -> None:
-        """Order buffer refills as well as replay after the preceding use."""
+        """Order buffer refills as well as replay after the preceding replay; call before refilling."""
         if stream is not None and self.stream is not None and stream != self.stream:
             stream.wait_stream(self.stream)
         self.stream = stream
