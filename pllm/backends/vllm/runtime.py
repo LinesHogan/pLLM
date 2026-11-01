@@ -302,6 +302,13 @@ class VllmLlm(Generic[DataT, ResultT]):
         """
         if max_rounds < 1 or not prompts:
             raise ValueError("feedback generation requires a nonempty prompt list and positive finite round bound")
+        # Round k samples indices k*n..(k+1)*n-1; fail before any round trains state.
+        if self._sample_limit is not None and max_rounds * sampling_params.n > self._sample_limit:
+            raise ValueError(
+                f"{max_rounds} feedback rounds of n={sampling_params.n} samples exceed this workload's "
+                f"pllm.samples(limit={self._sample_limit}); lower max_rounds to at most "
+                f"{self._sample_limit // sampling_params.n} or raise the workload's limit"
+            )
         texts: list[str] = list(prompts)
         indices: tuple[int, ...] = self._prompt_indices(texts, prompt_indices)
         route_values: list[str] | None = list(routes) if routes is not None else None
@@ -665,7 +672,8 @@ def create_vllm_llm(
         environment["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     options = graph_options(config, requirements)
     # vLLM keys its compiled-model cache by its own config; the hidden taps and position states pllm adds to the
-    # forward must enter that key, or an engine loads a model compiled for another workload.
+    # forward must enter that key, or an engine loads a model compiled for another workload. pllm's entries are
+    # integers (overlay_graph decodes them as dict[str, int]), so the digest enters as one.
     forward = sha256((environment[CAPTURE_ENV] + environment[POSITION_ENV]).encode()).hexdigest()
     options["additional_config"] = {**options.get("additional_config", {}), "pllm_forward": int(forward[:15], 16)}
     llm = vllm_engine(

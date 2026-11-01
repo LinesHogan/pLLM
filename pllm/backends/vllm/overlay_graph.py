@@ -44,8 +44,13 @@ class _GraphConfiguration(Protocol):
     def additional_config(self) -> Mapping[str, int | str] | SupportsHash: ...
 
 
+def _additional_config(config: _GraphConfiguration) -> dict[str, int]:
+    """pllm's entries in vLLM's compile-cache key; runtime.py adds its forward digest as an integer, too."""
+    return decode_boundary(encode_boundary(config.additional_config), dict[str, int])
+
+
 def _graph_budget(config: _GraphConfiguration) -> int:
-    value = decode_boundary(encode_boundary(config.additional_config), dict[str, int]).get(_BUDGET, 0)
+    value = _additional_config(config).get(_BUDGET, 0)
     if value < 0:
         raise ValueError("Overlay graph memory must be a nonnegative byte budget")
     return value
@@ -66,8 +71,6 @@ def graph_options(config: ModelConfig, requirements: BackendRequirements) -> Gra
         return {
             "compilation_config": CompilationConfig(max_cudagraph_capture_size=config.max_num_batched_tokens),
         }
-    if config.runner != "mrv2":
-        raise ValueError('Graph overlays need runner="mrv2"')
     return {
         "additional_config": {_BUDGET: config.execution.capture_memory_bytes},
         "compilation_config": CompilationConfig(
@@ -180,7 +183,7 @@ class OverlayGraphRunner(compat.ModelRunner):
             return
         # AOT loads before inspecting wrappers: the complete bound plan must enter its key.
         self.vllm_config.additional_config = {
-            _BUDGET: self.overlay_graph_bytes,
+            **_additional_config(self.vllm_config),
             "pllm_pinned_projection_plan": boundary_digest(attachment),
         }
         manager = self.cudagraph_manager

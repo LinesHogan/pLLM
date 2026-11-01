@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
+from torch.nn import functional as F
 
 from pllm.backends.vllm.architecture import CausalLM, DecoderLayer
 from pllm.contracts.backend_attachment import (
@@ -34,6 +35,9 @@ def activation_delta(hidden: torch.Tensor, fields: tuple[torch.Tensor, ...]) -> 
     if len(fields) == 1:
         return fields[0].to(hidden.dtype)
     weight, bias, rotation = fields
+    if weight.ndim == 2:
+        # Shared fields keep F.linear (addmm, bias fused in the epilogue), as before batched fields existed.
+        return (F.linear(hidden, weight, bias) - hidden @ rotation) @ rotation.T
     rows = hidden.unsqueeze(-2)
     coefficients = rows @ weight.transpose(-1, -2) + bias.unsqueeze(-2) - rows @ rotation
     return (coefficients @ rotation.transpose(-1, -2)).squeeze(-2)

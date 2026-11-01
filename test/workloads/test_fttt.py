@@ -96,6 +96,7 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
 
         generate_feedback = VllmLlm.generate_feedback
         _prompt_indices = VllmLlm._prompt_indices
+        _sample_limit = None
 
         def __init__(self, votes=False):
             self.calls = []

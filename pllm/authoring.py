@@ -101,12 +101,20 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
     def specialize(
         self, facts: BackendCompileFacts, options: ExecutionOptions, *, causal: CausalBinder | None = None
     ) -> tuple[BackendCompileFacts, TensorBinding]:
-        """Build the declaration once and fund it on this backend; planning and binding reuse both."""
+        """Measure and fund the declaration on this backend, then declare against the funded facts as workers do;
+        planning and binding reuse both."""
         facts = _apply_options(facts, options)
+        measured = self.declaration(facts, causal=causal)
+        timeline = _fund_attachment(measured, facts.probe, self.resource_facts(measured, facts, options), options)
+        facts = replace(facts, timeline=timeline)
+        return facts, self.funded_declaration(facts, causal=causal)
+
+    def funded_declaration(self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None) -> TensorBinding:
+        """The declaration on funded facts: tensor tasks funded resident memory run as captured CUDA graphs. The
+        driver and every worker process declare here, so their graphs agree."""
         declaration = self.declaration(facts, causal=causal)
-        timeline = self.resource_facts(declaration, facts, options)
-        declaration.select_capture(timeline.task_resources)
-        return replace(facts, timeline=_fund_attachment(declaration, facts.probe, timeline, options)), declaration
+        declaration.select_capture(facts.timeline.task_resources)
+        return declaration
 
     @abstractmethod
     def declaration(self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None) -> TensorBinding:

@@ -48,8 +48,7 @@ class GPUWorker(compat.Worker):
         """Bind the driver's plan to the workload this process imported, refusing drifted sources."""
         runner = self.workload_runner
         plan = install.attachment.plan
-        declaration = workload.declaration(install.facts, causal=partial(CausalTraining, runner.decoder))
-        declaration.select_capture(install.facts.timeline.task_resources)
+        declaration = workload.funded_declaration(install.facts, causal=partial(CausalTraining, runner.decoder))
         if (declaration.graph, declaration.layouts) != (plan.semantic_graph, plan.tensor_layout_request):
             raise ValueError(
                 "the EngineCore worker imported workload code that differs from the driver's; "

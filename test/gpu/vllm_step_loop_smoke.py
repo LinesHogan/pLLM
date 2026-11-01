@@ -317,8 +317,7 @@ def isolated_multiturn():
             namespace = handle._cache_policy.namespace
             workload = ImportedStepLoop()
             # The worker's install path: build against the driver's specialized facts.
-            declaration = workload.declaration(handle._facts)
-            declaration.select_capture(handle._facts.timeline.task_resources)
+            declaration = workload.funded_declaration(handle._facts)
             handle.attachment = workload.plan_backend(handle._facts, declaration)
             handle._cache_policy = CachePolicy.for_attachment(handle.attachment, "isolate")
             handle.command(BackendCommand.DETACH)
