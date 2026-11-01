@@ -47,7 +47,6 @@ class DecoderLayer(Module, Generic[_Attention, _MLP]):
     forward: Callable[[Tensor, Tensor, Tensor | None], tuple[Tensor, Tensor]]
 
 class DecoderModel(Module, Generic[_Layer]):
-    quant_config: object | None
     embed_tokens: VocabParallelEmbedding
     layers: Sequence[_Layer]
     norm: RMSNorm

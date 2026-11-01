@@ -1,7 +1,10 @@
 """Shared decoder structure and native logits bound once by the vLLM runners.
 
 All admitted families expose the same hidden sites. Block taps keep the fresh
-layer output, without its separately returned residual.
+layer output, without its separately returned residual. Only unquantized dense
+Qwen2, Llama and Qwen3 models expose the projections and per-layer KV that
+parameter overlays, causal training and layer routes rewrite; other admitted
+models run read-only workloads (hidden taps, sampler stages, activation patches).
 """
 
 from collections.abc import Callable
@@ -10,6 +13,13 @@ from typing import Protocol
 
 from torch import Tensor, nn
 from torch.nn import Parameter
+from vllm.model_executor.models.deepseek_v2 import (
+    DeepseekV2DecoderLayer,
+    DeepseekV2ForCausalLM,
+    DeepseekV2Model,
+    DeepseekV3ForCausalLM,
+)
+from vllm.model_executor.models.gpt_oss import GptOssForCausalLM, GptOssModel, TransformerBlock
 from vllm.model_executor.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaModel
 from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM, Qwen2Model
 from vllm.model_executor.models.qwen3 import Qwen3DecoderLayer, Qwen3ForCausalLM, Qwen3Model
@@ -18,9 +28,11 @@ from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
 
-CausalLM = Qwen2ForCausalLM | LlamaForCausalLM | Qwen3ForCausalLM
-DecoderBody = Qwen2Model | LlamaModel | Qwen3Model
-DecoderLayer = Qwen2DecoderLayer | LlamaDecoderLayer | Qwen3DecoderLayer
+DenseLM = Qwen2ForCausalLM | LlamaForCausalLM | Qwen3ForCausalLM
+CausalLM = DenseLM | DeepseekV2ForCausalLM | GptOssForCausalLM
+DecoderBody = Qwen2Model | LlamaModel | Qwen3Model | DeepseekV2Model | GptOssModel
+DenseLayer = Qwen2DecoderLayer | LlamaDecoderLayer | Qwen3DecoderLayer
+DecoderLayer = DenseLayer | DeepseekV2DecoderLayer | TransformerBlock
 Logits = Callable[[Tensor], Tensor | None]
 LinearOutput = Tensor | tuple[Tensor, Parameter | None]
 LinearForward = Callable[[Tensor], LinearOutput]
@@ -49,6 +61,15 @@ class Decoder:
 
     model: CausalLM
     compute_logits: Logits
+    # Why only read-only workloads run on this model; None when every workload does.
+    read_only: str | None
+
+    def writable(self, feature: str) -> DenseLM:
+        """The model for `feature`, which rewrites weights or reruns layers; read-only models reject it."""
+        if self.read_only is not None:
+            raise ValueError(f"{feature} {self.read_only}")
+        assert isinstance(self.model, DENSE_ARCHITECTURES)
+        return self.model
 
     @property
     def identity(self) -> str:
@@ -59,7 +80,7 @@ class Decoder:
     def projection(self, target: ParameterTarget) -> tuple[Projection, int, int, Mlp | None]:
         """Resolve the supported projection and its disjoint output slice."""
         assert target.layer is not None
-        layer = self.model.model.layers[target.layer]
+        layer = self.writable("a parameter overlay").model.layers[target.layer]
         if target.module is ParameterModuleKind.MLP and target.role is ParameterRole.DOWN_PROJECTION_WEIGHT:
             module = layer.mlp.down_proj
             return module, 0, int(module.weight.shape[0]), layer.mlp
@@ -77,17 +98,37 @@ class Decoder:
 # (Qwen3, or Qwen2 when enabled), RoPE and the attention query; it cannot write
 # same-layer K/V. Overlay corrections enter before that split.
 # These families share the decoder structure; logits dispatch remains native to each model.
-ARCHITECTURES = (Qwen2ForCausalLM, LlamaForCausalLM, Qwen3ForCausalLM)
+DENSE_ARCHITECTURES = (Qwen2ForCausalLM, LlamaForCausalLM, Qwen3ForCausalLM)
+_MLA_MOE = "has MLA attention (no separate V projection, a latent KV cache) and per-expert MoE projections"
+# Their decoder layers return (fresh block output, residual) and end in model.norm like the dense
+# families, so hidden sites and activation patches mean the same; their projections and KV do not.
+READ_ONLY_ARCHITECTURES: dict[type[CausalLM], str] = {
+    DeepseekV2ForCausalLM: _MLA_MOE,
+    DeepseekV3ForCausalLM: _MLA_MOE,
+    GptOssForCausalLM: "has sink attention with sliding windows and per-expert MXFP4 MoE projections",
+}
+ARCHITECTURES = (*DENSE_ARCHITECTURES, *READ_ONLY_ARCHITECTURES)
 
 
-def bind_model(model: nn.Module) -> Decoder:
+def bind_model(model: nn.Module, quantization: str | None) -> Decoder:
     """Admit a concrete vLLM architecture at model load, before any instance wrapping."""
     # Exact classes: vLLM subclasses such as Phi3 or TeleFLM change weights or logits scaling.
     if type(model) not in ARCHITECTURES or not isinstance(model, ARCHITECTURES):
-        raise ValueError("choose a Qwen2ForCausalLM, LlamaForCausalLM or Qwen3ForCausalLM model for vLLM workloads")
-    if model.model.quant_config is not None:
-        raise ValueError("vLLM workloads need an unquantized model")
-    return Decoder(model, model.compute_logits)
+        raise ValueError(
+            "choose a Qwen2, Llama, Qwen3, DeepseekV2, DeepseekV3 or GptOss ForCausalLM model for vLLM workloads"
+        )
+    family = READ_ONLY_ARCHITECTURES.get(type(model))
+    if family is not None:
+        reason = f"{type(model).__name__} {family}"
+    elif quantization is not None:
+        reason = f"this one is {quantization}-quantized, and pllm reads, corrects and replays dense weights only"
+    else:
+        return Decoder(model, model.compute_logits, None)
+    read_only = (
+        f"needs an unquantized Qwen2, Llama or Qwen3 model ({reason}); "
+        "hidden taps, ESamp, sampler stages and activation patches still run on this model"
+    )
+    return Decoder(model, model.compute_logits, read_only)
 
 
 def hidden_binding(layer: int, site: HiddenSite, layer_count: int) -> PackedHiddenResourceBinding:

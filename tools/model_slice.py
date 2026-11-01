@@ -1,8 +1,10 @@
-"""Extract pinned Qwen decoder fixtures by byte range, without downloading full weights.
+"""Extract decoder-layer fixtures by byte range, without reading or downloading full weights.
 
 Used by architecture admission experiments, not for producing useful language models.
-Planning fetches only repository metadata and safetensors headers. Quantized extraction
-and MTP are deliberately rejected until their dependency/renaming rules are implemented.
+The source is a pinned Hub revision or a checkpoint directory on a shared filesystem.
+Planning reads only metadata and safetensors headers. Quantized tensors are kept in their
+stored format when the quantization config names no layer indices; conversion and MTP
+are rejected until their dependency/renaming rules are implemented.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ import re
 import struct
 import sys
 import time
+from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from http.client import HTTPResponse, IncompleteRead
@@ -108,26 +111,89 @@ class Tensor:
         return self.end - self.start
 
 
-class Remote:
-    """Bounded HTTP reads with fresh Hub redirects on every retry and range chunk."""
+class Source(ABC):
+    """Byte counters shared by the remote and local checkpoint readers."""
 
-    def __init__(self, repo: str, revision: str) -> None:
-        self.base = f"https://huggingface.co/{repo}/resolve/{revision}/"
+    def __init__(self) -> None:
         self._counter_lock = Lock()
         self.metadata_bytes = 0
         self.payload_bytes = 0
 
+    @abstractmethod
     def metadata(self, name: str) -> bytes:
-        """Fetch a small asset with a hard size cap, never a weight file."""
-        if name.endswith(".safetensors"):
-            raise ValueError("Weight files require byte ranges")
+        """Read a small asset with a hard size cap, never a weight file; FileNotFoundError when absent."""
+
+    @abstractmethod
+    def range(self, name: str, start: int, end: int, size: int | None, sink: BinaryIO, *, payload: bool) -> int:
+        """Copy bytes [start, end) of `name` to `sink` and return the file size."""
+
+    def _record(self, count: int, payload: bool) -> None:
+        with self._counter_lock:
+            if payload:
+                self.payload_bytes += count
+            else:
+                self.metadata_bytes += count
+
+
+def capped(name: str, data: bytes) -> bytes:
+    """Reject weight files and oversized metadata before they are parsed."""
+    if name.endswith(".safetensors"):
+        raise ValueError("Weight files require byte ranges")
+    if len(data) > LIMIT:
+        raise ValueError(f"Metadata exceeds {LIMIT} bytes: {name}")
+    return data
+
+
+class Local(Source):
+    """Bounded reads from a checkpoint directory, e.g. a cluster's shared model store."""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__()
+        self.root = root
+
+    def metadata(self, name: str) -> bytes:
+        with (self.root / filename(name)).open("rb") as stream:
+            data = capped(name, stream.read(LIMIT + 1))
+        self._record(len(data), False)
+        return data
+
+    def range(self, name: str, start: int, end: int, size: int | None, sink: BinaryIO, *, payload: bool) -> int:
+        path = self.root / filename(name)
+        total = path.stat().st_size
+        if total < end or (size is not None and total != size):
+            raise ValueError(f"{path} changed or is shorter than its header claims")
+        with path.open("rb") as stream:
+            stream.seek(start)
+            offset = start
+            while offset < end:
+                data = stream.read(min(CHUNK, end - offset))
+                if not data:
+                    raise OSError(f"Short read from {path}")
+                write_bytes(sink, data)
+                offset += len(data)
+                self._record(len(data), payload)
+        return total
+
+
+class Remote(Source):
+    """Bounded HTTP reads with fresh Hub redirects on every retry and range chunk."""
+
+    def __init__(self, repo: str, revision: str) -> None:
+        super().__init__()
+        self.base = f"https://huggingface.co/{repo}/resolve/{revision}/"
+
+    def metadata(self, name: str) -> bytes:
         request = Request(self.base + quote(filename(name)), headers={"Accept-Encoding": "identity"})
         response: HTTPResponse
-        with urlopen(request, timeout=60) as response:
-            data = response.read(LIMIT + 1)
-        self.metadata_bytes += len(data)
-        if len(data) > LIMIT:
-            raise ValueError(f"Metadata exceeds {LIMIT} bytes: {name}")
+        try:
+            with urlopen(request, timeout=60) as response:
+                data = capped(name, response.read(LIMIT + 1))
+        except HTTPError as error:
+            error.close()
+            if error.code == 404:
+                raise FileNotFoundError(name) from error
+            raise
+        self._record(len(data), False)
         return data
 
     def range(self, name: str, start: int, end: int, size: int | None, sink: BinaryIO, *, payload: bool) -> int:
@@ -170,13 +236,6 @@ class Remote:
         assert total is not None
         return total
 
-    def _record(self, count: int, payload: bool) -> None:
-        with self._counter_lock:
-            if payload:
-                self.payload_bytes += count
-            else:
-                self.metadata_bytes += count
-
 
 def write_bytes(sink: BinaryIO, data: bytes) -> None:
     """Keep destination failures out of the HTTP retry path."""
@@ -206,7 +265,7 @@ def validate_response(response: HTTPResponse, start: int, end: int, size: int | 
     return total
 
 
-def read_header(remote: Remote, shard: str) -> tuple[dict[str, JSON], int, int]:
+def read_header(remote: Source, shard: str) -> tuple[dict[str, JSON], int, int]:
     """Fetch only a safetensors length prefix and bounded JSON header."""
     buffer = io.BytesIO()
     size = remote.range(shard, 0, 8, None, buffer, payload=False)
@@ -258,22 +317,81 @@ def select_layers(count: int, requested: str | None) -> list[int]:
     return layers
 
 
+def qwen2_kinds(config: dict[str, JSON], layers: list[int]) -> None:
+    """Qwen dense layers are uniform; sliding-window layer ranges are not remapped."""
+    if config.get("use_sliding_window", False):
+        raise ValueError("Sliding-window layer remapping is not implemented")
+    config["max_window_layers"] = len(layers)
+
+
+def qwen_moe_kinds(config: dict[str, JSON], layers: list[int]) -> None:
+    """Qwen MoE: remap the dense-MLP layer list; MTP layers are dropped."""
+    qwen2_kinds(config, layers)
+    dense = sequence(config.get("mlp_only_layers", []))
+    step = integer(config.get("decoder_sparse_step", 1))
+    if step <= 0:
+        raise ValueError("decoder_sparse_step must be positive")
+    config["mlp_only_layers"] = [i for i, src in enumerate(layers) if src in dense or (src + 1) % step != 0]
+    config["decoder_sparse_step"] = 1
+    config["mtp_num_hidden_layers"] = 0
+
+
+def qwen_hybrid_kinds(config: dict[str, JSON], layers: list[int]) -> None:
+    """Qwen hybrids: materialize the source full/linear pattern before slicing it."""
+    qwen_moe_kinds(config, layers)
+    count = integer(config["num_hidden_layers"])
+    interval = integer(config.get("full_attention_interval", 4))
+    if interval <= 0:
+        raise ValueError("full_attention_interval must be positive")
+    kinds = sequence(
+        config.get(
+            "layer_types",
+            ["full_attention" if (i + 1) % interval == 0 else "linear_attention" for i in range(count)],
+        )
+    )
+    if len(kinds) != count or any(k not in ("full_attention", "linear_attention") for k in kinds):
+        raise ValueError("Unsupported hybrid layer_types; supply one full/linear kind per source layer")
+    config["layer_types"] = [kinds[i] for i in layers]
+
+
+def deepseek_kinds(config: dict[str, JSON], layers: list[int]) -> None:
+    """DeepSeek V2/V3: the leading dense-MLP layers stay a prefix; MTP layers are dropped."""
+    if integer(config.get("moe_layer_freq", 1)) != 1:
+        raise ValueError("moe_layer_freq other than 1 changes layer kinds on renumbering; not implemented")
+    dense = [src < integer(config["first_k_dense_replace"]) for src in layers]
+    if dense != sorted(dense, reverse=True):
+        raise ValueError("Select the dense first_k_dense_replace layers before MoE layers")
+    config["first_k_dense_replace"] = sum(dense)
+    config["num_nextn_predict_layers"] = 0
+
+
+def gpt_oss_kinds(config: dict[str, JSON], layers: list[int]) -> None:
+    """gpt-oss alternates sliding and full attention; keep each selected layer's kind."""
+    kinds = sequence(config["layer_types"])
+    if len(kinds) != integer(config["num_hidden_layers"]):
+        raise ValueError("gpt-oss layer_types must list one kind per source layer")
+    config["layer_types"] = [kinds[i] for i in layers]
+
+
+# Per family: how a renumbered layer keeps its attention and MLP kind.
+FAMILIES = {
+    "Qwen2ForCausalLM": qwen2_kinds,
+    "Qwen3MoeForCausalLM": qwen_moe_kinds,
+    "Qwen3NextForCausalLM": qwen_hybrid_kinds,
+    "Qwen3_5MoeForCausalLM": qwen_hybrid_kinds,
+    "Qwen3_5ForCausalLM": qwen_hybrid_kinds,
+    "DeepseekV2ForCausalLM": deepseek_kinds,
+    "DeepseekV3ForCausalLM": deepseek_kinds,
+    "GptOssForCausalLM": gpt_oss_kinds,
+}
+
+
 def rewrite_config(
     source: dict[str, JSON], layers_arg: str | None, text_only: bool
 ) -> tuple[dict[str, JSON], list[int]]:
-    """Preserve source attention and MoE kinds while renumbering admitted Qwen families."""
+    """Preserve source attention and MoE kinds while renumbering a supported family."""
     arch = sequence(source["architectures"])
-    supported = (
-        "Qwen3MoeForCausalLM",
-        "Qwen3NextForCausalLM",
-        "Qwen3_5MoeForCausalLM",
-        "Qwen3_5ForCausalLM",
-        "Qwen3_5MoeForConditionalGeneration",
-        "Qwen3_5ForConditionalGeneration",
-    )
-    if len(arch) != 1 or arch[0] not in supported:
-        raise ValueError(f"Unsupported family {arch}; implement its dependency/config rules first")
-    architecture = string(arch[0])
+    architecture = string(arch[0]) if len(arch) == 1 else ""
     config = dict(source)
     if "text_config" in source:
         if not text_only:
@@ -284,33 +402,14 @@ def rewrite_config(
         for key in ("quantization_config", "transformers_version"):
             if key in source:
                 config[key] = source[key]
+    if architecture not in FAMILIES:
+        raise ValueError(f"Unsupported family {arch}; implement its dependency/config rules first")
+    # The slice ships no model code; vLLM and transformers use their native classes.
+    config.pop("auto_map", None)
     config["architectures"] = [architecture]
-    count = integer(config["num_hidden_layers"])
-    layers = select_layers(count, layers_arg)
-    if architecture != "Qwen3MoeForCausalLM":
-        interval = integer(config.get("full_attention_interval", 4))
-        if interval <= 0:
-            raise ValueError("full_attention_interval must be positive")
-        kinds = sequence(
-            config.get(
-                "layer_types",
-                ["full_attention" if (i + 1) % interval == 0 else "linear_attention" for i in range(count)],
-            )
-        )
-        if len(kinds) != count or any(k not in ("full_attention", "linear_attention") for k in kinds):
-            raise ValueError("Unsupported hybrid layer_types; supply one full/linear kind per source layer")
-        config["layer_types"] = [kinds[i] for i in layers]
-    dense = sequence(config.get("mlp_only_layers", []))
-    step = integer(config.get("decoder_sparse_step", 1))
-    if step <= 0:
-        raise ValueError("decoder_sparse_step must be positive")
-    config["mlp_only_layers"] = [i for i, src in enumerate(layers) if src in dense or (src + 1) % step != 0]
-    config["decoder_sparse_step"] = 1
+    layers = select_layers(integer(config["num_hidden_layers"]), layers_arg)
+    FAMILIES[architecture](config, layers)
     config["num_hidden_layers"] = len(layers)
-    config["mtp_num_hidden_layers"] = 0
-    if config.get("use_sliding_window", False):
-        raise ValueError("Sliding-window layer remapping is not implemented")
-    config["max_window_layers"] = len(layers)
     return config, layers
 
 
@@ -331,7 +430,7 @@ def selected_names(weights: dict[str, JSON], layers: list[int]) -> dict[str, str
     return result
 
 
-def plan(remote: Remote, weights: dict[str, JSON], names: dict[str, str]) -> list[Tensor]:
+def plan(remote: Source, weights: dict[str, JSON], names: dict[str, str]) -> list[Tensor]:
     """Resolve selected tensors against validated source headers before any payload."""
     shards = sorted({filename(string(weights[name])) for name in names})
     tensors: list[Tensor] = []
@@ -367,13 +466,17 @@ def dependency_problems(
         for component in (attention, "mlp.", "input_layernorm.", "post_attention_layernorm."):
             if not any(n.startswith(prefix + component) for n in layer_names):
                 problems.append(f"Layer {i} is missing {component} required by its config")
-    quantized = config.get("quantization_config") is not None or any(
-        t.dtype.startswith("F8") or "scale_inv" in t.name or "weight_packed" in t.name for t in tensors
-    )
-    if quantized:
+    quantization = config.get("quantization_config")
+    if quantization is None:
+        if any(t.dtype.startswith("F8") or "scale_inv" in t.name or "weight_packed" in t.name for t in tensors):
+            problems.append("Tensors look quantized but the config has no quantization_config")
+    elif mapping(quantization).get("quant_method") != "mxfp4":
+        # MXFP4 keeps its blocks and scales in per-layer tensors next to each weight; other formats are unchecked.
         problems.append(
-            "Quantized base extraction/dequantization is not implemented; scale, packing and name rules need a format-specific adapter"
+            f"Only MXFP4 tensors are validated to slice as stored, not {mapping(quantization).get('quant_method')}"
         )
+    elif re.search(r"layers\.\d", json.dumps(quantization)):
+        problems.append("quantization_config names source layer indices; remapping them is not implemented")
     if dequantize is not None:
         problems.append(
             "--dequantize bf16 is a stub: no conversion formats are implemented; omit it for native BF16 weights"
@@ -399,7 +502,7 @@ def shard_groups(tensors: list[Tensor], limit: int) -> list[list[Tensor]]:
     return groups
 
 
-def write_shard(remote: Remote, path: Path, tensors: list[Tensor]) -> None:
+def write_shard(remote: Source, path: Path, tensors: list[Tensor]) -> None:
     """Serialize a new header and stream adjacent selected intervals without gaps."""
     header: dict[str, JSON] = {"__metadata__": {"format": "pt"}}
     offset = 0
@@ -433,7 +536,7 @@ def write_json(path: Path, value: JSON) -> None:
     path.write_text(json.dumps(value, indent=2) + "\n")
 
 
-def assets(remote: Remote) -> dict[str, bytes]:
+def assets(remote: Source) -> dict[str, bytes]:
     """Fetch only a fixed allowlist of tokenizer/decoding files, never model code."""
     result: dict[str, bytes] = {}
     for name in (
@@ -448,17 +551,15 @@ def assets(remote: Remote) -> dict[str, bytes]:
     ):
         try:
             result[name] = remote.metadata(name)
-        except HTTPError as error:
-            error.close()
-            if error.code != 404:
-                raise
+        except FileNotFoundError:
+            pass
     if "tokenizer_config.json" not in result or not ({"tokenizer.json", "vocab.json"} & result.keys()):
         raise ValueError("Checkpoint lacks supported tokenizer assets")
     return result
 
 
 def extract(
-    remote: Remote,
+    remote: Source,
     output: Path,
     config: dict[str, JSON],
     tensors: list[Tensor],
@@ -498,10 +599,11 @@ def extract(
 
 
 def main() -> int:
-    """Plan or create one pinned model slice from the command line."""
+    """Plan or create one model slice from the command line."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repo", required=True)
-    parser.add_argument("--revision", required=True, help="Immutable 40-character Hub commit SHA")
+    parser.add_argument("--repo", help="Hub owner/name; requires --revision")
+    parser.add_argument("--revision", help="Immutable 40-character Hub commit SHA")
+    parser.add_argument("--source", type=Path, help="Local checkpoint directory instead of --repo/--revision")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--layers", help="Ordered source IDs, comma-separated; default first/middle/last two")
     parser.add_argument("--text-only", action="store_true")
@@ -512,26 +614,40 @@ def main() -> int:
     )
     parser.add_argument("--plan-only", action="store_true")
     args = parser.parse_args()
-    if re.fullmatch(r"[0-9a-f]{40}", args.revision) is None:
-        parser.error("--revision must be an immutable lowercase 40-character commit SHA, not a branch/tag")
-    if re.fullmatch(r"[\w.-]+/[\w.-]+", args.repo) is None or args.max_shard_bytes <= 0:
-        parser.error("Use --repo owner/name and positive --max-shard-bytes")
-    remote = Remote(args.repo, args.revision)
+    if args.max_shard_bytes <= 0:
+        parser.error("Use a positive --max-shard-bytes")
+    remote: Source
+    if args.source is not None:
+        if args.repo is not None or args.revision is not None:
+            parser.error("Use either --source or --repo/--revision")
+        remote = Local(args.source)
+        origin: dict[str, JSON] = {"source": str(args.source.resolve())}
+    else:
+        if re.fullmatch(r"[0-9a-f]{40}", args.revision or "") is None:
+            parser.error("--revision must be an immutable lowercase 40-character commit SHA, not a branch/tag")
+        if re.fullmatch(r"[\w.-]+/[\w.-]+", args.repo or "") is None:
+            parser.error("Use --repo owner/name, or --source DIR")
+        remote = Remote(args.repo, args.revision)
+        origin = {"repo": args.repo, "revision": args.revision}
     config, layers = rewrite_config(decode(remote.metadata("config.json")), args.layers, args.text_only)
     weights = mapping(decode(remote.metadata("model.safetensors.index.json"))["weight_map"])
     tensors = plan(remote, weights, selected_names(weights, layers))
     problems = dependency_problems(config, tensors, args.include_mtp, args.dequantize)
     tokenizer = assets(remote)
     manifest: dict[str, JSON] = {
-        "repo": args.repo,
-        "revision": args.revision,
+        **origin,
         "layer_map": {str(src): dst for dst, src in enumerate(layers)},
         "config": config,
         "payload_bytes": sum(t.size for t in tensors),
         "metadata_bytes": remote.metadata_bytes,
         "tokenizer_bytes": sum(map(len, tokenizer.values())),
         "dependency_problems": list(problems),
-        "decisions": ["text decoder only", "MTP excluded", "all selected-layer tensors retained", "no conversion"],
+        "decisions": [
+            "text decoder only",
+            "MTP excluded",
+            "all selected-layer tensors retained",
+            "quantized tensors kept as stored",
+        ],
         "gap_overfetch_bytes": 0,
         "conversion": None,
     }

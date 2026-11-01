@@ -132,7 +132,7 @@ class VllmSession(Generic[DataT, ResultT]):
         self._replay: VllmTokenwiseReplay[DataT, ResultT] | None = None
         if replay_task is not None:
             self._replay = VllmTokenwiseReplay(
-                decoder.model,
+                decoder.writable("a @pllm.layer_route"),
                 replay_task,
                 deployment.execution,
                 attachment.task_bindings[0].anchor_id,

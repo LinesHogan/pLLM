@@ -12,7 +12,7 @@ from vllm.sequence import IntermediateTensors
 
 from pllm.authoring import DataT, ResultT
 from pllm.backends.vllm.activation import VllmActivationPatch, activation_delta
-from pllm.backends.vllm.architecture import CausalLM
+from pllm.backends.vllm.architecture import DenseLM
 from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay
 from pllm.backends.vllm.position_state import PositionCacheLayer, PositionCacheProvider
 from pllm.backends.vllm.region_attention import (
@@ -170,7 +170,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
 
     def __init__(
         self,
-        model: CausalLM,
+        model: DenseLM,
         task: SemanticTask,
         execution: StateExecution[TensorStepInput, DataT, ResultT],
         anchor: AnchorId,

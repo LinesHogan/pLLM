@@ -27,6 +27,5 @@ class Qwen2ForCausalLM(Module):
     logits_processor: LogitsProcessor
     lm_head: VocabParallelEmbedding
     config: Qwen2Config
-    quant_config: object | None
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None: ...

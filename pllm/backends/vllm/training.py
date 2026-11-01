@@ -10,7 +10,7 @@ from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.models.qwen2 import Qwen2Attention
 from vllm.model_executor.models.qwen3 import Qwen3Attention
 
-from pllm.backends.vllm.architecture import Decoder, DecoderLayer, Projection
+from pllm.backends.vllm.architecture import Decoder, DenseLayer, Projection
 from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding
 from pllm.execution.parameter_projection import parameter_correction
 
@@ -52,7 +52,7 @@ def rotary(
 
 
 def attention_forward(
-    layer: DecoderLayer,
+    layer: DenseLayer,
     hidden: torch.Tensor,
     positions: torch.Tensor,
     mask: torch.Tensor | None,
@@ -78,14 +78,14 @@ def attention_forward(
     return project(attention.o_proj, hidden)
 
 
-def mlp_forward(layer: DecoderLayer, hidden: torch.Tensor, project: Project) -> torch.Tensor:
+def mlp_forward(layer: DenseLayer, hidden: torch.Tensor, project: Project) -> torch.Tensor:
     """Keep fused SwiGLU projections and activation storage in the model dtype."""
     hidden = project(layer.mlp.gate_up_proj, hidden)
     hidden = layer.mlp.act_fn.forward_native(hidden)
     return project(layer.mlp.down_proj, hidden)
 
 
-def bind_qk_norms(layer: DecoderLayer) -> tuple[RMSNorm, RMSNorm] | None:
+def bind_qk_norms(layer: DenseLayer) -> tuple[RMSNorm, RMSNorm] | None:
     """Resolve the sole attention family difference once when borrowing the model."""
     attention = layer.self_attn
     if isinstance(attention, Qwen3Attention) or isinstance(attention, Qwen2Attention) and attention.qk_norm:
@@ -97,7 +97,7 @@ class CausalTraining:
     """Frozen decoder arithmetic with projection views bound once by the worker."""
 
     def __init__(self, decoder: Decoder, bindings: tuple[ParameterOverlayFieldBinding, ...]) -> None:
-        self.model = decoder.model
+        self.model = decoder.writable("causal training")
         if self.model.model.embed_tokens.weight.dtype is not torch.bfloat16:
             raise ValueError("causal training requires qualified unquantized BF16 TP1 weights")
         self.projections: dict[Projection, list[tuple[int, int, ParameterOverlayFieldBinding, slice]]] = {}

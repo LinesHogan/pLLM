@@ -152,9 +152,16 @@ forward 重叠。采样前只读的任务固定读取延迟版本：步 N+1 可�
 
 ## 支持的模型与限制
 
-- **模型**：未量化的 Qwen2、Llama 与 Qwen3，即 vLLM 的 `Qwen2ForCausalLM`、`LlamaForCausalLM`、
-  `Qwen3ForCausalLM` 三个类。准入按精确类判断，不接受子类：Phi3、Mistral 等相近架构可能改变投影布局、
+- **模型**：准入按 vLLM 的精确类判断，不接受子类：Phi3、Mistral 等相近架构可能改变投影布局、
   注意力或 logits，尚未逐一验证。示例用 Qwen2.5 检查点只是为了方便。
+  - 未量化的 `Qwen2ForCausalLM`、`LlamaForCausalLM`、`Qwen3ForCausalLM` 支持全部功能。
+  - `DeepseekV2ForCausalLM`、`DeepseekV3ForCausalLM`（MLA 注意力 + MoE）、`GptOssForCausalLM`
+    （sink 注意力 + MXFP4 MoE），以及量化的 Qwen2/Llama/Qwen3（已验证 GPTQ-Int4），只支持只读功能：
+    hidden tap 与导出、ESamp、采样器引导与反馈、`add_logits`、激活补丁。它们只读取或改写层输出与 logits，
+    不碰权重和 KV 缓存；block tap 仍是该层新算出的输出（不含残差），最终位点仍是模型自己的 final norm。
+  - 参数 overlay、因果训练（TLM）、`@pllm.layer_route` 与 PositionState 需要稠密的 q/v/down 投影和逐层 KV：
+    MLA 没有独立的 V 投影，KV 缓存是压缩后的潜变量；MoE 的 down 投影按专家拆分；量化权重不是可直接读取或
+    修正的稠密矩阵。在这些模型上声明它们，会在模型加载后、工作负载绑定前报错并说明原因。
 - **vLLM**：0.32.0 或 0.27.1，其他版本启动即报错。默认 MRv2，张量、流水线与数据并行都为 1，
   不支持投机解码。MRv1 支持共享附着路径，但不支持 KV 重放。
 - **训练与重放**：因果训练（如 TLM）要求 BF16 权重；层间重放要求 FlashAttention 2，

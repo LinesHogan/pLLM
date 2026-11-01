@@ -147,8 +147,10 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
         self.position_states = decode_boundary(
             os.environ.get(POSITION_ENV, '{"states": []}'), PositionAnnouncement
         ).states
-        if self.position_states and self.cache_config.cache_dtype != "auto":
-            raise ValueError("PositionState requires cache_dtype=auto in the model dtype")
+        if self.position_states:
+            self.decoder.writable("a PositionState")
+            if self.cache_config.cache_dtype != "auto":
+                raise ValueError("PositionState requires cache_dtype=auto in the model dtype")
         self.position_layers = tuple(
             PositionCacheLayer(1, self.model_config.get_hidden_size(), prefix=f"pllm.position.{index}.state")
             for index, _ in enumerate(

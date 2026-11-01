@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -52,14 +53,13 @@ class _PatchRows:
 class _ActivationLayer:
     def __init__(self, layer: DecoderLayer, binding: ActivationPatchBinding) -> None:
         self.layer, self.binding = layer, binding
-        self.original = layer.forward
+        self.original: Callable[..., tuple[torch.Tensor, torch.Tensor]] = layer.forward
         self.prepared: tuple[_PatchRows, ...] = ()
         self.apply_count = 0
 
-    def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor, residual: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden, residual = self.original(positions, hidden_states, residual)
+    def forward(self, *inputs: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+        # Families order (positions, hidden, residual) differently; only the returned pair is shared.
+        hidden, residual = self.original(*inputs)
         if not self.prepared:
             return hidden, residual
         # Decoder layers return a fresh down-projection output, separate from its residual.
