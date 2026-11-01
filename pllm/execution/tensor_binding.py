@@ -218,7 +218,7 @@ class TensorBinding(Builder[TensorFrame]):
             self.bind_prepare(),
             lambda data, invocation: self.result(data, invocation) if self.graph.states else invocation.value,
             lambda previous, incoming: replace(
-                previous, step=incoming.step, rows=incoming.rows, index=None, plan=None, training=None
+                previous, step=incoming.step, rows=incoming.rows, plan=None, training=None
             ),
             parameter_phases=self.parameter_phases,
         )
@@ -259,20 +259,6 @@ class TensorBinding(Builder[TensorFrame]):
     ) -> dict[TaskSymbol, TensorOperation[TensorFrame]]:
         """Build each tensor operation once, with the same scan scope for eager and captured math."""
         capture = facts is not None and "compute/cuda_graph@1" in facts.timeline.capabilities
-        # Training that selects its rows on the host runs compact together with the tasks it differentiates.
-        selecting = {
-            item.symbol
-            for task in self.tensor_tasks.values()
-            if task.policy.update_states in task.domains or (task.training is not None and task.policy.forward_rows)
-            for item in task.dependencies(self.tensor_tasks)
-        }
-        fixed = {
-            symbol
-            for symbol, task in self.tensor_tasks.items()
-            if (task.writer is not None or reads_rows(task, self.tensor_tasks))
-            and task.export is None
-            and symbol not in selecting
-        }
         limits = {fact.task: fact for fact in resources}
         operations: dict[TaskSymbol, TensorOperation[TensorFrame]] = {}
         declarations = {task.symbol: task for task in self.graph.tasks}
@@ -310,17 +296,21 @@ class TensorBinding(Builder[TensorFrame]):
                 task,
                 self.tensor_tasks,
                 optimizer,
-                compact=symbol not in fixed and task.writer is None,
                 capture=StepCapture(
                     limits[symbol],
                     facts.max_admitted_lineages
+                    # A task without its own resource reads every state of the invocation.
                     if any(
-                        state.resource == task.resource and state.scope is StateScope.REQUEST
+                        task.resource in ("", state.resource) and state.scope is StateScope.REQUEST
                         for state in self.graph.states
                     )
                     else 1,
                 )
-                if capture and symbol in fixed and symbol in limits and facts is not None
+                if capture
+                and symbol in limits
+                and task.export is None
+                and (task.writer is not None or reads_rows(task, self.tensor_tasks))
+                and facts is not None
                 else None,
                 device=torch.device("cpu") if facts is None else facts.device,
             )

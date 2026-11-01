@@ -13,7 +13,7 @@ from torch.optim.sgd import sgd
 
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
-from pllm.contracts.parameter_overlay import FieldView, ParameterTarget
+from pllm.contracts.parameter_overlay import ParameterTarget
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
@@ -109,8 +109,6 @@ class TaskOutput:
     observations: tuple[Observation, ...] = ()
     gradient_indices: tuple[int, ...] = ()
     loss: torch.Tensor | None = None
-    # Per-lineage memory writes, rows aligned to the gradient/update selection.
-    field_writes: tuple[tuple[FieldView, torch.Tensor], ...] = ()
 
 
 def autograd_loss(
@@ -370,26 +368,39 @@ class PageUpdate(TensorAdamW):
         destinations: torch.Tensor,
         gradients: torch.Tensor,
         captures: Mapping[LayoutFieldId, torch.Tensor],
+        updates: torch.Tensor,
         last: torch.Tensor,
         *,
         paged: bool,
     ) -> None:
-        """Update issued destinations and carry fields inside the shared tensor body."""
+        """Write every issued destination inside the shared tensor body, without a host sync.
+
+        States with `updates` take the optimizer step and their memory captures from row `last` (when it is
+        not -1); every other destination receives its source page unchanged.
+        """
         count = gradients.shape[0]
+        stepped = torch.where(updates, destinations, -1)
         if paged:
-            paged_adamw(pools[:5], destinations[:5], gradients, self.config, sources[:5, :count].contiguous())
+            paged_adamw(pools[:5], stepped[:5], gradients, self.config, sources[:5, :count].contiguous())
         else:
             self.tensors(
                 tuple(tuple(value[row] for value in fields[:5]) for row in range(count)), tuple(gradients.unbind())
             )
             rows = torch.arange(count, device=destinations.device)
             for field in range(5):
-                copy_pages(fields[field], pools[field], rows, destinations[field])
-        for field in set(range(5, len(pools))) - captures.keys():
-            copy_pages(pools[field], pools[field], sources[field, :count], destinations[field])
+                copy_pages(fields[field], pools[field], rows, stepped[field])
+        captured = torch.where(updates & (last >= 0), destinations, -1)
         for field, value in captures.items():
             assert value.shape[1:] == pools[field].shape[1:] and value.dtype == pools[field].dtype
-            copy_pages(value.detach(), pools[field], last, destinations[field])
+            copy_pages(value.detach(), pools[field], last.clamp_min(0), captured[field])
+        for field in range(len(pools)):
+            written = stepped if field < 5 else captured if field in captures else None
+            copy_pages(
+                pools[field],
+                pools[field],
+                sources[field, :count],
+                destinations[field] if written is None else torch.where(written[field] >= 0, -1, destinations[field]),
+            )
 
 
 MemoryDataT = TypeVar("MemoryDataT", contravariant=True)
@@ -494,19 +505,6 @@ class TensorOperation(Generic[D]):
                 self.apply_gradients(roots, roots.field_slots, tuple(batch.roots[index] for index in selected), output)
             if write is None:
                 write = context.sole_write()
-            if output.field_writes:
-                assert write is not None
-                roots = context.arena.lazy_roots((write,) * len(selected), write.after_refs)
-                for view, values in output.field_writes:
-                    pool, slots = roots.field_slots(view.field)
-                    target = view.read(pool, pooled=True)
-                    assert values.shape == (len(selected), *view.shape) and values.dtype == target.dtype
-                    copy_pages(
-                        values.detach().contiguous(),
-                        target,
-                        upload(tuple(range(len(selected))), pool.device),
-                        upload(slots, pool.device),
-                    )
             if write is not None and (self.mode == "update" or self.publish):
                 context.publish_owned_write(write)
             if output.counters is not None:

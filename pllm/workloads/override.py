@@ -29,7 +29,8 @@ class OverRIDEConfig:
 
 
 def cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    return F.cross_entropy(logits.float(), labels.long())
+    """One loss per row; pllm averages the eligible rows."""
+    return F.cross_entropy(logits.float(), labels.long(), reduction="none")
 
 
 def head_logits(hidden: torch.Tensor, down: torch.Tensor, up: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
@@ -93,4 +94,8 @@ class OverRIDEWorkload(pllm.Workload):
         base: torch.Tensor = pllm.base_logits(),
         tokens: torch.Tensor = pllm.sampled_tokens(),
     ) -> torch.Tensor:
-        return self.objective(base + head_logits(hidden, down, up, samples), tokens)
+        # Every row evaluates and pllm masks the ineligible ones, so the last sample reads a valid head.
+        if self.config.num_iterations == 1:
+            return base.new_zeros(len(base))
+        heads = samples.clamp_max(self.config.num_iterations - 2)
+        return self.objective(base + head_logits(hidden, down, up, heads), tokens)

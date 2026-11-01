@@ -46,7 +46,6 @@ from pllm.execution.tensor_frame import (
     Tensors,
     feedback_port,
     field_rows,
-    row_index,
 )
 from pllm.execution.tensor_program import (
     BatchOperation,
@@ -275,15 +274,12 @@ def parameter_ports(
             field_index, start, shape = view.field, view.offset, view.shape
 
             def read(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
-                selected = batch.for_resource(state.declaration.resource)
-                data = data.for_resource(state.declaration.resource, batch)
-                batch = selected
+                table = data.table.for_resource(state.declaration.resource)
                 size = prod(shape)
-                if field_index == 0 and data.leaf is not None:
-                    leaf = data.leaf.narrow(1, start or 0, size)
-                    rows = row_index(data, batch, leaf.device).states.take(leaf)
+                if field_index == 0 and table.leaf is not None:
+                    rows = table.leaf.narrow(1, start or 0, size).index_select(0, table.index.states)
                 else:
-                    rows = field_rows(data, batch, field_index, start or 0, size)
+                    rows = field_rows(table, field_index, start or 0, size)
                 return rows.view(len(rows), *shape)
 
             return TensorPort(state.read(), read, field=field_index)
@@ -406,10 +402,8 @@ def state_metadata(state: State, *, version: bool) -> TensorPort:
                 device=tensors[0].device,
                 dtype=torch.long,
             )
-        selected = batch.for_resource(state.declaration.resource)
-        frame = data.for_resource(state.declaration.resource, batch)
-        index = row_index(frame, selected, selected.roots[0][0].device)
-        return index.versions.device if version else index.states.device
+        index = data.table.for_resource(state.declaration.resource).index
+        return index.versions if version else index.states
 
     return TensorPort(replace(state.read(), metadata=True), read)
 

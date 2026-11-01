@@ -7,7 +7,7 @@ parameters through a RowPlan and its per-invocation device RowIndex. Used by Ten
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, NamedTuple, overload
 
@@ -41,15 +41,6 @@ if TYPE_CHECKING:
 Tensors = Mapping[str, torch.Tensor]
 TensorMath = Callable[..., torch.Tensor | tuple[torch.Tensor, ...]]
 TensorReader = Callable[["TensorFrame", TensorBatch], torch.Tensor]
-
-
-def select_rows(value: torch.Tensor, rows: tuple[int, ...]) -> torch.Tensor:
-    """Borrow consecutive original rows; pack only an irregular selection."""
-    if not rows:
-        return value[:0]
-    if rows == tuple(range(rows[0], rows[0] + len(rows))):
-        return value.narrow(0, rows[0], len(rows))
-    return value[list(rows)]
 
 
 def flat_gradient(fields: tuple[torch.Tensor, ...]) -> torch.Tensor:
@@ -125,25 +116,22 @@ class TensorPort:
     adapt: Callable[[torch.Tensor], torch.Tensor | ModuleCall] = lambda value: value
 
 
-def take_rows(values: torch.Tensor, rows: Sequence[int], device_rows: torch.Tensor | None = None) -> torch.Tensor:
+def take_rows(values: torch.Tensor, rows: Sequence[int]) -> torch.Tensor:
     """`values[rows]` along dim 0: a view when the rows repeat one row or run consecutively, else one gather."""
     first = rows[0] if rows else 0
     if len(set(rows)) == 1:
         return values[first : first + 1].expand(len(rows), *values.shape[1:])
     if tuple(rows) == tuple(range(first, first + len(rows))):
         return values.narrow(0, first, len(rows))
-    if device_rows is None:
-        device_rows = upload(rows, values.device)
-    return values.index_select(0, device_rows)
+    return values.index_select(0, upload(rows, values.device))
 
 
 @dataclass(frozen=True, slots=True)
 class RowPlan:
-    """Host row facts and authorized slots shared by eager views and fixed tables.
+    """Host row facts and authorized slots that TensorExecutor stages into its fixed table.
 
     Columns serialize in sampler/samples/states/versions order; sources are [state, field] slots. Writes pair the
-    update-state positions with their issued destination slots. Selecting rows
-    changes only columns; page access stays in the invocation's state order.
+    update-state positions with their issued destination slots.
     """
 
     packed: Slots
@@ -171,80 +159,24 @@ class RowPlan:
             batch.slot_matrix()[1] if batch.roots else np.empty((0, 0), dtype=np.int64),
         )
 
-    def select(self, rows: tuple[int, ...]) -> "RowPlan":
-        """Keep operation-row order; capture positions refer to the compact inputs."""
-        return replace(
-            self,
-            packed=self.packed[list(rows)],
-            sampler=tuple(self.sampler[row] for row in rows),
-            samples=tuple(self.samples[row] for row in rows),
-            states=tuple(self.states[row] for row in rows),
-            versions=tuple(self.versions[row] for row in rows),
-        )
-
     @property
     def columns(self) -> tuple[tuple[int, ...], ...]:
         """Serialize named fields only at the device-table boundary."""
         return self.sampler, self.samples, self.states, self.versions
 
     @property
-    def counts(self) -> Slots:
-        """Per-state row counts, followed by the padding sink."""
-        return np.bincount(self.states, minlength=len(self.sources) + 1).astype(np.int64, copy=False)
-
-    @property
     def last(self) -> dict[int, int]:
-        """Last input position of every state with forward rows."""
+        """Last row position of every state with rows."""
         return {state: position for position, state in enumerate(self.states)}
 
 
-@dataclass(frozen=True, slots=True)
-class MaskedRows:
-    """A fixed device row selection, used inside masked tensor bodies."""
-
-    device: torch.Tensor
-
-    def take(self, values: torch.Tensor) -> torch.Tensor:
-        """Gather through fixed device indices."""
-        return values.index_select(0, self.device)
-
-    def select(self, rows: tuple[int, ...]) -> "MaskedRows":
-        """Keep a selected device view."""
-        return MaskedRows(select_rows(self.device, rows))
-
-
-@dataclass(frozen=True, slots=True)
-class CompactRows:
-    """Host-selected rows preserve consecutive and repeated eager views."""
-
-    device: torch.Tensor
-    rows: tuple[int, ...]
-
-    def take(self, values: torch.Tensor) -> torch.Tensor:
-        """Borrow eager views where row order permits them."""
-        assert -1 not in self.rows
-        return take_rows(values, self.rows, self.device)
-
-    def select(self, rows: tuple[int, ...]) -> "CompactRows":
-        """Keep matching host indices and device columns."""
-        return CompactRows(select_rows(self.device, rows), tuple(self.rows[row] for row in rows))
-
-
-# Both strategies read rows through `take` and `select`; the binding chooses one per invocation.
-RowColumn = MaskedRows | CompactRows
-
-
 class RowIndex(NamedTuple):
-    """Named read strategies for an invocation's four index columns."""
+    """An invocation's four fixed device row columns (padding rows point at the sink state)."""
 
-    sampler: RowColumn
-    samples: RowColumn
-    states: RowColumn
-    versions: RowColumn
-
-    def select(self, rows: tuple[int, ...]) -> "RowIndex":
-        """Select each column using its bound row strategy."""
-        return RowIndex(*(column.select(rows) for column in self))
+    sampler: torch.Tensor
+    samples: torch.Tensor
+    states: torch.Tensor
+    versions: torch.Tensor
 
 
 def row_plan(data: "TensorFrame", batch: TensorBatch) -> RowPlan:
@@ -254,25 +186,10 @@ def row_plan(data: "TensorFrame", batch: TensorBatch) -> RowPlan:
     return data.plan
 
 
-def row_index(data: "TensorFrame", batch: TensorBatch, device: torch.device) -> RowIndex:
-    """The invocation's row tables, built on first use."""
-    if data.index is None:
-        plan = row_plan(data, batch)
-        data.index = RowIndex(
-            *(CompactRows(value, rows) for value, rows in zip(upload(plan.columns, device), plan.columns, strict=True))
-        )
-    return data.index
-
-
-def field_rows(data: "TensorFrame", batch: TensorBatch, field: int, start: int, size: int) -> torch.Tensor:
+def field_rows(rows: FixedRows, field: int, start: int, size: int) -> torch.Tensor:
     """`field[start:start+size]` of each row's state, `[rows, size]`; copies only that slice."""
-    pool = data.fixed.fields[field] if data.fixed is not None else batch.field_slots(field)[0]
-    view = pool.reshape(len(pool), -1).narrow(1, start, size)
-    index = row_index(data, batch, pool.device)
-    if data.fixed is not None:
-        return index.states.take(view)
-    plan = row_plan(data, batch)
-    return take_rows(view, tuple(int(plan.sources[state, field]) for state in plan.states))
+    pool = rows.fields[field]
+    return pool.reshape(len(pool), -1).narrow(1, start, size).index_select(0, rows.index.states)
 
 
 class FieldRoots(Sequence[tuple[torch.Tensor, ...]]):
@@ -319,24 +236,6 @@ class LeafRoots(Sequence[tuple[torch.Tensor, ...]]):
         return (self._leaf[index], *self._roots[index][1:])
 
 
-def state_means(losses: torch.Tensor, plan: RowPlan) -> torch.Tensor:
-    """Average compact row losses using the same host counts as fixed table staging."""
-    totals = losses.new_zeros(len(plan.sources)).index_add(0, upload(plan.states, losses.device), losses)
-    return totals / upload([max(int(count), 1) for count in plan.counts[:-1]], losses.device, losses.dtype)
-
-
-def state_leaf(data: "TensorFrame", batch: TensorBatch) -> torch.Tensor:
-    """The invocation's differentiable parameters, created on first use."""
-    if data.leaf is None:
-        pool, slots = batch.field_slots(0)
-        data.leaf = (
-            (pool[slots[0] : slots[0] + 1] if len(slots) == 1 else pool.index_select(0, upload(slots, pool.device)))
-            .detach()
-            .requires_grad_(True)
-        )
-    return data.leaf
-
-
 class ParameterGradients(MutableMapping[StateRef, tuple[torch.Tensor, ...]]):
     """Stacked parameter derivatives; per-state views are created only when inspected."""
 
@@ -373,16 +272,27 @@ class ParameterGradients(MutableMapping[StateRef, tuple[torch.Tensor, ...]]):
 
 @dataclass(frozen=True, slots=True)
 class FixedRows:
-    """The gathered inputs of one fixed-table body, built by TensorExecutor: per-field state pages
-    (index S is the padding sink), row weights (1 active, 0 padding), per-state row counts, hidden
-    rows by locator, sampler feedback rows and the frames of other resources the task reads."""
+    """The gathered inputs of one fixed-table body, built by TensorExecutor; every row read goes through it.
+
+    `fields` hold each field's pages for the `states` states and the padding sink at index `states`,
+    `index` the device row columns,
+    `active` marks real rows (padding rows are False), `hidden` the hidden slots per locator and `feedback`
+    the sampler feedback rows. `leaf` is the differentiable copy of the flat parameter field when the body
+    differentiates parameters; `resources` are the tables of other resources the task reads.
+    """
 
     fields: tuple[torch.Tensor, ...]
-    weights: torch.Tensor | None
-    counts: torch.Tensor
+    states: int
+    index: RowIndex
+    active: torch.Tensor
     hidden: Mapping[tuple[str, str, str], tuple[torch.Tensor, torch.Tensor]]
     feedback: Mapping[str, torch.Tensor]
-    resources: Mapping[StateResource, TensorFrame] = field(default_factory=lambda: dict[StateResource, TensorFrame]())
+    leaf: torch.Tensor | None = None
+    resources: Mapping[StateResource, FixedRows] = field(default_factory=lambda: dict[StateResource, "FixedRows"]())
+
+    def for_resource(self, resource: StateResource) -> FixedRows:
+        """The table of `resource`: this one, or that of another resource the task also reads."""
+        return self.resources.get(resource, self)
 
 
 @dataclass(slots=True)
@@ -390,9 +300,6 @@ class TensorFrame:
     step: TensorStepInput
     rows: tuple[PackedPhaseRow, ...]
     entries: list[OverlayEntry] = field(default_factory=lambda: list[OverlayEntry]())
-    derivative_sources: dict[tuple[str, str], torch.Tensor] = field(
-        default_factory=lambda: dict[tuple[str, str], torch.Tensor]()
-    )
     input_gradients: dict[tuple[str, str], torch.Tensor] = field(
         default_factory=lambda: dict[tuple[str, str], torch.Tensor]()
     )
@@ -401,48 +308,32 @@ class TensorFrame:
     )
     training: TensorUpdate | None = None
     replacements: tuple[tuple[int, tuple[torch.Tensor, ...]], ...] = ()
-    index: RowIndex | None = None
     plan: RowPlan | None = None
-    # Differentiable [states, parameters] copy of the flat optimizer field, shared by the
-    # invocation's differentiable tasks and cleared by the training task that consumes it.
-    leaf: torch.Tensor | None = None
+    # Set only on the copy a fixed-table body evaluates.
     fixed: FixedRows | None = None
     # Owned by row_task_binding's weighted batch training.
     weighted: WeightedBatch | None = None
 
     @property
-    def weights(self) -> torch.Tensor | None:
-        """Row weights of a masked fixed body; None evaluates the rows as given."""
-        return None if self.fixed is None else self.fixed.weights
-
-    def for_resource(self, resource: StateResource, batch: TensorBatch) -> TensorFrame:
-        """Read the resource's fixed table, or build its compact row selection."""
-        if self.fixed is not None and resource in self.fixed.resources:
-            return self.fixed.resources[resource]
-        return self if batch.for_resource(resource) is batch else replace(self, index=None, plan=None, leaf=None)
+    def table(self) -> FixedRows:
+        """The fixed-table inputs; only fixed bodies read rows."""
+        assert self.fixed is not None
+        return self.fixed
 
 
 def feedback_port(name: Literal["base_logits", "sampled_tokens"]) -> TensorPort:
-    def resolve(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
-        if data.fixed is not None:
-            return data.fixed.feedback[name]
-        feedback = batch.feedback
-        assert feedback is not None
-        values = feedback.base_logits if name == "base_logits" else feedback.sampled_tokens
-        return row_index(data, batch, values.device).sampler.take(values)
-
-    return TensorPort(SamplerFeedbackInputSource(), resolve, feedback=name)
+    return TensorPort(SamplerFeedbackInputSource(), lambda data, batch: data.table.feedback[name], feedback=name)
 
 
 def training_observations(
-    data: TensorFrame, batch: TensorBatch, losses: torch.Tensor, inputs: Tensors, rows: tuple[int, ...]
+    data: TensorFrame, batch: TensorBatch, losses: torch.Tensor, inputs: Tensors
 ) -> tuple[Observation, ...]:
     if not batch.observing:
         return ()
     return tuple(
-        Observation(name, tensor, data.rows[row], ref, data.step.rows.step_id, gradient)
-        for position, row in enumerate(rows)
-        for index in (batch.selection.row_states[data.rows[row].identity],)
+        Observation(name, tensor, row, ref, data.step.rows.step_id, gradient)
+        for position, row in enumerate(data.rows)
+        for index in (batch.selection.row_states[row.identity],)
         for ref in (batch.selection.refs[index],)
         for name, tensor, gradient in (
             *((name, tensor[position], False) for name, tensor in inputs.items()),
@@ -456,16 +347,8 @@ def hidden_port(source: HiddenInputSource) -> TensorPort:
     """Gather the declared module's slots, promoting model dtypes for FP32 consumer math."""
 
     def hidden(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
-        key = (str(source.layer), "index", source.site.value)
-        if data.fixed is not None:
-            value, slots = data.fixed.hidden[key]
-            result = value.index_select(0, slots)
-        else:
-            (capture,) = (
-                item for item in data.step.hidden_batch(batch.stream).captures if item.resource.locator_key == key
-            )
-            slots = upload(capture.slots[row_plan(data, batch).packed], capture.storage.device)
-            result = capture.storage.index_select(0, slots)
+        value, slots = data.table.hidden[str(source.layer), "index", source.site.value]
+        result = value.index_select(0, slots)
         return result.to(torch.float32) if result.dtype in (torch.float16, torch.bfloat16) else result
 
     return TensorPort(source, hidden)
@@ -474,24 +357,9 @@ def hidden_port(source: HiddenInputSource) -> TensorPort:
 def samples_port(source: PackedSamplerRowsInputSource) -> TensorPort:
     """Read packed sample indices for the invocation rows."""
 
-    def samples(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
-        if data.index is not None:
-            return data.index.samples.device
-        device = data.step.hidden_batch(batch.stream).captures[0].storage.device
-        return row_index(data, batch, device).samples.device
-
-    return TensorPort(source, samples)
+    return TensorPort(source, lambda data, batch: data.table.index.samples)
 
 
 def result_port(source: TaskResultInputSource) -> TensorPort:
     """Read a previously evaluated task's named output."""
     return TensorPort(source, lambda data, batch: batch.results[source.task, source.output])
-
-
-def selected_rows(mask: torch.Tensor) -> tuple[int, ...]:
-    """Read a host row selection; shape tracing covers every potentially active row."""
-    return (
-        tuple(range(len(mask)))
-        if mask.is_meta
-        else tuple(int(index.item()) for index in mask.nonzero().flatten().cpu())
-    )

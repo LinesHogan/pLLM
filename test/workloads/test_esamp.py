@@ -29,7 +29,7 @@ from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.runtime_facts import model_timeline
-from pllm.execution.tensor_frame import CompactRows, RowIndex, RowPlan, TensorFrame, state_means
+from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import TaskOutput, TensorBatch
 from pllm.execution.tensor_task import TensorTask
 from pllm.testing import backend_facts
@@ -93,21 +93,6 @@ def reject_publication(arena, write):
 
 
 def test_esamp_predicts_before_training_and_isolates_request_versions(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Compact positions 0/1 came from operation rows 1/3 of one lineage.
-    positions = (0, 1, 2, 3)
-    plan = RowPlan(
-        np.asarray(positions), positions, positions, (0, 1, 0, 1), (0,) * 4, np.zeros((3, 1), dtype=np.int64)
-    )
-    losses = torch.tensor([2.0, 4.0], requires_grad=True)
-    means = state_means(losses, plan.select((1, 3)))
-    torch.testing.assert_close(means, torch.tensor([0.0, 3.0, 0.0]))
-    torch.testing.assert_close(torch.autograd.grad(means.sum(), losses)[0], torch.tensor([0.5, 0.5]))
-    index = RowIndex(
-        *(CompactRows(column, rows) for column, rows in zip(torch.tensor(plan.columns), plan.columns, strict=True))
-    )
-    values = torch.arange(12).view(4, 3)
-    assert index.select((1, 2)).sampler.take(values).data_ptr() == values[1].data_ptr()
-    assert index.select((2, 2)).sampler.take(values).stride(0) == 0
     refs = StateRefs(np.array([0, 0, 1]), np.array([1, 2, 3]), np.array([9, 5, 0]))
     history = (
         StateRefs(refs.layouts[:1], refs.lineages[:1], np.array([3])),

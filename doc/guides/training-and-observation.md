@@ -162,8 +162,10 @@ or mix rows with batch normalization, attention, or another cross-row operation.
 framework gives padding zero weight and a sink parameter row that is never optimized.
 Shared instance parameters use one live state; request parameters use the admitted state
 bound. Eager execution uses the same step body with the invocation's actual dimensions.
-CPU execution retains compact training for scalar losses and dynamic selections.
-Tasks with dynamic training selection remain on the main lane with compact rows.
+`rows=` and `update=` selectors stay boolean masks on the device: the method runs on every
+row, so it must accept unselected rows, and their losses get zero weight. A state without a
+selected row still publishes, with its fields byte-for-byte unchanged, so selection never
+reads the mask back to the host.
 Captured training requires one loss per row.
 
 One pinned int64 table carries row indices, masks, counts, last-row memory indices and

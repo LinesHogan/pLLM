@@ -58,11 +58,9 @@ def binding_case(*, alias=False, write_failure=False, runtime=False, missing=Non
     def write(data, batch):
         if write_failure:
             raise ArithmeticError("writer failed after private allocation")
-        return TaskOutput(
-            field_writes=((inject.view("delta", b.dimensions), batch.results[encoded.symbol, "value"].unsqueeze(0)),),
-            changed=(0,),
-            update_count=1,
-        )
+        view = inject.view("delta", b.dimensions)
+        view.read(batch.roots[0][view.field]).copy_(batch.results[encoded.symbol, "value"])
+        return TaskOutput(changed=(0,), update_count=1)
 
     transition = b.compute(
         "write",

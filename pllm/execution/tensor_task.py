@@ -35,12 +35,6 @@ from pllm.execution.tensor_frame import (
     TensorMath,
     TensorPort,
     gradient_rows,
-    row_index,
-    row_plan,
-    select_rows,
-    selected_rows,
-    state_leaf,
-    state_means,
     take_rows,
 )
 from pllm.execution.tensor_program import Observation, TaskOutput, TensorBatch
@@ -112,7 +106,7 @@ class TensorExport:
         """Skip disabled steps and bound the rows before evaluating tensor math."""
         if not self.enabled or data.step.rows.step_id % self.every or not data.rows:
             return None
-        return replace(data, rows=data.rows[: self.max_rows], index=None, plan=None)
+        return replace(data, rows=data.rows[: self.max_rows], plan=None)
 
     def output(self, value: torch.Tensor, data: TensorFrame) -> TaskOutput:
         """Publish the bounded result with its row identities and delivery policy."""
@@ -222,79 +216,60 @@ class TensorTask:
         return bool(self.policy.input_gradients or self.policy.parameter_gradients)
 
     def read(
-        self, data: TensorFrame, batch: TensorBatch, *, compact: bool = True
-    ) -> tuple[dict[str, torch.Tensor], tuple[int, ...]]:
-        """The function's inputs and the operation rows they cover.
+        self, data: TensorFrame, batch: TensorBatch
+    ) -> tuple[dict[str, torch.Tensor], dict[tuple[str, str], torch.Tensor]]:
+        """The function's inputs over every row of the fixed table, and the inputs it differentiates.
 
-        With `compact=False` every row is evaluated and the caller masks the result, which avoids
-        reading the row selector back to the host.
+        Row selectors stay boolean masks on the device: the caller masks results and losses, so no
+        selection is read back to the host.
         """
         policy = self.policy
         if policy.parameter_gradients:
-            batch = replace(batch, roots=LeafRoots(state_leaf(data, batch), batch.roots))
+            leaf = data.table.leaf
+            assert leaf is not None
+            batch = replace(batch, roots=LeafRoots(leaf, batch.roots))
         domains = self.domains
         inputs = {key: self.ports[key].read(data, batch) for key in domains}
         if any(inputs[key].dtype != torch.bool or inputs[key].shape != (len(data.rows),) for key in domains):
             raise ValueError("row domain must be a boolean mask over the operation rows")
-        compacted = bool(policy.forward_rows) and compact
-        rows = selected_rows(inputs[policy.forward_rows]) if compacted else tuple(range(len(data.rows)))
-        selected = (
-            replace(
-                data,
-                rows=tuple(data.rows[index] for index in rows),
-                index=row_index(data, batch, inputs[policy.forward_rows].device).select(rows),
-                plan=None if data.plan is None else data.plan.select(rows),
-            )
-            if compacted
-            else data
-        )
+        sources: dict[tuple[str, str], torch.Tensor] = {}
         for key in self.ports:
-            inputs[key] = self._input(key, inputs, data, selected, batch, rows, compacted)
-        return inputs, rows
+            inputs[key] = self._input(key, inputs, data, batch, sources)
+        return inputs, sources
 
     def _input(
         self,
         key: str,
         inputs: dict[str, torch.Tensor],
         data: TensorFrame,
-        selected: TensorFrame,
         batch: TensorBatch,
-        rows: tuple[int, ...],
-        compacted: bool,
+        sources: dict[tuple[str, str], torch.Tensor],
     ) -> torch.Tensor:
         """Read one input and attach the gradient behaviour its declaration asks for."""
         policy, port, source = self.policy, self.ports[key], self.sources[key]
         match source:
             case StateSelectionInputSource(resource=state_resource):
-                state_rows = port.rowwise
                 differentiable = key not in policy.detached_inputs and state_resource in policy.parameter_gradients
                 leaf = False
                 domain = policy.parameter_gradient_rows
             case TaskResultInputSource():
-                state_rows = False
                 differentiable = key not in policy.detached_inputs and key in policy.input_gradients
                 leaf = False
                 domain = policy.input_gradient_rows
             case _:
-                state_rows = False
                 differentiable = key not in policy.detached_inputs and key in policy.input_gradients
                 leaf = True
                 domain = policy.input_gradient_rows
-        value = inputs[key] if key in self.domains else port.read(selected if state_rows else data, batch)
+        value = inputs[key] if key in self.domains else port.read(data, batch)
         if not differentiable:
             value = value.detach()
         elif leaf:
             assert value.is_floating_point()
             value = value.detach().requires_grad_(True)
-            data.derivative_sources[str(self.symbol), key] = value
-        if compacted and port.rowwise and key not in self.domains and not state_rows:
-            assert value.ndim > 0 and value.shape[0] == len(data.rows)
-            value = select_rows(value, rows)
-        if differentiable and domain:
-            mask = select_rows(inputs[domain], rows) if compacted else inputs[domain]
-            assert port.rowwise and value.ndim > 0 and value.shape[0] == len(rows)
-            if value.requires_grad:
-                value = gradient_rows(value, mask.reshape(len(rows), *([1] * (value.ndim - 1))))
+            sources[str(self.symbol), key] = value
+        if differentiable and domain and value.requires_grad:
+            assert port.rowwise and value.ndim > 0 and value.shape[0] == len(data.rows)
+            value = gradient_rows(value, inputs[domain].reshape(len(data.rows), *([1] * (value.ndim - 1))))
         return value
 
     def arguments(self, inputs: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor | ModuleCall]:
@@ -302,13 +277,13 @@ class TensorTask:
         domains = self.domains
         return {key: port.adapt(inputs[key]) for key, port in self.ports.items() if key not in domains}
 
-    def evaluate(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
-        """Run a forward method and store its result for later tasks and the invocation output."""
-        differentiable = self.differentiable
-        with torch.set_grad_enabled(differentiable):
-            # Pure predictions run on every row and mask the result; differentiable forwards still
-            # compact so gradients see only the selected rows.
-            inputs, rows = self.read(data, batch, compact=differentiable and data.weights is None)
+    def evaluate(self, data: TensorFrame, batch: TensorBatch) -> dict[tuple[str, str], torch.Tensor]:
+        """Run a forward method on every row and store its result for later tasks and the invocation output.
+
+        Rows outside `rows=` get a zero result. Returns the inputs a training task differentiates through it.
+        """
+        with torch.set_grad_enabled(self.differentiable):
+            inputs, sources = self.read(data, batch)
             results = self.function(**self.arguments(inputs))
             if not self.tuple_output:
                 if not isinstance(results, torch.Tensor):
@@ -319,35 +294,34 @@ class TensorTask:
             for name, result in zip(self.outputs, results, strict=True):
                 for borrowed in batch.borrowed_roots:
                     borrowed.check_output(result)
-                batch.results[self.symbol, name] = (
-                    self.expand_selected(result, inputs, rows, data) if self.policy.forward_rows else result
-                )
-        return TaskOutput()
+                if self.policy.forward_rows:
+                    result = self._selected(result, inputs[self.policy.forward_rows])
+                batch.results[self.symbol, name] = result
+        return sources
 
-    def expand_selected(
-        self, result: torch.Tensor, inputs: dict[str, torch.Tensor], rows: tuple[int, ...], data: TensorFrame
-    ) -> torch.Tensor:
+    @staticmethod
+    def _selected(result: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """Give unselected rows a zero result, on the device."""
-        if result.ndim == 0 or result.shape[0] != len(rows):
+        if result.ndim == 0 or result.shape[0] != len(mask):
             raise ValueError("selected forward functions must preserve their row axis")
-        mask = inputs[self.policy.forward_rows]
-        if not self.differentiable or data.weights is not None:
-            zero = torch.zeros((), dtype=result.dtype, device=result.device)
-            return torch.where(mask.reshape(-1, *(1,) * (result.ndim - 1)), result, zero)
-        if len(rows) == len(data.rows):
-            return result
-        return result.new_zeros((len(data.rows), *result.shape[1:])).index_copy_(0, mask.nonzero().flatten(), result)
+        zero = torch.zeros((), dtype=result.dtype, device=result.device)
+        return torch.where(mask.reshape(-1, *(1,) * (result.ndim - 1)), result, zero)
 
     def differentiate(
-        self, inputs: dict[str, torch.Tensor], rows: tuple[int, ...], data: TensorFrame, batch: TensorBatch
+        self,
+        inputs: dict[str, torch.Tensor],
+        sources: Mapping[tuple[str, str], torch.Tensor],
+        data: TensorFrame,
+        rows: torch.Tensor,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
-        """Shared eager and captured forward, loss reduction and autograd step."""
+        """Forward, loss reduction over the selected `rows` and one autograd step to the parameters and `sources`."""
         loss = self.function(**self.arguments(inputs))
-        if not isinstance(loss, torch.Tensor):
-            raise ValueError("training methods must return a loss tensor")
-        loss, objective = self._loss(loss, rows, data, batch)
-        leaf = state_leaf(data, batch)
-        targets = (leaf, *data.derivative_sources.values())
+        if not isinstance(loss, torch.Tensor) or loss.shape != (len(data.rows),):
+            raise ValueError("training methods return one loss per row; pllm averages the selected rows")
+        loss, objective = self._loss(loss, data, rows)
+        leaf = data.table.leaf
+        assert leaf is not None
+        targets = (leaf, *sources.values())
         derivatives = (
             torch.autograd.grad(objective, targets, allow_unused=True, materialize_grads=True)
             if objective.requires_grad
@@ -355,28 +329,19 @@ class TensorTask:
         )
         return loss, derivatives
 
-    def _loss(
-        self, loss: torch.Tensor, rows: tuple[int, ...], data: TensorFrame, batch: TensorBatch
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """The reported loss and the scalar to differentiate."""
+    def _loss(self, loss: torch.Tensor, data: TensorFrame, rows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The reported loss and the scalar to differentiate.
+
+        `torch.where`, not a product, drops unselected rows, so a NaN or Inf there cannot reach the sums.
+        """
+        loss = torch.where(rows, loss, 0)
         if self.policy.reduction == "state_mean":
-            if loss.shape != (len(rows),):
-                raise ValueError("state_mean training returns one loss per row; pllm averages them per state")
-            if data.fixed is not None and data.fixed.weights is not None:
-                assert data.index is not None
-                counts = data.fixed.counts
-                loss = loss.new_zeros(len(counts)).index_add(
-                    0, data.index.states.device, loss * data.fixed.weights
-                ) / counts.clamp_min(1)
-            else:
-                loss = state_means(loss, row_plan(data, batch).select(rows))
+            states = data.table.index.states
+            size = data.table.states + 1
+            counts = loss.new_zeros(size).index_add(0, states, rows.to(loss.dtype))
+            loss = loss.new_zeros(size).index_add(0, states, loss) / counts.clamp_min(1)
             return loss, loss.sum()
-        if loss.ndim == 1:
-            loss = (
-                loss.mean() if data.weights is None else (loss * data.weights).sum() / data.weights.sum().clamp_min(1)
-            )
-        elif loss.ndim != 0 or data.weights is not None:
-            raise ValueError("optimizer functions must return a scalar or one loss per row")
+        loss = loss.sum() / rows.sum().clamp_min(1)
         return loss, loss
 
 

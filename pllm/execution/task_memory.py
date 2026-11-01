@@ -232,7 +232,6 @@ def derive_resources(
                 data,
                 step=replace(data.step, rows=packed, sampler_rows=sampler, hidden=hidden),
                 rows=packed.rows,
-                index=None,
                 plan=None,
             )
         usage = operation.memory(data, batch)

@@ -119,7 +119,8 @@ def main() -> None:
         # Side-lane training releases its pins when its GPU work completes; check after it has.
         execution.arena.collect_completed(wait=True)
         diagnostics = execution.diagnostics()
-        assert diagnostics.loss_count == diagnostics.update_count == 4
+        # Every training step reports a loss; steps without an eligible row update nothing.
+        assert (diagnostics.loss_count, diagnostics.update_count) == (6, 4)
         assert diagnostics.inference_pins == diagnostics.pending_state_releases == 0
         assert len(observed) == 6 and min(observed[-2:]) > 0
         expected_hidden = {}

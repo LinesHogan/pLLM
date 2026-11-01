@@ -116,7 +116,9 @@ def test_override_matches_reweight_adam_and_final_noop() -> None:
         assert result.guidance.affected_row_ids == tuple(link.sampler_row_index for link in decode)
         selected = [link for link in decode if sample(link) < 2]
         if not selected:
-            assert result.loss is result.publication is None
+            # No eligible row: the state republishes its exact values.
+            (latest,) = result.publication.after_refs
+            assert result.loss.item() == 0
             assert_roots(execution.snapshot(latest), before, exact=True)
             continue
         optimizer.zero_grad()
@@ -134,17 +136,17 @@ def test_override_matches_reweight_adam_and_final_noop() -> None:
     assert_roots(execution.arena.snapshot(held, initial), original, exact=True)
     execution.arena.wait_release(execution.arena.release_pin(held))
     execution.retire(())
-    assert execution.diagnostics().loss_count == execution.diagnostics().update_count == 2
+    assert (execution.diagnostics().loss_count, execution.diagnostics().update_count) == (3, 2)
     assert execution.diagnostics().active_lineages == 0
 
     single = OverRIDEWorkload(replace(config, num_iterations=1)).compile_backend(facts).execution
     single.admit(())
     result = run(single, samples((0,), 6), BASE[:1], TOKENS[:1])
-    assert not result.guidance.values.any() and result.publication is result.loss is None
+    assert not result.guidance.values.any() and result.loss.item() == 0
     single.retire(())
 
     def zero_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        return F.cross_entropy(logits.float(), labels.long()) * 0
+        return F.cross_entropy(logits.float(), labels.long(), reduction="none") * 0
 
     modified = replace(OverRIDEWorkload(config), objective=zero_loss).compile_backend(facts).execution
     modified.admit(())
@@ -183,7 +185,7 @@ def _request_heads() -> None:
             base: torch.Tensor = pllm.base_logits(),
             tokens: torch.Tensor = pllm.sampled_tokens(),
         ) -> torch.Tensor:
-            return F.cross_entropy(base + torch.bmm(hidden.unsqueeze(1), weight).squeeze(1), tokens)
+            return F.cross_entropy(base + torch.bmm(hidden.unsqueeze(1), weight).squeeze(1), tokens, reduction="none")
 
     requests = RequestHeads().compile_backend(facts_for(torch.device("cpu"), pages=9)).execution
     value = samples((0, 2, 0), 8)
@@ -191,17 +193,16 @@ def _request_heads() -> None:
     initial = requests.admit(identities)
     untouched = requests.snapshot(initial[1])
     result = run(requests, value)
-    # Only the eligible requests publish; the ineligible one keeps its exact version.
-    assert tuple(result.publication.before_refs) == (initial[0], initial[2])
-    assert requests.arena.latest(initial[1].lineage_id) == initial[1]
-    assert_roots(requests.snapshot(initial[1]), untouched, exact=True)
+    # Every request publishes; the ineligible one keeps its exact values.
+    assert tuple(result.publication.before_refs) == tuple(initial)
+    assert_roots(requests.snapshot(result.publication.after_refs[1]), untouched, exact=True)
     weights = torch.nn.Parameter(torch.zeros((2, 4, 7)))
     optimizer = torch.optim.Adam((weights,), lr=0.03, foreach=False)
     loss = F.cross_entropy(BASE[[0, 2]] + torch.bmm(HIDDEN[[0, 2]].unsqueeze(1), weights).squeeze(1), TOKENS[[0, 2]])
     loss.backward()
     optimizer.step()
     torch.testing.assert_close(result.loss, loss.detach())
-    for index, ref in enumerate(result.publication.after_refs):
+    for index, ref in enumerate(result.publication.after_refs[::2]):
         torch.testing.assert_close(requests.snapshot(ref)[0].reshape(4, 7), weights[index])
     requests.retire(identities)
     assert requests.diagnostics().update_count == 2 and requests.diagnostics().active_lineages == 0
@@ -245,7 +246,7 @@ def _chained_heads(facts) -> None:
             base: torch.Tensor = pllm.base_logits(),
             tokens: torch.Tensor = pllm.sampled_tokens(),
         ) -> torch.Tensor:
-            return F.cross_entropy(base + features, tokens)
+            return F.cross_entropy(base + features, tokens, reduction="none")
 
     chain = ChainedHeads().compile_backend(facts).execution
     (initial,) = chain.admit(())
@@ -269,10 +270,10 @@ def _chained_heads(facts) -> None:
     chain.execute_anchor(cancelled, AnchorId(0))
     chain.cancel_step(cancelled)
     assert chain.arena.latest(latest.lineage_id) == latest
-    # No eligible row: no loss, no gradients and no publication.
+    # No eligible row: a zero loss and zero gradients; the state republishes its exact values.
     result = run(chain, samples((2, 2, 2), 11))
-    assert result.publication is result.loss is None and not result.input_gradients
-    assert_roots(chain.snapshot(latest), before, exact=True)
+    assert result.loss.item() == 0 and not result.input_gradients["reweight", "hidden"].any()
+    assert_roots(chain.snapshot(result.publication.after_refs[0]), before, exact=True)
     assert chain.diagnostics().update_count == 1
     chain.retire(())
 
@@ -326,7 +327,7 @@ class Domains(pllm.Workload):
         samples: torch.Tensor = pllm.samples(),
         tokens: torch.Tensor = pllm.sampled_tokens(),
     ) -> torch.Tensor:
-        return features.square().mean()
+        return features.square().mean(1)
 
 
 class EarlyFeedback(Domains):
@@ -407,27 +408,26 @@ def _domains_oracle(device, request, identities) -> None:
         result = run(execution, value, torch.zeros((4, 7), device=device), tokens, stream)
         torch.testing.assert_close(result.guidance.values, expected_output)
         if loss is None:
-            assert result.loss is None and not result.input_gradients
+            assert result.loss.item() == 0 and not result.input_gradients["reweight", "hidden"].any()
         else:
             torch.testing.assert_close(result.loss, loss.detach())
             expected_input = torch.zeros_like(source) if source.grad is None else source.grad
             torch.testing.assert_close(result.input_gradients["reweight", "hidden"], expected_input)
             for ref, gradient in zip(latest, gradients, strict=True):
                 torch.testing.assert_close(result.parameter_gradients[ref].reshape(4, 7), gradient)
-        if active:
-            assert tuple(result.publication.before_refs) == tuple(latest[index] for index in active)
-            for index, ref in zip(active, result.publication.after_refs, strict=True):
-                latest[index] = ref
-                captured = [row for row in forward if not request or row == index]
-                if captured:
-                    carries[index] = expected_output[captured[-1]].detach().clone()
-                assert_roots(
-                    execution.snapshot(ref, stream), (*adam_roots(optimizers[index], parameters[index]), carries[index])
-                )
-        else:
-            assert result.publication is None
-        for index in set(range(len(latest))) - set(active):
-            assert_roots(execution.snapshot(latest[index], stream), before[index], exact=True)
+        # Every state publishes; those without an update keep their exact values.
+        assert tuple(result.publication.before_refs) == tuple(latest)
+        for index, ref in enumerate(result.publication.after_refs):
+            latest[index] = ref
+            if index not in active:
+                assert_roots(execution.snapshot(ref, stream), before[index], exact=True)
+                continue
+            captured = [row for row in forward if not request or row == index]
+            if captured:
+                carries[index] = expected_output[captured[-1]].detach().clone()
+            assert_roots(
+                execution.snapshot(ref, stream), (*adam_roots(optimizers[index], parameters[index]), carries[index])
+            )
     for ref, root in zip(initial, original, strict=True):
         assert_roots(execution.arena.snapshot(held, ref), root, exact=True)
     execution.arena.wait_release(execution.arena.release_pin(held))

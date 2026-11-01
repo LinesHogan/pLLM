@@ -1195,7 +1195,8 @@ def train(
     the `reset` method (pllm.SGD).
 
     `reduction="mean"` averages the loss over all rows; `"state_mean"` averages each state's rows, then sums over
-    states. WeightedCEBatch training ignores it: its loss is weighted per state, then averaged.
+    states. WeightedCEBatch training ignores it: its loss is weighted per state, then averaged. `rows=` names a
+    selector whose mask picks the rows that count; the method still runs on every row.
     """
     if reduction not in ("mean", "state_mean"):
         raise ValueError(f"@pllm.train(reduction={reduction!r}): use 'mean' or 'state_mean'")
