@@ -12,9 +12,9 @@ from pllm.authoring import StateImport
 from pllm.backends.vllm.activation import activation_delta
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
-    BackendPlacementProbe,
     DecodeRefresh,
     DecodeWindow,
+    ModelProbe,
 )
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch
@@ -34,7 +34,7 @@ from pllm.workloads.reft import ReFTConfig, ReFTWorkload, load_loreft_interventi
 def test_reft_matches_loreft_math_and_publish_skip_semantics(tmp_path) -> None:
     device = torch.device("cpu")
     facts = BackendCompileFacts(
-        BackendPlacementProbe(
+        ModelProbe(
             "c" * 64,
             AttachmentGraphMode.EAGER,
             StateDeviceKind.CPU,

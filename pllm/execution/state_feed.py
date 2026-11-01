@@ -279,7 +279,7 @@ class Feed:
         self._quiescent = True
 
     def close(self) -> None:
-        """Release settled pages; cancellation retains owners until consumer teardown."""
+        """Release finished pages; cancellation retains owners until consumer teardown."""
         if self._closed or self._moved:
             return
         try:

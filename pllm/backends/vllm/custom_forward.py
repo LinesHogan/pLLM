@@ -133,7 +133,7 @@ class ProgramWave(Generic[DataT, ResultT]):
             hidden, saved = ordinary_pass(self.seed, self.custom_forward.effect.layer_count, self.layer), tuple(entries)
         self.position.exit(saved)
         self.observation = hidden
-        self.results = tuple((tuple(row_overlay.results), row_overlay.captures()) for row_overlay in self.row_overlays)
+        self.results = tuple((tuple(row_overlay.results), row_overlay.operands()) for row_overlay in self.row_overlays)
         return self.custom_forward.model.norm(hidden)
 
     def apply_updates(self) -> None:
@@ -389,7 +389,7 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
             assert self.observations is not None
             self.observations.index_copy_(0, packed, hidden)
         for row_overlay in row_overlays:
-            row_overlay.collect(tuple(row_overlay.results), row_overlay.captures())
+            row_overlay.collect(tuple(row_overlay.results), row_overlay.operands())
             assert self.overlay is not None
             self.overlay.ordinary.extend(row_overlay.ordinary)
         self.save_span(

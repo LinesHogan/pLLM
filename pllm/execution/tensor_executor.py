@@ -1,4 +1,4 @@
-"""TensorExecutor: one tensor task's body over a fixed int64 row table, eager or captured, and its settlement.
+"""TensorExecutor: one tensor task's body over a fixed int64 row table, eager or captured, and how it writes its outputs.
 
 TensorBinding.executables builds one per tensor task. Row-reading tasks gather every input through the
 table and mask unselected rows on the device; tasks without row inputs evaluate directly.
@@ -94,7 +94,7 @@ def reads_rows(task: TensorTask, tasks: Mapping[TaskSymbol, TensorTask]) -> bool
 
 @dataclass
 class TensorExecutor:
-    """One body and one result settlement for a tensor task, evaluated over masked fixed tables.
+    """One body and one result write for a tensor task, evaluated over masked fixed tables.
 
     Field writes (`@pllm.write`, imports) run in FieldWriteExecutor instead.
     """
@@ -154,14 +154,11 @@ class TensorExecutor:
         self.feedback_names = tuple(
             sorted({port.feedback for task in dependencies for port in task.ports.values() if port.feedback})
         )
-        assert (
-            self.capture is None
-            or 8 * (5 * self.rows + self.state_count + 1) <= self.capture.entitlement.resident_bytes
-        )
+        assert self.capture is None or 8 * (5 * self.rows + self.state_count + 1) <= self.capture.budget.resident_bytes
 
     @property
     def rows(self) -> int:
-        return self.capture.entitlement.input_shapes[0][0] if self.capture is not None else self.active_rows
+        return self.capture.budget.input_shapes[0][0] if self.capture is not None else self.active_rows
 
     @property
     def state_count(self) -> int:
@@ -324,7 +321,7 @@ class TensorExecutor:
     def __call__(
         self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext[TensorFrame] | None = None
     ) -> TaskOutput:
-        """Prepare operands, run the shared body or graph, then settle invocation outputs."""
+        """Prepare operands, run the shared body or graph, then write invocation outputs."""
         prepared = data if self.task.export is None else self.task.export.prepare(data)
         if prepared is None:
             return TaskOutput()
@@ -371,7 +368,7 @@ class TensorExecutor:
                 addresses,
                 lambda: self.staging.copy_to(table),
             )
-        output = self.settle_rows(data, batch)
+        output = self.write_outputs(data, batch)
         frame.parameter_gradient_fields = data.parameter_gradient_fields
         if batch.selection is not parent.selection:
             positions = tuple(parent.selection.refs.index(ref) for ref in batch.selection.refs)
@@ -408,10 +405,10 @@ class TensorExecutor:
                     self.rows, states, len(pools), len(self.feedback_names) if resource == self.task.resource else 0
                 )
             self.pools = self.resource_pools[self.task.resource]
-        captures = () if data.step.hidden is None else data.step.hidden_batch(batch.stream).captures
-        addresses = tuple(item.storage.data_ptr() for item in captures)
+        taps = () if data.step.hidden is None else data.step.hidden_batch(batch.stream).taps
+        addresses = tuple(item.storage.data_ptr() for item in taps)
         if self.hidden_inputs is None or self.addresses != addresses:
-            self.hidden_inputs = {item.resource.locator_key: item.storage for item in captures}
+            self.hidden_inputs = {item.resource.locator_key: item.storage for item in taps}
         self.addresses = addresses
         if self.feedback_names:
             assert batch.feedback is not None
@@ -435,13 +432,13 @@ class TensorExecutor:
                 selected = plan if resource == self.task.resource else RowPlan.build(data, batch.for_resource(resource))
                 self._fill(host[offset : offset + layout.size], selected, layout)
                 offset += layout.size
-            captures = () if data.step.hidden is None else data.step.hidden.captures
-            for capture in captures:
-                host[offset : offset + self.rows] = capture.slots[0] if capture.slots.size else 0
-                host[offset : offset + len(data.rows)] = capture.slots[plan.packed]
+            taps = () if data.step.hidden is None else data.step.hidden.taps
+            for tap in taps:
+                host[offset : offset + self.rows] = tap.slots[0] if tap.slots.size else 0
+                host[offset : offset + len(data.rows)] = tap.slots[plan.packed]
                 offset += self.rows
 
-    def settle_rows(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
+    def write_outputs(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
         """Record results, gradients, losses and observations of the last body."""
         state_mean = self.task.policy.reduction == "state_mean"
         count = len(batch.roots) if self.optimizer is not None and state_mean else len(data.rows)

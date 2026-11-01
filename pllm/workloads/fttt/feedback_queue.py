@@ -36,7 +36,7 @@ class _LifecycleDecision:
 
 
 class FTTTFeedbackQueue:
-    """Own judge I/O, bounded queue, and lifecycle settlement only."""
+    """Own judge I/O, the bounded queue and the request lifecycles only."""
 
     __slots__ = (
         "_active",
@@ -197,22 +197,22 @@ class FTTTFeedbackQueue:
         """Settle each completion's lifecycle with the adapter version its edit step published."""
         assert self._active is queued
         assert intent == replace(queued.intent, adapter_version=intent.adapter_version)
-        settled = dict(self._lifecycles)
+        committed = dict(self._lifecycles)
         for transition in intent.transitions:
-            current = settled.get(transition.key, FTTTRequestLifecycle())
+            current = committed.get(transition.key, FTTTRequestLifecycle())
             assert current.retries == transition.previous.retries and current.stopped == transition.previous.stopped
             version = intent.adapter_version if transition.trained else current.adapter_version
-            settled[transition.key] = replace(
+            committed[transition.key] = replace(
                 transition.next,
                 adapter_version=version,
             )
-        projected = self._projected_lifecycles if self._queue else dict(settled)
-        self._lifecycles = settled
+        projected = self._projected_lifecycles if self._queue else dict(committed)
+        self._lifecycles = committed
         self._active = None
         self._projected_lifecycles = projected
 
     def abort(self, queued: FTTTQueuedFeedback) -> None:
-        """A failed edit step drops the whole queue; lifecycles stay as last settled."""
+        """A failed edit step drops the whole queue; lifecycles stay as last committed."""
         assert self._active is queued
         self._active = None
         self._queue.clear()

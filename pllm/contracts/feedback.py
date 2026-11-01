@@ -88,7 +88,7 @@ class UpdateBarrier:
 
 
 class CompletionFeedback(Protocol):
-    """Borrow the original settled control values; no second feedback envelope."""
+    """Borrow the final control values; no second feedback envelope."""
 
     @property
     def retry_controls(self) -> tuple[RetryControl, ...]: ...

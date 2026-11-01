@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from typing import Generic, TypeVar
 
 from pllm.config import ExecutionOptions
-from pllm.contracts.backend_attachment import BackendAttachment, BackendPlacementProbe
+from pllm.contracts.backend_attachment import BackendAttachment, ModelProbe
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.host_batch import (
     CausalTrainBatch as CausalTrainBatch,
@@ -104,7 +104,7 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
         """Measure and fund the declaration on this backend, then declare against the funded facts as workers do;
         planning and binding reuse both."""
         facts = _apply_options(facts, options)
-        measured = self.declaration(facts, causal=causal)
+        measured = self.build(facts, causal=causal)
         timeline = _fund_attachment(measured, facts.probe, self.resource_facts(measured, facts, options), options)
         facts = replace(facts, timeline=timeline)
         return facts, self.funded_declaration(facts, causal=causal)
@@ -112,12 +112,12 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
     def funded_declaration(self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None) -> TensorBinding:
         """The declaration on funded facts: tensor tasks funded resident memory run as captured CUDA graphs. The
         driver and every worker process declare here, so their graphs agree."""
-        declaration = self.declaration(facts, causal=causal)
+        declaration = self.build(facts, causal=causal)
         declaration.select_capture(facts.timeline.task_resources)
         return declaration
 
     @abstractmethod
-    def declaration(self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None) -> TensorBinding:
+    def build(self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None) -> TensorBinding:
         """Declare the graph, logical layouts, effects and tensor tasks; never a physical plan."""
         ...
 
@@ -199,7 +199,7 @@ def _apply_options(facts: BackendCompileFacts, options: ExecutionOptions) -> Bac
 
 
 def _fund_attachment(
-    declaration: TensorBinding, probe: BackendPlacementProbe, timeline: SchedulerTimeline, options: ExecutionOptions
+    declaration: TensorBinding, probe: ModelProbe, timeline: SchedulerTimeline, options: ExecutionOptions
 ) -> SchedulerTimeline:
     """Reserve the attachment's effect buffers and fund the custom-forward task."""
     graph, layouts, attachment = declaration.finish()

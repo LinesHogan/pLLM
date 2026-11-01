@@ -15,7 +15,7 @@ U = TypeVar("U")
 
 @dataclass(frozen=True, slots=True)
 class CausalTrainBatch(Generic[T]):
-    schema: ClassVar[str] = "canonical.causal_tokens@1"
+    schema: ClassVar[str] = "causal_tokens@1"
     names: ClassVar[tuple[str, ...]] = ("input_ids", "labels", "attention_mask")
     input_ids: T
     labels: T
@@ -30,7 +30,7 @@ class WeightedRowBatch(Generic[T]):
     """[rows, hidden_size] features with one target (a value or a fixed-shape tensor) and one weight per row; weight 0
     skips a row."""
 
-    schema: ClassVar[str] = "canonical.weighted_rows@1"
+    schema: ClassVar[str] = "weighted_rows@1"
     names: ClassVar[tuple[str, ...]] = ("hidden", "targets", "weights")
     hidden: T
     targets: T
@@ -44,7 +44,7 @@ class WeightedRowBatch(Generic[T]):
 class StateImport(Generic[T]):
     """Original external tensors in the signed layout's field order."""
 
-    schema: ClassVar[str] = "canonical.state_tensors@1"
+    schema: ClassVar[str] = "state_tensors@1"
     values: tuple[T, ...]
     keys: tuple[RequestStateKey, ...] = ()
 
@@ -53,7 +53,7 @@ class StateImport(Generic[T]):
 class WeightedCEBatch(Generic[T]):
     """Shared [rows, ...] or independently keyed [adapters, rows, ...] weighted CE."""
 
-    schema: ClassVar[str] = "canonical.weighted_ce@2"
+    schema: ClassVar[str] = "weighted_ce@2"
     names: ClassVar[tuple[str, ...]] = ("hidden", "base_logits", "labels", "weights")
     hidden: T
     base_logits: T

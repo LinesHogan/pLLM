@@ -1,4 +1,4 @@
-"""Tensor operations and their settlement.
+"""Tensor operations and how their results are written.
 
 Owns the operands a body borrows (TensorBatch, read_batch), what a body returns (TaskOutput), the optimizers
 (PoolSGD, PageUpdate) and TensorOperation, which runs one body and turns its output into private
@@ -423,7 +423,7 @@ def _no_resident(capture_bytes: int) -> int:
 
 @dataclass(frozen=True, slots=True)
 class TensorOperation(Generic[D]):
-    """Run one mathematical body and settle its declared effects."""
+    """Run one mathematical body and write its declared effects."""
 
     implementation_id: ImplementationId
     body: Callable[[D, TensorBatch, StateTaskContext[D] | None], TaskOutput]

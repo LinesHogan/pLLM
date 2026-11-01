@@ -1,4 +1,4 @@
-"""FTTT's values: configuration, judge results, queued feedback, settlement intent and the per-step result."""
+"""FTTT's values: configuration, judge results, queued feedback, the commit intent and the per-step result."""
 
 from __future__ import annotations
 

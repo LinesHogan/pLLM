@@ -15,8 +15,8 @@ from pllm import UpdateOutput, testing
 from pllm.authoring import StateImport
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
-    CapturedParameterOperand,
     Projection,
+    ProjectionOperands,
     ProjectionShape,
 )
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
@@ -31,7 +31,7 @@ from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
 from test.backend_facts import assert_finite_resources
 
 
-def _input(operands: tuple[CapturedParameterOperand, ...]) -> StepInput:
+def _input(operands: tuple[ProjectionOperands, ...]) -> StepInput:
     selected = tuple(dict.fromkeys((operand.identity, operand.phase) for operand in operands))
     identities, phases = zip(*selected, strict=True) if selected else ((), ())
     return testing.step_input(identities, tokens=phases, sampler_order=(), operands=operands)
@@ -61,9 +61,9 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     assert visibility.policy == "forward_pinned"
     assert visibility.tail == "transition" and visibility.chunk_size == 0
     pllm.train_in_forward(state="dense_fast_weights", targets=targets, visibility="exact")
-    declaration = workload.declaration(facts).graph
+    declaration = workload.build(facts).graph
     assert next(task.visibility for task in declaration.tasks if task.visibility is not None) == visibility
-    changed = InPlaceTTTWorkload(replace(config, chunk_size=3)).declaration(facts).graph
+    changed = InPlaceTTTWorkload(replace(config, chunk_size=3)).build(facts).graph
     changed_visibility = next(task.visibility for task in changed.tasks if task.visibility is not None)
     assert changed_visibility.equations_digest != visibility.equations_digest
     identities = (RequestIdentity("same", 0, 0), RequestIdentity("same", 0, 1))
@@ -77,7 +77,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     # Prefill rows fill a chunk of two; the update publishes once the chunk is complete.
     for row in range(2):
         step = tuple(
-            CapturedParameterOperand(
+            ProjectionOperands(
                 identities[0],
                 target,
                 HiddenPhase.PREFILL,
@@ -101,7 +101,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     for request_index, identity in enumerate(identities):
         value = _input(
             tuple(
-                CapturedParameterOperand(
+                ProjectionOperands(
                     identity,
                     target,
                     HiddenPhase.DECODE,
@@ -174,7 +174,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     result = low_rank.step(
         _input(
             (
-                CapturedParameterOperand(
+                ProjectionOperands(
                     requests[0],
                     targets[0],
                     HiddenPhase.PREFILL,
@@ -198,7 +198,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
         before = low_rank.snapshot(ref)
         value = _input(
             (
-                CapturedParameterOperand(
+                ProjectionOperands(
                     identity,
                     targets[0],
                     HiddenPhase.DECODE,
@@ -341,7 +341,7 @@ def _check_exact_projection_lifecycle():
     # First C=0, then one complete chunk, then a non-power-of-two count with a tail.
     for count in (1, 1, 7):
         operands = tuple(
-            CapturedParameterOperand(
+            ProjectionOperands(
                 identity,
                 target,
                 HiddenPhase.PREFILL,
@@ -432,7 +432,7 @@ def _check_causality_witness(workload, facts, requests, targets):
     execution = deployment.execution
     execution.admit(requests[:1])
     operands = tuple(
-        CapturedParameterOperand(
+        ProjectionOperands(
             requests[0],
             target,
             HiddenPhase.PREFILL,
@@ -481,7 +481,7 @@ def _check_exact_additive_projection():
     execution.admit((identity,))
     hidden = torch.arange(1.0, 8).view(-1, 1)
     operands = tuple(
-        CapturedParameterOperand(
+        ProjectionOperands(
             identity,
             target,
             HiddenPhase.PREFILL,
@@ -587,7 +587,7 @@ def test_prefill_adapters_keep_prompt_chunks_across_scheduler_spans(span):
     for start in range(0, len(x), span):
         end = min(start + span, len(x))
         operands = tuple(
-            CapturedParameterOperand(
+            ProjectionOperands(
                 identity,
                 target,
                 phase,
@@ -632,7 +632,7 @@ def test_prompt_end_operand_stays_live_during_replay():
     from pllm.workloads.prefill_adapters import TARGETS, PrefillAdaptersWorkload
 
     workload = PrefillAdaptersWorkload(chunk_size=3, rank=2, dtype=torch.float32)
-    math = workload.declaration(
+    math = workload.build(
         backend_facts(
             3,
             (),
@@ -649,7 +649,7 @@ def test_prompt_end_operand_stays_live_during_replay():
         _pending_grad_b=torch.zeros(2, 2, device="cuda"),
         _pending_length=torch.zeros((), dtype=torch.int64, device="cuda"),
     )
-    operand = CapturedParameterOperand(
+    operand = ProjectionOperands(
         RequestIdentity("graph", 0, 0),
         TARGETS[0],
         HiddenPhase.PREFILL,

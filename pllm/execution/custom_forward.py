@@ -112,7 +112,7 @@ class SerialCustomForward(CustomForwardPrimitive):
             normal = self.normalize(row, hidden, torch.zeros_like(hidden))
             outputs.append(normal)
             if self.overlay is not None:
-                self.overlay.collect(tuple(self.overlay.results), self.overlay.captures())
+                self.overlay.collect(tuple(self.overlay.results), self.overlay.operands())
             self.commit(row, lambda: observe(index, hidden) if selected else None)
         self.finish(tuple(outputs))
 

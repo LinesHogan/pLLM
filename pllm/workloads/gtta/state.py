@@ -14,7 +14,7 @@ from pllm.workloads.gtta.types import (
     GTTATrajectoryBatch,
     GTTAUpdateReceipt,
     PromptContext,
-    canonical_state_signature,
+    state_signature,
 )
 
 
@@ -67,7 +67,7 @@ class GTTADynamicsState:
         return GTTAUpdateReceipt(len(batch.entries), self._version)
 
     def query(self, query: GTTAQuery) -> GTTAQueryResult:
-        signature = query.state_signature or canonical_state_signature(query.observation)
+        signature = query.state_signature or state_signature(query.observation)
         # Stable sorting retains candidate/history order for equal keys without ordinal copies.
         ranked = tuple(
             sorted(

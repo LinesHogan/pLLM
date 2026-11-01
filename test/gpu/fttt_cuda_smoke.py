@@ -28,7 +28,7 @@ def main() -> int:
     with torch.cuda.stream(producer_stream):
         hidden_rows = torch.linspace(-1.0, 1.0, steps=4, device=device, dtype=torch.float32).reshape(1, 4)
     with torch.cuda.stream(consumer_stream):
-        result = workload(CompletionInput.capture(CompletionBatch((completion,)), hidden_rows, producer_stream))
+        result = workload(CompletionInput.copy_of(CompletionBatch((completion,)), hidden_rows, producer_stream))
     if result is None:
         raise RuntimeError("canonical FTTT did not execute its queued transaction")
     if (

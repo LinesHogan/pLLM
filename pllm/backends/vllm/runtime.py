@@ -30,7 +30,7 @@ from pllm.authoring import (
     map_host_batch,
 )
 from pllm.backends.vllm import compat
-from pllm.backends.vllm.hidden_capture import CAPTURE_ENV, HiddenCaptureAnnouncement, HiddenCaptureLayout
+from pllm.backends.vllm.hidden_taps import TAPS_ENV, HiddenTapAnnouncement, HiddenTapLayout
 from pllm.backends.vllm.overlay_graph import (
     GraphOptions,
     graph_mode,
@@ -46,8 +46,8 @@ from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
     AttachmentHiddenResource,
     BackendAttachment,
-    BackendPlacementProbe,
     CausalModelDomain,
+    ModelProbe,
 )
 from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.feedback import (
@@ -181,7 +181,7 @@ class _Generation:
 
 @dataclass(slots=True)
 class VllmLlm(Generic[DataT, ResultT]):
-    """Single public handle for signed vLLM workload workloads."""
+    """The handle make_llm returns for a workload: vLLM generate plus pllm diagnostics, traces and feeds."""
 
     _llm: LLM | None
     _runner: WorkloadModelRunner | Mrv1Runner | None
@@ -471,7 +471,7 @@ class VllmLlm(Generic[DataT, ResultT]):
             RequestKeyField.ROUTE in state.key_fields for state in self.attachment.plan.semantic_graph.states
         )
         if routes is not None and (not signed_route or len(routes) != len(texts) or any(not route for route in routes)):
-            raise ValueError("routes require a signed route-keyed state and one value per prompt")
+            raise ValueError('routes= needs a request state keyed by "route" and one value per prompt')
         if signed_route and routes is None:
             raise ValueError("a route-keyed request state requires per-prompt routes")
         validate_host_batch(
@@ -692,8 +692,8 @@ def create_vllm_llm(
     environment = {
         _MP_ENV: "1" if config.multiprocessing else "0",
         _V2_RUNNER_ENV: "1" if config.runner == "mrv2" else "0",
-        CAPTURE_ENV: encode_boundary(
-            HiddenCaptureAnnouncement(requirements.hidden_inputs, config.max_num_seqs, TensorDType(config.dtype))
+        TAPS_ENV: encode_boundary(
+            HiddenTapAnnouncement(requirements.hidden_inputs, config.max_num_seqs, TensorDType(config.dtype))
         ),
         POSITION_ENV: encode_boundary(PositionAnnouncement(requirements.position_states)),
     }
@@ -703,7 +703,7 @@ def create_vllm_llm(
     # vLLM keys its compiled-model cache by its own config; the hidden taps and position states pllm adds to the
     # forward must enter that key, or an engine loads a model compiled for another workload. pllm's entries are
     # integers (overlay_graph decodes them as dict[str, int]), so the digest enters as one.
-    forward = sha256((environment[CAPTURE_ENV] + environment[POSITION_ENV]).encode()).hexdigest()
+    forward = sha256((environment[TAPS_ENV] + environment[POSITION_ENV]).encode()).hexdigest()
     options["additional_config"] = {**options.get("additional_config", {}), "pllm_forward": int(forward[:15], 16)}
     llm = vllm_engine(
         config,
@@ -851,7 +851,7 @@ def probe_backend(
         replace(observed, reserved_bytes=required),
         (
             PageBundleProviderFacts(
-                "canonical.page_bundle_cuda@1",
+                "page_bundle_cuda@1",
                 capacity,
                 probe.device_kind,
             ),
@@ -873,8 +873,8 @@ def _base_probe(
     layer_count: int,
     hidden_resources: tuple[AttachmentHiddenResource, ...],
     capabilities: tuple[str, ...],
-) -> BackendPlacementProbe:
-    return BackendPlacementProbe(
+) -> ModelProbe:
+    return ModelProbe(
         model_fingerprint=model_fingerprint,
         graph_mode=graph_mode(runner.overlay_graph_bytes),
         device_kind=StateDeviceKind.CUDA,
@@ -895,8 +895,8 @@ __all__ = [
 
 
 def input_reservations(
-    probe: BackendPlacementProbe,
-    hidden_layouts: tuple[HiddenCaptureLayout, ...],
+    probe: ModelProbe,
+    hidden_layouts: tuple[HiddenTapLayout, ...],
     timeline: SchedulerTimeline,
     rows: int,
     vocab: int,

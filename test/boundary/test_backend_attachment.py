@@ -15,7 +15,7 @@ from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
     AttachmentHiddenResource,
     BackendAttachment,
-    BackendPlacementProbe,
+    ModelProbe,
 )
 from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.hidden_locator import HiddenLayerKind
@@ -39,7 +39,7 @@ from pllm.workloads.inplace_ttt import (
 def overlay_facts():
     target = Projection("down_proj", 0)
     workload = InPlaceTTTWorkload(InPlaceTTTConfig((target,), chunk_size=2))
-    probe = BackendPlacementProbe(
+    probe = ModelProbe(
         "c" * 64,
         AttachmentGraphMode.EAGER,
         StateDeviceKind.CPU,

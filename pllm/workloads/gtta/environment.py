@@ -9,7 +9,7 @@ from pllm.workloads.gtta.types import (
     GTTAConfig,
     GTTATrajectoryBatch,
     TrajectoryFeedback,
-    canonical_state_signature,
+    state_signature,
 )
 
 
@@ -42,7 +42,7 @@ class GTTAEnvironment:
         self._queue.append(
             DynamicsEvent(
                 task_id=feedback.task_id.strip(),
-                state_signature=canonical_state_signature(feedback.previous_observation),
+                state_signature=state_signature(feedback.previous_observation),
                 action=feedback.action.strip(),
                 previous_observation=feedback.previous_observation,
                 next_observation=feedback.next_observation,

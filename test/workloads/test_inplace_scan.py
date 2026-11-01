@@ -16,8 +16,8 @@ import pllm
 from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
-    CapturedParameterOperand,
     Projection,
+    ProjectionOperands,
     ProjectionShape,
 )
 from pllm.contracts.request_identity import RequestIdentity
@@ -62,9 +62,7 @@ def test_bound_scan_matches_original_chunk_math_bitwise(device, dtype, numerics)
     facts = facts_for(device, dtype)
     facts = replace(facts, timeline=replace(facts.timeline, tensor_policy=TensorPolicy(numerics)))
     execution = workload.compile_backend(facts).execution
-    reference_transition = ScanContext(TensorPolicy(False), 8, device).bind(
-        workload.declaration(facts).overlay_math.function
-    )
+    reference_transition = ScanContext(TensorPolicy(False), 8, device).bind(workload.build(facts).overlay_math.function)
     stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
     identity = RequestIdentity("region", 0, 0)
     (ref,) = execution.admit((identity,), stream)
@@ -89,7 +87,7 @@ def test_bound_scan_matches_original_chunk_math_bitwise(device, dtype, numerics)
             _pending_rows_targets=reference[2],
             _pending_length=reference[3],
         )
-        operand = CapturedParameterOperand(
+        operand = ProjectionOperands(
             identity, TARGET, phase, hidden, desired, base, hidden.new_full((), False, dtype=torch.bool)
         )
         (result,) = execution.step(_input((operand,)), stream=stream).entries
@@ -118,7 +116,7 @@ def test_production_tuning_policy_is_signed_into_worker_facts():
     assert facts.timeline.tensor_policy == policy
     # The policy crosses the process boundary inside the facts the worker binds with.
     facts = decode_boundary(encode_boundary(facts), BackendCompileFacts)
-    declaration = workload.declaration(facts)
+    declaration = workload.build(facts)
     attachment = workload.plan_backend(facts, declaration)
     rng = torch.get_rng_state().clone()
     workload.bind_backend(facts, attachment, declaration)

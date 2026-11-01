@@ -13,7 +13,7 @@ from pllm.authoring import CausalTrainBatch
 from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
-    BackendPlacementProbe,
+    ModelProbe,
 )
 from pllm.contracts.host_batch import validate_host_batch
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
@@ -67,7 +67,7 @@ def _facts(model, *, reserved=0, task_resources=()) -> BackendCompileFacts:
     kind = StateDeviceKind(model.device.type)
     timeline = model_timeline(model.device, ("optimizer/adamw@1", "transition/full_root@1"))
     timeline = replace(timeline, reserved_bytes=(reserved,) * len(timeline.anchors), task_resources=task_resources)
-    probe = BackendPlacementProbe(
+    probe = ModelProbe(
         "c" * 64,
         AttachmentGraphMode.EAGER,
         kind,
@@ -176,7 +176,7 @@ def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None
         config = TLMConfig(mode=mode, threshold=0.0)
         limits = (TaskResourceFact(TaskSymbol("update"), 4096, input_shapes=((1, 3),)),)
         workload, facts = TLMWorkload(config, 2, 2), _facts(model)
-        timeline = workload.resource_facts(workload.declaration(facts), facts, ExecutionOptions())
+        timeline = workload.resource_facts(workload.build(facts), facts, ExecutionOptions())
         assert min(timeline.reserved_bytes) == model.resident_bytes
         execution = workload.compile_backend(_facts(model, task_resources=limits), causal=model.bind).execution
         (initial,) = execution.admit(())

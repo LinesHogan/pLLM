@@ -1,6 +1,6 @@
-"""Declaration-derived capture layouts and hidden-state taps used by vLLM runners.
+"""Declaration-derived tap layouts and hidden-state taps used by vLLM runners.
 
-LayerOutputs are installed before vLLM compiles and captures the model. Persistent index tables
+LayerOutputs are installed before vLLM compiles and taps the model. Persistent index tables
 select packed rows to copy into PTTS slots. Consumers retain holds until their own
 streams complete; the session releases producer holds after publication.
 """
@@ -30,28 +30,28 @@ from pllm.execution.ptts.slot_pools import SlotPools, Slots
 from pllm.execution.state_execution import DataT, StateTaskContext
 from pllm.execution.step_input import StepInput
 
-CAPTURE_ENV = "PLLM_HIDDEN_CAPTURE"
+TAPS_ENV = "PLLM_HIDDEN_TAPS"
 
 
 @dataclass(frozen=True, slots=True)
-class HiddenCaptureLayout:
+class HiddenTapLayout:
     """One module's union of latest-decode and completed-prompt-ending rows.
 
-    All consumers share each captured row. Two generations fund a producer and an
+    All consumers share each tapped row. Two generations fund a producer and an
     outstanding reader; reuse must wait for every reader's completion, regardless of
     publish_lag.
     """
 
     module_path: str
     phases: tuple[HiddenPhase, ...]
-    capture_rows: int
+    tap_rows: int
     hidden_size: int
     dtype: TensorDType
 
     @property
     def retained_rows(self) -> int:
         """Total slot capacity, including the generation being written."""
-        return 2 * self.capture_rows
+        return 2 * self.tap_rows
 
     @property
     def resident_bytes(self) -> int:
@@ -60,7 +60,7 @@ class HiddenCaptureLayout:
         Retention already includes the producer's slots; there is no separate
         capture or handoff allocation. Host ownership and pinned staging are not GPU bytes.
         """
-        return self.retained_rows * self.hidden_size * self.dtype.itemsize + 2 * self.capture_rows * 8
+        return self.retained_rows * self.hidden_size * self.dtype.itemsize + 2 * self.tap_rows * 8
 
     def create_pool(self, device: torch.device) -> SlotPools:
         """Allocate stable storage before capture; steps lease free rows from field zero."""
@@ -69,14 +69,14 @@ class HiddenCaptureLayout:
 
 
 @dataclass(frozen=True, slots=True)
-class HiddenCaptureAnnouncement:
+class HiddenTapAnnouncement:
     """Declaration bounds sent before engine construction, resolved when the model loads."""
 
     inputs: tuple[HiddenInputSource, ...] = ()
     max_num_seqs: int = 1
     dtype: TensorDType = TensorDType.FLOAT32
 
-    def resolve(self, layer_count: int, hidden_size: int) -> tuple[HiddenCaptureLayout, ...]:
+    def resolve(self, layer_count: int, hidden_size: int) -> tuple[HiddenTapLayout, ...]:
         """Merge aliases and consumers before capture; phases share one request bound.
 
         Prefill here selects prompt endings, never all prompt tokens. An all-token
@@ -87,7 +87,7 @@ class HiddenCaptureAnnouncement:
             path = hidden_binding(source.layer, source.site, layer_count).module_path
             modules.setdefault(path, set()).add(source.phase)
         return tuple(
-            HiddenCaptureLayout(path, tuple(sorted(phases)), self.max_num_seqs, hidden_size, self.dtype)
+            HiddenTapLayout(path, tuple(sorted(phases)), self.max_num_seqs, hidden_size, self.dtype)
             for path, phases in sorted(modules.items())
         )
 
@@ -109,18 +109,18 @@ def _tapped(
 
 
 class HiddenTaps:
-    """Selective model-dtype capture into stable PTTS pools, keyed by module path."""
+    """Selective model-dtype copies of tapped rows into stable PTTS pools, keyed by module path."""
 
     def __init__(
         self,
         model: torch.nn.Module,
-        layouts: tuple[HiddenCaptureLayout, ...],
+        layouts: tuple[HiddenTapLayout, ...],
         pools: dict[str, SlotPools],
         device: torch.device,
     ) -> None:
         self.layouts, self.pools = layouts, pools
         self.indices = torch.full(
-            (sum(2 * layout.capture_rows for layout in layouts),), -1, dtype=torch.long, device=device
+            (sum(2 * layout.tap_rows for layout in layouts),), -1, dtype=torch.long, device=device
         )
         self._slots: dict[str, Slots] = {}
         self._rows: dict[str, Slots] = {}
@@ -129,8 +129,8 @@ class HiddenTaps:
         for layout in layouts:
             path = layout.module_path
             module = model.get_submodule(path)
-            size = 2 * layout.capture_rows
-            indices = self.indices[offset : offset + size].view(2, layout.capture_rows)
+            size = 2 * layout.tap_rows
+            indices = self.indices[offset : offset + size].view(2, layout.tap_rows)
             offset += size
             slots = pools[path].tensors[0]
             module.register_buffer("pllm_hidden_slots", slots, persistent=False)
@@ -155,8 +155,8 @@ class HiddenTaps:
             mapping = np.full(rows.total_rows, slots[0] if slots.size else 0, dtype=np.int64)
             mapping[selected] = slots
             self._rows[path] = mapping
-            size = 2 * layout.capture_rows
-            indices = host[offset : offset + size].reshape(2, layout.capture_rows)
+            size = 2 * layout.tap_rows
+            indices = host[offset : offset + size].reshape(2, layout.tap_rows)
             indices[0, : len(selected)] = selected
             indices[1, : len(selected)] = slots
             offset += size
@@ -164,7 +164,7 @@ class HiddenTaps:
 
     @torch.inference_mode()
     def clear(self) -> None:
-        """Disable capture and release producer holds independently of reader completion."""
+        """Disable the taps and release producer holds independently of reader completion."""
         completion = torch.cuda.Event() if self._slots else None
         if completion is not None:
             completion.record()
@@ -176,14 +176,14 @@ class HiddenTaps:
 
     def publish(self, value: StepInput, resources: tuple[PackedHiddenResourceBinding, ...]) -> StepInput:
         """Attach the current step's hidden rows for `resources` to `value`."""
-        captures = tuple(
+        taps = tuple(
             HiddenRows(resource, self.pools[resource.module_path].tensors[0], self._rows[resource.module_path])
             for resource in resources
         )
         stream = torch.cuda.current_stream()
         return replace(
             value,
-            hidden=HiddenRowBatch(value.rows, captures),
+            hidden=HiddenRowBatch(value.rows, taps),
             hidden_readiness=CudaStreamReadiness(stream),
         )
 
@@ -192,4 +192,4 @@ class HiddenTaps:
         context.hold_slots(tuple((self.pools[path], slots) for path, slots in self._slots.items()))
 
 
-__all__ = ["CAPTURE_ENV", "HiddenCaptureAnnouncement", "HiddenCaptureLayout", "HiddenTaps"]
+__all__ = ["TAPS_ENV", "HiddenTapAnnouncement", "HiddenTapLayout", "HiddenTaps"]

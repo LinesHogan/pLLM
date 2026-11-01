@@ -1,4 +1,4 @@
-"""Own invocation pages, sampler handoff and settlement for tensor execution and vLLM sessions.
+"""Own invocation pages, sampler handoff and commit for tensor execution and vLLM sessions.
 
 A StateExecution belongs to the one thread that runs the model step; it has no lock. The trace export thread
 reads only ExecutionTrace, which has its own Condition. Calling diagnostics()/command() from another thread
@@ -414,9 +414,11 @@ class StateDiagnostics:
         )
 
 
-class StateSettlementError(RuntimeError, Generic[DataT]):
+class PartialCommitError(RuntimeError, Generic[DataT]):
     def __init__(self, context: StateTaskContext[DataT], receipt: PagePublication) -> None:
-        super().__init__("state publication committed; settle the original invocation without replay")
+        super().__init__(
+            "the state update is published but finishing the step failed; finish it again (finish_step) without rerunning the step"
+        )
         self.context = context
         self.receipt = receipt
 
@@ -511,14 +513,14 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             raise
 
     def stage_hold(self, identities: tuple[RequestIdentity, ...], reason: str, *, step_id: int) -> HeldInput:
-        """Return the signed HOLD branch with exact versions from successful settlement."""
+        """Return the HOLD branch with exact versions from a successful commit."""
         self._require_borrow_live()
         try:
             if (
                 self.arena.plan.semantic_graph.input_groups
                 and not self.arena.plan.semantic_graph.input_groups[0].allow_absent
             ):
-                raise RuntimeError("missing activation input: signed STOP policy stops the instance")
+                raise RuntimeError('missing activation input: on_missing="stop" stops the request')
             return HeldInput(
                 reason, step_id, tuple((identity, *self._successful_inputs[identity]) for identity in identities)
             )
@@ -803,12 +805,12 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                     exc.add_note(f"local abort also failed; resources retained: {cleanup}")
                 raise exc
         if context.publication is not None:
-            raise StateSettlementError(context, context.publication) from exc
+            raise PartialCommitError(context, context.publication) from exc
         self.cancel_step(context)
         raise exc
 
     def _release(self, context: StateTaskContext[DataT]) -> None:
-        # Discard aliases before borrowed ACKs and settlement; test_video checks ACK/failure ordering.
+        # Discard aliases before borrowed ACKs and the commit; test_video checks ACK/failure ordering.
         context.value = None
         context.results.clear()
         context.loss = None

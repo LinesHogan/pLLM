@@ -63,7 +63,7 @@ class PostSampleOverlap:
     def _resume_latest(self, context: StateTaskContext[_DataT]) -> None:
         """Move the step's pin to the writer stream without losing exact read holds.
 
-        Old reader pages stay pinned on the writer stream until settlement, including aliases
+        Old reader pages stay pinned on the writer stream until the step commits, including aliases
         consumed by later tasks. Equal reader and writer refs share the new pin; retained
         history owns its own hold.
         """
@@ -91,7 +91,7 @@ class PostSampleOverlap:
             value = data.step
             if value.batch is not None:
                 # Worker-local device copies of external inputs can be dropped at
-                # host settlement while their side-stream consumers are still running.
+                # the host commit while their side-stream consumers are still running.
                 map_host_batch(value.batch, self._record_input)
             feedback = context.sampler_feedback
             if feedback is not None:

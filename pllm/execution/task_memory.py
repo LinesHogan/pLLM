@@ -18,7 +18,7 @@ from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.host_batch import WeightedCEBatch, WeightedRowBatch
 from pllm.contracts.packed_hidden import HiddenRowBatch, HiddenRows
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
-from pllm.contracts.parameter_overlay import CapturedParameterOperand
+from pllm.contracts.parameter_overlay import ProjectionOperands
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import SamplerFeedback
@@ -155,7 +155,7 @@ def example(
     # so both one longest prompt and every row's fixed cost are traced.
     lengths = (max(1, facts.probe.max_packed_rows - len(rows) + 1), *(1,) * (len(rows) - 1))
     operands = tuple(
-        CapturedParameterOperand(
+        ProjectionOperands(
             row.identity,
             target.target,
             HiddenPhase.PREFILL,
@@ -210,8 +210,8 @@ def producers_first(graph: SemanticGraph, symbols: tuple[TaskSymbol, ...]) -> tu
 def derive_resources(
     binding: TensorBinding, facts: BackendCompileFacts, options: ExecutionOptions
 ) -> SchedulerTimeline:
-    """Ask the executable operations for their memory; canonical plumbing is funded separately."""
-    # Shape-only steps do not allocate a capture pool or consume its eventual entitlement.
+    """Ask the executable operations for their memory; framework plumbing is funded separately."""
+    # Shape-only steps do not allocate a capture pool or consume its eventual budget.
     shape = ((facts.max_admitted_lineages, facts.probe.hidden_size),)
     resources = tuple(
         TaskResourceFact(symbol, 0, 1 << 60, shape) for symbol in (*binding.operations, *binding.tensor_tasks)

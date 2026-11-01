@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from pllm.contracts.backend_attachment import AttachmentKind, BackendPlacementProbe
+from pllm.contracts.backend_attachment import AttachmentKind, ModelProbe
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.host_batch import StateImport
@@ -120,7 +120,7 @@ class TensorBinding(Builder[TensorFrame]):
         # Module states: their flat initial values, built once at bind from the model dimensions and seed.
         self.initial_values: dict[str, Callable[[Dimensions, int], torch.Tensor]] = {}
         self.causal: CausalBinder | None = None
-        self.probe: BackendPlacementProbe | None = None
+        self.probe: ModelProbe | None = None
         self.overlay_targets: tuple[Projection, ...] = ()
         self.parameter_phases: tuple[HiddenPhase, ...] = ()
         self.field_views: dict[tuple[str, str], FieldView] = {}

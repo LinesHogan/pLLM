@@ -6,14 +6,14 @@ from dataclasses import dataclass
 
 import torch
 
-from pllm.contracts.backend_attachment import BackendPlacementProbe
+from pllm.contracts.backend_attachment import ModelProbe
 from pllm.contracts.semantic_graph import SchedulerTimeline
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 
 
 @dataclass(frozen=True, slots=True)
 class BackendCompileFacts:
-    probe: BackendPlacementProbe
+    probe: ModelProbe
     timeline: SchedulerTimeline
     providers: tuple[PageBundleProviderFacts, ...]
     max_admitted_lineages: int

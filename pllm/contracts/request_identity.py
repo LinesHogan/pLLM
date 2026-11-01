@@ -16,7 +16,7 @@ class RequestKeyField(StrEnum):
     ROUTE = "route"
 
 
-def canonical_request_key_fields(
+def ordered_key_fields(
     fields: tuple[RequestKeyField, ...],
 ) -> tuple[RequestKeyField, ...]:
     """Return one exact canonical request-key declaration or reject it."""

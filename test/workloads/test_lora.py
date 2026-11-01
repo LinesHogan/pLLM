@@ -26,7 +26,7 @@ BINDING = testing.final_hidden_binding(1)
 def compile_lora(config, device=torch.device("cpu"), *, lineages=3, pages=3):
     cuda = device.type == "cuda"
     provider = PageBundleProviderFacts(
-        "canonical.cuda_dense_page@1" if cuda else "test.page@1",
+        "cuda_dense_page@1" if cuda else "test.page@1",
         pages,
         StateDeviceKind.CUDA if cuda else StateDeviceKind.CPU,
     )

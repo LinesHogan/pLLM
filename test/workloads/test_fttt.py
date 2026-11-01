@@ -38,7 +38,7 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry() -> None:
     # A failed step (two failed rows exceed max_input_rows=1) publishes no edit and drops the queue.
     extra = replace(wrong, identity=RequestIdentity("excess", 1, 0))
     with pytest.raises(ValueError):
-        workload(CompletionInput.capture(CompletionBatch((wrong, extra)), hidden.expand(2, -1)))
+        workload(CompletionInput.copy_of(CompletionBatch((wrong, extra)), hidden.expand(2, -1)))
     assert workload.edit.diagnostics().update_count == 0 and service.queued_feedback == 0
 
     # Spell out the feature projection and use PyTorch Adam, not production helpers.
@@ -65,7 +65,7 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry() -> None:
         loss.backward()
         optimizer.step()
         retry_batch = CompletionBatch((replace(wrong, identity=RequestIdentity(f"attempt-{version}", 0, version)),))
-        result = workload(CompletionInput.capture(retry_batch, hidden))
+        result = workload(CompletionInput.copy_of(retry_batch, hidden))
         assert result.update_count == 1
         torch.testing.assert_close(result.losses[0], loss.detach())
         torch.testing.assert_close(result.edit_delta, (inputs @ down.T @ up.T).detach())
@@ -74,7 +74,7 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry() -> None:
         state = service.lifecycle("round", 0)
         assert state.retries == state.adapter_version == version
     accepted = Completion(identity, 0, "round", (4,), "4", FinishReason.STOP)
-    assert not service.enqueue(CompletionInput.capture(CompletionBatch((accepted,)), hidden))
+    assert not service.enqueue(CompletionInput.copy_of(CompletionBatch((accepted,)), hidden))
     result = workload.step()
     assert result.update_count == 0 and result.losses == () and result.state_version == 2
     assert result.intent.retry_controls[0].action is RetryAction.ACCEPT
@@ -126,7 +126,7 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
                 )
                 for row, index in enumerate(prompt_indices)
             )
-            return CompletionInput.capture(CompletionBatch(entries), torch.ones(len(entries), 4))
+            return CompletionInput.copy_of(CompletionBatch(entries), torch.ones(len(entries), 4))
 
     service = FTTTFeedbackQueue(FTTTConfig(rank=2, max_retries=2), ArithmeticJudge())
     processor = FTTTFeedback(service, HostConfig(torch.device("cpu"), hidden_size=4))

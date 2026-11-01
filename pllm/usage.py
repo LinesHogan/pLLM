@@ -31,7 +31,7 @@ from pllm.contracts.parameter_overlay import (
     Projection,
     ProjectionDelta,
 )
-from pllm.contracts.request_identity import RequestKeyField, canonical_request_key_fields
+from pllm.contracts.request_identity import RequestKeyField, ordered_key_fields
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
     AnchorSymbol,
@@ -149,10 +149,10 @@ class _Source:
 
     differentiable: ClassVar[bool] = True
 
-    def port(self, context: _Declaration) -> TensorPort:
+    def port(self, context: _Reflection) -> TensorPort:
         raise TypeError(f"unsupported tensor source: {type(self).__name__}")
 
-    def training_port(self, context: _Declaration) -> CausalPort:
+    def training_port(self, context: _Reflection) -> CausalPort:
         raise ValueError("causal training inputs must name Batch, Parameter or causal_model ports")
 
     def in_forward_binding(self, state: str, fields: Mapping[str, Field]) -> str:
@@ -196,7 +196,7 @@ class Hidden(_Source):
         """Resolve the model dependency without building a tensor binding."""
         return HiddenInputSource(_setting(self.layer, owner, int), self.site, self.phase)
 
-    def port(self, context: _Declaration) -> TensorPort:
+    def port(self, context: _Reflection) -> TensorPort:
         return hidden_port(self.resolve(context.owner))
 
 
@@ -206,7 +206,7 @@ class SampleIndex(_Source):
 
     differentiable: ClassVar[bool] = False
 
-    def port(self, context: _Declaration) -> TensorPort:
+    def port(self, context: _Reflection) -> TensorPort:
         return sample_index_port(context.binding.sampler_rows())
 
 
@@ -214,7 +214,7 @@ class SampleIndex(_Source):
 class Batch(_Source):
     field: str
 
-    def training_port(self, context: _Declaration) -> CausalPort:
+    def training_port(self, context: _Reflection) -> CausalPort:
         variant = next(
             (variant for variant in (CausalTrainBatch, WeightedRowBatch) if self.field in variant.names), None
         )
@@ -238,14 +238,14 @@ class Parameter(_Source):
     field: str
     per_row: bool = False
 
-    def training_port(self, context: _Declaration) -> CausalPort:
+    def training_port(self, context: _Reflection) -> CausalPort:
         context.parameter(self.state, self.field)
         view = context.binding.field_views[self.state, self.field]
         return CausalPort(
             context.states[self.state].read(), lambda batch, parameters: view.read(parameters["parameters"])
         )
 
-    def port(self, context: _Declaration) -> TensorPort:
+    def port(self, context: _Reflection) -> TensorPort:
         parameter = context.parameter(self.state, self.field)
         return parameter_rows(parameter) if self.per_row else parameter
 
@@ -266,7 +266,7 @@ class _CausalModelMarker(_Source):
 
     name: str
 
-    def training_port(self, context: _Declaration) -> CausalPort:
+    def training_port(self, context: _Reflection) -> CausalPort:
         adapter = context.adapters.get(self.name)
         if adapter is None:
             raise ValueError(f"pllm.causal_model({self.name!r}) must name a pllm.model.Adapter of the workload")
@@ -287,10 +287,10 @@ class _Module(Parameter):
 
     field: str = "parameters"
 
-    def port(self, context: _Declaration) -> TensorPort:
+    def port(self, context: _Reflection) -> TensorPort:
         return replace(super().port(context), adapt=self.adapt(context))
 
-    def adapt(self, context: _Declaration) -> Callable[[torch.Tensor], ModuleCall]:
+    def adapt(self, context: _Reflection) -> Callable[[torch.Tensor], ModuleCall]:
         definition = context.state_definition(self.state, f"{self.state}: pllm.module needs a declared module state")
         factory, dimensions = definition.module, context.binding.dimensions
         if factory is None:
@@ -322,7 +322,7 @@ class StateIndex(_Source):
 
     differentiable: ClassVar[bool] = False
 
-    def port(self, context: _Declaration) -> TensorPort:
+    def port(self, context: _Reflection) -> TensorPort:
         return state_metadata(context.state(self.state, "pllm.index needs a declared state"), version=False)
 
 
@@ -332,7 +332,7 @@ class StateVersion(_Source):
 
     differentiable: ClassVar[bool] = False
 
-    def port(self, context: _Declaration) -> TensorPort:
+    def port(self, context: _Reflection) -> TensorPort:
         return state_metadata(context.state(self.state, "pllm.version needs a declared state"), version=True)
 
 
@@ -340,13 +340,13 @@ class StateVersion(_Source):
 class Result(_Source):
     operation: str
 
-    def port(self, context: _Declaration) -> TensorPort:
+    def port(self, context: _Reflection) -> TensorPort:
         return result_port(TaskResultInputSource(TaskSymbol(self.operation), "value"))
 
 
 @dataclass(frozen=True)
 class BaseLogits(_Source):
-    def port(self, context: _Declaration) -> TensorPort:
+    def port(self, context: _Reflection) -> TensorPort:
         return feedback_port("base_logits")
 
 
@@ -354,7 +354,7 @@ class BaseLogits(_Source):
 class SampledTokens(_Source):
     differentiable: ClassVar[bool] = False
 
-    def port(self, context: _Declaration) -> TensorPort:
+    def port(self, context: _Reflection) -> TensorPort:
         return sampled_token_port()
 
 
@@ -520,7 +520,7 @@ class InstanceState:
     def tensor_dtype(self) -> TensorDType:
         return TensorDType(str(self.dtype).removeprefix("torch."))
 
-    def declare(self, name: str, context: _Declaration) -> None:
+    def declare(self, name: str, context: _Reflection) -> None:
         """Allocate tensor parameters; the layout of fields an adapter reads follows its targets."""
         context.signature.append((name, boundary_digest(fingerprint(self), tuple(self.fields))))
         if name in context.in_forward_states or name in context.states:
@@ -545,7 +545,7 @@ class InstanceState:
         if self.module is not None:
             context.binding.initial_values[name] = partial(initial_values, self.module, dtype=self.dtype)
 
-    def layout_fields(self, name: str, context: _Declaration) -> tuple[LayoutField, ...]:
+    def layout_fields(self, name: str, context: _Reflection) -> tuple[LayoutField, ...]:
         """The allocated fields: plain shapes in the state's dtype, or pllm.Field values sized by the hidden width or,
         when a pllm.model.Adapter reads the state, once per adapter target."""
         consumer = next((adapter for adapter in context.adapters.values() if adapter.state == name), None)
@@ -572,7 +572,7 @@ class RequestState(InstanceState):
         super().__post_init__()
         if any(name not in get_args(KeyField) for name in self.key_fields):
             raise ValueError(f"key_fields={self.key_fields}: use names from {get_args(KeyField)}")
-        canonical_request_key_fields(self.request_keys)
+        ordered_key_fields(self.request_keys)
 
     scope: ClassVar[StateScope] = StateScope.REQUEST
 
@@ -614,7 +614,7 @@ class ActivationPatch:
         if not self.decode and (self.refresh != "admission" or self.on_missing != "stop"):
             raise ValueError("refresh= and on_missing= apply to decode tokens; set decode=True")
 
-    def declare(self, context: _Declaration) -> None:
+    def declare(self, context: _Reflection) -> None:
         """Read local state, preserving custom-forward and HOLD publication dependencies when declared."""
         definition = context.state_definition(self.state, "pllm.model.ActivationPatch needs a declared state")
         if definition.feed is not None:
@@ -767,7 +767,7 @@ class _Export(_Effect):
             enabled=_setting(self.enabled, owner, bool),
             overflow=self.overflow,
         )
-        call = operation.tensor(result_schema="canonical.hidden_export@1", export=export)
+        call = operation.tensor(result_schema="hidden_export@1", export=export)
         operation.context.binding.model_effect(call)
 
 
@@ -1365,7 +1365,7 @@ def _arguments(
 class _Operation:
     """A reflected method, with marker types checked once at the boundary."""
 
-    context: _Declaration
+    context: _Reflection
     name: str
     phase: Phase
     effect: _Effect
@@ -1526,7 +1526,7 @@ def _candidates(owner: Workload, values: dict[str, object], members: dict[str, o
 
 
 @dataclass
-class _Declaration:
+class _Reflection:
     """Own the binding, reflected owner and ordered definitions during one build."""
 
     owner: Workload
@@ -1574,7 +1574,7 @@ class _Declaration:
         return delta.field_bindings(lambda name: self.binding.field_views[delta.state, name])
 
     @classmethod
-    def read(cls, workload: Workload) -> _Declaration:
+    def read(cls, workload: Workload) -> _Reflection:
         """Snapshot and sign reachable mathematics before evaluating state properties."""
         owner = _snapshot(workload)
         values, members = _values(owner), _members(owner)
@@ -1854,9 +1854,9 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         Tensor-parallel execution delivers exports only from the output rank (rank 0).
         """
 
-    def _build(self, b: TensorBinding, *, capabilities: tuple[str, ...] = ()) -> None:
+    def _declare(self, b: TensorBinding, *, capabilities: tuple[str, ...] = ()) -> None:
         """Declare owner values and operations, then compose and sign their graph."""
-        context = _Declaration.read(self)
+        context = _Reflection.read(self)
         context.binding = b
         context.adapters = {key: value.expand(b.dimensions.layer_count) for key, value in context.adapters.items()}
         context.declare_values()
@@ -1872,7 +1872,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             context.overlap_sampler()
         context.sign_composition()
 
-    def declaration(self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None) -> TensorBinding:
+    def build(self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None) -> TensorBinding:
         """Build the graph and tensor tasks against the backend's model dimensions."""
         dimensions = Dimensions(
             facts.probe.hidden_size,
@@ -1884,7 +1884,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         b = TensorBinding(type(self).__qualname__, boundary_digest(dimensions, facts.initialization_seed), dimensions)
         b.probe = facts.probe
         b.causal = causal
-        self._build(b, capabilities=facts.timeline.capabilities)
+        self._declare(b, capabilities=facts.timeline.capabilities)
         # Executable ports retain their dependencies; an unused factory must not pin the decoder.
         b.causal = None
         b.configure_scans(facts)
@@ -1892,7 +1892,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
 
     def backend_requirements(self) -> BackendRequirements:
         """Read model dependencies from markers before dimensions or tensor readers exist."""
-        context = _Declaration.read(self)
+        context = _Reflection.read(self)
         sources: dict[str, tuple[_Source, ...]] = {}
         targets = tuple(target for value in context.adapters.values() for target in value.targets)
         for operation in sorted(context.operations, key=lambda operation: operation.name):
@@ -1973,7 +1973,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             Dimensions(config.hidden_size, 0),
             host=True,
         )
-        self._build(b)
+        self._declare(b)
         timeline = config.timeline()
         if config.memory_budget_bytes is not None and b.graph.states:
             timeline = derive_host_resources(b, config)

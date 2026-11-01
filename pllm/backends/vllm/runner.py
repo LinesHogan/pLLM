@@ -27,10 +27,10 @@ from pllm.authoring import (
     ResultT,
 )
 from pllm.backends.vllm.architecture import Decoder
-from pllm.backends.vllm.hidden_capture import (
-    CAPTURE_ENV,
-    HiddenCaptureAnnouncement,
-    HiddenCaptureLayout,
+from pllm.backends.vllm.hidden_taps import (
+    TAPS_ENV,
+    HiddenTapAnnouncement,
+    HiddenTapLayout,
     HiddenTaps,
 )
 from pllm.backends.vllm.overlay_graph import (
@@ -62,7 +62,7 @@ class Runner:
     max_num_reqs: int
 
     hidden_taps: HiddenTaps | None = None
-    hidden_layouts: tuple[HiddenCaptureLayout, ...] = ()
+    hidden_layouts: tuple[HiddenTapLayout, ...] = ()
     hidden_pools: dict[str, SlotPools]
     position_states: tuple[tuple[str, float], ...] = ()
     position_layers: tuple[PositionCacheLayer, ...] = ()
@@ -73,7 +73,7 @@ class Runner:
         """Install the logits hook and announced hidden taps before vLLM compiles the model."""
         model = self.decoder.model
         model.compute_logits = self._compute_logits
-        announcement = decode_boundary(os.environ.get(CAPTURE_ENV, "{}"), HiddenCaptureAnnouncement)
+        announcement = decode_boundary(os.environ.get(TAPS_ENV, "{}"), HiddenTapAnnouncement)
         hidden_size = model.lm_head.weight.shape[1]
         self.hidden_layouts = announcement.resolve(len(model.model.layers), hidden_size)
         self.hidden_pools = {layout.module_path: layout.create_pool(self.device) for layout in self.hidden_layouts}

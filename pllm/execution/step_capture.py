@@ -66,7 +66,7 @@ def capture_graph(
 class StepCapture:
     """One task's fixed capacity, private graph pool and replay stream ordering."""
 
-    entitlement: TaskResourceFact
+    budget: TaskResourceFact
     states: int
     graph: torch.cuda.CUDAGraph | None = None
     addresses: tuple[int, ...] = ()
@@ -110,7 +110,7 @@ class StepCapture:
         destinations.fill_(-1)
         self.graph, _, pool = capture_graph(table.device, body)
         self.resident_bytes = sum(value.untyped_storage().nbytes() for value in (table, *buffers)) + pool
-        if self.resident_bytes > self.entitlement.resident_bytes:
+        if self.resident_bytes > self.budget.resident_bytes:
             raise ValueError(
-                f"capture requires {self.resident_bytes} resident bytes, reserved {self.entitlement.resident_bytes}"
+                f"capture requires {self.resident_bytes} resident bytes, reserved {self.budget.resident_bytes}"
             )

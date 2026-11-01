@@ -37,7 +37,7 @@ from pllm.execution.row_task_binding import (
     declare_tensor,
 )
 from pllm.execution.runtime_facts import model_timeline
-from pllm.execution.state_execution import MathBinding, StateSettlementError
+from pllm.execution.state_execution import MathBinding, PartialCommitError
 from pllm.execution.tensor_binding import TensorBinding
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import FunctionMath, TaskOutput
@@ -169,7 +169,7 @@ def test_video_binding_failure_retains_grants_and_stops_execution():
             execution.stage_readonly((root,))
             if failure == "close":
                 peers[0].close()  # The producer vanished: the read ACK cannot be delivered.
-            with pytest.raises(StateSettlementError if failure == "close" else (ValueError, ArithmeticError)):
+            with pytest.raises(PartialCommitError if failure == "close" else (ValueError, ArithmeticError)):
                 execution.step(step_input(()))
             if failure != "close":
                 assert execution.latest(()) == before and not any(peer.poll() for peer in peers)

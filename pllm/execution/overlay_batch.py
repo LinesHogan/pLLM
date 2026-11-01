@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from pllm.contracts.parameter_overlay import CapturedParameterOperand, ParameterOverlayOperator
+from pllm.contracts.parameter_overlay import ParameterOverlayOperator, ProjectionOperands
 from pllm.contracts.semantic_graph import TaskResourceFact
 from pllm.execution.cuda_stream import PinnedStaging
 from pllm.execution.overlay_task import ChunkUpdate, GradientUpdate
@@ -30,16 +30,16 @@ class OverlayBatch:
 
     states = 8
 
-    def __init__(self, math: OverlayTransition, entitlement: TaskResourceFact | None = None) -> None:
-        self.math, self.entitlement = math, entitlement
-        if entitlement is not None:
-            self.states = min(self.states, entitlement.input_shapes[0][0])
+    def __init__(self, math: OverlayTransition, budget: TaskResourceFact | None = None) -> None:
+        self.math, self.budget = math, budget
+        if budget is not None:
+            self.states = min(self.states, budget.input_shapes[0][0])
         self.tiles: dict[tuple[int, bool, int], OverlayTile | None] = {}
         self.batchable = False
 
     def resident(self, capture_bytes: int) -> int:
         """Reserve the planner's capture budget for batchable overlays."""
-        return capture_bytes if self.entitlement is not None and self.batchable else 0
+        return capture_bytes if self.budget is not None and self.batchable else 0
 
     def capacities(self) -> tuple[int, ...]:
         """Pad within the native power-of-two chunk-count bucket used by scan selection."""
@@ -49,7 +49,7 @@ class OverlayBatch:
 
     def run(
         self,
-        operands: tuple[CapturedParameterOperand, ...],
+        operands: tuple[ProjectionOperands, ...],
         target: int,
         indices: tuple[int, ...],
         batch: TensorBatch,
@@ -85,27 +85,27 @@ class OverlayBatch:
         train: bool,
         rows: int,
         pools: tuple[torch.Tensor, ...],
-        operand: CapturedParameterOperand,
+        operand: ProjectionOperands,
         count: int,
     ) -> OverlayTile:
         key = target, train, rows
-        bounded = self.entitlement is not None and self.entitlement.resident_bytes > 0 and rows in self.capacities()
+        bounded = self.budget is not None and self.budget.resident_bytes > 0 and rows in self.capacities()
         capture = bounded and pools[0].is_cuda
         tile = self.tiles.get(key)
         if tile is not None:
-            if tile.capture is not None and self.entitlement is not None:
-                tile.capture.entitlement = replace(self.entitlement, resident_bytes=self.available(key))
+            if tile.capture is not None and self.budget is not None:
+                tile.capture.budget = replace(self.budget, resident_bytes=self.available(key))
             return tile
         tile = OverlayTile(self.math, pools, operand, self.states if bounded else count, rows, train)
         self.batchable |= tile.batchable
-        if capture and key not in self.tiles and self.entitlement is not None:
+        if capture and key not in self.tiles and self.budget is not None:
             remaining = self.available(key)
             if tile.batchable:
                 with FakeTensorMode(allow_non_fake_inputs=True):
                     workspace = measure(partial(tile.body, operand.base_weight)).workspace
                 needed = workspace + tile.buffer_bytes
                 if needed <= remaining:
-                    tile.capture = StepCapture(replace(self.entitlement, resident_bytes=remaining), self.states)
+                    tile.capture = StepCapture(replace(self.budget, resident_bytes=remaining), self.states)
                     self.tiles[key] = tile
                 else:
                     self.tiles[key] = None
@@ -113,8 +113,8 @@ class OverlayBatch:
 
     def available(self, key: tuple[int, bool, int]) -> int:
         """An invalidated shape may reuse its budget, but never another live graph's bytes."""
-        assert self.entitlement is not None
-        return self.entitlement.resident_bytes - sum(
+        assert self.budget is not None
+        return self.budget.resident_bytes - sum(
             tile.capture.resident_bytes
             for shape, tile in self.tiles.items()
             if shape != key and tile is not None and tile.capture is not None
@@ -128,7 +128,7 @@ class OverlayTile:
         self,
         math: OverlayTransition,
         pools: tuple[torch.Tensor, ...],
-        operand: CapturedParameterOperand,
+        operand: ProjectionOperands,
         states: int,
         rows: int,
         train: bool,
@@ -225,7 +225,7 @@ class OverlayTile:
 
     def run(
         self,
-        operands: tuple[CapturedParameterOperand, ...],
+        operands: tuple[ProjectionOperands, ...],
         slots: np.ndarray[tuple[int, ...], np.dtype[np.int64]],
         pools: tuple[torch.Tensor, ...],
         stream: torch.cuda.Stream | None,

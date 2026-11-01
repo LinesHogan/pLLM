@@ -305,7 +305,7 @@ def test_initialized_reader_and_hidden_before_model_boundary():
             return (h,)
 
     with pytest.raises(ValueError, match="after model forward"):
-        Cycle().declaration(
+        Cycle().build(
             backend_facts(
                 4,
                 (),

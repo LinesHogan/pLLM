@@ -10,8 +10,8 @@ import torch
 import pllm
 from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.parameter_overlay import (
-    CapturedParameterOperand,
     Projection,
+    ProjectionOperands,
     ProjectionShape,
 )
 from pllm.contracts.semantic_graph import AnchorId
@@ -82,7 +82,7 @@ class UpdatingDecoder(Decoder):
     def layer(self, row, ordinal, positions, hidden, residual, kv="commit"):
         output, carry = super().layer(row, ordinal, positions, hidden, residual)
         if ordinal == TARGET.layer:
-            operand = CapturedParameterOperand(
+            operand = ProjectionOperands(
                 row.identity,
                 TARGET,
                 row.phase,
@@ -212,7 +212,7 @@ def test_updates_match_independent_private_version_oracle(boundaries, visits, em
 
 def test_marker_source_roundtrip_and_while_rejection():
     assert_finite_resources(Updating(), ROUTE_FACTS)
-    graph = Updating(empty=True).declaration(ROUTE_FACTS).graph
+    graph = Updating(empty=True).build(ROUTE_FACTS).graph
     assert decode_boundary(encode_boundary(graph), type(graph)) == graph
     assert next(task.custom_forward for task in graph.tasks if task.custom_forward is not None).apply_updates
 
@@ -224,7 +224,7 @@ def test_marker_source_roundtrip_and_while_rejection():
             )[0]
 
     with pytest.raises(ValueError, match="use a bounded for-loop"):
-        TracedWhile().declaration(ROUTE_FACTS)
+        TracedWhile().build(ROUTE_FACTS)
 
     class Unowned(pllm.Workload):
         @pllm.custom_forward()
@@ -233,7 +233,7 @@ def test_marker_source_roundtrip_and_while_rejection():
             return layers()[-1]
 
     with pytest.raises(ValueError, match="one trained parameter overlay"):
-        Unowned().declaration(ROUTE_FACTS)
+        Unowned().build(ROUTE_FACTS)
 
     class Second(Updating):
         @pllm.train_in_forward(state="weights", targets=(TARGET,), weight="delta")
@@ -247,7 +247,7 @@ def test_marker_source_roundtrip_and_while_rejection():
             return self.transition(hidden, desired, delta, tail)
 
     with pytest.raises(ValueError, match="sole request state"):
-        Second().declaration(ROUTE_FACTS)
+        Second().build(ROUTE_FACTS)
 
 
 @pytest.mark.parametrize("published", (False, True))

@@ -240,7 +240,7 @@ def _check_graph(handle):
         assert texts(handle.generate(list(reversed(prompts)), SAMPLING)) == first[::-1]
         assert texts(handle.generate(prompts[:1], SAMPLING)) == first[:1]
         assert all(texts(handle.generate(["The sky is blue. " * 5, "Water is cold. " * 2], SAMPLING)))
-    assert overlay.take_captures() == ()
+    assert overlay.take_operands() == ()
     assert pointers == (reader.table.data_ptr(), reader.captured.data_ptr(), reader.pools[0].data_ptr())
     assert handle.diagnostics().update_count > 0 and handle.diagnostics().active_states == 0
     _check_cancelled_projection(handle)
@@ -282,7 +282,7 @@ def _check_hybrid(handle):
         _check_cancelled_projection(handle)
     diagnostics = handle.diagnostics()
     assert diagnostics.update_count > 0 and diagnostics.active_states == diagnostics.pending_state_releases == 0
-    assert overlay.take_captures() == ()
+    assert overlay.take_operands() == ()
     return first
 
 

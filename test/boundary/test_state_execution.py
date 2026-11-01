@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.execution.state_execution import StateSettlementError
+from pllm.execution.state_execution import PartialCommitError
 from test.state_fixtures import (
     AUX,
     DENSE,
@@ -116,7 +116,7 @@ def test_cancellation_inside_a_loop_keeps_the_first_commit_and_stops():
 
     task.update = update
     invocation = execution.start_step(step)
-    with pytest.raises(StateSettlementError):
+    with pytest.raises(PartialCommitError):
         execution.execute_anchor(invocation, execution.plan.tasks[0].anchor_id)
     assert len(calls) == 2 and execution.arena.latest(refs[0].lineage_id).version_id == 1
     execution.cancel_step(invocation)
@@ -140,7 +140,7 @@ def test_task_failure_keeps_the_commit_boundary(committed):
 
     task.update = fail
     invocation = execution.start_step(step_for(identity))
-    with pytest.raises(StateSettlementError if committed else ValueError):
+    with pytest.raises(PartialCommitError if committed else ValueError):
         execution.execute_anchor(invocation, execution.plan.tasks[0].anchor_id)
     assert len(calls) == 1
     assert execution.arena.latest(refs[0].lineage_id).version_id == int(committed)

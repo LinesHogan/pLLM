@@ -11,7 +11,7 @@ import torch
 from pllm.authoring import CausalTrainBatch, StateImport
 from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.execution.host_runtime import CompletionCapture
+from pllm.execution.host_runtime import CompletionRows
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.host import Completion, CompletionBatch, FinishReason
 
@@ -46,7 +46,7 @@ def test_codec_round_trips_payloads_and_shared_tensors_own_their_mapping() -> No
 
 def test_completion_capture_orders_rows_and_requires_all_identities() -> None:
     hidden = torch.zeros(3, 2)
-    capture = CompletionCapture(IDENTITIES, hidden)
+    capture = CompletionRows(IDENTITIES, hidden)
     with pytest.raises(RuntimeError):
         capture.require_complete()
     capture.write((IDENTITIES[2], IDENTITIES[0]), torch.tensor([[2.0, 2.0], [0.0, 0.0]]))

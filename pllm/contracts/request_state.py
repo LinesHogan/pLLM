@@ -8,13 +8,13 @@ from dataclasses import dataclass
 from pllm.contracts.request_identity import (
     RequestIdentity,
     RequestKeyField,
-    canonical_request_key_fields,
+    ordered_key_fields,
 )
 
 
 @dataclass(frozen=True, slots=True)
 class RequestStateKey:
-    """Canonical projection of one identity under a signed key declaration."""
+    """The projection of one request identity onto a state's key fields."""
 
     fields: tuple[RequestKeyField, ...]
     request_id: str
@@ -29,7 +29,7 @@ class RequestStateKey:
         identity: RequestIdentity,
         fields: tuple[RequestKeyField, ...],
     ) -> "RequestStateKey":
-        fields = canonical_request_key_fields(fields)
+        fields = ordered_key_fields(fields)
         if (
             RequestKeyField.REQUEST_ID in fields
             and not identity.request_id

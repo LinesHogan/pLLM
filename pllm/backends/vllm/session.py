@@ -16,7 +16,7 @@ from pllm.authoring import BackendDeployment, DataT, HostBatch, ResultT
 from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.architecture import Decoder
 from pllm.backends.vllm.custom_forward import VllmCustomForward
-from pllm.backends.vllm.hidden_capture import HiddenTaps
+from pllm.backends.vllm.hidden_taps import HiddenTaps
 from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay, parameter_overlay
 from pllm.backends.vllm.position_state import PositionCacheLayer
 from pllm.backends.vllm.prefix_cache import POLICY_KEY, CachePolicy
@@ -39,7 +39,7 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.execution.backend_attachment import attachment_buffer_bytes
 from pllm.execution.cuda_stream import CudaStreamReadiness
-from pllm.execution.host_runtime import CompletionCapture
+from pllm.execution.host_runtime import CompletionRows
 from pllm.execution.overlay_task import ProjectionTask
 from pllm.execution.state_execution import HeldInput, StateDiagnostics, StateTaskContext
 from pllm.execution.state_feed import (
@@ -149,7 +149,7 @@ class VllmSession(Generic[DataT, ResultT]):
         self._next_step_id = 0
         self._step: _PackedStep[DataT] | None = None
         self._host_batch: HostBatch[torch.Tensor] | None = None
-        self.completion_capture: CompletionCapture | None = None
+        self.completion_rows: CompletionRows | None = None
         execution = deployment.execution
         execution.admit_instances(torch.cuda.current_stream(execution.device))
         if execution.feeds:
@@ -169,7 +169,7 @@ class VllmSession(Generic[DataT, ResultT]):
     ) -> None:
         """Stage request inputs, already validated by generate, and their optional completion destination."""
         self._require_input_live()
-        self.completion_capture = None if completion is None else CompletionCapture(identities, completion)
+        self.completion_rows = None if completion is None else CompletionRows(identities, completion)
         self._host_batch = batch
         self._pending_identities = {identity.request_id: identity for identity in identities}
 
@@ -349,7 +349,7 @@ class VllmSession(Generic[DataT, ResultT]):
         step.forward_done = True
         execution = self._deployment.execution
         stream = torch.cuda.current_stream(execution.device)
-        operands = () if self._overlay is None else self._overlay.take_captures()
+        operands = () if self._overlay is None else self._overlay.take_operands()
         value = StepInput(step.rows.row_batch, step.rows, operands=operands, batch=self._host_batch)
         if self._taps is not None and self._hidden_resources:
             value = self._taps.publish(value, self._hidden_resources)
@@ -403,8 +403,8 @@ class VllmSession(Generic[DataT, ResultT]):
         if step is None or step.forward_done:
             return lm_head(hidden)
         # Forward completion can discard a prefill step that has no workload inputs.
-        if self.completion_capture is not None:
-            self.completion_capture.write(step.rows.identities, hidden)
+        if self.completion_rows is not None:
+            self.completion_rows.write(step.rows.identities, hidden)
         self.complete_forward()
         if self._step is None or self._sampler is None or self._context().guidance is None:
             return lm_head(hidden)
@@ -474,18 +474,18 @@ class VllmSession(Generic[DataT, ResultT]):
 
     @torch.inference_mode(False)
     def retire_all(self, *, wait: bool = False) -> None:
-        if self.completion_capture is not None:
-            self.completion_capture.synchronize()
+        if self.completion_rows is not None:
+            self.completion_rows.synchronize()
         self._deployment.execution.release_history()
         self._retire(tuple(self._identities[request_id] for request_id in sorted(self._identities)))
         self._pending_identities.clear()
         self._deployment.execution.arena.collect_completed(wait=wait)
-        self.completion_capture = None
+        self.completion_rows = None
 
     def finish_requests(self) -> None:
         """Require every submitted completion row before releasing the generation's requests."""
-        if self.completion_capture is not None:
-            self.completion_capture.require_complete()
+        if self.completion_rows is not None:
+            self.completion_rows.require_complete()
         self.retire_all()
 
     def require_idle(self) -> None:

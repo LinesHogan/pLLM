@@ -15,7 +15,7 @@ from pllm.contracts.backend_attachment import (
     AttachmentTaskRole,
     BackendAttachment,
     BackendAttachmentSpec,
-    BackendPlacementProbe,
+    ModelProbe,
 )
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator
@@ -46,7 +46,7 @@ from pllm.execution.parameter_projection import ROWS_PER_BLOCK, projection_block
 
 
 def attachment_buffer_bytes(
-    probe: BackendPlacementProbe,
+    probe: ModelProbe,
     graph: SemanticGraph,
     layouts: TensorLayoutRequest,
     attachment: BackendAttachmentSpec,
@@ -108,7 +108,7 @@ def attachment_buffer_bytes(
 
 
 def derive_attachment_resources(
-    probe: BackendPlacementProbe,
+    probe: ModelProbe,
     graph: SemanticGraph,
     timeline: SchedulerTimeline,
     *,
@@ -264,7 +264,7 @@ def bind_attachment_tasks(
 
 def bind_backend_attachment(
     plan: PlanBundle,
-    probe: BackendPlacementProbe,
+    probe: ModelProbe,
     spec: BackendAttachmentSpec,
 ) -> BackendAttachment:
     anchors = {anchor.symbol: anchor for anchor in plan.timeline.anchors}

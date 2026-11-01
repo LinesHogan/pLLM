@@ -61,7 +61,7 @@ group = "rust"
 path = "rust/pllm_core/src/planning/state_representation.rs"
 command = "cargo test --manifest-path rust/pllm_core/Cargo.toml representation_selection_and_capacity_are_signed_once"
 environment = "Rust toolchain; CPU"
-observable_contract = "70 old-read timing, arena entitlement and total-memory-budget combinations match an independent two-resource provider product; reject cheap mutable storage when old versions must survive, account original arena reservation plus workspace/backend bytes in AER peak, and mechanically project/sign the selected state. Fixed candidate capacities and single execution domain only; dynamic pin/completion-derived live-version capacity and distributed placement remain pending"
+observable_contract = "70 old-read timing, arena budget and total-memory-budget combinations match an independent two-resource provider product; reject cheap mutable storage when old versions must survive, account original arena reservation plus workspace/backend bytes in AER peak, and mechanically project/sign the selected state. Fixed candidate capacities and single execution domain only; dynamic pin/completion-derived live-version capacity and distributed placement remain pending"
 replaces = "Independent cheapest-state selection, standalone state compile/lower/validation/reconstruction FFI, duplicate Rust JSON hashing, mirrored Python wire DTOs and Python semantic validation"
 
 [[evidence]]

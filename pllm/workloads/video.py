@@ -49,7 +49,7 @@ class VideoWorkload(pllm.Workload):
 
     @property
     def activation(self) -> pllm.model.ActivationPatch:
-        """Apply the latest settled injection to the selected prefill/decode rows."""
+        """Apply the latest published injection to the selected prefill/decode rows."""
         return pllm.model.ActivationPatch(
             "inject",
             (self.layer,),

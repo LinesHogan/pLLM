@@ -264,7 +264,7 @@ class ExecutionTrace:
             yield
         finally:
             with self._lock:
-                self._settle()
+                self._collect_timings()
                 (
                     self._events,
                     self._sequence,
@@ -529,7 +529,7 @@ class ExecutionTrace:
             if self._failure is not None:
                 raise self._failure
 
-    def _settle(self) -> None:
+    def _collect_timings(self) -> None:
         """Finish history's outstanding host copies before releasing their storage."""
         for entry in self._events:
             if entry.payload is not None and entry.payload[1] is not None:
@@ -549,7 +549,7 @@ class ExecutionTrace:
             if self._thread is not None:
                 self._thread.join()
             with self._lock:
-                self._settle()
+                self._collect_timings()
                 self._events.clear()
 
     def snapshot(self) -> TraceSnapshot:

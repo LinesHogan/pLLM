@@ -18,10 +18,10 @@ from pllm.contracts.backend_attachment import (
     ActivationPatchOperator,
     AttachmentKind,
     AttachmentTaskRole,
-    BackendPlacementProbe,
     DecodeRefresh,
     DecodeWindow,
     MissingPolicy,
+    ModelProbe,
 )
 from pllm.contracts.codec import boundary_digest
 from pllm.contracts.hidden_locator import HiddenPhase
@@ -138,7 +138,7 @@ def declare_parameter_overlay(
     b.overlay_math = math
     transition = b.compute(
         name,
-        inputs={"operands": b.input("parameter.operands", "dense_pairs", "canonical.dense_operand_pairs@1")},
+        inputs={"operands": b.input("parameter.operands", "dense_pairs", "dense_operand_pairs@1")},
         outputs=("transition",),
         changes=state,
         effect=StateEffectKind.TRANSITION_MAYBE,
@@ -158,12 +158,12 @@ def declare_parameter_overlay(
         state,
         implementations=(
             native(
-                "canonical.state:cuda_publish_parameter_overlay@1",
+                "state:cuda_publish_parameter_overlay@1",
                 "compute/cuda@1",
                 "state/fenced_reclaim@1",
                 "transition/full_root@1",
             ),
-            native("canonical.state:publish_parameter_overlay@1", "compute/cpu@1", "transition/full_root@1"),
+            native("state:publish_parameter_overlay@1", "compute/cpu@1", "transition/full_root@1"),
         ),
     )
     views = effect.field_bindings(
@@ -378,7 +378,7 @@ def _attach_custom_forward(b: TensorBinding, composed: bool, effect: TokenProgra
 
 
 def _trace_programs(
-    probe: BackendPlacementProbe,
+    probe: ModelProbe,
     forwards: tuple[tuple[Tokens, Over, Callable[[Layers], torch.Tensor]], ...],
     position_states: tuple[tuple[str, float], ...],
 ) -> tuple[tuple[Tokens, TokenProgram], ...]:

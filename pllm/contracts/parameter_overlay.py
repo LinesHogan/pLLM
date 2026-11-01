@@ -93,7 +93,7 @@ class ParameterOverlayFieldBinding:
 
 
 @dataclass(frozen=True, slots=True)
-class CapturedParameterOperand:
+class ProjectionOperands:
     """Projection tensors and a scalar prompt-end fact, live through captured replay."""
 
     identity: RequestIdentity
@@ -147,5 +147,5 @@ __all__ = [
     "ParameterOverlayFieldBinding",
     "ParameterOverlayOperator",
     "Projection",
-    "CapturedParameterOperand",
+    "ProjectionOperands",
 ]

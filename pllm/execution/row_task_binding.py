@@ -308,7 +308,7 @@ def declare_weighted_train(
         when=When.BEFORE_SAMPLE,
         function=prepare_function,
         operation_type=BatchPreparation,
-        implementations=(native("canonical.weighted_batch:prepare@1"),),
+        implementations=(native("weighted_batch:prepare@1"),),
     )
 
     def execute(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
@@ -346,7 +346,7 @@ def declare_weighted_train(
         name,
         inputs={"state": state.read(), "batch": TaskResultInputSource(prepared.symbol, "batch")},
         outputs=("publication",),
-        result_schema="canonical.page_publication@1",
+        result_schema="page_publication@1",
         changes=state,
         when=When.AFTER_SAMPLE,
         math=MathContract(
@@ -516,7 +516,7 @@ def declare_tensor(
             changes=update,
             effect=effect,
             math=math,
-            result_schema="canonical.tensor_training_result@1" if update is not None else result_schema,
+            result_schema="tensor_training_result@1" if update is not None else result_schema,
             when=When.HOST if b.host else when,
             reads=reads,
             implementations=(native(identity or f"{b.graph.workload_id}:{name}@1"),),

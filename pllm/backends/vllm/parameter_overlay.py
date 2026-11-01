@@ -16,10 +16,10 @@ from pllm.backends.vllm.architecture import Decoder, LinearOutput, Mlp, frozen_w
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import (
-    CapturedParameterOperand,
     ParameterOverlayFieldBinding,
     ParameterOverlayOperator,
     Projection,
+    ProjectionOperands,
     ProjectionShape,
 )
 from pllm.contracts.request_identity import RequestIdentity
@@ -87,14 +87,14 @@ class _ExactProjection:
         self.original_forward = module.forward
         self.original_mlp_forward = None if mlp is None else mlp.forward
         self.prepared: tuple[_PreparedRows, ...] = ()
-        self.capture_count = 0
+        self.operand_count = 0
         self.mlp_input: torch.Tensor | None = None
         self.total_rows = 0
         self.apply_count = self.updated_apply_count = 0
         self.transition: ProjectionTransition | None = None
         self.row_overlays: tuple[ProgramOverlay, ...] = ()
 
-    def captures_binding(self, binding: ParameterOverlayFieldBinding) -> bool:
+    def reads_operands(self, binding: ParameterOverlayFieldBinding) -> bool:
         return self.original_mlp_forward is not None or binding.operator is ParameterOverlayOperator.HEAD_ADD
 
     def forward_mlp(self, value: torch.Tensor) -> torch.Tensor:
@@ -109,7 +109,7 @@ class _ExactProjection:
         base = self.original_forward(hidden)
         if not self.prepared:
             return base
-        assert hidden.shape[0] == self.total_rows and not self.capture_count
+        assert hidden.shape[0] == self.total_rows and not self.operand_count
         # The unquantized TP1 projection owns this fresh output, not an input or state page.
         match base:
             case (output, *_):
@@ -139,10 +139,10 @@ class _ExactProjection:
         complete: bool,
     ) -> None:
         inputs = tuple(hidden.index_select(0, item.rows) for item in prepared)
-        captures = tuple(
-            self.capture(item, selected, weight)
+        operands = tuple(
+            self.operands_of(item, selected, weight)
             for item, selected in zip(prepared, inputs, strict=True)
-            if self.captures_binding(item.binding)
+            if self.reads_operands(item.binding)
         )
         if self.row_overlays:
             residuals = {
@@ -151,14 +151,14 @@ class _ExactProjection:
                 for key, value in row_overlay.run(
                     tuple(
                         operand
-                        for operand in captures
+                        for operand in operands
                         if operand.identity == row_overlay.data.step.rows.rows[row_overlay.row].identity
                     )
                 ).items()
             }
         else:
             assert self.transition is not None
-            residuals = self.transition.run(captures, complete=complete)
+            residuals = self.transition.run(operands, complete=complete)
         for item, selected in zip(prepared, inputs, strict=True):
             delta = (residuals[item.source.identity, item.binding.target] * item.binding.scale).to(output.dtype)
             columns = output[:, item.offset : item.offset + item.size]
@@ -167,15 +167,15 @@ class _ExactProjection:
             if item.ref.version_id > 0:
                 self.updated_apply_count += selected.shape[0]
         if not self.row_overlays:
-            self.capture_count += len(captures)
+            self.operand_count += len(operands)
 
-    def capture(self, item: _PreparedRows, selected: torch.Tensor, weight: torch.Tensor) -> CapturedParameterOperand:
+    def operands_of(self, item: _PreparedRows, selected: torch.Tensor, weight: torch.Tensor) -> ProjectionOperands:
         if item.binding.operator is ParameterOverlayOperator.HEAD_ADD:
             desired = selected
         else:
             assert self.mlp_input is not None and self.mlp_input.shape[0] == self.total_rows
             desired = self.mlp_input.index_select(0, item.rows)
-        return CapturedParameterOperand(
+        return ProjectionOperands(
             item.source.identity,
             item.binding.target,
             item.source.phase,
@@ -186,7 +186,7 @@ class _ExactProjection:
         )
 
     def clear(self) -> None:
-        self.prepared, self.capture_count = (), 0
+        self.prepared, self.operand_count = (), 0
         self.mlp_input = None
         self.total_rows = 0
         self.transition = None
@@ -279,15 +279,15 @@ class ExactParameterOverlay:
                 for row, row_overlay, index in zip(rows, row_overlays, indices, strict=True)
                 for binding, offset, size in handle.bindings
             )
-            handle.capture_count, handle.total_rows = 0, sum(index.numel() for index in indices)
+            handle.operand_count, handle.total_rows = 0, sum(index.numel() for index in indices)
 
-    def take_captures(self) -> tuple[CapturedParameterOperand, ...]:
+    def take_operands(self) -> tuple[ProjectionOperands, ...]:
         for handle in self._modules:
             if handle.row_overlays:
                 continue
-            expected = sum(handle.captures_binding(item.binding) for item in handle.prepared)
-            assert handle.capture_count == expected
-            handle.capture_count = 0
+            expected = sum(handle.reads_operands(item.binding) for item in handle.prepared)
+            assert handle.operand_count == expected
+            handle.operand_count = 0
         return ()
 
     def clear(self) -> None:
@@ -514,7 +514,7 @@ class PinnedParameterOverlay:
             reader.prepare(slots, self.starts, rows.total_rows)
         self.apply_count += len(rows.rows) * len(self.readers)
 
-    def take_captures(self) -> tuple[CapturedParameterOperand, ...]:
+    def take_operands(self) -> tuple[ProjectionOperands, ...]:
         if not self.sources or not self.phases:
             return ()
         spans = tuple(
@@ -524,13 +524,13 @@ class PinnedParameterOverlay:
             )
             if row.phase in self.phases
         )
-        results: list[CapturedParameterOperand] = []
+        results: list[ProjectionOperands] = []
         for reader in self.readers if spans else ():
             weight = base_weight(reader.module, reader.binding.reads_weight, reader.captured.device)
             for row, first, last in spans:
                 hidden = reader.captured[first:last].clone()
                 results.append(
-                    CapturedParameterOperand(
+                    ProjectionOperands(
                         row.identity,
                         reader.binding.target,
                         row.phase,
@@ -589,9 +589,9 @@ class HybridParameterOverlay:
         else:
             self.pinned.prepare(rows, context, directory)
 
-    def take_captures(self) -> tuple[CapturedParameterOperand, ...]:
+    def take_operands(self) -> tuple[ProjectionOperands, ...]:
         """Exact consumed training operands in forward; inactive reads produce no task operands."""
-        return self.exact.take_captures()
+        return self.exact.take_operands()
 
     def clear(self) -> None:
         """Release invocation views through their existing owners."""

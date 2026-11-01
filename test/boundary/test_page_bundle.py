@@ -62,7 +62,7 @@ def test_retired_roots_hold_storage_until_pages_are_free() -> None:
     a, b = _admit(arena)
     pin = arena.pin_exact(StateRefs.of((a, b)))
     arena.retire(StateRefs.of((a, b)))
-    assert arena.active_states == 2  # retired roots retain storage, not the admission entitlement
+    assert arena.active_states == 2  # retired roots retain storage, not the admission budget
     replacement = arena.publish(arena.prepare_admission(("dense_fast_weights",)))
     with pytest.raises(RuntimeError):
         arena.prepare_admission(("dense_fast_weights",) * 2)

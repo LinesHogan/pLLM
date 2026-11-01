@@ -13,7 +13,7 @@ from pllm.authoring import FunctionMath, StepInput, WeightedRowBatch
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.execution.state_execution import StateSettlementError
+from pllm.execution.state_execution import PartialCommitError
 from pllm.host import (
     BarrierState,
     Completion,
@@ -66,7 +66,7 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         original = execution.snapshot(initial, stream)
         source = torch.linspace(-1, 1, 24, device=device).reshape(6, 4)
         producer = torch.cuda.current_stream(device) if stream is not None else None
-        batch = CompletionInput.capture(completions, source, producer)
+        batch = CompletionInput.copy_of(completions, source, producer)
         source.zero_()
         assert batch.completions is completions and torch.count_nonzero(batch.hidden) > 0
         rewards = ttrl_vote(batch, config)
@@ -141,7 +141,7 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         with monkeypatch.context() as fault:
             # Fail result conversion after the update is published (workload code is signed, so inject here).
             fault.setattr(FunctionMath, "output", fail_output)
-            with pytest.raises(StateSettlementError) as failure:
+            with pytest.raises(PartialCommitError) as failure:
                 execution.step(rewards.step, stream)
         # Settlement can be retried: it returns the publication that already happened.
         retry = execution.finish_step(failure.value.context)
@@ -170,7 +170,7 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         diagnostics = execution.diagnostics()
         assert diagnostics.active_states == diagnostics.pending_state_releases == 0
 
-    disabled = ttrl_vote(CompletionInput.capture(completions, torch.zeros(6, 4)), replace(config, enabled=False))
+    disabled = ttrl_vote(CompletionInput.copy_of(completions, torch.zeros(6, 4)), replace(config, enabled=False))
     assert all(item.state is BarrierState.BLOCKED for item in disabled.update_barriers)
 
     facts = HostConfig(torch.device("cpu"), hidden_size=4, seed=11)

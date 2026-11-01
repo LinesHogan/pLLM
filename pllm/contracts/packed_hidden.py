@@ -32,7 +32,7 @@ class HiddenRows:
 
     resource: PackedHiddenResourceBinding
     storage: torch.Tensor
-    # Dense packed-row -> slot lookup. Uncaptured rows address a valid padding slot.
+    # Dense packed-row -> slot lookup. Rows without a tap address a valid padding slot.
     slots: npt.NDArray[np.int64]
 
 
@@ -41,7 +41,7 @@ class HiddenRowBatch:
     """Resource-keyed slot publications for one exact packed row batch."""
 
     row_batch: PackedPhaseRowBatch
-    captures: tuple[HiddenRows, ...]
+    taps: tuple[HiddenRows, ...]
 
     @property
     def step_id(self) -> int:

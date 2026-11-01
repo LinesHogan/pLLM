@@ -26,7 +26,7 @@ from pllm.backends.vllm import architecture
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
     AttachmentHiddenResource,
-    BackendPlacementProbe,
+    ModelProbe,
     ProjectionShape,
 )
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
@@ -37,7 +37,7 @@ from pllm.contracts.packed_hidden import (
     PackedHiddenResourceBinding,
 )
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
-from pllm.contracts.parameter_overlay import CapturedParameterOperand
+from pllm.contracts.parameter_overlay import ProjectionOperands
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
 from pllm.contracts.semantic_graph import AnchorId, SchedulerTimeline
@@ -81,7 +81,7 @@ def backend_facts(
     shapes for overlays; `vocab_size` and `layer_count` are needed by workloads that read logits or layers.
     """
     return BackendCompileFacts(
-        BackendPlacementProbe(
+        ModelProbe(
             "c" * 64,
             AttachmentGraphMode.EAGER,
             _CPU_PAGES.device_kind if provider is None else provider.device_kind,
@@ -136,7 +136,7 @@ def step_input(
     tokens: Sequence[Literal["prefill", "decode"]] | None = None,
     sampler_order: Sequence[int] | None = None,
     batch: HostBatch[torch.Tensor] | None = None,
-    operands: tuple[CapturedParameterOperand, ...] = (),
+    operands: tuple[ProjectionOperands, ...] = (),
     stream: torch.cuda.Stream | None = None,
 ) -> StepInput:
     """One packed step: row i belongs to `identities[i]` and decodes unless `tokens` says otherwise.
@@ -156,14 +156,14 @@ def step_input(
         ),
     )
     order = range(count) if sampler_order is None else sampler_order
-    captures = tuple(
+    taps = tuple(
         HiddenRows(binding, tensor, np.arange(count, dtype=np.int64))
         for binding, tensor in sorted((hidden or {}).items(), key=lambda item: item[0].locator_key)
     )
     return StepInput(
         rows,
         PackedSamplerRowBatch(rows, tuple(PackedSamplerRowLink(i, row) for i, row in enumerate(order))),
-        HiddenRowBatch(rows, captures) if captures else None,
+        HiddenRowBatch(rows, taps) if taps else None,
         operands=operands,
         batch=batch,
         hidden_readiness=None if stream is None else CudaStreamReadiness(stream),

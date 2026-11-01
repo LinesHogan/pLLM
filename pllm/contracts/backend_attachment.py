@@ -69,7 +69,7 @@ class CausalModelDomain:
 
 
 @dataclass(frozen=True, slots=True)
-class BackendPlacementProbe:
+class ModelProbe:
     model_fingerprint: str
     graph_mode: AttachmentGraphMode
     device_kind: StateDeviceKind
@@ -146,7 +146,7 @@ class BackendAttachment:
     spec: BackendAttachmentSpec
     task_bindings: tuple[AttachmentTaskBinding, ...]
     sampler_anchor_id: AnchorId
-    probe: BackendPlacementProbe
+    probe: ModelProbe
     plan: PlanBundle
 
 
@@ -159,7 +159,7 @@ __all__ = [
     "SamplerStage",
     "AttachmentTaskBinding",
     "AttachmentTaskRole",
-    "BackendPlacementProbe",
+    "ModelProbe",
 ]
 
 

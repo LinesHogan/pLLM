@@ -15,10 +15,10 @@ import torch
 
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
-    CapturedParameterOperand,
     ParameterOverlayOperator,
     Projection,
     ProjectionDelta,
+    ProjectionOperands,
 )
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import PackedSamplerRowBatch
@@ -252,7 +252,7 @@ class ProjectionTransition(Protocol):
     """The output boundary consumed by a model projection."""
 
     def run(
-        self, operands: tuple[CapturedParameterOperand, ...], *, complete: bool = True
+        self, operands: tuple[ProjectionOperands, ...], *, complete: bool = True
     ) -> Mapping[tuple[RequestIdentity, Projection], torch.Tensor]: ...
 
 
@@ -271,7 +271,7 @@ class ProjectionTask(Generic[DataT, ResultT]):
         self.pending = set(targets)
 
     def run(
-        self, operands: tuple[CapturedParameterOperand, ...], *, complete: bool = True
+        self, operands: tuple[ProjectionOperands, ...], *, complete: bool = True
     ) -> Mapping[tuple[RequestIdentity, Projection], torch.Tensor]:
         """Execute target segments; complete=False keeps targets open across a prompt/decode split."""
         from pllm.execution.step_input import StepInput
@@ -366,12 +366,12 @@ class OverlayTransition:
 
     def group(
         self,
-        operands: tuple[CapturedParameterOperand, ...],
+        operands: tuple[ProjectionOperands, ...],
         target: int,
         indices: tuple[int, ...],
         batch: TensorBatch,
     ) -> tuple[tuple[UpdateOutput, ...], torch.Tensor]:
-        """Gather issued slots once per target/phase; settlement still belongs to the task."""
+        """Gather issued slots once per target/phase; writing results still belongs to the task."""
         if self.chunk is not None:
             # TensorBinding installs the batched executor for every chunked overlay (configure_scans for routes).
             assert self.executor is not None
@@ -380,7 +380,7 @@ class OverlayTransition:
 
     def serial(
         self,
-        operands: tuple[CapturedParameterOperand, ...],
+        operands: tuple[ProjectionOperands, ...],
         target: int,
         indices: tuple[int, ...],
         batch: TensorBatch,
@@ -401,7 +401,7 @@ class OverlayTransition:
                 copy_pages(value, pool, sources, destinations)
         return results, torch.stack(tuple(torch.stack((r.update_count, r.trained_rows)) for r in results)).sum(0)
 
-    def result(self, operand: CapturedParameterOperand, values: Tensors) -> UpdateOutput:
+    def result(self, operand: ProjectionOperands, values: Tensors) -> UpdateOutput:
         """Validate the author's result at its tensor boundary without observing CUDA values."""
         inputs = {
             **values,
@@ -418,7 +418,7 @@ class OverlayTransition:
         return self.validate(result, operand)
 
     @staticmethod
-    def validate(result: UpdateOutput, operand: CapturedParameterOperand) -> UpdateOutput:
+    def validate(result: UpdateOutput, operand: ProjectionOperands) -> UpdateOutput:
         """Check authored results at the same boundary for eager and batched execution."""
         if (
             result.output.shape != operand.desired.shape
@@ -448,10 +448,10 @@ class ProgramOperand(NamedTuple):
 
 
 def join_encounters(
-    operands: Sequence[CapturedParameterOperand], key: Callable[[CapturedParameterOperand], Hashable]
-) -> tuple[CapturedParameterOperand, ...]:
+    operands: Sequence[ProjectionOperands], key: Callable[[ProjectionOperands], Hashable]
+) -> tuple[ProjectionOperands, ...]:
     """Concatenate the rows of operands sharing a key, in first-seen order; the last encounter's prompt end wins."""
-    groups: dict[Hashable, list[CapturedParameterOperand]] = {}
+    groups: dict[Hashable, list[ProjectionOperands]] = {}
     for operand in operands:
         groups.setdefault(key(operand), []).append(operand)
     return tuple(
@@ -481,8 +481,8 @@ class ProgramOverlay:
         self.saved: tuple[torch.Tensor, ...] = ()
         self.gate = torch.zeros((1, 1), device=batch.roots[0][0].device)
         self.prompt_end = torch.zeros((), device=batch.roots[0][0].device, dtype=torch.bool)
-        self.pending: list[CapturedParameterOperand] = []
-        self.ordinary: list[CapturedParameterOperand] = []
+        self.pending: list[ProjectionOperands] = []
+        self.ordinary: list[ProjectionOperands] = []
         self.results: list[OverlayTargetResult] = []
         self.row = 0
         self.in_program = self.private = False
@@ -522,7 +522,7 @@ class ProgramOverlay:
         )
 
     def run(
-        self, operands: tuple[CapturedParameterOperand, ...]
+        self, operands: tuple[ProjectionOperands, ...]
     ) -> Mapping[tuple[RequestIdentity, Projection], torch.Tensor]:
         """Own operands immediately because later model calls may mutate their inputs."""
         outputs: dict[tuple[RequestIdentity, Projection], torch.Tensor] = {}
@@ -558,7 +558,7 @@ class ProgramOverlay:
             self.gate.fill_(1.0)
         self.pending = []
 
-    def captures(self) -> tuple[ProgramOperand, ...]:
+    def operands(self) -> tuple[ProgramOperand, ...]:
         """Export graph outputs independently of the cold request identity."""
         return tuple(
             ProgramOperand(operand.target, operand.hidden, operand.desired, operand.base_weight)
@@ -592,7 +592,7 @@ class ProgramOverlay:
             )
         if not self.in_program:
             self.ordinary.extend(
-                CapturedParameterOperand(
+                ProjectionOperands(
                     row.identity,
                     operand.target,
                     row.phase,

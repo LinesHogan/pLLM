@@ -9,8 +9,8 @@ import pllm
 from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
-    BackendPlacementProbe,
     CausalModelDomain,
+    ModelProbe,
 )
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
@@ -30,7 +30,7 @@ from pllm.execution.step_input import StepInput
 from pllm.workload_transport import decode_workload, encode_workload
 from pllm.workloads.recirculation import RecirculationWorkload
 
-PROBE = BackendPlacementProbe(
+PROBE = ModelProbe(
     "c" * 64,
     AttachmentGraphMode.EAGER,
     StateDeviceKind.CPU,
@@ -165,8 +165,7 @@ def test_recirculation_declaration_fits_reference_budget_and_crosses_the_wire() 
         workload.specialize(FACTS, ExecutionOptions(memory_budget_bytes=reference_budget - 1))
     restored = decode_workload(encode_workload(workload))
     assert (
-        isinstance(restored, RecirculationWorkload)
-        and restored.declaration(FACTS).finish() == workload.declaration(FACTS).finish()
+        isinstance(restored, RecirculationWorkload) and restored.build(FACTS).finish() == workload.build(FACTS).finish()
     )
     with pytest.raises(ValueError):
         replace(WORKLOAD, destination=3).compile_backend(FACTS)

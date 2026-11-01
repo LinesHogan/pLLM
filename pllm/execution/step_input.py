@@ -1,4 +1,4 @@
-"""The packed rows, hidden captures and operands one engine step hands to a compiled workload."""
+"""The packed rows, hidden taps and projection operands one engine step hands to a compiled workload."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import torch
 from pllm.contracts.host_batch import HostBatch, map_host_batch
 from pllm.contracts.packed_hidden import HiddenRowBatch
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
-from pllm.contracts.parameter_overlay import CapturedParameterOperand
+from pllm.contracts.parameter_overlay import ProjectionOperands
 from pllm.execution.cuda_stream import CudaStreamReadiness
 
 
@@ -18,7 +18,7 @@ class StepInput:
     rows: PackedPhaseRowBatch
     sampler_rows: PackedSamplerRowBatch
     hidden: HiddenRowBatch | None = None
-    operands: tuple[CapturedParameterOperand, ...] = ()
+    operands: tuple[ProjectionOperands, ...] = ()
     batch: HostBatch[torch.Tensor] | None = None
     hidden_readiness: CudaStreamReadiness | None = None
     batch_readiness: CudaStreamReadiness | None = None
@@ -29,7 +29,7 @@ class StepInput:
             assert self.hidden_readiness is None
         else:
             assert self.hidden.row_batch is self.rows
-            device = self.hidden.captures[0].storage.device
+            device = self.hidden.taps[0].storage.device
             readiness = None if self.hidden_readiness is None else self.hidden_readiness.device
             assert readiness == (device if device.type == "cuda" else None)
 
@@ -49,9 +49,9 @@ class StepInput:
 
     def hidden_batch(self, stream: torch.cuda.Stream | None) -> HiddenRowBatch:
         if self.hidden is None or (self.hidden_readiness is None) != (stream is None):
-            raise ValueError("hidden captures differ from the input device")
+            raise ValueError("hidden taps differ from the input device")
         if self.hidden_readiness is not None and stream is not None:
             self.hidden_readiness.order_on(stream)
-            for capture in self.hidden.captures:
-                capture.storage.record_stream(stream)
+            for tap in self.hidden.taps:
+                tap.storage.record_stream(stream)
         return self.hidden

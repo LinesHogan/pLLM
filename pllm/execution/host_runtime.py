@@ -48,7 +48,7 @@ def bind_host(
     providers = (
         (
             PageBundleProviderFacts(
-                f"canonical.page_bundle_{config.device.type}@1",
+                f"page_bundle_{config.device.type}@1",
                 3,
                 StateDeviceKind(config.device.type),
             ),
@@ -84,7 +84,7 @@ class CompletionInput:
         )
 
     @classmethod
-    def capture(
+    def copy_of(
         cls, completions: CompletionBatch, hidden: torch.Tensor, stream: torch.cuda.Stream | None = None
     ) -> CompletionInput:
         if (
@@ -100,7 +100,7 @@ class CompletionInput:
             return cls(completions, owned, CudaStreamReadiness(stream) if stream is not None else None)
 
 
-class CompletionCapture:
+class CompletionRows:
     """Write final sampling rows directly into the original owned output tensor."""
 
     def __init__(self, identities: tuple[RequestIdentity, ...], hidden: torch.Tensor) -> None:

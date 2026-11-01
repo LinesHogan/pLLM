@@ -10,7 +10,7 @@ from pllm.workloads.gtta.types import (
     GTTAUpdateReceipt,
     PromptContext,
     TrajectoryFeedback,
-    canonical_state_signature,
+    state_signature,
 )
 from pllm.workloads.gtta.workload import GTTAWorkload
 
@@ -25,5 +25,5 @@ __all__ = [
     "GTTAWorkload",
     "PromptContext",
     "TrajectoryFeedback",
-    "canonical_state_signature",
+    "state_signature",
 ]

@@ -13,8 +13,8 @@ from pllm.contracts.backend_attachment import (
     AttachmentKind,
     AttachmentTaskRole,
     BackendAttachmentSpec,
-    BackendPlacementProbe,
     MissingPolicy,
+    ModelProbe,
 )
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
@@ -405,7 +405,7 @@ class Builder(Generic[D]):
         self,
         plan: PlanBundle | None = None,
         *,
-        model_probe: BackendPlacementProbe | None = None,
+        model_probe: ModelProbe | None = None,
         operations: Mapping[TaskSymbol, TensorOperation[D]],
     ) -> tuple[TaskGraphImplementation[StateTaskContext[D], ProjectionResiduals], ...]:
         functions: list[TaskGraphImplementation[StateTaskContext[D], ProjectionResiduals]] = list(
@@ -470,11 +470,11 @@ class Builder(Generic[D]):
         *,
         when: When = When.PUBLISH,
         name: str = "publish",
-        schema: str = "canonical.page_publication@1",
+        schema: str = "page_publication@1",
         output: str = "publication",
         implementations: tuple[TaskImplementationSpec, ...] = (),
     ) -> Call:
-        implementations = implementations or (native("canonical.state:publish@1", "transition/full_root@1"),)
+        implementations = implementations or (native("state:publish@1", "transition/full_root@1"),)
         call = self.compute(
             name,
             inputs={"transition": transition[transition.outputs[0]]},

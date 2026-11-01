@@ -28,7 +28,7 @@ class GTTAConfig:
             raise ValueError("GTTAConfig needs nonnegative max_queue_size and score_momentum in [0, 1]")
 
 
-def canonical_state_signature(observation: str) -> str:
+def state_signature(observation: str) -> str:
     return " ".join(observation.split()).casefold()
 
 
@@ -119,5 +119,5 @@ __all__ = [
     "GTTAUpdateReceipt",
     "PromptContext",
     "TrajectoryFeedback",
-    "canonical_state_signature",
+    "state_signature",
 ]
