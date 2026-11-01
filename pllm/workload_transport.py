@@ -15,15 +15,15 @@ def encode_workload(workload: BackendWorkload[DataT, ResultT]) -> str:
     """Pickle the workload for the worker; everything it holds must be importable there."""
     if type(workload).__module__ == "__main__":
         raise ValueError(
-            f"multiprocessing=True cannot send {type(workload).__name__} defined in __main__ or a notebook; "
-            "move it into an importable .py module, or keep multiprocessing=False"
+            f"worker processes cannot send {type(workload).__name__} defined in __main__ or a notebook; "
+            "move it into an importable .py module, or use tensor_parallel_size=1 with multiprocessing=False"
         )
     try:
         return b64encode(pickle.dumps(workload)).decode("ascii")
     except (pickle.PicklingError, AttributeError, TypeError) as exc:
         raise ValueError(
-            f"multiprocessing=True sends the workload to its worker by pickling ({exc}); hold module-level "
-            "functions instead of lambdas or closures, or keep multiprocessing=False"
+            f"worker processes receive the workload by pickling ({exc}); hold module-level "
+            "functions instead of lambdas or closures, or use tensor_parallel_size=1 with multiprocessing=False"
         ) from exc
 
 

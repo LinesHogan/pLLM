@@ -602,8 +602,8 @@ def _per_prompt(outputs: list[RequestOutput], n: int) -> list[RequestOutput]:
 
 def vllm_engine(config: ModelConfig, workload_options: dict[str, Any], environment: dict[str, str]) -> LLM:
     """Build the vLLM engine; a workload adds its worker, scheduler and graph options."""
-    compat.admit_parallel(config)
     if config.tensor_parallel_size > 1:
+        workload_options = {**graph_options(config, BackendRequirements()), **workload_options}
         environment.update(VLLM_USE_V2_MODEL_RUNNER="1", VLLM_WORKER_MULTIPROC_METHOD="spawn")
     previous = {name: os.environ.get(name) for name in environment}
     if any(previous[name] not in (None, value) for name, value in environment.items()):
@@ -615,8 +615,8 @@ def vllm_engine(config: ModelConfig, workload_options: dict[str, Any], environme
             revision=config.revision,
             dtype=config.dtype,
             tensor_parallel_size=config.tensor_parallel_size,
-            pipeline_parallel_size=1,
-            data_parallel_size=1,
+            pipeline_parallel_size=config.pipeline_parallel_size,
+            data_parallel_size=config.data_parallel_size,
             distributed_executor_backend="mp" if config.tensor_parallel_size > 1 else "uni",
             enforce_eager=not config.cuda_graphs,
             max_model_len=config.max_model_len,

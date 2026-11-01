@@ -22,7 +22,13 @@ VLLM_027 = __version__ == "0.27.1"
 
 
 def admit_parallel(config: ModelConfig, requirements: BackendRequirements = BackendRequirements()) -> None:
-    """Reject unsupported TP configurations before creating any worker processes."""
+    """Reject unsupported parallel configurations before creating any worker processes."""
+    for size, name in (
+        (config.pipeline_parallel_size, "pipeline_parallel_size"),
+        (config.data_parallel_size, "data_parallel_size"),
+    ):
+        if type(size) is not int or size != 1:
+            raise ValueError(f"pllm needs {name}=1; only tensor parallelism is supported")
     if config.tensor_parallel_size == 1:
         return
     if VLLM_027 or config.runner != "mrv2":

@@ -743,6 +743,8 @@ class _Train(_Effect):
         arguments, captures = operation.arguments()
         definition = operation.context.state_definition(self.state, "@pllm.train needs a declared state")
         mode = _training_mode(arguments)
+        if mode != "request" and operation.phase is Phase.AUTOMATIC:
+            operation = replace(operation, phase=Phase.AFTER_SAMPLE)
         match mode, definition.optimizer:
             case "weighted_batch", SGD() as optimizer:
                 self.weighted(operation, arguments, captures, definition, optimizer)
@@ -814,8 +816,6 @@ class _Train(_Effect):
         optimizer: SGD,
     ) -> None:
         """Declare the weighted SGD batch transition, including its reset and input bindings."""
-        if operation.phase is Phase.AUTOMATIC:
-            operation = replace(operation, phase=Phase.AFTER_SAMPLE)
         if captures:
             raise ValueError("SGD batch training manages its own state writes")
         if not self.reset:
@@ -1772,7 +1772,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         self, declaration: TensorBinding, facts: BackendCompileFacts, options: ExecutionOptions
     ) -> SchedulerTimeline:
         """Reserve ordinary tensor scratch and each requested graph's private pool."""
-        if declaration.trains_on_batch:
+        if declaration.graph.trains_on_batch:
             if options.memory_budget_bytes is not None and not facts.timeline.task_resources:
                 raise ValueError(
                     "training on CausalTrainBatch/WeightedRowBatch inputs (e.g. TLM) cannot be funded under "

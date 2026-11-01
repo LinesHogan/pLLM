@@ -215,13 +215,13 @@ def _observes(task: SemanticTask, output: SemanticOutputKind) -> bool:
 
 
 def _check_training(attachment: BackendAttachment) -> None:
-    """Training reads hidden rows; sampler feedback reaches only the update and its helpers."""
-    if not attachment.probe.hidden_resources:
-        raise ValueError("train and sampler operations need a hidden input, e.g. `h: torch.Tensor = pllm.hidden(0)`")
+    """Row training reads hidden rows; host-batch training already validates its inputs and state scope."""
     spec, graph = attachment.spec, attachment.plan.semantic_graph
+    if not graph.trains_on_batch and not attachment.probe.hidden_resources:
+        raise ValueError("train and sampler operations need a hidden input, e.g. `h: torch.Tensor = pllm.hidden(0)`")
     (state,) = (state for state in graph.states if state.resource == spec.state_resource)
     adds_logits = spec.sampler_stage is SamplerStage.PACKED_PRE_FILTER_ADD
-    if state.scope is not StateScope.REQUEST and not adds_logits:
+    if not graph.trains_on_batch and state.scope is not StateScope.REQUEST and not adds_logits:
         raise ValueError(
             f"declare the trained state {state.resource!r} as pllm.RequestState; only workloads with "
             "@pllm.add_logits train an InstanceState"

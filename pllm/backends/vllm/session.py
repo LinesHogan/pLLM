@@ -289,7 +289,12 @@ class VllmSession(Generic[DataT, ResultT]):
         if self._taps is not None:
             self._taps.prepare(rows.row_batch)
         adapter = self._forward_overlay
-        if adapter is None and self._activation is None and self._replay is None:
+        if (
+            adapter is None
+            and self._activation is None
+            and self._replay is None
+            and not self.attachment.plan.semantic_graph.trains_on_batch
+        ):
             return
         if adapter is not None:
             adapter.reserve()

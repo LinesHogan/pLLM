@@ -89,6 +89,8 @@ class ModelConfig:
     cuda_graphs: bool = True
     kv_offload: KVOffload | None = None
     tensor_parallel_size: int = 1
+    pipeline_parallel_size: int = 1
+    data_parallel_size: int = 1
 
     def __post_init__(self) -> None:
         if type(self.tensor_parallel_size) is not int or self.tensor_parallel_size < 1:

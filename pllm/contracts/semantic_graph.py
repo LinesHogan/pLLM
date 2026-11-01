@@ -229,6 +229,11 @@ class SemanticGraph:
     model_reads: tuple[StateResource, ...] = ()
 
     @property
+    def trains_on_batch(self) -> bool:
+        """Whether a task trains on a host CausalTrainBatch or WeightedRowBatch (declare_batch_train)."""
+        return any(task.math is not None and task.math.reduction == "custom" for task in self.tasks)
+
+    @property
     def replay_task(self) -> SemanticTask | None:
         """The layer-route task; a graph declares at most one."""
         return next((task for task in self.tasks if task.replay is not None), None)

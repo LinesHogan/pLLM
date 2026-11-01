@@ -224,11 +224,6 @@ class TensorBinding(Builder[TensorFrame]):
         )
 
     @property
-    def trains_on_batch(self) -> bool:
-        """Whether a task trains on a host CausalTrainBatch or WeightedRowBatch (declare_batch_train)."""
-        return any(task.math is not None and task.math.reduction == "custom" for task in self.graph.tasks)
-
-    @property
     def weighted_training(self) -> bool:
         """Whether a task trains on a host WeightedCEBatch (declare_weighted_train)."""
         return any(

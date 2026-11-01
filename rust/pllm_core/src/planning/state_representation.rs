@@ -155,9 +155,9 @@ pub(super) fn compile(
             return Ok(());
         }
         if plans.first().is_some_and(|first| {
-            plans.iter().any(|plan| {
-                plan.device_kind != first.device_kind
-            })
+            plans
+                .iter()
+                .any(|plan| plan.device_kind != first.device_kind)
         }) {
             return Ok(());
         }

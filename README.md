@@ -115,6 +115,21 @@ python -m pip install -e ".[vllm032,test]"   # 或 ".[vllm027,test]"
 字段必须能被 pickle（引用模块级函数，不要放 lambda 或闭包）。默认
 `multiprocessing=False` 进程内执行没有这些要求。
 
+`ModelConfig(tensor_parallel_size=2)`（或模型支持的 4）在 vLLM 0.32 MRv2 上启用单节点 TP；
+省略 `workload` 的普通推理也使用该设置。0.27.1 与 MRv1 仅允许 TP=1；PP/DP 固定为 1，其他值会提示设置 `pipeline_parallel_size=1` / `data_parallel_size=1`。
+TP>1 支持 hidden 观测、采样引导/反馈，以及各 rank 上一致训练的 RequestState/InstanceState
+（ESamp、TTRL、输出 LoRA 等）；激活补丁仍需 `cuda_graphs=False`。参数 overlay、causal_model/TLM、
+Feed、layer_route 和 PositionState 在 TP>1 构造时拒绝，并提示设置 `tensor_parallel_size=1`。
+TP>1 始终使用多进程 worker，负载须满足上面的 pickle 传输约束；不能直接访问 `llm.runner` 或 `llm.feed()`。
+辅助张量经 CPU 共享内存复制到各 rank；completion 只由输出 rank 写入，默认返回 CPU 张量。
+计划和附件不再保存设备 ordinal，绑定使用 worker 的本地设备；旧的序列化计划需要重新编译。
+`diagnostics()` / `worker_state()` 检查所有 rank 的逻辑计数，不一致时抛出断言；内存分配与回收时序不参与比较。
+`command()` 现在返回按 rank 排序的回复列表（TP=1 也返回单元素列表）；`trace_snapshots()` 返回所有 rank
+的 trace，`trace_snapshot()` 保留输出 rank 的视图。观测和导出回调在每个 worker 中运行。
+TP>1 的普通推理与负载推理使用相同的 graph capture 行数上限（`max_num_batched_tokens`）。
+批次 AdamW 训练的自动 phase 现在默认 AFTER_SAMPLE，与批次 SGD 一致；此前 TTRL 等未显式
+标注 phase 的宿主批次负载用于模型后端时会报错，宿主执行的 HOST_COMPUTE 行为不变。
+
 CUDA 后端自动将普通逐行预测、训练和字段写入捕获为 CUDA graph，包含 autograd、
 私有页写入和 AdamW；ESamp 使用此通用路径。逐请求训练的方法返回逐行 loss，由框架屏蔽填充行
 并执行 `mean` 或 `state_mean`，不能在用户方法中混合行；在宿主批次（`WeightedRowBatch`、

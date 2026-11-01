@@ -73,8 +73,10 @@ def make_llm(config: ModelConfig, *, workload: BackendWorkload[D, R] | None = No
     if workload is None:
         if config.execution != ExecutionOptions():
             raise ValueError("workload execution options require a workload")
+        from pllm.backends.vllm.compat import admit_parallel
         from pllm.backends.vllm.runtime import vllm_engine
 
+        admit_parallel(config)
         return vllm_engine(config, {"worker_cls": "auto"}, {})
     from pllm.backends.vllm.runtime import create_vllm_llm
 
