@@ -19,3 +19,9 @@ class RMSNorm(Module):
     def forward(self, x: torch.Tensor, residual: None = None) -> torch.Tensor: ...
     @overload
     def forward(self, x: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+class GemmaRMSNorm(Module):
+    """x * (1 + weight): the stored weight is an offset from unit gain."""
+
+    variance_epsilon: float
+    weight: torch.Tensor

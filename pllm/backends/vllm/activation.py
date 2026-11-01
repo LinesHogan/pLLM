@@ -57,12 +57,13 @@ class _ActivationLayer:
         self.prepared: tuple[_PatchRows, ...] = ()
         self.apply_count = 0
 
-    def forward(self, *inputs: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
-        # Families order (positions, hidden, residual) differently; only the returned pair is shared.
-        hidden, residual = self.original(*inputs)
+    def forward(self, *args: torch.Tensor | None, **kwargs: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+        # Families order (positions, hidden, residual) differently, and Qwen3.5 passes them by keyword;
+        # only the returned pair is shared.
+        hidden, residual = self.original(*args, **kwargs)
         if not self.prepared:
             return hidden, residual
-        # Decoder layers return a fresh down-projection output, separate from its residual.
+        # Decoder layers return a fresh MLP (or expert) output, separate from its residual.
         for item in self.prepared:
             # An added vector needs no gather of the patched rows.
             rows = hidden if len(item.fields) == 1 else hidden.index_select(0, item.rows)

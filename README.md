@@ -155,6 +155,20 @@ forward 重叠。采样前只读的任务固定读取延迟版本：步 N+1 可�
 - **模型**：准入按 vLLM 的精确类判断，不接受子类：Phi3、Mistral 等相近架构可能改变投影布局、
   注意力或 logits，尚未逐一验证。示例用 Qwen2.5 检查点只是为了方便。
   - 未量化的 `Qwen2ForCausalLM`、`LlamaForCausalLM`、`Qwen3ForCausalLM` 支持全部功能。
+  - 未量化的 Qwen3-MoE 与 Qwen3.5 混合模型支持所有只读功能（见下一条），改写类功能按结构取舍：
+
+    | 家族（vLLM 类） | q/v overlay | MLP down overlay | 层路由、PositionState | 因果训练（TLM） |
+    |---|---|---|---|---|
+    | Qwen3-MoE（`Qwen3MoeForCausalLM`） | 支持 | 专家层不支持 | 支持 | 不支持 |
+    | Qwen3.5（`Qwen3_5ForCausalLM`、`Qwen3_5MoeForCausalLM`） | 只有全注意力层的 v | 稠密层支持，专家层不支持 | 不支持 | 不支持 |
+
+    Qwen3-MoE 的注意力和 KV 与 Qwen3 相同；它的 MLP 由多个专家组成，每个专家有自己的 down 投影，
+    按专家做 overlay 还没有设计。Qwen3.5 的大部分层是 Gated DeltaNet，状态是随 token 更新的递归矩阵和
+    卷积窗口，不在 KV 页里，而层路由和 PositionState 只保存和重放 KV；这些层也没有 q/v 投影。
+    Qwen3.5 的全注意力层把每个头的 query 和输出门交错放在同一个投影里，只有 v 是连续的一段。
+    因果训练只实现了稠密 Qwen2、Llama、Qwen3 的前向。Qwen3.5 的官方检查点是多模态的
+    （`Qwen3_5ForConditionalGeneration`），需先做成纯文本模型：把 `text_config` 展开为顶层配置，
+    `architectures` 改为 `Qwen3_5ForCausalLM`，只保留 `model.language_model.*` 权重并改名为 `model.*`。
   - `DeepseekV2ForCausalLM`、`DeepseekV3ForCausalLM`（MLA 注意力 + MoE）、`GptOssForCausalLM`
     （sink 注意力 + MXFP4 MoE），以及量化的 Qwen2/Llama/Qwen3（已验证 GPTQ-Int4），只支持只读功能：
     hidden tap 与导出、ESamp、采样器引导与反馈、`add_logits`、激活补丁。它们只读取或改写层输出与 logits，

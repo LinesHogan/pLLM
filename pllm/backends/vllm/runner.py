@@ -148,7 +148,7 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
             os.environ.get(POSITION_ENV, '{"states": []}'), PositionAnnouncement
         ).states
         if self.position_states:
-            self.decoder.writable("a PositionState")
+            self.decoder.kv_writable("a PositionState")
             if self.cache_config.cache_dtype != "auto":
                 raise ValueError("PositionState requires cache_dtype=auto in the model dtype")
         self.position_layers = tuple(

@@ -1,4 +1,4 @@
-"""Causal training for the admitted vLLM decoders over borrowed weights and RoPE caches."""
+"""Causal training for the dense vLLM decoders (Qwen2, Llama, Qwen3) over borrowed weights and RoPE caches."""
 
 from collections.abc import Callable
 from functools import partial
@@ -10,7 +10,7 @@ from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.models.qwen2 import Qwen2Attention
 from vllm.model_executor.models.qwen3 import Qwen3Attention
 
-from pllm.backends.vllm.architecture import Decoder, DenseLayer, Projection
+from pllm.backends.vllm.architecture import DENSE_ARCHITECTURES, Decoder, DenseLayer, Projection
 from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding
 from pllm.execution.parameter_projection import parameter_correction
 
@@ -97,8 +97,14 @@ class CausalTraining:
     """Frozen decoder arithmetic with projection views bound once by the worker."""
 
     def __init__(self, decoder: Decoder, bindings: tuple[ParameterOverlayFieldBinding, ...]) -> None:
-        self.model = decoder.writable("causal training")
-        if self.model.model.embed_tokens.weight.dtype is not torch.bfloat16:
+        model = decoder.writable("causal training")
+        if not isinstance(model, DENSE_ARCHITECTURES):
+            raise ValueError(
+                f"causal training implements dense Qwen2, Llama and Qwen3 decoders; choose one of those "
+                f"instead of {type(model).__name__}"
+            )
+        self.model = model
+        if model.model.embed_tokens.weight.dtype is not torch.bfloat16:
             raise ValueError("causal training requires qualified unquantized BF16 TP1 weights")
         self.projections: dict[Projection, list[tuple[int, int, ParameterOverlayFieldBinding, slice]]] = {}
         start = 0

@@ -1,15 +1,18 @@
 """Shared decoder structure and native logits bound once by the vLLM runners.
 
 All admitted families expose the same hidden sites. Block taps keep the fresh
-layer output, without its separately returned residual. Only unquantized dense
-Qwen2, Llama and Qwen3 models expose the projections and per-layer KV that
-parameter overlays, causal training and layer routes rewrite; other admitted
-models run read-only workloads (hidden taps, sampler stages, activation patches).
+layer output, without its separately returned residual. Unquantized dense Qwen2,
+Llama and Qwen3 models support every feature. Qwen3-MoE keeps Qwen3 attention and
+KV but routes its MLP through experts; the Qwen3.5 hybrids interleave Gated
+DeltaNet layers, whose recurrent state is not KV, with gated full attention.
+`Decoder.projection` and `Decoder.kv_writable` decide which projections and layer
+replays those two admit. Other admitted models run read-only workloads (hidden
+taps, sampler stages, activation patches).
 """
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol, TypeAlias
 
 from torch import Tensor, nn
 from torch.nn import Parameter
@@ -23,16 +26,39 @@ from vllm.model_executor.models.gpt_oss import GptOssForCausalLM, GptOssModel, T
 from vllm.model_executor.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaModel
 from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM, Qwen2Model
 from vllm.model_executor.models.qwen3 import Qwen3DecoderLayer, Qwen3ForCausalLM, Qwen3Model
+from vllm.model_executor.models.qwen3_moe import (
+    Qwen3MoeDecoderLayer,
+    Qwen3MoeForCausalLM,
+    Qwen3MoeModel,
+    Qwen3MoeSparseMoeBlock,
+)
 
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
 
+# Importing vLLM's qwen3_next (and qwen3_5, which builds on it) initializes CUDA, which the frontend
+# process of a multiprocess engine must not do; the worker-side methods below import them where used.
+if TYPE_CHECKING:
+    from vllm.model_executor.models.qwen3_5 import (
+        Qwen3_5DecoderLayer,
+        Qwen3_5ForCausalLM,
+        Qwen3_5Model,
+        Qwen3_5MoeForCausalLM,
+    )
+
 DenseLM = Qwen2ForCausalLM | LlamaForCausalLM | Qwen3ForCausalLM
-CausalLM = DenseLM | DeepseekV2ForCausalLM | GptOssForCausalLM
-DecoderBody = Qwen2Model | LlamaModel | Qwen3Model | DeepseekV2Model | GptOssModel
+# Families whose layer state lives only in KV pages, so layer routes and PositionState can replay it.
+KvLM = DenseLM | Qwen3MoeForCausalLM
+WritableLM: TypeAlias = "KvLM | Qwen3_5ForCausalLM | Qwen3_5MoeForCausalLM"
+CausalLM: TypeAlias = "WritableLM | DeepseekV2ForCausalLM | GptOssForCausalLM"
+DecoderBody: TypeAlias = (
+    "Qwen2Model | LlamaModel | Qwen3Model | Qwen3MoeModel | Qwen3_5Model | DeepseekV2Model | GptOssModel"
+)
 DenseLayer = Qwen2DecoderLayer | LlamaDecoderLayer | Qwen3DecoderLayer
-DecoderLayer = DenseLayer | DeepseekV2DecoderLayer | TransformerBlock
+DecoderLayer: TypeAlias = (
+    "DenseLayer | Qwen3MoeDecoderLayer | Qwen3_5DecoderLayer | DeepseekV2DecoderLayer | TransformerBlock"
+)
 Logits = Callable[[Tensor], Tensor | None]
 LinearOutput = Tensor | tuple[Tensor, Parameter | None]
 LinearForward = Callable[[Tensor], LinearOutput]
@@ -64,12 +90,24 @@ class Decoder:
     # Why only read-only workloads run on this model; None when every workload does.
     read_only: str | None
 
-    def writable(self, feature: str) -> DenseLM:
+    def writable(self, feature: str) -> WritableLM:
         """The model for `feature`, which rewrites weights or reruns layers; read-only models reject it."""
         if self.read_only is not None:
             raise ValueError(f"{feature} {self.read_only}")
-        assert isinstance(self.model, DENSE_ARCHITECTURES)
+        assert not isinstance(self.model, (DeepseekV2ForCausalLM, GptOssForCausalLM))
         return self.model
+
+    def kv_writable(self, feature: str) -> KvLM:
+        """The model for `feature`, which replays layer state through KV pages alone."""
+        from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM
+
+        model = self.writable(feature)
+        if isinstance(model, (Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM)):
+            raise ValueError(
+                f"{feature} replays layer state through KV pages, but {type(model).__name__} keeps "
+                "Gated DeltaNet recurrent state outside them; use a Qwen2, Llama, Qwen3 or Qwen3-MoE model"
+            )
+        return model
 
     @property
     def identity(self) -> str:
@@ -78,25 +116,46 @@ class Decoder:
         return f"{cls.__module__}.{cls.__qualname__}"
 
     def projection(self, target: ParameterTarget) -> tuple[Projection, int, int, Mlp | None]:
-        """Resolve the supported projection and its disjoint output slice."""
+        """Resolve the supported projection and its disjoint output slice; reject layouts pllm cannot slice."""
+        from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer
+        from vllm.model_executor.models.qwen3_next import Qwen3NextAttention, Qwen3NextSparseMoeBlock
+
         assert target.layer is not None
         layer = self.writable("a parameter overlay").model.layers[target.layer]
         if target.module is ParameterModuleKind.MLP and target.role is ParameterRole.DOWN_PROJECTION_WEIGHT:
-            module = layer.mlp.down_proj
-            return module, 0, int(module.weight.shape[0]), layer.mlp
+            mlp = layer.mlp
+            if isinstance(mlp, (Qwen3MoeSparseMoeBlock, Qwen3NextSparseMoeBlock)):
+                raise ValueError(
+                    f"layer {target.layer} routes tokens to experts; MLP down overlays need a dense MLP, "
+                    "so overlay the attention query or value projection instead"
+                )
+            return mlp.down_proj, 0, int(mlp.down_proj.weight.shape[0]), mlp
         if target.module is ParameterModuleKind.ATTENTION:
+            if isinstance(layer, Qwen3_5DecoderLayer) and layer.layer_type != "full_attention":
+                raise ValueError(
+                    f"layer {target.layer} is a Gated DeltaNet layer; overlay a full-attention layer "
+                    "(see layer_types in the model config)"
+                )
             attention = layer.self_attn
+            # Gated attention stores qkv_proj rows as [per-head (query, gate) pairs, key, value].
+            gated = isinstance(attention, Qwen3NextAttention) and attention.attn_output_gate
             if target.role is ParameterRole.QUERY_PROJECTION_WEIGHT:
+                if gated:
+                    raise ValueError(
+                        "gated attention interleaves each head's query rows with its output-gate rows; "
+                        "overlay the value projection instead"
+                    )
                 return attention.qkv_proj, 0, attention.q_size, None
             if target.role is ParameterRole.VALUE_PROJECTION_WEIGHT:
-                return attention.qkv_proj, attention.q_size + attention.kv_size, attention.kv_size, None
+                start = (2 if gated else 1) * attention.q_size + attention.kv_size
+                return attention.qkv_proj, start, attention.kv_size, None
         raise ValueError("parameter overlay requires an MLP down or attention q/v projection")
 
 
 # Reviewed invariant for these exact vLLM classes: qkv_proj splits into
-# [q_size, kv_size, kv_size]. The query slice flows only through per-head q_norm
-# (Qwen3, or Qwen2 when enabled), RoPE and the attention query; it cannot write
-# same-layer K/V. Overlay corrections enter before that split.
+# [q_size, kv_size, kv_size], or [2 * q_size, kv_size, kv_size] with the Qwen3.5 output gate. The query
+# slice flows only through per-head q_norm (Qwen3 and Qwen3-MoE, or Qwen2 when enabled), RoPE and the
+# attention query; it cannot write same-layer K/V. Overlay corrections enter before that split.
 # These families share the decoder structure; logits dispatch remains native to each model.
 DENSE_ARCHITECTURES = (Qwen2ForCausalLM, LlamaForCausalLM, Qwen3ForCausalLM)
 _MLA_MOE = "has MLA attention (no separate V projection, a latent KV cache) and per-expert MoE projections"
@@ -107,15 +166,24 @@ READ_ONLY_ARCHITECTURES: dict[type[CausalLM], str] = {
     DeepseekV3ForCausalLM: _MLA_MOE,
     GptOssForCausalLM: "has sink attention with sliding windows and per-expert MXFP4 MoE projections",
 }
-ARCHITECTURES = (*DENSE_ARCHITECTURES, *READ_ONLY_ARCHITECTURES)
 
 
 def bind_model(model: nn.Module, quantization: str | None) -> Decoder:
     """Admit a concrete vLLM architecture at model load, before any instance wrapping."""
+    from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM
+
+    architectures = (
+        *DENSE_ARCHITECTURES,
+        Qwen3MoeForCausalLM,
+        Qwen3_5ForCausalLM,
+        Qwen3_5MoeForCausalLM,
+        *READ_ONLY_ARCHITECTURES,
+    )
     # Exact classes: vLLM subclasses such as Phi3 or TeleFLM change weights or logits scaling.
-    if type(model) not in ARCHITECTURES or not isinstance(model, ARCHITECTURES):
+    if type(model) not in architectures or not isinstance(model, architectures):
         raise ValueError(
-            "choose a Qwen2, Llama, Qwen3, DeepseekV2, DeepseekV3 or GptOss ForCausalLM model for vLLM workloads"
+            "choose a Qwen2, Llama, Qwen3, Qwen3Moe, Qwen3_5, Qwen3_5Moe, DeepseekV2, DeepseekV3 or GptOss "
+            "ForCausalLM model for vLLM workloads"
         )
     family = READ_ONLY_ARCHITECTURES.get(type(model))
     if family is not None:
@@ -125,7 +193,7 @@ def bind_model(model: nn.Module, quantization: str | None) -> Decoder:
     else:
         return Decoder(model, model.compute_logits, None)
     read_only = (
-        f"needs an unquantized Qwen2, Llama or Qwen3 model ({reason}); "
+        f"needs an unquantized Qwen2, Llama, Qwen3, Qwen3-MoE or Qwen3.5 model ({reason}); "
         "hidden taps, ESamp, sampler stages and activation patches still run on this model"
     )
     return Decoder(model, model.compute_logits, read_only)

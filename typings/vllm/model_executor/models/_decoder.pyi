@@ -36,7 +36,7 @@ class DecoderMLP(Module):
     def forward(self, x: Tensor) -> Tensor: ...
 
 _Attention = TypeVar("_Attention", bound=DecoderAttention)
-_MLP = TypeVar("_MLP", bound=DecoderMLP)
+_MLP = TypeVar("_MLP", bound=Module)
 _Layer = TypeVar("_Layer", bound=Module, covariant=True)
 
 class DecoderLayer(Module, Generic[_Attention, _MLP]):
