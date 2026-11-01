@@ -74,9 +74,11 @@ class FieldView:
     def read(self, tensor: torch.Tensor, *, pooled: bool = False) -> torch.Tensor:
         """Borrow the named slice while preserving a pool's leading slot axis."""
         prefix = (len(tensor),) if pooled else ()
-        return (
-            tensor.reshape(*prefix, -1).narrow(int(pooled), self.offset, prod(self.shape)).view((*prefix, *self.shape))
-        )
+        flat = tensor.reshape(*prefix, -1)
+        # Even a full-width narrow allocates and copies a full gradient in backward.
+        if self.offset or prod(self.shape) != flat.shape[-1]:
+            flat = flat.narrow(int(pooled), self.offset, prod(self.shape))
+        return flat.view((*prefix, *self.shape))
 
 
 @dataclass(frozen=True, slots=True)

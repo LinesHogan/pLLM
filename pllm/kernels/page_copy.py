@@ -14,9 +14,10 @@ def _copy_pages(
     source_stride: tl.constexpr,
     destination_stride: tl.constexpr,
     width: tl.constexpr,
+    block: tl.constexpr,
 ) -> None:
-    row = tl.program_id(0) // tl.cdiv(width, 256)
-    column = (tl.program_id(0) % tl.cdiv(width, 256)) * 256 + tl.arange(0, 256)
+    row = tl.program_id(0) // tl.cdiv(width, block)
+    column = (tl.program_id(0) % tl.cdiv(width, block)) * block + tl.arange(0, block)
     src = tl.load(sources + row)
     dst = tl.load(destinations + row)
     valid = (dst >= 0) & (column < width)
@@ -35,8 +36,10 @@ def copy_pages(
         return
     width = source[0].numel()
     if width:
-        _copy_pages[(len(destinations) * ((width + 255) // 256),)](
-            source, destination, sources, destinations, source.stride(0), destination.stride(0), width
+        # Larger tiles avoid thousands of idle blocks in masked optimizer fallback copies.
+        block = 2048
+        _copy_pages[(len(destinations) * triton.cdiv(width, block),)](
+            source, destination, sources, destinations, source.stride(0), destination.stride(0), width, block
         )
 
 

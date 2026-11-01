@@ -45,7 +45,6 @@ from pllm.execution.tensor_frame import (
     TensorPort,
     Tensors,
     feedback_port,
-    field_rows,
 )
 from pllm.execution.tensor_program import (
     BatchOperation,
@@ -271,18 +270,13 @@ def parameter_ports(
 
         def request_port(key: str) -> TensorPort:
             view = views[key]
-            field_index, start, shape = view.field, view.offset, view.shape
 
             def read(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
                 table = data.table.for_resource(state.declaration.resource)
-                size = prod(shape)
-                if field_index == 0 and table.leaf is not None:
-                    rows = table.leaf.narrow(1, start or 0, size).index_select(0, table.index.states)
-                else:
-                    rows = field_rows(table, field_index, start or 0, size)
-                return rows.view(len(rows), *shape)
+                field = table.leaf if view.field == 0 and table.leaf is not None else table.fields[view.field]
+                return view.read(field, pooled=True).index_select(0, table.index.states)
 
-            return TensorPort(state.read(), read, field=field_index)
+            return TensorPort(state.read(), read, field=view.field)
 
         return {key: request_port(key) for key in views}
 

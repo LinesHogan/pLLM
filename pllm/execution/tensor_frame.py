@@ -186,12 +186,6 @@ def row_plan(data: "TensorFrame", batch: TensorBatch) -> RowPlan:
     return data.plan
 
 
-def field_rows(rows: FixedRows, field: int, start: int, size: int) -> torch.Tensor:
-    """`field[start:start+size]` of each row's state, `[rows, size]`; copies only that slice."""
-    pool = rows.fields[field]
-    return pool.reshape(len(pool), -1).narrow(1, start, size).index_select(0, rows.index.states)
-
-
 class FieldRoots(Sequence[tuple[torch.Tensor, ...]]):
     """Lazy per-state views of gathered fields; request ports usually need no root views."""
 
