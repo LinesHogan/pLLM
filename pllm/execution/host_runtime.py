@@ -57,7 +57,6 @@ class TensorHostBinding(Generic[InputT, DataT, ResultT]):
                     f"canonical.page_bundle_{facts.device.type}@1",
                     3,
                     StateDeviceKind(facts.device.type),
-                    facts.device.index or 0,
                 ),
             )
             if self.layouts.layouts

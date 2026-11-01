@@ -34,7 +34,6 @@ PROBE = BackendPlacementProbe(
     "c" * 64,
     AttachmentGraphMode.EAGER,
     StateDeviceKind.CPU,
-    0,
     TensorDType.FLOAT32,
     4,
     4,

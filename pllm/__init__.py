@@ -75,11 +75,11 @@ def make_llm(config: ModelConfig, *, workload: BackendWorkload[D, R] | None = No
             raise ValueError("workload execution options require a workload")
         from pllm.backends.vllm.runtime import vllm_engine
 
-        return vllm_engine(config, {"worker_cls": "auto"})
+        return vllm_engine(config, {"worker_cls": "auto"}, {})
     from pllm.backends.vllm.runtime import create_vllm_llm
 
     definition = None
-    if config.multiprocessing:
+    if config.multiprocessing or config.tensor_parallel_size > 1:
         from pllm.workload_transport import encode_workload
 
         definition = encode_workload(workload)

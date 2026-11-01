@@ -20,7 +20,6 @@ class StateProviderPlan:
     resource: str
     provider_id: str
     device_kind: StateDeviceKind
-    device_ordinal: int
     layout_id: LayoutId
     max_admitted_lineages: int
     page_capacity: int

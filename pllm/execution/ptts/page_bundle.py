@@ -20,7 +20,7 @@ from pllm.contracts.codec import boundary_digest, encode_boundary
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.semantic_graph import StateEffectKind
 from pllm.contracts.state_ref import LineageId, StateRef, VersionId
-from pllm.contracts.state_representation import StateDeviceKind, StateProviderPlan
+from pllm.contracts.state_representation import StateProviderPlan
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.admission import WindowBackpressure
 from pllm.execution.cuda_stream import upload
@@ -236,13 +236,8 @@ class PageBundleArena:
     ) -> None:
         self.plan = plan
         self.plan_digest = boundary_digest(plan)
-        placements = {(item.device_kind, item.device_ordinal) for item in plan.states.plans}
-        if not placements:
-            assert device is not None
-            self.device = device
-        else:
-            kind, ordinal = placements.pop()
-            self.device = torch.device("cpu") if kind is StateDeviceKind.CPU else torch.device("cuda", ordinal)
+        device = device or torch.device(plan.states.plans[0].device_kind.value)
+        self.device = torch.device("cuda", torch.cuda.current_device()) if device == torch.device("cuda") else device
         self._pools: dict[str, SlotPools] = {}
         self._tables: dict[str, _Table] = {}
         layouts = {item.resource: item.layout for item in plan.tensor_layout_request.layouts}

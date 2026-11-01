@@ -402,6 +402,18 @@ class StateDiagnostics:
     hold_count: int = 0
     last_hold: HeldInput | None = None
 
+    def logical_counts(self) -> tuple[int, ...]:
+        """Rank-invariant progress, excluding allocator/event timing and device identities."""
+        return (
+            self.active_lineages,
+            self.inference_pins,
+            self.loss_count,
+            self.update_count,
+            self.trained_rows,
+            self.completed_sampler_pins,
+            self.hold_count,
+        )
+
 
 class StateSettlementError(RuntimeError, Generic[DataT]):
     def __init__(self, context: StateTaskContext[DataT], receipt: PagePublication) -> None:

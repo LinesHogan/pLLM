@@ -12,10 +12,30 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.sample.sampler import Sampler as VllmSampler
 from vllm.v1.worker.gpu_worker import Worker as VllmWorker
 
+from pllm.authoring import BackendRequirements
+from pllm.config import ModelConfig
+
 SUPPORTED_VLLM = ("0.27.1", "0.32.0")
 if __version__ not in SUPPORTED_VLLM:
     raise ImportError(f"pllm runs on vLLM 0.27.1 or 0.32.0; install one of them instead of vLLM {__version__}")
 VLLM_027 = __version__ == "0.27.1"
+
+
+def admit_parallel(config: ModelConfig, requirements: BackendRequirements = BackendRequirements()) -> None:
+    """Reject unsupported TP configurations before creating any worker processes."""
+    if config.tensor_parallel_size == 1:
+        return
+    if VLLM_027 or config.runner != "mrv2":
+        raise ValueError('multi-GPU needs vLLM 0.32.0 and runner="mrv2"; otherwise use tensor_parallel_size=1')
+    for used, feature in (
+        (requirements.causal_training, "causal_model training"),
+        (requirements.parameter_targets, "parameter overlays"),
+        (requirements.feeds, "state feeds"),
+        (requirements.layer_routes or requirements.position_states, "layer routes and PositionState"),
+    ):
+        if used:
+            raise ValueError(f"{feature} needs tensor_parallel_size=1")
+
 
 if VLLM_027:
     from contextlib import AbstractContextManager

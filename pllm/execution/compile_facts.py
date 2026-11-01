@@ -25,7 +25,7 @@ class BackendCompileFacts:
     @property
     def device(self) -> torch.device:
         return (
-            torch.device("cuda", self.probe.device_ordinal)
+            torch.device("cuda", torch.cuda.current_device() if torch.cuda.is_initialized() else 0)
             if self.probe.device_kind.value == "cuda"
             else torch.device("cpu")
         )

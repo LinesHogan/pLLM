@@ -384,7 +384,7 @@ def _capture_routes(
     tensor = TokenTensor(
         (1, probe.hidden_size),
         probe.tensor_dtype.torch,
-        "cpu" if probe.device_kind.value == "cpu" else f"cuda:{probe.device_ordinal}",
+        probe.device_kind.value,
     )
     names = tuple(name for name, _ in position_states)
     return tuple(

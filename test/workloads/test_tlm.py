@@ -67,21 +67,20 @@ class TinyCausalPort:
 
 def _facts(model, *, reserved=0, task_resources=()) -> BackendCompileFacts:
     """Single-device facts before workload template reservations."""
-    kind, ordinal = StateDeviceKind(model.device.type), model.device.index or 0
+    kind = StateDeviceKind(model.device.type)
     timeline = model_timeline(model.device, ("optimizer/adamw@1", "transition/full_root@1"))
     timeline = replace(timeline, reserved_bytes=(reserved,) * len(timeline.anchors), task_resources=task_resources)
     probe = BackendPlacementProbe(
         "c" * 64,
         AttachmentGraphMode.EAGER,
         kind,
-        ordinal,
         model.tensor_dtype,
         model.targets[0].input_size,
         8,
         (),
         (),
     )
-    provider = PageBundleProviderFacts("test.tlm@1", 4, kind, ordinal)
+    provider = PageBundleProviderFacts("test.tlm@1", 4, kind)
     return BackendCompileFacts(replace(probe, targets=model.targets), timeline, (provider,), 2, 32768, 7, layer_count=1)
 
 

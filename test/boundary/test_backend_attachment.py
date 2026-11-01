@@ -45,7 +45,6 @@ def overlay_facts():
         "c" * 64,
         AttachmentGraphMode.EAGER,
         StateDeviceKind.CPU,
-        0,
         TensorDType.FLOAT32,
         3,
         8,
@@ -106,7 +105,7 @@ def test_factory_failure_releases_an_already_created_engine(multiprocessing: boo
         }
         # Inject the engine at the vLLM constructor boundary.
         with patch.dict(os.environ, environment), patch.object(runtime, "LLM", return_value=engine):
-            with pytest.raises((AttributeError, IndexError)):
+            with pytest.raises((AttributeError, ValueError)):
                 pllm.make_llm(
                     pllm.ModelConfig("unused-local-model", multiprocessing=multiprocessing),
                     workload=ESampRequestWorkload(),
@@ -146,6 +145,7 @@ def test_failed_shutdown_retains_the_shared_input_fd_until_close_retries() -> No
         collective_rpc=rpc,
         llm_engine=SimpleNamespace(
             engine_core=SimpleNamespace(shutdown=shutdown),
+            vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=1)),
             abort_request=fail,
             output_processor=SimpleNamespace(request_states={"0": SimpleNamespace(external_req_id="0")}),
         ),

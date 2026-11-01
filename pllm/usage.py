@@ -1764,6 +1764,8 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             ),
             position_states=context.position_states(),
             layer_routes=bool(context.routes),
+            causal_training=any(isinstance(source, _CausalModel) for source in inputs),
+            feeds=any(state.feed is not None for state in context.state_definitions.values()),
         )
 
     def resource_facts(

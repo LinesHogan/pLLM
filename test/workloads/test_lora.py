@@ -31,7 +31,6 @@ def compile_lora(config, device=torch.device("cpu"), *, lineages=3, pages=3):
         "canonical.cuda_dense_page@1" if cuda else "test.page@1",
         pages,
         StateDeviceKind.CUDA if cuda else StateDeviceKind.CPU,
-        0,
     )
     facts = backend_facts(
         4, (BINDING,), model_timeline(device), provider, max_lineages=lineages, memory_bytes=32 * 1024**2

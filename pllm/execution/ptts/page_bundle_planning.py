@@ -65,10 +65,6 @@ def compile_page_bundle_plan(
         candidates,
     )
     states, schedule = compile_state_schedule(graph, timeline, request)
-    if any(
-        item.device_kind.value != device.type or item.device_ordinal != (device.index or 0) for item in states.plans
-    ):
-        raise RuntimeError("Rust-selected state placement differs from mathematical specialization")
     return PlanBundle(graph, timeline, schedule, states, layouts, layout_decision)
 
 
@@ -82,7 +78,6 @@ class PageBundleProviderFacts:
     provider_id: str
     page_capacity: int
     device_kind: StateDeviceKind = StateDeviceKind.CPU
-    device_ordinal: int = 0
 
     def materialize_plan(
         self,
@@ -105,7 +100,6 @@ class PageBundleProviderFacts:
             resource=resource,
             provider_id=self.provider_id,
             device_kind=self.device_kind,
-            device_ordinal=self.device_ordinal,
             layout_id=binding.layout_id,
             max_admitted_lineages=1 if immutable_instance else max_admitted_lineages,
             page_capacity=capacity,

@@ -75,7 +75,7 @@ class GPUWorker(compat.Worker):
                     return encode_boundary(BackendWorkerState(os.getpid(), runner.require_session().diagnostics()))
                 case BackendCommand.STAGE:
                     stage = decode_boundary(payload, BackendStage)
-                    peer = os.getppid()
+                    peer = stage.driver_pid
                     stream = torch.cuda.current_stream(runner.device)
                     auxiliary = map_auxiliary(
                         stage.auxiliary, lambda tensor: tensor.map(peer, stream).to(runner.device)
@@ -83,7 +83,7 @@ class GPUWorker(compat.Worker):
                     runner.require_session().stage_input(
                         auxiliary,
                         stage.identities,
-                        None if stage.completion is None else stage.completion.map(peer, stream),
+                        None if stage.completion is None or self.rank != 0 else stage.completion.map(peer, stream),
                     )
                 case BackendCommand.FINISH:
                     runner.require_session().finish_requests()

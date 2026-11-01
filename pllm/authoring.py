@@ -6,8 +6,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from typing import Generic, TypeVar
 
-import torch
-
 from pllm.config import ExecutionOptions
 from pllm.contracts.auxiliary import (
     AuxiliaryInput as AuxiliaryInput,
@@ -72,6 +70,8 @@ class BackendRequirements:
     position_states: tuple[tuple[str, float], ...] = ()
     # Whether a @pllm.layer_route reruns model layers, which vLLM's CUDA graphs cannot capture.
     layer_routes: bool = False
+    causal_training: bool = False
+    feeds: bool = False
     # The smallest pllm.samples(limit=); requests must use a lower sample index.
     sample_limit: int | None = None
 
@@ -138,12 +138,7 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
     ) -> BackendDeployment[DataT, ResultT]:
         plan = attachment.plan
         math = self.bind_math(facts, plan, declaration)
-        device = (
-            torch.device("cpu")
-            if facts.probe.device_kind.value == "cpu"
-            else torch.device("cuda", facts.probe.device_ordinal)
-        )
-        arena = PageBundleArena(plan, device=device, _owned_resources=math.local_resources(plan))
+        arena = PageBundleArena(plan, device=facts.device, _owned_resources=math.local_resources(plan))
         return BackendDeployment(math.bind(arena, attachment.sampler_anchor_id), attachment)
 
     def compile_backend(

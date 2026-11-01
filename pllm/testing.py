@@ -85,7 +85,6 @@ def backend_facts(
             "c" * 64,
             AttachmentGraphMode.EAGER,
             _CPU_PAGES.device_kind if provider is None else provider.device_kind,
-            0 if provider is None else provider.device_ordinal,
             dtype,
             hidden_size,
             max_lineages * 2 if max_rows is None else max_rows,

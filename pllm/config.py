@@ -88,8 +88,11 @@ class ModelConfig:
     # before the engine starts, with a message to set cuda_graphs=False.
     cuda_graphs: bool = True
     kv_offload: KVOffload | None = None
+    tensor_parallel_size: int = 1
 
     def __post_init__(self) -> None:
+        if type(self.tensor_parallel_size) is not int or self.tensor_parallel_size < 1:
+            raise ValueError("tensor_parallel_size must be an integer >= 1")
         if self.dtype not in get_args(ModelDType):
             raise ValueError(f'dtype must be "bfloat16", "float16" or "float32"; got {self.dtype!r}')
         if self.runner not in get_args(RunnerName):

@@ -53,7 +53,7 @@ def facts_for(device=torch.device("cpu")):
     from pllm.contracts.state_representation import StateDeviceKind
 
     timeline = model_timeline(device, ("transition/full_root@1",))
-    provider = PageBundleProviderFacts("test.feed@1", 3, StateDeviceKind(device.type), device.index or 0)
+    provider = PageBundleProviderFacts("test.feed@1", 3, StateDeviceKind(device.type))
     return backend_facts(2, (), timeline, provider, layer_count=1, memory_bytes=65536)
 
 

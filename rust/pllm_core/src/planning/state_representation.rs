@@ -20,7 +20,6 @@ pub(crate) struct StateProviderPlan {
     pub(crate) resource: String,
     provider_id: String,
     pub(crate) device_kind: StateDeviceKind,
-    pub(crate) device_ordinal: u64,
     pub(crate) layout_id: u64,
     pub(crate) max_admitted_lineages: u64,
     pub(crate) page_capacity: u64,
@@ -157,7 +156,7 @@ pub(super) fn compile(
         }
         if plans.first().is_some_and(|first| {
             plans.iter().any(|plan| {
-                plan.device_kind != first.device_kind || plan.device_ordinal != first.device_ordinal
+                plan.device_kind != first.device_kind
             })
         }) {
             return Ok(());
@@ -214,7 +213,7 @@ mod tests {
         let candidate = |resource, provider, bytes, retained| {
             json!({
                 "resource": resource, "provider_id": provider,
-                "device_kind": "cpu", "device_ordinal": 0, "layout_id": 0,
+                "device_kind": "cpu", "layout_id": 0,
                 "max_admitted_lineages": 1, "page_capacity": 3,
                 "root_page_count": 1, "reserved_bytes": bytes, "capture_stable": false,
                 "capabilities": if retained {vec!["state/exact_versions@1"]} else {vec![]}

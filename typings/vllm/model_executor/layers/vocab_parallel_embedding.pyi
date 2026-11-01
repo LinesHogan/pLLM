@@ -5,6 +5,7 @@ from torch.nn import Module, Parameter
 
 class VocabParallelEmbedding(Module):
     weight: Parameter
+    num_embeddings_padded: int
 
     def forward(self, input_: Tensor) -> Tensor: ...
 

@@ -95,6 +95,7 @@ def _restore_feed(
     control: DupFd,
     channels: tuple[tuple[DupFd, ...], ...],
     peer: int,
+    device: torch.device,
 ) -> Feed:
     return Feed(
         plan,
@@ -102,6 +103,7 @@ def _restore_feed(
         Connection(control.detach()),
         tuple(tuple(Connection(channel.detach()) for channel in row) for row in channels),
         peer,
+        device,
     )
 
 
@@ -113,15 +115,20 @@ class Feed:
     """Publish complete tensor fields into a declared state, with bounded backpressure."""
 
     def __init__(
-        self, plan: PlanBundle, binding: FeedBinding, control: Connection, channels: Channels, peer: int
+        self,
+        plan: PlanBundle,
+        binding: FeedBinding,
+        control: Connection,
+        channels: Channels,
+        peer: int,
+        device: torch.device,
     ) -> None:
         self._plan, self._binding, self._control, self._channels, self._peer = plan, binding, control, channels, peer
         (self._layout,) = (
             entry.layout for entry in plan.tensor_layout_request.layouts if entry.resource == binding.resource
         )
-        (provider,) = (entry for entry in plan.states.plans if entry.resource == binding.resource)
         self._fields = dict(zip(binding.fields, self._layout.fields, strict=True))
-        self._device = torch.device("cuda", provider.device_ordinal)
+        self._device = device
         self._peer_exit = _process_exit(peer)
         self._arena: PageBundleArena | None = None
         self._current: StateRef | None = None
@@ -132,8 +139,8 @@ class Feed:
     def __reduce__(
         self,
     ) -> tuple[
-        Callable[[PlanBundle, FeedBinding, DupFd, tuple[tuple[DupFd, ...], ...], int], Feed],
-        tuple[PlanBundle, FeedBinding, DupFd, tuple[tuple[DupFd, ...], ...], int],
+        Callable[[PlanBundle, FeedBinding, DupFd, tuple[tuple[DupFd, ...], ...], int, torch.device], Feed],
+        tuple[PlanBundle, FeedBinding, DupFd, tuple[tuple[DupFd, ...], ...], int, torch.device],
     ]:
         if self._arena is not None or self._credits or self._moved or self._closed:
             raise RuntimeError("transfer the feed once, before publishing")
@@ -143,6 +150,7 @@ class Feed:
             DupFd(self._control.fileno()),
             tuple(tuple(DupFd(channel.fileno()) for channel in row) for row in self._channels),
             self._peer,
+            self._device,
         )
         self._moved = True
         self._disconnect()
@@ -200,7 +208,7 @@ class Feed:
 
     def _start(self, stream: torch.cuda.Stream) -> PageBundleArena:
         if self._arena is None:
-            self._arena = PageBundleArena(self._plan, _owned_resources=(self._binding.resource,))
+            self._arena = PageBundleArena(self._plan, device=self._device, _owned_resources=(self._binding.resource,))
             publication = self._arena.publish(self._arena.prepare_admission((self._binding.resource,), stream))
             (self._current,) = publication.after_refs
         return self._arena
@@ -315,7 +323,12 @@ class FeedReceiver:
         pipes = tuple(tuple(context.Pipe() for _ in layout.fields) for _ in range(FEED_SLOTS))
         self.channels = tuple(tuple(pair[0] for pair in row) for row in pipes)
         self.writer: Feed | None = Feed(
-            arena.plan, binding, writer, tuple(tuple(pair[1] for pair in row) for row in pipes), os.getpid()
+            arena.plan,
+            binding,
+            writer,
+            tuple(tuple(pair[1] for pair in row) for row in pipes),
+            os.getpid(),
+            arena.device,
         )
         self.records: deque[FeedRecord] = deque()
         self.partial: list[BorrowedPage] = []

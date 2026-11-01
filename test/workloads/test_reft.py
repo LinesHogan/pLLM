@@ -40,7 +40,6 @@ def test_reft_matches_loreft_math_and_publish_skip_semantics(tmp_path) -> None:
             "c" * 64,
             AttachmentGraphMode.EAGER,
             StateDeviceKind.CPU,
-            0,
             TensorDType.FLOAT64,
             4,
             8,

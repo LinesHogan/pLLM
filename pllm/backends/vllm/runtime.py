@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from functools import partial
 from hashlib import sha256
@@ -28,6 +28,7 @@ from pllm.authoring import (
     StateTensorUpdate,
     map_auxiliary,
 )
+from pllm.backends.vllm import compat
 from pllm.backends.vllm.hidden_capture import CAPTURE_ENV, HiddenCaptureAnnouncement, HiddenCaptureLayout
 from pllm.backends.vllm.overlay_graph import (
     graph_mode,
@@ -156,6 +157,7 @@ class BackendStage:
     identities: tuple[RequestIdentity, ...]
     auxiliary: AuxiliaryInput[SharedTensor] | None
     completion: SharedTensor | None
+    driver_pid: int = field(default_factory=os.getpid)
 
 
 FeedbackT = TypeVar("FeedbackT", bound=CompletionFeedback)
@@ -190,7 +192,7 @@ class VllmLlm(Generic[DataT, ResultT]):
 
     @property
     def device(self) -> torch.device:
-        return self._facts.device
+        return self._runner.device if self._runner is not None else torch.device("cuda", 0)
 
     def __enter__(self) -> VllmLlm[DataT, ResultT]:
         self._require_open()
@@ -210,7 +212,9 @@ class VllmLlm(Generic[DataT, ResultT]):
         """Return the producer handle for a declared externally fed state."""
         self._require_open()
         if self._runner is None:
-            raise ValueError("state feeds need multiprocessing=False; pass the writer to a spawned producer")
+            raise ValueError(
+                "state feeds need tensor_parallel_size=1 and multiprocessing=False; pass the writer to a spawned producer"
+            )
         return self.runner.require_session().feed(name)
 
     def diagnostics(self) -> StateDiagnostics:
@@ -221,20 +225,29 @@ class VllmLlm(Generic[DataT, ResultT]):
     def runner(self) -> WorkloadModelRunner | Mrv1Runner:
         self._require_open()
         if self._runner is None:
-            raise RuntimeError("use multiprocessing=False to access the runner")
+            raise RuntimeError("use tensor_parallel_size=1 and multiprocessing=False to access the runner")
         return self._runner
 
-    def command(self, command: BackendCommand, payload: str = "", *, timeout: float = 30.0) -> str:
+    def command(self, command: BackendCommand, payload: str = "", *, timeout: float = 30.0) -> list[str]:
         replies = self._require_open().collective_rpc(
             "workload_command", timeout=timeout, args=(command.value, payload)
         )
-        return replies[0]
+        return replies
 
     def worker_state(self) -> BackendWorkerState:
-        return decode_boundary(self.command(BackendCommand.DIAGNOSTICS), BackendWorkerState)
+        states = [decode_boundary(reply, BackendWorkerState) for reply in self.command(BackendCommand.DIAGNOSTICS)]
+        assert all(state.diagnostics.logical_counts() == states[0].diagnostics.logical_counts() for state in states), (
+            "TP worker logical counters diverged",
+            states,
+        )
+        return states[0]
 
     def trace_snapshot(self) -> TraceSnapshot:
-        return decode_boundary(self.command(BackendCommand.TRACE), TraceSnapshot)
+        return self.trace_snapshots()[0]
+
+    def trace_snapshots(self) -> tuple[TraceSnapshot, ...]:
+        """Return every worker's trace in rank order; trace_snapshot selects the output rank."""
+        return tuple(decode_boundary(reply, TraceSnapshot) for reply in self.command(BackendCommand.TRACE))
 
     def profile_tasks(self, tasks: tuple[TaskId, ...]) -> None:
         self.command(BackendCommand.PROFILE, encode_boundary(tasks))
@@ -504,8 +517,8 @@ class VllmLlm(Generic[DataT, ResultT]):
         output_device = completion_device or (torch.device("cpu") if self._runner is None else self.device)
         if output_device.type == "cuda":
             if output_device == torch.device("cuda"):
-                output_device = torch.device("cuda", self.attachment.probe.device_ordinal)
-            if output_device.index != self.attachment.probe.device_ordinal:
+                output_device = self.device
+            if output_device != self.device:
                 raise ValueError("completion IPC currently requires the model's CUDA device")
         elif output_device.type != "cpu":
             raise ValueError("completion output requires CPU or CUDA storage")
@@ -519,9 +532,13 @@ class VllmLlm(Generic[DataT, ResultT]):
                 else:
                     destination = torch.empty(field.shape, device=output_device, dtype=torch.float32)
         if self._runner is None:
-            auxiliary_wire = map_auxiliary(auxiliary, lambda tensor: SharedTensor.export(tensor, lifetime))
+            tp = self._require_open().llm_engine.vllm_config.parallel_config.tensor_parallel_size
+            auxiliary_wire = map_auxiliary(
+                auxiliary, lambda tensor: SharedTensor.export(tensor.cpu() if tp > 1 else tensor, lifetime)
+            )
             self.command(
-                BackendCommand.STAGE, encode_boundary(BackendStage(identities, auxiliary_wire, completion_wire))
+                BackendCommand.STAGE,
+                encode_boundary(BackendStage(identities, auxiliary_wire, completion_wire)),
             )
         else:
             auxiliary = map_auxiliary(auxiliary, lambda tensor: tensor.to(self.device))
@@ -583,28 +600,42 @@ def _per_prompt(outputs: list[RequestOutput], n: int) -> list[RequestOutput]:
     return merged
 
 
-def vllm_engine(config: ModelConfig, workload_options: dict[str, Any]) -> LLM:
-    """The single-device vLLM engine `config` describes; a workload adds its worker, scheduler and graph options."""
-    return LLM(
-        model=config.model,
-        revision=config.revision,
-        dtype=config.dtype,
-        tensor_parallel_size=1,
-        pipeline_parallel_size=1,
-        data_parallel_size=1,
-        distributed_executor_backend="uni",
-        enforce_eager=not config.cuda_graphs,
-        max_model_len=config.max_model_len,
-        max_num_seqs=config.max_num_seqs,
-        max_num_batched_tokens=config.max_num_batched_tokens,
-        gpu_memory_utilization=config.gpu_memory_utilization,
-        seed=config.seed,
-        trust_remote_code=config.trust_remote_code,
-        enable_prefix_caching=config.enable_prefix_caching,
-        enable_chunked_prefill=config.enable_chunked_prefill,
-        kv_transfer_config=None if config.kv_offload is None else config.kv_offload.options(),
-        **workload_options,
-    )
+def vllm_engine(config: ModelConfig, workload_options: dict[str, Any], environment: dict[str, str]) -> LLM:
+    """Build the vLLM engine; a workload adds its worker, scheduler and graph options."""
+    compat.admit_parallel(config)
+    if config.tensor_parallel_size > 1:
+        environment.update(VLLM_USE_V2_MODEL_RUNNER="1", VLLM_WORKER_MULTIPROC_METHOD="spawn")
+    previous = {name: os.environ.get(name) for name in environment}
+    if any(previous[name] not in (None, value) for name, value in environment.items()):
+        raise RuntimeError("vLLM workload conflicts with explicit MP, spawn or legacy-runner environment")
+    os.environ.update(environment)
+    try:
+        return LLM(
+            model=config.model,
+            revision=config.revision,
+            dtype=config.dtype,
+            tensor_parallel_size=config.tensor_parallel_size,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            distributed_executor_backend="mp" if config.tensor_parallel_size > 1 else "uni",
+            enforce_eager=not config.cuda_graphs,
+            max_model_len=config.max_model_len,
+            max_num_seqs=config.max_num_seqs,
+            max_num_batched_tokens=config.max_num_batched_tokens,
+            gpu_memory_utilization=config.gpu_memory_utilization,
+            seed=config.seed,
+            trust_remote_code=config.trust_remote_code,
+            enable_prefix_caching=config.enable_prefix_caching,
+            enable_chunked_prefill=config.enable_chunked_prefill,
+            kv_transfer_config=None if config.kv_offload is None else config.kv_offload.options(),
+            **workload_options,
+        )
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name)
+            else:
+                os.environ[name] = value
 
 
 def create_vllm_llm(
@@ -614,6 +645,7 @@ def create_vllm_llm(
     definition: str | None = None,
 ) -> VllmLlm[DataT, ResultT]:
     requirements = workload.backend_requirements()
+    compat.admit_parallel(config, requirements)
     if requirements.position_states and config.runner == "mrv1":
         raise ValueError('PositionState layer routes need runner="mrv2"')
     if config.cuda_graphs and (config.runner == "mrv1" or requirements.activation_layers or requirements.layer_routes):
@@ -629,39 +661,29 @@ def create_vllm_llm(
         ),
         POSITION_ENV: encode_boundary(PositionAnnouncement(requirements.position_states)),
     }
-    if config.multiprocessing:
+    if config.multiprocessing or config.tensor_parallel_size > 1:
         environment["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-    previous_environment = {name: os.environ.get(name) for name in environment}
-    if any(previous_environment[name] not in (None, value) for name, value in environment.items()):
-        raise RuntimeError("vLLM workload conflicts with explicit MP, spawn or legacy-runner environment")
-    os.environ.update(environment)
     options = graph_options(config, requirements)
     # vLLM keys its compiled-model cache by its own config; the hidden taps and position states pllm adds to the
     # forward must enter that key, or an engine loads a model compiled for another workload.
     forward = sha256((environment[CAPTURE_ENV] + environment[POSITION_ENV]).encode()).hexdigest()
     options["additional_config"] = {**options.get("additional_config", {}), "pllm_forward": int(forward[:15], 16)}
-    try:
-        llm = vllm_engine(
-            config,
-            {
-                **options,
-                "worker_cls": _WORKER_CLASS,
-                # The supported uni-process, non-speculative decoder enables async by default.
-                "async_scheduling": config.runner == "mrv2",
-                "scheduler_cls": "pllm.backends.vllm.prefix_cache."
-                + ("WorkloadAsyncScheduler" if config.runner == "mrv2" else "WorkloadScheduler"),
-            },
-        )
-    finally:
-        for name, value in previous_environment.items():
-            if value is None:
-                os.environ.pop(name)
-            else:
-                os.environ[name] = value
+    llm = vllm_engine(
+        config,
+        {
+            **options,
+            "worker_cls": _WORKER_CLASS,
+            # The supported uni-process, non-speculative decoder enables async by default.
+            "async_scheduling": config.runner == "mrv2",
+            "scheduler_cls": "pllm.backends.vllm.prefix_cache."
+            + ("WorkloadAsyncScheduler" if config.runner == "mrv2" else "WorkloadScheduler"),
+        },
+        environment,
+    )
 
     with ExitStack() as construction:
         construction.callback(llm.llm_engine.engine_core.shutdown)
-        if config.multiprocessing:
+        if config.multiprocessing or config.tensor_parallel_size > 1:
             replies = llm.collective_rpc(
                 "workload_command",
                 timeout=30.0,
@@ -670,7 +692,12 @@ def create_vllm_llm(
                     encode_boundary(BackendProbe(requirements, config.execution.publish_lag)),
                 ),
             )
-            facts = decode_boundary(replies[0], BackendCompileFacts)
+            probes = [decode_boundary(reply, BackendCompileFacts) for reply in replies]
+            budget = min(probe.state_memory_budget_bytes for probe in probes)
+            facts = replace(probes[0], state_memory_budget_bytes=budget)
+            assert all(replace(probe, state_memory_budget_bytes=budget) == facts for probe in probes), (
+                "TP workers disagree on model or planning facts"
+            )
             facts, declaration = workload.specialize(facts, config.execution)
             attachment = workload.plan_backend(facts, declaration)
             policy = CachePolicy.for_attachment(attachment, config.generated_kv)
@@ -768,7 +795,7 @@ def probe_backend(
         runner.hidden_layouts,
         observed,
         runner.max_num_reqs,
-        model.lm_head.weight.shape[0],
+        model.lm_head.num_embeddings_padded,
         requirements.sampler_stage,
         requirements.sampler_feedback,
     )
@@ -787,7 +814,6 @@ def probe_backend(
                 "canonical.page_bundle_cuda@1",
                 capacity,
                 probe.device_kind,
-                probe.device_ordinal,
             ),
         ),
         runner.max_num_reqs,
@@ -808,13 +834,10 @@ def _base_probe(
     hidden_resources: tuple[AttachmentHiddenResource, ...],
     capabilities: tuple[str, ...],
 ) -> BackendPlacementProbe:
-    device_ordinal = runner.device.index
-    assert device_ordinal is not None
     return BackendPlacementProbe(
         model_fingerprint=model_fingerprint,
         graph_mode=graph_mode(runner.overlay_graph_bytes),
         device_kind=StateDeviceKind.CUDA,
-        device_ordinal=device_ordinal,
         tensor_dtype=_tensor_dtype(runner.dtype),
         hidden_size=hidden_size,
         max_packed_rows=runner.max_num_tokens,

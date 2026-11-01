@@ -41,7 +41,7 @@ def _plan():
         tuple(TimelineAnchor(AnchorSymbol(name), index) for index, name in enumerate(anchors)),
         ("compute/cuda@1", "state/dense_page_cuda@1"),
     )
-    provider = PageBundleProviderFacts("test.page_bundle@1", 6, StateDeviceKind.CUDA, 0)
+    provider = PageBundleProviderFacts("test.page_bundle@1", 6, StateDeviceKind.CUDA)
     facts = backend_facts(4, bindings, timeline, provider)
     workload = ESampRequestWorkload(ESampRequestConfig(rank=2))
     return workload.plan_backend(*workload.specialize(facts, ExecutionOptions())).plan

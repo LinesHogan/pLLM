@@ -73,7 +73,6 @@ class BackendPlacementProbe:
     model_fingerprint: str
     graph_mode: AttachmentGraphMode
     device_kind: StateDeviceKind
-    device_ordinal: int
     tensor_dtype: TensorDType
     hidden_size: int
     max_packed_rows: int

@@ -7,6 +7,7 @@ mode support shutdown. These declarations describe the configured object graph.
 from pllm.backends.vllm.mrv1 import Mrv1Runner
 from pllm.backends.vllm.runner import WorkloadModelRunner
 from vllm.v1.engine.output_processor import OutputProcessor
+from vllm.config import VllmConfig
 
 class _Worker:
     model_runner: WorkloadModelRunner | Mrv1Runner
@@ -25,6 +26,7 @@ class _CoreClient:
     def shutdown(self) -> None: ...
 
 class LLMEngine:
+    vllm_config: VllmConfig
     engine_core: _CoreClient
     output_processor: OutputProcessor
     def abort_request(self, request_ids: list[str], *, internal: bool) -> None: ...
