@@ -28,14 +28,15 @@ def _weights(
     tree: tl.constexpr,
     block: tl.constexpr,
 ) -> None:
-    batch = tl.program_id(1)
+    # Dense deltas can cross 2**31 elements along either the request or prefix axis.
+    batch = tl.program_id(1).to(tl.int64)
     width = rows * columns
     increments_ptr = increments + batch * increment_batch
     carry_ptr = carry + batch * carry_batch
     active_ptr = active + batch * active_batch
     weights_ptr = weights + batch * capacity * width
     final_ptr = final + batch * width
-    index = tl.program_id(0) * block + tl.arange(0, block)
+    index = tl.program_id(0).to(tl.int64) * block + tl.arange(0, block)
     mask = index < width
     row, column = index // columns, index % columns
     initial = tl.load(carry_ptr + row * carry_row + column * carry_column, mask, 0).to(tl.float32)
@@ -43,7 +44,7 @@ def _weights(
         lane = tl.arange(0, capacity)
         increment = (
             tl.load(
-                increments_ptr + lane[:, None] * width + index[None, :],
+                increments_ptr + lane[:, None].to(tl.int64) * width + index[None, :],
                 tl.load(active_ptr + lane)[:, None] & mask[None, :],
                 0,
             ).to(tl.float32)
@@ -57,7 +58,7 @@ def _weights(
         prefix = (prefix + initial[None, :]).to(weights_ptr.dtype.element_ty).to(tl.float32)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType, reportAttributeAccessIssue]
         tl.store(weights_ptr + index, initial, mask)
         tl.store(
-            weights_ptr + (lane[:, None] + 1) * width + index[None, :],
+            weights_ptr + (lane[:, None].to(tl.int64) + 1) * width + index[None, :],
             prefix,
             (lane[:, None] + 1 < capacity) & mask[None, :],
         )
@@ -66,11 +67,9 @@ def _weights(
     else:
         state = initial
         for chunk in range(capacity):
-            tl.store(weights_ptr + chunk * width + index, state, mask)
-            increment = (
-                tl.load(increments_ptr + chunk * width + index, mask & tl.load(active_ptr + chunk), 0).to(tl.float32)
-                * scale
-            )
+            offset = tl.cast(chunk, tl.int64) * width + index
+            tl.store(weights_ptr + offset, state, mask)
+            increment = tl.load(increments_ptr + offset, mask & tl.load(active_ptr + chunk), 0).to(tl.float32) * scale
             increment = increment.to(weights_ptr.dtype.element_ty).to(tl.float32)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType, reportAttributeAccessIssue]
             updated = (state + increment).to(weights_ptr.dtype.element_ty).to(tl.float32)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType, reportAttributeAccessIssue]
             state = tl.where(tl.load(active_ptr + chunk), updated, state)

@@ -13,6 +13,7 @@ class dtype: ...
 float32: dtype
 float64: dtype
 int32: dtype
+int64: dtype
 
 class tensor:
     def to(self, dtype: dtype) -> tensor: ...
