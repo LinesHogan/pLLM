@@ -30,7 +30,7 @@ from pllm.execution.replay import TokenwiseReplayPrimitive, TokenwiseReplayTask
 from pllm.execution.route_executor import execute_route, ordinary_pass
 from pllm.execution.state_execution import StateExecution, StateTaskContext
 from pllm.execution.step_capture import capture_graph
-from pllm.execution.step_input import TensorStepInput
+from pllm.execution.step_input import StepInput
 from pllm.execution.tensor_frame import OverlayTargetResult
 from pllm.execution.token_program import KV, Save, TokenProgram
 
@@ -172,7 +172,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         self,
         model: KvLM,
         task: SemanticTask,
-        execution: StateExecution[TensorStepInput, DataT, ResultT],
+        execution: StateExecution[StepInput, DataT, ResultT],
         anchor: AnchorId,
         *,
         activation: VllmActivationPatch | None = None,

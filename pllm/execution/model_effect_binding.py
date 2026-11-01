@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from pllm.contracts.auxiliary import StateTensorUpdate
 from pllm.contracts.backend_attachment import (
     ActivationPatchBinding,
     ActivationPatchOperator,
@@ -26,6 +25,7 @@ from pllm.contracts.backend_attachment import (
 )
 from pllm.contracts.codec import boundary_digest
 from pllm.contracts.hidden_locator import HiddenPhase
+from pllm.contracts.host_batch import StateImport
 from pllm.contracts.parameter_overlay import (
     FieldView,
     ParameterEffect,
@@ -50,7 +50,7 @@ from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION
 from pllm.execution.tensor_frame import (
     TensorFrame,
     Tensors,
-    TensorUpdate,
+    UpdateOutput,
 )
 from pllm.execution.tensor_task import FieldWriter, TensorTask
 from pllm.execution.token_program import ApplyUpdates, Cell, Layers, Over, Segment, TokenProgram, Tokens, TokenTensor
@@ -71,11 +71,10 @@ def declare_parameter_overlay(
     buffers: Mapping[str, Buffer],
     *,
     initialize: Callable[[Tensors, torch.Generator], None] | None,
-    namespace: str,
     keys: tuple[RequestKeyField, ...],
     phases: tuple[HiddenPhase, ...],
     identity: str,
-    function: Callable[..., TensorUpdate],
+    function: Callable[..., UpdateOutput],
     arguments: Mapping[str, str],
     visibility: Visibility,
     equations_digest: str,
@@ -90,7 +89,6 @@ def declare_parameter_overlay(
     state = b.state(
         effect.state,
         fields,
-        namespace=namespace,
         scope=StateScope.REQUEST,
         keys=keys,
     )
@@ -144,7 +142,7 @@ def declare_parameter_overlay(
         outputs=("transition",),
         changes=state,
         effect=StateEffectKind.TRANSITION_MAYBE,
-        when=When.MODEL_UPDATE,
+        when=When.IN_FORWARD,
         function=math,
         select=select,
         implementations=(
@@ -203,15 +201,15 @@ def _write_task(b: TensorBinding, update: Call, writer: FieldWriter) -> None:
 
 
 def import_update(b: TensorBinding, state: State, identity: str) -> Call:
-    """One BEFORE_MODEL import of externally produced field values into private roots."""
+    """One BEFORE_FORWARD import of externally produced field values into private roots."""
     writer = FieldWriter(None, b.imports[str(state.declaration.resource)], state.declaration.resource, None)
     update = b.compute(
         "update",
-        inputs={"parameters": b.input("input", "state", StateTensorUpdate.schema)},
+        inputs={"parameters": b.input("input", "state", StateImport.schema)},
         outputs=("updated",),
         changes=state,
         effect=StateEffectKind.TRANSITION_MAYBE,
-        when=When.BEFORE_MODEL,
+        when=When.BEFORE_FORWARD,
         implementations=(native(identity, "transition/full_root@1"),),
     )
     _write_task(b, update, writer)
@@ -350,7 +348,7 @@ def _attach_replay(b: TensorBinding, composed: bool, effect: TokenProgramEffect)
             "forward",
             inputs={"rows": b.rows()},
             outputs=("normal_hidden",),
-            when=When.MODEL_UPDATE,
+            when=When.IN_FORWARD,
             replay=effect,
             implementations=(native(TOKENWISE_REPLAY_IMPLEMENTATION, "model/tokenwise_replay@1"),),
         )

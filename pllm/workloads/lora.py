@@ -23,8 +23,8 @@ class OutputLoRAConfig:
     seed: int = 0
     scope: pllm.state.StateScope = pllm.state.StateScope.INSTANCE
     key_fields: tuple[pllm.state.RequestKeyField, ...] = (
-        pllm.state.RequestKeyField.PROMPT_IDX,
-        pllm.state.RequestKeyField.SAMPLE_IDX,
+        pllm.state.RequestKeyField.PROMPT_INDEX,
+        pllm.state.RequestKeyField.SAMPLE_INDEX,
     )
 
     def __post_init__(self) -> None:
@@ -44,7 +44,6 @@ class OutputLoRAConfig:
 
 @dataclass(frozen=True)
 class OutputLoRAWorkload(pllm.Workload):
-    name = "lora.output_head"
     config: OutputLoRAConfig = OutputLoRAConfig()
 
     @property
@@ -64,14 +63,12 @@ class OutputLoRAWorkload(pllm.Workload):
                 fields,
                 optimizer=pllm.SGD(self.config.learning_rate),
                 initialize=initialize,
-                namespace="canonical.output_lora@1",
                 keys=self.config.key_fields,
             )
         return pllm.InstanceState(
             fields,
             optimizer=pllm.SGD(self.config.learning_rate),
             initialize=initialize,
-            namespace="canonical.output_lora@1",
         )
 
     def reset(self, parameters: pllm.state.Tensors, generator: torch.Generator) -> None:

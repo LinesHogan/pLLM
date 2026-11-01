@@ -3,7 +3,7 @@
 import argparse
 
 from pllm.benchmark import BenchmarkOptions, compare
-from pllm.workloads import ESampRequestConfig, ESampRequestWorkload
+from pllm.workloads import ESampConfig, ESampWorkload
 
 
 def main() -> None:
@@ -11,9 +11,9 @@ def main() -> None:
     parser.add_argument("--beta", type=float, default=0.0, help="ESamp sampling-guidance strength")
     options, args = BenchmarkOptions.parse(parser)
     compare(
-        ESampRequestWorkload(ESampRequestConfig(rank=4, intervention_beta=args.beta)),
+        ESampWorkload(ESampConfig(rank=4, intervention_beta=args.beta)),
         options,
-        training_rows=1,
+        max_training_rows=1,
         require_training=True,
     )
 

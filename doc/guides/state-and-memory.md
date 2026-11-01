@@ -92,7 +92,7 @@ torch.bmm(h.unsqueeze(1), w).squeeze(1)     # (rows, H) @ (rows, H, H) → (rows
 pin 住的版本，永远不是「最新值」。`pllm.version(state)` 输入给出该版本号，常用
 作「是否训练过」的门（`versions > 0`）。
 
-## 我想跨步记点东西：memory 字段与 Capture
+## 我想跨步记点东西：carry 字段与 pllm.carry
 
 优化器状态（参数 + Adam 槽）之外的普通记忆——上一轮的 carry、上一个请求
 的终态——用 `memory=` 声明：
@@ -101,16 +101,16 @@ pin 住的版本，永远不是「最新值」。`pllm.version(state)` 输入给
 head = pllm.RequestState(
     {"w": lambda m: (m.hidden_size, m.hidden_size)},
     optimizer=pllm.AdamW(lr=1e-3),
-    memory={"carry": lambda m: (m.hidden_size,)},   # 无梯度/动量槽，不被 Adam 碰
+    carry={"carry": lambda m: (m.hidden_size,)},   # 无梯度/动量槽，不被 Adam 碰
 )
 ```
 
-写：把训练方法的输入包一层 `pllm.capture`，例如
-`h: torch.Tensor = pllm.capture(pllm.hidden(0), state="head", field="carry")`——发布时
-把该输入每个 lineage 最后一行的值写进 memory。读：`pllm.parameter("head",
+写：把训练方法的输入包一层 `pllm.carry`，例如
+`h: torch.Tensor = pllm.carry(pllm.hidden(0), state="head", field="carry")`——发布时
+把该输入每个 lineage 最后一行的值写进 carry 字段。读：`pllm.parameter("head",
 "carry")`，读到的是**上一步发布**的值（输入版本）。
 
-**第一步读到什么？** 零。memory 页在准入时零初始化，这不是 bug——正是
+**第一步读到什么？** 零。carry 页在准入时零初始化，这不是 bug——正是
 「输入版本」语义的直接推论：第 N+1 步看到第 N 步发布的值。
 
 这一个机制组合出教程里的三种循环：

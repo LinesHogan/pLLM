@@ -21,7 +21,7 @@ from vllm import SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
 
 import pllm
-from pllm.authoring import CausalTrainBatch, StateTensorUpdate, WeightedCEBatch
+from pllm.authoring import CausalTrainBatch, StateImport, WeightedCEBatch
 from pllm.config import ExecutionOptions, ModelConfig, RunnerName
 from pllm.contracts.backend_attachment import (
     ActivationPatchOperator,
@@ -29,10 +29,10 @@ from pllm.contracts.backend_attachment import (
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.semantic_graph import StateScope
-from pllm.execution.trace import TracePhase, TraceSelection
+from pllm.execution.trace import TraceEventKind, TraceSelection
 from pllm.host import HostConfig, make_host
 from pllm.workloads.dummy import DummyConfig, DummyWorkload
-from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
+from pllm.workloads.esamp import ESampConfig, ESampWorkload
 from pllm.workloads.fttt import (
     FTTTConfig,
     FTTTDefaultJudge,
@@ -43,9 +43,9 @@ from pllm.workloads.fttt import (
 )
 from pllm.workloads.fttt.types import FTTTResult
 from pllm.workloads.lora import OutputLoRAConfig, OutputLoRAWorkload
-from pllm.workloads.prefill_adapters import PrefillAdapters
+from pllm.workloads.prefill_adapters import PrefillAdaptersWorkload
 from pllm.workloads.recirculation import RecirculationWorkload
-from pllm.workloads.reft import ActivationConfig, ActivationWorkload
+from pllm.workloads.reft import ReFTConfig, ReFTWorkload
 from pllm.workloads.tlm import TLMConfig, TLMWorkload
 from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload, ttrl_rewards
 
@@ -65,14 +65,14 @@ def greedy(max_tokens, **options) -> SamplingParams:
 
 
 def assert_clean(diagnostics) -> None:
-    assert diagnostics.active_lineages == diagnostics.inference_pins == diagnostics.pending_state_releases == 0
+    assert diagnostics.active_states == diagnostics.inference_pins == diagnostics.pending_state_releases == 0
 
 
 class RetryOnce(FTTTJudgeService):
     """Prompt 7 is right at once; every other prompt is right on its first retry."""
 
     def judge(self, completion):
-        correct = completion.identity.prompt_idx == 7 or completion.identity.sample_idx > 0
+        correct = completion.identity.prompt_index == 7 or completion.identity.sample_index > 0
         feedback = "correct" if correct else "wrong carry"
         return FTTTJudgeResult(
             correct,
@@ -88,7 +88,7 @@ class RetryOnce(FTTTJudgeService):
 def _gpu_shared_input() -> None:
     assert not torch.cuda.is_initialized()
     handle = pllm.make_llm(
-        workload=ActivationWorkload(ActivationConfig((23,), 2, first_tokens=1, last_tokens=1)),
+        workload=ReFTWorkload(ReFTConfig((23,), 2, first_tokens=1, last_tokens=1)),
         config=engine(),
     )
     try:
@@ -108,14 +108,14 @@ def _gpu_shared_input() -> None:
         changed = handle.generate(
             PROMPTS,
             sampling,
-            auxiliary=StateTensorUpdate(factors),
+            batch=StateImport(factors),
             feedback_group="gpu",
             completion_device=device,
         )
         assert changed.hidden.device == device and changed.readiness is not None
         changed.readiness.order_on(torch.cuda.current_stream(device))
         assert torch.isfinite(changed.hidden).all() and not torch.allclose(baseline.hidden, changed.hidden.cpu())
-        diagnostics = handle.worker_state().diagnostics
+        diagnostics = handle.diagnostics()
         assert diagnostics.update_count == 1
         assert diagnostics.inference_pins == diagnostics.pending_state_releases == 0
         expected = changed.hidden.clone()
@@ -133,10 +133,10 @@ def _user_reference_workload() -> None:
     assert not torch.cuda.is_initialized()
     handle = pllm.make_llm(workload=HuberWorkload(2), config=engine())
     try:
-        child = handle.worker_state().process_id
+        child = handle._worker_state().process_id
         assert child != os.getpid()
         assert len(handle.generate(PROMPTS, greedy(4))) == 2
-        finished = handle.worker_state().diagnostics
+        finished = handle.diagnostics()
         assert finished.loss_count == finished.update_count > 0
         assert_clean(finished)
         print(f"user workload by reference: child={child} loss={finished.loss_count}")
@@ -148,16 +148,18 @@ def _prefill_adapter_reconstruction() -> None:
     """A rebuilt worker starts fresh request identities and exact version-zero roots."""
     processes, requests = [], []
     for _ in range(2):
-        with pllm.make_llm(workload=PrefillAdapters(chunk_size=3, rank=2), config=engine(memory=0.15)) as handle:
-            handle.observe(TraceSelection(max_events=4096))
+        with pllm.make_llm(
+            workload=PrefillAdaptersWorkload(chunk_size=3, rank=2), config=engine(memory=0.15)
+        ) as handle:
+            handle.select_trace(TraceSelection(max_events=4096))
             outputs = handle.generate(["The quick brown fox jumps over the lazy dog.", "Hello there."], greedy(2))
-            state = handle.worker_state()
+            state = handle._worker_state()
             assert state.process_id != os.getpid()
             assert state.diagnostics.update_count == 5 * sum(
                 (len(output.prompt_token_ids) + 2) // 3 for output in outputs
             )
             assert_clean(state.diagnostics)
-            admissions = [event for event in handle.trace_snapshot().events if event.phase is TracePhase.ADMIT]
+            admissions = [event for event in handle.trace_snapshot().events if event.kind is TraceEventKind.ADMIT]
             assert admissions and all(ref.version_id == 0 for event in admissions for ref in event.refs)
             processes.append(state.process_id)
             requests.append({identity.request_id for event in admissions for identity in event.identities})
@@ -183,14 +185,14 @@ def _dummy_export() -> None:
     try:
         handle.generate(PROMPTS, greedy(4), prompt_indices=(7, 9))
         handle.generate(["The sea is"], greedy(3), prompt_indices=(11,))
-        events = tuple(event for event in handle.trace_snapshot().events if event.phase is TracePhase.TENSOR)
+        events = tuple(event for event in handle.trace_snapshot().events if event.kind is TraceEventKind.TENSOR)
         assert [event.step_id for event in events] == [2, 6]
-        assert [tuple(identity.prompt_idx for identity in event.identities) for event in events] == [(7, 9), (11,)]
+        assert [tuple(identity.prompt_index for identity in event.identities) for event in events] == [(7, 9), (11,)]
         for event in events:
             tensor = event.tensor()
             assert tensor.shape == (len(event.identities), 3) and tensor.dtype == torch.float32
             assert tensor.device.type == "cpu" and torch.isfinite(tensor).all() and tensor.abs().sum() > 0
-        diagnostics = handle.worker_state().diagnostics
+        diagnostics = handle.diagnostics()
         assert_clean(diagnostics)
         assert diagnostics.loss_count == diagnostics.update_count == 0
         assert not torch.cuda.is_initialized()
@@ -228,7 +230,7 @@ def _graph_overlay(*, exact: bool = False) -> None:
         first = handle.generate(prompts, greedy(3))
         second = handle.generate(prompts[::-1], greedy(3))
         assert [o.outputs[0].token_ids for o in first] == [o.outputs[0].token_ids for o in second][::-1]
-        state = handle.worker_state()
+        state = handle._worker_state()
         assert state.process_id != os.getpid() and state.diagnostics.update_count > 0
         assert_clean(state.diagnostics)
         assert not torch.cuda.is_initialized()
@@ -239,7 +241,7 @@ def _captured_esamp(runner: RunnerName = "mrv2") -> None:
     assert not torch.cuda.is_initialized()
     options = ExecutionOptions(capture_memory_bytes=16 * 1024**2)
     handle = pllm.make_llm(
-        workload=ESampRequestWorkload(ESampRequestConfig(rank=2)),
+        workload=ESampWorkload(ESampConfig(rank=2)),
         config=engine(runner=runner, execution=options),
     )
     try:
@@ -248,22 +250,22 @@ def _captured_esamp(runner: RunnerName = "mrv2") -> None:
         selected = tuple(task.task_id for task in tasks)
         handle.profile_tasks(selected)
         loss = next(task.task_id for task in tasks if ":loss@" in task.implementation_id)
-        handle.observe(TraceSelection(tasks=(loss,), gradients=True, kernel_calls=1))
+        handle.select_trace(TraceSelection(tasks=(loss,), gradients=True, kernel_calls=1))
         for prompts in (
             ["The sky is", "The sea is", "The grass is"],
             ["Water freezes at"],
         ):
             handle.generate(prompts, greedy(3))
-        diagnostics = handle.worker_state().diagnostics
+        diagnostics = handle.diagnostics()
         assert diagnostics.loss_count == diagnostics.update_count == 8
-        assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
+        assert diagnostics.active_states == diagnostics.pending_state_releases == 0
         assert not torch.cuda.is_initialized()
         trace = handle.trace_snapshot()
         assert trace.pending_device_timings == 0 and {task for task, _ in trace.device_task_times()} == set(selected)
         assert all(count > 0 and elapsed > 0 for count, elapsed in trace.device_task_times().values())
-        assert any(event.phase is TracePhase.KERNEL and event.device_duration_ns > 0 for event in trace.events)
-        assert any(event.phase is TracePhase.GRADIENT and event.tensor().abs().sum() > 0 for event in trace.events)
-        handle.observe(TraceSelection())
+        assert any(event.kind is TraceEventKind.KERNEL and event.device_duration_ns > 0 for event in trace.events)
+        assert any(event.kind is TraceEventKind.GRADIENT and event.tensor().abs().sum() > 0 for event in trace.events)
+        handle.select_trace(TraceSelection())
         handle.profile_tasks(())
         print(f"Captured ESamp EngineCore ({runner}): loss/update=8, profiled tasks, parent CUDA=off")
     finally:
@@ -281,17 +283,17 @@ def _tlm_shared_input(model_id: str = MODEL) -> None:
         batch = handle.generate(
             PROMPTS,
             greedy(2),
-            auxiliary=CausalTrainBatch(tokens, tokens),
+            batch=CausalTrainBatch(tokens, tokens),
             feedback_group="tlm",
         )
-        diagnostics = handle.worker_state().diagnostics
+        diagnostics = handle.diagnostics()
         assert diagnostics.loss_count == diagnostics.update_count == 1 and diagnostics.trained_rows > 0
         assert diagnostics.inference_pins == diagnostics.pending_state_releases == 0
         assert batch.hidden.device.type == "cpu" and torch.isfinite(batch.hidden).all()
         assert not torch.cuda.is_initialized()
         # Without a training batch the next invocation does not update.
         handle.generate("A second invocation", SamplingParams(max_tokens=2, temperature=0.0))
-        assert handle.worker_state().diagnostics.update_count == 1
+        assert handle.diagnostics().update_count == 1
         print("TLM borrowed worker model: loss/update=1, parent CUDA=off")
     finally:
         handle.close()
@@ -303,7 +305,7 @@ def _output_lora_shared_input() -> None:
     # This case asserts immediate next-draw visibility; exercise strict ordering.
     handle = pllm.make_llm(
         workload=workload,
-        config=engine(execution=ExecutionOptions(training_rows=2, publish_lag=0)),
+        config=engine(execution=ExecutionOptions(max_training_rows=2, publish_lag=0)),
     )
     try:
         sampling = greedy(3, logprobs=1)
@@ -315,8 +317,8 @@ def _output_lora_shared_input() -> None:
             torch.tensor([entry.token_ids[-1] for entry in captured.completions.entries]),
             torch.tensor([1.0, 3.0]),
         )
-        trained = handle.generate(PROMPTS, sampling, auxiliary=batch)
-        diagnostics = handle.worker_state().diagnostics
+        trained = handle.generate(PROMPTS, sampling, batch=batch)
+        diagnostics = handle.diagnostics()
         assert diagnostics.loss_count == 2 and diagnostics.update_count == 1 and diagnostics.trained_rows == 2
         assert diagnostics.inference_pins == diagnostics.pending_state_releases == 0
         changed = False
@@ -330,7 +332,7 @@ def _output_lora_shared_input() -> None:
             changed |= old.token_ids[2] != new.token_ids[2] or abs(old_logprob - new_logprob) > 1e-5
         assert changed, "published weighted-CE factors never affected the actual sampler"
         handle.generate(PROMPTS, sampling)
-        assert handle.worker_state().diagnostics.update_count == 1
+        assert handle.diagnostics().update_count == 1
 
         service = FTTTFeedbackService(FTTTConfig(rank=2, max_retries=3), RetryOnce())
         processor = FTTTTrainer(service, HostConfig(torch.device("cpu"), hidden_size=captured.hidden.shape[1]))
@@ -344,10 +346,12 @@ def _output_lora_shared_input() -> None:
                 prompt_indices=(7, 9),
             )
         )
-        prompt_rounds = [tuple(entry.identity.prompt_idx for entry in batch.completions.entries) for batch, _ in rounds]
+        prompt_rounds = [
+            tuple(entry.identity.prompt_index for entry in batch.completions.entries) for batch, _ in rounds
+        ]
         assert prompt_rounds == [(7, 9), (9,)]
         assert sum(result.update_count for _, result in rounds) == 1
-        assert service.instance_state("retry", 9).retries == 1 and service.instance_state("retry", 9).stopped
+        assert service.lifecycle("retry", 9).retries == 1 and service.lifecycle("retry", 9).stopped
         assert service.queued_transactions == service.queued_feedback == 0
         assert all(batch.hidden.device.type == "cpu" for batch, _ in rounds)
         assert not torch.cuda.is_initialized()
@@ -369,7 +373,7 @@ def _independent_lora_input() -> None:
         sampling = greedy(4, logprobs=1)
         baseline = handle.generate(PROMPTS, sampling)
         completed = handle.generate(PROMPTS, sampling, feedback_group="independent-lora")
-        fields = (RequestKeyField.PROMPT_IDX, RequestKeyField.SAMPLE_IDX)
+        fields = (RequestKeyField.PROMPT_INDEX, RequestKeyField.SAMPLE_INDEX)
         keys = tuple(RequestStateKey.project(RequestIdentity("", index, 0), fields) for index in (7, 9))
         batch = WeightedCEBatch(
             completed.hidden.unsqueeze(1),
@@ -378,18 +382,18 @@ def _independent_lora_input() -> None:
             torch.ones(2, 1),
             keys,
         )
-        handle.observe(TraceSelection(tensors=True, gradients=True, max_tensor_bytes=64))
-        trained = handle.generate(PROMPTS, sampling, auxiliary=batch, prompt_indices=(7, 9))
+        handle.select_trace(TraceSelection(tensors=True, gradients=True, max_tensor_bytes=64))
+        trained = handle.generate(PROMPTS, sampling, batch=batch, prompt_indices=(7, 9))
         events = handle.trace_snapshot().events
-        gradients = [event for event in events if event.phase is TracePhase.GRADIENT]
-        assert len(gradients) == 4 and {identity.prompt_idx for e in gradients for identity in e.identities} == {7, 9}
+        gradients = [event for event in events if event.kind is TraceEventKind.GRADIENT]
+        assert len(gradients) == 4 and {identity.prompt_index for e in gradients for identity in e.identities} == {7, 9}
         assert all(event.refs and torch.isfinite(event.tensor()).all() for event in gradients)
-        diagnostics = handle.worker_state().diagnostics
+        diagnostics = handle.diagnostics()
         assert diagnostics.loss_count == 4 and diagnostics.update_count == 2 and diagnostics.trained_rows == 2
-        assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
+        assert diagnostics.active_states == diagnostics.pending_state_releases == 0
         # Each request's own published version guides its sampler.
         guided = [event for event in events if event.tensor_name == "guidance" and event.refs[0].version_id > 0]
-        assert len(guided) == 2 and {event.row.identity.prompt_idx for event in guided} == {7, 9}
+        assert len(guided) == 2 and {event.row.identity.prompt_index for event in guided} == {7, 9}
         assert all(torch.isfinite(event.tensor()).all() and torch.count_nonzero(event.tensor()) > 0 for event in guided)
         for before, after in zip(baseline, trained, strict=True):
             assert before.outputs[0].token_ids[:3] == after.outputs[0].token_ids[:3]
@@ -408,14 +412,14 @@ def _recirculation() -> None:
         second = handle.generate(PROMPTS, greedy(2))
         tokens = lambda results: tuple(tuple(output.outputs[0].token_ids) for output in results)
         assert tokens(first) == tokens(second) and all(len(ids) == 2 for ids in tokens(first))
-        replay = tuple(event for event in handle.trace_snapshot().events if event.phase is TracePhase.REPLAY)
-        assert replay and {event.row.identity.prompt_idx for event in replay} == {
+        replay = tuple(event for event in handle.trace_snapshot().events if event.kind is TraceEventKind.REPLAY)
+        assert replay and {event.row.identity.prompt_index for event in replay} == {
             0,
             1,
             2,
             3,
         }
-        assert_clean(handle.worker_state().diagnostics)
+        assert_clean(handle.diagnostics())
         assert not torch.cuda.is_initialized()
         print(f"Recirculation EngineCore: serial replay rows={len(replay)}")
     finally:
@@ -423,7 +427,7 @@ def _recirculation() -> None:
 
 
 def _fttt_activation_retry() -> None:
-    config = ActivationConfig(
+    config = ReFTConfig(
         (23,),
         rank=1,
         first_tokens=0,
@@ -431,7 +435,7 @@ def _fttt_activation_retry() -> None:
         operator=ActivationPatchOperator.ADD,
         scope=StateScope.REQUEST,
     )
-    handle = pllm.make_llm(workload=ActivationWorkload(config), config=engine(seqs=1))
+    handle = pllm.make_llm(workload=ReFTWorkload(config), config=engine(seqs=1))
     try:
         service = FTTTFeedbackService(FTTTConfig(rank=2, learning_rate=0.1, max_retries=3), RetryOnce())
         processor = FTTTTrainer(service, HostConfig(torch.device("cpu"), hidden_size=896))
@@ -446,12 +450,14 @@ def _fttt_activation_retry() -> None:
                 prompt_indices=(7, 9, 11),
             )
         )
-        prompt_rounds = [tuple(entry.identity.prompt_idx for entry in batch.completions.entries) for batch, _ in rounds]
+        prompt_rounds = [
+            tuple(entry.identity.prompt_index for entry in batch.completions.entries) for batch, _ in rounds
+        ]
         assert prompt_rounds == [(7, 9, 11), (9, 11)]
         # Retried prompts run with their FTTT edit applied to the real model's hidden state.
         before, after = rounds[0][0].hidden, rounds[1][0].hidden
         assert not torch.equal(before[1], after[0]) and not torch.equal(before[2], after[1])
-        diagnostics = handle.worker_state().diagnostics
+        diagnostics = handle.diagnostics()
         assert diagnostics.update_count == 2, "each queued retry must import its own edit once"
         assert_clean(diagnostics)
         assert not torch.cuda.is_initialized()
@@ -462,11 +468,11 @@ def _fttt_activation_retry() -> None:
 
 def main() -> int:
     assert not torch.cuda.is_initialized()
-    workload = ESampRequestWorkload(ESampRequestConfig(rank=2, source_layer=0, target_layer=-1, intervention_beta=0.2))
+    workload = ESampWorkload(ESampConfig(rank=2, source_layer=0, target_layer=-1, intervention_beta=0.2))
     handle = pllm.make_llm(workload=workload, config=engine(memory=0.35))
     try:
         assert not torch.cuda.is_initialized(), "frontend allocated a second GPU execution"
-        child = handle.worker_state().process_id
+        child = handle._worker_state().process_id
         assert child != os.getpid()
         outputs = handle.generate(
             ["The sky is", "The sea is", "The grass is"],
@@ -475,17 +481,17 @@ def main() -> int:
             sample_index=2,
         )
         assert len(outputs) == 3 and all(len(output.outputs[0].token_ids) == 3 for output in outputs)
-        diagnostics = handle.worker_state().diagnostics
+        diagnostics = handle.diagnostics()
         assert diagnostics.loss_count == diagnostics.update_count == 6
-        assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
+        assert diagnostics.active_states == diagnostics.pending_state_releases == 0
         again = handle.generate(["A second invocation"], greedy(3))
         assert len(again[0].outputs[0].token_ids) == 3
-        final = handle.worker_state().diagnostics
+        final = handle.diagnostics()
         assert final.loss_count == final.update_count == 8
-        assert final.active_lineages == final.pending_state_releases == 0
+        assert final.active_states == final.pending_state_releases == 0
         trace = handle.trace_snapshot()
         assert trace.process_id == child and trace.host_task_times()
-        assert all(event.phase is not TracePhase.TASK_FAILED for event in trace.events)
+        assert all(event.kind is not TraceEventKind.TASK_FAILED for event in trace.events)
         # One shared completion batch feeds both host workloads.
         regex = StructuredOutputsParams(regex=r"\\boxed\{[12]\}")
         batch = handle.generate(
@@ -495,7 +501,7 @@ def main() -> int:
             prompt_indices=(100,),
             sample_index=2,
         )
-        assert [(entry.identity.prompt_idx, entry.identity.sample_idx) for entry in batch.completions.entries] == [
+        assert [(entry.identity.prompt_index, entry.identity.sample_index) for entry in batch.completions.entries] == [
             (100, 2),
             (100, 3),
             (100, 4),
@@ -517,24 +523,24 @@ def main() -> int:
         print(f"enginecore child={child} loss={final.loss_count} update={final.update_count}")
     finally:
         handle.close()
-    # Inputs use the original StateTensorUpdate; outputs outlive the child and exporting FD.
+    # Inputs use the original StateImport; outputs outlive the child and exporting FD.
     reft = pllm.make_llm(
-        workload=ActivationWorkload(ActivationConfig((23,), 2, first_tokens=1, last_tokens=1)),
+        workload=ReFTWorkload(ReFTConfig((23,), 2, first_tokens=1, last_tokens=1)),
         config=engine(memory=0.35),
     )
     try:
         baseline = reft.generate(PROMPTS, greedy(2), feedback_group="before")
         width = baseline.hidden.shape[1]
-        parameters = StateTensorUpdate(
+        parameters = StateImport(
             (
                 torch.zeros(2, width, dtype=torch.bfloat16),
                 torch.ones(2, dtype=torch.bfloat16),
                 torch.full((width, 2), 0.1, dtype=torch.bfloat16),
             )
         )
-        changed = reft.generate(PROMPTS, greedy(2), auxiliary=parameters, feedback_group="after")
+        changed = reft.generate(PROMPTS, greedy(2), batch=parameters, feedback_group="after")
         assert not torch.equal(baseline.hidden, changed.hidden)
-        diagnostics = reft.worker_state().diagnostics
+        diagnostics = reft.diagnostics()
         assert diagnostics.update_count == 1
         assert diagnostics.inference_pins == diagnostics.pending_state_releases == 0
         assert not torch.cuda.is_initialized()

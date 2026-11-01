@@ -36,11 +36,11 @@ def compile_lora(config, device=torch.device("cpu"), *, lineages=3, pages=3):
         4, (BINDING,), model_timeline(device), provider, max_lineages=lineages, memory_bytes=32 * 1024**2
     )
     workload = OutputLoRAWorkload(config)
-    return workload.compile_backend(replace(facts, vocab_size=7), ExecutionOptions(training_rows=4)).execution
+    return workload.compile_backend(replace(facts, vocab_size=7), ExecutionOptions(max_training_rows=4)).execution
 
 
-def step_input(identities, hidden, auxiliary, stream=None):
-    return testing.step_input(identities, {BINDING: hidden}, auxiliary=auxiliary, stream=stream)
+def step_input(identities, hidden, batch, stream=None):
+    return testing.step_input(identities, {BINDING: hidden}, batch=batch, stream=stream)
 
 
 def test_weighted_ce_shared_update_matches_sgd_and_preserves_original_pins() -> None:
@@ -75,14 +75,14 @@ def test_weighted_ce_shared_update_matches_sgd_and_preserves_original_pins() -> 
     (latest,) = execution.step(value).publication.after_refs
     for actual, expected in zip(execution.snapshot(latest), (a, b), strict=True):
         torch.testing.assert_close(actual, expected)
-    guidance, idle = testing.run_guided_step(execution, replace(value, auxiliary=None))
+    guidance, idle = testing.run_guided_step(execution, replace(value, batch=None))
     torch.testing.assert_close(guidance.values, hidden @ a @ b * 1.5)
     assert idle.publication is None and idle.loss is None
     for actual, expected in zip(execution.arena.snapshot(old_pin, initial), original, strict=True):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     execution.arena.wait_release(execution.arena.release_pin(old_pin))
     execution.retire(())
-    assert execution.diagnostics().active_lineages == 0
+    assert execution.diagnostics().active_states == 0
 
 
 def sgd_reference(config, seed, hidden, logits, labels, weights, groups):
@@ -101,7 +101,7 @@ def sgd_reference(config, seed, hidden, logits, labels, weights, groups):
 def test_independent_lora_bmm_preserves_keyed_mean_and_private_publication() -> None:
     identities = tuple(RequestIdentity(str(index), index, 0) for index in range(3))
     keys = tuple(
-        RequestStateKey.project(identity, (RequestKeyField.PROMPT_IDX, RequestKeyField.SAMPLE_IDX))
+        RequestStateKey.project(identity, (RequestKeyField.PROMPT_INDEX, RequestKeyField.SAMPLE_INDEX))
         for identity in identities
     )
     config = OutputLoRAConfig(rank=2, alpha=3.0, learning_rate=0.2, steps=3, seed=11, scope=StateScope.REQUEST)
@@ -132,7 +132,7 @@ def test_independent_lora_bmm_preserves_keyed_mean_and_private_publication() -> 
                     torch.testing.assert_close(actual, target, rtol=1e-5, atol=1e-7)
             assert execution.arena.latest(initial[2].lineage_id) == initial[2]
             # Each row is guided by its own adapter; the untrained request keeps its initial factors.
-            guidance, _ = testing.run_guided_step(execution, replace(value, auxiliary=None), stream=stream)
+            guidance, _ = testing.run_guided_step(execution, replace(value, batch=None), stream=stream)
             expected = torch.cat(
                 [
                     torch.ones(1, 4, device=device) @ factors[0] @ factors[1] * 1.5
@@ -145,7 +145,7 @@ def test_independent_lora_bmm_preserves_keyed_mean_and_private_publication() -> 
                     torch.testing.assert_close(actual, target, rtol=0, atol=0)
         execution.arena.wait_release(execution.arena.release_pin(old_pin))
         execution.retire(identities)
-        assert execution.diagnostics().active_lineages == 0
+        assert execution.diagnostics().active_states == 0
     route_keyed_lineages_until_dormant_retirement()
 
 
@@ -183,9 +183,9 @@ def route_keyed_lineages_until_dormant_retirement() -> None:
     for actual, initial in zip(execution.snapshot(joined_code), code_initial, strict=True):
         torch.testing.assert_close(actual, initial)
     execution.retire((math_a, math_b, code))
-    assert execution.diagnostics().active_lineages == 2, "dormant route lineages persist"
+    assert execution.diagnostics().active_states == 2, "dormant route lineages persist"
     execution.retire_dormant()
-    assert execution.diagnostics().active_lineages == 0
+    assert execution.diagnostics().active_states == 0
     # A later admission of the same route starts a fresh initialized lineage.
     (fresh,) = execution.admit((RequestIdentity("r3", 3, 0, "math"),))
     assert fresh.version_id == 0 and fresh.lineage_id != first.lineage_id

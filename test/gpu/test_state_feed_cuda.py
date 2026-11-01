@@ -12,7 +12,7 @@ import pllm
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.execution.ptts.page_borrow import BorrowedPage
 from pllm.execution.state_feed import FeedReceiver, ReadonlyStepEnd, receive_field
-from pllm.execution.step_input import TensorStepInput
+from pllm.execution.step_input import StepInput
 from test.workloads.test_state_feed import FeedWorkload, facts_for
 
 pytestmark = [pytest.mark.slow, pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA IPC requires a GPU")]
@@ -37,7 +37,7 @@ def producer(feed, probe):
         feed.end()
     finally:
         feed.close()
-    assert arena.active_lineages == arena.pending_pin_releases == 0
+    assert arena.active_states == arena.pending_pin_releases == 0
     probe.send(("closed", None))
     probe.close()
 
@@ -111,7 +111,7 @@ def test_feed_selects_complete_versions_and_reclaims_only_after_completion(order
                 event = torch.cuda.Event()
                 torch.cuda._sleep(100_000_000)
                 event.record(stream)
-                receipt = execution.step(TensorStepInput(rows.row_batch, rows), stream)
+                receipt = execution.step(StepInput(rows.row_batch, rows), stream)
                 assert event.query(), "read ACK must follow CUDA completion"
                 torch.testing.assert_close(
                     execution.snapshot(receipt.publication.after_refs[0], stream)[0],

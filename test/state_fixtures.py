@@ -207,6 +207,6 @@ def assert_multistate_reclaimed(execution):
     """Require retirement to reclaim every resource, inference pin and receipt."""
     execution.arena.collect_completed(wait=True)
     usage = execution.arena.usage()
-    assert execution.directory.active_count == execution.arena.active_lineages == 0
+    assert execution.directory.active_count == execution.arena.active_states == 0
     assert execution.directory.inference_pin_count == 0
     assert usage.private_versions == usage.pinned_versions == usage.pending_receipts == 0

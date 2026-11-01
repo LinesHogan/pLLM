@@ -53,12 +53,12 @@ def main() -> None:
         outputs = handle.generate(
             ["The sky is", "Water freezes at"],
             SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True),
-            auxiliary=batch,
+            batch=batch,
         )
         assert all(output.outputs[0].token_ids for output in outputs)
         diagnostics = execution.diagnostics()
         assert diagnostics.update_count == diagnostics.loss_count == 1
-        assert diagnostics.active_lineages == 1 and diagnostics.inference_pins == 0
+        assert diagnostics.active_states == 1 and diagnostics.inference_pins == 0
         assert diagnostics.pending_state_releases == 0
         assert (handle.runner.require_session().updated_apply_count == 0) == (args.mode == TLMMode.ONLINE)
         (current,) = execution.directory.select(()).refs
@@ -108,7 +108,7 @@ def main() -> None:
         for hook in hooks:
             hook.remove()
         handle.close()
-    assert execution.diagnostics().active_lineages == execution.diagnostics().inference_pins == 0
+    assert execution.diagnostics().active_states == execution.diagnostics().inference_pins == 0
 
 
 if __name__ == "__main__":

@@ -143,7 +143,7 @@ class TensorTask:
     policy: MathContract
     outputs: tuple[str, ...]
     # Memory fields written from inputs at publication; only training tasks have them.
-    captures: Mapping[str, LayoutFieldId]
+    carries: Mapping[str, LayoutFieldId]
     phase: HiddenPhase | None = None
     resource: StateResource = StateResource("")
     writer: FieldWriter | None = None
@@ -211,7 +211,7 @@ class TensorTask:
     def domains(self) -> tuple[str, ...]:
         """Inputs that are boolean row masks (row selector, gradient rows, update states)."""
         policy = self.policy
-        keys = (policy.forward_rows, policy.input_gradient_rows, policy.parameter_gradient_rows, policy.update_states)
+        keys = (policy.forward_rows, policy.input_gradient_rows, policy.parameter_gradient_rows, policy.update_rows)
         return tuple(
             key
             for key in dict.fromkeys(keys)

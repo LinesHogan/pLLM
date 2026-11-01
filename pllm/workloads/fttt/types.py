@@ -7,7 +7,7 @@ from math import isfinite
 
 import torch
 
-from pllm.authoring import AdamW, StateTensorUpdate
+from pllm.authoring import AdamW, StateImport
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
 from pllm.host import Completion, CompletionInput, RetryControl, RewardOutcome, UpdateBarrier
@@ -30,12 +30,12 @@ class FTTTResult:
     def update_barriers(self) -> tuple[UpdateBarrier, ...]:
         return self.intent.update_barriers
 
-    def state_update(self) -> StateTensorUpdate[torch.Tensor]:
+    def state_update(self) -> StateImport[torch.Tensor]:
         """Borrow the original delta rows for a signed single-layer additive patch."""
-        return StateTensorUpdate(
+        return StateImport(
             (self.edit_delta,),
             tuple(
-                RequestStateKey.project(record.completion.identity, (RequestKeyField.PROMPT_IDX,))
+                RequestStateKey.project(record.completion.identity, (RequestKeyField.PROMPT_INDEX,))
                 for record in self.intent.feedback_records
             ),
         )
@@ -94,7 +94,7 @@ class FTTTFeedbackRecord:
 
 
 @dataclass(frozen=True, slots=True)
-class FTTTInstanceState:
+class FTTTRequestLifecycle:
     retries: int = 0
     stopped: bool = False
     adapter_version: int = 0
@@ -103,8 +103,8 @@ class FTTTInstanceState:
 @dataclass(frozen=True, slots=True)
 class FTTTLifecycleTransition:
     key: tuple[str, int]
-    previous: FTTTInstanceState
-    next: FTTTInstanceState
+    previous: FTTTRequestLifecycle
+    next: FTTTRequestLifecycle
     trained: bool
 
 
@@ -133,7 +133,7 @@ __all__ = [
     "FTTTConfig",
     "FTTTFeedbackRecord",
     "FTTTQueuedFeedback",
-    "FTTTInstanceState",
+    "FTTTRequestLifecycle",
     "FTTTJudgeResult",
     "FTTTLifecycleTransition",
 ]

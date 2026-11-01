@@ -31,7 +31,7 @@ from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
-from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
+from pllm.workloads.esamp import ESampConfig, ESampWorkload
 from pllm.workloads.inplace_ttt import (
     InPlaceTTTConfig,
     InPlaceTTTWorkload,
@@ -64,7 +64,7 @@ def overlay_facts():
 
 
 def sampler_deployment(probe, facts):
-    esamp = ESampRequestWorkload(ESampRequestConfig(rank=2, source_layer=0, target_layer=1, intervention_beta=0.2))
+    esamp = ESampWorkload(ESampConfig(rank=2, source_layer=0, target_layer=1, intervention_beta=0.2))
     sampler_probe = replace(
         probe,
         hidden_resources=tuple(
@@ -108,7 +108,7 @@ def test_factory_failure_releases_an_already_created_engine(multiprocessing: boo
             with pytest.raises((AttributeError, ValueError)):
                 pllm.make_llm(
                     pllm.ModelConfig("unused-local-model", multiprocessing=multiprocessing),
-                    workload=ESampRequestWorkload(),
+                    workload=ESampWorkload(),
                 )
             assert resource.closed
 

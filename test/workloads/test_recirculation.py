@@ -26,7 +26,7 @@ from pllm.execution.replay import (
     TokenwiseReplayTask,
 )
 from pllm.execution.runtime_facts import model_timeline
-from pllm.execution.step_input import TensorStepInput
+from pllm.execution.step_input import StepInput
 from pllm.workload_transport import decode_workload, encode_workload
 from pllm.workloads.recirculation import RecirculationWorkload
 
@@ -60,7 +60,7 @@ ROWS = PackedPhaseRowBatch(
         for i in range(4)
     ),
 )
-VALUE = TensorStepInput(ROWS, PackedSamplerRowBatch(ROWS, (PackedSamplerRowLink(0, 2), PackedSamplerRowLink(1, 3))))
+VALUE = StepInput(ROWS, PackedSamplerRowBatch(ROWS, (PackedSamplerRowLink(0, 2), PackedSamplerRowLink(1, 3))))
 INPUTS = torch.tensor([[0.4, -0.1, 0.3, 0.7], [0.2, 0.9, -0.3, 0.8], [-0.2, 0.1, 0.8, 0.4], [0.7, 0.2, -0.1, 0.3]])
 
 

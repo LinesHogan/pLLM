@@ -39,7 +39,7 @@ class PackedPhaseRowBatch:
         return tuple(
             sorted(
                 last.values(),
-                key=lambda row: (row.identity.request_id, row.identity.prompt_idx, row.identity.sample_idx),
+                key=lambda row: (row.identity.request_id, row.identity.prompt_index, row.identity.sample_index),
             )
         )
 

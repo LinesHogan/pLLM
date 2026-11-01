@@ -48,7 +48,7 @@ def test_admission_failure_rolls_back_every_resource_and_inference_pin():
     with pytest.raises(RuntimeError):
         execution.admit((a, b))
     execution.arena.collect_completed(wait=True)
-    assert execution.directory.active_count == execution.arena.active_lineages == 1
+    assert execution.directory.active_count == execution.arena.active_states == 1
     assert execution.directory.inference_pin_count == 0
     assert execution.arena.usage().private_versions == execution.arena.usage().pinned_versions == 0
     execution.retire(())

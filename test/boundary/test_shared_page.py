@@ -8,7 +8,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from pllm.authoring import CausalTrainBatch, StateTensorUpdate
+from pllm.authoring import CausalTrainBatch, StateImport
 from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.execution.host_runtime import CompletionCapture
@@ -27,7 +27,7 @@ def test_codec_round_trips_payloads_and_shared_tensors_own_their_mapping() -> No
         descriptor = SharedTensor.export(source, lifetime)
         for value, target in (
             (CausalTrainBatch(descriptor, descriptor), CausalTrainBatch[SharedTensor]),
-            (StateTensorUpdate((descriptor,)), StateTensorUpdate[SharedTensor]),
+            (StateImport((descriptor,)), StateImport[SharedTensor]),
             (BATCH, CompletionBatch),
         ):
             assert decode_boundary(encode_boundary(value), target) == value

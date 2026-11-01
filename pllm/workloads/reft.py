@@ -11,7 +11,7 @@ import pllm
 
 def load_loreft_interventions(
     directory: str | Path, layers: tuple[int, ...], device: torch.device, dtype: torch.dtype
-) -> pllm.state.StateTensorUpdate[torch.Tensor]:
+) -> pllm.state.StateImport[torch.Tensor]:
     """Read pyreft checkpoints once into the original shared publication input."""
     loaded: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
     for path in sorted(Path(directory).glob("intkey_*.bin")):
@@ -29,11 +29,11 @@ def load_loreft_interventions(
         )
     if set(loaded) != set(layers):
         raise FileNotFoundError("missing requested LoReFT layer checkpoints")
-    return pllm.state.StateTensorUpdate(tuple(value for layer in layers for value in loaded[layer]))
+    return pllm.state.StateImport(tuple(value for layer in layers for value in loaded[layer]))
 
 
 @dataclass(frozen=True, slots=True)
-class ActivationConfig:
+class ReFTConfig:
     layers: tuple[int, ...]
     rank: int = 4
     first_tokens: int = 0
@@ -53,9 +53,8 @@ class ActivationConfig:
 
 
 @dataclass(frozen=True)
-class ActivationWorkload(pllm.Workload):
-    name = "activation"
-    config: ActivationConfig
+class ReFTWorkload(pllm.Workload):
+    config: ReFTConfig
 
     @property
     def intervention(self) -> pllm.InstanceState:
@@ -70,7 +69,6 @@ class ActivationWorkload(pllm.Workload):
         state = pllm.RequestState if self.config.scope is pllm.state.StateScope.REQUEST else pllm.InstanceState
         return state(
             {f"layer_{layer}_{offset}": buffer for layer in self.config.layers for offset, buffer in enumerate(fields)},
-            namespace="canonical.activation@1",
             imported=True,
         )
 

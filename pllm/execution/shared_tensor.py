@@ -175,7 +175,7 @@ class SharedTensor:
     def describe(tensor: torch.Tensor) -> TensorFieldSpec:
         dtype = next((dtype for dtype in TensorDType if dtype.torch == tensor.dtype), None)
         if dtype is None or tensor.layout != torch.strided or tensor.device.type not in ("cpu", "cuda"):
-            raise ValueError("auxiliary tensor must use a strided CPU or CUDA tensor in the closed dtype vocabulary")
+            raise ValueError("host batch tensors must be strided CPU or CUDA tensors of a supported dtype")
         return TensorFieldSpec(LayoutFieldId(0), tuple(tensor.shape), dtype, tensor.element_size())
 
     def map(self, peer_pid: int, stream: torch.cuda.Stream | None = None) -> torch.Tensor:

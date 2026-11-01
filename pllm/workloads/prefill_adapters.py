@@ -27,10 +27,9 @@ def initialize(fields: Mapping[str, torch.Tensor], generator: torch.Generator) -
 
 
 @dataclass(frozen=True)
-class PrefillAdapters(pllm.Workload):
+class PrefillAdaptersWorkload(pllm.Workload):
     """A request learns during prefill and uses its frozen final adapter for decode."""
 
-    name = "prefill_adapters"
     chunk_size: int = 128
     rank: int = 8
     learning_rate: float = 1e-3

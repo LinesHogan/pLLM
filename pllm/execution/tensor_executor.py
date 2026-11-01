@@ -299,7 +299,7 @@ class TensorExecutor:
             slots,
             destinations,
             self.gradients,
-            {field: self.inputs[key] for key, field in self.task.captures.items()},
+            {field: self.inputs[key] for key, field in self.task.carries.items()},
             updates,
             last,
             paged=self.paged,
@@ -315,9 +315,7 @@ class TensorExecutor:
         """
         policy, states = self.task.policy, rows.index.states
         trained = rows.active & self.inputs[policy.forward_rows] if policy.forward_rows else rows.active
-        chosen = (
-            rows.active & self.inputs[policy.update_states] if policy.update_states in self.task.domains else trained
-        )
+        chosen = rows.active & self.inputs[policy.update_rows] if policy.update_rows in self.task.domains else trained
         count = states.new_zeros(rows.states + 1).index_add_(0, states, chosen.long())
         positions = torch.where(trained, torch.arange(len(states), device=states.device), -1)
         last = torch.full_like(count, -1).scatter_reduce_(0, states, positions, "amax")

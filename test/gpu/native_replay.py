@@ -60,7 +60,7 @@ class NativeSteps:
     """vLLM worker extension for native numerical checks without serializing callbacks."""
 
     def begin_native_steps(self):
-        """Install the same native StepLoop checks in either an in-process or EngineCore worker."""
+        """Install the same native StepLoopWorkload checks in either an in-process or EngineCore worker."""
         from contextlib import ExitStack
         from unittest.mock import patch
 

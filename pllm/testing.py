@@ -23,7 +23,6 @@ import numpy as np
 import torch
 
 from pllm.backends.vllm.architecture import hidden_binding
-from pllm.contracts.auxiliary import AuxiliaryInput
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
     AttachmentHiddenResource,
@@ -31,6 +30,7 @@ from pllm.contracts.backend_attachment import (
     ParameterTargetShape,
 )
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from pllm.contracts.host_batch import HostBatch
 from pllm.contracts.packed_hidden import (
     HiddenRowBatch,
     HiddenRows,
@@ -47,7 +47,7 @@ from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.state_execution import StateExecution
-from pllm.execution.step_input import TensorStepInput
+from pllm.execution.step_input import StepInput
 
 if TYPE_CHECKING:
     from pllm.authoring import BackendWorkload
@@ -107,7 +107,7 @@ def backend_facts(
 
 def compile_execution(
     workload: BackendWorkload[DataT, ResultT], facts: BackendCompileFacts, stream: torch.cuda.Stream | None = None
-) -> StateExecution[TensorStepInput, DataT, ResultT]:
+) -> StateExecution[StepInput, DataT, ResultT]:
     """Compile `workload` against `facts` and admit its instance state, as the vLLM runner does on install.
 
     Request state is admitted per request with `execution.admit(identities)`.
@@ -125,10 +125,10 @@ def step_input(
     token_offset: int = 0,
     phases: Sequence[HiddenPhase] | None = None,
     sampler_order: Sequence[int] | None = None,
-    auxiliary: AuxiliaryInput[torch.Tensor] | None = None,
+    batch: HostBatch[torch.Tensor] | None = None,
     operands: tuple[CapturedParameterOperand, ...] = (),
     stream: torch.cuda.Stream | None = None,
-) -> TensorStepInput:
+) -> StepInput:
     """One packed step: row i belongs to `identities[i]` and decodes unless `phases` says otherwise.
 
     `sampler_order` lists the packed row behind each sampler row (identity order by default; `()` for a
@@ -150,19 +150,19 @@ def step_input(
         HiddenRows(binding, tensor, np.arange(count, dtype=np.int64))
         for binding, tensor in sorted((hidden or {}).items(), key=lambda item: item[0].locator_key)
     )
-    return TensorStepInput(
+    return StepInput(
         rows,
         PackedSamplerRowBatch(rows, tuple(PackedSamplerRowLink(i, row) for i, row in enumerate(order))),
         HiddenRowBatch(rows, captures) if captures else None,
         operands=operands,
-        auxiliary=auxiliary,
+        batch=batch,
         hidden_readiness=None if stream is None else CudaStreamReadiness(stream),
     )
 
 
 def run_step(
-    execution: StateExecution[TensorStepInput, DataT, ResultT],
-    value: TensorStepInput,
+    execution: StateExecution[StepInput, DataT, ResultT],
+    value: StepInput,
     *,
     feedback: SamplerFeedback | None = None,
     stream: torch.cuda.Stream | None = None,
@@ -172,8 +172,8 @@ def run_step(
 
 
 def run_guided_step(
-    execution: StateExecution[TensorStepInput, DataT, ResultT],
-    value: TensorStepInput,
+    execution: StateExecution[StepInput, DataT, ResultT],
+    value: StepInput,
     *,
     feedback: SamplerFeedback | None = None,
     stream: torch.cuda.Stream | None = None,

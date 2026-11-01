@@ -12,7 +12,7 @@ from typing import Generic
 import torch
 from vllm.v1.core.sched.output import SchedulerOutput
 
-from pllm.authoring import AuxiliaryInput, BackendDeployment, DataT, ResultT
+from pllm.authoring import BackendDeployment, DataT, HostBatch, ResultT
 from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.architecture import Decoder
 from pllm.backends.vllm.hidden_capture import HiddenTaps
@@ -49,7 +49,7 @@ from pllm.execution.state_feed import (
     ReadonlyStepEnd,
     ReadonlyStepInput,
 )
-from pllm.execution.step_input import TensorStepInput
+from pllm.execution.step_input import StepInput
 
 
 @dataclass(slots=True)
@@ -148,7 +148,7 @@ class VllmSession(Generic[DataT, ResultT]):
         self._pending_identities: dict[str, RequestIdentity] = {}
         self._next_step_id = 0
         self._step: _PackedStep[DataT] | None = None
-        self._auxiliary: AuxiliaryInput[torch.Tensor] | None = None
+        self._host_batch: HostBatch[torch.Tensor] | None = None
         self.completion_capture: CompletionCapture | None = None
         execution = deployment.execution
         execution.admit_instances(torch.cuda.current_stream(execution.device))
@@ -163,14 +163,14 @@ class VllmSession(Generic[DataT, ResultT]):
 
     def stage_input(
         self,
-        batch: AuxiliaryInput[torch.Tensor] | None,
+        batch: HostBatch[torch.Tensor] | None,
         identities: tuple[RequestIdentity, ...],
         completion: torch.Tensor | None = None,
     ) -> None:
         """Stage request inputs, already validated by generate, and their optional completion destination."""
         self._require_input_live()
         self.completion_capture = None if completion is None else CompletionCapture(identities, completion)
-        self._auxiliary = batch
+        self._host_batch = batch
         self._pending_identities = {identity.request_id: identity for identity in identities}
 
     def feed(self, name: str) -> Feed:
@@ -297,17 +297,18 @@ class VllmSession(Generic[DataT, ResultT]):
         execution = self._deployment.execution
         identities = tuple(
             sorted(
-                rows.identities, key=lambda identity: (identity.request_id, identity.prompt_idx, identity.sample_idx)
+                rows.identities,
+                key=lambda identity: (identity.request_id, identity.prompt_index, identity.sample_index),
             )
         )
         stream = torch.cuda.current_stream(execution.device)
         if not self._in_forward_overlay:
             held_input = self._receive_readonly(rows, stream)
-            value = TensorStepInput(rows.row_batch, rows, auxiliary=self._auxiliary)
+            value = StepInput(rows.row_batch, rows, batch=self._host_batch)
             context = execution.start_step(value, stream, held_input=held_input)
             instance_states = bool(execution.directory.instance_states)
             if instance_states or not self._pending_identities:
-                self._auxiliary = None
+                self._host_batch = None
             step.context = context
             execution.advance_to(context, "request.prepare")
             # Offline publication precedes admission; existing request pins remain unchanged.
@@ -349,7 +350,7 @@ class VllmSession(Generic[DataT, ResultT]):
         execution = self._deployment.execution
         stream = torch.cuda.current_stream(execution.device)
         operands = () if self._overlay is None else self._overlay.take_captures()
-        value = TensorStepInput(step.rows.row_batch, step.rows, operands=operands, auxiliary=self._auxiliary)
+        value = StepInput(step.rows.row_batch, step.rows, operands=operands, batch=self._host_batch)
         if self._taps is not None and self._hidden_resources:
             value = self._taps.publish(value, self._hidden_resources)
         if (
@@ -365,7 +366,7 @@ class VllmSession(Generic[DataT, ResultT]):
             if overlap is not None and not overlap.lag:
                 stream = overlap.stream
             step.context = execution.start_step(value, stream, history=() if overlap is None else overlap.history)
-            self._auxiliary = None
+            self._host_batch = None
         elif step.context.value is None or self._hidden_resources or operands:
             execution.submit_input(step.context, value, CudaStreamReadiness(stream))
         if self._taps is not None and self._hidden_resources:
@@ -454,7 +455,7 @@ class VllmSession(Generic[DataT, ResultT]):
             self._sampler.abort_guidance()
         self._finish_effects()
         self._deployment.execution.cancel_active()
-        self._auxiliary = None
+        self._host_batch = None
         self._step = None
 
     def _retire(self, identities: tuple[RequestIdentity, ...]) -> None:

@@ -7,17 +7,17 @@ from dataclasses import dataclass, replace
 from typing import Generic, TypeVar
 
 from pllm.config import ExecutionOptions
-from pllm.contracts.auxiliary import (
-    AuxiliaryInput as AuxiliaryInput,
-    CausalTrainBatch as CausalTrainBatch,
-    StateTensorUpdate as StateTensorUpdate,
-    WeightedCEBatch as WeightedCEBatch,
-    WeightedRowBatch as WeightedRowBatch,
-    map_auxiliary as map_auxiliary,
-)
 from pllm.contracts.backend_attachment import BackendAttachment, BackendPlacementProbe
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenSite as HiddenSite
+from pllm.contracts.host_batch import (
+    CausalTrainBatch as CausalTrainBatch,
+    HostBatch as HostBatch,
+    StateImport as StateImport,
+    WeightedCEBatch as WeightedCEBatch,
+    WeightedRowBatch as WeightedRowBatch,
+    map_host_batch as map_host_batch,
+)
 from pllm.contracts.parameter_overlay import ParameterTarget
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import HiddenInputSource, SchedulerTimeline, StateScope
@@ -33,8 +33,8 @@ from pllm.execution.declaration import Dimensions as Dimensions
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import compile_page_bundle_plan
 from pllm.execution.state_execution import MathBinding, StateExecution
-from pllm.execution.step_input import TensorStepInput as TensorStepInput
-from pllm.execution.tensor_binding import TensorBinding, TensorResult as TensorResult
+from pllm.execution.step_input import StepInput as StepInput
+from pllm.execution.tensor_binding import StepResult as StepResult, TensorBinding
 from pllm.execution.tensor_program import FunctionMath as FunctionMath
 from pllm.kernels.adamw import AdamWConfig
 
@@ -43,7 +43,7 @@ ResultT = TypeVar("ResultT")
 AdamW = AdamWConfig
 __all__ = [
     "AdamW",
-    "AuxiliaryInput",
+    "HostBatch",
     "BackendDeployment",
     "BackendRequirements",
     "BackendWorkload",
@@ -51,12 +51,12 @@ __all__ = [
     "Dimensions",
     "FunctionMath",
     "HiddenSite",
-    "StateTensorUpdate",
-    "TensorResult",
-    "TensorStepInput",
+    "StateImport",
+    "StepResult",
+    "StepInput",
     "WeightedCEBatch",
     "WeightedRowBatch",
-    "map_auxiliary",
+    "map_host_batch",
 ]
 
 
@@ -74,13 +74,13 @@ class BackendRequirements:
     instance_overlay: bool = False
     causal_training: bool = False
     feeds: bool = False
-    # The smallest pllm.samples(limit=); requests must use a lower sample index.
+    # The smallest pllm.sample_index(limit=); requests must use a lower sample index.
     sample_limit: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class BackendDeployment(Generic[DataT, ResultT]):
-    execution: StateExecution[TensorStepInput, DataT, ResultT]
+    execution: StateExecution[StepInput, DataT, ResultT]
     attachment: BackendAttachment
 
     def __post_init__(self) -> None:
@@ -139,7 +139,7 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
     @abstractmethod
     def bind_math(
         self, facts: BackendCompileFacts, plan: PlanBundle, declaration: TensorBinding
-    ) -> MathBinding[TensorStepInput, DataT, ResultT]:
+    ) -> MathBinding[StepInput, DataT, ResultT]:
         """Bind the planned declaration to selected implementations; no storage or execution ownership."""
         ...
 

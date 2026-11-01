@@ -62,7 +62,7 @@ def test_video_real_frame_math_and_signed_composition():
         execution.admit(())
         execution.stage_readonly((BorrowedStateRoot(execution.arena, "features", ref, tuple(pages)),))
         rows = PackedPhaseRowBatch(0, 0, ())
-        result = execution.step(pllm.authoring.TensorStepInput(rows, PackedSamplerRowBatch(rows, ())))
+        result = execution.step(pllm.authoring.StepInput(rows, PackedSamplerRowBatch(rows, ())))
         signal = torch.cat(
             (
                 values[0].flatten() / 63,

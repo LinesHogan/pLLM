@@ -18,8 +18,8 @@ class RequestStateKey:
 
     fields: tuple[RequestKeyField, ...]
     request_id: str
-    prompt_idx: int
-    sample_idx: int
+    prompt_index: int
+    sample_index: int
     route: str = ""
 
     @classmethod
@@ -33,10 +33,10 @@ class RequestStateKey:
         if (
             RequestKeyField.REQUEST_ID in fields
             and not identity.request_id
-            or RequestKeyField.PROMPT_IDX in fields
-            and identity.prompt_idx < 0
-            or RequestKeyField.SAMPLE_IDX in fields
-            and identity.sample_idx < 0
+            or RequestKeyField.PROMPT_INDEX in fields
+            and identity.prompt_index < 0
+            or RequestKeyField.SAMPLE_INDEX in fields
+            and identity.sample_index < 0
             or RequestKeyField.ROUTE in fields
             and not identity.route
         ):
@@ -44,7 +44,7 @@ class RequestStateKey:
         return cls(
             fields=fields,
             request_id=(identity.request_id if RequestKeyField.REQUEST_ID in fields else ""),
-            prompt_idx=(identity.prompt_idx if RequestKeyField.PROMPT_IDX in fields else -1),
-            sample_idx=(identity.sample_idx if RequestKeyField.SAMPLE_IDX in fields else -1),
+            prompt_index=(identity.prompt_index if RequestKeyField.PROMPT_INDEX in fields else -1),
+            sample_index=(identity.sample_index if RequestKeyField.SAMPLE_INDEX in fields else -1),
             route=(identity.route if RequestKeyField.ROUTE in fields else ""),
         )

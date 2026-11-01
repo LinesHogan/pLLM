@@ -32,13 +32,13 @@ from pllm.execution.ptts.page_bundle import PagePin, PagePublication, PageWrite
 from pllm.execution.ptts.request_state import RequestStateSelection, StateAddress
 from pllm.execution.ptts.slot_pools import Slots
 from pllm.execution.state_execution import ProjectionResiduals, StateTaskContext
-from pllm.execution.step_input import TensorStepInput
+from pllm.execution.step_input import StepInput
 from pllm.execution.torch_private import MemoryTrace, MemoryUsage, measure
-from pllm.execution.trace import TracePhase
+from pllm.execution.trace import TraceEventKind
 from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw, paged_adamw
 from pllm.kernels.page_copy import copy_pages
 
-I = TypeVar("I", bound=TensorStepInput)
+I = TypeVar("I", bound=StepInput)
 D = TypeVar("D")
 R = TypeVar("R")
 Roots = tuple[tuple[torch.Tensor, ...], ...]
@@ -241,7 +241,7 @@ class FunctionMath(Generic[I, D, R]):
             nullcontext() if context.pin.stream is None else torch.cuda.stream(context.pin.stream),
             torch.inference_mode(False),
         ):
-            value.order_auxiliary()
+            value.order_host_batch()
             data = self.prepare_data(value, read_batch(context))
             return data if context.value is None or self.resume_data is None else self.resume_data(context.value, data)
 
@@ -361,7 +361,7 @@ class PageUpdate:
         sources: torch.Tensor,
         destinations: torch.Tensor,
         gradients: torch.Tensor,
-        captures: Mapping[LayoutFieldId, torch.Tensor],
+        carries: Mapping[LayoutFieldId, torch.Tensor],
         updates: torch.Tensor,
         last: torch.Tensor,
         *,
@@ -369,7 +369,7 @@ class PageUpdate:
     ) -> None:
         """Write every issued destination inside the shared tensor body, without a host sync.
 
-        States with `updates` take the optimizer step and their memory captures from row `last` (when it is
+        States with `updates` take the optimizer step and their carried values from row `last` (when it is
         not -1); every other destination receives its source page unchanged.
         """
         count = gradients.shape[0]
@@ -383,12 +383,12 @@ class PageUpdate:
             rows = torch.arange(count, device=destinations.device)
             for field in range(ADAM):
                 copy_pages(fields[field], pools[field], rows, stepped[field])
-        captured = torch.where(updates & (last >= 0), destinations, -1)
-        for field, value in captures.items():
+        carried = torch.where(updates & (last >= 0), destinations, -1)
+        for field, value in carries.items():
             assert value.shape[1:] == pools[field].shape[1:] and value.dtype == pools[field].dtype
-            copy_pages(value.detach(), pools[field], last.clamp_min(0), captured[field])
+            copy_pages(value.detach(), pools[field], last.clamp_min(0), carried[field])
         for field in range(len(pools)):
-            written = stepped if field < ADAM else captured if field in captures else None
+            written = stepped if field < ADAM else carried if field in carries else None
             copy_pages(
                 pools[field],
                 pools[field],
@@ -523,7 +523,7 @@ class TensorOperation(Generic[D]):
                 for observation in output.observations:
                     if observation.export is not None:
                         context.trace.record(
-                            TracePhase.TENSOR,
+                            TraceEventKind.TENSOR,
                             context.invocation_id,
                             task_id=task.task_id,
                             identities=observation.identities,

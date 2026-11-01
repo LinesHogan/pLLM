@@ -17,8 +17,8 @@ from torch.nn import functional as F
 
 import pllm
 from pllm.execution.cuda_stream import upload
-from pllm.execution.step_input import TensorStepInput
-from pllm.execution.tensor_binding import TensorResult
+from pllm.execution.step_input import StepInput
+from pllm.execution.tensor_binding import StepResult
 from pllm.host import CompletionInput, HostConfig, WeightedRowBatch, make_host
 from pllm.workloads.fttt.host_service import FTTTFeedbackService
 from pllm.workloads.fttt.math import feedback_rows
@@ -43,7 +43,6 @@ def edit_targets(feedback: torch.Tensor, hidden_size: int, edit_scale: float) ->
 class FTTTWorkload(pllm.Workload):
     """A rank-r edit from (hidden, feedback features, reward) rows to hidden-size deltas, fit by AdamW."""
 
-    name = "fttt"
     config: FTTTConfig = FTTTConfig()
 
     @property
@@ -51,7 +50,6 @@ class FTTTWorkload(pllm.Workload):
         rank, feedback = self.config.rank, self.config.feedback_width
         return pllm.InstanceState(
             {"down": lambda m: (rank, m.hidden_size + feedback), "up": lambda m: (m.hidden_size, rank)},
-            namespace="canonical.fttt_edit@1",
             optimizer=pllm.AdamW(self.config.learning_rate, self.config.betas, self.config.eps),
             initialize=self.initialize,
         )
@@ -122,8 +120,8 @@ class FTTTTrainer:
                 feedback_rows(records, feature_size=self.feedback.config.feedback_feature_size), device, torch.float32
             )
             weights = torch.ones(len(records), device=device)
-            result = self.edit.step(TensorStepInput.of_batch(WeightedRowBatch(rows, feedback, weights)), stream)
-            assert isinstance(result, TensorResult) and result.publication is not None and result.loss is not None
+            result = self.edit.step(StepInput.of_batch(WeightedRowBatch(rows, feedback, weights)), stream)
+            assert isinstance(result, StepResult) and result.publication is not None and result.loss is not None
             delta = edit_rows(rows, feedback, result.parameters["down"], result.parameters["up"])
         (published,) = result.publication.after_refs
         intent = replace(queued.intent, adapter_version=published.version_id)

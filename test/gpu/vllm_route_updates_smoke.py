@@ -264,7 +264,7 @@ def run(chunk):
             (len(output.prompt_token_ids) + len(output.outputs[0].token_ids) - 1) // chunk
             for output in (*outputs, *profile_outputs)
         )
-        assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
+        assert diagnostics.active_states == diagnostics.pending_state_releases == 0
         print(
             f"route_updates chunk={chunk}: tokens={len(checked)} routed=4 variants=2 updates={diagnostics.update_count} trained_rows={diagnostics.trained_rows} relative_error={max(errors):.6f}"
         )

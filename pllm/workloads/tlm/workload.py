@@ -46,7 +46,6 @@ class TLMConfig:
 class TLMWorkload(pllm.Workload):
     """All-layer q/v LoRA trained from host-supplied causal sequence batches."""
 
-    name = "tlm.qv_lora"
     config: TLMConfig
     rank: int = 8
     alpha: int = 16
@@ -57,7 +56,7 @@ class TLMWorkload(pllm.Workload):
 
     @property
     def phase(self) -> pllm.Phase:
-        return pllm.Phase.BEFORE_MODEL if self.config.mode is TLMMode.OFFLINE else pllm.Phase.AFTER_SAMPLE
+        return pllm.Phase.BEFORE_FORWARD if self.config.mode is TLMMode.OFFLINE else pllm.Phase.AFTER_SAMPLE
 
     @property
     def factors(self) -> pllm.InstanceState:
@@ -69,7 +68,6 @@ class TLMWorkload(pllm.Workload):
             },
             optimizer=self.config.optimizer,
             initialize=self.initialize,
-            namespace="canonical.qv_adamw@1",
         )
 
     @property
@@ -104,7 +102,7 @@ class TLMWorkload(pllm.Workload):
         labels: torch.Tensor = pllm.batch("labels"),
         attention_mask: torch.Tensor | None = pllm.batch("attention_mask"),
         model: pllm.model.CausalCall = pllm.causal_model("adapter"),
-    ) -> pllm.TensorUpdate | None:
+    ) -> pllm.UpdateOutput | None:
         """Select online with adapted logits, offline with base logits.
 
         Empty selections publish unchanged fields; selected_count remains a device tensor.
@@ -126,4 +124,4 @@ class TLMWorkload(pllm.Workload):
         count = selected.sum()
         loss = torch.where(count == 0, weighted.mean(), weighted.sum() / count.clamp_min(1))
         changed = count > 0
-        return pllm.TensorUpdate(loss, changed, changed.to(torch.int64), count, {"selected_count": count})
+        return pllm.UpdateOutput(loss, changed, changed.to(torch.int64), count, {"selected_count": count})

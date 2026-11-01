@@ -17,7 +17,13 @@ from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
 from pllm.testing import backend_facts
-from pllm.workloads.state_producers import TARGETS, DecodeFactors, ProjectionState, PromptFactors, PromptMixture
+from pllm.workloads.state_producers import (
+    TARGETS,
+    DecodeFactorsWorkload,
+    FactorAdapterWorkload,
+    PromptFactorsWorkload,
+    PromptMixtureWorkload,
+)
 from test.backend_facts import assert_finite_resources
 
 
@@ -71,7 +77,7 @@ def packed(identities, hidden, phases, lengths=(1, 1), *, offset=0, stream=None)
     )
 
 
-@pytest.mark.parametrize("workload", [PromptFactors(), PromptMixture()])
+@pytest.mark.parametrize("workload", [PromptFactorsWorkload(), PromptMixtureWorkload()])
 @pytest.mark.parametrize("length", [1, 75, 127, 128, 129, 2047, 2048, 2049])
 def test_prompt_producers_publish_only_completed_requests(workload, device, length):
     stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
@@ -123,7 +129,7 @@ def test_prompt_producers_publish_only_completed_requests(workload, device, leng
     assert changed.version_id == 1 and execution.arena.latest(refs[1].lineage_id) == refs[1]
     actual = execution.snapshot(changed, stream=stream)
     h = context[:1].double()
-    if isinstance(workload, PromptMixture):
+    if isinstance(workload, PromptMixtureWorkload):
         k, r = workload.components, workload.rank
         gate, bias, aq, av, bq, bv = weights.split((4 * k, k, k * r * 4, k * r * 4, k * 4 * r, k * 2 * r))
         probabilities = F.linear(h, gate.reshape(k, 4), bias).softmax(-1)[0]
@@ -149,13 +155,13 @@ def test_prompt_producers_publish_only_completed_requests(workload, device, leng
     torch.testing.assert_close(execution.snapshot(network_ref, stream=stream)[0].double(), weights, rtol=0, atol=0)
     execution.retire(identities, wait=True)
     execution.retire((), wait=True)
-    assert execution.diagnostics().active_lineages == 0
+    assert execution.diagnostics().active_states == 0
     assert initial
 
 
 def test_decode_adam_matches_independent_optimizer_and_keeps_entry_pin(device):
     stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
-    execution = deployment(DecodeFactors(), device=device).execution
+    execution = deployment(DecodeFactorsWorkload(), device=device).execution
     ids = (RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0))
     refs = execution.admit(ids, stream=stream)
     flat = execution.snapshot(refs[0], stream=stream)[0].clone().requires_grad_()
@@ -189,8 +195,13 @@ def test_decode_adam_matches_independent_optimizer_and_keeps_entry_pin(device):
     assert execution.arena.latest(refs[1].lineage_id) == refs[1]
     assert not x.requires_grad and not target.requires_grad
     execution.retire(ids, wait=True)
-    assert execution.diagnostics().active_lineages == 0
-    assert PromptFactors.consume is PromptMixture.consume is DecodeFactors.consume is ProjectionState.consume
+    assert execution.diagnostics().active_states == 0
+    assert (
+        PromptFactorsWorkload.consume
+        is PromptMixtureWorkload.consume
+        is DecodeFactorsWorkload.consume
+        is FactorAdapterWorkload.consume
+    )
 
 
 def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch, device):
@@ -199,12 +210,12 @@ def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch
     from pllm.contracts.request_state import RequestStateKey
     from pllm.execution.state_execution import PublishStateTask
 
-    class Imported(ProjectionState):
+    class Imported(FactorAdapterWorkload):
         @property
         def factors(self) -> pllm.RequestState:
             return replace(super().factors, imported=True)
 
-    class Written(ProjectionState):
+    class Written(FactorAdapterWorkload):
         @pllm.write(state="factors", fields=("a_0", "b_0", "a_1", "b_1"))
         def produce(
             self,
@@ -218,30 +229,30 @@ def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch
     imported, written = deployment(Imported(), device=device), deployment(Written(), device=device)
     assert imported.attachment.spec.overlay_bindings == written.attachment.spec.overlay_bindings
     identity = RequestIdentity("swap", 0, 0)
-    key = RequestStateKey.project(identity, (RequestKeyField.PROMPT_IDX,))
+    key = RequestStateKey.project(identity, (RequestKeyField.PROMPT_INDEX,))
     values = tuple(
         torch.full((1, *shape), index + 1.0, device=device)
         for index, shape in enumerate(((2, 4), (4, 2), (2, 4), (2, 2)))
     )
-    for deployed, payload in ((imported, pllm.state.StateTensorUpdate(values, (key,))), (written, None)):
+    for deployed, payload in ((imported, pllm.state.StateImport(values, (key,))), (written, None)):
         execution = deployed.execution
         execution.admit((identity,), stream=stream)
-        result = testing.run_step(execution, testing.step_input((identity,), auxiliary=payload), stream=stream)
+        result = testing.run_step(execution, testing.step_input((identity,), batch=payload), stream=stream)
         torch.testing.assert_close(
             execution.snapshot(result.publication.after_refs[0], stream=stream), tuple(value[0] for value in values)
         )
         execution.retire((identity,), wait=True)
-        assert execution.diagnostics().active_lineages == 0
+        assert execution.diagnostics().active_states == 0
         execution.admit((identity,), stream=stream)
         payload = None if payload is None else replace(payload, values=tuple(value.clone() * 2 for value in values))
-        result = testing.run_step(execution, testing.step_input((identity,), auxiliary=payload), stream=stream)
+        result = testing.run_step(execution, testing.step_input((identity,), batch=payload), stream=stream)
         torch.testing.assert_close(
             execution.snapshot(result.publication.after_refs[0], stream=stream),
             tuple(value[0] * (2 if payload is not None else 1) for value in values),
         )
         execution.retire((identity,), wait=True)
-        assert execution.diagnostics().active_lineages == execution.diagnostics().pending_state_releases == 0
-        pair = (identity, replace(identity, request_id="another", prompt_idx=1))
+        assert execution.diagnostics().active_states == execution.diagnostics().pending_state_releases == 0
+        pair = (identity, replace(identity, request_id="another", prompt_index=1))
         execution.admit(pair, stream=stream)
         payload = (
             None
@@ -249,10 +260,10 @@ def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch
             else replace(
                 payload,
                 values=tuple(torch.cat((value, value * 3)) for value in values),
-                keys=tuple(RequestStateKey.project(item, (RequestKeyField.PROMPT_IDX,)) for item in pair),
+                keys=tuple(RequestStateKey.project(item, (RequestKeyField.PROMPT_INDEX,)) for item in pair),
             )
         )
-        result = testing.run_step(execution, testing.step_input(pair, auxiliary=payload), stream=stream)
+        result = testing.run_step(execution, testing.step_input(pair, batch=payload), stream=stream)
         for index, item in enumerate(pair):
             (ref,) = execution.latest((item,))
             torch.testing.assert_close(
@@ -260,7 +271,7 @@ def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch
                 tuple(value[0] * (3 if index and payload is not None else 1) for value in values),
             )
         execution.retire(pair, wait=True)
-        assert execution.diagnostics().active_lineages == execution.diagnostics().pending_state_releases == 0
+        assert execution.diagnostics().active_states == execution.diagnostics().pending_state_releases == 0
     execution = written.execution
     (entry,) = execution.admit((identity,), stream=stream)
     before = execution.snapshot(entry, stream=stream)
@@ -275,21 +286,21 @@ def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch
     assert execution.arena.latest(entry.lineage_id) == entry
     torch.testing.assert_close(execution.snapshot(entry, stream=stream), before)
     execution.retire((identity,), wait=True)
-    assert execution.diagnostics().active_lineages == execution.diagnostics().pending_state_releases == 0
+    assert execution.diagnostics().active_states == execution.diagnostics().pending_state_releases == 0
 
 
 def test_initialized_reader_and_hidden_before_model_boundary():
-    execution = deployment(ProjectionState()).execution
+    execution = deployment(FactorAdapterWorkload()).execution
     identity = RequestIdentity("readonly", 0, 0)
     (ref,) = execution.admit((identity,))
     assert testing.run_step(execution, testing.step_input((identity,))).publication is None
     assert execution.arena.latest(ref.lineage_id) == ref
     execution.retire((identity,))
 
-    class Cycle(PromptFactors):
-        @pllm.on(pllm.Phase.BEFORE_MODEL)
+    class Cycle(PromptFactorsWorkload):
+        @pllm.on(pllm.Phase.BEFORE_FORWARD)
         @pllm.write(state="factors", fields=("a_0",))
-        def produce(self, h=pllm.hidden(8, phase="prefill")):
+        def produce(self, h=pllm.hidden(8, tokens="prefill")):
             return (h,)
 
     with pytest.raises(ValueError, match="after model forward"):
@@ -308,7 +319,7 @@ def test_tasks_run_at_backend_points():
     from pllm.contracts.semantic_graph import AnchorSymbol, TimingConstraint
     from pllm.execution.scheduler import compile_schedule
 
-    plan = deployment(PromptFactors()).attachment.plan
+    plan = deployment(PromptFactorsWorkload()).attachment.plan
     point = next(a.ordinal for a in plan.timeline.anchors if a.symbol == "state.publish")
     assert all(t.anchor_id == point for t in plan.schedule.tasks)
     constrained = replace(

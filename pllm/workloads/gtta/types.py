@@ -64,7 +64,7 @@ class GTTATrajectoryBatch:
 
 @dataclass(frozen=True, slots=True)
 class GTTAQuery:
-    prompt_idx: int
+    prompt_index: int
     task_id: str
     candidate_actions: tuple[str, ...]
     observation: str
@@ -74,13 +74,13 @@ class GTTAQuery:
     position: GTTAPromptPosition
 
     def __post_init__(self) -> None:
-        if self.prompt_idx < 0 or self.max_records < 0:
-            raise ValueError("GTTAQuery needs nonnegative prompt_idx and max_records")
+        if self.prompt_index < 0 or self.max_records < 0:
+            raise ValueError("GTTAQuery needs nonnegative prompt_index and max_records")
 
 
 @dataclass(frozen=True, slots=True)
 class PromptContext:
-    prompt_idx: int
+    prompt_index: int
     text: str
     position: GTTAPromptPosition
 

@@ -23,7 +23,6 @@ def norm_match(
 class RecirculationWorkload(pllm.Workload):
     """Overwrite upper-layer KV after each normal token, keeping normal-pass logits."""
 
-    name = "recirculation"
     source: int = -1
     destination: int = 0
     alpha: float = 0.15
@@ -34,7 +33,7 @@ class RecirculationWorkload(pllm.Workload):
         """Resolve the destination against the model's layer count."""
         return self.destination if self.destination >= 0 else layers.layer_count + self.destination
 
-    def mix(self, taps: pllm.Taps, destination: torch.Tensor, position: torch.Tensor) -> torch.Tensor:
+    def mix(self, taps: pllm.LayerOutputs, destination: torch.Tensor, position: torch.Tensor) -> torch.Tensor:
         """Mix source and destination streams with the position-dependent ramp."""
         a = (
             self.alpha * (position.float().clamp(max=self.ramp_tokens) / self.ramp_tokens)
@@ -57,7 +56,7 @@ class RecirculationWorkload(pllm.Workload):
 
 
 @dataclass(frozen=True)
-class JacobiRecirculation(RecirculationWorkload):
+class JacobiRecirculationWorkload(RecirculationWorkload):
     """Recirculation whose prompt is solved by rounds Jacobi sweeps instead of token by token."""
 
     rounds: int = 2

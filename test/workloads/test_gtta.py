@@ -24,7 +24,7 @@ FEEDBACK = (
 
 
 QUERY = GTTAQuery(
-    prompt_idx=4,
+    prompt_index=4,
     task_id="maps",
     candidate_actions=("clear", "unknown", "open"),
     observation="map results",
@@ -54,7 +54,7 @@ def test_gtta_scores_actions_settles_fifo_and_rolls_back_aborts(monkeypatch: pyt
     assert result.query.ranked_actions == (("open", 0.5625), ("unknown", 0.0), ("clear", -0.1875))
     assert tuple(record.reward for record in result.query.records) == (1.0, 0.5, -0.25)
     context = result.query.prompt_context
-    assert context.prompt_idx == 4 and context.position is GTTAPromptPosition.SUFFIX
+    assert context.prompt_index == 4 and context.position is GTTAPromptPosition.SUFFIX
     assert [json.loads(line)["reward"] for line in context.text.splitlines()] == [1.0, 0.5, -0.25]
     empty = workload.run(GTTAHostRequest(QUERY))
     assert (empty.update.processed, empty.update.state_version) == (0, 1)

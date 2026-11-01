@@ -29,7 +29,7 @@ def seed_factors(fields: Mapping[str, torch.Tensor], generator: torch.Generator)
 
 
 @dataclass(frozen=True)
-class ProjectionState(pllm.Workload):
+class FactorAdapterWorkload(pllm.Workload):
     """The same state and consumer declaration for every producer below."""
 
     rank: int = 2
@@ -58,10 +58,8 @@ class ProjectionState(pllm.Workload):
         return pllm.model.Overlay("factors", TARGETS, operator=pllm.model.ParameterOverlayOperator.LOW_RANK_ADD)
 
 
-class PromptFactors(ProjectionState):
+class PromptFactorsWorkload(FactorAdapterWorkload):
     """A shared illustrative hypernetwork produces each request's factors from its prompt."""
-
-    name = "prompt_factors"
 
     @property
     def network(self) -> pllm.InstanceState:
@@ -77,7 +75,7 @@ class PromptFactors(ProjectionState):
     @pllm.write(state="factors", fields=("a_0", "b_0", "a_1", "b_1"))
     def produce(
         self,
-        h: torch.Tensor = pllm.hidden(8, phase="prefill"),
+        h: torch.Tensor = pllm.hidden(8, tokens="prefill"),
         net: Callable[[torch.Tensor], torch.Tensor] = pllm.module("network"),
         aq: torch.Tensor = pllm.parameter("factors", "a_0"),
         bq: torch.Tensor = pllm.parameter("factors", "b_0"),
@@ -122,10 +120,9 @@ class Mixture(nn.Module):
 
 
 @dataclass(frozen=True)
-class PromptMixture(PromptFactors):
+class PromptMixtureWorkload(PromptFactorsWorkload):
     """A prompt discriminator selects a mixture of shared LoRAs for each request."""
 
-    name = "prompt_mixture"
     components: int = 3
 
     @property
@@ -141,10 +138,9 @@ class PromptMixture(PromptFactors):
         )
 
 
-class DecodeFactors(ProjectionState):
+class DecodeFactorsWorkload(FactorAdapterWorkload):
     """Train side predictions with AdamW; internal projections read the update next forward."""
 
-    name = "decode_factors"
     optimizer = pllm.AdamW(lr=1e-3)
 
     @pllm.train(state="factors", reduction="state_mean")

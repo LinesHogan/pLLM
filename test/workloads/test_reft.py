@@ -8,7 +8,7 @@ import pytest
 import torch
 
 import pllm
-from pllm.authoring import StateTensorUpdate
+from pllm.authoring import StateImport
 from pllm.backends.vllm.activation import activation_delta
 from pllm.contracts.backend_attachment import (
     ActivationPatchOperator,
@@ -29,8 +29,8 @@ from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.runtime_facts import model_timeline
-from pllm.execution.step_input import TensorStepInput
-from pllm.workloads.reft import ActivationConfig, ActivationWorkload, load_loreft_interventions
+from pllm.execution.step_input import StepInput
+from pllm.workloads.reft import ReFTConfig, ReFTWorkload, load_loreft_interventions
 
 
 def test_reft_matches_loreft_math_and_publish_skip_semantics(tmp_path) -> None:
@@ -52,12 +52,12 @@ def test_reft_matches_loreft_math_and_publish_skip_semantics(tmp_path) -> None:
         65536,
         0,
     )
-    workload = ActivationWorkload(ActivationConfig((0,), 2, first_tokens=1, last_tokens=1))
+    workload = ReFTWorkload(ReFTConfig((0,), 2, first_tokens=1, last_tokens=1))
     deployment = workload.compile_backend(facts)
     execution = deployment.execution
     _decode_declarations_are_checked(facts)
     rows = PackedPhaseRowBatch(0, 0, ())
-    value = TensorStepInput(rows, PackedSamplerRowBatch(rows, ()))
+    value = StepInput(rows, PackedSamplerRowBatch(rows, ()))
     (initial,) = execution.admit(())
     assert execution.step(value).publication is None
     identity = RequestIdentity("old", 0, 0)
@@ -68,14 +68,14 @@ def test_reft_matches_loreft_math_and_publish_skip_semantics(tmp_path) -> None:
     checkpoint = tmp_path / "intkey_layer.0.comp.block_output.unit.pos.nunit.1#0.bin"
     torch.save(dict(weight=fields[0], bias=fields[1], rotate_layer=fields[2]), checkpoint)
     update = load_loreft_interventions(tmp_path, (0,), device, torch.float64)
-    publication = execution.step(replace(value, auxiliary=update)).publication
+    publication = execution.step(replace(value, batch=update)).publication
     assert publication is not None and publication.after_refs[0].version_id == 1
     for actual, expected in zip(execution.snapshot(publication.after_refs[0]), fields, strict=True):
         torch.testing.assert_close(actual, expected)
     assert all(torch.count_nonzero(field) == 0 for field in execution.arena.snapshot(old, initial))
     assert execution.step(value).publication is None
     with pytest.raises(ValueError):  # A missing field does not match the declared layout.
-        execution.step(replace(value, auxiliary=StateTensorUpdate(fields[:2])))
+        execution.step(replace(value, batch=StateImport(fields[:2])))
     assert execution.arena.latest(initial.lineage_id) == publication.after_refs[0]
     hidden = torch.randn((5, 4), dtype=torch.float64, generator=generator)
     weight, bias, rotation = fields
@@ -100,7 +100,7 @@ def test_reft_matches_loreft_math_and_publish_skip_semantics(tmp_path) -> None:
         )
     execution.retire((identity,))
     execution.retire(())
-    assert execution.diagnostics().active_lineages == execution.diagnostics().inference_pins == 0
+    assert execution.diagnostics().active_states == execution.diagnostics().inference_pins == 0
     if find_spec("vllm") is not None:
         _request_edits_share_publication_and_exact_prefill_rows(facts)
 
@@ -121,7 +121,7 @@ def _decode_low_rank_keeps_parameters_and_recomputes_delta(
     rows = PackedPhaseRowBatch(
         0, len(hidden), tuple(PackedPhaseRow(i, 0, i, HiddenPhase.DECODE, identity) for i in range(len(hidden)))
     )
-    invocation = execution.start_step(replace(value, auxiliary=update))
+    invocation = execution.start_step(replace(value, batch=update))
     execution.execute_anchor(invocation, AnchorId(0))
     try:
         adapter.prepare(rows, invocation, execution.directory)
@@ -171,10 +171,10 @@ def _decode_declarations_are_checked(facts):
 def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:
     from pllm.backends.vllm.activation import VllmActivationPatch
 
-    config = ActivationConfig(
+    config = ReFTConfig(
         (0,), first_tokens=0, last_tokens=1, operator=ActivationPatchOperator.ADD, scope=StateScope.REQUEST
     )
-    deployment = ActivationWorkload(config).compile_backend(facts)
+    deployment = ReFTWorkload(config).compile_backend(facts)
     execution = deployment.execution
     identities = (RequestIdentity("a", 7, 1), RequestIdentity("b", 9, 1))
     initial = execution.admit(identities)
@@ -188,8 +188,10 @@ def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:
         ),
     )
     delta = torch.tensor([[-0.25, 0.5, -1.0, 0.75], [1.0, -2.0, 3.0, -4.0]])
-    keys = tuple(RequestStateKey.project(identity, (RequestKeyField.PROMPT_IDX,)) for identity in reversed(identities))
-    value = TensorStepInput(rows, PackedSamplerRowBatch(rows, ()), auxiliary=StateTensorUpdate((delta,), keys))
+    keys = tuple(
+        RequestStateKey.project(identity, (RequestKeyField.PROMPT_INDEX,)) for identity in reversed(identities)
+    )
+    value = StepInput(rows, PackedSamplerRowBatch(rows, ()), batch=StateImport((delta,), keys))
     invocation = execution.start_step(value)
     execution.execute_anchor(invocation, AnchorId(0))
     context = invocation
@@ -233,4 +235,4 @@ def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:
         adapter.close()
         execution.arena.wait_release(execution.arena.release_pin(old_pin))
         execution.retire(identities)
-    assert execution.diagnostics().active_lineages == 0
+    assert execution.diagnostics().active_states == 0

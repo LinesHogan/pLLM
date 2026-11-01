@@ -49,7 +49,7 @@ from pllm.execution.ptts.request_state import RequestStateDirectory, RequestStat
 from pllm.execution.ptts.slot_pools import SlotPools, Slots
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.torch_private import MemoryUsage
-from pllm.execution.trace import ExecutionTrace, TraceEvent, TracePhase
+from pllm.execution.trace import ExecutionTrace, TraceEvent, TraceEventKind
 
 if TYPE_CHECKING:
     from pllm.execution.post_sample import PostSampleOverlap
@@ -221,7 +221,7 @@ class StateTaskContext(Generic[DataT]):
         self.publications.append(receipt)
         self._obligations.remove(obligation)
         self.trace.record(
-            TracePhase.PUBLISH, self.invocation_id, refs=receipt.after_refs, operation_id=receipt.operation_id
+            TraceEventKind.PUBLISH, self.invocation_id, refs=receipt.after_refs, operation_id=receipt.operation_id
         )
         return receipt
 
@@ -358,7 +358,7 @@ class ConditionalProducerTask(Generic[DataT]):
         context.check_page_execution()
         if context.held_input is None:
             return self.original.execute(context)
-        context.trace.record(TracePhase.INPUT_SKIPPED, context.invocation_id)
+        context.trace.record(TraceEventKind.INPUT_SKIPPED, context.invocation_id)
         return {}
 
 
@@ -387,7 +387,7 @@ class PublishStateTask(Generic[DataT]):
 
 @dataclass(frozen=True, slots=True)
 class StateDiagnostics:
-    active_lineages: int
+    active_states: int
     inference_pins: int
     loss_count: int
     update_count: int
@@ -404,7 +404,7 @@ class StateDiagnostics:
     def logical_counts(self) -> tuple[int, ...]:
         """Rank-invariant progress, excluding allocator/event timing and device identities."""
         return (
-            self.active_lineages,
+            self.active_states,
             self.inference_pins,
             self.loss_count,
             self.update_count,
@@ -562,9 +562,11 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         # One visible ref per unique admitted key, whether created or joined.
         refs = self.latest(identities)
         if receipt is None:
-            self.trace.record(TracePhase.ADMIT, 0, identities=identities, refs=refs)
+            self.trace.record(TraceEventKind.ADMIT, 0, identities=identities, refs=refs)
         else:
-            self.trace.record(TracePhase.ADMIT, 0, identities=identities, refs=refs, operation_id=receipt.operation_id)
+            self.trace.record(
+                TraceEventKind.ADMIT, 0, identities=identities, refs=refs, operation_id=receipt.operation_id
+            )
         return refs
 
     def latest(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateRef, ...]:
@@ -602,7 +604,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             except Exception as exc:
                 self._failed(context, exc)
         self.trace.record(
-            TracePhase.BEGIN,
+            TraceEventKind.BEGIN,
             context.invocation_id,
             refs=pin.refs,
             pin_id=pin.pin_id,
@@ -660,7 +662,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                 readiness.order_on(context.pin.stream)
             context.value = self.math.prepare(value, context)
         except Exception as exc:
-            self.trace.record(TracePhase.FAILED, context.invocation_id)
+            self.trace.record(TraceEventKind.FAILED, context.invocation_id)
             # Failed preparation can leave aliases in traceback frames; test_video retains grants.
             if context.borrowed_roots:
                 self._failed(context, exc)
@@ -742,7 +744,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         self._order_sampler(context, stream)
         context.sampler_feedback = feedback
         self._sampler_count += 1
-        self.trace.record(TracePhase.SAMPLER_COMPLETE, context.invocation_id, pin_id=context.pin.pin_id)
+        self.trace.record(TraceEventKind.SAMPLER_COMPLETE, context.invocation_id, pin_id=context.pin.pin_id)
 
     def finish_step(self, context: StateTaskContext[DataT], stream: torch.cuda.Stream | None = None) -> ResultT:
         """Complete the step; pass the stream that will read the result so it is ordered after the writer lane.
@@ -771,7 +773,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             self._failed(context, RuntimeError("borrowed invocation cancelled; resources retained"))
         self._order_sampler(context, context.sampler_stream)
         context.finish_pages(("abort",))
-        self.trace.record(TracePhase.ABORT, context.invocation_id)
+        self.trace.record(TraceEventKind.ABORT, context.invocation_id)
         self._release(context)
 
     def cancel_active(self) -> None:
@@ -787,7 +789,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     def _failed(self, context: StateTaskContext[DataT], exc: Exception) -> NoReturn:
         context.cancel_requested = True
         self.trace.record(
-            TracePhase.FAILED,
+            TraceEventKind.FAILED,
             context.invocation_id,
             operation_id=None if context.publication is None else context.publication.operation_id,
         )
@@ -818,7 +820,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         self._active.pop(context.invocation_id)
         release = next(receipt for receipt in context.releases if receipt.pin is context.pin)
         self.trace.record(
-            TracePhase.SETTLED,
+            TraceEventKind.COMMITTED,
             context.invocation_id,
             pin_id=context.pin.pin_id,
             release_id=release.release_id,
@@ -851,7 +853,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             self._successful_inputs.pop(identity, None)
         if not self.directory.states:
             self.arena.collect_completed(wait=wait)
-            self.trace.record(TracePhase.RETIRE, 0, identities=identities)
+            self.trace.record(TraceEventKind.RETIRE, 0, identities=identities)
             return ()
         if not identities:
             for context in tuple(self._active.values()):
@@ -867,13 +869,13 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                     self.cancel_step(context)
         self.arena.collect_completed(wait=wait)
         refs = self.directory.retire(identities)
-        self.trace.record(TracePhase.RETIRE, 0, identities=identities, refs=refs)
+        self.trace.record(TraceEventKind.RETIRE, 0, identities=identities, refs=refs)
         return refs
 
     def retire_dormant(self, *, wait: bool = False) -> tuple[StateRef, ...]:
         self.arena.collect_completed(wait=wait)
         refs = self.directory.retire_dormant()
-        self.trace.record(TracePhase.RETIRE, 0, identities=(), refs=refs)
+        self.trace.record(TraceEventKind.RETIRE, 0, identities=(), refs=refs)
         return refs
 
     def snapshot(self, ref: StateRef, stream: torch.cuda.Stream | None = None) -> tuple[torch.Tensor, ...]:

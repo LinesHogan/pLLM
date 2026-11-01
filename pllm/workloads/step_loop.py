@@ -8,7 +8,7 @@ import pllm
 
 
 @dataclass(frozen=True)
-class StepLoop(pllm.Workload):
+class StepLoopWorkload(pllm.Workload):
     """Use prompt embeddings, then recurrent pre-norm hidden states during generation."""
 
     history = pllm.PositionState()
@@ -17,6 +17,6 @@ class StepLoop(pllm.Workload):
     def loop(self, layers: pllm.Layers) -> torch.Tensor:
         """Save every token so cached prompt blocks also carry the boundary state."""
         previous = layers.load("history", offset=-1)
-        taps = layers(hidden=torch.where(layers.generated, previous, layers.seed))
+        taps = layers(hidden=torch.where(layers.generated, previous, layers.embeddings))
         layers.save("history", taps[-1])
         return taps[-1]

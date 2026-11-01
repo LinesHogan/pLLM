@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, TypeVar
 
 import torch
 
-from pllm.contracts.auxiliary import map_auxiliary
+from pllm.contracts.host_batch import map_host_batch
 from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.ptts.state_refs import StateRefs
@@ -89,10 +89,10 @@ class PostSampleOverlap:
             data = context.data()
             assert isinstance(data, TensorFrame)
             value = data.step
-            if value.auxiliary is not None:
+            if value.batch is not None:
                 # Worker-local device copies of external inputs can be dropped at
                 # host settlement while their side-stream consumers are still running.
-                map_auxiliary(value.auxiliary, self._record_input)
+                map_host_batch(value.batch, self._record_input)
             feedback = context.sampler_feedback
             if feedback is not None:
                 context.sampler_feedback = replace(

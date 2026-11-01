@@ -33,7 +33,6 @@ class InPlaceTTTConfig:
 class InPlaceTTTWorkload(pllm.Workload):
     """Train dense residuals at the declared projections using carried input/target chunks."""
 
-    name = "inplace_ttt.dense_fast_weight"
     config: InPlaceTTTConfig
     dtype: torch.dtype = torch.float32
 
@@ -43,11 +42,10 @@ class InPlaceTTTWorkload(pllm.Workload):
             {
                 "delta": pllm.Buffer(lambda inputs, outputs: (outputs, inputs), dtype=self.dtype),
             },
-            namespace="canonical.dense_fast_weight.state@1",
             keys=(
                 pllm.state.RequestKeyField.REQUEST_ID,
-                pllm.state.RequestKeyField.PROMPT_IDX,
-                pllm.state.RequestKeyField.SAMPLE_IDX,
+                pllm.state.RequestKeyField.PROMPT_INDEX,
+                pllm.state.RequestKeyField.SAMPLE_INDEX,
             ),
         )
 

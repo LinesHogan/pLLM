@@ -16,7 +16,7 @@ from pllm.contracts.semantic_graph import TaskResourceFact
 from pllm.execution.cuda_stream import PinnedStaging
 from pllm.execution.overlay_task import ChunkUpdate, GradientUpdate
 from pllm.execution.step_capture import StepCapture
-from pllm.execution.tensor_frame import Tensors, TensorUpdate
+from pllm.execution.tensor_frame import Tensors, UpdateOutput
 from pllm.execution.tensor_program import TensorBatch
 from pllm.execution.torch_private import measure
 from pllm.kernels.page_copy import copy_pages
@@ -53,13 +53,13 @@ class OverlayBatch:
         target: int,
         indices: tuple[int, ...],
         batch: TensorBatch,
-    ) -> tuple[tuple[TensorUpdate, ...], torch.Tensor]:
+    ) -> tuple[tuple[UpdateOutput, ...], torch.Tensor]:
         """Bucket actual rows, then tile states; oversized rows stay eager at native size."""
         groups: dict[int, list[int]] = defaultdict(list)
         for i, operand in enumerate(operands):
             rows = len(operand.hidden)
             groups[next((size for size in self.capacities() if rows <= size), rows)].append(i)
-        results: dict[int, TensorUpdate] = {}
+        results: dict[int, UpdateOutput] = {}
         counters: list[torch.Tensor] = []
         width = len(self.math.buffers)
         fields = tuple(batch.field_slots(target * width + i) for i in range(width))
@@ -185,7 +185,7 @@ class OverlayTile:
             assert isinstance(chunk, ChunkUpdate) and self.plan is not None
             result = chunk.counted(self.plan, count, self.arguments(values, hidden, desired, base))
         else:
-            result = TensorUpdate.unchanged(self.math.apply(hidden, values))
+            result = UpdateOutput.unchanged(self.math.apply(hidden, values))
         return values, result.output, result.changed, result.update_count, result.trained_rows
 
     def body(self, base: torch.Tensor) -> None:
@@ -229,7 +229,7 @@ class OverlayTile:
         slots: np.ndarray[tuple[int, ...], np.dtype[np.int64]],
         pools: tuple[torch.Tensor, ...],
         stream: torch.cuda.Stream | None,
-    ) -> tuple[tuple[TensorUpdate, ...], torch.Tensor]:
+    ) -> tuple[tuple[UpdateOutput, ...], torch.Tensor]:
         """Fence staging through PinnedStaging and detach outputs before the next tile replay."""
         self.pools = pools
         base = operands[0].base_weight
@@ -263,7 +263,7 @@ class OverlayTile:
         output, changed, updates, trained, lengths, counters = (value.clone() for value in self.output)
         return tuple(
             self.math.validate(
-                TensorUpdate(
+                UpdateOutput(
                     output[i, : len(o.hidden)],
                     changed[i],
                     updates[i],

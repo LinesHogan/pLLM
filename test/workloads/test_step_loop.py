@@ -9,12 +9,12 @@ import pllm
 from pllm.config import ExecutionOptions
 from pllm.execution.position_state import PositionBuffers
 from pllm.execution.token_program import Layers, TokenProgram, TokenTensor
-from pllm.workloads.step_loop import StepLoop
+from pllm.workloads.step_loop import StepLoopWorkload
 from test.workloads.test_recirculation import FACTS, IDENTITIES, VALUE, Decoder, run_step
 
 
 def test_step_loop_signing_and_provider_agreement():
-    workload = StepLoop()
+    workload = StepLoopWorkload()
     schema = workload.backend_requirements().position_states
     facts = replace(FACTS, probe=replace(FACTS.probe, position_states=schema))
     deployment = workload.compile_backend(facts, ExecutionOptions())
@@ -28,8 +28,8 @@ def test_positional_authoring_errors(case):
             return layers.load("missing")
         if case == "offset":
             return layers.load("history", offset=0)
-        layers.save("history", layers.seed[:, :1] if case == "shape" else layers.seed.double())
-        return layers.seed
+        layers.save("history", layers.embeddings[:, :1] if case == "shape" else layers.embeddings.double())
+        return layers.embeddings
 
     with pytest.raises(ValueError, match="PositionState|save history"):
         TokenProgram.capture(route, TokenTensor((1, 4), torch.float32, "cpu"), 3, ("history",))
@@ -41,7 +41,7 @@ def test_stacked_marker_and_unused_declaration():
         @pllm.layer_route()
         @pllm.write(state="state", fields=("hidden",))
         def route(self, layers):
-            return (layers.seed,)
+            return (layers.embeddings,)
 
     @dataclass(frozen=True)
     class Unused(pllm.Workload):

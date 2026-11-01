@@ -17,8 +17,8 @@ from pllm.config import ExecutionOptions, ModelConfig
 from pllm.contracts.feedback import RetryAction
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.workloads.dummy import DummyConfig, DummyWorkload
-from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
-from pllm.workloads.prefill_adapters import PrefillAdapters
+from pllm.workloads.esamp import ESampConfig, ESampWorkload
+from pllm.workloads.prefill_adapters import PrefillAdaptersWorkload
 from pllm.workloads.tlm import TLMConfig, TLMWorkload
 from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload, ttrl_rewards
 from pllm.workloads.video import VideoWorkload
@@ -124,7 +124,7 @@ def test_j1_tokens(graphs):
         plain.llm_engine.engine_core.shutdown()
     for workload in (
         ExportingDummy(DummyConfig(export_every_n_steps=1)),
-        ESampRequestWorkload(ESampRequestConfig(rank=4)),
+        ESampWorkload(ESampConfig(rank=4)),
     ):
         with pllm.make_llm(settings, workload=workload) as handle:
             actual = [tokens(handle.generate(PROMPTS, params)) for params in sampling]
@@ -136,7 +136,7 @@ def test_j1_tokens(graphs):
             ]
             assert not differences, (workload.name, differences)
             counters = handle.diagnostics()
-            assert counters.active_lineages == counters.inference_pins == 0
+            assert counters.active_states == counters.inference_pins == 0
             assert len(handle.trace_snapshots()) == 2
             if isinstance(workload, ExportingDummy):
                 exports = handle._require_open().collective_rpc(_exports)
@@ -153,7 +153,7 @@ def test_j1_admission():
         with pytest.raises(ValueError, match=name + "=1"):
             pllm.make_llm(replace(config(), **{name: 2}), workload=DummyWorkload())
     for workload, message in (
-        (PrefillAdapters(), "parameter overlays"),
+        (PrefillAdaptersWorkload(), "parameter overlays"),
         (TLMWorkload(TLMConfig()), "causal_model"),
         (VideoWorkload(), "state feeds"),
     ):
@@ -168,14 +168,14 @@ def test_j1_ttrl(monkeypatch):
 
     # Only the test digest callback crosses EngineCore via pickle; production commands remain JSON.
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-    settings = replace(config(), multiprocessing=True, execution=ExecutionOptions(training_rows=8, publish_lag=0))
+    settings = replace(config(), multiprocessing=True, execution=ExecutionOptions(max_training_rows=8, publish_lag=0))
     with pllm.make_llm(settings, workload=TTRLWorkload(TTRLConfig(rank=4))) as handle:
 
         def feedback(completed):
             reward = ttrl_rewards(completed, TTRLConfig(rank=4))
             # Known targets ensure the transport/training check does not depend on boxed-answer quality.
             batch = WeightedRowBatch(completed.hidden, torch.ones(8), torch.ones(8))
-            handle.generate(PROMPTS, SamplingParams(max_tokens=2, temperature=0), auxiliary=batch)
+            handle.generate(PROMPTS, SamplingParams(max_tokens=2, temperature=0), batch=batch)
             return replace(
                 reward,
                 retry_controls=tuple(
@@ -206,7 +206,7 @@ def test_j2(lag):
     expected = None
     for run in range(2):
         with pllm.make_llm(
-            config(lag=lag), workload=ESampRequestWorkload(ESampRequestConfig(rank=4, intervention_beta=0.2))
+            config(lag=lag), workload=ESampWorkload(ESampConfig(rank=4, intervention_beta=0.2))
         ) as handle:
             llm = handle._require_open()
             llm.collective_rpc(_record_retirement)

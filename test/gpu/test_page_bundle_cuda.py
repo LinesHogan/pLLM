@@ -26,7 +26,7 @@ from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw
 from pllm.testing import backend_facts
-from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
+from pllm.workloads.esamp import ESampConfig, ESampWorkload
 
 
 def _plan():
@@ -43,7 +43,7 @@ def _plan():
     )
     provider = PageBundleProviderFacts("test.page_bundle@1", 6, StateDeviceKind.CUDA)
     facts = backend_facts(4, bindings, timeline, provider)
-    workload = ESampRequestWorkload(ESampRequestConfig(rank=2))
+    workload = ESampWorkload(ESampConfig(rank=2))
     return workload.plan_backend(*workload.specialize(facts, ExecutionOptions())).plan
 
 
@@ -104,7 +104,7 @@ def test_cuda_ptts_waits_for_exact_fence_before_reclaim() -> None:
     arena.wait_release(arena.release_pin(updated))
     arena.retire(replacement.after_refs)
     arena.collect_completed(wait=True)
-    assert arena.free_pages == 6 and arena.active_lineages == 0
+    assert arena.free_pages == 6 and arena.active_states == 0
     _cuda_ipc_lifecycle()
 
 
@@ -201,7 +201,7 @@ def _cuda_ipc_lifecycle():
             if outcome == "complete":
                 arena.wait_release(released)
                 arena.collect_completed(wait=True)
-                assert arena.active_lineages == arena.pending_pin_releases == 0 and arena.free_pages == 6
+                assert arena.active_states == arena.pending_pin_releases == 0 and arena.free_pages == 6
             else:
                 with pytest.raises(RuntimeError):  # no completion proof: the page stays owned
                     arena.wait_release(released)

@@ -50,7 +50,7 @@ def binding_case(*, alias=False, write_failure=False, runtime=False, missing=Non
     features, ports = declare_parameters(
         b, "features", tuple(Field(name, (2,)) for name in ("qp", "residual", "mv", "segmentation")), optimizer=None
     )
-    encoded = declare_tensor(b, "encode", inputs=ports, when=When.BEFORE_MODEL)(
+    encoded = declare_tensor(b, "encode", inputs=ports, when=When.BEFORE_FORWARD)(
         lambda **values: values["qp"] if alias else sum(values.values())
     )
     inject = b.state("inject", (Field("delta", (2,)),))
@@ -68,10 +68,10 @@ def binding_case(*, alias=False, write_failure=False, runtime=False, missing=Non
         outputs=("updated",),
         changes=inject,
         effect=StateEffectKind.TRANSITION,
-        when=When.BEFORE_MODEL,
+        when=When.BEFORE_FORWARD,
         function=write,
     )
-    publication = b.publish(transition, inject, when=When.BEFORE_MODEL)
+    publication = b.publish(transition, inject, when=When.BEFORE_FORWARD)
     timeline = model_timeline(torch.device("cpu"), ("transition/full_root@1",))
     if runtime:
         b.overlay(
@@ -294,7 +294,7 @@ def _decode_steps_keep_exact_publications_and_ack_order():
             )
         assert received == [0, 1] and execution.diagnostics().update_count == 2
         session.close()
-        assert execution.diagnostics().active_lineages == execution.diagnostics().inference_pins == 0
+        assert execution.diagnostics().active_states == execution.diagnostics().inference_pins == 0
 
 
 def _hold_steps_reuse_the_settled_injection():

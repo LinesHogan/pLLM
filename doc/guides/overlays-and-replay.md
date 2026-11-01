@@ -12,14 +12,14 @@
 Buffer 默认使用 FP32 保存累积状态。Dense / low-rank 投影读取时转换到模型输入 dtype；
 HEAD_ADD 保持 FP32。`pllm.Buffer(shape, dtype=torch.bfloat16)` 可显式节省一半字段显存，
 代价是小更新可能被舍入掉；`dtype=None` 显式跟随模型 dtype。
-`InPlaceTTTWorkload(..., dtype=...)` 与 `PrefillAdapters(dtype=...)` 均可配置状态精度，默认 FP32。
+`InPlaceTTTWorkload(..., dtype=...)` 与 `PrefillAdaptersWorkload(dtype=...)` 均可配置状态精度，默认 FP32。
 
 ## 引擎内训练的 overlay
 
 **要解决的问题**：请求在生成的同时，根据它自己的推理轨迹更新一副私有补丁，
 后续 token 立刻在"基座权重 + 补丁"的有效权重下运行——且不碰共享的基座权重。
 
-`@pllm.overlay` 把一个 `MODEL_UPDATE` 任务变成"读操作数 → 写私有因子 →
+`@pllm.overlay` 把一个 `IN_FORWARD` 任务变成"读操作数 → 写私有因子 →
 应用有效权重"的完整循环：
 
 ```python
@@ -45,11 +45,11 @@ class MyLoRA(pllm.Workload):
         y: torch.Tensor = pllm.operand("target"),
         a: torch.Tensor = pllm.parameter("factors", "a"),
         b: torch.Tensor = pllm.parameter("factors", "b"),
-    ) -> pllm.TensorUpdate:
+    ) -> pllm.UpdateOutput:
         residual = (x @ a.to(x.dtype).T) @ b.to(x.dtype).T                         # 只返回补丁的增量，不含基座投影
         a.add_((0.1 * y[:, :a.shape[0]].T @ x).to(a))    # 只有 a/b 可原地写
         b.add_((0.1 * (y.T @ y)[:, :b.shape[1]]).to(b))
-        return pllm.TensorUpdate(
+        return pllm.UpdateOutput(
             residual,
             residual.new_ones((), dtype=torch.bool),                     # changed
             residual.new_ones((), dtype=torch.int64),                    # update_count
@@ -57,9 +57,9 @@ class MyLoRA(pllm.Workload):
         )
 ```
 
-返回的 `TensorUpdate` 里，`residual` 是补丁在基座投影之上**加上**的那部分（框架再乘
+返回的 `UpdateOutput` 里，`residual` 是补丁在基座投影之上**加上**的那部分（框架再乘
 `scale` 并加到基座输出上）；三个计数都是与输出同设备的 0 维张量，不是 Python
-数字，这样一步之内不需要主机同步。默认在 `MODEL_UPDATE` 时机运行。
+数字，这样一步之内不需要主机同步。默认在 `IN_FORWARD` 时机运行。
 
 **overlay 会不会改到共享权重？** 不会。`pllm.operand("input"/"target"/"weight")`
 是捕获的张量，永远只读；能原地修改的只有 `pllm.parameter` 命名的 buffer——那是
@@ -120,11 +120,11 @@ def settle(self, layers: pllm.Layers) -> torch.Tensor:
 维护中的三个短示例见 [state_producers.py](../../pllm/workloads/state_producers.py)：
 
 ```python
-from pllm.workloads.state_producers import PromptFactors, PromptMixture, DecodeFactors
+from pllm.workloads.state_producers import PromptFactorsWorkload, PromptMixtureWorkload, DecodeFactorsWorkload
 
-workload = PromptFactors(rank=2)                 # 共享超网络 → 每请求 q/v 因子
-workload = PromptMixture(rank=2, components=3)  # 判别器 → K 个 LoRA 的精确加权和
-workload = DecodeFactors(rank=2)               # hidden 目标 → AdamW → 下次前向
+workload = PromptFactorsWorkload(rank=2)                 # 共享超网络 → 每请求 q/v 因子
+workload = PromptMixtureWorkload(rank=2, components=3)  # 判别器 → K 个 LoRA 的精确加权和
+workload = DecodeFactorsWorkload(rank=2)               # hidden 目标 → AdamW → 下次前向
 ```
 
 三者继承同一个 `consume` property。形状由模型的 q/v 投影决定，包括 GQA 的不同输出宽度。
@@ -132,9 +132,9 @@ workload = DecodeFactors(rank=2)               # hidden 目标 → AdamW → 下
 AdamW 示例的损失只训练旁路预测，不对 vLLM attention 或历史 KV 求梯度。
 
 ```python
-@pllm.on(pllm.Phase.OBSERVE)
+@pllm.on(pllm.Phase.AFTER_FORWARD)
 @pllm.write(state="factors", fields=("a_0", "b_0", "a_1", "b_1"))
-def produce(self, h=pllm.hidden(8, phase="prefill"), net=pllm.module("network")):
+def produce(self, h=pllm.hidden(8, tokens="prefill"), net=pllm.module("network")):
     return make_factor_tuple(net(h))  # 四个 tensor，前导轴对应本任务的请求行
 ```
 
@@ -143,10 +143,10 @@ def produce(self, h=pllm.hidden(8, phase="prefill"), net=pllm.module("network"))
 目标展开名称是 `a_0/b_0/a_1/b_1`。InstanceState 写入没有请求轴。
 替换优化器管理的参数保留其 moments/step；不会隐式重置优化器。
 
-`hidden(..., phase="prefill")` 只取**完整 prompt 的最后一个 token**，每个合格请求一行；
+`hidden(..., tokens="prefill")` 只取**完整 prompt 的最后一个 token**，每个合格请求一行；
 部分 prompt span 不发布。默认仍是 decode。各任务独立选择 phase，结果消费者继承生产者的行域；
-没有显式 join 时不能混合两种 phase。`write` 默认 BEFORE_MODEL，读取本次 hidden 的写入须使用
-OBSERVE 或 AFTER_SAMPLE。前向入口 pin 在整个 forward 内不变；prefill 结果只影响第一次 decode
+没有显式 join 时不能混合两种 phase。`write` 默认 BEFORE_FORWARD，读取本次 hidden 的写入须使用
+AFTER_FORWARD 或 AFTER_SAMPLE。前向入口 pin 在整个 forward 内不变；prefill 结果只影响第一次 decode
 forward，不改变已完成的 prompt forward 或由它采样的第一个生成 token。
 
 These examples use eager execution with TP=PP=1. See
@@ -181,7 +181,7 @@ checkpoint，或任何一段宿主计算。
 
 声明状态时设置 `imported=True`，例如 `pllm.RequestState(fields, imported=True)`；再声明一个 `Overlay` property
 命名状态、targets、算子、因子与 scale；把产出的张量经
-`generate(..., auxiliary=pllm.state.StateTensorUpdate(values, keys), prompt_indices=...)`
+`generate(..., batch=pllm.state.StateImport(values, keys), prompt_indices=...)`
 送入：
 
 ```python
@@ -203,7 +203,7 @@ def adapter(self) -> pllm.model.Overlay:
 **要解决的问题**：要改的不是权重，而是激活。
 
 声明 `imported=True` 的 buffer 状态加一个 `pllm.model.Activation` property（命名状态、层、首/末 prefill
-token、算子），同样经 `auxiliary=` 送入。`LOW_RANK_AFFINE` 每层用
+token、算子），同样经 `batch=` 送入。`LOW_RANK_AFFINE` 每层用
 weight/bias/rotation 字段，`ADD` 用一个 FP32 向量。见维护中的
 [ReFT](../../pllm/workloads/reft.py)。
 
@@ -235,5 +235,5 @@ prefix caching 仍拒绝组合；没有按注入版本 cache_salt 键控或历�
 组合。多个 overlay、外部导入 overlay 加路由、三方组合不在当前支持范围内。
 后端在绑定或安装时拒绝不支持的组合。共享前缀缓存仍与 overlay/层路由不兼容。
 
-精确语义（TensorUpdate 字段、changed 与发布、copy_fields、容量声明）见
+精确语义（UpdateOutput 字段、changed 与发布、copy_fields、容量声明）见
 [创作契约](../reference/authoring-contract.md#请求-overlay)。

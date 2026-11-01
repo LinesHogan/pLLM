@@ -16,7 +16,7 @@ import pllm
 from pllm.backends.vllm.prefix_cache import CachePolicy, RequestBlockHasher, WorkloadAsyncScheduler, WorkloadScheduler
 from pllm.config import ExecutionOptions
 from pllm.workloads.recirculation import RecirculationWorkload
-from pllm.workloads.step_loop import StepLoop
+from pllm.workloads.step_loop import StepLoopWorkload
 from test.workloads.test_recirculation import FACTS
 
 POLICY = CachePolicy("a" * 64, True, "isolate")
@@ -105,18 +105,18 @@ def test_namespace_caller_extras_and_envelope():
 class GeneratedRoute(pllm.Workload):
     @pllm.layer_route(tokens="all")
     def loop(self, layers):
-        return layers(hidden=torch.where(layers.generated, layers.seed * 0.5, layers.seed))[-1]
+        return layers(hidden=torch.where(layers.generated, layers.embeddings * 0.5, layers.embeddings))[-1]
 
 
 class DecodeRoute(pllm.Workload):
     @pllm.layer_route(tokens="decode")
     def loop(self, layers):
-        return layers(hidden=layers.seed * 0.5)[-1]
+        return layers(hidden=layers.embeddings * 0.5)[-1]
 
 
 @pytest.mark.parametrize(
     "workload,sensitive",
-    ((StepLoop(), True), (RecirculationWorkload(), False), (GeneratedRoute(), True), (DecodeRoute(), True)),
+    ((StepLoopWorkload(), True), (RecirculationWorkload(), False), (GeneratedRoute(), True), (DecodeRoute(), True)),
 )
 def test_signed_sensitivity(workload, sensitive):
     facts = replace(FACTS, probe=replace(FACTS.probe, position_states=workload.backend_requirements().position_states))

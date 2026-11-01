@@ -30,7 +30,7 @@ from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.admission import WindowBackpressure
 
-TRACE_SCHEMA_VERSION = 7
+TRACE_SCHEMA_VERSION = 8
 MAX_SNAPSHOT_BYTES = 32768
 
 
@@ -43,7 +43,7 @@ class _KernelEvent(Protocol):
     def device_time_total(self) -> float: ...
 
 
-class TracePhase(StrEnum):
+class TraceEventKind(StrEnum):
     TENSOR = "tensor"
     GRADIENT = "gradient"
     KERNEL = "kernel"
@@ -57,7 +57,7 @@ class TracePhase(StrEnum):
     PUBLISH = "publish"
     SAMPLER_COMPLETE = "sampler_complete"
     PREPARED = "prepared"
-    SETTLED = "settled"
+    COMMITTED = "committed"
     ABORT = "abort"
     FAILED = "failed"
     INPUT_SKIPPED = "input_skipped"
@@ -68,7 +68,7 @@ class TracePhase(StrEnum):
 class TraceEvent:
     sequence: int
     host_time_ns: int
-    phase: TracePhase
+    kind: TraceEventKind
     invocation_id: int
     task_id: TaskId | None = None
     identities: tuple[RequestIdentity, ...] = ()
@@ -122,11 +122,11 @@ class TraceSnapshot:
             if event.task_id is None:
                 continue
             key = (event.invocation_id, event.task_id)
-            if event.phase is TracePhase.TASK_BEGIN:
+            if event.kind is TraceEventKind.TASK_BEGIN:
                 starts[key] = event.host_time_ns
-            elif event.phase in (TracePhase.TASK_END, TracePhase.TASK_FAILED):
+            elif event.kind in (TraceEventKind.TASK_END, TraceEventKind.TASK_FAILED):
                 started = starts.pop(key, None)
-                if started is not None and event.phase is TracePhase.TASK_END:
+                if started is not None and event.kind is TraceEventKind.TASK_END:
                     count, elapsed = totals.get(event.task_id, (0, 0))
                     totals[event.task_id] = (count + 1, elapsed + event.host_time_ns - started)
         return totals
@@ -136,7 +136,7 @@ class TraceSnapshot:
         totals: dict[tuple[TaskId, int], tuple[int, int]] = {}
         for event in self.events:
             if (
-                event.phase is TracePhase.TASK_END
+                event.kind is TraceEventKind.TASK_END
                 and event.task_id is not None
                 and event.device_ordinal is not None
                 and event.device_duration_ns is not None
@@ -320,7 +320,7 @@ class ExecutionTrace:
             count = selection.max_tensor_bytes // tensor.element_size()
             tensor = torch.take(tensor.detach(), torch.arange(count, device=tensor.device))
         self.record(
-            TracePhase.GRADIENT if gradient else TracePhase.TENSOR,
+            TraceEventKind.GRADIENT if gradient else TraceEventKind.TENSOR,
             invocation_id,
             task_id=task_id,
             identities=identities,
@@ -372,7 +372,7 @@ class ExecutionTrace:
         if timed and stream is not None:
             timing = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             timing[0].record(stream)
-        self.record(TracePhase.TASK_BEGIN, invocation_id, task_id=task_id)
+        self.record(TraceEventKind.TASK_BEGIN, invocation_id, task_id=task_id)
         try:
             with profiler if profiler is not None else nullcontext():
                 yield
@@ -381,16 +381,16 @@ class ExecutionTrace:
         except Exception as exc:
             match exc:
                 case WindowBackpressure():
-                    self.record(TracePhase.BACKPRESSURE, invocation_id, task_id=task_id)
+                    self.record(TraceEventKind.BACKPRESSURE, invocation_id, task_id=task_id)
                 case _:
-                    self.record(TracePhase.TASK_FAILED, invocation_id, task_id=task_id)
+                    self.record(TraceEventKind.TASK_FAILED, invocation_id, task_id=task_id)
             raise
         if profiler is not None:
             events = tuple[_KernelEvent, ...](profiler.events() or ())
             for event in events:
                 if event.device_type == DeviceType.CUDA:
                     self.record(
-                        TracePhase.KERNEL,
+                        TraceEventKind.KERNEL,
                         invocation_id,
                         task_id=task_id,
                         kernel_name=event.name,
@@ -398,7 +398,7 @@ class ExecutionTrace:
                         device_duration_ns=round(event.device_time_total * 1000),
                     )
         self.record(
-            TracePhase.TASK_END,
+            TraceEventKind.TASK_END,
             invocation_id,
             task_id=task_id,
             timing=timing,
@@ -407,7 +407,7 @@ class ExecutionTrace:
 
     def record(
         self,
-        phase: TracePhase,
+        kind: TraceEventKind,
         invocation_id: int,
         *,
         task_id: TaskId | None = None,
@@ -469,7 +469,7 @@ class ExecutionTrace:
                     TraceEvent(
                         self._sequence,
                         monotonic_ns(),
-                        phase,
+                        kind,
                         invocation_id,
                         task_id,
                         identities,

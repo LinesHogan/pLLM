@@ -7,7 +7,7 @@ from functools import partial
 
 import torch
 
-from pllm.authoring import BackendWorkload, DataT, ResultT, map_auxiliary
+from pllm.authoring import BackendWorkload, DataT, ResultT, map_host_batch
 from pllm.backends.vllm import compat
 from pllm.backends.vllm.mrv1 import Mrv1Runner
 from pllm.backends.vllm.runner import BackendWorkerState, WorkloadModelRunner
@@ -67,7 +67,7 @@ class GPUWorker(compat.Worker):
             BackendCommand.INSTALL,
             BackendCommand.STAGE,
             BackendCommand.PROFILE,
-            BackendCommand.OBSERVE,
+            BackendCommand.SELECT_TRACE,
         )
         with torch.inference_mode(False):
             match operation:
@@ -82,11 +82,9 @@ class GPUWorker(compat.Worker):
                     stage = decode_boundary(payload, BackendStage)
                     peer = stage.driver_pid
                     stream = torch.cuda.current_stream(runner.device)
-                    auxiliary = map_auxiliary(
-                        stage.auxiliary, lambda tensor: tensor.map(peer, stream).to(runner.device)
-                    )
+                    host_batch = map_host_batch(stage.batch, lambda tensor: tensor.map(peer, stream).to(runner.device))
                     runner.require_session().stage_input(
-                        auxiliary,
+                        host_batch,
                         stage.identities,
                         None if stage.completion is None or self.rank != 0 else stage.completion.map(peer, stream),
                     )
@@ -102,7 +100,7 @@ class GPUWorker(compat.Worker):
                     return encode_boundary(runner.require_session().trace.snapshot())
                 case BackendCommand.PROFILE:
                     runner.require_session().trace.profile_tasks(decode_boundary(payload, tuple[TaskId, ...]))
-                case BackendCommand.OBSERVE:
+                case BackendCommand.SELECT_TRACE:
                     runner.require_session().trace.configure(decode_boundary(payload, TraceSelection))
                 case BackendCommand.DETACH:
                     runner.detach_workload()

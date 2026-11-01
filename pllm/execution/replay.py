@@ -19,7 +19,7 @@ from pllm.execution.route_executor import execute_route, ordinary_pass
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import TaskOutput, TensorBatch, TensorOperation, read_batch
 from pllm.execution.token_program import KV, TokenProgram
-from pllm.execution.trace import TracePhase
+from pllm.execution.trace import TraceEventKind
 
 if TYPE_CHECKING:
     from pllm.execution.execution import TaskGraphImplementation
@@ -160,7 +160,7 @@ class TokenwiseReplayTask(Generic[DataT]):
         def observe(index: int, hidden: torch.Tensor) -> None:
             row = primitive.rows[index]
             context.trace.observe(context.invocation_id, task_id, "replay.hidden", hidden, row=row, iteration=0)
-            context.trace.record(TracePhase.REPLAY, context.invocation_id, task_id=task_id, row=row, iteration=0)
+            context.trace.record(TraceEventKind.REPLAY, context.invocation_id, task_id=task_id, row=row, iteration=0)
 
         with torch.no_grad(), nullcontext() if context.pin.stream is None else torch.cuda.stream(context.pin.stream):
             primitive.run(self.program, effect, observe)

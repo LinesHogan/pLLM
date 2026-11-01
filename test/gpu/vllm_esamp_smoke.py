@@ -22,7 +22,7 @@ from pllm.backends.vllm.runtime import VllmLlm
 from pllm.config import ExecutionOptions, ModelConfig
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
+from pllm.workloads.esamp import ESampConfig, ESampWorkload
 
 
 def lag_equivalence() -> None:
@@ -51,7 +51,7 @@ def lag_equivalence() -> None:
             cuda_graphs=True,
             execution=ExecutionOptions(publish_lag=lag, capture_memory_bytes=16 * 1024**2),
         )
-        with pllm.make_llm(config, workload=ESampRequestWorkload(ESampRequestConfig(rank=2))) as llm:
+        with pllm.make_llm(config, workload=ESampWorkload(ESampConfig(rank=2))) as llm:
             assert any(task.lane == "side" for task in llm.attachment.plan.schedule.tasks) == bool(lag)
             # Requests retire inside generate; read each final version just before it is retired.
             with patch.object(PageBundleArena, "retire", snapshot):
@@ -105,7 +105,7 @@ def main() -> int:
         del plain
         gc.collect()
         torch.cuda.empty_cache()
-    workload = ESampRequestWorkload(ESampRequestConfig(rank=2, source_layer=0, target_layer=-1, intervention_beta=0.2))
+    workload = ESampWorkload(ESampConfig(rank=2, source_layer=0, target_layer=-1, intervention_beta=0.2))
     routed = pllm.make_llm(
         workload=workload,
         config=ModelConfig(
@@ -134,7 +134,7 @@ def main() -> int:
             or diagnostics.loss_count != 2
             or diagnostics.update_count != 2
             or diagnostics.completed_sampler_pins != 2
-            or diagnostics.active_lineages != 0
+            or diagnostics.active_states != 0
             or diagnostics.pending_state_releases != 0
         ):
             raise RuntimeError("canonical ESamp lifecycle evidence is incomplete")

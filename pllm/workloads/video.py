@@ -5,7 +5,6 @@ Features arrive from a producer; the model consumes a local activation state.
 
 from dataclasses import dataclass
 from math import isfinite, pi
-from typing import ClassVar
 
 import torch
 from torch.nn import functional as F
@@ -24,7 +23,6 @@ def injection_shape(inputs: int, outputs: int) -> tuple[int, ...]:
 class VideoWorkload(pllm.Workload):
     """Encode fed feature maps into one local injection on each supplied step."""
 
-    name: ClassVar[str] = "video.session"
     grid_size: int = 8
     layer: int = 0
     gain: float = 0.1
@@ -38,7 +36,6 @@ class VideoWorkload(pllm.Workload):
         """Declare the four read-only feature fields supplied by the producer."""
         return pllm.InstanceState(
             {name: (self.grid_size, self.grid_size) for name in FEATURES},
-            namespace="video.features@1",
             dtype=torch.float32,
             feed=pllm.state.FeedOrder.ORDERED,
         )
@@ -48,7 +45,6 @@ class VideoWorkload(pllm.Workload):
         """Declare the local state written by the encoder and read by Activation."""
         return pllm.InstanceState(
             {"delta": pllm.Buffer(injection_shape, dtype=torch.float32)},
-            namespace="video.inject@1",
         )
 
     @property

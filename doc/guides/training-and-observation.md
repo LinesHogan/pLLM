@@ -115,14 +115,14 @@ def features(self, h: torch.Tensor = pllm.hidden(0)) -> torch.Tensor:
 ```python
 from pllm.execution.trace import TraceSelection
 
-llm.observe(TraceSelection(names=("loss",), tensors=True, max_tensor_bytes=32768))
+llm.select_trace(TraceSelection(names=("loss",), tensors=True, max_tensor_bytes=32768))
 llm.generate(prompts, params)
 snapshot = llm.trace_snapshot()          # 含 tensors=False 时的 loss/梯度元数据
-llm.observe(TraceSelection())            # 关掉
+llm.select_trace(TraceSelection())            # 关掉
 ```
 
 选择器开启时，训练任务会按名记录它的 Hidden 输入、`loss`（按 lineage）与
-`parameters.grad`（扁平梯度）。`llm.observe(TraceSelection())` 用空选择器
+`parameters.grad`（扁平梯度）。`llm.select_trace(TraceSelection())` 用空选择器
 关闭观测。
 
 有一个用法细节必须注意：trace 是**跨 generate 全局**的队列，不是每次

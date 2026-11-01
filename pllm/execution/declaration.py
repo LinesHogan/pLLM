@@ -101,13 +101,13 @@ class When(Enum):
     AUTOMATIC = ("request.prepare", "next.prepare")
     BEFORE_SAMPLE = ("model.execute", "sampler.pre_draw")
     AFTER_SAMPLE = ("token.commit", "next.prepare")
-    BEFORE_MODEL = ("request.prepare", "model.execute")
-    MODEL_UPDATE = ("model.execute", "state.publish")
+    BEFORE_FORWARD = ("request.prepare", "model.execute")
+    IN_FORWARD = ("model.execute", "state.publish")
     PUBLISH = ("state.publish", "next.prepare")
     HOST_COMPUTE = ("host.input.ready", "host.compute.end")
     HOST_COMMIT = ("host.compute.end", "host.next")
     HOST = ("host.input.ready", "host.next")
-    OBSERVE = ("state.publish", "sampler.pre_draw")
+    AFTER_FORWARD = ("state.publish", "sampler.pre_draw")
 
     @property
     def publication(self) -> When:
@@ -158,8 +158,8 @@ class State:
         return PageUpdate(self.optimizer)
 
     @property
-    def memory_fields(self) -> tuple[Field, ...]:
-        """The plain memory fields that follow the AdamW fields."""
+    def carry_fields(self) -> tuple[Field, ...]:
+        """The plain carried fields that follow the AdamW fields."""
         return self.fields[0 if self.optimizer is None else ADAM :]
 
     @property
@@ -229,14 +229,13 @@ class Builder(Generic[D]):
         name: str,
         fields: tuple[Field, ...] | None = None,
         *,
-        namespace: str = "",
         scope: StateScope = StateScope.INSTANCE,
         keys: tuple[RequestKeyField, ...] = (),
         optimizer: AdamWConfig | None = None,
-        memory: tuple[Field, ...] = (),
+        carry: tuple[Field, ...] = (),
     ) -> State:
         if fields is None:
-            assert optimizer is None and not memory, "an optimizer and memory need declared parameter fields"
+            assert optimizer is None and not carry, "an optimizer and carried fields need declared parameter fields"
             declaration = SemanticState(StateResource(name), scope, keys)
             self.graph = replace(
                 self.graph, states=tuple(sorted((*self.graph.states, declaration), key=lambda state: state.resource))
@@ -253,7 +252,7 @@ class Builder(Generic[D]):
                 )
                 for name in ADAM_FIELDS
             )
-        fields = (*fields, *memory)
+        fields = (*fields, *carry)
         if len({field.name for field in fields}) != len(fields):
             raise ValueError(f"{name}: duplicate field name")
         declaration = SemanticState(StateResource(name), scope, keys)
@@ -278,7 +277,7 @@ class Builder(Generic[D]):
                 return field.dtype
 
             layout = TensorLayoutSpec(
-                namespace or f"{self.graph.workload_id}.{name}@1",
+                f"{self.graph.workload_id}.{name}@1",
                 tuple(
                     TensorFieldSpec(LayoutFieldId(i), shape, dtype(field), field.alignment)
                     for i, (field, shape) in enumerate(zip(fields, shapes, strict=True))

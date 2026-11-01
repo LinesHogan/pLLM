@@ -17,12 +17,12 @@ from pllm import make_llm
 from pllm.backends.vllm import mrv1
 from pllm.backends.vllm.sampler import SamplerGuidance
 from pllm.config import ModelConfig
-from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
+from pllm.workloads.esamp import ESampConfig, ESampWorkload
 
 
 def main() -> None:
     handle = make_llm(
-        workload=ESampRequestWorkload(ESampRequestConfig(rank=2, intervention_beta=0.2)),
+        workload=ESampWorkload(ESampConfig(rank=2, intervention_beta=0.2)),
         config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", "bfloat16", 64, 2, 128, 0.25, seed=7, runner="mrv1"),
     )
     native_rows, native_reweight = mrv1.encode_mrv1_rows, SamplerGuidance._reweight_finite_survivors
@@ -44,7 +44,7 @@ def main() -> None:
         assert [link.packed_row_index for link in result.links] == links == logits_indices.tolist()
         widths.add(batch.num_reqs)
         phases.update(row.phase.value for row in result.row_batch.rows)
-        identities_seen.update(identity.prompt_idx for identity in identities)
+        identities_seen.update(identity.prompt_index for identity in identities)
         row_checks += len(expected)
         return result
 
@@ -81,10 +81,10 @@ def main() -> None:
         assert widths == {1, 2} and phases == {"prefill", "decode"} and identities_seen == {7, 9, 11}
         assert row_checks > 9 and sampler_checks > 0 and affected_checks > 0
         assert batch.hidden.shape == (3, 896) and torch.isfinite(batch.hidden).all()
-        assert tuple(entry.identity.prompt_idx for entry in batch.completions.entries) == (7, 9, 11)
-        diagnostics = handle.worker_state().diagnostics
+        assert tuple(entry.identity.prompt_index for entry in batch.completions.entries) == (7, 9, 11)
+        diagnostics = handle.diagnostics()
         assert diagnostics.loss_count == diagnostics.update_count == 9
-        assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
+        assert diagnostics.active_states == diagnostics.pending_state_releases == 0
         print(f"MRv1: rows={row_checks} sampler_checks={sampler_checks} updates={diagnostics.update_count}")
     finally:
         handle.close()

@@ -30,9 +30,7 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry() -> None:
         FTTTConfig(edit_scale=float("nan"))
     config = FTTTConfig(rank=2, learning_rate=0.05, feedback_feature_size=3, max_retries=2)
     service = FTTTFeedbackService(config, ArithmeticJudge())
-    host = HostConfig(
-        torch.device("cpu"), hidden_size=4, initialization_seed=7, max_input_rows=1, memory_budget_bytes=1 << 20
-    )
+    host = HostConfig(torch.device("cpu"), hidden_size=4, seed=7, max_input_rows=1, memory_budget_bytes=1 << 20)
     workload = FTTTTrainer(service, host)
     identity = RequestIdentity("arithmetic", 0, 0)
     hidden = torch.tensor([[-1.0, -0.25, 0.5, 1.0]])
@@ -73,7 +71,7 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry() -> None:
         torch.testing.assert_close(result.edit_delta, (inputs @ down.T @ up.T).detach())
         assert result.state_version == version
         assert result.intent.retry_controls[0].action is action
-        state = service.instance_state("round", 0)
+        state = service.lifecycle("round", 0)
         assert state.retries == state.adapter_version == version
     accepted = Completion(identity, 0, "round", (4,), "4", FinishReason.STOP)
     assert not service.enqueue(CompletionInput.capture(CompletionBatch((accepted,)), hidden))
@@ -111,7 +109,7 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
             feedback_group,
             prompt_indices,
             sample_index,
-            auxiliary=None,
+            batch=None,
             completion_device=None,
             routes=None,
         ):
@@ -144,11 +142,11 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
         )
     )
     assert generator.calls == [(7, 9), (9,)]
-    assert service.instance_state("retry", 9).retries == 2
+    assert service.lifecycle("retry", 9).retries == 2
     assert rounds[-1][1].retry_controls[0].action is RetryAction.STOP
     assert service.queued_transactions == service.queued_feedback == 0
     update = rounds[0][1].state_update()
-    assert update.values[0] is rounds[0][1].edit_delta and update.keys[0].prompt_idx == 9
+    assert update.values[0] is rounds[0][1].edit_delta and update.keys[0].prompt_index == 9
 
     # Retries that wait for an update stop when nothing was published.
     def no_published_update(batch):

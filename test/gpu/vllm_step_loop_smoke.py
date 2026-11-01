@@ -1,4 +1,4 @@
-"""StepLoop on real MRv2: cache-backed recurrence and source-owned token capture."""
+"""StepLoopWorkload on real MRv2: cache-backed recurrence and source-owned token capture."""
 
 import sys
 from contextlib import contextmanager
@@ -28,7 +28,7 @@ from pllm.config import KVOffload
 from pllm.contracts.codec import encode_boundary
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.workload_transport import encode_workload
-from pllm.workloads.step_loop import StepLoop
+from pllm.workloads.step_loop import StepLoopWorkload
 from test.gpu.native_replay import native_pass, native_span
 from test.gpu.vllm_recirculation_smoke import replay_handle
 
@@ -116,7 +116,7 @@ def forced_preemption():
 
         # One block is vLLM's null block; vLLM 0.32 refuses a max_model_len beyond the others.
         handle = replay_handle(
-            StepLoop(), length=16 * (capacity - 1), prefix=True, generated_kv=policy, blocks=capacity
+            StepLoopWorkload(), length=16 * (capacity - 1), prefix=True, generated_kv=policy, blocks=capacity
         )
         try:
             with (
@@ -154,11 +154,11 @@ def generate_ids(handle, prompts, params=None):
         use_tqdm=False,
     )
     identities = tuple(RequestIdentity(name, handle._next_prompt_index + i, 0) for i, name in enumerate(ids))
-    handle.command(BackendCommand.STAGE, encode_boundary(BackendStage(identities, None, None)))
+    handle._command(BackendCommand.STAGE, encode_boundary(BackendStage(identities, None, None)))
     handle._next_prompt_index += len(ids)
     llm.wake_up(tags=["scheduling"])
     outputs = llm.wait_for_completion(RequestOutput, use_tqdm=False)
-    handle.command(BackendCommand.FINISH)
+    handle._command(BackendCommand.FINISH)
     return outputs
 
 
@@ -168,7 +168,7 @@ def offload_roundtrips(expected):
     for connector in ("OffloadingConnector", "SimpleCPUOffloadConnector"):
         local, boundaries = {}, []
         handle = replay_handle(
-            StepLoop(),
+            StepLoopWorkload(),
             length=64,
             prefix=True,
             generated_kv="reuse",
@@ -215,19 +215,21 @@ def offload_roundtrips(expected):
 
 def donor_loss():
     """A reused request recomputes lost donor pages using its own prompt roles."""
-    handle = replay_handle(StepLoop(), length=64, prefix=True, generated_kv="reuse", blocks=5)
+    handle = replay_handle(StepLoopWorkload(), length=64, prefix=True, generated_kv="reuse", blocks=5)
     lookup, hits = KVCacheManager.get_computed_blocks, []
     frontiers, saved = [], []
     native_forward = VllmTokenwiseReplay.forward
 
     def forwarded(primitive, *args, **kwargs):
-        rows = [row.token_offset for row in primitive.rows if row.identity.prompt_idx == 2]
+        rows = [row.token_offset for row in primitive.rows if row.identity.prompt_index == 2]
         if rows:
             frontiers.append((rows[0], rows[-1]))
         result = native_forward(primitive, *args, **kwargs)
         if rows:
             layer = primitive.position_layers[0]
-            last = next(row for row in primitive.rows if row.identity.prompt_idx == 2 and row.token_offset == rows[-1])
+            last = next(
+                row for row in primitive.rows if row.identity.prompt_index == 2 and row.token_offset == rows[-1]
+            )
             slot = get_forward_context().slot_mapping[layer.layer_name][
                 last.packed_row_index : last.packed_row_index + 1
             ]
@@ -279,12 +281,12 @@ def donor_loss():
 
 
 @dataclass(frozen=True)
-class ScaledStepLoop(StepLoop):
+class ScaledStepLoop(StepLoopWorkload):
     """Same cache schema with distinct frozen route mathematics."""
 
     @pllm.layer_route(tokens="all")
     def loop(self, layers):
-        hidden = torch.where(layers.generated, layers.load("history", offset=-1), layers.seed)
+        hidden = torch.where(layers.generated, layers.load("history", offset=-1), layers.embeddings)
         result = layers(hidden=hidden)[-1] * 0.999
         layers.save("history", result)
         return result
@@ -298,7 +300,7 @@ def isolated_multiturn():
         with patch.object(
             runtime, "LLM", partial(runtime.LLM, worker_extension_cls="test.gpu.native_replay.NativeSteps")
         ):
-            handle = replay_handle(StepLoop(), length=128, prefix=True, multiprocessing=multiprocessing)
+            handle = replay_handle(StepLoopWorkload(), length=128, prefix=True, multiprocessing=multiprocessing)
         try:
             handle._llm.collective_rpc("begin_native_steps")
             (donor,) = handle.generate(
@@ -320,9 +322,9 @@ def isolated_multiturn():
             declaration = workload.funded_declaration(handle._facts)
             handle.attachment = workload.plan_backend(handle._facts, declaration)
             handle._cache_policy = CachePolicy.for_attachment(handle.attachment, "isolate")
-            handle.command(BackendCommand.DETACH)
+            handle._command(BackendCommand.DETACH)
             if multiprocessing:
-                handle.command(
+                handle._command(
                     BackendCommand.INSTALL,
                     encode_boundary(
                         BackendInstall(
@@ -350,7 +352,7 @@ def isolated_multiturn():
 
 def main():
     isolated_multiturn()
-    handle = replay_handle(StepLoop(), length=128, prefix=True, generated_kv="reuse")
+    handle = replay_handle(StepLoopWorkload(), length=128, prefix=True, generated_kv="reuse")
     primitive = handle.runner._workload_session._replay
     stage, replay = RouteWave.stage, torch.cuda.CUDAGraph.replay
     save_span = VllmTokenwiseReplay.save_span

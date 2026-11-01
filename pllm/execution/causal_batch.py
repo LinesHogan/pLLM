@@ -9,11 +9,11 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 
-from pllm.contracts.auxiliary import CausalTrainBatch, WeightedRowBatch
+from pllm.contracts.host_batch import CausalTrainBatch, WeightedRowBatch
 from pllm.contracts.parameter_overlay import FieldView, ParameterOverlayFieldBinding
 from pllm.contracts.semantic_graph import MathContract, SemanticInputSource, StateEffectKind, StateSelectionInputSource
 from pllm.execution.declaration import Call, State, When, native
-from pllm.execution.tensor_frame import TensorFrame, Tensors, TensorUpdate
+from pllm.execution.tensor_frame import TensorFrame, Tensors, UpdateOutput
 from pllm.execution.tensor_program import TaskOutput, TensorBatch, autograd_loss
 
 if TYPE_CHECKING:
@@ -59,7 +59,7 @@ class CausalPort:
     adapt: Callable[[TrainingBatch, Tensors], torch.Tensor | CausalCall | None]
 
 
-_TRAINING_WINDOWS = (When.BEFORE_MODEL, When.AFTER_SAMPLE, When.HOST_COMPUTE)
+_TRAINING_WINDOWS = (When.BEFORE_FORWARD, When.AFTER_SAMPLE, When.HOST_COMPUTE)
 
 
 def declare_batch_train(
@@ -68,19 +68,19 @@ def declare_batch_train(
     state: State,
     *,
     ports: Mapping[str, CausalPort],
-    function: Callable[..., torch.Tensor | TensorUpdate | None],
+    function: Callable[..., torch.Tensor | UpdateOutput | None],
     identity: str,
     when: When,
 ) -> Call:
     """Bind batch inputs, explicit parameter gradients and the shared AdamW transition.
 
-    The method returns a scalar loss (every row trains), a TensorUpdate whose `changed` flag is a device
+    The method returns a scalar loss (every row trains), a UpdateOutput whose `changed` flag is a device
     tensor, or None to skip the step.
     """
     if state.declaration.key_fields or when not in _TRAINING_WINDOWS:
         raise ValueError(
             "training on WeightedRowBatch or CausalTrainBatch fields updates one pllm.InstanceState in "
-            "Phase.BEFORE_MODEL or Phase.AFTER_SAMPLE"
+            "Phase.BEFORE_FORWARD or Phase.AFTER_SAMPLE"
         )
     if any(
         isinstance(port.source, StateSelectionInputSource) and port.source.resource != state.declaration.resource
@@ -90,17 +90,17 @@ def declare_batch_train(
     names = state.parameter_names
 
     def loss(data: TensorFrame, parameters: Tensors) -> torch.Tensor | None:
-        batch = data.step.auxiliary
+        batch = data.step.batch
         if batch is None:
             return None
         assert isinstance(batch, (CausalTrainBatch, WeightedRowBatch))
         result = function(**{key: port.adapt(batch, parameters) for key, port in ports.items()})
         if result is None:
             return None
-        if not isinstance(result, TensorUpdate):
+        if not isinstance(result, UpdateOutput):
             rows = (batch.input_ids if isinstance(batch, CausalTrainBatch) else batch.hidden).shape[0]
             one = torch.ones((), dtype=torch.int64, device=result.device)
-            result = TensorUpdate(result, one.bool(), one, one * rows)
+            result = UpdateOutput(result, one.bool(), one, one * rows)
         data.training = replace(result, output=result.output.detach())
         return result.output
 
@@ -136,7 +136,7 @@ def declare_batch_train(
     if when is When.HOST_COMPUTE:
         resource = str(state.declaration.resource)
         views = {key: view for (owner, key), view in b.field_views.items() if owner == resource}
-        # The caller of a host step reads the updated state (TensorResult.parameters): copy the updated version.
+        # The caller of a host step reads the updated state (StepResult.parameters): copy the updated version.
         b.compute(
             f"{name}.parameters",
             inputs={"state": state.read()},

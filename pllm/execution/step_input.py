@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
-from pllm.contracts.auxiliary import AuxiliaryInput, map_auxiliary
+from pllm.contracts.host_batch import HostBatch, map_host_batch
 from pllm.contracts.packed_hidden import HiddenRowBatch
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.contracts.parameter_overlay import CapturedParameterOperand
@@ -14,14 +14,14 @@ from pllm.execution.cuda_stream import CudaStreamReadiness
 
 
 @dataclass(frozen=True, slots=True)
-class TensorStepInput:
+class StepInput:
     rows: PackedPhaseRowBatch
     sampler_rows: PackedSamplerRowBatch
     hidden: HiddenRowBatch | None = None
     operands: tuple[CapturedParameterOperand, ...] = ()
-    auxiliary: AuxiliaryInput[torch.Tensor] | None = None
+    batch: HostBatch[torch.Tensor] | None = None
     hidden_readiness: CudaStreamReadiness | None = None
-    auxiliary_readiness: CudaStreamReadiness | None = None
+    batch_readiness: CudaStreamReadiness | None = None
 
     def __post_init__(self) -> None:
         assert self.sampler_rows.row_batch is self.rows
@@ -34,20 +34,18 @@ class TensorStepInput:
             assert readiness == (device if device.type == "cuda" else None)
 
     @classmethod
-    def of_batch(
-        cls, auxiliary: AuxiliaryInput[torch.Tensor], readiness: CudaStreamReadiness | None = None
-    ) -> TensorStepInput:
-        """A host step without request rows, carrying one auxiliary batch its CUDA producer readies at `readiness`."""
+    def of_batch(cls, batch: HostBatch[torch.Tensor], readiness: CudaStreamReadiness | None = None) -> StepInput:
+        """A host step without request rows, carrying one host batch its CUDA producer readies at `readiness`."""
         rows = PackedPhaseRowBatch(0, 0, ())
-        return cls(rows, PackedSamplerRowBatch(rows, ()), auxiliary=auxiliary, auxiliary_readiness=readiness)
+        return cls(rows, PackedSamplerRowBatch(rows, ()), batch=batch, batch_readiness=readiness)
 
-    def order_auxiliary(self) -> None:
-        """Order the current stream after the auxiliary producer and keep its tensors alive for that stream."""
-        if self.auxiliary is None or self.auxiliary_readiness is None:
+    def order_host_batch(self) -> None:
+        """Order the current stream after the host batch producer and keep its tensors alive for that stream."""
+        if self.batch is None or self.batch_readiness is None:
             return
-        stream = torch.cuda.current_stream(self.auxiliary_readiness.device)
-        self.auxiliary_readiness.order_on(stream)
-        map_auxiliary(self.auxiliary, lambda tensor: tensor.record_stream(stream))
+        stream = torch.cuda.current_stream(self.batch_readiness.device)
+        self.batch_readiness.order_on(stream)
+        map_host_batch(self.batch, lambda tensor: tensor.record_stream(stream))
 
     def hidden_batch(self, stream: torch.cuda.Stream | None) -> HiddenRowBatch:
         if self.hidden is None or (self.hidden_readiness is None) != (stream is None):

@@ -12,7 +12,7 @@ import pllm
 
 
 @dataclass(frozen=True, slots=True)
-class ESampRequestConfig:
+class ESampConfig:
     rank: int = 128
     source_layer: int = 0
     target_layer: int = -1
@@ -49,9 +49,8 @@ class Distiller(nn.Module):
 
 
 @dataclass(frozen=True)
-class ESampRequestWorkload(pllm.Workload):
-    name = "esamp.request"
-    config: ESampRequestConfig = ESampRequestConfig()
+class ESampWorkload(pllm.Workload):
+    config: ESampConfig = ESampConfig()
 
     @property
     def distiller(self) -> pllm.RequestState:
@@ -82,4 +81,4 @@ class ESampRequestWorkload(pllm.Workload):
         return (distiller(source) - target).square().mean(1)
 
 
-__all__ = ["ESampRequestConfig", "ESampRequestWorkload"]
+__all__ = ["ESampConfig", "ESampWorkload"]

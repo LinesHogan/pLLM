@@ -33,7 +33,7 @@ from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import TaskOutput, TensorBatch
 from pllm.execution.tensor_task import TensorTask
 from pllm.testing import backend_facts
-from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
+from pllm.workloads.esamp import ESampConfig, ESampWorkload
 
 BINDINGS = tuple(
     PackedHiddenResourceBinding(str(layer), HiddenLayerKind.INDEX, HiddenSite.BLOCK_OUTPUT, f"model.layers[{layer}]")
@@ -105,10 +105,10 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(monkeypatc
     with pytest.raises(ValueError):
         ExecutionOptions(publish_lag=-1)
     with pytest.raises(ValueError):
-        ESampRequestConfig(learning_rate=float("nan"))
-    config = ESampRequestConfig(rank=2, intervention_beta=0.2, learning_rate=0.03, weight_decay=0.1)
+        ESampConfig(learning_rate=float("nan"))
+    config = ESampConfig(rank=2, intervention_beta=0.2, learning_rate=0.03, weight_decay=0.1)
     facts = facts_for(torch.device("cpu"), 4, 6)
-    execution = ESampRequestWorkload(config).compile_backend(facts).execution
+    execution = ESampWorkload(config).compile_backend(facts).execution
     identities = (RequestIdentity("first", 0, 0), RequestIdentity("second", 0, 1))
     latest = list(execution.admit(identities))
     parameters = [execution.snapshot(ref)[0].requires_grad_() for ref in latest]
@@ -171,14 +171,14 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(monkeypatc
 
     execution.retire(identities, wait=True)
     diagnostics = execution.diagnostics()
-    assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
+    assert diagnostics.active_states == diagnostics.pending_state_releases == 0
     assert diagnostics.loss_count == diagnostics.update_count == 3 and diagnostics.trained_rows == 4
     with monkeypatch.context() as fault:
         # Admission publishes initial versions; a failure must not leak a lineage.
         fault.setattr(PageBundleArena, "publish", reject_publication)
         with pytest.raises(RuntimeError):
             execution.admit(identities)
-    assert execution.diagnostics().active_lineages == 0
+    assert execution.diagnostics().active_states == 0
     execution.admit(identities)
     execution.retire(identities)
     for device in DEVICES:
@@ -190,10 +190,10 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(monkeypatc
 
 def _esamp_native_oracle(device, normalized):
     stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
-    config = ESampRequestConfig(
+    config = ESampConfig(
         rank=4, output_layernorm=normalized, intervention_beta=0.2, learning_rate=0.03, weight_decay=0.1
     )
-    workload = ESampRequestWorkload(config)
+    workload = ESampWorkload(config)
     facts = facts_for(device, 8, 8, lineages=3, memory_bytes=100000)
     facts, declaration = workload.specialize(facts, ExecutionOptions(capture_memory_bytes=16 * 1024**2))
     deployment = workload.bind_backend(facts, workload.plan_backend(facts, declaration), declaration)
@@ -245,7 +245,7 @@ def _esamp_native_oracle(device, normalized):
             torch.testing.assert_close(execution.arena.snapshot(held, ref)[0], expected, rtol=0, atol=0)
     execution.arena.wait_release(execution.arena.release_pin(held))
     execution.retire(identities)
-    assert execution.diagnostics().active_lineages == 0
+    assert execution.diagnostics().active_states == 0
 
 
 class Distillation(pllm.Workload):
@@ -254,8 +254,8 @@ class Distillation(pllm.Workload):
     heads = pllm.RequestState(
         {"weight": lambda m: (m.hidden_size, m.hidden_size)},
         optimizer=pllm.AdamW(lr=0.03, weight_decay=0.1),
-        keys=(RequestKeyField.PROMPT_IDX, RequestKeyField.SAMPLE_IDX),
-        memory={"carry": lambda m: (m.hidden_size,)},
+        keys=(RequestKeyField.PROMPT_INDEX, RequestKeyField.SAMPLE_INDEX),
+        carry={"carry": lambda m: (m.hidden_size,)},
     )
 
     def ready(self, versions: torch.Tensor = pllm.version("heads")) -> torch.Tensor:
@@ -272,7 +272,7 @@ class Distillation(pllm.Workload):
     @pllm.train(state="heads", reduction="state_mean")
     def train(
         self,
-        source: torch.Tensor = pllm.capture(pllm.hidden(0), state="heads", field="carry"),
+        source: torch.Tensor = pllm.carry(pllm.hidden(0), state="heads", field="carry"),
         target: torch.Tensor = pllm.hidden(-1),
         weight: torch.Tensor = pllm.parameter("heads", "weight"),
         carry: torch.Tensor = pllm.parameter("heads", "carry"),
@@ -333,7 +333,7 @@ def _ordinary_request_distillation() -> None:
         execution.retire(identities, wait=True)
         diagnostics = execution.diagnostics()
         assert diagnostics.loss_count == diagnostics.update_count == 4 and diagnostics.trained_rows == 6
-        assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
+        assert diagnostics.active_states == diagnostics.pending_state_releases == 0
 
 
 def test_sampler_adapts_step_results_in_memory_trace_and_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -359,7 +359,7 @@ def test_sampler_adapts_step_results_in_memory_trace_and_runtime(monkeypatch: py
 
     monkeypatch.setattr(TensorTask, "evaluate", dependency)
     monkeypatch.setattr(TensorTask, "sampler_output", output)
-    workload = ESampRequestWorkload(ESampRequestConfig(rank=2, intervention_beta=0.2))
+    workload = ESampWorkload(ESampConfig(rank=2, intervention_beta=0.2))
     execution = workload.compile_backend(facts_for(torch.device("cpu"), 4, 8), ExecutionOptions()).execution
     assert "meta" in devices
     identities = (RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0))

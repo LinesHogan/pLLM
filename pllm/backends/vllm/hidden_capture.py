@@ -1,6 +1,6 @@
 """Declaration-derived capture layouts and hidden-state taps used by vLLM runners.
 
-Taps are installed before vLLM compiles and captures the model. Persistent index tables
+LayerOutputs are installed before vLLM compiles and captures the model. Persistent index tables
 select packed rows to copy into PTTS slots. Consumers retain holds until their own
 streams complete; the session releases producer holds after publication.
 """
@@ -28,7 +28,7 @@ from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorField
 from pllm.execution.cuda_stream import CudaStreamReadiness, PinnedStaging
 from pllm.execution.ptts.slot_pools import SlotPools, Slots
 from pllm.execution.state_execution import DataT, StateTaskContext
-from pllm.execution.step_input import TensorStepInput
+from pllm.execution.step_input import StepInput
 
 CAPTURE_ENV = "PLLM_HIDDEN_CAPTURE"
 
@@ -174,7 +174,7 @@ class HiddenTaps:
         self._rows.clear()
         self.indices.fill_(-1)
 
-    def publish(self, value: TensorStepInput, resources: tuple[PackedHiddenResourceBinding, ...]) -> TensorStepInput:
+    def publish(self, value: StepInput, resources: tuple[PackedHiddenResourceBinding, ...]) -> StepInput:
         """Attach the current step's hidden rows for `resources` to `value`."""
         captures = tuple(
             HiddenRows(resource, self.pools[resource.module_path].tensors[0], self._rows[resource.module_path])

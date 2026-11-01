@@ -46,7 +46,7 @@ class KVOffload:
 class ExecutionOptions:
     """Framework execution policy; lag counts post-sampler steps hidden from readers."""
 
-    training_rows: int = 1
+    max_training_rows: int = 1
     capture_memory_bytes: int = 64 * 1024**2
     state_memory_bytes: int = 0  # Zero uses the backend's observed available capacity.
     memory_budget_bytes: int | None = None  # Original AER declared-memory limit, not total CUDA residency.
@@ -61,8 +61,8 @@ class ExecutionOptions:
             raise ValueError("publish_lag must be >= 0; use 0 for strict ordering")
         if self.tuning not in ("heuristic", "measured"):
             raise ValueError("tuning must be heuristic or measured")
-        if self.training_rows < 1:
-            raise ValueError("training_rows must be >= 1")
+        if self.max_training_rows < 1:
+            raise ValueError("max_training_rows must be >= 1")
         if self.capture_memory_bytes < 1:
             raise ValueError("capture_memory_bytes must be positive")
 

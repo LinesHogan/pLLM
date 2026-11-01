@@ -35,7 +35,7 @@ from pllm.execution.torch_private import register_gradient_hook
 
 if TYPE_CHECKING:
     from pllm.execution.row_task_binding import WeightedBatch
-    from pllm.execution.step_input import TensorStepInput
+    from pllm.execution.step_input import StepInput
 
 
 Tensors = Mapping[str, torch.Tensor]
@@ -59,7 +59,7 @@ _NO_METRICS: Mapping[str, torch.Tensor] = MappingProxyType({})
 
 
 @dataclass(frozen=True)
-class TensorUpdate:
+class UpdateOutput:
     """What a training or overlay method returns: its output and 0-d device counters.
 
     `output` is the loss for `@pllm.train` methods; for `@pllm.overlay` it is the unscaled residual
@@ -76,7 +76,7 @@ class TensorUpdate:
     metrics: Mapping[str, torch.Tensor] = field(default_factory=lambda: _NO_METRICS)
 
     @classmethod
-    def unchanged(cls, output: torch.Tensor) -> "TensorUpdate":
+    def unchanged(cls, output: torch.Tensor) -> "UpdateOutput":
         """A residual-only result with device-valued zero counters."""
         return cls(
             output,
@@ -89,7 +89,7 @@ class TensorUpdate:
 @dataclass(frozen=True, slots=True)
 class OverlayTargetResult:
     target: ParameterTarget
-    update: TensorUpdate
+    update: UpdateOutput
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,7 +153,7 @@ class RowPlan:
         return cls(
             np.fromiter((row.packed_row_index for row in data.rows), dtype=np.int64, count=len(data.rows)),
             tuple(links.get(row.packed_row_index, -1) for row in data.rows),
-            tuple(row.identity.sample_idx for row in data.rows),
+            tuple(row.identity.sample_index for row in data.rows),
             states,
             tuple(selection.refs.versions[list(states)].tolist()) if selection.groups else states,
             batch.slot_matrix()[1] if batch.roots else np.empty((0, 0), dtype=np.int64),
@@ -291,7 +291,7 @@ class FixedRows:
 
 @dataclass(slots=True)
 class TensorFrame:
-    step: TensorStepInput
+    step: StepInput
     rows: tuple[PackedPhaseRow, ...]
     entries: list[OverlayEntry] = field(default_factory=lambda: list[OverlayEntry]())
     input_gradients: dict[tuple[str, str], torch.Tensor] = field(
@@ -300,8 +300,8 @@ class TensorFrame:
     parameter_gradient_fields: MutableMapping[StateRef, tuple[torch.Tensor, ...]] = field(
         default_factory=lambda: dict[StateRef, tuple[torch.Tensor, ...]]()
     )
-    training: TensorUpdate | None = None
-    # A host training step's updated state fields, by name (TensorResult.parameters).
+    training: UpdateOutput | None = None
+    # A host training step's updated state fields, by name (StepResult.parameters).
     parameters: dict[str, torch.Tensor] = field(default_factory=lambda: dict[str, torch.Tensor]())
     replacements: tuple[tuple[int, tuple[torch.Tensor, ...]], ...] = ()
     plan: RowPlan | None = None
@@ -350,7 +350,7 @@ def hidden_port(source: HiddenInputSource) -> TensorPort:
     return TensorPort(source, hidden)
 
 
-def samples_port(source: PackedSamplerRowsInputSource) -> TensorPort:
+def sample_index_port(source: PackedSamplerRowsInputSource) -> TensorPort:
     """Read packed sample indices for the invocation rows."""
 
     return TensorPort(source, lambda data, batch: data.table.index.samples)

@@ -10,7 +10,7 @@ import torch
 from torch.nn import functional as F
 
 import pllm
-from pllm.authoring import TensorStepInput
+from pllm.authoring import StepInput
 from pllm.execution.state_execution import StateExecution
 from pllm.execution.tensor_binding import TensorOutput
 from pllm.execution.tensor_frame import TensorFrame
@@ -71,7 +71,7 @@ class TTRLRewards:
     reward_outcomes: tuple[RewardOutcome, ...]
     retry_controls: tuple[RetryControl, ...]
     update_barriers: tuple[UpdateBarrier, ...]
-    step: TensorStepInput
+    step: StepInput
 
     @property
     def update_count(self) -> int:
@@ -84,7 +84,7 @@ def ttrl_rewards(value: CompletionInput, config: TTRLConfig) -> TTRLRewards:
     entries = value.completions.entries
     groups: dict[int, list[int]] = {}
     for index, completion in enumerate(entries):
-        groups.setdefault(completion.identity.prompt_idx, []).append(index)
+        groups.setdefault(completion.identity.prompt_index, []).append(index)
     labels = tuple(boxed_label(completion.text) for completion in entries)
     majority: dict[int, str] = {}
     selected: list[int] = []
@@ -115,7 +115,7 @@ def ttrl_rewards(value: CompletionInput, config: TTRLConfig) -> TTRLRewards:
     rewards: list[RewardOutcome] = []
     controls: list[RetryControl] = []
     for completion, label in zip(entries, labels, strict=True):
-        correct = label == majority[completion.identity.prompt_idx] if label else None
+        correct = label == majority[completion.identity.prompt_index] if label else None
         rewards.append(
             RewardOutcome(
                 completion,
@@ -146,12 +146,12 @@ def ttrl_rewards(value: CompletionInput, config: TTRLConfig) -> TTRLRewards:
         hidden.new_tensor([reward.reward or 0.0 for reward in rewards]),
         hidden.new_tensor([float(index in chosen) for index in range(len(entries))]),
     )
-    step = TensorStepInput.of_batch(batch, value.readiness)
+    step = StepInput.of_batch(batch, value.readiness)
     return TTRLRewards(tuple(rewards), tuple(controls), tuple(barriers), step)
 
 
 def ttrl_feedback(
-    execution: StateExecution[TensorStepInput, TensorFrame, TensorOutput],
+    execution: StateExecution[StepInput, TensorFrame, TensorOutput],
     config: TTRLConfig,
     stream: torch.cuda.Stream | None = None,
 ) -> Callable[[CompletionInput], TTRLRewards]:
@@ -169,7 +169,6 @@ def ttrl_feedback(
 class TTRLWorkload(pllm.Workload):
     """A rank-r reward head, fit by AdamW to the 0/1 majority rewards of `ttrl_rewards` steps."""
 
-    name = "ttrl"
     config: TTRLConfig = TTRLConfig()
 
     @property
@@ -177,7 +176,6 @@ class TTRLWorkload(pllm.Workload):
         rank = self.config.rank
         return pllm.InstanceState(
             {"head": lambda m: (rank * (m.hidden_size + 1),)},
-            namespace="canonical.reward_head@1",
             optimizer=pllm.AdamW(lr=self.config.learning_rate),
             initialize=self.initialize,
         )
@@ -194,7 +192,7 @@ class TTRLWorkload(pllm.Workload):
         targets: torch.Tensor = pllm.batch("targets"),
         weights: torch.Tensor = pllm.batch("weights"),
         head: torch.Tensor = pllm.parameter("head", "head"),
-    ) -> pllm.TensorUpdate:
+    ) -> pllm.UpdateOutput:
         """Weighted mean squared error; an empty selection has zero loss and leaves the head unchanged."""
         rank, width = self.config.rank, hidden.shape[1]
         split = rank * width
@@ -202,4 +200,4 @@ class TTRLWorkload(pllm.Workload):
         total = weights.sum()
         loss = (weights * (prediction.squeeze(-1) - targets).square()).sum() / torch.where(total > 0, total, 1)
         changed = total > 0
-        return pllm.TensorUpdate(loss, changed, changed.to(torch.int64), (weights > 0).sum())
+        return pllm.UpdateOutput(loss, changed, changed.to(torch.int64), (weights > 0).sum())

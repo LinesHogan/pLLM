@@ -8,8 +8,8 @@ from pllm.workloads.fttt.judge import (
 from pllm.workloads.fttt.types import (
     FTTTClosedLoopIntent,
     FTTTConfig,
-    FTTTInstanceState,
     FTTTJudgeResult,
+    FTTTRequestLifecycle,
 )
 from pllm.workloads.fttt.workload import FTTTTrainer, FTTTWorkload
 
@@ -18,7 +18,7 @@ __all__ = [
     "FTTTConfig",
     "FTTTDefaultJudge",
     "FTTTFeedbackService",
-    "FTTTInstanceState",
+    "FTTTRequestLifecycle",
     "FTTTJudgeResult",
     "FTTTJudgeService",
     "FTTTTrainer",

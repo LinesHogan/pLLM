@@ -174,7 +174,7 @@ class MathContract:
     forward_rows: str = ""
     input_gradient_rows: str = ""
     parameter_gradient_rows: str = ""
-    update_states: str = ""
+    update_rows: str = ""
     reduction: LossReduction = "none"
 
 

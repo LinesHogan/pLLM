@@ -81,9 +81,11 @@ def main() -> None:
             expected = torch.zeros(logits.shape, device=logits.device, dtype=torch.float32)
             for link in rows.links:
                 identity = rows.row_batch.rows[link.packed_row_index].identity
-                if identity.sample_idx:
+                if identity.sample_index:
                     expected[link.sampler_row_index] = config.lambd * (
-                        hidden[link.packed_row_index] @ down[identity.sample_idx - 1].T @ up[identity.sample_idx - 1].T
+                        hidden[link.packed_row_index]
+                        @ down[identity.sample_index - 1].T
+                        @ up[identity.sample_index - 1].T
                     )
             torch.testing.assert_close(guidance.pred_dense_logits, expected, rtol=2e-4, atol=2e-5)
             result = native_add(logits, guidance)
@@ -97,7 +99,7 @@ def main() -> None:
             assert feedback is not None and base_logits is not None
             torch.testing.assert_close(feedback.base_logits, base_logits, rtol=0, atol=0)
             for identity, token in zip(feedback.sampler_rows.identities, feedback.sampled_tokens.tolist(), strict=True):
-                drawn.setdefault((identity.prompt_idx, identity.sample_idx), []).append(token)
+                drawn.setdefault((identity.prompt_index, identity.sample_index), []).append(token)
 
         with (
             patch.object(GuidedSampler, "_add_logits", staticmethod(inspect_add)),
@@ -148,7 +150,7 @@ def main() -> None:
         batch.readiness.order_on(stream)
         assert len(batch.completions.entries) == 3
         for completion, row in zip(batch.completions.entries, batch.hidden, strict=True):
-            assert completion.identity.prompt_idx == 100
+            assert completion.identity.prompt_index == 100
             torch.testing.assert_close(row, expected_hidden[completion.identity.request_id], rtol=0, atol=0)
         facts = HostConfig(execution.device, hidden_size=batch.hidden.shape[1])
         edited = FTTTTrainer(FTTTFeedbackService(FTTTConfig(), FTTTDefaultJudge()), facts).run(batch)
@@ -164,7 +166,7 @@ def main() -> None:
         if hook is not None:
             hook.remove()
         handle.close()
-    assert execution.diagnostics().active_lineages == 0
+    assert execution.diagnostics().active_states == 0
 
 
 if __name__ == "__main__":

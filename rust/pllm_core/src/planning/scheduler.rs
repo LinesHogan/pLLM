@@ -735,7 +735,7 @@ mod tests {
         timeline.memory_budget_bytes = Some(inline.peak_memory_bytes - 1);
         assert!(compile(&graph, &timeline, None).is_err());
         timeline.memory_budget_bytes = None;
-        graph.tasks[1].math = Some(serde_json::from_value(json!({"input_gradients":[],"parameter_gradients":[],"detached_inputs":[],"forward_rows":"","input_gradient_rows":"","parameter_gradient_rows":"","update_states":"","reduction":"none"})).unwrap());
+        graph.tasks[1].math = Some(serde_json::from_value(json!({"input_gradients":[],"parameter_gradients":[],"detached_inputs":[],"forward_rows":"","input_gradient_rows":"","parameter_gradient_rows":"","update_rows":"","reduction":"none"})).unwrap());
         let main = compile(&graph, &timeline, None).unwrap();
         assert!(main.tasks.iter().all(|t| t.lane == super::Lane::Main));
         assert_eq!(main.tasks[0].read_distance, 2);
@@ -996,7 +996,7 @@ mod tests {
         for task in &mut graph.tasks[1..] {
             task.math = Some(serde_json::from_value(json!({"input_gradients": ["input"],
                 "parameter_gradients": [], "detached_inputs": [], "forward_rows": "", "input_gradient_rows": "",
-                "parameter_gradient_rows": "", "update_states": "", "reduction": "none"})).unwrap());
+                "parameter_gradient_rows": "", "update_rows": "", "reduction": "none"})).unwrap());
         }
         let backward = compile(&graph, &roomy, None).unwrap();
         // The first value is saved by t1 for the gradient consumed at t2.

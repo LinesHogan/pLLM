@@ -1,7 +1,7 @@
-"""Host execution without a model: the facts a host workload compiles against (HostConfig), planning and binding
+"""Host execution without a model: the settings a host workload compiles against (HostConfig), planning and binding
 its graph (bind_host), and the completion rows a generate call hands to host feedback (CompletionInput).
 
-pllm.host.make_host compiles a pllm.Workload with these facts; the vLLM session writes CompletionInput rows.
+pllm.host.make_host compiles a pllm.Workload with this config; the vLLM session writes CompletionInput rows.
 """
 
 from __future__ import annotations
@@ -41,26 +41,24 @@ def bind_host(
     graph: SemanticGraph,
     layouts: TensorLayoutRequest,
     math: MathBinding[InputT, DataT, ResultT],
-    facts: HostConfig,
+    config: HostConfig,
     timeline: SchedulerTimeline,
 ) -> StateExecution[InputT, DataT, ResultT]:
-    """Plan a host graph against `timeline` and bind its math to a page arena on `facts.device`."""
+    """Plan a host graph against `timeline` and bind its math to a page arena on `config.device`."""
     providers = (
         (
             PageBundleProviderFacts(
-                f"canonical.page_bundle_{facts.device.type}@1",
+                f"canonical.page_bundle_{config.device.type}@1",
                 3,
-                StateDeviceKind(facts.device.type),
+                StateDeviceKind(config.device.type),
             ),
         )
         if layouts.layouts
         else ()
     )
-    plan = compile_page_bundle_plan(
-        (graph, layouts), timeline, providers, 1, facts.state_memory_budget_bytes, facts.device
-    )
+    plan = compile_page_bundle_plan((graph, layouts), timeline, providers, 1, config.state_memory_bytes, config.device)
     (anchor,) = (AnchorId(item.ordinal) for item in timeline.anchors if item.symbol == "host.next")
-    return math.bind(PageBundleArena(plan, device=facts.device), anchor)
+    return math.bind(PageBundleArena(plan, device=config.device), anchor)
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,16 +70,17 @@ class CompletionInput:
     readiness: CudaStreamReadiness | None = None
 
     @classmethod
-    def example(cls, facts: HostConfig, device: torch.device = torch.device("meta")) -> CompletionInput:
+    def example(cls, config: HostConfig, device: torch.device = torch.device("meta")) -> CompletionInput:
         """A shape-only input with domain-neutral completion metadata."""
-        if facts.max_input_rows is None:
+        if config.max_input_rows is None:
             raise ValueError("finite completion costs require max_input_rows")
         entries = tuple(
             Completion(RequestIdentity(str(i), i, 0), i, str(i), (), "", FinishReason.LENGTH)
-            for i in range(facts.max_input_rows)
+            for i in range(config.max_input_rows)
         )
         return cls(
-            CompletionBatch(entries), torch.empty((len(entries), facts.hidden_size), dtype=torch.float32, device=device)
+            CompletionBatch(entries),
+            torch.empty((len(entries), config.hidden_size), dtype=torch.float32, device=device),
         )
 
     @classmethod
@@ -147,8 +146,8 @@ class HostConfig:
     device: torch.device
     hidden_size: int = 0
     target_shape: tuple[int, ...] = ()
-    initialization_seed: int = 0
-    state_memory_budget_bytes: int = 64 * 1024 * 1024
+    seed: int = 0
+    state_memory_bytes: int = 64 * 1024 * 1024
     max_input_rows: int | None = None
     memory_budget_bytes: int | None = None
 
@@ -157,8 +156,8 @@ class HostConfig:
             self.device.type not in ("cpu", "cuda")
             or self.hidden_size < 0
             or any(size < 1 for size in self.target_shape)
-            or self.initialization_seed < 0
-            or self.state_memory_budget_bytes < 0
+            or self.seed < 0
+            or self.state_memory_bytes < 0
             or self.max_input_rows is not None
             and self.max_input_rows < 0
             or self.memory_budget_bytes is not None
@@ -166,7 +165,7 @@ class HostConfig:
         ):
             raise ValueError(
                 "HostConfig needs a cpu or cuda device, positive target_shape sizes and nonnegative hidden_size, "
-                f"initialization_seed, state_memory_budget_bytes, max_input_rows and memory_budget_bytes; got {self}"
+                f"seed, state_memory_bytes, max_input_rows and memory_budget_bytes; got {self}"
             )
 
     def timeline(self) -> SchedulerTimeline:
@@ -191,13 +190,13 @@ class HostConfig:
 
 
 def measured_timeline(
-    facts: HostConfig,
+    config: HostConfig,
     reserved_bytes: int,
     costs: list[tuple[Call, MemoryUsage]],
     input_shapes: tuple[tuple[int, ...], ...] = (),
 ) -> SchedulerTimeline:
     """The host timeline with each call's measured workspace and the bytes its one output keeps."""
-    timeline = facts.timeline()
+    timeline = config.timeline()
     costs = sorted(costs, key=lambda cost: cost[0].symbol)
     return replace(
         timeline,

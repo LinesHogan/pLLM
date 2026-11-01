@@ -17,7 +17,7 @@ import torch
 from vllm import SamplingParams
 
 from pllm import make_llm
-from pllm.authoring import AuxiliaryInput, BackendWorkload
+from pllm.authoring import BackendWorkload, HostBatch
 from pllm.config import ExecutionOptions, ModelConfig
 from pllm.contracts.codec import boundary_digest
 from pllm.execution.ptts.page_bundle import PageBundleUsage
@@ -178,8 +178,8 @@ class _Setup(Generic[D, R]):
 
     options: BenchmarkOptions
     requests: _Requests
-    prepare: Callable[[VllmLlm[D, R]], AuxiliaryInput[torch.Tensor]] | None
-    training_rows: int
+    prepare: Callable[[VllmLlm[D, R]], HostBatch[torch.Tensor]] | None
+    max_training_rows: int
     require_training: bool
 
 
@@ -209,7 +209,7 @@ def _vanilla(options: BenchmarkOptions, requests: _Requests) -> float:
 
 
 def _generate_rounds(
-    handle: VllmLlm[D, R], requests: _Requests, auxiliary: AuxiliaryInput[torch.Tensor] | None, rounds: int
+    handle: VllmLlm[D, R], requests: _Requests, host_batch: HostBatch[torch.Tensor] | None, rounds: int
 ) -> tuple[tuple[float, ...], tuple[float, ...], int]:
     """Wall and process CPU seconds of each round, and the tokens generated over all rounds."""
     elapsed: list[float] = []
@@ -219,7 +219,7 @@ def _generate_rounds(
         cpu_started = process_time()
         started = perf_counter()
         outputs = handle.generate(
-            requests.prompts, requests.sampling, auxiliary=auxiliary, prompt_indices=requests.indices
+            requests.prompts, requests.sampling, batch=host_batch, prompt_indices=requests.indices
         )
         torch.cuda.synchronize()
         elapsed.append(perf_counter() - started)
@@ -236,7 +236,7 @@ def _measure_arm(
     config = replace(
         options.model_config(),
         execution=ExecutionOptions(
-            setup.training_rows,
+            setup.max_training_rows,
             capture_memory_bytes=options.capture_memory_bytes,
             state_memory_bytes=options.state_memory_bytes,
             memory_budget_bytes=options.memory_budget_bytes,
@@ -245,22 +245,22 @@ def _measure_arm(
     started = perf_counter()
     with make_llm(config, workload=arm.workload) as handle:
         cold = perf_counter() - started
-        auxiliary = None if setup.prepare is None else setup.prepare(handle)
+        host_batch = None if setup.prepare is None else setup.prepare(handle)
         for _ in range(options.warmup):
-            handle.generate(requests.prompts, requests.sampling, auxiliary=auxiliary, prompt_indices=requests.indices)
+            handle.generate(requests.prompts, requests.sampling, batch=host_batch, prompt_indices=requests.indices)
         before = handle.diagnostics()
         torch.cuda.synchronize()
         baseline = torch.cuda.memory_allocated()
         torch.cuda.reset_peak_memory_stats()
         allocation_before = torch.cuda.memory_stats()
         if directory is None:
-            elapsed, cpu_elapsed, tokens = _generate_rounds(handle, requests, auxiliary, options.rounds)
+            elapsed, cpu_elapsed, tokens = _generate_rounds(handle, requests, host_batch, options.rounds)
         else:
             with torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
                 profile_memory=True,
             ) as profiler:
-                elapsed, cpu_elapsed, tokens = _generate_rounds(handle, requests, auxiliary, options.rounds)
+                elapsed, cpu_elapsed, tokens = _generate_rounds(handle, requests, host_batch, options.rounds)
             profiler.export_chrome_trace(str(directory / f"{arm.name}.json"))
         after = handle.diagnostics()
         plan = handle.attachment.plan
@@ -451,8 +451,8 @@ def compare(
     workload: BackendWorkload[D, R],
     options: BenchmarkOptions,
     *,
-    prepare: Callable[[VllmLlm[D, R]], AuxiliaryInput[torch.Tensor]] | None = None,
-    training_rows: int = 1,
+    prepare: Callable[[VllmLlm[D, R]], HostBatch[torch.Tensor]] | None = None,
+    max_training_rows: int = 1,
     require_training: bool = False,
     prompt_indices: tuple[int, ...] | None = None,
     alternatives: tuple[tuple[str, BackendWorkload[D, R]], ...] = (),
@@ -491,7 +491,7 @@ def compare(
     if options.profile is not None:
         options.profile.mkdir(parents=True, exist_ok=True)
     requests = _Requests(prompts, sampling, indices)
-    setup = _Setup(options, requests, prepare, training_rows, require_training)
+    setup = _Setup(options, requests, prepare, max_training_rows, require_training)
     vanilla = _vanilla(options, requests)
     reports: list[BenchmarkResult] = []
     # CUPTI can affect later launches even after the profiling context exits, so profiles run last.

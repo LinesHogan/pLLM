@@ -4,7 +4,7 @@ import torch
 
 from examples.huber import HuberWorkload
 from pllm import testing
-from pllm.authoring import TensorResult
+from pllm.authoring import StepResult
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from pllm.contracts.request_identity import RequestIdentity
@@ -119,7 +119,7 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
             if timeline_anchor.ordinal > execution.sampler_anchor_id:
                 execution.execute_anchor(handle, AnchorId(timeline_anchor.ordinal))
         result = execution.finish_step(handle)
-        assert isinstance(result, TensorResult)
+        assert isinstance(result, StepResult)
         assert handle.value is None and handle.loss is None
         assert result.publication is not None and result.loss is not None
         assert result.guidance is guidance
@@ -160,5 +160,5 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
     diagnostics = execution.diagnostics()
     assert diagnostics.loss_count == diagnostics.update_count == updates
     assert diagnostics.trained_rows == trained_rows
-    assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
+    assert diagnostics.active_states == diagnostics.pending_state_releases == 0
     assert execution.arena.free_pages == 12

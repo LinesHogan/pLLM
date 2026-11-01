@@ -10,14 +10,14 @@ from vllm import SamplingParams
 
 import pllm
 from pllm.config import ModelConfig
-from pllm.workloads.reft import ActivationConfig, ActivationWorkload
+from pllm.workloads.reft import ReFTConfig, ReFTWorkload
 
 BUDGET = pllm.ExecutionOptions(memory_budget_bytes=1 << 30)
 
 
 def main() -> None:
     handle = pllm.make_llm(
-        workload=ActivationWorkload(ActivationConfig((23,), 2, first_tokens=1, last_tokens=1)),
+        workload=ReFTWorkload(ReFTConfig((23,), 2, first_tokens=1, last_tokens=1)),
         config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", "bfloat16", 64, 2, 64, 0.25, seed=7, execution=BUDGET),
     )
     execution = handle.runner.require_session()._deployment.execution
@@ -65,7 +65,7 @@ def main() -> None:
             observed.append(selected.numel())
 
         hook = layer.register_forward_hook(check)
-        handle.generate(prompts, sampling, auxiliary=pllm.state.StateTensorUpdate(parameters))
+        handle.generate(prompts, sampling, batch=pllm.state.StateImport(parameters))
         assert observed == [4]
         diagnostics = execution.diagnostics()
         assert diagnostics.update_count == 1
@@ -75,7 +75,7 @@ def main() -> None:
         if hook is not None:
             hook.remove()
         handle.close()
-    assert execution.diagnostics().active_lineages == 0
+    assert execution.diagnostics().active_states == 0
 
 
 if __name__ == "__main__":

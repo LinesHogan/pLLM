@@ -21,7 +21,7 @@ from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.tensor_task import TensorTask
-from pllm.execution.trace import ExecutionTrace, TracePhase, TraceSelection, TraceSnapshot
+from pllm.execution.trace import ExecutionTrace, TraceEventKind, TraceSelection, TraceSnapshot
 from pllm.host import HostConfig, make_host
 from pllm.testing import backend_facts
 from pllm.workloads.dummy import DummyConfig, DummyWorkload
@@ -70,8 +70,8 @@ def test_dummy_runs_graph_sign_plan_execute() -> None:
 
     snapshot = execution.trace.snapshot()
     assert decode_boundary(encode_boundary(snapshot), TraceSnapshot) == snapshot
-    (observed,) = (event for event in snapshot.events if event.phase is TracePhase.TENSOR)
-    assert observed.step_id == 2 and tuple(identity.prompt_idx for identity in observed.identities) == (1, 2)
+    (observed,) = (event for event in snapshot.events if event.kind is TraceEventKind.TENSOR)
+    assert observed.step_id == 2 and tuple(identity.prompt_index for identity in observed.identities) == (1, 2)
     torch.testing.assert_close(observed.tensor(), expected)
     _trace_selection_and_bounds(execution.plan)
 
@@ -91,7 +91,7 @@ def test_dummy_runs_graph_sign_plan_execute() -> None:
     torch.testing.assert_close(exported(attached, value(2)), expected)
 
     class Chained(DummyWorkload):
-        @pllm.on(pllm.Phase.OBSERVE)
+        @pllm.on(pllm.Phase.AFTER_FORWARD)
         def shift(self, x: torch.Tensor = pllm.hidden(0)) -> torch.Tensor:
             return x + 1
 
@@ -129,7 +129,7 @@ def _trace_selection_and_bounds(plan) -> None:
     trace = ExecutionTrace(plan, capacity=2)
     special = torch.tensor([float("nan"), float("inf")], dtype=torch.bfloat16)
     for _ in range(3):
-        trace.record(TracePhase.TENSOR, 1, task_id=task.task_id, tensor=special, tensor_name="selected")
+        trace.record(TraceEventKind.TENSOR, 1, task_id=task.task_id, tensor=special, tensor_name="selected")
     snapshot = decode_boundary(encode_boundary(trace.snapshot()), TraceSnapshot)
     assert snapshot.dropped == 1 and len(snapshot.events) == 2
     torch.testing.assert_close(snapshot.events[-1].tensor(), special, equal_nan=True)
@@ -156,7 +156,7 @@ def _trace_selection_and_bounds(plan) -> None:
     trace.observe(1, task.task_id, "activation", tensor, row=row, iteration=2)
     trace.observe(1, task.task_id, "weight.grad", tensor + 1, row=row, iteration=2, gradient=True)
     observed, grad = decode_boundary(encode_boundary(trace.snapshot()), TraceSnapshot).events
-    assert observed.source_shape == (2, 3) and observed.row == row and grad.phase is TracePhase.GRADIENT
+    assert observed.source_shape == (2, 3) and observed.row == row and grad.kind is TraceEventKind.GRADIENT
     torch.testing.assert_close(observed.tensor(), tensor.flatten()[:2])
     torch.testing.assert_close(grad.tensor(), (tensor + 1).flatten()[:2])
     # A bounded snapshot of a huge broadcast view must not materialize the source first.
@@ -238,7 +238,7 @@ def test_export_queue_delivery_and_lifecycle(device, overflow) -> None:
     trace = ExecutionTrace(execution.plan, capacity=1, on_export=consume)
     value = torch.ones((2, 3), device=device)
     record = lambda policy: trace.record(
-        TracePhase.TENSOR,
+        TraceEventKind.TENSOR,
         1,
         task_id=execution.plan.tasks[0].task_id,
         tensor=value,
@@ -250,7 +250,7 @@ def test_export_queue_delivery_and_lifecycle(device, overflow) -> None:
         record(overflow)
         value.fill_(2)  # Same-stream reuse must follow the DtoH, including on CUDA.
         assert entered.wait(10)
-        trace.record(TracePhase.BEGIN, 2)
+        trace.record(TraceEventKind.BEGIN, 2)
         with ThreadPoolExecutor() as pool:
             pending = pool.submit(record, overflow)
             try:
@@ -289,7 +289,7 @@ def test_export_failure_and_meta() -> None:
     execution = make_host(CPU, InvalidConsumer())
     trace = execution.trace
     record = lambda device: trace.record(
-        TracePhase.TENSOR,
+        TraceEventKind.TENSOR,
         1,
         task_id=execution.plan.tasks[0].task_id,
         tensor=torch.ones(1, device=device),

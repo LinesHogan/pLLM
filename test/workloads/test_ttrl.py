@@ -9,7 +9,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from pllm.authoring import FunctionMath, TensorStepInput, WeightedRowBatch
+from pllm.authoring import FunctionMath, StepInput, WeightedRowBatch
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId
 from pllm.execution.ptts.state_refs import StateRefs
@@ -50,8 +50,8 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         facts = HostConfig(
             device,
             hidden_size=4,
-            initialization_seed=11,
-            state_memory_budget_bytes=65536,
+            seed=11,
+            state_memory_bytes=65536,
             max_input_rows=6,
             memory_budget_bytes=1 << 20,
         )
@@ -79,7 +79,7 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         expected_rewards = [1.0, 0.0, None, 0.0, 1.0, 1.0]
         latest = initial
         ones = torch.ones(7, device=device)
-        excess = TensorStepInput.of_batch(WeightedRowBatch(torch.ones(7, 4, device=device), ones, ones))
+        excess = StepInput.of_batch(WeightedRowBatch(torch.ones(7, 4, device=device), ones, ones))
         with pytest.raises(ValueError):  # seven rows exceed max_input_rows
             execution.step(excess, stream)
         assert execution.arena.latest(initial.lineage_id) == initial
@@ -168,17 +168,17 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
             )
         execution.retire((), wait=True)
         diagnostics = execution.diagnostics()
-        assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
+        assert diagnostics.active_states == diagnostics.pending_state_releases == 0
 
     disabled = ttrl_rewards(CompletionInput.capture(completions, torch.zeros(6, 4)), replace(config, enabled=False))
     assert all(item.state is BarrierState.BLOCKED for item in disabled.update_barriers)
 
-    facts = HostConfig(torch.device("cpu"), hidden_size=4, initialization_seed=11)
+    facts = HostConfig(torch.device("cpu"), hidden_size=4, seed=11)
     execution = make_host(facts, TTRLWorkload(config))
     (initial,) = execution.admit(())
     before = execution.snapshot(initial)
     zeros = torch.zeros(6, 4)
-    result = execution.step(TensorStepInput.of_batch(WeightedRowBatch(zeros, zeros[:, 0], torch.ones(6))))
+    result = execution.step(StepInput.of_batch(WeightedRowBatch(zeros, zeros[:, 0], torch.ones(6))))
     # A zero loss still publishes: the step count advances with zero gradients and unchanged weights.
     assert result.loss.item() == 0 and result.publication is not None
     after = execution.snapshot(result.publication.after_refs[0])

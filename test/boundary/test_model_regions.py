@@ -67,7 +67,7 @@ def test_direct_route_batches_positions_taps_and_state(width):
     from pllm.execution.token_program import TokenProgram
 
     def route(layers):
-        seed = torch.where(layers.generated, layers.load("history"), layers.seed)
+        seed = torch.where(layers.generated, layers.load("history"), layers.embeddings)
         first = layers(stop=2, hidden=seed + layers.position + seed - seed.mean(dim=0, keepdim=True))
         last = layers(start=1, hidden=first[0].reshape(first[0].shape))[-1]
         layers.save("history", last)
@@ -94,10 +94,10 @@ def test_direct_route_batches_positions_taps_and_state(width):
 def test_prompt_classification_is_structural_and_requires_the_complete_stack():
     from pllm.execution.token_program import TokenProgram
     from pllm.workloads.recirculation import RecirculationWorkload
-    from pllm.workloads.step_loop import StepLoop
+    from pllm.workloads.step_loop import StepLoopWorkload
 
     tensor = TokenTensor((1, 4), torch.float32, "cpu")
-    assert TokenProgram.capture(StepLoop().loop, tensor, 3, ("history",)).prompt_pass_is_identity
+    assert TokenProgram.capture(StepLoopWorkload().loop, tensor, 3, ("history",)).prompt_pass_is_identity
     assert not TokenProgram.capture(RecirculationWorkload().recirculate, tensor, 3).prompt_pass_is_identity
     assert not TokenProgram.capture(lambda layers: layers(stop=2)[-2], tensor, 3).prompt_pass_is_identity
 
@@ -107,7 +107,11 @@ def test_segments_reject_incompatible_hidden_tensors(kind):
     from pllm.execution.token_program import TokenProgram
 
     def route(layers):
-        hidden = {"shape": layers.seed[:, :1], "dtype": layers.seed.double(), "device": layers.seed.to("meta")}[kind]
+        hidden = {
+            "shape": layers.embeddings[:, :1],
+            "dtype": layers.embeddings.double(),
+            "device": layers.embeddings.to("meta"),
+        }[kind]
         return layers(hidden=hidden)[-1]
 
     with pytest.raises(ValueError, match="hidden tensor"):

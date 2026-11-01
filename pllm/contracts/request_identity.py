@@ -11,8 +11,8 @@ class RequestKeyField(StrEnum):
     """Closed fields that can identify native request-scoped state."""
 
     REQUEST_ID = "request_id"
-    PROMPT_IDX = "prompt_idx"
-    SAMPLE_IDX = "sample_idx"
+    PROMPT_INDEX = "prompt_index"
+    SAMPLE_INDEX = "sample_index"
     ROUTE = "route"
 
 
@@ -25,8 +25,8 @@ def canonical_request_key_fields(
         field
         for field in (
             RequestKeyField.REQUEST_ID,
-            RequestKeyField.PROMPT_IDX,
-            RequestKeyField.SAMPLE_IDX,
+            RequestKeyField.PROMPT_INDEX,
+            RequestKeyField.SAMPLE_INDEX,
             RequestKeyField.ROUTE,
         )
         if field in fields
@@ -39,8 +39,8 @@ def canonical_request_key_fields(
 @dataclass(frozen=True, slots=True)
 class RequestIdentity:
     request_id: str
-    prompt_idx: int
-    sample_idx: int
+    prompt_index: int
+    sample_index: int
     # User-computed routing value (regex, discriminator, tenant id); the framework
     # signs the key declaration and never interprets the value.
     route: str = ""

@@ -12,13 +12,13 @@ from pllm.backends.vllm import region_attention as attention
 from pllm.backends.vllm.prefix_cache import CachePolicy
 from pllm.execution.route_executor import execute_route
 from pllm.execution.token_program import TokenProgram, TokenTensor
-from pllm.workloads.recirculation import JacobiRecirculation
+from pllm.workloads.recirculation import JacobiRecirculationWorkload
 from test.workloads.test_recirculation import FACTS
 
 
 @pytest.mark.parametrize("tokens", ("all", "decode", "prefill"))
 def test_overlapping_routes_rejected(tokens):
-    class Overlap(JacobiRecirculation):
+    class Overlap(JacobiRecirculationWorkload):
         @pllm.layer_route(tokens=tokens)
         def extra(self, layers):
             return layers()[-1]
@@ -43,8 +43,8 @@ def test_capture_rejects_invalid_dependencies(over, route, message):
 @pytest.mark.parametrize("width", (1, 7))
 def test_span_cells_keep_packed_tensor_semantics(width):
     def route(layers):
-        value = layers.seed - layers.seed.mean(0, keepdim=True) + layers.position + layers.generated
-        shape = layers.seed.shape
+        value = layers.embeddings - layers.embeddings.mean(0, keepdim=True) + layers.position + layers.generated
+        shape = layers.embeddings.shape
         layers.save("state", value.reshape(shape))
         return layers(hidden=value.reshape(shape))[-1]
 
@@ -108,7 +108,7 @@ def test_peek_dense_reference_and_unchanged_cache(start, length):
 
 def test_solver_modes_change_cache_identity():
     policies = [
-        CachePolicy.for_attachment(JacobiRecirculation(rounds=r).compile_backend(FACTS).attachment, "isolate")
+        CachePolicy.for_attachment(JacobiRecirculationWorkload(rounds=r).compile_backend(FACTS).attachment, "isolate")
         for r in (1, 2, 3)
     ]
     assert len({policy.namespace for policy in policies}) == 3 and all(policy.role_sensitive for policy in policies)

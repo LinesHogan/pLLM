@@ -10,11 +10,11 @@ from vllm import SamplingParams
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.semantic_graph import StateResource
 from pllm.execution.tensor_executor import TensorExecutor
-from pllm.workloads.state_producers import DecodeFactors, PromptFactors, PromptMixture
+from pllm.workloads.state_producers import DecodeFactorsWorkload, PromptFactorsWorkload, PromptMixtureWorkload
 from test.gpu.vllm_inplace_ttt_smoke import open_llm
 
 
-@pytest.mark.parametrize("workload", [PromptFactors(), PromptMixture(), DecodeFactors()])
+@pytest.mark.parametrize("workload", [PromptFactorsWorkload(), PromptMixtureWorkload(), DecodeFactorsWorkload()])
 def test_internal_projection_consumes_pinned_request_factors(workload, monkeypatch):
     with open_llm(workload, memory_budget_bytes=1 << 30) as handle:
         session = handle.runner.require_session()
@@ -61,7 +61,7 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
                     root = execution.snapshot(ref, torch.cuda.current_stream())
                     width, inputs = reader.width, hidden.shape[-1]
                     rank = workload.factor_rank
-                    if isinstance(workload, DecodeFactors):
+                    if isinstance(workload, DecodeFactorsWorkload):
                         shapes = tuple(
                             (rank, target.input_size) if side == 0 else (target.output_size, rank)
                             for target in handle.attachment.probe.targets
@@ -99,7 +99,7 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
             SamplingParams(max_tokens=4, temperature=0, ignore_eos=True),
         )
         elapsed = time.perf_counter() - start
-        assert len(captures) == (1 if isinstance(workload, DecodeFactors) else 2)
+        assert len(captures) == (1 if isinstance(workload, DecodeFactorsWorkload) else 2)
 
         def forbid_body(*args):
             raise AssertionError("tensor Python body ran after graph warmup")
@@ -110,7 +110,7 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
                 ["Name a color.", "A short question about stars."],
                 SamplingParams(max_tokens=3, temperature=0, ignore_eos=True),
             )
-        assert len(captures) == (1 if isinstance(workload, DecodeFactors) else 2)
+        assert len(captures) == (1 if isinstance(workload, DecodeFactorsWorkload) else 2)
         assert frozenset((HiddenPhase.PREFILL, HiddenPhase.DECODE)) in phases
         assert launches and set(launches) == {"state.publish"}
         assert tuple(a.symbol for a in plan.timeline.anchors) == (
@@ -126,7 +126,7 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
         assert len(outputs) == 3 and {entry[2] for entry in checked} == {0, 1}
         assert any(entry[1] == 0 for entry in checked) and any(entry[1] > 0 for entry in checked)
         assert any(entry[3] != entry[4] for entry in checked)
-        assert handle.diagnostics().active_lineages == len(execution.directory.instance_states)
+        assert handle.diagnostics().active_states == len(execution.directory.instance_states)
         assert handle.diagnostics().pending_state_releases == 0
         print(
             type(workload).__name__,
@@ -138,10 +138,10 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
             torch.cuda.max_memory_reserved(),
         )
 
-    assert execution.diagnostics().active_lineages == 0
+    assert execution.diagnostics().active_states == 0
 
 
-@pytest.mark.parametrize("workload", [PromptFactors(), DecodeFactors()])
+@pytest.mark.parametrize("workload", [PromptFactorsWorkload(), DecodeFactorsWorkload()])
 def test_composed_readers_replay_model_graphs(workload, monkeypatch):
     from pllm.backends.vllm.parameter_overlay import capacities
     from pllm.execution.step_capture import StepCapture
@@ -179,7 +179,7 @@ def test_composed_readers_replay_model_graphs(workload, monkeypatch):
                     SamplingParams(max_tokens=5, temperature=0, ignore_eos=True, logprobs=1),
                 )
             results.append([(o.outputs[0].token_ids, o.outputs[0].cumulative_logprob) for o in outputs])
-            if isinstance(workload, PromptFactors):
+            if isinstance(workload, PromptFactorsWorkload):
                 session = handle.runner.require_session()
                 before_execute = session.before_execute
 
@@ -200,13 +200,13 @@ def test_composed_readers_replay_model_graphs(workload, monkeypatch):
     + [(runner, 128, 128) for runner in ("mrv1", "mrv2")],
 )
 def test_chunked_runners_discard_partial_prompt_feedback(runner, budget, seqs):
-    from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkload
+    from pllm.workloads.esamp import ESampConfig, ESampWorkload
 
     tokens = []
     prompts = ["word"] * (seqs + 2) if seqs == 128 else ["word " * (budget + 4), "word " * 74]
     for chunked in (False, True):
         with open_llm(
-            ESampRequestWorkload(ESampRequestConfig(rank=2)),
+            ESampWorkload(ESampConfig(rank=2)),
             runner=runner,
             seqs=seqs,
             chunked=chunked,
@@ -223,5 +223,5 @@ def test_chunked_runners_discard_partial_prompt_feedback(runner, budget, seqs):
             diagnostics = handle.diagnostics()
             assert diagnostics.loss_count == diagnostics.update_count == 2 * len(prompts)
             # Releases finish asynchronously; their completion is covered by the page-arena tests.
-            assert diagnostics.active_lineages == 0
+            assert diagnostics.active_states == 0
     assert tokens[0] == tokens[1]

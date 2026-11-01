@@ -84,7 +84,7 @@ PLLM 的加速技术（内置的 advanced 精细操作）；但自动页表总�
 | 需求 | 契约入口 | 维护中的范例 |
 | --- | --- | --- |
 | hidden 观察、普通数学／函数替换 | [Tensor methods](../reference/authoring-contract.md#张量方法与状态) | [Dummy](../../pllm/workloads/dummy.py)、[局部替换](../../examples/centered_hidden.py) |
-| 请求独立训练、采样引导 | [状态与梯度](../reference/authoring-contract.md#张量方法与状态) | [Huber](../../examples/huber.py)、[ESamp](../../pllm/workloads/esamp_request.py) |
+| 请求独立训练、采样引导 | [状态与梯度](../reference/authoring-contract.md#张量方法与状态) | [Huber](../../examples/huber.py)、[ESamp](../../pllm/workloads/esamp.py) |
 | 实例共享头、实际采样反馈与选择性更新 | [Tensor methods](../reference/authoring-contract.md#张量方法与状态) | [OverRIDE](../../pllm/workloads/override.py) |
 | 共享／独立 LoRA、外部 batch、多步 SGD | [Weighted batch training](../reference/authoring-contract.md#加权批量训练) | [Output LoRA](../../pllm/workloads/lora.py) |
 | 参数 overlay、更新后条件 replay | [Request overlays](../reference/authoring-contract.md#请求-overlay) | [In-Place-TTT](../../pllm/workloads/inplace_ttt.py) |

@@ -14,10 +14,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from pllm.contracts.auxiliary import StateTensorUpdate
 from pllm.contracts.backend_attachment import AttachmentKind, BackendPlacementProbe
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
+from pllm.contracts.host_batch import StateImport
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import FieldView, ParameterTarget
 from pllm.contracts.request_identity import RequestKeyField
@@ -59,11 +59,11 @@ from pllm.execution.tensor_task import TensorTask
 
 if TYPE_CHECKING:
     from pllm.execution.compile_facts import BackendCompileFacts
-    from pllm.execution.step_input import TensorStepInput
+    from pllm.execution.step_input import StepInput
 
 
 @dataclass(frozen=True, slots=True)
-class TensorResult:
+class StepResult:
     value: torch.Tensor | None
     invocation: InvocationOutput
     entries: tuple[OverlayEntry, ...] = ()
@@ -97,7 +97,7 @@ class TensorResult:
         return self.invocation.publication
 
 
-TensorOutput = TensorResult | torch.Tensor | None
+TensorOutput = StepResult | torch.Tensor | None
 
 
 class TensorBinding(Builder[TensorFrame]):
@@ -195,7 +195,7 @@ class TensorBinding(Builder[TensorFrame]):
                     "side tensor tasks need fixed row inputs; declare row inputs or move the task before the model"
                 )
 
-    def step_row_reader(self) -> Callable[[TensorStepInput], tuple[PackedPhaseRow, ...]]:
+    def step_row_reader(self) -> Callable[[StepInput], tuple[PackedPhaseRow, ...]]:
         """The rows that open a step's state context, chosen once at bind; model-replay and activation steps
         differ from the rows tasks read."""
         if self.attachment is not None and (
@@ -211,9 +211,7 @@ class TensorBinding(Builder[TensorFrame]):
         read = self.row_reader()
         return lambda value: read(value.rows)
 
-    def function_math(
-        self, device: torch.device, seed: int
-    ) -> FunctionMath[TensorStepInput, TensorFrame, TensorOutput]:
+    def function_math(self, device: torch.device, seed: int) -> FunctionMath[StepInput, TensorFrame, TensorOutput]:
         """Bind state initialization, step rows and frame preparation for execution."""
         return FunctionMath(
             {str(state.resource): self.initializer(str(state.resource), device, seed) for state in self.graph.states},
@@ -334,7 +332,7 @@ class TensorBinding(Builder[TensorFrame]):
         )
         return StepCapture(limits[task.symbol], facts.max_admitted_lineages if request else 1)
 
-    def prepare_import(self, update: StateTensorUpdate[torch.Tensor], batch: TensorBatch, data: TensorFrame) -> None:
+    def prepare_import(self, update: StateImport[torch.Tensor], batch: TensorBatch, data: TensorFrame) -> None:
         """Validate imported fields and map them onto resource-specific private roots."""
         if not update.values:
             return
@@ -350,10 +348,10 @@ class TensorBinding(Builder[TensorFrame]):
                 not update.keys
                 or len(set(update.keys)) != len(update.keys)
                 or any(
-                    key.fields != (RequestKeyField.PROMPT_IDX,)
+                    key.fields != (RequestKeyField.PROMPT_INDEX,)
                     or key.request_id
-                    or key.sample_idx != -1
-                    or key.prompt_idx < 0
+                    or key.sample_index != -1
+                    or key.prompt_index < 0
                     for key in update.keys
                 )
                 or any(tensor.ndim < 1 or tensor.shape[0] != len(update.keys) for tensor in update.values)
@@ -362,7 +360,7 @@ class TensorBinding(Builder[TensorFrame]):
             indices = {key: index for index, key in enumerate(update.keys)}
             selected: dict[int, int] = {}
             for row, index in zip(selection.rows, group.state_indices, strict=True):
-                if (key := RequestStateKey.project(row.identity, (RequestKeyField.PROMPT_IDX,))) in indices:
+                if (key := RequestStateKey.project(row.identity, (RequestKeyField.PROMPT_INDEX,))) in indices:
                     if selection.refs[index].version_id != 0:
                         continue
                     # Several packed rows of one request share its state; two
@@ -398,7 +396,7 @@ class TensorBinding(Builder[TensorFrame]):
             return lambda rows: rows.request_rows
         return lambda rows: rows.latest_decode_rows
 
-    def bind_prepare(self) -> Callable[[TensorStepInput, TensorBatch], TensorFrame]:
+    def bind_prepare(self) -> Callable[[StepInput, TensorBatch], TensorFrame]:
         """Prepare independent input channels into the same invocation frame."""
         read = self.row_reader()
         # Additive logits read the decode rows the sampler draws from, in sampler order.
@@ -408,7 +406,7 @@ class TensorBinding(Builder[TensorFrame]):
             and self.attachment.sampler_stage is SamplerStage.PACKED_PRE_FILTER_ADD
         )
 
-        def prepare(value: TensorStepInput, batch: TensorBatch) -> TensorFrame:
+        def prepare(value: StepInput, batch: TensorBatch) -> TensorFrame:
             rows = read(value.rows)
             if sampled:
                 rows = tuple(
@@ -417,10 +415,10 @@ class TensorBinding(Builder[TensorFrame]):
                     if value.rows.rows[link.packed_row_index].phase is HiddenPhase.DECODE
                 )
             data = TensorFrame(value, rows)
-            match value.auxiliary:
-                case StateTensorUpdate() as update:
+            match value.batch:
+                case StateImport() as update:
                     if not self.imports:
-                        raise ValueError("declare imported=True to consume StateTensorUpdate")
+                        raise ValueError("declare imported=True to consume StateImport")
                     self.prepare_import(update, batch, data)
                 case _:
                     pass
@@ -429,8 +427,8 @@ class TensorBinding(Builder[TensorFrame]):
         return prepare
 
     @staticmethod
-    def result(data: TensorFrame, invocation: InvocationOutput) -> TensorResult:
-        return TensorResult(
+    def result(data: TensorFrame, invocation: InvocationOutput) -> StepResult:
+        return StepResult(
             invocation.value if data.training is None else data.training.output.detach(),
             invocation,
             tuple(data.entries),

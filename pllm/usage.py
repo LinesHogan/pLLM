@@ -15,7 +15,6 @@ import torch
 
 from pllm.authoring import BackendRequirements, BackendWorkload
 from pllm.config import ExecutionOptions
-from pllm.contracts.auxiliary import CausalTrainBatch, WeightedCEBatch, WeightedRowBatch, validate_auxiliary
 from pllm.contracts.backend_attachment import (
     ActivationPatchOperator,
     DecodeRefresh,
@@ -25,6 +24,7 @@ from pllm.contracts.backend_attachment import (
 from pllm.contracts.codec import boundary_digest
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from pllm.contracts.host_batch import CausalTrainBatch, WeightedCEBatch, WeightedRowBatch, validate_host_batch
 from pllm.contracts.parameter_overlay import (
     ParameterEffect as ParameterEffect,
     ParameterOverlayFieldBinding,
@@ -92,18 +92,18 @@ from pllm.execution.row_task_binding import (
 )
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.state_execution import MathBinding, StateExecution
-from pllm.execution.step_input import TensorStepInput
+from pllm.execution.step_input import StepInput
 from pllm.execution.task_memory import derive_host_resources, derive_resources
 from pllm.execution.tensor_binding import TensorBinding, TensorOutput as TensorOutput
 from pllm.execution.tensor_frame import (
     TensorFrame,
     TensorPort,
     Tensors,
-    TensorUpdate as TensorUpdate,
+    UpdateOutput as UpdateOutput,
     feedback_port,
     hidden_port,
     result_port,
-    samples_port,
+    sample_index_port,
 )
 from pllm.execution.tensor_program import PoolSGD, TaskOutput, TensorBatch
 from pllm.execution.tensor_task import TensorExport
@@ -111,7 +111,7 @@ from pllm.execution.token_program import Over, Tokens
 from pllm.execution.trace import TraceEvent
 from pllm.kernels.adamw import AdamWConfig
 
-F = TypeVar("F", bound=Callable[..., torch.Tensor | tuple[torch.Tensor, ...] | TensorUpdate | None])
+F = TypeVar("F", bound=Callable[..., torch.Tensor | tuple[torch.Tensor, ...] | UpdateOutput | None])
 Initializer = Callable[[Tensors, torch.Generator], None]
 C = TypeVar("C")
 # How @pllm.train averages per-row losses: over all rows, or per state and then summed over states.
@@ -119,11 +119,11 @@ TrainReduction = Literal["mean", "state_mean"]
 
 
 class Phase(Enum):
-    BEFORE_MODEL = When.BEFORE_MODEL
-    OBSERVE = When.OBSERVE
+    BEFORE_FORWARD = When.BEFORE_FORWARD
+    AFTER_FORWARD = When.AFTER_FORWARD
     BEFORE_SAMPLE = When.BEFORE_SAMPLE
     AFTER_SAMPLE = When.AFTER_SAMPLE
-    MODEL_UPDATE = When.MODEL_UPDATE
+    IN_FORWARD = When.IN_FORWARD
     AUTOMATIC = When.AUTOMATIC
 
 
@@ -181,13 +181,13 @@ class Hidden(_Source):
 
 
 @dataclass(frozen=True)
-class Samples(_Source):
+class SampleIndex(_Source):
     limit: int | Config | None = None
 
     differentiable: ClassVar[bool] = False
 
     def port(self, context: _Declaration) -> TensorPort:
-        return samples_port(context.binding.sampler_rows())
+        return sample_index_port(context.binding.sampler_rows())
 
 
 @dataclass(frozen=True)
@@ -277,21 +277,20 @@ class _Module(Parameter):
 
 
 @dataclass(frozen=True)
-class Capture:
-    """Second Annotated marker: on a training task, write this input's value into
-    the state's memory field at publication — the next step reads it as the input
-    version. Per lineage, the last selected row wins."""
+class Carry:
+    """Where a training method's pllm.carry input is written at publication: one carried field of its own state,
+    which the next step reads as the input version. Per request the last selected row wins."""
 
     state: str
     field: str
 
     def declare(self, state: str, update: State | None) -> LayoutFieldId:
-        """Validate a memory publication against the training state's fields."""
+        """Check the carried field against the training state's fields."""
         if self.state != state:
-            raise ValueError("memory captures target the task's own training state")
+            raise ValueError("pllm.carry writes into the training method's own state")
         assert update is not None
-        if self.field not in {field.name for field in update.memory_fields}:
-            raise ValueError(f"{self.field}: captures name a declared memory field")
+        if self.field not in {field.name for field in update.carry_fields}:
+            raise ValueError(f"{self.field}: pllm.carry names a field declared in the state's carry=")
         return update.field(self.field)
 
 
@@ -348,11 +347,11 @@ class Operand(_Source, Enum):
 
 
 @dataclass(frozen=True)
-class _Captured(_Source):
-    """An input whose value a training task also writes into a memory field."""
+class _Carried(_Source):
+    """An input whose value a training task also writes into a carried field."""
 
     source: _Source
-    capture: Capture
+    carry: Carry
 
 
 # Inputs are declared as parameter defaults: `h: torch.Tensor = pllm.hidden(0)`. The factories return the
@@ -363,10 +362,11 @@ def hidden(
     layer: int | Config = 0,
     site: HiddenSite = HiddenSite.BLOCK_OUTPUT,
     *,
-    phase: Literal["decode", "prefill"] = "decode",
+    tokens: Literal["decode", "prefill"] = "decode",
 ) -> Any:
-    """One row per request: latest decode, or the last prompt token of completed prefill."""
-    return Hidden(layer, site, HiddenPhase(phase))
+    """One row per request: the latest decode token, or with tokens="prefill" the last prompt token of completed
+    prefill."""
+    return Hidden(layer, site, HiddenPhase(tokens))
 
 
 def parameter(state: str, field: str, *, per_row: bool = False) -> Any:
@@ -394,12 +394,12 @@ def index(state: str) -> Any:
     return StateIndex(state)
 
 
-def samples(limit: int | Config | None = None) -> Any:
+def sample_index(limit: int | Config | None = None) -> Any:
     """The sample index of each row's request: 0 for a prompt's first sample.
 
     With `limit`, generate rejects requests whose sample index is `limit` or more.
     """
-    return Samples(limit)
+    return SampleIndex(limit)
 
 
 def result(operation: str) -> Any:
@@ -422,12 +422,12 @@ def operand(name: Literal["input", "target", "weight", "prompt_end"]) -> Any:
     return Operand(name)
 
 
-def capture(source: _Source, *, state: str, field: str) -> Any:
-    """Read `source` and, when the training update publishes, write its value into `state.field`.
+def carry(source: _Source, *, state: str, field: str) -> Any:
+    """Read `source` and, when the training update publishes, write its value into the carried `state.field`.
 
     The next step reads that field as its input version; per request the last selected row wins.
     """
-    return _Captured(source, Capture(state, field))
+    return _Carried(source, Carry(state, field))
 
 
 def batch(
@@ -450,13 +450,12 @@ class InstanceState:
     optimizer: AdamWConfig | SGD | None = field(default=None, kw_only=True)
     # Run once per resource when binding; every admission copies the same seeded initial tensors.
     initialize: Callable[[Tensors, torch.Generator], None] | None = None
-    namespace: str = ""
     shape: Shape | None = None
     dtype: torch.dtype = torch.float32
     alignment: int = field(default=16, kw_only=True)
     feed: FeedOrder | None = field(default=None, kw_only=True)
-    # Plain per-lineage tensors carried across steps; never optimizer-managed.
-    memory: Mapping[str, Shape] = field(default_factory=lambda: dict[str, Shape](), kw_only=True)
+    # Plain per-request tensors carried across steps (written by pllm.carry); never optimizer-managed.
+    carry: Mapping[str, Shape] = field(default_factory=lambda: dict[str, Shape](), kw_only=True)
     # An `nn.Module` built from the model's dimensions; its parameters become the state, initialized as the
     # module initializes them (every request starts from the same values).
     module: ModuleFactory | None = field(default=None, kw_only=True)
@@ -473,16 +472,16 @@ class InstanceState:
             self.scope is not StateScope.INSTANCE
             or self.optimizer is not None
             or self.initialize is not None
-            or self.memory
+            or self.carry
             or self.imported
         ):
-            raise ValueError("fed state needs InstanceState without an optimizer, initializer or memory fields")
+            raise ValueError("fed state needs InstanceState without an optimizer, initializer or carry fields")
         if self.shape is not None:
             object.__setattr__(self, "fields", {"value": self.shape})
-        if self.memory and self.optimizer is None:
-            raise ValueError("memory fields ride on the training transition; give the state an optimizer")
-        if set(self.memory) & set(self.fields):
-            raise ValueError("rename the memory fields that repeat a parameter field name")
+        if self.carry and self.optimizer is None:
+            raise ValueError("carry fields ride on the training transition; give the state an optimizer")
+        if set(self.carry) & set(self.fields):
+            raise ValueError("rename the carry fields that repeat a parameter field name")
 
     scope: ClassVar[StateScope] = StateScope.INSTANCE
 
@@ -508,11 +507,10 @@ class InstanceState:
             name,
             self.layout_fields(name, context),
             optimizer=self.optimizer,
-            namespace=self.namespace,
             initialize=_frozen(self.initialize),
             scope=self.scope,
             keys=self.request_keys,
-            memory=tuple(Field(key, shape, self.tensor_dtype, self.alignment) for key, shape in self.memory.items()),
+            carry=tuple(Field(key, shape, self.tensor_dtype, self.alignment) for key, shape in self.carry.items()),
         )
         context.parameters.update({(name, field): port for field, port in ports.items()})
         if self.module is not None:
@@ -631,7 +629,7 @@ class _Effect:
     phase: ClassVar[Phase | None] = None
 
     state: str = ""
-    update: str = ""
+    update_rows: str = ""
     reduction: TrainReduction = "mean"
 
     def declare(self, operation: _Operation) -> None:
@@ -690,7 +688,7 @@ class _Export(_Effect):
     enabled: bool | Config
     overflow: Literal["drop", "block"]
 
-    phase: ClassVar[Phase | None] = Phase.OBSERVE
+    phase: ClassVar[Phase | None] = Phase.AFTER_FORWARD
     model_effect: ClassVar[bool] = True
 
     def declare(self, operation: _Operation) -> None:
@@ -734,7 +732,7 @@ def _training_mode(arguments: Mapping[str, _Source]) -> TrainingMode:
 @dataclass(frozen=True, kw_only=True)
 class _Train(_Effect):
     state: str
-    update: str
+    update_rows: str
     reduction: TrainReduction
     steps: int | Config
     reset: str
@@ -744,18 +742,18 @@ class _Train(_Effect):
 
     def declare(self, operation: _Operation) -> None:
         """Train on what the method reads (see `_training_mode`); the state's optimizer must suit it."""
-        arguments, captures = operation.arguments()
+        arguments, carries = operation.arguments()
         definition = operation.context.state_definition(self.state, "@pllm.train needs a declared state")
         mode = _training_mode(arguments)
         if mode != "request" and operation.phase is Phase.AUTOMATIC:
             operation = replace(operation, phase=Phase.AFTER_SAMPLE)
         match mode, definition.optimizer:
             case "weighted_batch", SGD() as optimizer:
-                self.weighted(operation, arguments, captures, definition, optimizer)
+                self.weighted(operation, arguments, carries, definition, optimizer)
             case "batch", AdamWConfig():
-                self.batch(operation, arguments, captures)
+                self.batch(operation, arguments, carries)
             case "request", AdamWConfig():
-                self.request(operation, arguments, captures)
+                self.request(operation, arguments, carries)
             case _:
                 expected = "pllm.SGD(lr)" if mode == "weighted_batch" else "pllm.AdamW(lr)"
                 raise ValueError(
@@ -763,13 +761,13 @@ class _Train(_Effect):
                     f"{self.state!r} with optimizer={expected}"
                 )
 
-    def batch(self, operation: _Operation, arguments: dict[str, _Source], captures: dict[str, Capture]) -> None:
+    def batch(self, operation: _Operation, arguments: dict[str, _Source], carries: dict[str, Carry]) -> None:
         """One AdamW step on a host CausalTrainBatch or WeightedRowBatch."""
         context = operation.context
-        if captures or operation.gradient or operation.rows or self.update or self.reset or self.steps != 1:
+        if carries or operation.gradient or operation.rows or self.update_rows or self.reset or self.steps != 1:
             raise ValueError(
                 "training on WeightedRowBatch or CausalTrainBatch fields takes one AdamW step over the whole batch: "
-                "remove rows=, update=, steps=, reset=, @pllm.differentiate and pllm.capture"
+                "remove rows=, update_rows=, steps=, reset=, @pllm.differentiate and pllm.carry"
             )
         context.train(
             declare_batch_train(
@@ -785,7 +783,7 @@ class _Train(_Effect):
             "batch",
         )
 
-    def request(self, operation: _Operation, arguments: dict[str, _Source], captures: dict[str, Capture]) -> None:
+    def request(self, operation: _Operation, arguments: dict[str, _Source], carries: dict[str, Carry]) -> None:
         """Train each request's state on its rows; token commit owns the step unless a model effect does."""
         if self.reset or self.steps != 1:
             raise ValueError(
@@ -796,16 +794,16 @@ class _Train(_Effect):
         sampler = context.sampler
         request_training = sampler is not None or not context.has_model_effect
         unconditional = request_training and (sampler is None or sampler.stage is SamplerStage.PACKED_POST_FILTER_EXACT)
-        if unconditional and (operation.rows or self.update):
+        if unconditional and (operation.rows or self.update_rows):
             raise ValueError(
-                "request training updates every selected state: remove rows= and custom update_states from @pllm.train"
+                "request training updates every selected state: remove rows= and update_rows= from @pllm.train"
             )
         # Selectors keep their declared phase.
         when = When.AFTER_SAMPLE if request_training and operation.phase is Phase.AUTOMATIC else operation.phase.value
         context.train(
             operation.tensor(
                 arguments,
-                captures,
+                carries,
                 when=when,
                 update_kind=StateEffectKind.UPDATE if unconditional else StateEffectKind.UPDATE_MAYBE,
             ),
@@ -817,21 +815,26 @@ class _Train(_Effect):
         self,
         operation: _Operation,
         arguments: dict[str, _Source],
-        captures: dict[str, Capture],
+        carries: dict[str, Carry],
         definition: InstanceState,
         optimizer: SGD,
     ) -> None:
         """Declare the weighted SGD batch transition, including its reset and input bindings."""
-        if captures:
+        if carries:
             raise ValueError("SGD batch training manages its own state writes")
         if not self.reset:
             raise ValueError(
                 "training on WeightedCEBatch fields restarts each state before its SGD steps: give "
                 "@pllm.train(reset=...) naming a method that sets the starting values"
             )
-        if operation.gradient is not None or operation.rows or self.update or operation.phase is not Phase.AFTER_SAMPLE:
+        if (
+            operation.gradient is not None
+            or operation.rows
+            or self.update_rows
+            or operation.phase is not Phase.AFTER_SAMPLE
+        ):
             raise ValueError(
-                "training on WeightedCEBatch fields uses the whole batch after sampling: remove rows=, update=, "
+                "training on WeightedCEBatch fields uses the whole batch after sampling: remove rows=, update_rows=, "
                 "@pllm.differentiate and @pllm.on"
             )
         context = operation.context
@@ -911,7 +914,7 @@ class _Gradient:
         )
 
         return (
-            replace(math, update_states=next(iter(parameters), "__update_state"), reduction=operation.effect.reduction)
+            replace(math, update_rows=next(iter(parameters), "__update_state"), reduction=operation.effect.reduction)
             if operation.effect.training
             else math
         )
@@ -956,7 +959,7 @@ def _chunked_overlay(
     chunk: int,
     optimizer: SGD | None,
     flush: str | None,
-) -> tuple[Callable[..., TensorUpdate], Initializer | None]:
+) -> tuple[Callable[..., UpdateOutput], Initializer | None]:
     """Generate pending state before layout interning and bind the existing chunk executor."""
     if initialize is not None:
         initialize = partial(_author_buffers, initialize, tuple(buffers))
@@ -1025,7 +1028,7 @@ class _Overlay(_Effect):
     chunk: int | Config | None
     flush: Literal["prompt_end"] | None
 
-    phase: ClassVar[Phase | None] = Phase.MODEL_UPDATE
+    phase: ClassVar[Phase | None] = Phase.IN_FORWARD
     model_effect: ClassVar[bool] = True
 
     def __post_init__(self) -> None:
@@ -1047,8 +1050,8 @@ class _Overlay(_Effect):
         """Declare a request buffer transition and its parameter overlay attachment."""
         if operation.gradient is not None or operation.rows:
             raise ValueError("ordinary overlays update private buffers without cross-operation autograd")
-        if operation.phase is not Phase.MODEL_UPDATE:
-            raise ValueError("parameter overlays require MODEL_UPDATE")
+        if operation.phase is not Phase.IN_FORWARD:
+            raise ValueError("parameter overlays require IN_FORWARD")
         context = operation.context
         definition = context.state_definition(self.state, "parameter overlays require a declared request state")
         if definition.scope is not StateScope.REQUEST:
@@ -1069,7 +1072,7 @@ class _Overlay(_Effect):
             raise ValueError("overlay buffers conflict with reserved operand names")
         effect = self.parameter_effect(context.owner, context.binding.dimensions.layer_count)
         identity = fingerprint(operation.function)
-        function: Callable[..., TensorUpdate] = freeze(operation.function)
+        function: Callable[..., UpdateOutput] = freeze(operation.function)
         initialize = _frozen(definition.initialize)
         if self.chunk is not None:
             function, initialize = _chunked_overlay(
@@ -1088,7 +1091,6 @@ class _Overlay(_Effect):
             effect,
             buffers,
             initialize=initialize,
-            namespace=definition.namespace,
             keys=definition.request_keys,
             phases=tuple(
                 p
@@ -1194,7 +1196,7 @@ def guide_sampling(*, beta: float | Config, rows: str = "") -> Callable[[F], F]:
 def train(
     *,
     state: str,
-    update: str = "",
+    update_rows: str = "",
     reduction: TrainReduction = "mean",
     steps: int | Config = 1,
     reset: str = "",
@@ -1217,7 +1219,9 @@ def train(
     """
     if reduction not in ("mean", "state_mean"):
         raise ValueError(f"@pllm.train(reduction={reduction!r}): use 'mean' or 'state_mean'")
-    return _mark(effect=_Train(state=state, update=update, reduction=reduction, steps=steps, reset=reset), rows=rows)
+    return _mark(
+        effect=_Train(state=state, update_rows=update_rows, reduction=reduction, steps=steps, reset=reset), rows=rows
+    )
 
 
 def _setting(value: C | Config, config: Workload, expected: type[C]) -> C:
@@ -1269,7 +1273,7 @@ def _typed(value: object, expected: type[C]) -> C | None:
 
 
 def _arguments(
-    function: Callable[..., torch.Tensor | tuple[torch.Tensor, ...] | TensorUpdate | None],
+    function: Callable[..., torch.Tensor | tuple[torch.Tensor, ...] | UpdateOutput | None],
 ) -> dict[str, _Source]:
     """Read each parameter's source from its default value, e.g. `h: torch.Tensor = pllm.hidden(0)`."""
     result: dict[str, _Source] = {}
@@ -1303,18 +1307,18 @@ class _Operation:
         """Where this method's state transition runs; host workloads have their own step anchors."""
         return When.HOST_COMPUTE if self.context.binding.host else self.phase.value
 
-    def arguments(self) -> tuple[dict[str, _Source], dict[str, Capture]]:
-        """Split captured inputs into their read source and the memory field the update writes."""
-        sources, captures = _arguments(self.function), dict[str, Capture]()
+    def arguments(self) -> tuple[dict[str, _Source], dict[str, Carry]]:
+        """Split carried inputs into their read source and the carried field the update writes."""
+        sources, carries = _arguments(self.function), dict[str, Carry]()
         for key, source in sources.items():
-            if (captured := _typed(source, _Captured)) is not None:
-                sources[key], captures[key] = captured.source, captured.capture
-        return sources, captures
+            if (carried := _typed(source, _Carried)) is not None:
+                sources[key], carries[key] = carried.source, carried.carry
+        return sources, carries
 
     def tensor(
         self,
         arguments: dict[str, _Source] | None = None,
-        captures: dict[str, Capture] | None = None,
+        carries: dict[str, Carry] | None = None,
         *,
         when: When | None = None,
         update_kind: StateEffectKind = StateEffectKind.UPDATE_MAYBE,
@@ -1326,7 +1330,7 @@ class _Operation:
     ) -> Call:
         """Declare tensor mathematics, derivative domains and memory publication."""
         if arguments is None:
-            arguments, captures = self.arguments()
+            arguments, carries = self.arguments()
         context, effect = self.context, self.effect
         inputs, identity = {key: source.port(context) for key, source in arguments.items()}, fingerprint(self.function)
         context.signature.append(
@@ -1335,14 +1339,14 @@ class _Operation:
                 boundary_digest(
                     identity,
                     tuple((key, fingerprint(source)) for key, source in arguments.items()),
-                    fingerprint(captures),
+                    fingerprint(carries),
                 ),
             )
         )
         demand = self.gradient or _Gradient((), effect.training)
         math = demand.contract(self, arguments)
         update = context.states[effect.state] if effect.training else None
-        writes = {key: capture.declare(effect.state, update) for key, capture in (captures or {}).items()}
+        writes = {key: carry.declare(effect.state, update) for key, carry in (carries or {}).items()}
         math = self.selectors(arguments, inputs, math)
         return declare_tensor(
             context.binding,
@@ -1352,7 +1356,7 @@ class _Operation:
             identity=f"python:{identity}",
             update=update,
             math=math,
-            captures=writes,
+            carries=writes,
             outputs=effect.outputs,
             tuple_output=effect.tuple_output,
             effect=update_kind,
@@ -1371,7 +1375,7 @@ class _Operation:
             "forward_rows": self.rows,
             "input_gradient_rows": demand.input_rows,
             "parameter_gradient_rows": demand.parameter_rows,
-            "update_states": self.effect.update,
+            "update_rows": self.effect.update_rows,
         }
 
     def sources(self) -> dict[str, dict[str, _Source]]:
@@ -1636,7 +1640,7 @@ class _Declaration:
                 update = import_update(self.binding, allocated, f"{name}:import@1")
                 self.writes[name] = (
                     update,
-                    self.binding.publish(update, allocated, when=When.BEFORE_MODEL, name=f"{name}.publish"),
+                    self.binding.publish(update, allocated, when=When.BEFORE_FORWARD, name=f"{name}.publish"),
                 )
         self.signature.extend((name, fingerprint(value)) for name, value in self.model_values.items())
 
@@ -1726,14 +1730,14 @@ class _Declaration:
         """Validate composed effects and sign ordered definitions and owner values."""
         b = self.binding
         if len(b.imports) > 1:
-            raise ValueError("StateTensorUpdate supplies one imported resource per workload")
+            raise ValueError("StateImport supplies one imported resource per workload")
         if not b.graph.tasks and b.attachment is not None:
             state = self.states[b.attachment.state_resource]
             b.compute(
                 "model.read",
                 inputs={"state": state.read()},
                 reads=(state.version(),),
-                when=When.MODEL_UPDATE,
+                when=When.IN_FORWARD,
                 function=lambda data, batch: TaskOutput(),
             )
 
@@ -1761,8 +1765,6 @@ class _Declaration:
 
 class Workload(BackendWorkload[TensorFrame, TensorOutput]):
     """Python methods and effects compiled once, not runtime hooks or a second IR."""
-
-    name: ClassVar[str] = "python.workload"
 
     def on_export(self, event: TraceEvent) -> None:
         """Consume ordered CPU snapshots in the execution process; never reenter execution.
@@ -1798,7 +1800,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             facts.probe.tensor_dtype,
             facts.layer_count,
         )
-        b = TensorBinding(self.name, boundary_digest(dimensions, facts.initialization_seed), dimensions)
+        b = TensorBinding(type(self).__qualname__, boundary_digest(dimensions, facts.initialization_seed), dimensions)
         b.probe = facts.probe
         b.causal = causal
         self._build(b, capabilities=facts.timeline.capabilities)
@@ -1833,7 +1835,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
                 (
                     _setting(source.limit, context.owner, int)
                     for source in inputs
-                    if isinstance(source, Samples) and source.limit is not None
+                    if isinstance(source, SampleIndex) and source.limit is not None
                 ),
                 default=None,
             ),
@@ -1871,7 +1873,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
 
     def bind_math(
         self, facts: BackendCompileFacts, plan: PlanBundle, declaration: TensorBinding
-    ) -> MathBinding[TensorStepInput, TensorFrame, TensorOutput]:
+    ) -> MathBinding[StepInput, TensorFrame, TensorOutput]:
         """Bind the planned declaration's tensor tasks to the implementations the plan selected."""
         operations = declaration.executables(facts, plan.timeline.task_resources)
         declaration.require_resident_side_tasks(plan, operations)
@@ -1882,31 +1884,31 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             on_export=self.on_export if declaration.has_exports else None,
         )
 
-    def compile_host(self, facts: HostConfig) -> StateExecution[TensorStepInput, TensorFrame, TensorOutput]:
+    def compile_host(self, config: HostConfig) -> StateExecution[StepInput, TensorFrame, TensorOutput]:
         """Build, plan and bind the graph without a model (see pllm.host.make_host); training reads host batches."""
         b = TensorBinding(
-            self.name,
-            boundary_digest(facts.hidden_size, facts.initialization_seed),
-            Dimensions(facts.hidden_size, 0),
+            type(self).__qualname__,
+            boundary_digest(config.hidden_size, config.seed),
+            Dimensions(config.hidden_size, 0),
             host=True,
         )
         self._build(b)
-        timeline = facts.timeline()
-        if facts.memory_budget_bytes is not None and b.graph.states:
-            timeline = derive_host_resources(b, facts)
-        math = b.function_math(facts.device, facts.initialization_seed)
+        timeline = config.timeline()
+        if config.memory_budget_bytes is not None and b.graph.states:
+            timeline = derive_host_resources(b, config)
+        math = b.function_math(config.device, config.seed)
         prepare = math.prepare_data
 
-        def checked_prepare(value: TensorStepInput, batch: TensorBatch) -> TensorFrame:
-            validate_auxiliary(
-                value.auxiliary,
+        def checked_prepare(value: StepInput, batch: TensorBatch) -> TensorFrame:
+            validate_host_batch(
+                value.batch,
                 b.graph,
                 b.layouts,
                 timeline,
                 SharedTensor.describe,
-                hidden_size=facts.hidden_size,
+                hidden_size=config.hidden_size,
                 vocab_size=0,
-                target_shape=facts.target_shape,
+                target_shape=config.target_shape,
             )
             return prepare(value, batch)
 
@@ -1918,7 +1920,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
                 b.bind_all(operations=b.executables(None, ())),
                 on_export=self.on_export if b.has_exports else None,
             ),
-            facts,
+            config,
             timeline,
         )
 
@@ -1939,19 +1941,19 @@ __all__ = [
     "module",
     "version",
     "index",
-    "samples",
+    "sample_index",
     "result",
     "base_logits",
     "sampled_tokens",
     "operand",
-    "capture",
+    "carry",
     "causal_model",
     "batch",
     "InstanceState",
     "RequestState",
     "overlay",
     "Buffer",
-    "TensorUpdate",
+    "UpdateOutput",
     "differentiate",
     "Activation",
     "Overlay",

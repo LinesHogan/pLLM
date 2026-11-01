@@ -7,14 +7,12 @@ import pytest
 import torch
 
 import pllm
-from pllm.authoring import TensorStepInput, WeightedRowBatch
+from pllm.authoring import StepInput, WeightedRowBatch
 from pllm.host import HostConfig, make_host
 
 
 @dataclass(frozen=True)
 class TwoGroups(pllm.Workload):
-    name = "test.completion.two_groups"
-
     @property
     def parameters(self) -> pllm.InstanceState:
         return pllm.InstanceState(
@@ -48,8 +46,8 @@ def test_default_completion_region_keeps_multigroup_adamw_and_publication(device
     facts = HostConfig(
         device,
         hidden_size=2,
-        initialization_seed=23,
-        state_memory_budget_bytes=65536,
+        seed=23,
+        state_memory_bytes=65536,
         memory_budget_bytes=1 << 20,
         max_input_rows=4,
     )
@@ -80,7 +78,7 @@ def test_default_completion_region_keeps_multigroup_adamw_and_publication(device
     )
     with context:
         hidden = torch.tensor([[0.4, -0.7]], device=device)
-        batch = TensorStepInput.of_batch(WeightedRowBatch(hidden, hidden[:, 0], hidden[:, 0]))
+        batch = StepInput.of_batch(WeightedRowBatch(hidden, hidden[:, 0], hidden[:, 0]))
     latest = initial
     for round_ in range(1, 4):
         oracle.zero_grad(set_to_none=True)
@@ -111,10 +109,10 @@ def test_default_completion_region_keeps_multigroup_adamw_and_publication(device
     # A None loss skips the update: no publication, the latest version stays.
     with context:
         pair = hidden.expand(2, 2)
-        skipped = TensorStepInput.of_batch(WeightedRowBatch(pair, pair[:, 0], pair[:, 0]))
+        skipped = StepInput.of_batch(WeightedRowBatch(pair, pair[:, 0], pair[:, 0]))
     result = execution.step(skipped, stream)
     assert result.publication is None
     assert execution.arena.latest(initial.lineage_id) == latest
     assert execution.diagnostics().update_count == 3
     execution.retire((), wait=True)
-    assert execution.diagnostics().active_lineages == execution.diagnostics().pending_state_releases == 0
+    assert execution.diagnostics().active_states == execution.diagnostics().pending_state_releases == 0

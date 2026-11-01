@@ -28,7 +28,7 @@ from pllm.execution.cuda_stream import upload
 from pllm.execution.parameter_projection import parameter_correction
 from pllm.execution.scan import execute_scan, prepare_scan
 from pllm.execution.scan_execution import PreparedScan, Step
-from pllm.execution.tensor_frame import OverlayEntry, OverlayTargetResult, TensorFrame, Tensors, TensorUpdate
+from pllm.execution.tensor_frame import OverlayEntry, OverlayTargetResult, TensorFrame, Tensors, UpdateOutput
 from pllm.execution.tensor_program import PoolSGD, TaskOutput, TensorBatch
 from pllm.execution.torch_private import MemoryTrace
 from pllm.kernels.page_copy import chunk_capacity, copy_pages, prepend_rows
@@ -38,7 +38,7 @@ ResultT = TypeVar("ResultT")
 if TYPE_CHECKING:
     from pllm.execution.overlay_batch import OverlayBatch
     from pllm.execution.state_execution import StateExecution, StateTaskContext
-    from pllm.execution.step_input import TensorStepInput
+    from pllm.execution.step_input import StepInput
 
 
 def join_tail(
@@ -76,7 +76,7 @@ class ChunkUpdate:
     chunk: int
     arguments: tuple[str, ...]
 
-    def __call__(self, **values: torch.Tensor) -> TensorUpdate:
+    def __call__(self, **values: torch.Tensor) -> UpdateOutput:
         plan = self.prepare(values)
         count = values["_pending_length"].new_full((), len(values[self.arguments[1]]))
         return self.counted(plan, count, values)
@@ -93,7 +93,7 @@ class ChunkUpdate:
         )
         return prepare_scan(self.step, values[carry], over, self.chunk, valid_rows=values["_pending_length"])
 
-    def counted(self, plan: PreparedScan, count: torch.Tensor, values: Tensors) -> TensorUpdate:
+    def counted(self, plan: PreparedScan, count: torch.Tensor, values: Tensors) -> UpdateOutput:
         """Advance complete chunks only; padded requests and rows contribute no updates."""
         carry, *columns = self.arguments
         rows = tuple(values[name] for name in columns)
@@ -106,7 +106,7 @@ class ChunkUpdate:
         updated, outputs = execute_scan(plan, values[carry], joined, (), trained)
         values[carry].copy_(updated)
         remaining = save_tail(tails, joined, length, valid, trained)
-        return TensorUpdate(
+        return UpdateOutput(
             torch.cat(outputs).index_select(0, positions),
             trained > 0,
             trained // self.chunk,
@@ -166,14 +166,14 @@ class GradientUpdate:
         """The authored argument carrying arriving rows."""
         return next(name for name, source in self.bindings.items() if source == "input")
 
-    def __call__(self, **values: torch.Tensor) -> TensorUpdate:
+    def __call__(self, **values: torch.Tensor) -> UpdateOutput:
         count = values["_pending_length"].new_full((), len(values[self.input_name]))
         return self.advance(values, count, batched=False)
 
     def prepare(self, values: Tensors) -> None:
         """Autograd has no scan selection."""
 
-    def counted(self, plan: None, count: torch.Tensor, values: Tensors) -> TensorUpdate:
+    def counted(self, plan: None, count: torch.Tensor, values: Tensors) -> UpdateOutput:
         """Execute the already mapped derivative over a tile."""
         return self.advance(values, count, batched=True)
 
@@ -208,7 +208,7 @@ class GradientUpdate:
             total.masked_fill_(complete, 0)
         length.masked_fill_(complete, 0)
 
-    def advance(self, values: Tensors, count: torch.Tensor, *, batched: bool) -> TensorUpdate:
+    def advance(self, values: Tensors, count: torch.Tensor, *, batched: bool) -> UpdateOutput:
         """Keep per-request accumulation and SGD eager around the compiled loss derivative."""
         parameters = {
             name: values[name] for name, source in self.bindings.items() if source in self.effect.applied_fields
@@ -245,7 +245,7 @@ class GradientUpdate:
             if batched
             else output.index_select(0, positions)
         )
-        return TensorUpdate(output, updates > 0, updates, trained, {"tail_rows": length.clone()})
+        return UpdateOutput(output, updates > 0, updates, trained, {"tail_rows": length.clone()})
 
 
 class ProjectionTransition(Protocol):
@@ -261,7 +261,7 @@ class ProjectionTask(Generic[DataT, ResultT]):
 
     def __init__(
         self,
-        execution: StateExecution[TensorStepInput, DataT, ResultT],
+        execution: StateExecution[StepInput, DataT, ResultT],
         context: StateTaskContext[DataT],
         rows: PackedSamplerRowBatch,
         task: TaskId,
@@ -274,7 +274,7 @@ class ProjectionTask(Generic[DataT, ResultT]):
         self, operands: tuple[CapturedParameterOperand, ...], *, complete: bool = True
     ) -> Mapping[tuple[RequestIdentity, ParameterTarget], torch.Tensor]:
         """Execute target segments; complete=False keeps targets open across a prompt/decode split."""
-        from pllm.execution.step_input import TensorStepInput
+        from pllm.execution.step_input import StepInput
 
         targets = {operand.target for operand in operands}
         assert targets and targets <= self.pending
@@ -282,7 +282,7 @@ class ProjectionTask(Generic[DataT, ResultT]):
             self.pending.difference_update(targets)
         return self.execution.execute_part(
             self.context,
-            TensorStepInput(self.rows.row_batch, self.rows, operands=operands),
+            StepInput(self.rows.row_batch, self.rows, operands=operands),
             self.task,
             complete=not self.pending,
         )
@@ -301,7 +301,7 @@ class OverlayTransition:
     targets: tuple[ParameterTarget, ...]
     phases: tuple[HiddenPhase, ...]
     apply: Callable[[torch.Tensor, Tensors], torch.Tensor]
-    function: Callable[..., TensorUpdate]
+    function: Callable[..., UpdateOutput]
     arguments: Mapping[str, str]
     visibility: VisibilitySource
     task: TaskSymbol
@@ -322,7 +322,7 @@ class OverlayTransition:
             for row, index in zip(batch.selection.rows, batch.selection.state_indices, strict=True)
         )
         indices = {identity: index for identity, index in selected}
-        updates: dict[tuple[RequestIdentity, ParameterTarget], TensorUpdate] = {}
+        updates: dict[tuple[RequestIdentity, ParameterTarget], UpdateOutput] = {}
         counters: list[torch.Tensor] = []
         with torch.no_grad():
             for target_index, target in enumerate(self.targets):
@@ -370,7 +370,7 @@ class OverlayTransition:
         target: int,
         indices: tuple[int, ...],
         batch: TensorBatch,
-    ) -> tuple[tuple[TensorUpdate, ...], torch.Tensor]:
+    ) -> tuple[tuple[UpdateOutput, ...], torch.Tensor]:
         """Gather issued slots once per target/phase; settlement still belongs to the task."""
         if self.chunk is not None:
             # TensorBinding installs the batched executor for every chunked overlay (configure_scans for routes).
@@ -384,7 +384,7 @@ class OverlayTransition:
         target: int,
         indices: tuple[int, ...],
         batch: TensorBatch,
-    ) -> tuple[tuple[TensorUpdate, ...], torch.Tensor]:
+    ) -> tuple[tuple[UpdateOutput, ...], torch.Tensor]:
         """Keep unbatchable implementations on their selected numerical path."""
         width = len(self.buffers)
         fields = tuple(batch.field_slots(target * width + i) for i in range(width))
@@ -401,7 +401,7 @@ class OverlayTransition:
                 copy_pages(value, pool, sources, destinations)
         return results, torch.stack(tuple(torch.stack((r.update_count, r.trained_rows)) for r in results)).sum(0)
 
-    def result(self, operand: CapturedParameterOperand, values: Tensors) -> TensorUpdate:
+    def result(self, operand: CapturedParameterOperand, values: Tensors) -> UpdateOutput:
         """Validate the author's result at its tensor boundary without observing CUDA values."""
         inputs = {
             **values,
@@ -413,12 +413,12 @@ class OverlayTransition:
         result = (
             self.function(**{key: inputs[source] for key, source in self.arguments.items()})
             if operand.phase in self.phases
-            else TensorUpdate.unchanged(self.apply(operand.hidden, values))
+            else UpdateOutput.unchanged(self.apply(operand.hidden, values))
         )
         return self.validate(result, operand)
 
     @staticmethod
-    def validate(result: TensorUpdate, operand: CapturedParameterOperand) -> TensorUpdate:
+    def validate(result: UpdateOutput, operand: CapturedParameterOperand) -> UpdateOutput:
         """Check authored results at the same boundary for eager and batched execution."""
         if (
             result.output.shape != operand.desired.shape

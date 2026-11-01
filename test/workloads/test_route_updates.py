@@ -59,7 +59,7 @@ class Updating(pllm.Workload):
         delta.add_(desired.T @ hidden / len(hidden) ** 2 + 0.01)
         tail.add_(len(hidden))
         count = tail.new_tensor(1)
-        return pllm.TensorUpdate(output, count == 2, count, count * len(hidden), {"tail": tail.clone()})
+        return pllm.UpdateOutput(output, count == 2, count, count * len(hidden), {"tail": tail.clone()})
 
     @pllm.layer_route(tokens="all")
     def route(self, layers: pllm.Layers) -> torch.Tensor:
@@ -218,7 +218,9 @@ def test_marker_source_roundtrip_and_while_rejection():
     class TracedWhile(Updating):
         @pllm.layer_route()
         def route(self, layers: pllm.Layers) -> torch.Tensor:
-            return torch.while_loop(lambda hidden: hidden.sum() > 0, lambda hidden: (hidden * 0.5,), (layers.seed,))[0]
+            return torch.while_loop(
+                lambda hidden: hidden.sum() > 0, lambda hidden: (hidden * 0.5,), (layers.embeddings,)
+            )[0]
 
     with pytest.raises(ValueError, match="use a bounded for-loop"):
         TracedWhile().declaration(ROUTE_FACTS)

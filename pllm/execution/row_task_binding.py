@@ -13,8 +13,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from pllm.contracts.auxiliary import WeightedCEBatch
 from pllm.contracts.hidden_locator import HiddenPhase
+from pllm.contracts.host_batch import WeightedCEBatch
 from pllm.contracts.parameter_overlay import FieldView
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
@@ -153,7 +153,7 @@ def prepare_weighted_batch(
     view: TensorBatch,
 ) -> TaskOutput:
     """Mask invalid rows of the generate-validated batch and initialize the selected parameters."""
-    match data.step.auxiliary:
+    match data.step.batch:
         case WeightedCEBatch() as batch:
             pass
         case _:
@@ -193,11 +193,10 @@ def declare_parameters(
     fields: tuple[Field, ...],
     *,
     optimizer: AdamWConfig | SGD | None,
-    namespace: str = "",
     initialize: Callable[[Tensors, torch.Generator], None] | None = None,
     scope: StateScope = StateScope.INSTANCE,
     keys: tuple[RequestKeyField, ...] = (RequestKeyField.REQUEST_ID,),
-    memory: tuple[Field, ...] = (),
+    carry: tuple[Field, ...] = (),
 ) -> tuple[State, dict[str, TensorPort]]:
     """Allocate a state and expose a tensor port per field.
 
@@ -216,14 +215,13 @@ def declare_parameters(
     state = b.state(
         name,
         fields,
-        namespace=namespace,
         optimizer=optimizer if isinstance(optimizer, AdamWConfig) else None,
         scope=scope,
         keys=keys if scope is StateScope.REQUEST else (),
-        memory=memory,
+        carry=carry,
     )
     return state, parameter_ports(
-        b, state, shapes, initialize=initialize, memory={field.name: field.shape for field in memory}
+        b, state, shapes, initialize=initialize, carry={field.name: field.shape for field in carry}
     )
 
 
@@ -233,7 +231,7 @@ def parameter_ports(
     shapes: Mapping[str, Shape],
     *,
     initialize: Callable[[Tensors, torch.Generator], None] | None = None,
-    memory: Mapping[str, Shape] = {},
+    carry: Mapping[str, Shape] = {},
 ) -> dict[str, TensorPort]:
     """Bind named views of an allocated state without creating another root."""
     dimensions = b.dimensions
@@ -244,9 +242,9 @@ def parameter_ports(
     for index, (key, shape) in enumerate(zip(shapes, sizes, strict=True)):
         views[key] = FieldView(LayoutFieldId(index if raw else 0), 0 if raw else offset, shape)
         offset += prod(shape)
-    # Memory fields follow the parameter (or AdamW) fields.
-    base = len(state.fields) - len(memory)
-    for index, (key, shape) in enumerate(memory.items()):
+    # Carried fields follow the parameter (or AdamW) fields.
+    base = len(state.fields) - len(carry)
+    for index, (key, shape) in enumerate(carry.items()):
         views[key] = FieldView(LayoutFieldId(base + index), 0, shape(dimensions) if callable(shape) else shape)
     b.field_views.update({(str(state.declaration.resource), key): view for key, view in views.items()})
 
@@ -356,7 +354,7 @@ def declare_weighted_train(
             detached_inputs=("batch",),
             forward_rows="batch",
             parameter_gradient_rows="batch",
-            update_states="state",
+            update_rows="state",
         ),
         function=execute,
         operation_type=BatchOperation,
@@ -415,7 +413,7 @@ def declare_tensor(
     output_kind: SemanticOutputKind = SemanticOutputKind.TEMPORARY,
     result_schema: str = "",
     effect: StateEffectKind = StateEffectKind.UPDATE_MAYBE,
-    captures: Mapping[str, LayoutFieldId] = {},
+    carries: Mapping[str, LayoutFieldId] = {},
     export: TensorExport | None = None,
     sampler_stage: SamplerStage | None = None,
     sampler_beta: float = 0.0,
@@ -436,7 +434,7 @@ def declare_tensor(
         )
 
     domains = set[HiddenPhase]().union(*(phases(source) for source in sources.values()))
-    if len(domains) > 1 or domains and when is When.BEFORE_MODEL:
+    if len(domains) > 1 or domains and when is When.BEFORE_FORWARD:
         raise ValueError("tensor inputs need one phase; hidden inputs become available after model forward")
     phase = next(iter(domains), None)
     sources = {
@@ -445,10 +443,10 @@ def declare_tensor(
         else source
         for key, source in sources.items()
     }
-    if captures and update is None:
-        raise ValueError("memory captures require the task's own training transition")
-    if any(key not in sources for key in captures):
-        raise ValueError("memory captures must name a declared tensor input")
+    if carries and update is None:
+        raise ValueError("pllm.carry needs the method to train its own state")
+    if any(key not in sources for key in carries):
+        raise ValueError("pllm.carry must wrap a declared tensor input")
     if update is not None and not any(
         isinstance(source, StateSelectionInputSource) and source.resource == update.declaration.resource
         for source in sources.values()
@@ -494,7 +492,7 @@ def declare_tensor(
             sources,
             policy,
             outputs,
-            captures,
+            carries,
             phase,
             update.declaration.resource
             if update is not None

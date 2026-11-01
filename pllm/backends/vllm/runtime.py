@@ -21,13 +21,13 @@ from vllm import RequestOutput, SamplingParams
 from vllm.entrypoints.llm import LLM
 
 from pllm.authoring import (
-    AuxiliaryInput,
     BackendRequirements,
     BackendWorkload,
     DataT,
+    HostBatch,
     ResultT,
-    StateTensorUpdate,
-    map_auxiliary,
+    StateImport,
+    map_host_batch,
 )
 from pllm.backends.vllm import compat
 from pllm.backends.vllm.hidden_capture import CAPTURE_ENV, HiddenCaptureAnnouncement, HiddenCaptureLayout
@@ -41,7 +41,6 @@ from pllm.backends.vllm.parameter_overlay import (
 )
 from pllm.backends.vllm.training import CausalTraining
 from pllm.config import ModelConfig
-from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import (
     TOKEN_CAPTURE_CAPABILITY,
     AttachmentGraphMode,
@@ -59,6 +58,7 @@ from pllm.contracts.feedback import (
     FinishReason,
     RetryAction,
 )
+from pllm.contracts.host_batch import validate_host_batch
 from pllm.contracts.parameter_overlay import expand_targets
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.sampler import SamplerStage
@@ -134,7 +134,7 @@ class BackendCommand(StrEnum):
     DIAGNOSTICS = "diagnostics"
     TRACE = "trace"
     PROFILE = "profile_tasks"
-    OBSERVE = "observe"
+    SELECT_TRACE = "select_trace"
     DETACH = "detach"
 
 
@@ -159,7 +159,7 @@ class BackendInstall:
 @dataclass(frozen=True, slots=True)
 class BackendStage:
     identities: tuple[RequestIdentity, ...]
-    auxiliary: AuxiliaryInput[SharedTensor] | None
+    batch: HostBatch[SharedTensor] | None
     completion: SharedTensor | None
     driver_pid: int = field(default_factory=os.getpid)
 
@@ -224,7 +224,7 @@ class VllmLlm(Generic[DataT, ResultT]):
 
     def diagnostics(self) -> StateDiagnostics:
         self._require_open()
-        return replace(self.worker_state().diagnostics, eager_reason=self._eager_reason)
+        return replace(self._worker_state().diagnostics, eager_reason=self._eager_reason)
 
     @property
     def runner(self) -> WorkloadModelRunner | Mrv1Runner:
@@ -233,14 +233,14 @@ class VllmLlm(Generic[DataT, ResultT]):
             raise RuntimeError("use tensor_parallel_size=1 and multiprocessing=False to access the runner")
         return self._runner
 
-    def command(self, command: BackendCommand, payload: str = "", *, timeout: float = 30.0) -> list[str]:
+    def _command(self, command: BackendCommand, payload: str = "", *, timeout: float = 30.0) -> list[str]:
         replies = self._require_open().collective_rpc(
             "workload_command", timeout=timeout, args=(command.value, payload)
         )
         return replies
 
-    def worker_state(self) -> BackendWorkerState:
-        states = [decode_boundary(reply, BackendWorkerState) for reply in self.command(BackendCommand.DIAGNOSTICS)]
+    def _worker_state(self) -> BackendWorkerState:
+        states = [decode_boundary(reply, BackendWorkerState) for reply in self._command(BackendCommand.DIAGNOSTICS)]
         assert all(state.diagnostics.logical_counts() == states[0].diagnostics.logical_counts() for state in states), (
             "TP worker logical counters diverged",
             states,
@@ -252,21 +252,21 @@ class VllmLlm(Generic[DataT, ResultT]):
 
     def trace_snapshots(self) -> tuple[TraceSnapshot, ...]:
         """Return every worker's trace in rank order; trace_snapshot selects the output rank."""
-        return tuple(decode_boundary(reply, TraceSnapshot) for reply in self.command(BackendCommand.TRACE))
+        return tuple(decode_boundary(reply, TraceSnapshot) for reply in self._command(BackendCommand.TRACE))
 
     def profile_tasks(self, tasks: tuple[TaskId, ...]) -> None:
-        self.command(BackendCommand.PROFILE, encode_boundary(tasks))
+        self._command(BackendCommand.PROFILE, encode_boundary(tasks))
 
-    def observe(self, selection: TraceSelection) -> None:
-        """Configure bounded explicit tensor/gradient snapshots and opt-in Kineto profiling."""
-        self.command(BackendCommand.OBSERVE, encode_boundary(selection))
+    def select_trace(self, selection: TraceSelection) -> None:
+        """Select what the trace records: bounded tensor/gradient snapshots and opt-in Kineto profiling."""
+        self._command(BackendCommand.SELECT_TRACE, encode_boundary(selection))
 
     def close(self) -> None:
         if self._llm is None and self._pending_input is None:
             return
         try:
             if not self._closed:
-                self.command(BackendCommand.DETACH)
+                self._command(BackendCommand.DETACH)
         finally:
             self._shutdown()
 
@@ -291,7 +291,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         prompt_indices: tuple[int, ...] | None = None,
         use_tqdm: bool = False,
         completion_device: torch.device | None = None,
-        edit: Callable[[FeedbackT], StateTensorUpdate[torch.Tensor] | None] | None = None,
+        edit: Callable[[FeedbackT], StateImport[torch.Tensor] | None] | None = None,
         routes: tuple[str, ...] | None = None,
     ) -> Iterator[tuple[CompletionInput, FeedbackT]]:
         """Generate, settle feedback, then retry eligible original prompts within a finite bound.
@@ -300,7 +300,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         never installed on a worker. Each yield is the original completion and result,
         with no retained history. Multi-request barriers are regenerated as a full
         vote group. Closing the iterator leaves no pending generation or transaction.
-        Optional edits reuse StateTensorUpdate and require a signed activation workload;
+        Optional edits reuse StateImport and require a signed activation workload;
         the feedback adapter returns original tensors, never a worker callback.
         A callback that returns None has nothing to feed back for its round: the round
         is not yielded (the callback already saw its completions) and nothing retries.
@@ -311,13 +311,13 @@ class VllmLlm(Generic[DataT, ResultT]):
         if self._sample_limit is not None and max_rounds * sampling_params.n > self._sample_limit:
             raise ValueError(
                 f"{max_rounds} feedback rounds of n={sampling_params.n} samples exceed this workload's "
-                f"pllm.samples(limit={self._sample_limit}); lower max_rounds to at most "
+                f"pllm.sample_index(limit={self._sample_limit}); lower max_rounds to at most "
                 f"{self._sample_limit // sampling_params.n} or raise the workload's limit"
             )
         texts: list[str] = list(prompts)
         indices: tuple[int, ...] = self._prompt_indices(texts, prompt_indices)
         route_values: list[str] | None = list(routes) if routes is not None else None
-        auxiliary: AuxiliaryInput[torch.Tensor] | None = None
+        edits: HostBatch[torch.Tensor] | None = None
         for attempt in range(max_rounds):
             batch: CompletionInput = self.generate(
                 texts,
@@ -326,7 +326,7 @@ class VllmLlm(Generic[DataT, ResultT]):
                 feedback_group=feedback_group,
                 prompt_indices=indices,
                 sample_index=attempt * sampling_params.n,
-                auxiliary=auxiliary,
+                batch=edits,
                 completion_device=completion_device,
                 routes=None if route_values is None else tuple(route_values),
             )
@@ -358,7 +358,7 @@ class VllmLlm(Generic[DataT, ResultT]):
             selected: tuple[int, ...] = tuple(
                 index for index, entry in enumerate(entries) if entry.identity.request_id in retry
             )
-            auxiliary = edit(result) if edit is not None and selected and attempt + 1 < max_rounds else None
+            edits = edit(result) if edit is not None and selected and attempt + 1 < max_rounds else None
             yield batch, result
             if not selected:
                 return
@@ -374,7 +374,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         sampling_params: SamplingParams,
         *,
         use_tqdm: bool = False,
-        auxiliary: AuxiliaryInput[torch.Tensor] | None = None,
+        batch: HostBatch[torch.Tensor] | None = None,
         sample_index: int = 0,
         feedback_group: None = None,
         prompt_indices: tuple[int, ...] | None = None,
@@ -389,7 +389,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         sampling_params: SamplingParams,
         *,
         use_tqdm: bool = False,
-        auxiliary: AuxiliaryInput[torch.Tensor] | None = None,
+        batch: HostBatch[torch.Tensor] | None = None,
         sample_index: int = 0,
         feedback_group: str,
         prompt_indices: tuple[int, ...] | None = None,
@@ -403,7 +403,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         sampling_params: SamplingParams,
         *,
         use_tqdm: bool = False,
-        auxiliary: AuxiliaryInput[torch.Tensor] | None = None,
+        batch: HostBatch[torch.Tensor] | None = None,
         sample_index: int = 0,
         feedback_group: str | None = None,
         prompt_indices: tuple[int, ...] | None = None,
@@ -422,7 +422,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         if self._sample_limit is not None and sample_index + n > self._sample_limit:
             raise ValueError(
                 f"sample indices {sample_index}..{sample_index + n - 1}: this workload reads "
-                f"pllm.samples(limit={self._sample_limit}); keep sample_index + n at most {self._sample_limit} or "
+                f"pllm.sample_index(limit={self._sample_limit}); keep sample_index + n at most {self._sample_limit} or "
                 "raise the workload's limit"
             )
         indices = self._prompt_indices(texts, prompt_indices)
@@ -435,8 +435,8 @@ class VllmLlm(Generic[DataT, ResultT]):
             raise ValueError("routes require a signed route-keyed state and one value per prompt")
         if signed_route and routes is None:
             raise ValueError("a route-keyed request state requires per-prompt routes")
-        validate_auxiliary(
-            auxiliary,
+        validate_host_batch(
+            batch,
             self.attachment.plan.semantic_graph,
             self.attachment.plan.tensor_layout_request,
             self.attachment.plan.timeline,
@@ -461,7 +461,7 @@ class VllmLlm(Generic[DataT, ResultT]):
                 llm.llm_engine.output_processor.request_states[identity.request_id].external_req_id: identity
                 for identity in identities
             }
-            destination = self._stage(identities, auxiliary, feedback_group, completion_device, lifetime)
+            destination = self._stage(identities, batch, feedback_group, completion_device, lifetime)
             self._next_prompt_index = max(self._next_prompt_index, max(indices) + 1)
             llm.wake_up(tags=["scheduling"])
             outputs = llm.wait_for_completion(RequestOutput, use_tqdm=use_tqdm)
@@ -469,7 +469,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         except Exception as original:
             try:
                 llm.llm_engine.abort_request(request_ids, internal=True)
-                self.command(BackendCommand.ABORT)
+                self._command(BackendCommand.ABORT)
                 llm.wake_up(tags=["scheduling"])
             except Exception as cleanup:
                 # Borrowed input storage cannot outlive an unacknowledged worker.
@@ -521,7 +521,7 @@ class VllmLlm(Generic[DataT, ResultT]):
     def _stage(
         self,
         identities: tuple[RequestIdentity, ...],
-        auxiliary: AuxiliaryInput[torch.Tensor] | None,
+        batch: HostBatch[torch.Tensor] | None,
         feedback_group: str | None,
         completion_device: torch.device | None,
         lifetime: ExitStack,
@@ -545,16 +545,16 @@ class VllmLlm(Generic[DataT, ResultT]):
                     destination = torch.empty(field.shape, device=output_device, dtype=torch.float32)
         if self._runner is None:
             tp = self._require_open().llm_engine.vllm_config.parallel_config.tensor_parallel_size
-            auxiliary_wire = map_auxiliary(
-                auxiliary, lambda tensor: SharedTensor.export(tensor.cpu() if tp > 1 else tensor, lifetime)
+            batch_wire = map_host_batch(
+                batch, lambda tensor: SharedTensor.export(tensor.cpu() if tp > 1 else tensor, lifetime)
             )
-            self.command(
+            self._command(
                 BackendCommand.STAGE,
-                encode_boundary(BackendStage(identities, auxiliary_wire, completion_wire)),
+                encode_boundary(BackendStage(identities, batch_wire, completion_wire)),
             )
         else:
-            auxiliary = map_auxiliary(auxiliary, lambda tensor: tensor.to(self.device))
-            self.runner.require_session().stage_input(auxiliary, identities, destination)
+            batch = map_host_batch(batch, lambda tensor: tensor.to(self.device))
+            self.runner.require_session().stage_input(batch, identities, destination)
         return destination
 
     def _collect(
@@ -567,7 +567,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         n: int,
     ) -> list[RequestOutput] | CompletionInput:
         # FINISH validates and synchronizes the staged rows before releasing requests.
-        self.command(BackendCommand.FINISH)
+        self._command(BackendCommand.FINISH)
         if feedback_group is None:
             return _per_prompt(outputs, n)
         completions: dict[RequestIdentity, Completion] = {}
@@ -736,9 +736,8 @@ def create_vllm_llm(
             handle = VllmLlm[DataT, ResultT](
                 llm, None, attachment, facts, policy, requirements.sample_limit, eager_reason
             )
-            handle.command(
-                BackendCommand.INSTALL, encode_boundary(BackendInstall(facts, attachment, definition or "", policy))
-            )
+            install = encode_boundary(BackendInstall(facts, attachment, definition or "", policy))
+            llm.collective_rpc("workload_command", timeout=30.0, args=(BackendCommand.INSTALL.value, install))
         else:
             runner = llm.llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner
             facts, declaration = workload.specialize(

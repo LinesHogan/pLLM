@@ -21,16 +21,16 @@ from pllm.workloads.fttt.types import (
     FTTTClosedLoopIntent,
     FTTTConfig,
     FTTTFeedbackRecord,
-    FTTTInstanceState,
     FTTTLifecycleTransition,
     FTTTQueuedFeedback,
+    FTTTRequestLifecycle,
 )
 
 
 @dataclass(frozen=True, slots=True)
 class _LifecycleDecision:
     adaptable: bool
-    next_state: FTTTInstanceState
+    next_state: FTTTRequestLifecycle
     action: RetryAction
     reason: ControlReason
 
@@ -42,10 +42,10 @@ class FTTTFeedbackService:
         "_active",
         "_config",
         "_dropped_feedback",
-        "_instances",
+        "_lifecycles",
         "_judge",
         "_next_transaction_id",
-        "_projected_instances",
+        "_projected_lifecycles",
         "_queue",
         "_queued_feedback",
     )
@@ -53,8 +53,8 @@ class FTTTFeedbackService:
     def __init__(self, config: FTTTConfig, judge: FTTTJudgeService) -> None:
         self._config = config
         self._judge = judge
-        self._instances: dict[tuple[str, int], FTTTInstanceState] = {}
-        self._projected_instances: dict[tuple[str, int], FTTTInstanceState] = {}
+        self._lifecycles: dict[tuple[str, int], FTTTRequestLifecycle] = {}
+        self._projected_lifecycles: dict[tuple[str, int], FTTTRequestLifecycle] = {}
         self._queue: deque[FTTTQueuedFeedback] = deque()
         self._active: FTTTQueuedFeedback | None = None
         self._next_transaction_id = 1
@@ -77,8 +77,8 @@ class FTTTFeedbackService:
     def config(self) -> FTTTConfig:
         return self._config
 
-    def instance_state(self, group_id: str, prompt_idx: int) -> FTTTInstanceState:
-        return self._instances.get((group_id, prompt_idx), FTTTInstanceState())
+    def lifecycle(self, group_id: str, prompt_index: int) -> FTTTRequestLifecycle:
+        return self._lifecycles.get((group_id, prompt_index), FTTTRequestLifecycle())
 
     def enqueue(self, batch: CompletionInput) -> bool:
         outcomes: list[RewardOutcome] = []
@@ -88,7 +88,7 @@ class FTTTFeedbackService:
         transitions: list[FTTTLifecycleTransition] = []
         selected_rows: list[int] = []
         available = self._config.max_queue_size - self._queued_feedback
-        projected_instances = dict(self._projected_instances)
+        projected_lifecycles = dict(self._projected_lifecycles)
         dropped_feedback = self._dropped_feedback
         for row, completion in enumerate(batch.completions.entries):
             judged = self._judge.judge(completion)
@@ -103,10 +103,10 @@ class FTTTFeedbackService:
                 judged.skip_reason or (ControlReason.CORRECT_OUTPUT.value if judged.is_correct else ""),
             )
             outcomes.append(outcome)
-            key = (completion.group_id, completion.identity.prompt_idx)
-            previous = projected_instances.get(
+            key = (completion.group_id, completion.identity.prompt_index)
+            previous = projected_lifecycles.get(
                 key,
-                self._instances.get(key, FTTTInstanceState()),
+                self._lifecycles.get(key, FTTTRequestLifecycle()),
             )
             if judged.is_correct:
                 decision = _LifecycleDecision(
@@ -144,7 +144,7 @@ class FTTTFeedbackService:
                     trained,
                 )
             )
-            projected_instances[key] = decision.next_state
+            projected_lifecycles[key] = decision.next_state
             retry_controls.append(
                 RetryControl(
                     completion,
@@ -158,9 +158,9 @@ class FTTTFeedbackService:
                     "fttt:"
                     + completion.group_id
                     + ":"
-                    + str(completion.identity.prompt_idx)
+                    + str(completion.identity.prompt_index)
                     + ":"
-                    + str(completion.identity.sample_idx),
+                    + str(completion.identity.sample_index),
                     completion.group_id,
                     BarrierState.READY if trained else BarrierState.BLOCKED,
                     (completion.identity.request_id,),
@@ -177,7 +177,7 @@ class FTTTFeedbackService:
             tuple(transitions),
         )
         self._queue.append(FTTTQueuedFeedback(batch, tuple(selected_rows), intent))
-        self._projected_instances = projected_instances
+        self._projected_lifecycles = projected_lifecycles
         self._dropped_feedback = dropped_feedback
         self._next_transaction_id += 1
         self._queued_feedback += len(records)
@@ -197,19 +197,19 @@ class FTTTFeedbackService:
         """Settle each completion's lifecycle with the adapter version its edit step published."""
         assert self._active is queued
         assert intent == replace(queued.intent, adapter_version=intent.adapter_version)
-        settled = dict(self._instances)
+        settled = dict(self._lifecycles)
         for transition in intent.transitions:
-            current = settled.get(transition.key, FTTTInstanceState())
+            current = settled.get(transition.key, FTTTRequestLifecycle())
             assert current.retries == transition.previous.retries and current.stopped == transition.previous.stopped
             version = intent.adapter_version if transition.trained else current.adapter_version
             settled[transition.key] = replace(
                 transition.next,
                 adapter_version=version,
             )
-        projected = self._projected_instances if self._queue else dict(settled)
-        self._instances = settled
+        projected = self._projected_lifecycles if self._queue else dict(settled)
+        self._lifecycles = settled
         self._active = None
-        self._projected_instances = projected
+        self._projected_lifecycles = projected
 
     def abort(self, queued: FTTTQueuedFeedback) -> None:
         """A failed edit step drops the whole queue; lifecycles stay as last settled."""
@@ -217,12 +217,12 @@ class FTTTFeedbackService:
         self._active = None
         self._queue.clear()
         self._queued_feedback = 0
-        self._projected_instances = dict(self._instances)
+        self._projected_lifecycles = dict(self._lifecycles)
 
     def _decision(
         self,
         record: FTTTFeedbackRecord,
-        current: FTTTInstanceState,
+        current: FTTTRequestLifecycle,
     ) -> _LifecycleDecision:
         if current.stopped:
             return _LifecycleDecision(
@@ -258,7 +258,7 @@ class FTTTFeedbackService:
         stopped = self._config.max_retries > 0 and retries >= self._config.max_retries
         return _LifecycleDecision(
             True,
-            FTTTInstanceState(retries, stopped, current.adapter_version),
+            FTTTRequestLifecycle(retries, stopped, current.adapter_version),
             RetryAction.STOP if stopped else RetryAction.RETRY,
             ControlReason.RETRY_LIMIT if stopped else ControlReason.FEEDBACK_UPDATE,
         )

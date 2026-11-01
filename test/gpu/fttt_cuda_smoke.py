@@ -22,7 +22,7 @@ def main() -> int:
     consumer_stream = torch.cuda.Stream(device=device)
     config = FTTTConfig(rank=2, learning_rate=0.05, feedback_feature_size=3, max_retries=2)
     service = FTTTFeedbackService(config, _CudaNegativeJudge())
-    workload = FTTTTrainer(service, HostConfig(device, hidden_size=4, initialization_seed=7, max_input_rows=1))
+    workload = FTTTTrainer(service, HostConfig(device, hidden_size=4, seed=7, max_input_rows=1))
     identity = RequestIdentity("cuda-feedback-0", 0, 0)
     completion = Completion(identity, 0, "cuda-round-0", (1, 2), "wrong arithmetic", FinishReason.STOP)
     with torch.cuda.stream(producer_stream):
@@ -39,7 +39,7 @@ def main() -> int:
         or result.update_count != 1
         or result.state_version != 1
         or result.intent.retry_controls[0].action is not RetryAction.RETRY
-        or service.instance_state("cuda-round-0", 0).adapter_version != 1
+        or service.lifecycle("cuda-round-0", 0).adapter_version != 1
         or len(result.losses) != 1
     ):
         raise RuntimeError("canonical FTTT CUDA lifecycle evidence is incomplete")

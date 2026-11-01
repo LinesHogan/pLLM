@@ -19,7 +19,7 @@ import torch
 from vllm import LLM, SamplingParams
 
 import pllm
-from pllm import TensorUpdate
+from pllm import UpdateOutput
 from pllm.backends.vllm.runtime import VllmLlm
 from pllm.config import ModelConfig
 from pllm.contracts.parameter_overlay import (
@@ -71,14 +71,14 @@ class RequestLowRankTTT(pllm.Workload):
         base: torch.Tensor = pllm.operand("weight"),
         a: torch.Tensor = pllm.parameter("factors", "a"),
         b: torch.Tensor = pllm.parameter("factors", "b"),
-    ) -> TensorUpdate:
+    ) -> UpdateOutput:
         output = (hidden @ a.to(hidden.dtype).T) @ b.to(hidden.dtype).T
         error = hidden @ base.T + 0.5 * output - desired
         gradient_b = 2 * error.T @ (hidden @ a.to(hidden.dtype).T) / hidden.shape[0]
         gradient_a = 2 * (error @ b.to(hidden.dtype)).T @ hidden / hidden.shape[0]
         a.add_(-1e-3 * gradient_a)
         b.add_(-1e-3 * gradient_b)
-        return TensorUpdate(
+        return UpdateOutput(
             output,
             output.new_ones((), dtype=torch.bool),
             output.new_ones((), dtype=torch.int64),
@@ -165,7 +165,7 @@ def _check(handle: VllmLlm[object, object], label: str) -> tuple[str, ...]:
         or diagnostics.trained_rows < 1
         or handle.runner.require_session().apply_count < 2
         or handle.runner.require_session().updated_apply_count < 1
-        or diagnostics.active_lineages != 0
+        or diagnostics.active_states != 0
         or diagnostics.pending_state_releases != 0
     ):
         raise RuntimeError(
@@ -247,7 +247,7 @@ def _check_graph(handle):
         assert all(texts(handle.generate(["The sky is blue. " * 5, "Water is cold. " * 2], SAMPLING)))
     assert overlay.take_captures() == ()
     assert pointers == (reader.table.data_ptr(), reader.captured.data_ptr(), reader.pools[0].data_ptr())
-    assert handle.diagnostics().update_count > 0 and handle.diagnostics().active_lineages == 0
+    assert handle.diagnostics().update_count > 0 and handle.diagnostics().active_states == 0
     _check_cancelled_projection(handle)
     return first
 
@@ -286,13 +286,13 @@ def _check_hybrid(handle):
         assert any(not training for training, _ in modes)
         _check_cancelled_projection(handle)
     diagnostics = handle.diagnostics()
-    assert diagnostics.update_count > 0 and diagnostics.active_lineages == diagnostics.pending_state_releases == 0
+    assert diagnostics.update_count > 0 and diagnostics.active_states == diagnostics.pending_state_releases == 0
     assert overlay.take_captures() == ()
     return first
 
 
 def _key(prompt_index: int) -> RequestStateKey:
-    return RequestStateKey.project(RequestIdentity("", prompt_index, 0), (RequestKeyField.PROMPT_IDX,))
+    return RequestStateKey.project(RequestIdentity("", prompt_index, 0), (RequestKeyField.PROMPT_INDEX,))
 
 
 def _check_imported(handle: VllmLlm[object, object]) -> tuple[str, ...]:
@@ -307,8 +307,8 @@ def _check_imported(handle: VllmLlm[object, object]) -> tuple[str, ...]:
     generator = torch.Generator().manual_seed(11)
     down = torch.randn(down_shape, generator=generator).to(device=device, dtype=torch.float32)
     up = torch.randn(up_shape, generator=generator).to(device=device, dtype=torch.float32)
-    update = pllm.state.StateTensorUpdate((down.unsqueeze(0), up.unsqueeze(0)), (_key(2),))
-    mixed = texts(handle.generate(PROMPTS, SAMPLING, prompt_indices=(2, 3), auxiliary=update))
+    update = pllm.state.StateImport((down.unsqueeze(0), up.unsqueeze(0)), (_key(2),))
+    mixed = texts(handle.generate(PROMPTS, SAMPLING, prompt_indices=(2, 3), batch=update))
     if mixed[0] == baseline[0] or mixed[1] != baseline[1]:
         raise RuntimeError("imported factors must move exactly their own request's outputs")
     # Imported zero factors are an exact no-op on fresh requests.
@@ -316,11 +316,11 @@ def _check_imported(handle: VllmLlm[object, object]) -> tuple[str, ...]:
         torch.zeros((2, *down_shape), device=device, dtype=torch.float32),
         torch.zeros((2, *up_shape), device=device, dtype=torch.float32),
     )
-    update = pllm.state.StateTensorUpdate(zeros, (_key(4), _key(5)))
-    if texts(handle.generate(PROMPTS, SAMPLING, prompt_indices=(4, 5), auxiliary=update)) != baseline:
+    update = pllm.state.StateImport(zeros, (_key(4), _key(5)))
+    if texts(handle.generate(PROMPTS, SAMPLING, prompt_indices=(4, 5), batch=update)) != baseline:
         raise RuntimeError("imported zero factors must reproduce the base model exactly")
     diagnostics = handle.diagnostics()
-    if diagnostics.update_count != 3 or diagnostics.active_lineages != 0 or diagnostics.pending_state_releases != 0:
+    if diagnostics.update_count != 3 or diagnostics.active_states != 0 or diagnostics.pending_state_releases != 0:
         raise RuntimeError("imported overlay lifecycle evidence is incomplete")
     return mixed
 
@@ -340,7 +340,7 @@ def _check_routed(handle: VllmLlm[object, object]) -> tuple[str, ...]:
     # Three retired requests, two route lineages still resident: the two math
     # prompts shared one adapter, and the dormant pool outlives its requests.
     if (
-        diagnostics.active_lineages != 2
+        diagnostics.active_states != 2
         or diagnostics.update_count < 1
         or handle.runner.require_session().apply_count < 3
         or handle.runner.require_session().updated_apply_count < 1
@@ -351,17 +351,19 @@ def _check_routed(handle: VllmLlm[object, object]) -> tuple[str, ...]:
 
 
 def main() -> int:
-    from pllm.workloads.prefill_adapters import PrefillAdapters
+    from pllm.workloads.prefill_adapters import PrefillAdaptersWorkload
 
     adapter_tokens = []
     for chunked in (False, True):
-        with open_llm(PrefillAdapters(chunk_size=3, rank=2), chunked=chunked, tokens=7 if chunked else 64) as handle:
+        with open_llm(
+            PrefillAdaptersWorkload(chunk_size=3, rank=2), chunked=chunked, tokens=7 if chunked else 64
+        ) as handle:
             outputs = handle.generate(["The sky is blue. " * 5, "Water freezes at " * 7], SAMPLING)
             adapter_tokens.append(texts(outputs))
             diagnostics = handle.diagnostics()
             assert diagnostics.update_count == 5 * sum((len(output.prompt_token_ids) + 2) // 3 for output in outputs)
             assert diagnostics.trained_rows == 5 * sum(len(output.prompt_token_ids) for output in outputs)
-            assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
+            assert diagnostics.active_states == diagnostics.pending_state_releases == 0
     assert adapter_tokens[0] == adapter_tokens[1]
     dense = InPlaceTTTWorkload(
         InPlaceTTTConfig((TARGET,), chunk_size=1, learning_rate=1e-4, update_prefill=True, update_decode=False)
@@ -597,7 +599,7 @@ def preemption_replays():
             )
         assert any(call.args[0] for call in preempt.call_args_list)
         assert all(len(output.outputs[0].token_ids) == 48 for output in outputs)
-        assert handle.diagnostics().active_lineages == 0
+        assert handle.diagnostics().active_states == 0
 
 
 if __name__ == "__main__":

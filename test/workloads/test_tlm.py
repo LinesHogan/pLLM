@@ -11,11 +11,11 @@ from torch.nn import functional as F
 
 from pllm.authoring import CausalTrainBatch
 from pllm.config import ExecutionOptions
-from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
     BackendPlacementProbe,
 )
+from pllm.contracts.host_batch import validate_host_batch
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget, ParameterTargetShape
 from pllm.contracts.request_identity import RequestIdentity
@@ -26,7 +26,7 @@ from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.shared_tensor import SharedTensor
-from pllm.execution.step_input import TensorStepInput
+from pllm.execution.step_input import StepInput
 from pllm.kernels.adamw import AdamWConfig
 from pllm.workloads.tlm import TLMConfig, TLMMode, TLMWorkload
 
@@ -90,7 +90,7 @@ def _compile(model, config: TLMConfig):
 
 def _input(batch):
     rows = PackedPhaseRowBatch(0, 0, ())
-    return TensorStepInput(rows, PackedSamplerRowBatch(rows, ()), auxiliary=batch)
+    return StepInput(rows, PackedSamplerRowBatch(rows, ()), batch=batch)
 
 
 def _reference(model, parameters, batch, config):
@@ -162,7 +162,7 @@ def test_global_multifactor_adamw_matches_oracle_and_publishes_one_version() -> 
     with pytest.raises(AssertionError):
         execution.arena.snapshot(old_pin, ref)
     execution.retire(())
-    assert execution.diagnostics().active_lineages == 0
+    assert execution.diagnostics().active_states == 0
 
 
 def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None:
@@ -185,7 +185,7 @@ def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None
         (initial,) = execution.admit(())
         tokens = torch.zeros((2, 3), dtype=torch.int64)
         with pytest.raises(ValueError):  # Larger than the planned input shape.
-            validate_auxiliary(
+            validate_host_batch(
                 CausalTrainBatch(tokens, tokens),
                 execution.arena.plan.semantic_graph,
                 execution.arena.plan.tensor_layout_request,

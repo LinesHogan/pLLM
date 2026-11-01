@@ -14,8 +14,8 @@ import numpy as np
 import torch
 
 from pllm.config import ExecutionOptions
-from pllm.contracts.auxiliary import WeightedCEBatch, WeightedRowBatch
 from pllm.contracts.hidden_locator import HiddenPhase
+from pllm.contracts.host_batch import WeightedCEBatch, WeightedRowBatch
 from pllm.contracts.packed_hidden import HiddenRowBatch, HiddenRows
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
 from pllm.contracts.parameter_overlay import CapturedParameterOperand
@@ -38,7 +38,7 @@ from pllm.execution.declaration import Call
 from pllm.execution.host_runtime import HostConfig, measured_timeline
 from pllm.execution.ptts.request_state import RequestStateSelection, ResourceSelection
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.execution.step_input import TensorStepInput
+from pllm.execution.step_input import StepInput
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import MemoryOperation, TensorBatch
 
@@ -139,11 +139,11 @@ def example(
         field_slots=lambda field: (pools[field], tuple(range(len(pools[field])))),
         slot_matrix=lambda: ("", np.repeat(np.arange(len(roots), dtype=np.int64)[:, None], len(pools), axis=1)),
     )
-    auxiliary = None
+    host_batch = None
     if binding.graph.training_mode == "weighted_batch":
         keys = tuple(key for key in selection.keys if key is not None)
-        shape = (len(keys), options.training_rows) if keys else (options.training_rows,)
-        auxiliary = WeightedCEBatch(
+        shape = (len(keys), options.max_training_rows) if keys else (options.max_training_rows,)
+        host_batch = WeightedCEBatch(
             meta(*shape, facts.probe.hidden_size),
             meta(*shape, facts.vocab_size),
             meta(*shape, dtype=torch.long),
@@ -168,7 +168,7 @@ def example(
         for target in facts.probe.targets
     )
     data = TensorFrame(
-        TensorStepInput(packed, sampler, hidden, operands=operands, auxiliary=auxiliary),
+        StepInput(packed, sampler, hidden, operands=operands, batch=host_batch),
         rows[::-1],
         replacements=tuple(
             (
@@ -244,8 +244,8 @@ def derive_resources(
             len(data.rows),
             facts.probe.hidden_size,
             (
-                (len(batch.roots), options.training_rows, facts.probe.hidden_size),
-                (len(batch.roots), options.training_rows, facts.vocab_size),
+                (len(batch.roots), options.max_training_rows, facts.probe.hidden_size),
+                (len(batch.roots), options.max_training_rows, facts.vocab_size),
             ),
         )
         tasks.append(
@@ -269,12 +269,12 @@ def derive_resources(
     )
 
 
-def derive_host_resources(binding: TensorBinding, facts: HostConfig) -> SchedulerTimeline:
+def derive_host_resources(binding: TensorBinding, config: HostConfig) -> SchedulerTimeline:
     """Measure a rowless host step over the workload's one instance state at the maximum input rows."""
-    if facts.max_input_rows is None:
+    if config.max_input_rows is None:
         raise ValueError("set HostConfig.max_input_rows when memory_budget_bytes is set")
-    rows = facts.max_input_rows
-    auxiliary = WeightedRowBatch(meta(rows, facts.hidden_size), meta(rows, *facts.target_shape), meta(rows))
+    rows = config.max_input_rows
+    host_batch = WeightedRowBatch(meta(rows, config.hidden_size), meta(rows, *config.target_shape), meta(rows))
     (layout,) = binding.layouts.layouts
     refs = StateRefs.of((StateRef(LayoutId(1), LineageId(1), VersionId(1)),))
     selection = RequestStateSelection((), (ResourceSelection(StateResource(layout.resource), (None,), refs, ()),))
@@ -286,7 +286,7 @@ def derive_host_resources(binding: TensorBinding, facts: HostConfig) -> Schedule
         None,
         field_slots=lambda field: (pools[field], (0,)),
     )
-    data = TensorFrame(TensorStepInput.of_batch(auxiliary), ())
+    data = TensorFrame(StepInput.of_batch(host_batch), ())
     operations: dict[TaskSymbol, MemoryOperation[TensorFrame]] = {
         **binding.executables(None, ()),
         **binding.publications,
@@ -299,6 +299,6 @@ def derive_host_resources(binding: TensorBinding, facts: HostConfig) -> Schedule
         for symbol in producers_first(binding.graph, tuple(operations))
     ]
     held = sum(
-        tensor.numel() * tensor.element_size() for tensor in (auxiliary.hidden, auxiliary.targets, auxiliary.weights)
+        tensor.numel() * tensor.element_size() for tensor in (host_batch.hidden, host_batch.targets, host_batch.weights)
     )
-    return measured_timeline(facts, held, costs, ((rows, facts.hidden_size),))
+    return measured_timeline(config, held, costs, ((rows, config.hidden_size),))

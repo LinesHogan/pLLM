@@ -62,13 +62,13 @@ def test_retired_roots_hold_storage_until_pages_are_free() -> None:
     a, b = _admit(arena)
     pin = arena.pin_exact(StateRefs.of((a, b)))
     arena.retire(StateRefs.of((a, b)))
-    assert arena.active_lineages == 2  # retired roots retain storage, not the admission entitlement
+    assert arena.active_states == 2  # retired roots retain storage, not the admission entitlement
     replacement = arena.publish(arena.prepare_admission(("dense_fast_weights",)))
     with pytest.raises(RuntimeError):
         arena.prepare_admission(("dense_fast_weights",) * 2)
     arena.wait_release(arena.release_pin(pin))
     arena.retire(replacement.after_refs)
-    assert arena.active_lineages == 0 and arena.free_pages == 6
+    assert arena.active_states == 0 and arena.free_pages == 6
 
 
 def test_versions_stack_until_pool_exhaustion_and_pins_keep_their_version() -> None:
@@ -102,7 +102,7 @@ def test_versions_stack_until_pool_exhaustion_and_pins_keep_their_version() -> N
     for held in retained:
         arena.wait_release(arena.release_pin(held))
     arena.retire(StateRefs.of((current, idle)))
-    assert arena.active_lineages == 0 and arena.free_pages == 6
+    assert arena.active_states == 0 and arena.free_pages == 6
 
 
 def test_multi_lineage_admission_failures_roll_back_atomically(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -110,7 +110,7 @@ def test_multi_lineage_admission_failures_roll_back_atomically(monkeypatch: pyte
     capacity = arena.free_pages
     with pytest.raises(RuntimeError):
         arena.prepare_admission(("dense_fast_weights",) * 3)
-    assert arena.free_pages == capacity and arena.active_lineages == 0
+    assert arena.free_pages == capacity and arena.active_states == 0
     original_fill = torch.Tensor.index_fill_
 
     def fail_second_resource(tensor: torch.Tensor, *args: object) -> torch.Tensor:
@@ -123,7 +123,7 @@ def test_multi_lineage_admission_failures_roll_back_atomically(monkeypatch: pyte
         patch.setattr(torch.Tensor, "index_fill_", fail_second_resource)
         with pytest.raises(RuntimeError):
             arena.prepare_admission(("dense_fast_weights", "global_factors"))
-    assert arena.free_pages == capacity and arena.active_lineages == 0
+    assert arena.free_pages == capacity and arena.active_states == 0
 
 
 def test_multi_resource_update_is_atomic_and_write_handles_are_single_use() -> None:
@@ -153,4 +153,4 @@ def test_multi_resource_update_is_atomic_and_write_handles_are_single_use() -> N
     arena.wait_release(arena.release_pin(new_pin))
     arena.wait_release(arena.release_pin(pin))
     arena.retire(published.after_refs)
-    assert arena.active_lineages == 0
+    assert arena.active_states == 0

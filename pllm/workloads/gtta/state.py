@@ -111,5 +111,5 @@ class GTTADynamicsState:
         return GTTAQueryResult(
             ranked,
             records,
-            PromptContext(query.prompt_idx, context, query.position),
+            PromptContext(query.prompt_index, context, query.position),
         )

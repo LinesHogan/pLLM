@@ -46,8 +46,8 @@ pub(crate) enum StateScope {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RequestKeyField {
     RequestId,
-    PromptIdx,
-    SampleIdx,
+    PromptIndex,
+    SampleIndex,
     Route,
 }
 

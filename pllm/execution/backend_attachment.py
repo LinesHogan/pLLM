@@ -185,7 +185,7 @@ def _check_exports(attachment: BackendAttachment) -> None:
         output = SemanticOutputKind.HOST if task.symbol in exports else SemanticOutputKind.TEMPORARY
         if not _observes(task, output):
             raise ValueError(
-                f"{task.symbol}: a workload with exports runs only exports and read-only helpers in Phase.OBSERVE "
+                f"{task.symbol}: a workload with exports runs only exports and read-only helpers in Phase.AFTER_FORWARD "
                 "that read hidden rows, state and results; remove its other operations, state writes and phase "
                 "overrides"
             )

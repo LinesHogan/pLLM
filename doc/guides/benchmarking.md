@@ -67,7 +67,7 @@ results = compare(my_workload, BenchmarkOptions(batch=4, tokens=64, rounds=1))
 这个入口测的是模型生成。要计带类型宿主服务的时间，用
 [验证指南](validation.md) 里的共享执行 trace，不是合成 GPU 循环。
 
-LoRA 场景还有自己的一组参数：`--rank`、`--training-rows`、
+LoRA 场景还有自己的一组参数：`--rank`、`--max-training-rows`、
 `--training-fraction`、`--scope instance|request|both` 与
 `--state-groups N`（默认每请求一个请求状态）。活跃行数向上取整并报告，
 剩余权重为零。请求作用域下，组共享 prompt/样本键与相同 prompt 文本；训练
@@ -123,7 +123,7 @@ memcpy 字节。解读时注意四条边界：API 时间含同步，不是纯 CP
 
 ```bash
 .venv/bin/python -m tools.benchmark_lora --batch 2 --tokens 4 --rounds 1 \
-  --training-rows 4 --training-fraction 0.25 --scope request --profile /tmp/lora-profile
+  --max-training-rows 4 --training-fraction 0.25 --scope request --profile /tmp/lora-profile
 ```
 
 ## 我要用独立训练输入或自定义实现臂

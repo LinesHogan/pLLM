@@ -16,10 +16,10 @@ PLLM 补上这段路。算法只声明数学、数据流、状态与效果；Rus
 ```python
 from vllm import SamplingParams
 from pllm import ExecutionOptions, ModelConfig, make_llm
-from pllm.workloads import ESampRequestConfig, ESampRequestWorkload
+from pllm.workloads import ESampConfig, ESampWorkload
 
 config = ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", execution=ExecutionOptions())
-with make_llm(config, workload=ESampRequestWorkload(ESampRequestConfig(rank=2))) as llm:
+with make_llm(config, workload=ESampWorkload(ESampConfig(rank=2))) as llm:
     outputs = llm.generate(["Explain gradient descent:"], SamplingParams(max_tokens=32))
     print(outputs[0].outputs[0].text)
     print(llm.diagnostics())
@@ -46,7 +46,7 @@ with make_llm(config, workload=ESampRequestWorkload(ESampRequestConfig(rank=2)))
 | [01 观测：给三层 hidden 装 SAE](doc/tutorials/01_observe_sae.ipynb) | 观测任务、导出语义（`max_rows`/`max_cols`）、冻结状态、后台线程消费 trace、落盘 pkl |
 | [02 自定义训练头](doc/tutorials/02_custom_head.ipynb) | 训练任务与采样引导、loss 约定、参数按行就位的 `bmm` 写法；把头从 MLP 换成 CNN |
 | [03 每请求 LoRA](doc/tutorials/03_request_lora.ipynb) | 参数 overlay、route 键共享 lineage、判别器混合两个头、prefill 逐块学习（波前 vs Jacobi） |
-| [04 三种循环](doc/tutorials/04_loops.ipynb) | 层间重放、逐步 hidden 再循环、跨请求会话循环（memory + Capture） |
+| [04 三种循环](doc/tutorials/04_loops.ipynb) | 层间重放、逐步 hidden 再循环、跨请求会话循环（carry + pllm.carry） |
 | [05 decode 时在线训练](doc/tutorials/05_decode_training.ipynb) | 跨步与跨请求的训练目标：当前步、下一步、上一 VIP 请求终态，全靠输入声明组合 |
 
 ## 自己写负载
@@ -123,7 +123,7 @@ Feed、layer_route 和 PositionState 在 TP>1 构造时拒绝，并提示设置 
 TP>1 始终使用多进程 worker，负载须满足上面的 pickle 传输约束；不能直接访问 `llm.runner` 或 `llm.feed()`。
 辅助张量经 CPU 共享内存复制到各 rank；completion 只由输出 rank 写入，默认返回 CPU 张量。
 计划和附件不再保存设备 ordinal，绑定使用 worker 的本地设备；旧的序列化计划需要重新编译。
-`diagnostics()` / `worker_state()` 检查所有 rank 的逻辑计数，不一致时抛出断言；内存分配与回收时序不参与比较。
+`diagnostics()` 检查所有 rank 的逻辑计数，不一致时抛出断言；内存分配与回收时序不参与比较。
 `command()` 现在返回按 rank 排序的回复列表（TP=1 也返回单元素列表）；`trace_snapshots()` 返回所有 rank
 的 trace，`trace_snapshot()` 保留输出 rank 的视图。观测和导出回调在每个 worker 中运行。
 TP>1 的普通推理与负载推理使用相同的 graph capture 行数上限（`max_num_batched_tokens`）。
@@ -143,7 +143,7 @@ forward 重叠。采样前只读的任务固定读取延迟版本：步 N+1 可�
 分块递推（`pllm.scan`，如 In-Place-TTT 的 chunk 递推）默认使用预算内的固定实现；
 `ExecutionOptions(tuning="measured")` 让它在首次运行时实测各候选实现并选最快的。
 调度层不按算法名字分派。
-模型维度与有界资源事实在签名前完成特化；`training_rows` 限制每个状态的
+模型维度与有界资源事实在签名前完成特化；`max_training_rows` 限制每个状态的
 外部训练行数，`capture_memory_bytes` 是每个任务的驻留上限。容量不足是
 错误，不是静默退回 eager。Overlay 不能使用共享前缀缓存。
 `ModelConfig(cuda_graphs="auto")` 是默认值：负载支持时模型走 vLLM 的 CUDA graph，否则以 eager 运行，
@@ -172,7 +172,7 @@ forward 重叠。采样前只读的任务固定读取延迟版本：步 N+1 可�
     `architectures` 改为 `Qwen3_5ForCausalLM`，只保留 `model.language_model.*` 权重并改名为 `model.*`。
   - 量化检查点按上面同一家族的规则准入：层路由与 PositionState 只重跑 vLLM 自己的层模块，量化的
     投影照常执行（已验证 GPTQ-Int4 的 Qwen2.5-14B、AWQ 的 Qwen2.5-32B 与 vLLM 在线 FP8：路由输出与
-    全部层 KV 和原生 vLLM 逐位相等；GPTQ 上 StepLoop 波次也逐位相等）。参数 overlay 和 vLLM 对量化
+    全部层 KV 和原生 vLLM 逐位相等；GPTQ 上 StepLoopWorkload 波次也逐位相等）。参数 overlay 和 vLLM 对量化
     模型做 LoRA 一样，在量化 kernel 的输出上加一份由输入 x 算出的 BF16/FP32 修正，不需要稠密权重；零修正时输出与原生 vLLM 逐位相等，CUDA graph 路径同样可用。
     overlay 函数读取 `pllm.operand("weight")` 时，pllm 用 vLLM 自己的反量化工具为该投影生成一份
     稠密副本并常驻（例如 14B 的一个 down 投影约 135 MiB），不读取则没有这份内存。
@@ -195,7 +195,7 @@ forward 重叠。采样前只读的任务固定读取延迟版本：步 N+1 可�
 - **训练与重放**：因果训练（如 TLM）要求 BF16 模型（投影可以量化）；层间重放要求 FlashAttention 2，
   其余组合限制见[Overlay 与重放](doc/guides/overlays-and-replay.md)。
 - **多样本**：`SamplingParams(n=k)` 把每个 prompt 的 k 个样本作为独立请求运行，样本序号依次为
-  `sample_index, …, sample_index+k-1`，按 `(PROMPT_IDX, SAMPLE_IDX)` 键的请求状态互不共享。
+  `sample_index, …, sample_index+k-1`，按 `(PROMPT_INDEX, SAMPLE_INDEX)` 键的请求状态互不共享。
 - **数值**：重放得到的 carry、tap 归一化结果和 KV 与同形状的原生 vLLM 逐位相等。
   不同批宽、填充或前缀命中会改变 BF16 舍入，所以不同调度之间不保证逐 token 相同，这与原生 vLLM 一致。
 

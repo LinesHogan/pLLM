@@ -137,7 +137,7 @@ def test_override_matches_reweight_adam_and_final_noop() -> None:
     execution.arena.wait_release(execution.arena.release_pin(held))
     execution.retire(())
     assert (execution.diagnostics().loss_count, execution.diagnostics().update_count) == (3, 2)
-    assert execution.diagnostics().active_lineages == 0
+    assert execution.diagnostics().active_states == 0
 
     single = OverRIDEWorkload(replace(config, num_iterations=1)).compile_backend(facts).execution
     single.admit(())
@@ -161,26 +161,25 @@ def test_override_matches_reweight_adam_and_final_noop() -> None:
 
 def _request_heads() -> None:
     class RequestHeads(pllm.Workload):
-        name = "request_heads"
         heads = pllm.RequestState({"weight": (4, 7)}, optimizer=pllm.AdamW(lr=0.03))
 
         @pllm.add_logits()
         def reweight(
             self,
             hidden: torch.Tensor = pllm.hidden(-1, HiddenSite.MODEL_OUTPUT),
-            samples: torch.Tensor = pllm.samples(),
+            samples: torch.Tensor = pllm.sample_index(),
             weight: torch.Tensor = pllm.parameter("heads", "weight"),
         ) -> torch.Tensor:
             return torch.bmm(hidden.unsqueeze(1), weight).squeeze(1)
 
-        def eligible(self, samples: torch.Tensor = pllm.samples()) -> torch.Tensor:
+        def eligible(self, samples: torch.Tensor = pllm.sample_index()) -> torch.Tensor:
             return samples == 0
 
         @pllm.train(state="heads", rows="eligible")
         def train(
             self,
             hidden: torch.Tensor = pllm.hidden(-1, HiddenSite.MODEL_OUTPUT),
-            samples: torch.Tensor = pllm.samples(),
+            samples: torch.Tensor = pllm.sample_index(),
             weight: torch.Tensor = pllm.parameter("heads", "weight"),
             base: torch.Tensor = pllm.base_logits(),
             tokens: torch.Tensor = pllm.sampled_tokens(),
@@ -205,7 +204,7 @@ def _request_heads() -> None:
     for index, ref in enumerate(result.publication.after_refs[::2]):
         torch.testing.assert_close(requests.snapshot(ref)[0].reshape(4, 7), weights[index])
     requests.retire(identities)
-    assert requests.diagnostics().update_count == 2 and requests.diagnostics().active_lineages == 0
+    assert requests.diagnostics().update_count == 2 and requests.diagnostics().active_states == 0
 
 
 def _chained_heads(facts) -> None:
@@ -220,7 +219,7 @@ def _chained_heads(facts) -> None:
         def reweight(
             self,
             hidden: torch.Tensor = pllm.hidden(-1, HiddenSite.MODEL_OUTPUT),
-            samples: torch.Tensor = pllm.samples(),
+            samples: torch.Tensor = pllm.sample_index(),
             weight: torch.Tensor = pllm.parameter("heads", "weight"),
         ) -> torch.Tensor:
             return hidden @ weight
@@ -234,7 +233,7 @@ def _chained_heads(facts) -> None:
         ) -> torch.Tensor:
             return features @ weight.T @ weight
 
-        def eligible(self, samples: torch.Tensor = pllm.samples()) -> torch.Tensor:
+        def eligible(self, samples: torch.Tensor = pllm.sample_index()) -> torch.Tensor:
             return samples == 0
 
         @pllm.train(state="heads", rows="eligible")
@@ -242,7 +241,7 @@ def _chained_heads(facts) -> None:
         def train(
             self,
             features: torch.Tensor = pllm.result("frozen"),
-            samples: torch.Tensor = pllm.samples(),
+            samples: torch.Tensor = pllm.sample_index(),
             base: torch.Tensor = pllm.base_logits(),
             tokens: torch.Tensor = pllm.sampled_tokens(),
         ) -> torch.Tensor:
@@ -290,21 +289,21 @@ class Domains(pllm.Workload):
             {"weight": (4, 7)},
             optimizer=pllm.AdamW(lr=0.03, weight_decay=0.1),
             initialize=initialize,
-            memory={"carry": (7,)},
+            carry={"carry": (7,)},
         )
 
-    def forward_rows(self, samples: torch.Tensor = pllm.samples()) -> torch.Tensor:
+    def forward_rows(self, samples: torch.Tensor = pllm.sample_index()) -> torch.Tensor:
         return samples.bitwise_and(1) != 0
 
-    def input_rows(self, samples: torch.Tensor = pllm.samples()) -> torch.Tensor:
+    def input_rows(self, samples: torch.Tensor = pllm.sample_index()) -> torch.Tensor:
         return samples.bitwise_and(2) != 0
 
-    def parameter_rows(self, samples: torch.Tensor = pllm.samples()) -> torch.Tensor:
+    def parameter_rows(self, samples: torch.Tensor = pllm.sample_index()) -> torch.Tensor:
         return samples.bitwise_and(4) != 0
 
     def updates(
         self,
-        samples: torch.Tensor = pllm.samples(),
+        samples: torch.Tensor = pllm.sample_index(),
         tokens: torch.Tensor = pllm.sampled_tokens(),
     ) -> torch.Tensor:
         return (samples.bitwise_and(8) != 0) & (tokens == 0)
@@ -314,17 +313,17 @@ class Domains(pllm.Workload):
     def reweight(
         self,
         hidden: torch.Tensor = pllm.hidden(-1, HiddenSite.MODEL_OUTPUT),
-        samples: torch.Tensor = pllm.samples(),
+        samples: torch.Tensor = pllm.sample_index(),
         weight: torch.Tensor = pllm.parameter("heads", "weight", per_row=True),
     ) -> torch.Tensor:
         return torch.bmm(hidden.unsqueeze(1), weight).squeeze(1)
 
-    @pllm.train(state="heads", update="updates", rows="forward_rows")
+    @pllm.train(state="heads", update_rows="updates", rows="forward_rows")
     @pllm.differentiate(inputs=("features",))
     def train(
         self,
-        features: torch.Tensor = pllm.capture(pllm.result("reweight"), state="heads", field="carry"),
-        samples: torch.Tensor = pllm.samples(),
+        features: torch.Tensor = pllm.carry(pllm.result("reweight"), state="heads", field="carry"),
+        samples: torch.Tensor = pllm.sample_index(),
         tokens: torch.Tensor = pllm.sampled_tokens(),
     ) -> torch.Tensor:
         return features.square().mean(1)
@@ -337,7 +336,7 @@ class EarlyFeedback(Domains):
 
 
 class IntegerRows(Domains):
-    def forward_rows(self, samples: torch.Tensor = pllm.samples()) -> torch.Tensor:
+    def forward_rows(self, samples: torch.Tensor = pllm.sample_index()) -> torch.Tensor:
         return samples
 
 
@@ -402,7 +401,7 @@ def _domains_oracle(device, request, identities) -> None:
         for index in active:
             parameters[index].grad = gradients[index]
             optimizers[index].step()
-        sampled = tuple(replace(identity, sample_idx=flags) for identity, flags in zip(identities, bits, strict=True))
+        sampled = tuple(replace(identity, sample_index=flags) for identity, flags in zip(identities, bits, strict=True))
         value = step_input(sampled, hidden, step_id, stream=stream)
         tokens = torch.full((4,), int(no_feedback_update), device=device, dtype=torch.long)
         result = run(execution, value, torch.zeros((4, 7), device=device), tokens, stream)
@@ -432,4 +431,4 @@ def _domains_oracle(device, request, identities) -> None:
         assert_roots(execution.arena.snapshot(held, ref), root, exact=True)
     execution.arena.wait_release(execution.arena.release_pin(held))
     execution.retire(identities if request else (), wait=True)
-    assert execution.diagnostics().active_lineages == execution.diagnostics().pending_state_releases == 0
+    assert execution.diagnostics().active_states == execution.diagnostics().pending_state_releases == 0

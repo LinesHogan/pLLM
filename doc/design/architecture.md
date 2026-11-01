@@ -167,7 +167,7 @@ prompt、张量或活 receipt。`snapshot.host_task_times()` 只报告成功完�
 启动，未插桩的性能数字必须关闭它。Schema 5 保留原始打包行，不复制请求 ID 或
 decode 序号。Dummy 显式启用的快照在同一有界队列中存至多 32 KiB 原始张量
 字节；它们可能同步，并通过 `event.tensor()` 重建独立 CPU 值。
-`execution.trace.configure()` 或 `handle.observe()` 上的 `TraceSelection` 选择
+`execution.trace.configure()` 或 `handle.select_trace()` 上的 `TraceSelection` 选择
 原始 TaskId、请求身份、迭代与名字。张量与梯度捕获分别独立开启。数学用真实
 值或算出的梯度调用 `trace.observe`；trace 收集不做签名检查或自动梯度发现。
 ESamp 暴露源/目标/loss/参数梯度，Output LoRA 暴露最终 SGD 迭代的

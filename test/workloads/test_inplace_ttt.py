@@ -11,8 +11,8 @@ import pytest
 import torch
 
 import pllm
-from pllm import TensorUpdate, testing
-from pllm.authoring import StateTensorUpdate
+from pllm import UpdateOutput, testing
+from pllm.authoring import StateImport
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
     CapturedParameterOperand,
@@ -27,13 +27,13 @@ from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.overlay_task import ChunkUpdate
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
-from pllm.execution.step_input import TensorStepInput
+from pllm.execution.step_input import StepInput
 from pllm.testing import backend_facts
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
 from test.backend_facts import assert_finite_resources
 
 
-def _input(operands: tuple[CapturedParameterOperand, ...]) -> TensorStepInput:
+def _input(operands: tuple[CapturedParameterOperand, ...]) -> StepInput:
     selected = tuple(dict.fromkeys((operand.identity, operand.phase) for operand in operands))
     identities, phases = zip(*selected, strict=True) if selected else ((), ())
     return testing.step_input(identities, phases=phases, sampler_order=(), operands=operands)
@@ -130,7 +130,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
             torch.testing.assert_close(fields[4 * index], weight)
     assert execution.retire(identities, wait=True) == (latest, refs[1])
     diagnostics = execution.diagnostics()
-    assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
+    assert diagnostics.active_states == diagnostics.pending_state_releases == 0
     assert (diagnostics.update_count, diagnostics.trained_rows) == (2, 4)
 
     # A request-scope low-rank overlay shares the same signed binding, pin and isolation rules.
@@ -157,11 +157,11 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
             y: torch.Tensor = pllm.operand("target"),
             a: torch.Tensor = pllm.parameter("factors", "a"),
             b: torch.Tensor = pllm.parameter("factors", "b"),
-        ) -> TensorUpdate:
+        ) -> UpdateOutput:
             output = x @ (b @ a).T
             a.add_(0.1 * y.T @ x)
             b.add_(0.2 * y.T @ y)
-            return TensorUpdate(
+            return UpdateOutput(
                 output,
                 output.new_ones((), dtype=torch.bool),
                 output.new_ones((), dtype=torch.int64),
@@ -249,13 +249,13 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     ).execution
     prompts = (RequestIdentity("first", 0, 0), RequestIdentity("second", 1, 0))
     initial = imported.admit(prompts)
-    keys = tuple(RequestStateKey.project(identity, (RequestKeyField.PROMPT_IDX,)) for identity in prompts)
+    keys = tuple(RequestStateKey.project(identity, (RequestKeyField.PROMPT_INDEX,)) for identity in prompts)
     # Each prompt imports its externally produced factors on its own, at its own version.
     published = []
     for index, key in enumerate(keys):
-        update = StateTensorUpdate(tuple(tensor.unsqueeze(0) for tensor in generated), (key,))
+        update = StateImport(tuple(tensor.unsqueeze(0) for tensor in generated), (key,))
         publication = imported.step(
-            testing.step_input(prompts, phases=(HiddenPhase.PREFILL,) * 2, sampler_order=(), auxiliary=update)
+            testing.step_input(prompts, phases=(HiddenPhase.PREFILL,) * 2, sampler_order=(), batch=update)
         ).publication
         (ref,) = publication.after_refs
         assert ref.lineage_id == initial[index].lineage_id and ref.version_id == 1
@@ -266,14 +266,14 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
             assert all(not tensor.any() for tensor in imported.snapshot(initial[1]))
             # A staged batch does not import twice: the published version no longer matches.
             again = imported.step(
-                testing.step_input(prompts, phases=(HiddenPhase.PREFILL,) * 2, sampler_order=(), auxiliary=update)
+                testing.step_input(prompts, phases=(HiddenPhase.PREFILL,) * 2, sampler_order=(), batch=update)
             )
             assert again.publication is None
         published.append(ref)
     assert imported.retire(prompts, wait=True) == tuple(published)
     diagnostics = imported.diagnostics()
     assert diagnostics.update_count == 2
-    assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
+    assert diagnostics.active_states == diagnostics.pending_state_releases == 0
 
 
 def _check_headwise_math_and_tail():
@@ -425,7 +425,7 @@ def _check_projection_abort(execution, value, targets, binding, refs, operands, 
     for ref, expected in zip(refs, before, strict=True):
         torch.testing.assert_close(execution.snapshot(ref), expected)
     execution.retire(requests)
-    assert execution.diagnostics().active_lineages == 0
+    assert execution.diagnostics().active_states == 0
 
 
 def _check_causality_witness(workload, facts, requests, targets):
@@ -554,9 +554,9 @@ def _check_exact_additive_projection():
 def test_prefill_adapters_keep_prompt_chunks_across_scheduler_spans(span):
     from pllm.contracts.semantic_graph import AnchorId
     from pllm.execution.overlay_task import ProjectionTask
-    from pllm.workloads.prefill_adapters import TARGETS, PrefillAdapters
+    from pllm.workloads.prefill_adapters import TARGETS, PrefillAdaptersWorkload
 
-    workload = PrefillAdapters(chunk_size=3, rank=2, dtype=torch.float64)
+    workload = PrefillAdaptersWorkload(chunk_size=3, rank=2, dtype=torch.float64)
     facts = backend_facts(
         3,
         (),
@@ -632,14 +632,14 @@ def test_prefill_adapters_keep_prompt_chunks_across_scheduler_spans(span):
     assert execution.diagnostics().update_count == 4 * len(TARGETS)
     assert execution.diagnostics().trained_rows == len(x) * len(TARGETS)
     execution.retire(ids, wait=True)
-    assert execution.diagnostics().active_lineages == 0
+    assert execution.diagnostics().active_states == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph operand lifetime")
 def test_prompt_end_operand_stays_live_during_replay():
-    from pllm.workloads.prefill_adapters import TARGETS, PrefillAdapters
+    from pllm.workloads.prefill_adapters import TARGETS, PrefillAdaptersWorkload
 
-    workload = PrefillAdapters(chunk_size=3, rank=2, dtype=torch.float32)
+    workload = PrefillAdaptersWorkload(chunk_size=3, rank=2, dtype=torch.float32)
     math = workload.declaration(
         backend_facts(
             3,

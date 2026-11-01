@@ -52,7 +52,7 @@ _apply_updates.register_fake(_fake_updates)  # pyright: ignore[reportUnknownMemb
 
 
 @dataclass(frozen=True)
-class Taps:
+class LayerOutputs:
     """Post-layer residual streams indexed by absolute layer, negative from the model end."""
 
     values: tuple[torch.Tensor, ...]
@@ -70,7 +70,8 @@ class Taps:
 class Layers:
     """Public model slices and position state used inside layer_route methods."""
 
-    seed: torch.Tensor
+    # The hidden entering layer 0: the token embeddings.
+    embeddings: torch.Tensor
     position: torch.Tensor
     layer_count: int
     generated: torch.Tensor
@@ -96,31 +97,31 @@ class Layers:
 
     def __call__(
         self, start: int = 0, stop: int | None = None, hidden: torch.Tensor | None = None, *, kv: KV = "commit"
-    ) -> Taps:
+    ) -> LayerOutputs:
         """Commit causal K/V, or peek at earlier committed positions plus fresh own K/V.
 
         A peek leaves the cache untouched and requires an earlier commit to every
         layer in this slice within the same route.
         """
         stop = self.layer_count if stop is None else stop
-        value = self.seed if hidden is None else hidden
+        value = self.embeddings if hidden is None else hidden
         if (
             kv not in ("commit", "peek")
             or not 0 <= start < stop <= self.layer_count
             or (hidden is None and start != 0)
-            or value.shape != self.seed.shape
-            or value.dtype != self.seed.dtype
-            or value.device != self.seed.device
+            or value.shape != self.embeddings.shape
+            or value.dtype != self.embeddings.dtype
+            or value.device != self.embeddings.device
         ):
             raise ValueError(
                 "use 0 <= start < stop <= layer_count, kv in ('commit', 'peek'), "
                 "and supply a hidden tensor with the model shape, dtype and device when start > 0"
             )
-        return Taps(tuple(_layers(value, start, stop, kv)), start, self.layer_count)
+        return LayerOutputs(tuple(_layers(value, start, stop, kv)), start, self.layer_count)
 
     def apply_updates(self) -> None:
         """Apply operands captured since the previous boundary to this token's private overlay."""
-        _apply_updates(self.seed)
+        _apply_updates(self.embeddings)
 
 
 @dataclass(frozen=True)

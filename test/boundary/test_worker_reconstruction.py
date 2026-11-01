@@ -22,7 +22,7 @@ from pllm.worker import GPUWorker
 from pllm.workload_transport import decode_workload, encode_workload
 from pllm.workloads.dummy import DummyWorkload
 from pllm.workloads.override import OverRIDEWorkload
-from pllm.workloads.prefill_adapters import PrefillAdapters
+from pllm.workloads.prefill_adapters import PrefillAdaptersWorkload
 from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload
 from test.boundary.test_backend_attachment import overlay_facts
 
@@ -54,7 +54,7 @@ def test_workload_transport_round_trips_workloads_and_rejects_what_the_worker_ca
         DummyWorkload(),
         replace(OverRIDEWorkload(), objective=doubled_cross_entropy),
         HuberWorkload(3),
-        PrefillAdapters(dtype=torch.float64),
+        PrefillAdaptersWorkload(dtype=torch.float64),
     ):
         assert decode_workload(encode_workload(workload)) == workload
     restored = decode_workload(encode_workload(TemplateHolder(extra=FakeTemplate(2))))

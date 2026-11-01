@@ -41,7 +41,7 @@ class WeightedRowBatch(Generic[T]):
 
 
 @dataclass(frozen=True, slots=True)
-class StateTensorUpdate(Generic[T]):
+class StateImport(Generic[T]):
     """Original external tensors in the signed layout's field order."""
 
     schema: ClassVar[str] = "canonical.state_tensors@1"
@@ -63,12 +63,12 @@ class WeightedCEBatch(Generic[T]):
 
     @staticmethod
     def for_prompts(
-        hidden: U, base_logits: U, labels: U, weights: U, prompt_indices: tuple[int, ...], *, sample_idx: int = 0
+        hidden: U, base_logits: U, labels: U, weights: U, prompt_indices: tuple[int, ...], *, sample_index: int = 0
     ) -> "WeightedCEBatch[U]":
         """Key the adapter axis by the same prompt indices supplied to generate."""
         keys = tuple(
             RequestStateKey.project(
-                RequestIdentity("", index, sample_idx), (RequestKeyField.PROMPT_IDX, RequestKeyField.SAMPLE_IDX)
+                RequestIdentity("", index, sample_index), (RequestKeyField.PROMPT_INDEX, RequestKeyField.SAMPLE_INDEX)
             )
             for index in prompt_indices
         )
@@ -77,11 +77,11 @@ class WeightedCEBatch(Generic[T]):
         return WeightedCEBatch(hidden, base_logits, labels, weights, keys)
 
 
-AuxiliaryInput = CausalTrainBatch[T] | StateTensorUpdate[T] | WeightedCEBatch[T] | WeightedRowBatch[T]
+HostBatch = CausalTrainBatch[T] | StateImport[T] | WeightedCEBatch[T] | WeightedRowBatch[T]
 
 
-def validate_auxiliary(
-    value: AuxiliaryInput[T] | None,
+def validate_host_batch(
+    value: HostBatch[T] | None,
     graph: SemanticGraph,
     layouts: TensorLayoutRequest,
     timeline: SchedulerTimeline,
@@ -91,7 +91,7 @@ def validate_auxiliary(
     vocab_size: int,
     target_shape: tuple[int, ...] = (),
 ) -> None:
-    """Check a generate call's auxiliary input once, before export, mapping or device copies; tasks trust it.
+    """Check a generate call's host batch once, before export, mapping or device copies; tasks trust it.
 
     `target_shape` is the shape of each WeightedRowBatch row's target (HostConfig.target_shape).
     """
@@ -106,7 +106,9 @@ def validate_auxiliary(
         )
     )
     if not consumers:
-        raise ValueError("signed workload does not consume this auxiliary input")
+        raise ValueError(
+            f"this workload reads no {type(value).__name__}; pass batch=None or add a method that reads it"
+        )
 
     def shape(tensor: T) -> tuple[int, ...]:
         return describe(tensor).shape
@@ -169,7 +171,7 @@ def validate_auxiliary(
                     "dtype; set HostConfig(target_shape=...) to the shape of each row's target"
                 )
             actual = (features,)
-        case StateTensorUpdate():
+        case StateImport():
             # The bound import validates logical field views, including optimizer slices,
             # against local roots before allocating or publishing any writes.
             return
@@ -182,21 +184,21 @@ def validate_auxiliary(
             for dims, bounds in zip(actual, limit.input_shapes)
         ):
             raise ValueError(
-                f"{task.symbol}: auxiliary input shapes {list(actual)} exceed the planned {list(limit.input_shapes)}; "
-                "raise ExecutionOptions(training_rows=N) for more training rows per state, or "
+                f"{task.symbol}: host batch shapes {list(actual)} exceed the planned {list(limit.input_shapes)}; "
+                "raise ExecutionOptions(max_training_rows=N) for more training rows per state, or "
                 "HostConfig(max_input_rows=N) for a host workload"
             )
 
 
-def map_auxiliary(value: AuxiliaryInput[T] | None, convert: Callable[[T], U]) -> AuxiliaryInput[U] | None:
+def map_host_batch(value: HostBatch[T] | None, convert: Callable[[T], U]) -> HostBatch[U] | None:
     """Transform tensor storage without introducing a transport-specific input."""
     match value:
         case None:
             return None
         case CausalTrainBatch(input_ids=ids, labels=labels, attention_mask=mask):
             return CausalTrainBatch(convert(ids), convert(labels), None if mask is None else convert(mask))
-        case StateTensorUpdate(values=values, keys=keys):
-            return StateTensorUpdate(tuple(convert(item) for item in values), keys)
+        case StateImport(values=values, keys=keys):
+            return StateImport(tuple(convert(item) for item in values), keys)
         case WeightedCEBatch(hidden=hidden, base_logits=logits, labels=labels, weights=weights, keys=keys):
             return WeightedCEBatch(convert(hidden), convert(logits), convert(labels), convert(weights), keys)
         case WeightedRowBatch(hidden=hidden, targets=targets, weights=weights):

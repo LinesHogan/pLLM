@@ -16,7 +16,7 @@ from pllm.workloads import OutputLoRAConfig, OutputLoRAWorkload
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rank", type=int, default=4)
-    parser.add_argument("--training-rows", type=int, default=2)
+    parser.add_argument("--max-training-rows", type=int, default=2)
     parser.add_argument("--training-fraction", type=float, default=1.0)
     parser.add_argument("--scope", choices=("instance", "request", "both"), default="both")
     parser.add_argument(
@@ -27,12 +27,12 @@ def main() -> None:
         for scope in ("instance", "request"):
             subprocess.run([sys.executable, "-m", "tools.benchmark_lora", *sys.argv[1:], "--scope", scope], check=True)
         return
-    if args.training_rows < 1 or not 0 < args.training_fraction <= 1:
+    if args.max_training_rows < 1 or not 0 < args.training_fraction <= 1:
         parser.error("training rows must be positive and training fraction in (0, 1]")
     groups = options.batch if args.state_groups is None else args.state_groups
     if not 1 <= groups <= options.batch:
         parser.error("state groups must be between one and the request batch size")
-    active = ceil(args.training_rows * args.training_fraction)
+    active = ceil(args.max_training_rows * args.training_fraction)
     for scope in (pllm.state.StateScope.INSTANCE, pllm.state.StateScope.REQUEST):
         if args.scope not in ("both", scope.value):
             continue
@@ -45,12 +45,16 @@ def main() -> None:
         print(f"Output LoRA scope: {scope.value}")
 
         def prepare(hidden_size: int, vocab_size: int, device: torch.device) -> pllm.host.WeightedCEBatch[torch.Tensor]:
-            shape = (states, args.training_rows) if scope is pllm.state.StateScope.REQUEST else (args.training_rows,)
+            shape = (
+                (states, args.max_training_rows)
+                if scope is pllm.state.StateScope.REQUEST
+                else (args.max_training_rows,)
+            )
             generator = torch.Generator(device=device).manual_seed(7)
             hidden = torch.randn((*shape, hidden_size), device=device, generator=generator)
             logits = torch.zeros((*shape, vocab_size), device=device)
             labels = torch.zeros(shape, device=device, dtype=torch.long)
-            weights = (torch.arange(args.training_rows, device=device) < active).float().expand(shape)
+            weights = (torch.arange(args.max_training_rows, device=device) < active).float().expand(shape)
             return (
                 pllm.host.WeightedCEBatch.for_prompts(hidden, logits, labels, weights, tuple(range(states)))
                 if scope is pllm.state.StateScope.REQUEST
@@ -59,13 +63,13 @@ def main() -> None:
 
         config = OutputLoRAConfig(rank=args.rank, steps=2, scope=scope)
         print(
-            f"rank={config.rank}, training_rows={args.training_rows}, active_rows={active}, steps={config.steps}, state_groups={states}"
+            f"rank={config.rank}, max_training_rows={args.max_training_rows}, active_rows={active}, steps={config.steps}, state_groups={states}"
         )
         compare(
             OutputLoRAWorkload(config),
             replace(options, profile=None if options.profile is None else options.profile / scope.value),
             prepare=lambda handle: prepare(handle.hidden_size, handle.vocab_size, handle.device),
-            training_rows=args.training_rows,
+            max_training_rows=args.max_training_rows,
             require_training=True,
             prompt_indices=indices,
         )

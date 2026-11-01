@@ -39,14 +39,13 @@ def head_logits(hidden: torch.Tensor, down: torch.Tensor, up: torch.Tensor, indi
 
 
 HIDDEN = pllm.hidden(-1, site=pllm.model.HiddenSite.MODEL_OUTPUT)
-SAMPLES = pllm.samples(pllm.Config("config.num_iterations"))
+SAMPLES = pllm.sample_index(pllm.Config("config.num_iterations"))
 DOWN = pllm.parameter("iteration_heads", "down")
 UP = pllm.parameter("iteration_heads", "up")
 
 
 @dataclass(frozen=True, slots=True)
 class OverRIDEWorkload(pllm.Workload):
-    name = "override"
     config: OverRIDEConfig = OverRIDEConfig()
     objective: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = cross_entropy
 
@@ -64,7 +63,6 @@ class OverRIDEWorkload(pllm.Workload):
             },
             optimizer=pllm.AdamW(lr=config.learning_rate),
             initialize=initialize,
-            namespace="canonical.iteration_heads@1",
         )
 
     @pllm.add_logits()

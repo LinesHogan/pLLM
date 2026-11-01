@@ -26,7 +26,7 @@ from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
 from pllm.execution.runtime_facts import model_timeline
-from pllm.execution.step_input import TensorStepInput
+from pllm.execution.step_input import StepInput
 from pllm.execution.tensor_task import TensorTask
 from pllm.testing import backend_facts
 from test.workloads.test_esamp import _esamp_native_oracle, _ordinary_request_distillation
@@ -94,7 +94,7 @@ def mean_capture(publish_lag: int = 0) -> None:
             tuple(PackedPhaseRow(i, i, step, HiddenPhase.DECODE, RequestIdentity(str(i), i, 0)) for i in range(count)),
         )
         sampler = PackedSamplerRowBatch(rows, tuple(PackedSamplerRowLink(i, i) for i in range(count)))
-        value = TensorStepInput(
+        value = StepInput(
             rows,
             sampler,
             HiddenRowBatch(rows, (HiddenRows(resource, hidden, np.arange(count, dtype=np.int64)),)),

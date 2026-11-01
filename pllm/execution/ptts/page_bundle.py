@@ -298,7 +298,7 @@ class PageBundleArena:
         return self._owned_resources
 
     @property
-    def active_lineages(self) -> int:
+    def active_states(self) -> int:
         self.collect_completed()
         return sum(int(np.count_nonzero(table.status >= 2)) for table in self._tables.values())
 

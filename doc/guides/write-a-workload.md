@@ -25,13 +25,13 @@ class MyProbe(pllm.Workload):
 
 这就是全部——没有 register、没有 hook 句柄、没有运行时回调。逐个问题看：
 
-**什么时候运行**：每个效果有默认时机——导出在 `OBSERVE`，采样引导在
+**什么时候运行**：每个效果有默认时机——导出在 `AFTER_FORWARD`，采样引导在
 `BEFORE_SAMPLE`，训练在采样之后。要改时机，或方法没有效果时，加
-`@pllm.on(phase)`。`Phase` 是时间轴上的窗口（`OBSERVE`、`BEFORE_SAMPLE`、
-`AFTER_SAMPLE`、`MODEL_UPDATE` 等），不是运行时钩子：你在声明"这段数学属于
+`@pllm.on(phase)`。`Phase` 是时间轴上的窗口（`AFTER_FORWARD`、`BEFORE_SAMPLE`、
+`AFTER_SAMPLE`、`IN_FORWARD` 等），不是运行时钩子：你在声明"这段数学属于
 这个窗口"，调度由引擎决定。
 
-**数据从哪来**，由参数默认值回答：`pllm.hidden(layer)`、`pllm.samples()`、
+**数据从哪来**，由参数默认值回答：`pllm.hidden(layer)`、`pllm.sample_index()`、
 `pllm.parameter(state, field)`、`pllm.module(state)`、`pllm.index(state)`、
 `pllm.version(state)`、`pllm.result(operation)` 等。每个张量参数都要写明来源，
 类型注解只说明方法体拿到的值是什么。

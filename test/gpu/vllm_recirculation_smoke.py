@@ -19,7 +19,7 @@ import pllm
 from pllm.backends.vllm import runtime
 from pllm.backends.vllm.replay import RouteWave, VllmTokenwiseReplay
 from pllm.config import ModelConfig
-from pllm.workloads.recirculation import JacobiRecirculation, RecirculationWorkload
+from pllm.workloads.recirculation import JacobiRecirculationWorkload, RecirculationWorkload
 
 
 def replay_handle(
@@ -197,7 +197,7 @@ def main():
         assert all(value == tokens[0] for value in tokens)
         assert 2 in checked and len(numerical) == 2 * sum(checked)
         diagnostics = handle.diagnostics()
-        assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
+        assert diagnostics.active_states == diagnostics.pending_state_releases == 0
         print(f"recirculation waves={len(checked)} same-width native layer comparisons={len(numerical)}")
     finally:
         handle.close()
@@ -260,7 +260,7 @@ def jacobi_evidence():
     assert len(ids) == 256
     for rounds in (0, 1, 2, 3):
         handle = replay_handle(
-            RecirculationWorkload() if rounds == 0 else JacobiRecirculation(rounds=rounds),
+            RecirculationWorkload() if rounds == 0 else JacobiRecirculationWorkload(rounds=rounds),
             length=320,
             batch=8,
             budget=2048,

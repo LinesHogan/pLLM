@@ -27,7 +27,6 @@ def hidden_rows(hidden: torch.Tensor) -> torch.Tensor:
 
 @dataclass(frozen=True, slots=True)
 class DummyWorkload(pllm.Workload):
-    name = "dummy"
     config: DummyConfig = DummyConfig()
     transform: Callable[[torch.Tensor], torch.Tensor] = hidden_rows
     export_name: str = "hidden_rows"

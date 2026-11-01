@@ -10,11 +10,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from pllm.contracts.auxiliary import (
-    CausalTrainBatch as CausalTrainBatch,
-    WeightedCEBatch as WeightedCEBatch,
-    WeightedRowBatch as WeightedRowBatch,
-)
 from pllm.contracts.feedback import (
     BarrierState as BarrierState,
     Completion as Completion,
@@ -26,18 +21,23 @@ from pllm.contracts.feedback import (
     RewardOutcome as RewardOutcome,
     UpdateBarrier as UpdateBarrier,
 )
+from pllm.contracts.host_batch import (
+    CausalTrainBatch as CausalTrainBatch,
+    WeightedCEBatch as WeightedCEBatch,
+    WeightedRowBatch as WeightedRowBatch,
+)
 from pllm.execution.host_runtime import CompletionInput as CompletionInput, HostConfig as HostConfig
 
 if TYPE_CHECKING:
     from pllm.execution.state_execution import StateExecution
-    from pllm.execution.step_input import TensorStepInput
+    from pllm.execution.step_input import StepInput
     from pllm.execution.tensor_binding import TensorOutput
     from pllm.execution.tensor_frame import TensorFrame
     from pllm.usage import Workload
 
 
-def make_host(config: HostConfig, workload: Workload) -> StateExecution[TensorStepInput, TensorFrame, TensorOutput]:
-    """Compile `workload` without a model; each `step(TensorStepInput.of_batch(batch))` trains on one host batch.
+def make_host(config: HostConfig, workload: Workload) -> StateExecution[StepInput, TensorFrame, TensorOutput]:
+    """Compile `workload` without a model; each `step(StepInput.of_batch(batch))` trains on one host batch.
 
     Admit the instance state with `admit(())` before the first step and release it with `retire(())`.
     """

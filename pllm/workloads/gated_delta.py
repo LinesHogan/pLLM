@@ -53,7 +53,6 @@ class GatedDeltaWorkload(pllm.Workload):
                     ),
                 ),
             },
-            namespace="gated_delta.fast_weight.state@1",
         )
 
     @pllm.overlay(

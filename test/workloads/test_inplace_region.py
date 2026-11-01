@@ -109,7 +109,7 @@ def test_bound_scan_matches_original_chunk_math_bitwise(device, dtype, numerics)
         for a, b in zip(execution.snapshot(ref, stream), reference, strict=True):
             torch.testing.assert_close(a, b, **tolerance)
     execution.retire((identity,))
-    assert execution.arena.active_lineages == 0
+    assert execution.arena.active_states == 0
 
 
 def test_production_tuning_policy_is_signed_into_worker_facts():
