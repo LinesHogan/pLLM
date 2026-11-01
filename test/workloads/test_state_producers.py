@@ -8,9 +8,10 @@ from torch.nn import functional as F
 
 import pllm
 from pllm import testing
+from pllm.backends.vllm.architecture import hidden_binding
 from pllm.contracts.backend_attachment import AttachmentHiddenResource
 from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.parameter_overlay import ParameterTargetShape
+from pllm.contracts.parameter_overlay import ProjectionShape
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId, StateResource
 from pllm.contracts.state_representation import StateDeviceKind
@@ -41,7 +42,7 @@ def deployment(workload, device=torch.device("cpu")):
         memory_bytes=1 << 20,
         max_rows=8,
         layer_count=10,
-        targets=tuple(ParameterTargetShape(t, 4, o) for t, o in zip(TARGETS, (4, 2), strict=True)),
+        targets=tuple(ProjectionShape(t, 4, o) for t, o in zip(TARGETS, (4, 2), strict=True)),
     )
     facts = replace(
         facts,
@@ -50,7 +51,7 @@ def deployment(workload, device=torch.device("cpu")):
             hidden_resources=tuple(
                 sorted(
                     (
-                        AttachmentHiddenResource(testing.hidden_binding(h.layer, h.site, 10), h.phase)
+                        AttachmentHiddenResource(hidden_binding(h.layer, h.site, 10), h.phase)
                         for h in workload.backend_requirements().hidden_inputs
                     ),
                     key=lambda r: r.resource_key,
@@ -63,7 +64,7 @@ def deployment(workload, device=torch.device("cpu")):
 
 def packed(identities, hidden, phases, lengths=(1, 1), *, offset=0, stream=None):
     value = testing.step_input(
-        identities, hidden, phases=phases, sampler_order=(1, 0), token_offset=offset, stream=stream
+        identities, hidden, tokens=phases, sampler_order=(1, 0), token_offset=offset, stream=stream
     )
     rows = replace(
         value.rows,
@@ -89,7 +90,7 @@ def test_prompt_producers_publish_only_completed_requests(workload, device, leng
     execution.admit((), stream=stream)
     initial = execution.admit(identities, stream=stream)
     context = torch.tensor([[0.2, -0.4, 0.1, 0.7], [-0.6, 0.3, 0.8, -0.2]], device=device)
-    tap = testing.hidden_binding(8, pllm.model.HiddenSite.BLOCK_OUTPUT, layer_count=10)
+    tap = testing.hidden_binding(8, layer_count=10)
     for offset in range(0, length - 1, 128):
         testing.run_step(
             execution,
@@ -177,8 +178,8 @@ def test_decode_adam_matches_independent_optimizer_and_keeps_entry_pin(device):
     loss.backward()
     optimizer.step()
     hidden = {
-        testing.hidden_binding(0, pllm.model.HiddenSite.BLOCK_OUTPUT, layer_count=10): x.expand(2, -1),
-        testing.hidden_binding(9, pllm.model.HiddenSite.BLOCK_OUTPUT, layer_count=10): target.expand(2, -1),
+        testing.hidden_binding(0, layer_count=10): x.expand(2, -1),
+        testing.hidden_binding(9, layer_count=10): target.expand(2, -1),
     }
     result = testing.run_step(
         execution, packed(ids, hidden, (HiddenPhase.DECODE, HiddenPhase.PREFILL), stream=stream), stream=stream
@@ -310,7 +311,7 @@ def test_initialized_reader_and_hidden_before_model_boundary():
                 (),
                 model_timeline(torch.device("cpu")),
                 None,
-                targets=tuple(ParameterTargetShape(target, 4, 4) for target in TARGETS),
+                targets=tuple(ProjectionShape(target, 4, 4) for target in TARGETS),
             )
         )
 

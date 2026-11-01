@@ -36,7 +36,7 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.binding_base import SGD
-from pllm.execution.declaration import Call, Dimensions, Field, Shape, State, When, native
+from pllm.execution.declaration import Call, Dimensions, LayoutField, Shape, State, When, native
 from pllm.execution.ptts.page_borrow import borrowed_root
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.tensor_frame import (
@@ -190,13 +190,13 @@ def sampled_token_port() -> TensorPort:
 def declare_parameters(
     b: TensorBinding,
     name: str,
-    fields: tuple[Field, ...],
+    fields: tuple[LayoutField, ...],
     *,
     optimizer: AdamWConfig | SGD | None,
     initialize: Callable[[Tensors, torch.Generator], None] | None = None,
     scope: StateScope = StateScope.INSTANCE,
     keys: tuple[RequestKeyField, ...] = (RequestKeyField.REQUEST_ID,),
-    carry: tuple[Field, ...] = (),
+    carry: tuple[LayoutField, ...] = (),
 ) -> tuple[State, dict[str, TensorPort]]:
     """Allocate a state and expose a tensor port per field.
 
@@ -211,7 +211,7 @@ def declare_parameters(
         def size(model: Dimensions) -> tuple[int]:
             return (sum(prod(shape(model) if callable(shape) else shape) for shape in shapes.values()),)
 
-        fields = (Field("parameters", size, dtype, first.alignment),)
+        fields = (LayoutField("parameters", size, dtype, first.alignment),)
     state = b.state(
         name,
         fields,

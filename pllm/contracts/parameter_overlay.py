@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from math import prod
-from typing import Self
+from typing import Literal, Self, get_args
 
 import torch
 
@@ -15,41 +15,41 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.tensor_layout import LayoutFieldId
 
 
-class ParameterModuleKind(StrEnum):
-    ATTENTION = "attention"
-    MLP = "mlp"
-
-
-class ParameterRole(StrEnum):
-    DOWN_PROJECTION_WEIGHT = "down_projection_weight"
-    QUERY_PROJECTION_WEIGHT = "query_projection_weight"
-    VALUE_PROJECTION_WEIGHT = "value_projection_weight"
-
-
 class ParameterOverlayOperator(StrEnum):
     DENSE_ADD = "dense_add"
     LOW_RANK_ADD = "low_rank_add"
     HEAD_ADD = "head_add"
 
 
-@dataclass(frozen=True, slots=True, order=True)
-class ParameterTarget:
-    layer: int | None
-    module: ParameterModuleKind
-    role: ParameterRole
+# Hugging Face module names of the projections pllm can adapt, in their order inside one decoder layer.
+ProjectionName = Literal["q_proj", "v_proj", "down_proj"]
+_PROJECTION_ORDER: tuple[ProjectionName, ...] = get_args(ProjectionName)
+
+
+@dataclass(frozen=True, slots=True)
+class Projection:
+    """One linear projection of the base model by its Hugging Face module name; `layer=None` means every layer."""
+
+    name: ProjectionName
+    layer: int | None = None
 
     def __post_init__(self) -> None:
-        if self.layer is not None and self.layer < 0:
-            raise ValueError("parameter target layer must be resolved and non-negative")
+        if self.name not in _PROJECTION_ORDER or self.layer is not None and self.layer < 0:
+            raise ValueError(f"Projection needs name in {_PROJECTION_ORDER} and layer >= 0 or None; got {self}")
+
+    def __lt__(self, other: Projection) -> bool:
+        """Model order: by layer, then q_proj, v_proj, down_proj within a layer."""
+        assert self.layer is not None and other.layer is not None
+        return (self.layer, _PROJECTION_ORDER.index(self.name)) < (other.layer, _PROJECTION_ORDER.index(other.name))
 
 
-def expand_targets(targets: tuple[ParameterTarget, ...], layers: int) -> tuple[ParameterTarget, ...]:
+def expand_targets(targets: tuple[Projection, ...], layers: int) -> tuple[Projection, ...]:
     """Resolve layer=None declarations against the loaded model, in projection order."""
     if all(target.layer is not None for target in targets):
         return targets
     return tuple(
         sorted(
-            ParameterTarget(layer, target.module, target.role)
+            Projection(target.name, layer)
             for target in targets
             for layer in (range(layers) if target.layer is None else (target.layer,))
         )
@@ -57,8 +57,8 @@ def expand_targets(targets: tuple[ParameterTarget, ...], layers: int) -> tuple[P
 
 
 @dataclass(frozen=True, slots=True)
-class ParameterTargetShape:
-    target: ParameterTarget
+class ProjectionShape:
+    target: Projection
     input_size: int
     output_size: int
 
@@ -83,7 +83,7 @@ class FieldView:
 
 @dataclass(frozen=True, slots=True)
 class ParameterOverlayFieldBinding:
-    target: ParameterTarget
+    target: Projection
     operator: ParameterOverlayOperator
     fields: tuple[FieldView, ...]
     resource: str
@@ -97,7 +97,7 @@ class CapturedParameterOperand:
     """Projection tensors and a scalar prompt-end fact, live through captured replay."""
 
     identity: RequestIdentity
-    target: ParameterTarget
+    target: Projection
     phase: HiddenPhase
     hidden: torch.Tensor
     desired: torch.Tensor
@@ -110,7 +110,7 @@ class ProjectionDelta:
     """Apply request state at original model projections."""
 
     state: str
-    targets: tuple[ParameterTarget, ...]
+    targets: tuple[Projection, ...]
     weight: str = "value"
     operator: ParameterOverlayOperator = ParameterOverlayOperator.DENSE_ADD
     factors: tuple[str, str] = ("a", "b")
@@ -144,10 +144,8 @@ class ProjectionDelta:
 
 __all__ = [
     "ProjectionDelta",
-    "ParameterModuleKind",
     "ParameterOverlayFieldBinding",
     "ParameterOverlayOperator",
-    "ParameterRole",
-    "ParameterTarget",
+    "Projection",
     "CapturedParameterOperand",
 ]

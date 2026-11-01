@@ -1,7 +1,7 @@
 """Prefill adapters: each request learns low-rank MLP adapters chunk by chunk while its prompt is read.
 
 The adapter of a layer is trained to reconstruct that layer's MLP input from the down projection; later
-chunks of the same prompt already use the update from earlier chunks (Exact visibility), and decode uses
+chunks of the same prompt already use the update from earlier chunks (visibility="exact"), and decode uses
 the adapter the prompt ended with.
 """
 
@@ -12,12 +12,7 @@ import torch
 
 import pllm
 
-TARGETS = tuple(
-    pllm.model.ParameterTarget(
-        layer, pllm.model.ParameterModuleKind.MLP, pllm.model.ParameterRole.DOWN_PROJECTION_WEIGHT
-    )
-    for layer in (0, 2, 4, 6, 8)
-)
+TARGETS = tuple(pllm.model.Projection("down_proj", layer) for layer in (0, 2, 4, 6, 8))
 
 
 def initialize(fields: Mapping[str, torch.Tensor], generator: torch.Generator) -> None:
@@ -39,8 +34,8 @@ class PrefillAdaptersWorkload(pllm.Workload):
     def adapters(self) -> pllm.RequestState:
         return pllm.RequestState(
             {
-                "a": pllm.Buffer(lambda inputs, outputs: (self.rank, inputs), dtype=self.dtype),
-                "b": pllm.Buffer(lambda inputs, outputs: (outputs, self.rank), dtype=self.dtype),
+                "a": pllm.Field(lambda in_features, out_features: (self.rank, in_features), dtype=self.dtype),
+                "b": pllm.Field(lambda in_features, out_features: (out_features, self.rank), dtype=self.dtype),
             },
             initialize=initialize,
             # Apply the mean reconstruction gradient once per prompt chunk.
@@ -50,9 +45,9 @@ class PrefillAdaptersWorkload(pllm.Workload):
     @pllm.train_in_forward(
         state="adapters",
         targets=TARGETS,
-        operator=pllm.model.ParameterOverlayOperator.LOW_RANK_ADD,
-        visibility=pllm.Exact(),
-        chunk=pllm.Config("chunk_size"),
+        operator="low_rank",
+        visibility="exact",
+        chunk=pllm.Attr("chunk_size"),
         flush="prompt_end",
     )
     def learn(

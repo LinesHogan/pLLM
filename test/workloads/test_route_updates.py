@@ -1,6 +1,7 @@
 """Routed overlay reads and explicit boundaries reuse one private root and one publication."""
 
 from dataclasses import dataclass, replace
+from typing import Literal
 from unittest.mock import patch
 
 import pytest
@@ -10,10 +11,8 @@ import pllm
 from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.parameter_overlay import (
     CapturedParameterOperand,
-    ParameterModuleKind,
-    ParameterRole,
-    ParameterTarget,
-    ParameterTargetShape,
+    Projection,
+    ProjectionShape,
 )
 from pllm.contracts.semantic_graph import AnchorId
 from pllm.contracts.state_representation import StateDeviceKind
@@ -23,11 +22,11 @@ from pllm.execution.runtime_facts import model_timeline
 from test.backend_facts import assert_finite_resources
 from test.workloads.test_recirculation import FACTS, IDENTITIES, INPUTS, ROWS, VALUE, Decoder
 
-TARGET = ParameterTarget(1, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT)
+TARGET = Projection("down_proj", 1)
 CAPABILITIES = tuple(sorted(("model/tokenwise_replay@1", "transition/full_root@1", "state/fenced_reclaim@1")))
 ROUTE_FACTS = replace(
     FACTS,
-    probe=replace(FACTS.probe, capabilities=CAPABILITIES, targets=(ParameterTargetShape(TARGET, 4, 4),)),
+    probe=replace(FACTS.probe, capabilities=CAPABILITIES, targets=(ProjectionShape(TARGET, 4, 4),)),
     timeline=model_timeline(torch.device("cpu"), CAPABILITIES),
     providers=(PageBundleProviderFacts("test.route@1", 16, StateDeviceKind.CPU),),
     state_memory_budget_bytes=1 << 20,
@@ -36,7 +35,7 @@ ROUTE_FACTS = replace(
 
 @dataclass(frozen=True)
 class Updating(pllm.Workload):
-    visibility: pllm.Visibility = pllm.Visibility.forward_pinned()
+    visibility: Literal["forward_pinned", "exact"] = "forward_pinned"
     boundaries: int = 1
     visits: int = 1
     empty: bool = False
@@ -45,10 +44,10 @@ class Updating(pllm.Workload):
 
     @property
     def weights(self) -> pllm.RequestState:
-        return pllm.RequestState({"delta": pllm.Buffer((4, 4)), "tail": pllm.Buffer((), dtype=torch.int64)})
+        return pllm.RequestState({"delta": pllm.Field((4, 4)), "tail": pllm.Field((), dtype=torch.int64)})
 
     @pllm.train_in_forward(
-        state="weights", targets=(TARGET,), weight="delta", tokens="all", visibility=pllm.Config("visibility")
+        state="weights", targets=(TARGET,), weight="delta", tokens="all", visibility=pllm.Attr("visibility")
     )
     def transition(
         self,
@@ -104,7 +103,7 @@ def oracle(workload):
     for row in ROWS.rows:
         request, position = row.request_ordinal, row.token_offset
         routed = workload.tokens == "all" or row.phase.value == workload.tokens
-        visible = fields[request].clone() if workload.visibility == pllm.Exact() else torch.zeros(4, 4)
+        visible = fields[request].clone() if workload.visibility == "exact" else torch.zeros(4, 4)
         pending = []
 
         def layer(ordinal, hidden):
@@ -113,7 +112,7 @@ def oracle(workload):
             base = (hidden * (ordinal + 1) * 0.8 + previous * 0.6).tanh()
             if ordinal == 1:
                 result = base + hidden @ visible.T
-                if not routed and workload.visibility == pllm.Exact():
+                if not routed and workload.visibility == "exact":
                     fields[request] += torch.outer(base, hidden) + 0.01
                     tails[request] += 1
                 else:
@@ -151,10 +150,10 @@ def oracle(workload):
 @pytest.mark.parametrize(
     "boundaries,visits,empty,visibility",
     [
-        (0, 1, False, pllm.Visibility.forward_pinned()),
-        (1, 1, False, pllm.Visibility.forward_pinned()),
-        (2, 2, True, pllm.Visibility.forward_pinned()),
-        (2, 2, True, pllm.Exact()),
+        (0, 1, False, "forward_pinned"),
+        (1, 1, False, "forward_pinned"),
+        (2, 2, True, "forward_pinned"),
+        (2, 2, True, "exact"),
     ],
 )
 @pytest.mark.parametrize("tokens", ("all", "prefill", "decode"))

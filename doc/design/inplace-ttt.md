@@ -11,16 +11,10 @@ from pllm.workloads.inplace_ttt import (
     InPlaceTTTConfig, InPlaceTTTWorkload,
 )
 from pllm import ModelConfig
-from pllm.contracts.parameter_overlay import (
-    ParameterModuleKind, ParameterRole, ParameterTarget,
-)
+from pllm.model import Projection
 
 workload = InPlaceTTTWorkload(InPlaceTTTConfig(
-    targets=(ParameterTarget(
-        0,
-        ParameterModuleKind.MLP,
-        ParameterRole.DOWN_PROJECTION_WEIGHT,
-    ),),
+    targets=(Projection("down_proj", 0),),
     chunk_size=4096,
     learning_rate=1e-3,
     tokens="prefill",
@@ -33,7 +27,7 @@ with pllm.make_llm(ModelConfig("Qwen/Qwen2.5-0.5B-Instruct"), workload=workload)
 target 的 delta 权重与固定尾部缓冲。完整块以当前有效权重发射，然后应用
 `delta += lr * target.T @ hidden`；不完整的行留在不可变的 next 根里。仅尾部的
 迁移推进 PTTS 状态，但不伪造参数发布。权重变化时，一次原子发布把所有 target
-字段绑定暴露为 `DENSE_ADD`。
+字段绑定暴露为 `"dense"`。
 
 eager MRv2 适配器从不修改模型参数，也不拥有版本表。它 pin 住精确的 PTTS 根，
 只对签名打包行加 `F.linear(hidden, delta)`，捕获真实的 MLP/down 投影操作数对，

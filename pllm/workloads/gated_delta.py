@@ -13,13 +13,13 @@ import pllm
 class GatedDeltaConfig:
     """Chunk-level gated delta rule with constant, untrained gates."""
 
-    targets: tuple[pllm.model.ParameterTarget, ...]
+    targets: tuple[pllm.model.Projection, ...]
     head_width: int = 64
     chunk_size: int = 64
     alpha: float = 0.99
     beta: float = 0.1
     tokens: Literal["prefill", "decode", "all"] = "prefill"  # whose projection operands train the state
-    visibility: pllm.Visibility = pllm.Exact()
+    visibility: Literal["forward_pinned", "exact"] = "exact"
 
     def __post_init__(self) -> None:
         if (
@@ -46,9 +46,9 @@ class GatedDeltaWorkload(pllm.Workload):
         """Declare fp32 head weights for each request."""
         return pllm.RequestState(
             {
-                "weights": pllm.Buffer(
-                    lambda inputs, outputs: (
-                        inputs // self.config.head_width,
+                "weights": pllm.Field(
+                    lambda in_features, out_features: (
+                        in_features // self.config.head_width,
                         self.config.head_width,
                         self.config.head_width,
                     ),
@@ -57,13 +57,13 @@ class GatedDeltaWorkload(pllm.Workload):
         )
 
     @pllm.train_in_forward(
-        visibility=pllm.Config("config.visibility"),
+        visibility=pllm.Attr("config.visibility"),
         state="fast_weights",
-        targets=pllm.Config("config.targets"),
+        targets=pllm.Attr("config.targets"),
         weight="weights",
-        chunk=pllm.Config("config.chunk_size"),
-        operator=pllm.model.ParameterOverlayOperator.HEAD_ADD,
-        tokens=pllm.Config("config.tokens"),
+        chunk=pllm.Attr("config.chunk_size"),
+        operator="per_head",
+        tokens=pllm.Attr("config.tokens"),
     )
     def step(
         self,

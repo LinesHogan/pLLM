@@ -11,18 +11,16 @@ import pllm
 from pllm.authoring import StateImport
 from pllm.backends.vllm.activation import activation_delta
 from pllm.contracts.backend_attachment import (
-    ActivationPatchOperator,
     AttachmentGraphMode,
     BackendPlacementProbe,
     DecodeRefresh,
     DecodeWindow,
-    MissingPolicy,
 )
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
-from pllm.contracts.semantic_graph import AnchorId, StateScope
+from pllm.contracts.semantic_graph import AnchorId
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.compile_facts import BackendCompileFacts
@@ -147,14 +145,10 @@ def _decode_low_rank_keeps_parameters_and_recomputes_delta(
 
 
 def _decode_declarations_are_checked(facts):
-    legacy = pllm.model.ActivationPatch("intervention", (0,), 1, 1, ActivationPatchOperator.ADD)
-    assert (legacy.decode, legacy.decode_refresh, legacy.on_missing) == (
-        DecodeWindow.NONE,
-        DecodeRefresh.INHERIT,
-        MissingPolicy.STOP,
-    )
+    legacy = pllm.model.ActivationPatch("intervention", (0,), 1, 1, "add")
+    assert (legacy.decode, legacy.refresh, legacy.on_missing) == (False, "admission", "stop")
     with pytest.raises(ValueError):  # Refresh is meaningless while the decode window is off.
-        replace(legacy, decode_refresh=DecodeRefresh.STEP)
+        replace(legacy, refresh="step")
 
     @dataclass(frozen=True)
     class DeclaredActivation(pllm.Workload):
@@ -162,18 +156,16 @@ def _decode_declarations_are_checked(facts):
 
         @property
         def intervention(self) -> pllm.InstanceState:
-            return pllm.InstanceState({"delta": pllm.Buffer((4,), dtype=torch.float32)}, imported=True)
+            return pllm.InstanceState({"delta": pllm.Field((4,), dtype=torch.float32)}, imported=True)
 
-    workload = DeclaredActivation(replace(legacy, decode=DecodeWindow.ALL, on_missing=MissingPolicy.HOLD))
+    workload = DeclaredActivation(replace(legacy, decode=True, on_missing="hold"))
     workload.plan_backend(*workload.specialize(facts, pllm.ExecutionOptions()))
 
 
 def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:
     from pllm.backends.vllm.activation import VllmActivationPatch
 
-    config = ReFTConfig(
-        (0,), first_tokens=0, last_tokens=1, operator=ActivationPatchOperator.ADD, scope=StateScope.REQUEST
-    )
+    config = ReFTConfig((0,), first_tokens=0, last_tokens=1, operator="add", scope="request")
     deployment = ReFTWorkload(config).compile_backend(facts)
     execution = deployment.execution
     identities = (RequestIdentity("a", 7, 1), RequestIdentity("b", 9, 1))

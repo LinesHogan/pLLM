@@ -27,7 +27,7 @@ from pllm.contracts.state_feed import FeedBinding, FeedOrder
 from pllm.contracts.state_ref import LineageId, StateRef, VersionId
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.backend_attachment import attachment_buffer_bytes, bind_backend_attachment
-from pllm.execution.declaration import Dimensions, Field, When
+from pllm.execution.declaration import Dimensions, LayoutField, When
 from pllm.execution.ptts.page_borrow import BorrowedPage, BorrowedStateRoot, PageFieldTransfer
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
@@ -48,12 +48,15 @@ from pllm.testing import backend_facts, step_input
 def binding_case(*, alias=False, write_failure=False, runtime=False, missing=None):
     b = TensorBinding("video.binding", "a" * 64, Dimensions(2, 0))
     features, ports = declare_parameters(
-        b, "features", tuple(Field(name, (2,)) for name in ("qp", "residual", "mv", "segmentation")), optimizer=None
+        b,
+        "features",
+        tuple(LayoutField(name, (2,)) for name in ("qp", "residual", "mv", "segmentation")),
+        optimizer=None,
     )
     encoded = declare_tensor(b, "encode", inputs=ports, when=When.BEFORE_FORWARD)(
         lambda **values: values["qp"] if alias else sum(values.values())
     )
-    inject = b.state("inject", (Field("delta", (2,)),))
+    inject = b.state("inject", (LayoutField("delta", (2,)),))
 
     def write(data, batch):
         if write_failure:

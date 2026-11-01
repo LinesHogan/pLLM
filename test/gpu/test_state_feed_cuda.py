@@ -65,9 +65,7 @@ def join_producer(process, receiver, execution):
     assert process.exitcode == 0
 
 
-@pytest.mark.parametrize(
-    "order,versions", [(pllm.state.FeedOrder.ORDERED, (1, 2, 3, 4)), (pllm.state.FeedOrder.LATEST, (3, 4))]
-)
+@pytest.mark.parametrize("order,versions", [("ordered", (1, 2, 3, 4)), ("latest", (3, 4))])
 def test_feed_selects_complete_versions_and_reclaims_only_after_completion(order, versions):
     execution, receiver = setup_feed(FeedWorkload(order))
     context = mp.get_context("spawn")

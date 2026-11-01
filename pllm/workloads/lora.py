@@ -7,6 +7,7 @@ batches arrive as `pllm.host.WeightedCEBatch` inputs; pllm runs the SGD steps an
 from collections.abc import Callable
 from dataclasses import dataclass
 from math import isfinite
+from typing import Literal
 
 import torch
 from torch.nn import functional as F
@@ -21,10 +22,11 @@ class OutputLoRAConfig:
     learning_rate: float = 1e-3
     steps: int = 1
     seed: int = 0
-    scope: pllm.state.StateScope = pllm.state.StateScope.INSTANCE
-    key_fields: tuple[pllm.state.RequestKeyField, ...] = (
-        pllm.state.RequestKeyField.PROMPT_INDEX,
-        pllm.state.RequestKeyField.SAMPLE_INDEX,
+    scope: Literal["instance", "request"] = "instance"
+    # The request-state key in request scope; see pllm.RequestState(key_fields=).
+    key_fields: tuple[Literal["request_id", "prompt_index", "sample_index", "route"], ...] = (
+        "prompt_index",
+        "sample_index",
     )
 
     def __post_init__(self) -> None:
@@ -35,7 +37,7 @@ class OutputLoRAConfig:
             or not isfinite(self.learning_rate)
             or self.learning_rate <= 0
             or not 0 <= self.seed < 2**63
-            or self.scope not in (pllm.state.StateScope.INSTANCE, pllm.state.StateScope.REQUEST)
+            or self.scope not in ("instance", "request")
         ):
             raise ValueError(
                 "output LoRA requires positive rank/steps/scale/rate, 0 <= seed < 2**63, and instance or request scope"
@@ -58,12 +60,12 @@ class OutputLoRAWorkload(pllm.Workload):
             "a": lambda m: (m.hidden_size, rank),
             "b": lambda m: (rank, m.vocab_size),
         }
-        if self.config.scope is pllm.state.StateScope.REQUEST:
+        if self.config.scope == "request":
             return pllm.RequestState(
                 fields,
                 optimizer=pllm.SGD(self.config.learning_rate),
                 initialize=initialize,
-                keys=self.config.key_fields,
+                key_fields=self.config.key_fields,
             )
         return pllm.InstanceState(
             fields,
@@ -84,7 +86,7 @@ class OutputLoRAWorkload(pllm.Workload):
     @pllm.add_logits()
     def predict(
         self,
-        hidden: torch.Tensor = pllm.hidden(-1, pllm.model.HiddenSite.MODEL_OUTPUT),
+        hidden: torch.Tensor = pllm.final_hidden(),
         down: torch.Tensor = pllm.parameter("output_factors", "a"),
         up: torch.Tensor = pllm.parameter("output_factors", "b"),
     ) -> torch.Tensor:
@@ -94,7 +96,7 @@ class OutputLoRAWorkload(pllm.Workload):
 
     @pllm.train(
         state="output_factors",
-        steps=pllm.Config("config.steps"),
+        steps=pllm.Attr("config.steps"),
         reset="reset",
     )
     def train(

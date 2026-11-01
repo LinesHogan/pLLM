@@ -23,12 +23,8 @@ from vllm.sampling_params import StructuredOutputsParams
 import pllm
 from pllm.authoring import CausalTrainBatch, StateImport, WeightedCEBatch
 from pllm.config import ExecutionOptions, ModelConfig, RunnerName
-from pllm.contracts.backend_attachment import (
-    ActivationPatchOperator,
-)
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
-from pllm.contracts.semantic_graph import StateScope
 from pllm.execution.trace import TraceEventKind, TraceSelection
 from pllm.host import HostConfig, make_host
 from pllm.workloads.dummy import DummyConfig, DummyWorkload
@@ -213,14 +209,9 @@ def _graph_overlay(*, exact: bool = False) -> None:
     from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
 
     assert not torch.cuda.is_initialized()
-    targets = tuple(
-        pllm.model.ParameterTarget(
-            layer, pllm.model.ParameterModuleKind.ATTENTION, pllm.model.ParameterRole.QUERY_PROJECTION_WEIGHT
-        )
-        for layer in (0, 2)
-    )
+    targets = tuple(pllm.model.Projection("q_proj", layer) for layer in (0, 2))
     workload = GatedDeltaWorkload(
-        GatedDeltaConfig(targets, chunk_size=4, visibility=pllm.Exact() if exact else pllm.Visibility.forward_pinned())
+        GatedDeltaConfig(targets, chunk_size=4, visibility="exact" if exact else "forward_pinned")
     )
     options = ExecutionOptions(
         capture_memory_bytes=512 << 20, memory_budget_bytes=2 << 30, allow_numerical_transforms=False
@@ -364,9 +355,7 @@ def _output_lora_shared_input() -> None:
 
 def _independent_lora_input() -> None:
     assert not torch.cuda.is_initialized()
-    workload = OutputLoRAWorkload(
-        OutputLoRAConfig(rank=2, learning_rate=10.0, steps=2, seed=7, scope=StateScope.REQUEST)
-    )
+    workload = OutputLoRAWorkload(OutputLoRAConfig(rank=2, learning_rate=10.0, steps=2, seed=7, scope="request"))
     handle = pllm.make_llm(workload=workload, config=engine(execution=ExecutionOptions()))
     try:
         # Default lag 1 makes the first decode update visible on the fourth draw.
@@ -432,8 +421,8 @@ def _fttt_activation_retry() -> None:
         rank=1,
         first_tokens=0,
         last_tokens=1,
-        operator=ActivationPatchOperator.ADD,
-        scope=StateScope.REQUEST,
+        operator="add",
+        scope="request",
     )
     handle = pllm.make_llm(workload=ReFTWorkload(config), config=engine(seqs=1))
     try:

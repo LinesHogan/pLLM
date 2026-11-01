@@ -618,12 +618,12 @@ fn prefix_replay_rejection(
         .iter()
         .filter_map(|task| task.visibility.as_ref())
         .any(|visibility| {
-            visibility.lag != 0 || visibility.policy.kind == VisibilityKind::ForwardPinned
+            visibility.lag != 0 || visibility.policy == VisibilityKind::ForwardPinned
         })
         || planned.iter().any(|task| task.read_distance != 0)
         || graph.edges.iter().any(|edge| edge.step_distance != 0)
     {
-        return Some("use Exact visibility with zero publish lag and no cross-step dependencies");
+        return Some("use visibility=\"exact\" with zero publish lag and no cross-step dependencies");
     }
     if graph.tasks.iter().any(|task| {
         task.visibility.is_none()
@@ -635,7 +635,7 @@ fn prefix_replay_rejection(
                         .any(|state| state.resource == effect.resource && !state.immutable)
             })
     }) {
-        return Some("use Exact visibility for request state reads and transitions instead of forward_pinned execution");
+        return Some("use visibility=\"exact\" for request state reads and transitions instead of \"forward_pinned\"");
     }
     None
 }
@@ -720,7 +720,7 @@ mod tests {
             "capabilities":["compute/cuda@1"],
             "anchors":vec!["request.prepare","model.execute","state.publish","sampler.pre_draw","sampler.complete","token.commit","request.finish","next.prepare"]
                 .into_iter().enumerate().map(|(i,s)| json!({"symbol":s,"ordinal":i})).collect::<Vec<_>>(),
-            "visibility":{"policy":{"kind":"step_lag"},"scope":"post_sampler","equations_digest":"retained-step-inputs@1","resources":[],"chunk_size":0,"tail":"transition","lag":2},
+            "visibility":{"policy":"step_lag","scope":"post_sampler","equations_digest":"retained-step-inputs@1","resources":[],"chunk_size":0,"tail":"transition","lag":2},
             "task_resources":(0..3).map(|i|json!({"task":format!("t{i}"),"workspace_bytes":16})).collect::<Vec<_>>(),
             "value_resources":(0..3).map(|i|json!({"task":format!("t{i}"),"output":"value","bytes":8})).collect::<Vec<_>>()
         }).to_string()).unwrap();

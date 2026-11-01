@@ -10,7 +10,7 @@ from vllm.forward_context import override_forward_context
 
 import pllm
 from pllm.config import ModelConfig
-from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
+from pllm.contracts.parameter_overlay import Projection
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
 
 
@@ -30,9 +30,7 @@ class SettledInPlaceTTT(InPlaceTTTWorkload):
 
 
 def run(chunk):
-    targets = tuple(
-        ParameterTarget(layer, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT) for layer in (22, 23)
-    )
+    targets = tuple(Projection("down_proj", layer) for layer in (22, 23))
     workload = SettledInPlaceTTT(InPlaceTTTConfig(targets, chunk_size=chunk, learning_rate=1e-6, tokens="all"))
     handle = pllm.make_llm(
         workload=workload,

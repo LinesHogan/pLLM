@@ -19,7 +19,7 @@ from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.host_batch import StateImport
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
-from pllm.contracts.parameter_overlay import FieldView, ParameterTarget
+from pllm.contracts.parameter_overlay import FieldView, Projection
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
@@ -121,7 +121,7 @@ class TensorBinding(Builder[TensorFrame]):
         self.initial_values: dict[str, Callable[[Dimensions, int], torch.Tensor]] = {}
         self.causal: CausalBinder | None = None
         self.probe: BackendPlacementProbe | None = None
-        self.overlay_targets: tuple[ParameterTarget, ...] = ()
+        self.overlay_targets: tuple[Projection, ...] = ()
         self.parameter_phases: tuple[HiddenPhase, ...] = ()
         self.field_views: dict[tuple[str, str], FieldView] = {}
         self.imports: dict[str, tuple[FieldView, ...]] = {}

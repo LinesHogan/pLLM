@@ -16,10 +16,8 @@ from pllm.authoring import StateImport
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
     CapturedParameterOperand,
-    ParameterModuleKind,
-    ParameterRole,
-    ParameterTarget,
-    ParameterTargetShape,
+    Projection,
+    ProjectionShape,
 )
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
@@ -36,16 +34,14 @@ from test.backend_facts import assert_finite_resources
 def _input(operands: tuple[CapturedParameterOperand, ...]) -> StepInput:
     selected = tuple(dict.fromkeys((operand.identity, operand.phase) for operand in operands))
     identities, phases = zip(*selected, strict=True) if selected else ((), ())
-    return testing.step_input(identities, phases=phases, sampler_order=(), operands=operands)
+    return testing.step_input(identities, tokens=phases, sampler_order=(), operands=operands)
 
 
 def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     _check_headwise_math_and_tail()
     _check_exact_projection_lifecycle()
     _check_exact_additive_projection()
-    targets = tuple(
-        ParameterTarget(layer, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT) for layer in (0, 1)
-    )
+    targets = tuple(Projection("down_proj", layer) for layer in (0, 1))
     config = InPlaceTTTConfig(targets, chunk_size=2, learning_rate=0.3)
     workload = InPlaceTTTWorkload(config, dtype=torch.float64)
     facts = backend_facts(
@@ -56,15 +52,15 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
         memory_bytes=4096,
         max_rows=8,
         dtype=TensorDType.FLOAT64,
-        targets=tuple(ParameterTargetShape(target, 3, 2) for target in targets),
+        targets=tuple(ProjectionShape(target, 3, 2) for target in targets),
     )
     execution = assert_finite_resources(workload, facts).execution
     visibility = next(
         task.visibility for task in execution.arena.plan.semantic_graph.tasks if task.visibility is not None
     )
-    assert visibility.policy == pllm.Visibility.forward_pinned()
+    assert visibility.policy == "forward_pinned"
     assert visibility.tail == "transition" and visibility.chunk_size == 0
-    pllm.train_in_forward(state="dense_fast_weights", targets=targets, visibility=pllm.Exact())
+    pllm.train_in_forward(state="dense_fast_weights", targets=targets, visibility="exact")
     declaration = workload.declaration(facts).graph
     assert next(task.visibility for task in declaration.tasks if task.visibility is not None) == visibility
     changed = InPlaceTTTWorkload(replace(config, chunk_size=3)).declaration(facts).graph
@@ -137,17 +133,17 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     class LowRankOverlay(pllm.Workload):
         factors = pllm.RequestState(
             {
-                "a": pllm.Buffer(lambda inputs, outputs: (2, inputs), dtype=torch.float64),
-                "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2), dtype=torch.float64),
+                "a": pllm.Field(lambda in_features, out_features: (2, in_features), dtype=torch.float64),
+                "b": pllm.Field(lambda in_features, out_features: (out_features, 2), dtype=torch.float64),
             },
             dtype=torch.float64,
         )
 
         @pllm.train_in_forward(
-            visibility=pllm.Visibility.forward_pinned(),
+            visibility="forward_pinned",
             state="factors",
             targets=(targets[0],),
-            operator=pllm.model.ParameterOverlayOperator.LOW_RANK_ADD,
+            operator="low_rank",
             factors=("a", "b"),
             scale=0.5,
         )
@@ -223,8 +219,8 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     class ImportedOverlay(pllm.Workload):
         factors = pllm.RequestState(
             {
-                "a": pllm.Buffer(lambda inputs, outputs: (2, inputs), dtype=torch.float64),
-                "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2), dtype=torch.float64),
+                "a": pllm.Field(lambda in_features, out_features: (2, in_features), dtype=torch.float64),
+                "b": pllm.Field(lambda in_features, out_features: (out_features, 2), dtype=torch.float64),
             },
             imported=True,
             dtype=torch.float64,
@@ -235,7 +231,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
             return pllm.model.Adapter(
                 "factors",
                 (targets[0],),
-                operator=pllm.model.ParameterOverlayOperator.LOW_RANK_ADD,
+                operator="low_rank",
                 factors=("a", "b"),
                 scale=0.5,
             )
@@ -255,7 +251,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     for index, key in enumerate(keys):
         update = StateImport(tuple(tensor.unsqueeze(0) for tensor in generated), (key,))
         publication = imported.step(
-            testing.step_input(prompts, phases=(HiddenPhase.PREFILL,) * 2, sampler_order=(), batch=update)
+            testing.step_input(prompts, tokens=(HiddenPhase.PREFILL,) * 2, sampler_order=(), batch=update)
         ).publication
         (ref,) = publication.after_refs
         assert ref.lineage_id == initial[index].lineage_id and ref.version_id == 1
@@ -266,7 +262,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
             assert all(not tensor.any() for tensor in imported.snapshot(initial[1]))
             # A staged batch does not import twice: the published version no longer matches.
             again = imported.step(
-                testing.step_input(prompts, phases=(HiddenPhase.PREFILL,) * 2, sampler_order=(), batch=update)
+                testing.step_input(prompts, tokens=(HiddenPhase.PREFILL,) * 2, sampler_order=(), batch=update)
             )
             assert again.publication is None
         published.append(ref)
@@ -281,7 +277,7 @@ def _check_headwise_math_and_tail():
     from pllm.kernels.head_overlay import head_correction
     from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
 
-    target = ParameterTarget(0, ParameterModuleKind.ATTENTION, ParameterRole.QUERY_PROJECTION_WEIGHT)
+    target = Projection("q_proj", 0)
     workload = GatedDeltaWorkload(GatedDeltaConfig((target,), head_width=3, chunk_size=2, alpha=0.9, beta=0.2))
     generator = torch.Generator().manual_seed(123)
     rows = torch.randn(5, 6, generator=generator)
@@ -325,9 +321,7 @@ def _check_exact_projection_lifecycle():
     from pllm.execution.overlay_task import ProjectionTask
     from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
 
-    targets = tuple(
-        ParameterTarget(layer, ParameterModuleKind.ATTENTION, ParameterRole.QUERY_PROJECTION_WEIGHT) for layer in (0, 2)
-    )
+    targets = tuple(Projection("q_proj", layer) for layer in (0, 2))
     workload = GatedDeltaWorkload(GatedDeltaConfig(targets, head_width=1, chunk_size=2, alpha=1, beta=0.1))
     facts = backend_facts(
         1,
@@ -336,7 +330,7 @@ def _check_exact_projection_lifecycle():
         PageBundleProviderFacts("test.cpu.full_root@1", 4),
         memory_bytes=4096,
         max_rows=16,
-        targets=tuple(ParameterTargetShape(target, 1, 1) for target in targets),
+        targets=tuple(ProjectionShape(target, 1, 1) for target in targets),
     )
     deployment = workload.compile_backend(facts, pllm.ExecutionOptions())
     execution = deployment.execution
@@ -470,10 +464,8 @@ def _check_exact_additive_projection():
     from pllm.contracts.semantic_graph import AnchorId
     from pllm.execution.overlay_task import ProjectionTask
 
-    targets = tuple(
-        ParameterTarget(layer, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT) for layer in (0, 1)
-    )
-    workload = InPlaceTTTWorkload(InPlaceTTTConfig(targets, chunk_size=2, learning_rate=0.01, visibility=pllm.Exact()))
+    targets = tuple(Projection("down_proj", layer) for layer in (0, 1))
+    workload = InPlaceTTTWorkload(InPlaceTTTConfig(targets, chunk_size=2, learning_rate=0.01, visibility="exact"))
     facts = backend_facts(
         1,
         (),
@@ -481,7 +473,7 @@ def _check_exact_additive_projection():
         PageBundleProviderFacts("test.cpu.full_root@1", 4),
         memory_bytes=4096,
         max_rows=8,
-        targets=tuple(ParameterTargetShape(target, 1, 1) for target in targets),
+        targets=tuple(ProjectionShape(target, 1, 1) for target in targets),
     )
     deployment = workload.compile_backend(facts)
     execution = deployment.execution
@@ -566,7 +558,7 @@ def test_prefill_adapters_keep_prompt_chunks_across_scheduler_spans(span):
         max_rows=32,
         dtype=TensorDType.FLOAT64,
         layer_count=10,
-        targets=tuple(ParameterTargetShape(target, 3, 2) for target in TARGETS),
+        targets=tuple(ProjectionShape(target, 3, 2) for target in TARGETS),
     )
     deployed = assert_finite_resources(workload, facts)
     execution = deployed.execution
@@ -646,7 +638,7 @@ def test_prompt_end_operand_stays_live_during_replay():
             (),
             model_timeline(torch.device("cpu"), ("transition/full_root@1",)),
             None,
-            targets=tuple(ParameterTargetShape(target, 3, 2) for target in TARGETS),
+            targets=tuple(ProjectionShape(target, 3, 2) for target in TARGETS),
         )
     ).overlay_math
     x, base = torch.ones(1, 3, device="cuda"), torch.zeros(2, 3, device="cuda")

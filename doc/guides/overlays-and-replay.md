@@ -9,8 +9,8 @@
 声明这两件事，以及一个常见的后续问题：补丁的字段值不来自引擎内训练行不行？
 （行，见下文「外部生产的 overlay」。）
 
-Buffer 默认使用 FP32 保存累积状态。Dense / low-rank 投影读取时转换到模型输入 dtype；
-HEAD_ADD 保持 FP32。`pllm.Buffer(shape, dtype=torch.bfloat16)` 可显式节省一半字段显存，
+`pllm.Field` 默认使用 FP32 保存累积状态。Dense / low-rank 投影读取时转换到模型输入 dtype；
+"per_head" 保持 FP32。`pllm.Field(shape, dtype=torch.bfloat16)` 可显式节省一半字段显存，
 代价是小更新可能被舍入掉；`dtype=None` 显式跟随模型 dtype。
 `InPlaceTTTWorkload(..., dtype=...)` 与 `PrefillAdaptersWorkload(dtype=...)` 均可配置状态精度，默认 FP32。
 
@@ -25,19 +25,17 @@ HEAD_ADD 保持 FP32。`pllm.Buffer(shape, dtype=torch.bfloat16)` 可显式节�
 ```python
 import torch
 import pllm
-from pllm.model import ParameterModuleKind, ParameterRole
 
-targets = (pllm.model.ParameterTarget(9, ParameterModuleKind.MLP,
-                                      ParameterRole.DOWN_PROJECTION_WEIGHT),)
+targets = (pllm.model.Projection("down_proj", 9),)
 
 class MyLoRA(pllm.Workload):
     factors = pllm.RequestState({
-        "a": pllm.Buffer(lambda inputs, outputs: (2, inputs)),    # (rank, 输入宽)
-        "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2)),   # (输出宽, rank)
+        "a": pllm.Field(lambda in_features, out_features: (2, in_features)),    # (rank, 输入宽)
+        "b": pllm.Field(lambda in_features, out_features: (out_features, 2)),   # (输出宽, rank)
     })
 
     @pllm.train_in_forward(state="factors", targets=targets,
-                  operator=pllm.model.ParameterOverlayOperator.LOW_RANK_ADD,
+                  operator="low_rank",
                   factors=("a", "b"), scale=1.0, tokens="all")
     def update(
         self,
@@ -79,8 +77,8 @@ class MyLoRA(pllm.Workload):
 **`tokens` 控制什么？** 更新资格（默认 `tokens="prefill"`，可选 `"decode"`、`"all"`）。
 被禁用的阶段不更新，但仍会应用既有 overlay——它读的是已发布的版本。
 
-**稠密还是低秩？** 稠密补丁用默认的 `DENSE_ADD` 和一个固定 `shape=` 的
-`value` 字段；低秩用 `LOW_RANK_ADD` + `factors`，应用 `scale · b @ a`。
+**稠密还是低秩？** 稠密补丁用默认的 `"dense"` 和一个固定 `shape=` 的
+`value` 字段；低秩用 `"low_rank"` + `factors`，应用 `scale · b @ a`。
 算子选择与请求作用域正交：同样的发布、pin 与隔离规则对两者都适用。
 
 两个边界提前说清：后端目前定位 MLP down 与 attention q/v 投影；overlay
@@ -106,7 +104,7 @@ def settle(self, layers: pllm.Layers) -> torch.Tensor:
 
 返回值决定采样；示例保留第一遍输出。层调用覆盖当前 token 对应层的 KV，历史槽
 保持不变。未选中的行遵循 overlay 的普通行为。入口读取遵循 `forward_pinned`
-或 `Exact()`；显式边界之后的私有读取由路由源程序表达。
+或 `"exact"`；显式边界之后的私有读取由路由源程序表达。
 目前支持有界 Python `for` 循环；被追踪的 `while_loop` 会提示改用有界 for-loop。
 逐 token 的 hidden 循环可直接使用独立 `layer_route`，无需 overlay。
 
@@ -188,7 +186,7 @@ checkpoint，或任何一段宿主计算。
 @property
 def adapter(self) -> pllm.model.Adapter:
     return pllm.model.Adapter("factors", targets,
-                        operator=pllm.model.ParameterOverlayOperator.LOW_RANK_ADD,
+                        operator="low_rank",
                         factors=("a", "b"), scale=0.5)
 ```
 
@@ -208,9 +206,9 @@ weight/bias/rotation 字段，`ADD` 用一个 FP32 向量。见维护中的
 [ReFT](../../pllm/workloads/reft.py)。
 
 `first_tokens/last_tokens` 仍只选择 prefill 行。逐 decode 通过三个 keyword-only
-字段声明：`decode=pllm.model.DecodeWindow.ALL`、
-`decode_refresh=pllm.model.DecodeRefresh.STEP`、`on_missing=pllm.model.MissingPolicy.HOLD`
-（默认分别为 NONE/INHERIT/STOP）。NONE 携带非默认刷新/缺席策略会在声明期拒绝。
+字段声明：`decode=True`、
+`refresh="step"`、`on_missing="hold"`
+（默认分别为 `False`、`"admission"`、`"stop"`）。`decode=False` 携带非默认刷新/缺席策略会在声明期拒绝。
 INHERIT 保留原作用域的版本选择，STEP 每步读取本 invocation 新发布的 exact ref；
 只有签署且成功验证的 HOLD 分支可以在没有新 publication 时读已成功的输入版本。
 单独声明 HOLD 不会给任意缺根图添加保持能力，完整生命周期见

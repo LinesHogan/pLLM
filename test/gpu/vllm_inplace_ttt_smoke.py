@@ -23,10 +23,7 @@ from pllm import UpdateOutput
 from pllm.backends.vllm.runtime import VllmLlm
 from pllm.config import ModelConfig
 from pllm.contracts.parameter_overlay import (
-    ParameterModuleKind,
-    ParameterOverlayOperator,
-    ParameterRole,
-    ParameterTarget,
+    Projection,
 )
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
@@ -35,17 +32,17 @@ from pllm.execution.scan_execution import PreparedScan
 from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
 
-TARGET = ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT)
+TARGET = Projection("down_proj", 0)
 PROMPTS = ["The sky is", "Water freezes at"]
 SAMPLING = SamplingParams(max_tokens=2, temperature=0.0, n=1, ignore_eos=True)
 
 
-def low_rank_factors(keys=()) -> pllm.RequestState:
+def low_rank_factors(key_fields=()) -> pllm.RequestState:
     shapes = {
-        "a": pllm.Buffer(lambda inputs, outputs: (2, inputs)),
-        "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2)),
+        "a": pllm.Field(lambda in_features, out_features: (2, in_features)),
+        "b": pllm.Field(lambda in_features, out_features: (out_features, 2)),
     }
-    return pllm.RequestState(shapes, keys=keys) if keys else pllm.RequestState(shapes)
+    return pllm.RequestState(shapes, key_fields=key_fields) if key_fields else pllm.RequestState(shapes)
 
 
 @dataclass(frozen=True)
@@ -57,10 +54,10 @@ class RequestLowRankTTT(pllm.Workload):
         return low_rank_factors()
 
     @pllm.train_in_forward(
-        visibility=pllm.Visibility.forward_pinned(),
+        visibility="forward_pinned",
         state="factors",
         targets=(TARGET,),
-        operator=ParameterOverlayOperator.LOW_RANK_ADD,
+        operator="low_rank",
         factors=("a", "b"),
         scale=0.5,
     )
@@ -92,7 +89,7 @@ class RoutedLowRankTTT(RequestLowRankTTT):
 
     @property
     def factors(self) -> pllm.RequestState:
-        return low_rank_factors((pllm.state.RequestKeyField.ROUTE,))
+        return low_rank_factors(("route",))
 
 
 @dataclass(frozen=True)
@@ -105,9 +102,7 @@ class ImportedLowRank(pllm.Workload):
 
     @property
     def adapter(self) -> pllm.model.Adapter:
-        return pllm.model.Adapter(
-            "factors", (TARGET,), operator=ParameterOverlayOperator.LOW_RANK_ADD, factors=("a", "b"), scale=0.5
-        )
+        return pllm.model.Adapter("factors", (TARGET,), operator="low_rank", factors=("a", "b"), scale=0.5)
 
 
 def open_llm(
@@ -366,11 +361,7 @@ def main() -> int:
             assert diagnostics.active_states == diagnostics.pending_state_releases == 0
     assert adapter_tokens[0] == adapter_tokens[1]
     dense = InPlaceTTTWorkload(InPlaceTTTConfig((TARGET,), chunk_size=1, learning_rate=1e-4, tokens="prefill"))
-    headwise = GatedDeltaWorkload(
-        GatedDeltaConfig(
-            (ParameterTarget(0, ParameterModuleKind.ATTENTION, ParameterRole.QUERY_PROJECTION_WEIGHT),), chunk_size=64
-        )
-    )
+    headwise = GatedDeltaWorkload(GatedDeltaConfig((Projection("q_proj", 0),), chunk_size=64))
     scenarios = (
         (
             "dense_strict",
@@ -401,7 +392,7 @@ def main() -> int:
         (
             "gated",
             lambda: open_llm(
-                replace(headwise, config=replace(headwise.config, visibility=pllm.Visibility.forward_pinned())),
+                replace(headwise, config=replace(headwise.config, visibility="forward_pinned")),
                 tokens=2048,
                 model_length=1024,
                 memory_budget_bytes=256 << 20,
@@ -413,7 +404,7 @@ def main() -> int:
             lambda: open_llm(
                 replace(
                     headwise,
-                    config=replace(headwise.config, chunk_size=16, visibility=pllm.Visibility.forward_pinned()),
+                    config=replace(headwise.config, chunk_size=16, visibility="forward_pinned"),
                 ),
                 tokens=128,
                 model_length=128,
@@ -428,7 +419,7 @@ def main() -> int:
             lambda: open_llm(
                 replace(
                     headwise,
-                    config=replace(headwise.config, chunk_size=16, visibility=pllm.Visibility.forward_pinned()),
+                    config=replace(headwise.config, chunk_size=16, visibility="forward_pinned"),
                 ),
                 tokens=128,
                 model_length=128,
@@ -478,7 +469,7 @@ def main() -> int:
         (
             "hybrid_dense",
             lambda: open_llm(
-                replace(dense, config=replace(dense.config, visibility=pllm.Exact())),
+                replace(dense, config=replace(dense.config, visibility="exact")),
                 tokens=128,
                 model_length=128,
                 cuda_graphs=True,
@@ -573,7 +564,7 @@ def preemption_replays():
         pllm.make_llm(
             workload=GatedDeltaWorkload(
                 GatedDeltaConfig(
-                    (ParameterTarget(0, ParameterModuleKind.ATTENTION, ParameterRole.QUERY_PROJECTION_WEIGHT),),
+                    (Projection("q_proj", 0),),
                     chunk_size=7,
                     tokens="all",
                 )

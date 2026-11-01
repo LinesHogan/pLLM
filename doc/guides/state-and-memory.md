@@ -40,9 +40,9 @@ class Probe(pllm.Workload):
 准入时初始化、任何任务（包括观测）可读、可通过外部通道导入、永不更新。
 没有优化器，就没有梯度/动量槽，字段布局本身就是全部存储。
 
-形状可以是 lambda（拿模型事实 `m`），也可以是 `pllm.Buffer(...)`（overlay
+形状可以是 lambda（拿模型事实 `m`），也可以是 `pllm.Field(...)`（overlay
 场景按目标输入/输出宽度解析）。声明可以写在类上、实例上；形状依赖配置时，
-写成带类型的 property。`Buffer` 与普通状态字段都默认 FP32；Buffer 自己的
+写成带类型的 property。`pllm.Field` 与普通状态字段都默认 FP32；Field 自己的
 `dtype=` 决定存储精度，`dtype=None` 显式跟随模型。`RequestState.dtype` 只作用于普通形状字段。
 FP32 相对 BF16 使该字段的 payload 翻倍，也增加投影读取的转换工作区。旧的紧预算
 可能在规划或图捕获时报错；提高 state / capture / execution 预算，或显式选择 BF16。
@@ -56,7 +56,7 @@ FP32 相对 BF16 使该字段的 payload 翻倍，也增加投影读取的转换
 ```python
 session = pllm.RequestState({"proj": lambda m: (m.hidden_size, m.hidden_size)},
                             optimizer=pllm.AdamW(lr=1e-3),
-                            keys=(pllm.state.RequestKeyField.ROUTE,))
+                            key_fields=("route",))
 
 llm.generate(prompts, params, routes=tuple(route_of(p) for p in prompts))
 ```
@@ -216,7 +216,7 @@ keyword-only 字段，变更声明必须重新编译签署定义并重建 worker
 
 ### 没有新特征时：签署的 HOLD / STOP
 
-视频负载声明 `decode=ALL、decode_refresh=STEP、on_missing=HOLD`。完整输入与保持
+视频负载声明 `decode=True、refresh="step"、on_missing="hold"`。完整输入与保持
 共用一个 invocation 和完整静态 DAG；签署的条件生产组在解析输入之前分支。
 HOLD 步不读取 borrowed features，不执行 encode/write/publish；模型只读本地
 最后成功注入的 exact pin。静态依赖和最坏情况预算保留，不在运行时删任务。

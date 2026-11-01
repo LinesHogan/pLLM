@@ -9,7 +9,7 @@ from enum import Enum
 from functools import partial
 from inspect import Parameter as SignatureParameter, signature
 from types import FunctionType, MethodType
-from typing import Any, ClassVar, Literal, TypeVar
+from typing import Any, ClassVar, Literal, TypeVar, get_args
 
 import torch
 
@@ -28,7 +28,7 @@ from pllm.contracts.host_batch import CausalTrainBatch, WeightedCEBatch, Weighte
 from pllm.contracts.parameter_overlay import (
     ParameterOverlayFieldBinding,
     ParameterOverlayOperator,
-    ParameterTarget,
+    Projection,
     ProjectionDelta,
 )
 from pllm.contracts.request_identity import RequestKeyField, canonical_request_key_fields
@@ -50,11 +50,11 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.state_feed import FeedBinding, FeedOrder
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
-from pllm.contracts.visibility import Exact as Exact, Visibility as Visibility
-from pllm.execution.binding_base import SGD as SGD, Buffer as Buffer, buffer_field, overlay_fields
+from pllm.contracts.visibility import VisibilityKind
+from pllm.execution.binding_base import SGD as SGD, Field as Field, layout_field, overlay_fields
 from pllm.execution.causal_batch import CausalBinder, CausalModel, CausalPort, declare_batch_train
 from pllm.execution.compile_facts import BackendCompileFacts
-from pllm.execution.declaration import Call, Dimensions, Field, Shape, State, When
+from pllm.execution.declaration import Call, Dimensions, LayoutField, Shape, State, When
 from pllm.execution.freeze import (
     fingerprint,
     freeze,
@@ -116,12 +116,23 @@ Initializer = Callable[[Tensors, torch.Generator], None]
 C = TypeVar("C")
 # How @pllm.train averages per-row losses: over all rows, or per state and then summed over states.
 TrainReduction = Literal["mean", "state_mean"]
+L = TypeVar("L", bound=str)
 # The tokens whose projection operands train a @pllm.train_in_forward state.
 _TOKEN_PHASES: dict[str, tuple[HiddenPhase, ...]] = {
     "prefill": (HiddenPhase.PREFILL,),
     "decode": (HiddenPhase.DECODE,),
     "all": (HiddenPhase.PREFILL, HiddenPhase.DECODE),
 }
+# How an adapter's fields change a projection: a dense (out_features, in_features) delta, low-rank factors
+# (rank, in_features) and (out_features, rank), or one (width, width) block per attention head.
+AdapterOperator = Literal["dense", "low_rank", "per_head"]
+_OPERATORS: dict[str, ParameterOverlayOperator] = {
+    "dense": ParameterOverlayOperator.DENSE_ADD,
+    "low_rank": ParameterOverlayOperator.LOW_RANK_ADD,
+    "per_head": ParameterOverlayOperator.HEAD_ADD,
+}
+# The fields that key a request state: the vLLM request, the prompt, the sample of a prompt, a user route.
+KeyField = Literal["request_id", "prompt_index", "sample_index", "route"]
 
 
 class Phase(Enum):
@@ -144,7 +155,7 @@ class _Source:
     def training_port(self, context: _Declaration) -> CausalPort:
         raise ValueError("causal training inputs must name Batch, Parameter or causal_model ports")
 
-    def in_forward_binding(self, state: str, buffers: Mapping[str, Buffer]) -> str:
+    def in_forward_binding(self, state: str, fields: Mapping[str, Field]) -> str:
         raise TypeError("@pllm.train_in_forward inputs are pllm.operand(...) or pllm.parameter fields of its own state")
 
     def batch(self, state: str, definition: InstanceState) -> tuple[str, str]:
@@ -152,20 +163,23 @@ class _Source:
 
 
 @dataclass(frozen=True)
-class Config:
+class Attr:
+    """A reference to a workload attribute by dotted path, e.g. pllm.Attr("config.chunk_size"), resolved once when
+    the workload is built."""
+
     name: str
 
     @staticmethod
     def resolve(value: object, owner: object) -> object:
-        """Resolve an explicit configuration path against the snapshotted owner."""
+        """Resolve an attribute path against the snapshotted owner."""
         match value:
-            case Config(name=name):
+            case Attr(name=name):
                 for part in name.split("."):
                     try:
                         owner = object.__getattribute__(owner, part)
                     except AttributeError:
                         raise ValueError(
-                            f"pllm.Config({name!r}): {type(owner).__name__} has no attribute {part!r}"
+                            f"pllm.Attr({name!r}): {type(owner).__name__} has no attribute {part!r}"
                         ) from None
                 return owner
             case _:
@@ -174,7 +188,7 @@ class Config:
 
 @dataclass(frozen=True)
 class Hidden(_Source):
-    layer: int | Config = 0
+    layer: int | Attr = 0
     site: HiddenSite = HiddenSite.BLOCK_OUTPUT
     phase: HiddenPhase = HiddenPhase.DECODE
 
@@ -188,7 +202,7 @@ class Hidden(_Source):
 
 @dataclass(frozen=True)
 class SampleIndex(_Source):
-    limit: int | Config | None = None
+    limit: int | Attr | None = None
 
     differentiable: ClassVar[bool] = False
 
@@ -235,10 +249,10 @@ class Parameter(_Source):
         parameter = context.parameter(self.state, self.field)
         return parameter_rows(parameter) if self.per_row else parameter
 
-    def in_forward_binding(self, state: str, buffers: Mapping[str, Buffer]) -> str:
-        if self.state == state and self.field in buffers:
+    def in_forward_binding(self, state: str, fields: Mapping[str, Field]) -> str:
+        if self.state == state and self.field in fields:
             return self.field
-        return super().in_forward_binding(state, buffers)
+        return super().in_forward_binding(state, fields)
 
     def batch(self, state: str, definition: InstanceState) -> tuple[str, str]:
         if self.state != state or self.field not in definition.fields or self.per_row:
@@ -257,7 +271,7 @@ class _CausalModelMarker(_Source):
         if adapter is None:
             raise ValueError(f"pllm.causal_model({self.name!r}) must name a pllm.model.Adapter of the workload")
         state = context.states[adapter.state]
-        bindings = adapter.bindings(context)
+        bindings = context.adapter_bindings(adapter)
         forward = None if context.binding.causal is None else context.binding.causal(bindings)
         return CausalPort(
             state.read(),
@@ -350,7 +364,7 @@ class Operand(_Source, Enum):
     WEIGHT = "weight"
     PROMPT_END = "prompt_end"
 
-    def in_forward_binding(self, state: str, buffers: Mapping[str, Buffer]) -> str:
+    def in_forward_binding(self, state: str, fields: Mapping[str, Field]) -> str:
         return self.value
 
 
@@ -366,15 +380,16 @@ class _Carried(_Source):
 # source marker typed `Any`, so the annotation can name the value the method body receives.
 
 
-def hidden(
-    layer: int | Config = 0,
-    site: HiddenSite = HiddenSite.BLOCK_OUTPUT,
-    *,
-    tokens: Literal["decode", "prefill"] = "decode",
-) -> Any:
-    """One row per request: the latest decode token, or with tokens="prefill" the last prompt token of completed
-    prefill."""
-    return Hidden(layer, site, HiddenPhase(tokens))
+def hidden(layer: int | Attr = 0, *, tokens: Literal["decode", "prefill"] = "decode") -> Any:
+    """The output of decoder layer `layer` (negative from the end), one row per request: the latest decode token,
+    or with tokens="prefill" the last prompt token of completed prefill."""
+    return Hidden(layer, HiddenSite.BLOCK_OUTPUT, HiddenPhase(tokens))
+
+
+def final_hidden(*, tokens: Literal["decode", "prefill"] = "decode") -> Any:
+    """The hidden state after the model's final norm, which the LM head reads (Hugging Face's last_hidden_state);
+    one row per request, chosen as in pllm.hidden."""
+    return Hidden(-1, HiddenSite.MODEL_OUTPUT, HiddenPhase(tokens))
 
 
 def parameter(state: str, field: str, *, per_row: bool = False) -> Any:
@@ -402,7 +417,7 @@ def index(state: str) -> Any:
     return StateIndex(state)
 
 
-def sample_index(limit: int | Config | None = None) -> Any:
+def sample_index(limit: int | Attr | None = None) -> Any:
     """The sample index of each row's request: 0 for a prompt's first sample.
 
     With `limit`, generate rejects requests whose sample index is `limit` or more.
@@ -452,7 +467,7 @@ def batch(
 
 @dataclass(frozen=True)
 class InstanceState:
-    fields: Mapping[str, Shape | Buffer] = field(default_factory=lambda: dict[str, Shape | Buffer]())
+    fields: Mapping[str, Shape | Field] = field(default_factory=lambda: dict[str, Shape | Field]())
     # How @pllm.train or @pllm.train_in_forward updates the state. Training on request rows or on WeightedRowBatch
     # and CausalTrainBatch fields takes pllm.AdamW; WeightedCEBatch training and @pllm.train_in_forward take pllm.SGD.
     optimizer: AdamWConfig | SGD | None = field(default=None, kw_only=True)
@@ -461,7 +476,9 @@ class InstanceState:
     shape: Shape | None = None
     dtype: torch.dtype = torch.float32
     alignment: int = field(default=16, kw_only=True)
-    feed: FeedOrder | None = field(default=None, kw_only=True)
+    # A fed state is filled by a producer process (VllmLlm.feed): "ordered" consumes every publication in order,
+    # "latest" only the newest.
+    feed: Literal["ordered", "latest"] | None = field(default=None, kw_only=True)
     # Plain per-request tensors carried across steps (written by pllm.carry); never optimizer-managed.
     carry: Mapping[str, Shape] = field(default_factory=lambda: dict[str, Shape](), kw_only=True)
     # An `nn.Module` built from the model's dimensions; its parameters become the state, initialized as the
@@ -470,6 +487,8 @@ class InstanceState:
     imported: bool = field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
+        if self.feed not in (None, "ordered", "latest"):
+            raise ValueError(f'feed={self.feed!r}: use "ordered", "latest" or None')
         if self.module is not None:
             if self.fields or self.shape is not None or self.initialize is not None or self.feed:
                 raise ValueError(
@@ -502,14 +521,14 @@ class InstanceState:
         return TensorDType(str(self.dtype).removeprefix("torch."))
 
     def declare(self, name: str, context: _Declaration) -> None:
-        """Allocate tensor parameters; buffer layouts belong to their effects."""
+        """Allocate tensor parameters; the layout of fields an adapter reads follows its targets."""
         context.signature.append((name, boundary_digest(fingerprint(self), tuple(self.fields))))
         if name in context.in_forward_states or name in context.states:
             return
         if self.feed is not None:
             if context.binding.feeds:
                 raise ValueError("declare one fed state per workload")
-            context.binding.feeds = (FeedBinding(name, self.feed, tuple(self.fields)),)
+            context.binding.feeds = (FeedBinding(name, FeedOrder(self.feed), tuple(self.fields)),)
         context.states[name], ports = declare_parameters(
             context.binding,
             name,
@@ -518,62 +537,82 @@ class InstanceState:
             initialize=_frozen(self.initialize),
             scope=self.scope,
             keys=self.request_keys,
-            carry=tuple(Field(key, shape, self.tensor_dtype, self.alignment) for key, shape in self.carry.items()),
+            carry=tuple(
+                LayoutField(key, shape, self.tensor_dtype, self.alignment) for key, shape in self.carry.items()
+            ),
         )
         context.parameters.update({(name, field): port for field, port in ports.items()})
         if self.module is not None:
             context.binding.initial_values[name] = partial(initial_values, self.module, dtype=self.dtype)
 
-    def layout_fields(self, name: str, context: _Declaration) -> tuple[Field, ...]:
-        """The allocated fields: plain shapes in the state's dtype, or Buffers sized by the hidden width or, when a
-        pllm.model.Adapter reads the state, once per adapter target."""
+    def layout_fields(self, name: str, context: _Declaration) -> tuple[LayoutField, ...]:
+        """The allocated fields: plain shapes in the state's dtype, or pllm.Field values sized by the hidden width or,
+        when a pllm.model.Adapter reads the state, once per adapter target."""
         consumer = next((adapter for adapter in context.adapters.values() if adapter.state == name), None)
-        shapes = {key: spec for key, spec in self.fields.items() if not isinstance(spec, Buffer)}
+        shapes = {key: spec for key, spec in self.fields.items() if not isinstance(spec, Field)}
         if consumer is None and len(shapes) == len(self.fields):
-            return tuple(Field(key, shape, self.tensor_dtype, self.alignment) for key, shape in shapes.items())
-        buffers = _buffers(self, context.binding.dimensions.dtype)
+            return tuple(LayoutField(key, shape, self.tensor_dtype, self.alignment) for key, shape in shapes.items())
+        fields = _fields(self, context.binding.dimensions.dtype)
         if consumer is None:
             return tuple(
-                buffer_field(key, buffer, lambda m: (m.hidden_size, m.hidden_size)) for key, buffer in buffers.items()
+                layout_field(key, value, lambda m: (m.hidden_size, m.hidden_size)) for key, value in fields.items()
             )
         context.binding.overlay_targets = consumer.targets
-        return overlay_fields(buffers, consumer, context.binding.dimensions)
+        return overlay_fields(fields, consumer, context.binding.dimensions)
 
 
 @dataclass(frozen=True)
 class RequestState(InstanceState):
     """Per-request parameters, read as tensors aligned to the current operation's rows."""
 
-    keys: tuple[RequestKeyField, ...] = (RequestKeyField.REQUEST_ID,)
+    # Requests with equal values of these fields share one copy of the state, listed in KeyField order.
+    key_fields: tuple[KeyField, ...] = ("request_id",)
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        canonical_request_key_fields(self.keys)
+        if any(name not in get_args(KeyField) for name in self.key_fields):
+            raise ValueError(f"key_fields={self.key_fields}: use names from {get_args(KeyField)}")
+        canonical_request_key_fields(self.request_keys)
 
     scope: ClassVar[StateScope] = StateScope.REQUEST
 
     @property
     def request_keys(self) -> tuple[RequestKeyField, ...]:
-        return self.keys
+        return tuple(RequestKeyField(name) for name in self.key_fields)
 
 
 @dataclass(frozen=True)
 class ActivationPatch:
+    """Edit the hidden state at `layers` from a state, whoever writes it (ReFT-style): the first and last prompt
+    tokens, and with decode=True every decode token.
+
+    operator="low_rank_affine" reads three fields per layer, "add" one delta per layer. refresh="admission" keeps
+    the version a request was admitted with; "step" reads the newest version at every decode step, and on_missing
+    says what a step without a new version does ("stop" the request or "hold" the last version).
+    """
+
     state: str
     layers: tuple[int, ...]
     first_tokens: int = 0
     last_tokens: int = 2
-    operator: ActivationPatchOperator = ActivationPatchOperator.LOW_RANK_AFFINE
+    operator: Literal["low_rank_affine", "add"] = "low_rank_affine"
     _: KW_ONLY
-    decode: DecodeWindow = DecodeWindow.NONE
-    decode_refresh: DecodeRefresh = DecodeRefresh.INHERIT
-    on_missing: MissingPolicy = MissingPolicy.STOP
+    decode: bool = False
+    refresh: Literal["admission", "step"] = "admission"
+    on_missing: Literal["stop", "hold"] = "stop"
 
     def __post_init__(self) -> None:
-        if self.decode is DecodeWindow.NONE and (
-            self.decode_refresh is not DecodeRefresh.INHERIT or self.on_missing is not MissingPolicy.STOP
+        if (
+            self.operator not in ("low_rank_affine", "add")
+            or self.refresh not in ("admission", "step")
+            or self.on_missing not in ("stop", "hold")
         ):
-            raise ValueError("decode window is off; refresh and missing policies require decode rows")
+            raise ValueError(
+                'ActivationPatch takes operator "low_rank_affine" or "add", refresh "admission" or "step" and '
+                f'on_missing "stop" or "hold"; got {self}'
+            )
+        if not self.decode and (self.refresh != "admission" or self.on_missing != "stop"):
+            raise ValueError("refresh= and on_missing= apply to decode tokens; set decode=True")
 
     def declare(self, context: _Declaration) -> None:
         """Read local state, preserving replay/HOLD publication dependencies when declared."""
@@ -588,44 +627,60 @@ class ActivationPatch:
             state,
             context.writes.get(self.state) if context.routes or context.binding.feeds else None,
             layers=self.layers,
-            operator=self.operator,
+            operator=ActivationPatchOperator(self.operator),
             first_tokens=self.first_tokens,
             last_tokens=self.last_tokens,
-            decode=self.decode,
-            decode_refresh=self.decode_refresh,
-            on_missing=self.on_missing,
+            decode=DecodeWindow.ALL if self.decode else DecodeWindow.NONE,
+            decode_refresh=DecodeRefresh.STEP if self.refresh == "step" else DecodeRefresh.INHERIT,
+            on_missing=MissingPolicy(self.on_missing),
         )
 
 
 @dataclass(frozen=True)
-class Adapter(ProjectionDelta):
-    """Read declared state at internal model projections, independently of its producer."""
+class Adapter:
+    """Apply a state as a weight delta at the target projections, whoever trains it (a PEFT-style adapter).
 
-    def declare(self, context: _Declaration) -> None:
-        """Bind logical parameter views to the model's targets."""
-        context.binding.overlay(context.states[self.state], None, self.bindings(context))
+    `weight` names the field of a "dense" or "per_head" delta, `factors` the two fields of a "low_rank" one; the
+    delta is multiplied by `scale`.
+    """
 
-    def bindings(self, context: _Declaration) -> tuple[ParameterOverlayFieldBinding, ...]:
-        """The same logical views consumed by inference and differentiable model calls."""
-        return self.field_bindings(lambda name: context.binding.field_views[self.state, name])
+    state: str
+    targets: tuple[Projection, ...]
+    weight: str = "value"
+    operator: AdapterOperator = "dense"
+    factors: tuple[str, str] = ("a", "b")
+    scale: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.operator not in _OPERATORS:
+            raise ValueError(f'Adapter(operator={self.operator!r}): use "dense", "low_rank" or "per_head"')
+
+    @property
+    def delta(self) -> ProjectionDelta:
+        return ProjectionDelta(
+            self.state, self.targets, self.weight, _OPERATORS[self.operator], self.factors, self.scale
+        )
 
 
 def _frozen(initialize: Initializer | None) -> Initializer | None:
     return None if initialize is None else freeze(initialize)
 
 
-def _buffers(state: InstanceState, model: TensorDType) -> dict[str, Buffer]:
-    """Resolve model precision before optimizer fields are derived; plain shapes use the state's dtype."""
-    buffers: dict[str, Buffer] = {}
+def _fields(state: InstanceState, model: TensorDType) -> dict[str, Field]:
+    """The state's fields as pllm.Field values with model precision resolved (before optimizer fields are derived);
+    a fixed shape takes the state's dtype."""
+    fields: dict[str, Field] = {}
     for key, value in state.fields.items():
         match value:
-            case Buffer():
-                buffers[key] = replace(value, dtype=value.dtype or model.torch)
+            case Field():
+                fields[key] = replace(value, dtype=value.dtype or model.torch)
             case tuple():
-                buffers[key] = Buffer(value, state.dtype)
+                fields[key] = Field(value, state.dtype)
             case _:
-                raise TypeError("operand-dependent shapes require Buffer(input_size, output_size)")
-    return buffers
+                raise TypeError(
+                    f"{key}: a shape that depends on the projection is pllm.Field(lambda in_features, out_features: ...)"
+                )
+    return fields
 
 
 class _Effect:
@@ -691,11 +746,11 @@ def write(*, state: str, fields: tuple[str, ...]) -> Callable[[F], F]:
 
 @dataclass(frozen=True)
 class _Export(_Effect):
-    name: str | Config
-    every: int | Config
-    max_rows: int | Config
-    max_cols: int | Config
-    enabled: bool | Config
+    name: str | Attr
+    every: int | Attr
+    max_rows: int | Attr
+    max_cols: int | Attr
+    enabled: bool | Attr
     overflow: Literal["drop", "block"]
 
     phase: ClassVar[Phase | None] = Phase.AFTER_FORWARD
@@ -744,7 +799,7 @@ class _Train(_Effect):
     state: str
     update_rows: str
     reduction: TrainReduction
-    steps: int | Config
+    steps: int | Attr
     reset: str
 
     training: ClassVar[bool] = True
@@ -872,7 +927,7 @@ class _Train(_Effect):
 @dataclass(frozen=True)
 class _Sampler(_Effect):
     stage: SamplerStage
-    beta: float | Config | None = None  # None for additive logits, which have no guidance strength
+    beta: float | Attr | None = None  # None for additive logits, which have no guidance strength
 
     phase: ClassVar[Phase | None] = Phase.BEFORE_SAMPLE
 
@@ -953,10 +1008,10 @@ def differentiate(
     return _mark(gradient=_Gradient(inputs, parameters, input_rows, parameter_rows))
 
 
-def _author_buffers(
+def _author_fields(
     initialize: Initializer, names: tuple[str, ...], values: Tensors, generator: torch.Generator
 ) -> None:
-    """Run the author's initializer on the buffers it declared, not on the generated pending ones."""
+    """Run the author's initializer on the fields it declared, not on the generated pending ones."""
     initialize({name: values[name] for name in names}, generator)
 
 
@@ -964,7 +1019,7 @@ def _chunked_in_forward(
     function: Callable[..., Any],
     initialize: Initializer | None,
     bindings: dict[str, str],
-    buffers: dict[str, Buffer],
+    fields: dict[str, Field],
     effect: ProjectionDelta,
     chunk: int,
     optimizer: SGD | None,
@@ -972,7 +1027,7 @@ def _chunked_in_forward(
 ) -> tuple[Callable[..., UpdateOutput], Initializer | None]:
     """Generate pending state before layout interning and bind the existing chunk executor."""
     if initialize is not None:
-        initialize = partial(_author_buffers, initialize, tuple(buffers))
+        initialize = partial(_author_fields, initialize, tuple(fields))
     arguments = tuple(bindings)
     sources = tuple(bindings.values())
     if chunk < 1:
@@ -981,7 +1036,7 @@ def _chunked_in_forward(
         if len(sources) < 2 or sources[0] != effect.weight or any(s not in ("input", "target") for s in sources[1:]):
             raise ValueError("a chunked update without an optimizer takes the weight carry, then input/target operands")
         pending = {
-            f"_pending_rows_{name}": Buffer(
+            f"_pending_rows_{name}": Field(
                 lambda inputs, outputs, source=source: (max(1, chunk - 1), inputs if source == "input" else outputs),
                 dtype=None,
             )
@@ -997,10 +1052,10 @@ def _chunked_in_forward(
             raise ValueError('a chunked loss reads pllm.operand("input") and each applied state field exactly once')
         pending = {
             f"_pending_grad_{name}": replace(
-                buffers[source],
+                fields[source],
                 dtype=torch.float32
-                if buffers[source].dtype in (torch.float16, torch.bfloat16)
-                else buffers[source].dtype,
+                if fields[source].dtype in (torch.float16, torch.bfloat16)
+                else fields[source].dtype,
             )
             for name, source in bindings.items()
             if source in effect.applied_fields
@@ -1014,10 +1069,10 @@ def _chunked_in_forward(
             flush == "prompt_end",
             dict(bindings),
         )
-    pending["_pending_length"] = Buffer((), dtype=torch.int64)
-    if (pending.keys() | {"_prompt_end"}) & (buffers.keys() | bindings.keys()):
+    pending["_pending_length"] = Field((), dtype=torch.int64)
+    if (pending.keys() | {"_prompt_end"}) & (fields.keys() | bindings.keys()):
         raise ValueError("rename the state fields or arguments that start with _pending_; pllm reserves them")
-    buffers.update(pending)
+    fields.update(pending)
     bindings.update((name, name) for name in pending)
     if optimizer is not None:
         bindings["_prompt_end"] = "prompt_end"
@@ -1027,14 +1082,14 @@ def _chunked_in_forward(
 @dataclass(frozen=True, kw_only=True)
 class _TrainInForward(_Effect):
     state: str
-    targets: tuple[ParameterTarget, ...] | Config
+    targets: tuple[Projection, ...] | Attr
     weight: str
-    operator: ParameterOverlayOperator | Config
-    factors: tuple[str, str] | Config
-    scale: float | Config
-    tokens: Tokens | Config
-    visibility: Visibility | Config
-    chunk: int | Config | None
+    operator: AdapterOperator | Attr
+    factors: tuple[str, str] | Attr
+    scale: float | Attr
+    tokens: Tokens | Attr
+    visibility: VisibilityKind | Attr
+    chunk: int | Attr | None
     flush: Literal["prompt_end"] | None
 
     phase: ClassVar[Phase | None] = Phase.IN_FORWARD
@@ -1050,7 +1105,7 @@ class _TrainInForward(_Effect):
             self.state,
             _targets(_setting(self.targets, owner, tuple)),
             self.weight,
-            _setting(self.operator, owner, ParameterOverlayOperator),
+            _OPERATORS[_option(self.operator, owner, get_args(AdapterOperator), "operator")],
             _setting(self.factors, owner, tuple),
             _setting(self.scale, owner, float),
         ).expand(layers)
@@ -1077,12 +1132,11 @@ class _TrainInForward(_Effect):
             )
         if self.flush is not None and optimizer is None:
             raise ValueError(f"flush='prompt_end' trains a short final chunk; declare {self.state!r} with an optimizer")
-        buffers = _buffers(definition, context.binding.dimensions.dtype)
+        fields = _fields(definition, context.binding.dimensions.dtype)
         bindings = {
-            key: source.in_forward_binding(self.state, buffers)
-            for key, source in _arguments(operation.function).items()
+            key: source.in_forward_binding(self.state, fields) for key, source in _arguments(operation.function).items()
         }
-        if set(buffers) & {source.value for source in Operand}:
+        if set(fields) & {source.value for source in Operand}:
             raise ValueError("rename the state fields that repeat an operand name (input, target, weight, prompt_end)")
         effect = self.projection_delta(context.owner, context.binding.dimensions.layer_count)
         identity = fingerprint(operation.function)
@@ -1093,7 +1147,7 @@ class _TrainInForward(_Effect):
                 function,
                 initialize,
                 bindings,
-                buffers,
+                fields,
                 effect,
                 _setting(self.chunk, context.owner, int),
                 optimizer,
@@ -1103,14 +1157,14 @@ class _TrainInForward(_Effect):
             context.binding,
             operation.name,
             effect,
-            buffers,
+            fields,
             initialize=initialize,
             keys=definition.request_keys,
-            phases=_TOKEN_PHASES[_setting(self.tokens, context.owner, str)],
+            phases=_TOKEN_PHASES[_option(self.tokens, context.owner, get_args(Tokens), "tokens")],
             identity=f"python:{identity}",
             function=function,
             arguments=bindings,
-            visibility=_setting(self.visibility, context.owner, Visibility),
+            visibility=_option(self.visibility, context.owner, ("forward_pinned", "exact"), "visibility"),
             equations_digest=boundary_digest(context.signature, context.bindings, self.chunk, self.flush),
         )
         context.signature.append(
@@ -1133,27 +1187,28 @@ class _TrainInForward(_Effect):
 def train_in_forward(
     *,
     state: str,
-    targets: tuple[ParameterTarget, ...] | Config,
+    targets: tuple[Projection, ...] | Attr,
     weight: str = "value",
-    operator: ParameterOverlayOperator | Config = ParameterOverlayOperator.DENSE_ADD,
-    factors: tuple[str, str] | Config = ("a", "b"),
-    scale: float | Config = 1.0,
-    tokens: Tokens | Config = "prefill",
-    visibility: Visibility | Config = Visibility.forward_pinned(),
-    chunk: int | Config | None = None,
+    operator: AdapterOperator | Attr = "dense",
+    factors: tuple[str, str] | Attr = ("a", "b"),
+    scale: float | Attr = 1.0,
+    tokens: Tokens | Attr = "prefill",
+    visibility: Literal["forward_pinned", "exact"] | Attr = "forward_pinned",
+    chunk: int | Attr | None = None,
     flush: Literal["prompt_end"] | None = None,
 ) -> Callable[[F], F]:
     """Train a request state inside the forward and add its residual at each target projection.
 
-    `tokens` picks the tokens whose projection operands train the state: "prefill", "decode" or "all". With ``chunk``, the function takes the weight carry followed by input/target row
-    operands and returns (next carry, readouts). Pending rows belong to the framework.
-    When ``state`` declares ``optimizer=pllm.SGD(lr)``, return one loss per row instead;
-    gradients accumulate until a chunk completes, including a short final chunk with
-    ``flush="prompt_end"``.
-    """
+    `tokens` picks the tokens whose projection operands train the state: "prefill", "decode" or "all";
+    `operator`, `weight`, `factors` and `scale` say how the state changes each projection, as in
+    pllm.model.Adapter. visibility="forward_pinned" reads the state the forward started with; "exact" also reads
+    every chunk already trained in this forward.
 
-    if type(tokens) is str and tokens not in _TOKEN_PHASES:
-        raise ValueError(f'@pllm.train_in_forward(tokens={tokens!r}): use "prefill", "decode" or "all"')
+    With ``chunk``, the function takes the weight carry followed by input/target row operands and returns
+    (next carry, readouts). Pending rows belong to the framework. When ``state`` declares
+    ``optimizer=pllm.SGD(lr)``, return one loss per row instead; gradients accumulate until a chunk completes,
+    including a short final chunk with ``flush="prompt_end"``.
+    """
     return _mark(
         effect=_TrainInForward(
             state=state,
@@ -1170,18 +1225,18 @@ def train_in_forward(
     )
 
 
-def on(phase: Phase | Config) -> Callable[[F], F]:
+def on(phase: Phase | Attr) -> Callable[[F], F]:
     """Run the method in `phase`; needed for methods without an effect or to move an effect's phase."""
     return _mark(phase=phase)
 
 
 def export(
     *,
-    name: str | Config = "value",
-    every: int | Config = 1,
-    max_rows: int | Config = 1,
-    max_cols: int | Config = 16,
-    enabled: bool | Config = True,
+    name: str | Attr = "value",
+    every: int | Attr = 1,
+    max_rows: int | Attr = 1,
+    max_cols: int | Attr = 16,
+    enabled: bool | Attr = True,
     overflow: Literal["drop", "block"] = "drop",
 ) -> Callable[[F], F]:
     """Deliver bounded observations to on_export; block only when explicitly requested."""
@@ -1198,7 +1253,7 @@ def add_logits(*, rows: str = "") -> Callable[[F], F]:
     return _mark(effect=_Sampler(SamplerStage.PACKED_PRE_FILTER_ADD), rows=rows)
 
 
-def guide_sampling(*, beta: float | Config, rows: str = "") -> Callable[[F], F]:
+def guide_sampling(*, beta: float | Attr, rows: str = "") -> Callable[[F], F]:
     """Steer sampling toward the returned hidden-state prediction with strength `beta`."""
     return _mark(effect=_Sampler(SamplerStage.PACKED_POST_FILTER_EXACT, beta), rows=rows)
 
@@ -1208,7 +1263,7 @@ def train(
     state: str,
     update_rows: str = "",
     reduction: TrainReduction = "mean",
-    steps: int | Config = 1,
+    steps: int | Attr = 1,
     reset: str = "",
     rows: str = "",
 ) -> Callable[[F], F]:
@@ -1234,8 +1289,17 @@ def train(
     )
 
 
-def _setting(value: C | Config, config: Workload, expected: type[C]) -> C:
-    resolved = Config.resolve(value, config)
+def _option(value: L | Attr, owner: Workload, options: tuple[L, ...], name: str) -> L:
+    """Resolve a closed string option, possibly a pllm.Attr, and check it is one of `options`."""
+    resolved = Attr.resolve(value, owner)
+    for option in options:
+        if resolved == option:
+            return option
+    raise ValueError(f"{name}={resolved!r}: use one of {', '.join(map(repr, options))}")
+
+
+def _setting(value: C | Attr, config: Workload, expected: type[C]) -> C:
+    resolved = Attr.resolve(value, config)
     if expected is float and type(resolved) is int:
         resolved = float(resolved)
     if (typed := _typed(resolved, expected)) is None or type(resolved) is not expected:
@@ -1243,10 +1307,10 @@ def _setting(value: C | Config, config: Workload, expected: type[C]) -> C:
     return typed
 
 
-def _targets(value: tuple[object, ...]) -> tuple[ParameterTarget, ...]:
-    targets = tuple(target for item in value if (target := _typed(item, ParameterTarget)) is not None)
+def _targets(value: tuple[object, ...]) -> tuple[Projection, ...]:
+    targets = tuple(target for item in value if (target := _typed(item, Projection)) is not None)
     if len(targets) != len(value):
-        raise TypeError("targets must be pllm.model.ParameterTarget values")
+        raise TypeError("targets must be pllm.model.Projection values")
     return targets
 
 
@@ -1470,7 +1534,8 @@ class _Declaration:
     # The owner's values, signed; the declared states and model values among them, by type.
     bindings: tuple[tuple[str, str], ...] = ()
     state_definitions: dict[str, InstanceState] = field(default_factory=lambda: {})
-    adapters: dict[str, Adapter] = field(default_factory=lambda: {})
+    # Each declared pllm.model.Adapter as the projection delta it applies.
+    adapters: dict[str, ProjectionDelta] = field(default_factory=lambda: {})
     activations: dict[str, ActivationPatch] = field(default_factory=lambda: {})
     position_definitions: dict[str, PositionState] = field(default_factory=lambda: {})
     # Ordered (name, digest) entries folded into the graph's execution parameters digest.
@@ -1504,10 +1569,9 @@ class _Declaration:
             operation.effect.model_effect for operation in self.operations
         )
 
-    @property
-    def model_values(self) -> dict[str, ActivationPatch | Adapter]:
-        """The values that act inside the model forward; a workload declares at most one."""
-        return {**self.activations, **self.adapters}
+    def adapter_bindings(self, delta: ProjectionDelta) -> tuple[ParameterOverlayFieldBinding, ...]:
+        """The field views an adapter applies, shared by inference and differentiable model calls."""
+        return delta.field_bindings(lambda name: self.binding.field_views[delta.state, name])
 
     @classmethod
     def read(cls, workload: Workload) -> _Declaration:
@@ -1533,7 +1597,7 @@ class _Declaration:
             if _property(member):
                 values[name] = object.__getattribute__(owner, name)
         context.state_definitions = _of_type(values, InstanceState)
-        context.adapters = _of_type(values, Adapter)
+        context.adapters = {key: value.delta for key, value in _of_type(values, Adapter).items()}
         context.activations = _of_type(values, ActivationPatch)
         context.position_definitions = _of_type(values, PositionState)
         return context
@@ -1564,7 +1628,7 @@ class _Declaration:
             seeds.append(function)
             return
         phase, marked, gradient, rows = (
-            _typed(Config.resolve(markers.get("__pllm_phase__"), self.owner), Phase),
+            _typed(Attr.resolve(markers.get("__pllm_phase__"), self.owner), Phase),
             _typed(markers.get("__pllm_effect__"), _Effect),
             _typed(markers.get("__pllm_gradient__"), _Gradient),
             _typed(markers.get("__pllm_rows__", ""), str),
@@ -1633,7 +1697,7 @@ class _Declaration:
 
     def declare_values(self) -> None:
         """Allocate ordinary state before effects and operations consume its ports."""
-        if self.binding.host and (self.routes or self.model_values):
+        if self.binding.host and (self.routes or self.adapters or self.activations):
             raise ValueError(
                 "pllm.model.Adapter, pllm.model.ActivationPatch and layer routes act inside a model forward; compile this "
                 "workload with make_llm, not make_host"
@@ -1652,13 +1716,18 @@ class _Declaration:
                     update,
                     self.binding.publish(update, allocated, when=When.BEFORE_FORWARD, name=f"{name}.publish"),
                 )
-        self.signature.extend((name, fingerprint(value)) for name, value in self.model_values.items())
+        self.signature.extend(
+            (name, fingerprint(value)) for name, value in {**self.activations, **self.adapters}.items()
+        )
 
     def attach_effects(self) -> None:
         """Connect publications before replay and missing-input branches."""
-        for name, value in self.model_values.items():
+        for name, patch in self.activations.items():
             with self.declaring(name):
-                value.declare(self)
+                patch.declare(self)
+        for name, delta in self.adapters.items():
+            with self.declaring(name):
+                self.binding.overlay(self.states[delta.state], None, self.adapter_bindings(delta))
         if self.routes:
             declare_layer_route(
                 self.binding,
@@ -1945,8 +2014,9 @@ __all__ = [
     "add_logits",
     "guide_sampling",
     "train",
-    "Config",
+    "Attr",
     "hidden",
+    "final_hidden",
     "parameter",
     "module",
     "version",
@@ -1962,12 +2032,10 @@ __all__ = [
     "InstanceState",
     "RequestState",
     "train_in_forward",
-    "Buffer",
+    "Field",
     "UpdateOutput",
     "differentiate",
     "ActivationPatch",
     "Adapter",
-    "Exact",
-    "Visibility",
     "SGD",
 ]

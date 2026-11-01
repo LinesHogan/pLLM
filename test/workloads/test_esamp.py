@@ -18,7 +18,7 @@ from pllm import testing
 from pllm.config import ExecutionOptions
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
-from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
+from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId, TaskSymbol
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.visibility import VisibilitySource
@@ -254,7 +254,7 @@ class Distillation(pllm.Workload):
     heads = pllm.RequestState(
         {"weight": lambda m: (m.hidden_size, m.hidden_size)},
         optimizer=pllm.AdamW(lr=0.03, weight_decay=0.1),
-        keys=(RequestKeyField.PROMPT_INDEX, RequestKeyField.SAMPLE_INDEX),
+        key_fields=("prompt_index", "sample_index"),
         carry={"carry": lambda m: (m.hidden_size,)},
     )
 

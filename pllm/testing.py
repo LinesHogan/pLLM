@@ -4,10 +4,10 @@
 the vLLM runner probes; `compile_execution` compiles a workload against them and admits its instance state.
 `step_input` builds one packed step (one row per request) the way the runner would hand it to the
 workload; `run_step` and `run_guided_step` execute every anchor of that step, delivering sampler feedback
-when the workload reads it. `hidden_binding` names a hidden tap exactly as the runner does, so the same
-bindings serve the facts and the step input.
+when the workload reads it. `hidden_binding` and `final_hidden_binding` name the tap `pllm.hidden(layer)` and
+`pllm.final_hidden()` read, exactly as the runner does, so the same bindings serve the facts and the step input.
 
-    binding = testing.hidden_binding(0, testing.HiddenSite.BLOCK_OUTPUT, layer_count=1)
+    binding = testing.hidden_binding(0, layer_count=1)
     execution = testing.compile_execution(workload, testing.backend_facts(4, (binding,), layer_count=1))
     rows = (testing.RequestIdentity("a", 0, 0),)
     execution.admit(rows)
@@ -17,17 +17,17 @@ bindings serve the facts and the step input.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Literal, TypeVar
 
 import numpy as np
 import torch
 
-from pllm.backends.vllm.architecture import hidden_binding
+from pllm.backends.vllm import architecture
 from pllm.contracts.backend_attachment import (
     AttachmentGraphMode,
     AttachmentHiddenResource,
     BackendPlacementProbe,
-    ParameterTargetShape,
+    ProjectionShape,
 )
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.host_batch import HostBatch
@@ -71,7 +71,7 @@ def backend_facts(
     dtype: TensorDType = TensorDType.FLOAT32,
     vocab_size: int = 0,
     layer_count: int = 0,
-    targets: tuple[ParameterTargetShape, ...] = (),
+    targets: tuple[ProjectionShape, ...] = (),
 ) -> BackendCompileFacts:
     """Facts for an eager in-process model, in place of what the vLLM runner probes.
 
@@ -105,6 +105,16 @@ def backend_facts(
     )
 
 
+def hidden_binding(layer: int, layer_count: int) -> PackedHiddenResourceBinding:
+    """The tap `pllm.hidden(layer)` reads, named as the vLLM runner names it."""
+    return architecture.hidden_binding(layer, HiddenSite.BLOCK_OUTPUT, layer_count)
+
+
+def final_hidden_binding(layer_count: int) -> PackedHiddenResourceBinding:
+    """The tap `pllm.final_hidden()` reads, named as the vLLM runner names it."""
+    return architecture.hidden_binding(-1, HiddenSite.MODEL_OUTPUT, layer_count)
+
+
 def compile_execution(
     workload: BackendWorkload[DataT, ResultT], facts: BackendCompileFacts, stream: torch.cuda.Stream | None = None
 ) -> StateExecution[StepInput, DataT, ResultT]:
@@ -123,20 +133,20 @@ def step_input(
     *,
     step_id: int = 0,
     token_offset: int = 0,
-    phases: Sequence[HiddenPhase] | None = None,
+    tokens: Sequence[Literal["prefill", "decode"]] | None = None,
     sampler_order: Sequence[int] | None = None,
     batch: HostBatch[torch.Tensor] | None = None,
     operands: tuple[CapturedParameterOperand, ...] = (),
     stream: torch.cuda.Stream | None = None,
 ) -> StepInput:
-    """One packed step: row i belongs to `identities[i]` and decodes unless `phases` says otherwise.
+    """One packed step: row i belongs to `identities[i]` and decodes unless `tokens` says otherwise.
 
     `sampler_order` lists the packed row behind each sampler row (identity order by default; `()` for a
     step without sampling). Hidden tensors are given per tap, one row per identity; CUDA tensors need the
     `stream` they were produced on.
     """
     count = len(identities)
-    row_phases = tuple(phases) if phases is not None else (HiddenPhase.DECODE,) * count
+    row_phases = tuple(HiddenPhase(token) for token in tokens) if tokens is not None else (HiddenPhase.DECODE,) * count
     rows = PackedPhaseRowBatch(
         step_id,
         count,
@@ -191,12 +201,11 @@ def run_guided_step(
 
 
 __all__ = [
-    "HiddenPhase",
-    "HiddenSite",
     "RequestIdentity",
     "SamplerFeedback",
     "backend_facts",
     "compile_execution",
+    "final_hidden_binding",
     "hidden_binding",
     "run_guided_step",
     "run_step",

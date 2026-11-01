@@ -57,7 +57,7 @@ from pllm.backends.vllm.compat import VLLM_027
 from pllm.backends.vllm.marlin import dequantize
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
-from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
+from pllm.contracts.parameter_overlay import Projection
 
 # Importing vLLM's qwen3_next (and qwen3_5, which builds on it) initializes CUDA, which the frontend
 # process of a multiprocess engine must not do; the worker-side methods below import them where used.
@@ -181,14 +181,14 @@ class Decoder:
         cls = type(self.model)
         return f"{cls.__module__}.{cls.__qualname__}"
 
-    def projection(self, target: ParameterTarget) -> tuple[LinearBase, int, int, Mlp | None]:
+    def projection(self, target: Projection) -> tuple[LinearBase, int, int, Mlp | None]:
         """Resolve the supported projection and its disjoint output slice; reject layouts pllm cannot slice."""
         from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer
         from vllm.model_executor.models.qwen3_next import Qwen3NextAttention, Qwen3NextSparseMoeBlock
 
         assert target.layer is not None
         layer = self.writable("a parameter overlay").model.layers[target.layer]
-        if target.module is ParameterModuleKind.MLP and target.role is ParameterRole.DOWN_PROJECTION_WEIGHT:
+        if target.name == "down_proj":
             mlp = layer.mlp
             if isinstance(mlp, (Qwen3MoeSparseMoeBlock, Qwen3NextSparseMoeBlock)):
                 raise ValueError(
@@ -196,7 +196,7 @@ class Decoder:
                     "so overlay the attention query or value projection instead"
                 )
             return mlp.down_proj, 0, mlp.down_proj.output_size_per_partition, mlp
-        if target.module is ParameterModuleKind.ATTENTION:
+        if target.name in ("q_proj", "v_proj"):
             if isinstance(layer, Qwen3_5DecoderLayer) and layer.layer_type != "full_attention":
                 raise ValueError(
                     f"layer {target.layer} is a Gated DeltaNet layer; overlay a full-attention layer "
@@ -205,14 +205,14 @@ class Decoder:
             attention = layer.self_attn
             # Gated attention stores qkv_proj rows as [per-head (query, gate) pairs, key, value].
             gated = isinstance(attention, Qwen3NextAttention) and attention.attn_output_gate
-            if target.role is ParameterRole.QUERY_PROJECTION_WEIGHT:
+            if target.name == "q_proj":
                 if gated:
                     raise ValueError(
                         "gated attention interleaves each head's query rows with its output-gate rows; "
                         "overlay the value projection instead"
                     )
                 return attention.qkv_proj, 0, attention.q_size, None
-            if target.role is ParameterRole.VALUE_PROJECTION_WEIGHT:
+            if target.name == "v_proj":
                 start = (2 if gated else 1) * attention.q_size + attention.kv_size
                 return attention.qkv_proj, start, attention.kv_size, None
         raise ValueError("parameter overlay requires an MLP down or attention q/v projection")

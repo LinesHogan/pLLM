@@ -38,8 +38,8 @@ def head_logits(hidden: torch.Tensor, down: torch.Tensor, up: torch.Tensor, indi
     return torch.bmm(torch.bmm(hidden.unsqueeze(1), down.transpose(1, 2)), up.transpose(1, 2)).squeeze(1)
 
 
-HIDDEN = pllm.hidden(-1, site=pllm.model.HiddenSite.MODEL_OUTPUT)
-SAMPLES = pllm.sample_index(pllm.Config("config.num_iterations"))
+HIDDEN = pllm.final_hidden()
+SAMPLES = pllm.sample_index(pllm.Attr("config.num_iterations"))
 DOWN = pllm.parameter("iteration_heads", "down")
 UP = pllm.parameter("iteration_heads", "up")
 

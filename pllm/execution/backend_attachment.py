@@ -167,7 +167,7 @@ def _check_attachment(attachment: BackendAttachment) -> None:
     """Reject attachments a workload author can declare but the backend cannot run.
 
     Only mistakes reachable from a declaration are checked: export and training inputs, the
-    trained state's scope and sampled-token readers. Buffer shapes and
+    trained state's scope and sampled-token readers. Field shapes and
     dtypes are checked earlier, where the declaration resolves them against the model.
     """
     if attachment.spec.kind is AttachmentKind.OBSERVATION:

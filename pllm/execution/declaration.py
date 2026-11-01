@@ -117,7 +117,7 @@ class When(Enum):
 
 
 @dataclass(frozen=True, slots=True)
-class Field:
+class LayoutField:
     name: str
     shape: Shape
     dtype: TensorDType | Callable[[Dimensions], TensorDType] = TensorDType.FLOAT32
@@ -127,7 +127,7 @@ class Field:
 @dataclass(frozen=True, slots=True)
 class State:
     declaration: SemanticState
-    fields: tuple[Field, ...]
+    fields: tuple[LayoutField, ...]
     # With AdamW, the first ADAM fields are one flat parameter field and its optimizer fields.
     optimizer: AdamWConfig | None = None
 
@@ -158,7 +158,7 @@ class State:
         return PageUpdate(self.optimizer)
 
     @property
-    def carry_fields(self) -> tuple[Field, ...]:
+    def carry_fields(self) -> tuple[LayoutField, ...]:
         """The plain carried fields that follow the AdamW fields."""
         return self.fields[0 if self.optimizer is None else ADAM :]
 
@@ -227,12 +227,12 @@ class Builder(Generic[D]):
     def state(
         self,
         name: str,
-        fields: tuple[Field, ...] | None = None,
+        fields: tuple[LayoutField, ...] | None = None,
         *,
         scope: StateScope = StateScope.INSTANCE,
         keys: tuple[RequestKeyField, ...] = (),
         optimizer: AdamWConfig | None = None,
-        carry: tuple[Field, ...] = (),
+        carry: tuple[LayoutField, ...] = (),
     ) -> State:
         if fields is None:
             assert optimizer is None and not carry, "an optimizer and carried fields need declared parameter fields"
@@ -270,7 +270,7 @@ class Builder(Generic[D]):
                 else:
                     shapes.append(field.shape)
 
-            def dtype(field: Field) -> TensorDType:
+            def dtype(field: LayoutField) -> TensorDType:
                 if callable(field.dtype):
                     assert self.dimensions is not None
                     return field.dtype(self.dimensions)

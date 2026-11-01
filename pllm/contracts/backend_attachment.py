@@ -8,7 +8,7 @@ from enum import StrEnum
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
-from pllm.contracts.parameter_overlay import FieldView, ParameterOverlayFieldBinding, ParameterTargetShape
+from pllm.contracts.parameter_overlay import FieldView, ParameterOverlayFieldBinding, ProjectionShape
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
     AnchorId,
@@ -78,7 +78,7 @@ class BackendPlacementProbe:
     max_packed_rows: int
     hidden_resources: tuple[AttachmentHiddenResource, ...]
     capabilities: tuple[str, ...]
-    targets: tuple[ParameterTargetShape, ...] = ()
+    targets: tuple[ProjectionShape, ...] = ()
     causal_domain: CausalModelDomain | None = None
     position_states: tuple[tuple[str, float], ...] = ()
 

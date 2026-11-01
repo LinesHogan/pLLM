@@ -13,7 +13,7 @@ from torch.nn import functional as F
 
 import pllm
 from pllm import testing
-from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import SamplerFeedback
 from pllm.contracts.semantic_graph import AnchorId
@@ -25,7 +25,7 @@ from pllm.testing import backend_facts
 from pllm.workloads.override import OverRIDEConfig, OverRIDEWorkload
 from test.backend_facts import assert_finite_resources
 
-BINDING = testing.hidden_binding(-1, HiddenSite.MODEL_OUTPUT, 1)
+BINDING = testing.final_hidden_binding(1)
 HIDDEN = torch.tensor([[0.2, -0.1, 0.4, 0.3], [-0.5, 0.7, 0.1, -0.2], [0.1, 0.3, -0.2, 0.8]])
 BASE = torch.linspace(-1, 1, 21).reshape(3, 7)
 TOKENS = torch.tensor([2, 4, 1])
@@ -46,7 +46,7 @@ def step_input(identities, hidden, step_id, order=None, prefill=False, stream=No
         {BINDING: hidden[: len(identities)]},
         step_id=step_id,
         token_offset=step_id,
-        phases=phases,
+        tokens=phases,
         sampler_order=order,
         stream=stream,
     )
@@ -166,7 +166,7 @@ def _request_heads() -> None:
         @pllm.add_logits()
         def reweight(
             self,
-            hidden: torch.Tensor = pllm.hidden(-1, HiddenSite.MODEL_OUTPUT),
+            hidden: torch.Tensor = pllm.final_hidden(),
             samples: torch.Tensor = pllm.sample_index(),
             weight: torch.Tensor = pllm.parameter("heads", "weight"),
         ) -> torch.Tensor:
@@ -178,7 +178,7 @@ def _request_heads() -> None:
         @pllm.train(state="heads", rows="eligible")
         def train(
             self,
-            hidden: torch.Tensor = pllm.hidden(-1, HiddenSite.MODEL_OUTPUT),
+            hidden: torch.Tensor = pllm.final_hidden(),
             samples: torch.Tensor = pllm.sample_index(),
             weight: torch.Tensor = pllm.parameter("heads", "weight"),
             base: torch.Tensor = pllm.base_logits(),
@@ -218,7 +218,7 @@ def _chained_heads(facts) -> None:
         @pllm.differentiate(inputs=("hidden",), parameters=True)
         def reweight(
             self,
-            hidden: torch.Tensor = pllm.hidden(-1, HiddenSite.MODEL_OUTPUT),
+            hidden: torch.Tensor = pllm.final_hidden(),
             samples: torch.Tensor = pllm.sample_index(),
             weight: torch.Tensor = pllm.parameter("heads", "weight"),
         ) -> torch.Tensor:
@@ -312,7 +312,7 @@ class Domains(pllm.Workload):
     @pllm.differentiate(inputs=("hidden",), parameters=True, input_rows="input_rows", parameter_rows="parameter_rows")
     def reweight(
         self,
-        hidden: torch.Tensor = pllm.hidden(-1, HiddenSite.MODEL_OUTPUT),
+        hidden: torch.Tensor = pllm.final_hidden(),
         samples: torch.Tensor = pllm.sample_index(),
         weight: torch.Tensor = pllm.parameter("heads", "weight", per_row=True),
     ) -> torch.Tensor:

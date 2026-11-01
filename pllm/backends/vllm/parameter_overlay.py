@@ -19,8 +19,8 @@ from pllm.contracts.parameter_overlay import (
     CapturedParameterOperand,
     ParameterOverlayFieldBinding,
     ParameterOverlayOperator,
-    ParameterTarget,
-    ParameterTargetShape,
+    Projection,
+    ProjectionShape,
 )
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import StateResource
@@ -42,9 +42,9 @@ from pllm.execution.state_execution import DataT, StateTaskContext
 
 
 def inspect_parameter_targets(
-    decoder: Decoder, targets: tuple[ParameterTarget, ...], dtype: torch.dtype
-) -> tuple[ParameterTargetShape, ...]:
-    specs: list[ParameterTargetShape] = []
+    decoder: Decoder, targets: tuple[Projection, ...], dtype: torch.dtype
+) -> tuple[ProjectionShape, ...]:
+    specs: list[ProjectionShape] = []
     for index, target in enumerate(targets):
         module, offset, size, _ = decoder.projection(target)
         if (
@@ -55,7 +55,7 @@ def inspect_parameter_targets(
             or offset + size > module.output_size_per_partition
         ):
             raise ValueError("parameter overlay requires unique, exact unsharded projections matching model dtype")
-        specs.append(ParameterTargetShape(target, module.input_size_per_partition, size))
+        specs.append(ProjectionShape(target, module.input_size_per_partition, size))
     return tuple(specs)
 
 

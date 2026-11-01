@@ -19,7 +19,7 @@ from torch.optim.sgd import sgd
 
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
-from pllm.contracts.parameter_overlay import ParameterTarget
+from pllm.contracts.parameter_overlay import Projection
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
@@ -109,7 +109,7 @@ class Observation:
 @dataclass(frozen=True, slots=True)
 class TaskOutput:
     residuals: ProjectionResiduals = field(
-        default_factory=lambda: dict[tuple[RequestIdentity, ParameterTarget], torch.Tensor]()
+        default_factory=lambda: dict[tuple[RequestIdentity, Projection], torch.Tensor]()
     )
     guidance: PackedSamplerGuidanceBatch | None = None
     gradients: tuple[torch.Tensor, ...] = ()

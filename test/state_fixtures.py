@@ -12,7 +12,7 @@ from pllm import testing
 from pllm.config import ExecutionOptions
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
-from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget, ParameterTargetShape
+from pllm.contracts.parameter_overlay import Projection, ProjectionShape
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.semantic_graph import AnchorId, SemanticState, StateResource, StateScope
 from pllm.contracts.state_representation import StateDeviceKind, StateLayoutRequirement, StateRepresentationRequest
@@ -60,10 +60,10 @@ def paged_rows(positions=(4, 5, 4, 5)) -> tuple[PackedPhaseRow, ...]:
 
 def inplace_plan(device: torch.device, provider: PageBundleProviderFacts, capabilities: tuple[str, ...]):
     """The InPlaceTTT plan for one request-scoped dense resource on ``device``."""
-    target = ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT)
+    target = Projection("down_proj", 0)
     timeline = model_timeline(device, capabilities)
     facts = testing.backend_facts(
-        3, (), timeline, provider, memory_bytes=4096, max_rows=8, targets=(ParameterTargetShape(target, 3, 2),)
+        3, (), timeline, provider, memory_bytes=4096, max_rows=8, targets=(ProjectionShape(target, 3, 2),)
     )
     workload = InPlaceTTTWorkload(InPlaceTTTConfig((target,), chunk_size=2))
     return workload.plan_backend(*workload.specialize(facts, ExecutionOptions())).plan
@@ -200,7 +200,7 @@ def multistate(*, route=False, instance=True, failing=()):
 
 def step_for(*identities):
     """A step with one prefill row per request identity."""
-    return testing.step_input(identities, phases=(HiddenPhase.PREFILL,) * len(identities), sampler_order=())
+    return testing.step_input(identities, tokens=(HiddenPhase.PREFILL,) * len(identities), sampler_order=())
 
 
 def assert_multistate_reclaimed(execution):

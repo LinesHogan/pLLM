@@ -17,10 +17,8 @@ from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
     CapturedParameterOperand,
-    ParameterModuleKind,
-    ParameterRole,
-    ParameterTarget,
-    ParameterTargetShape,
+    Projection,
+    ProjectionShape,
 )
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.state_representation import StateDeviceKind
@@ -36,7 +34,7 @@ from pllm.testing import backend_facts
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
 from test.workloads.test_inplace_ttt import _input
 
-TARGET = ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT)
+TARGET = Projection("down_proj", 0)
 
 
 def facts_for(device, dtype):
@@ -50,7 +48,7 @@ def facts_for(device, dtype):
         memory_bytes=65536,
         max_rows=8,
         dtype=TensorDType(str(dtype).removeprefix("torch.")),
-        targets=(ParameterTargetShape(TARGET, 7, 5),),
+        targets=(ProjectionShape(TARGET, 7, 5),),
     )
 
 
@@ -229,7 +227,7 @@ def test_counted_gated_tail_keeps_inactive_chunks_and_never_reads_device_counts(
     from pllm.kernels.head_overlay import head_correction
     from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
 
-    target = ParameterTarget(0, ParameterModuleKind.ATTENTION, ParameterRole.QUERY_PROJECTION_WEIGHT)
+    target = Projection("q_proj", 0)
     workload = GatedDeltaWorkload(GatedDeltaConfig((target,), head_width=4, chunk_size=4))
     context = ScanContext(TensorPolicy(numerics), 32, torch.device("cuda:0"), 64 << 20)
     run = context.bind(ChunkUpdate(workload.step, 4, ("state", "hidden")))

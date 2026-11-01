@@ -9,7 +9,6 @@ from typing import Generic, TypeVar
 from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import BackendAttachment, BackendPlacementProbe
 from pllm.contracts.compilation import PlanBundle
-from pllm.contracts.hidden_locator import HiddenSite as HiddenSite
 from pllm.contracts.host_batch import (
     CausalTrainBatch as CausalTrainBatch,
     HostBatch as HostBatch,
@@ -18,7 +17,7 @@ from pllm.contracts.host_batch import (
     WeightedRowBatch as WeightedRowBatch,
     map_host_batch as map_host_batch,
 )
-from pllm.contracts.parameter_overlay import ParameterTarget
+from pllm.contracts.parameter_overlay import Projection
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import HiddenInputSource, SchedulerTimeline, StateScope
 from pllm.contracts.visibility import VisibilitySource
@@ -50,7 +49,6 @@ __all__ = [
     "CausalTrainBatch",
     "Dimensions",
     "FunctionMath",
-    "HiddenSite",
     "StateImport",
     "StepResult",
     "StepInput",
@@ -63,7 +61,7 @@ __all__ = [
 @dataclass(frozen=True, slots=True)
 class BackendRequirements:
     hidden_inputs: tuple[HiddenInputSource, ...] = ()
-    parameter_targets: tuple[ParameterTarget, ...] = ()
+    parameter_targets: tuple[Projection, ...] = ()
     activation_layers: tuple[int, ...] = ()
     sampler_stage: SamplerStage | None = None
     sampler_feedback: bool = False

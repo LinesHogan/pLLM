@@ -3,6 +3,7 @@
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import torch
 
@@ -38,8 +39,8 @@ class ReFTConfig:
     rank: int = 4
     first_tokens: int = 0
     last_tokens: int = 2
-    operator: pllm.model.ActivationPatchOperator = pllm.model.ActivationPatchOperator.LOW_RANK_AFFINE
-    scope: pllm.state.StateScope = pllm.state.StateScope.INSTANCE
+    operator: Literal["low_rank_affine", "add"] = "low_rank_affine"
+    scope: Literal["instance", "request"] = "instance"
 
     def __post_init__(self) -> None:
         if (
@@ -60,15 +61,15 @@ class ReFTWorkload(pllm.Workload):
     def intervention(self) -> pllm.InstanceState:
         rank = self.config.rank
         fields = (
-            pllm.Buffer(lambda inputs, outputs: (rank, inputs), dtype=None),
-            pllm.Buffer((rank,), dtype=None),
-            pllm.Buffer(lambda inputs, outputs: (outputs, rank), dtype=None),
+            pllm.Field(lambda in_features, out_features: (rank, in_features), dtype=None),
+            pllm.Field((rank,), dtype=None),
+            pllm.Field(lambda in_features, out_features: (out_features, rank), dtype=None),
         )
-        if self.config.operator is pllm.model.ActivationPatchOperator.ADD:
-            fields = (pllm.Buffer(lambda inputs, outputs: (inputs,), dtype=torch.float32),)
-        state = pllm.RequestState if self.config.scope is pllm.state.StateScope.REQUEST else pllm.InstanceState
+        if self.config.operator == "add":
+            fields = (pllm.Field(lambda in_features, out_features: (in_features,), dtype=torch.float32),)
+        state = pllm.RequestState if self.config.scope == "request" else pllm.InstanceState
         return state(
-            {f"layer_{layer}_{offset}": buffer for layer in self.config.layers for offset, buffer in enumerate(fields)},
+            {f"layer_{layer}_{offset}": field for layer in self.config.layers for offset, field in enumerate(fields)},
             imported=True,
         )
 

@@ -17,7 +17,7 @@ from pllm.contracts.backend_attachment import (
 )
 from pllm.contracts.host_batch import validate_host_batch
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
-from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget, ParameterTargetShape
+from pllm.contracts.parameter_overlay import Projection, ProjectionShape
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import TaskResourceFact, TaskSymbol
 from pllm.contracts.state_representation import StateDeviceKind
@@ -34,10 +34,7 @@ from pllm.workloads.tlm import TLMConfig, TLMMode, TLMWorkload
 class TinyCausalPort:
     device = torch.device("cpu")
     tensor_dtype = TensorDType.FLOAT64
-    targets = tuple(
-        ParameterTargetShape(ParameterTarget(0, ParameterModuleKind.ATTENTION, role), 3, 3)
-        for role in (ParameterRole.QUERY_PROJECTION_WEIGHT, ParameterRole.VALUE_PROJECTION_WEIGHT)
-    )
+    targets = tuple(ProjectionShape(Projection(name, 0), 3, 3) for name in ("q_proj", "v_proj"))
 
     def __init__(self) -> None:
         generator = torch.Generator().manual_seed(23)

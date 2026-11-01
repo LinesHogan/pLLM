@@ -11,10 +11,8 @@ import pllm
 from pllm import testing
 from pllm.authoring import WeightedCEBatch
 from pllm.config import ExecutionOptions
-from pllm.contracts.hidden_locator import HiddenSite
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
-from pllm.contracts.semantic_graph import StateScope
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.state_refs import StateRefs
@@ -22,7 +20,7 @@ from pllm.execution.runtime_facts import model_timeline
 from pllm.testing import backend_facts
 from pllm.workloads.lora import OutputLoRAConfig, OutputLoRAWorkload
 
-BINDING = testing.hidden_binding(-1, HiddenSite.MODEL_OUTPUT, 1)
+BINDING = testing.final_hidden_binding(1)
 
 
 def compile_lora(config, device=torch.device("cpu"), *, lineages=3, pages=3):
@@ -104,7 +102,7 @@ def test_independent_lora_bmm_preserves_keyed_mean_and_private_publication() -> 
         RequestStateKey.project(identity, (RequestKeyField.PROMPT_INDEX, RequestKeyField.SAMPLE_INDEX))
         for identity in identities
     )
-    config = OutputLoRAConfig(rank=2, alpha=3.0, learning_rate=0.2, steps=3, seed=11, scope=StateScope.REQUEST)
+    config = OutputLoRAConfig(rank=2, alpha=3.0, learning_rate=0.2, steps=3, seed=11, scope="request")
     for device in (torch.device("cpu"), *([torch.device("cuda", 0)] if torch.cuda.is_available() else [])):
         stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
         execution = compile_lora(config, device, pages=8)
@@ -157,8 +155,8 @@ def route_keyed_lineages_until_dormant_retirement() -> None:
         learning_rate=0.2,
         steps=1,
         seed=11,
-        scope=StateScope.REQUEST,
-        key_fields=(RequestKeyField.ROUTE,),
+        scope="request",
+        key_fields=("route",),
     )
     execution = compile_lora(config, lineages=4, pages=8)
     math_a, math_b = RequestIdentity("r0", 0, 0, "math"), RequestIdentity("r1", 1, 0, "math")

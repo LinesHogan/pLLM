@@ -33,23 +33,19 @@ def main() -> None:
     if not 1 <= groups <= options.batch:
         parser.error("state groups must be between one and the request batch size")
     active = ceil(args.max_training_rows * args.training_fraction)
-    for scope in (pllm.state.StateScope.INSTANCE, pllm.state.StateScope.REQUEST):
-        if args.scope not in ("both", scope.value):
+    for scope in ("instance", "request"):
+        if args.scope not in ("both", scope):
             continue
-        states = groups if scope is pllm.state.StateScope.REQUEST else 1
+        states = groups if scope == "request" else 1
         indices = (
             tuple(index % states for index in range(options.batch))
-            if scope is pllm.state.StateScope.REQUEST
+            if scope == "request"
             else tuple(range(options.batch))
         )
-        print(f"Output LoRA scope: {scope.value}")
+        print(f"Output LoRA scope: {scope}")
 
         def prepare(hidden_size: int, vocab_size: int, device: torch.device) -> pllm.host.WeightedCEBatch[torch.Tensor]:
-            shape = (
-                (states, args.max_training_rows)
-                if scope is pllm.state.StateScope.REQUEST
-                else (args.max_training_rows,)
-            )
+            shape = (states, args.max_training_rows) if scope == "request" else (args.max_training_rows,)
             generator = torch.Generator(device=device).manual_seed(7)
             hidden = torch.randn((*shape, hidden_size), device=device, generator=generator)
             logits = torch.zeros((*shape, vocab_size), device=device)
@@ -57,7 +53,7 @@ def main() -> None:
             weights = (torch.arange(args.max_training_rows, device=device) < active).float().expand(shape)
             return (
                 pllm.host.WeightedCEBatch.for_prompts(hidden, logits, labels, weights, tuple(range(states)))
-                if scope is pllm.state.StateScope.REQUEST
+                if scope == "request"
                 else pllm.host.WeightedCEBatch(hidden, logits, labels, weights)
             )
 
@@ -67,7 +63,7 @@ def main() -> None:
         )
         compare(
             OutputLoRAWorkload(config),
-            replace(options, profile=None if options.profile is None else options.profile / scope.value),
+            replace(options, profile=None if options.profile is None else options.profile / scope),
             prepare=lambda handle: prepare(handle.hidden_size, handle.vocab_size, handle.device),
             max_training_rows=args.max_training_rows,
             require_training=True,

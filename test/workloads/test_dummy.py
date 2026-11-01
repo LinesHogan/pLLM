@@ -16,7 +16,7 @@ from examples.centered_hidden import centered_hidden
 from examples.sae_export import SAE
 from pllm import testing
 from pllm.contracts.codec import decode_boundary, encode_boundary
-from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.execution.runtime_facts import model_timeline
@@ -27,7 +27,7 @@ from pllm.testing import backend_facts
 from pllm.workloads.dummy import DummyConfig, DummyWorkload
 from test.backend_facts import assert_finite_resources
 
-BINDING = testing.hidden_binding(0, HiddenSite.BLOCK_OUTPUT, 1)
+BINDING = testing.hidden_binding(0, 1)
 CPU = HostConfig(torch.device("cpu"))
 
 
@@ -35,7 +35,7 @@ def step_input(step, hidden, count=3):
     """Row 0 is a prefill row; the rest decode, one request each."""
     phases = (HiddenPhase.PREFILL,) + (HiddenPhase.DECODE,) * (count - 1)
     identities = tuple(RequestIdentity(str(i), i, 0) for i in range(count))
-    return testing.step_input(identities, {BINDING: hidden[:count]}, step_id=step, phases=phases)
+    return testing.step_input(identities, {BINDING: hidden[:count]}, step_id=step, tokens=phases)
 
 
 def exported(execution, value):
@@ -197,7 +197,7 @@ def _frozen_state_is_readable_by_an_observation() -> None:
 
         encoder = pllm.InstanceState(module=lambda model: Encoder(model.hidden_size))
 
-    bindings = tuple(testing.hidden_binding(layer, HiddenSite.BLOCK_OUTPUT, 18) for layer in (3, 5, 17))
+    bindings = tuple(testing.hidden_binding(layer, 18) for layer in (3, 5, 17))
     execution = testing.compile_execution(FrozenEncoder(), backend_facts(32, bindings, layer_count=18))
     identity = RequestIdentity("req", 0, 0)
     execution.admit((identity,))

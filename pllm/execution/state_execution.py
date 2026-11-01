@@ -18,7 +18,7 @@ import torch
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
-from pllm.contracts.parameter_overlay import ParameterTarget
+from pllm.contracts.parameter_overlay import Projection
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
 from pllm.contracts.semantic_graph import (
@@ -60,7 +60,7 @@ InputContra = TypeVar("InputContra", contravariant=True)
 DataT = TypeVar("DataT")
 ResultT = TypeVar("ResultT")
 ResultCo = TypeVar("ResultCo", covariant=True)
-ProjectionResiduals = Mapping[tuple[RequestIdentity, ParameterTarget], torch.Tensor]
+ProjectionResiduals = Mapping[tuple[RequestIdentity, Projection], torch.Tensor]
 _PagePhase = Literal["abort", "release"]
 
 

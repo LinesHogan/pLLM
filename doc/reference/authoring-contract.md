@@ -180,7 +180,7 @@ receipt 能结算为止。
 ## 采样引导、logits 与导出
 
 本节约束负载与采样器/导出的接口，以及冷绑定器的签名与传输规则。前半部分
-（`@guide_sampling`、`@add_logits`、`@export`、`Config`）是写负载时用的声明面；
+（`@guide_sampling`、`@add_logits`、`@export`、`Attr`）是写负载时用的声明面；
 后半部分（函数替换、指纹、冻结、EngineCore 按引用传输）决定「改数学」的代价：
 改动函数体或受检依赖会重新签名，多进程 worker 重建时签名必须与驱动端逐字节
 相等。排查签名不匹配、函数替换不生效、worker 重建失败时回到本节末尾。
@@ -191,7 +191,7 @@ ESamp 用它做版本感知引导和普通的 Tensor loss/初始化；其五字�
 初始化种子推进保持不变。
 
 `@add_logits` 和 `@train` 把过滤前加法连接到真实采样反馈。
-`@export` 拥有有界、按步长门控的 CPU 输出；`Config("config.layer")` 等属性路径
+`@export` 拥有有界、按步长门控的 CPU 输出；`Attr("config.layer")` 等属性路径
 在装载时绑定不可变配置。普通负载不需要 `build`、输入字典、`prepare/output`、
 字段 ID、digest 或显式发布节点。
 
@@ -220,11 +220,11 @@ worker 重新导入并重建，安装时其编译签名必须与驱动端签名�
 一个加性参数 overlay 与它的发布绑定在一起。状态不带优化器时，方法自己算出下一个
 值；状态声明 `optimizer=pllm.SGD(lr)` 时，方法返回每行一个 loss，框架按 `chunk=`
 累积梯度并做 SGD（`flush="prompt_end"` 让 prompt 末尾的短 chunk 也训练）。
-`@overlay` 不再接受 `optimizer=`。固定 `shape=` 使用默认的 `value` 字段；具名 `Buffer` 字段可以按每个 target
-解析 `(input_size, output_size)`。`Buffer` 默认以 FP32 存储并累积状态，独立于
+`@train_in_forward` 不接受 `optimizer=`。固定 `shape=` 使用默认的 `value` 字段；具名 `pllm.Field` 字段可以按每个 target
+解析 `(in_features, out_features)`。`pllm.Field` 默认以 FP32 存储并累积状态，独立于
 模型 dtype；字段自身的 `dtype=` 覆盖默认值（不会继承 `RequestState.dtype`）。
-`dtype=None` 显式选择模型 dtype，整数 buffer 保留自己的 dtype。
-Dense / low-rank overlay 在投影读取时转换到输入 dtype，HEAD_ADD 始终要求 FP32；
+`dtype=None` 显式选择模型 dtype，整数字段 保留自己的 dtype。
+Dense / low-rank overlay 在投影读取时转换到输入 dtype，"per_head" 始终要求 FP32；
 FP64 可用于数值 oracle。SGD 的梯度累积至少使用 FP32，显式选择模型 dtype 时也一样。
 自定义更新函数也必须在自己的投影运算中显式转换操作数。`Operand.INPUT/TARGET/WEIGHT` 命名捕获的张量；
 `Parameter(state, field)` 命名私有 buffer 视图。只有这些被授权的 buffer 可以
@@ -232,8 +232,8 @@ FP64 可用于数值 oracle。SGD 的梯度累积至少使用 FP32，显式选�
 `UpdateOutput(output, changed=..., update_count=..., trained_rows=...)`。
 可选的 `metrics` 属于算法，不属于状态或 replay 协议。
 
-默认算子是 `DENSE_ADD`，应用 `weight` 字段。传
-`operator=ParameterOverlayOperator.LOW_RANK_ADD` 和 `factors=("a", "b")` 加
+默认算子是 `"dense"`，应用 `weight` 字段。传
+`operator="low_rank"` 和 `factors=("a", "b")` 加
 有限 `scale`，则应用 `scale * b @ a`：down 因子是每个 target 的
 `(rank, input_size)`，up 因子是 `(output_size, rank)`。算子选择与请求作用域
 正交：同样的发布、pin 与隔离规则对两者都适用。targets 可以命名任何可定位的
@@ -275,13 +275,13 @@ class ShineStyleLoRA(pllm.Workload):
     @property
     def factors(self) -> pllm.RequestState:
         return pllm.RequestState({
-            "a": pllm.Buffer(lambda inputs, outputs: (2, inputs)),
-            "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2)),
+            "a": pllm.Field(lambda in_features, out_features: (2, in_features)),
+            "b": pllm.Field(lambda in_features, out_features: (out_features, 2)),
         }, imported=True)
 
     @property
     def adapter(self) -> pllm.model.Adapter:
-        return pllm.model.Adapter("factors", targets, operator=ParameterOverlayOperator.LOW_RANK_ADD,
+        return pllm.model.Adapter("factors", targets, operator="low_rank",
                             factors=("a", "b"), scale=0.5)
 ```
 
@@ -300,8 +300,8 @@ class ShineStyleLoRA(pllm.Workload):
 两个容易忽略的后果：休眠 lineage 仍然存活并占用 `max_admitted_lineages`
 额度；缺少 route 值的请求在准入时被拒。
 
-请求状态键是签名声明；键值可以由用户计算。给 `RequestState` 的 `keys` 加上
-`RequestKeyField.ROUTE`，并传 `generate(..., routes=(...))` —— 每个 prompt 一个
+请求状态键是签名声明；键值可以由用户计算。给 `RequestState` 的 `key_fields` 加上
+`"route"`，并传 `generate(..., routes=(...))` —— 每个 prompt 一个
 路由值，由你自己的宿主代码计算（一个正则、一个判别器分数、一个租户 id；
 框架从不解释它）。键重合的请求**加入同一 lineage**：任何一个请求训练出的
 适配器对全部生效，无论在同一批次内还是跨步。不同 route 保持隔离。route
@@ -320,7 +320,7 @@ lineage。缺少 route 值的请求在准入时被拒。辅助批输入（`Weigh
 声明普通的 `InstanceState` 或 `RequestState` buffer 和一个 `ActivationPatch`
 property，命名状态、层、首个/末个 prefill token 与支持的算子。
 `LOW_RANK_AFFINE` 每层使用 weight/bias/rotation 字段；`ADD` 使用一个 FP32 向量。
-Buffer 形状回调收到激活的输入/输出宽度。以原始 `pllm.state.StateImport` 作为
+Field 形状回调收到激活的输入/输出宽度。以原始 `pllm.state.StateImport` 作为
 `batch=` 提供。共享绑定校验检查点、选择根、拷贝私有字段并在模型执行前发布。
 实例替换可重复；请求替换使用原始 prompt 键，只导入到版本零的请求状态。
 缺失的更新不发布，既有推理 pin 继续看到它们精确的旧版本。见维护中的 ReFT
@@ -351,7 +351,7 @@ reset 与多步训练。这条路径把「外部数据喂入 + 实例/请求共�
 
 [Output LoRA](../../pllm/workloads/lora.py) 声明具名字段状态（`SGD(lr)` 与
 初始化器）、一个普通的 `@add_logits` 预测，以及一个读取 `WeightedCEBatch` 字段的
-`AFTER_SAMPLE` 方法（`@train(state=..., reset="reset", steps=Config(...))`）。reset 方法接收具名局部参数张量和
+`AFTER_SAMPLE` 方法（`@train(state=..., reset="reset", steps=Attr(...))`）。reset 方法接收具名局部参数张量和
 一个生成器。reset 按训练批次进行，区别于准入初始化；两个函数都被冻结并与普通
 数学一起签名。SGD 保留原始状态字段，没有 Adam 槽。
 
@@ -503,17 +503,17 @@ with pllm.make_llm(config, workload=workload) as llm:
 同形，省略时为 `None`。TLM 在 loss 内移动标签以预测下一个 token，忽略
 `ignore_index` 标记的标签。`generate(..., batch=batch)` 每次调用只消费一次训练批。
 
-TLM 的 `InstanceState` 用 a/b `Buffer` 声明因子，形状回调接收目标投影的输入/输出
-宽度；`Adapter("factors", targets, operator=LOW_RANK_ADD, scale=alpha/rank)`
-声明如何应用它们。Adapter 的 `ParameterTarget(layer=None, ...)` 表示所有层，
+TLM 的 `InstanceState` 用 a/b `pllm.Field` 声明因子，形状回调接收目标投影的输入/输出
+宽度；`Adapter("factors", targets, operator="low_rank", scale=alpha/rank)`
+声明如何应用它们。Adapter 的 `Projection(layer=None, ...)` 表示所有层，
 模型层数确定后展开；显式层目标须有序且唯一。
 
 训练方法声明 `model: pllm.model.CausalModel = pllm.causal_model("adapter")`，其中
 `"adapter"` 是 Adapter 声明的名称。`model(ids, attention_mask=mask)` 返回带该
 Adapter 的 logits，梯度流向其因子；`model.base(ids, attention_mask=mask)` 返回
 冻结基座的 logits。负载不持有或传输活模型。
-`@pllm.on(pllm.Config("phase"))` 在绑定时读取负载的 `phase` 属性并解析为 `Phase`；
-也可用 `Config("config.phase")` 读取嵌套配置。TLM 的 ONLINE 选择
+`@pllm.on(pllm.Attr("phase"))` 在绑定时读取负载的 `phase` 属性并解析为 `Phase`；
+也可用 `Attr("config.phase")` 读取嵌套配置。TLM 的 ONLINE 选择
 `AFTER_SAMPLE`，用适配后的 logits 选句；OFFLINE 选择 `BEFORE_FORWARD`，用
 `torch.no_grad()` 下的基座 logits 选句，再训练选中的句子。
 

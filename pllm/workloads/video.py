@@ -37,14 +37,14 @@ class VideoWorkload(pllm.Workload):
         return pllm.InstanceState(
             {name: (self.grid_size, self.grid_size) for name in FEATURES},
             dtype=torch.float32,
-            feed=pllm.state.FeedOrder.ORDERED,
+            feed="ordered",
         )
 
     @property
     def inject(self) -> pllm.InstanceState:
         """Declare the local state written by the encoder and read by the ActivationPatch."""
         return pllm.InstanceState(
-            {"delta": pllm.Buffer(injection_shape, dtype=torch.float32)},
+            {"delta": pllm.Field(injection_shape, dtype=torch.float32)},
         )
 
     @property
@@ -55,10 +55,10 @@ class VideoWorkload(pllm.Workload):
             (self.layer,),
             first_tokens=1,
             last_tokens=1,
-            operator=pllm.model.ActivationPatchOperator.ADD,
-            decode=pllm.model.DecodeWindow.ALL,
-            decode_refresh=pllm.model.DecodeRefresh.STEP,
-            on_missing=pllm.model.MissingPolicy.HOLD,
+            operator="add",
+            decode=True,
+            refresh="step",
+            on_missing="hold",
         )
 
     @pllm.write(state="inject", fields=("delta",))

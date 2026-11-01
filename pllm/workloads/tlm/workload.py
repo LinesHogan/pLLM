@@ -63,8 +63,8 @@ class TLMWorkload(pllm.Workload):
         """Declare projection-shaped views of the packed AdamW state."""
         return pllm.InstanceState(
             {
-                "a": pllm.Buffer(lambda inputs, outputs: (self.rank, inputs)),
-                "b": pllm.Buffer(lambda inputs, outputs: (outputs, self.rank)),
+                "a": pllm.Field(lambda in_features, out_features: (self.rank, in_features)),
+                "b": pllm.Field(lambda in_features, out_features: (out_features, self.rank)),
             },
             optimizer=self.config.optimizer,
             initialize=self.initialize,
@@ -75,14 +75,8 @@ class TLMWorkload(pllm.Workload):
         """Resolve all-layer q/v geometry after probing the model."""
         return pllm.model.Adapter(
             "factors",
-            tuple(
-                pllm.model.ParameterTarget(None, pllm.model.ParameterModuleKind.ATTENTION, role)
-                for role in (
-                    pllm.model.ParameterRole.QUERY_PROJECTION_WEIGHT,
-                    pllm.model.ParameterRole.VALUE_PROJECTION_WEIGHT,
-                )
-            ),
-            operator=pllm.model.ParameterOverlayOperator.LOW_RANK_ADD,
+            (pllm.model.Projection("q_proj"), pllm.model.Projection("v_proj")),
+            operator="low_rank",
             scale=self.alpha / self.rank,
         )
 
@@ -94,7 +88,7 @@ class TLMWorkload(pllm.Workload):
             else:
                 value.zero_()
 
-    @pllm.on(pllm.Config("phase"))
+    @pllm.on(pllm.Attr("phase"))
     @pllm.train(state="factors")
     def update(
         self,

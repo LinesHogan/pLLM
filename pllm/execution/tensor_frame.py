@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from pllm.contracts.packed_rows import PackedPhaseRow
-from pllm.contracts.parameter_overlay import ParameterTarget
+from pllm.contracts.parameter_overlay import Projection
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import (
     HiddenInputSource,
@@ -88,7 +88,7 @@ class UpdateOutput:
 
 @dataclass(frozen=True, slots=True)
 class OverlayTargetResult:
-    target: ParameterTarget
+    target: Projection
     update: UpdateOutput
 
 

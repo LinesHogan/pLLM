@@ -41,8 +41,8 @@ from pllm.contracts.semantic_graph import (
     TokenProgramEffect,
 )
 from pllm.contracts.tensor_layout import TensorDType
-from pllm.contracts.visibility import Exact, Visibility, VisibilitySource
-from pllm.execution.binding_base import Buffer, overlay_fields
+from pllm.contracts.visibility import VisibilityKind, VisibilitySource
+from pllm.execution.binding_base import Field, overlay_fields
 from pllm.execution.declaration import Call, State, When, native
 from pllm.execution.overlay_task import ChunkUpdate, GradientUpdate, OverlayTransition, overlay_apply
 from pllm.execution.ptts.request_state import RequestStateSelection
@@ -68,7 +68,7 @@ def declare_parameter_overlay(
     b: TensorBinding,
     name: str,
     effect: ProjectionDelta,
-    buffers: Mapping[str, Buffer],
+    fields: Mapping[str, Field],
     *,
     initialize: Callable[[Tensors, torch.Generator], None] | None,
     keys: tuple[RequestKeyField, ...],
@@ -76,28 +76,28 @@ def declare_parameter_overlay(
     identity: str,
     function: Callable[..., UpdateOutput],
     arguments: Mapping[str, str],
-    visibility: Visibility,
+    visibility: VisibilityKind,
     equations_digest: str,
 ) -> None:
     """Declare a parameter overlay and its request-state transition."""
     if b.graph.tasks or b.graph.states or b.host:
         raise ValueError("ordinary overlay requires a sole request state and model transition")
-    fields = overlay_fields(buffers, effect, b.dimensions)
+    layout = overlay_fields(fields, effect, b.dimensions)
     targets = effect.targets
     b.overlay_targets = targets
     b.parameter_phases = phases
     state = b.state(
         effect.state,
-        fields,
+        layout,
         scope=StateScope.REQUEST,
         keys=keys,
     )
     if initialize is not None:
 
         def init(root: tuple[torch.Tensor, ...], generator: torch.Generator) -> None:
-            """Initialize each target's buffers; fields are laid out target by target."""
-            for start in range(0, len(root), len(buffers)):
-                initialize(dict(zip(buffers, root[start : start + len(buffers)], strict=True)), generator)
+            """Initialize each target's copy of the fields; they are laid out target by target."""
+            for start in range(0, len(root), len(fields)):
+                initialize(dict(zip(fields, root[start : start + len(fields)], strict=True)), generator)
 
         b.initializers[str(state.declaration.resource)] = init
 
@@ -121,10 +121,10 @@ def declare_parameter_overlay(
         equations_digest,
         (str(state.declaration.resource),) * len(targets),
         0,
-        "carry" if visibility == Exact() else "transition",
+        "carry" if visibility == "exact" else "transition",
     )
     math = OverlayTransition(
-        tuple(buffers),
+        tuple(fields),
         targets,
         phases,
         apply,
@@ -151,7 +151,7 @@ def declare_parameter_overlay(
         ),
     )
     _bind_visibility(b, transition, source)
-    if visibility == Exact():
+    if visibility == "exact":
         b.operations[transition.symbol] = replace(b.operations[transition.symbol], version="private")
     publication = b.publish(
         transition,

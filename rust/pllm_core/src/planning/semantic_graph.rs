@@ -205,13 +205,8 @@ pub(super) enum VisibilityKind {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub(super) struct Visibility {
-    pub kind: VisibilityKind,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub(super) struct VisibilitySource {
-    pub policy: Visibility,
+    pub policy: VisibilityKind,
     #[serde(default)]
     pub lag: u64,
 }
@@ -228,10 +223,10 @@ fn validate_task(task: &SemanticTask) -> Result<(), String> {
     if task
         .visibility
         .as_ref()
-        .is_some_and(|visibility| visibility.policy.kind == VisibilityKind::StepLag)
+        .is_some_and(|visibility| visibility.policy == VisibilityKind::StepLag)
     {
         return Err(format!(
-            "{}: set overlay visibility to pllm.Exact() or pllm.Visibility.forward_pinned()",
+            "{}: set visibility=\"exact\" or visibility=\"forward_pinned\"",
             task.symbol
         ));
     }

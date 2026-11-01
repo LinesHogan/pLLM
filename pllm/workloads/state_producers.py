@@ -13,13 +13,7 @@ from torch import nn
 
 import pllm
 
-TARGETS = tuple(
-    pllm.model.ParameterTarget(layer, pllm.model.ParameterModuleKind.ATTENTION, role)
-    for layer, role in (
-        (0, pllm.model.ParameterRole.QUERY_PROJECTION_WEIGHT),
-        (1, pllm.model.ParameterRole.VALUE_PROJECTION_WEIGHT),
-    )
-)
+TARGETS = (pllm.model.Projection("q_proj", 0), pllm.model.Projection("v_proj", 1))
 
 
 def seed_factors(fields: Mapping[str, torch.Tensor], generator: torch.Generator) -> None:
@@ -45,8 +39,8 @@ class FactorAdapterWorkload(pllm.Workload):
         """Resolve factor widths from the inspected model projections."""
         return pllm.RequestState(
             {
-                "a": pllm.Buffer(lambda inputs, outputs: (self.factor_rank, inputs)),
-                "b": pllm.Buffer(lambda inputs, outputs: (outputs, self.factor_rank)),
+                "a": pllm.Field(lambda in_features, out_features: (self.factor_rank, in_features)),
+                "b": pllm.Field(lambda in_features, out_features: (out_features, self.factor_rank)),
             },
             optimizer=self.optimizer,
             initialize=seed_factors,
@@ -55,7 +49,7 @@ class FactorAdapterWorkload(pllm.Workload):
     @property
     def consume(self) -> pllm.model.Adapter:
         """Read each request's pinned factors inside the q/v projections."""
-        return pllm.model.Adapter("factors", TARGETS, operator=pllm.model.ParameterOverlayOperator.LOW_RANK_ADD)
+        return pllm.model.Adapter("factors", TARGETS, operator="low_rank")
 
 
 class PromptFactorsWorkload(FactorAdapterWorkload):

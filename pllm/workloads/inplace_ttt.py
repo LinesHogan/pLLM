@@ -6,18 +6,18 @@ from typing import Literal
 import torch
 
 import pllm
-from pllm.model import ParameterTarget
+from pllm.model import Projection
 
 
 @dataclass(frozen=True, slots=True)
 class InPlaceTTTConfig:
     """Chunk mathematics and state visibility for a request-owned dense residual."""
 
-    targets: tuple[ParameterTarget, ...]
+    targets: tuple[Projection, ...]
     chunk_size: int = 4096
     learning_rate: float = 1e-3
     tokens: Literal["prefill", "decode", "all"] = "prefill"  # whose projection operands train the state
-    visibility: pllm.Visibility = pllm.Visibility.forward_pinned()
+    visibility: Literal["forward_pinned", "exact"] = "forward_pinned"
 
     def __post_init__(self) -> None:
         if (
@@ -40,22 +40,18 @@ class InPlaceTTTWorkload(pllm.Workload):
     def dense_fast_weights(self) -> pllm.RequestState:
         return pllm.RequestState(
             {
-                "delta": pllm.Buffer(lambda inputs, outputs: (outputs, inputs), dtype=self.dtype),
+                "delta": pllm.Field(lambda in_features, out_features: (out_features, in_features), dtype=self.dtype),
             },
-            keys=(
-                pllm.state.RequestKeyField.REQUEST_ID,
-                pllm.state.RequestKeyField.PROMPT_INDEX,
-                pllm.state.RequestKeyField.SAMPLE_INDEX,
-            ),
+            key_fields=("request_id", "prompt_index", "sample_index"),
         )
 
     @pllm.train_in_forward(
-        visibility=pllm.Config("config.visibility"),
+        visibility=pllm.Attr("config.visibility"),
         state="dense_fast_weights",
-        targets=pllm.Config("config.targets"),
+        targets=pllm.Attr("config.targets"),
         weight="delta",
-        chunk=pllm.Config("config.chunk_size"),
-        tokens=pllm.Config("config.tokens"),
+        chunk=pllm.Attr("config.chunk_size"),
+        tokens=pllm.Attr("config.tokens"),
     )
     def step(
         self,

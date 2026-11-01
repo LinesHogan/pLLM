@@ -17,7 +17,7 @@ from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
     CapturedParameterOperand,
     ParameterOverlayOperator,
-    ParameterTarget,
+    Projection,
     ProjectionDelta,
 )
 from pllm.contracts.request_identity import RequestIdentity
@@ -253,7 +253,7 @@ class ProjectionTransition(Protocol):
 
     def run(
         self, operands: tuple[CapturedParameterOperand, ...], *, complete: bool = True
-    ) -> Mapping[tuple[RequestIdentity, ParameterTarget], torch.Tensor]: ...
+    ) -> Mapping[tuple[RequestIdentity, Projection], torch.Tensor]: ...
 
 
 class ProjectionTask(Generic[DataT, ResultT]):
@@ -265,14 +265,14 @@ class ProjectionTask(Generic[DataT, ResultT]):
         context: StateTaskContext[DataT],
         rows: PackedSamplerRowBatch,
         task: TaskId,
-        targets: tuple[ParameterTarget, ...],
+        targets: tuple[Projection, ...],
     ) -> None:
         self.execution, self.context, self.rows, self.task = execution, context, rows, task
         self.pending = set(targets)
 
     def run(
         self, operands: tuple[CapturedParameterOperand, ...], *, complete: bool = True
-    ) -> Mapping[tuple[RequestIdentity, ParameterTarget], torch.Tensor]:
+    ) -> Mapping[tuple[RequestIdentity, Projection], torch.Tensor]:
         """Execute target segments; complete=False keeps targets open across a prompt/decode split."""
         from pllm.execution.step_input import StepInput
 
@@ -298,7 +298,7 @@ class OverlayTransition:
     """
 
     buffers: tuple[str, ...]
-    targets: tuple[ParameterTarget, ...]
+    targets: tuple[Projection, ...]
     phases: tuple[HiddenPhase, ...]
     apply: Callable[[torch.Tensor, Tensors], torch.Tensor]
     function: Callable[..., UpdateOutput]
@@ -322,7 +322,7 @@ class OverlayTransition:
             for row, index in zip(batch.selection.rows, batch.selection.state_indices, strict=True)
         )
         indices = {identity: index for identity, index in selected}
-        updates: dict[tuple[RequestIdentity, ParameterTarget], UpdateOutput] = {}
+        updates: dict[tuple[RequestIdentity, Projection], UpdateOutput] = {}
         counters: list[torch.Tensor] = []
         with torch.no_grad():
             for target_index, target in enumerate(self.targets):
@@ -441,7 +441,7 @@ class OverlayTransition:
 class RouteOperand(NamedTuple):
     """Capture outputs without retaining the cold invocation's request or phase."""
 
-    target: ParameterTarget
+    target: Projection
     hidden: torch.Tensor
     desired: torch.Tensor
     weight: torch.Tensor
@@ -510,7 +510,7 @@ class RouteOverlay:
         self.private = self.math.visibility.in_forward
         self.gate.zero_()
 
-    def values(self, target: ParameterTarget, private: bool) -> Tensors:
+    def values(self, target: Projection, private: bool) -> Tensors:
         width = len(self.math.buffers)
         start = self.math.targets.index(target) * width
         return dict(
@@ -523,9 +523,9 @@ class RouteOverlay:
 
     def run(
         self, operands: tuple[CapturedParameterOperand, ...]
-    ) -> Mapping[tuple[RequestIdentity, ParameterTarget], torch.Tensor]:
+    ) -> Mapping[tuple[RequestIdentity, Projection], torch.Tensor]:
         """Own operands immediately because later model calls may mutate their inputs."""
-        outputs: dict[tuple[RequestIdentity, ParameterTarget], torch.Tensor] = {}
+        outputs: dict[tuple[RequestIdentity, Projection], torch.Tensor] = {}
         for operand in operands:
             captured = replace(
                 operand, hidden=operand.hidden.detach().clone(), desired=operand.desired.detach().clone()

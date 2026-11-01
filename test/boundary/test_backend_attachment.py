@@ -21,10 +21,8 @@ from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.hidden_locator import HiddenLayerKind
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from pllm.contracts.parameter_overlay import (
-    ParameterModuleKind,
-    ParameterRole,
-    ParameterTarget,
-    ParameterTargetShape,
+    Projection,
+    ProjectionShape,
 )
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
@@ -39,7 +37,7 @@ from pllm.workloads.inplace_ttt import (
 
 
 def overlay_facts():
-    target = ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT)
+    target = Projection("down_proj", 0)
     workload = InPlaceTTTWorkload(InPlaceTTTConfig((target,), chunk_size=2))
     probe = BackendPlacementProbe(
         "c" * 64,
@@ -50,7 +48,7 @@ def overlay_facts():
         8,
         (),
         (),
-        targets=(ParameterTargetShape(target, 3, 2),),
+        targets=(ProjectionShape(target, 3, 2),),
     )
     facts = BackendCompileFacts(
         probe,

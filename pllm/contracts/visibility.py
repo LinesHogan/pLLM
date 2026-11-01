@@ -3,22 +3,10 @@
 from dataclasses import dataclass
 from typing import Literal
 
-
-@dataclass(frozen=True, slots=True)
-class Visibility:
-    """Choose which state a model read sees; use Exact or forward_pinned."""
-
-    kind: Literal["forward_pinned", "exact", "step_lag"]
-
-    @staticmethod
-    def forward_pinned() -> "Visibility":
-        """Select the entry snapshot; explicit route update boundaries govern subsequent reads."""
-        return Visibility("forward_pinned")
-
-
-def Exact() -> Visibility:
-    """Read the state produced by every preceding logical chunk."""
-    return Visibility("exact")
+# Which state version a model read sees: "forward_pinned" the version the forward started with (later updates
+# only behind explicit route boundaries), "exact" also every chunk trained before it, "step_lag" the version
+# published a fixed number of steps earlier (the post-sampler writer lane).
+VisibilityKind = Literal["forward_pinned", "exact", "step_lag"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,7 +16,7 @@ class VisibilitySource:
     Overlays keep their chunk/tail mathematics inside the transition's own scan (chunk_size=0).
     """
 
-    policy: Visibility
+    policy: VisibilityKind
     scope: Literal["overlay", "post_sampler"]
     equations_digest: str
     resources: tuple[str, ...]
@@ -39,11 +27,9 @@ class VisibilitySource:
     @staticmethod
     def post_sampler(lag: int) -> "VisibilitySource":
         """Declare the retained-input boundary for the optional serial writer lane."""
-        return VisibilitySource(
-            Visibility("step_lag"), "post_sampler", "retained-step-inputs@1", (), 0, "transition", lag
-        )
+        return VisibilitySource("step_lag", "post_sampler", "retained-step-inputs@1", (), 0, "transition", lag)
 
     @property
     def in_forward(self) -> bool:
         """Exact entry reads and ordinary projection updates use accumulated private state."""
-        return self.scope == "overlay" and self.policy == Exact()
+        return self.scope == "overlay" and self.policy == "exact"
