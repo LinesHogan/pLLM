@@ -363,7 +363,6 @@ def declare_weighted_train(
             forward_rows="batch",
             parameter_gradient_rows="batch",
             update_states="state",
-            reduction="weighted_state_mean_then_mean",
         ),
         function=execute,
         operation_type=BatchOperation,

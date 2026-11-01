@@ -156,8 +156,12 @@ class TokenProgramEffect:
     span: bool = False
 
 
-# "mean" and "state_mean" are the author's @pllm.train choices; the other values are set by pllm's own paths.
-LossReduction = Literal["none", "mean", "state_mean", "weighted_state_mean_then_mean", "custom"]
+# How a request-training loss averages its rows: the author's @pllm.train choice ("mean", "state_mean"), or "none".
+# Batch training still sets "custom" (its method reduces the loss); nothing reads it.
+LossReduction = Literal["none", "mean", "state_mean", "custom"]
+# What a workload's @pllm.train method trains on, read from its inputs: the rows of running requests, a host batch
+# with one AdamW step, or a WeightedCEBatch with SGD steps per state.
+TrainingMode = Literal["request", "batch", "weighted_batch"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,11 +225,12 @@ class SemanticGraph:
     edges: tuple[SemanticEdge, ...] = ()
     input_groups: tuple[ConditionalInputGroup, ...] = ()
     model_reads: tuple[StateResource, ...] = ()
+    training_mode: TrainingMode | None = None
 
     @property
     def trains_on_batch(self) -> bool:
-        """Whether a task trains on a host CausalTrainBatch or WeightedRowBatch (declare_batch_train)."""
-        return any(task.math is not None and task.math.reduction == "custom" for task in self.tasks)
+        """Whether the workload trains on a host CausalTrainBatch or WeightedRowBatch (declare_batch_train)."""
+        return self.training_mode == "batch"
 
     @property
     def replay_task(self) -> SemanticTask | None:

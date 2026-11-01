@@ -224,14 +224,6 @@ class TensorBinding(Builder[TensorFrame]):
         )
 
     @property
-    def weighted_training(self) -> bool:
-        """Whether a task trains on a host WeightedCEBatch (declare_weighted_train)."""
-        return any(
-            task.math is not None and task.math.reduction == "weighted_state_mean_then_mean"
-            for task in self.graph.tasks
-        )
-
-    @property
     def has_exports(self) -> bool:
         """Whether tensor tasks need a host observation callback."""
         return any(task.export is not None for task in self.tensor_tasks.values())

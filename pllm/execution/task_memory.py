@@ -140,7 +140,7 @@ def example(
         slot_matrix=lambda: ("", np.repeat(np.arange(len(roots), dtype=np.int64)[:, None], len(pools), axis=1)),
     )
     auxiliary = None
-    if binding.weighted_training:
+    if binding.graph.training_mode == "weighted_batch":
         keys = tuple(key for key in selection.keys if key is not None)
         shape = (len(keys), options.training_rows) if keys else (options.training_rows,)
         auxiliary = WeightedCEBatch(

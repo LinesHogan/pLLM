@@ -42,6 +42,7 @@ from pllm.contracts.semantic_graph import (
     StateScope,
     TaskResultInputSource,
     TaskSymbol,
+    TrainingMode,
 )
 from pllm.contracts.state_feed import FeedBinding, FeedOrder
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
@@ -111,9 +112,6 @@ Initializer = Callable[[Tensors, torch.Generator], None]
 C = TypeVar("C")
 # How @pllm.train averages per-row losses: over all rows, or per state and then summed over states.
 TrainReduction = Literal["mean", "state_mean"]
-# What a @pllm.train method trains on, read from its inputs: the rows of running requests, a host batch with one
-# AdamW step, or a WeightedCEBatch with SGD steps per state.
-TrainingMode = Literal["request", "batch", "weighted_batch"]
 
 
 class Phase(Enum):
@@ -778,6 +776,7 @@ class _Train(_Effect):
                 when=When.HOST_COMPUTE if context.binding.host else operation.phase.value,
             ),
             self.state,
+            "batch",
         )
 
     def request(self, operation: _Operation, arguments: dict[str, _Source], captures: dict[str, Capture]) -> None:
@@ -805,6 +804,7 @@ class _Train(_Effect):
                 update_kind=StateEffectKind.UPDATE if unconditional else StateEffectKind.UPDATE_MAYBE,
             ),
             self.state,
+            "request",
         )
 
     def weighted(
@@ -846,6 +846,7 @@ class _Train(_Effect):
                 arguments=sources,
             ),
             self.state,
+            "weighted_batch",
         )
 
 
@@ -1634,10 +1635,11 @@ class _Declaration:
             raise ValueError("PositionState requires layers.load/save inside a layer_route")
         return states
 
-    def train(self, call: Call, state: str) -> None:
+    def train(self, call: Call, state: str, mode: TrainingMode) -> None:
         if self.training is not None:
             raise ValueError(f"declare one @pllm.train method per workload; {self.training[0].symbol} already trains")
         self.training = call, self.states[state]
+        self.binding.graph = replace(self.binding.graph, training_mode=mode)
 
     def attach_training(self) -> None:
         """Validate gradients and pair the single prediction and training operations."""
