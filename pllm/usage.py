@@ -34,14 +34,18 @@ from pllm.contracts.parameter_overlay import (
 from pllm.contracts.request_identity import RequestKeyField, canonical_request_key_fields
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
+    AnchorSymbol,
     HiddenInputSource,
     MathContract,
+    SamplerFeedbackInputSource,
     SchedulerTimeline,
     SemanticOutputKind,
+    SemanticTask,
     StateEffectKind,
     StateScope,
     TaskResultInputSource,
     TaskSymbol,
+    TimingConstraint,
     TrainingMode,
 )
 from pllm.contracts.state_feed import FeedBinding, FeedOrder
@@ -1188,7 +1192,11 @@ def train(
     reset: str = "",
     rows: str = "",
 ) -> Callable[[F], F]:
-    """Minimize the returned loss with `state`'s optimizer; runs after sampling by default.
+    """Minimize the returned loss with `state`'s optimizer; updates publish after sampling by default.
+
+    With tensor parallelism, independent automatic request training can compute a private update before the
+    draw. Publication still follows sampling; cancellation discards the private version. Use
+    `@pllm.on(pllm.Phase.AFTER_SAMPLE)` to require the computation itself to follow sampling.
 
     The method's inputs say what it trains on. Without pllm.batch fields it trains each request's state on that
     request's rows (pllm.AdamW). WeightedRowBatch or CausalTrainBatch fields, or a causal model, take one AdamW
@@ -1657,6 +1665,45 @@ class _Declaration:
         elif self.training is not None and self.binding.attachment is None:
             self.binding.request_training(*self.training)
 
+    def overlap_sampler(self) -> None:
+        """Overlap an independent private update with sampling, retaining the token-commit publication boundary."""
+        b = self.binding
+        # The invocation owns one pending write. Other writers, model effects and feeds retain their placement.
+        if self.training is None or self.has_model_effect or self.writes or b.feeds:
+            return
+        call, state = self.training
+        if call.symbol not in b.tensor_tasks:
+            return  # Host-batch training has its own execution and publication policy.
+        operation = next(operation for operation in self.operations if operation.name == call.symbol)
+        if operation.phase is not Phase.AUTOMATIC:
+            return
+        dependencies = b.tensor_tasks[call.symbol].dependencies(b.tensor_tasks)
+        late = {task.symbol for task in b.graph.tasks if task.timing.after == AnchorSymbol("token.commit")}
+        if any(task.symbol in late for task in dependencies[:-1]) or any(
+            isinstance(source, SamplerFeedbackInputSource) for task in dependencies for source in task.sources.values()
+        ):
+            return
+
+        def private(task: SemanticTask) -> SemanticTask:
+            return replace(
+                task,
+                timing=TimingConstraint(AnchorSymbol("sampler.pre_draw"), AnchorSymbol("next.prepare")),
+                effects=tuple(
+                    replace(
+                        effect,
+                        kind=StateEffectKind.TRANSITION
+                        if effect.kind is StateEffectKind.UPDATE
+                        else StateEffectKind.TRANSITION_MAYBE,
+                    )
+                    if effect.kind in (StateEffectKind.UPDATE, StateEffectKind.UPDATE_MAYBE)
+                    else effect
+                    for effect in task.effects
+                ),
+            )
+
+        b.update_task(call.symbol, private)
+        b.publish(call, state, when=When.AFTER_SAMPLE, name=f"{call.symbol}.publish")
+
     def sign_composition(self) -> None:
         """Validate composed effects and sign ordered definitions and owner values."""
         b = self.binding
@@ -1706,7 +1753,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         Tensor-parallel execution delivers exports only from the output rank (rank 0).
         """
 
-    def _build(self, b: TensorBinding) -> None:
+    def _build(self, b: TensorBinding, *, capabilities: tuple[str, ...] = ()) -> None:
         """Declare owner values and operations, then compose and sign their graph."""
         context = _Declaration.read(self)
         context.binding = b
@@ -1717,6 +1764,11 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
                 operation.effect.declare(operation)
         context.attach_effects()
         context.attach_training()
+        if all(
+            capability in capabilities
+            for capability in ("compute/cuda@1", "transition/full_root@1", "backend/tensor_parallel@1")
+        ):
+            context.overlap_sampler()
         context.sign_composition()
 
     def declaration(self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None) -> TensorBinding:
@@ -1731,7 +1783,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         b = TensorBinding(self.name, boundary_digest(dimensions, facts.initialization_seed), dimensions)
         b.probe = facts.probe
         b.causal = causal
-        self._build(b)
+        self._build(b, capabilities=facts.timeline.capabilities)
         # Executable ports retain their dependencies; an unused factory must not pin the decoder.
         b.causal = None
         b.configure_scans(facts)

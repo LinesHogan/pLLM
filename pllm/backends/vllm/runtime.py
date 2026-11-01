@@ -787,6 +787,7 @@ def probe_backend(
             "state/fenced_reclaim@1",
             "transition/full_root@1",
             "optimizer/adamw@1",
+            *(("backend/tensor_parallel@1",) if runner.parallel_config.tensor_parallel_size > 1 else ()),
             *replay_capabilities,
         ),
     )

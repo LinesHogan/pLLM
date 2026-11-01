@@ -450,7 +450,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         self._last_hold: HeldInput | None = None
 
     def _post_sample_overlap(self) -> PostSampleOverlap | None:
-        """Tasks that read the latest version need sampler outputs handed off; side-lane tasks need a stream."""
+        """Bind the latest-version writer lane and the retained-reader policy."""
         from pllm.execution.post_sample import PostSampleOverlap  # tensor_frame imports this module
 
         tasks = self.plan.tasks

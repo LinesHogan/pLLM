@@ -511,7 +511,7 @@ class Builder(Generic[D]):
         )
 
     def request_training(self, transition: Call, state: State) -> None:
-        """Train request state from hidden rows after the token transaction commits."""
+        """Attach request-state training to the token transaction."""
         self.attachment = BackendAttachmentSpec(
             AttachmentKind.REQUEST_TRAINING,
             ((AttachmentTaskRole.TRANSITION, transition.symbol),),
