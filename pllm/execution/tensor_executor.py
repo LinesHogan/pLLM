@@ -341,11 +341,8 @@ class TensorExecutor:
             plan = row_plan(data, batch)
             self.updated = () if self.optimizer is None else tuple(sorted(plan.last))
             if context is not None and self.optimizer is not None:
-                write = context.prepare_owned_write(batch.selection.refs.take(self.updated), copy_fields=())
-                plan = replace(
-                    plan,
-                    writes=(self.updated, context.arena.slots((write,) * len(write.after_refs), write.after_refs)[1]),
-                )
+                slots = context.owned_write_slots(batch.selection.refs.take(self.updated), copy_fields=())
+                plan = replace(plan, writes=(self.updated, slots))
             if context is None:
                 self.table = torch.empty(self.table_size, device="meta", dtype=torch.long)
             else:
@@ -421,20 +418,17 @@ class TensorExecutor:
         size = self.table_size
         if self.table is None or self.table.numel() != size:
             self.table = torch.empty(size, dtype=torch.long, device=device)
-        host = self.staging.take(size).numpy() if device.type == "cuda" else self.table.numpy()
-        host.fill(0)
-        offset = 0
-        for resource, layout in self.layouts.items():
-            selected = plan if resource == self.task.resource else RowPlan.build(data, batch.for_resource(resource))
-            self._fill(host[offset : offset + layout.size], selected, layout)
-            offset += layout.size
-        captures = () if data.step.hidden is None else data.step.hidden.captures
-        for capture in captures:
-            host[offset : offset + self.rows] = capture.slots[0] if capture.slots.size else 0
-            host[offset : offset + len(data.rows)] = capture.slots[plan.packed]
-            offset += self.rows
-        if device.type == "cuda":
-            self.staging.copy_to(self.table)
+        with self.staging.fill(self.table) as host:
+            offset = 0
+            for resource, layout in self.layouts.items():
+                selected = plan if resource == self.task.resource else RowPlan.build(data, batch.for_resource(resource))
+                self._fill(host[offset : offset + layout.size], selected, layout)
+                offset += layout.size
+            captures = () if data.step.hidden is None else data.step.hidden.captures
+            for capture in captures:
+                host[offset : offset + self.rows] = capture.slots[0] if capture.slots.size else 0
+                host[offset : offset + len(data.rows)] = capture.slots[plan.packed]
+                offset += self.rows
 
     def settle_rows(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
         """Record results, gradients, losses and observations of the last body."""
@@ -529,15 +523,10 @@ class FieldWriteExecutor:
         table = self.table
         assert table is not None
         if context is not None:
-            write = context.prepare_owned_write(batch.selection.refs.take(updated), copy_fields=None)
-            slots = context.arena.slots((write,) * len(write.after_refs), write.after_refs)[1]
-            cuda = table.device.type == "cuda"
-            host = self.staging.take(table.numel()).numpy()[: table.numel()] if cuda else table.numpy()
-            destinations = host.reshape(table.shape)
-            destinations.fill(-1)
-            destinations[:, : len(updated)] = slots[:, [view.field for view in writer.fields]].T
-            if cuda:
-                self.staging.copy_to(table)
+            slots = context.owned_write_slots(batch.selection.refs.take(updated), copy_fields=None)
+            with self.staging.fill(table) as destinations:
+                destinations.fill(-1)
+                destinations[:, : len(updated)] = slots[:, [view.field for view in writer.fields]].T
         if self.capture is None or context is None:
             self._store()
         else:

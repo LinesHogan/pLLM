@@ -7,7 +7,8 @@ None of them makes the host wait for the stream.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager
 
 import numpy as np
 import numpy.typing as npt
@@ -60,6 +61,18 @@ class PinnedStaging:
         host = self._current[0][:size]
         host.zero_()
         return host
+
+    @contextmanager
+    def fill(self, table: torch.Tensor) -> Generator[npt.NDArray[np.int64]]:
+        """Fill an int64 `table` through a zeroed host array shaped like it, copied into the table on exit (queued
+        from a taken pinned buffer for CUDA; a no-op for meta tables while planning)."""
+        if not table.is_cuda:
+            host = torch.zeros_like(table, device="cpu")
+            yield host.numpy()
+            table.copy_(host)
+            return
+        yield self.take(table.numel()).view(table.shape).numpy()
+        self.copy_to(table)
 
     def copy_to(self, destination: torch.Tensor) -> None:
         """Queue the copy of the taken buffer into `destination` on its device's current stream."""

@@ -230,19 +230,13 @@ class OverlayTile:
         self.base = operands[0].base_weight
         if self.capture is not None:
             self.capture.order(stream)
-        host = (
-            self.staging.take(self.table.numel()).view(self.table.shape)
-            if self.table.is_cuda
-            else torch.zeros_like(self.table, device="cpu")
-        )
         width, count = len(pools), len(operands)
-        host.numpy()[:width, :count] = slots
-        host[width : 2 * width].fill_(-1)
-        if self.train:
-            host.numpy()[width : 2 * width, :count] = slots
-        host.numpy()[-1, :count] = tuple(len(o.hidden) for o in operands)
-        refill = partial(self.staging.copy_to, self.table) if self.table.is_cuda else partial(self.table.copy_, host)
-        refill()
+        with self.staging.fill(self.table) as host:
+            host[:width, :count] = slots
+            host[width : 2 * width] = -1
+            if self.train:
+                host[width : 2 * width, :count] = slots
+            host[-1, :count] = tuple(len(o.hidden) for o in operands)
         self.hidden.zero_()
         self.desired.zero_()
         self.prompt_end.zero_()

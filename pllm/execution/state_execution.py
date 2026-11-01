@@ -206,6 +206,12 @@ class StateTaskContext(Generic[DataT]):
         self._obligations.append(_WriteAbort(token))
         return token
 
+    def owned_write_slots(self, sources: StateRefs, *, copy_fields: tuple[LayoutFieldId, ...] | None) -> Slots:
+        """Prepare a private transition of `sources` and return its destination slots: a row per source, a column
+        per field."""
+        write = self.prepare_owned_write(sources, copy_fields=copy_fields)
+        return self.arena.slots((write,) * len(write.after_refs), write.after_refs)[1]
+
     def publish_owned_write(self, token: PageWrite) -> PagePublication:
         self.check_page_execution()
         obligation = _WriteAbort(token)
