@@ -484,8 +484,8 @@ from pllm.workloads.tlm import TLMConfig, TLMMode, TLMWorkload
 
 workload = TLMWorkload(TLMConfig(mode=TLMMode.ONLINE), rank=8, alpha=16)
 ids = torch.tensor([[1, 2, 3, 4]], device="cuda")
-# TLM 的 overlay 读 InstanceState，不能在 CUDA graph 下运行。
-config = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", cuda_graphs=False)
+# TLM 的 overlay 读 InstanceState，默认的 cuda_graphs="auto" 因此让模型以 eager 运行。
+config = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct")
 with pllm.make_llm(config, workload=workload) as llm:
     outputs = llm.generate(
         ["The sky is"], SamplingParams(max_tokens=2),

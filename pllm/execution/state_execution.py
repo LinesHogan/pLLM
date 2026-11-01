@@ -396,6 +396,8 @@ class StateDiagnostics:
     state_usage: PageBundleUsage
     hold_count: int = 0
     last_hold: HeldInput | None = None
+    # Why the model runs without CUDA graphs (ModelConfig.cuda_graphs); empty when it uses them.
+    eager_reason: str = ""
 
     def logical_counts(self) -> tuple[int, ...]:
         """Rank-invariant progress, excluding allocator/event timing and device identities."""

@@ -70,6 +70,8 @@ class BackendRequirements:
     position_states: tuple[tuple[str, float], ...] = ()
     # Whether a @pllm.layer_route reruns model layers, which vLLM's CUDA graphs cannot capture.
     layer_routes: bool = False
+    # Whether a pllm.model.Overlay reads an InstanceState; CUDA-graph overlays bind request state only.
+    instance_overlay: bool = False
     causal_training: bool = False
     feeds: bool = False
     # The smallest pllm.samples(limit=); requests must use a lower sample index.

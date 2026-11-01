@@ -313,7 +313,6 @@ def model_config():
         max_num_seqs=1,
         max_num_batched_tokens=64,
         gpu_memory_utilization=0.25,
-        cuda_graphs=False,
     )
 
 

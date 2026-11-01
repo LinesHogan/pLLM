@@ -84,9 +84,9 @@ class ModelConfig:
     multiprocessing: bool = False
     runner: RunnerName = "mrv2"
     execution: ExecutionOptions = ExecutionOptions()
-    # Run the model through vLLM's CUDA graphs. Workloads whose in-model effects have no graph binding are rejected
-    # before the engine starts, with a message to set cuda_graphs=False.
-    cuda_graphs: bool = True
+    # "auto" runs the model through vLLM's CUDA graphs when the workload supports them, else eagerly, with the reason
+    # in diagnostics().eager_reason; True requires graphs (an unsupported workload raises), False runs eagerly.
+    cuda_graphs: Literal["auto"] | bool = "auto"
     kv_offload: KVOffload | None = None
     tensor_parallel_size: int = 1
     pipeline_parallel_size: int = 1

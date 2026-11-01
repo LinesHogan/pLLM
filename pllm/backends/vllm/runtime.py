@@ -5,6 +5,7 @@ Sessions live in session.py and runners in runner.py; this module builds the eng
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack
@@ -31,6 +32,7 @@ from pllm.authoring import (
 from pllm.backends.vllm import compat
 from pllm.backends.vllm.hidden_capture import CAPTURE_ENV, HiddenCaptureAnnouncement, HiddenCaptureLayout
 from pllm.backends.vllm.overlay_graph import (
+    GraphOptions,
     graph_mode,
     graph_options,
 )
@@ -83,6 +85,8 @@ from pllm.backends.vllm.prefix_cache import CachePolicy
 from pllm.backends.vllm.runner import BackendWorkerState, WorkloadModelRunner
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.execution.position_state import PositionAnnouncement
+
+_logger = logging.getLogger(__name__)
 
 _MP_ENV = "VLLM_ENABLE_V1_MULTIPROCESSING"
 
@@ -173,6 +177,7 @@ class VllmLlm(Generic[DataT, ResultT]):
     _facts: BackendCompileFacts
     _cache_policy: CachePolicy
     _sample_limit: int | None
+    _eager_reason: str
     _closed: bool = False
     _next_prompt_index: int = 0
     _pending_input: ExitStack | None = None
@@ -219,7 +224,7 @@ class VllmLlm(Generic[DataT, ResultT]):
 
     def diagnostics(self) -> StateDiagnostics:
         self._require_open()
-        return self.worker_state().diagnostics
+        return replace(self.worker_state().diagnostics, eager_reason=self._eager_reason)
 
     @property
     def runner(self) -> WorkloadModelRunner | Mrv1Runner:
@@ -607,10 +612,13 @@ def _per_prompt(outputs: list[RequestOutput], n: int) -> list[RequestOutput]:
     return merged
 
 
-def vllm_engine(config: ModelConfig, workload_options: dict[str, Any], environment: dict[str, str]) -> LLM:
+def vllm_engine(
+    config: ModelConfig, workload_options: dict[str, Any], environment: dict[str, str], *, cuda_graphs: bool
+) -> LLM:
     """Build the vLLM engine; a workload adds its worker, scheduler and graph options."""
     if config.tensor_parallel_size > 1:
-        workload_options = {**graph_options(config, BackendRequirements()), **workload_options}
+        if cuda_graphs:
+            workload_options = {**graph_options(config, BackendRequirements()), **workload_options}
         environment.update(VLLM_USE_V2_MODEL_RUNNER="1", VLLM_WORKER_MULTIPROC_METHOD="spawn")
     previous = {name: os.environ.get(name) for name in environment}
     if any(previous[name] not in (None, value) for name, value in environment.items()):
@@ -625,7 +633,7 @@ def vllm_engine(config: ModelConfig, workload_options: dict[str, Any], environme
             pipeline_parallel_size=config.pipeline_parallel_size,
             data_parallel_size=config.data_parallel_size,
             distributed_executor_backend="mp" if config.tensor_parallel_size > 1 else "uni",
-            enforce_eager=not config.cuda_graphs,
+            enforce_eager=not cuda_graphs,
             max_model_len=config.max_model_len,
             max_num_seqs=config.max_num_seqs,
             max_num_batched_tokens=config.max_num_batched_tokens,
@@ -645,6 +653,21 @@ def vllm_engine(config: ModelConfig, workload_options: dict[str, Any], environme
                 os.environ[name] = value
 
 
+def _eager_reason(config: ModelConfig, requirements: BackendRequirements) -> str:
+    """Why the workload's model runs without vLLM's CUDA graphs; empty when it can use them."""
+    if config.cuda_graphs is False:
+        return "ModelConfig(cuda_graphs=False)"
+    if config.runner == "mrv1":
+        return 'runner="mrv1" runs workloads without CUDA graphs'
+    if requirements.activation_layers:
+        return "activation patches run outside CUDA graphs"
+    if requirements.layer_routes:
+        return "@pllm.layer_route reruns model layers outside CUDA graphs"
+    if requirements.instance_overlay:
+        return "CUDA-graph overlays read request state only; declare the pllm.model.Overlay state as pllm.RequestState"
+    return ""
+
+
 def create_vllm_llm(
     workload: BackendWorkload[DataT, ResultT],
     config: ModelConfig,
@@ -655,11 +678,11 @@ def create_vllm_llm(
     compat.admit_parallel(config, requirements)
     if requirements.position_states and config.runner == "mrv1":
         raise ValueError('PositionState layer routes need runner="mrv2"')
-    if config.cuda_graphs and (config.runner == "mrv1" or requirements.activation_layers or requirements.layer_routes):
-        raise ValueError(
-            'activation patches, @pllm.layer_route and runner="mrv1" run the model without CUDA graphs; '
-            "set ModelConfig(cuda_graphs=False)"
-        )
+    eager_reason = _eager_reason(config, requirements)
+    if config.cuda_graphs is True and eager_reason:
+        raise ValueError(f'{eager_reason}; set ModelConfig(cuda_graphs="auto") or cuda_graphs=False')
+    if config.cuda_graphs == "auto" and eager_reason:
+        _logger.warning("running the model without CUDA graphs: %s", eager_reason)
     environment = {
         _MP_ENV: "1" if config.multiprocessing else "0",
         _V2_RUNNER_ENV: "1" if config.runner == "mrv2" else "0",
@@ -670,7 +693,7 @@ def create_vllm_llm(
     }
     if config.multiprocessing or config.tensor_parallel_size > 1:
         environment["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-    options = graph_options(config, requirements)
+    options: GraphOptions = {} if eager_reason else graph_options(config, requirements)
     # vLLM keys its compiled-model cache by its own config; the hidden taps and position states pllm adds to the
     # forward must enter that key, or an engine loads a model compiled for another workload. pllm's entries are
     # integers (overlay_graph decodes them as dict[str, int]), so the digest enters as one.
@@ -687,6 +710,7 @@ def create_vllm_llm(
             + ("WorkloadAsyncScheduler" if config.runner == "mrv2" else "WorkloadScheduler"),
         },
         environment,
+        cuda_graphs=not eager_reason,
     )
 
     with ExitStack() as construction:
@@ -709,7 +733,9 @@ def create_vllm_llm(
             facts, declaration = workload.specialize(facts, config.execution)
             attachment = workload.plan_backend(facts, declaration)
             policy = CachePolicy.for_attachment(attachment, config.generated_kv)
-            handle = VllmLlm[DataT, ResultT](llm, None, attachment, facts, policy, requirements.sample_limit)
+            handle = VllmLlm[DataT, ResultT](
+                llm, None, attachment, facts, policy, requirements.sample_limit, eager_reason
+            )
             handle.command(
                 BackendCommand.INSTALL, encode_boundary(BackendInstall(facts, attachment, definition or "", policy))
             )
@@ -724,7 +750,7 @@ def create_vllm_llm(
             policy = CachePolicy.for_attachment(deployment.attachment, config.generated_kv)
             runner.attach_workload(deployment, policy)
             handle = VllmLlm[DataT, ResultT](
-                llm, runner, deployment.attachment, facts, policy, requirements.sample_limit
+                llm, runner, deployment.attachment, facts, policy, requirements.sample_limit, eager_reason
             )
         construction.pop_all()
         return handle

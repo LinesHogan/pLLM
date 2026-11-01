@@ -85,7 +85,6 @@ def main() -> None:
                 max_num_seqs=1,
                 max_num_batched_tokens=64,
                 gpu_memory_utilization=0.25,
-                cuda_graphs=False,  # the activation patch runs outside CUDA graphs
             ),
             workload=workload,
         ) as llm:

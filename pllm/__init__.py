@@ -77,7 +77,7 @@ def make_llm(config: ModelConfig, *, workload: BackendWorkload[D, R] | None = No
         from pllm.backends.vllm.runtime import vllm_engine
 
         admit_parallel(config)
-        return vllm_engine(config, {"worker_cls": "auto"}, {})
+        return vllm_engine(config, {"worker_cls": "auto"}, {}, cuda_graphs=config.cuda_graphs is not False)
     from pllm.backends.vllm.runtime import create_vllm_llm
 
     definition = None

@@ -23,9 +23,7 @@ from pllm.workloads.esamp_request import ESampRequestConfig, ESampRequestWorkloa
 def main() -> None:
     handle = make_llm(
         workload=ESampRequestWorkload(ESampRequestConfig(rank=2, intervention_beta=0.2)),
-        config=ModelConfig(
-            "Qwen/Qwen2.5-0.5B-Instruct", "bfloat16", 64, 2, 128, 0.25, seed=7, runner="mrv1", cuda_graphs=False
-        ),
+        config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", "bfloat16", 64, 2, 128, 0.25, seed=7, runner="mrv1"),
     )
     native_rows, native_reweight = mrv1.encode_mrv1_rows, SamplerGuidance._reweight_finite_survivors
     widths, phases, identities_seen = set(), set(), set()

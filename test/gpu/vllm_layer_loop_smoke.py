@@ -24,7 +24,7 @@ class LayerLoop(pllm.Workload):
 def main():
     handle = pllm.make_llm(
         workload=LayerLoop(),
-        config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", "bfloat16", 64, 1, 64, 0.25, seed=7, cuda_graphs=False),
+        config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", "bfloat16", 64, 1, 64, 0.25, seed=7),
     )
     primitive = handle.runner.require_session()._replay
     native_replay, checked = torch.cuda.CUDAGraph.replay, []

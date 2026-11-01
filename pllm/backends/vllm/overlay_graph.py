@@ -65,8 +65,6 @@ class GraphOptions(TypedDict, total=False):
 
 def graph_options(config: ModelConfig, requirements: BackendRequirements) -> GraphOptions:
     """Size model graphs and announce overlays before vLLM profiles the model."""
-    if not config.cuda_graphs:
-        return {}
     if not requirements.parameter_targets:
         return {
             "compilation_config": CompilationConfig(max_cudagraph_capture_size=config.max_num_batched_tokens),

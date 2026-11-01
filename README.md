@@ -118,7 +118,7 @@ python -m pip install -e ".[vllm032,test]"   # 或 ".[vllm027,test]"
 `ModelConfig(tensor_parallel_size=2)`（或模型支持的 4）在 vLLM 0.32 MRv2 上启用单节点 TP；
 省略 `workload` 的普通推理也使用该设置。0.27.1 与 MRv1 仅允许 TP=1；PP/DP 固定为 1，其他值会提示设置 `pipeline_parallel_size=1` / `data_parallel_size=1`。
 TP>1 支持 hidden 观测、采样引导/反馈，以及各 rank 上一致训练的 RequestState/InstanceState
-（ESamp、TTRL、输出 LoRA 等）；激活补丁仍需 `cuda_graphs=False`。参数 overlay、causal_model/TLM、
+（ESamp、TTRL、输出 LoRA 等）；激活补丁不使用 CUDA graph（见下文 `cuda_graphs="auto"`）。参数 overlay、causal_model/TLM、
 Feed、layer_route 和 PositionState 在 TP>1 构造时拒绝，并提示设置 `tensor_parallel_size=1`。
 TP>1 始终使用多进程 worker，负载须满足上面的 pickle 传输约束；不能直接访问 `llm.runner` 或 `llm.feed()`。
 辅助张量经 CPU 共享内存复制到各 rank；completion 只由输出 rank 写入，默认返回 CPU 张量。
@@ -146,9 +146,10 @@ forward 重叠。采样前只读的任务固定读取延迟版本：步 N+1 可�
 模型维度与有界资源事实在签名前完成特化；`training_rows` 限制每个状态的
 外部训练行数，`capture_memory_bytes` 是每个任务的驻留上限。容量不足是
 错误，不是静默退回 eager。Overlay 不能使用共享前缀缓存。
-`ModelConfig(cuda_graphs=True)` 是默认值：模型走 vLLM 的 CUDA graph。激活补丁、
-`@pllm.layer_route`、`runner="mrv1"` 以及读取 `InstanceState` 的模型内 overlay 不能在 CUDA graph
-下运行，`make_llm` 会报错并提示设置 `cuda_graphs=False`。
+`ModelConfig(cuda_graphs="auto")` 是默认值：负载支持时模型走 vLLM 的 CUDA graph，否则以 eager 运行，
+并记录一次日志、在 `diagnostics().eager_reason` 中给出原因。激活补丁、`@pllm.layer_route`、
+`runner="mrv1"` 以及读取 `InstanceState` 的 `pllm.model.Overlay` 不能在 CUDA graph 下运行。
+`cuda_graphs=True` 强制使用 CUDA graph，负载不支持时 `make_llm` 报错并说明原因；`cuda_graphs=False` 强制 eager。
 
 ## 支持的模型与限制
 

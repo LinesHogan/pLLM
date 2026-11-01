@@ -18,9 +18,7 @@ BUDGET = pllm.ExecutionOptions(memory_budget_bytes=1 << 30)
 def main() -> None:
     handle = pllm.make_llm(
         workload=ActivationWorkload(ActivationConfig((23,), 2, first_tokens=1, last_tokens=1)),
-        config=ModelConfig(
-            "Qwen/Qwen2.5-0.5B-Instruct", "bfloat16", 64, 2, 64, 0.25, seed=7, execution=BUDGET, cuda_graphs=False
-        ),
+        config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", "bfloat16", 64, 2, 64, 0.25, seed=7, execution=BUDGET),
     )
     execution = handle.runner.require_session()._deployment.execution
     baseline = []

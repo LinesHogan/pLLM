@@ -167,21 +167,13 @@ def _check_attachment(attachment: BackendAttachment) -> None:
     """Reject attachments a workload author can declare but the backend cannot run.
 
     Only mistakes reachable from a declaration are checked: export and training inputs, the
-    trained state's scope, sampled-token readers and CUDA-graph overlay state. Buffer shapes and
+    trained state's scope and sampled-token readers. Buffer shapes and
     dtypes are checked earlier, where the declaration resolves them against the model.
     """
     if attachment.spec.kind is AttachmentKind.OBSERVATION:
         _check_exports(attachment)
     elif attachment.spec.kind is AttachmentKind.REQUEST_TRAINING:
         _check_training(attachment)
-    if attachment.probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH:
-        graph = attachment.plan.semantic_graph
-        for state in graph.states:
-            if state.resource in graph.model_reads and state.scope is not StateScope.REQUEST:
-                raise ValueError(
-                    f"CUDA-graph overlays read request state; declare {state.resource!r} as "
-                    "pllm.RequestState or set cuda_graphs=False"
-                )
 
 
 def _check_exports(attachment: BackendAttachment) -> None:

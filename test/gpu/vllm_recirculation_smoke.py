@@ -49,7 +49,6 @@ def replay_handle(
                 length if budget is None else budget,
                 0.25,
                 seed=7,
-                cuda_graphs=False,
                 enable_prefix_caching=prefix,
                 enable_chunked_prefill=chunked,
                 kv_offload=offload,
