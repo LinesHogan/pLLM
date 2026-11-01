@@ -1,6 +1,6 @@
 {
   "typeCheckingMode": "strict",
-  "include": ["pllm", "tools/benchmark_esamp.py", "tools/benchmark_lora.py", "examples",
+  "include": ["pllm", "tools/benchmark_esamp.py", "tools/benchmark_lora.py", "tools/check_docs.py", "examples",
     "test/gpu/vllm_esamp_smoke.py", "test/gpu/fttt_cuda_smoke.py"],
   "exclude": ["**/__pycache__"],
   "reportMissingImports": true,
