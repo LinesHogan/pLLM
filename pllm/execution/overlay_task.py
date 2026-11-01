@@ -1,4 +1,9 @@
-"""Drive in-forward overlay segments at model projections through the existing state task runner."""
+"""In-forward overlays at model projections, run as ordinary state tasks.
+
+Owns the overlay update rules (ChunkUpdate, GradientUpdate), the per-invocation projection driver
+(ProjectionTask), OverlayTransition (one task's request/target adaptation) and RouteOverlay. model_effect_binding
+declares them; the vLLM backend calls ProjectionTask from its projection hooks.
+"""
 
 from __future__ import annotations
 
@@ -285,10 +290,11 @@ class ProjectionTask(Generic[DataT, ResultT]):
 
 @dataclass(frozen=True, slots=True)
 class OverlayTransition:
-    """Request/target adaptation shared by source and explicitly lowered math.
+    """One overlay task's mathematics: groups operands per target and phase, runs each group and reports the
+    residuals, the changed states and device counters.
 
-    Replacing this immutable callable during binding changes only the imported
-    mathematics. The original TensorOperation still owns private-page access.
+    Binding replaces this immutable callable (for instance to install its executor); the TensorOperation that
+    runs it keeps private-page access.
     """
 
     buffers: tuple[str, ...]

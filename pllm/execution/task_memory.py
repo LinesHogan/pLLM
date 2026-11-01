@@ -1,4 +1,9 @@
-"""Maximum-shape invocation inputs used to trace the bound tensor operations."""
+"""Memory planning for bound tensor operations.
+
+Builds maximum-shape meta inputs for every operation (example), traces each operation's workspace and capture
+residency (derive_resources, derive_host_resources) and orders producers before their readers. Workload
+specialization (usage.py) calls it before planning.
+"""
 
 from __future__ import annotations
 

@@ -1,4 +1,10 @@
-"""Native tensor functions bound to the original state invocation."""
+"""Tensor operations and their settlement.
+
+Owns the operands a body borrows (TensorBatch, read_batch), what a body returns (TaskOutput), the optimizers
+(PoolSGD, TensorAdamW, PageUpdate) and TensorOperation, which runs one body and turns its output into private
+writes, publications, counters and trace records. TensorBinding and the other bindings build TensorOperations;
+StateExecution runs them.
+"""
 
 from __future__ import annotations
 

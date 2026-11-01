@@ -1,4 +1,8 @@
-"""Bounded observations of original execution identities; never a state authority."""
+"""A bounded trace of one execution: task timings, observed tensors and exports, keyed by execution identity.
+
+StateExecution and TensorOperation record into ExecutionTrace; callers read it through snapshots. It never
+decides state.
+"""
 
 from __future__ import annotations
 

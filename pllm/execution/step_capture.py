@@ -1,4 +1,8 @@
-"""CUDA graph capture for whole tensor steps and batched layer routes."""
+"""CUDA graph capture for fixed-table tensor bodies.
+
+StepCapture captures one body per tensor task (TensorExecutor, FieldWriteExecutor) and overlay tile
+(OverlayBatch) and replays it; capture_graph is the warmup-and-capture routine it shares with vLLM layer replay.
+"""
 
 from __future__ import annotations
 
