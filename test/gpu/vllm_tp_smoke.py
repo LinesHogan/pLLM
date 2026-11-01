@@ -35,6 +35,21 @@ PROMPTS = [
     "Hello",
 ]
 _FINAL = []
+_EXPORTS = []
+
+
+class ExportingDummy(DummyWorkload):
+    def on_export(self, event):
+        from test.gpu.vllm_tp_smoke import _EXPORTS
+
+        _EXPORTS.append(event.invocation_id)
+
+
+def _exports(worker):
+    from test.gpu.vllm_tp_smoke import _EXPORTS
+
+    worker.workload_runner.require_session().trace.drain()
+    return _EXPORTS
 
 
 def config(graphs=True, lag=1):
@@ -108,7 +123,7 @@ def test_j1_tokens(graphs):
     finally:
         plain.llm_engine.engine_core.shutdown()
     for workload in (
-        DummyWorkload(DummyConfig(export_every_n_steps=1)),
+        ExportingDummy(DummyConfig(export_every_n_steps=1)),
         ESampRequestWorkload(ESampRequestConfig(rank=4)),
     ):
         with pllm.make_llm(settings, workload=workload) as handle:
@@ -123,6 +138,10 @@ def test_j1_tokens(graphs):
             counters = handle.diagnostics()
             assert counters.active_lineages == counters.inference_pins == 0
             assert len(handle.trace_snapshots()) == 2
+            if isinstance(workload, ExportingDummy):
+                exports = handle._require_open().collective_rpc(_exports)
+                assert len(exports[0]) == len(set(exports[0])) == 126  # Two runs of 63 decode steps.
+                assert exports[1] == []
             print(
                 f"J1 graphs={graphs} workload={workload.name}: greedy/seeded 8x64 bitwise parity; {counters}",
                 flush=True,

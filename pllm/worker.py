@@ -51,7 +51,8 @@ class GPUWorker(compat.Worker):
                 "run both processes from the same installed sources"
             )
         runner.attach_workload(
-            workload.bind_backend(install.facts, install.attachment, declaration), install.cache_policy
+            workload.bind_backend(install.facts, install.attachment, declaration, is_output_rank=self.rank == 0),
+            install.cache_policy,
         )
 
     def workload_command(self, command: str, payload: str) -> str:

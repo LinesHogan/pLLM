@@ -7,10 +7,11 @@ from torch.func import functional_call, vmap
 
 
 def _views(module: torch.nn.Module, flat: torch.Tensor) -> Iterator[tuple[str, torch.Tensor]]:
-    offset = 0
-    for name, p in module.named_parameters():
-        yield name, flat.narrow(-1, offset, p.numel()).view(*flat.shape[:-1], *p.shape)
-        offset += p.numel()
+    parameters = tuple(module.named_parameters())
+    # Split joins disjoint gradients once; separate narrows each build and add a full zero-padded gradient.
+    views = flat.split([parameter.numel() for _, parameter in parameters], dim=-1)
+    for (name, parameter), view in zip(parameters, views, strict=True):
+        yield name, view.view(*flat.shape[:-1], *parameter.shape)
 
 
 class _Method(torch.nn.Module):

@@ -1703,6 +1703,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         """Consume ordered CPU snapshots in the execution process; never reenter execution.
 
         The default retains snapshot history only. Own any retained tensors and I/O resources.
+        Tensor-parallel execution delivers exports only from the output rank (rank 0).
         """
 
     def _build(self, b: TensorBinding) -> None:

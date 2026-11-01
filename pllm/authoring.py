@@ -134,10 +134,17 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
         ...
 
     def bind_backend(
-        self, facts: BackendCompileFacts, attachment: BackendAttachment, declaration: TensorBinding
+        self,
+        facts: BackendCompileFacts,
+        attachment: BackendAttachment,
+        declaration: TensorBinding,
+        *,
+        is_output_rank: bool = True,
     ) -> BackendDeployment[DataT, ResultT]:
         plan = attachment.plan
         math = self.bind_math(facts, plan, declaration)
+        if not is_output_rank:
+            math = replace(math, on_export=None)
         arena = PageBundleArena(plan, device=facts.device, _owned_resources=math.local_resources(plan))
         return BackendDeployment(math.bind(arena, attachment.sampler_anchor_id), attachment)
 
