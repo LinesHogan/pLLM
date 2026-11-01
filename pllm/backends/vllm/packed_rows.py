@@ -1,6 +1,6 @@
 """Label vLLM MRv1/MRv2 input batches as packed phase rows; used by the runners.
 
-create_vllm_llm pins the vLLM version, so the batch layout asserted here is the one this version produces.
+compat.py admits only the vLLM releases in SUPPORTED_VLLM; the batch layout asserted here is the one they produce.
 """
 
 import numpy as np
