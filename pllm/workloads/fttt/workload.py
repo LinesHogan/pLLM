@@ -1,42 +1,93 @@
 """FTTT on the host: judge each completion, train a low-rank edit on the failed ones, and return the edit a retry
-applies. Pass `FTTTWorkload.run` as generate_feedback's `feedback=` and `FTTTResult.state_update` as its `edit=`."""
+applies.
+
+FTTTWorkload is the edit as an ordinary pllm.Workload state trained by AdamW. FTTTTrainer compiles it with
+pllm.host.make_host and steps it: pass `FTTTTrainer.run` as generate_feedback's `feedback=` and
+`FTTTResult.state_update` as its `edit=`.
+"""
 
 from __future__ import annotations
 
-from dataclasses import replace
+from collections.abc import Mapping
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
 
 import torch
+from torch.nn import functional as F
 
-from pllm.execution.cuda_stream import CudaStreamReadiness
-from pllm.host import CompletionInput
-from pllm.workloads.fttt.edit import FTTTEdit
+import pllm
+from pllm.execution.cuda_stream import upload
+from pllm.execution.step_input import TensorStepInput
+from pllm.execution.tensor_binding import TensorResult
+from pllm.host import CompletionInput, HostConfig, WeightedRowBatch, make_host
 from pllm.workloads.fttt.host_service import FTTTFeedbackService
+from pllm.workloads.fttt.math import feedback_rows
 from pllm.workloads.fttt.types import FTTTConfig, FTTTQueuedFeedback, FTTTResult
 
 
-class FTTTWorkload:
-    """One feedback service and the edit it trains; steps run on the caller's current CUDA stream."""
+def edit_rows(hidden: torch.Tensor, feedback: torch.Tensor, down: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """The edit each row gets: `up @ down` applied to the row's hidden state, feedback features and reward."""
+    return F.linear(F.linear(torch.cat((hidden, feedback), dim=1), down), up)
 
-    def __init__(
-        self,
-        feedback: FTTTFeedbackService,
-        *,
-        hidden_size: int,
-        device: torch.device = torch.device("cpu"),
-        initialization_seed: int = 0,
-        max_input_rows: int | None = None,
-    ) -> None:
-        if not 0 < feedback.config.rank <= hidden_size:
-            raise ValueError(f"FTTT rank {feedback.config.rank} must be in 1..hidden_size ({hidden_size})")
-        self.feedback = feedback
-        self.hidden_size, self.device, self.max_input_rows = hidden_size, device, max_input_rows
-        self.edit = FTTTEdit.initial(feedback.config, hidden_size, device, initialization_seed)
-        # Steps may run on different streams; each orders after the last write to the edit.
-        self._written = CudaStreamReadiness(torch.cuda.current_stream(device)) if device.type == "cuda" else None
+
+def edit_targets(feedback: torch.Tensor, hidden_size: int, edit_scale: float) -> torch.Tensor:
+    """What each row's edit should be: feedback feature c added to column c % hidden_size, averaged over
+    features // hidden_size + 1, and scaled by edit_scale and how far the reward is below 1."""
+    features, rewards = feedback[:, :-1], feedback[:, -1:]
+    width = features.shape[1]
+    folded = F.pad(features, (0, -width % hidden_size)).view(len(features), -1, hidden_size).sum(dim=1)
+    return folded / (width // hidden_size + 1) * ((1.0 - rewards).clamp(min=0.0) * edit_scale)
+
+
+@dataclass(frozen=True)
+class FTTTWorkload(pllm.Workload):
+    """A rank-r edit from (hidden, feedback features, reward) rows to hidden-size deltas, fit by AdamW."""
+
+    name = "fttt"
+    config: FTTTConfig = FTTTConfig()
 
     @property
-    def config(self) -> FTTTConfig:
-        return self.feedback.config
+    def edit(self) -> pllm.InstanceState:
+        rank, feedback = self.config.rank, self.config.feedback_width
+        return pllm.InstanceState(
+            {"down": lambda m: (rank, m.hidden_size + feedback), "up": lambda m: (m.hidden_size, rank)},
+            namespace="canonical.fttt_edit@1",
+            optimizer=pllm.AdamW(self.config.learning_rate, self.config.betas, self.config.eps),
+            initialize=self.initialize,
+        )
+
+    def initialize(self, parameters: Mapping[str, torch.Tensor], generator: torch.Generator) -> None:
+        """A random down factor and a zero up factor: the first edit is zero and the first step learns `up`."""
+        down = parameters["down"]
+        down.normal_(std=down.shape[1] ** -0.5, generator=generator)
+
+    @pllm.train(state="edit")
+    def update(
+        self,
+        hidden: torch.Tensor = pllm.batch("hidden"),
+        feedback: torch.Tensor = pllm.batch("targets"),
+        down: torch.Tensor = pllm.parameter("edit", "down"),
+        up: torch.Tensor = pllm.parameter("edit", "up"),
+    ) -> torch.Tensor:
+        """Mean squared error of each row's edit against its target; FTTT batches hold only the failed rows."""
+        target = edit_targets(feedback, hidden.shape[1], self.config.edit_scale)
+        return F.mse_loss(edit_rows(hidden, feedback, down, up), target)
+
+
+def current_stream(device: torch.device) -> torch.cuda.Stream | None:
+    return torch.cuda.current_stream(device) if device.type == "cuda" else None
+
+
+class FTTTTrainer:
+    """One feedback service and the edit it trains, compiled and admitted on `host` (whose target_shape FTTT sets to
+    its feedback width); steps run on the caller's current CUDA stream. `edit` is the ordinary execution handle."""
+
+    def __init__(self, feedback: FTTTFeedbackService, host: HostConfig) -> None:
+        self.feedback = feedback
+        self.edit = make_host(
+            replace(host, target_shape=(feedback.config.feedback_width,)), FTTTWorkload(feedback.config)
+        )
+        self.edit.admit((), current_stream(host.device))
 
     def run(self, batch: CompletionInput) -> FTTTResult | None:
         """Judge `batch`, queue its feedback, and run one edit step on the oldest queued feedback."""
@@ -44,52 +95,48 @@ class FTTTWorkload:
         return self.step()
 
     def step(self) -> FTTTResult | None:
-        """One edit step on the oldest queued feedback, None when nothing is queued. A failure restores the edit
-        and drops the queue."""
+        """One edit step on the oldest queued feedback, None when nothing is queued. A failed step publishes no
+        edit and drops the queue."""
         queued = self.feedback.begin()
         if queued is None:
             return None
-        snapshot = self.edit.snapshot()
         try:
-            result = self._train(queued)
+            result = self._train(queued) if queued.selected_rows else self._unchanged(queued)
             self.feedback.commit(queued, result.intent)
         except BaseException:
-            self.edit = snapshot
             self.feedback.abort(queued)
             raise
         return result
 
     def _train(self, queued: FTTTQueuedFeedback) -> FTTTResult:
+        """Step the edit on the failed rows, then apply the updated edit to the same rows."""
+        hidden, readiness = queued.batch.hidden, queued.batch.readiness
+        device = hidden.device
+        stream = current_stream(device)
+        with nullcontext() if stream is None else torch.cuda.stream(stream):
+            if readiness is not None and stream is not None:
+                readiness.order_on(stream)
+            rows = hidden.index_select(0, upload(queued.selected_rows, device))
+            records = queued.intent.feedback_records
+            feedback = upload(
+                feedback_rows(records, feature_size=self.feedback.config.feedback_feature_size), device, torch.float32
+            )
+            weights = torch.ones(len(records), device=device)
+            result = self.edit.step(TensorStepInput.of_batch(WeightedRowBatch(rows, feedback, weights)), stream)
+            assert isinstance(result, TensorResult) and result.publication is not None and result.loss is not None
+            delta = edit_rows(rows, feedback, result.parameters["down"], result.parameters["up"])
+        (published,) = result.publication.after_refs
+        intent = replace(queued.intent, adapter_version=published.version_id)
+        return FTTTResult(intent.transaction_id, delta, intent, (result.loss,), 1, published.version_id)
+
+    def _unchanged(self, queued: FTTTQueuedFeedback) -> FTTTResult:
+        """Nothing failed: no step, an empty delta, and the current edit version."""
+        (latest,) = self.edit.latest(())
         hidden = queued.batch.hidden
-        if (
-            hidden.shape[1] != self.hidden_size
-            or hidden.dtype != torch.float32
-            or hidden.device != self.device
-            or self.max_input_rows is not None
-            and len(hidden) > self.max_input_rows
-        ):
-            limit = "" if self.max_input_rows is None else f" and at most {self.max_input_rows} rows"
-            raise ValueError(f"FTTT needs float32 completion rows of width {self.hidden_size} on {self.device}{limit}")
-        if self._written is not None:
-            stream = torch.cuda.current_stream(self.device)
-            self._written.order_on(stream)
-            if queued.batch.readiness is not None:
-                queued.batch.readiness.order_on(stream)
-        loss = None
-        with torch.inference_mode(False), torch.enable_grad():
-            if queued.selected_rows:
-                rows = torch.tensor(queued.selected_rows, dtype=torch.long, device=hidden.device)
-                edit_input, loss = self.edit.train(
-                    self.config, hidden.detach().index_select(0, rows), queued.intent.feedback_records
-                )
-            else:
-                edit_input = hidden.new_empty((0, hidden.shape[1] + self.config.feedback_feature_size + 1))
-            delta = self.edit.delta(edit_input)
-        if self._written is not None:
-            self._written = CudaStreamReadiness(torch.cuda.current_stream(self.device))
-        intent = replace(queued.intent, adapter_version=self.edit.version)
-        losses = () if loss is None else (loss,)
-        return FTTTResult(intent.transaction_id, delta, intent, losses, len(losses), self.edit.version)
+        intent = replace(queued.intent, adapter_version=latest.version_id)
+        return FTTTResult(
+            intent.transaction_id, hidden.new_empty((0, hidden.shape[1])), intent, (), 0, latest.version_id
+        )
 
 
-__all__ = ["FTTTWorkload"]
+__all__ = ["FTTTTrainer", "FTTTWorkload", "edit_rows", "edit_targets"]

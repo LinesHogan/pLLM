@@ -301,6 +301,8 @@ class TensorFrame:
         default_factory=lambda: dict[StateRef, tuple[torch.Tensor, ...]]()
     )
     training: TensorUpdate | None = None
+    # A host training step's updated state fields, by name (TensorResult.parameters).
+    parameters: dict[str, torch.Tensor] = field(default_factory=lambda: dict[str, torch.Tensor]())
     replacements: tuple[tuple[int, tuple[torch.Tensor, ...]], ...] = ()
     plan: RowPlan | None = None
     # Set only on the copy a fixed-table body evaluates.

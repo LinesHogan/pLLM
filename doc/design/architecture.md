@@ -38,7 +38,7 @@
 全部十一个内置负载使用构造同一张原始图的共享绑定。普通模型方法用
 `pllm.Workload`，TLM 也通过这个接口声明因果批输入与模型端口；TTRL 也用
 `pllm.Workload`（宿主路径，`pllm.host.make_host` 编译，奖励由 `ttrl_rewards` 先算好）；
-FTTT/GTTA 是普通宿主类，其 `run` 作为 `generate_feedback` 的反馈回调，不经框架执行。Output LoRA 用普通加权批量 SGD。旧的 `authoring.Workload` 和
+FTTT 的编辑同样是宿主路径的 `pllm.Workload`，由 `FTTTTrainer.run` 这个反馈回调 `step`；GTTA 是普通宿主类，其 `run` 作为 `generate_feedback` 的反馈回调，不经框架执行。Output LoRA 用普通加权批量 SGD。旧的 `authoring.Workload` 和
 按负载的采样器 `build` 方法已移除。ESamp 用普通具名参数、预测与按状态 loss；
 其显式分页/捕获绑定在同一签名图上替换计算，原始 loss/Adam 对与五字段状态
 不变。LoRA 用原始加权批次、裸具名因子、reset 与多步 SGD；`SamplerWorkload`
@@ -90,8 +90,8 @@ Python 在 FFI 边界序列化同样的不可变描述符，只加封闭的输�
 服务，不在 GPU arena 预算内。宿主绑定保留原始不可变事实，不在编译期接受
 另一套。宿主 `Workload` 的成本由框架按最大形状测量；有界 TTRL 提供
 head/MSE/Adam 成本与 hidden 行预留，带准备前行准入与消费流寿命。文本与
-Python 元数据在该张量预算之外。FTTT 在原始宿主 timeline 上声明其参数/动量
-存储、回滚快照、活跃输入与训练/查询/结果成本。执行器在调用状态构造函数前
+Python 元数据在该张量预算之外。FTTT 的编辑同理按最大形状测量（行数与
+`target_shape`），包括交给结果的更新后参数拷贝。执行器在调用状态构造函数前
 准入该计划。GTTA 不断增长的 Python 历史与外部服务分配仍没有完整堆成本声明。
 `handle.diagnostics().state_usage` 是从原始 arena 根、字段槽、私有写与 receipt
 直接推导的冻结快照；它不保留这些所有者。逻辑字节计入每个保留/私有版本，

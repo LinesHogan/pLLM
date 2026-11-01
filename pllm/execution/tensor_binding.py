@@ -75,6 +75,9 @@ class TensorResult:
     )
 
     metrics: Mapping[str, torch.Tensor] = field(default_factory=lambda: dict[str, torch.Tensor]())
+    # A host training step's state after its update, by field name: owned copies on the step's stream. Empty for
+    # engine steps.
+    parameters: Mapping[str, torch.Tensor] = field(default_factory=lambda: dict[str, torch.Tensor]())
 
     @property
     def parameter_gradients(self) -> Mapping[StateRef, torch.Tensor]:
@@ -434,4 +437,5 @@ class TensorBinding(Builder[TensorFrame]):
             data.input_gradients,
             data.parameter_gradient_fields,
             {} if data.training is None else data.training.metrics,
+            data.parameters,
         )

@@ -1883,6 +1883,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
                 SharedTensor.describe,
                 hidden_size=facts.hidden_size,
                 vocab_size=0,
+                target_shape=facts.target_shape,
             )
             return prepare(value, batch)
 

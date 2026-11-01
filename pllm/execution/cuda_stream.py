@@ -1,6 +1,6 @@
 """Small CUDA helpers: stream readiness between producer and consumer, non-blocking uploads and device counters.
 
-The PTTS arena and the tensor executor upload small index lists with `upload`; step capture reuses
+The PTTS arena, the tensor executor and host workloads upload small host lists with `upload`; step capture reuses
 `PinnedStaging` for its per-step index table; state execution keeps diagnostics in `DeviceCounters`.
 None of them makes the host wait for the stream.
 """
@@ -18,11 +18,11 @@ from pllm.execution.admission import WindowBackpressure
 
 
 def upload(
-    values: Sequence[int] | Sequence[Sequence[int]] | npt.NDArray[np.int64],
+    values: Sequence[float] | Sequence[Sequence[float]] | npt.NDArray[np.int64],
     device: torch.device,
     dtype: torch.dtype = torch.long,
 ) -> torch.Tensor:
-    """Copy small host index lists to `device` without blocking the host.
+    """Copy small host lists (indices, or values with a float `dtype`) to `device` without blocking the host.
 
     `torch.tensor(values, device=cuda)` copies from pageable memory, which makes the host wait for
     the stream. Staging through pinned memory lets the copy queue behind the GPU work instead.

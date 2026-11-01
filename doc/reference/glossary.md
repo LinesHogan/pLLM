@@ -19,7 +19,8 @@
 - **配置引用（Config）** —— `pllm.Config("phase")` 在绑定时读取负载属性；
   `@pllm.on(...)` 可据此决定阶段，如 TLM 的在线/离线训练时机。
 - **张量结果（TensorResult）** —— 一次执行的报告值、loss、发布与观测；
-  `metrics` 保存算法提供的设备张量，TLM 的 `selected_count` 是选中的句子数。
+  `metrics` 保存算法提供的设备张量，TLM 的 `selected_count` 是选中的句子数；
+  宿主训练步的 `parameters` 是更新后的状态字段。
 - **捕获标记（Capture marker）** —— 训练输入上的第三注解参数
   `Capture(state, field)`：发布时，每个 lineage 的 memory 字段收到该输入
   最后一个选中行的值。

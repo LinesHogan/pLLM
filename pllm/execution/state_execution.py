@@ -556,12 +556,16 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             return ()
         receipt = self.directory.admit(identities, stream, self.math.initialize)
         # One visible ref per unique admitted key, whether created or joined.
-        refs = self.directory.latest_refs(identities)
+        refs = self.latest(identities)
         if receipt is None:
             self.trace.record(TracePhase.ADMIT, 0, identities=identities, refs=refs)
         else:
             self.trace.record(TracePhase.ADMIT, 0, identities=identities, refs=refs, operation_id=receipt.operation_id)
         return refs
+
+    def latest(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateRef, ...]:
+        """The newest published version of each admitted state of `identities`; `()` names the instance states."""
+        return self.directory.latest_refs(identities)
 
     def admit_instances(self, stream: torch.cuda.Stream | None = None) -> None:
         """Admit instance-scoped state once, when the execution is installed; requests admit their own state."""

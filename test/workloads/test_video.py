@@ -162,14 +162,14 @@ def test_video_binding_keeps_remote_roots_out_of_local_ownership():
 def test_video_binding_failure_retains_grants_and_stops_execution():
     for failure in ("alias", "write", "close"):
         with binding_case(alias=failure == "alias", write_failure=failure == "write") as (*_, execution, root, peers):
-            before = execution.directory.latest_refs(())
+            before = execution.latest(())
             execution.stage_readonly((root,))
             if failure == "close":
                 peers[0].close()  # The producer vanished: the read ACK cannot be delivered.
             with pytest.raises(StateSettlementError if failure == "close" else (ValueError, ArithmeticError)):
                 execution.step(step_input(()))
             if failure != "close":
-                assert execution.directory.latest_refs(()) == before and not any(peer.poll() for peer in peers)
+                assert execution.latest(()) == before and not any(peer.poll() for peer in peers)
             with pytest.raises(RuntimeError):
                 execution.admit(())
 
@@ -273,7 +273,7 @@ def _decode_steps_keep_exact_publications_and_ack_order():
             rows = _step_rows(step, identities)
             rng = torch.random.get_rng_state().clone()
             session.prepare_input(rows)
-            assert execution.directory.latest_refs(())[0].version_id == step + 1
+            assert execution.latest(())[0].version_id == step + 1
             assert not any(peer.poll() for peer in peers)
             expected_deltas = (
                 ((10, 0, 10, 10),) * 3 if step == 0 else ((20, 10, 0, 10), (10, 10, 0, 10), (0, 10, 0, 10))
@@ -330,7 +330,7 @@ def _hold_steps_reuse_the_settled_injection():
             rng = torch.random.get_rng_state().clone()
             session.prepare_input(rows(step))
             hold = step in (1, 3)
-            current = execution.directory.latest_refs(())[0]
+            current = execution.latest(())[0]
             refs.append(current)
             assert current.version_id == (1 if step < 2 else 2)
             for index, layer in enumerate(model.model.layers):

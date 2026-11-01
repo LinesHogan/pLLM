@@ -140,11 +140,13 @@ class CompletionCapture:
 
 @dataclass(frozen=True, slots=True)
 class HostConfig:
-    """What pllm.host.make_host compiles a workload against: the device, the width of hidden rows in host batches,
-    the seed of initial state values, and the state and per-step memory limits (max_input_rows bounds a batch)."""
+    """What pllm.host.make_host compiles a workload against: the device, the width of hidden rows in host batches
+    and the shape of each row's target (() for one value per row), the seed of initial state values, and the state
+    and per-step memory limits (max_input_rows bounds a batch)."""
 
     device: torch.device
     hidden_size: int = 0
+    target_shape: tuple[int, ...] = ()
     initialization_seed: int = 0
     state_memory_budget_bytes: int = 64 * 1024 * 1024
     max_input_rows: int | None = None
@@ -154,6 +156,7 @@ class HostConfig:
         if (
             self.device.type not in ("cpu", "cuda")
             or self.hidden_size < 0
+            or any(size < 1 for size in self.target_shape)
             or self.initialization_seed < 0
             or self.state_memory_budget_bytes < 0
             or self.max_input_rows is not None
@@ -162,8 +165,8 @@ class HostConfig:
             and self.memory_budget_bytes < 0
         ):
             raise ValueError(
-                "HostConfig needs a cpu or cuda device and nonnegative hidden_size, initialization_seed, "
-                f"state_memory_budget_bytes, max_input_rows and memory_budget_bytes; got {self}"
+                "HostConfig needs a cpu or cuda device, positive target_shape sizes and nonnegative hidden_size, "
+                f"initialization_seed, state_memory_budget_bytes, max_input_rows and memory_budget_bytes; got {self}"
             )
 
     def timeline(self) -> SchedulerTimeline:

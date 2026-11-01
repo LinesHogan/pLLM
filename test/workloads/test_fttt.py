@@ -14,7 +14,7 @@ import torch
 
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.host import Completion, CompletionBatch, CompletionInput, FinishReason, HostConfig, RetryAction, make_host
-from pllm.workloads.fttt import FTTTConfig, FTTTFeedbackService, FTTTJudgeResult, FTTTJudgeService, FTTTWorkload
+from pllm.workloads.fttt import FTTTConfig, FTTTFeedbackService, FTTTJudgeResult, FTTTJudgeService, FTTTTrainer
 
 
 class ArithmeticJudge(FTTTJudgeService):
@@ -30,15 +30,18 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry() -> None:
         FTTTConfig(edit_scale=float("nan"))
     config = FTTTConfig(rank=2, learning_rate=0.05, feedback_feature_size=3, max_retries=2)
     service = FTTTFeedbackService(config, ArithmeticJudge())
-    workload = FTTTWorkload(service, hidden_size=4, initialization_seed=7, max_input_rows=1)
+    host = HostConfig(
+        torch.device("cpu"), hidden_size=4, initialization_seed=7, max_input_rows=1, memory_budget_bytes=1 << 20
+    )
+    workload = FTTTTrainer(service, host)
     identity = RequestIdentity("arithmetic", 0, 0)
     hidden = torch.tensor([[-1.0, -0.25, 0.5, 1.0]])
     wrong = Completion(identity, 0, "round", (1, 2), "3", FinishReason.STOP)
-    # A failed step (two completions exceed max_input_rows=1) leaves the edit at version 0 and drops the queue.
+    # A failed step (two failed rows exceed max_input_rows=1) publishes no edit and drops the queue.
     extra = replace(wrong, identity=RequestIdentity("excess", 1, 0))
     with pytest.raises(ValueError):
         workload.run(CompletionInput.capture(CompletionBatch((wrong, extra)), hidden.expand(2, -1)))
-    assert workload.edit.version == 0 and service.queued_feedback == 0
+    assert workload.edit.diagnostics().update_count == 0 and service.queued_feedback == 0
 
     # Spell out the feature projection and use PyTorch Adam, not production helpers.
     feature = torch.zeros(3)
@@ -127,7 +130,7 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
             return CompletionInput.capture(CompletionBatch(entries), torch.ones(len(entries), 4))
 
     service = FTTTFeedbackService(FTTTConfig(rank=2, max_retries=2), ArithmeticJudge())
-    processor = FTTTWorkload(service, hidden_size=4)
+    processor = FTTTTrainer(service, HostConfig(torch.device("cpu"), hidden_size=4))
     generator = Generation()
     rounds = list(
         generator.generate_feedback(

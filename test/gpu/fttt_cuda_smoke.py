@@ -5,8 +5,8 @@ from __future__ import annotations
 import torch
 
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.host import Completion, CompletionBatch, CompletionInput, FinishReason, RetryAction
-from pllm.workloads.fttt import FTTTConfig, FTTTFeedbackService, FTTTJudgeResult, FTTTJudgeService, FTTTWorkload
+from pllm.host import Completion, CompletionBatch, CompletionInput, FinishReason, HostConfig, RetryAction
+from pllm.workloads.fttt import FTTTConfig, FTTTFeedbackService, FTTTJudgeResult, FTTTJudgeService, FTTTTrainer
 
 
 class _CudaNegativeJudge(FTTTJudgeService):
@@ -22,7 +22,7 @@ def main() -> int:
     consumer_stream = torch.cuda.Stream(device=device)
     config = FTTTConfig(rank=2, learning_rate=0.05, feedback_feature_size=3, max_retries=2)
     service = FTTTFeedbackService(config, _CudaNegativeJudge())
-    workload = FTTTWorkload(service, hidden_size=4, device=device, initialization_seed=7, max_input_rows=1)
+    workload = FTTTTrainer(service, HostConfig(device, hidden_size=4, initialization_seed=7, max_input_rows=1))
     identity = RequestIdentity("cuda-feedback-0", 0, 0)
     completion = Completion(identity, 0, "cuda-round-0", (1, 2), "wrong arithmetic", FinishReason.STOP)
     with torch.cuda.stream(producer_stream):
@@ -43,7 +43,7 @@ def main() -> int:
         or len(result.losses) != 1
     ):
         raise RuntimeError("canonical FTTT CUDA lifecycle evidence is incomplete")
-    print(f"FTTT CUDA: update_count={result.update_count} state_version={workload.edit.version}")
+    print(f"FTTT CUDA: update_count={result.update_count} state_version={result.state_version}")
     return 0
 
 

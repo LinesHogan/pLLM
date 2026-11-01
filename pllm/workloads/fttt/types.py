@@ -53,6 +53,11 @@ class FTTTConfig:
     betas: tuple[float, float] = (0.9, 0.999)
     eps: float = 1e-8
 
+    @property
+    def feedback_width(self) -> int:
+        """The width of each failed row's feedback: its hashed features and its reward."""
+        return self.feedback_feature_size + 1
+
     def __post_init__(self) -> None:
         AdamW(self.learning_rate, self.betas, self.eps)
         if (

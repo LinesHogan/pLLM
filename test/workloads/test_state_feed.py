@@ -178,7 +178,7 @@ def test_ordinary_state_ports_and_write_do_not_depend_on_declaration_order():
     execution.admit(())
     rows = PackedPhaseRowBatch(0, 0, ())
     execution.step(TensorStepInput(rows, PackedSamplerRowBatch(rows, ())))
-    refs = execution.directory.latest_refs(())
+    refs = execution.latest(())
     assert [ref.version_id for ref in refs] == [0, 1, 0]
     torch.testing.assert_close(execution.snapshot(refs[1])[0], torch.ones(2))
     execution.retire(())

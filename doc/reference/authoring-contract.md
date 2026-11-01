@@ -33,7 +33,8 @@
 [OverRIDE](../../pllm/workloads/override.py)、[In-Place-TTT](../../pllm/workloads/inplace_ttt.py)
 和 [ReFT](../../pllm/workloads/reft.py) 使用这个接口；[Recirculation](../../pllm/workloads/recirculation.py)
 使用普通的 `Recurrence` 声明；[TTRL](../../pllm/workloads/ttrl.py) 使用普通 `Workload`
-的宿主路径（奖励投票是宿主函数 `ttrl_rewards`）；FTTT 和 GTTA 是普通宿主类，其 `run` 作反馈回调；
+的宿主路径（奖励投票是宿主函数 `ttrl_rewards`），FTTT 的编辑也是（`FTTTTrainer.run` 作反馈回调）；
+GTTA 是普通宿主类，其 `run` 作反馈回调；
 [TLM](../../pllm/workloads/tlm/workload.py) 使用普通 `Workload` 的因果批输入与模型端口；
 [ESamp](../../pllm/workloads/esamp_request.py) 使用普通具名参数、预测与 loss，
 并在同一张图上做显式分页/捕获替换；Output LoRA 使用普通 `Batch` 输入与多步 SGD。
@@ -425,11 +426,13 @@ Hidden 需求从声明推导。形状/dtype 回调只在模型事实可用后运
 宿主循环只有一种写法：反馈回调 `CompletionInput -> 反馈`（带 `retry_controls`、
 `update_barriers`、`update_count`）传给 `generate_feedback(feedback=...)`。需要框架管理的
 张量状态写成普通 `pllm.Workload`，用 `pllm.host.make_host(HostConfig(...), workload)` 编译，
-回调里 `step`。[FTTT](../../pllm/workloads/fttt/workload.py) 与
-[GTTA](../../pllm/workloads/gtta/workload.py) 是普通宿主类：`FTTTWorkload.run(batch)`
-评判、入队并训练一步低秩编辑（`step()` 只处理已排队的反馈），失败时恢复编辑并清空
-队列；`GTTAWorkload.run(request)` 把排队的环境事件并入动力学记忆再回答查询，失败时
-恢复记忆并把事件放回队首。旧的 `pllm.host.transaction`、receipt 与两阶段结算已移除。
+回调里 `step`。[FTTT](../../pllm/workloads/fttt/workload.py) 的低秩编辑就是这样的
+`FTTTWorkload`（AdamW 写在状态上）；`FTTTTrainer(service, HostConfig(...))` 用 `make_host` 编译并准入它
+（`trainer.edit` 是普通执行句柄，可取 `diagnostics()`），`run(batch)` 评判、入队，
+在失败行上 `step` 一次，再用 `TensorResult.parameters` 里更新后的编辑算出重试要加的
+增量（`step()` 只处理已排队的反馈）；失败的一步不发布编辑并清空队列。
+[GTTA](../../pllm/workloads/gtta/workload.py) 是普通宿主类：`GTTAWorkload.run(request)`
+把排队的环境事件并入动力学记忆再回答查询，失败时恢复记忆并把事件放回队首。旧的 `pllm.host.transaction`、receipt 与两阶段结算已移除。
 
 `Observation` 把选中行或身份出处带到既有 trace。显式有界导出用 `export=True`；
 可选的数学观测仍遵循原始 trace 选择。两者都不需要访问执行器或 arena。
@@ -448,12 +451,15 @@ Hidden 需求从声明推导。形状/dtype 回调只在模型事实可用后运
 `update_count`。
 
 训练步携带 `WeightedRowBatch(hidden, targets, weights)`（`pllm.host`）：`hidden` 是
-`[行数, hidden_size]`，`targets` 与 `weights` 是同 dtype 的 `[行数]`，权重为 0 的行不参与。
+`[行数, hidden_size]`，`weights` 是同 dtype 的 `[行数]`，权重为 0 的行不参与；`targets` 是
+`[行数, *HostConfig.target_shape]`——默认 `target_shape=()` 即每行一个值（TTRL），FTTT 每行
+一个向量（反馈特征加奖励，`FTTTTrainer` 自己设置 `target_shape`）。
 训练方法用 `@pllm.train(state=...)`，通过 `pllm.batch("hidden")`、`pllm.batch("targets")`、
 `pllm.batch("weights")` 与 `pllm.parameter(state, field)` 取输入，返回
 `pllm.TensorUpdate(loss, changed, update_count, trained_rows)`、标量 loss（每行都训练），或返回 `None` 跳过整个
 更新。`changed` 是设备张量：空选择（权重全 0）时发布不变的值，优化器字段保持原样，
-训练路径没有主机同步。
+训练路径没有主机同步。宿主训练步的 `TensorResult.parameters` 按字段名给出这次更新后的
+状态（在步所在流上的独立拷贝，计入资源测量），回调在同一步里就能用更新后的值。
 
 参数是带 `pllm.AdamW` 的普通 `InstanceState`；具名形状只是同一个打包 AdamW 组的视图
 （AdamW 逐元素，所以与独立参数逐位一致）。标量配置在绑定时快照（包括类属性），
@@ -461,7 +467,7 @@ Hidden 需求从声明推导。形状/dtype 回调只在模型事实可用后运
 平局规则、采样限制与重试/栅栏构造是 `ttrl_rewards` 的数学，原始 completion 对象保留。
 
 有界宿主执行使用 `HostConfig(max_input_rows=..., memory_budget_bytes=...)`。框架用
-最大形状的 `WeightedRowBatch` 执行实际 loss/update 路径来推导资源，不要求负载申报字节；
+最大形状的 `WeightedRowBatch`（含 `target_shape`）执行实际 loss/update 路径来推导资源，不要求负载申报字节；
 超过 `max_input_rows` 的输入在 `step` 前被拒绝。
 
 ## 因果批训练
@@ -669,7 +675,7 @@ vLLM 继续按真实容量预留 hidden 快照、采样反馈和效果/replay �
 | Output LoRA | 实例/请求作用域、原始键、外部加权 CE、独立训练/更新选择、SGD 与捕获 |
 | ReFT | 无优化器外部字段替换、发布、激活目标与选中行 |
 | Recirculation | 无状态逐 token replay；有序 prefill、原始 KV/RNG 与正常输出 |
-| FTTT | completion/judge 输入、update-before-predict、原始事务、receipt 与重试输出 |
+| FTTT | 宿主 judge 与有界队列、向量目标 `WeightedRowBatch`、AdamW 编辑、用 `parameters` 做 update-before-predict 与重试输出 |
 | GTTA | 无张量字段的宿主状态；FIFO 轨迹、update-before-query、abort/requeue 与 commit |
 | TTRL | 宿主 `ttrl_rewards` 投票、`WeightedRowBatch` 加权梯度、空选择不变发布与重试/栅栏结果 |
 

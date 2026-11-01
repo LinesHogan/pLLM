@@ -274,7 +274,7 @@ def derive_host_resources(binding: TensorBinding, facts: HostConfig) -> Schedule
     if facts.max_input_rows is None:
         raise ValueError("set HostConfig.max_input_rows when memory_budget_bytes is set")
     rows = facts.max_input_rows
-    auxiliary = WeightedRowBatch(meta(rows, facts.hidden_size), meta(rows), meta(rows))
+    auxiliary = WeightedRowBatch(meta(rows, facts.hidden_size), meta(rows, *facts.target_shape), meta(rows))
     (layout,) = binding.layouts.layouts
     refs = StateRefs.of((StateRef(LayoutId(1), LineageId(1), VersionId(1)),))
     selection = RequestStateSelection((), (ResourceSelection(StateResource(layout.resource), (None,), refs, ()),))

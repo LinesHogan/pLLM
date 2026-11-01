@@ -27,7 +27,8 @@ class CausalTrainBatch(Generic[T]):
 
 @dataclass(frozen=True, slots=True)
 class WeightedRowBatch(Generic[T]):
-    """[rows, hidden_size] features with one target and one weight per row; weight 0 skips a row."""
+    """[rows, hidden_size] features with one target (a value or a fixed-shape tensor) and one weight per row; weight 0
+    skips a row."""
 
     schema: ClassVar[str] = "canonical.weighted_rows@1"
     names: ClassVar[tuple[str, ...]] = ("hidden", "targets", "weights")
@@ -88,8 +89,12 @@ def validate_auxiliary(
     *,
     hidden_size: int,
     vocab_size: int,
+    target_shape: tuple[int, ...] = (),
 ) -> None:
-    """Check a generate call's auxiliary input once, before export, mapping or device copies; tasks trust it."""
+    """Check a generate call's auxiliary input once, before export, mapping or device copies; tasks trust it.
+
+    `target_shape` is the shape of each WeightedRowBatch row's target (HostConfig.target_shape).
+    """
     if value is None:
         return
     consumers = tuple(
@@ -153,13 +158,15 @@ def validate_auxiliary(
                 len(features) != 2
                 or features[0] < 1
                 or features[1] != hidden_size
-                or shape(targets) != features[:1]
+                or shape(targets) != features[:1] + target_shape
                 or shape(weights) != features[:1]
                 or describe(targets).dtype is not describe(hidden).dtype
                 or describe(weights).dtype is not describe(hidden).dtype
             ):
+                rows = ", ".join(("rows", *map(str, target_shape)))
                 raise ValueError(
-                    f"weighted rows need hidden [rows, {hidden_size}] with targets and weights [rows] of one dtype"
+                    f"weighted rows need hidden [rows, {hidden_size}], targets [{rows}] and weights [rows] of one "
+                    "dtype; set HostConfig(target_shape=...) to the shape of each row's target"
                 )
             actual = (features,)
         case StateTensorUpdate():

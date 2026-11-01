@@ -98,18 +98,21 @@ def _advance_steps(
     count: tl.constexpr,
     stride: tl.constexpr,
     lr: float,
-    beta1: float,
-    beta2: float,
+    alpha1: float,
+    alpha2: float,
 ) -> None:
     state = tl.program_id(0)
     slot = tl.load(slots + 2 * count + state)
     source = tl.load(sources + 2 * count + state)
     value = tl.load(steps + source * stride, slot >= 0, 0) + 1
     tl.store(steps + slot * stride, value, slot >= 0)
-    power1 = libdevice.pow(tl.cast(beta1, tl.float64), tl.cast(value, tl.float64)).to(tl.float32)
-    power2 = libdevice.pow(tl.cast(beta2, tl.float64), tl.cast(value, tl.float64)).to(tl.float32)
-    tl.store(corrections + state * 2, tl.div_rn(1.0, tl.div_rn(power1 - 1, lr)))
-    tl.store(corrections + state * 2 + 1, tl.sqrt(1 - power2))
+    # The bias corrections 1 - beta**step, in FP64 from alpha = 1 - beta: an FP32 beta near 1 (0.999 rounds by
+    # 1.3e-8) would put a 1e-5 relative error into 1 - beta2**step.
+    steps64 = tl.cast(value, tl.float64)
+    correction1 = -libdevice.expm1(steps64 * libdevice.log1p(-tl.cast(alpha1, tl.float64)))
+    correction2 = -libdevice.expm1(steps64 * libdevice.log1p(-tl.cast(alpha2, tl.float64)))
+    tl.store(corrections + state * 2, (-tl.cast(lr, tl.float64) / correction1).to(tl.float32))
+    tl.store(corrections + state * 2 + 1, tl.sqrt(correction2).to(tl.float32))
 
 
 @triton.jit
@@ -190,7 +193,7 @@ def _paged_update(
     lr, beta1, beta2, eps, decay = hyperparameters
     count, width = gradients.shape
     # Increment in a separate launch: no tile may observe another tile's step write.
-    _advance_steps[(count,)](step, slots, sources, corrections, count, step.stride(0), lr, beta1, beta2)
+    _advance_steps[(count,)](step, slots, sources, corrections, count, step.stride(0), lr, 1 - beta1, 1 - beta2)
     _paged_adamw[(count * ((width + 255) // 256),)](
         parameter,
         gradient,

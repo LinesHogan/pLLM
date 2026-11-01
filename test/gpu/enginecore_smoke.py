@@ -39,7 +39,7 @@ from pllm.workloads.fttt import (
     FTTTFeedbackService,
     FTTTJudgeResult,
     FTTTJudgeService,
-    FTTTWorkload,
+    FTTTTrainer,
 )
 from pllm.workloads.fttt.types import FTTTResult
 from pllm.workloads.lora import OutputLoRAConfig, OutputLoRAWorkload
@@ -333,7 +333,7 @@ def _output_lora_shared_input() -> None:
         assert handle.worker_state().diagnostics.update_count == 1
 
         service = FTTTFeedbackService(FTTTConfig(rank=2, max_retries=3), RetryOnce())
-        processor = FTTTWorkload(service, hidden_size=captured.hidden.shape[1])
+        processor = FTTTTrainer(service, HostConfig(torch.device("cpu"), hidden_size=captured.hidden.shape[1]))
         rounds = list(
             handle.generate_feedback(
                 PROMPTS,
@@ -434,7 +434,7 @@ def _fttt_activation_retry() -> None:
     handle = pllm.make_llm(workload=ActivationWorkload(config), config=engine(seqs=1))
     try:
         service = FTTTFeedbackService(FTTTConfig(rank=2, learning_rate=0.1, max_retries=3), RetryOnce())
-        processor = FTTTWorkload(service, hidden_size=896)
+        processor = FTTTTrainer(service, HostConfig(torch.device("cpu"), hidden_size=896))
         rounds = list(
             handle.generate_feedback(
                 ["The sky is", "Water freezes at", "The sea is"],
@@ -505,7 +505,7 @@ def main() -> int:
         assert torch.isfinite(batch.hidden).all() and torch.count_nonzero(batch.hidden) > 0
         facts = HostConfig(torch.device("cpu"), hidden_size=batch.hidden.shape[1])
         feedback = FTTTFeedbackService(FTTTConfig(), FTTTDefaultJudge())
-        edited = FTTTWorkload(feedback, hidden_size=facts.hidden_size).run(batch)
+        edited = FTTTTrainer(feedback, facts).run(batch)
         assert edited is not None and edited.update_count == 1
         ttrl = TTRLConfig(rank=2, votes_per_prompt=3, samples_per_prompt=2)
         reward = make_host(facts, TTRLWorkload(ttrl))

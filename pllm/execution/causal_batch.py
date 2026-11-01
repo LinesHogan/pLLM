@@ -4,16 +4,17 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+from functools import partial
 from typing import TYPE_CHECKING, Protocol
 
 import torch
 
 from pllm.contracts.auxiliary import CausalTrainBatch, WeightedRowBatch
-from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding
+from pllm.contracts.parameter_overlay import FieldView, ParameterOverlayFieldBinding
 from pllm.contracts.semantic_graph import MathContract, SemanticInputSource, StateEffectKind, StateSelectionInputSource
 from pllm.execution.declaration import Call, State, When, native
 from pllm.execution.tensor_frame import TensorFrame, Tensors, TensorUpdate
-from pllm.execution.tensor_program import TaskOutput, autograd_loss
+from pllm.execution.tensor_program import TaskOutput, TensorBatch, autograd_loss
 
 if TYPE_CHECKING:
     from pllm.execution.tensor_binding import TensorBinding
@@ -133,4 +134,23 @@ def declare_batch_train(
     )
     # A host step publishes only after its compute window closes, so an abandoned step publishes nothing.
     b.publish(call, state, when=When.HOST_COMMIT if when is When.HOST_COMPUTE else when)
+    if when is When.HOST_COMPUTE:
+        resource = str(state.declaration.resource)
+        views = {key: view for (owner, key), view in b.field_views.items() if owner == resource}
+        # The caller of a host step reads the updated state (TensorResult.parameters): copy the updated version.
+        b.compute(
+            f"{name}.parameters",
+            inputs={"state": state.read()},
+            outputs=("parameters",),
+            reads=(state.version(call),),
+            when=When.HOST_COMMIT,
+            function=partial(copy_parameters, resource, views),
+        )
     return call
+
+
+def copy_parameters(resource: str, views: Mapping[str, FieldView], data: TensorFrame, batch: TensorBatch) -> TaskOutput:
+    """Hand owned copies of a state's fields, as the training update left them, to the step result."""
+    root = batch.parameter_root(resource)
+    data.parameters = {key: view.read(root[view.field]).clone() for key, view in views.items()}
+    return TaskOutput()

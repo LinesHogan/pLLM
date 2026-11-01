@@ -254,7 +254,7 @@ def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch
         )
         result = testing.run_step(execution, testing.step_input(pair, auxiliary=payload), stream=stream)
         for index, item in enumerate(pair):
-            (ref,) = execution.directory.latest_refs((item,))
+            (ref,) = execution.latest((item,))
             torch.testing.assert_close(
                 execution.snapshot(ref, stream=stream),
                 tuple(value[0] * (3 if index and payload is not None else 1) for value in values),

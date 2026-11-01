@@ -22,7 +22,7 @@ from pllm.backends.vllm.sampler import GuidedSampler
 from pllm.config import ModelConfig
 from pllm.execution.state_execution import StateExecution
 from pllm.host import HostConfig, make_host
-from pllm.workloads.fttt import FTTTConfig, FTTTDefaultJudge, FTTTFeedbackService, FTTTWorkload
+from pllm.workloads.fttt import FTTTConfig, FTTTDefaultJudge, FTTTFeedbackService, FTTTTrainer
 from pllm.workloads.override import OverRIDEConfig, OverRIDEWorkload
 from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload, ttrl_rewards
 
@@ -151,10 +151,7 @@ def main() -> None:
             assert completion.identity.prompt_idx == 100
             torch.testing.assert_close(row, expected_hidden[completion.identity.request_id], rtol=0, atol=0)
         facts = HostConfig(execution.device, hidden_size=batch.hidden.shape[1])
-        feedback = FTTTWorkload(
-            FTTTFeedbackService(FTTTConfig(), FTTTDefaultJudge()), hidden_size=facts.hidden_size, device=facts.device
-        )
-        edited = feedback.run(batch)
+        edited = FTTTTrainer(FTTTFeedbackService(FTTTConfig(), FTTTDefaultJudge()), facts).run(batch)
         assert edited is not None and edited.update_count == 1
         ttrl = TTRLConfig(rank=2, votes_per_prompt=3, samples_per_prompt=2)
         reward = make_host(replace(facts, max_input_rows=3, memory_budget_bytes=1 << 20), TTRLWorkload(ttrl))
