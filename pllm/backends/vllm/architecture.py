@@ -8,7 +8,7 @@ through dequantized weights (see `frozen_weight`). Qwen3-MoE keeps Qwen3 attenti
 KV but routes its MLP through experts; the Qwen3.5 hybrids interleave Gated
 DeltaNet layers, whose recurrent state is not KV, with gated full attention.
 `Decoder.projection` and `Decoder.kv_writable` decide which projections and layer
-replays those two admit. Other admitted models run read-only workloads (hidden
+reruns those two admit. Other admitted models run read-only workloads (hidden
 taps, sampler stages, activation patches).
 """
 
@@ -70,7 +70,7 @@ if TYPE_CHECKING:
     )
 
 DenseLM = Qwen2ForCausalLM | LlamaForCausalLM | Qwen3ForCausalLM
-# Families whose layer state lives only in KV pages, so layer routes and PositionState can replay it.
+# Families whose layer state lives only in KV pages, so custom forwards and PositionState can recompute it.
 KvLM = DenseLM | Qwen3MoeForCausalLM
 WritableLM: TypeAlias = "KvLM | Qwen3_5ForCausalLM | Qwen3_5MoeForCausalLM"
 CausalLM: TypeAlias = "WritableLM | DeepseekV2ForCausalLM | GptOssForCausalLM"
@@ -164,13 +164,13 @@ class Decoder:
         return self.model
 
     def kv_writable(self, feature: str) -> KvLM:
-        """The model for `feature`, which replays layer state through KV pages alone."""
+        """The model for `feature`, which recomputes layer state from KV pages alone."""
         from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM
 
         model = self.writable(feature)
         if isinstance(model, (Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM)):
             raise ValueError(
-                f"{feature} replays layer state through KV pages, but {type(model).__name__} keeps "
+                f"{feature} recomputes layer state from KV pages, but {type(model).__name__} keeps "
                 "Gated DeltaNet recurrent state outside them; use a Qwen2, Llama, Qwen3 or Qwen3-MoE model"
             )
         return model

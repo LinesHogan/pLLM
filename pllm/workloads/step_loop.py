@@ -13,7 +13,7 @@ class StepLoopWorkload(pllm.Workload):
 
     history = pllm.PositionState()
 
-    @pllm.layer_route(tokens="all")
+    @pllm.custom_forward(tokens="all")
     def loop(self, layers: pllm.Layers) -> torch.Tensor:
         """Save every token so cached prompt blocks also carry the boundary state."""
         previous = layers.load("history", offset=-1)

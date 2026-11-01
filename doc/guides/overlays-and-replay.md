@@ -86,14 +86,14 @@ class MyLoRA(pllm.Workload):
 
 ## 层路由：让更新当步生效
 
-在同一 workload 上组合一个训练 overlay 与 `@pllm.layer_route(tokens="decode")`。
+在同一 workload 上组合一个训练 overlay 与 `@pllm.custom_forward(tokens="decode")`。
 `layers(...)` 读取当前可见版本并捕获操作数；`layers.apply_updates()` 将上个边界后
 同一 target 的全部操作数按访问顺序拼接，执行 overlay transition。后续层调用读取
 该 token 的私有字段。空边界不改变可见版本；最后一个边界之后的捕获被丢弃。
 整个步骤复用同一个私有根，结束时由原 publication 发布，包括只更新尾部 buffer 的情况。
 
 ```python
-@pllm.layer_route(tokens="decode")
+@pllm.custom_forward(tokens="decode")
 def settle(self, layers: pllm.Layers) -> torch.Tensor:
     taps = layers()
     layers.apply_updates()
@@ -106,7 +106,7 @@ def settle(self, layers: pllm.Layers) -> torch.Tensor:
 保持不变。未选中的行遵循 overlay 的普通行为。入口读取遵循 `forward_pinned`
 或 `"exact"`；显式边界之后的私有读取由路由源程序表达。
 目前支持有界 Python `for` 循环；被追踪的 `while_loop` 会提示改用有界 for-loop。
-逐 token 的 hidden 循环可直接使用独立 `layer_route`，无需 overlay。
+逐 token 的 hidden 循环可直接使用独立 `custom_forward`，无需 overlay。
 
 ## 独立声明状态生产者与模型消费者
 
@@ -214,7 +214,7 @@ INHERIT 保留原作用域的版本选择，STEP 每步读取本 invocation 新�
 单独声明 HOLD 不会给任意缺根图添加保持能力，完整生命周期见
 [状态与记忆](state-and-memory.md#没有新特征时签署的-hold--stop)。
 
-ActivationPatch 可与 `layer_route` 组合：注入在 DecoderSource 层输出之后、tap 之前，
+ActivationPatch 可与 `custom_forward` 组合：注入在 DecoderSource 层输出之后、tap 之前，
 normal/replay 使用同一 ref 和选择位；低秩算子用 replay 新 hidden 重算 delta，
 ADD 不在已注入的结果上重复累加。HOLD 的 source 数学与正常输入相同，只改变
 签署的版本来源；borrowed 输入生产组全部关闭，模型 READ 仍精确绑定 inject。
@@ -229,7 +229,7 @@ prefix caching 仍拒绝组合；没有按注入版本 cache_salt 键控或历�
 
 ## 组合边界：失败关闭
 
-一个 `layer_route` 可以独立执行，或与一个训练 overlay、一个 ActivationPatch 分别
+一个 `custom_forward` 可以独立执行，或与一个训练 overlay、一个 ActivationPatch 分别
 组合。多个 overlay、外部导入 overlay 加路由、三方组合不在当前支持范围内。
 后端在绑定或安装时拒绝不支持的组合。共享前缀缓存仍与 overlay/层路由不兼容。
 

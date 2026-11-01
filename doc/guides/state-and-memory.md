@@ -118,7 +118,7 @@ head = pllm.RequestState(
 - **跨步**：每步捕获、下步读取（教程 05 的「下一步目标」）；
 - **跨请求**：route 键让 lineage 跨请求存活，memory 随之留存
   （教程 04 的会话循环、教程 05 的「上一请求终态」）；
-- **步内多层**：不需要 memory——`@pllm.layer_route` 直接声明
+- **步内多层**：不需要 memory——`@pllm.custom_forward` 直接声明
   （见 [Overlay 与重放](overlays-and-replay.md)）。
 
 ## 状态会不会爆显存：state_memory_bytes 预算

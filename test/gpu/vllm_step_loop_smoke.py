@@ -20,9 +20,9 @@ from vllm.v1.core.sched.scheduler import Scheduler
 
 import pllm
 from pllm.backends.vllm import runtime
+from pllm.backends.vllm.custom_forward import ProgramWave, VllmCustomForward
 from pllm.backends.vllm.position_state import PositionCacheProvider
 from pllm.backends.vllm.prefix_cache import CachePolicy
-from pllm.backends.vllm.replay import RouteWave, VllmTokenwiseReplay
 from pllm.backends.vllm.runtime import BackendCommand, BackendInstall, BackendStage
 from pllm.config import KVOffload
 from pllm.contracts.codec import encode_boundary
@@ -40,8 +40,8 @@ PROMPTS = ["One two", "Water freezes at"]
 def record_steps(handle):
     """Record native span/wave results and independently verify every recurrent state handoff."""
     records, active, samples = {}, [], {}
-    primitive = handle.runner.require_session()._replay
-    stage, replay, span = RouteWave.stage, torch.cuda.CUDAGraph.replay, VllmTokenwiseReplay.save_span
+    primitive = handle.runner.require_session()._custom_forward
+    stage, replay, span = ProgramWave.stage, torch.cuda.CUDAGraph.replay, VllmCustomForward.save_span
 
     def external(row):
         return handle._llm.llm_engine.output_processor.request_states[row.identity.request_id].external_req_id
@@ -89,9 +89,9 @@ def record_steps(handle):
         return span(self, rows, groups, requests, hidden, saved_values)
 
     with (
-        patch.object(RouteWave, "stage", staged),
+        patch.object(ProgramWave, "stage", staged),
         patch.object(torch.cuda.CUDAGraph, "replay", replayed),
-        patch.object(VllmTokenwiseReplay, "save_span", saved),
+        patch.object(VllmCustomForward, "save_span", saved),
     ):
         yield records, samples
 
@@ -183,7 +183,7 @@ def offload_roundtrips(expected):
 
         def staged(provider, context, rows, requests, positions, generated):
             stage(provider, context, rows, requests, positions, generated)
-            primitive = handle.runner.require_session()._replay
+            primitive = handle.runner.require_session()._custom_forward
             for lane, index in enumerate(rows.tolist()):
                 row = primitive.rows[index]
                 if row.token_offset == 32:
@@ -218,7 +218,7 @@ def donor_loss():
     handle = replay_handle(StepLoopWorkload(), length=64, prefix=True, generated_kv="reuse", blocks=5)
     lookup, hits = KVCacheManager.get_computed_blocks, []
     frontiers, saved = [], []
-    native_forward = VllmTokenwiseReplay.forward
+    native_forward = VllmCustomForward.forward
 
     def forwarded(primitive, *args, **kwargs):
         rows = [row.token_offset for row in primitive.rows if row.identity.prompt_index == 2]
@@ -251,9 +251,9 @@ def donor_loss():
         with (
             patch.object(KVCacheManager, "get_computed_blocks", locate),
             patch.object(
-                handle.runner._workload_session._replay.model,
+                handle.runner._workload_session._custom_forward.model,
                 "forward",
-                partial(forwarded, handle.runner._workload_session._replay),
+                partial(forwarded, handle.runner._workload_session._custom_forward),
             ),
             record_steps(handle) as (recorded, sampled),
         ):
@@ -284,7 +284,7 @@ def donor_loss():
 class ScaledStepLoop(StepLoopWorkload):
     """Same cache schema with distinct frozen route mathematics."""
 
-    @pllm.layer_route(tokens="all")
+    @pllm.custom_forward(tokens="all")
     def loop(self, layers):
         hidden = torch.where(layers.generated, layers.load("history", offset=-1), layers.embeddings)
         result = layers(hidden=hidden)[-1] * 0.999
@@ -353,14 +353,14 @@ def isolated_multiturn():
 def main():
     isolated_multiturn()
     handle = replay_handle(StepLoopWorkload(), length=128, prefix=True, generated_kv="reuse")
-    primitive = handle.runner._workload_session._replay
-    stage, replay = RouteWave.stage, torch.cuda.CUDAGraph.replay
-    save_span = VllmTokenwiseReplay.save_span
+    primitive = handle.runner._workload_session._custom_forward
+    stage, replay = ProgramWave.stage, torch.cuda.CUDAGraph.replay
+    save_span = VllmCustomForward.save_span
     records, active = {}, []
     entered, roles = {}, set()
-    schedule, capture_token = Scheduler.schedule, RouteWave.capture
+    schedule, capture_token = Scheduler.schedule, ProgramWave.capture
     admitted = False
-    forward = VllmTokenwiseReplay.forward
+    forward = VllmCustomForward.forward
 
     def permuted(primitive, *args, **kwargs):
         context = get_forward_context()
@@ -463,9 +463,9 @@ def main():
         with (
             patch.object(primitive.model, "forward", partial(permuted, primitive)),
             patch.object(Scheduler, "schedule", mixed),
-            patch.object(RouteWave, "capture", cold),
-            patch.object(RouteWave, "stage", staged),
-            patch.object(VllmTokenwiseReplay, "save_span", span_saved),
+            patch.object(ProgramWave, "capture", cold),
+            patch.object(ProgramWave, "stage", staged),
+            patch.object(VllmCustomForward, "save_span", span_saved),
             patch.object(torch.cuda.CUDAGraph, "replay", replayed),
         ):
             outputs = handle.generate(
@@ -486,9 +486,9 @@ def main():
         with (
             patch.object(primitive.model, "forward", partial(permuted, primitive)),
             patch.object(Scheduler, "schedule", mixed),
-            patch.object(RouteWave, "capture", cold),
-            patch.object(RouteWave, "stage", staged),
-            patch.object(VllmTokenwiseReplay, "save_span", span_saved),
+            patch.object(ProgramWave, "capture", cold),
+            patch.object(ProgramWave, "stage", staged),
+            patch.object(VllmCustomForward, "save_span", span_saved),
             patch.object(torch.cuda.CUDAGraph, "replay", replayed),
         ):
             (received,) = generate_ids(handle, [receiver])

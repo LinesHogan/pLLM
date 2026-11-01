@@ -64,14 +64,14 @@ class NativeSteps:
         from contextlib import ExitStack
         from unittest.mock import patch
 
-        from pllm.backends.vllm.replay import RouteWave, VllmTokenwiseReplay
+        from pllm.backends.vllm.custom_forward import ProgramWave, VllmCustomForward
 
         waves, seeds = {}, {}
         stage, capture, replay, save = (
-            RouteWave.stage,
-            RouteWave.capture,
+            ProgramWave.stage,
+            ProgramWave.capture,
             torch.cuda.CUDAGraph.replay,
-            VllmTokenwiseReplay.save_span,
+            VllmCustomForward.save_span,
         )
 
         def staged(wave, rows):
@@ -86,7 +86,7 @@ class NativeSteps:
             replay(graph)
             if graph in waves:
                 wave = waves[graph]
-                carry, normal = native_pass(wave.replay, seeds[wave], wave.positions, wave.attention.context)
+                carry, normal = native_pass(wave.custom_forward, seeds[wave], wave.positions, wave.attention.context)
                 torch.testing.assert_close(wave.output, normal, rtol=0, atol=0)
                 torch.testing.assert_close(wave.position.tables[0][wave.position.indices[0, 0]], carry, rtol=0, atol=0)
 
@@ -99,10 +99,10 @@ class NativeSteps:
 
         self.step_reference = ExitStack()
         for owner, name, function in (
-            (RouteWave, "stage", staged),
-            (RouteWave, "capture", captured),
+            (ProgramWave, "stage", staged),
+            (ProgramWave, "capture", captured),
             (torch.cuda.CUDAGraph, "replay", replayed),
-            (VllmTokenwiseReplay, "save_span", saved),
+            (VllmCustomForward, "save_span", saved),
         ):
             self.step_reference.enter_context(patch.object(owner, name, function))
 

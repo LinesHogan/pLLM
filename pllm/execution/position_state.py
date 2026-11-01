@@ -1,4 +1,4 @@
-"""Positional cache declarations and ordered tensor ports used by token routes."""
+"""Positional cache declarations and ordered tensor ports used by custom forwards."""
 
 from dataclasses import dataclass
 from math import isfinite
@@ -27,7 +27,7 @@ class PositionAnnouncement:
 
 @torch.library.custom_op("pllm::position_save", mutates_args=())
 def position_save(value: torch.Tensor, name: str) -> None:
-    raise RuntimeError("use layers.save inside a @pllm.layer_route method")
+    raise RuntimeError("use layers.save inside a @pllm.custom_forward method")
 
 
 def _fake_save(value: torch.Tensor, name: str) -> None:

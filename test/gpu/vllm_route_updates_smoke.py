@@ -20,7 +20,7 @@ class SettledInPlaceTTT(InPlaceTTTWorkload):
 
     iterations: int = 2
 
-    @pllm.layer_route(tokens="decode")
+    @pllm.custom_forward(tokens="decode")
     def settle(self, layers: pllm.Layers) -> torch.Tensor:
         taps = layers()
         layers.apply_updates()
@@ -45,7 +45,7 @@ def run(chunk):
             execution=pllm.ExecutionOptions(capture_memory_bytes=128 << 20),
         ),
     )
-    primitive = handle.runner.require_session()._replay
+    primitive = handle.runner.require_session()._custom_forward
     native, checked, errors = torch.cuda.CUDAGraph.replay, [], []
 
     def rms(value, norm):
@@ -122,7 +122,9 @@ def run(chunk):
     def replay(graph):
         capture = next(value for value in primitive.captures.values() if value.graph is graph)
         ports = tuple(
-            value for adapter in capture.routes for value in (*adapter.entry_fields, *adapter.fields, *adapter.saved)
+            value
+            for adapter in capture.row_overlays
+            for value in (*adapter.entry_fields, *adapter.fields, *adapter.saved)
         )
         fields = tuple(value.clone() for value in ports)
         slots = tuple(
@@ -139,7 +141,7 @@ def run(chunk):
             port.copy_(value)
         for (cache, slot), value in zip(slots, saved, strict=True):
             cache[slot // cache.shape[2], :, slot % cache.shape[2]] = value
-        for adapter in capture.routes:
+        for adapter in capture.row_overlays:
             adapter.reset()
         context = capture.attention.context
 
@@ -148,7 +150,7 @@ def run(chunk):
             deltas = (
                 tuple(
                     adapter.values(targets[ordinal - 22], adapter.private)["delta"].clone()
-                    for adapter in capture.routes
+                    for adapter in capture.row_overlays
                 )
                 if ordinal in (22, 23)
                 else ()
@@ -195,7 +197,7 @@ def run(chunk):
             for ordinal in range(24):
                 hidden, residual = layer(ordinal, hidden, residual)
                 taps.append(hidden + residual)
-            for adapter in capture.routes:
+            for adapter in capture.row_overlays:
                 adapter.apply_updates()
             for _ in range(workload.iterations):
                 hidden, residual = taps[21].clone(), None
@@ -216,7 +218,7 @@ def run(chunk):
             )
             cache[slot // cache.shape[2], :, slot % cache.shape[2]] = value
         primitive.projections.prepare_wave(
-            tuple(primitive.rows[adapter.row] for adapter in capture.routes), capture.routes, capture.lanes
+            tuple(primitive.rows[adapter.row] for adapter in capture.row_overlays), capture.row_overlays, capture.lanes
         )
         torch.testing.assert_close(torch.cuda.get_rng_state(), rng, rtol=0, atol=0)
         checked.append(capture.seed.shape[0])
@@ -264,7 +266,7 @@ def run(chunk):
         )
         assert diagnostics.active_states == diagnostics.pending_state_releases == 0
         print(
-            f"route_updates chunk={chunk}: tokens={len(checked)} routed=4 variants=2 updates={diagnostics.update_count} trained_rows={diagnostics.trained_rows} relative_error={max(errors):.6f}"
+            f"custom_forward_updates chunk={chunk}: tokens={len(checked)} routed=4 variants=2 updates={diagnostics.update_count} trained_rows={diagnostics.trained_rows} relative_error={max(errors):.6f}"
         )
     finally:
         handle.close()

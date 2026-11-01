@@ -213,7 +213,7 @@ worker 重新导入并重建，安装时其编译签名必须与驱动端签名�
 本节约束由引擎内更新产出的加性参数 overlay：状态怎么声明、哪些 buffer 可以
 被原地修改、更新何时发布、replay 重跑哪些层。它存在的原因是 overlay 直接
 作用于模型执行，所以可写集合被显式收窄——只有被授权的 buffer 可以原地修改，
-操作数永远不行。一个训练 overlay 可以与同一 workload 的一个 `layer_route` 组合。
+操作数永远不行。一个训练 overlay 可以与同一 workload 的一个 `custom_forward` 组合。
 写 In-Place-TTT 风格负载时读本节。
 
 `@on(Phase.IN_FORWARD)` 和 `@train_in_forward(state=..., targets=..., weight=...)` 把
@@ -240,7 +240,7 @@ FP64 可用于数值 oracle。SGD 的梯度累积至少使用 FP32，显式选�
 投影；后端目前定位 MLP down 与 attention q/v 投影。
 
 `prefill`/`decode` 决定更新资格。被禁用的阶段只应用既有 overlay。
-`@pllm.layer_route(tokens="prefill" | "decode" | "all")` 内的 `layers(...)` 捕获每次
+`@pllm.custom_forward(tokens="prefill" | "decode" | "all")` 内的 `layers(...)` 捕获每次
 投影的操作数；`layers.apply_updates()` 按 target 拼接自上个边界以来的捕获，并对
 当前私有字段执行 transition。后续调用读取更新后的私有版本，尾部 buffer 变化
 同样保留。空边界不改变状态或可见版本；末尾未消费的捕获被丢弃。每个步骤仅分配

@@ -21,9 +21,9 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.compile_facts import BackendCompileFacts
-from pllm.execution.replay import (
-    SerialTokenwiseReplay,
-    TokenwiseReplayTask,
+from pllm.execution.custom_forward import (
+    CustomForwardTask,
+    SerialCustomForward,
 )
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.step_input import StepInput
@@ -38,11 +38,11 @@ PROBE = BackendPlacementProbe(
     4,
     4,
     (),
-    ("model/tokenwise_replay@1",),
+    ("model/custom_forward@1",),
     causal_domain=CausalModelDomain(2, 3, 3),
 )
 FACTS = BackendCompileFacts(
-    PROBE, model_timeline(torch.device("cpu"), ("model/tokenwise_replay@1",)), (), 2, 0, 0, layer_count=3
+    PROBE, model_timeline(torch.device("cpu"), ("model/custom_forward@1",)), (), 2, 0, 0, layer_count=3
 )
 WORKLOAD = RecirculationWorkload(alpha=0.7, ramp_tokens=2)
 IDENTITIES = (RequestIdentity("prefill", 0, 0), RequestIdentity("decode", 1, 0))
@@ -64,7 +64,7 @@ VALUE = StepInput(ROWS, PackedSamplerRowBatch(ROWS, (PackedSamplerRowLink(0, 2),
 INPUTS = torch.tensor([[0.4, -0.1, 0.3, 0.7], [0.2, 0.9, -0.3, 0.8], [-0.2, 0.1, 0.8, 0.4], [0.7, 0.2, -0.1, 0.3]])
 
 
-class Decoder(SerialTokenwiseReplay):
+class Decoder(SerialCustomForward):
     def __init__(self):
         self.batch = ROWS
         self.cache = torch.zeros(2, 3, 3, 4)
@@ -76,9 +76,9 @@ class Decoder(SerialTokenwiseReplay):
         task = next(
             task
             for task in execution.arena.plan.schedule.tasks
-            if execution.arena.plan.semantic_graph.tasks[task.task_id].replay is not None
+            if execution.arena.plan.semantic_graph.tasks[task.task_id].custom_forward is not None
         )
-        binding = TokenwiseReplayTask.from_implementation(execution.implementation(task.implementation_id))
+        binding = CustomForwardTask.from_implementation(execution.implementation(task.implementation_id))
         execution.rebind_implementation(replace(binding, primitive=self))
 
     @property
@@ -190,7 +190,7 @@ def test_recirculation_replay_matches_serial_oracle() -> None:
 @pytest.mark.parametrize("tokens, expected", [("prefill", (2, "replay")), ("decode", (3, "replay"))])
 def test_route_selects_its_declared_rows(tokens, expected) -> None:
     class Prefill(RecirculationWorkload):
-        @pllm.layer_route(tokens=tokens)
+        @pllm.custom_forward(tokens=tokens)
         def recirculate(self, layers: pllm.Layers) -> torch.Tensor:
             return super().recirculate(layers)
 
@@ -203,7 +203,7 @@ def test_route_selects_its_declared_rows(tokens, expected) -> None:
 
 def test_route_must_return_a_residual_stream() -> None:
     class MissingOutput(pllm.Workload):
-        @pllm.layer_route()
+        @pllm.custom_forward()
         def route(self, layers: pllm.Layers):
             layers()
 
@@ -217,7 +217,7 @@ def test_route_observation_precedes_sampling_normalization():
 
     decoder, observed = Decoder(), []
     decoder.normalize = lambda row, hidden, residual: 2 * (hidden + residual)
-    program = TokenProgram.capture(WORKLOAD.recirculate, TokenTensor((1, 4), torch.float32, "cpu"), 3)
+    program = TokenProgram.trace(WORKLOAD.recirculate, TokenTensor((1, 4), torch.float32, "cpu"), 3)
     decoder.run(
         {"prefill": program, "decode": program},
         TokenProgramEffect(3),

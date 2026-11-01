@@ -66,7 +66,7 @@
 - **Adapter** —— 模型执行时从状态字段应用的签名参数效果（稠密或低秩），
   与字段的生产方式无关。`Projection(layer=None, ...)` 表示所有层；
   TLM 用一个 Adapter 让训练与推理读取同一组 q/v 因子。
-- **重放（Replay）** —— `layer_route` 定义逐 token 的层调用与返回 residual；
+- **重放（Replay）** —— `custom_forward` 定义逐 token 的层调用与返回 residual；
   `recirculation` 是使用该接口的负载。组合一个训练 overlay 时，
   `layers.apply_updates()` 消费捕获并改变本 token 后续读取的私有字段。
   执行使用 `tokenwise_region.py` 和 vLLM 的稳定 token CUDA graph；状态仍由原

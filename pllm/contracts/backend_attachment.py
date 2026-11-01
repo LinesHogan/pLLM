@@ -26,7 +26,7 @@ from pllm.contracts.tensor_layout import TensorDType
 
 class AttachmentKind(StrEnum):
     OBSERVATION = "observation"
-    MODEL_REPLAY = "model_replay"
+    CUSTOM_FORWARD = "custom_forward"
     REQUEST_TRAINING = "request_training"
     PARAMETER_OVERLAY = "parameter_overlay"
     ACTIVATION_PATCH = "activation_patch"

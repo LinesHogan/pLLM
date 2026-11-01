@@ -1,4 +1,4 @@
-"""Exact and Jacobi-prefill recirculation tutorials built from public layer routes."""
+"""Exact and Jacobi-prefill recirculation tutorials built from @pllm.custom_forward."""
 
 from dataclasses import dataclass
 
@@ -44,12 +44,12 @@ class RecirculationWorkload(pllm.Workload):
         return norm_match(taps[self.source], destination, a, b)
 
     def step(self, layers: pllm.Layers) -> torch.Tensor:
-        """Run the normal stack, then replay above the mixed destination tap."""
+        """Run the normal stack, then rerun the layers above the mixed destination tap."""
         taps = layers()
         layers(start=self.destination_layer(layers) + 1, hidden=self.mix(taps, taps[self.destination], layers.position))
         return taps[-1]
 
-    @pllm.layer_route(tokens="all")
+    @pllm.custom_forward(tokens="all")
     def recirculate(self, layers: pllm.Layers) -> torch.Tensor:
         """Apply exact recirculation to every token."""
         return self.step(layers)
@@ -65,12 +65,12 @@ class JacobiRecirculationWorkload(RecirculationWorkload):
         if type(self.rounds) is not int or self.rounds < 1:
             raise ValueError("set rounds to at least 1 for Jacobi prefill")
 
-    @pllm.layer_route(tokens="decode")
+    @pllm.custom_forward(tokens="decode")
     def recirculate(self, layers: pllm.Layers) -> torch.Tensor:
         """Keep exact per-token recirculation during decoding."""
         return self.step(layers)
 
-    @pllm.layer_route(tokens="prefill", over="span")
+    @pllm.custom_forward(tokens="prefill", over="span")
     def prefill(self, layers: pllm.Layers) -> torch.Tensor:
         """Commit a seed pass, then read prior sweeps without overwriting their KV."""
         d = self.destination_layer(layers)

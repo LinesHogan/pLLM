@@ -119,7 +119,7 @@ python -m pip install -e ".[vllm032,test]"   # 或 ".[vllm027,test]"
 省略 `workload` 的普通推理也使用该设置。0.27.1 与 MRv1 仅允许 TP=1；PP/DP 固定为 1，其他值会提示设置 `pipeline_parallel_size=1` / `data_parallel_size=1`。
 TP>1 支持 hidden 观测、采样引导/反馈，以及各 rank 上一致训练的 RequestState/InstanceState
 （ESamp、TTRL、输出 LoRA 等）；激活补丁不使用 CUDA graph（见下文 `cuda_graphs="auto"`）。参数 overlay、causal_model/TLM、
-Feed、layer_route 和 PositionState 在 TP>1 构造时拒绝，并提示设置 `tensor_parallel_size=1`。
+Feed、custom_forward 和 PositionState 在 TP>1 构造时拒绝，并提示设置 `tensor_parallel_size=1`。
 TP>1 始终使用多进程 worker，负载须满足上面的 pickle 传输约束；不能直接访问 `llm.runner` 或 `llm.feed()`。
 辅助张量经 CPU 共享内存复制到各 rank；completion 只由输出 rank 写入，默认返回 CPU 张量。
 计划和附件不再保存设备 ordinal，绑定使用 worker 的本地设备；旧的序列化计划需要重新编译。
@@ -147,7 +147,7 @@ forward 重叠。采样前只读的任务固定读取延迟版本：步 N+1 可�
 外部训练行数，`capture_memory_bytes` 是每个任务的驻留上限。容量不足是
 错误，不是静默退回 eager。Adapter 与 train_in_forward 不能使用共享前缀缓存。
 `ModelConfig(cuda_graphs="auto")` 是默认值：负载支持时模型走 vLLM 的 CUDA graph，否则以 eager 运行，
-并记录一次日志、在 `diagnostics().eager_reason` 中给出原因。激活补丁、`@pllm.layer_route`、
+并记录一次日志、在 `diagnostics().eager_reason` 中给出原因。激活补丁、`@pllm.custom_forward`、
 `runner="mrv1"` 以及读取 `InstanceState` 的 `pllm.model.Adapter` 不能在 CUDA graph 下运行。
 `cuda_graphs=True` 强制使用 CUDA graph，负载不支持时 `make_llm` 报错并说明原因；`cuda_graphs=False` 强制 eager。
 
@@ -187,7 +187,7 @@ forward 重叠。采样前只读的任务固定读取延迟版本：步 N+1 可�
     Kimi K2.5–K2.7 的 INT4 文本塔可用 `tools/model_slice.py --text-only` 展开为上述 DeepSeek V3 类；
     六层切片保留 MLA、全部专家与量化尺度，约 51 GiB，只用于结构与数值验证。见
     [Kimi 切片与 tokenizer](doc/guides/kimi-slice.md)。
-  - 参数 overlay、因果训练（TLM）、`@pllm.layer_route` 与 PositionState 需要稠密的 q/v/down 投影和逐层 KV：
+  - 参数 overlay、因果训练（TLM）、`@pllm.custom_forward` 与 PositionState 需要稠密的 q/v/down 投影和逐层 KV：
     MLA 没有独立的 V 投影，KV 缓存是压缩后的潜变量；MoE 的 down 投影按专家拆分。在这些模型上声明它们，
     会在模型加载后、工作负载绑定前报错并说明原因。
 - **vLLM**：0.32.0 或 0.27.1，其他版本启动即报错。默认 MRv2，张量、流水线与数据并行都为 1，

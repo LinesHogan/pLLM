@@ -23,7 +23,7 @@ from test.backend_facts import assert_finite_resources
 from test.workloads.test_recirculation import FACTS, IDENTITIES, INPUTS, ROWS, VALUE, Decoder
 
 TARGET = Projection("down_proj", 1)
-CAPABILITIES = tuple(sorted(("model/tokenwise_replay@1", "transition/full_root@1", "state/fenced_reclaim@1")))
+CAPABILITIES = tuple(sorted(("model/custom_forward@1", "transition/full_root@1", "state/fenced_reclaim@1")))
 ROUTE_FACTS = replace(
     FACTS,
     probe=replace(FACTS.probe, capabilities=CAPABILITIES, targets=(ProjectionShape(TARGET, 4, 4),)),
@@ -62,7 +62,7 @@ class Updating(pllm.Workload):
         count = tail.new_tensor(1)
         return pllm.UpdateOutput(output, count == 2, count, count * len(hidden), {"tail": tail.clone()})
 
-    @pllm.layer_route(tokens="all")
+    @pllm.custom_forward(tokens="all")
     def route(self, layers: pllm.Layers) -> torch.Tensor:
         if self.empty:
             layers.apply_updates()
@@ -159,7 +159,7 @@ def oracle(workload):
 @pytest.mark.parametrize("tokens", ("all", "prefill", "decode"))
 def test_updates_match_independent_private_version_oracle(boundaries, visits, empty, visibility, tokens):
     class Selected(Updating):
-        @pllm.layer_route(tokens=tokens)
+        @pllm.custom_forward(tokens=tokens)
         def route(self, layers: pllm.Layers) -> torch.Tensor:
             return super().route(layers)
 
@@ -214,10 +214,10 @@ def test_marker_source_roundtrip_and_while_rejection():
     assert_finite_resources(Updating(), ROUTE_FACTS)
     graph = Updating(empty=True).declaration(ROUTE_FACTS).graph
     assert decode_boundary(encode_boundary(graph), type(graph)) == graph
-    assert next(task.replay for task in graph.tasks if task.replay is not None).apply_updates
+    assert next(task.custom_forward for task in graph.tasks if task.custom_forward is not None).apply_updates
 
     class TracedWhile(Updating):
-        @pllm.layer_route()
+        @pllm.custom_forward()
         def route(self, layers: pllm.Layers) -> torch.Tensor:
             return torch.while_loop(
                 lambda hidden: hidden.sum() > 0, lambda hidden: (hidden * 0.5,), (layers.embeddings,)
@@ -227,7 +227,7 @@ def test_marker_source_roundtrip_and_while_rejection():
         TracedWhile().declaration(ROUTE_FACTS)
 
     class Unowned(pllm.Workload):
-        @pllm.layer_route()
+        @pllm.custom_forward()
         def route(self, layers: pllm.Layers) -> torch.Tensor:
             layers.apply_updates()
             return layers()[-1]
@@ -293,7 +293,7 @@ def test_route_failure_aborts_private_fields():
 
 def test_untargeted_route_boundary_allocates_and_publishes_nothing():
     class Untargeted(Updating):
-        @pllm.layer_route()
+        @pllm.custom_forward()
         def route(self, layers: pllm.Layers) -> torch.Tensor:
             first = layers(stop=1)
             layers.apply_updates()

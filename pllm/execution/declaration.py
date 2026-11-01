@@ -59,10 +59,10 @@ from pllm.contracts.tensor_layout import (
     TensorLayoutRequest,
     TensorLayoutSpec,
 )
+from pllm.execution.custom_forward import CustomForwardTask
 from pllm.execution.execution import TaskGraphImplementation
 from pllm.execution.overlay_task import OverlayTransition
 from pllm.execution.ptts.request_state import RequestStateSelection
-from pllm.execution.replay import TokenwiseReplayTask
 from pllm.execution.state_execution import (
     ConditionalProducerTask,
     ProjectionResiduals,
@@ -219,10 +219,10 @@ class Builder(Generic[D]):
         # Fields that start at zero in a fresh page pool, so admission need not write them (AdamW state other than
         # the parameters). Request-scoped pages are recycled and dirty, so only instance states qualify.
         self.zero_start_fields: dict[str, frozenset[int]] = {}
-        self.route_program: dict[str, TokenProgram] | None = None
+        self.custom_forward_programs: dict[str, TokenProgram] | None = None
         self.overlay_math: OverlayTransition | None = None
-        self.route_updates = False
-        self.route_rows = 0
+        self.custom_forward_updates = False
+        self.custom_forward_rows = 0
 
     def state(
         self,
@@ -314,7 +314,7 @@ class Builder(Generic[D]):
         source: Call | None = None,
         result_schema: str = "",
         output_kind: SemanticOutputKind = SemanticOutputKind.TEMPORARY,
-        replay: TokenProgramEffect | None = None,
+        custom_forward: TokenProgramEffect | None = None,
         math: MathContract | None = None,
         function: Callable[[D, TensorBatch], TaskOutput] | None = None,
         operation_type: type[TensorOperation[D]] = TensorOperation,
@@ -345,7 +345,7 @@ class Builder(Generic[D]):
             ),
             implementations,
             effects,
-            replay,
+            custom_forward,
             math,
         )
         self.graph = replace(self.graph, tasks=tuple(sorted((*self.graph.tasks, task), key=lambda item: item.symbol)))
@@ -397,7 +397,7 @@ class Builder(Generic[D]):
                     )
                     else "published"
                 )
-            if task.replay is None:
+            if task.custom_forward is None:
                 functions.append(replace(operations[task.symbol], implementation_id=identity, version=version))
         return tuple(functions)
 
@@ -413,16 +413,16 @@ class Builder(Generic[D]):
         )
         graph = self.graph if plan is None else plan.semantic_graph
         for task in graph.tasks:
-            if task.symbol in operations and task.replay is None:
+            if task.symbol in operations and task.custom_forward is None:
                 continue
             identity = planned_implementation(task, plan)
-            if task.replay is not None:
+            if task.custom_forward is not None:
                 assert model_probe is not None and model_probe.causal_domain is not None
-                assert self.route_program is not None
+                assert self.custom_forward_programs is not None
                 functions.append(
-                    TokenwiseReplayTask[D](
+                    CustomForwardTask[D](
                         task,
-                        self.route_program,
+                        self.custom_forward_programs,
                         model_probe.causal_domain,
                         identity,
                         operation=None
@@ -448,7 +448,7 @@ class Builder(Generic[D]):
         if self.attachment is None or not self.attachment.activation_bindings or self.graph.input_groups:
             raise ValueError("conditional input requires one original activation chain")
         publication = self.attachment.tasks[-1][1]
-        readers = tuple(task.symbol for task in self.graph.tasks if task.replay is not None)
+        readers = tuple(task.symbol for task in self.graph.tasks if task.custom_forward is not None)
         self.graph = replace(
             self.graph,
             input_groups=(
@@ -552,7 +552,7 @@ class Builder(Generic[D]):
         if self.attachment is None:
             raise ValueError(
                 "the workload has no effect on the model: add @pllm.train, @pllm.add_logits, @pllm.guide_sampling, "
-                "@pllm.export, @pllm.train_in_forward, a layer_route or a pllm.model.ActivationPatch/Adapter"
+                "@pllm.export, @pllm.train_in_forward, a custom_forward or a pllm.model.ActivationPatch/Adapter"
             )
         return self.graph, self.layouts, self.attachment
 
@@ -578,17 +578,19 @@ class Builder(Generic[D]):
         if previous is None or previous.kind is spec.kind is AttachmentKind.OBSERVATION:
             self.attachment = spec if previous is None else replace(previous, tasks=previous.tasks + spec.tasks)
             return
-        if {previous.kind, spec.kind} != {AttachmentKind.ACTIVATION_PATCH, AttachmentKind.MODEL_REPLAY}:
-            raise ValueError("only activation and tokenwise model effects can share an attachment")
-        activation, replay = (previous, spec) if previous.kind is AttachmentKind.ACTIVATION_PATCH else (spec, previous)
-        if replay.activation_bindings or replay.overlay_bindings or activation.overlay_bindings:
-            raise ValueError("model replay requires one activation publication")
-        ((_, forward_symbol),) = replay.tasks
+        if {previous.kind, spec.kind} != {AttachmentKind.ACTIVATION_PATCH, AttachmentKind.CUSTOM_FORWARD}:
+            raise ValueError("only an activation patch and a custom forward can share an attachment")
+        activation, forward_spec = (
+            (previous, spec) if previous.kind is AttachmentKind.ACTIVATION_PATCH else (spec, previous)
+        )
+        if forward_spec.activation_bindings or forward_spec.overlay_bindings or activation.overlay_bindings:
+            raise ValueError("a custom forward composes with one activation patch publication")
+        ((_, forward_symbol),) = forward_spec.tasks
         publication_symbol = activation.tasks[-1][1] if activation.tasks else None
         forward = next(task for task in self.graph.tasks if task.symbol == forward_symbol)
         publication = next((task for task in self.graph.tasks if task.symbol == publication_symbol), None)
         if forward.effects or any(port.name == "activation_publication" for port in forward.inputs):
-            raise ValueError("model replay already declares state dependencies")
+            raise ValueError("the custom forward already declares state dependencies")
         dependency = (
             ()
             if publication is None
@@ -606,8 +608,8 @@ class Builder(Generic[D]):
         )
         self.update_task(forward_symbol, lambda _: forward)
         self.attachment = replace(
-            replay,
-            tasks=(*replay.tasks, *activation.tasks),
+            forward_spec,
+            tasks=(*forward_spec.tasks, *activation.tasks),
             state_resource=activation.state_resource,
             activation_bindings=activation.activation_bindings,
         )

@@ -661,8 +661,8 @@ def _eager_reason(config: ModelConfig, requirements: BackendRequirements) -> str
         return 'runner="mrv1" runs workloads without CUDA graphs'
     if requirements.activation_layers:
         return "activation patches run outside CUDA graphs"
-    if requirements.layer_routes:
-        return "@pllm.layer_route reruns model layers outside CUDA graphs"
+    if requirements.custom_forward:
+        return "@pllm.custom_forward reruns model layers outside CUDA graphs"
     if requirements.instance_adapter:
         return "CUDA-graph overlays read request state only; declare the pllm.model.Adapter state as pllm.RequestState"
     return ""
@@ -677,7 +677,7 @@ def create_vllm_llm(
     requirements = workload.backend_requirements()
     compat.admit_parallel(config, requirements)
     if requirements.position_states and config.runner == "mrv1":
-        raise ValueError('PositionState layer routes need runner="mrv2"')
+        raise ValueError('PositionState and @pllm.custom_forward need runner="mrv2"')
     eager_reason = _eager_reason(config, requirements)
     if config.cuda_graphs is True and eager_reason:
         raise ValueError(f'{eager_reason}; set ModelConfig(cuda_graphs="auto") or cuda_graphs=False')
@@ -777,8 +777,8 @@ def probe_backend(
     )
     requested_targets = expand_targets(requirements.parameter_targets, layer_count)
     targets = inspect_parameter_targets(decoder, requested_targets, runner.dtype) if requested_targets else ()
-    replay_capabilities = (
-        ("model/tokenwise_replay@1", TOKEN_CAPTURE_CAPABILITY)
+    custom_forward_capabilities = (
+        ("model/custom_forward@1", TOKEN_CAPTURE_CAPABILITY)
         if runner.runner_kind == "mrv2" and graph_mode(runner.overlay_graph_bytes) is AttachmentGraphMode.EAGER
         else ()
     )
@@ -806,7 +806,7 @@ def probe_backend(
                     (
                         *_REQUEST_CAPABILITIES,
                         *_OVERLAY_CAPABILITIES,
-                        *replay_capabilities,
+                        *custom_forward_capabilities,
                         f"backend/vllm_{runner.runner_kind}@1",
                     )
                 )
@@ -821,7 +821,7 @@ def probe_backend(
             "transition/full_root@1",
             "optimizer/adamw@1",
             *(("backend/tensor_parallel@1",) if runner.parallel_config.tensor_parallel_size > 1 else ()),
-            *replay_capabilities,
+            *custom_forward_capabilities,
         ),
     )
     required = input_reservations(

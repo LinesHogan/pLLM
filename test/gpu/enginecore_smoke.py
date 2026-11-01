@@ -401,7 +401,7 @@ def _recirculation() -> None:
         second = handle.generate(PROMPTS, greedy(2))
         tokens = lambda results: tuple(tuple(output.outputs[0].token_ids) for output in results)
         assert tokens(first) == tokens(second) and all(len(ids) == 2 for ids in tokens(first))
-        replay = tuple(event for event in handle.trace_snapshot().events if event.kind is TraceEventKind.REPLAY)
+        replay = tuple(event for event in handle.trace_snapshot().events if event.kind is TraceEventKind.CUSTOM_FORWARD)
         assert replay and {event.row.identity.prompt_index for event in replay} == {
             0,
             1,

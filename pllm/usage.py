@@ -66,7 +66,7 @@ from pllm.execution.freeze import (
 from pllm.execution.host_runtime import HostConfig, bind_host
 from pllm.execution.model_effect_binding import (
     declare_activation_patch,
-    declare_layer_route,
+    declare_custom_forward,
     declare_parameter_overlay,
     import_update,
     write_result,
@@ -615,7 +615,7 @@ class ActivationPatch:
             raise ValueError("refresh= and on_missing= apply to decode tokens; set decode=True")
 
     def declare(self, context: _Declaration) -> None:
-        """Read local state, preserving replay/HOLD publication dependencies when declared."""
+        """Read local state, preserving custom-forward and HOLD publication dependencies when declared."""
         definition = context.state_definition(self.state, "pllm.model.ActivationPatch needs a declared state")
         if definition.feed is not None:
             raise ValueError(
@@ -625,7 +625,7 @@ class ActivationPatch:
         declare_activation_patch(
             context.binding,
             state,
-            context.writes.get(self.state) if context.routes or context.binding.feeds else None,
+            context.writes.get(self.state) if context.custom_forwards or context.binding.feeds else None,
             layers=self.layers,
             operator=ActivationPatchOperator(self.operator),
             first_tokens=self.first_tokens,
@@ -1314,17 +1314,17 @@ def _targets(value: tuple[object, ...]) -> tuple[Projection, ...]:
     return targets
 
 
-def layer_route(*, tokens: Tokens = "all", over: Over = "token") -> Callable[[F], F]:
-    """Route disjoint token roles through model slices and tensor math.
+def custom_forward(*, tokens: Tokens = "all", over: Over = "token") -> Callable[[F], F]:
+    """Replace the forward of the selected tokens with this method's program over model layer slices and tensor math.
 
     ``over="token"`` runs each position independently in causal order. ``over="span"``
     packs each request's contiguous scheduled tokens into [M, H] hidden tensors;
     position and generated flags have shape [M, 1]. Spans cannot load predecessors.
     """
     if tokens not in ("prefill", "decode", "all"):
-        raise ValueError('set layer_route(tokens=) to "prefill", "decode" or "all"')
+        raise ValueError('set @pllm.custom_forward(tokens=) to "prefill", "decode" or "all"')
     if over not in ("token", "span"):
-        raise ValueError('set layer_route(over=) to "token" or "span"')
+        raise ValueError('set @pllm.custom_forward(over=) to "token" or "span"')
     return _mark(tokens=tokens, over=over)
 
 
@@ -1541,7 +1541,7 @@ class _Declaration:
     # Ordered (name, digest) entries folded into the graph's execution parameters digest.
     signature: list[tuple[str, str]] = field(default_factory=lambda: [])
     operations: list[_Operation] = field(default_factory=lambda: [])
-    routes: list[tuple[str, Tokens, Over]] = field(default_factory=lambda: [])
+    custom_forwards: list[tuple[str, Tokens, Over]] = field(default_factory=lambda: [])
     positions: tuple[tuple[str, float], ...] = ()
     in_forward_states: set[str] = field(default_factory=lambda: set[str]())
     states: dict[str, State] = field(default_factory=lambda: {})
@@ -1565,7 +1565,7 @@ class _Declaration:
     @property
     def has_model_effect(self) -> bool:
         """Model effects own training unless a sampler pairs with it."""
-        return bool(self.routes or self.adapters or self.activations) or any(
+        return bool(self.custom_forwards or self.adapters or self.activations) or any(
             operation.effect.model_effect for operation in self.operations
         )
 
@@ -1614,17 +1614,17 @@ class _Declaration:
                 markers.get(f"__pllm_{marker}__") is not None for marker in ("phase", "effect", "gradient", "rows")
             ):
                 raise ValueError(
-                    "layer_route requires (self, layers) and no stacked markers; use layers.save inside the route instead of @write"
+                    "@pllm.custom_forward methods take (self, layers) and no other pllm decorator; use layers.save instead of @write"
                 )
             overlap = {
                 role
-                for _, selected, _ in self.routes
+                for _, selected, _ in self.custom_forwards
                 for role in ("prefill", "decode")
                 if selected in (role, "all") and tokens in (role, "all")
             }
             if overlap:
-                raise ValueError(f"layer_route tokens overlap: {', '.join(sorted(overlap))}")
-            self.routes.append((name, tokens, markers["__pllm_over__"]))
+                raise ValueError(f"@pllm.custom_forward tokens overlap: {', '.join(sorted(overlap))}")
+            self.custom_forwards.append((name, tokens, markers["__pllm_over__"]))
             seeds.append(function)
             return
         phase, marked, gradient, rows = (
@@ -1697,9 +1697,9 @@ class _Declaration:
 
     def declare_values(self) -> None:
         """Allocate ordinary state before effects and operations consume its ports."""
-        if self.binding.host and (self.routes or self.adapters or self.activations):
+        if self.binding.host and (self.custom_forwards or self.adapters or self.activations):
             raise ValueError(
-                "pllm.model.Adapter, pllm.model.ActivationPatch and layer routes act inside a model forward; compile this "
+                "pllm.model.Adapter, pllm.model.ActivationPatch and @pllm.custom_forward act inside a model forward; compile this "
                 "workload with make_llm, not make_host"
             )
         self.positions = self.position_states()
@@ -1721,17 +1721,17 @@ class _Declaration:
         )
 
     def attach_effects(self) -> None:
-        """Connect publications before replay and missing-input branches."""
+        """Connect publications before the custom forward and missing-input branches."""
         for name, patch in self.activations.items():
             with self.declaring(name):
                 patch.declare(self)
         for name, delta in self.adapters.items():
             with self.declaring(name):
                 self.binding.overlay(self.states[delta.state], None, self.adapter_bindings(delta))
-        if self.routes:
-            declare_layer_route(
+        if self.custom_forwards:
+            declare_custom_forward(
                 self.binding,
-                tuple((tokens, over, self.method(name)) for name, tokens, over in self.routes),
+                tuple((tokens, over, self.method(name)) for name, tokens, over in self.custom_forwards),
                 self.positions,
             )
         if self.binding.feeds:
@@ -1740,8 +1740,10 @@ class _Declaration:
     def position_states(self) -> tuple[tuple[str, float], ...]:
         """Resolve the pre-allocation schema without tracing tensors."""
         states = tuple((name, value.initial) for name, value in sorted(self.position_definitions.items()))
-        if states and not self.routes:
-            raise ValueError("PositionState requires layers.load/save inside a layer_route")
+        if states and not self.custom_forwards:
+            raise ValueError(
+                "PositionState is read and written by layers.load/save inside a @pllm.custom_forward method"
+            )
         return states
 
     def train(self, call: Call, state: str, mode: TrainingMode) -> None:
@@ -1919,7 +1921,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
                 default=None,
             ),
             position_states=context.position_states(),
-            layer_routes=bool(context.routes),
+            custom_forward=bool(context.custom_forwards),
             instance_adapter=any(
                 context.state_definitions[value.state].scope is StateScope.INSTANCE
                 for value in context.adapters.values()
@@ -2006,7 +2008,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
 
 __all__ = [
     "Workload",
-    "layer_route",
+    "custom_forward",
     "Phase",
     "on",
     "write",

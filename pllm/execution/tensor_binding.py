@@ -200,13 +200,13 @@ class TensorBinding(Builder[TensorFrame]):
         differ from the rows tasks read."""
         if self.attachment is not None and (
             self.attachment.activation_bindings
-            or any(task.replay is not None for task in self.graph.tasks)
+            or any(task.custom_forward is not None for task in self.graph.tasks)
             and self.overlay_targets
         ):
             if self.graph.states[0].scope is StateScope.REQUEST:
                 return lambda value: value.rows.rows
             return lambda value: ()
-        if self.attachment is not None and self.attachment.kind is AttachmentKind.MODEL_REPLAY:
+        if self.attachment is not None and self.attachment.kind is AttachmentKind.CUSTOM_FORWARD:
             return lambda value: ()
         read = self.row_reader()
         return lambda value: read(value.rows)
@@ -232,12 +232,12 @@ class TensorBinding(Builder[TensorFrame]):
     def configure_scans(self, facts: BackendCompileFacts) -> None:
         """Scope model-route scans and give a chunked route overlay its eager batched executor; ordinary task
         scopes and executors are built in executables."""
-        if self.overlay_math is not None and any(task.replay is not None for task in self.graph.tasks):
+        if self.overlay_math is not None and any(task.custom_forward is not None for task in self.graph.tasks):
             math = replace(
                 self.overlay_math,
                 function=ScanContext(
                     facts.timeline.tensor_policy,
-                    self.route_rows,
+                    self.custom_forward_rows,
                     facts.device,
                     replay="compute/cuda_graph@1" in facts.timeline.capabilities,
                 ).bind(self.overlay_math.function),

@@ -43,10 +43,10 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.contracts.visibility import VisibilityKind, VisibilitySource
 from pllm.execution.binding_base import Field, overlay_fields
+from pllm.execution.custom_forward import CUSTOM_FORWARD_IMPLEMENTATION
 from pllm.execution.declaration import Call, State, When, native
 from pllm.execution.overlay_task import ChunkUpdate, GradientUpdate, OverlayTransition, overlay_apply
 from pllm.execution.ptts.request_state import RequestStateSelection
-from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION
 from pllm.execution.tensor_frame import (
     TensorFrame,
     Tensors,
@@ -229,7 +229,7 @@ def declare_activation_patch(
     decode_refresh: DecodeRefresh = DecodeRefresh.INHERIT,
     on_missing: MissingPolicy = MissingPolicy.STOP,
 ) -> None:
-    """Read logical state views at activation sites; replay/HOLD also bind their publication dependency."""
+    """Read logical state views at activation sites; custom forwards and HOLD also bind their publication dependency."""
     width = 1 if operator is ActivationPatchOperator.ADD else 3
     views = tuple(view for (resource, _), view in b.field_views.items() if resource == state.declaration.resource)
     if (
@@ -284,13 +284,13 @@ def _check_activation_fields(
             )
 
 
-def declare_layer_route(
+def declare_custom_forward(
     b: TensorBinding,
-    routes: tuple[tuple[Tokens, Over, Callable[[Layers], torch.Tensor]], ...],
+    forwards: tuple[tuple[Tokens, Over, Callable[[Layers], torch.Tensor]], ...],
     position_states: tuple[tuple[str, float], ...] = (),
 ) -> None:
-    """Trace a user route and sign its complete model/tensor source before planning."""
-    tokens: Tokens = routes[0][0] if len(routes) == 1 else "all"
+    """Trace the workload's @pllm.custom_forward methods and sign their complete model/tensor source before planning."""
+    tokens: Tokens = forwards[0][0] if len(forwards) == 1 else "all"
     activation = b.attachment is not None and b.attachment.kind is AttachmentKind.ACTIVATION_PATCH
     composed = (
         b.attachment is not None
@@ -299,28 +299,28 @@ def declare_layer_route(
     )
     if not activation and not composed and (b.attachment is not None or b.graph.tasks or b.graph.states):
         raise ValueError(
-            "a layer_route combines only with one pllm.model.ActivationPatch or one @pllm.train_in_forward; move other states and "
+            "a custom_forward combines only with one pllm.model.ActivationPatch or one @pllm.train_in_forward; move other states and "
             "methods to a separate workload"
         )
     if position_states and (activation or composed):
-        raise ValueError("use PositionState on a pure route without learned overlays or activations")
+        raise ValueError("PositionState needs a @pllm.custom_forward without train_in_forward or an activation patch")
     b.position_states = position_states
-    symbol = _attach_replay(b, composed, TokenProgramEffect(b.dimensions.layer_count, tokens, position_states))
+    symbol = _attach_custom_forward(b, composed, TokenProgramEffect(b.dimensions.layer_count, tokens, position_states))
     probe = b.probe
     assert probe is not None and probe.causal_domain is not None
-    captured = _capture_routes(probe, routes, position_states)
+    captured = _trace_programs(probe, forwards, position_states)
     programs = {
         role: program for selected, program in captured for role in ("prefill", "decode") if selected in (role, "all")
     }
-    _count_route_work(b, tuple(program for _, program in captured))
+    _count_program_work(b, tuple(program for _, program in captured))
     applies_updates = any(isinstance(step, ApplyUpdates) for _, program in captured for step in program.steps)
     if composed:
-        select = partial(_route_states, b.parameter_phases, b.route_updates, tokens)
+        select = partial(_program_states, b.parameter_phases, b.custom_forward_updates, tokens)
         b.operations[symbol] = replace(b.operations[symbol], select=select)
     elif applies_updates:
         raise ValueError("apply_updates needs one trained parameter overlay on the same workload")
-    b.route_program = programs
-    replay = TokenProgramEffect(
+    b.custom_forward_programs = programs
+    program_effect = TokenProgramEffect(
         probe.causal_domain.layers,
         tokens,
         position_states,
@@ -334,25 +334,25 @@ def declare_layer_route(
                 for role, program in programs.items()
             )
         ),
-        len(routes) > 1 or any(program.role_sensitive for program in programs.values()),
+        len(forwards) > 1 or any(program.role_sensitive for program in programs.values()),
         applies_updates,
         any(program.over == "span" for program in programs.values()),
     )
-    b.update_task(symbol, lambda task: replace(task, replay=replay))
+    b.update_task(symbol, lambda task: replace(task, custom_forward=program_effect))
 
 
-def _attach_replay(b: TensorBinding, composed: bool, effect: TokenProgramEffect) -> TaskSymbol:
-    """Run the replay as the trained overlay's transition, or as a standalone forward; return its task."""
+def _attach_custom_forward(b: TensorBinding, composed: bool, effect: TokenProgramEffect) -> TaskSymbol:
+    """Run the custom forward as the trained overlay's transition, or as a standalone forward; return its task."""
     if not composed:
         forward = b.compute(
             "forward",
             inputs={"rows": b.rows()},
             outputs=("normal_hidden",),
             when=When.IN_FORWARD,
-            replay=effect,
-            implementations=(native(TOKENWISE_REPLAY_IMPLEMENTATION, "model/tokenwise_replay@1"),),
+            custom_forward=effect,
+            implementations=(native(CUSTOM_FORWARD_IMPLEMENTATION, "model/custom_forward@1"),),
         )
-        b.model_effect(forward, AttachmentKind.MODEL_REPLAY)
+        b.model_effect(forward, AttachmentKind.CUSTOM_FORWARD)
         return forward.symbol
     assert b.attachment is not None
     symbol = next(symbol for role, symbol in b.attachment.tasks if role is AttachmentTaskRole.TRANSITION)
@@ -360,13 +360,13 @@ def _attach_replay(b: TensorBinding, composed: bool, effect: TokenProgramEffect)
         symbol,
         lambda task: replace(
             task,
-            replay=effect,
+            custom_forward=effect,
             inputs=(*task.inputs, SemanticInput("rows", PackedRowsInputSource())),
             implementations=tuple(
                 replace(
                     implementation,
                     required_capabilities=tuple(
-                        sorted((*implementation.required_capabilities, "model/tokenwise_replay@1"))
+                        sorted((*implementation.required_capabilities, "model/custom_forward@1"))
                     ),
                 )
                 for implementation in task.implementations
@@ -377,12 +377,12 @@ def _attach_replay(b: TensorBinding, composed: bool, effect: TokenProgramEffect)
     return symbol
 
 
-def _capture_routes(
+def _trace_programs(
     probe: BackendPlacementProbe,
-    routes: tuple[tuple[Tokens, Over, Callable[[Layers], torch.Tensor]], ...],
+    forwards: tuple[tuple[Tokens, Over, Callable[[Layers], torch.Tensor]], ...],
     position_states: tuple[tuple[str, float], ...],
 ) -> tuple[tuple[Tokens, TokenProgram], ...]:
-    """Trace each route method into a token program over the model's layers."""
+    """Trace each @pllm.custom_forward method into a token program over the model's layers."""
     assert probe.causal_domain is not None
     tensor = TokenTensor(
         (1, probe.hidden_size),
@@ -391,16 +391,16 @@ def _capture_routes(
     )
     names = tuple(name for name, _ in position_states)
     return tuple(
-        (selected, TokenProgram.capture(function, tensor, probe.causal_domain.layers, names, over))
-        for selected, over, function in routes
+        (selected, TokenProgram.trace(function, tensor, probe.causal_domain.layers, names, over))
+        for selected, over, function in forwards
     )
 
 
-def _count_route_work(b: TensorBinding, programs: tuple[TokenProgram, ...]) -> None:
+def _count_program_work(b: TensorBinding, programs: tuple[TokenProgram, ...]) -> None:
     """Fund packed rows for each model segment, and note whether apply_updates follows a targeted layer."""
     assert b.probe is not None
     segments = sum(isinstance(step, Segment) for program in programs for step in program.steps)
-    b.route_rows = b.probe.max_packed_rows * max(1, segments)
+    b.custom_forward_rows = b.probe.max_packed_rows * max(1, segments)
     for program in programs:
         pending = False
         for step in program.steps:
@@ -409,18 +409,18 @@ def _count_route_work(b: TensorBinding, programs: tuple[TokenProgram, ...]) -> N
                     target.layer is not None and step.start <= target.layer < step.stop for target in b.overlay_targets
                 )
             elif isinstance(step, ApplyUpdates):
-                b.route_updates |= pending
+                b.custom_forward_updates |= pending
                 pending = False
 
 
-def _route_states(
+def _program_states(
     phases: tuple[HiddenPhase, ...],
     updates: bool,
     tokens: Tokens,
     data: TensorFrame,
     selection: RequestStateSelection,
 ) -> tuple[int, ...]:
-    """The overlay states a routed step transitions: rows in an overlay phase that the route does not skip."""
+    """The overlay states a custom-forward step transitions: rows in an overlay phase that the program does not skip."""
     return tuple(
         sorted(
             {

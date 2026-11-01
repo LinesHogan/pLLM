@@ -1,4 +1,4 @@
-"""Direct batched layer-route execution under vLLM's own model and FA2 context."""
+"""Direct batched custom-forward execution under vLLM's own model and FA2 context."""
 
 from __future__ import annotations
 
@@ -13,65 +13,65 @@ from vllm.sequence import IntermediateTensors
 from pllm.authoring import DataT, ResultT
 from pllm.backends.vllm.activation import VllmActivationPatch, activation_delta
 from pllm.backends.vllm.architecture import KvLM
-from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay
-from pllm.backends.vllm.position_state import PositionCacheLayer, PositionCacheProvider
-from pllm.backends.vllm.region_attention import (
+from pllm.backends.vllm.custom_forward_attention import (
     BatchAttentionBuffers,
     attention_mode,
     attention_paged_access,
     span_context,
     validate_attention_resources,
 )
+from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay
+from pllm.backends.vllm.position_state import PositionCacheLayer, PositionCacheProvider
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.semantic_graph import AnchorId, SemanticTask, TokenProgramEffect
 from pllm.execution.cuda_stream import PinnedStaging, upload
-from pllm.execution.overlay_task import RouteOperand, RouteOverlay
-from pllm.execution.replay import TokenwiseReplayPrimitive, TokenwiseReplayTask
-from pllm.execution.route_executor import execute_route, ordinary_pass
+from pllm.execution.custom_forward import CustomForwardPrimitive, CustomForwardTask
+from pllm.execution.overlay_task import ProgramOperand, ProgramOverlay
 from pllm.execution.state_execution import StateExecution, StateTaskContext
 from pllm.execution.step_capture import capture_graph
 from pllm.execution.step_input import StepInput
 from pllm.execution.tensor_frame import OverlayTargetResult
 from pllm.execution.token_program import KV, Save, TokenProgram
+from pllm.execution.token_program_executor import execute_token_program, ordinary_pass
 
 Signature = tuple[bool, tuple[bool, ...], bool]
 
 
-class RouteWave(Generic[DataT, ResultT]):
+class ProgramWave(Generic[DataT, ResultT]):
     """Stable inputs, page indices and captured outputs for an exact active width."""
 
-    def __init__(self, replay: VllmTokenwiseReplay[DataT, ResultT], width: int, signature: Signature) -> None:
-        self.replay, self.signature = replay, signature
-        tensor = replay.model.norm.weight
+    def __init__(self, owner: VllmCustomForward[DataT, ResultT], width: int, signature: Signature) -> None:
+        self.custom_forward, self.signature = owner, signature
+        tensor = owner.model.norm.weight
         self.seed = tensor.new_empty((width, tensor.numel()))
         self.positions = torch.empty(width, device=tensor.device, dtype=torch.long)
         self.staging = PinnedStaging()
         self.indices = torch.empty((3, width), device=tensor.device, dtype=torch.long)
-        self.attention = BatchAttentionBuffers(get_forward_context(), replay.attentions, replay.domain.positions, width)
+        self.attention = BatchAttentionBuffers(get_forward_context(), owner.attentions, owner.domain.positions, width)
         self.position = PositionCacheProvider(
-            replay.position_layers,
-            tuple(value for _, value in replay.effect.position_states),
-            replay.allocation,
+            owner.position_layers,
+            tuple(value for _, value in owner.effect.position_states),
+            owner.allocation,
             self.seed,
         )
         self.fields: dict[int, tuple[torch.Tensor, ...]] = {}
-        if replay.activation is not None:
-            for ordinal, handle in enumerate(replay.activation.layers):
+        if owner.activation is not None:
+            for ordinal, handle in enumerate(owner.activation.layers):
                 if signature[1][ordinal]:
-                    fields = next(items[ordinal] for items in replay.activation_rows if items[ordinal])
+                    fields = next(items[ordinal] for items in owner.activation_rows if items[ordinal])
                     self.fields[handle.binding.layer] = tuple(
                         field.new_empty((width, *field.shape)) for field in fields
                     )
-        self.routes: tuple[RouteOverlay, ...] = ()
+        self.row_overlays: tuple[ProgramOverlay, ...] = ()
         self.graph: torch.cuda.CUDAGraph | None = None
         self.output = self.observation = self.seed
-        self.results: tuple[tuple[tuple[OverlayTargetResult, ...], tuple[RouteOperand, ...]], ...] = ()
+        self.results: tuple[tuple[tuple[OverlayTargetResult, ...], tuple[ProgramOperand, ...]], ...] = ()
         self.lanes = tuple(torch.tensor([i], device=tensor.device) for i in range(width))
 
     def stage(self, rows: tuple[PackedPhaseRow, ...]) -> None:
         """Queue complete wave input copies without reading any device scalar."""
-        replay = self.replay
-        assert replay.hidden is not None and replay.positions is not None
+        owner = self.custom_forward
+        assert owner.hidden is not None and owner.positions is not None
         host = self.staging.take(self.indices.numel()).view_as(self.indices)
         host.copy_(
             torch.tensor(
@@ -80,46 +80,48 @@ class RouteWave(Generic[DataT, ResultT]):
         )
         self.staging.copy_to(self.indices)
         packed, requests, generated = self.indices
-        self.seed.copy_(replay.hidden.index_select(0, packed))
-        self.positions.copy_(replay.positions.index_select(0, packed))
-        bindings = self.attention.bind(get_forward_context(), replay.attentions, replay.positions + 1)
+        self.seed.copy_(owner.hidden.index_select(0, packed))
+        self.positions.copy_(owner.positions.index_select(0, packed))
+        bindings = self.attention.bind(get_forward_context(), owner.attentions, owner.positions + 1)
         self.attention.refresh(bindings, packed, requests)
         self.position.stage(get_forward_context(), packed, requests, self.positions, generated)
-        if replay.activation is not None:
-            for ordinal, handle in enumerate(replay.activation.layers):
+        if owner.activation is not None:
+            for ordinal, handle in enumerate(owner.activation.layers):
                 for column, target in enumerate(self.fields.get(handle.binding.layer, ())):
                     for lane, row in enumerate(rows):
-                        target[lane].copy_(replay.activation_rows[row.packed_row_index][ordinal][column])
-        if replay.overlay is not None:
-            parent = replay.overlay
-            if not self.routes:
-                self.routes = tuple(RouteOverlay(parent.math, parent.batch, parent.entry, parent.data) for _ in rows)
-            for route, row in zip(self.routes, rows, strict=True):
-                route.batch, route.entry, route.data = parent.batch, parent.entry, parent.data
-                route.ordinary = []
-                route.stage(row.packed_row_index, self.signature[0])
-            assert replay.projections is not None
-            replay.projections.prepare_wave(rows, self.routes, self.lanes)
+                        target[lane].copy_(owner.activation_rows[row.packed_row_index][ordinal][column])
+        if owner.overlay is not None:
+            parent = owner.overlay
+            if not self.row_overlays:
+                self.row_overlays = tuple(
+                    ProgramOverlay(parent.math, parent.batch, parent.entry, parent.data) for _ in rows
+                )
+            for row_overlay, row in zip(self.row_overlays, rows, strict=True):
+                row_overlay.batch, row_overlay.entry, row_overlay.data = parent.batch, parent.entry, parent.data
+                row_overlay.ordinary = []
+                row_overlay.stage(row.packed_row_index, self.signature[0])
+            assert owner.projections is not None
+            owner.projections.prepare_wave(rows, self.row_overlays, self.lanes)
 
     def layer(
         self, ordinal: int, hidden: torch.Tensor, residual: torch.Tensor | None, kv: KV = "commit"
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Call the intact native layer and apply any declared post-layer patch."""
-        with attention_mode(self.replay.attentions[ordinal], self.positions, kv):
-            hidden, residual = self.replay.model.layers[ordinal](self.positions, hidden, residual)
+        with attention_mode(self.custom_forward.attentions[ordinal], self.positions, kv):
+            hidden, residual = self.custom_forward.model.layers[ordinal](self.positions, hidden, residual)
         if ordinal in self.fields:
             hidden = hidden + activation_delta(hidden, self.fields[ordinal])
         assert residual is not None
         return hidden, residual
 
     def body(self) -> torch.Tensor:
-        """All route boundaries, including gate changes and state stores, are captured."""
-        for route in self.routes:
-            route.reset()
+        """All program boundaries, including gate changes and state stores, are captured."""
+        for row_overlay in self.row_overlays:
+            row_overlay.reset()
         generated, *entries = self.position.entry(())
         if self.signature[0]:
-            hidden, saved = execute_route(
-                self.replay.program["decode" if self.signature[2] else "prefill"],
+            hidden, saved = execute_token_program(
+                self.custom_forward.program["decode" if self.signature[2] else "prefill"],
                 self.seed,
                 self.positions,
                 generated,
@@ -128,21 +130,21 @@ class RouteWave(Generic[DataT, ResultT]):
                 self.apply_updates,
             )
         else:
-            hidden, saved = ordinary_pass(self.seed, self.replay.effect.layer_count, self.layer), tuple(entries)
+            hidden, saved = ordinary_pass(self.seed, self.custom_forward.effect.layer_count, self.layer), tuple(entries)
         self.position.exit(saved)
         self.observation = hidden
-        self.results = tuple((tuple(route.results), route.captures()) for route in self.routes)
-        return self.replay.model.norm(hidden)
+        self.results = tuple((tuple(row_overlay.results), row_overlay.captures()) for row_overlay in self.row_overlays)
+        return self.custom_forward.model.norm(hidden)
 
     def apply_updates(self) -> None:
-        for route in self.routes:
-            route.apply_updates()
+        for row_overlay in self.row_overlays:
+            row_overlay.apply_updates()
 
     def capture(self) -> None:
         """Restore writable KV and PositionState pages after every cold execution."""
         cells = tuple(
             (attention.kv_cache, self.attention.metadata[attention.layer_name].slot_mapping)
-            for attention in self.replay.attentions
+            for attention in self.custom_forward.attentions
         )
         saved = tuple(cache[slots // cache.shape[2], :, slots % cache.shape[2], :].clone() for cache, slots in cells)
         self.position.backup()
@@ -155,18 +157,18 @@ class RouteWave(Generic[DataT, ResultT]):
         try:
             with override_forward_context(self.attention.context):
                 self.graph, self.output, resident = capture_graph(
-                    self.seed.device, self.body, restore=restore, pool=self.replay.pool
+                    self.seed.device, self.body, restore=restore, pool=self.custom_forward.pool
                 )
-            if resident > self.replay.resident_bytes:
+            if resident > self.custom_forward.resident_bytes:
                 raise ValueError(
-                    f"route graphs need {resident} bytes; increase capture_memory_bytes above {self.replay.resident_bytes}"
+                    f"custom-forward CUDA graphs need {resident} bytes; raise ExecutionOptions.capture_memory_bytes above {self.custom_forward.resident_bytes}"
                 )
         finally:
             restore()
 
 
-class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
-    """Run ordinary spans natively and dependent route positions in cross-request waves."""
+class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
+    """Run ordinary spans natively and dependent program positions in cross-request waves."""
 
     def __init__(
         self,
@@ -180,15 +182,15 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         position_layers: tuple[PositionCacheLayer, ...] = (),
         allocation_block_size: int = 16,
     ) -> None:
-        assert task.replay is not None
-        self.model, self.effect = model.model, task.replay
+        assert task.custom_forward is not None
+        self.model, self.effect = model.model, task.custom_forward
         self.execution, self.anchor, self.activation, self.projections = execution, anchor, activation, overlay
         implementation = next(
             item
             for item in execution.arena.plan.schedule.tasks
             if execution.arena.plan.semantic_graph.tasks[item.task_id].symbol == task.symbol
         )
-        binding = TokenwiseReplayTask[DataT].from_implementation(
+        binding = CustomForwardTask[DataT].from_implementation(
             execution.implementation(implementation.implementation_id)
         )
         self.program, self.domain = binding.program, binding.domain
@@ -205,7 +207,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         self.positions: torch.Tensor | None = None
         self.output: torch.Tensor | None = None
         self.observations: torch.Tensor | None = None
-        self.captures: dict[tuple[int, Signature], RouteWave[DataT, ResultT]] = {}
+        self.captures: dict[tuple[int, Signature], ProgramWave[DataT, ResultT]] = {}
         self.activation_rows: tuple[tuple[tuple[torch.Tensor, ...], ...], ...] = ()
         self.pool = torch.cuda.graph_pool_handle()
         self.identity: tuple[int, ...] = ()
@@ -231,7 +233,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         if self.context is None:
             return self.original(input_ids, positions, intermediate_tensors, inputs_embeds)
         if intermediate_tensors is not None or positions.ndim != 1 or positions.numel() != len(self.rows):
-            raise ValueError("layer routes need one position per packed row without pipeline parallelism")
+            raise ValueError("@pllm.custom_forward needs one position per packed row without pipeline parallelism")
         if inputs_embeds is None:
             assert input_ids is not None
             inputs_embeds = self.model.embed_input_ids(input_ids)
@@ -305,7 +307,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
                 selected = tuple(rows)
                 key = len(rows), signature
                 if key not in self.captures:
-                    self.captures[key] = RouteWave(self, len(rows), signature)
+                    self.captures[key] = ProgramWave(self, len(rows), signature)
                 captured = self.captures[key]
                 captured.stage(selected)
                 if captured.graph is None:
@@ -314,10 +316,10 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
                 captured.graph.replay()
                 self.output.index_copy_(0, captured.indices[0], captured.output)
                 self.observations.index_copy_(0, captured.indices[0], captured.observation)
-                for route, (results, pending) in zip(captured.routes, captured.results, strict=True):
-                    route.collect(results, pending)
+                for row_overlay, (results, pending) in zip(captured.row_overlays, captured.results, strict=True):
+                    row_overlay.collect(results, pending)
                     assert self.overlay is not None
-                    self.overlay.ordinary.extend(route.ordinary)
+                    self.overlay.ordinary.extend(row_overlay.ordinary)
         for row in self.rows:
             if effect.rows == "all" or row.phase.value == effect.rows:
                 observe(row.packed_row_index, self.observations[row.packed_row_index : row.packed_row_index + 1])
@@ -337,17 +339,17 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
             starts.append(starts[-1] + len(group))
         if rows != self.rows:
             context = span_context(context, self.attentions, groups, packed, requests, starts)
-        routes: tuple[RouteOverlay, ...] = ()
+        row_overlays: tuple[ProgramOverlay, ...] = ()
         if self.overlay is not None:
             parent = self.overlay
-            routes = tuple(RouteOverlay(parent.math, parent.batch, parent.entry, parent.data) for _ in groups)
-            for route, group in zip(routes, groups, strict=True):
-                route.stage(group[0].packed_row_index, program is not None)
-                route.reset()
+            row_overlays = tuple(ProgramOverlay(parent.math, parent.batch, parent.entry, parent.data) for _ in groups)
+            for row_overlay, group in zip(row_overlays, groups, strict=True):
+                row_overlay.stage(group[0].packed_row_index, program is not None)
+                row_overlay.reset()
             assert self.projections is not None
             self.projections.prepare_wave(
                 tuple(group[0] for group in groups),
-                routes,
+                row_overlays,
                 tuple(upload(tuple(range(start, stop)), self.hidden.device) for start, stop in zip(starts, starts[1:])),
             )
         positions = self.positions.index_select(0, packed)
@@ -365,8 +367,8 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
             return hidden, residual
 
         def apply_updates() -> None:
-            for route in routes:
-                route.apply_updates()
+            for row_overlay in row_overlays:
+                row_overlay.apply_updates()
 
         seed = self.hidden.index_select(0, packed)
         saved: tuple[torch.Tensor, ...] = ()
@@ -374,7 +376,7 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
             if program is None:
                 hidden = ordinary_pass(seed, self.effect.layer_count, layer)
             else:
-                hidden, saved = execute_route(
+                hidden, saved = execute_token_program(
                     program,
                     seed,
                     positions,
@@ -386,10 +388,10 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
             self.output.index_copy_(0, packed, self.model.norm(hidden))
             assert self.observations is not None
             self.observations.index_copy_(0, packed, hidden)
-        for route in routes:
-            route.collect(tuple(route.results), route.captures())
+        for row_overlay in row_overlays:
+            row_overlay.collect(tuple(row_overlay.results), row_overlay.captures())
             assert self.overlay is not None
-            self.overlay.ordinary.extend(route.ordinary)
+            self.overlay.ordinary.extend(row_overlay.ordinary)
         self.save_span(
             rows,
             groups,

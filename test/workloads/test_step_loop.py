@@ -18,7 +18,7 @@ def test_step_loop_signing_and_provider_agreement():
     schema = workload.backend_requirements().position_states
     facts = replace(FACTS, probe=replace(FACTS.probe, position_states=schema))
     deployment = workload.compile_backend(facts, ExecutionOptions())
-    assert deployment.attachment.plan.semantic_graph.tasks[0].replay.position_states == schema
+    assert deployment.attachment.plan.semantic_graph.tasks[0].custom_forward.position_states == schema
 
 
 @pytest.mark.parametrize("case", ("name", "offset", "shape", "dtype"))
@@ -32,13 +32,13 @@ def test_positional_authoring_errors(case):
         return layers.embeddings
 
     with pytest.raises(ValueError, match="PositionState|save history"):
-        TokenProgram.capture(route, TokenTensor((1, 4), torch.float32, "cpu"), 3, ("history",))
+        TokenProgram.trace(route, TokenTensor((1, 4), torch.float32, "cpu"), 3, ("history",))
 
 
 def test_stacked_marker_and_unused_declaration():
     @dataclass(frozen=True)
     class Stacked(pllm.Workload):
-        @pllm.layer_route()
+        @pllm.custom_forward()
         @pllm.write(state="state", fields=("hidden",))
         def route(self, layers):
             return (layers.embeddings,)
@@ -48,7 +48,7 @@ def test_stacked_marker_and_unused_declaration():
         history = pllm.PositionState()
 
     for workload in (Stacked(), Unused()):
-        with pytest.raises(ValueError, match="layer_route"):
+        with pytest.raises(ValueError, match="custom_forward"):
             workload.backend_requirements()
 
 
@@ -58,7 +58,7 @@ def test_ineligible_and_unsaved_tokens_fill_forward(save):
     class Fill(pllm.Workload):
         history = pllm.PositionState(initial=2)
 
-        @pllm.layer_route(tokens="decode")
+        @pllm.custom_forward(tokens="decode")
         def route(self, layers):
             if save:
                 layers.save("history", layers.load("history").add_(2))

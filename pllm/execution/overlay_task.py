@@ -1,7 +1,7 @@
 """In-forward overlays at model projections, run as ordinary state tasks.
 
 Owns the overlay update rules (ChunkUpdate, GradientUpdate), the per-invocation projection driver
-(ProjectionTask), OverlayTransition (one task's request/target adaptation) and RouteOverlay. model_effect_binding
+(ProjectionTask), OverlayTransition (one task's request/target adaptation) and ProgramOverlay. model_effect_binding
 declares them; the vLLM backend calls ProjectionTask from its projection hooks.
 """
 
@@ -70,7 +70,7 @@ def save_tail(
 
 @dataclass(frozen=True)
 class ChunkUpdate:
-    """Authored recurrence metadata used by both routed and batched overlay execution."""
+    """Authored recurrence metadata used by both custom-forward and batched overlay execution."""
 
     step: Step
     chunk: int
@@ -438,7 +438,7 @@ class OverlayTransition:
         return result
 
 
-class RouteOperand(NamedTuple):
+class ProgramOperand(NamedTuple):
     """Capture outputs without retaining the cold invocation's request or phase."""
 
     target: Projection
@@ -465,7 +465,7 @@ def join_encounters(
     )
 
 
-class RouteOverlay:
+class ProgramOverlay:
     """Read and capture at projections; apply grouped operands within one owned transition."""
 
     def __init__(
@@ -485,11 +485,11 @@ class RouteOverlay:
         self.ordinary: list[CapturedParameterOperand] = []
         self.results: list[OverlayTargetResult] = []
         self.row = 0
-        self.routed = self.private = False
+        self.in_program = self.private = False
 
-    def stage(self, row: int, routed: bool) -> None:
+    def stage(self, row: int, in_program: bool) -> None:
         """Resolve input/private roots once, outside cold execution and graph replay."""
-        self.row, self.routed = row, routed
+        self.row, self.in_program = row, in_program
         if not self.fields:
             self.entry_fields, self.fields, self.saved = (
                 tuple(torch.empty_like(field) for field in self.batch.roots[0]) for _ in range(3)
@@ -530,7 +530,7 @@ class RouteOverlay:
             captured = replace(
                 operand, hidden=operand.hidden.detach().clone(), desired=operand.desired.detach().clone()
             )
-            if not self.routed and self.math.visibility.in_forward:
+            if not self.in_program and self.math.visibility.in_forward:
                 result = self.math.result(captured, self.values(operand.target, True))
                 self.results.append(OverlayTargetResult(operand.target, result))
                 output = result.output
@@ -558,14 +558,14 @@ class RouteOverlay:
             self.gate.fill_(1.0)
         self.pending = []
 
-    def captures(self) -> tuple[RouteOperand, ...]:
+    def captures(self) -> tuple[ProgramOperand, ...]:
         """Export graph outputs independently of the cold request identity."""
         return tuple(
-            RouteOperand(operand.target, operand.hidden, operand.desired, operand.base_weight)
+            ProgramOperand(operand.target, operand.hidden, operand.desired, operand.base_weight)
             for operand in self.pending
         )
 
-    def collect(self, results: tuple[OverlayTargetResult, ...], pending: tuple[RouteOperand, ...]) -> None:
+    def collect(self, results: tuple[OverlayTargetResult, ...], pending: tuple[ProgramOperand, ...]) -> None:
         """Reconstruct invocation metadata from device outputs, including cached graph replays."""
         row = self.data.step.rows.rows[self.row]
         index = self.batch.selection.state_indices[self.row]
@@ -590,7 +590,7 @@ class RouteOverlay:
             self.data.entries.append(
                 OverlayEntry(row.identity, self.batch.selection.refs[index], self.batch.after_refs[index], copied)
             )
-        if not self.routed:
+        if not self.in_program:
             self.ordinary.extend(
                 CapturedParameterOperand(
                     row.identity,
@@ -607,7 +607,7 @@ class RouteOverlay:
             )
 
     def finish(self) -> TaskOutput:
-        """Apply ordinary pinned rows once as a batch; routed trailing captures are discarded."""
+        """Apply ordinary pinned rows once as a batch; trailing operands inside a custom forward are discarded."""
         grouped = join_encounters(self.ordinary, lambda operand: (operand.identity, operand.target))
         self.math(replace(self.data, step=replace(self.data.step, operands=grouped)), self.batch)
         return TaskOutput(

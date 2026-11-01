@@ -43,7 +43,7 @@ def test_unsupported_transfer():
 def test_span_saves_every_page_and_fills_unselected_generated_pages(span):
     from unittest.mock import patch
 
-    from pllm.backends.vllm.replay import VllmTokenwiseReplay
+    from pllm.backends.vllm.custom_forward import VllmCustomForward
     from pllm.contracts.hidden_locator import HiddenPhase
     from pllm.contracts.semantic_graph import TokenProgramEffect
     from pllm.execution.token_program import Save
@@ -72,8 +72,8 @@ def test_span_saves_every_page_and_fills_unselected_generated_pages(span):
         )
         context = SimpleNamespace(attn_metadata={"carry": metadata}, slot_mapping={"carry": slots})
         hidden = torch.arange(start * 4, stop * 4, dtype=torch.float32).reshape(-1, 4)
-        with patch("pllm.backends.vllm.replay.get_forward_context", return_value=context):
-            VllmTokenwiseReplay.save_span(
+        with patch("pllm.backends.vllm.custom_forward.get_forward_context", return_value=context):
+            VllmCustomForward.save_span(
                 replay, rows, (rows,), torch.tensor([0]), hidden, {"history": hidden} if span else {}
             )
     torch.testing.assert_close(

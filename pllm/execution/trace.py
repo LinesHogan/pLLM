@@ -53,7 +53,7 @@ class TraceEventKind(StrEnum):
     TASK_END = "task_end"
     TASK_FAILED = "task_failed"
     BACKPRESSURE = "backpressure"
-    REPLAY = "replay"
+    CUSTOM_FORWARD = "custom_forward"
     PUBLISH = "publish"
     SAMPLER_COMPLETE = "sampler_complete"
     PREPARED = "prepared"

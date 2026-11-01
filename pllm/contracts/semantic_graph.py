@@ -186,7 +186,7 @@ class SemanticTask:
     outputs: tuple[SemanticOutput, ...]
     implementations: tuple[TaskImplementationSpec, ...]
     effects: tuple[SemanticEffect, ...] = ()
-    replay: TokenProgramEffect | None = None
+    custom_forward: TokenProgramEffect | None = None
     math: MathContract | None = None
     visibility: VisibilitySource | None = None
 
@@ -233,9 +233,9 @@ class SemanticGraph:
         return self.training_mode == "batch"
 
     @property
-    def replay_task(self) -> SemanticTask | None:
-        """The layer-route task; a graph declares at most one."""
-        return next((task for task in self.tasks if task.replay is not None), None)
+    def custom_forward_task(self) -> SemanticTask | None:
+        """The custom-forward task; a graph declares at most one."""
+        return next((task for task in self.tasks if task.custom_forward is not None), None)
 
     @property
     def updates_in_forward(self) -> bool:
@@ -294,7 +294,7 @@ class ScheduleDecision:
 
     tasks: tuple[PhysicalTask, ...]
     peak_memory_bytes: int
-    prefix_replay_rejection: str | None
+    recompute_rejection: str | None
 
 
 __all__ = [

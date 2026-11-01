@@ -1,4 +1,4 @@
-"""Bind direct route execution to the owning state invocation and its trace."""
+"""Bind custom-forward execution to the owning state invocation and its trace."""
 
 from __future__ import annotations
 
@@ -13,12 +13,12 @@ import torch
 from pllm.contracts.backend_attachment import CausalModelDomain
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.semantic_graph import ImplementationId, SemanticTask, TaskId, TokenProgramEffect
-from pllm.execution.overlay_task import OverlayTransition, RouteOverlay
+from pllm.execution.overlay_task import OverlayTransition, ProgramOverlay
 from pllm.execution.position_state import PositionBuffers
-from pllm.execution.route_executor import execute_route, ordinary_pass
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import TaskOutput, TensorBatch, TensorOperation, read_batch
 from pllm.execution.token_program import KV, TokenProgram
+from pllm.execution.token_program_executor import execute_token_program, ordinary_pass
 from pllm.execution.trace import TraceEventKind
 
 if TYPE_CHECKING:
@@ -26,13 +26,13 @@ if TYPE_CHECKING:
     from pllm.execution.state_execution import ProjectionResiduals, StateTaskContext
 
 DataT = TypeVar("DataT")
-TOKENWISE_REPLAY_IMPLEMENTATION = ImplementationId("canonical.tokenwise_layer_replay@1")
+CUSTOM_FORWARD_IMPLEMENTATION = ImplementationId("custom_forward@1")
 
 
-class TokenwiseReplayPrimitive(ABC):
-    """A backend's executor of a step's route programs over its packed rows."""
+class CustomForwardPrimitive(ABC):
+    """A backend's executor of a step's token programs over its packed rows."""
 
-    overlay: RouteOverlay | None = None
+    overlay: ProgramOverlay | None = None
 
     @property
     @abstractmethod
@@ -44,7 +44,7 @@ class TokenwiseReplayPrimitive(ABC):
     ) -> None: ...
 
 
-class SerialTokenwiseReplay(TokenwiseReplayPrimitive):
+class SerialCustomForward(CustomForwardPrimitive):
     """Serial reference executor: one row at a time through model-owned layer calls (CPU test models)."""
 
     position: PositionBuffers | None = None
@@ -75,8 +75,10 @@ class SerialTokenwiseReplay(TokenwiseReplayPrimitive):
     def run(
         self, program: dict[str, TokenProgram], effect: TokenProgramEffect, observe: Callable[[int, torch.Tensor], None]
     ) -> None:
-        """Run every row's route, or its ordinary pass when the route skips its phase."""
-        assert all(route.over == "token" for route in program.values()), "span routes need a backend span executor"
+        """Run every row's program, or its ordinary pass when the program skips its phase."""
+        assert all(item.over == "token" for item in program.values()), (
+            'over="span" programs need a backend span executor'
+        )
         outputs: list[torch.Tensor] = []
         for index, row in enumerate(self.rows):
             positions, seed = self.begin(row)
@@ -92,7 +94,7 @@ class SerialTokenwiseReplay(TokenwiseReplayPrimitive):
 
             if selected:
                 entries = () if self.position is None else self.position.entry(())[1:]
-                hidden, saved = execute_route(
+                hidden, saved = execute_token_program(
                     program[row.phase.value],
                     seed,
                     positions,
@@ -116,23 +118,23 @@ class SerialTokenwiseReplay(TokenwiseReplayPrimitive):
 
 
 @dataclass(frozen=True, slots=True)
-class TokenwiseReplayTask(Generic[DataT]):
+class CustomForwardTask(Generic[DataT]):
     """Disjoint role programs and their publication-owned optional overlay transition."""
 
     task: SemanticTask
     program: dict[str, TokenProgram]
     domain: CausalModelDomain
-    implementation_id: ImplementationId = TOKENWISE_REPLAY_IMPLEMENTATION
+    implementation_id: ImplementationId = CUSTOM_FORWARD_IMPLEMENTATION
     operation: TensorOperation[DataT] | None = None
     overlay_math: OverlayTransition | None = None
-    primitive: TokenwiseReplayPrimitive | None = None
+    primitive: CustomForwardPrimitive | None = None
 
     @classmethod
     def from_implementation(
         cls, implementation: TaskGraphImplementation[StateTaskContext[DataT], ProjectionResiduals]
-    ) -> TokenwiseReplayTask[DataT]:
+    ) -> CustomForwardTask[DataT]:
         if not isinstance(implementation, cls):
-            raise ValueError("tokenwise replay requires its native task binding")
+            raise ValueError("a custom forward needs its native task binding")
         return implementation
 
     def execute(self, context: StateTaskContext[DataT]) -> ProjectionResiduals:
@@ -145,7 +147,7 @@ class TokenwiseReplayTask(Generic[DataT]):
         assert context is not None and isinstance(data, TensorFrame) and self.overlay_math is not None
         primitive = self.primitive
         assert primitive is not None
-        primitive.overlay = RouteOverlay(self.overlay_math, batch, read_batch(context), data)
+        primitive.overlay = ProgramOverlay(self.overlay_math, batch, read_batch(context), data)
         try:
             self.run(context)
             return primitive.overlay.finish()
@@ -153,14 +155,16 @@ class TokenwiseReplayTask(Generic[DataT]):
             primitive.overlay = None
 
     def run(self, context: StateTaskContext[DataT]) -> None:
-        primitive, effect = self.primitive, self.task.replay
+        primitive, effect = self.primitive, self.task.custom_forward
         assert primitive is not None and effect is not None
         task_id = TaskId(context.arena.plan.semantic_graph.tasks.index(self.task))
 
         def observe(index: int, hidden: torch.Tensor) -> None:
             row = primitive.rows[index]
-            context.trace.observe(context.invocation_id, task_id, "replay.hidden", hidden, row=row, iteration=0)
-            context.trace.record(TraceEventKind.REPLAY, context.invocation_id, task_id=task_id, row=row, iteration=0)
+            context.trace.observe(context.invocation_id, task_id, "custom_forward.hidden", hidden, row=row, iteration=0)
+            context.trace.record(
+                TraceEventKind.CUSTOM_FORWARD, context.invocation_id, task_id=task_id, row=row, iteration=0
+            )
 
         with torch.no_grad(), nullcontext() if context.pin.stream is None else torch.cuda.stream(context.pin.stream):
             primitive.run(self.program, effect, observe)

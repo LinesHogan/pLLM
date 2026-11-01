@@ -37,7 +37,7 @@ def admit_parallel(config: ModelConfig, requirements: BackendRequirements = Back
         (requirements.causal_training, "causal_model training"),
         (requirements.parameter_targets, "parameter overlays"),
         (requirements.feeds, "state feeds"),
-        (requirements.layer_routes or requirements.position_states, "layer routes and PositionState"),
+        (requirements.custom_forward or requirements.position_states, "@pllm.custom_forward and PositionState"),
     ):
         if used:
             raise ValueError(f"{feature} needs tensor_parallel_size=1")

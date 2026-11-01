@@ -1,4 +1,4 @@
-"""Register block-sized positional caches and stage their own group mappings for routes."""
+"""Register block-sized positional caches and stage their own group mappings for custom forwards."""
 
 import torch
 from vllm.config import VllmConfig

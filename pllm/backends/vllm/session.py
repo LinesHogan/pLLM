@@ -15,11 +15,11 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from pllm.authoring import BackendDeployment, DataT, HostBatch, ResultT
 from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.architecture import Decoder
+from pllm.backends.vllm.custom_forward import VllmCustomForward
 from pllm.backends.vllm.hidden_capture import HiddenTaps
 from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay, parameter_overlay
 from pllm.backends.vllm.position_state import PositionCacheLayer
 from pllm.backends.vllm.prefix_cache import POLICY_KEY, CachePolicy
-from pllm.backends.vllm.replay import VllmTokenwiseReplay
 from pllm.backends.vllm.sampler import (
     SamplerGuidance,
     SignedSamplerGuidance,
@@ -94,8 +94,8 @@ class VllmSession(Generic[DataT, ResultT]):
         self._trains_on_batch = plan.semantic_graph.trains_on_batch
         self._taps = taps
         overlay_bindings = attachment.spec.overlay_bindings
-        replay_task = plan.semantic_graph.replay_task
-        routed_overlay = bool(overlay_bindings) and replay_task is not None
+        custom_forward_task = plan.semantic_graph.custom_forward_task
+        program_overlay = bool(overlay_bindings) and custom_forward_task is not None
         self._overlay = (
             parameter_overlay(
                 decoder,
@@ -107,14 +107,14 @@ class VllmSession(Generic[DataT, ResultT]):
                 phases=deployment.execution.math.parameter_phases,
                 in_forward=plan.semantic_graph.updates_in_forward,
                 graphs=probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH,
-                routed=routed_overlay,
+                in_program=program_overlay,
             )
             if overlay_bindings
             else None
         )
-        # The overlay prepared for each model forward; the replay drives a routed overlay itself.
-        self._forward_overlay = None if routed_overlay else self._overlay
-        self._in_forward_overlay = plan.semantic_graph.updates_in_forward and not routed_overlay
+        # The overlay prepared for each model forward; a custom forward drives its program overlay itself.
+        self._forward_overlay = None if program_overlay else self._overlay
+        self._in_forward_overlay = plan.semantic_graph.updates_in_forward and not program_overlay
         self._transition_task = next(
             (item.task_id for item in attachment.task_bindings if item.role is AttachmentTaskRole.TRANSITION), None
         )
@@ -123,7 +123,7 @@ class VllmSession(Generic[DataT, ResultT]):
                 decoder.model,
                 attachment.spec.activation_bindings,
                 attachment.spec.state_resource,
-                install=replay_task is None,
+                install=custom_forward_task is None,
             )
             if (attachment.spec.activation_bindings)
             else None
@@ -131,17 +131,17 @@ class VllmSession(Generic[DataT, ResultT]):
         self._feed: FeedReceiver | None = None
         self._received_readonly: ReadonlyStepInput | ReadonlyStepAbsent | ReadonlyStepEnd | None = None
         self._input_failed = False
-        self._replay: VllmTokenwiseReplay[DataT, ResultT] | None = None
-        if replay_task is not None:
-            self._replay = VllmTokenwiseReplay(
-                decoder.kv_writable("a @pllm.layer_route"),
-                replay_task,
+        self._custom_forward: VllmCustomForward[DataT, ResultT] | None = None
+        if custom_forward_task is not None:
+            self._custom_forward = VllmCustomForward(
+                decoder.kv_writable("a @pllm.custom_forward"),
+                custom_forward_task,
                 deployment.execution,
                 attachment.task_bindings[0].anchor_id,
                 activation=self._activation,
                 position_layers=position_layers,
                 allocation_block_size=allocation_block_size,
-                overlay=self._overlay if isinstance(self._overlay, ExactParameterOverlay) and routed_overlay else None,
+                overlay=self._overlay if isinstance(self._overlay, ExactParameterOverlay) and program_overlay else None,
             )
         self._sampler = sampler
         self._identities: dict[str, RequestIdentity] = {}
@@ -265,7 +265,7 @@ class VllmSession(Generic[DataT, ResultT]):
         identities = tuple(self._identities[key] for key in sorted(self._identities.keys() & request_ids))
         if not identities:
             return
-        rejection = self.attachment.plan.schedule.prefix_replay_rejection
+        rejection = self.attachment.plan.schedule.recompute_rejection
         if rejection is not None:
             self._input_failed = True
             raise RuntimeError(
@@ -290,7 +290,7 @@ class VllmSession(Generic[DataT, ResultT]):
         if self._taps is not None:
             self._taps.prepare(rows.row_batch)
         adapter = self._forward_overlay
-        if adapter is None and self._activation is None and self._replay is None and not self._trains_on_batch:
+        if adapter is None and self._activation is None and self._custom_forward is None and not self._trains_on_batch:
             return
         if adapter is not None:
             adapter.reserve()
@@ -337,8 +337,8 @@ class VllmSession(Generic[DataT, ResultT]):
             adapter.prepare(rows.row_batch, context, execution.directory, projection)
         if self._activation is not None:
             self._activation.prepare(rows.row_batch, context, execution.directory)
-        if self._replay is not None:
-            self._replay.prepare(rows.row_batch, context)
+        if self._custom_forward is not None:
+            self._custom_forward.prepare(rows.row_batch, context)
 
     @torch.inference_mode(False)
     @torch.enable_grad()
@@ -376,12 +376,12 @@ class VllmSession(Generic[DataT, ResultT]):
 
     def _finish_effects(self) -> None:
         """Clear every active optional primitive after forward or abort."""
-        for effect in (self._taps, self._overlay, self._activation, self._replay):
+        for effect in (self._taps, self._overlay, self._activation, self._custom_forward):
             if effect is not None:
                 effect.clear()
 
     def _close_effects(self) -> None:
-        for effect in (self._overlay, self._activation, self._replay):
+        for effect in (self._overlay, self._activation, self._custom_forward):
             if effect is not None:
                 effect.close()
 

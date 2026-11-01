@@ -17,7 +17,7 @@ use std::collections::{BTreeSet, HashMap};
 pub(crate) struct ScheduleDecision {
     pub(crate) tasks: Vec<PhysicalTask>,
     peak_memory_bytes: u64,
-    prefix_replay_rejection: Option<String>,
+    recompute_rejection: Option<String>,
 }
 
 impl ScheduleDecision {
@@ -286,7 +286,7 @@ fn select_lanes(
         || graph
             .tasks
             .iter()
-            .any(|t| t.replay.is_some() || t.visibility.is_some())
+            .any(|t| t.custom_forward.is_some() || t.visibility.is_some())
     {
         return;
     }
@@ -574,7 +574,7 @@ pub(super) fn compile(
 
 // Torch transitions are assumed deterministic. Initialization and execution support are separate
 // from this structural eligibility fact; it does not enable preemption or prefix-cache hits.
-fn prefix_replay_rejection(
+fn recompute_rejection(
     graph: &SemanticGraph,
     planned: &[PhysicalTask],
 ) -> Option<&'static str> {
@@ -609,8 +609,8 @@ fn prefix_replay_rejection(
                 _ => {}
             }
         }
-        if task.replay.as_ref().is_some_and(|replay| replay.span) {
-            return Some("use tokenwise layer routes instead of span sweeps");
+        if task.custom_forward.as_ref().is_some_and(|program| program.span) {
+            return Some("use over=\"token\" in @pllm.custom_forward instead of over=\"span\"");
         }
     }
     if graph
@@ -655,11 +655,11 @@ fn build_decision(
             task
         })
         .collect();
-    let rejection = prefix_replay_rejection(graph, &plans);
+    let rejection = recompute_rejection(graph, &plans);
     ScheduleDecision {
         tasks: plans,
         peak_memory_bytes: solution.peak,
-        prefix_replay_rejection: rejection.map(str::to_owned),
+        recompute_rejection: rejection.map(str::to_owned),
     }
 }
 

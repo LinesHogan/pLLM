@@ -17,7 +17,7 @@ from vllm.forward_context import get_forward_context, override_forward_context
 
 import pllm
 from pllm.backends.vllm import runtime
-from pllm.backends.vllm.replay import RouteWave, VllmTokenwiseReplay
+from pllm.backends.vllm.custom_forward import ProgramWave, VllmCustomForward
 from pllm.config import ModelConfig
 from pllm.workloads.recirculation import JacobiRecirculationWorkload, RecirculationWorkload
 
@@ -108,10 +108,10 @@ def main():
         budget=7 if chunked else None,
         prefix="--prefix" in sys.argv,
     )
-    primitive = handle.runner.require_session()._replay
+    primitive = handle.runner.require_session()._custom_forward
     layer = primitive.model.layers[23]
-    native_layer, native_capture, native_replay = RouteWave.layer, RouteWave.capture, torch.cuda.CUDAGraph.replay
-    native_forward = VllmTokenwiseReplay.forward
+    native_layer, native_capture, native_replay = ProgramWave.layer, ProgramWave.capture, torch.cuda.CUDAGraph.replay
+    native_forward = VllmCustomForward.forward
     recordings, numerical, checked = {}, [], []
     active_records = None
 
@@ -180,8 +180,8 @@ def main():
 
     try:
         with (
-            patch.object(RouteWave, "layer", called),
-            patch.object(RouteWave, "capture", capture),
+            patch.object(ProgramWave, "layer", called),
+            patch.object(ProgramWave, "capture", capture),
             patch.object(torch.cuda.CUDAGraph, "replay", replay),
             patch.object(primitive.model, "forward", partial(sparse_forward, primitive)),
         ):
@@ -265,7 +265,7 @@ def jacobi_evidence():
             batch=8,
             budget=2048,
         )
-        primitive = handle.runner.require_session()._replay
+        primitive = handle.runner.require_session()._custom_forward
         native, records = primitive.model.forward, []
 
         def forward(*args, **kwargs):

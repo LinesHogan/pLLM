@@ -1,4 +1,4 @@
-"""Execute traced route steps on a batch of independent token positions."""
+"""Execute a traced token program's steps on a batch of independent token positions."""
 
 from collections.abc import Callable
 
@@ -9,7 +9,7 @@ from pllm.execution.token_program import KV, ApplyUpdates, Cell, Save, Segment, 
 Layer = Callable[[int, torch.Tensor, torch.Tensor | None, KV], tuple[torch.Tensor, torch.Tensor]]
 
 
-def execute_route(
+def execute_token_program(
     program: TokenProgram,
     seed: torch.Tensor,
     positions: torch.Tensor,

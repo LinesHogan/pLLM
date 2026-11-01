@@ -1,4 +1,4 @@
-"""Bind vLLM attention resources and read-only peek calls for layer-route replay.
+"""Bind vLLM attention resources and read-only peek calls for custom forwards.
 
 vLLM owns the cache and FA2 attention. Peek merges strictly earlier cached
 attention with the fresh diagonal without writing any cache slots.
@@ -23,26 +23,30 @@ from pllm.execution.token_program import KV
 
 
 def validate_attention_resources(attentions: tuple[Attention, ...], *, hidden_size: int) -> None:
-    """Check the backend ABI before attaching a replay resource provider."""
+    """Check the backend ABI before attaching a custom-forward resource provider."""
     for attention in attentions:
         layer, impl = attention.layer_name, attention.impl
         if not isinstance(impl, FlashAttentionImpl) or impl.vllm_flash_attn_version != 2:
             raise ValueError(
-                f"layer routes replay vLLM's FlashAttention 2 kernels, but {layer} runs another attention backend "
+                f"@pllm.custom_forward reruns vLLM's FlashAttention 2 kernels, but {layer} runs another attention backend "
                 "on this GPU and vLLM build; use a setup where vLLM selects FlashAttention 2"
             )
         if impl.sliding_window != (-1, -1):
-            raise ValueError(f"layer routes need full attention; {layer} uses a sliding window, so pick another model")
+            raise ValueError(
+                f"@pllm.custom_forward needs full attention; {layer} uses a sliding window, so pick another model"
+            )
         if attention.kv_cache_dtype != "auto":
-            raise ValueError(f"layer routes need an unquantized KV cache; {layer} stores {attention.kv_cache_dtype}")
+            raise ValueError(
+                f"@pllm.custom_forward needs an unquantized KV cache; {layer} stores {attention.kv_cache_dtype}"
+            )
         if attention.kv_sharing_target_layer_name is not None:
             raise ValueError(
-                f"layer routes need each layer to own its KV cache; {layer} shares "
+                f"@pllm.custom_forward needs each layer to own its KV cache; {layer} shares "
                 f"{attention.kv_sharing_target_layer_name}'s, so pick a model without cross-layer KV sharing"
             )
         if attention.num_kv_heads * attention.head_size > hidden_size:
             raise ValueError(
-                f"layer routes need GQA/MHA attention whose KV width fits the hidden size; {layer} does not"
+                f"@pllm.custom_forward needs GQA/MHA attention whose KV width fits the hidden size; {layer} does not"
             )
 
 
@@ -56,7 +60,7 @@ def attention_metadata(
         or not isinstance(context.attn_metadata, dict)
         or not isinstance(context.slot_mapping, dict)
     ):
-        raise ValueError("replay requires eager single-batch attention metadata")
+        raise ValueError("a custom forward needs eager single-batch attention metadata")
     metadata = context.attn_metadata[attention.layer_name]
     if (
         not isinstance(metadata, FlashAttentionMetadata)
@@ -64,10 +68,10 @@ def attention_metadata(
         or metadata.max_dcp_context_kv_len not in (None, 0)
         or metadata.rswa_prefix_lens is not None
     ):
-        raise ValueError("replay requires ordinary causal FlashAttention metadata")
+        raise ValueError("a custom forward needs ordinary causal FlashAttention metadata")
     cache = attention.kv_cache
     if cache.ndim != 4 or cache.shape[1] != attention.num_kv_heads or cache.shape[3] != 2 * attention.head_size:
-        raise ValueError("replay requires FA2 packed KV layout")
+        raise ValueError("a custom forward needs the FA2 packed KV layout")
     return metadata, cache, context.slot_mapping[attention.layer_name]
 
 
@@ -81,7 +85,7 @@ def attention_paged_access(
 
 
 class BatchAttentionBuffers:
-    """Stable width-B FA2 metadata; invocation tables and slots are copied before replay."""
+    """Stable width-B FA2 metadata; invocation tables and slots are copied before each wave."""
 
     def __init__(self, context: ForwardContext, attentions: tuple[Attention, ...], capacity: int, width: int) -> None:
         self.metadata: dict[str, FlashAttentionMetadata] = {}
@@ -114,7 +118,7 @@ class BatchAttentionBuffers:
                 scheduler_metadata=None,
             )
             self.metadata[attention.layer_name] = selected
-        self.context = _replay_context(context, self.metadata)
+        self.context = _wave_context(context, self.metadata)
 
     @staticmethod
     def mapping_groups(context: ForwardContext, attentions: tuple[Attention, ...]) -> tuple[int, ...]:
@@ -154,7 +158,7 @@ class BatchAttentionBuffers:
             metadata.block_table[:, :width].copy_(tables.index_select(0, requests)[:, :width])
 
 
-def _replay_context(context: ForwardContext, metadata: dict[str, FlashAttentionMetadata]) -> ForwardContext:
+def _wave_context(context: ForwardContext, metadata: dict[str, FlashAttentionMetadata]) -> ForwardContext:
     return replace(
         context,
         attn_metadata=metadata,
@@ -195,7 +199,7 @@ def span_context(
             num_prefill_tokens=starts[-1],
             scheduler_metadata=None,
         )
-    return _replay_context(context, metadata)
+    return _wave_context(context, metadata)
 
 
 def merge_diagonal(

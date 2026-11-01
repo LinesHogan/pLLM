@@ -25,7 +25,7 @@ AUTHORITY_FILES = (
     Path("rust/pllm_core/src/planning/version_hazards.rs"),
     Path("rust/pllm_core/src/planning/state_representation.rs"),
     Path("rust/pllm_core/src/planning/scheduler.rs"),
-    Path("pllm/execution/replay.py"),
+    Path("pllm/execution/custom_forward.py"),
     Path("pllm/execution/execution.py"),
     Path("pllm/execution/module_graph.py"),
     Path("pllm/execution/paged_access.py"),
@@ -45,7 +45,7 @@ AUTHORITY_FILES = (
 # those names without acquiring physical scheduling authority.
 NATIVE_BINDING_FILES = (
     Path("pllm/worker.py"),
-    Path("pllm/backends/vllm/replay.py"),
+    Path("pllm/backends/vllm/custom_forward.py"),
     Path("pllm/backends/vllm/activation.py"),
     Path("pllm/backends/vllm/parameter_overlay.py"),
 )

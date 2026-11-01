@@ -13,7 +13,7 @@ from pllm.config import ModelConfig
 class LayerLoop(pllm.Workload):
     """A decode token traverses 0..8, 5..8, then the rest of the model."""
 
-    @pllm.layer_route(tokens="decode")
+    @pllm.custom_forward(tokens="decode")
     def loop(self, layers: pllm.Layers) -> torch.Tensor:
         """Feed the first layer-8 output back into layer 5."""
         first = layers(stop=9)
@@ -26,7 +26,7 @@ def main():
         workload=LayerLoop(),
         config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", "bfloat16", 64, 1, 64, 0.25, seed=7),
     )
-    primitive = handle.runner.require_session()._replay
+    primitive = handle.runner.require_session()._custom_forward
     native_replay, checked = torch.cuda.CUDAGraph.replay, []
 
     def replay(graph):

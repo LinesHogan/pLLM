@@ -92,10 +92,10 @@ def attachment_buffer_bytes(
         rank = shape[0] if len(shape) == 2 else 0
         buffers += rows * (width * (2 * hidden + 3 * rank) + 8)
     for task in graph.tasks:
-        match task.replay:
+        match task.custom_forward:
             case TokenProgramEffect():
                 buffers += 2 * rows * hidden * width
-                buffers += (3 * hidden * width + 16) * len(task.replay.position_states) + 2
+                buffers += (3 * hidden * width + 16) * len(task.custom_forward.position_states) + 2
                 if probe.causal_domain is not None and attachment.overlay_bindings:
                     requests = probe.causal_domain.requests
                     # Two phase signatures at every exact width, plus one ordinary span.
@@ -118,15 +118,15 @@ def derive_attachment_resources(
 
     Preserve producer task/value facts when the model reads a publication.
     The adapter keeps embeddings and output concatenation in reserved_bytes;
-    the replay task pays for its own tensors and recovery lifetimes.
+    the custom-forward task pays for its own tensors and recovery lifetimes.
     """
-    tasks = tuple(task for task in graph.tasks if isinstance(task.replay, TokenProgramEffect))
+    tasks = tuple(task for task in graph.tasks if isinstance(task.custom_forward, TokenProgramEffect))
     if not tasks:
         return timeline
     if len(tasks) != 1:
-        raise ValueError("tokenwise attachment costs require one model replay task")
+        raise ValueError("custom-forward attachment costs need one custom-forward task")
     (task,) = tasks
-    # Builder._attach composes the replay with its publication; a conditional input group keeps
+    # Builder._attach composes the custom forward with its publication; a conditional input group keeps
     # all producer facts, so the complete DAG funds the worst case.
     resident = capture_memory_bytes if TOKEN_CAPTURE_CAPABILITY in probe.capabilities else 0
     workspace = probe.max_packed_rows * probe.hidden_size * 8
@@ -144,7 +144,7 @@ def derive_attachment_resources(
         + sum(fact.bytes for fact in timeline.value_resources)
         > timeline.memory_budget_bytes
     ):
-        raise ValueError("increase memory_budget_bytes to fund route workspace and captures")
+        raise ValueError("raise memory_budget_bytes to fund the custom forward's workspace and graphs")
     # The output lives in the original adapter's concatenation reservation;
     # the outer task runner does not allocate a second copy of this value.
     known = {(fact.task, fact.output) for fact in timeline.value_resources}

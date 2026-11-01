@@ -104,7 +104,7 @@ def observe_model(workload):
         def views(module, rows):
             from vllm.forward_context import get_forward_context
 
-            from pllm.backends.vllm.region_attention import attention_metadata
+            from pllm.backends.vllm.custom_forward_attention import attention_metadata
 
             _, cache, slots = attention_metadata(get_forward_context(), module.self_attn.attn)
             return tuple(
@@ -206,12 +206,12 @@ def observe_model(workload):
 def observe_replay(*, versions):
     from vllm.forward_context import get_forward_context
 
-    from pllm.backends.vllm.region_attention import attention_paged_access
-    from pllm.backends.vllm.replay import RouteWave, VllmTokenwiseReplay
+    from pllm.backends.vllm.custom_forward import ProgramWave, VllmCustomForward
+    from pllm.backends.vllm.custom_forward_attention import attention_paged_access
 
-    original_make, original_layer = pllm.make_llm, RouteWave.layer
-    original_run = VllmTokenwiseReplay.run
-    original_capture, original_replay = RouteWave.capture, torch.cuda.CUDAGraph.replay
+    original_make, original_layer = pllm.make_llm, ProgramWave.layer
+    original_run = VllmCustomForward.run
+    original_capture, original_replay = ProgramWave.capture, torch.cuda.CUDAGraph.replay
     holder, history, recordings = {}, {}, {}
     capturing = None
     calls, completed = [], []
@@ -219,7 +219,7 @@ def observe_replay(*, versions):
     def make(*args, **kwargs):
         llm = original_make(*args, **kwargs)
         session = llm.runner.require_session()
-        holder.update(session=session, primitive=session._replay, execution=session._deployment.execution)
+        holder.update(session=session, primitive=session._custom_forward, execution=session._deployment.execution)
         return llm
 
     def capture(item):
@@ -236,7 +236,7 @@ def observe_replay(*, versions):
             if torch.cuda.is_current_stream_capturing():
                 base.append(result[0].clone())
 
-        hook = wave.replay.model.layers[ordinal].register_forward_hook(native) if ordinal == 1 else None
+        hook = wave.custom_forward.model.layers[ordinal].register_forward_hook(native) if ordinal == 1 else None
         try:
             result = original_layer(wave, ordinal, hidden, residual, kv)
         finally:
@@ -245,8 +245,8 @@ def observe_replay(*, versions):
         if capturing is not None and torch.cuda.is_current_stream_capturing():
             if ordinal == 1 and base and 1 in wave.fields:
                 capturing["patches"].append((base[0], wave.fields[1][0].clone(), result[0].clone()))
-            if ordinal == len(wave.replay.model.layers) - 1 and capturing["normal"] is None:
-                capturing["normal"] = wave.replay.model.norm(result[0] + result[1]).clone()
+            if ordinal == len(wave.custom_forward.model.layers) - 1 and capturing["normal"] is None:
+                capturing["normal"] = wave.custom_forward.model.norm(result[0] + result[1]).clone()
         return result
 
     def replay(graph):
@@ -293,10 +293,10 @@ def observe_replay(*, versions):
 
     with (
         patch.object(pllm, "make_llm", make),
-        patch.object(RouteWave, "layer", layer),
-        patch.object(RouteWave, "capture", capture),
+        patch.object(ProgramWave, "layer", layer),
+        patch.object(ProgramWave, "capture", capture),
         patch.object(torch.cuda.CUDAGraph, "replay", replay),
-        patch.object(VllmTokenwiseReplay, "run", run),
+        patch.object(VllmCustomForward, "run", run),
     ):
         yield
     assert len(completed) == len(versions) and len({identity for rows in completed for identity in rows}) == 1
@@ -365,7 +365,7 @@ def run_video(workload, events, steps, config=None):
 
 @dataclass(frozen=True)
 class RecirculatingVideo(VideoWorkload, RecirculationWorkload):
-    """Compose the video ActivationPatch and an ordinary user-authored layer route."""
+    """Compose the video ActivationPatch and an ordinary user-authored custom forward."""
 
 
 @pytest.mark.slow

@@ -124,7 +124,7 @@ pub(crate) struct SemanticTask {
     pub(crate) effects: Vec<SemanticEffect>,
     pub(crate) implementations: Vec<ImplementationCandidate>,
     #[serde(default)]
-    pub(crate) replay: Option<TokenProgramEffect>,
+    pub(crate) custom_forward: Option<TokenProgramEffect>,
     #[serde(default)]
     pub(crate) math: Option<MathContract>,
     #[serde(default)]
@@ -340,7 +340,7 @@ fn validate_input_groups(graph: &SemanticGraph) -> Result<(), String> {
         }
         for task in &graph.tasks {
             if producer(&task.symbol) {
-                if task.replay.is_some()
+                if task.custom_forward.is_some()
                     || task.effects.iter().any(|effect| {
                         if group.borrowed_resources.contains(&effect.resource) {
                             effect.kind != StateEffectKind::Read || effect.version.is_some()

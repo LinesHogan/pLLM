@@ -8,10 +8,10 @@ import torch
 from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
 
 import pllm
-from pllm.backends.vllm import region_attention as attention
+from pllm.backends.vllm import custom_forward_attention as attention
 from pllm.backends.vllm.prefix_cache import CachePolicy
-from pllm.execution.route_executor import execute_route
 from pllm.execution.token_program import TokenProgram, TokenTensor
+from pllm.execution.token_program_executor import execute_token_program
 from pllm.workloads.recirculation import JacobiRecirculationWorkload
 from test.workloads.test_recirculation import FACTS
 
@@ -19,7 +19,7 @@ from test.workloads.test_recirculation import FACTS
 @pytest.mark.parametrize("tokens", ("all", "decode", "prefill"))
 def test_overlapping_routes_rejected(tokens):
     class Overlap(JacobiRecirculationWorkload):
-        @pllm.layer_route(tokens=tokens)
+        @pllm.custom_forward(tokens=tokens)
         def extra(self, layers):
             return layers()[-1]
 
@@ -37,7 +37,7 @@ def test_overlapping_routes_rejected(tokens):
 )
 def test_capture_rejects_invalid_dependencies(over, route, message):
     with pytest.raises(ValueError, match=message):
-        TokenProgram.capture(route, TokenTensor((1, 4), torch.float32, "cpu"), 3, ("state",), over)
+        TokenProgram.trace(route, TokenTensor((1, 4), torch.float32, "cpu"), 3, ("state",), over)
 
 
 @pytest.mark.parametrize("width", (1, 7))
@@ -48,9 +48,9 @@ def test_span_cells_keep_packed_tensor_semantics(width):
         layers.save("state", value.reshape(shape))
         return layers(hidden=value.reshape(shape))[-1]
 
-    program = TokenProgram.capture(route, TokenTensor((1, 4), torch.float32, "cpu"), 1, ("state",), "span")
+    program = TokenProgram.trace(route, TokenTensor((1, 4), torch.float32, "cpu"), 1, ("state",), "span")
     seed = torch.arange(width * 4, dtype=torch.float32).reshape(width, 4)
-    output, (saved,) = execute_route(
+    output, (saved,) = execute_token_program(
         program,
         seed,
         torch.arange(width),

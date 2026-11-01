@@ -103,13 +103,13 @@ def test_namespace_caller_extras_and_envelope():
 
 
 class GeneratedRoute(pllm.Workload):
-    @pllm.layer_route(tokens="all")
+    @pllm.custom_forward(tokens="all")
     def loop(self, layers):
         return layers(hidden=torch.where(layers.generated, layers.embeddings * 0.5, layers.embeddings))[-1]
 
 
 class DecodeRoute(pllm.Workload):
-    @pllm.layer_route(tokens="decode")
+    @pllm.custom_forward(tokens="decode")
     def loop(self, layers):
         return layers(hidden=layers.embeddings * 0.5)[-1]
 

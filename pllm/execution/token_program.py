@@ -1,4 +1,4 @@
-"""Trace layer routes into model slices and functional tensor cells for direct execution."""
+"""Trace @pllm.custom_forward methods into model slices and functional tensor cells for direct execution."""
 
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -20,7 +20,7 @@ KV = Literal["commit", "peek"]
 
 @dataclass(frozen=True)
 class TokenTensor:
-    """Static seed metadata for layer-route capture without allocating model storage."""
+    """Static seed metadata for custom-forward tracing without allocating model storage."""
 
     shape: tuple[int, ...]
     dtype: torch.dtype
@@ -29,7 +29,7 @@ class TokenTensor:
 
 @torch.library.custom_op("pllm::layers", mutates_args=())
 def _layers(hidden: torch.Tensor, start: int, stop: int, kv: str) -> list[torch.Tensor]:
-    raise RuntimeError("call Layers only inside a @pllm.layer_route method")
+    raise RuntimeError("call Layers only inside a @pllm.custom_forward method")
 
 
 def _fake_layers(hidden: torch.Tensor, start: int, stop: int, kv: str) -> list[torch.Tensor]:
@@ -41,7 +41,7 @@ _layers.register_fake(_fake_layers)  # pyright: ignore[reportUnknownMemberType]
 
 @torch.library.custom_op("pllm::apply_updates", mutates_args=())
 def _apply_updates(hidden: torch.Tensor) -> None:
-    raise RuntimeError("call apply_updates only inside a @pllm.layer_route method")
+    raise RuntimeError("call apply_updates only inside a @pllm.custom_forward method")
 
 
 def _fake_updates(hidden: torch.Tensor) -> None:
@@ -68,7 +68,7 @@ class LayerOutputs:
 
 @dataclass(frozen=True)
 class Layers:
-    """Public model slices and position state used inside layer_route methods."""
+    """Public model slices and position state used inside custom_forward methods."""
 
     # The hidden entering layer 0: the token embeddings.
     embeddings: torch.Tensor
@@ -82,7 +82,7 @@ class Layers:
         """Read the previous token's state, even after a save in this token."""
         if self.over == "span" or offset != -1 or name not in self.entries:
             raise ValueError(
-                f"use layers.load({name!r}, offset=-1) in over=token routes with a declared PositionState {name!r} "
+                f'use layers.load({name!r}, offset=-1) in over="token" custom forwards with a declared PositionState {name!r} '
                 "(spans have no serial predecessor)"
             )
         return self.entries[name].clone()
@@ -101,7 +101,7 @@ class Layers:
         """Commit causal K/V, or peek at earlier committed positions plus fresh own K/V.
 
         A peek leaves the cache untouched and requires an earlier commit to every
-        layer in this slice within the same route.
+        layer in this slice within the same custom forward.
         """
         stop = self.layer_count if stop is None else stop
         value = self.embeddings if hidden is None else hidden
@@ -126,7 +126,7 @@ class Layers:
 
 @dataclass(frozen=True)
 class Segment:
-    """One model slice and just the post-layer values consumed by the route."""
+    """One model slice and just the post-layer values consumed by the program."""
 
     start: int
     stop: int
@@ -172,7 +172,7 @@ def _tensor(node: torch.fx.Node) -> torch.Tensor:
 
 
 def _cell(nodes: list[torch.fx.Node], over: Over) -> Cell:
-    # Recompute symbolic sizes in each fragment so route boundaries carry tensors only.
+    # Recompute symbolic sizes in each fragment so program boundaries carry tensors only.
     needed = set(nodes)
     for node in reversed(tuple(nodes[0].graph.nodes)):
         if node in needed:
@@ -232,7 +232,7 @@ class TokenProgram:
     over: Over = "token"
 
     @classmethod
-    def capture(
+    def trace(
         cls,
         function: Callable[[Layers], torch.Tensor | None],
         tensor: TokenTensor,
@@ -279,7 +279,7 @@ class TokenProgram:
             placeholders = tuple(node.name for node in graph.graph.nodes if node.op == "placeholder")
             for node in graph.graph.nodes:
                 if node.target == torch.ops.higher_order.while_loop:
-                    raise ValueError("layer routes do not support traced while_loop; use a bounded for-loop")
+                    raise ValueError("@pllm.custom_forward does not support traced while_loop; use a bounded for-loop")
                 if (
                     node.target
                     in (

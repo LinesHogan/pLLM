@@ -66,8 +66,8 @@ class BackendRequirements:
     sampler_stage: SamplerStage | None = None
     sampler_feedback: bool = False
     position_states: tuple[tuple[str, float], ...] = ()
-    # Whether a @pllm.layer_route reruns model layers, which vLLM's CUDA graphs cannot capture.
-    layer_routes: bool = False
+    # Whether a @pllm.custom_forward reruns model layers, which vLLM's CUDA graphs cannot capture.
+    custom_forward: bool = False
     # Whether a pllm.model.Adapter reads an InstanceState; CUDA-graph overlays bind request state only.
     instance_adapter: bool = False
     causal_training: bool = False
@@ -201,7 +201,7 @@ def _apply_options(facts: BackendCompileFacts, options: ExecutionOptions) -> Bac
 def _fund_attachment(
     declaration: TensorBinding, probe: BackendPlacementProbe, timeline: SchedulerTimeline, options: ExecutionOptions
 ) -> SchedulerTimeline:
-    """Reserve the attachment's effect buffers and fund the model-replay task."""
+    """Reserve the attachment's effect buffers and fund the custom-forward task."""
     graph, layouts, attachment = declaration.finish()
     buffers = attachment_buffer_bytes(probe, graph, layouts, attachment)
     if buffers:

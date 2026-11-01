@@ -26,7 +26,7 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import StateResource
 from pllm.contracts.state_ref import StateRef
 from pllm.execution.cuda_stream import CudaStreamReadiness, PinnedStaging
-from pllm.execution.overlay_task import ProjectionTransition, RouteOverlay
+from pllm.execution.overlay_task import ProgramOverlay, ProjectionTransition
 from pllm.execution.parameter_projection import (
     ROWS_PER_BLOCK,
     prepare_projection_read,
@@ -92,7 +92,7 @@ class _ExactProjection:
         self.total_rows = 0
         self.apply_count = self.updated_apply_count = 0
         self.transition: ProjectionTransition | None = None
-        self.routes: tuple[RouteOverlay, ...] = ()
+        self.row_overlays: tuple[ProgramOverlay, ...] = ()
 
     def captures_binding(self, binding: ParameterOverlayFieldBinding) -> bool:
         return self.original_mlp_forward is not None or binding.operator is ParameterOverlayOperator.HEAD_ADD
@@ -144,15 +144,15 @@ class _ExactProjection:
             for item, selected in zip(prepared, inputs, strict=True)
             if self.captures_binding(item.binding)
         )
-        if self.routes:
+        if self.row_overlays:
             residuals = {
                 key: value
-                for route in self.routes
-                for key, value in route.run(
+                for row_overlay in self.row_overlays
+                for key, value in row_overlay.run(
                     tuple(
                         operand
                         for operand in captures
-                        if operand.identity == route.data.step.rows.rows[route.row].identity
+                        if operand.identity == row_overlay.data.step.rows.rows[row_overlay.row].identity
                     )
                 ).items()
             }
@@ -166,7 +166,7 @@ class _ExactProjection:
             self.apply_count += selected.shape[0]
             if item.ref.version_id > 0:
                 self.updated_apply_count += selected.shape[0]
-        if not self.routes:
+        if not self.row_overlays:
             self.capture_count += len(captures)
 
     def capture(self, item: _PreparedRows, selected: torch.Tensor, weight: torch.Tensor) -> CapturedParameterOperand:
@@ -190,7 +190,7 @@ class _ExactProjection:
         self.mlp_input = None
         self.total_rows = 0
         self.transition = None
-        self.routes = ()
+        self.row_overlays = ()
 
 
 class ExactParameterOverlay:
@@ -256,31 +256,34 @@ class ExactParameterOverlay:
             handle.total_rows = rows.total_rows
 
     def prepare_wave(
-        self, rows: tuple[PackedPhaseRow, ...], routes: tuple[RouteOverlay, ...], indices: tuple[torch.Tensor, ...]
+        self,
+        rows: tuple[PackedPhaseRow, ...],
+        row_overlays: tuple[ProgramOverlay, ...],
+        indices: tuple[torch.Tensor, ...],
     ) -> None:
         """Use one projection call across the wave and request-local update operands."""
-        for row, route, index in zip(rows, routes, indices, strict=True):
-            route.prompt_end.fill_(row.token_offset + index.numel() == row.prompt_length)
+        for row, row_overlay, index in zip(rows, row_overlays, indices, strict=True):
+            row_overlay.prompt_end.fill_(row.token_offset + index.numel() == row.prompt_length)
         for handle in self._modules:
-            handle.routes = routes
+            handle.row_overlays = row_overlays
             handle.prepared = tuple(
                 _PreparedRows(
                     row,
-                    route.batch.after_refs[route.batch.selection.state_indices[route.row]],
+                    row_overlay.batch.after_refs[row_overlay.batch.selection.state_indices[row_overlay.row]],
                     index,
                     binding,
                     offset,
                     size,
-                    route.prompt_end,
+                    row_overlay.prompt_end,
                 )
-                for row, route, index in zip(rows, routes, indices, strict=True)
+                for row, row_overlay, index in zip(rows, row_overlays, indices, strict=True)
                 for binding, offset, size in handle.bindings
             )
             handle.capture_count, handle.total_rows = 0, sum(index.numel() for index in indices)
 
     def take_captures(self) -> tuple[CapturedParameterOperand, ...]:
         for handle in self._modules:
-            if handle.routes:
+            if handle.row_overlays:
                 continue
             expected = sum(handle.captures_binding(item.binding) for item in handle.prepared)
             assert handle.capture_count == expected
@@ -612,10 +615,10 @@ def parameter_overlay(
     *,
     in_forward: bool,
     graphs: bool,
-    routed: bool = False,
+    in_program: bool = False,
 ) -> PinnedParameterOverlay | ExactParameterOverlay | HybridParameterOverlay:
     """Install each projection wrapper once, before compiling or capturing the model."""
-    if routed or not uses_pinned_projection(in_forward=in_forward, graphs=graphs):
+    if in_program or not uses_pinned_projection(in_forward=in_forward, graphs=graphs):
         return ExactParameterOverlay(decoder, bindings, arena.device)
     pinned = PinnedParameterOverlay(
         decoder, bindings, arena, rows, requests, budget, phases=() if in_forward else phases
