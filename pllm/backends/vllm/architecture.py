@@ -16,9 +16,24 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, TypeAlias
 
+import torch
 from torch import Tensor, nn
 from torch.nn import Parameter
+from vllm import _custom_ops as ops
+from vllm.model_executor.kernels.linear.mixed_precision.marlin import MarlinLinearKernel
+from vllm.model_executor.kernels.linear.scaled_mm.marlin import MarlinFP8ScaledMMLinearKernel
 from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.layers.quantization.auto_awq import AutoAWQLinearMethod, AutoAWQMarlinLinearMethod
+from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQLinearMethod
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsLinearMethod
+from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a16_fp8 import (
+    CompressedTensorsW8A16Fp8,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
+    CompressedTensorsWNA16,
+)
+from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+from vllm.model_executor.layers.quantization.online.fp8 import Fp8PerTensorOnlineLinearMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import get_and_maybe_dequant_weights
 from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2DecoderLayer,
@@ -36,7 +51,10 @@ from vllm.model_executor.models.qwen3_moe import (
     Qwen3MoeModel,
     Qwen3MoeSparseMoeBlock,
 )
+from vllm.scalar_type import scalar_types
 
+from pllm.backends.vllm.compat import VLLM_027
+from pllm.backends.vllm.marlin import dequantize
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
@@ -69,11 +87,57 @@ MlpForward = Callable[[Tensor], Tensor]
 
 
 def frozen_weight(projection: LinearBase) -> Tensor:
-    """The dense [output, input] weight the inference kernel applies, in the model dtype.
+    """Borrow dense storage or dequantize one transient [output, input] operand.
 
-    An unquantized weight is borrowed; vLLM dequantizes a quantized one into a new dense copy
-    (applying the layer's own kernel to an identity matrix when the method has no direct inverse).
+    Marlin A16 weights have a direct tile inverse. Other layouts keep vLLM's
+    dequantizer, including its native FP8 scale application and identity fallback.
     """
+    method = projection.quant_method
+    if isinstance(method, AutoAWQLinearMethod):
+        return ops.awq_dequantize(
+            projection.get_parameter("qweight"),
+            projection.get_parameter("scales"),
+            projection.get_parameter("qzeros"),
+            0,
+            0,
+            0,
+        ).T.to(projection.params_dtype)
+    kernel = None
+    if isinstance(method, (AutoGPTQLinearMethod, AutoAWQMarlinLinearMethod)):
+        kernel = method.kernel
+    elif isinstance(method, (Fp8LinearMethod, Fp8PerTensorOnlineLinearMethod)):
+        kernel = method.fp8_linear
+    elif isinstance(method, CompressedTensorsLinearMethod):
+        scheme = projection.scheme
+        if isinstance(scheme, CompressedTensorsWNA16):
+            kernel = scheme.kernel
+        elif isinstance(scheme, CompressedTensorsW8A16Fp8):
+            kernel = scheme.linear_kernel
+    shape = (projection.input_size_per_partition, projection.output_size_per_partition)
+    if projection.params_dtype == torch.bfloat16:
+        if isinstance(kernel, MarlinLinearKernel) and kernel.config.act_type == torch.bfloat16:
+            # 0.27 also admits activation-order GPTQ; its permuted K axis uses vLLM's inverse.
+            if not VLLM_027 or not kernel.config.has_g_idx:
+                assert kernel.w_zp_name is not None
+                return dequantize(
+                    projection.get_parameter(kernel.w_q_name),
+                    projection.get_parameter(kernel.w_s_name),
+                    projection.get_parameter(kernel.w_zp_name) if kernel.config.zero_points else None,
+                    shape,
+                    kernel.config.weight_type,
+                    kernel.config.group_size,
+                )
+        elif isinstance(kernel, MarlinFP8ScaledMMLinearKernel):
+            scales = projection.get_parameter("weight_scale_inv" if kernel.block_quant else "weight_scale")
+            weight = projection.get_parameter("weight")
+            return dequantize(
+                weight,
+                scales,
+                None,
+                shape,
+                scalar_types.float8_e4m3fn,
+                weight.shape[0] * 16 // scales.shape[0] if kernel.block_quant else -1,
+            )
     return get_and_maybe_dequant_weights(projection, projection.params_dtype)
 
 
