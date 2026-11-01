@@ -5,7 +5,7 @@
 一层展开，其他层只给链接。
 
 ```text
-第一次接触 → 教程 00 → 按兴趣分流：算法向 01–05 / 系统向 internals 三篇
+第一次接触 → 教程 00 → 按兴趣继续 01–05
 写自己的负载 → 使用指南（任务导向）
 查某条声明的精确边界 → 参考：创作契约 / 词汇表
 理解架构与所有权 → 设计说明
@@ -13,7 +13,7 @@
 
 ## 教程（学习导向，可执行 notebook）
 
-**算法向**（GPU）：从心智模型到完整场景，按顺序读。
+需要 GPU。从心智模型到完整场景，按顺序读。
 
 - [00 快速上手：心智模型与最小观测负载](tutorials/00_quickstart.ipynb)
 - [01 观测：给三层 hidden 装 SAE](tutorials/01_observe_sae.ipynb)
@@ -21,12 +21,6 @@
 - [03 每请求 LoRA：路由共享、混合与 prefill 学习](tutorials/03_request_lora.ipynb)
 - [04 三种循环：层间、步间、会话](tutorials/04_loops.ipynb)
 - [05 decode 时在线训练：跨步与跨请求目标](tutorials/05_decode_training.ipynb)
-
-**系统向**（内部机制，写给想搞清框架怎么运转的读者，纯 CPU 可运行）：
-
-- [签名编译管线：声明如何变成签名计划](tutorials/internals/01_signed_compilation.ipynb)
-- [托管状态与页 arena：版本、COW、pin、预算](tutorials/internals/02_state_arena.ipynb)
-- [进程边界：按引用传输与签名复核](tutorials/internals/03_process_boundary.ipynb)
 
 ## 使用指南（任务导向）
 
@@ -45,18 +39,7 @@
 
 ## 设计说明（解释导向）
 
-当前权威：
-
 - [当前架构与所有权](design/architecture.md)
-- [Region IR](design/region-ir.md)
-- [计算模型](design/computation-model.md)
-- [ISL 调度](design/isl-scheduling.md)
 - [In-Place-TTT 稠密 overlay 语义](design/inplace-ttt.md)
-- [实现状态台账](design/implementation-status.md) —— 唯一进度入口
-- [E1 上下文包：跨进程页授权](design/e1-cross-process-page-authorization.md) —— 复杂工程任务交接
-- [E3 上下文包：模型与算法迁移（管线驱动）](design/e3-model-migration.md) —— 第 3 步程序与阶段任务卡
 
-验收证据快照在
-[design/evidence/](design/evidence/)；可执行证据清单在
-`test/evidence_manifest.toml`。已退役的 API 指南与迁移报告不与当前架构
-并存维护。
+支持哪些模型、有哪些限制，见仓库首页的[支持的模型与限制](../README.md#支持的模型与限制)。

@@ -9,10 +9,7 @@ PLLM 补上这段路。算法只声明数学、数据流、状态与效果；Rus
 约束只来自形状、dtype、依赖、效果、设备与容量。
 
 第一次来？先跑下面的[五分钟起步](#五分钟起步)，再到[教程](#教程从基础到场景)
-按兴趣分流。
-
-编译中段改造的当前能力、验收证据与剩余工作见
-[功能与进展收口](doc/design/implementation-status.md)。
+按兴趣分流。支持哪些模型、有哪些限制，见[支持的模型与限制](#支持的模型与限制)。
 
 ## 五分钟起步
 
@@ -41,10 +38,7 @@ with make_llm(config, workload=ESampRequestWorkload(ESampRequestConfig(rank=2)))
 
 入门路径是 `doc/tutorials/` 下的中文 notebook，读法和 PyTorch 官方教程一样：
 **边跑边改**。每篇从一个能跑的最小例子出发，逐步加概念，最后落到完整场景。
-主线六篇按顺序读，跑完 00 之后就可以按兴趣分流——做算法的继续 01–05，
-想搞清框架内部机制的直接跳系统向支线（纯 CPU 即可运行）：
-
-**算法向（GPU 环境，见[安装](#安装)）**
+六篇按顺序读，跑完 00 之后可以按兴趣挑 01–05（需要 GPU 环境，见[安装](#安装)）：
 
 | 教程 | 你会学到什么 |
 | --- | --- |
@@ -54,14 +48,6 @@ with make_llm(config, workload=ESampRequestWorkload(ESampRequestConfig(rank=2)))
 | [03 每请求 LoRA](doc/tutorials/03_request_lora.ipynb) | 参数 overlay、route 键共享 lineage、判别器混合两个头、prefill 逐块学习（波前 vs Jacobi） |
 | [04 三种循环](doc/tutorials/04_loops.ipynb) | 层间重放、逐步 hidden 再循环、跨请求会话循环（memory + Capture） |
 | [05 decode 时在线训练](doc/tutorials/05_decode_training.ipynb) | 跨步与跨请求的训练目标：当前步、下一步、上一 VIP 请求终态，全靠输入声明组合 |
-
-**系统向（内部机制，纯 CPU 可运行）**
-
-| 教程 | 你会学到什么 |
-| --- | --- |
-| [签名编译管线](doc/tutorials/internals/01_signed_compilation.ipynb) | 声明如何变成签名计划 |
-| [托管状态与页 arena](doc/tutorials/internals/02_state_arena.ipynb) | 版本、COW、pin、预算 |
-| [进程边界](doc/tutorials/internals/03_process_boundary.ipynb) | 按引用传输与签名复核 |
 
 ## 自己写负载
 
@@ -119,10 +105,6 @@ source .venv/bin/activate
 python -m pip install -e ".[vllm032,test]"   # 或 ".[vllm027,test]"
 ```
 
-当前后端面向未量化的 Qwen2 模型与 vLLM 0.32.0 或 0.27.1（其他版本启动即报错）：默认 MRv2，TP1/PP1/DP1，
-非投机执行。`SamplingParams(n=k)` 把每个 prompt 的 k 个样本作为独立请求运行，样本序号
-依次为 `sample_index, …, sample_index+k-1`，按 `(PROMPT_IDX, SAMPLE_IDX)` 键的请求状态互不共享。
-MRv1 支持共享附着路径但不支持 KV 重放。
 本仓库的本地环境是 PyTorch 2.13/CUDA 12.9 与 vLLM 0.27.1+cu129（`.venv`）、0.32.0+cu129（`.venv-vllm032`）——请选择
 相互匹配的 wheel，不要假设任意上游 CUDA 变体都兼容。仅 CPU 开发可安装
 `.[test]`。不安装任何全局 vLLM 插件。
@@ -153,6 +135,20 @@ Region 默认采用静态安排：在合法且预算足够时使用复用的双 
 `ModelConfig(cuda_graphs=True)` 是默认值：模型走 vLLM 的 CUDA graph。激活补丁、
 `@pllm.layer_route`、`runner="mrv1"` 以及读取 `InstanceState` 的模型内 overlay 不能在 CUDA graph
 下运行，`make_llm` 会报错并提示设置 `cuda_graphs=False`。
+
+## 支持的模型与限制
+
+- **模型**：未量化的 Qwen2、Llama 与 Qwen3，即 vLLM 的 `Qwen2ForCausalLM`、`LlamaForCausalLM`、
+  `Qwen3ForCausalLM` 三个类。准入按精确类判断，不接受子类：Phi3、Mistral 等相近架构可能改变投影布局、
+  注意力或 logits，尚未逐一验证。示例用 Qwen2.5 检查点只是为了方便。
+- **vLLM**：0.32.0 或 0.27.1，其他版本启动即报错。默认 MRv2，张量、流水线与数据并行都为 1，
+  不支持投机解码。MRv1 支持共享附着路径，但不支持 KV 重放。
+- **训练与重放**：因果训练（如 TLM）要求 BF16 权重；层间重放要求 FlashAttention 2，
+  其余组合限制见[Overlay 与重放](doc/guides/overlays-and-replay.md)。
+- **多样本**：`SamplingParams(n=k)` 把每个 prompt 的 k 个样本作为独立请求运行，样本序号依次为
+  `sample_index, …, sample_index+k-1`，按 `(PROMPT_IDX, SAMPLE_IDX)` 键的请求状态互不共享。
+- **数值**：重放得到的 carry、tap 归一化结果和 KV 与同形状的原生 vLLM 逐位相等。
+  不同批宽、填充或前缀命中会改变 BF16 舍入，所以不同调度之间不保证逐 token 相同，这与原生 vLLM 一致。
 
 ## 基准
 

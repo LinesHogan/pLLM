@@ -231,3 +231,6 @@ package-lock.json
 # Rust core build artifacts
 pllm/_core*.so
 rust/target/
+
+# Tutorial outputs
+doc/tutorials/*.pkl
