@@ -263,19 +263,15 @@ class StateTaskContext(Generic[DataT]):
                 (pin, next(ref for ref in pin.refs if self.arena.root(ref).resource == resource)) for pin in pins
             )
         if group.keys == (None,):
-            (instance,) = group.refs
-            entry = (instance,) * len(identities)
+            entry = group.refs.take((0,) * len(identities))
         else:
             # One index for the whole batch: decode replays resolve every request before each graph launch.
             index = dict(zip((row.identity for row in self.selection.rows), group.state_indices, strict=True))
-            entry = tuple(self.selection.refs[index[identity]] for identity in identities)
-        refs = self.current_owned_refs(StateRefs.of(entry))
-        updated = tuple(
-            ref
-            for ref, selected in zip(self.current_owned_refs(group.refs), group.refs, strict=True)
-            if ref != selected
-        )
-        borrowed = self.borrow_published(StateRefs.of(updated)) if updated else self.pin
+            entry = self.selection.refs.take(tuple(index[identity] for identity in identities))
+        refs = self.current_owned_refs(entry)
+        current = self.current_owned_refs(group.refs)
+        updated = current.take(np.flatnonzero(current.versions != group.refs.versions))
+        borrowed = self.borrow_published(updated) if updated else self.pin
         return tuple(
             (self.pin if ref == selected else borrowed, ref) for ref, selected in zip(refs, entry, strict=True)
         )

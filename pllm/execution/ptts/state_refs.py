@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from functools import cached_property
 from typing import overload
@@ -36,6 +36,9 @@ class StateRefs(Sequence[StateRef]):
 
     def __len__(self) -> int:
         return len(self.lineages)
+
+    def __iter__(self) -> Iterator[StateRef]:
+        return iter(self.refs)
 
     @overload
     def __getitem__(self, index: int) -> StateRef: ...
