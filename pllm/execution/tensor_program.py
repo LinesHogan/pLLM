@@ -110,6 +110,7 @@ class TaskOutput:
     guidance: PackedSamplerGuidanceBatch | None = None
     gradients: tuple[torch.Tensor, ...] = ()
     loss_count: int = 0
+    # Counts known on the host; `counters` carries device [applied updates, trained rows] known only on the device.
     update_count: int = 0
     trained_rows: int = 0
     changed: tuple[int, ...] = ()
@@ -496,8 +497,10 @@ class TensorOperation(Generic[D]):
             if write is not None and (self.mode == "update" or self.publish):
                 context.publish_owned_write(write)
             if output.counters is not None:
-                context.overlay_counters = (
-                    output.counters if context.overlay_counters is None else context.overlay_counters + output.counters
+                context.training_counters = (
+                    output.counters
+                    if context.training_counters is None
+                    else context.training_counters + output.counters
                 )
             if output.guidance is not None:
                 context.guidance = output.guidance

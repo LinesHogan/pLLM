@@ -135,7 +135,8 @@ class StateTaskContext(Generic[DataT]):
     loss_count: int = 0
     update_count: int = 0
     trained_rows: int = 0
-    overlay_counters: torch.Tensor | None = None
+    # Device [applied updates, trained rows] summed over the step's training tasks.
+    training_counters: torch.Tensor | None = None
     cancel_requested: bool = False
     borrowed_roots: tuple[BorrowedStateRoot, ...] = ()
     held_input: HeldInput | None = None
@@ -437,15 +438,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         self._active: dict[int, StateTaskContext[DataT]] = {}
         self._next_invocation = 1
         self._loss_count = self._update_count = self._trained_rows = self._sampler_count = 0
-        self._overlay_counters = (
-            DeviceCounters(self.device)
-            if any(
-                (task.visibility is not None and task.visibility.scope == "overlay")
-                or (task.math is not None and (task.math.parameter_gradients or task.math.reduction != "none"))
-                for task in arena.plan.semantic_graph.tasks
-            )
-            else None
-        )
+        self._training_counters = DeviceCounters(self.device)
         self.feeds = feeds
         self.post_sample = self._post_sample_overlap()
         self._pending_borrows: tuple[BorrowedStateRoot, ...] | None = None
@@ -825,9 +818,8 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             self._loss_count += context.loss_count
             self._update_count += context.update_count
             self._trained_rows += context.trained_rows
-            if context.overlay_counters is not None:
-                assert self._overlay_counters is not None
-                self._overlay_counters.add(context.overlay_counters, context.pin.stream)
+            if context.training_counters is not None:
+                self._training_counters.add(context.training_counters, context.pin.stream)
         if context.finished and self.arena.plan.semantic_graph.input_groups and context.held_input is None:
             for identity, refs in context.injected_refs.items():
                 self._successful_inputs[identity] = tuple(sorted(refs)), context.input_step_id
@@ -884,7 +876,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     def diagnostics(self) -> StateDiagnostics:
         """Exact counts for every step submitted so far; waits on the device counters' latest copy, so keep it off per-step paths."""
         self.arena.collect_completed()
-        updates, rows = (0, 0) if self._overlay_counters is None else self._overlay_counters.read(wait=True)
+        updates, rows = self._training_counters.read(wait=True)
         return StateDiagnostics(
             self.directory.active_count,
             self.directory.inference_pin_count,
