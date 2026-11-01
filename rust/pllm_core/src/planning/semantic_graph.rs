@@ -1,5 +1,5 @@
 //! Semantic graph and timeline as the Rust planner reads them, and the checks of the declaration facts
-//! a user can get wrong (conditional input groups, overlay visibility, loss reductions, route tokens).
+//! a user can get wrong (conditional input groups, overlay visibility).
 //!
 //! Python's declaration layer produces these structs; Rust decodes only the fields it reads.
 
@@ -105,7 +105,6 @@ pub(crate) struct ImplementationCandidate {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub(crate) struct TokenProgramEffect {
-    pub(crate) rows: String,
     #[serde(default)]
     pub(crate) span: bool,
 }
@@ -114,7 +113,6 @@ pub(crate) struct TokenProgramEffect {
 pub(crate) struct MathContract {
     pub(crate) input_gradients: Vec<String>,
     pub(crate) parameter_gradients: Vec<String>,
-    pub(crate) reduction: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -226,33 +224,7 @@ pub(crate) fn decode_timeline(payload: &str) -> Result<Timeline, String> {
     serde_json::from_str(payload).map_err(|source| format!("invalid Timeline: {source}"))
 }
 
-const REDUCTIONS: [&str; 7] = [
-    "none",
-    "sum",
-    "mean",
-    "state_mean",
-    "weighted_state_mean",
-    "weighted_state_mean_then_mean",
-    "custom",
-];
-
 fn validate_task(task: &SemanticTask) -> Result<(), String> {
-    if let Some(math) = &task.math {
-        if !REDUCTIONS.contains(&math.reduction.as_str()) {
-            return Err(format!(
-                "{}: set train(reduction=) to one of {}",
-                task.symbol,
-                REDUCTIONS.join(", ")
-            ));
-        }
-    }
-    if task
-        .replay
-        .as_ref()
-        .is_some_and(|replay| !matches!(replay.rows.as_str(), "prefill" | "decode" | "all"))
-    {
-        return Err(r#"set layer_route(tokens=) to "prefill", "decode" or "all""#.into());
-    }
     if task
         .visibility
         .as_ref()

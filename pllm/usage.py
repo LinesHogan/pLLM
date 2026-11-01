@@ -1226,6 +1226,8 @@ def layer_route(*, tokens: Tokens = "all", over: Over = "token") -> Callable[[F]
     packs each request's contiguous scheduled tokens into [M, H] hidden tensors;
     position and generated flags have shape [M, 1]. Spans cannot load predecessors.
     """
+    if tokens not in ("prefill", "decode", "all"):
+        raise ValueError('set layer_route(tokens=) to "prefill", "decode" or "all"')
     if over not in ("token", "span"):
         raise ValueError('set layer_route(over=) to "token" or "span"')
     return _mark(tokens=tokens, over=over)
