@@ -72,11 +72,11 @@ def main() -> None:
             patch.object(mrv1, "encode_mrv1_rows", inspect_rows),
             patch.object(SamplerGuidance, "_reweight_finite_survivors", staticmethod(inspect_reweight)),
         ):
-            batch = handle.generate(
+            batch = handle.generate_completions(
                 ["The sky is", "Explain why water freezes at", "The sea is"],
                 SamplingParams(max_tokens=4, temperature=0.8, top_k=7, top_p=0.9, ignore_eos=True, logprobs=2),
                 prompt_indices=(7, 9, 11),
-                feedback_group="mrv1",
+                group_id="mrv1",
             )
         assert widths == {1, 2} and phases == {"prefill", "decode"} and identities_seen == {7, 9, 11}
         assert row_checks > 9 and sampler_checks > 0 and affected_checks > 0

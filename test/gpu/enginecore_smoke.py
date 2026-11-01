@@ -32,10 +32,10 @@ from pllm.workloads.esamp import ESampConfig, ESampWorkload
 from pllm.workloads.fttt import (
     FTTTConfig,
     FTTTDefaultJudge,
-    FTTTFeedbackService,
+    FTTTFeedback,
+    FTTTFeedbackQueue,
+    FTTTJudge,
     FTTTJudgeResult,
-    FTTTJudgeService,
-    FTTTTrainer,
 )
 from pllm.workloads.fttt.types import FTTTResult
 from pllm.workloads.lora import OutputLoRAConfig, OutputLoRAWorkload
@@ -43,7 +43,7 @@ from pllm.workloads.prefill_adapters import PrefillAdaptersWorkload
 from pllm.workloads.recirculation import RecirculationWorkload
 from pllm.workloads.reft import ReFTConfig, ReFTWorkload
 from pllm.workloads.tlm import TLMConfig, TLMWorkload
-from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload, ttrl_rewards
+from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload, ttrl_vote
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 PROMPTS = ["The sky is", "Water freezes at"]
@@ -64,7 +64,7 @@ def assert_clean(diagnostics) -> None:
     assert diagnostics.active_states == diagnostics.inference_pins == diagnostics.pending_state_releases == 0
 
 
-class RetryOnce(FTTTJudgeService):
+class RetryOnce(FTTTJudge):
     """Prompt 7 is right at once; every other prompt is right on its first retry."""
 
     def judge(self, completion):
@@ -89,7 +89,7 @@ def _gpu_shared_input() -> None:
     )
     try:
         sampling = greedy(2)
-        baseline = handle.generate(PROMPTS, sampling, feedback_group="cpu")
+        baseline = handle.generate_completions(PROMPTS, sampling, group_id="cpu")
         assert not torch.cuda.is_initialized() and baseline.hidden.device.type == "cpu"
         width = baseline.hidden.shape[1]
         device = torch.device("cuda", 0)
@@ -101,11 +101,11 @@ def _gpu_shared_input() -> None:
             torch.full((width, 2), 0.1, device=device, dtype=torch.bfloat16),
         )
         assert not factors[0].is_contiguous() and factors[0].storage_offset() > 0
-        changed = handle.generate(
+        changed = handle.generate_completions(
             PROMPTS,
             sampling,
             batch=StateImport(factors),
-            feedback_group="gpu",
+            group_id="gpu",
             completion_device=device,
         )
         assert changed.hidden.device == device and changed.readiness is not None
@@ -271,11 +271,11 @@ def _tlm_shared_input(model_id: str = MODEL) -> None:
     handle = pllm.make_llm(workload=TLMWorkload(TLMConfig(threshold=0.0), rank=2, alpha=4), config=engine(model_id))
     try:
         tokens = torch.tensor([[1, 2, 3, 4]])
-        batch = handle.generate(
+        batch = handle.generate_completions(
             PROMPTS,
             greedy(2),
             batch=CausalTrainBatch(tokens, tokens),
-            feedback_group="tlm",
+            group_id="tlm",
         )
         diagnostics = handle.diagnostics()
         assert diagnostics.loss_count == diagnostics.update_count == 1 and diagnostics.trained_rows > 0
@@ -301,7 +301,7 @@ def _output_lora_shared_input() -> None:
     try:
         sampling = greedy(3, logprobs=1)
         baseline = handle.generate(PROMPTS, sampling)
-        captured = handle.generate(PROMPTS, sampling, feedback_group="output-lora")
+        captured = handle.generate_completions(PROMPTS, sampling, group_id="output-lora")
         batch = WeightedCEBatch(
             captured.hidden,
             torch.zeros(2, 151936),
@@ -325,14 +325,14 @@ def _output_lora_shared_input() -> None:
         handle.generate(PROMPTS, sampling)
         assert handle.diagnostics().update_count == 1
 
-        service = FTTTFeedbackService(FTTTConfig(rank=2, max_retries=3), RetryOnce())
-        processor = FTTTTrainer(service, HostConfig(torch.device("cpu"), hidden_size=captured.hidden.shape[1]))
+        service = FTTTFeedbackQueue(FTTTConfig(rank=2, max_retries=3), RetryOnce())
+        processor = FTTTFeedback(service, HostConfig(torch.device("cpu"), hidden_size=captured.hidden.shape[1]))
         rounds = list(
             handle.generate_feedback(
                 PROMPTS,
                 sampling,
-                feedback=processor.run,
-                feedback_group="retry",
+                feedback=processor,
+                group_id="retry",
                 max_rounds=3,
                 prompt_indices=(7, 9),
             )
@@ -361,7 +361,7 @@ def _independent_lora_input() -> None:
         # Default lag 1 makes the first decode update visible on the fourth draw.
         sampling = greedy(4, logprobs=1)
         baseline = handle.generate(PROMPTS, sampling)
-        completed = handle.generate(PROMPTS, sampling, feedback_group="independent-lora")
+        completed = handle.generate_completions(PROMPTS, sampling, group_id="independent-lora")
         fields = (RequestKeyField.PROMPT_INDEX, RequestKeyField.SAMPLE_INDEX)
         keys = tuple(RequestStateKey.project(RequestIdentity("", index, 0), fields) for index in (7, 9))
         batch = WeightedCEBatch(
@@ -426,15 +426,15 @@ def _fttt_activation_retry() -> None:
     )
     handle = pllm.make_llm(workload=ReFTWorkload(config), config=engine(seqs=1))
     try:
-        service = FTTTFeedbackService(FTTTConfig(rank=2, learning_rate=0.1, max_retries=3), RetryOnce())
-        processor = FTTTTrainer(service, HostConfig(torch.device("cpu"), hidden_size=896))
+        service = FTTTFeedbackQueue(FTTTConfig(rank=2, learning_rate=0.1, max_retries=3), RetryOnce())
+        processor = FTTTFeedback(service, HostConfig(torch.device("cpu"), hidden_size=896))
         rounds = list(
             handle.generate_feedback(
                 ["The sky is", "Water freezes at", "The sea is"],
                 greedy(1),
-                feedback=processor.run,
+                feedback=processor,
                 edit=FTTTResult.state_update,
-                feedback_group="edited-retry",
+                group_id="edited-retry",
                 max_rounds=3,
                 prompt_indices=(7, 9, 11),
             )
@@ -483,10 +483,10 @@ def main() -> int:
         assert all(event.kind is not TraceEventKind.TASK_FAILED for event in trace.events)
         # One shared completion batch feeds both host workloads.
         regex = StructuredOutputsParams(regex=r"\\boxed\{[12]\}")
-        batch = handle.generate(
+        batch = handle.generate_completions(
             ["Choose 1 or 2, boxed: "],
             SamplingParams(n=3, max_tokens=16, temperature=0.8, structured_outputs=regex),
-            feedback_group="vote",
+            group_id="vote",
             prompt_indices=(100,),
             sample_index=2,
         )
@@ -499,13 +499,13 @@ def main() -> int:
         assert batch.hidden.shape == (3, handle.attachment.probe.hidden_size)
         assert torch.isfinite(batch.hidden).all() and torch.count_nonzero(batch.hidden) > 0
         facts = HostConfig(torch.device("cpu"), hidden_size=batch.hidden.shape[1])
-        feedback = FTTTFeedbackService(FTTTConfig(), FTTTDefaultJudge())
-        edited = FTTTTrainer(feedback, facts).run(batch)
+        feedback = FTTTFeedbackQueue(FTTTConfig(), FTTTDefaultJudge())
+        edited = FTTTFeedback(feedback, facts)(batch)
         assert edited is not None and edited.update_count == 1
         ttrl = TTRLConfig(rank=2, votes_per_prompt=3, samples_per_prompt=2)
         reward = make_host(facts, TTRLWorkload(ttrl))
         reward.admit(())
-        trained = reward.step(ttrl_rewards(batch, ttrl).step)
+        trained = reward.step(ttrl_vote(batch, ttrl).step)
         assert trained.loss is not None and reward.diagnostics().update_count == 1
         reward.retire(())
         assert not torch.cuda.is_initialized()
@@ -518,7 +518,7 @@ def main() -> int:
         config=engine(memory=0.35),
     )
     try:
-        baseline = reft.generate(PROMPTS, greedy(2), feedback_group="before")
+        baseline = reft.generate_completions(PROMPTS, greedy(2), group_id="before")
         width = baseline.hidden.shape[1]
         parameters = StateImport(
             (
@@ -527,7 +527,7 @@ def main() -> int:
                 torch.full((width, 2), 0.1, dtype=torch.bfloat16),
             )
         )
-        changed = reft.generate(PROMPTS, greedy(2), batch=parameters, feedback_group="after")
+        changed = reft.generate_completions(PROMPTS, greedy(2), batch=parameters, group_id="after")
         assert not torch.equal(baseline.hidden, changed.hidden)
         diagnostics = reft.diagnostics()
         assert diagnostics.update_count == 1

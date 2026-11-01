@@ -1,4 +1,4 @@
-"""Canonical GTTA typed host-service workload."""
+"""GTTA: a host-side dynamics memory, queried and updated between generate calls."""
 
 from pllm.workloads.gtta.types import (
     DynamicsEvent,

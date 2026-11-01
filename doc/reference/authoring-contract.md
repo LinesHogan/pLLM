@@ -33,7 +33,7 @@
 [OverRIDE](../../pllm/workloads/override.py)、[In-Place-TTT](../../pllm/workloads/inplace_ttt.py)
 和 [ReFT](../../pllm/workloads/reft.py) 使用这个接口；[Recirculation](../../pllm/workloads/recirculation.py)
 使用普通的 `Recurrence` 声明；[TTRL](../../pllm/workloads/ttrl.py) 使用普通 `Workload`
-的宿主路径（奖励投票是宿主函数 `ttrl_rewards`），FTTT 的编辑也是（`FTTTTrainer.run` 作反馈回调）；
+的宿主路径（奖励投票是宿主函数 `ttrl_vote`），FTTT 的编辑也是（`FTTTFeedback.run` 作反馈回调）；
 GTTA 是普通宿主类，其 `run` 作反馈回调；
 [TLM](../../pllm/workloads/tlm/workload.py) 使用普通 `Workload` 的因果批输入与模型端口；
 [ESamp](../../pllm/workloads/esamp.py) 使用普通具名参数、预测与 loss，
@@ -431,7 +431,7 @@ Hidden 需求从声明推导。形状/dtype 回调只在模型事实可用后运
 `update_barriers`、`update_count`）传给 `generate_feedback(feedback=...)`。需要框架管理的
 张量状态写成普通 `pllm.Workload`，用 `pllm.host.make_host(HostConfig(...), workload)` 编译，
 回调里 `step`。[FTTT](../../pllm/workloads/fttt/workload.py) 的低秩编辑就是这样的
-`FTTTWorkload`（AdamW 写在状态上）；`FTTTTrainer(service, HostConfig(...))` 用 `make_host` 编译并准入它
+`FTTTWorkload`（AdamW 写在状态上）；`FTTTFeedback(service, HostConfig(...))` 用 `make_host` 编译并准入它
 （`trainer.edit` 是普通执行句柄，可取 `diagnostics()`），`run(batch)` 评判、入队，
 在失败行上 `step` 一次，再用 `StepResult.parameters` 里更新后的编辑算出重试要加的
 增量（`step()` 只处理已排队的反馈）；失败的一步不发布编辑并清空队列。
@@ -448,7 +448,7 @@ Hidden 需求从声明推导。形状/dtype 回调只在模型事实可用后运
 没有请求状态、没有跨调用反向、没有自动捕获。
 
 奖励投票是宿主字符串逻辑，不是张量数学，所以是一个普通函数：
-`ttrl_rewards(completion_input, config)` 返回 `TTRLRewards`（`reward_outcomes`、
+`ttrl_vote(completion_input, config)` 返回 `TTRLResult`（`reward_outcomes`、
 `retry_controls`、`update_barriers`，以及训练步 `step`）。调用方先算它，再
 `execution.step(rewards.step, stream)`；CUDA 上在传给 `step` 的同一条流里调用它。
 `generate_feedback` 的 `feedback` 回调可以先 `step` 再返回 `rewards`，它带
@@ -457,7 +457,7 @@ Hidden 需求从声明推导。形状/dtype 回调只在模型事实可用后运
 训练步携带 `WeightedRowBatch(hidden, targets, weights)`（`pllm.host`）：`hidden` 是
 `[行数, hidden_size]`，`weights` 是同 dtype 的 `[行数]`，权重为 0 的行不参与；`targets` 是
 `[行数, *HostConfig.target_shape]`——默认 `target_shape=()` 即每行一个值（TTRL），FTTT 每行
-一个向量（反馈特征加奖励，`FTTTTrainer` 自己设置 `target_shape`）。
+一个向量（反馈特征加奖励，`FTTTFeedback` 自己设置 `target_shape`）。
 训练方法用 `@pllm.train(state=...)`，通过 `pllm.batch("hidden")`、`pllm.batch("targets")`、
 `pllm.batch("weights")` 与 `pllm.parameter(state, field)` 取输入，返回
 `pllm.UpdateOutput(loss, changed, update_count, trained_rows)`、标量 loss（每行都训练），或返回 `None` 跳过整个
@@ -468,7 +468,7 @@ Hidden 需求从声明推导。形状/dtype 回调只在模型事实可用后运
 参数是带 `pllm.AdamW` 的普通 `InstanceState`；具名形状只是同一个打包 AdamW 组的视图
 （AdamW 逐元素，所以与独立参数逐位一致）。标量配置在绑定时快照（包括类属性），
 之后的 monkey patch 只影响新绑定的执行。TTRL 是维护中的范例：多数投票、
-平局规则、采样限制与重试/栅栏构造是 `ttrl_rewards` 的数学，原始 completion 对象保留。
+平局规则、采样限制与重试/栅栏构造是 `ttrl_vote` 的数学，原始 completion 对象保留。
 
 有界宿主执行使用 `HostConfig(max_input_rows=..., memory_budget_bytes=...)`。框架用
 最大形状的 `WeightedRowBatch`（含 `target_shape`）执行实际 loss/update 路径来推导资源，不要求负载申报字节；
@@ -681,7 +681,7 @@ vLLM 继续按真实容量预留 hidden 快照、采样反馈和效果/replay �
 | Recirculation | 无状态逐 token replay；有序 prefill、原始 KV/RNG 与正常输出 |
 | FTTT | 宿主 judge 与有界队列、向量目标 `WeightedRowBatch`、AdamW 编辑、用 `parameters` 做 update-before-predict 与重试输出 |
 | GTTA | 无张量字段的宿主状态；FIFO 轨迹、update-before-query、abort/requeue 与 commit |
-| TTRL | 宿主 `ttrl_rewards` 投票、`WeightedRowBatch` 加权梯度、空选择不变发布与重试/栅栏结果 |
+| TTRL | 宿主 `ttrl_vote` 投票、`WeightedRowBatch` 加权梯度、空选择不变发布与重试/栅栏结果 |
 
 `Builder.input` 命名既有带类型服务端口；无字段的 `state` 描述不分配张量 arena
 的宿主状态。宿主图由 `make_host`（`Workload.compile_host`）规划并绑定。Adapter/激活绑定与两种原始 replay 效果保持彼此独立。

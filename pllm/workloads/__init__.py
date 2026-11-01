@@ -25,8 +25,8 @@ from pllm.workloads.step_loop import StepLoopWorkload as StepLoopWorkload
 from pllm.workloads.tlm import TLMConfig as TLMConfig, TLMWorkload as TLMWorkload
 from pllm.workloads.ttrl import (
     TTRLConfig as TTRLConfig,
-    TTRLRewards as TTRLRewards,
+    TTRLFeedback as TTRLFeedback,
+    TTRLResult as TTRLResult,
     TTRLWorkload as TTRLWorkload,
-    ttrl_feedback as ttrl_feedback,
-    ttrl_rewards as ttrl_rewards,
+    ttrl_vote as ttrl_vote,
 )

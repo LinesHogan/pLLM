@@ -16,7 +16,7 @@ from pllm.host import (
     RewardOutcome,
     UpdateBarrier,
 )
-from pllm.workloads.fttt.judge import FTTTJudgeService
+from pllm.workloads.fttt.judge import FTTTJudge
 from pllm.workloads.fttt.types import (
     FTTTClosedLoopIntent,
     FTTTConfig,
@@ -35,7 +35,7 @@ class _LifecycleDecision:
     reason: ControlReason
 
 
-class FTTTFeedbackService:
+class FTTTFeedbackQueue:
     """Own judge I/O, bounded queue, and lifecycle settlement only."""
 
     __slots__ = (
@@ -50,7 +50,7 @@ class FTTTFeedbackService:
         "_queued_feedback",
     )
 
-    def __init__(self, config: FTTTConfig, judge: FTTTJudgeService) -> None:
+    def __init__(self, config: FTTTConfig, judge: FTTTJudge) -> None:
         self._config = config
         self._judge = judge
         self._lifecycles: dict[tuple[str, int], FTTTRequestLifecycle] = {}
@@ -276,5 +276,5 @@ class FTTTFeedbackService:
 
 
 __all__ = [
-    "FTTTFeedbackService",
+    "FTTTFeedbackQueue",
 ]

@@ -20,7 +20,7 @@ from pllm.workloads.dummy import DummyConfig, DummyWorkload
 from pllm.workloads.esamp import ESampConfig, ESampWorkload
 from pllm.workloads.prefill_adapters import PrefillAdaptersWorkload
 from pllm.workloads.tlm import TLMConfig, TLMWorkload
-from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload, ttrl_rewards
+from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload, ttrl_vote
 from pllm.workloads.video import VideoWorkload
 
 pytestmark = pytest.mark.skipif(torch.cuda.device_count() < 2 or compat.VLLM_027, reason="needs two GPUs and vLLM 0.32")
@@ -172,7 +172,7 @@ def test_j1_ttrl(monkeypatch):
     with pllm.make_llm(settings, workload=TTRLWorkload(TTRLConfig(rank=4))) as handle:
 
         def feedback(completed):
-            reward = ttrl_rewards(completed, TTRLConfig(rank=4))
+            reward = ttrl_vote(completed, TTRLConfig(rank=4))
             # Known targets ensure the transport/training check does not depend on boxed-answer quality.
             batch = WeightedRowBatch(completed.hidden, torch.ones(8), torch.ones(8))
             handle.generate(PROMPTS, SamplingParams(max_tokens=2, temperature=0), batch=batch)
@@ -189,7 +189,7 @@ def test_j1_ttrl(monkeypatch):
                 PROMPTS,
                 SamplingParams(max_tokens=4, temperature=0),
                 feedback=feedback,
-                feedback_group="tp",
+                group_id="tp",
                 max_rounds=2,
             )
         )

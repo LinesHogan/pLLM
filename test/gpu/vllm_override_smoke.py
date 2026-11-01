@@ -22,9 +22,9 @@ from pllm.backends.vllm.sampler import GuidedSampler
 from pllm.config import ModelConfig
 from pllm.execution.state_execution import StateExecution
 from pllm.host import HostConfig, make_host
-from pllm.workloads.fttt import FTTTConfig, FTTTDefaultJudge, FTTTFeedbackService, FTTTTrainer
+from pllm.workloads.fttt import FTTTConfig, FTTTDefaultJudge, FTTTFeedback, FTTTFeedbackQueue
 from pllm.workloads.override import OverRIDEConfig, OverRIDEWorkload
-from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload, ttrl_rewards
+from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload, ttrl_vote
 
 
 def main() -> None:
@@ -137,13 +137,13 @@ def main() -> None:
             return native_sample(runner, hidden_states, input_batch, grammar)
 
         with patch.object(WorkloadModelRunner, "sample", inspect_completion):
-            batch = handle.generate(
+            batch = handle.generate_completions(
                 ["Choose 1 or 2, boxed: "] * 3,
                 SamplingParams(
                     max_tokens=16, temperature=0.8, structured_outputs=StructuredOutputsParams(regex=r"\\boxed\{[12]\}")
                 ),
                 sample_index=2,
-                feedback_group="vote",
+                group_id="vote",
                 prompt_indices=(100, 100, 100),
             )
         stream = torch.cuda.current_stream(execution.device)
@@ -153,12 +153,12 @@ def main() -> None:
             assert completion.identity.prompt_index == 100
             torch.testing.assert_close(row, expected_hidden[completion.identity.request_id], rtol=0, atol=0)
         facts = HostConfig(execution.device, hidden_size=batch.hidden.shape[1])
-        edited = FTTTTrainer(FTTTFeedbackService(FTTTConfig(), FTTTDefaultJudge()), facts).run(batch)
+        edited = FTTTFeedback(FTTTFeedbackQueue(FTTTConfig(), FTTTDefaultJudge()), facts)(batch)
         assert edited is not None and edited.update_count == 1
         ttrl = TTRLConfig(rank=2, votes_per_prompt=3, samples_per_prompt=2)
         reward = make_host(replace(facts, max_input_rows=3, memory_budget_bytes=1 << 20), TTRLWorkload(ttrl))
         reward.admit((), stream)
-        trained = reward.step(ttrl_rewards(batch, ttrl).step, stream)
+        trained = reward.step(ttrl_vote(batch, ttrl).step, stream)
         assert trained.loss is not None and reward.diagnostics().update_count == 1
         reward.retire(())
         print(f"OverRIDE: updates={diagnostics.update_count} sampler_checks={len(observed)}; FTTT/TTRL updates=1/1")

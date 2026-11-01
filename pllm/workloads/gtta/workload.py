@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pllm.workloads.gtta.environment import GTTAEnvironmentService
+from pllm.workloads.gtta.environment import GTTAEnvironment
 from pllm.workloads.gtta.state import GTTADynamicsState
 from pllm.workloads.gtta.types import GTTAConfig, GTTAHostRequest, GTTAResult
 
@@ -10,8 +10,8 @@ from pllm.workloads.gtta.types import GTTAConfig, GTTAHostRequest, GTTAResult
 class GTTAWorkload:
     """One environment queue and the dynamics memory its events update."""
 
-    def __init__(self, environment: GTTAEnvironmentService | None = None) -> None:
-        self.environment = environment if environment is not None else GTTAEnvironmentService(GTTAConfig())
+    def __init__(self, environment: GTTAEnvironment | None = None) -> None:
+        self.environment = environment if environment is not None else GTTAEnvironment(GTTAConfig())
         self.dynamics = GTTADynamicsState()
         self._runs = 0
 

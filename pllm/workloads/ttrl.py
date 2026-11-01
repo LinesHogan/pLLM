@@ -2,7 +2,7 @@
 
 import re
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from math import isfinite
 
@@ -65,7 +65,7 @@ class TTRLConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class TTRLRewards:
+class TTRLResult:
     """Host feedback for one completion batch, and the training step that learns from it."""
 
     reward_outcomes: tuple[RewardOutcome, ...]
@@ -79,7 +79,7 @@ class TTRLRewards:
         return int(any(barrier.ready_count for barrier in self.update_barriers))
 
 
-def ttrl_rewards(value: CompletionInput, config: TTRLConfig) -> TTRLRewards:
+def ttrl_vote(value: CompletionInput, config: TTRLConfig) -> TTRLResult:
     """Vote each prompt's boxed answers; rows matching the majority train the head toward reward 1."""
     entries = value.completions.entries
     groups: dict[int, list[int]] = {}
@@ -147,27 +147,27 @@ def ttrl_rewards(value: CompletionInput, config: TTRLConfig) -> TTRLRewards:
         hidden.new_tensor([float(index in chosen) for index in range(len(entries))]),
     )
     step = StepInput.of_batch(batch, value.readiness)
-    return TTRLRewards(tuple(rewards), tuple(controls), tuple(barriers), step)
+    return TTRLResult(tuple(rewards), tuple(controls), tuple(barriers), step)
 
 
-def ttrl_feedback(
-    execution: StateExecution[StepInput, TensorFrame, TensorOutput],
-    config: TTRLConfig,
-    stream: torch.cuda.Stream | None = None,
-) -> Callable[[CompletionInput], TTRLRewards]:
-    """A `generate_feedback` callback: vote, step the reward head on the votes, return the rewards."""
+@dataclass(frozen=True)
+class TTRLFeedback:
+    """The `generate_feedback` callable: vote, step the reward head (`execution`, a TTRLWorkload compiled with
+    pllm.host.make_host) on the votes, and return the result."""
 
-    def feedback(value: CompletionInput) -> TTRLRewards:
-        rewards = ttrl_rewards(value, config)
-        execution.step(rewards.step, stream)
-        return rewards
+    execution: StateExecution[StepInput, TensorFrame, TensorOutput]
+    config: TTRLConfig
+    stream: torch.cuda.Stream | None = None
 
-    return feedback
+    def __call__(self, value: CompletionInput) -> TTRLResult:
+        result = ttrl_vote(value, self.config)
+        self.execution.step(result.step, self.stream)
+        return result
 
 
 @dataclass(frozen=True)
 class TTRLWorkload(pllm.Workload):
-    """A rank-r reward head, fit by AdamW to the 0/1 majority rewards of `ttrl_rewards` steps."""
+    """A rank-r reward head, fit by AdamW to the 0/1 majority rewards of `ttrl_vote` steps."""
 
     config: TTRLConfig = TTRLConfig()
 

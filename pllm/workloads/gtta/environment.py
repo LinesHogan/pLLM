@@ -13,7 +13,7 @@ from pllm.workloads.gtta.types import (
 )
 
 
-class GTTAEnvironmentService:
+class GTTAEnvironment:
     """One bounded event queue; events past max_queue_size are dropped and counted."""
 
     __slots__ = ("_config", "_dropped_trajectories", "_queue")
@@ -62,4 +62,4 @@ class GTTAEnvironmentService:
         self._queue.extendleft(reversed(trajectories.entries))
 
 
-__all__ = ["GTTAEnvironmentService"]
+__all__ = ["GTTAEnvironment"]

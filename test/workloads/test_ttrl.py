@@ -24,7 +24,7 @@ from pllm.host import (
     RetryAction,
     make_host,
 )
-from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload, boxed_label, ttrl_rewards
+from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload, boxed_label, ttrl_vote
 
 
 def fail_output(self, context):
@@ -69,7 +69,7 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         batch = CompletionInput.capture(completions, source, producer)
         source.zero_()
         assert batch.completions is completions and torch.count_nonzero(batch.hidden) > 0
-        rewards = ttrl_rewards(batch, config)
+        rewards = ttrl_vote(batch, config)
         if stream is not None:
             stream.synchronize()
         down = torch.nn.Parameter(original[0][:8].reshape(2, 4).clone())
@@ -153,7 +153,7 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         missing = replace(
             batch, completions=CompletionBatch(tuple(replace(c, text="missing") for c in completions.entries))
         )
-        blocked = ttrl_rewards(missing, config)
+        blocked = ttrl_vote(missing, config)
         assert all(item.reward is None for item in blocked.reward_outcomes)
         assert all(item.state is BarrierState.BLOCKED and item.ready_count == 0 for item in blocked.update_barriers)
         # Nothing selected: the step publishes the same values and leaves every optimizer field untouched.
@@ -163,14 +163,14 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         for value, reference in zip(execution.snapshot(published, stream), before, strict=True):
             torch.testing.assert_close(value, reference, rtol=0, atol=0)
         with pytest.raises(ValueError):  # an incomplete vote group
-            ttrl_rewards(
+            ttrl_vote(
                 replace(batch, completions=CompletionBatch((completions.entries[0],)), hidden=batch.hidden[:1]), config
             )
         execution.retire((), wait=True)
         diagnostics = execution.diagnostics()
         assert diagnostics.active_states == diagnostics.pending_state_releases == 0
 
-    disabled = ttrl_rewards(CompletionInput.capture(completions, torch.zeros(6, 4)), replace(config, enabled=False))
+    disabled = ttrl_vote(CompletionInput.capture(completions, torch.zeros(6, 4)), replace(config, enabled=False))
     assert all(item.state is BarrierState.BLOCKED for item in disabled.update_barriers)
 
     facts = HostConfig(torch.device("cpu"), hidden_size=4, seed=11)

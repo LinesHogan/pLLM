@@ -1,6 +1,6 @@
 """FTTT's judged feedback as numbers: each failed completion's hashed feedback features and its reward.
 
-FTTTTrainer turns queued feedback records into these rows; they are the targets of the edit's training batch.
+FTTTFeedback turns queued feedback records into these rows; they are the targets of the edit's training batch.
 """
 
 from __future__ import annotations

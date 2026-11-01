@@ -1,8 +1,8 @@
 """FTTT on the host: judge each completion, train a low-rank edit on the failed ones, and return the edit a retry
 applies.
 
-FTTTWorkload is the edit as an ordinary pllm.Workload state trained by AdamW. FTTTTrainer compiles it with
-pllm.host.make_host and steps it: pass `FTTTTrainer.run` as generate_feedback's `feedback=` and
+FTTTWorkload is the edit as an ordinary pllm.Workload state trained by AdamW. FTTTFeedback compiles it with
+pllm.host.make_host and steps it: pass `FTTTFeedback.run` as generate_feedback's `feedback=` and
 `FTTTResult.state_update` as its `edit=`.
 """
 
@@ -20,7 +20,7 @@ from pllm.execution.cuda_stream import upload
 from pllm.execution.step_input import StepInput
 from pllm.execution.tensor_binding import StepResult
 from pllm.host import CompletionInput, HostConfig, WeightedRowBatch, make_host
-from pllm.workloads.fttt.host_service import FTTTFeedbackService
+from pllm.workloads.fttt.feedback_queue import FTTTFeedbackQueue
 from pllm.workloads.fttt.math import feedback_rows
 from pllm.workloads.fttt.types import FTTTConfig, FTTTQueuedFeedback, FTTTResult
 
@@ -76,33 +76,32 @@ def current_stream(device: torch.device) -> torch.cuda.Stream | None:
     return torch.cuda.current_stream(device) if device.type == "cuda" else None
 
 
-class FTTTTrainer:
-    """One feedback service and the edit it trains, compiled and admitted on `host` (whose target_shape FTTT sets to
-    its feedback width); steps run on the caller's current CUDA stream. `edit` is the ordinary execution handle."""
+class FTTTFeedback:
+    """The `generate_feedback` callable: a queue of judged feedback and the edit it trains, compiled and admitted
+    on `host` (whose target_shape FTTT sets to its feedback width); steps run on the caller's current CUDA stream.
+    `edit` is the ordinary execution handle."""
 
-    def __init__(self, feedback: FTTTFeedbackService, host: HostConfig) -> None:
-        self.feedback = feedback
-        self.edit = make_host(
-            replace(host, target_shape=(feedback.config.feedback_width,)), FTTTWorkload(feedback.config)
-        )
+    def __init__(self, queue: FTTTFeedbackQueue, host: HostConfig) -> None:
+        self.queue = queue
+        self.edit = make_host(replace(host, target_shape=(queue.config.feedback_width,)), FTTTWorkload(queue.config))
         self.edit.admit((), current_stream(host.device))
 
-    def run(self, batch: CompletionInput) -> FTTTResult | None:
+    def __call__(self, batch: CompletionInput) -> FTTTResult | None:
         """Judge `batch`, queue its feedback, and run one edit step on the oldest queued feedback."""
-        self.feedback.enqueue(batch)
+        self.queue.enqueue(batch)
         return self.step()
 
     def step(self) -> FTTTResult | None:
         """One edit step on the oldest queued feedback, None when nothing is queued. A failed step publishes no
         edit and drops the queue."""
-        queued = self.feedback.begin()
+        queued = self.queue.begin()
         if queued is None:
             return None
         try:
             result = self._train(queued) if queued.selected_rows else self._unchanged(queued)
-            self.feedback.commit(queued, result.intent)
+            self.queue.commit(queued, result.intent)
         except BaseException:
-            self.feedback.abort(queued)
+            self.queue.abort(queued)
             raise
         return result
 
@@ -117,7 +116,7 @@ class FTTTTrainer:
             rows = hidden.index_select(0, upload(queued.selected_rows, device))
             records = queued.intent.feedback_records
             feedback = upload(
-                feedback_rows(records, feature_size=self.feedback.config.feedback_feature_size), device, torch.float32
+                feedback_rows(records, feature_size=self.queue.config.feedback_feature_size), device, torch.float32
             )
             weights = torch.ones(len(records), device=device)
             result = self.edit.step(StepInput.of_batch(WeightedRowBatch(rows, feedback, weights)), stream)
@@ -137,4 +136,4 @@ class FTTTTrainer:
         )
 
 
-__all__ = ["FTTTTrainer", "FTTTWorkload", "edit_rows", "edit_targets"]
+__all__ = ["FTTTFeedback", "FTTTWorkload", "edit_rows", "edit_targets"]

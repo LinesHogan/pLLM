@@ -37,8 +37,8 @@
 
 全部十一个内置负载使用构造同一张原始图的共享绑定。普通模型方法用
 `pllm.Workload`，TLM 也通过这个接口声明因果批输入与模型端口；TTRL 也用
-`pllm.Workload`（宿主路径，`pllm.host.make_host` 编译，奖励由 `ttrl_rewards` 先算好）；
-FTTT 的编辑同样是宿主路径的 `pllm.Workload`，由 `FTTTTrainer.run` 这个反馈回调 `step`；GTTA 是普通宿主类，其 `run` 作为 `generate_feedback` 的反馈回调，不经框架执行。Output LoRA 用普通加权批量 SGD。旧的 `authoring.Workload` 和
+`pllm.Workload`（宿主路径，`pllm.host.make_host` 编译，奖励由 `ttrl_vote` 先算好）；
+FTTT 的编辑同样是宿主路径的 `pllm.Workload`，由 `FTTTFeedback.run` 这个反馈回调 `step`；GTTA 是普通宿主类，其 `run` 作为 `generate_feedback` 的反馈回调，不经框架执行。Output LoRA 用普通加权批量 SGD。旧的 `authoring.Workload` 和
 按负载的采样器 `build` 方法已移除。ESamp 用普通具名参数、预测与按状态 loss；
 其显式分页/捕获绑定在同一签名图上替换计算，原始 loss/Adam 对与五字段状态
 不变。LoRA 用原始加权批次、裸具名因子、reset 与多步 SGD；`SamplerWorkload`

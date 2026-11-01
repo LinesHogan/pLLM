@@ -13,7 +13,7 @@ from pllm.workloads.gtta import (
     GTTAWorkload,
     TrajectoryFeedback,
 )
-from pllm.workloads.gtta.environment import GTTAEnvironmentService
+from pllm.workloads.gtta.environment import GTTAEnvironment
 from pllm.workloads.gtta.state import GTTADynamicsState
 
 FEEDBACK = (
@@ -40,7 +40,7 @@ def interrupted_query(self, query):
 
 
 def test_gtta_scores_actions_settles_fifo_and_rolls_back_aborts(monkeypatch: pytest.MonkeyPatch) -> None:
-    service = GTTAEnvironmentService(GTTAConfig(max_queue_size=3, score_momentum=0.25))
+    service = GTTAEnvironment(GTTAConfig(max_queue_size=3, score_momentum=0.25))
     workload = GTTAWorkload(service)
     assert all(service.enqueue_feedback(event) for event in FEEDBACK)
     assert not service.enqueue_feedback(FEEDBACK[0])

@@ -156,7 +156,7 @@ def test_failed_shutdown_retains_the_shared_input_fd_until_close_retries() -> No
     handle = runtime.VllmLlm(engine, None, overlay, facts, CachePolicy.for_attachment(overlay, "isolate"), None, "")
     del engine
     with pytest.raises(RuntimeError):
-        handle.generate(["test"], SamplingParams(max_tokens=1), feedback_group="ownership")
+        handle.generate_completions(["test"], SamplingParams(max_tokens=1), group_id="ownership")
     shared = staged[0].completion.storage
     assert isinstance(shared, CpuFileStorage)
     assert owned() is not None

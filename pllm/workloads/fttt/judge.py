@@ -10,15 +10,15 @@ from pllm.workloads.fttt.types import (
 )
 
 
-class FTTTJudgeService(ABC):
-    """Cold host-service implementation selected outside the task graph."""
+class FTTTJudge(ABC):
+    """Judges one completion; implementations run on the host, outside the task graph."""
 
     @abstractmethod
     def judge(self, completion: Completion) -> FTTTJudgeResult:
         raise NotImplementedError
 
 
-class FTTTDefaultJudge(FTTTJudgeService):
+class FTTTDefaultJudge(FTTTJudge):
     def judge(self, completion: Completion) -> FTTTJudgeResult:
         text = completion.text.strip().lower()
         negative = ("incorrect", "wrong", "failed", "failure", "error")
@@ -49,4 +49,4 @@ class FTTTDefaultJudge(FTTTJudgeService):
         )
 
 
-__all__ = ["FTTTDefaultJudge", "FTTTJudgeService"]
+__all__ = ["FTTTDefaultJudge", "FTTTJudge"]

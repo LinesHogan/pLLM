@@ -14,10 +14,10 @@ import torch
 
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.host import Completion, CompletionBatch, CompletionInput, FinishReason, HostConfig, RetryAction, make_host
-from pllm.workloads.fttt import FTTTConfig, FTTTFeedbackService, FTTTJudgeResult, FTTTJudgeService, FTTTTrainer
+from pllm.workloads.fttt import FTTTConfig, FTTTFeedback, FTTTFeedbackQueue, FTTTJudge, FTTTJudgeResult
 
 
-class ArithmeticJudge(FTTTJudgeService):
+class ArithmeticJudge(FTTTJudge):
     def judge(self, completion: Completion) -> FTTTJudgeResult:
         correct = completion.text == "4"
         return FTTTJudgeResult(
@@ -29,16 +29,16 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry() -> None:
     with pytest.raises(ValueError):
         FTTTConfig(edit_scale=float("nan"))
     config = FTTTConfig(rank=2, learning_rate=0.05, feedback_feature_size=3, max_retries=2)
-    service = FTTTFeedbackService(config, ArithmeticJudge())
+    service = FTTTFeedbackQueue(config, ArithmeticJudge())
     host = HostConfig(torch.device("cpu"), hidden_size=4, seed=7, max_input_rows=1, memory_budget_bytes=1 << 20)
-    workload = FTTTTrainer(service, host)
+    workload = FTTTFeedback(service, host)
     identity = RequestIdentity("arithmetic", 0, 0)
     hidden = torch.tensor([[-1.0, -0.25, 0.5, 1.0]])
     wrong = Completion(identity, 0, "round", (1, 2), "3", FinishReason.STOP)
     # A failed step (two failed rows exceed max_input_rows=1) publishes no edit and drops the queue.
     extra = replace(wrong, identity=RequestIdentity("excess", 1, 0))
     with pytest.raises(ValueError):
-        workload.run(CompletionInput.capture(CompletionBatch((wrong, extra)), hidden.expand(2, -1)))
+        workload(CompletionInput.capture(CompletionBatch((wrong, extra)), hidden.expand(2, -1)))
     assert workload.edit.diagnostics().update_count == 0 and service.queued_feedback == 0
 
     # Spell out the feature projection and use PyTorch Adam, not production helpers.
@@ -65,7 +65,7 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry() -> None:
         loss.backward()
         optimizer.step()
         retry_batch = CompletionBatch((replace(wrong, identity=RequestIdentity(f"attempt-{version}", 0, version)),))
-        result = workload.run(CompletionInput.capture(retry_batch, hidden))
+        result = workload(CompletionInput.capture(retry_batch, hidden))
         assert result.update_count == 1
         torch.testing.assert_close(result.losses[0], loss.detach())
         torch.testing.assert_close(result.edit_delta, (inputs @ down.T @ up.T).detach())
@@ -87,7 +87,7 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
     from vllm import SamplingParams
 
     from pllm.backends.vllm.runtime import VllmLlm
-    from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload, ttrl_feedback
+    from pllm.workloads.ttrl import TTRLConfig, TTRLFeedback, TTRLWorkload
 
     class Generation:
         """Scripted generation: prompt 7 answers correctly; with votes, two of three agree."""
@@ -100,13 +100,13 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
             self.calls = []
             self.votes = votes
 
-        def generate(
+        def generate_completions(
             self,
             prompts,
             sampling_params,
             *,
             use_tqdm,
-            feedback_group,
+            group_id,
             prompt_indices,
             sample_index,
             batch=None,
@@ -119,7 +119,7 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
                 Completion(
                     RequestIdentity(f"request-{sample_index}-{row}", index, sample_index),
                     0,
-                    feedback_group,
+                    group_id,
                     (1,),
                     (r"\boxed{1}" if row < 2 else r"\boxed{2}") if self.votes else "4" if index == 7 else "3",
                     FinishReason.STOP,
@@ -128,15 +128,15 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
             )
             return CompletionInput.capture(CompletionBatch(entries), torch.ones(len(entries), 4))
 
-    service = FTTTFeedbackService(FTTTConfig(rank=2, max_retries=2), ArithmeticJudge())
-    processor = FTTTTrainer(service, HostConfig(torch.device("cpu"), hidden_size=4))
+    service = FTTTFeedbackQueue(FTTTConfig(rank=2, max_retries=2), ArithmeticJudge())
+    processor = FTTTFeedback(service, HostConfig(torch.device("cpu"), hidden_size=4))
     generator = Generation()
     rounds = list(
         generator.generate_feedback(
             ["accepted", "retry"],
             SamplingParams(max_tokens=1),
-            feedback=processor.run,
-            feedback_group="retry",
+            feedback=processor,
+            group_id="retry",
             max_rounds=5,
             prompt_indices=(7, 9),
         )
@@ -150,7 +150,7 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
 
     # Retries that wait for an update stop when nothing was published.
     def no_published_update(batch):
-        result = processor.run(batch)
+        result = processor(batch)
         return replace(result, update_count=0)
 
     blocked = Generation()
@@ -161,7 +161,7 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
                     ["retry"],
                     SamplingParams(max_tokens=1),
                     feedback=no_published_update,
-                    feedback_group="blocked",
+                    group_id="blocked",
                     max_rounds=5,
                     prompt_indices=(9,),
                 )
@@ -175,7 +175,7 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
         ["retry"],
         SamplingParams(max_tokens=1),
         feedback=lambda batch: None,
-        feedback_group="idle",
+        group_id="idle",
         max_rounds=5,
         prompt_indices=(9,),
     )
@@ -191,8 +191,8 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
         votes.generate_feedback(
             ["vote"] * 3,
             SamplingParams(max_tokens=1),
-            feedback=ttrl_feedback(reward, ttrl),
-            feedback_group="votes",
+            feedback=TTRLFeedback(reward, ttrl),
+            group_id="votes",
             max_rounds=2,
             prompt_indices=(11, 11, 11),
         )

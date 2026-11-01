@@ -14,7 +14,7 @@ from enum import StrEnum
 from functools import partial
 from hashlib import sha256
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Generic, TypeVar, overload
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 import torch
 from vllm import RequestOutput, SamplingParams
@@ -167,6 +167,18 @@ class BackendStage:
 FeedbackT = TypeVar("FeedbackT", bound=CompletionFeedback)
 
 
+@dataclass(frozen=True, slots=True)
+class _Generation:
+    """What one generate call produced: vLLM's outputs, each sample's identity (by vLLM's external request id) and
+    the final hidden rows when completions were requested."""
+
+    outputs: list[RequestOutput]
+    identities: tuple[RequestIdentity, ...]
+    external: dict[str, RequestIdentity]
+    destination: torch.Tensor | None
+    n: int
+
+
 @dataclass(slots=True)
 class VllmLlm(Generic[DataT, ResultT]):
     """Single public handle for signed vLLM workload workloads."""
@@ -286,7 +298,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         sampling_params: SamplingParams,
         *,
         feedback: Callable[[CompletionInput], FeedbackT | None],
-        feedback_group: str,
+        group_id: str,
         max_rounds: int,
         prompt_indices: tuple[int, ...] | None = None,
         use_tqdm: bool = False,
@@ -294,13 +306,14 @@ class VllmLlm(Generic[DataT, ResultT]):
         edit: Callable[[FeedbackT], StateImport[torch.Tensor] | None] | None = None,
         routes: tuple[str, ...] | None = None,
     ) -> Iterator[tuple[CompletionInput, FeedbackT]]:
-        """Generate, settle feedback, then retry eligible original prompts within a finite bound.
+        """Generate completions labelled `group_id`, run `feedback` on them, then retry eligible prompts, at most
+        `max_rounds` rounds.
 
         The callable runs locally after generate has released backend requests; it is
         never installed on a worker. Each yield is the original completion and result,
         with no retained history. Multi-request barriers are regenerated as a full
         vote group. Closing the iterator leaves no pending generation or transaction.
-        Optional edits reuse StateImport and require a signed activation workload;
+        Optional edits return a StateImport for an activation-patch workload;
         the feedback adapter returns original tensors, never a worker callback.
         A callback that returns None has nothing to feed back for its round: the round
         is not yielded (the callback already saw its completions) and nothing retries.
@@ -319,11 +332,11 @@ class VllmLlm(Generic[DataT, ResultT]):
         route_values: list[str] | None = list(routes) if routes is not None else None
         edits: HostBatch[torch.Tensor] | None = None
         for attempt in range(max_rounds):
-            batch: CompletionInput = self.generate(
+            batch = self.generate_completions(
                 texts,
                 sampling_params,
+                group_id=group_id,
                 use_tqdm=use_tqdm,
-                feedback_group=feedback_group,
                 prompt_indices=indices,
                 sample_index=attempt * sampling_params.n,
                 batch=edits,
@@ -367,7 +380,6 @@ class VllmLlm(Generic[DataT, ResultT]):
             if route_values is not None:
                 route_values = [route_values[index] for index in selected]
 
-    @overload
     def generate(
         self,
         prompts: str | list[str],
@@ -376,48 +388,75 @@ class VllmLlm(Generic[DataT, ResultT]):
         use_tqdm: bool = False,
         batch: HostBatch[torch.Tensor] | None = None,
         sample_index: int = 0,
-        feedback_group: None = None,
         prompt_indices: tuple[int, ...] | None = None,
-        completion_device: torch.device | None = None,
         routes: tuple[str, ...] | None = None,
-    ) -> list[RequestOutput]: ...
+    ) -> list[RequestOutput]:
+        """vLLM's generate with the workload running: one RequestOutput per prompt, holding its n samples.
 
-    @overload
-    def generate(
-        self,
-        prompts: str | list[str],
-        sampling_params: SamplingParams,
-        *,
-        use_tqdm: bool = False,
-        batch: HostBatch[torch.Tensor] | None = None,
-        sample_index: int = 0,
-        feedback_group: str,
-        prompt_indices: tuple[int, ...] | None = None,
-        completion_device: torch.device | None = None,
-        routes: tuple[str, ...] | None = None,
-    ) -> CompletionInput: ...
+        `batch` feeds the methods that read pllm.batch fields this call; `sample_index` numbers the first sample of
+        each prompt; `routes` gives one routing value per prompt for request states keyed by "route".
+        """
+        run = self._generate(prompts, sampling_params, use_tqdm, batch, sample_index, prompt_indices, routes, None)
+        return _per_prompt(run.outputs, run.n)
 
-    def generate(
+    def generate_completions(
         self,
         prompts: str | list[str],
         sampling_params: SamplingParams,
         *,
+        group_id: str,
         use_tqdm: bool = False,
         batch: HostBatch[torch.Tensor] | None = None,
         sample_index: int = 0,
-        feedback_group: str | None = None,
         prompt_indices: tuple[int, ...] | None = None,
         completion_device: torch.device | None = None,
         routes: tuple[str, ...] | None = None,
-    ) -> list[RequestOutput] | CompletionInput:
+    ) -> CompletionInput:
+        """Generate like `generate`, returning every sample as a Completion labelled `group_id` together with its
+        final hidden row (on `completion_device`, by default the model's device), the input host feedback reads."""
+        if not group_id:
+            raise ValueError("generate_completions needs a non-empty group_id")
+        device = completion_device or (torch.device("cpu") if self._runner is None else self.device)
+        run = self._generate(prompts, sampling_params, use_tqdm, batch, sample_index, prompt_indices, routes, device)
+        assert run.destination is not None
+        completions: dict[RequestIdentity, Completion] = {}
+        for output in run.outputs:
+            identity = run.external[output.request_id]
+            (completion,) = output.outputs
+            completions[identity] = Completion(
+                identity,
+                completion.index,
+                group_id,
+                tuple(completion.token_ids),
+                completion.text,
+                FinishReason(completion.finish_reason),
+            )
+        return CompletionInput(
+            CompletionBatch(tuple(completions[identity] for identity in run.identities)),
+            run.destination,
+            CudaStreamReadiness(torch.cuda.current_stream(run.destination.device))
+            if run.destination.device.type == "cuda"
+            else None,
+        )
+
+    def _generate(
+        self,
+        prompts: str | list[str],
+        sampling_params: SamplingParams,
+        use_tqdm: bool,
+        batch: HostBatch[torch.Tensor] | None,
+        sample_index: int,
+        prompt_indices: tuple[int, ...] | None,
+        routes: tuple[str, ...] | None,
+        completion_device: torch.device | None,
+    ) -> _Generation:
+        """Run one generate call; with a `completion_device`, also collect each sample's final hidden row there."""
         self._require_open()
-        if completion_device is not None and feedback_group is None:
-            raise ValueError("completion device requires completion feedback")
         texts = [prompts] if isinstance(prompts, str) else prompts
         if not texts or any(not prompt for prompt in texts):
             raise ValueError("provide non-empty prompts")
-        if sample_index < 0 or feedback_group is not None and not feedback_group:
-            raise ValueError("use a nonnegative sample index and a non-empty feedback group")
+        if sample_index < 0:
+            raise ValueError("use a nonnegative sample index")
         n = sampling_params.n
         if self._sample_limit is not None and sample_index + n > self._sample_limit:
             raise ValueError(
@@ -461,11 +500,13 @@ class VllmLlm(Generic[DataT, ResultT]):
                 llm.llm_engine.output_processor.request_states[identity.request_id].external_req_id: identity
                 for identity in identities
             }
-            destination = self._stage(identities, batch, feedback_group, completion_device, lifetime)
+            destination = self._stage(identities, batch, completion_device, lifetime)
             self._next_prompt_index = max(self._next_prompt_index, max(indices) + 1)
             llm.wake_up(tags=["scheduling"])
             outputs = llm.wait_for_completion(RequestOutput, use_tqdm=use_tqdm)
-            return self._collect(outputs, identities, external, feedback_group, destination, n)
+            # FINISH validates and synchronizes the staged rows before releasing requests.
+            self._command(BackendCommand.FINISH)
+            return _Generation(outputs, identities, external, destination, n)
         except Exception as original:
             try:
                 llm.llm_engine.abort_request(request_ids, internal=True)
@@ -522,21 +563,20 @@ class VllmLlm(Generic[DataT, ResultT]):
         self,
         identities: tuple[RequestIdentity, ...],
         batch: HostBatch[torch.Tensor] | None,
-        feedback_group: str | None,
         completion_device: torch.device | None,
         lifetime: ExitStack,
     ) -> torch.Tensor | None:
-        output_device = completion_device or (torch.device("cpu") if self._runner is None else self.device)
-        if output_device.type == "cuda":
-            if output_device == torch.device("cuda"):
-                output_device = self.device
-            if output_device != self.device:
-                raise ValueError("completion IPC currently requires the model's CUDA device")
-        elif output_device.type != "cpu":
-            raise ValueError("completion output requires CPU or CUDA storage")
         destination = None
         completion_wire = None
-        if feedback_group is not None:
+        if completion_device is not None:
+            output_device = completion_device
+            if output_device.type == "cuda":
+                if output_device == torch.device("cuda"):
+                    output_device = self.device
+                if output_device != self.device:
+                    raise ValueError("completion IPC currently requires the model's CUDA device")
+            elif output_device.type != "cpu":
+                raise ValueError("completion output requires CPU or CUDA storage")
             field = TensorFieldSpec(LayoutFieldId(0), (len(identities), self.hidden_size), TensorDType.FLOAT32, 4)
             with torch.inference_mode(False):
                 if self._runner is None:
@@ -556,40 +596,6 @@ class VllmLlm(Generic[DataT, ResultT]):
             batch = map_host_batch(batch, lambda tensor: tensor.to(self.device))
             self.runner.require_session().stage_input(batch, identities, destination)
         return destination
-
-    def _collect(
-        self,
-        outputs: list[RequestOutput],
-        identities: tuple[RequestIdentity, ...],
-        external: dict[str, RequestIdentity],
-        feedback_group: str | None,
-        destination: torch.Tensor | None,
-        n: int,
-    ) -> list[RequestOutput] | CompletionInput:
-        # FINISH validates and synchronizes the staged rows before releasing requests.
-        self._command(BackendCommand.FINISH)
-        if feedback_group is None:
-            return _per_prompt(outputs, n)
-        completions: dict[RequestIdentity, Completion] = {}
-        for output in outputs:
-            identity = external[output.request_id]
-            (completion,) = output.outputs
-            completions[identity] = Completion(
-                identity,
-                completion.index,
-                feedback_group,
-                tuple(completion.token_ids),
-                completion.text,
-                FinishReason(completion.finish_reason),
-            )
-        assert destination is not None
-        return CompletionInput(
-            CompletionBatch(tuple(completions[identity] for identity in identities)),
-            destination,
-            CudaStreamReadiness(torch.cuda.current_stream(destination.device))
-            if destination.device.type == "cuda"
-            else None,
-        )
 
 
 def _one_per_sample(params: SamplingParams) -> list[SamplingParams]:

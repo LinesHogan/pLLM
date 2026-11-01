@@ -1,9 +1,9 @@
 """FTTT: feedback test-time training of a low-rank edit, stepped from a host feedback callback."""
 
-from pllm.workloads.fttt.host_service import FTTTFeedbackService
+from pllm.workloads.fttt.feedback_queue import FTTTFeedbackQueue
 from pllm.workloads.fttt.judge import (
     FTTTDefaultJudge,
-    FTTTJudgeService,
+    FTTTJudge,
 )
 from pllm.workloads.fttt.types import (
     FTTTClosedLoopIntent,
@@ -11,16 +11,16 @@ from pllm.workloads.fttt.types import (
     FTTTJudgeResult,
     FTTTRequestLifecycle,
 )
-from pllm.workloads.fttt.workload import FTTTTrainer, FTTTWorkload
+from pllm.workloads.fttt.workload import FTTTFeedback, FTTTWorkload
 
 __all__ = [
     "FTTTClosedLoopIntent",
     "FTTTConfig",
     "FTTTDefaultJudge",
-    "FTTTFeedbackService",
+    "FTTTFeedbackQueue",
     "FTTTRequestLifecycle",
     "FTTTJudgeResult",
-    "FTTTJudgeService",
-    "FTTTTrainer",
+    "FTTTJudge",
+    "FTTTFeedback",
     "FTTTWorkload",
 ]
