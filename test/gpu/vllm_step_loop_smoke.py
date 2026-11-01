@@ -231,7 +231,9 @@ def donor_loss():
             slot = get_forward_context().slot_mapping[layer.layer_name][
                 last.packed_row_index : last.packed_row_index + 1
             ]
-            saved.append(layer.kv_cache.view(-1, 896)[slot // primitive.allocation].clone())
+            saved.append(
+                layer.kv_cache.view(-1, primitive.model.norm.weight.numel())[slot // primitive.allocation].clone()
+            )
         return result
 
     try:
@@ -362,7 +364,10 @@ def main():
     def permuted(primitive, *args, **kwargs):
         context = get_forward_context()
         metadata = {name: copy(item) for name, item in context.attn_metadata.items()}
-        blocks, allocation = primitive.position_layers[0].kv_cache.view(-1, 896).shape[0], primitive.allocation
+        blocks, allocation = (
+            primitive.position_layers[0].kv_cache.view(-1, primitive.model.norm.weight.numel()).shape[0],
+            primitive.allocation,
+        )
 
         def page(ids):
             return torch.where(ids == 0, 0, 1 + ids % (blocks - 1))
@@ -469,9 +474,9 @@ def main():
             )
         assert frozenset(("prefill", "decode")) in roles
         assert len(handle.runner.kv_cache_config.kv_cache_groups) == 1
-        assert primitive.position_layers[0].kv_cache.view(-1, 896).shape == (
+        assert primitive.position_layers[0].kv_cache.view(-1, primitive.model.norm.weight.numel()).shape == (
             handle.runner.kv_cache_config.num_blocks,
-            896,
+            primitive.model.norm.weight.numel(),
         )
         print("Native vLLM pre-norm carry, materialized-tap normalization and KV match exactly")
         assert {width for width, _ in primitive.captures} <= {1, 2}

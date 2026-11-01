@@ -2,7 +2,9 @@
 
 All admitted families expose the same hidden sites. Block taps keep the fresh
 layer output, without its separately returned residual. Unquantized dense Qwen2,
-Llama and Qwen3 models support every feature. Qwen3-MoE keeps Qwen3 attention and
+Llama and Qwen3 models support every feature; quantized ones rerun layers through
+vLLM's own quantized modules but have no dense weights to overlay or differentiate
+yet. Qwen3-MoE keeps Qwen3 attention and
 KV but routes its MLP through experts; the Qwen3.5 hybrids interleave Gated
 DeltaNet layers, whose recurrent state is not KV, with gated full attention.
 `Decoder.projection` and `Decoder.kv_writable` decide which projections and layer
@@ -89,6 +91,8 @@ class Decoder:
     compute_logits: Logits
     # Why only read-only workloads run on this model; None when every workload does.
     read_only: str | None
+    # vLLM's quantization method name; layer reruns work as is, projection weights are packed.
+    quantization: str | None
 
     def writable(self, feature: str) -> WritableLM:
         """The model for `feature`, which rewrites weights or reruns layers; read-only models reject it."""
@@ -122,6 +126,11 @@ class Decoder:
 
         assert target.layer is not None
         layer = self.writable("a parameter overlay").model.layers[target.layer]
+        if self.quantization is not None:
+            raise ValueError(
+                f"a parameter overlay reads dense projection weights, but this model is {self.quantization}-quantized; "
+                "use an unquantized checkpoint"
+            )
         if target.module is ParameterModuleKind.MLP and target.role is ParameterRole.DOWN_PROJECTION_WEIGHT:
             mlp = layer.mlp
             if isinstance(mlp, (Qwen3MoeSparseMoeBlock, Qwen3NextSparseMoeBlock)):
@@ -186,17 +195,13 @@ def bind_model(model: nn.Module, quantization: str | None) -> Decoder:
             "ForCausalLM model for vLLM workloads"
         )
     family = READ_ONLY_ARCHITECTURES.get(type(model))
-    if family is not None:
-        reason = f"{type(model).__name__} {family}"
-    elif quantization is not None:
-        reason = f"this one is {quantization}-quantized, and pllm reads, corrects and replays dense weights only"
-    else:
-        return Decoder(model, model.compute_logits, None)
+    if family is None:
+        return Decoder(model, model.compute_logits, None, quantization)
     read_only = (
-        f"needs an unquantized Qwen2, Llama, Qwen3, Qwen3-MoE or Qwen3.5 model ({reason}); "
+        f"needs a Qwen2, Llama, Qwen3, Qwen3-MoE or Qwen3.5 model ({type(model).__name__} {family}); "
         "hidden taps, ESamp, sampler stages and activation patches still run on this model"
     )
-    return Decoder(model, model.compute_logits, read_only)
+    return Decoder(model, model.compute_logits, read_only, quantization)
 
 
 def hidden_binding(layer: int, site: HiddenSite, layer_count: int) -> PackedHiddenResourceBinding:

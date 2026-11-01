@@ -104,6 +104,11 @@ class CausalTraining:
                 f"instead of {type(model).__name__}"
             )
         self.model = model
+        if decoder.quantization is not None:
+            raise ValueError(
+                f"causal training differentiates dense weights, but this model is {decoder.quantization}-quantized; "
+                "use an unquantized checkpoint"
+            )
         if model.model.embed_tokens.weight.dtype is not torch.bfloat16:
             raise ValueError("causal training requires qualified unquantized BF16 TP1 weights")
         self.projections: dict[Projection, list[tuple[int, int, ParameterOverlayFieldBinding, slice]]] = {}
