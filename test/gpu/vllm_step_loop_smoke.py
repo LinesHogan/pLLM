@@ -40,6 +40,8 @@ PROMPTS = ["One two", "Water freezes at"]
 def record_steps(handle):
     """Record native span/wave results and independently verify every recurrent state handoff."""
     records, active, samples = {}, [], {}
+    # Preemption may recompute a position at a different batch width. Replay rounding must not
+    # rewrite the sampling oracle for a token that was already emitted.
     primitive = handle.runner.require_session()._custom_forward
     stage, replay, span = ProgramWave.stage, torch.cuda.CUDAGraph.replay, VllmCustomForward.save_span
 
@@ -64,8 +66,9 @@ def record_steps(handle):
             pre = wave.position.tables[0][wave.position.indices[0, 0]]
             torch.testing.assert_close(pre, pre_native, rtol=0, atol=0)
             for lane, row in enumerate(active):
-                samples[external(row), row.token_offset] = int(
-                    F.linear(normal_native[lane], handle.runner.model.lm_head.weight).argmax()
+                samples.setdefault(
+                    (external(row), row.token_offset),
+                    int(F.linear(normal_native[lane], handle.runner.model.lm_head.weight).argmax()),
                 )
                 records[external(row), row.token_offset] = (
                     pre[lane : lane + 1].clone(),
@@ -78,8 +81,9 @@ def record_steps(handle):
         torch.testing.assert_close(hidden, pre, rtol=0, atol=0)
         for lane, row in enumerate(rows):
             torch.testing.assert_close(self.output[row.packed_row_index], normal[lane], rtol=0, atol=0)
-            samples[external(row), row.token_offset] = int(
-                F.linear(normal[lane], handle.runner.model.lm_head.weight).argmax()
+            samples.setdefault(
+                (external(row), row.token_offset),
+                int(F.linear(normal[lane], handle.runner.model.lm_head.weight).argmax()),
             )
             records[external(row), row.token_offset] = (
                 hidden[lane : lane + 1].clone(),
@@ -162,7 +166,7 @@ def generate_ids(handle, prompts, params=None):
     return outputs
 
 
-def offload_roundtrips(expected):
+def offload_roundtrips():
     """Restore generated-prefix KV/carry from both stock CPU connectors after GPU eviction."""
     stage, lookup = PositionCacheProvider.stage, KVCacheManager.get_computed_blocks
     for connector in ("OffloadingConnector", "SimpleCPUOffloadConnector"):
@@ -201,13 +205,16 @@ def offload_roundtrips(expected):
                 patch.object(KVCacheManager, "get_computed_blocks", locate),
             ):
                 (donor,) = handle.generate([PROMPTS[0]], SamplingParams(temperature=0, max_tokens=35, ignore_eos=True))
+                # A different batch can generate a different BF16 donor history; compare this same donor across eviction.
+                receiver = donor.prompt_token_ids + list(donor.outputs[0].token_ids)
+                (resident,) = generate_ids(handle, [receiver])
                 for word in ("apple ", "river "):
                     handle.generate([word * 48], SamplingParams(temperature=0, max_tokens=2, ignore_eos=True))
-                (received,) = generate_ids(handle, [donor.prompt_token_ids + list(donor.outputs[0].token_ids)])
+                (received,) = generate_ids(handle, [receiver])
             first, last = boundaries[0], boundaries[-1]
             assert local[last[0]] == 0 and first[1] != last[1], (connector, local, first[:2], last[:2])
             torch.testing.assert_close(first[2].view(torch.uint8), last[2].view(torch.uint8), rtol=0, atol=0)
-            assert list(received.outputs[0].token_ids) == expected
+            assert list(received.outputs[0].token_ids) == list(resident.outputs[0].token_ids)
             print(f"{connector} full-page asynchronous restore PASS allocation={first[1]}->{last[1]}", flush=True)
         finally:
             handle.close()
@@ -519,7 +526,7 @@ def main():
     finally:
         handle.close()
     forced_preemption()
-    offload_roundtrips(list(received.outputs[0].token_ids))
+    offload_roundtrips()
     donor_loss()
 
 
