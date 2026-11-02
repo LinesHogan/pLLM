@@ -47,8 +47,8 @@ class PinnedStaging:
         )
         self._current: tuple[torch.Tensor, torch.cuda.Event] | None = None
 
-    def take(self, size: int) -> torch.Tensor:
-        """A zeroed int64 pinned host buffer of `size` elements, valid until the next `take`."""
+    def take(self, size: int) -> npt.NDArray[np.int64]:
+        """A zeroed int64 view of pinned host storage, valid until the next `take`."""
         self._current = next((item for item in self._buffers if item[0].numel() >= size and item[1].query()), None)
         if self._current is None:
             if self._bounded:
@@ -58,8 +58,8 @@ class PinnedStaging:
             capacity = 1 << max(size - 1, 0).bit_length()
             self._current = (torch.empty(capacity, dtype=torch.long, pin_memory=True), torch.cuda.Event())
             self._buffers.append(self._current)
-        host = self._current[0][:size]
-        host.zero_()
+        host = self._current[0].numpy()[:size]
+        host.fill(0)
         return host
 
     @contextmanager
@@ -71,7 +71,7 @@ class PinnedStaging:
             yield host.numpy()
             table.copy_(host)
             return
-        yield self.take(table.numel()).view(table.shape).numpy()
+        yield self.take(table.numel()).reshape(table.shape)
         self.copy_to(table)
 
     def copy_to(self, destination: torch.Tensor) -> None:

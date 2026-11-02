@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from typing import Generic
 
+import numpy as np
 import torch
 from vllm.forward_context import get_forward_context, override_forward_context
 from vllm.sequence import IntermediateTensors
@@ -69,12 +70,11 @@ class ProgramWave(Generic[DataT, ResultT]):
         owner = self.custom_forward
         self.packed = tuple(row.packed_row_index for row in rows)
         assert owner.hidden is not None and owner.positions is not None
-        host = self.staging.take(self.indices.numel()).view_as(self.indices)
-        host.copy_(
-            torch.tensor(
-                [(row.packed_row_index, row.request_ordinal, int(row.phase.value == "decode")) for row in rows]
-            ).T
-        )
+        host = self.staging.take(self.indices.numel()).reshape(self.indices.shape)
+        host[:] = np.asarray(
+            [(row.packed_row_index, row.request_ordinal, int(row.phase.value == "decode")) for row in rows],
+            dtype=np.int64,
+        ).T
         self.staging.copy_to(self.indices)
         packed, requests, generated = self.indices
         self.seed.copy_(owner.hidden.index_select(0, packed))

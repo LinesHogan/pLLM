@@ -234,7 +234,7 @@ class ExactParameterOverlay:
         for row in rows.rows:
             grouped.setdefault((row.identity, row.phase), []).append(row)
         table = torch.empty((len(rows.rows) + len(grouped),), dtype=torch.long, device=self.device)
-        host = self._staging.take(table.numel()).numpy()
+        host = self._staging.take(table.numel())
         host[: len(rows.rows)] = [row.packed_row_index for source in grouped.values() for row in source]
         host[len(rows.rows) :] = [
             source[-1].token_offset == source[-1].prompt_length - 1 for source in grouped.values()
@@ -371,7 +371,7 @@ class _ProjectionReader:
         self.captured = self.pools[0].new_zeros((rows, inputs), dtype=self.module.params_dtype)
         self.desired = self.captured.new_empty((rows, self.width)) if self.mlp is not None else self.captured
         self.staging = PinnedStaging(capacity=self.table.numel(), slots=2)
-        self.host = torch.empty(0, dtype=torch.long)
+        self.host = np.empty(0, dtype=np.int64)
         self.programs: dict[int, Callable[..., tuple[torch.Tensor, ...]]] = {}
         for count in capacities(rows):
             with torch.inference_mode(False), FakeTensorMode(allow_non_fake_inputs=True):
@@ -437,7 +437,7 @@ class _ProjectionReader:
         return self.programs[count](*values)[0]
 
     def prepare(self, field_slots: Slots, starts: Slots, total: int) -> None:
-        host = self.host.numpy()
+        host = self.host
         maximum = projection_blocks(self.rows, self.requests)
         slots = host[: maximum * len(self.pools)].reshape(maximum, len(self.pools))
         positions = host[maximum * len(self.pools) : -self.rows].reshape(maximum, ROWS_PER_BLOCK)

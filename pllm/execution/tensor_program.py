@@ -73,6 +73,7 @@ class TensorBatch:
     borrowed_roots: tuple[BorrowedStateRoot, ...] = ()
     local_pin: PagePin | None = None
     select_resource: Callable[[StateResource], TensorBatch] = _unwired
+    retain_gradients: bool = True
 
     def for_resource(self, resource: StateResource) -> TensorBatch:
         """Use the operation resource without redirecting reads of other states."""
@@ -218,6 +219,7 @@ def read_batch(
         field_slots=roots.field_slots,
         slot_matrix=roots.slot_matrix,
         select_resource=scoped,
+        retain_gradients=context.retain_gradients or context.trace.observing,
     )
     return batch
 
@@ -370,18 +372,18 @@ class PageUpdate:
         destinations: torch.Tensor,
         gradients: torch.Tensor,
         carries: Mapping[LayoutFieldId, torch.Tensor],
-        updates: torch.Tensor,
-        last: torch.Tensor,
+        updates: torch.Tensor | None,
+        last: torch.Tensor | None,
         *,
         paged: bool,
     ) -> None:
         """Write every issued destination inside the shared tensor body, without a host sync.
 
-        States with `updates` take the optimizer step and their carried values from row `last` (when it is
-        not -1); every other destination receives its source page unchanged.
+        An absent update mask means every issued destination takes the optimizer step. Masked updates
+        preserve other destinations. Carries read their last trained row when one exists.
         """
         count = gradients.shape[0]
-        stepped = torch.where(updates, destinations, -1)
+        stepped = destinations if updates is None else torch.where(updates, destinations, -1)
         if paged:
             paged_adamw(pools[:ADAM], stepped[:ADAM], gradients, self.config, sources[:ADAM, :count].contiguous())
         else:
@@ -391,11 +393,16 @@ class PageUpdate:
             rows = torch.arange(count, device=destinations.device)
             for field in range(ADAM):
                 copy_pages(fields[field], pools[field], rows, stepped[field])
-        carried = torch.where(updates & (last >= 0), destinations, -1)
-        for field, value in carries.items():
-            assert value.shape[1:] == pools[field].shape[1:] and value.dtype == pools[field].dtype
-            copy_pages(value.detach(), pools[field], last.clamp_min(0), carried[field])
+        carried = None
+        if carries:
+            assert last is not None
+            carried = destinations if updates is None else torch.where(updates & (last >= 0), destinations, -1)
+            for field, value in carries.items():
+                assert value.shape[1:] == pools[field].shape[1:] and value.dtype == pools[field].dtype
+                copy_pages(value.detach(), pools[field], last.clamp_min(0), carried[field])
         for field in range(len(pools)):
+            if updates is None and (field < ADAM or field in carries):
+                continue
             written = stepped if field < ADAM else carried if field in carries else None
             copy_pages(
                 pools[field],

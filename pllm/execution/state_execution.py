@@ -146,6 +146,7 @@ class StateTaskContext(Generic[DataT]):
         default_factory=lambda: dict[RequestIdentity, set[StateRef]]()
     )
     input_step_id: int = -1
+    retain_gradients: bool = True
 
     def data(self) -> DataT:
         assert self.value is not None
@@ -165,11 +166,16 @@ class StateTaskContext(Generic[DataT]):
         self._obligations.append(_SlotRelease(allocations, self.pin.stream))
 
     def move_slots(self) -> None:
-        """Transfer input holds to the current pin's stream before releasing prior readers."""
-        for obligation in tuple(self._obligations):
+        """Transfer input holds after ordering the current pin's stream behind their prior readers."""
+        for index, obligation in enumerate(self._obligations):
             if isinstance(obligation, _SlotRelease):
-                self.hold_slots(obligation.allocations)
-                self._discharge(obligation)
+                if (
+                    obligation.stream is not None
+                    and self.pin.stream is not None
+                    and obligation.stream != self.pin.stream
+                ):
+                    self.pin.stream.wait_stream(obligation.stream)
+                self._obligations[index] = _SlotRelease(obligation.allocations, self.pin.stream)
 
     def pending_write(self, resource: StateResource) -> PageWrite | None:
         """The invocation's pending private write of `resource`, which the tasks transitioning it share."""
@@ -615,13 +621,16 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         *,
         history: tuple[StateRefs, ...] = (),
         held_input: HeldInput | None = None,
+        retain_gradients: bool = True,
     ) -> StateTaskContext[DataT]:
+        """Open a state invocation; token-only consumers can omit returned gradient snapshots."""
         self._require_borrow_live()
         self.arena.collect_completed()
         selection = self.directory.select(rows, history)
         pin = self.arena.pin_exact(selection.refs, stream)
         context = StateTaskContext[DataT](selection, self.arena, pin, self.trace, self._next_invocation)
         context.held_input = held_input
+        context.retain_gradients = retain_gradients
         self._next_invocation += 1
         self._active[context.invocation_id] = context
         if self.feeds and context.held_input is None:
@@ -649,8 +658,12 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         *,
         history: tuple[StateRefs, ...] = (),
         held_input: HeldInput | None = None,
+        retain_gradients: bool = True,
     ) -> StateTaskContext[DataT]:
-        context = self.begin(self.math.rows(value), stream, history=history, held_input=held_input)
+        """Prepare one invocation, retaining gradients for direct step results unless the consumer opts out."""
+        context = self.begin(
+            self.math.rows(value), stream, history=history, held_input=held_input, retain_gradients=retain_gradients
+        )
         self.submit_input(context, value)
         return context
 

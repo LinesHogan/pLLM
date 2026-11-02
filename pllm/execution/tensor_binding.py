@@ -300,6 +300,7 @@ class TensorBinding(Builder[TensorFrame]):
                 optimizer,
                 capture=step_capture,
                 device=torch.device("cpu") if facts is None else facts.device,
+                filter_rows=task.phase is not None and task.phase is not self.row_phase(),
             )
             if task.writer is None
             else FieldWriteExecutor(task.writer, step_capture)
@@ -383,9 +384,8 @@ class TensorBinding(Builder[TensorFrame]):
             ):
                 raise ValueError("replacement tensors must match the declared layout shape, dtype and device")
 
-    def row_reader(self) -> Callable[[PackedPhaseRowBatch], tuple[PackedPhaseRow, ...]]:
-        """The rows the tensor tasks read, chosen once at bind: every request's final row for overlays, activation
-        patches and prefill inputs, otherwise each request's latest decode row."""
+    def row_phase(self) -> HiddenPhase | None:
+        """The frame's preselected phase; None keeps every request's final row for model effects or prefill."""
         if (
             self.overlay_targets
             or self.effects.activation_bindings
@@ -395,6 +395,12 @@ class TensorBinding(Builder[TensorFrame]):
                 for port in task.inputs
             )
         ):
+            return None
+        return HiddenPhase.DECODE
+
+    def row_reader(self) -> Callable[[PackedPhaseRowBatch], tuple[PackedPhaseRow, ...]]:
+        """Bind the frame's row selection once; tasks filter only when they need a narrower phase."""
+        if self.row_phase() is None:
             return lambda rows: rows.request_rows
         return lambda rows: rows.latest_decode_rows
 

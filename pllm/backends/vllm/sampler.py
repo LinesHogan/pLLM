@@ -87,9 +87,12 @@ class SamplerGuidance:
         )
         if not guidance.guidance.affected_row_ids or guidance.guidance.beta == 0.0:
             return processed_logits
-        dense = guidance.guidance.affected_row_ids == tuple(range(processed_logits.shape[0]))
-        rows = upload(() if dense else guidance.guidance.affected_row_ids, processed_logits.device)
-        survivors = processed_logits if dense else processed_logits.index_select(0, rows)
+        rows = (
+            None
+            if guidance.guidance.affected_row_ids == tuple(range(processed_logits.shape[0]))
+            else upload(guidance.guidance.affected_row_ids, processed_logits.device)
+        )
+        survivors = processed_logits if rows is None else processed_logits.index_select(0, rows)
         weights = guidance.guidance.row_weights
         beta = (
             survivors.new_full((survivors.shape[0], 1), guidance.guidance.beta)
@@ -97,7 +100,7 @@ class SamplerGuidance:
             else guidance.guidance.beta * weights.to(survivors).unsqueeze(1)
         )
         reweighted: torch.Tensor = _reweight(survivors, guidance.pred_dense_logits, beta)  # pyright: ignore[reportAssignmentType]
-        if dense:
+        if rows is None:
             return reweighted
         output = processed_logits.clone()
         output.index_copy_(0, rows, reweighted)

@@ -316,7 +316,7 @@ class VllmSession(Generic[DataT, ResultT]):
         if not self._in_forward_overlay:
             held_input = self._receive_readonly(rows, stream)
             value = StepInput(rows.row_batch, rows, batch=self._host_batch)
-            context = execution.start_step(value, stream, held_input=held_input)
+            context = execution.start_step(value, stream, held_input=held_input, retain_gradients=False)
             instance_states = bool(execution.directory.instance_states)
             if instance_states or not self._pending_identities:
                 self._host_batch = None
@@ -331,7 +331,7 @@ class VllmSession(Generic[DataT, ResultT]):
             if pending:
                 execution.admit(pending, stream)
         else:
-            context = execution.begin(rows.row_batch.request_rows, stream)
+            context = execution.begin(rows.row_batch.request_rows, stream, retain_gradients=False)
             step.context = context
         if adapter is not None:
             projection = None
@@ -378,7 +378,9 @@ class VllmSession(Generic[DataT, ResultT]):
             overlap = execution.post_sample
             if overlap is not None and not overlap.lag:
                 stream = overlap.stream
-            step.context = execution.start_step(value, stream, history=() if overlap is None else overlap.history)
+            step.context = execution.start_step(
+                value, stream, history=() if overlap is None else overlap.history, retain_gradients=False
+            )
             self._host_batch = None
         elif step.context.value is None or self._hidden_resources or operands:
             execution.submit_input(step.context, value, CudaStreamReadiness(stream))

@@ -104,6 +104,7 @@ class TensorExecutor:
     optimizer: PageUpdate | None = None
     capture: StepCapture | None = None
     device: torch.device = torch.device("cpu")
+    filter_rows: bool = True
     table: torch.Tensor | None = None
     pools: tuple[torch.Tensor, ...] = ()
     results: tuple[torch.Tensor, ...] = ()
@@ -129,7 +130,7 @@ class TensorExecutor:
         default_factory=lambda: dict[StateResource, TableLayout]()
     )
     staging: PinnedStaging = dataclass_field(default_factory=PinnedStaging)
-    # Named segments of `table`, split once per call.
+    # Named segments bound to the fixed table; eager layouts are rebound each call.
     views: dict[StateResource, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = dataclass_field(
         default_factory=lambda: dict[StateResource, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]()
     )
@@ -192,7 +193,7 @@ class TensorExecutor:
             row[:] = (value.data_ptr(), value.stride(0), value.stride(1) if value.ndim > 1 else 1)
 
     def _split(self) -> None:
-        """Name the table's segments once per call: each resource's views, then the hidden slot columns."""
+        """Bind the table's resource views and hidden slot columns."""
         assert self.table is not None
         offset = 0
         for resource, layout in self.layouts.items():
@@ -288,7 +289,7 @@ class TensorExecutor:
         self.results = (result.detach(),)
         self.input_gradients = dict(zip(sources, (value.detach() for value in derivatives[1:]), strict=True))
         self.gradients = derivatives[0].detach()[: self.state_count].contiguous()
-        self.counters = torch.stack((updates.sum(), trained.sum()))
+        self.counters = None if updates is None else torch.stack((updates.sum(), trained.sum()))
         _, slots, destinations, _ = self.views[self.task.resource]
         self.optimizer.staged(
             self.pools,
@@ -304,7 +305,7 @@ class TensorExecutor:
         for key, value in operands.results.items():
             operands.results[key] = value.detach()
 
-    def _selection(self, rows: FixedRows) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _selection(self, rows: FixedRows) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Which rows train, which states update and each state's last trained row (-1: none), on the device.
 
         `rows=` selects the trained rows; `update=` (or else the trained rows) selects the states whose optimizer
@@ -312,11 +313,18 @@ class TensorExecutor:
         """
         policy, states = self.task.policy, rows.index.states
         trained = rows.active & self.inputs[policy.forward_rows] if policy.forward_rows else rows.active
-        chosen = rows.active & self.inputs[policy.update_rows] if policy.update_rows in self.task.domains else trained
-        count = states.new_zeros(rows.states + 1).index_add_(0, states, chosen.long())
-        positions = torch.where(trained, torch.arange(len(states), device=states.device), -1)
-        last = torch.full_like(count, -1).scatter_reduce_(0, states, positions, "amax")
-        return trained, count[: self.state_count] > 0, last[: self.state_count]
+        update_rows = self.inputs[policy.update_rows] if policy.update_rows in self.task.domains else None
+        updates = None
+        if policy.forward_rows or update_rows is not None:
+            chosen = trained if update_rows is None else rows.active & update_rows
+            count = states.new_zeros(rows.states + 1).index_add_(0, states, chosen.long())
+            updates = count[: self.state_count] > 0
+        last = None
+        if self.task.carries:
+            positions = torch.where(trained, torch.arange(len(states), device=states.device), -1)
+            last = states.new_full((rows.states + 1,), -1).scatter_reduce_(0, states, positions, "amax")
+            last = last[: self.state_count]
+        return trained, updates, last
 
     def __call__(
         self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext[TensorFrame] | None = None
@@ -327,7 +335,7 @@ class TensorExecutor:
             batch = batch.state_free()
         elif any(group.resource == self.task.resource for group in batch.selection.groups):
             batch = batch.for_resource(self.task.resource)
-        rows = data.producer_rows(self.task.phase)
+        rows = data.producer_rows(self.task.phase) if self.filter_rows else data.rows
         if rows != data.rows or batch.selection is not parent.selection:
             data = replace(data, rows=rows, plan=None)
         if not data.rows and self.task.phase is not None:
@@ -351,9 +359,9 @@ class TensorExecutor:
                 plan = replace(plan, writes=(self.updated, slots))
             if context is None:
                 self.table = torch.empty(self.table_size, device="meta", dtype=torch.long)
+                self._split()
             else:
                 self._prepare(plan, data, batch)
-            self._split()
         if self.capture is None or context is None:
             self._body(data, batch)
         else:
@@ -424,6 +432,9 @@ class TensorExecutor:
         size = self.table_size
         if self.table is None or self.table.numel() != size:
             self.table = torch.empty(size, dtype=torch.long, device=device)
+            self._split()
+        elif self.capture is None:
+            self._split()
         with self.staging.fill(self.table) as host:
             offset = 0
             for resource, layout in self.layouts.items():
@@ -454,20 +465,23 @@ class TensorExecutor:
             if self.task.sampler_stage is not None:
                 return self.task.sampler_output(data, batch)
             return TaskOutput()
-        assert self.gradients is not None and self.counters is not None
-        data.input_gradients.update(
-            (key, retain_rows(value, len(data.rows), copy=True)) for key, value in self.input_gradients.items()
-        )
-        data.parameter_gradient_fields = ParameterGradients(
-            batch.selection.refs,
-            retain_rows(self.gradients, len(batch.roots), copy=True),
-            data.parameter_gradient_fields,
-        )
+        assert self.gradients is not None
+        if batch.retain_gradients:
+            data.input_gradients.update(
+                (key, retain_rows(value, len(data.rows), copy=True)) for key, value in self.input_gradients.items()
+            )
+            data.parameter_gradient_fields = ParameterGradients(
+                batch.selection.refs,
+                retain_rows(self.gradients, len(batch.roots), copy=True),
+                data.parameter_gradient_fields,
+            )
         return TaskOutput(
             loss=values[0],
             changed=self.updated,
             loss_count=count if state_mean else 1,
-            counters=self.counters.clone(),
+            update_count=len(self.updated) if self.counters is None else 0,
+            trained_rows=len(data.rows) if self.counters is None else 0,
+            counters=None if self.counters is None else self.counters.clone(),
             observations=training_observations(data, batch, values[0], self.inputs),
         )
 

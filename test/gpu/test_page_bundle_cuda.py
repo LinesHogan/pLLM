@@ -247,8 +247,8 @@ def test_bounded_staging_and_diagnostics_wait_for_completion_without_host_waits(
     torch.cuda.synchronize()
     with torch.cuda.stream(stream):
         host = staging.take(8)
-        address = host.data_ptr()
-        host.fill_(23)
+        address = host.ctypes.data
+        host.fill(23)
         _wait_for_gate[(1,)](gate, expired, 5_000_000)  # each read of host memory takes ~2 us: ~10 s
         staging.copy_to(destination)
         counters.add(increments, stream)
@@ -265,5 +265,5 @@ def test_bounded_staging_and_diagnostics_wait_for_completion_without_host_waits(
         stream.synchronize()
         assert not expired.item(), "the gate expired: a kernel launched behind it was not loaded beforehand"
     torch.testing.assert_close(destination, torch.full_like(destination, 23))
-    assert staging.take(8).data_ptr() == address
+    assert staging.take(8).ctypes.data == address
     assert counters.read() == (3, 17)

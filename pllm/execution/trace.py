@@ -14,6 +14,7 @@ from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from functools import partial
 from math import prod
 from threading import Condition, Thread
 from time import monotonic_ns
@@ -180,7 +181,7 @@ class TraceSelection:
 
 @dataclass(slots=True, eq=False)
 class _TraceEntry:
-    event: TraceEvent
+    make_event: Callable[[], TraceEvent]
     # Producers pass immutable tuples or StateRefs columns; only snapshots need individual objects.
     refs: Sequence[StateRef]
     timing: tuple[torch.cuda.Event, torch.cuda.Event] | None
@@ -189,15 +190,16 @@ class _TraceEntry:
 
     def snapshot(self) -> TraceEvent:
         """Materialize retained immutable refs and encode a completed owned host value on inspection."""
+        event = self.make_event()
         if self.payload is None and not self.refs:
-            return self.event
+            return event
         payload = None
         if self.payload is not None:
             host, ready = self.payload
             if ready is not None:
                 ready.synchronize()
             payload = b64encode(host.reshape(-1).view(torch.uint8).numpy().tobytes()).decode("ascii")
-        return replace(self.event, refs=tuple(self.refs), tensor_data=payload)
+        return replace(event, refs=tuple(self.refs), tensor_data=payload)
 
 
 class ExecutionTrace:
@@ -468,7 +470,8 @@ class ExecutionTrace:
             self._sequence += 1
             self._events.append(
                 _TraceEntry(
-                    TraceEvent(
+                    partial(
+                        TraceEvent,
                         self._sequence,
                         monotonic_ns(),
                         kind,
@@ -499,7 +502,8 @@ class ExecutionTrace:
                 )
             )
 
-            self._lock.notify_all()
+            if export is not None and self._on_export is not None:
+                self._lock.notify_all()
 
     def _deliver(self, on_export: Callable[[TraceEvent], None]) -> None:
         while True:
@@ -526,7 +530,7 @@ class ExecutionTrace:
             self._lock.wait_for(
                 lambda: (
                     self._failure is not None
-                    or not any(entry.pending and entry.event.sequence <= watermark for entry in self._events)
+                    or not any(entry.pending and entry.make_event().sequence <= watermark for entry in self._events)
                 )
             )
             if self._failure is not None:

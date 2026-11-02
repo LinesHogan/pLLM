@@ -59,8 +59,8 @@ class SlotPools:
         self.holders = np.zeros((len(layout.fields), capacity), dtype=np.int32)
         self.generations = np.zeros((len(layout.fields), capacity), dtype=np.int64)
         self._field_offsets = np.arange(len(layout.fields), dtype=np.int64) * capacity
-        # Each completion fences a batch of field-offset slot IDs, independent of current holders.
-        self._readiness: dict[torch.cuda.Event, Slots] = {}
+        # Each completion fences a mask of field slots, independent of current holders.
+        self._readiness: dict[torch.cuda.Event, npt.NDArray[np.bool_]] = {}
 
     def free_count(self, field: int) -> int:
         """Slots available for allocation, possibly still awaiting GPU completion."""
@@ -74,22 +74,20 @@ class SlotPools:
         self._collect_completed()
         slots = free[:count]
         if self._readiness:
-            fenced = np.isin(free + self._field_offsets[field], np.concatenate(tuple(self._readiness.values())))
+            fenced = np.zeros(len(free), dtype=np.bool_)
+            for pending in self._readiness.values():
+                fenced |= pending[field, free]
             ready = free[~fenced][:count]
             reuse = free[fenced][: count - len(ready)]
             slots = np.concatenate((ready, reuse))
             if reuse.size:
-                allocated = reuse + self._field_offsets[field]
                 for event, pending in tuple(self._readiness.items()):
-                    overlap = np.isin(pending, allocated, assume_unique=True, kind="sort")
-                    if overlap.any():
+                    if pending[field, reuse].any():
                         assert stream is not None
                         stream.wait_event(event)
                         # Other slots may be reused on another stream and still need this fence.
-                        remaining = pending[~overlap]
-                        if remaining.size:
-                            self._readiness[event] = remaining
-                        else:
+                        pending[field, reuse] = False
+                        if not pending.any():
                             del self._readiness[event]
         self.holders[field, slots] = 1
         return slots, self.generations[field, slots]
@@ -132,9 +130,9 @@ class SlotPools:
         counts = self._counts(slots)
         if completion is not None:
             self._collect_completed()
-            pending = np.flatnonzero(counts)
             if completion in self._readiness:
-                pending = np.union1d(self._readiness[completion], pending)
-            self._readiness[completion] = pending
+                self._readiness[completion] |= counts != 0
+            else:
+                self._readiness[completion] = counts != 0
         self.holders -= counts
         self.generations += (counts != 0) & (self.holders == 0)

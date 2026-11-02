@@ -183,7 +183,7 @@ class HiddenTaps:
 
     def prepare(self, rows: PackedPhaseRowBatch) -> None:
         """Reserve the declared row union and upload its packed-row to slot mapping before forward."""
-        host = self._staging.take(self.indices.numel()).numpy()
+        host = self._staging.take(self.indices.numel())
         host.fill(-1)
         stream = torch.cuda.current_stream(self.indices.device)
         phase_rows = tuple(
