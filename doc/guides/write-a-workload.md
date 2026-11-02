@@ -63,7 +63,8 @@ with pllm.make_llm(ModelConfig("Qwen/Qwen2.5-0.5B-Instruct"), workload=MyProbe()
 **状态 property 要写返回类型。** 形状依赖配置的状态写成 property 时，必须标注
 `-> pllm.RequestState`（或 `-> pllm.InstanceState`），框架靠这个返回类型认出
 状态声明；`from __future__ import annotations` 下的字符串注解同样可以。漏写时
-`@pllm.train` 会报 "'adapter' is not a declared state"。
+声明检查会指明属性名并要求添加返回注解。普通辅助 property 也要标注其返回类型，
+这样框架无需执行任意 getter 来判断它是否声明状态。
 
 **声明即签名。** 冷绑定器会签名你的函数体、依赖与配置，并为实例快照它们；之后
 改动源码不影响已绑定的执行。反射式数学或未受检依赖需要显式原生绑定。所以"我

@@ -109,8 +109,6 @@ class StepCapture:
         # Inactive destinations make warmup and capture read-only with respect to the arena.
         destinations.fill_(-1)
         self.graph, _, pool = capture_graph(table.device, body)
+        # Maximum-shape tracing funds capture at build, so exceeding it is a framework bug.
         self.resident_bytes = sum(value.untyped_storage().nbytes() for value in (table, *buffers)) + pool
-        if self.resident_bytes > self.budget.resident_bytes:
-            raise ValueError(
-                f"capture requires {self.resident_bytes} resident bytes, reserved {self.budget.resident_bytes}"
-            )
+        assert self.resident_bytes <= self.budget.resident_bytes, (self.resident_bytes, self.budget.resident_bytes)

@@ -213,4 +213,4 @@ def _fund_attachment(
                 value + buffers for value in (timeline.reserved_bytes or (0,) * len(timeline.anchors))
             ),
         )
-    return derive_attachment_resources(probe, graph, timeline, capture_memory_bytes=options.capture_memory_bytes)
+    return derive_attachment_resources(probe, graph, timeline, capture_memory_bytes=options.model_capture_bytes)

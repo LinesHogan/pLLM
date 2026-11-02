@@ -219,6 +219,7 @@ def derive_resources(
     data, batch = example(binding, facts, options)
     tasks: list[TaskResourceFact] = []
     values: list[ValueResourceFact] = []
+    required_capture = 0
     operations: dict[TaskSymbol, MemoryOperation[TensorFrame]] = {
         **binding.executables(facts, resources),
         **binding.publications,
@@ -240,6 +241,10 @@ def derive_resources(
                 plan=None,
             )
         usage = operation.memory(data, batch)
+        # Model overlays capture bounded tiles, not their whole maximum-shape operation.
+        required = operation.resident(usage.capture) if task is not None else 0
+        required_capture = max(required_capture, required)
+        resident = operation.resident(options.capture_memory_bytes or required or options.model_capture_bytes)
         shapes = operation.input_shapes(
             len(data.rows),
             facts.probe.hidden_size,
@@ -252,7 +257,7 @@ def derive_resources(
             TaskResourceFact(
                 symbol,
                 usage.workspace,
-                operation.resident(options.capture_memory_bytes),
+                resident,
                 shapes,
             )
         )
@@ -261,6 +266,11 @@ def derive_resources(
             for task in binding.graph.tasks
             if task.symbol == symbol
             for output in task.outputs
+        )
+    if options.capture_memory_bytes is not None and options.capture_memory_bytes < required_capture:
+        raise ValueError(
+            f"workload needs capture_memory_bytes >= {required_capture} for its conservative task capture "
+            f"reservations; got {options.capture_memory_bytes}; leave it unset to size from the workload"
         )
     return replace(
         facts.timeline,

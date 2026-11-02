@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, overload
 import numpy as np
 import torch
 
+from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.parameter_overlay import Projection
 from pllm.contracts.request_identity import RequestIdentity
@@ -309,6 +310,13 @@ class TensorFrame:
     fixed: FixedRows | None = None
     # Owned by row_task_binding's weighted batch training.
     weighted: WeightedBatch | None = None
+
+    def producer_rows(self, phase: HiddenPhase | None) -> tuple[PackedPhaseRow, ...]:
+        """The producer's eligible rows in this frame's order, for both its math and destinations."""
+        if phase is None:
+            return self.rows
+        eligible = {row.packed_row_index for row in self.step.rows.producer_rows(phase)}
+        return tuple(row for row in self.rows if row.packed_row_index in eligible)
 
     @property
     def table(self) -> FixedRows:

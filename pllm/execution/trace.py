@@ -30,7 +30,7 @@ from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.admission import WindowBackpressure
 
-TRACE_SCHEMA_VERSION = 8
+TRACE_SCHEMA_VERSION = 9
 MAX_SNAPSHOT_BYTES = 32768
 
 
@@ -87,6 +87,7 @@ class TraceEvent:
     tensor_data: str | None = None
     step_id: int | None = None
     source_shape: tuple[int, ...] = ()
+    dropped_rows: int = 0
     kernel_name: str | None = None
 
     def tensor(self) -> torch.Tensor:
@@ -428,6 +429,7 @@ class ExecutionTrace:
         kernel_name: str | None = None,
         device_duration_ns: int | None = None,
         export: Literal["drop", "block"] | None = None,
+        dropped_rows: int = 0,
     ) -> None:
         if tensor is not None and tensor.is_meta:
             return
@@ -486,6 +488,7 @@ class ExecutionTrace:
                         tensor_shape=shape,
                         step_id=step_id,
                         source_shape=source_shape,
+                        dropped_rows=dropped_rows,
                         kernel_name=kernel_name,
                         device_duration_ns=device_duration_ns,
                     ),

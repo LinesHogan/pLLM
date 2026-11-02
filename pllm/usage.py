@@ -383,8 +383,10 @@ class _Carried(_Source):
 
 
 def hidden(layer: int | Attr = 0, *, tokens: Literal["decode", "prefill"] = "decode") -> Any:
-    """The output of decoder layer `layer` (negative from the end), one row per request: the latest decode token,
-    or with tokens="prefill" the last prompt token of completed prefill."""
+    """The MLP output before the residual add in decoder layer `layer` (negative from the end).
+
+    One row per request: the latest decode token, or with tokens="prefill" the last prompt token of completed prefill.
+    """
     return Hidden(layer, HiddenSite.BLOCK_OUTPUT, HiddenPhase(tokens))
 
 
@@ -1599,6 +1601,11 @@ def _return_type(getter: FunctionType) -> type | None:
 def _property(member: object) -> FunctionType | None:
     """Find declaration getters without evaluating arbitrary owner properties."""
     getter = _typed(member.fget, FunctionType) if isinstance(member, property) else None
+    if getter is not None and signature(getter).return_annotation is SignatureParameter.empty:
+        raise TypeError(
+            f"property {getter.__name__!r} needs a return annotation; annotate state declarations with "
+            "-> pllm.RequestState or -> pllm.InstanceState, and other properties with their return type"
+        )
     declared = (InstanceState, RequestState, ActivationPatch, Adapter, PositionState)
     return getter if getter is not None and _return_type(getter) in declared else None
 

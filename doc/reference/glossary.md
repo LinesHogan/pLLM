@@ -12,6 +12,8 @@
 - **来源标记（Source marker）** —— 命名输入来源的 `Annotated[Tensor, ...]`
   参数：`Hidden`、`Samples`、`Batch`、`Parameter`、`StateIndex`、
   `StateVersion`、`Result`、`BaseLogits`、`SampledTokens`。
+- **Hidden / BLOCK_OUTPUT** —— `pllm.hidden(L)` 读取第 L 个 decoder 层的 MLP 输出，
+  位于残差加法之前；它不是残差流。每个请求读取最新 decode token 或 prompt 最后一个 token。
 - **因果批（Causal batch）** —— `pllm.host.CausalTrainBatch` 提供同形的
   `input_ids`、`labels` 和可选 `attention_mask`，训练方法用 `pllm.batch(...)` 读取。
 - **因果模型端口（Causal model port）** —— `pllm.causal_model("adapter")` 注入

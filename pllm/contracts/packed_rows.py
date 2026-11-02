@@ -34,14 +34,9 @@ class PackedPhaseRowBatch:
 
     @property
     def request_rows(self) -> tuple[PackedPhaseRow, ...]:
-        """Borrow each request's final original row in stable identity order."""
+        """Borrow each request's final row in packed request order, shared by producers and consumers."""
         last = {row.identity: row for row in self.rows}
-        return tuple(
-            sorted(
-                last.values(),
-                key=lambda row: (row.identity.request_id, row.identity.prompt_index, row.identity.sample_index),
-            )
-        )
+        return tuple(last.values())
 
     def producer_rows(self, phase: HiddenPhase | None) -> tuple[PackedPhaseRow, ...]:
         """Completed prompt endings or latest decode rows; None selects every request."""

@@ -105,6 +105,7 @@ def features(self, h: torch.Tensor = pllm.hidden(0)) -> torch.Tensor:
 数字约束需要记住：
 
 - `max_rows`/`max_cols` 会同时截断输入帧与输出帧（先按行选，再按列截）；
+- 每个导出事件的 `dropped_rows` 精确记录因 `max_rows` 被截去的行数；`export_dropped` 仍只计队列丢弃的事件数。
 - 每事件字节上限 32 KiB，即 `max_rows × max_cols × 8 ≤ 32768`；
 - 导出事件进容量 256 的全局有界队列，溢出时丢最旧的事件并计入 `dropped`。
 
@@ -183,10 +184,14 @@ sampler allocations do not force recapture or a host readback. Prediction result
 loss/gradient outputs are copied out before a later replay can overwrite them.
 
 The first invocation warms up on a side stream and captures into a private graph pool.
-`capture_memory_bytes` reserves resident memory **per task**; the captured pool and index
-table and owned import/write staging buffers are checked against that reservation.
-Import-only store graphs allocate no tensors during replay and reserve their exact
-fixed storage, up to this limit. Replacing hidden buffer storage starts a new
+By default, each tensor task's capture reservation is derived at build from its maximum-shape
+allocation trace, including index tables and owned staging. It conservatively assumes no allocator
+reuse; actual graph residency is usually smaller. An explicit `capture_memory_bytes` sets a per-task
+limit and fails at build if it cannot cover that reservation, naming the required value.
+Import-only store graphs allocate no tensors during replay and reserve their exact fixed storage.
+Model overlay and custom-forward graphs retain a 64 MiB default reservation when the option is unset.
+Overlay tiles keep a fixed per-task capture budget; a tile whose conservative reservation does not fit executes eagerly.
+Replacing hidden buffer storage starts a new
 cold capture. Subsequent invocations with fixed tap buffers perform no host-device wait.
 
 Each resource has its own source slots and row selection in the table. Only completed

@@ -16,7 +16,8 @@ from test.gpu.vllm_inplace_ttt_smoke import open_llm
 
 @pytest.mark.parametrize("workload", [PromptFactorsWorkload(), PromptMixtureWorkload(), DecodeFactorsWorkload()])
 def test_internal_projection_consumes_pinned_request_factors(workload, monkeypatch):
-    with open_llm(workload, memory_budget_bytes=1 << 30) as handle:
+    with open_llm(workload, seqs=3, chunked=True, memory_budget_bytes=1 << 30) as handle:
+        monkeypatch.setattr(handle._require_open(), "request_counter", iter(range(99, 0, -1)))
         session = handle.runner.require_session()
         execution = session._deployment.execution
         overlay = session._overlay
@@ -29,6 +30,17 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
 
         monkeypatch.setattr(torch.cuda.CUDAGraph, "capture_begin", begin)
         checked = []
+        produced = {}
+        write_outputs = TensorExecutor.write_outputs
+
+        def remember(executor, data, batch, source_rows):
+            output = write_outputs(executor, data, batch, source_rows)
+            if executor.task.tuple_output:
+                for index, row in enumerate(data.rows):
+                    produced[row.identity] = tuple(value[index].clone() for value in executor.results)
+            return output
+
+        monkeypatch.setattr(TensorExecutor, "write_outputs", remember)
         launches = []
         plan = handle.attachment.plan
         execute = execution.execute_anchor
@@ -75,6 +87,10 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
                         )
                     else:
                         fields = root
+                        if row.phase is HiddenPhase.DECODE:
+                            assert ref.version_id > 0
+                            for field, expected_field in zip(fields, produced[row.identity], strict=True):
+                                torch.testing.assert_close(field, expected_field)
                     a, b = fields[index * 2 : index * 2 + 2]
                     x = hidden[row.packed_row_index].double()
                     expected = (
@@ -95,7 +111,7 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
             monkeypatch.setattr(reader, "emit", intercept(reader, index))
         start = time.perf_counter()
         outputs = handle.generate(
-            ["A short question about stars.", "word " * 61, "Name a color."],
+            ["Name a color.", "word " * 61, "Name a color."],
             SamplingParams(max_tokens=4, temperature=0, ignore_eos=True),
         )
         elapsed = time.perf_counter() - start

@@ -98,10 +98,11 @@ def cuda_graph_pool_bytes(pool: tuple[int, int], device: int) -> int:
 
 @dataclass(frozen=True)
 class MemoryUsage:
-    """Task peak and allocations retained after its return, in allocator-rounded bytes."""
+    """Task peak, retained allocations and conservative capture reservation, in bytes."""
 
     workspace: int
     output: int
+    capture: int = 0
 
 
 class MemoryTrace(TorchDispatchMode):
@@ -114,6 +115,29 @@ class MemoryTrace(TorchDispatchMode):
         self.sizes: dict[StorageWeakRef, int] = {}
         self.live = 0
         self.peak = 0
+        self.small_allocations = 0
+        self.large_allocations = 0
+        self.oversize_allocations = 0
+
+    def _capture_allocation(self, size: int) -> None:
+        # Bound a private native allocator pool without assuming any reuse. Small requests use
+        # 2 MiB segments, medium requests 20 MiB; each fills at least half a segment before
+        # another is needed. Oversize requests get individually rounded 2 MiB segments.
+        if size <= 1 << 20:
+            self.small_allocations += size
+        elif size < 10 << 20:
+            self.large_allocations += size
+        else:
+            self.oversize_allocations += (size + (2 << 20) - 1) // (2 << 20) * (2 << 20)
+
+    @property
+    def capture_bytes(self) -> int:
+        """Conservative no-reuse reservation, including each used pool's unfinished segment."""
+        return (
+            (2 * self.small_allocations + (2 << 20) if self.small_allocations else 0)
+            + (2 * self.large_allocations + (20 << 20) if self.large_allocations else 0)
+            + self.oversize_allocations
+        )
 
     def _forget(self, ref: StorageWeakRef) -> None:
         self.live -= self.sizes.pop(ref)
@@ -126,6 +150,8 @@ class MemoryTrace(TorchDispatchMode):
                 if ref in self.sizes:
                     continue
                 size = (storage.nbytes() + 511) // 512 * 512
+                if owned:
+                    self._capture_allocation(size)
                 # Native large-pool reuse can keep an unsplit tail of up to 1 MiB.
                 size += (1 << 20) if size > (1 << 20) else 0
                 self.sizes[ref] = size if owned else 0
@@ -153,6 +179,7 @@ class MemoryTrace(TorchDispatchMode):
         trace = cls.active.get()
         if trace is not None:
             trace.peak = max(trace.peak, trace.live + size)
+            trace._capture_allocation(size)
 
 
 def measure(function: Callable[[], object]) -> MemoryUsage:
@@ -161,6 +188,6 @@ def measure(function: Callable[[], object]) -> MemoryUsage:
         token = MemoryTrace.active.set(trace)
         try:
             _result = function()
-            return MemoryUsage(trace.peak, trace.live)
+            return MemoryUsage(trace.peak, trace.live, trace.capture_bytes)
         finally:
             MemoryTrace.active.reset(token)

@@ -322,23 +322,21 @@ class TensorExecutor:
         self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext[TensorFrame] | None = None
     ) -> TaskOutput:
         """Prepare operands, run the shared body or graph, then write invocation outputs."""
-        prepared = data if self.task.export is None else self.task.export.prepare(data)
-        if prepared is None:
-            return TaskOutput()
-        data = prepared
         parent, frame = batch, data
         if not self.task.resource:
             batch = batch.state_free()
         elif any(group.resource == self.task.resource for group in batch.selection.groups):
             batch = batch.for_resource(self.task.resource)
-        rows = data.rows
-        if self.task.phase is not None:
-            eligible = {row.packed_row_index for row in data.step.rows.producer_rows(self.task.phase)}
-            rows = tuple(row for row in rows if row.packed_row_index in eligible)
+        rows = data.producer_rows(self.task.phase)
         if rows != data.rows or batch.selection is not parent.selection:
             data = replace(data, rows=rows, plan=None)
         if not data.rows and self.task.phase is not None:
             return TaskOutput()
+        source_rows = len(data.rows)
+        prepared = data if self.task.export is None else self.task.export.prepare(data)
+        if prepared is None:
+            return TaskOutput()
+        data = prepared
         addresses: tuple[int, ...] = ()
         if self.capture is not None and context is not None:
             self.capture.order(batch.stream)
@@ -368,7 +366,7 @@ class TensorExecutor:
                 addresses,
                 lambda: self.staging.copy_to(table),
             )
-        output = self.write_outputs(data, batch)
+        output = self.write_outputs(data, batch, source_rows)
         frame.parameter_gradient_fields = data.parameter_gradient_fields
         if batch.selection is not parent.selection:
             positions = tuple(parent.selection.refs.index(ref) for ref in batch.selection.refs)
@@ -438,7 +436,7 @@ class TensorExecutor:
                 host[offset : offset + len(data.rows)] = tap.slots[plan.packed]
                 offset += self.rows
 
-    def write_outputs(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
+    def write_outputs(self, data: TensorFrame, batch: TensorBatch, source_rows: int) -> TaskOutput:
         """Record results, gradients, losses and observations of the last body."""
         state_mean = self.task.policy.reduction == "state_mean"
         count = len(batch.roots) if self.optimizer is not None and state_mean else len(data.rows)
@@ -452,7 +450,7 @@ class TensorExecutor:
         batch.results.update(((self.task.symbol, name), value) for name, value in zip(self.task.outputs, values))
         if self.optimizer is None:
             if self.task.export is not None:
-                return self.task.export.output(values[0], data)
+                return self.task.export.output(values[0], data, source_rows)
             if self.task.sampler_stage is not None:
                 return self.task.sampler_output(data, batch)
             return TaskOutput()

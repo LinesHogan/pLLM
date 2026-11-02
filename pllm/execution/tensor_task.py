@@ -88,12 +88,13 @@ class FieldWriter:
         if self.source is None:
             return tuple(index for index, _ in data.replacements)
         group = selection.for_resource(self.resource)
-        if self.phase is not None and not data.step.rows.producer_rows(self.phase):
+        rows = data.producer_rows(self.phase)
+        if self.phase is not None and not rows:
             return ()
         if group.keys == (None,):
             return tuple(selection.refs.index(ref) for ref in group.refs)
         indices = {row.identity: index for row, index in zip(selection.rows, group.state_indices, strict=True)}
-        return tuple(dict.fromkeys(indices[row.identity] for row in data.step.rows.producer_rows(self.phase)))
+        return tuple(dict.fromkeys(indices[row.identity] for row in rows))
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +110,10 @@ class TensorExport:
 
     def __post_init__(self) -> None:
         if min(self.every, self.max_rows, self.max_cols) < 1 or self.max_rows * self.max_cols * 8 > MAX_SNAPSHOT_BYTES:
-            raise ValueError("tensor export requires positive stride and bounded snapshot dimensions")
+            raise ValueError(
+                f"tensor export needs positive every, max_rows and max_cols, with "
+                f"max_rows * max_cols * 8 <= {MAX_SNAPSHOT_BYTES} bytes (32 KiB)"
+            )
 
     def prepare(self, data: TensorFrame) -> TensorFrame | None:
         """Skip disabled steps and bound the rows before evaluating tensor math."""
@@ -117,7 +121,7 @@ class TensorExport:
             return None
         return replace(data, rows=data.rows[: self.max_rows], plan=None)
 
-    def output(self, value: torch.Tensor, data: TensorFrame) -> TaskOutput:
+    def output(self, value: torch.Tensor, data: TensorFrame, source_rows: int) -> TaskOutput:
         """Publish the bounded result with its row identities and delivery policy."""
         return TaskOutput(
             observations=(
@@ -127,6 +131,7 @@ class TensorExport:
                     step_id=data.step.rows.step_id,
                     identities=tuple(row.identity for row in data.rows),
                     export=self.overflow,
+                    dropped_rows=source_rows - len(data.rows),
                 ),
             )
         )

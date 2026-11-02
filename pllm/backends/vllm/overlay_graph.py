@@ -70,7 +70,7 @@ def graph_options(config: ModelConfig, requirements: BackendRequirements) -> Gra
             "compilation_config": CompilationConfig(max_cudagraph_capture_size=config.max_num_batched_tokens),
         }
     return {
-        "additional_config": {_BUDGET: config.execution.capture_memory_bytes},
+        "additional_config": {_BUDGET: config.execution.model_capture_bytes},
         "compilation_config": CompilationConfig(
             mode=CompilationMode.VLLM_COMPILE,
             # Capture the model's source CUDA operators; the shared region selects overlay kernels.
@@ -196,8 +196,11 @@ class OverlayGraphRunner(compat.ModelRunner):
                 self.vllm_config, self.device, manager.cudagraph_mode, manager.decode_query_len, phases
             )
         self.projection_model.do_not_compile = False
+        pool = current_platform.get_global_graph_pool()
+        # vLLM shares this pool across engines; charge this engine's added residency.
+        before = cuda_graph_pool_bytes(pool, self.device.index or 0)
         self.capture_model()
-        used = cuda_graph_pool_bytes(current_platform.get_global_graph_pool(), self.device.index or 0)
+        used = cuda_graph_pool_bytes(pool, self.device.index or 0) - before
         if used > self.overlay_graph_bytes:
             raise ValueError(
                 f"CUDA graphs of the adapted projections need {used} bytes; raise ExecutionOptions.capture_memory_bytes"

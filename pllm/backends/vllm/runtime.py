@@ -674,7 +674,7 @@ def _eager_reason(config: ModelConfig, requirements: BackendRequirements) -> str
     if requirements.custom_forward:
         return "@pllm.custom_forward reruns model layers outside CUDA graphs"
     if requirements.instance_adapter:
-        return "CUDA-graph overlays read request state only; declare the pllm.model.Adapter state as pllm.RequestState"
+        return "CUDA-graph overlays do not support adapters backed by shared InstanceState"
     return ""
 
 

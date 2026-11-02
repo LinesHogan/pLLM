@@ -105,8 +105,8 @@ class OverlayBatch:
             remaining = self.available(key)
             if tile.batchable:
                 with FakeTensorMode(allow_non_fake_inputs=True):
-                    workspace = measure(partial(tile.body, operand.base_weight)).workspace
-                needed = workspace + tile.buffer_bytes
+                    capture_bytes = measure(partial(tile.body, operand.base_weight)).capture
+                needed = capture_bytes + tile.buffer_bytes
                 if needed <= remaining:
                     tile.capture = StepCapture(replace(self.budget, resident_bytes=remaining), self.states)
                     self.tiles[key] = tile

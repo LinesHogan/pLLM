@@ -104,6 +104,7 @@ class Observation:
     identities: tuple[RequestIdentity, ...] = ()
     iteration: int = 0
     export: Literal["drop", "block"] | None = None
+    dropped_rows: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -531,6 +532,7 @@ class TensorOperation(Generic[D]):
                             tensor=observation.value,
                             tensor_name=observation.name,
                             export=observation.export,
+                            dropped_rows=observation.dropped_rows,
                         )
                         continue
                     context.trace.observe(
