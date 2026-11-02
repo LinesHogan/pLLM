@@ -1,8 +1,8 @@
 # 状态与记忆
 
 > **先决条件**：[写一个负载](write-a-workload.md)；教程
-> [03](../tutorials/03_request_lora.ipynb)、[04](../tutorials/04_loops.ipynb)
-> 演示了本文的每个概念。
+> [02](../tutorials/02_request_adapters.ipynb)、[03](../tutorials/03_decode_training.ipynb)
+> 演示了请求状态与实例状态。
 >
 > **本文回答**：我有值要跨步、跨请求保存，该怎么声明？该选哪种状态？
 
@@ -227,7 +227,7 @@ HOLD 步不读取 borrowed features，不执行 encode/write/publish；模型只
 都不是 Absent。α 使用显式 next-step 协议，FIFO/latest-ready/跳帧仍不在此协议中。
 
 同一借用资源组原子分流，绑定中任一 `on_missing=STOP` 就在缺席时停实例。
-HOLD 也必须已有成功首版：只有模型实际使用过、sampler 完成、ACK 与 settle
+HOLD 也必须已有成功首版：只有模型实际使用过、sampler 完成、ACK 与提交
 全部成功的版本才能成为保持凭据。初始化版本零、仅发布尚未收束的版本不算。
 同 ref 再发新 grant 是一次新消费和本地更新，不能记作 HOLD。
 

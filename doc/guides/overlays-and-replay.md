@@ -1,8 +1,8 @@
 # Overlay 与重放
 
 > **先决条件**：[状态与记忆](state-and-memory.md)；教程
-> [03](../tutorials/03_request_lora.ipynb)（overlay 全家桶）、
-> [04](../tutorials/04_loops.ipynb)（层间重放与再循环）。
+> [02](../tutorials/02_request_adapters.ipynb)（每请求 LoRA）、
+> [04](../tutorials/04_custom_forward.ipynb)（层间重放）。
 
 生产里常见的两类需求：推理过程中修改模型的**有效权重**（每请求一副 LoRA
 式补丁、在线 TTT），或者让某些层在更新发布后**立即重跑**。这篇指南回答怎么
@@ -94,7 +94,7 @@ class MyLoRA(pllm.Workload):
 
 ```python
 @pllm.custom_forward(tokens="decode")
-def settle(self, layers: pllm.model.Layers) -> torch.Tensor:
+def update_then_rerun(self, layers: pllm.model.Layers) -> torch.Tensor:
     taps = layers()
     layers.apply_updates()
     for _ in range(2):

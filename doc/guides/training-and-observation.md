@@ -1,8 +1,8 @@
 # 训练与观测
 
 > **先决条件**：[状态与记忆](state-and-memory.md)；教程
-> [01](../tutorials/01_observe_sae.ipynb)（观测）、[02](../tutorials/02_custom_head.ipynb)
-> （训练）、[05](../tutorials/05_decode_training.ipynb)（decode 在线训练）。
+> [01](../tutorials/01_observe_probe.ipynb)（观测）、[03](../tutorials/03_decode_training.ipynb)
+> （decode 时训练）、[05](../tutorials/05_host_feedback.ipynb)（宿主批次训练）。
 >
 > **本文回答**：怎么声明一个训练任务？loss 按什么约定写？怎么把 loss/梯度/
 > hidden 拿出来看？

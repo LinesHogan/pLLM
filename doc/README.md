@@ -13,14 +13,14 @@
 
 ## 教程（学习导向，可执行 notebook）
 
-需要 GPU。从心智模型到完整场景，按顺序读。
+需要 GPU。每篇围绕一个算法，在 Qwen2.5-0.5B 上跑完，输出保留在 notebook 里。
 
-- [00 快速上手：心智模型与最小观测负载](tutorials/00_quickstart.ipynb)
-- [01 观测：给三层 hidden 装 SAE](tutorials/01_observe_sae.ipynb)
-- [02 自定义训练头：从线性头到 CNN](tutorials/02_custom_head.ipynb)
-- [03 每请求 LoRA：路由共享、混合与 prefill 学习](tutorials/03_request_lora.ipynb)
-- [04 三种循环：层间、步间、会话](tutorials/04_loops.ipynb)
-- [05 decode 时在线训练：跨步与跨请求目标](tutorials/05_decode_training.ipynb)
+- [00 快速上手：把激活引导（CAA）搬进 vLLM](tutorials/00_quickstart.ipynb)
+- [01 观测：用探针逐 token 监控生成](tutorials/01_observe_probe.ipynb)
+- [02 每请求 LoRA：Text-to-LoRA 式超网络](tutorials/02_request_adapters.ipynb)
+- [03 decode 时训练：ESamp](tutorials/03_decode_training.ipynb)
+- [04 改写 forward：循环深度](tutorials/04_custom_forward.ipynb)
+- [05 反馈循环：TTRL](tutorials/05_host_feedback.ipynb)
 
 ## 使用指南（任务导向）
 
