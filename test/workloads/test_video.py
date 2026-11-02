@@ -77,11 +77,10 @@ def binding_case(*, alias=False, write_failure=False, runtime=False, missing=Non
     publication = b.publish(transition, inject, when=When.BEFORE_FORWARD)
     timeline = model_timeline(torch.device("cpu"), ("transition/full_root@1",))
     if runtime:
-        b.overlay(
-            inject,
-            (transition, publication),
-            activations=tuple(
+        b.activation_patch(
+            tuple(
                 ActivationPatchBinding(
+                    inject.declaration.resource,
                     i,
                     (inject.view("delta", b.dimensions),),
                     1,
@@ -92,12 +91,12 @@ def binding_case(*, alias=False, write_failure=False, runtime=False, missing=Non
                     MissingPolicy.STOP if missing is None else missing,
                 )
                 for i in range(3)
-            ),
+            )
         )
         if missing is not None:
-            b.conditional_input(("features",))
+            b.conditional_input(("features",), publication)
         facts = backend_facts(2, (), timeline, PageBundleProviderFacts("video.binding@1", 3))
-        buffers = attachment_buffer_bytes(facts.probe, b.graph, b.layouts, b.attachment)
+        buffers = attachment_buffer_bytes(facts.probe, b.graph, b.layouts, b.effects)
         timeline = replace(timeline, reserved_bytes=(buffers,) * len(timeline.anchors))
     plan = compile_page_bundle_plan(
         (b.graph, b.layouts), timeline, (PageBundleProviderFacts("video.binding@1", 3),), 1, 65536, torch.device("cpu")
@@ -187,7 +186,7 @@ def _session(b, execution):
 
     plan = execution.arena.plan
     facts = backend_facts(2, (), plan.timeline, PageBundleProviderFacts("video.binding@1", 3))
-    deployment = BackendDeployment(execution, bind_backend_attachment(plan, facts.probe, b.attachment))
+    deployment = BackendDeployment(execution, bind_backend_attachment(plan, facts.probe, b.effects))
     model = SimpleNamespace(
         model=SimpleNamespace(layers=[_Layer() for _ in range(3)]), lm_head=SimpleNamespace(weight=torch.zeros(2, 2))
     )

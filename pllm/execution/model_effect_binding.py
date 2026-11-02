@@ -16,8 +16,6 @@ import torch
 from pllm.contracts.backend_attachment import (
     ActivationPatchBinding,
     ActivationPatchOperator,
-    AttachmentKind,
-    AttachmentTaskRole,
     DecodeRefresh,
     DecodeWindow,
     MissingPolicy,
@@ -32,11 +30,15 @@ from pllm.contracts.parameter_overlay import (
 )
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.semantic_graph import (
+    HiddenInputSource,
     MathContract,
     PackedRowsInputSource,
+    SemanticEffect,
     SemanticInput,
+    SemanticTask,
     StateEffectKind,
     StateScope,
+    TaskResultInputSource,
     TaskSymbol,
     TokenProgramEffect,
 )
@@ -82,12 +84,12 @@ def declare_parameter_overlay(
     reads: tuple[State, ...],
 ) -> None:
     """Declare a parameter overlay and its request-state transition."""
-    if (
-        b.graph.tasks
-        or any(state.resource not in {read.declaration.resource for read in reads} for state in b.graph.states)
-        or b.host
-    ):
-        raise ValueError("ordinary overlay requires a sole request state and model transition")
+    if b.host:
+        raise ValueError("@pllm.train_in_forward trains inside a model forward; compile this workload with make_llm")
+    if b.effects.in_forward is not None:
+        raise ValueError(
+            f"declare one @pllm.train_in_forward method per workload; {b.effects.in_forward} already is one"
+        )
     layout = overlay_fields(fields, effect, b.dimensions)
     targets = effect.targets
     b.overlay_targets = targets
@@ -170,7 +172,7 @@ def declare_parameter_overlay(
         b.operations[transition.symbol] = replace(
             b.operations[transition.symbol], version="private", select_fields=math.written_fields
         )
-    publication = b.publish(
+    b.publish(
         transition,
         state,
         implementations=(
@@ -186,7 +188,7 @@ def declare_parameter_overlay(
     views = effect.field_bindings(
         lambda name: state.view(name, b.dimensions), reads_weight="weight" in arguments.values()
     )
-    b.overlay(state, (transition, publication), views)
+    b.overlay(views, transition)
 
 
 def write_result(b: TensorBinding, source: Call, state: State, fields: tuple[str, ...], when: When) -> Call:
@@ -236,7 +238,6 @@ def import_update(b: TensorBinding, state: State, identity: str) -> Call:
 def declare_activation_patch(
     b: TensorBinding,
     state: State,
-    producer: tuple[Call, Call] | None,
     *,
     layers: tuple[int, ...],
     operator: ActivationPatchOperator,
@@ -246,7 +247,7 @@ def declare_activation_patch(
     decode_refresh: DecodeRefresh = DecodeRefresh.INHERIT,
     on_missing: MissingPolicy = MissingPolicy.STOP,
 ) -> None:
-    """Read logical state views at activation sites; custom forwards and HOLD also bind their publication dependency."""
+    """Read logical state views at activation sites."""
     width = 1 if operator is ActivationPatchOperator.ADD else 3
     views = tuple(view for (resource, _), view in b.field_views.items() if resource == state.declaration.resource)
     if (
@@ -259,11 +260,10 @@ def declare_activation_patch(
         raise ValueError("activation fields must cover each ordered layer and operator")
     for start in range(0, len(views), width):
         _check_activation_fields(b, state, operator, views[start : start + width])
-    b.overlay(
-        state,
-        producer,
-        activations=tuple(
+    b.activation_patch(
+        tuple(
             ActivationPatchBinding(
+                state.declaration.resource,
                 layer,
                 views[index * width : (index + 1) * width],
                 first_tokens,
@@ -274,7 +274,7 @@ def declare_activation_patch(
                 on_missing=on_missing,
             )
             for index, layer in enumerate(layers)
-        ),
+        )
     )
 
 
@@ -304,25 +304,22 @@ def _check_activation_fields(
 def declare_custom_forward(
     b: TensorBinding,
     forwards: tuple[tuple[Tokens, Over, Callable[[Layers], torch.Tensor]], ...],
-    position_states: tuple[tuple[str, float], ...] = (),
+    position_states: tuple[tuple[str, float], ...],
+    publications: tuple[Call, ...],
 ) -> None:
-    """Trace the workload's @pllm.custom_forward methods and sign their complete model/tensor source before planning."""
+    """Trace the workload's @pllm.custom_forward methods and sign their complete model/tensor source before planning.
+
+    The forward reads every version in `publications`: the writes of states its activation patches read.
+    """
     tokens: Tokens = forwards[0][0] if len(forwards) == 1 else "all"
-    activation = b.attachment is not None and b.attachment.kind is AttachmentKind.ACTIVATION_PATCH
-    composed = (
-        b.attachment is not None
-        and b.attachment.kind is AttachmentKind.PARAMETER_OVERLAY
-        and b.overlay_math is not None
-    )
-    if not activation and not composed and (b.attachment is not None or b.graph.tasks or b.graph.states):
-        raise ValueError(
-            "a custom_forward combines only with one pllm.model.ActivationPatch or one @pllm.train_in_forward; move other states and "
-            "methods to a separate workload"
-        )
-    if position_states and (activation or composed):
+    composed = b.effects.in_forward is not None
+    _check_custom_forward(b)
+    if position_states and (composed or b.effects.activation_bindings):
         raise ValueError("PositionState needs a @pllm.custom_forward without train_in_forward or an activation patch")
     b.position_states = position_states
     symbol = _attach_custom_forward(b, composed, TokenProgramEffect(b.dimensions.layer_count, tokens, position_states))
+    if publications:
+        b.update_task(symbol, partial(_read_publications, b, publications))
     probe = b.probe
     assert probe is not None and probe.causal_domain is not None
     captured = _trace_programs(probe, forwards, position_states)
@@ -358,6 +355,46 @@ def declare_custom_forward(
     b.update_task(symbol, lambda task: replace(task, custom_forward=program_effect))
 
 
+def _check_custom_forward(b: TensorBinding) -> None:
+    """Reject effects whose backend hooks index the forward's packed rows, which a custom forward replaces with its
+    own row waves and layer visits."""
+    for task in b.graph.tasks:
+        if any(isinstance(port.source, HiddenInputSource) for port in task.inputs):
+            raise ValueError(
+                f"{task.symbol} reads hidden rows (pllm.hidden, pllm.residual, pllm.layer_logits or "
+                "pllm.final_hidden), which a @pllm.custom_forward does not produce: it may run a layer several "
+                "times or not at all per token; move this method to a workload without the custom forward"
+            )
+    adapters = {binding.resource for binding in b.effects.overlay_bindings} - {
+        str(effect.resource) for task in b.graph.tasks if task.symbol == b.effects.in_forward for effect in task.effects
+    }
+    if adapters:
+        raise ValueError(
+            f"pllm.model.Adapter reading {sorted(adapters)} corrects projections for the model's own packed rows; "
+            "inside a @pllm.custom_forward only the @pllm.train_in_forward state is applied, so train the adapter "
+            "with train_in_forward or drop the custom forward"
+        )
+
+
+def _read_publications(b: TensorBinding, publications: tuple[Call, ...], task: SemanticTask) -> SemanticTask:
+    """Make the custom forward read the published versions of the states its activation patches read."""
+    published = tuple(next(item for item in b.graph.tasks if item.symbol == call.symbol) for call in publications)
+    return replace(
+        task,
+        inputs=(
+            *task.inputs,
+            *(
+                SemanticInput(f"published_{index}", TaskResultInputSource(item.symbol, item.outputs[0].name))
+                for index, item in enumerate(published)
+            ),
+        ),
+        effects=(
+            *task.effects,
+            *(SemanticEffect(item.effects[-1].resource, StateEffectKind.READ, item.symbol) for item in published),
+        ),
+    )
+
+
 def _attach_custom_forward(b: TensorBinding, composed: bool, effect: TokenProgramEffect) -> TaskSymbol:
     """Run the custom forward as the trained overlay's transition, or as a standalone forward; return its task."""
     if not composed:
@@ -369,10 +406,11 @@ def _attach_custom_forward(b: TensorBinding, composed: bool, effect: TokenProgra
             custom_forward=effect,
             implementations=(native(CUSTOM_FORWARD_IMPLEMENTATION, "model/custom_forward@1"),),
         )
-        b.model_effect(forward, AttachmentKind.CUSTOM_FORWARD)
+        b.custom_forward(forward.symbol)
         return forward.symbol
-    assert b.attachment is not None
-    symbol = next(symbol for role, symbol in b.attachment.tasks if role is AttachmentTaskRole.TRANSITION)
+    symbol = b.effects.in_forward
+    assert symbol is not None
+    b.custom_forward(symbol)
     b.update_task(
         symbol,
         lambda task: replace(

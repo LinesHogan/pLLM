@@ -713,17 +713,15 @@ class ActivationPatch:
             raise ValueError("refresh= and on_missing= apply to decode tokens; set decode=True")
 
     def declare(self, context: _Reflection) -> None:
-        """Read local state, preserving custom-forward and HOLD publication dependencies when declared."""
+        """Read the state at the activation sites; its writer, if the workload has one, is connected later."""
         definition = context.state_definition(self.state, "pllm.model.ActivationPatch needs a declared state")
         if definition.feed is not None:
             raise ValueError(
                 "pllm.model.ActivationPatch reads a state the workload writes; it cannot read a fed state directly"
             )
-        state = context.states[self.state]
         declare_activation_patch(
             context.binding,
-            state,
-            context.writes.get(self.state) if context.custom_forwards or context.binding.feeds else None,
+            context.states[self.state],
             layers=self.layers,
             operator=ActivationPatchOperator(self.operator),
             first_tokens=self.first_tokens,
@@ -865,8 +863,7 @@ class _Export(_Effect):
             enabled=_setting(self.enabled, owner, bool),
             overflow=self.overflow,
         )
-        call = operation.tensor(result_schema="hidden_export@1", export=export)
-        operation.context.binding.model_effect(call)
+        operation.context.binding.exports(operation.tensor(result_schema="hidden_export@1", export=export))
 
 
 _TRAINING_INPUTS: dict[TrainingMode, str] = {
@@ -1042,7 +1039,11 @@ class _Sampler(_Effect):
                 sampler_beta=0.0 if self.beta is None else _setting(self.beta, operation.context.owner, float),
             )
             if operation.context.prediction is not None:
-                raise ValueError("declare at most one @pllm.add_logits or @pllm.guide_sampling method")
+                raise ValueError(
+                    f"{operation.context.prediction[0].symbol} and {operation.name} both send a result to vLLM's "
+                    "sampler, which applies one @pllm.add_logits or @pllm.guide_sampling method per step; combine "
+                    "them into one method"
+                )
             operation.context.prediction = call, self
 
 
@@ -1697,7 +1698,8 @@ class _Reflection:
     parameters: dict[tuple[str, str], TensorPort] = field(default_factory=lambda: {})
     writes: dict[str, tuple[Call, Call]] = field(default_factory=lambda: {})
     prediction: tuple[Call, _Sampler] | None = None
-    training: tuple[Call, State] | None = None
+    # Each @pllm.train method and the state it trains.
+    trainers: list[tuple[Call, State]] = field(default_factory=lambda: [])
 
     @property
     def sampler(self) -> _Sampler | None:
@@ -1876,15 +1878,26 @@ class _Reflection:
                 patch.declare(self)
         for name, delta in self.adapters.items():
             with self.declaring(name):
-                self.binding.overlay(self.states[delta.state], None, self.adapter_bindings(delta))
+                self.binding.overlay(self.adapter_bindings(delta))
+        # The writes of states activation patches read: a custom forward reads their versions, and a fed chain
+        # (feed -> @pllm.write -> patch) closes its conditional input at that publication.
+        publications = tuple(
+            self.writes[patch.state][1] for patch in self.activations.values() if patch.state in self.writes
+        )
         if self.custom_forwards:
             declare_custom_forward(
                 self.binding,
                 tuple((tokens, over, self.method(name)) for name, tokens, over in self.custom_forwards),
                 self.positions,
+                publications,
             )
         if self.binding.feeds:
-            self.binding.conditional_input(tuple(feed.resource for feed in self.binding.feeds))
+            if len(publications) != 1:
+                raise ValueError(
+                    "a fed state reaches the model through one @pllm.write into the state a "
+                    "pllm.model.ActivationPatch reads"
+                )
+            self.binding.conditional_input(tuple(feed.resource for feed in self.binding.feeds), publications[0])
 
     def position_states(self) -> tuple[tuple[str, float], ...]:
         """Resolve the pre-allocation schema without tracing tensors."""
@@ -1896,34 +1909,32 @@ class _Reflection:
         return states
 
     def train(self, call: Call, state: str, mode: TrainingMode) -> None:
-        if self.training is not None:
-            raise ValueError(f"declare one @pllm.train method per workload; {self.training[0].symbol} already trains")
-        self.training = call, self.states[state]
+        mode_now = self.binding.graph.training_mode
+        if mode_now is not None and mode_now != mode:
+            raise ValueError(
+                f"{call.symbol} trains on {_TRAINING_INPUTS[mode]} but {self.trainers[0][0].symbol} on "
+                f"{_TRAINING_INPUTS[mode_now]}; pllm funds one training mode per workload, so move one of them to a "
+                "separate workload"
+            )
+        self.trainers.append((call, self.states[state]))
         self.binding.graph = replace(self.binding.graph, training_mode=mode)
 
     def attach_training(self) -> None:
-        """Validate gradients and pair the single prediction and training operations."""
-        validate_gradients(self.binding, None if self.training is None else self.training[0])
+        """Validate gradients and record the sampler and training operations."""
+        validate_gradients(self.binding, tuple(call for call, _ in self.trainers))
         if self.prediction is not None:
-            if self.training is None:
-                raise ValueError("@pllm.add_logits and @pllm.guide_sampling need a @pllm.train method for their state")
             call, sampler = self.prediction
-            declare_logits(
-                self.binding,
-                call,
-                *self.training,
-                stage=sampler.stage,
-            )
-        elif self.training is not None and self.binding.attachment is None:
-            self.binding.request_training(*self.training)
+            declare_logits(self.binding, call, stage=sampler.stage)
+        for call, _ in self.trainers:
+            self.binding.trains(call)
 
     def overlap_sampler(self) -> None:
         """Overlap an independent private update with sampling, retaining the token-commit publication boundary."""
         b = self.binding
         # The invocation owns one pending write. Other writers, model effects and feeds retain their placement.
-        if self.training is None or self.has_model_effect or self.writes or b.feeds:
+        if len(self.trainers) != 1 or self.has_model_effect or self.writes or b.feeds:
             return
-        call, state = self.training
+        ((call, state),) = self.trainers
         if call.symbol not in b.tensor_tasks:
             return  # Host-batch training has its own execution and publication policy.
         operation = next(operation for operation in self.operations if operation.name == call.symbol)
@@ -1961,12 +1972,12 @@ class _Reflection:
         b = self.binding
         if len(b.imports) > 1:
             raise ValueError("StateImport supplies one imported resource per workload")
-        if not b.graph.tasks and b.attachment is not None:
-            state = self.states[b.attachment.state_resource]
+        if not b.graph.tasks and b.graph.model_reads:
+            states = tuple(self.states[str(resource)] for resource in b.graph.model_reads)
             b.compute(
                 "model.read",
-                inputs={"state": state.read()},
-                reads=(state.version(),),
+                inputs={str(state.declaration.resource): state.read() for state in states},
+                reads=tuple(state.version() for state in states),
                 when=When.IN_FORWARD,
                 function=lambda data, batch: TaskOutput(),
             )

@@ -25,11 +25,7 @@ from pllm.backends.vllm.sampler import (
     SamplerGuidance,
     SignedSamplerGuidance,
 )
-from pllm.contracts.backend_attachment import (
-    AttachmentGraphMode,
-    AttachmentTaskRole,
-    BackendAttachment,
-)
+from pllm.contracts.backend_attachment import AttachmentGraphMode, BackendAttachment
 from pllm.contracts.codec import encode_boundary
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedSamplerRowBatch
@@ -120,17 +116,11 @@ class VllmSession(Generic[DataT, ResultT]):
         # The overlay prepared for each model forward; a custom forward drives its program overlay itself.
         self._forward_overlay = None if program_overlay else self._overlay
         self._in_forward_overlay = plan.semantic_graph.updates_in_forward and not program_overlay
-        self._transition_task = next(
-            (item.task_id for item in attachment.task_bindings if item.role is AttachmentTaskRole.TRANSITION), None
-        )
+        in_forward = attachment.spec.in_forward
+        self._transition_task = None if in_forward is None else plan.scheduled(in_forward).task_id
         self._activation = (
-            VllmActivationPatch(
-                decoder.model,
-                attachment.spec.activation_bindings,
-                attachment.spec.state_resource,
-                install=custom_forward_task is None,
-            )
-            if (attachment.spec.activation_bindings)
+            VllmActivationPatch(decoder.model, attachment.spec.activation_bindings, install=custom_forward_task is None)
+            if attachment.spec.activation_bindings
             else None
         )
         self._feed: FeedReceiver | None = None
@@ -142,7 +132,7 @@ class VllmSession(Generic[DataT, ResultT]):
                 decoder.kv_writable("a @pllm.custom_forward"),
                 custom_forward_task,
                 deployment.execution,
-                attachment.task_bindings[0].anchor_id,
+                plan.scheduled(custom_forward_task.symbol).anchor_id,
                 activation=self._activation,
                 position_layers=position_layers,
                 allocation_block_size=allocation_block_size,
@@ -447,7 +437,7 @@ class VllmSession(Generic[DataT, ResultT]):
             feedback = self._sampler.finish_guidance()
         execution = self._deployment.execution
         context = self._context()
-        execution.execute_anchor(context, self._deployment.attachment.sampler_anchor_id)
+        execution.execute_anchor(context, execution.sampler_anchor_id)
         execution.complete_sampler(context, torch.cuda.current_stream(execution.device), feedback=feedback)
 
     @torch.inference_mode(False)

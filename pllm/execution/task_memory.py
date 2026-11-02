@@ -62,7 +62,12 @@ def example(
     binding: TensorBinding, facts: BackendCompileFacts, options: ExecutionOptions
 ) -> tuple[TensorFrame, TensorBatch]:
     """Construct metadata and borrowed operands; execution itself constructs all task scratch."""
-    count = facts.max_admitted_lineages if binding.graph.states else facts.probe.max_packed_rows
+    # Hidden taps keep one row per request (its prompt end or decode token), as do request states.
+    count = (
+        facts.max_admitted_lineages
+        if binding.graph.states or facts.probe.hidden_resources
+        else facts.probe.max_packed_rows
+    )
     rows = tuple(
         PackedPhaseRow(i, i, 0, HiddenPhase.DECODE, RequestIdentity(str(i), i, 0, str(i))) for i in range(count)
     )

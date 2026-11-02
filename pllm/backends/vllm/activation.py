@@ -78,15 +78,7 @@ class _ActivationLayer:
 
 
 class VllmActivationPatch:
-    def __init__(
-        self,
-        model: CausalLM,
-        bindings: tuple[ActivationPatchBinding, ...],
-        resource: str,
-        *,
-        install: bool = True,
-    ) -> None:
-        self.resource = StateResource(resource)
+    def __init__(self, model: CausalLM, bindings: tuple[ActivationPatchBinding, ...], *, install: bool = True) -> None:
         self.installed = install
         self.row_count = 0
         self.layers = tuple(_ActivationLayer(model.model.layers[binding.layer], binding) for binding in bindings)
@@ -107,7 +99,7 @@ class VllmActivationPatch:
             and {identity for identity, _, _ in held.successful} == {row.identity for row in rows.rows}
         )
         context.input_step_id = rows.step_id
-        versions: dict[tuple[RequestIdentity, bool], tuple[PagePin, StateRef]] = {}
+        versions: dict[tuple[StateResource, RequestIdentity, bool], tuple[PagePin, StateRef]] = {}
         self.row_count = rows.total_rows
         for handle in self.layers:
             prepared: list[_PatchRows] = []
@@ -126,9 +118,9 @@ class VllmActivationPatch:
                     )
                     if not selected:
                         continue
-                    key = (identity, refresh)
+                    key = (handle.binding.resource, identity, refresh)
                     if key not in versions:
-                        pin, ref = self._version(identity, refresh, context, directory)
+                        pin, ref = self._version(handle.binding.resource, identity, refresh, context, directory)
                         if not self.installed or context.arena.plan.semantic_graph.input_groups:
                             # Admission pins belong to the request directory. Borrow
                             # the same exact version for this invocation's source view.
@@ -167,23 +159,23 @@ class VllmActivationPatch:
             rows.append(tuple(selected))
         return tuple(rows)
 
+    @staticmethod
     def _version(
-        self,
+        resource: StateResource,
         identity: RequestIdentity,
         refresh: bool,
         context: StateTaskContext[DataT],
         directory: RequestStateDirectory,
     ) -> tuple[PagePin, StateRef]:
-        ((pin, ref),) = context.read_versions((identity,), self.resource, directory, latest=refresh)
+        ((pin, ref),) = context.read_versions((identity,), resource, directory, latest=refresh)
         if (
             refresh
-            and ref in context.selection.for_resource(self.resource).refs
+            and ref in context.selection.for_resource(resource).refs
             and context.held_input is None
             and any(
                 task.timing.after == "request.prepare"
                 and any(
-                    effect.resource == self.resource and effect.kind is not StateEffectKind.READ
-                    for effect in task.effects
+                    effect.resource == resource and effect.kind is not StateEffectKind.READ for effect in task.effects
                 )
                 for task in context.arena.plan.semantic_graph.tasks
             )

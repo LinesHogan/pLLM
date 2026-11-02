@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from pllm.contracts.backend_attachment import AttachmentKind, ModelProbe
+from pllm.contracts.backend_attachment import ModelProbe
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.host_batch import StateImport
@@ -197,17 +197,12 @@ class TensorBinding(Builder[TensorFrame]):
                 )
 
     def step_row_reader(self) -> Callable[[StepInput], tuple[PackedPhaseRow, ...]]:
-        """The rows that open a step's state context, chosen once at bind; model-replay and activation steps
-        differ from the rows tasks read."""
-        if self.attachment is not None and (
-            self.attachment.activation_bindings
-            or any(task.custom_forward is not None for task in self.graph.tasks)
-            and self.overlay_targets
-        ):
-            if self.graph.states[0].scope is StateScope.REQUEST:
-                return lambda value: value.rows.rows
-            return lambda value: ()
-        if self.attachment is not None and self.attachment.kind is AttachmentKind.CUSTOM_FORWARD:
+        """The rows that open a step's state context, chosen once at bind: a model effect reading request state
+        selects every packed row's request; a custom forward over no request state selects none."""
+        effects, request = self.effects, any(state.scope is StateScope.REQUEST for state in self.graph.states)
+        if effects.activation_bindings or (effects.custom_forward is not None and effects.overlay_bindings):
+            return (lambda value: value.rows.rows) if request else (lambda value: ())
+        if effects.custom_forward is not None and not request:
             return lambda value: ()
         read = self.row_reader()
         return lambda value: read(value.rows)
@@ -317,6 +312,7 @@ class TensorBinding(Builder[TensorFrame]):
             optimizer=optimizer,
             copy_fields=None if state is None else state.copy_fields,
             capture_resident=executor.resident,
+            resource=StateResource("") if state is None else state.declaration.resource,
         )
 
     def _step_capture(
@@ -387,7 +383,7 @@ class TensorBinding(Builder[TensorFrame]):
         patches and prefill inputs, otherwise each request's latest decode row."""
         if (
             self.overlay_targets
-            or (self.attachment is not None and self.attachment.activation_bindings)
+            or self.effects.activation_bindings
             or any(
                 isinstance(port.source, HiddenInputSource) and port.source.phase is HiddenPhase.PREFILL
                 for task in self.graph.tasks
@@ -400,20 +396,17 @@ class TensorBinding(Builder[TensorFrame]):
     def bind_prepare(self) -> Callable[[StepInput, TensorBatch], TensorFrame]:
         """Prepare independent input channels into the same invocation frame."""
         read = self.row_reader()
-        # Additive logits read the decode rows the sampler draws from, in sampler order.
-        sampled = (
-            self.attachment is not None
-            and self.attachment.guides_sampler
-            and self.attachment.sampler_stage is SamplerStage.PACKED_PRE_FILTER_ADD
-        )
+        # Additive logits read the rows the sampler draws from that complete a prompt or decode, in sampler order.
+        sampled = self.effects.sampler is not None and self.effects.sampler.stage is SamplerStage.PACKED_PRE_FILTER_ADD
 
         def prepare(value: StepInput, batch: TensorBatch) -> TensorFrame:
             rows = read(value.rows)
             if sampled:
                 rows = tuple(
-                    value.rows.rows[link.packed_row_index]
+                    row
                     for link in value.sampler_rows.links
-                    if value.rows.rows[link.packed_row_index].phase is HiddenPhase.DECODE
+                    for row in (value.rows.rows[link.packed_row_index],)
+                    if row.phase is HiddenPhase.DECODE or row.token_offset == row.prompt_length - 1
                 )
             data = TensorFrame(value, rows)
             match value.batch:

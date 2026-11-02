@@ -1,5 +1,6 @@
 """Maintained algorithms using the shared authoring and execution contracts."""
 
+from pllm.workloads.dola import DoLaWorkload as DoLaWorkload
 from pllm.workloads.dummy import DummyConfig as DummyConfig, DummyWorkload as DummyWorkload
 from pllm.workloads.esamp import (
     ESampConfig as ESampConfig,

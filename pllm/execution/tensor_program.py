@@ -169,19 +169,21 @@ class InvocationOutput:
 
 
 def read_batch(
-    context: StateTaskContext[D], version: Literal["input", "private", "published"] = "input"
+    context: StateTaskContext[D],
+    version: Literal["input", "private", "published"] = "input",
+    resource: StateResource = StateResource(""),
 ) -> TensorBatch:
-    """Borrow the invocation's selected version for tensor operations and layer replay."""
-    assert version == "input" or len(context.publications) <= 1
+    """Borrow the invocation's selected version for tensor operations and layer replay: the input version, or the
+    pending private write / the publication of `resource` this invocation made."""
     refs = context.pin.refs
     access: tuple[PagePin | PageWrite, ...] = (context.pin,) * len(refs)
-    write = context.sole_write()
+    write = context.pending_write(resource)
+    receipt = context.publication_of(resource)
     if version == "private" and write is not None:
         positions = write.before_refs.positions(refs)
         refs = refs.replace_versions(write.before_refs, write.after_refs)
         access = tuple(write if index >= 0 else context.pin for index in positions.tolist())
-    elif version in ("private", "published") and context.publication is not None:
-        receipt = context.publication
+    elif version in ("private", "published") and receipt is not None:
         pin = context.borrow_published(receipt.after_refs)
         positions = receipt.before_refs.positions(refs)
         refs = refs.replace_versions(receipt.before_refs, receipt.after_refs)
@@ -438,6 +440,8 @@ class TensorOperation(Generic[D]):
         Callable[[D, RequestStateSelection, tuple[int, ...]], tuple[tuple[LayoutFieldId, ...], ...]] | None
     ) = None
     capture_resident: Callable[[int], int] = _no_resident
+    # The state the operation changes; its body sees that state's selection and roots. Empty for a reader.
+    resource: StateResource = StateResource("")
 
     def input_shapes(
         self, rows: int, hidden: int, training_shapes: tuple[tuple[int, ...], ...]
@@ -449,6 +453,8 @@ class TensorOperation(Generic[D]):
 
     def memory(self, data: D, batch: TensorBatch) -> MemoryUsage:
         """Execute this operation's tensor path, excluding the already-funded pages."""
+
+        batch = self.scoped(batch)
 
         def run() -> TaskOutput:
             output = self.body(data, batch, None)
@@ -473,21 +479,28 @@ class TensorOperation(Generic[D]):
                 for value, previous in zip(root[:ADAM], source, strict=False):
                     torch.where(output.update_mask, value, previous, out=value)
 
+    def scoped(self, batch: TensorBatch) -> TensorBatch:
+        """The roots the body reads: the operation's own state when it changes or reads a produced version of one."""
+        return batch.for_resource(self.resource) if self.resource else batch
+
+    def batch(self, context: StateTaskContext[D], version: Literal["input", "private", "published"]) -> TensorBatch:
+        return self.scoped(read_batch(context, version, self.resource))
+
     def execute(self, context: StateTaskContext[D]) -> ProjectionResiduals:
         data, stream = context.data(), context.pin.stream
         with nullcontext() if stream is None else torch.cuda.stream(stream), torch.inference_mode(False):
-            batch = read_batch(context, self.version)
-            selected = tuple(range(len(batch.roots))) if self.select is None else self.select(data, context.selection)
+            batch = self.batch(context, self.version)
+            selected = tuple(range(len(batch.roots))) if self.select is None else self.select(data, batch.selection)
             write: PageWrite | None = None
             if self.mode == "transition" and selected:
-                if self.version == "input" or context.sole_write() is None:
+                if self.version == "input" or context.pending_write(self.resource) is None:
                     fields = (
                         None if self.select_fields is None else self.select_fields(data, context.selection, selected)
                     )
                     write = context.prepare_owned_write(
-                        context.pin.refs.take(selected), fields=fields, copy_fields=self.copy_fields
+                        batch.selection.refs.take(selected), fields=fields, copy_fields=self.copy_fields
                     )
-                batch = read_batch(context, "private")
+                batch = self.batch(context, "private")
             output = self.body(data, batch, context)
             if output.gradient_indices:
                 assert (
@@ -502,11 +515,11 @@ class TensorOperation(Generic[D]):
                     and self.optimizer is not None
                     and len(output.gradients) == len(selected)
                 )
-                write = context.prepare_owned_write(context.pin.refs.take(selected), copy_fields=self.copy_fields)
+                write = context.prepare_owned_write(batch.selection.refs.take(selected), copy_fields=self.copy_fields)
                 roots = context.arena.lazy_roots((write,) * len(selected), write.after_refs)
                 self.apply_gradients(roots, roots.field_slots, tuple(batch.roots[index] for index in selected), output)
             if write is None:
-                write = context.sole_write()
+                write = context.pending_write(self.resource)
             if write is not None and (self.mode == "update" or self.publish):
                 context.publish_owned_write(write)
             if output.counters is not None:

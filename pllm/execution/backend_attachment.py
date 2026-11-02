@@ -10,9 +10,6 @@ import torch
 from pllm.contracts.backend_attachment import (
     TOKEN_CAPTURE_CAPABILITY,
     AttachmentGraphMode,
-    AttachmentKind,
-    AttachmentTaskBinding,
-    AttachmentTaskRole,
     BackendAttachment,
     BackendAttachmentSpec,
     ModelProbe,
@@ -21,7 +18,6 @@ from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
-    AnchorId,
     AnchorSymbol,
     HiddenInputSource,
     SamplerFeedbackInputSource,
@@ -54,12 +50,8 @@ def attachment_buffer_bytes(
     """Fund effect buffers and pinned projection scratch; excludes model scratch."""
     rows, hidden = probe.max_packed_rows, probe.hidden_size
     width = 8 if probe.tensor_dtype is TensorDType.FLOAT64 else 4
-    fields = {
-        field.field_id: field
-        for layout in layouts.layouts
-        if layout.resource == attachment.state_resource
-        for field in layout.layout.fields
-    }
+    overlaid = {binding.resource for binding in attachment.overlay_bindings}
+    fields = tuple(field for layout in layouts.layouts if layout.resource in overlaid for field in layout.layout.fields)
     buffers = 1024 if attachment.overlay_bindings else 0
     projection_operands: list[int] = []
     pinned = uses_pinned_projection(
@@ -107,7 +99,7 @@ def attachment_buffer_bytes(
                     requests = probe.causal_domain.requests
                     # Two phase signatures at every exact width, plus one ordinary span.
                     buffers += (requests * (requests + 1) + requests) * (
-                        3 * sum(prod(field.shape) * width for field in fields.values()) + 1
+                        3 * sum(prod(field.shape) * width for field in fields) + 1
                     )
             case None:
                 pass
@@ -173,29 +165,35 @@ def derive_attachment_resources(
 def _check_attachment(attachment: BackendAttachment) -> None:
     """Reject attachments a workload author can declare but the backend cannot run.
 
-    Only mistakes reachable from a declaration are checked: export and training inputs, the
-    trained state's scope and sampled-token readers. Field shapes and
-    dtypes are checked earlier, where the declaration resolves them against the model.
+    Only mistakes reachable from a declaration are checked, each for its own effect: export inputs, training inputs,
+    the trained states' scope and sampled-token readers. Field shapes and dtypes are checked earlier, where the
+    declaration resolves them against the model.
     """
-    if attachment.spec.kind is AttachmentKind.OBSERVATION:
+    if attachment.spec.exports:
         _check_exports(attachment)
-    elif attachment.spec.kind is AttachmentKind.REQUEST_TRAINING:
+    if attachment.spec.training:
         _check_training(attachment)
 
 
 def _check_exports(attachment: BackendAttachment) -> None:
-    """Exports and the read-only helpers feeding them run between publication and sampling."""
+    """Exports, and the helpers whose results they read, observe the step between publication and sampling."""
     if not attachment.probe.hidden_resources:
         raise ValueError("exports need a hidden input, e.g. `h: torch.Tensor = pllm.hidden(0)`")
-    exports = {symbol for _, symbol in attachment.spec.tasks}
-    for task in attachment.plan.semantic_graph.tasks:
-        output = SemanticOutputKind.HOST if task.symbol in exports else SemanticOutputKind.TEMPORARY
+    tasks = {task.symbol: task for task in attachment.plan.semantic_graph.tasks}
+    pending, seen = list(attachment.spec.exports), set[TaskSymbol]()
+    while pending:
+        symbol = pending.pop()
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        task = tasks[symbol]
+        output = SemanticOutputKind.HOST if symbol in attachment.spec.exports else SemanticOutputKind.TEMPORARY
         if not _observes(task, output):
             raise ValueError(
-                f"{task.symbol}: a workload with exports runs only exports and read-only helpers in Phase.AFTER_FORWARD "
-                "that read hidden rows, state and results; remove its other operations, state writes and phase "
-                "overrides"
+                f"{task.symbol}: an export and the helpers it reads run read-only in Phase.AFTER_FORWARD on hidden "
+                "rows, state and results; read the value from a helper without state writes or phase overrides"
             )
+        pending.extend(port.source.task for port in task.inputs if isinstance(port.source, TaskResultInputSource))
 
 
 def _observes(task: SemanticTask, output: SemanticOutputKind) -> bool:
@@ -218,19 +216,21 @@ def _check_training(attachment: BackendAttachment) -> None:
     spec, graph = attachment.spec, attachment.plan.semantic_graph
     if not graph.trains_on_batch and not attachment.probe.hidden_resources:
         raise ValueError("train and sampler operations need a hidden input, e.g. `h: torch.Tensor = pllm.hidden(0)`")
-    (state,) = (state for state in graph.states if state.resource == spec.state_resource)
-    adds_logits = spec.sampler_stage is SamplerStage.PACKED_PRE_FILTER_ADD
-    if not graph.trains_on_batch and state.scope is not StateScope.REQUEST and not adds_logits:
-        raise ValueError(
-            f"declare the trained state {state.resource!r} as pllm.RequestState; only workloads with "
-            "@pllm.add_logits train an InstanceState"
-        )
+    adds_logits = spec.sampler is not None and spec.sampler.stage is SamplerStage.PACKED_PRE_FILTER_ADD
+    scopes = {state.resource: state.scope for state in graph.states}
+    tasks = {task.symbol: task for task in graph.tasks}
+    for symbol in spec.training:
+        trained = next(effect.resource for effect in tasks[symbol].effects if effect.kind is not StateEffectKind.READ)
+        if not graph.trains_on_batch and scopes[trained] is not StateScope.REQUEST and not adds_logits:
+            raise ValueError(
+                f"declare the trained state {trained!r} as pllm.RequestState; only workloads with "
+                "@pllm.add_logits train an InstanceState"
+            )
     # Planning already places every feedback reader after the draw; what remains is who may read it.
-    transition = attachment.task_bindings[-1].task_id
-    updated = False
+    remaining = set(spec.training)
     for scheduled in attachment.plan.schedule.tasks:
         task = graph.tasks[scheduled.task_id]
-        feeds_update = not updated and (scheduled.task_id == transition or _read_only_helper(task))
+        feeds_update = bool(remaining) and (task.symbol in spec.training or _read_only_helper(task))
         if any(isinstance(port.source, SamplerFeedbackInputSource) for port in task.inputs) and not (
             adds_logits and feeds_update
         ):
@@ -238,7 +238,7 @@ def _check_training(attachment: BackendAttachment) -> None:
                 f"{task.symbol}: sampled tokens are readable only beside @pllm.add_logits, by the train "
                 "operation or by read-only operations that feed it"
             )
-        updated |= scheduled.task_id == transition
+        remaining.discard(task.symbol)
 
 
 def _read_only_helper(task: SemanticTask) -> bool:
@@ -247,47 +247,10 @@ def _read_only_helper(task: SemanticTask) -> bool:
     )
 
 
-def bind_attachment_tasks(
-    plan_bundle: PlanBundle,
-    roles: tuple[tuple[AttachmentTaskRole, TaskSymbol], ...],
-) -> tuple[AttachmentTaskBinding, ...]:
-    bindings: list[AttachmentTaskBinding] = []
-    for role, symbol in roles:
-        (physical,) = (
-            task
-            for task in plan_bundle.schedule.tasks
-            if plan_bundle.semantic_graph.tasks[task.task_id].symbol == symbol
-        )
-        bindings.append(
-            AttachmentTaskBinding(
-                role,
-                physical.task_id,
-                physical.implementation_id,
-                physical.anchor_id,
-            )
-        )
-    return tuple(bindings)
-
-
-def bind_backend_attachment(
-    plan: PlanBundle,
-    probe: ModelProbe,
-    spec: BackendAttachmentSpec,
-) -> BackendAttachment:
-    anchors = {anchor.symbol: anchor for anchor in plan.timeline.anchors}
-    sampler = anchors[spec.sampler_anchor]
-    attachment = BackendAttachment(
-        spec=spec,
-        task_bindings=bind_attachment_tasks(plan, spec.tasks),
-        sampler_anchor_id=AnchorId(sampler.ordinal),
-        probe=probe,
-        plan=plan,
-    )
+def bind_backend_attachment(plan: PlanBundle, probe: ModelProbe, spec: BackendAttachmentSpec) -> BackendAttachment:
+    attachment = BackendAttachment(spec, probe, plan)
     _check_attachment(attachment)
     return attachment
 
 
-__all__ = [
-    "bind_attachment_tasks",
-    "bind_backend_attachment",
-]
+__all__ = ["bind_backend_attachment"]

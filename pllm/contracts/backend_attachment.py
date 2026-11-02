@@ -10,37 +10,16 @@ from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from pllm.contracts.parameter_overlay import FieldView, ParameterOverlayFieldBinding, ProjectionShape
 from pllm.contracts.sampler import SamplerStage
-from pllm.contracts.semantic_graph import (
-    AnchorId,
-    AnchorSymbol,
-    ImplementationId,
-    StateResource,
-    TaskId,
-    TaskSymbol,
-)
+from pllm.contracts.semantic_graph import StateResource, TaskSymbol
 from pllm.contracts.state_representation import (
     StateDeviceKind,
 )
 from pllm.contracts.tensor_layout import TensorDType
 
 
-class AttachmentKind(StrEnum):
-    OBSERVATION = "observation"
-    CUSTOM_FORWARD = "custom_forward"
-    REQUEST_TRAINING = "request_training"
-    PARAMETER_OVERLAY = "parameter_overlay"
-    ACTIVATION_PATCH = "activation_patch"
-
-
 class AttachmentGraphMode(StrEnum):
     EAGER = "eager"
     CUDA_GRAPH = "cuda_graph"
-
-
-class AttachmentTaskRole(StrEnum):
-    COMPUTE = "compute"
-    TRANSITION = "transition"
-    PUBLISH = "publish"
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,14 +30,6 @@ class AttachmentHiddenResource:
     @property
     def resource_key(self) -> tuple[str, str, str]:
         return self.binding.locator_key
-
-
-@dataclass(frozen=True, slots=True)
-class AttachmentTaskBinding:
-    role: AttachmentTaskRole
-    task_id: TaskId
-    implementation_id: ImplementationId
-    anchor_id: AnchorId
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +86,7 @@ class MissingPolicy(StrEnum):
 class ActivationPatchBinding:
     """Signed tensor operation on selected prefill and declared decode block-output rows."""
 
+    resource: StateResource
     layer: int
     fields: tuple[FieldView, ...]
     first_tokens: int
@@ -126,28 +98,43 @@ class ActivationPatchBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class SamplerBinding:
+    """The method whose result enters vLLM's sampler, and at which stage."""
+
+    task: TaskSymbol
+    stage: SamplerStage
+
+
+@dataclass(frozen=True, slots=True)
 class BackendAttachmentSpec:
-    kind: AttachmentKind
-    tasks: tuple[tuple[AttachmentTaskRole, TaskSymbol], ...]
-    sampler_anchor: AnchorSymbol
-    state_resource: StateResource
+    """What a workload does to the model's step, one independent entry per kind of effect.
+
+    Effects compose by appearing side by side; each binding names its own tasks and states. The planner orders
+    their tasks; the backend installs each model-side binding on its own hook.
+    """
+
+    sampler: SamplerBinding | None = None
+    # The @pllm.train methods (request rows or a host batch).
+    training: tuple[TaskSymbol, ...] = ()
+    exports: tuple[TaskSymbol, ...] = ()
+    # Every pllm.model.Adapter and @pllm.train_in_forward projection, each naming the state it reads.
     overlay_bindings: tuple[ParameterOverlayFieldBinding, ...] = ()
+    # The @pllm.train_in_forward transition the projection hooks drive.
+    in_forward: TaskSymbol | None = None
     activation_bindings: tuple[ActivationPatchBinding, ...] = ()
-    sampler_stage: SamplerStage = SamplerStage.PACKED_POST_FILTER_EXACT
+    # The task that runs the @pllm.custom_forward programs (the in-forward transition when both are declared).
+    custom_forward: TaskSymbol | None = None
 
     @property
-    def guides_sampler(self) -> bool:
-        """True when a compute task feeds the sampler; False for training alone."""
-        return self.kind is AttachmentKind.REQUEST_TRAINING and self.tasks[0][0] is AttachmentTaskRole.COMPUTE
+    def empty(self) -> bool:
+        return self == BackendAttachmentSpec()
 
 
 @dataclass(frozen=True, slots=True)
 class BackendAttachment:
-    """Declared effects and resolved plan bindings shared by the driver and worker."""
+    """Declared effects and the plan they were scheduled in, shared by the driver and worker."""
 
     spec: BackendAttachmentSpec
-    task_bindings: tuple[AttachmentTaskBinding, ...]
-    sampler_anchor_id: AnchorId
     probe: ModelProbe
     plan: PlanBundle
 
@@ -156,11 +143,9 @@ __all__ = [
     "BackendAttachmentSpec",
     "BackendAttachment",
     "AttachmentGraphMode",
-    "AttachmentKind",
     "AttachmentHiddenResource",
+    "SamplerBinding",
     "SamplerStage",
-    "AttachmentTaskBinding",
-    "AttachmentTaskRole",
     "ModelProbe",
 ]
 

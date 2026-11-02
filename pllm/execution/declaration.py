@@ -10,11 +10,10 @@ from typing import Generic, Literal, TypeVar
 
 from pllm.contracts.backend_attachment import (
     ActivationPatchBinding,
-    AttachmentKind,
-    AttachmentTaskRole,
     BackendAttachmentSpec,
     MissingPolicy,
     ModelProbe,
+    SamplerBinding,
 )
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
@@ -212,7 +211,7 @@ class Builder(Generic[D]):
     def __init__(self, name: str, digest: str, dimensions: Dimensions | None = None) -> None:
         self.graph = SemanticGraph(WorkloadId(name), (), digest)
         self.layouts = TensorLayoutRequest(())
-        self.attachment: BackendAttachmentSpec | None = None
+        self.effects = BackendAttachmentSpec()
         self.dimensions = dimensions
         self.operations: dict[TaskSymbol, TensorOperation[D]] = {}
         self.publications: dict[TaskSymbol, PublishStateTask[D]] = {}
@@ -363,6 +362,7 @@ class Builder(Generic[D]):
                 select=select,
                 optimizer=optimizer,
                 copy_fields=copy_fields,
+                resource=StateResource("") if changes is None else changes.declaration.resource,
             )
         return Call(task.symbol, outputs)
 
@@ -382,23 +382,24 @@ class Builder(Generic[D]):
                 continue
             identity = planned_implementation(task, plan)
             versions = tuple(
-                effect.version
-                for effect in task.effects
-                if effect.kind is StateEffectKind.READ and effect.version is not None
+                effect for effect in task.effects if effect.kind is StateEffectKind.READ and effect.version is not None
             )
-            version = operations[task.symbol].version
+            operation = replace(operations[task.symbol], implementation_id=identity)
             if versions:
-                producer = next(item for item in graph.tasks if item.symbol == versions[0])
-                version = (
-                    "private"
+                producer = next(item for item in graph.tasks if item.symbol == versions[0].version)
+                operation = replace(
+                    operation,
+                    version="private"
                     if any(
                         effect.kind in (StateEffectKind.TRANSITION, StateEffectKind.TRANSITION_MAYBE)
                         for effect in producer.effects
                     )
-                    else "published"
+                    else "published",
+                    # A reader of a produced version reads that state's private write or publication.
+                    resource=operation.resource or versions[0].resource,
                 )
             if task.custom_forward is None:
-                functions.append(replace(operations[task.symbol], implementation_id=identity, version=version))
+                functions.append(operation)
         return tuple(functions)
 
     def bind_all(
@@ -443,22 +444,35 @@ class Builder(Generic[D]):
             for function in functions
         )
 
-    def conditional_input(self, borrowed_resources: tuple[str, ...]) -> None:
-        """Declare one atomic input closure without changing the task/state symbols."""
-        if self.attachment is None or not self.attachment.activation_bindings or self.graph.input_groups:
-            raise ValueError("conditional input requires one original activation chain")
-        publication = self.attachment.tasks[-1][1]
+    def conditional_input(self, borrowed_resources: tuple[str, ...], publication: Call) -> None:
+        """Declare one atomic input closure ending at `publication`, the write of the state an activation patch
+        reads, without changing the task/state symbols."""
+        tasks = {task.symbol: task for task in self.graph.tasks}
         readers = tuple(task.symbol for task in self.graph.tasks if task.custom_forward is not None)
+        resource = tasks[publication.symbol].effects[-1].resource
+        # The producers are the publication and every task whose result it transitively reads.
+        producers, pending = set[TaskSymbol](), [publication.symbol]
+        while pending:
+            symbol = pending.pop()
+            if symbol not in producers:
+                producers.add(symbol)
+                pending.extend(
+                    port.source.task for port in tasks[symbol].inputs if isinstance(port.source, TaskResultInputSource)
+                )
         self.graph = replace(
             self.graph,
             input_groups=(
                 ConditionalInputGroup(
-                    self.attachment.state_resource,
+                    resource,
                     tuple(StateResource(name) for name in sorted(borrowed_resources)),
-                    tuple(task.symbol for task in self.graph.tasks if task.symbol not in readers),
-                    publication,
+                    tuple(sorted(producers)),
+                    publication.symbol,
                     readers,
-                    all(binding.on_missing is MissingPolicy.HOLD for binding in self.attachment.activation_bindings),
+                    all(
+                        binding.on_missing is MissingPolicy.HOLD
+                        for binding in self.effects.activation_bindings
+                        if binding.resource == resource
+                    ),
                 ),
             ),
         )
@@ -469,14 +483,14 @@ class Builder(Generic[D]):
         state: State,
         *,
         when: When = When.PUBLISH,
-        name: str = "publish",
+        name: str = "",
         schema: str = "page_publication@1",
         output: str = "publication",
         implementations: tuple[TaskImplementationSpec, ...] = (),
     ) -> Call:
         implementations = implementations or (native("state:publish@1", "transition/full_root@1"),)
         call = self.compute(
-            name,
+            name or f"{state.declaration.resource}.publish",
             inputs={"transition": transition[transition.outputs[0]]},
             outputs=(output,),
             changes=state,
@@ -486,130 +500,51 @@ class Builder(Generic[D]):
             when=when,
             implementations=implementations,
         )
-        self.publications[call.symbol] = PublishStateTask(implementations[0].implementation_id)
+        self.publications[call.symbol] = PublishStateTask(
+            implementations[0].implementation_id, state.declaration.resource
+        )
         return call
 
-    def sampler(
-        self,
-        prediction: Call,
-        transition: Call,
-        state: State,
-        *,
-        output: str = "guidance",
-        stage: SamplerStage = SamplerStage.PACKED_POST_FILTER_EXACT,
-    ) -> None:
-        prediction[output]
-        # The sampler attachment keeps an earlier pllm.model.Adapter's bindings; an activation patch would need
-        # this attachment's state_resource, which names the trained state.
-        previous = self.attachment
-        if previous is not None and previous.activation_bindings:
+    def sampler(self, prediction: Call, stage: SamplerStage) -> None:
+        """Send `prediction`'s result to vLLM's sampler at `stage`."""
+        self.effects = replace(self.effects, sampler=SamplerBinding(prediction.symbol, stage))
+
+    def trains(self, transition: Call) -> None:
+        """Record a @pllm.train method."""
+        self.effects = replace(self.effects, training=(*self.effects.training, transition.symbol))
+
+    def exports(self, call: Call) -> None:
+        self.effects = replace(self.effects, exports=(*self.effects.exports, call.symbol))
+
+    def overlay(self, bindings: tuple[ParameterOverlayFieldBinding, ...], transition: Call | None = None) -> None:
+        """Correct the target projections from the bindings' states; `transition` trains one of them in forward."""
+        if self.effects.in_forward is not None or (transition is not None and self.effects.overlay_bindings):
             raise ValueError(
-                "@pllm.add_logits and @pllm.guide_sampling do not combine with pllm.model.ActivationPatch; remove one of them"
+                "a @pllm.train_in_forward method drives every projection hook of its workload, so it does not yet "
+                "combine with a pllm.model.Adapter; train the adapter's state in that method or use two workloads"
             )
-        self.attachment = BackendAttachmentSpec(
-            AttachmentKind.REQUEST_TRAINING,
-            ((AttachmentTaskRole.COMPUTE, prediction.symbol), (AttachmentTaskRole.TRANSITION, transition.symbol)),
-            AnchorSymbol("sampler.pre_draw"),
-            state.declaration.resource,
-            () if previous is None else previous.overlay_bindings,
-            sampler_stage=stage,
+        self.model_reads(tuple(StateResource(binding.resource) for binding in bindings))
+        self.effects = replace(
+            self.effects,
+            overlay_bindings=(*self.effects.overlay_bindings, *bindings),
+            in_forward=self.effects.in_forward if transition is None else transition.symbol,
         )
 
-    def request_training(self, transition: Call, state: State) -> None:
-        """Attach request-state training to the token transaction."""
-        self.attachment = BackendAttachmentSpec(
-            AttachmentKind.REQUEST_TRAINING,
-            ((AttachmentTaskRole.TRANSITION, transition.symbol),),
-            AnchorSymbol("sampler.pre_draw"),
-            state.declaration.resource,
-        )
+    def activation_patch(self, bindings: tuple[ActivationPatchBinding, ...]) -> None:
+        self.model_reads(tuple(binding.resource for binding in bindings))
+        self.effects = replace(self.effects, activation_bindings=(*self.effects.activation_bindings, *bindings))
 
-    def overlay(
-        self,
-        state: State,
-        producer: tuple[Call, Call] | None,
-        bindings: tuple[ParameterOverlayFieldBinding, ...] = (),
-        *,
-        activations: tuple[ActivationPatchBinding, ...] = (),
-    ) -> None:
-        self._attach(
-            BackendAttachmentSpec(
-                AttachmentKind.ACTIVATION_PATCH if activations else AttachmentKind.PARAMETER_OVERLAY,
-                ()
-                if producer is None
-                else (
-                    (AttachmentTaskRole.TRANSITION, producer[0].symbol),
-                    (AttachmentTaskRole.PUBLISH, producer[1].symbol),
-                ),
-                AnchorSymbol("sampler.complete"),
-                state.declaration.resource,
-                bindings,
-                activations,
-            )
-        )
+    def custom_forward(self, task: TaskSymbol) -> None:
+        self.effects = replace(self.effects, custom_forward=task)
+
+    def model_reads(self, resources: tuple[StateResource, ...]) -> None:
+        """Note states the model forward reads, so planning keeps their versions readable."""
+        self.graph = replace(self.graph, model_reads=tuple(sorted({*self.graph.model_reads, *resources})))
 
     def finish(self) -> tuple[SemanticGraph, TensorLayoutRequest, BackendAttachmentSpec]:
-        if self.attachment is None:
+        if self.effects.empty:
             raise ValueError(
                 "the workload has no effect on the model: add @pllm.train, @pllm.add_logits, @pllm.guide_sampling, "
                 "@pllm.export, @pllm.train_in_forward, a custom_forward or a pllm.model.ActivationPatch/Adapter"
             )
-        return self.graph, self.layouts, self.attachment
-
-    def model_effect(self, call: Call, kind: AttachmentKind = AttachmentKind.OBSERVATION) -> None:
-        self._attach(
-            BackendAttachmentSpec(
-                kind, ((AttachmentTaskRole.COMPUTE, call.symbol),), AnchorSymbol("sampler.pre_draw"), StateResource("")
-            )
-        )
-
-    def _attach(self, spec: BackendAttachmentSpec) -> None:
-        self.graph = replace(
-            self.graph,
-            model_reads=tuple(
-                sorted(
-                    set(self.graph.model_reads)
-                    | {StateResource(binding.resource) for binding in spec.overlay_bindings}
-                    | ({spec.state_resource} if spec.activation_bindings else set())
-                )
-            ),
-        )
-        previous = self.attachment
-        if previous is None or previous.kind is spec.kind is AttachmentKind.OBSERVATION:
-            self.attachment = spec if previous is None else replace(previous, tasks=previous.tasks + spec.tasks)
-            return
-        if {previous.kind, spec.kind} != {AttachmentKind.ACTIVATION_PATCH, AttachmentKind.CUSTOM_FORWARD}:
-            raise ValueError("only an activation patch and a custom forward can share an attachment")
-        activation, forward_spec = (
-            (previous, spec) if previous.kind is AttachmentKind.ACTIVATION_PATCH else (spec, previous)
-        )
-        if forward_spec.activation_bindings or forward_spec.overlay_bindings or activation.overlay_bindings:
-            raise ValueError("a custom forward composes with one activation patch publication")
-        ((_, forward_symbol),) = forward_spec.tasks
-        publication_symbol = activation.tasks[-1][1] if activation.tasks else None
-        forward = next(task for task in self.graph.tasks if task.symbol == forward_symbol)
-        publication = next((task for task in self.graph.tasks if task.symbol == publication_symbol), None)
-        if forward.effects or any(port.name == "activation_publication" for port in forward.inputs):
-            raise ValueError("the custom forward already declares state dependencies")
-        dependency = (
-            ()
-            if publication is None
-            else (
-                SemanticInput(
-                    "activation_publication", TaskResultInputSource(publication.symbol, publication.outputs[0].name)
-                ),
-            )
-        )
-        # Preserve both the value dependency and the exact state-version read.
-        forward = replace(
-            forward,
-            inputs=(*forward.inputs, *dependency),
-            effects=(SemanticEffect(activation.state_resource, StateEffectKind.READ, publication_symbol),),
-        )
-        self.update_task(forward_symbol, lambda _: forward)
-        self.attachment = replace(
-            forward_spec,
-            tasks=(*forward_spec.tasks, *activation.tasks),
-            state_resource=activation.state_resource,
-            activation_bindings=activation.activation_bindings,
-        )
+        return self.graph, self.layouts, self.effects

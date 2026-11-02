@@ -19,6 +19,8 @@
   只是第 L 层 MLP 在加入残差流之前的输出。
 - **层 logits（pllm.layer_logits）** —— 模型自己的最终 norm 与 LM head 作用于若干层之后的
   残差流（logit lens），FP32 `[rows, layers, vocab]`，覆盖采样器抽取的每个 token。
+- **效果组合（Effect composition）** —— 一个负载里的效果各自声明位置与状态读写、
+  并排生效；只有真实冲突（同一位置的两个所有者、同一状态的两个写者等）被拒绝。
 - **因果批（Causal batch）** —— `pllm.host.CausalTrainBatch` 提供同形的
   `input_ids`、`labels` 和可选 `attention_mask`，训练方法用 `pllm.batch(...)` 读取。
 - **因果模型端口（Causal model port）** —— `pllm.causal_model("adapter")` 注入

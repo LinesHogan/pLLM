@@ -526,51 +526,46 @@ def declare_tensor(
     return decorate
 
 
-def validate_gradients(b: TensorBinding, training: Call | None) -> None:
-    """Check that one training sink consumes all declared differentiable paths."""
+def validate_gradients(b: TensorBinding, trainers: tuple[Call, ...]) -> None:
+    """Check that every differentiable path ends in a @pllm.train loss and each loss differentiates only its state."""
     tasks = {task.symbol: task for task in b.graph.tasks}
     retained = {
         task.symbol
         for task in tasks.values()
         if task.math is not None and (task.math.input_gradients or task.math.parameter_gradients)
     }
-    if training is None:
-        if retained:
-            raise ValueError("differentiable operations require an explicit training sink")
-        return
-    visited: set[TaskSymbol] = set()
-    resources: set[str] = set()
+    if retained and not trainers:
+        raise ValueError("differentiable operations require an explicit training sink")
+    reached: set[TaskSymbol] = set()
+    for training in trainers:
+        visited: set[TaskSymbol] = set()
+        resources: set[str] = set()
+        pending = [training.symbol]
+        while pending:
+            symbol = pending.pop()
+            if symbol in visited:
+                continue
+            visited.add(symbol)
+            math = tasks[symbol].math
+            if math is None:
+                continue
+            resources.update(math.parameter_gradients)
+            pending.extend(
+                port.source.task
+                for port in tasks[symbol].inputs
+                if port.name in math.input_gradients and isinstance(port.source, TaskResultInputSource)
+            )
+        reached |= visited
+        if resources != {
+            effect.resource for effect in tasks[training.symbol].effects if effect.kind is not StateEffectKind.READ
+        }:
+            raise ValueError(f"the @pllm.train loss of {training.symbol} must differentiate only its own state")
+    if retained - reached:
+        raise ValueError("every @pllm.differentiate result must feed a @pllm.train loss")
 
-    def visit(symbol: TaskSymbol) -> None:
-        if symbol in visited:
-            return
-        visited.add(symbol)
-        task = tasks[symbol]
-        if task.math is None:
-            return
-        resources.update(task.math.parameter_gradients)
-        for port in task.inputs:
-            if port.name in task.math.input_gradients and isinstance(port.source, TaskResultInputSource):
-                visit(port.source.task)
 
-    visit(training.symbol)
-    if retained - visited or resources != {
-        effect.resource for effect in tasks[training.symbol].effects if effect.kind is not StateEffectKind.READ
-    }:
-        raise ValueError(
-            "the @pllm.train loss must use every @pllm.differentiate result and differentiate only its own state"
-        )
-
-
-def declare_logits(
-    b: TensorBinding,
-    prediction: Call,
-    training: Call,
-    state: State,
-    *,
-    stage: SamplerStage = SamplerStage.PACKED_PRE_FILTER_ADD,
-) -> None:
-    """Attach prediction and training tasks to the sampler."""
+def declare_logits(b: TensorBinding, prediction: Call, *, stage: SamplerStage) -> None:
+    """Send the prediction to the sampler: added to the logits before filtering, or guiding the draw after it."""
     if stage is SamplerStage.PACKED_PRE_FILTER_ADD and b.dimensions.vocab_size < 1:
-        raise ValueError("logits binding requires the backend vocabulary size")
-    b.sampler(prediction, training, state, output=prediction.outputs[0], stage=stage)
+        raise ValueError("@pllm.add_logits needs the model's vocabulary size; compile this workload with make_llm")
+    b.sampler(prediction, stage)

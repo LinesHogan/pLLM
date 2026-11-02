@@ -67,7 +67,7 @@ class PostSampleOverlap:
         consumed by later tasks. Equal reader and writer refs share the new pin; retained
         history owns its own hold.
         """
-        assert context.sole_write() is None and not context.publications and not context.borrowed_roots
+        assert not context.writing and not context.publications and not context.borrowed_roots
         reader = context.pin
         context.selection = self.directory.select(context.selection.rows)
         context.pin = self.arena.pin_exact(context.selection.refs, self.stream)

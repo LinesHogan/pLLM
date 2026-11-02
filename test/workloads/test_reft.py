@@ -114,7 +114,6 @@ def _decode_low_rank_keeps_parameters_and_recomputes_delta(
     adapter = VllmActivationPatch(
         SimpleNamespace(model=SimpleNamespace(layers=[layer])),
         (replace(binding, decode=DecodeWindow.ALL, decode_refresh=DecodeRefresh.STEP),),
-        deployment.attachment.spec.state_resource,
     )
     rows = PackedPhaseRowBatch(
         0, len(hidden), tuple(PackedPhaseRow(i, 0, i, HiddenPhase.DECODE, identity) for i in range(len(hidden)))
@@ -198,7 +197,6 @@ def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:
     adapter = VllmActivationPatch(
         SimpleNamespace(model=SimpleNamespace(layers=[layer])),
         deployment.attachment.spec.activation_bindings,
-        deployment.attachment.spec.state_resource,
     )
     try:
         adapter.prepare(rows, context, execution.directory)

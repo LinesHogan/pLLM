@@ -185,11 +185,7 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
         assert task.custom_forward is not None
         self.model, self.effect = model.model, task.custom_forward
         self.execution, self.anchor, self.activation, self.projections = execution, anchor, activation, overlay
-        implementation = next(
-            item
-            for item in execution.arena.plan.schedule.tasks
-            if execution.arena.plan.semantic_graph.tasks[item.task_id].symbol == task.symbol
-        )
+        implementation = execution.arena.plan.scheduled(task.symbol)
         binding = CustomForwardTask[DataT].from_implementation(
             execution.implementation(implementation.implementation_id)
         )

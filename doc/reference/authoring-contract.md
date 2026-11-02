@@ -84,7 +84,8 @@ class CenteredHidden(pllm.Workload):
 `pllm.layer_logits(layers)` 把模型自己的最终 norm 与 LM head 用到这些层之后的残差流上
 （logit lens），返回 FP32 `[rows, len(layers), vocab]`；最后一层就是模型自己的 logits。
 它覆盖采样器抽取的每个 token：prompt 的最后一个 token 与每个 decode token。层 logits
-在 LM head 处用一个独立 GEMM 计算，模型自身的 logits 保持与 vLLM 逐位相同。
+在 LM head 处用一个独立 GEMM 计算，模型自身的 logits 保持与 vLLM 逐位相同；
+内置的 `pllm.workloads.DoLaWorkload` 用它实现 DoLa。
 
 实例参数就是声明的形状；请求参数会多出一个操作行轴。普通实现显式打包这些
 视图 —— 这**不是原生分页 GEMM**。输入与参数视图是借来的只读值；普通数学
@@ -200,7 +201,8 @@ receipt 能结算为止。
 ESamp 用它做版本感知引导和普通的 Tensor loss/初始化；其五字段 Adam 布局与
 初始化种子推进保持不变。
 
-`@add_logits` 和 `@train` 把过滤前加法连接到真实采样反馈。
+`@add_logits` 在过滤前把结果加到 logits 上，不需要 `@train`；与 `@train` 同在时，
+训练方法可读真实采样反馈（`pllm.base_logits`、`pllm.sampled_tokens`）。
 `@export` 拥有有界、按步长门控的 CPU 输出；`Attr("config.layer")` 等属性路径
 在装载时绑定不可变配置。普通负载不需要 `build`、输入字典、`prepare/output`、
 字段 ID、digest 或显式发布节点。
@@ -217,6 +219,23 @@ worker 重新导入并重建，安装时其编译签名必须与驱动端签名�
 运行时执行不检查签名。旧的 `TensorWorkload`、`TensorBuilder` 和
 `TensorFunction` 公共 API 已移除。任意模块锚点、捕获和结构化宿主事务仍需
 高级绑定。
+
+## 效果组合
+
+每个效果各自声明它的位置与状态读写，框架按位置排序；只有真实冲突被拒绝，
+错误信息说明冲突是什么。可以并存的例子：多个 `@pllm.train`（同一种训练方式，
+各训各的状态）、`@pllm.export` 与训练或写入、`@pllm.add_logits` /
+`@pllm.guide_sampling` 与 Adapter、ActivationPatch、`@pllm.train_in_forward`。
+当前仍被拒绝的组合及原因：
+
+| 组合 | 原因 |
+| --- | --- |
+| 两个采样器方法（`@add_logits` 与 `@guide_sampling`，或两个同类） | 采样器每步只应用一个方法；合并成一个方法 |
+| 请求行训练与宿主批训练 | 每个负载只资助一种训练方式 |
+| `@custom_forward` 与读 hidden 行的方法 | custom forward 可能每个 token 跑某层多次或不跑，hidden 行没有唯一值 |
+| `@custom_forward` 与 `pllm.model.Adapter` | Adapter 的投影钩子按模型自己的行索引 |
+| `@train_in_forward` 与 `pllm.model.Adapter` | 两者共用同一组投影钩子 |
+| 带 feed 的状态与其他状态或方法 | feed 的条件输入组只容纳它的写链与读取它的模型 |
 
 ## 请求 Overlay
 

@@ -90,14 +90,12 @@ class Runner:
         deployment: BackendDeployment[DataT, ResultT],
         cache_policy: CachePolicy,
     ) -> None:
-        if self.cache_config.enable_prefix_caching and (
-            deployment.attachment.spec.activation_bindings or deployment.attachment.spec.overlay_bindings
-        ):
+        spec = deployment.attachment.spec
+        if self.cache_config.enable_prefix_caching and (spec.activation_bindings or spec.overlay_bindings):
             raise ValueError("disable prefix caching when using parameter overlays or activation patches")
         if deployment.attachment.probe.position_states != self.position_states:
             raise ValueError("PositionState schema changed; create a new engine with this workload")
-        spec = deployment.attachment.spec
-        adapter = self._sampler_guidance if spec.guides_sampler else None
+        adapter = self._sampler_guidance if spec.sampler is not None else None
         session = VllmSession(
             deployment,
             self.decoder,

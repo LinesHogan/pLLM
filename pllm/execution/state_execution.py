@@ -170,14 +170,35 @@ class StateTaskContext(Generic[DataT]):
                 self.hold_slots(obligation.allocations)
                 self._discharge(obligation)
 
-    def sole_write(self) -> PageWrite | None:
-        """The invocation's one pending private write, which its tensor tasks share."""
-        (write,) = [entry.write for entry in self._obligations if isinstance(entry, _WriteAbort)] or (None,)
+    def pending_write(self, resource: StateResource) -> PageWrite | None:
+        """The invocation's pending private write of `resource`, which the tasks transitioning it share."""
+        (write,) = [
+            entry.write
+            for entry in self._obligations
+            if isinstance(entry, _WriteAbort) and self.arena.root(entry.write.before_refs[0]).resource == resource
+        ] or (None,)
         return write
 
     @property
+    def writing(self) -> bool:
+        """Whether any private write is pending."""
+        return any(isinstance(entry, _WriteAbort) for entry in self._obligations)
+
+    @property
     def publication(self) -> PagePublication | None:
+        """The invocation's latest publication, of any state."""
         return next(reversed(self.publications), None)
+
+    def publication_of(self, resource: StateResource) -> PagePublication | None:
+        """The invocation's latest publication of `resource`."""
+        return next(
+            (
+                receipt
+                for receipt in reversed(self.publications)
+                if self.arena.root(receipt.after_refs[0]).resource == resource
+            ),
+            None,
+        )
 
     def current_owned_ref(self, original: StateRef) -> StateRef:
         return self.current_owned_refs(StateRefs.of((original,)))[0]
@@ -365,6 +386,7 @@ class ConditionalProducerTask(Generic[DataT]):
 @dataclass(frozen=True, slots=True)
 class PublishStateTask(Generic[DataT]):
     implementation_id: ImplementationId
+    resource: StateResource
 
     def memory(self, data: DataT, batch: TensorBatch) -> MemoryUsage:
         """Publication changes ownership metadata; PTTS already funds its tensor pages."""
@@ -379,7 +401,7 @@ class PublishStateTask(Generic[DataT]):
         return 0
 
     def execute(self, context: StateTaskContext[DataT]) -> ProjectionResiduals:
-        write = context.sole_write()
+        write = context.pending_write(self.resource)
         if write is not None:
             context.publish_owned_write(write)
         return {}

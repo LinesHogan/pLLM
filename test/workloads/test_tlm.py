@@ -196,8 +196,8 @@ def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None
             for task in execution.arena.plan.schedule.tasks
         }
         timeline = {item.symbol: item.ordinal for item in execution.arena.plan.timeline.anchors}
-        assert anchors["update"] <= anchors["publish"]
-        assert (anchors["publish"] < timeline["model.execute"]) == (mode is TLMMode.OFFLINE)
+        assert anchors["update"] <= anchors["factors.publish"]
+        assert (anchors["factors.publish"] < timeline["model.execute"]) == (mode is TLMMode.OFFLINE)
         assert (anchors["update"] >= timeline["token.commit"]) == (mode is TLMMode.ONLINE)
         expected = _reference(
             model,

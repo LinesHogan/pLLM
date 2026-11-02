@@ -16,7 +16,7 @@ from pllm.contracts.semantic_graph import ImplementationId, SemanticTask, TaskId
 from pllm.execution.overlay_task import OverlayTransition, ProgramOverlay
 from pllm.execution.position_state import PositionBuffers
 from pllm.execution.tensor_frame import TensorFrame
-from pllm.execution.tensor_program import TaskOutput, TensorBatch, TensorOperation, read_batch
+from pllm.execution.tensor_program import TaskOutput, TensorBatch, TensorOperation
 from pllm.execution.token_program import KV, TokenProgram
 from pllm.execution.token_program_executor import execute_token_program, ordinary_pass
 from pllm.execution.trace import TraceEventKind
@@ -145,9 +145,9 @@ class CustomForwardTask(Generic[DataT]):
 
     def _overlay_body(self, data: DataT, batch: TensorBatch, context: StateTaskContext[DataT] | None) -> TaskOutput:
         assert context is not None and isinstance(data, TensorFrame) and self.overlay_math is not None
-        primitive = self.primitive
-        assert primitive is not None
-        primitive.overlay = ProgramOverlay(self.overlay_math, batch, read_batch(context), data)
+        primitive, operation = self.primitive, self.operation
+        assert primitive is not None and operation is not None
+        primitive.overlay = ProgramOverlay(self.overlay_math, batch, operation.batch(context, "input"), data)
         try:
             self.run(context)
             return primitive.overlay.finish()

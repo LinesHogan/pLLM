@@ -206,7 +206,7 @@ def test_updates_match_independent_private_version_oracle(boundaries, visits, em
         assert sum(int(target.update.trained_rows) for entry in result.entries for target in entry.targets) == sum(
             tails
         )
-    assert invocation.sole_write() is None
+    assert not invocation.writing
     execution.retire(IDENTITIES)
 
 
@@ -246,7 +246,7 @@ def test_marker_source_roundtrip_and_while_rejection():
         ):
             return self.transition(hidden, desired, delta, tail)
 
-    with pytest.raises(ValueError, match="sole request state"):
+    with pytest.raises(ValueError, match="one @pllm.train_in_forward method per workload"):
         Second().build(ROUTE_FACTS)
 
 
@@ -305,6 +305,6 @@ def test_untargeted_route_boundary_allocates_and_publishes_nothing():
     invocation = execution.start_step(VALUE)
     for anchor in range(3):
         execution.execute_anchor(invocation, AnchorId(anchor))
-    assert invocation.sole_write() is None and invocation.publication is None
+    assert not invocation.writing and invocation.publication is None
     execution.cancel_step(invocation)
     execution.retire(IDENTITIES)

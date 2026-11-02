@@ -19,7 +19,7 @@ from pllm.contracts.host_batch import (
 )
 from pllm.contracts.parameter_overlay import Projection
 from pllm.contracts.sampler import SamplerStage
-from pllm.contracts.semantic_graph import HiddenInputSource, SchedulerTimeline, StateScope
+from pllm.contracts.semantic_graph import AnchorId, HiddenInputSource, SchedulerTimeline, StateScope
 from pllm.contracts.visibility import VisibilitySource
 from pllm.execution.backend_attachment import (
     attachment_buffer_bytes,
@@ -158,7 +158,10 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
         if not is_output_rank:
             math = replace(math, on_export=None)
         arena = PageBundleArena(plan, device=facts.device, _owned_resources=math.local_resources(plan))
-        return BackendDeployment(math.bind(arena, attachment.sampler_anchor_id), attachment)
+        (sampler,) = (
+            AnchorId(anchor.ordinal) for anchor in plan.timeline.anchors if anchor.symbol == "sampler.pre_draw"
+        )
+        return BackendDeployment(math.bind(arena, sampler), attachment)
 
     def compile_backend(
         self,

@@ -1,6 +1,7 @@
-"""Model sites on Qwen2.5-0.5B against an independent FP32 Hugging Face oracle: residual readouts and layer logits
-under CUDA graphs."""
+"""Model sites on Qwen2.5-0.5B against independent FP32 Hugging Face oracles: residual readouts and layer logits
+under CUDA graphs, and DoLa through pllm.layer_logits."""
 
+import math
 from dataclasses import dataclass, field
 from functools import cache
 
@@ -9,6 +10,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import SamplingParams
 
 import pllm
+from pllm.workloads.dola import DoLaWorkload
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 PROMPTS = ("The capital of France is", "Water boils at a temperature of", "def fibonacci(n):")
@@ -116,3 +118,38 @@ def test_layer_logits_and_residuals_match_fp32_oracle():
     # Earlier layers' logits deviate from FP32 truth no more than vLLM's own bf16 final logits do.
     assert (lens_error[:-1] <= lens_error[-1]).all()
     assert stream_error < 0.1
+
+
+def _dola_scores(logits: torch.Tensor, plausibility: float) -> torch.Tensor:
+    """Independent DoLa: per row, contrast the final layer with the candidate of largest Jensen-Shannon divergence."""
+    scores = []
+    for row in logits:
+        final, early = row[-1].log_softmax(-1), row[:-1].log_softmax(-1)
+        divergences = []
+        for candidate in early:
+            mixture = torch.logsumexp(torch.stack((final, candidate)), 0) - math.log(2)
+            divergences.append(
+                (final.exp() * (final - mixture)).sum() + (candidate.exp() * (candidate - mixture)).sum()
+            )
+        chosen = early[int(torch.stack(divergences).argmax())]
+        keep = final.exp() >= plausibility * final.exp().max()
+        scores.append(torch.where(keep, final - chosen, -torch.inf))
+    return torch.stack(scores)
+
+
+def test_dola_greedy_tokens_follow_fp32_oracle():
+    workload, tokenizer = DoLaWorkload(), AutoTokenizer.from_pretrained(MODEL)
+    with pllm.make_llm(CONFIG, workload=workload) as handle:
+        outputs = handle.generate(list(PROMPTS), SamplingParams(max_tokens=8, temperature=0.0, ignore_eos=True))
+    exact, worst = 0, 0.0
+    for prompt, output in zip(PROMPTS, outputs, strict=True):
+        prompt_ids, generated = tokenizer(prompt).input_ids, list(output.outputs[0].token_ids)
+        # Every sampled token is contrasted: the one after the prompt and each decode token.
+        rows = list(range(len(prompt_ids) - 1, len(prompt_ids) + len(generated) - 1))
+        scores = _dola_scores(_layer_logits(prompt_ids + generated, workload.lens, rows), workload.plausibility)
+        chosen = scores[torch.arange(len(rows)), torch.tensor(generated, device=scores.device)]
+        exact += int((scores.argmax(-1) == torch.tensor(generated, device=scores.device)).sum())
+        worst = max(worst, (scores.max(-1).values - chosen).max().item())
+    print(f"DoLa: {exact}/{len(PROMPTS) * 8} greedy tokens equal the FP32 oracle's; worst score gap {worst:.4f}")
+    # bf16 may flip a near-tie or the premature layer the divergence picks, never choose an implausible token.
+    assert math.isfinite(worst) and exact >= len(PROMPTS) * 8 - 2
