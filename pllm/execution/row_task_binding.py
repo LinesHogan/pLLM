@@ -423,7 +423,8 @@ def declare_tensor(
 
     def phases(source: SemanticInputSource) -> set[HiddenPhase]:
         if isinstance(source, HiddenInputSource):
-            return {source.phase}
+            # Layer logits cover every row the sampler draws, of either phase.
+            return set() if source.phase is HiddenPhase.NONE else {source.phase}
         return set[HiddenPhase]().union(
             *(
                 phases(port.source)

@@ -64,7 +64,7 @@ class Runner:
 
     hidden_taps: HiddenTaps | None = None
     hidden_layouts: tuple[HiddenTapLayout, ...] = ()
-    hidden_pools: dict[str, SlotPools]
+    hidden_pools: dict[tuple[str, int], SlotPools]
     position_states: tuple[tuple[str, float], ...] = ()
     position_layers: tuple[PositionCacheLayer, ...] = ()
 
@@ -76,8 +76,8 @@ class Runner:
         model.compute_logits = self._compute_logits
         announcement = decode_boundary(os.environ.get(TAPS_ENV, "{}"), HiddenTapAnnouncement)
         hidden_size = model.lm_head.weight.shape[1]
-        self.hidden_layouts = announcement.resolve(len(model.model.layers), hidden_size)
-        self.hidden_pools = {layout.module_path: layout.create_pool(self.device) for layout in self.hidden_layouts}
+        self.hidden_layouts = announcement.resolve(len(model.model.layers), hidden_size, model.config.vocab_size)
+        self.hidden_pools = {layout.tap: layout.create_pool(self.device) for layout in self.hidden_layouts}
         if not self.hidden_layouts:
             return
         self.hidden_taps = HiddenTaps(model, self.hidden_layouts, self.hidden_pools, self.device)

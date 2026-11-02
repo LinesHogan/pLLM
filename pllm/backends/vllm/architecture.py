@@ -14,7 +14,7 @@ taps, sampler stages, activation patches).
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Protocol, TypeAlias, overload
 
 import torch
 from torch import Tensor, nn
@@ -22,6 +22,7 @@ from torch.nn import Parameter
 from vllm import _custom_ops as ops
 from vllm.model_executor.kernels.linear.mixed_precision.marlin import MarlinLinearKernel
 from vllm.model_executor.kernels.linear.scaled_mm.marlin import MarlinFP8ScaledMMLinearKernel
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQLinearMethod, AutoAWQMarlinLinearMethod
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQLinearMethod
@@ -82,6 +83,18 @@ DecoderLayer: TypeAlias = (
     "DenseLayer | Qwen3MoeDecoderLayer | Qwen3_5DecoderLayer | DeepseekV2DecoderLayer | TransformerBlock"
 )
 Logits = Callable[[Tensor], Tensor | None]
+Norm: TypeAlias = "RMSNorm | GemmaRMSNorm"
+
+
+class NormForward(Protocol):
+    """A norm's forward: normalize, or with the previous sublayer's output add it into the residual stream first."""
+
+    @overload
+    def __call__(self, x: Tensor, residual: None = None) -> Tensor: ...
+    @overload
+    def __call__(self, x: Tensor, residual: Tensor) -> tuple[Tensor, Tensor]: ...
+
+
 LinearOutput = Tensor | tuple[Tensor, Parameter | None]
 MlpForward = Callable[[Tensor], Tensor]
 
@@ -155,6 +168,8 @@ class Decoder:
     compute_logits: Logits
     # Why only read-only workloads run on this model; None when every workload does.
     read_only: str | None
+    # The norms between sublayers (see `sublayer_norms`), as their own forwards saved before any tap wraps them.
+    norms: tuple[NormForward, ...]
 
     def writable(self, feature: str) -> WritableLM:
         """The model for `feature`, which rewrites weights or reruns layers; read-only models reject it."""
@@ -252,22 +267,49 @@ def bind_model(model: nn.Module) -> Decoder:
             "ForCausalLM model for vLLM workloads"
         )
     family = READ_ONLY_ARCHITECTURES.get(type(model))
-    if family is None:
-        return Decoder(model, model.compute_logits, None)
     read_only = (
-        f"needs a Qwen2, Llama, Qwen3, Qwen3-MoE or Qwen3.5 model ({type(model).__name__} {family}); "
+        None
+        if family is None
+        else f"needs a Qwen2, Llama, Qwen3, Qwen3-MoE or Qwen3.5 model ({type(model).__name__} {family}); "
         "hidden taps, ESamp, sampler stages and activation patches still run on this model"
     )
-    return Decoder(model, model.compute_logits, read_only)
+    return Decoder(model, model.compute_logits, read_only, tuple(norm.forward for norm in sublayer_norms(model)))
+
+
+def sublayer_norms(model: CausalLM) -> tuple[Norm, ...]:
+    """The 2L + 1 norms between sublayers, in forward order: each layer's input and post-attention norm, then the
+    final norm. Every admitted family calls them with (branch output, residual) and returns (normalized, sum), so
+    they are where each sublayer's residual add happens; the attribute names are shared, so this is no table."""
+    body = model.model
+    return (
+        *(norm for layer in body.layers for norm in (layer.input_layernorm, layer.post_attention_layernorm)),
+        body.norm,
+    )
 
 
 def hidden_binding(layer: int, site: HiddenSite, layer_count: int) -> PackedHiddenResourceBinding:
-    """Resolve the shared decoder sites: fresh block output or final normalized output."""
-    if site is HiddenSite.MODEL_OUTPUT and layer == -1:
-        return PackedHiddenResourceBinding(str(layer), HiddenLayerKind.INDEX, site, "model.norm")
-    module_index = layer if layer >= 0 else layer_count + layer
-    if site is not HiddenSite.BLOCK_OUTPUT or not 0 <= module_index < layer_count:
+    """Resolve the shared decoder sites to the module a tap wraps.
+
+    Every admitted family computes `h, r = input_layernorm(h, r)`, attention, `h, r = post_attention_layernorm(h,
+    r)`, MLP, and ends with `model.norm(h, r)`; each norm adds the previous sublayer's output into the residual
+    stream and returns the sum second. So the stream after layer l is the second output of layer l+1's input norm
+    (of model.norm after the last layer), and the stream between attention and MLP that of the post-attention norm.
+    Layer logits are computed from residual taps by the session, at the LM head.
+    """
+    if layer == -1 and site in (HiddenSite.MODEL_OUTPUT, HiddenSite.LAYER_LOGITS):
+        return PackedHiddenResourceBinding(
+            str(layer), HiddenLayerKind.INDEX, site, "model.norm" if site is HiddenSite.MODEL_OUTPUT else "lm_head"
+        )
+    index = layer if layer >= 0 else layer_count + layer
+    if not 0 <= index < layer_count:
         raise ValueError(f"hidden layer {layer} at site {site.value} is outside 0..{layer_count - 1}")
-    return PackedHiddenResourceBinding(
-        str(layer), HiddenLayerKind.INDEX, HiddenSite.BLOCK_OUTPUT, f"model.layers.{module_index}"
-    )
+    match site:
+        case HiddenSite.BLOCK_OUTPUT:
+            path, output = f"model.layers.{index}", 0
+        case HiddenSite.RESIDUAL:
+            path, output = "model.norm" if index == layer_count - 1 else f"model.layers.{index + 1}.input_layernorm", 1
+        case HiddenSite.ATTENTION_RESIDUAL:
+            path, output = f"model.layers.{index}.post_attention_layernorm", 1
+        case _:
+            raise ValueError(f"hidden site {site.value} reads layer -1 only")
+    return PackedHiddenResourceBinding(str(layer), HiddenLayerKind.INDEX, site, path, output)

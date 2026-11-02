@@ -17,6 +17,7 @@ from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.architecture import Decoder
 from pllm.backends.vllm.custom_forward import VllmCustomForward
 from pllm.backends.vllm.hidden_taps import HiddenTaps
+from pllm.backends.vllm.layer_logits import LayerLogits
 from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay, parameter_overlay
 from pllm.backends.vllm.position_state import PositionCacheLayer
 from pllm.backends.vllm.prefix_cache import POLICY_KEY, CachePolicy
@@ -93,6 +94,10 @@ class VllmSession(Generic[DataT, ResultT]):
         self._hidden_phases = frozenset(resource.phase for resource in probe.hidden_resources)
         self._trains_on_batch = plan.semantic_graph.trains_on_batch
         self._taps = taps
+        self._layer_logits = None
+        if probe.layer_logits:
+            assert taps is not None
+            self._layer_logits = LayerLogits(decoder, taps, probe.layer_logits)
         overlay_bindings = attachment.spec.overlay_bindings
         custom_forward_task = plan.semantic_graph.custom_forward_task
         program_overlay = bool(overlay_bindings) and custom_forward_task is not None
@@ -394,8 +399,9 @@ class VllmSession(Generic[DataT, ResultT]):
         rows change the model rows' logits only as a larger batch would (cuBLAS picks kernels by row
         count); on Qwen2.5-0.5B and a DeepSeek-V2-Lite slice that never exceeded plain vLLM's own
         batch-size sensitivity (0.0625 and 0.5). Steps without guided rows append none, and zero-strength
-        guidance declares no sampler. A request for logits means the transformer forward is over on both
-        runner ABIs.
+        guidance declares no sampler. Layer logits need the model's rows before the workload's tasks run,
+        so with them the model's rows and the guidance are projected in separate calls. A request for logits
+        means the transformer forward is over on both runner ABIs.
         """
         lm_head = self._compute_logits
         step = self._step
@@ -405,18 +411,25 @@ class VllmSession(Generic[DataT, ResultT]):
         # Forward completion can discard a prefill step that has no workload inputs.
         if self.completion_rows is not None:
             self.completion_rows.write(step.rows.identities, hidden)
+        logits = None
+        if self._layer_logits is not None:
+            logits = lm_head(hidden)
+            assert logits is not None
+            self._layer_logits.compute(step.rows, logits)
         self.complete_forward()
         if self._step is None or self._sampler is None or self._context().guidance is None:
-            return lm_head(hidden)
+            return lm_head(hidden) if logits is None else logits
         guidance = self._sampler_guidance()
-        if guidance.stage is SamplerStage.PACKED_POST_FILTER_EXACT:
-            logits = lm_head(torch.cat((hidden, guidance.values.to(hidden.dtype))))
-            assert logits is not None
-            predicted = logits[len(hidden) :]
-            logits = logits[: len(hidden)]
-        else:
-            logits = lm_head(hidden)
+        if guidance.stage is not SamplerStage.PACKED_POST_FILTER_EXACT:
             predicted = guidance.values
+        elif logits is None:
+            projected = lm_head(torch.cat((hidden, guidance.values.to(hidden.dtype))))
+            assert projected is not None
+            logits, predicted = projected[: len(hidden)], projected[len(hidden) :]
+        else:
+            predicted = lm_head(guidance.values.to(hidden.dtype))
+            assert predicted is not None
+        logits = lm_head(hidden) if logits is None else logits
         self._sampler.begin_guidance(SignedSamplerGuidance(guidance, predicted, self._capture_feedback))
         return logits
 

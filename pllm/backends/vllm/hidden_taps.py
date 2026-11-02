@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from math import prod
 from typing import ParamSpec
 
 import numpy as np
@@ -16,7 +17,7 @@ import torch
 from torch import Tensor
 
 from pllm.backends.vllm.architecture import hidden_binding
-from pllm.contracts.hidden_locator import HiddenPhase
+from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite, logit_layers
 from pllm.contracts.packed_hidden import (
     HiddenRowBatch,
     HiddenRows,
@@ -25,7 +26,7 @@ from pllm.contracts.packed_hidden import (
 from pllm.contracts.packed_rows import PackedPhaseRowBatch
 from pllm.contracts.semantic_graph import HiddenInputSource
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorFieldSpec, TensorLayoutSpec
-from pllm.execution.cuda_stream import CudaStreamReadiness, PinnedStaging
+from pllm.execution.cuda_stream import CudaStreamReadiness, PinnedStaging, upload
 from pllm.execution.ptts.slot_pools import SlotPools, Slots
 from pllm.execution.state_execution import DataT, StateTaskContext
 from pllm.execution.step_input import StepInput
@@ -35,17 +36,18 @@ TAPS_ENV = "PLLM_HIDDEN_TAPS"
 
 @dataclass(frozen=True, slots=True)
 class HiddenTapLayout:
-    """One module's union of latest-decode and completed-prompt-ending rows.
+    """One module output's union of latest-decode and completed-prompt-ending rows.
 
     All consumers share each tapped row. Two generations fund a producer and an
     outstanding reader; reuse must wait for every reader's completion, regardless of
-    publish_lag.
+    publish_lag. Layer logits use the same slots but are written by the session at the LM head, not by a hook.
     """
 
-    module_path: str
+    tap: tuple[str, int]
+    site: HiddenSite
     phases: tuple[HiddenPhase, ...]
     tap_rows: int
-    hidden_size: int
+    shape: tuple[int, ...]
     dtype: TensorDType
 
     @property
@@ -55,16 +57,16 @@ class HiddenTapLayout:
 
     @property
     def resident_bytes(self) -> int:
-        """Model-dtype slots plus the persistent source/destination int64 table.
+        """Slots plus the persistent source/destination int64 table.
 
         Retention already includes the producer's slots; there is no separate
         capture or handoff allocation. Host ownership and pinned staging are not GPU bytes.
         """
-        return self.retained_rows * self.hidden_size * self.dtype.itemsize + 2 * self.tap_rows * 8
+        return self.retained_rows * prod(self.shape) * self.dtype.itemsize + 2 * self.tap_rows * 8
 
     def create_pool(self, device: torch.device) -> SlotPools:
         """Allocate stable storage before capture; steps lease free rows from field zero."""
-        field = TensorFieldSpec(LayoutFieldId(0), (self.hidden_size,), self.dtype, self.dtype.itemsize)
+        field = TensorFieldSpec(LayoutFieldId(0), self.shape, self.dtype, self.dtype.itemsize)
         return SlotPools(TensorLayoutSpec("pllm.hidden@1", (field,)), self.retained_rows, device)
 
 
@@ -75,20 +77,45 @@ class HiddenTapAnnouncement:
     inputs: tuple[HiddenInputSource, ...] = ()
     max_num_seqs: int = 1
     dtype: TensorDType = TensorDType.FLOAT32
+    # The layers pllm.layer_logits reads; the residual stream after each is tapped.
+    layer_logits: tuple[int, ...] = ()
 
-    def resolve(self, layer_count: int, hidden_size: int) -> tuple[HiddenTapLayout, ...]:
+    def resolve(self, layer_count: int, hidden_size: int, vocab_size: int) -> tuple[HiddenTapLayout, ...]:
         """Merge aliases and consumers before capture; phases share one request bound.
 
         Prefill here selects prompt endings, never all prompt tokens. An all-token
         declaration needs its own token bound rather than this request capacity.
         """
-        modules: dict[str, set[HiddenPhase]] = {}
-        for source in self.inputs:
-            path = hidden_binding(source.layer, source.site, layer_count).module_path
-            modules.setdefault(path, set()).add(source.phase)
-        return tuple(
-            HiddenTapLayout(path, tuple(sorted(phases)), self.max_num_seqs, hidden_size, self.dtype)
-            for path, phases in sorted(modules.items())
+        layers = logit_layers(self.layer_logits, layer_count)
+        sources = (
+            *(source for source in self.inputs if source.site is not HiddenSite.LAYER_LOGITS),
+            *(
+                HiddenInputSource(layer, HiddenSite.RESIDUAL, phase)
+                for layer in layers
+                for phase in (HiddenPhase.PREFILL, HiddenPhase.DECODE)
+            ),
+        )
+        taps: dict[tuple[str, int], tuple[HiddenSite, set[HiddenPhase]]] = {}
+        for source in sources:
+            binding = hidden_binding(source.layer, source.site, layer_count)
+            taps.setdefault(binding.tap, (binding.site, set()))[1].add(source.phase)
+        layouts = tuple(
+            HiddenTapLayout(tap, site, tuple(sorted(phases)), self.max_num_seqs, (hidden_size,), self.dtype)
+            for tap, (site, phases) in sorted(taps.items())
+        )
+        if not layers:
+            return layouts
+        logits = hidden_binding(-1, HiddenSite.LAYER_LOGITS, layer_count)
+        return (
+            *layouts,
+            HiddenTapLayout(
+                logits.tap,
+                logits.site,
+                (HiddenPhase.PREFILL, HiddenPhase.DECODE),
+                self.max_num_seqs,
+                (len(layers), vocab_size),
+                TensorDType.FLOAT32,
+            ),
         )
 
 
@@ -96,12 +123,13 @@ P = ParamSpec("P")
 
 
 def _tapped(
-    pool: SlotPools, indices: Tensor, forward: Callable[P, Tensor | tuple[Tensor, ...]]
+    pool: SlotPools, indices: Tensor, forward: Callable[P, Tensor | tuple[Tensor, ...]], index: int
 ) -> Callable[P, Tensor | tuple[Tensor, ...]]:
     def tapped(*args: P.args, **kwargs: P.kwargs) -> Tensor | tuple[Tensor, ...]:
         output = forward(*args, **kwargs)
-        # vLLM decoder layers return (layer output, residual); the tap keeps the layer output.
-        hidden = output if isinstance(output, Tensor) else output[0]
+        # Decoder layers return (layer output, residual) and norms (normalized, residual stream); the tap keeps
+        # output `index`. The norm's sum is written in place, so it is copied before the next layer reuses it.
+        hidden = output if isinstance(output, Tensor) else output[index]
         pool.copy_from(0, hidden, indices[0], indices[1])
         return output
 
@@ -109,33 +137,36 @@ def _tapped(
 
 
 class HiddenTaps:
-    """Selective model-dtype copies of tapped rows into stable PTTS pools, keyed by module path."""
+    """Selective model-dtype copies of tapped rows into stable PTTS pools, keyed by module output."""
 
     def __init__(
         self,
         model: torch.nn.Module,
         layouts: tuple[HiddenTapLayout, ...],
-        pools: dict[str, SlotPools],
+        pools: dict[tuple[str, int], SlotPools],
         device: torch.device,
     ) -> None:
         self.layouts, self.pools = layouts, pools
         self.indices = torch.full(
             (sum(2 * layout.tap_rows for layout in layouts),), -1, dtype=torch.long, device=device
         )
-        self._slots: dict[str, Slots] = {}
-        self._rows: dict[str, Slots] = {}
+        self._slots: dict[tuple[str, int], Slots] = {}
+        self._rows: dict[tuple[str, int], Slots] = {}
+        # The packed rows each tap selected this step.
+        self._selected: dict[tuple[str, int], Slots] = {}
         self._staging = PinnedStaging()
         offset = 0
         for layout in layouts:
-            path = layout.module_path
-            module = model.get_submodule(path)
+            path, index = layout.tap
             size = 2 * layout.tap_rows
             indices = self.indices[offset : offset + size].view(2, layout.tap_rows)
             offset += size
-            slots = pools[path].tensors[0]
-            module.register_buffer("pllm_hidden_slots", slots, persistent=False)
-            module.register_buffer("pllm_hidden_indices", indices, persistent=False)
-            module.forward = _tapped(pools[path], indices, module.forward)
+            if layout.site is HiddenSite.LAYER_LOGITS:
+                continue
+            module = model.get_submodule(path)
+            module.register_buffer(f"pllm_hidden_slots_{index}", pools[layout.tap].tensors[0], persistent=False)
+            module.register_buffer(f"pllm_hidden_indices_{index}", indices, persistent=False)
+            module.forward = _tapped(pools[layout.tap], indices, module.forward, index)
 
     def prepare(self, rows: PackedPhaseRowBatch) -> None:
         """Reserve the declared row union and upload its packed-row to slot mapping before forward."""
@@ -148,13 +179,14 @@ class HiddenTaps:
         )
         offset = 0
         for layout in self.layouts:
-            path = layout.module_path
+            tap = layout.tap
             selected = np.concatenate(tuple(indices for phase, indices in phase_rows if phase in layout.phases))
-            slots, _ = self.pools[path].allocate(0, len(selected), stream)
-            self._slots[path] = slots[:, None]
+            slots, _ = self.pools[tap].allocate(0, len(selected), stream)
+            self._slots[tap] = slots[:, None]
             mapping = np.full(rows.total_rows, slots[0] if slots.size else 0, dtype=np.int64)
             mapping[selected] = slots
-            self._rows[path] = mapping
+            self._rows[tap] = mapping
+            self._selected[tap] = selected
             size = 2 * layout.tap_rows
             indices = host[offset : offset + size].reshape(2, layout.tap_rows)
             indices[0, : len(selected)] = selected
@@ -168,16 +200,31 @@ class HiddenTaps:
         completion = torch.cuda.Event() if self._slots else None
         if completion is not None:
             completion.record()
-        for path, slots in self._slots.items():
-            self.pools[path].release(slots, completion)
+        for tap, slots in self._slots.items():
+            self.pools[tap].release(slots, completion)
         self._slots.clear()
         self._rows.clear()
+        self._selected.clear()
         self.indices.fill_(-1)
+
+    def selected(self, tap: tuple[str, int]) -> Slots:
+        """The packed rows `tap` keeps this step."""
+        return self._selected[tap]
+
+    def read(self, tap: tuple[str, int], packed: Slots) -> Tensor:
+        """This step's rows of `tap` at `packed` rows it keeps."""
+        storage = self.pools[tap].tensors[0]
+        return storage.index_select(0, upload(self._rows[tap][packed], storage.device))
+
+    def write(self, tap: tuple[str, int], packed: Slots, values: Tensor) -> None:
+        """Fill the rows `tap` keeps at `packed`; used for layer logits, which no module hook produces."""
+        storage = self.pools[tap].tensors[0]
+        storage.index_copy_(0, upload(self._rows[tap][packed], storage.device), values)
 
     def publish(self, value: StepInput, resources: tuple[PackedHiddenResourceBinding, ...]) -> StepInput:
         """Attach the current step's hidden rows for `resources` to `value`."""
         taps = tuple(
-            HiddenRows(resource, self.pools[resource.module_path].tensors[0], self._rows[resource.module_path])
+            HiddenRows(resource, self.pools[resource.tap].tensors[0], self._rows[resource.tap])
             for resource in resources
         )
         stream = torch.cuda.current_stream()
@@ -189,7 +236,7 @@ class HiddenTaps:
 
     def hold(self, context: StateTaskContext[DataT]) -> None:
         """Acquire the reader's holds before the runner releases the producer."""
-        context.hold_slots(tuple((self.pools[path], slots) for path, slots in self._slots.items()))
+        context.hold_slots(tuple((self.pools[tap], slots) for tap, slots in self._slots.items()))
 
 
 __all__ = ["TAPS_ENV", "HiddenTapAnnouncement", "HiddenTapLayout", "HiddenTaps"]

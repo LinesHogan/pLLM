@@ -85,7 +85,7 @@ from pllm.backends.vllm.architecture import hidden_binding
 from pllm.backends.vllm.position_state import POSITION_ENV
 from pllm.backends.vllm.prefix_cache import CachePolicy
 from pllm.backends.vllm.runner import BackendWorkerState, WorkloadModelRunner
-from pllm.contracts.hidden_locator import HiddenPhase
+from pllm.contracts.hidden_locator import HiddenPhase, logit_layers
 from pllm.execution.position_state import PositionAnnouncement
 
 _logger = logging.getLogger(__name__)
@@ -697,7 +697,9 @@ def create_vllm_llm(
         _MP_ENV: "1" if config.multiprocessing else "0",
         _V2_RUNNER_ENV: "1" if config.runner == "mrv2" else "0",
         TAPS_ENV: encode_boundary(
-            HiddenTapAnnouncement(requirements.hidden_inputs, config.max_num_seqs, TensorDType(config.dtype))
+            HiddenTapAnnouncement(
+                requirements.hidden_inputs, config.max_num_seqs, TensorDType(config.dtype), requirements.layer_logits
+            )
         ),
         POSITION_ENV: encode_boundary(PositionAnnouncement(requirements.position_states)),
     }
@@ -777,6 +779,10 @@ def probe_backend(
     layer_count = len(model.model.layers)
     if any(layer < 0 or layer >= layer_count for layer in requirements.activation_layers):
         raise ValueError("activation layer is outside the backend model")
+    if any(not -layer_count <= layer < layer_count for layer in requirements.layer_logits):
+        raise ValueError(
+            f"pllm.layer_logits{requirements.layer_logits} names a layer outside the model's {layer_count} layers"
+        )
     hidden_resources = tuple(
         sorted(
             (
@@ -786,6 +792,7 @@ def probe_backend(
             key=lambda resource: (*resource.resource_key, resource.phase is HiddenPhase.DECODE),
         )
     )
+    layer_logits = logit_layers(requirements.layer_logits, layer_count)
     requested_targets = expand_targets(requirements.parameter_targets, layer_count)
     targets = inspect_parameter_targets(decoder, requested_targets, runner.dtype) if requested_targets else ()
     custom_forward_capabilities = (
@@ -803,7 +810,8 @@ def probe_backend(
                 f"hidden_size={model.config.hidden_size}",
                 f"layers={layer_count}",
                 f"vocab_size={model.config.vocab_size}",
-                *(f"hidden={resource.binding.module_path}" for resource in hidden_resources),
+                *(f"hidden={resource.binding.tap}" for resource in hidden_resources),
+                f"layer_logits={layer_logits}",
                 *(f"activation_layer={layer}" for layer in requirements.activation_layers),
                 *(f"target={target.target}:{target.input_size}:{target.output_size}" for target in targets),
             )
@@ -811,6 +819,7 @@ def probe_backend(
         hidden_size=model.config.hidden_size,
         layer_count=layer_count,
         hidden_resources=hidden_resources,
+        layer_logits=layer_logits,
         capabilities=tuple(
             sorted(
                 set(
@@ -879,6 +888,7 @@ def _base_probe(
     hidden_size: int,
     layer_count: int,
     hidden_resources: tuple[AttachmentHiddenResource, ...],
+    layer_logits: tuple[int, ...],
     capabilities: tuple[str, ...],
 ) -> ModelProbe:
     return ModelProbe(
@@ -892,6 +902,7 @@ def _base_probe(
         capabilities=capabilities,
         causal_domain=CausalModelDomain(runner.max_num_reqs, layer_count, runner.model_config.max_model_len),
         position_states=runner.position_states,
+        layer_logits=layer_logits,
     )
 
 
@@ -923,6 +934,10 @@ def input_reservations(
         if stage is SamplerStage.PACKED_PRE_FILTER_ADD
         else 0
     )
+    # Layer logits at the LM head: the gathered streams, their norm and logits in the model dtype, and the FP32
+    # [rows, layers, vocab] values before they are copied into their slots.
+    width = probe.tensor_dtype.itemsize
+    workspace += rows * len(probe.layer_logits) * (2 * width * probe.hidden_size + (width + 4) * vocab)
     retained = rows * (4 * vocab + 8) if feedback else 0
     # StepCapture retains its feedback pointers until the next table is prepared.
     # Budget both old and new private copies during handoff, including next forward.

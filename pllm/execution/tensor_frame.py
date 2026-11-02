@@ -358,6 +358,18 @@ def hidden_port(source: HiddenInputSource) -> TensorPort:
     return TensorPort(source, hidden)
 
 
+def layer_logits_port(source: HiddenInputSource, columns: tuple[int, ...]) -> TensorPort:
+    """Gather the step's layer logits, [rows, layers, vocab] in FP32, keeping the marker's `columns` of the probed
+    layers; views and a stack keep the read free of host-to-device copies, so captured bodies replay it."""
+
+    def read(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
+        value, slots = data.table.hidden[str(source.layer), "index", source.site.value]
+        rows = value.index_select(0, slots)
+        return rows if columns == tuple(range(rows.shape[1])) else torch.stack([rows[:, c] for c in columns], 1)
+
+    return TensorPort(source, read)
+
+
 def sample_index_port(source: PackedSamplerRowsInputSource) -> TensorPort:
     """Read packed sample indices for the invocation rows."""
 

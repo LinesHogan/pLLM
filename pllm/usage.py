@@ -104,6 +104,7 @@ from pllm.execution.tensor_frame import (
     UpdateOutput as UpdateOutput,
     feedback_port,
     hidden_port,
+    layer_logits_port,
     result_port,
     sample_index_port,
 )
@@ -200,6 +201,30 @@ class Hidden(_Source):
 
     def port(self, context: _Reflection) -> TensorPort:
         return hidden_port(self.resolve(context.owner))
+
+
+@dataclass(frozen=True)
+class LayerLogits(_Source):
+    layers: tuple[int, ...] | Attr
+
+    def resolve(self, owner: Workload) -> HiddenInputSource:
+        """All layer-logit readers of a workload share one input holding every layer any of them names, for every
+        row the sampler draws (phase NONE: prompt ends and decode rows)."""
+        return HiddenInputSource(-1, HiddenSite.LAYER_LOGITS, HiddenPhase.NONE)
+
+    def layer_tuple(self, owner: Workload) -> tuple[int, ...]:
+        layers = _setting(self.layers, owner, tuple)
+        if not layers or any(type(layer) is not int for layer in layers):
+            raise TypeError(f"pllm.layer_logits({layers!r}) takes a non-empty tuple of layer indices")
+        return layers
+
+    def port(self, context: _Reflection) -> TensorPort:
+        probe = context.binding.probe
+        if probe is None:
+            raise ValueError("pllm.layer_logits reads the model's LM head; compile this workload with make_llm")
+        count = context.binding.dimensions.layer_count
+        columns = tuple(probe.layer_logits.index(layer % count) for layer in self.layer_tuple(context.owner))
+        return layer_logits_port(self.resolve(context.owner), columns)
 
 
 @dataclass(frozen=True)
@@ -388,6 +413,31 @@ def hidden(layer: int | Attr = 0, *, tokens: Literal["decode", "prefill"] = "dec
     One row per request: the latest decode token, or with tokens="prefill" the last prompt token of completed prefill.
     """
     return Hidden(layer, HiddenSite.BLOCK_OUTPUT, HiddenPhase(tokens))
+
+
+def residual(
+    layer: int | Attr,
+    *,
+    after: Literal["layer", "attention"] = "layer",
+    tokens: Literal["decode", "prefill"] = "decode",
+) -> Any:
+    """The residual stream after decoder layer `layer` (negative from the end): the embedding plus every earlier
+    sublayer's output, which the next sublayer normalizes. This is what steering vectors, sparse autoencoders and the
+    logit lens read; pllm.hidden(layer) is only the layer's MLP output before it is added to this stream.
+    after="attention" reads the stream between the layer's attention and its MLP. One row per request, chosen as in
+    pllm.hidden."""
+    if after not in ("layer", "attention"):
+        raise ValueError(f'pllm.residual(after={after!r}): use "layer" or "attention"')
+    return Hidden(
+        layer, HiddenSite.RESIDUAL if after == "layer" else HiddenSite.ATTENTION_RESIDUAL, HiddenPhase(tokens)
+    )
+
+
+def layer_logits(layers: tuple[int, ...] | Attr) -> Any:
+    """The model's final norm and LM head applied to the residual stream after each of `layers` (negative from the
+    end), as float32 [rows, len(layers), vocab]: the logit lens. The last layer's logits are the model's own. One row
+    for each token the sampler draws: a prompt's last token and every decode token."""
+    return LayerLogits(layers)
 
 
 def final_hidden(*, tokens: Literal["decode", "prefill"] = "decode") -> Any:
@@ -2024,7 +2074,23 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
                 for op in context.operations
             ),
             hidden_inputs=tuple(
-                dict.fromkeys(source.resolve(context.owner) for source in inputs if isinstance(source, Hidden))
+                dict.fromkeys(
+                    (
+                        *(source.resolve(context.owner) for source in inputs if isinstance(source, Hidden)),
+                        *(
+                            HiddenInputSource(-1, HiddenSite.LAYER_LOGITS, phase)
+                            for source in inputs
+                            if isinstance(source, LayerLogits)
+                            for phase in (HiddenPhase.PREFILL, HiddenPhase.DECODE)
+                        ),
+                    )
+                )
+            ),
+            layer_logits=tuple(
+                layer
+                for source in inputs
+                if isinstance(source, LayerLogits)
+                for layer in source.layer_tuple(context.owner)
             ),
             parameter_targets=targets,
             activation_layers=tuple(layer for value in context.activations.values() for layer in value.layers),
@@ -2136,6 +2202,8 @@ __all__ = [
     "train",
     "Attr",
     "hidden",
+    "residual",
+    "layer_logits",
     "final_hidden",
     "parameter",
     "module",

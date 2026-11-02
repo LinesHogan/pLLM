@@ -13,7 +13,12 @@
   参数：`Hidden`、`Samples`、`Batch`、`Parameter`、`StateIndex`、
   `StateVersion`、`Result`、`BaseLogits`、`SampledTokens`。
 - **Hidden / BLOCK_OUTPUT** —— `pllm.hidden(L)` 读取第 L 个 decoder 层的 MLP 输出，
-  位于残差加法之前；它不是残差流。每个请求读取最新 decode token 或 prompt 最后一个 token。
+  位于残差加法之前；它不是残差流（残差流见 `pllm.residual`）。每个请求读取最新 decode token 或 prompt 最后一个 token。
+- **残差流读取（pllm.residual）** —— 某层之后（或 attention 与 MLP 之间）的残差流：
+  下一个子层的 norm 读入的和。steering 向量、SAE 与 logit lens 读的是它；`pllm.hidden(L)`
+  只是第 L 层 MLP 在加入残差流之前的输出。
+- **层 logits（pllm.layer_logits）** —— 模型自己的最终 norm 与 LM head 作用于若干层之后的
+  残差流（logit lens），FP32 `[rows, layers, vocab]`，覆盖采样器抽取的每个 token。
 - **因果批（Causal batch）** —— `pllm.host.CausalTrainBatch` 提供同形的
   `input_ids`、`labels` 和可选 `attention_mask`，训练方法用 `pllm.batch(...)` 读取。
 - **因果模型端口（Causal model port）** —— `pllm.causal_model("adapter")` 注入

@@ -14,9 +14,9 @@ import numpy as np
 import torch
 
 from pllm.config import ExecutionOptions
-from pllm.contracts.hidden_locator import HiddenPhase
+from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.host_batch import WeightedCEBatch, WeightedRowBatch
-from pllm.contracts.packed_hidden import HiddenRowBatch, HiddenRows
+from pllm.contracts.packed_hidden import HiddenRowBatch, HiddenRows, PackedHiddenResourceBinding
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
 from pllm.contracts.parameter_overlay import ProjectionOperands
 from pllm.contracts.request_identity import RequestIdentity
@@ -51,6 +51,13 @@ def meta(*shape: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     return torch.empty(shape, device="meta", dtype=dtype)
 
 
+def _hidden_storage(facts: BackendCompileFacts, resource: PackedHiddenResourceBinding, count: int) -> torch.Tensor:
+    """Shape-only rows of one hidden input: model-dtype hidden rows, or FP32 [layers, vocab] layer logits."""
+    if resource.site is HiddenSite.LAYER_LOGITS:
+        return meta(count, len(facts.probe.layer_logits), facts.vocab_size, dtype=torch.float32)
+    return meta(count, facts.probe.hidden_size, dtype=facts.probe.tensor_dtype.torch)
+
+
 def example(
     binding: TensorBinding, facts: BackendCompileFacts, options: ExecutionOptions
 ) -> tuple[TensorFrame, TensorBatch]:
@@ -63,14 +70,11 @@ def example(
     sampler = PackedSamplerRowBatch(packed, tuple(PackedSamplerRowLink(i, count - i - 1) for i in range(count)))
     # Trace hidden_port's model-dtype gather and FP32 conversion, including their
     # overlapping lifetimes, along with each executor's consumer index table.
-    hidden_dtype = facts.probe.tensor_dtype.torch
     hidden = (
         HiddenRowBatch(
             packed,
             tuple(
-                HiddenRows(
-                    resource, meta(count, facts.probe.hidden_size, dtype=hidden_dtype), np.arange(count, dtype=np.int64)
-                )
+                HiddenRows(resource, _hidden_storage(facts, resource, count), np.arange(count, dtype=np.int64))
                 for resource in dict.fromkeys(item.binding for item in facts.probe.hidden_resources)
             ),
         )

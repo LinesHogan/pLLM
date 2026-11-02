@@ -9,6 +9,8 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
 class TransformerBlock(Module):
+    input_layernorm: RMSNorm
+    post_attention_layernorm: RMSNorm
     # Unlike the other decoders, the block takes (hidden_states, positions, residual).
     forward: Callable[[Tensor, Tensor, Tensor | None], tuple[Tensor, Tensor]]
 

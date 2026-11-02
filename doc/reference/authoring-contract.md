@@ -62,7 +62,8 @@ class CenteredHidden(pllm.Workload):
 ```
 
 `pllm.hidden(layer)` 声明的是受支持的块/模型输出捕获，不是任意的 eager PyTorch 钩子。
-每个输入的来源写成参数默认值：`pllm.hidden`、`pllm.sample_index`、`pllm.base_logits`、
+每个输入的来源写成参数默认值：`pllm.hidden`、`pllm.residual`、`pllm.layer_logits`、
+`pllm.sample_index`、`pllm.base_logits`、
 `pllm.sampled_tokens`、`pllm.parameter(state, field)`、`pllm.module(state)`、
 `pllm.index(state)`、`pllm.version(state)`、`pllm.result(operation)` 与
 `pllm.batch(field)`；参数名不做猜测。
@@ -75,6 +76,15 @@ class CenteredHidden(pllm.Workload):
 
 请求状态默认按真实请求 ID 隔离。它不因 Python 对象析构而回收：
 生命周期由原始 PTTS pin 与完成管理。
+
+`pllm.hidden(layer)` 是第 `layer` 层新鲜的 MLP 输出（不含残差）；`pllm.residual(layer)`
+是该层之后的残差流——embedding 加上之前每个子层的输出，也就是下一个子层 norm 读入的和；
+`pllm.residual(layer, after="attention")` 是该层 attention 与 MLP 之间的残差流。
+两者都按请求取一行（`tokens="decode"` 或 `"prefill"`），在 vLLM 的 CUDA graph 内捕获。
+`pllm.layer_logits(layers)` 把模型自己的最终 norm 与 LM head 用到这些层之后的残差流上
+（logit lens），返回 FP32 `[rows, len(layers), vocab]`；最后一层就是模型自己的 logits。
+它覆盖采样器抽取的每个 token：prompt 的最后一个 token 与每个 decode token。层 logits
+在 LM head 处用一个独立 GEMM 计算，模型自身的 logits 保持与 vLLM 逐位相同。
 
 实例参数就是声明的形状；请求参数会多出一个操作行轴。普通实现显式打包这些
 视图 —— 这**不是原生分页 GEMM**。输入与参数视图是借来的只读值；普通数学

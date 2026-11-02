@@ -81,6 +81,8 @@ class ModelProbe:
     targets: tuple[ProjectionShape, ...] = ()
     causal_domain: CausalModelDomain | None = None
     position_states: tuple[tuple[str, float], ...] = ()
+    # The distinct absolute layers whose logits the layer-logits input holds, in its column order.
+    layer_logits: tuple[int, ...] = ()
 
 
 class ActivationPatchOperator(StrEnum):

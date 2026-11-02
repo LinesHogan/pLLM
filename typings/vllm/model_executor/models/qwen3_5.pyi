@@ -16,6 +16,8 @@ class Qwen3_5DecoderLayer(Module):
     layer_type: str
     self_attn: Qwen3NextAttention
     mlp: Qwen3NextMLP | Qwen3NextSparseMoeBlock
+    input_layernorm: GemmaRMSNorm
+    post_attention_layernorm: GemmaRMSNorm
     # Called with keywords: (hidden_states, residual, positions) in declaration order.
     forward: Callable[..., tuple[Tensor, Tensor]]
 

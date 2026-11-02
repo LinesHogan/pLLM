@@ -14,16 +14,23 @@ from pllm.contracts.packed_rows import PackedPhaseRowBatch
 
 @dataclass(frozen=True, slots=True)
 class PackedHiddenResourceBinding:
-    """One signed backend module for a packed block-output locator."""
+    """One signed backend module for a packed hidden locator, and which of its outputs the tap copies: 0 for a
+    layer's fresh output or a norm's normalized value, 1 for the residual stream a norm returns beside it."""
 
     layer: str
     layer_kind: HiddenLayerKind
     site: HiddenSite
     module_path: str
+    output: int = 0
 
     @property
     def locator_key(self) -> tuple[str, str, str]:
         return (self.layer, self.layer_kind.value, self.site.value)
+
+    @property
+    def tap(self) -> tuple[str, int]:
+        """The module output a tap copies rows from."""
+        return (self.module_path, self.output)
 
 
 @dataclass(frozen=True, slots=True)

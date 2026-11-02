@@ -25,3 +25,8 @@ class GemmaRMSNorm(Module):
 
     variance_epsilon: float
     weight: torch.Tensor
+
+    @overload
+    def forward(self, x: torch.Tensor, residual: None = None) -> torch.Tensor: ...
+    @overload
+    def forward(self, x: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]: ...
