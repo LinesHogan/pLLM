@@ -15,6 +15,7 @@ import pllm
 from examples.video_session import video_frames
 from pllm.config import ExecutionOptions, ModelConfig
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
+from pllm.contracts.semantic_graph import StateResource
 from pllm.contracts.state_ref import LineageId, StateRef, VersionId
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.ptts.page_borrow import BorrowedPage, BorrowedStateRoot, PageFieldTransfer
@@ -135,7 +136,7 @@ def observe_model(workload):
             original = expected.clone()
             selected = torch.tensor(sorted({0, len(expected) - 1}), device=expected.device)
             expected.index_add_(0, selected, delta.to(expected).expand(len(selected), -1))
-            torch.testing.assert_close(output[0], expected, rtol=0, atol=0)
+            torch.testing.assert_close(output[1], inputs[1] + expected, rtol=0, atol=0)
             assert torch.count_nonzero(expected - original) > 0
             rows = step.rows.row_batch.rows
             for (_, actual), prior in zip(views(layer, rows), prior_kv, strict=True):
@@ -148,7 +149,10 @@ def observe_model(workload):
             steps.append((step.rows.step_id, int(ref.version_id)))
             phases.append(tuple(row.phase.value for row in rows))
 
-        layer.register_forward_hook(check)
+        # The patched MLP output joins the residual stream in the next norm; its second output is that stream.
+        layers = llm.runner.model.model.layers
+        following = layers[workload.layer + 1].input_layernorm if workload.layer + 1 < len(layers) else None
+        (following or llm.runner.model.model.norm).register_forward_hook(check)
         complete = session.complete_forward
 
         def completed():
@@ -206,10 +210,11 @@ def observe_model(workload):
 def observe_replay(*, versions):
     from vllm.forward_context import get_forward_context
 
+    from pllm.backends.vllm.activation import VllmActivationPatch
     from pllm.backends.vllm.custom_forward import ProgramWave, VllmCustomForward
     from pllm.backends.vllm.custom_forward_attention import attention_paged_access
 
-    original_make, original_layer = pllm.make_llm, ProgramWave.layer
+    original_make, original_layer, original_patch = pllm.make_llm, ProgramWave.layer, VllmActivationPatch.patch
     original_run = VllmCustomForward.run
     original_capture, original_replay = ProgramWave.capture, torch.cuda.CUDAGraph.replay
     holder, history, recordings = {}, {}, {}
@@ -230,24 +235,24 @@ def observe_replay(*, versions):
         capturing = None
 
     def layer(wave, ordinal, hidden, residual, kv="commit"):
-        base = []
-
-        def native(module, args, result):
-            if torch.cuda.is_current_stream_capturing():
-                base.append(result[0].clone())
-
-        hook = wave.custom_forward.model.layers[ordinal].register_forward_hook(native) if ordinal == 1 else None
-        try:
-            result = original_layer(wave, ordinal, hidden, residual, kv)
-        finally:
-            if hook is not None:
-                hook.remove()
+        result = original_layer(wave, ordinal, hidden, residual, kv)
         if capturing is not None and torch.cuda.is_current_stream_capturing():
-            if ordinal == 1 and base and 1 in wave.fields:
-                capturing["patches"].append((base[0], wave.fields[1][0].clone(), result[0].clone()))
             if ordinal == len(wave.custom_forward.model.layers) - 1 and capturing["normal"] is None:
                 capturing["normal"] = wave.custom_forward.model.norm(result[0] + result[1]).clone()
         return result
+
+    def patching(activation, resource, layer, rows, packed):
+        """Record a captured wave's MLP output of the patched layer before and after the patch."""
+        apply = original_patch(activation, resource, layer, rows, packed)
+
+        def recorded(hidden):
+            base = hidden.clone() if capturing is not None and torch.cuda.is_current_stream_capturing() else None
+            result = apply(hidden)
+            if base is not None:
+                capturing["patches"].append((base, result.clone()))
+            return result
+
+        return recorded
 
     def replay(graph):
         original_replay(graph)
@@ -255,7 +260,7 @@ def observe_replay(*, versions):
             return
         wave, observed = recordings[graph]
         torch.testing.assert_close(wave.output, observed["normal"], rtol=0, atol=0)
-        if 1 not in wave.fields:
+        if not any(wave.signature[1]):
             return
         step = holder["session"]._step
         context = step.context
@@ -266,12 +271,13 @@ def observe_replay(*, versions):
             (ref,) = context.pin.refs
             pin = context.pin
         field = context.arena.borrow_field(pin, ref, LayoutFieldId(0))
-        staged = wave.fields[1][0]
-        assert staged.data_ptr() != field.data_ptr()
+        # Each lane's fields are staged into stable per-row buffers the captured wave gathers from.
+        (buffer,) = holder["session"]._activation._row_fields[StateResource("inject"), 1]
+        staged = buffer.index_select(0, wave.indices[0])
+        assert buffer.data_ptr() != field.data_ptr()
         torch.testing.assert_close(staged, field.expand_as(staged), rtol=0, atol=0)
-        for hidden, delta, patched in observed["patches"]:
-            torch.testing.assert_close(delta, field.expand_as(delta), rtol=0, atol=0)
-            torch.testing.assert_close(patched, hidden + delta.to(hidden.dtype), rtol=0, atol=0)
+        for hidden, patched in observed["patches"]:
+            torch.testing.assert_close(patched, hidden + field.expand_as(hidden).to(hidden.dtype), rtol=0, atol=0)
             calls.append((step.rows.step_id, int(ref.version_id)))
 
     def run(self, *args):
@@ -294,6 +300,7 @@ def observe_replay(*, versions):
     with (
         patch.object(pllm, "make_llm", make),
         patch.object(ProgramWave, "layer", layer),
+        patch.object(VllmActivationPatch, "patch", patching),
         patch.object(ProgramWave, "capture", capture),
         patch.object(torch.cuda.CUDAGraph, "replay", replay),
         patch.object(VllmCustomForward, "run", run),

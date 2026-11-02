@@ -22,7 +22,7 @@ from pllm.contracts.codec import encode_boundary
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.contracts.semantic_graph import AnchorId, StateEffectKind
+from pllm.contracts.semantic_graph import AnchorId, StateEffectKind, StateResource
 from pllm.contracts.state_feed import FeedBinding, FeedOrder
 from pllm.contracts.state_ref import LineageId, StateRef, VersionId
 from pllm.contracts.tensor_layout import LayoutFieldId
@@ -176,20 +176,13 @@ def test_video_binding_failure_retains_grants_and_stops_execution():
                 execution.admit(())
 
 
-class _Layer(torch.nn.Module):
-    def forward(self, positions, hidden_states, residual=None):
-        return hidden_states * 2, residual
-
-
 def _session(b, execution):
     from pllm.backends.vllm.session import VllmSession
 
     plan = execution.arena.plan
     facts = backend_facts(2, (), plan.timeline, PageBundleProviderFacts("video.binding@1", 3))
     deployment = BackendDeployment(execution, bind_backend_attachment(plan, facts.probe, b.effects))
-    model = SimpleNamespace(
-        model=SimpleNamespace(layers=[_Layer() for _ in range(3)]), lm_head=SimpleNamespace(weight=torch.zeros(2, 2))
-    )
+    model = SimpleNamespace(model=SimpleNamespace(layers=()), lm_head=SimpleNamespace(weight=torch.zeros(2, 2)))
     from pllm.backends.vllm.prefix_cache import CachePolicy
 
     return (
@@ -280,11 +273,10 @@ def _decode_steps_keep_exact_publications_and_ack_order():
             expected_deltas = (
                 ((10, 0, 10, 10),) * 3 if step == 0 else ((20, 10, 0, 10), (10, 10, 0, 10), (0, 10, 0, 10))
             )
-            hidden, residual = torch.arange(8).reshape(4, 2).float(), torch.ones(4, 2)
-            for layer, values in zip(model.model.layers, expected_deltas, strict=True):
-                actual, carry = layer(torch.arange(4), hidden, residual)
-                torch.testing.assert_close(actual, hidden * 2 + torch.tensor(values)[:, None], rtol=0, atol=0)
-                assert carry is residual
+            hidden = torch.arange(8).reshape(4, 2).float()
+            for layer, values in enumerate(expected_deltas):
+                actual = session._activation.patch(StateResource("inject"), layer, None, ())(hidden.clone())
+                torch.testing.assert_close(actual, hidden + torch.tensor(values)[:, None], rtol=0, atol=0)
             session.complete_forward()
             session.complete_sampler()
             assert not any(peer.poll() for peer in peers), "sampler completion alone is not settlement"
@@ -335,9 +327,9 @@ def _hold_steps_reuse_the_settled_injection():
             current = execution.latest(())[0]
             refs.append(current)
             assert current.version_id == (1 if step < 2 else 2)
-            for index, layer in enumerate(model.model.layers):
-                delta = 20 if step >= 2 and index == 0 else 10
-                actual, _ = layer(torch.zeros(1), torch.ones(1, 2))
+            for layer in range(3):
+                delta = 20 if step >= 2 and layer == 0 else 10
+                actual = session._activation.patch(StateResource("inject"), layer, None, ())(torch.full((1, 2), 2.0))
                 torch.testing.assert_close(actual, torch.full((1, 2), float(2 + delta)))
             session.complete_forward()
             session.complete_sampler()

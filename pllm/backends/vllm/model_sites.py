@@ -16,11 +16,12 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
+from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.architecture import Decoder, LinearOutput, NormForward, sublayer_norms
 from pllm.backends.vllm.hidden_taps import HiddenTaps, Tap
 from pllm.contracts.packed_rows import PackedPhaseRowBatch
 from pllm.execution.cuda_stream import upload
-from pllm.execution.model_sites import EarlierInput, Place, ResidualRewrite, StateInput, position
+from pllm.execution.model_sites import EarlierInput, PatchInput, Place, ResidualRewrite, StateInput, position
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.state_execution import DataT, StateTaskContext
 
@@ -32,15 +33,24 @@ class ModelSites:
     forward they read. Every copy lives in a stable buffer, so custom-forward graph replays see the step's values."""
 
     def __init__(
-        self, decoder: Decoder, rewrites: tuple[ResidualRewrite, ...], taps: HiddenTaps | None, rows: int, requests: int
+        self,
+        decoder: Decoder,
+        rewrites: tuple[ResidualRewrite, ...],
+        taps: HiddenTaps | None,
+        activation: VllmActivationPatch | None,
+        rows: int,
+        requests: int,
     ) -> None:
         body = decoder.model.model
         count, weight = len(body.layers), body.norm.weight
         owners = {place: rewrite for rewrite in rewrites for place in rewrite.places}
         earlier = {source for rewrite in rewrites for source in rewrite.earlier}
         self.streams, self.hidden = max(rewrite.streams for rewrite in rewrites), weight.shape[0]
-        # The packed rows of the layer call a custom forward is running; None while vLLM runs the whole step.
+        # The packed rows of the layer call a custom forward is running (on the device and the host); None while
+        # vLLM runs the whole step.
         self.rows: Tensor | None = None
+        self.packed: tuple[int, ...] = ()
+        self._activation = activation
         self.count = 0  # rows of the current hook call (vLLM may pad the step's rows)
         self._requests_of = torch.zeros(rows, dtype=torch.long, device=weight.device)
         self._sources = tuple(
@@ -155,6 +165,10 @@ class ModelSites:
 
     def earlier(self, source: EarlierInput) -> Tensor:
         return self._rows_of(self._earlier[source])
+
+    def patch(self, source: PatchInput, layer: int) -> Callable[[Tensor], Tensor]:
+        assert self._activation is not None
+        return self._activation.patch(source.resource, layer, self.rows, self.packed)
 
     def keep(self, source: EarlierInput, values: Tensor) -> None:
         """Copy the current rows' value at an earlier place for methods later in this forward."""

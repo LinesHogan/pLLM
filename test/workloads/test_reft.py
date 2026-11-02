@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass, replace
 from importlib.util import find_spec
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -110,10 +109,8 @@ def _decode_low_rank_keeps_parameters_and_recomputes_delta(
 
     execution = deployment.execution
     (binding,) = deployment.attachment.spec.activation_bindings
-    layer = SimpleNamespace(forward=lambda positions, hidden, residual: (hidden.clone(), residual))
     adapter = VllmActivationPatch(
-        SimpleNamespace(model=SimpleNamespace(layers=[layer])),
-        (replace(binding, decode=DecodeWindow.ALL, decode_refresh=DecodeRefresh.STEP),),
+        (replace(binding, decode=DecodeWindow.ALL, decode_refresh=DecodeRefresh.STEP),), len(hidden), in_program=False
     )
     rows = PackedPhaseRowBatch(
         0, len(hidden), tuple(PackedPhaseRow(i, 0, i, HiddenPhase.DECODE, identity) for i in range(len(hidden)))
@@ -122,10 +119,10 @@ def _decode_low_rank_keeps_parameters_and_recomputes_delta(
     execution.execute_anchor(invocation, AnchorId(0))
     try:
         adapter.prepare(rows, invocation, execution.directory)
-        actual, _ = layer.forward(torch.arange(len(hidden)), hidden, None)
+        actual = adapter.patch(binding.resource, binding.layer, None, ())(hidden.clone())
         torch.testing.assert_close(actual, hidden + expected)
         # The same exact parameters must operate on each forward's current hidden.
-        actual, _ = layer.forward(torch.arange(len(hidden)), hidden * 2, None)
+        actual = adapter.patch(binding.resource, binding.layer, None, ())(hidden * 2)
         constant = sum(bias[k] * rotation[:, k] for k in range(len(bias)))
         torch.testing.assert_close(actual, 2 * hidden + 2 * expected - constant)
         adapter.clear()
@@ -140,7 +137,7 @@ def _decode_low_rank_keeps_parameters_and_recomputes_delta(
             adapter.prepare(rows, missing, execution.directory)
         execution.cancel_step(missing)
     finally:
-        adapter.close()
+        adapter.clear()
 
 
 def _decode_declarations_are_checked(facts):
@@ -187,29 +184,19 @@ def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:
     execution.execute_anchor(invocation, AnchorId(0))
     context = invocation
 
-    class Layer(torch.nn.Module):
-        def forward(self, positions, hidden_states, residual=None):
-            # Like Qwen2's down projection, the layer owns a fresh output.
-            self.output = hidden_states.clone()
-            return self.output, residual
-
-    layer = Layer()
-    adapter = VllmActivationPatch(
-        SimpleNamespace(model=SimpleNamespace(layers=[layer])),
-        deployment.attachment.spec.activation_bindings,
-    )
+    (binding,) = deployment.attachment.spec.activation_bindings
+    adapter = VllmActivationPatch(deployment.attachment.spec.activation_bindings, 3, in_program=False)
     try:
         adapter.prepare(rows, context, execution.directory)
         hidden = torch.arange(12, dtype=torch.float64).reshape(3, 4)
-        residual = torch.ones_like(hidden)
         expected = hidden.clone()
         expected[1] += delta[1].double()
         expected[2] += delta[0].double()
-        patched, actual_residual = layer(torch.arange(3), hidden, residual)
-        assert patched is layer.output
+        # The patch edits the MLP output it is handed, before the residual add.
+        branch = hidden.clone()
+        patched = adapter.patch(binding.resource, binding.layer, None, ())(branch)
+        assert patched is branch
         torch.testing.assert_close(patched, expected, rtol=0, atol=0)
-        assert actual_residual is residual
-        assert torch.equal(hidden, torch.arange(12, dtype=torch.float64).reshape(3, 4))
         for ref in initial:
             assert torch.count_nonzero(execution.arena.snapshot(old_pin, ref)[0]) == 0
         adapter.clear()
@@ -222,7 +209,7 @@ def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:
             "a request imports its edit once, even if the input batch remains staged"
         )
     finally:
-        adapter.close()
+        adapter.clear()
         execution.arena.wait_release(execution.arena.release_pin(old_pin))
         execution.retire(identities)
     assert execution.diagnostics().active_states == 0

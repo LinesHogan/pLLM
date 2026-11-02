@@ -30,6 +30,7 @@ class SiteValues(Protocol):
 
     def state(self, source: StateInput) -> torch.Tensor: ...
     def earlier(self, source: EarlierInput) -> torch.Tensor: ...
+    def patch(self, source: PatchInput, layer: int) -> Callable[[torch.Tensor], torch.Tensor]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,7 +78,23 @@ class EarlierInput:
         return position((kind, self.layer))
 
 
-SiteInput = StateInput | DepthInput | EarlierInput
+@dataclass(frozen=True, slots=True)
+class PatchInput:
+    """The edit a pllm.model.ActivationPatch on `resource` applies to the MLP output of the place's layer, on the rows
+    it selects with the fields of the versions they read."""
+
+    resource: StateResource
+
+    def value(self, values: SiteValues, depth: int) -> Callable[[torch.Tensor], torch.Tensor]:
+        return values.patch(self, depth)
+
+
+def activation_write(x: torch.Tensor, y: torch.Tensor, patch: Callable[[torch.Tensor], torch.Tensor]) -> torch.Tensor:
+    """An activation patch as a custom residual: the edited MLP output joins the stream with the plain add."""
+    return x + patch(y)
+
+
+SiteInput = StateInput | DepthInput | EarlierInput | PatchInput
 
 
 def position(place: Place, *, read: bool = False) -> int:

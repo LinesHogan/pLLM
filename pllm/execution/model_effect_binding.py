@@ -47,6 +47,7 @@ from pllm.contracts.visibility import VisibilityKind, VisibilitySource
 from pllm.execution.binding_base import Field, overlay_fields
 from pllm.execution.custom_forward import CUSTOM_FORWARD_IMPLEMENTATION
 from pllm.execution.declaration import Call, State, When, native
+from pllm.execution.model_sites import PatchInput, ResidualRewrite, activation_write
 from pllm.execution.overlay_task import ChunkUpdate, GradientUpdate, OverlayTransition, overlay_apply
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.tensor_frame import (
@@ -237,6 +238,7 @@ def import_update(b: TensorBinding, state: State, identity: str) -> Call:
 
 def declare_activation_patch(
     b: TensorBinding,
+    name: str,
     state: State,
     *,
     layers: tuple[int, ...],
@@ -260,6 +262,16 @@ def declare_activation_patch(
         raise ValueError("activation fields must cover each ordered layer and operator")
     for start in range(0, len(views), width):
         _check_activation_fields(b, state, operator, views[start : start + width])
+    # The patch owns each layer's MLP residual update: another custom residual there is a conflict.
+    b.sites.add(
+        ResidualRewrite(
+            name,
+            "mlp",
+            tuple(("mlp", layer) for layer in layers),
+            activation_write,
+            (("patch", PatchInput(state.declaration.resource)),),
+        )
+    )
     b.activation_patch(
         tuple(
             ActivationPatchBinding(

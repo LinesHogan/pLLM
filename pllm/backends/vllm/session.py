@@ -120,13 +120,17 @@ class VllmSession(Generic[DataT, ResultT]):
         in_forward = attachment.spec.in_forward
         self._transition_task = None if in_forward is None else plan.scheduled(in_forward).task_id
         self._activation = (
-            VllmActivationPatch(decoder.model, attachment.spec.activation_bindings, install=custom_forward_task is None)
+            VllmActivationPatch(
+                attachment.spec.activation_bindings, probe.max_packed_rows, in_program=custom_forward_task is not None
+            )
             if attachment.spec.activation_bindings
             else None
         )
         model_sites = deployment.execution.math.model_sites
         self._sites = (
-            ModelSites(decoder, model_sites, taps, probe.max_packed_rows, max_sampler_rows) if model_sites else None
+            ModelSites(decoder, model_sites, taps, self._activation, probe.max_packed_rows, max_sampler_rows)
+            if model_sites
+            else None
         )
         self._feed: FeedReceiver | None = None
         self._received_readonly: ReadonlyStepInput | ReadonlyStepAbsent | ReadonlyStepEnd | None = None
@@ -390,7 +394,7 @@ class VllmSession(Generic[DataT, ResultT]):
                 effect.clear()
 
     def _close_effects(self) -> None:
-        for effect in (self._overlay, self._activation, self._sites, self._custom_forward):
+        for effect in (self._overlay, self._sites, self._custom_forward):
             if effect is not None:
                 effect.close()
 

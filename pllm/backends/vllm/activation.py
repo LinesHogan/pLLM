@@ -1,14 +1,16 @@
-"""Signed phase windows borrowing admission or exact invocation publication pins."""
+"""pllm.model.ActivationPatch on vLLM: the patched rows of a step, the fields of the versions they read, and the edit
+model_sites applies to a layer's MLP output. Patched rows are the first and last prompt tokens per request (and
+decode tokens when enabled); versions follow the patch's refresh policy, borrowing admission or invocation pins."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 
 import torch
 from torch.nn import functional as F
 
-from pllm.backends.vllm.architecture import CausalLM, DecoderLayer
 from pllm.contracts.backend_attachment import (
     ActivationPatchBinding,
     DecodeRefresh,
@@ -45,50 +47,29 @@ def activation_delta(hidden: torch.Tensor, fields: tuple[torch.Tensor, ...]) -> 
 
 @dataclass(frozen=True, slots=True)
 class _PatchRows:
+    """One request's patched rows at one layer and the fields of the version it reads."""
+
     rows: torch.Tensor
     fields: tuple[torch.Tensor, ...]
     indices: tuple[int, ...]
-    pin: PagePin
-    ref: StateRef
-    identity: RequestIdentity
-    used: dict[RequestIdentity, set[StateRef]]
-
-
-class _ActivationLayer:
-    def __init__(self, layer: DecoderLayer, binding: ActivationPatchBinding) -> None:
-        self.layer, self.binding = layer, binding
-        self.original: Callable[..., tuple[torch.Tensor, torch.Tensor]] = layer.forward
-        self.prepared: tuple[_PatchRows, ...] = ()
-        self.apply_count = 0
-
-    def forward(self, *args: torch.Tensor | None, **kwargs: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
-        # Families order (positions, hidden, residual) differently, and Qwen3.5 passes them by keyword;
-        # only the returned pair is shared.
-        hidden, residual = self.original(*args, **kwargs)
-        if not self.prepared:
-            return hidden, residual
-        # Decoder layers return a fresh MLP (or expert) output, separate from its residual.
-        for item in self.prepared:
-            # An added vector needs no gather of the patched rows.
-            rows = hidden if len(item.fields) == 1 else hidden.index_select(0, item.rows)
-            hidden.index_add_(0, item.rows, activation_delta(rows, item.fields).expand(item.rows.numel(), -1))
-            item.used.setdefault(item.identity, set()).add(item.ref)
-            self.apply_count += item.rows.numel()
-        return hidden, residual
 
 
 class VllmActivationPatch:
-    def __init__(self, model: CausalLM, bindings: tuple[ActivationPatchBinding, ...], *, install: bool = True) -> None:
-        self.installed = install
-        self.row_count = 0
-        self.layers = tuple(_ActivationLayer(model.model.layers[binding.layer], binding) for binding in bindings)
-        if install:
-            for handle in self.layers:
-                handle.layer.forward = handle.forward
+    """pllm.model.ActivationPatch rows and fields for one step. The patch is a custom residual of each patched layer's
+    MLP: model_sites adds the edit to the MLP output before the residual add, through `patch`.
 
-    @property
-    def apply_count(self) -> int:
-        return sum(handle.apply_count for handle in self.layers)
+    In a custom forward a layer call covers some packed rows, maybe replayed from a CUDA graph: each patched row's
+    fields are also copied into stable per-row buffers, and `presence` tells the custom forward which layers patch a
+    row so its waves group rows that patch the same layers.
+    """
+
+    def __init__(self, bindings: tuple[ActivationPatchBinding, ...], rows: int, *, in_program: bool) -> None:
+        self.bindings, self.in_program = bindings, in_program
+        self.prepared: dict[tuple[StateResource, int], tuple[_PatchRows, ...]] = {}
+        # Per binding, stable [rows, *field] copies of each packed row's fields (zeros for unpatched rows).
+        self._row_fields: dict[tuple[StateResource, int], tuple[torch.Tensor, ...]] = {}
+        self._capacity = rows
+        self._patched: dict[int, tuple[bool, ...]] = {}
 
     def prepare(
         self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT], directory: RequestStateDirectory
@@ -100,28 +81,28 @@ class VllmActivationPatch:
         )
         context.input_step_id = rows.step_id
         versions: dict[tuple[StateResource, RequestIdentity, bool], tuple[PagePin, StateRef]] = {}
-        self.row_count = rows.total_rows
-        for handle in self.layers:
+        self.prepared.clear()
+        for binding in self.bindings:
             prepared: list[_PatchRows] = []
             for phase, phase_rows in ((HiddenPhase.PREFILL, rows.prefill_rows), (HiddenPhase.DECODE, rows.decode_rows)):
-                if phase is HiddenPhase.DECODE and handle.binding.decode is DecodeWindow.NONE:
+                if phase is HiddenPhase.DECODE and binding.decode is DecodeWindow.NONE:
                     continue
-                refresh = phase is HiddenPhase.DECODE and handle.binding.decode_refresh is DecodeRefresh.STEP
+                refresh = phase is HiddenPhase.DECODE and binding.decode_refresh is DecodeRefresh.STEP
                 for identity in dict.fromkeys(row.identity for row in phase_rows):
                     source = tuple(row for row in phase_rows if row.identity == identity)
                     selected = tuple(
                         row.packed_row_index
                         for index, row in enumerate(source)
                         if phase is HiddenPhase.DECODE
-                        or index < handle.binding.first_tokens
-                        or index >= len(source) - handle.binding.last_tokens
+                        or index < binding.first_tokens
+                        or index >= len(source) - binding.last_tokens
                     )
                     if not selected:
                         continue
-                    key = (handle.binding.resource, identity, refresh)
+                    key = (binding.resource, identity, refresh)
                     if key not in versions:
-                        pin, ref = self._version(handle.binding.resource, identity, refresh, context, directory)
-                        if not self.installed or context.arena.plan.semantic_graph.input_groups:
+                        pin, ref = self._version(binding.resource, identity, refresh, context, directory)
+                        if self.in_program or context.arena.plan.semantic_graph.input_groups:
                             # Admission pins belong to the request directory. Borrow
                             # the same exact version for this invocation's source view.
                             pin = context.pin_for(StateRefs.of((ref,)))
@@ -130,34 +111,47 @@ class VllmActivationPatch:
                     assert held is None or any(
                         identity == held_identity and ref in refs for held_identity, refs, _ in held.successful
                     )
-                    prepared.append(
-                        _PatchRows(
-                            upload(selected, context.arena.device),
-                            tuple(
-                                view.read(context.arena.borrow_field(pin, ref, view.field))
-                                for view in handle.binding.fields
-                            ),
-                            selected,
-                            pin,
-                            ref,
-                            identity,
-                            context.injected_refs,
-                        )
+                    context.injected_refs.setdefault(identity, set()).add(ref)
+                    fields = tuple(
+                        view.read(context.arena.borrow_field(pin, ref, view.field)) for view in binding.fields
                     )
-            handle.prepared = tuple(prepared)
+                    prepared.append(_PatchRows(upload(selected, context.arena.device), fields, selected))
+            self.prepared[binding.resource, binding.layer] = tuple(prepared)
+        if self.in_program:
+            self._stage_rows(rows.total_rows)
 
-    def prepare_token_rows(self) -> tuple[tuple[tuple[torch.Tensor, ...], ...], ...]:
-        """Resolve row/layer fields and account their exact pins once per invocation."""
-        rows: list[tuple[tuple[torch.Tensor, ...], ...]] = []
-        for row in range(self.row_count):
-            selected: list[tuple[torch.Tensor, ...]] = []
-            for handle in self.layers:
-                item = next((item for item in handle.prepared if row in item.indices), None)
-                if item is not None:
-                    item.used.setdefault(item.identity, set()).add(item.ref)
-                selected.append(() if item is None else item.fields)
-            rows.append(tuple(selected))
-        return tuple(rows)
+    def _stage_rows(self, count: int) -> None:
+        """Copy every patched row's fields into the stable per-row buffers a custom forward gathers from."""
+        self._patched = {}
+        for ordinal, binding in enumerate(self.bindings):
+            key = (binding.resource, binding.layer)
+            items = self.prepared[key]
+            if key not in self._row_fields and items:
+                self._row_fields[key] = tuple(
+                    field.new_zeros((self._capacity, *field.shape)) for field in items[0].fields
+                )
+            for buffer in self._row_fields.get(key, ()):
+                buffer[:count].zero_()
+            for item in items:
+                for buffer, field in zip(self._row_fields[key], item.fields, strict=True):
+                    buffer.index_copy_(0, item.rows, field.expand(len(item.indices), *field.shape))
+                for row in item.indices:
+                    marks = self._patched.setdefault(row, (False,) * len(self.bindings))
+                    self._patched[row] = (*marks[:ordinal], True, *marks[ordinal + 1 :])
+
+    def presence(self, row: int) -> tuple[bool, ...]:
+        """Which bindings patch packed row `row` this step."""
+        return self._patched.get(row, (False,) * len(self.bindings))
+
+    def patch(self, resource: StateResource, layer: int, rows: torch.Tensor | None, packed: tuple[int, ...]) -> Patch:
+        """The edit of layer `layer`'s MLP output for the current call: every packed row (`rows` None), or the packed
+        rows `rows` (host copy `packed`) a custom forward runs."""
+        items = self.prepared[resource, layer]
+        if rows is None:
+            return partial(_patch_step, items)
+        patched = {row for item in items for row in item.indices}
+        lanes = tuple(lane for lane, row in enumerate(packed) if row in patched)
+        return partial(_patch_lanes, self._row_fields.get((resource, layer), ()), rows, lanes, len(packed))
 
     @staticmethod
     def _version(
@@ -185,12 +179,32 @@ class VllmActivationPatch:
         return pin, ref
 
     def clear(self) -> None:
-        self.row_count = 0
-        for handle in self.layers:
-            handle.prepared = ()
+        self.prepared.clear()
+        self._patched = {}
 
-    def close(self) -> None:
-        self.clear()
-        if self.installed:
-            for handle in self.layers:
-                handle.layer.forward = handle.original
+
+Patch = Callable[[torch.Tensor], torch.Tensor]
+
+
+def _patch_step(items: tuple[_PatchRows, ...], hidden: torch.Tensor) -> torch.Tensor:
+    """Each request's edit on its patched rows of the whole step, with that request's shared fields."""
+    for item in items:
+        # An added vector needs no gather of the patched rows.
+        rows = hidden if len(item.fields) == 1 else hidden.index_select(0, item.rows)
+        hidden.index_add_(0, item.rows, activation_delta(rows, item.fields).expand(item.rows.numel(), -1))
+    return hidden
+
+
+def _patch_lanes(
+    fields: tuple[torch.Tensor, ...], rows: torch.Tensor, lanes: tuple[int, ...], width: int, hidden: torch.Tensor
+) -> torch.Tensor:
+    """The edit on the patched lanes of a custom forward's layer call, with each lane's fields gathered from the
+    stable per-row buffers (a CUDA-graph wave's lanes all patch the same layers)."""
+    if not lanes:
+        return hidden
+    if len(lanes) == width:
+        return hidden + activation_delta(hidden, tuple(field.index_select(0, rows) for field in fields))
+    selected = upload(lanes, hidden.device)
+    packed = rows.index_select(0, selected)
+    delta = activation_delta(hidden.index_select(0, selected), tuple(field.index_select(0, packed) for field in fields))
+    return hidden.index_add(0, selected, delta)

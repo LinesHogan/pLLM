@@ -777,7 +777,7 @@ class ActivationPatch:
         if not self.decode and (self.refresh != "admission" or self.on_missing != "stop"):
             raise ValueError("refresh= and on_missing= apply to decode tokens; set decode=True")
 
-    def declare(self, context: _Reflection) -> None:
+    def declare(self, name: str, context: _Reflection) -> None:
         """Read the state at the activation sites; its writer, if the workload has one, is connected later."""
         definition = context.state_definition(self.state, "pllm.model.ActivationPatch needs a declared state")
         if definition.feed is not None:
@@ -786,6 +786,7 @@ class ActivationPatch:
             )
         declare_activation_patch(
             context.binding,
+            name,
             context.states[self.state],
             layers=self.layers,
             operator=ActivationPatchOperator(self.operator),
@@ -2059,7 +2060,7 @@ class _Reflection:
         """Connect publications before the custom forward and missing-input branches."""
         for name, patch in self.activations.items():
             with self.declaring(name):
-                patch.declare(self)
+                patch.declare(name, self)
         for name, delta in self.adapters.items():
             with self.declaring(name):
                 self.binding.overlay(self.adapter_bindings(delta))

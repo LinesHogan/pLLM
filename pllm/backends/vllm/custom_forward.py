@@ -12,7 +12,7 @@ from vllm.forward_context import get_forward_context, override_forward_context
 from vllm.sequence import IntermediateTensors
 
 from pllm.authoring import DataT, ResultT
-from pllm.backends.vllm.activation import VllmActivationPatch, activation_delta
+from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.architecture import KvLM
 from pllm.backends.vllm.custom_forward_attention import (
     BatchAttentionBuffers,
@@ -56,15 +56,9 @@ class ProgramWave(Generic[DataT, ResultT]):
             owner.allocation,
             self.seed,
         )
-        self.fields: dict[int, tuple[torch.Tensor, ...]] = {}
-        if owner.activation is not None:
-            for ordinal, handle in enumerate(owner.activation.layers):
-                if signature[1][ordinal]:
-                    fields = next(items[ordinal] for items in owner.activation_rows if items[ordinal])
-                    self.fields[handle.binding.layer] = tuple(
-                        field.new_empty((width, *field.shape)) for field in fields
-                    )
         self.row_overlays: tuple[ProgramOverlay, ...] = ()
+        # The packed rows of the staged lanes, on the host.
+        self.packed: tuple[int, ...] = ()
         self.graph: torch.cuda.CUDAGraph | None = None
         self.output = self.observation = self.seed
         self.results: tuple[tuple[tuple[OverlayTargetResult, ...], tuple[ProgramOperand, ...]], ...] = ()
@@ -73,6 +67,7 @@ class ProgramWave(Generic[DataT, ResultT]):
     def stage(self, rows: tuple[PackedPhaseRow, ...]) -> None:
         """Queue complete wave input copies without reading any device scalar."""
         owner = self.custom_forward
+        self.packed = tuple(row.packed_row_index for row in rows)
         assert owner.hidden is not None and owner.positions is not None
         host = self.staging.take(self.indices.numel()).view_as(self.indices)
         host.copy_(
@@ -87,11 +82,6 @@ class ProgramWave(Generic[DataT, ResultT]):
         bindings = self.attention.bind(get_forward_context(), owner.attentions, owner.positions + 1)
         self.attention.refresh(bindings, packed, requests)
         self.position.stage(get_forward_context(), packed, requests, self.positions, generated)
-        if owner.activation is not None:
-            for ordinal, handle in enumerate(owner.activation.layers):
-                for column, target in enumerate(self.fields.get(handle.binding.layer, ())):
-                    for lane, row in enumerate(rows):
-                        target[lane].copy_(owner.activation_rows[row.packed_row_index][ordinal][column])
         if owner.overlay is not None:
             parent = owner.overlay
             if not self.row_overlays:
@@ -108,11 +98,9 @@ class ProgramWave(Generic[DataT, ResultT]):
     def layer(
         self, ordinal: int, hidden: torch.Tensor, residual: torch.Tensor | None, kv: KV = "commit"
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Call the intact native layer and apply any declared post-layer patch."""
+        """Call the intact native layer; custom residuals (activation patches among them) apply at its norms."""
         with attention_mode(self.custom_forward.attentions[ordinal], self.positions, kv):
             hidden, residual = self.custom_forward.model.layers[ordinal](self.positions, hidden, residual)
-        if ordinal in self.fields:
-            hidden = hidden + activation_delta(hidden, self.fields[ordinal])
         assert residual is not None
         return hidden, residual
 
@@ -121,7 +109,7 @@ class ProgramWave(Generic[DataT, ResultT]):
         for row_overlay in self.row_overlays:
             row_overlay.reset()
         generated, *entries = self.position.entry(())
-        with self.custom_forward.sites_rows(self.indices[0]) as stream:
+        with self.custom_forward.sites_rows(self.indices[0], self.packed) as stream:
             if self.signature[0]:
                 hidden, saved = execute_token_program(
                     self.custom_forward.program["decode" if self.signature[2] else "prefill"],
@@ -213,7 +201,6 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
         self.output: torch.Tensor | None = None
         self.observations: torch.Tensor | None = None
         self.captures: dict[tuple[int, Signature], ProgramWave[DataT, ResultT]] = {}
-        self.activation_rows: tuple[tuple[tuple[torch.Tensor, ...], ...], ...] = ()
         self.pool = torch.cuda.graph_pool_handle()
         self.identity: tuple[int, ...] = ()
         self.stream: torch.cuda.Stream | None = None
@@ -225,17 +212,17 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
         return self._rows
 
     @contextmanager
-    def sites_rows(self, packed: torch.Tensor) -> Generator[Stream]:
-        """Point the custom residual hooks at the packed rows of the layers run inside, and give the program the
-        stream after a layer as those hooks complete it."""
+    def sites_rows(self, packed: torch.Tensor, rows: tuple[int, ...]) -> Generator[Stream]:
+        """Point the custom residual hooks at the packed rows of the layers run inside (on the device and the host),
+        and give the program the stream after a layer as those hooks complete it."""
         if self.sites is None:
             yield add
             return
-        self.sites.rows = packed
+        self.sites.rows, self.sites.packed = packed, rows
         try:
             yield self.sites.stream_after
         finally:
-            self.sites.rows = None
+            self.sites.rows, self.sites.packed = None, ()
 
     def prepare(self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT]) -> None:
         self.clear()
@@ -282,7 +269,6 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
             stream.synchronize()
             self.captures.clear()
             self.identity = identity
-        self.activation_rows = () if self.activation is None else self.activation.prepare_token_rows()
         self.output = torch.empty_like(self.hidden)
         self.observations = torch.empty_like(self.hidden)
         ordinary = tuple(
@@ -313,9 +299,7 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
                     row = request.pop(0)
                     signature = (
                         effect.rows == "all" or row.phase.value == effect.rows,
-                        tuple(bool(fields) for fields in self.activation_rows[row.packed_row_index])
-                        if self.activation_rows
-                        else (),
+                        () if self.activation is None else self.activation.presence(row.packed_row_index),
                         row.phase.value == "decode",
                     )
                     groups.setdefault(signature, []).append(row)
@@ -371,16 +355,12 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
                 tuple(upload(tuple(range(start, stop)), self.hidden.device) for start, stop in zip(starts, starts[1:])),
             )
         positions = self.positions.index_select(0, packed)
-        patches = self.span_patches(rows)
 
         def layer(
             ordinal: int, hidden: torch.Tensor, residual: torch.Tensor | None, kv: KV
         ) -> tuple[torch.Tensor, torch.Tensor]:
             with attention_mode(self.attentions[ordinal], positions, kv):
                 hidden, residual = self.model.layers[ordinal](positions, hidden, residual)
-            if ordinal in patches:
-                lanes, fields = patches[ordinal]
-                hidden.index_add_(0, lanes, activation_delta(hidden.index_select(0, lanes), fields))
             assert residual is not None
             return hidden, residual
 
@@ -390,7 +370,10 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
 
         seed = self.hidden.index_select(0, packed)
         saved: tuple[torch.Tensor, ...] = ()
-        with override_forward_context(context), self.sites_rows(packed) as stream:
+        with (
+            override_forward_context(context),
+            self.sites_rows(packed, tuple(row.packed_row_index for row in rows)) as stream,
+        ):
             if program is None:
                 hidden = ordinary_pass(seed, self.effect.layer_count, layer, stream)
             else:
@@ -422,22 +405,6 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
                 if program is not None and any(isinstance(step, Save) and step.name == name for step in program.steps)
             },
         )
-
-    def span_patches(
-        self, rows: tuple[PackedPhaseRow, ...]
-    ) -> dict[int, tuple[torch.Tensor, tuple[torch.Tensor, ...]]]:
-        """Per patched layer, the span lanes that carry fields and those fields stacked per lane."""
-        assert self.hidden is not None
-        patches: dict[int, tuple[torch.Tensor, tuple[torch.Tensor, ...]]] = {}
-        for index, handle in enumerate(() if self.activation is None else self.activation.layers):
-            lanes = tuple(lane for lane, row in enumerate(rows) if self.activation_rows[row.packed_row_index][index])
-            if lanes:
-                columns = zip(*(self.activation_rows[rows[lane].packed_row_index][index] for lane in lanes))
-                patches[handle.binding.layer] = (
-                    upload(lanes, self.hidden.device),
-                    tuple(torch.stack(column) for column in columns),
-                )
-        return patches
 
     def save_span(
         self,
@@ -501,7 +468,6 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
     def clear(self) -> None:
         self._rows, self.context = (), None
         self.hidden, self.positions, self.output, self.observations = None, None, None, None
-        self.activation_rows = ()
 
     def close(self) -> None:
         if self.stream is not None:
