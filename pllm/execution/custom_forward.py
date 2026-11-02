@@ -139,7 +139,9 @@ class CustomForwardTask(Generic[DataT]):
 
     def execute(self, context: StateTaskContext[DataT]) -> ProjectionResiduals:
         if self.operation is not None:
-            return replace(self.operation, body=self._overlay_body).execute(context)
+            # The program overlay stages and restores whole roots, so every field takes a private page; sharing
+            # unchanged chunk carries applies to ordinary forwards only.
+            return replace(self.operation, body=self._overlay_body, select_fields=None).execute(context)
         self.run(context)
         return {}
 
