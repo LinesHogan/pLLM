@@ -13,7 +13,7 @@ from vllm import SamplingParams
 
 import pllm
 from pllm.model import Projection
-from test.gpu.test_custom_residual import _deviation, _oracle_logprobs, _vanilla
+from test.gpu.test_custom_residual import BF16_NOISE, _deviation, _oracle_logprobs, _vanilla
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 PROMPTS = ("The capital of France is", "Water boils at a temperature of", "def fibonacci(n):")
@@ -244,4 +244,4 @@ def test_custom_forward_custom_residual_and_ttt_compose_on_qwen() -> None:
             f"{trained:.4f} against the same program without the TTT update"
         )
         assert min(composed, trained) > 5 * max(baseline, 0.01), "every effect must matter beyond bf16 noise"
-        assert worst <= max(2 * baseline, 0.05) and misses <= 2
+        assert worst <= max(2 * baseline, BF16_NOISE) and misses <= 2

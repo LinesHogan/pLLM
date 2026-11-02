@@ -18,6 +18,9 @@ PROMPTS = ("The capital of France is", "Water boils at a temperature of", "def f
 CONFIG = pllm.ModelConfig(
     MODEL, max_model_len=128, max_num_seqs=4, max_num_batched_tokens=128, gpu_memory_utilization=0.3, cuda_graphs=False
 )
+# The largest per-token logprob gap of bf16 vLLM to an FP32 oracle over these prompts: one near-tie dominates it, so it
+# varies by GPU (0.24 on an RTX 4090, 0.06 on an A100) while a wrong residual update moves logprobs by more than 1.
+BF16_NOISE = 0.5
 SAMPLING = SamplingParams(max_tokens=12, temperature=0.0, ignore_eos=True, logprobs=4)
 
 
@@ -333,7 +336,7 @@ def test_rewrites_follow_fp32_oracle() -> None:
         print(
             f"{name}: max logprob gap to FP32 {deviation:.4f} (plain bf16 vLLM {baseline:.4f}), {misses} non-argmax tokens"
         )
-        assert deviation <= max(2 * baseline, 0.05) and misses <= 2
+        assert deviation <= max(2 * baseline, BF16_NOISE) and misses <= 2
     assert math.isfinite(baseline)
 
 
@@ -362,4 +365,4 @@ def test_memory_sublayer_follows_fp32_chunk_oracle() -> None:
         print(
             f"memory chunk={chunk}: max logprob gap to FP32 {deviation:.4f} (plain bf16 vLLM {baseline:.4f}), {misses} non-argmax tokens"
         )
-        assert deviation <= max(2 * baseline, 0.05) and misses <= 2
+        assert deviation <= max(2 * baseline, BF16_NOISE) and misses <= 2
