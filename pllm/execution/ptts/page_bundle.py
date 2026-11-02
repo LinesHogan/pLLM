@@ -705,6 +705,16 @@ class PageBundleArena:
         self._pins[token] = _Pin(groups)
         return token
 
+    def move_pin(self, pin: PagePin, stream: torch.cuda.Stream) -> PagePin:
+        """Transfer an exact hold to a stream ordered after the prior reader, retaining remote readers."""
+        self._require_stream(stream)
+        self._issued_pin(pin)
+        if pin.stream is not None and pin.stream != stream:
+            stream.wait_stream(pin.stream)
+        moved = PagePin(pin.pin_id, pin.refs, stream)
+        self._pins[moved] = self._pins.pop(pin)
+        return moved
+
     def borrow_field(self, pin: PagePin, ref: StateRef, field: LayoutFieldId) -> torch.Tensor:
         """Read-only page view; use on pin.stream and discard before releasing pin.
 

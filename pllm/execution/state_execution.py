@@ -267,6 +267,13 @@ class StateTaskContext(Generic[DataT]):
             self.releases.append(receipt)
         self._obligations.remove(obligation)
 
+    def move_owned_pin(self, pin: PagePin, stream: torch.cuda.Stream) -> PagePin:
+        """Move a retained reader and its release obligation without reacquiring its pages."""
+        index = self._obligations.index(_PinRelease(pin))
+        moved = self.arena.move_pin(pin, stream)
+        self._obligations[index] = _PinRelease(moved)
+        return moved
+
     def release_owned_pin(self, pin: PagePin) -> None:
         """Discharge an early release through the same operation as terminal cleanup."""
         self._discharge(_PinRelease(pin))

@@ -70,12 +70,13 @@ class PostSampleOverlap:
         assert not context.writing and not context.publications and not context.borrowed_roots
         reader = context.pin
         context.selection = self.directory.select(context.selection.rows)
-        context.pin = self.arena.pin_exact(context.selection.refs, self.stream)
-        context.register_pin(context.pin)
+        if reader.refs == context.selection.refs:
+            context.pin = context.move_owned_pin(reader, self.stream)
+        else:
+            context.pin = self.arena.pin_exact(context.selection.refs, self.stream)
+            context.register_pin(context.pin)
+            context.move_owned_pin(reader, self.stream)
         context.move_slots()
-        if reader.refs != context.pin.refs:
-            context.register_pin(self.arena.pin_exact(reader.refs, self.stream))
-        context.release_owned_pin(reader)
 
     def _copy_inputs(self, context: StateTaskContext[_DataT]) -> None:
         """Own sampler feedback and results before the writer consumes them.
