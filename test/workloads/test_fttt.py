@@ -70,15 +70,15 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry() -> None:
         torch.testing.assert_close(result.losses[0], loss.detach())
         torch.testing.assert_close(result.edit_delta, (inputs @ down.T @ up.T).detach())
         assert result.state_version == version
-        assert result.intent.retry_controls[0].action is action
+        assert result.retry_controls[0].action is action
         state = service.lifecycle("round", 0)
         assert state.retries == state.adapter_version == version
     accepted = Completion(identity, 0, "round", (4,), "4", FinishReason.STOP)
     assert not service.enqueue(CompletionInput.copy_of(CompletionBatch((accepted,)), hidden))
     result = workload.step()
     assert result.update_count == 0 and result.losses == () and result.state_version == 2
-    assert result.intent.retry_controls[0].action is RetryAction.ACCEPT
-    assert service.queued_transactions == service.queued_feedback == 0
+    assert result.retry_controls[0].action is RetryAction.ACCEPT
+    assert service.queued_feedback == 0
     if find_spec("vllm") is not None:
         _automatic_retry_uses_original_control_and_quorum()
 
@@ -144,7 +144,7 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
     assert generator.calls == [(7, 9), (9,)]
     assert service.lifecycle("retry", 9).retries == 2
     assert rounds[-1][1].retry_controls[0].action is RetryAction.STOP
-    assert service.queued_transactions == service.queued_feedback == 0
+    assert service.queued_feedback == 0
     update = rounds[0][1].state_update()
     assert update.values[0] is rounds[0][1].edit_delta and update.keys[0].prompt_index == 9
 

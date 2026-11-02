@@ -38,7 +38,7 @@ def main() -> int:
         or float(result.edit_delta.abs().max().item()) == 0.0
         or result.update_count != 1
         or result.state_version != 1
-        or result.intent.retry_controls[0].action is not RetryAction.RETRY
+        or result.retry_controls[0].action is not RetryAction.RETRY
         or service.lifecycle("cuda-round-0", 0).adapter_version != 1
         or len(result.losses) != 1
     ):

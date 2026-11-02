@@ -33,7 +33,7 @@
 [OverRIDE](../../pllm/workloads/override.py)、[In-Place-TTT](../../pllm/workloads/inplace_ttt.py)
 和 [ReFT](../../pllm/workloads/reft.py) 使用这个接口；[Recirculation](../../pllm/workloads/recirculation.py)
 使用普通的 `Recurrence` 声明；[TTRL](../../pllm/workloads/ttrl.py) 使用普通 `Workload`
-的宿主路径（奖励投票是宿主函数 `ttrl_vote`），FTTT 的编辑也是（`FTTTFeedback.run` 作反馈回调）；
+的宿主路径（奖励投票是宿主函数 `ttrl_vote`），FTTT 的编辑也是（`FTTTFeedback` 作反馈回调）；
 GTTA 是普通宿主类，其 `run` 作反馈回调；
 [TLM](../../pllm/workloads/tlm/workload.py) 使用普通 `Workload` 的因果批输入与模型端口；
 [ESamp](../../pllm/workloads/esamp.py) 使用普通具名参数、预测与 loss，
@@ -432,11 +432,13 @@ Hidden 需求从声明推导。形状/dtype 回调只在模型事实可用后运
 张量状态写成普通 `pllm.Workload`，用 `pllm.host.make_host(HostConfig(...), workload)` 编译，
 回调里 `step`。[FTTT](../../pllm/workloads/fttt/workload.py) 的低秩编辑就是这样的
 `FTTTWorkload`（AdamW 写在状态上）；`FTTTFeedback(service, HostConfig(...))` 用 `make_host` 编译并准入它
-（`trainer.edit` 是普通执行句柄，可取 `diagnostics()`），`run(batch)` 评判、入队，
+（`feedback.edit` 是普通执行句柄，可取 `diagnostics()`），`feedback(batch)` 评判、入队，
 在失败行上 `step` 一次，再用 `StepResult.parameters` 里更新后的编辑算出重试要加的
-增量（`step()` 只处理已排队的反馈）；失败的一步不发布编辑并清空队列。
+增量（`step()` 只处理已排队的反馈）；失败的一步清空队列，已经发布的编辑保留。
 [GTTA](../../pllm/workloads/gtta/workload.py) 是普通宿主类：`GTTAWorkload.run(request)`
-把排队的环境事件并入动力学记忆再回答查询，失败时恢复记忆并把事件放回队首。旧的 `pllm.host.transaction`、receipt 与两阶段结算已移除。
+从 `GTTAEnvironment` 的 FIFO 队列取出事件，用 Python 字典中的 FP64 EMA 更新动力学记忆，再回答查询。
+分数、稳定排名和历史格式保持不变；`GTTAResult` 直接返回 `processed` 与 `query`。
+查询失败时，已消费的事件和已更新的记忆保留。私有 snapshot/restore、版本计数、transaction ID、intent、receipt 与两阶段结算已移除。
 
 `Observation` 把选中行或身份出处带到既有 trace。显式有界导出用 `export=True`；
 可选的数学观测仍遵循原始 trace 选择。两者都不需要访问执行器或 arena。
@@ -680,7 +682,7 @@ vLLM 继续按真实容量预留 hidden 快照、采样反馈和效果/replay �
 | ReFT | 无优化器外部字段替换、发布、激活目标与选中行 |
 | Recirculation | 无状态逐 token replay；有序 prefill、原始 KV/RNG 与正常输出 |
 | FTTT | 宿主 judge 与有界队列、向量目标 `WeightedRowBatch`、AdamW 编辑、用 `parameters` 做 update-before-predict 与重试输出 |
-| GTTA | 无张量字段的宿主状态；FIFO 轨迹、update-before-query、abort/requeue 与 commit |
+| GTTA | Python 字典中的动力学记忆；FIFO 轨迹、update-before-query，查询失败保留更新 |
 | TTRL | 宿主 `ttrl_vote` 投票、`WeightedRowBatch` 加权梯度、空选择不变发布与重试/栅栏结果 |
 
 `Builder.input` 命名既有带类型服务端口；无字段的 `state` 描述不分配张量 arena

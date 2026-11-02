@@ -18,7 +18,6 @@ from pllm.host import (
 )
 from pllm.workloads.fttt.judge import FTTTJudge
 from pllm.workloads.fttt.types import (
-    FTTTClosedLoopIntent,
     FTTTConfig,
     FTTTFeedbackRecord,
     FTTTLifecycleTransition,
@@ -39,12 +38,10 @@ class FTTTFeedbackQueue:
     """Own judge I/O, the bounded queue and the request lifecycles only."""
 
     __slots__ = (
-        "_active",
         "_config",
         "_dropped_feedback",
         "_lifecycles",
         "_judge",
-        "_next_transaction_id",
         "_projected_lifecycles",
         "_queue",
         "_queued_feedback",
@@ -56,18 +53,12 @@ class FTTTFeedbackQueue:
         self._lifecycles: dict[tuple[str, int], FTTTRequestLifecycle] = {}
         self._projected_lifecycles: dict[tuple[str, int], FTTTRequestLifecycle] = {}
         self._queue: deque[FTTTQueuedFeedback] = deque()
-        self._active: FTTTQueuedFeedback | None = None
-        self._next_transaction_id = 1
         self._queued_feedback = 0
         self._dropped_feedback = 0
 
     @property
     def queued_feedback(self) -> int:
         return self._queued_feedback
-
-    @property
-    def queued_transactions(self) -> int:
-        return len(self._queue)
 
     @property
     def dropped_feedback(self) -> int:
@@ -139,7 +130,6 @@ class FTTTFeedbackQueue:
             transitions.append(
                 FTTTLifecycleTransition(
                     key,
-                    previous,
                     decision.next_state,
                     trained,
                 )
@@ -168,53 +158,45 @@ class FTTTFeedbackQueue:
                     decision.reason,
                 )
             )
-        intent = FTTTClosedLoopIntent(
-            self._next_transaction_id,
-            tuple(outcomes),
-            tuple(retry_controls),
-            tuple(barriers),
-            tuple(records),
-            tuple(transitions),
+        self._queue.append(
+            FTTTQueuedFeedback(
+                batch,
+                tuple(selected_rows),
+                tuple(outcomes),
+                tuple(retry_controls),
+                tuple(barriers),
+                tuple(records),
+                tuple(transitions),
+            )
         )
-        self._queue.append(FTTTQueuedFeedback(batch, tuple(selected_rows), intent))
         self._projected_lifecycles = projected_lifecycles
         self._dropped_feedback = dropped_feedback
-        self._next_transaction_id += 1
         self._queued_feedback += len(records)
         return bool(records)
 
     def begin(self) -> FTTTQueuedFeedback | None:
         """Take the oldest queued feedback for an edit step; None when the queue is empty."""
-        assert self._active is None
         if not self._queue:
             return None
         queued = self._queue.popleft()
-        self._queued_feedback -= len(queued.intent.feedback_records)
-        self._active = queued
+        self._queued_feedback -= len(queued.feedback_records)
         return queued
 
-    def commit(self, queued: FTTTQueuedFeedback, intent: FTTTClosedLoopIntent) -> None:
-        """Settle each completion's lifecycle with the adapter version its edit step published."""
-        assert self._active is queued
-        assert intent == replace(queued.intent, adapter_version=intent.adapter_version)
+    def commit(self, queued: FTTTQueuedFeedback, version: int) -> None:
+        """Apply each completion's retry decision with the edit version its step published."""
         committed = dict(self._lifecycles)
-        for transition in intent.transitions:
+        for transition in queued.transitions:
             current = committed.get(transition.key, FTTTRequestLifecycle())
-            assert current.retries == transition.previous.retries and current.stopped == transition.previous.stopped
-            version = intent.adapter_version if transition.trained else current.adapter_version
             committed[transition.key] = replace(
                 transition.next,
-                adapter_version=version,
+                adapter_version=version if transition.trained else current.adapter_version,
             )
         projected = self._projected_lifecycles if self._queue else dict(committed)
         self._lifecycles = committed
-        self._active = None
         self._projected_lifecycles = projected
 
-    def abort(self, queued: FTTTQueuedFeedback) -> None:
+    def abort(self) -> None:
         """A failed edit step drops the whole queue; lifecycles stay as last committed."""
-        assert self._active is queued
-        self._active = None
         self._queue.clear()
         self._queued_feedback = 0
         self._projected_lifecycles = dict(self._lifecycles)

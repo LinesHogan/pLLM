@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from itertools import islice
 
 from pllm.workloads.gtta.types import (
@@ -11,62 +10,35 @@ from pllm.workloads.gtta.types import (
     GTTAConfig,
     GTTAQuery,
     GTTAQueryResult,
-    GTTATrajectoryBatch,
-    GTTAUpdateReceipt,
     PromptContext,
     state_signature,
 )
 
 
-@dataclass(frozen=True, slots=True)
-class GTTADynamicsSnapshot:
-    state_action_scores: dict[tuple[str, str, str], float]
-    records: tuple[DynamicsEvent, ...]
-    version: int
-
-
 class GTTADynamicsState:
     """Sequential EMA scores and immutable event history for one instance."""
 
-    __slots__ = ("_records", "_state_action_scores", "_version")
+    __slots__ = ("_records", "_state_action_scores")
 
     def __init__(self) -> None:
         self._state_action_scores: dict[tuple[str, str, str], float] = {}
         self._records: list[DynamicsEvent] = []
-        self._version = 0
-
-    @property
-    def version(self) -> int:
-        return self._version
-
-    def snapshot(self) -> GTTADynamicsSnapshot:
-        return GTTADynamicsSnapshot(
-            dict(self._state_action_scores),
-            tuple(self._records),
-            self._version,
-        )
-
-    def restore(self, snapshot: GTTADynamicsSnapshot) -> None:
-        self._state_action_scores = dict(snapshot.state_action_scores)
-        self._records = list(snapshot.records)
-        self._version = snapshot.version
 
     def update(
         self,
-        batch: GTTATrajectoryBatch,
+        events: tuple[DynamicsEvent, ...],
         config: GTTAConfig,
-    ) -> GTTAUpdateReceipt:
-        for event in batch.entries:
+    ) -> None:
+        """Fold events into the host dictionary in FIFO order."""
+        for event in events:
             state_key = (event.task_id, event.state_signature, event.action)
             self._state_action_scores[state_key] = self._state_action_scores.get(
                 state_key, 0.0
             ) * config.score_momentum + event.reward * (1.0 - config.score_momentum)
             self._records.append(event)
-        if batch.entries:
-            self._version += 1
-        return GTTAUpdateReceipt(len(batch.entries), self._version)
 
     def query(self, query: GTTAQuery) -> GTTAQueryResult:
+        """Rank actions and render matching event history for a host query."""
         signature = query.state_signature or state_signature(query.observation)
         # Stable sorting retains candidate/history order for equal keys without ordinal copies.
         ranked = tuple(

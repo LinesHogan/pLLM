@@ -7,7 +7,6 @@ from collections import deque
 from pllm.workloads.gtta.types import (
     DynamicsEvent,
     GTTAConfig,
-    GTTATrajectoryBatch,
     TrajectoryFeedback,
     state_signature,
 )
@@ -52,14 +51,10 @@ class GTTAEnvironment:
         )
         return True
 
-    def take(self, limit: int) -> GTTATrajectoryBatch:
+    def take(self, limit: int) -> tuple[DynamicsEvent, ...]:
         """Remove the oldest `limit` queued events (all of them for 0)."""
         count = len(self._queue) if limit == 0 else min(limit, len(self._queue))
-        return GTTATrajectoryBatch(tuple(self._queue.popleft() for _ in range(count)))
-
-    def requeue(self, trajectories: GTTATrajectoryBatch) -> None:
-        """Put events taken by a failed run back at the front, in their order."""
-        self._queue.extendleft(reversed(trajectories.entries))
+        return tuple(self._queue.popleft() for _ in range(count))
 
 
 __all__ = ["GTTAEnvironment"]

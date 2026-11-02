@@ -1,4 +1,4 @@
-"""FTTT's values: configuration, judge results, queued feedback, the commit intent and the per-step result."""
+"""FTTT's values: configuration, judge results, queued feedback, retry lifecycles and the per-step result."""
 
 from __future__ import annotations
 
@@ -16,28 +16,22 @@ from pllm.io import StateImport
 
 @dataclass(frozen=True, slots=True)
 class FTTTResult:
-    transaction_id: int
     edit_delta: torch.Tensor
-    intent: FTTTClosedLoopIntent
+    reward_outcomes: tuple[RewardOutcome, ...]
+    retry_controls: tuple[RetryControl, ...]
+    update_barriers: tuple[UpdateBarrier, ...]
+    feedback_records: tuple[FTTTFeedbackRecord, ...]
     losses: tuple[torch.Tensor, ...]
     update_count: int
     state_version: int
 
-    @property
-    def retry_controls(self) -> tuple[RetryControl, ...]:
-        return self.intent.retry_controls
-
-    @property
-    def update_barriers(self) -> tuple[UpdateBarrier, ...]:
-        return self.intent.update_barriers
-
     def state_update(self) -> StateImport[torch.Tensor]:
-        """Borrow the original delta rows for a signed single-layer additive patch."""
+        """Borrow the delta rows for a single-layer additive patch."""
         return StateImport(
             (self.edit_delta,),
             tuple(
                 RequestStateKey.project(record.completion.identity, (RequestKeyField.PROMPT_INDEX,))
-                for record in self.intent.feedback_records
+                for record in self.feedback_records
             ),
         )
 
@@ -104,33 +98,24 @@ class FTTTRequestLifecycle:
 @dataclass(frozen=True, slots=True)
 class FTTTLifecycleTransition:
     key: tuple[str, int]
-    previous: FTTTRequestLifecycle
     next: FTTTRequestLifecycle
     trained: bool
 
 
 @dataclass(frozen=True, slots=True)
-class FTTTClosedLoopIntent:
-    transaction_id: int
+class FTTTQueuedFeedback:
+    """One judged completion batch waiting for its edit step: the rows to train and their retry decisions."""
+
+    batch: CompletionInput
+    selected_rows: tuple[int, ...]
     reward_outcomes: tuple[RewardOutcome, ...]
     retry_controls: tuple[RetryControl, ...]
     update_barriers: tuple[UpdateBarrier, ...]
     feedback_records: tuple[FTTTFeedbackRecord, ...]
     transitions: tuple[FTTTLifecycleTransition, ...]
-    adapter_version: int = 0
-
-
-@dataclass(frozen=True, slots=True)
-class FTTTQueuedFeedback:
-    """One judged completion batch waiting for its edit step: the rows to train and what settles afterwards."""
-
-    batch: CompletionInput
-    selected_rows: tuple[int, ...]
-    intent: FTTTClosedLoopIntent
 
 
 __all__ = [
-    "FTTTClosedLoopIntent",
     "FTTTConfig",
     "FTTTFeedbackRecord",
     "FTTTQueuedFeedback",

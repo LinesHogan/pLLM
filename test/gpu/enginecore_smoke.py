@@ -343,7 +343,7 @@ def _output_lora_shared_input() -> None:
         assert prompt_rounds == [(7, 9), (9,)]
         assert sum(result.update_count for _, result in rounds) == 1
         assert service.lifecycle("retry", 9).retries == 1 and service.lifecycle("retry", 9).stopped
-        assert service.queued_transactions == service.queued_feedback == 0
+        assert service.queued_feedback == 0
         assert all(batch.hidden.device.type == "cpu" for batch, _ in rounds)
         assert not torch.cuda.is_initialized()
         print(

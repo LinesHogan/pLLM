@@ -6,7 +6,6 @@ from pllm.workloads.fttt.judge import (
     FTTTJudge,
 )
 from pllm.workloads.fttt.types import (
-    FTTTClosedLoopIntent,
     FTTTConfig,
     FTTTJudgeResult,
     FTTTRequestLifecycle,
@@ -14,7 +13,6 @@ from pllm.workloads.fttt.types import (
 from pllm.workloads.fttt.workload import FTTTFeedback, FTTTWorkload
 
 __all__ = [
-    "FTTTClosedLoopIntent",
     "FTTTConfig",
     "FTTTDefaultJudge",
     "FTTTFeedbackQueue",

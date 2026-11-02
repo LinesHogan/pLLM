@@ -314,7 +314,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         The callable runs locally after generate has released backend requests; it is
         never installed on a worker. Each yield is the original completion and result,
         with no retained history. Multi-request barriers are regenerated as a full
-        vote group. Closing the iterator leaves no pending generation or transaction.
+        vote group. Closing the iterator leaves no pending generation.
         Optional edits return a StateImport for an activation-patch workload;
         the feedback adapter returns original tensors, never a worker callback.
         A callback that returns None has nothing to feed back for its round: the round

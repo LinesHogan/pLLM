@@ -2,7 +2,7 @@
 applies.
 
 FTTTWorkload is the edit as an ordinary pllm.Workload state trained by AdamW. FTTTFeedback compiles it with
-pllm.host.make_host and steps it: pass `FTTTFeedback.run` as generate_feedback's `feedback=` and
+pllm.host.make_host and steps it: pass `FTTTFeedback` as generate_feedback's `feedback=` and
 `FTTTResult.state_update` as its `edit=`.
 """
 
@@ -92,20 +92,34 @@ class FTTTFeedback:
         return self.step()
 
     def step(self) -> FTTTResult | None:
-        """One edit step on the oldest queued feedback, None when nothing is queued. A failed step publishes no
-        edit and drops the queue."""
+        """Train the oldest feedback, or return None for an empty queue. Failure drops the queue;
+        any edit already published remains available."""
         queued = self.queue.begin()
         if queued is None:
             return None
         try:
-            result = self._train(queued) if queued.selected_rows else self._unchanged(queued)
-            self.queue.commit(queued, result.intent)
+            if queued.selected_rows:
+                delta, losses, version = self._train(queued)
+            else:
+                (latest,) = self.edit.latest(())
+                delta = queued.batch.hidden.new_empty((0, queued.batch.hidden.shape[1]))
+                losses, version = (), latest.version_id
+            self.queue.commit(queued, version)
         except BaseException:
-            self.queue.abort(queued)
+            self.queue.abort()
             raise
-        return result
+        return FTTTResult(
+            delta,
+            queued.reward_outcomes,
+            queued.retry_controls,
+            queued.update_barriers,
+            queued.feedback_records,
+            losses,
+            len(losses),
+            version,
+        )
 
-    def _train(self, queued: FTTTQueuedFeedback) -> FTTTResult:
+    def _train(self, queued: FTTTQueuedFeedback) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], int]:
         """Step the edit on the failed rows, then apply the updated edit to the same rows."""
         hidden, readiness = queued.batch.hidden, queued.batch.readiness
         device = hidden.device
@@ -114,7 +128,7 @@ class FTTTFeedback:
             if readiness is not None and stream is not None:
                 readiness.order_on(stream)
             rows = hidden.index_select(0, upload(queued.selected_rows, device))
-            records = queued.intent.feedback_records
+            records = queued.feedback_records
             feedback = upload(
                 feedback_rows(records, feature_size=self.queue.config.feedback_feature_size), device, torch.float32
             )
@@ -123,17 +137,7 @@ class FTTTFeedback:
             assert isinstance(result, StepResult) and result.publication is not None and result.loss is not None
             delta = edit_rows(rows, feedback, result.parameters["down"], result.parameters["up"])
         (published,) = result.publication.after_refs
-        intent = replace(queued.intent, adapter_version=published.version_id)
-        return FTTTResult(intent.transaction_id, delta, intent, (result.loss,), 1, published.version_id)
-
-    def _unchanged(self, queued: FTTTQueuedFeedback) -> FTTTResult:
-        """Nothing failed: no step, an empty delta, and the current edit version."""
-        (latest,) = self.edit.latest(())
-        hidden = queued.batch.hidden
-        intent = replace(queued.intent, adapter_version=latest.version_id)
-        return FTTTResult(
-            intent.transaction_id, hidden.new_empty((0, hidden.shape[1])), intent, (), 0, latest.version_id
-        )
+        return delta, (result.loss,), published.version_id
 
 
 __all__ = ["FTTTFeedback", "FTTTWorkload", "edit_rows", "edit_targets"]

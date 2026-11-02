@@ -13,25 +13,19 @@ class GTTAWorkload:
     def __init__(self, environment: GTTAEnvironment | None = None) -> None:
         self.environment = environment if environment is not None else GTTAEnvironment(GTTAConfig())
         self.dynamics = GTTADynamicsState()
-        self._runs = 0
 
     @property
     def config(self) -> GTTAConfig:
         return self.environment.config
 
     def run(self, request: GTTAHostRequest) -> GTTAResult:
-        """Update the memory with up to `request.limit` queued events, then answer `request.query`. A failure restores
-        the memory and requeues the events."""
-        self._runs += 1
+        """Consume queued feedback, update the host memory, then answer the query.
+
+        Applied feedback remains in memory if the query fails.
+        """
         trajectories = self.environment.take(request.limit)
-        snapshot = self.dynamics.snapshot()
-        try:
-            update = self.dynamics.update(trajectories, self.config)
-            return GTTAResult(self._runs, update, self.dynamics.query(request.query))
-        except BaseException:
-            self.dynamics.restore(snapshot)
-            self.environment.requeue(trajectories)
-            raise
+        self.dynamics.update(trajectories, self.config)
+        return GTTAResult(len(trajectories), self.dynamics.query(request.query))
 
 
 __all__ = ["GTTAWorkload"]

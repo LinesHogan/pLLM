@@ -8,8 +8,7 @@ from enum import StrEnum
 
 @dataclass(frozen=True, slots=True)
 class GTTAResult:
-    transaction_id: int
-    update: GTTAUpdateReceipt
+    processed: int
     query: GTTAQueryResult
 
 
@@ -58,11 +57,6 @@ class DynamicsEvent:
 
 
 @dataclass(frozen=True, slots=True)
-class GTTATrajectoryBatch:
-    entries: tuple[DynamicsEvent, ...]
-
-
-@dataclass(frozen=True, slots=True)
 class GTTAQuery:
     prompt_index: int
     task_id: str
@@ -83,12 +77,6 @@ class PromptContext:
     prompt_index: int
     text: str
     position: GTTAPromptPosition
-
-
-@dataclass(frozen=True, slots=True)
-class GTTAUpdateReceipt:
-    processed: int
-    state_version: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,8 +103,6 @@ __all__ = [
     "GTTAPromptPosition",
     "GTTAQuery",
     "GTTAQueryResult",
-    "GTTATrajectoryBatch",
-    "GTTAUpdateReceipt",
     "PromptContext",
     "TrajectoryFeedback",
     "state_signature",
