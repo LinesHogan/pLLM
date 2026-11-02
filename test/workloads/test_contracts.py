@@ -85,5 +85,7 @@ def test_builtin_schedule_contracts(workload, tmp_path):
         },
         tmp_path / "model.safetensors",
     )
+    cuda_initialized = torch.cuda.is_initialized()
     result = testing.check(workload, pllm.ModelConfig(str(tmp_path)))
+    assert torch.cuda.is_initialized() == cuda_initialized
     assert result.passed or result.skipped

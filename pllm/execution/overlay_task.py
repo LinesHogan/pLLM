@@ -211,7 +211,7 @@ def overlay_gradient(function: Callable[..., torch.Tensor], *, batched: bool = F
     )
 
     def gradient(parameters: Tensors, operands: Tensors, constants: Tensors, valid: torch.Tensor) -> Tensors:
-        return (eager if valid.is_meta or MemoryTrace.active.get() is not None else compiled)(
+        return (eager if valid.device.type != "cuda" or MemoryTrace.active.get() is not None else compiled)(
             parameters, operands, constants, valid
         )
 
