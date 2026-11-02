@@ -38,6 +38,25 @@ python tools/check_typing.py
 不接受「先记下来以后修」。类型检查用一份严格配置，覆盖维护中的实现、基准
 场景与示例，要求零错误零警告。
 
+## 检查自己写的 workload
+
+```python
+from pllm import testing
+
+result = testing.check(workload, model_config, neutral=disabled_workload)
+print(result)
+```
+
+`neutral` 可省略。检查只在 CPU 上运行：读取模型配置，用固定的三个请求比较独立、合批、
+倒序、其他请求输入扰动，以及混合 prefill/decode 和分块 prompt。它复用 runner 的行标签和
+真实 planner/executor，比较方法输出、状态、采样干预和已交付的 export；浮点比较使用 FP32
+`torch.testing.assert_close` 默认容差。checkpoint-backed state 还需要配置指向的本地权重。
+
+失败抛出 `testing.ContractError`，列出所有差异，并区分方法混合请求行和框架错写目的行。
+成功返回不可变的 `CheckResult(passed, skipped)`；`dataclasses.asdict(result)` 可转成 JSON。
+共享训练后的依赖输出、export 的限行规则、host batch/feed 和需要模型的效果都有明确的
+skip 原因。CPU 检查不验证 preemption、publish_lag/visibility 或模型里的实际应用；这些仍需 GPU 证据。
+
 ## CPU 全过了，能说明 CUDA 没问题吗？
 
 不能。在仅 CPU 主机上被跳过的 CUDA 测试不算 GPU 证据；跳过不是通过。动了

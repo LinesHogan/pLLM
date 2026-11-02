@@ -1,4 +1,6 @@
-"""Compile and step a workload without vLLM, with hand-chosen rows, for unit tests and notebooks.
+"""Check schedule contracts or step workloads on CPU, for unit tests and notebooks.
+
+`check(workload, config)` compares fixed request schedules and diagnoses row mixing or routing errors.
 
 `backend_facts` describes an in-process model (hidden size, hidden taps, state pages) in place of the facts
 the vLLM runner probes; `compile_execution` compiles a workload against them and admits its instance state.
@@ -41,7 +43,6 @@ from pllm.contracts.packed_rows import (
     PackedPhaseRowBatch,
     PackedSamplerRowBatch,
     PackedSamplerRowLink,
-    label_rows,
 )
 from pllm.contracts.parameter_overlay import ProjectionOperands
 from pllm.contracts.request_identity import RequestIdentity
@@ -54,6 +55,12 @@ from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.state_execution import StateExecution
 from pllm.execution.step_input import StepInput
+from pllm.testing_contracts import (
+    CheckResult as CheckResult,
+    ContractError as ContractError,
+    check as check,
+    scheduled_step as scheduled_step,
+)
 
 if TYPE_CHECKING:
     from pllm.authoring import BackendWorkload
@@ -176,40 +183,6 @@ def step_input(
     )
 
 
-def scheduled_step(
-    identities: tuple[RequestIdentity, ...],
-    scheduled: list[int],
-    prompt: list[int],
-    computed: list[int],
-    hidden: Mapping[AttachmentHiddenResource, torch.Tensor],
-    *,
-    step_id: int = 0,
-    operands: tuple[ProjectionOperands, ...] = (),
-) -> StepInput:
-    """Build a CPU step from scheduler counts, selecting only the runners' tapped rows.
-
-    Hidden inputs contain one value per packed token. Only completed prompt endings
-    and latest decode rows are retained, just as in HiddenTaps.prepare.
-    """
-    sampler = label_rows(identities, scheduled, prompt, computed, step_id)
-    rows = sampler.row_batch
-    taps: list[HiddenRows] = []
-    for binding in dict.fromkeys(resource.binding for resource in hidden):
-        sources = tuple((resource, value) for resource, value in hidden.items() if resource.binding == binding)
-        selected = tuple(row for resource, _ in sources for row in rows.producer_rows(resource.phase))
-        storage = torch.cat(
-            tuple(
-                value[[row.packed_row_index for row in rows.producer_rows(resource.phase)]]
-                for resource, value in sources
-            )
-        )
-        mapping = np.zeros(rows.total_rows, dtype=np.int64)
-        for index, row in enumerate(selected):
-            mapping[row.packed_row_index] = index
-        taps.append(HiddenRows(binding, storage, mapping))
-    return StepInput(rows, sampler, HiddenRowBatch(rows, tuple(taps)) if taps else None, operands=operands)
-
-
 def run_step(
     execution: StateExecution[StepInput, DataT, ResultT],
     value: StepInput,
@@ -241,6 +214,9 @@ def run_guided_step(
 
 
 __all__ = [
+    "CheckResult",
+    "ContractError",
+    "check",
     "RequestIdentity",
     "SamplerFeedback",
     "backend_facts",

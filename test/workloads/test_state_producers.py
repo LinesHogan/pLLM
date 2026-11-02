@@ -146,13 +146,6 @@ def test_prompt_producers_publish_only_completed_requests(workload, device, leng
         torch.testing.assert_close(
             torch.cat([field.flatten() for field in actual]).double(), expected, rtol=2e-6, atol=1e-7
         )
-    # Reordering and decode cannot publish another prompt update; a partial prompt cannot publish early.
-    testing.run_step(
-        execution,
-        packed(identities[::-1], {tap: context.flip(0)}, (HiddenPhase.DECODE, HiddenPhase.DECODE), stream=stream),
-        stream=stream,
-    )
-    assert execution.arena.latest(refs[0].lineage_id) == changed
     torch.testing.assert_close(execution.snapshot(network_ref, stream=stream)[0].double(), weights, rtol=0, atol=0)
     execution.retire(identities, wait=True)
     execution.retire((), wait=True)

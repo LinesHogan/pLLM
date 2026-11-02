@@ -8,7 +8,7 @@ after execution. TensorBinding builds one per declared method.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import Literal
 
@@ -158,6 +158,8 @@ class TensorTask:
     sampler_stage: SamplerStage | None = None
     sampler_beta: float = 0.0
     training: State | None = None
+    # CPU contract diagnostics attach after shape tracing; ordinary execution keeps this unset.
+    observe: Callable[[TensorFrame, Mapping[str, torch.Tensor], tuple[torch.Tensor, ...]], None] | None = None
 
     def sampler_output(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
         """Adapt a computed prediction to sampler rows without executing its mathematics."""
@@ -272,7 +274,15 @@ class TensorTask:
                 differentiable = key not in policy.detached_inputs and key in policy.input_gradients
                 leaf = True
                 domain = policy.input_gradient_rows
-        value = inputs[key] if key in self.domains else port.read(data, batch)
+        try:
+            value = inputs[key] if key in self.domains else port.read(data, batch)
+        except (RuntimeError, ValueError, LookupError) as error:
+            if self.observe is not None:
+                error.add_note(
+                    f"pllm input routing failed for `{self.symbol}.{key}` before the method ran; "
+                    "report this as a framework bug."
+                )
+            raise
         if not differentiable:
             value = value.detach()
         elif leaf:
@@ -289,6 +299,10 @@ class TensorTask:
         domains = self.domains
         return {key: port.adapt(inputs[key]) for key, port in self.ports.items() if key not in domains}
 
+    def observation_inputs(self, inputs: Mapping[str, torch.Tensor]) -> Mapping[str, torch.Tensor]:
+        """Diagnostics retain inputs before authored in-place math can change them."""
+        return inputs if self.observe is None else {name: value.detach().clone() for name, value in inputs.items()}
+
     def evaluate(self, data: TensorFrame, batch: TensorBatch) -> dict[tuple[str, str], torch.Tensor]:
         """Run a forward method on every row and store its result for later tasks and the invocation output.
 
@@ -296,6 +310,7 @@ class TensorTask:
         """
         with torch.set_grad_enabled(self.differentiable):
             inputs, sources = self.read(data, batch)
+            observed_inputs = self.observation_inputs(inputs)
             results = self.function(**self.arguments(inputs))
             if not self.tuple_output:
                 if not isinstance(results, torch.Tensor):
@@ -309,6 +324,8 @@ class TensorTask:
                 if self.policy.forward_rows:
                     result = self._selected(result, inputs[self.policy.forward_rows])
                 batch.results[self.symbol, name] = result
+            if self.observe is not None:
+                self.observe(data, observed_inputs, tuple(batch.results[self.symbol, name] for name in self.outputs))
         return sources
 
     @staticmethod
@@ -327,9 +344,12 @@ class TensorTask:
         rows: torch.Tensor,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         """Forward, loss reduction over the selected `rows` and one autograd step to the parameters and `sources`."""
+        observed_inputs = self.observation_inputs(inputs)
         loss = self.function(**self.arguments(inputs))
         if not isinstance(loss, torch.Tensor) or loss.shape != (len(data.rows),):
             raise ValueError("training methods return one loss per row; pllm averages the selected rows")
+        if self.observe is not None:
+            self.observe(data, observed_inputs, (loss,))
         loss, objective = self._loss(loss, data, rows)
         leaf = data.table.leaf
         assert leaf is not None

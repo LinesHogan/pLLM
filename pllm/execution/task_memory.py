@@ -249,7 +249,14 @@ def derive_resources(
                 rows=packed.rows,
                 plan=None,
             )
-        usage = operation.memory(data, batch)
+        try:
+            usage = operation.memory(data, batch)
+        except (RuntimeError, ValueError, TypeError) as error:
+            error.add_note(
+                f"while shape tracing method {symbol!r}; methods run inside CUDA graphs: "
+                "use tensor operations such as torch.where, not .item() or Python branches on tensor values"
+            )
+            raise
         # Model overlays capture bounded tiles, not their whole maximum-shape operation.
         required = operation.resident(usage.capture) if task is not None else 0
         required_capture = max(required_capture, required)
