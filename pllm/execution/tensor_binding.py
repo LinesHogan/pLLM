@@ -200,7 +200,11 @@ class TensorBinding(Builder[TensorFrame]):
         """The rows that open a step's state context, chosen once at bind: a model effect reading request state
         selects every packed row's request; a custom forward over no request state selects none."""
         effects, request = self.effects, any(state.scope is StateScope.REQUEST for state in self.graph.states)
-        if effects.activation_bindings or (effects.custom_forward is not None and effects.overlay_bindings):
+        if (
+            effects.activation_bindings
+            or self.sites.rewrites
+            or (effects.custom_forward is not None and effects.overlay_bindings)
+        ):
             return (lambda value: value.rows.rows) if request else (lambda value: ())
         if effects.custom_forward is not None and not request:
             return lambda value: ()
@@ -218,6 +222,7 @@ class TensorBinding(Builder[TensorFrame]):
                 previous, step=incoming.step, rows=incoming.rows, plan=None, training=None
             ),
             parameter_phases=self.parameter_phases,
+            model_sites=tuple(self.sites.rewrites),
         )
 
     @property

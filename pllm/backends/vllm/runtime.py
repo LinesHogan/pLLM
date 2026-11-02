@@ -673,6 +673,8 @@ def _eager_reason(config: ModelConfig, requirements: BackendRequirements) -> str
         return "activation patches run outside CUDA graphs"
     if requirements.custom_forward:
         return "@pllm.custom_forward reruns model layers outside CUDA graphs"
+    if requirements.custom_residual:
+        return "@pllm.custom_residual runs the model without CUDA graphs"
     if requirements.instance_adapter:
         return "CUDA-graph overlays do not support adapters backed by shared InstanceState"
     return ""
@@ -686,6 +688,11 @@ def create_vllm_llm(
 ) -> VllmLlm[DataT, ResultT]:
     requirements = workload.backend_requirements()
     compat.admit_parallel(config, requirements)
+    if requirements.custom_residual and config.enable_prefix_caching:
+        raise ValueError(
+            "disable prefix caching (enable_prefix_caching=False) when a workload rewrites model sites; cached KV "
+            "would not match"
+        )
     if requirements.position_states and config.runner == "mrv1":
         raise ValueError('PositionState and @pllm.custom_forward need runner="mrv2"')
     eager_reason = _eager_reason(config, requirements)

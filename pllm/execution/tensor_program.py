@@ -27,6 +27,7 @@ from pllm.contracts.semantic_graph import ImplementationId, SemanticOutputKind, 
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.cuda_stream import CudaStreamReadiness, upload
+from pllm.execution.model_sites import ResidualRewrite
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot, borrowed_root
 from pllm.execution.ptts.page_bundle import PagePin, PagePublication, PageWrite
 from pllm.execution.ptts.request_state import RequestStateSelection, StateAddress
@@ -227,6 +228,8 @@ class FunctionMath(Generic[I, D, R]):
     output_data: Callable[[D, InvocationOutput], R]
     resume_data: Callable[[D, D], D] | None = None
     parameter_phases: tuple[HiddenPhase, ...] = ()
+    # The @pllm.custom_residual methods the backend installs on the model.
+    model_sites: tuple[ResidualRewrite, ...] = ()
 
     def initialize(self, roots: Roots, addresses: tuple[StateAddress, ...]) -> None:
         resources = tuple(str(address.resource) for address in addresses)

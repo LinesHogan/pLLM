@@ -122,15 +122,25 @@ class HiddenTapAnnouncement:
 P = ParamSpec("P")
 
 
+@dataclass(frozen=True, slots=True)
+class Tap:
+    """Copies one module output's selected rows into its slots; the slot table is uploaded before each forward."""
+
+    pool: SlotPools
+    indices: Tensor
+
+    def copy(self, output: Tensor) -> None:
+        self.pool.copy_from(0, output, self.indices[0], self.indices[1])
+
+
 def _tapped(
-    pool: SlotPools, indices: Tensor, forward: Callable[P, Tensor | tuple[Tensor, ...]], index: int
+    tap: Tap, forward: Callable[P, Tensor | tuple[Tensor, ...]], index: int
 ) -> Callable[P, Tensor | tuple[Tensor, ...]]:
     def tapped(*args: P.args, **kwargs: P.kwargs) -> Tensor | tuple[Tensor, ...]:
         output = forward(*args, **kwargs)
         # Decoder layers return (layer output, residual) and norms (normalized, residual stream); the tap keeps
         # output `index`. The norm's sum is written in place, so it is copied before the next layer reuses it.
-        hidden = output if isinstance(output, Tensor) else output[index]
-        pool.copy_from(0, hidden, indices[0], indices[1])
+        tap.copy(output if isinstance(output, Tensor) else output[index])
         return output
 
     return tapped
@@ -155,6 +165,8 @@ class HiddenTaps:
         # The packed rows each tap selected this step.
         self._selected: dict[tuple[str, int], Slots] = {}
         self._staging = PinnedStaging()
+        # The taps wrapping module outputs; a model-site hook that takes over a module copies through them itself.
+        self.taps: dict[tuple[str, int], Tap] = {}
         offset = 0
         for layout in layouts:
             path, index = layout.tap
@@ -166,7 +178,8 @@ class HiddenTaps:
             module = model.get_submodule(path)
             module.register_buffer(f"pllm_hidden_slots_{index}", pools[layout.tap].tensors[0], persistent=False)
             module.register_buffer(f"pllm_hidden_indices_{index}", indices, persistent=False)
-            module.forward = _tapped(pools[layout.tap], indices, module.forward, index)
+            self.taps[layout.tap] = Tap(pools[layout.tap], indices)
+            module.forward = _tapped(self.taps[layout.tap], module.forward, index)
 
     def prepare(self, rows: PackedPhaseRowBatch) -> None:
         """Reserve the declared row union and upload its packed-row to slot mapping before forward."""

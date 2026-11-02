@@ -142,6 +142,26 @@ class Feed(Patch):
         return (v * 2,)
 
 
+class Residual(pllm.Workload):
+    """A stateless custom residual: a learned gate on layer 2's MLP branch."""
+
+    @property
+    def gate(self) -> pllm.InstanceState:
+        return pllm.InstanceState({"g": (1,)})
+
+    @pllm.custom_residual(site="mlp", layers=(2,))
+    def gated(self, x, y, g=pllm.parameter("gate", "g")):
+        return x + y * (1 + g)
+
+
+class ResidualAgain(pllm.Workload):
+    """A second owner of layer 2's MLP residual update."""
+
+    @pllm.custom_residual(site="both", layers=(2,))
+    def again(self, x, y):
+        return x + y
+
+
 EFFECTS = {
     effect.__name__: effect
     for effect in (
@@ -158,6 +178,8 @@ EFFECTS = {
         Export,
         Write,
         Feed,
+        Residual,
+        ResidualAgain,
     )
 }
 CUSTOM_FORWARD_TAPS = "which a @pllm.custom_forward does not produce"
@@ -195,6 +217,8 @@ REJECTED = {
     "AddLogits+Feed": FEED_READERS,
     "Guide+Feed": FEED_READERS,
     "Export+Feed": FEED_READERS,
+    "Feed+Residual": FEED_STATES,
+    "Residual+ResidualAgain": 'layer 2 "mlp" already has a custom residual',
 }
 CASES = tuple("+".join(names) for count in (1, 2) for names in itertools.combinations(EFFECTS, count))
 

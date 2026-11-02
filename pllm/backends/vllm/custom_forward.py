@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from dataclasses import replace
 from typing import Generic
 
@@ -20,6 +21,7 @@ from pllm.backends.vllm.custom_forward_attention import (
     span_context,
     validate_attention_resources,
 )
+from pllm.backends.vllm.model_sites import ModelSites
 from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay
 from pllm.backends.vllm.position_state import PositionCacheLayer, PositionCacheProvider
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
@@ -32,7 +34,7 @@ from pllm.execution.step_capture import capture_graph
 from pllm.execution.step_input import StepInput
 from pllm.execution.tensor_frame import OverlayTargetResult
 from pllm.execution.token_program import KV, Save, TokenProgram
-from pllm.execution.token_program_executor import execute_token_program, ordinary_pass
+from pllm.execution.token_program_executor import Stream, add, execute_token_program, ordinary_pass
 
 Signature = tuple[bool, tuple[bool, ...], bool]
 
@@ -119,22 +121,27 @@ class ProgramWave(Generic[DataT, ResultT]):
         for row_overlay in self.row_overlays:
             row_overlay.reset()
         generated, *entries = self.position.entry(())
-        if self.signature[0]:
-            hidden, saved = execute_token_program(
-                self.custom_forward.program["decode" if self.signature[2] else "prefill"],
-                self.seed,
-                self.positions,
-                generated,
-                tuple(entries),
-                self.layer,
-                self.apply_updates,
+        with self.custom_forward.sites_rows(self.indices[0]) as stream:
+            if self.signature[0]:
+                hidden, saved = execute_token_program(
+                    self.custom_forward.program["decode" if self.signature[2] else "prefill"],
+                    self.seed,
+                    self.positions,
+                    generated,
+                    tuple(entries),
+                    self.layer,
+                    self.apply_updates,
+                    stream,
+                )
+            else:
+                count = self.custom_forward.effect.layer_count
+                hidden, saved = ordinary_pass(self.seed, count, self.layer, stream), tuple(entries)
+            self.position.exit(saved)
+            self.observation = hidden
+            self.results = tuple(
+                (tuple(row_overlay.results), row_overlay.operands()) for row_overlay in self.row_overlays
             )
-        else:
-            hidden, saved = ordinary_pass(self.seed, self.custom_forward.effect.layer_count, self.layer), tuple(entries)
-        self.position.exit(saved)
-        self.observation = hidden
-        self.results = tuple((tuple(row_overlay.results), row_overlay.operands()) for row_overlay in self.row_overlays)
-        return self.custom_forward.model.norm(hidden)
+            return self.custom_forward.model.norm(hidden)
 
     def apply_updates(self) -> None:
         for row_overlay in self.row_overlays:
@@ -178,6 +185,7 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
         anchor: AnchorId,
         *,
         activation: VllmActivationPatch | None = None,
+        sites: ModelSites | None = None,
         overlay: ExactParameterOverlay | None = None,
         position_layers: tuple[PositionCacheLayer, ...] = (),
         allocation_block_size: int = 16,
@@ -185,6 +193,7 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
         assert task.custom_forward is not None
         self.model, self.effect = model.model, task.custom_forward
         self.execution, self.anchor, self.activation, self.projections = execution, anchor, activation, overlay
+        self.sites = sites
         implementation = execution.arena.plan.scheduled(task.symbol)
         binding = CustomForwardTask[DataT].from_implementation(
             execution.implementation(implementation.implementation_id)
@@ -214,6 +223,19 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
     @property
     def rows(self) -> tuple[PackedPhaseRow, ...]:
         return self._rows
+
+    @contextmanager
+    def sites_rows(self, packed: torch.Tensor) -> Generator[Stream]:
+        """Point the custom residual hooks at the packed rows of the layers run inside, and give the program the
+        stream after a layer as those hooks complete it."""
+        if self.sites is None:
+            yield add
+            return
+        self.sites.rows = packed
+        try:
+            yield self.sites.stream_after
+        finally:
+            self.sites.rows = None
 
     def prepare(self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT]) -> None:
         self.clear()
@@ -368,9 +390,9 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
 
         seed = self.hidden.index_select(0, packed)
         saved: tuple[torch.Tensor, ...] = ()
-        with override_forward_context(context):
+        with override_forward_context(context), self.sites_rows(packed) as stream:
             if program is None:
-                hidden = ordinary_pass(seed, self.effect.layer_count, layer)
+                hidden = ordinary_pass(seed, self.effect.layer_count, layer, stream)
             else:
                 hidden, saved = execute_token_program(
                     program,
@@ -380,6 +402,7 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
                     tuple(torch.empty_like(seed) for _ in program.entries),
                     layer,
                     apply_updates,
+                    stream,
                 )
             self.output.index_copy_(0, packed, self.model.norm(hidden))
             assert self.observations is not None

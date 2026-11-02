@@ -18,6 +18,7 @@ from pllm.backends.vllm.architecture import Decoder
 from pllm.backends.vllm.custom_forward import VllmCustomForward
 from pllm.backends.vllm.hidden_taps import HiddenTaps
 from pllm.backends.vllm.layer_logits import LayerLogits
+from pllm.backends.vllm.model_sites import ModelSites
 from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay, parameter_overlay
 from pllm.backends.vllm.position_state import PositionCacheLayer
 from pllm.backends.vllm.prefix_cache import POLICY_KEY, CachePolicy
@@ -123,6 +124,10 @@ class VllmSession(Generic[DataT, ResultT]):
             if attachment.spec.activation_bindings
             else None
         )
+        model_sites = deployment.execution.math.model_sites
+        self._sites = (
+            ModelSites(decoder, model_sites, taps, probe.max_packed_rows, max_sampler_rows) if model_sites else None
+        )
         self._feed: FeedReceiver | None = None
         self._received_readonly: ReadonlyStepInput | ReadonlyStepAbsent | ReadonlyStepEnd | None = None
         self._input_failed = False
@@ -134,6 +139,7 @@ class VllmSession(Generic[DataT, ResultT]):
                 deployment.execution,
                 plan.scheduled(custom_forward_task.symbol).anchor_id,
                 activation=self._activation,
+                sites=self._sites,
                 position_layers=position_layers,
                 allocation_block_size=allocation_block_size,
                 overlay=self._overlay if isinstance(self._overlay, ExactParameterOverlay) and program_overlay else None,
@@ -230,7 +236,7 @@ class VllmSession(Generic[DataT, ResultT]):
         )
         self._retire(finished)
         # Sampler/hidden-only workloads retain their current state and preemption behavior.
-        if self._overlay is not None or self._activation is not None:
+        if self._overlay is not None or self._activation is not None or self._sites is not None:
             for request_id in scheduler_output.finished_req_ids:
                 self._pending_identities.pop(request_id, None)
             # Installed vLLM 0.27.1 emits this set for both runners, despite its MRv2-only field comment.
@@ -285,7 +291,13 @@ class VllmSession(Generic[DataT, ResultT]):
         if self._taps is not None:
             self._taps.prepare(rows.row_batch)
         adapter = self._forward_overlay
-        if adapter is None and self._activation is None and self._custom_forward is None and not self._trains_on_batch:
+        if (
+            adapter is None
+            and self._activation is None
+            and self._sites is None
+            and self._custom_forward is None
+            and not self._trains_on_batch
+        ):
             return
         if adapter is not None:
             adapter.reserve()
@@ -332,6 +344,8 @@ class VllmSession(Generic[DataT, ResultT]):
             adapter.prepare(rows.row_batch, context, execution.directory, projection)
         if self._activation is not None:
             self._activation.prepare(rows.row_batch, context, execution.directory)
+        if self._sites is not None:
+            self._sites.prepare(rows.row_batch, context, execution.directory)
         if self._custom_forward is not None:
             self._custom_forward.prepare(rows.row_batch, context)
 
@@ -376,7 +390,7 @@ class VllmSession(Generic[DataT, ResultT]):
                 effect.clear()
 
     def _close_effects(self) -> None:
-        for effect in (self._overlay, self._activation, self._custom_forward):
+        for effect in (self._overlay, self._activation, self._sites, self._custom_forward):
             if effect is not None:
                 effect.close()
 

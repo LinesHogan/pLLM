@@ -60,6 +60,7 @@ from pllm.contracts.tensor_layout import (
 )
 from pllm.execution.custom_forward import CustomForwardTask
 from pllm.execution.execution import TaskGraphImplementation
+from pllm.execution.model_sites import SiteOwners
 from pllm.execution.overlay_task import OverlayTransition
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.state_execution import (
@@ -222,6 +223,8 @@ class Builder(Generic[D]):
         self.overlay_math: OverlayTransition | None = None
         self.custom_forward_updates = False
         self.custom_forward_rows = 0
+        # The @pllm.custom_residual methods, by the model places they own.
+        self.sites = SiteOwners()
 
     def state(
         self,
@@ -542,9 +545,10 @@ class Builder(Generic[D]):
         self.graph = replace(self.graph, model_reads=tuple(sorted({*self.graph.model_reads, *resources})))
 
     def finish(self) -> tuple[SemanticGraph, TensorLayoutRequest, BackendAttachmentSpec]:
-        if self.effects.empty:
+        if self.effects.empty and not self.sites.rewrites:
             raise ValueError(
                 "the workload has no effect on the model: add @pllm.train, @pllm.add_logits, @pllm.guide_sampling, "
-                "@pllm.export, @pllm.train_in_forward, a custom_forward or a pllm.model.ActivationPatch/Adapter"
+                "@pllm.export, @pllm.train_in_forward, @pllm.custom_residual, a custom_forward or a "
+                "pllm.model.ActivationPatch/Adapter"
             )
         return self.graph, self.layouts, self.effects

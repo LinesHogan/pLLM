@@ -35,6 +35,7 @@ from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.admission import WindowBackpressure
 from pllm.execution.cuda_stream import CudaStreamReadiness, DeviceCounters
 from pllm.execution.execution import TaskGraphExecution, TaskGraphImplementation
+from pllm.execution.model_sites import ResidualRewrite
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle import (
     FieldNumericHealth,
@@ -323,6 +324,11 @@ class StateMath(Protocol[InputContra, DataT, ResultCo]):
     @property
     def parameter_phases(self) -> tuple[HiddenPhase, ...]:
         """Authored training phases used to select pinned projection captures."""
+        ...
+
+    @property
+    def model_sites(self) -> tuple[ResidualRewrite, ...]:
+        """The @pllm.custom_residual methods a model backend installs."""
         ...
 
     def initialize(

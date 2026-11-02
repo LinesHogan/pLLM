@@ -73,6 +73,15 @@ from pllm.execution.model_effect_binding import (
     import_update,
     write_result,
 )
+from pllm.execution.model_sites import (
+    DepthInput,
+    EarlierInput,
+    Place,
+    ResidualRewrite,
+    Site,
+    SiteInput,
+    StateInput,
+)
 from pllm.execution.module_graph import ModuleCall
 from pllm.execution.module_state import (
     ModuleFactory,
@@ -164,6 +173,11 @@ class _Source:
     def batch(self, state: str, definition: InstanceState) -> tuple[str, str]:
         raise ValueError("batch training inputs must name its batch tensors or own parameters")
 
+    def site_input(self, context: _Reflection) -> SiteInput:
+        raise TypeError(
+            "@pllm.custom_residual methods read pllm.parameter, pllm.module, pllm.depth, pllm.value and pllm.residual"
+        )
+
 
 @dataclass(frozen=True)
 class Attr:
@@ -201,6 +215,13 @@ class Hidden(_Source):
 
     def port(self, context: _Reflection) -> TensorPort:
         return hidden_port(self.resolve(context.owner))
+
+    def site_input(self, context: _Reflection) -> SiteInput:
+        """Inside a custom residual, pllm.residual reads the same token's stream earlier in this forward."""
+        if self.site not in (HiddenSite.RESIDUAL, HiddenSite.ATTENTION_RESIDUAL):
+            return super().site_input(context)
+        layer = _setting(self.layer, context.owner, int) % context.binding.dimensions.layer_count
+        return EarlierInput("residual" if self.site is HiddenSite.RESIDUAL else "attention_residual", layer)
 
 
 @dataclass(frozen=True)
@@ -286,6 +307,14 @@ class Parameter(_Source):
             return super().batch(state, definition)
         return "parameter", self.field
 
+    def site_input(self, context: _Reflection) -> SiteInput:
+        context.parameter(self.state, self.field)
+        return StateInput(
+            context.states[self.state].declaration.resource,
+            context.binding.field_views[self.state, self.field],
+            context.state_definitions[self.state].scope is StateScope.REQUEST,
+        )
+
 
 @dataclass(frozen=True)
 class _CausalModelMarker(_Source):
@@ -318,11 +347,19 @@ class _Module(Parameter):
         return replace(super().port(context), adapt=self.adapt(context))
 
     def adapt(self, context: _Reflection) -> Callable[[torch.Tensor], ModuleCall]:
+        return partial(ModuleCall, self.skeleton(context), per_row=self.request(context))
+
+    def skeleton(self, context: _Reflection) -> torch.nn.Module:
         definition = context.state_definition(self.state, f"{self.state}: pllm.module needs a declared module state")
-        factory, dimensions = definition.module, context.binding.dimensions
-        if factory is None:
+        if definition.module is None:
             raise TypeError(f"{self.state}: pllm.module needs a state declared with module=")
-        return partial(ModuleCall, skeleton(factory, dimensions), per_row=definition.scope is StateScope.REQUEST)
+        return skeleton(definition.module, context.binding.dimensions)
+
+    def request(self, context: _Reflection) -> bool:
+        return context.state_definition(self.state, "pllm.module needs a declared state").scope is StateScope.REQUEST
+
+    def site_input(self, context: _Reflection) -> SiteInput:
+        return replace(super().site_input(context), module=self.skeleton(context))
 
 
 @dataclass(frozen=True)
@@ -369,6 +406,22 @@ class Result(_Source):
 
     def port(self, context: _Reflection) -> TensorPort:
         return result_port(TaskResultInputSource(TaskSymbol(self.operation), "value"))
+
+
+@dataclass(frozen=True)
+class Depth(_Source):
+    differentiable: ClassVar[bool] = False
+
+    def site_input(self, context: _Reflection) -> SiteInput:
+        return DepthInput()
+
+
+@dataclass(frozen=True)
+class Value(_Source):
+    layer: int | Attr
+
+    def site_input(self, context: _Reflection) -> SiteInput:
+        return EarlierInput("value", _setting(self.layer, context.owner, int) % context.binding.dimensions.layer_count)
 
 
 @dataclass(frozen=True)
@@ -482,6 +535,18 @@ def sample_index(limit: int | Attr | None = None) -> Any:
 def result(operation: str) -> Any:
     """The value another operation of this workload returned in the same step."""
     return Result(operation)
+
+
+def depth() -> Any:
+    """Inside a @pllm.custom_residual method, the index of the place it runs at, a Python int: the layer, or
+    2 * layer (+ 1 for the MLP) with site="both"."""
+    return Depth()
+
+
+def value(layer: int | Attr) -> Any:
+    """Inside a @pllm.custom_residual method, the value rows [rows, kv_heads, head_dim] layer `layer` computed for the
+    same token in this forward (after its own value rewrite)."""
+    return Value(layer)
 
 
 def base_logits() -> Any:
@@ -1329,6 +1394,125 @@ class _TrainInForward(_Effect):
         )
 
 
+_SITE_TENSORS: dict[str, int] = {"attention": 2, "mlp": 2, "both": 2, "value": 1, "final": 1}
+# The places a site owns in each chosen layer.
+_SITE_KINDS: dict[str, tuple[Literal["attention", "mlp", "value"], ...]] = {
+    "attention": ("attention",),
+    "mlp": ("mlp",),
+    "both": ("attention", "mlp"),
+    "value": ("value",),
+}
+
+
+def _site_inputs(
+    function: Callable[..., torch.Tensor], leading: int, context: _Reflection, method: str
+) -> tuple[tuple[str, SiteInput], ...]:
+    """The marker inputs after a method's `leading` site tensors (the stream and branch output, or value rows)."""
+    parameters = tuple(signature(function, eval_str=False).parameters.items())
+    if len(parameters) < leading or any(
+        parameter.default is not SignatureParameter.empty for _, parameter in parameters[:leading]
+    ):
+        tensors = ("x", "y") if leading == 2 else ("x",)
+        raise TypeError(f"{method}: take the site tensors {', '.join(tensors)} first, without defaults, then markers")
+    inputs: list[tuple[str, SiteInput]] = []
+    for name, parameter in parameters[leading:]:
+        source = _typed(parameter.default, _Source)
+        if source is None:
+            raise TypeError(f"{name}: give every input after the site tensors a source as its default")
+        inputs.append((name, source.site_input(context)))
+    return tuple(inputs)
+
+
+@dataclass(frozen=True, kw_only=True)
+class _CustomResidual(_Effect):
+    site: Site
+    layers: tuple[int, ...] | Attr | None
+    read: str
+    streams: int | Attr
+
+    phase: ClassVar[Phase | None] = Phase.IN_FORWARD
+    model_effect: ClassVar[bool] = True
+
+    def __post_init__(self) -> None:
+        if self.site not in _SITE_TENSORS:
+            raise ValueError(
+                f"@pllm.custom_residual(site={self.site!r}): use one of {', '.join(map(repr, _SITE_TENSORS))}"
+            )
+
+    def places(self, owner: Workload, count: int) -> tuple[Place, ...]:
+        """The owned places: the chosen layers' sublayer adds or value rows, or the final stream."""
+        if self.site == "final":
+            if self.layers is not None:
+                raise ValueError('@pllm.custom_residual(site="final") rewrites the one final stream; remove layers=')
+            return (("final", count),)
+        layers = tuple(range(count)) if self.layers is None else _setting(self.layers, owner, tuple)
+        if (
+            not layers
+            or tuple(sorted(set(layers))) != layers
+            or not all(type(layer) is int and 0 <= layer < count for layer in layers)
+        ):
+            raise ValueError(f"@pllm.custom_residual(layers={layers!r}): give sorted distinct layers in 0..{count - 1}")
+        return tuple((kind, layer) for layer in layers for kind in _SITE_KINDS[self.site])
+
+    def declare(self, operation: _Operation) -> None:
+        """Own the chosen sites' residual updates (or value rows) with the method; it reads states and earlier values."""
+        context = operation.context
+        if operation.gradient is not None or operation.rows:
+            raise ValueError(
+                "@pllm.custom_residual rewrites every row of its sites: remove rows= and @pllm.differentiate"
+            )
+        if operation.phase is not Phase.IN_FORWARD:
+            raise ValueError("@pllm.custom_residual runs inside the forward; remove @pllm.on")
+        if context.binding.host:
+            raise ValueError("@pllm.custom_residual acts inside a model forward; compile this workload with make_llm")
+        owner, count = context.owner, context.binding.dimensions.layer_count
+        reader = context.method(self.read) if self.read else None
+        rewrite = ResidualRewrite(
+            operation.name,
+            self.site,
+            self.places(owner, count),
+            freeze(operation.function),
+            _site_inputs(operation.function, _SITE_TENSORS[self.site], context, operation.name),
+            None if reader is None else freeze(reader),
+            () if reader is None else _site_inputs(reader, 1, context, self.read),
+            _setting(self.streams, owner, int),
+        )
+        if rewrite.streams < 1 or (self.read and self.site in ("value", "final")):
+            raise ValueError("@pllm.custom_residual takes streams >= 1, and read= only at attention/MLP sites")
+        context.binding.sites.add(rewrite)
+        context.binding.model_reads(
+            tuple(
+                source.resource
+                for _, source in (*rewrite.inputs, *rewrite.read_inputs)
+                if isinstance(source, StateInput)
+            )
+        )
+        context.signature.append(
+            (operation.name, boundary_digest(fingerprint(operation.function), fingerprint(reader), self))
+        )
+
+
+def custom_residual(
+    *,
+    site: Site,
+    layers: tuple[int, ...] | Attr | None = None,
+    read: str = "",
+    streams: int | Attr = 1,
+) -> Callable[[F], F]:
+    """Own the residual update at `site` of `layers` (default: every layer) with this method.
+
+    site="attention" or "mlp" (or "both", in forward order) take the stream before the sublayer and its branch
+    output, `write(x, y, ...) -> stream`, replacing the plain `x + y`; the native branch always runs. site="value"
+    maps a full-attention layer's value rows [rows, kv_heads, head_dim] before attention reads and caches them;
+    site="final" maps the stream entering the final norm to one stream. `read` names a method `(x, ...) -> branch
+    input` that the sublayer normalizes instead of the stream. With `streams=n` the stream is [rows, n, hidden] from the
+    embedding to a "final" method that collapses it. After the site tensors, methods read pllm.parameter, pllm.module,
+    pllm.depth(), pllm.value(layer) and pllm.residual(layer) (the same token, earlier in this forward). Tensors are in the
+    model dtype; compute in float32 inside the method when needed.
+    """
+    return _mark(effect=_CustomResidual(site=site, layers=layers, read=read, streams=streams))
+
+
 def train_in_forward(
     *,
     state: str,
@@ -1970,6 +2154,16 @@ class _Reflection:
     def sign_composition(self) -> None:
         """Validate composed effects and sign ordered definitions and owner values."""
         b = self.binding
+        b.sites.check_streams(
+            b.dimensions.layer_count,
+            bool(self.custom_forwards),
+            any(
+                isinstance(port.source, HiddenInputSource)
+                and port.source.site in (HiddenSite.RESIDUAL, HiddenSite.ATTENTION_RESIDUAL, HiddenSite.LAYER_LOGITS)
+                for task in b.graph.tasks
+                for port in task.inputs
+            ),
+        )
         if len(b.imports) > 1:
             raise ValueError("StateImport supplies one imported resource per workload")
         if not b.graph.tasks and b.graph.model_reads:
@@ -2068,7 +2262,10 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             if isinstance(effect, _TrainInForward):
                 targets = _targets(_setting(effect.targets, context.owner, tuple))
                 continue
-            if isinstance(effect, _Sampler) and not effect.enabled(context.owner):
+            # Custom residual methods read state and earlier values of the forward, never tapped rows.
+            if isinstance(effect, _CustomResidual) or (
+                isinstance(effect, _Sampler) and not effect.enabled(context.owner)
+            ):
                 continue
             with context.declaring(operation.name):
                 sources.update((name, tuple(arguments.values())) for name, arguments in operation.sources().items())
@@ -2117,6 +2314,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             ),
             position_states=context.position_states(),
             custom_forward=bool(context.custom_forwards),
+            custom_residual=any(isinstance(operation.effect, _CustomResidual) for operation in context.operations),
             instance_adapter=any(
                 context.state_definitions[value.state].scope is StateScope.INSTANCE
                 for value in context.adapters.values()
@@ -2231,6 +2429,9 @@ __all__ = [
     "InstanceState",
     "RequestState",
     "train_in_forward",
+    "custom_residual",
+    "depth",
+    "value",
     "Field",
     "UpdateOutput",
     "differentiate",

@@ -38,6 +38,7 @@ def admit_parallel(config: ModelConfig, requirements: BackendRequirements = Back
         (requirements.parameter_targets, "parameter overlays"),
         (requirements.feeds, "state feeds"),
         (requirements.custom_forward or requirements.position_states, "@pllm.custom_forward and PositionState"),
+        (requirements.custom_residual, "@pllm.custom_residual"),
     ):
         if used:
             raise ValueError(f"{feature} needs tensor_parallel_size=1")

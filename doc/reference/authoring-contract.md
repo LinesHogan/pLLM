@@ -236,6 +236,29 @@ worker 重新导入并重建，安装时其编译签名必须与驱动端签名�
 | `@custom_forward` 与 `pllm.model.Adapter` | Adapter 的投影钩子按模型自己的行索引 |
 | `@train_in_forward` 与 `pllm.model.Adapter` | 两者共用同一组投影钩子 |
 | 带 feed 的状态与其他状态或方法 | feed 的条件输入组只容纳它的写链与读取它的模型 |
+| 同一子层上的两个 `@custom_residual` 方法 | 一个方法拥有一个子层的残差更新 |
+
+## 定制残差（`@pllm.custom_residual`）
+
+`@pllm.custom_residual(site=...)` 让一个方法拥有某些层某个位置的残差更新。原生分支
+（attention 或 MLP、KV 写入、MoE 路由）总是照常运行，方法只决定流怎样更新：
+
+| `site` | 方法收到 | 返回 | 替换的原生行为 |
+| --- | --- | --- | --- |
+| `"attention"` / `"mlp"` | 子层前的流 `x` 与分支输出 `y` | 子层后的流 | `x + y` |
+| `"both"` | 同上，按前向顺序作用于两个子层 | 同上 | 同上 |
+| `"value"` | 全注意力层的 value 行 `[rows, kv_heads, head_dim]` | 替换后的 value（attention 读取并写入 KV cache） | `v` |
+| `"final"` | 进入最终 norm 的流 | 一条流 `[rows, hidden]` | 流本身 |
+
+`layers=` 选层（默认所有层）；`read="method"` 命名一个 `(x, ...) -> 分支输入` 的方法，子层归一化它
+而不是流；`streams=n` 让 n 条残差流从 embedding 一直走到 `"final"` 方法把它们合成一条（超连接）。
+位置张量之后的参数读取 `pllm.parameter`、`pllm.module`、`pllm.depth()`（层号；`"both"` 时为
+`2 * layer`，MLP 再加 1）、`pllm.value(layer)` 与 `pllm.residual(layer)`（同一 token 在本次前向中
+更早位置的值）。张量为模型 dtype，需要时在方法内用 float32 计算。实例状态按本步最新版本读取，
+请求状态按每行所属请求的版本读取。框架用模型自己的融合 add+norm kernel 归一化方法写出的流，
+所以恒等方法与原模型逐位相同。定制残差目前以 eager 运行（`cuda_graphs="auto"` 自动选择 eager），
+需要 `tensor_parallel_size=1`，且要求关闭前缀缓存。它与 `@pllm.custom_forward` 组合：
+custom forward 运行的每一层也经过这些方法。
 
 ## 请求 Overlay
 

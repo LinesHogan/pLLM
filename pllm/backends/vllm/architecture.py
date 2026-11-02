@@ -214,8 +214,8 @@ class Decoder:
         if target.name in ("q_proj", "v_proj"):
             if isinstance(layer, Qwen3_5DecoderLayer) and layer.layer_type != "full_attention":
                 raise ValueError(
-                    f"layer {target.layer} is a Gated DeltaNet layer; overlay a full-attention layer "
-                    "(see layer_types in the model config)"
+                    f"layer {target.layer} is a Gated DeltaNet layer without q/v projections; choose a full-attention "
+                    "layer (see layer_types in the model config)"
                 )
             attention = layer.self_attn
             # Gated attention stores qkv_proj rows as [per-head (query, gate) pairs, key, value].
@@ -231,6 +231,11 @@ class Decoder:
                 start = (2 if gated else 1) * attention.q_size + attention.kv_size
                 return attention.qkv_proj, start, attention.kv_size, None
         raise ValueError("parameter overlay requires an MLP down or attention q/v projection")
+
+    def value_rows(self, layer: int) -> tuple[LinearBase, int, int, int]:
+        """A full-attention layer's value slice of its qkv projection and the width of one head."""
+        module, start, width, _ = self.projection(Projection("v_proj", layer))
+        return module, start, width, self.writable("a value site").model.layers[layer].self_attn.head_dim
 
 
 # Reviewed invariant for these exact vLLM classes: qkv_proj splits into
