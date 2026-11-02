@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
-from typing import Generic, Literal, Never, Protocol, TypeVar
+from typing import TYPE_CHECKING, Generic, Literal, Never, Protocol, TypeVar
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
@@ -27,7 +27,6 @@ from pllm.contracts.semantic_graph import ImplementationId, SemanticOutputKind, 
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.cuda_stream import CudaStreamReadiness, upload
-from pllm.execution.model_sites import ResidualRewrite
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot, borrowed_root
 from pllm.execution.ptts.page_bundle import PagePin, PagePublication, PageWrite
 from pllm.execution.ptts.request_state import RequestStateSelection, StateAddress
@@ -38,6 +37,9 @@ from pllm.execution.torch_private import MemoryTrace, MemoryUsage, measure
 from pllm.execution.trace import TraceEventKind
 from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw, paged_adamw
 from pllm.kernels.page_copy import copy_pages
+
+if TYPE_CHECKING:
+    from pllm.execution.model_sites import ResidualRewrite
 
 I = TypeVar("I", bound=StepInput)
 D = TypeVar("D")

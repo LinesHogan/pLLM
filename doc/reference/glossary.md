@@ -21,6 +21,8 @@
   残差流（logit lens），FP32 `[rows, layers, vocab]`，覆盖采样器抽取的每个 token。
 - **定制残差（@pllm.custom_residual）** —— 拥有某些层 attention/MLP 子层残差更新、value 行或最终流的
   方法；原生分支照常运行，方法决定流如何更新。
+- **状态子层（state= / chunk=）** —— 带每请求携带量的定制残差：按 chunk 扫描，每行读其 chunk 开始时的
+  携带量，chunk 完成后更新。
 - **位置索引（pllm.depth）** —— 定制残差方法所在位置的 Python 整数：层号，`site="both"` 时为子层号。
 - **值行（pllm.value）** —— 定制残差方法内读取的、同一 token 在更早层计算出的 value 行。
 - **效果组合（Effect composition）** —— 一个负载里的效果各自声明位置与状态读写、

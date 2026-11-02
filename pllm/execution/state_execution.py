@@ -35,7 +35,6 @@ from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.admission import WindowBackpressure
 from pllm.execution.cuda_stream import CudaStreamReadiness, DeviceCounters
 from pllm.execution.execution import TaskGraphExecution, TaskGraphImplementation
-from pllm.execution.model_sites import ResidualRewrite
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle import (
     FieldNumericHealth,
@@ -53,6 +52,7 @@ from pllm.execution.torch_private import MemoryUsage
 from pllm.execution.trace import ExecutionTrace, TraceEvent, TraceEventKind
 
 if TYPE_CHECKING:
+    from pllm.execution.model_sites import ResidualRewrite
     from pllm.execution.post_sample import PostSampleOverlap
     from pllm.execution.tensor_program import TensorBatch
 

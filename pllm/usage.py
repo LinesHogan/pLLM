@@ -70,16 +70,19 @@ from pllm.execution.model_effect_binding import (
     declare_activation_patch,
     declare_custom_forward,
     declare_parameter_overlay,
+    declare_site_memory,
     import_update,
     write_result,
 )
 from pllm.execution.model_sites import (
     DepthInput,
     EarlierInput,
+    PatchInput,
     Place,
     ResidualRewrite,
     Site,
     SiteInput,
+    SiteMemory,
     StateInput,
 )
 from pllm.execution.module_graph import ModuleCall
@@ -1430,6 +1433,8 @@ class _CustomResidual(_Effect):
     layers: tuple[int, ...] | Attr | None
     read: str
     streams: int | Attr
+    state: str
+    chunk: int | Attr | None
 
     phase: ClassVar[Phase | None] = Phase.IN_FORWARD
     model_effect: ClassVar[bool] = True
@@ -1467,29 +1472,100 @@ class _CustomResidual(_Effect):
         if context.binding.host:
             raise ValueError("@pllm.custom_residual acts inside a model forward; compile this workload with make_llm")
         owner, count = context.owner, context.binding.dimensions.layer_count
+        places = self.places(owner, count)
+        memory = None if not self.state else self.memory(operation, places)
         reader = context.method(self.read) if self.read else None
         rewrite = ResidualRewrite(
             operation.name,
             self.site,
-            self.places(owner, count),
+            places,
             freeze(operation.function),
             _site_inputs(operation.function, _SITE_TENSORS[self.site], context, operation.name),
             None if reader is None else freeze(reader),
             () if reader is None else _site_inputs(reader, 1, context, self.read),
             _setting(self.streams, owner, int),
+            memory,
         )
         if rewrite.streams < 1 or (self.read and self.site in ("value", "final")):
             raise ValueError("@pllm.custom_residual takes streams >= 1, and read= only at attention/MLP sites")
+        if memory is not None and (
+            rewrite.read is not None
+            or any(
+                isinstance(source, (EarlierInput, PatchInput)) or source.request and source != memory.carry
+                for _, source in rewrite.inputs
+                if not isinstance(source, DepthInput)
+            )
+        ):
+            raise ValueError(
+                f"a stateful @pllm.custom_residual reads its carry pllm.parameter({self.state!r}, ...), instance "
+                "state and pllm.depth(), without read="
+            )
         context.binding.sites.add(rewrite)
         context.binding.model_reads(
             tuple(
                 source.resource
                 for _, source in (*rewrite.inputs, *rewrite.read_inputs)
-                if isinstance(source, StateInput)
+                if isinstance(source, StateInput) and (memory is None or source != memory.carry)
             )
         )
         context.signature.append(
             (operation.name, boundary_digest(fingerprint(operation.function), fingerprint(reader), self))
+        )
+
+    def memory(self, operation: _Operation, places: tuple[Place, ...]) -> SiteMemory:
+        """Declare the request state the method carries chunk by chunk, with the framework's unfinished-chunk rows,
+        and the transition that advances it inside the forward."""
+        context, b = operation.context, operation.context.binding
+        definition = context.state_definition(self.state, "@pllm.custom_residual(state=...) needs a declared state")
+        if (
+            definition.scope is not StateScope.REQUEST
+            or definition.optimizer is not None
+            or definition.module is not None
+            or len(definition.fields) != 1
+            or self.chunk is None
+            or len(places) != 1
+            or places[0][0] not in ("attention", "mlp")
+        ):
+            raise ValueError(
+                f"@pllm.custom_residual(state={self.state!r}) needs one attention or MLP site of one layer, chunk=, "
+                "and a pllm.RequestState with one field, its carry, and no optimizer"
+            )
+        chunk = _setting(self.chunk, context.owner, int)
+        if chunk < 1:
+            raise ValueError("@pllm.custom_residual(chunk=) must be positive")
+        ((name, shape),) = definition.fields.items()
+        if isinstance(shape, Field):
+            raise TypeError(f"{name}: give the carry a fixed shape or a function of the model dimensions")
+        rows: Shape = lambda dimensions: (max(1, chunk - 1), dimensions.hidden_size)  # noqa: E731
+        initialize = (
+            None if definition.initialize is None else partial(_author_fields, freeze(definition.initialize), (name,))
+        )
+        state, ports = declare_parameters(
+            b,
+            self.state,
+            (
+                LayoutField(name, shape, definition.tensor_dtype, definition.alignment),
+                LayoutField("_pending_rows_x", rows, lambda dimensions: dimensions.dtype),
+                LayoutField("_pending_rows_y", rows, lambda dimensions: dimensions.dtype),
+                LayoutField("_pending_length", (), TensorDType.INT64),
+            ),
+            optimizer=None,
+            initialize=initialize,
+            scope=StateScope.REQUEST,
+            keys=definition.request_keys,
+        )
+        context.states[self.state] = state
+        context.parameters.update({(self.state, field): port for field, port in ports.items()})
+        declare_site_memory(b, operation.name, state)
+        views = b.field_views
+        return SiteMemory(
+            StateInput(state.declaration.resource, views[self.state, name], True),
+            (
+                views[self.state, "_pending_rows_x"],
+                views[self.state, "_pending_rows_y"],
+                views[self.state, "_pending_length"],
+            ),
+            chunk,
         )
 
 
@@ -1499,6 +1575,8 @@ def custom_residual(
     layers: tuple[int, ...] | Attr | None = None,
     read: str = "",
     streams: int | Attr = 1,
+    state: str = "",
+    chunk: int | Attr | None = None,
 ) -> Callable[[F], F]:
     """Own the residual update at `site` of `layers` (default: every layer) with this method.
 
@@ -1510,8 +1588,13 @@ def custom_residual(
     embedding to a "final" method that collapses it. After the site tensors, methods read pllm.parameter, pllm.module,
     pllm.depth(), pllm.value(layer) and pllm.residual(layer) (the same token, earlier in this forward). Tensors are in the
     model dtype; compute in float32 inside the method when needed.
+
+    With `state` (a pllm.RequestState with one field) and `chunk`, the method is a stateful sublayer at one site: it
+    sees one chunk of one request, `write(x, y, carry=pllm.parameter(state, ...), ...) -> (stream, next carry)`,
+    where every row reads the carry its chunk started with and a chunk's update applies once its last row has run.
+    Each row's stream should depend only on that row and the carry.
     """
-    return _mark(effect=_CustomResidual(site=site, layers=layers, read=read, streams=streams))
+    return _mark(effect=_CustomResidual(site=site, layers=layers, read=read, streams=streams, state=state, chunk=chunk))
 
 
 def train_in_forward(
@@ -1976,6 +2059,8 @@ class _Reflection:
         seeds.extend(candidates[text] for text in texts if type(text) is str and text in candidates)
         if (trained := _typed(effect, _TrainInForward)) is not None:
             self.in_forward_states.add(trained.state)
+        if (residual := _typed(effect, _CustomResidual)) is not None and residual.state:
+            self.in_forward_states.add(residual.state)
         phase = phase or effect.phase or Phase.AFTER_SAMPLE
         seeds.append(function)
         assert rows is not None
@@ -2155,7 +2240,7 @@ class _Reflection:
     def sign_composition(self) -> None:
         """Validate composed effects and sign ordered definitions and owner values."""
         b = self.binding
-        b.sites.check_streams(
+        b.sites.check(
             b.dimensions.layer_count,
             bool(self.custom_forwards),
             any(

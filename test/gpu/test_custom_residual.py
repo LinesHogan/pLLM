@@ -151,6 +151,33 @@ class StaticHyperConnections(pllm.Workload):
         return x.float().mean(1).to(x.dtype)
 
 
+@dataclass(frozen=True)
+class FastWeightMemory(pllm.Workload):
+    """A fast-weight memory beside one layer's MLP (TTT-Linear / Titans style): every row reads M k for its normalized
+    stream k, and once a chunk completes M takes one gradient step on |M k - y|^2 over the chunk; gate=0 is the model."""
+
+    layer: int = 12
+    chunk: int = 16
+    lr: float = 0.5
+    gate: float = 0.25
+
+    @property
+    def memory(self) -> pllm.RequestState:
+        return pllm.RequestState({"M": lambda m: (m.hidden_size, m.hidden_size)})
+
+    @property
+    def layers_(self) -> tuple[int, ...]:
+        return (self.layer,)
+
+    @pllm.custom_residual(site="mlp", layers=pllm.Attr("layers_"), state="memory", chunk=pllm.Attr("chunk"))
+    def remember(
+        self, x: torch.Tensor, y: torch.Tensor, M: torch.Tensor = pllm.parameter("memory", "M")
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        k = torch.nn.functional.normalize(x.float(), dim=-1)
+        read = k @ M.T
+        return (x.float() + y.float() + self.gate * read).to(x.dtype), M - self.lr / len(x) * (read - y.float()).T @ k
+
+
 def _generate(workload: pllm.Workload) -> list[tuple[list[int], list[float]]]:
     """Greedy tokens and their logprobs."""
     with pllm.make_llm(CONFIG, workload=workload) as handle:
@@ -172,7 +199,9 @@ def _vanilla() -> list[tuple[list[int], list[float]]]:
     return _generate(Observe())
 
 
-@pytest.mark.parametrize("workload", [Laurel(), ValueResidual(), StaticHyperConnections()], ids=type)
+@pytest.mark.parametrize(
+    "workload", [Laurel(), ValueResidual(), StaticHyperConnections(), FastWeightMemory(gate=0.0)], ids=type
+)
 def test_identity_rewrites_reproduce_the_model_bitwise(workload: pllm.Workload) -> None:
     assert _generate(workload) == _vanilla()
 
@@ -306,3 +335,31 @@ def test_rewrites_follow_fp32_oracle() -> None:
         )
         assert deviation <= max(2 * baseline, 0.05) and misses <= 2
     assert math.isfinite(baseline)
+
+
+def test_memory_sublayer_follows_fp32_chunk_oracle() -> None:
+    baseline, _ = _deviation(_vanilla(), _oracle_logprobs)
+    for chunk in (1, 16):
+        workload = FastWeightMemory(chunk=chunk)
+
+        def memory(x: torch.Tensor, y: torch.Tensor, layer: int, workload: FastWeightMemory = workload) -> torch.Tensor:
+            """Rows read the memory their chunk started with; M steps on |M k - y|^2 after each complete chunk."""
+            if layer != workload.layer:
+                return x + y
+            keys, reads, state = (
+                torch.nn.functional.normalize(x, dim=-1),
+                [],
+                torch.zeros(len(x[0]), len(x[0]), device=x.device),
+            )
+            for start in range(0, len(x), workload.chunk):
+                k, v = keys[start : start + workload.chunk], y[start : start + workload.chunk]
+                reads.append(k @ state.T)
+                if len(k) == workload.chunk:
+                    state = state - workload.lr / workload.chunk * (k @ state.T - v).T @ k
+            return x + y + workload.gate * torch.cat(reads)
+
+        deviation, misses = _deviation(_generate(workload), lambda tokens: _oracle_logprobs(tokens, mlp=memory))
+        print(
+            f"memory chunk={chunk}: max logprob gap to FP32 {deviation:.4f} (plain bf16 vLLM {baseline:.4f}), {misses} non-argmax tokens"
+        )
+        assert deviation <= max(2 * baseline, 0.05) and misses <= 2

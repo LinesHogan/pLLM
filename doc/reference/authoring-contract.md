@@ -237,6 +237,7 @@ worker 重新导入并重建，安装时其编译签名必须与驱动端签名�
 | `@train_in_forward` 与 `pllm.model.Adapter` | 两者共用同一组投影钩子 |
 | 带 feed 的状态与其他状态或方法 | feed 的条件输入组只容纳它的写链与读取它的模型 |
 | 同一子层上的两个 `@custom_residual` 方法 | 一个方法拥有一个子层的残差更新 |
+| 状态子层与 `@custom_forward` | 记忆每个 token 前进一次，custom forward 的层访问次数不定 |
 
 ## 定制残差（`@pllm.custom_residual`）
 
@@ -259,6 +260,13 @@ worker 重新导入并重建，安装时其编译签名必须与驱动端签名�
 所以恒等方法与原模型逐位相同。定制残差目前以 eager 运行（`cuda_graphs="auto"` 自动选择 eager），
 需要 `tensor_parallel_size=1`，且要求关闭前缀缓存。它与 `@pllm.custom_forward` 组合：
 custom forward 运行的每一层也经过这些方法。
+
+带 `state=` 与 `chunk=` 的方法是一个**状态子层**（TTT / Titans 风格的快权重记忆）：`state` 是只有一个
+字段（携带量）的 `pllm.RequestState`，方法只作用于一层的一个 attention 或 MLP 位置，每次看到一个请求的
+一个 chunk：`write(x, y, carry=pllm.parameter(state, ...), ...) -> (流, 下一个携带量)`。每行读取它所在
+chunk 开始时的携带量；chunk 的最后一行运行后才应用更新，所以结果不依赖 vLLM 怎样把 prompt 切成步。
+未完成 chunk 的行由框架保存。每行的流应只依赖该行与携带量。状态子层读自己的携带量、实例状态与
+`pllm.depth()`；它不与 `@pllm.custom_forward` 组合（custom forward 可能在一个 token 内多次运行或跳过该层）。
 
 ## 请求 Overlay
 

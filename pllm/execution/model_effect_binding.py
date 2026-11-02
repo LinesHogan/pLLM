@@ -55,6 +55,7 @@ from pllm.execution.tensor_frame import (
     Tensors,
     UpdateOutput,
 )
+from pllm.execution.tensor_program import TaskOutput, TensorBatch
 from pllm.execution.tensor_task import FieldWriter, TensorTask
 from pllm.execution.token_program import ApplyUpdates, Cell, Layers, Over, Segment, TokenProgram, Tokens, TokenTensor
 
@@ -190,6 +191,27 @@ def declare_parameter_overlay(
         lambda name: state.view(name, b.dimensions), reads_weight="weight" in arguments.values()
     )
     b.overlay(views, transition)
+
+
+def declare_site_memory(b: TensorBinding, name: str, state: State) -> None:
+    """A stateful custom residual's transition: before the forward it copies each request's memory into a private
+    write, which the method's hook advances chunk by chunk; the publication makes it visible after the forward."""
+    transition = b.compute(
+        f"{name}.memory",
+        inputs={"memory": state.read()},
+        outputs=("transition",),
+        changes=state,
+        effect=StateEffectKind.TRANSITION_MAYBE,
+        when=When.BEFORE_FORWARD,
+        function=_open_memory,
+        implementations=(native(f"site.memory:{name}@1", "transition/full_root@1"),),
+    )
+    b.publish(transition, state)
+
+
+def _open_memory(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
+    """The private write itself is the transition; the forward's site hook fills it."""
+    return TaskOutput()
 
 
 def write_result(b: TensorBinding, source: Call, state: State, fields: tuple[str, ...], when: When) -> Call:

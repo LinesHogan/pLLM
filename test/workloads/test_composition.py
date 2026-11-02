@@ -162,6 +162,18 @@ class ResidualAgain(pllm.Workload):
         return x + y
 
 
+class Memory(pllm.Workload):
+    """A stateful custom residual: a per-request memory beside layer 0's MLP, advanced chunk by chunk."""
+
+    @property
+    def memory(self) -> pllm.RequestState:
+        return pllm.RequestState({"M": (4, 4)})
+
+    @pllm.custom_residual(site="mlp", layers=(0,), state="memory", chunk=2)
+    def remember(self, x, y, M=pllm.parameter("memory", "M")):
+        return x + y + x @ M.T, M + y.T @ x
+
+
 EFFECTS = {
     effect.__name__: effect
     for effect in (
@@ -180,6 +192,7 @@ EFFECTS = {
         Feed,
         Residual,
         ResidualAgain,
+        Memory,
     )
 }
 CUSTOM_FORWARD_TAPS = "which a @pllm.custom_forward does not produce"
@@ -219,6 +232,9 @@ REJECTED = {
     "Export+Feed": FEED_READERS,
     "Feed+Residual": FEED_STATES,
     "Residual+ResidualAgain": 'layer 2 "mlp" already has a custom residual',
+    "Forward+Memory": "advances its memory once per token",
+    "Positions+Memory": "advances its memory once per token",
+    "Feed+Memory": FEED_STATES,
 }
 CASES = tuple("+".join(names) for count in (1, 2) for names in itertools.combinations(EFFECTS, count))
 

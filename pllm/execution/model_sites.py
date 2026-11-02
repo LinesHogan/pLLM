@@ -16,6 +16,7 @@ import torch
 from pllm.contracts.parameter_overlay import FieldView
 from pllm.contracts.semantic_graph import StateResource
 from pllm.execution.module_graph import ModuleCall
+from pllm.execution.overlay_task import ChunkUpdate
 
 # Where a method applies: one sublayer's residual add (attention or MLP), both of a layer's adds, the value rows
 # attention reads and caches, or the stream entering the model's final norm.
@@ -131,6 +132,8 @@ class ResidualRewrite:
     read: Callable[..., torch.Tensor] | None = None
     read_inputs: tuple[tuple[str, SiteInput], ...] = ()
     streams: int = 1
+    # A stateful method's per-request memory; its write then returns (stream, next carry) for one chunk.
+    memory: SiteMemory | None = None
 
     def depth(self, place: Place) -> int:
         kind, layer = place
@@ -163,6 +166,72 @@ class ResidualRewrite:
                         )
 
 
+@dataclass(frozen=True, slots=True)
+class SiteMemory:
+    """The per-request memory of a stateful custom residual (state= and chunk=): the carry field the method advances
+    chunk by chunk, and the rows of a chunk not yet complete, which the framework keeps.
+
+    Every row reads the carry its chunk started with; a chunk's update applies once its last row has run, so the
+    result does not depend on how vLLM splits prompts into steps. A transition before the forward copies each
+    request's version into a private write; the method's hook advances it; a publication after the forward makes it
+    visible.
+    """
+
+    carry: StateInput
+    # The fields of the unfinished chunk: its streams, branch outputs and length.
+    pending: tuple[FieldView, FieldView, FieldView]
+    chunk: int
+
+    def invariants(self, rewrite: ResidualRewrite) -> tuple[StateInput, ...]:
+        """The instance state the method reads besides its carry, passed to every chunk unchanged."""
+        return tuple(source for _, source in rewrite.inputs if isinstance(source, StateInput) and source != self.carry)
+
+    def update(self, rewrite: ResidualRewrite, place: Place) -> ChunkUpdate:
+        """The chunk recurrence over one request's (stream, branch output) rows."""
+        invariants = self.invariants(rewrite)
+        return ChunkUpdate(
+            MemoryStep(rewrite, place, self, invariants),
+            self.chunk,
+            ("carry", "x", "y"),
+            tuple(f"__invariant_{index}" for index in range(len(invariants))),
+        )
+
+
+@dataclass(frozen=True)
+class MemoryStep:
+    """pllm.scan's step for one chunk: the method's (stream, next carry) as (next carry, stream rows)."""
+
+    rewrite: ResidualRewrite
+    place: Place
+    memory: SiteMemory
+    invariants: tuple[StateInput, ...]
+
+    def __call__(
+        self, carry: torch.Tensor, x: torch.Tensor, y: torch.Tensor, *invariants: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        values = _ChunkValues(self.memory.carry, carry, dict(zip(self.invariants, invariants, strict=True)))
+        stream, updated = self.rewrite.call_write(self.place, values, x, y)
+        return updated, stream
+
+
+@dataclass(frozen=True)
+class _ChunkValues:
+    """A chunk's inputs: the carry it started with and the instance state the method reads."""
+
+    source: StateInput
+    carry: torch.Tensor
+    invariants: dict[StateInput, torch.Tensor]
+
+    def state(self, source: StateInput) -> torch.Tensor:
+        return self.carry if source == self.source else self.invariants[source]
+
+    def earlier(self, source: EarlierInput) -> torch.Tensor:
+        raise AssertionError("stateful custom residuals read no earlier values")
+
+    def patch(self, source: PatchInput, layer: int) -> Callable[[torch.Tensor], torch.Tensor]:
+        raise AssertionError("stateful custom residuals apply no activation patch")
+
+
 class SiteOwners:
     """The rewrites of one workload, keyed by the places they own; two owners of one place are a conflict."""
 
@@ -185,10 +254,17 @@ class SiteOwners:
         self.rewrites.append(rewrite)
         self.owners.update((place, rewrite) for place in rewrite.places)
 
-    def check_streams(self, layer_count: int, custom_forward: bool, reads_streams: bool) -> None:
-        """n > 1 residual streams exist from the embedding to the final norm, so every sublayer and the final stream
-        need an owner, and nothing else may read the one-stream residual. One method declares streams=n; the others
-        see the same n streams."""
+    def check(self, layer_count: int, custom_forward: bool, reads_streams: bool) -> None:
+        """Rewrites the rest of the workload conflicts with. A stateful method advances its memory once per token,
+        which a custom forward's layer visits do not respect. n > 1 residual streams exist from the embedding to the
+        final norm, so every sublayer and the final stream need an owner, and nothing else may read the one-stream
+        residual; one method declares streams=n and the others see the same n streams."""
+        stateful = next((rewrite.name for rewrite in self.rewrites if rewrite.memory is not None), None)
+        if stateful is not None and custom_forward:
+            raise ValueError(
+                f"{stateful} advances its memory once per token, but a @pllm.custom_forward may run its layer several "
+                "times or not at all per token; drop state= or the custom forward"
+            )
         counts = {rewrite.streams for rewrite in self.rewrites if rewrite.streams > 1}
         if not counts:
             return
