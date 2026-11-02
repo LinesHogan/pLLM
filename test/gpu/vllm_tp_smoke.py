@@ -134,7 +134,7 @@ def test_j1_tokens(graphs):
                 for row, (got, want) in enumerate(zip(got_arm, want_arm))
                 if got != want
             ]
-            assert not differences, (workload.name, differences)
+            assert not differences, (type(workload).__name__, differences)
             counters = handle.diagnostics()
             assert counters.active_states == counters.inference_pins == 0
             assert len(handle.trace_snapshots()) == 2
@@ -143,7 +143,7 @@ def test_j1_tokens(graphs):
                 assert len(exports[0]) == len(set(exports[0])) == 126  # Two runs of 63 decode steps.
                 assert exports[1] == []
             print(
-                f"J1 graphs={graphs} workload={workload.name}: greedy/seeded 8x64 bitwise parity; {counters}",
+                f"J1 graphs={graphs} workload={type(workload).__name__}: greedy/seeded 8x64 bitwise parity; {counters}",
                 flush=True,
             )
 
@@ -223,3 +223,49 @@ def test_j2(lag):
                 f"J2 lag={lag} run={run}: rank-equal final fields {digests[0]}; updates={counters.update_count}",
                 flush=True,
             )
+
+
+class Steering(pllm.Workload):
+    """Activation steering (CAA): add an imported vector to layer 12's MLP output on decode rows."""
+
+    steer: pllm.InstanceState = pllm.InstanceState({"vector": pllm.Field(lambda width, _: (width,))}, imported=True)
+    patch: pllm.model.ActivationPatch = pllm.model.ActivationPatch("steer", layers=(12,), operator="add", decode=True)
+
+
+class Observe(pllm.Workload):
+    @pllm.export(max_cols=1)
+    def mean(self, h: torch.Tensor = pllm.hidden(0)) -> torch.Tensor:
+        return h.mean(-1, keepdim=True)
+
+
+def _greedy(settings, workload, batch=None):
+    sampling = SamplingParams(max_tokens=24, temperature=0.0, ignore_eos=True, logprobs=0)
+    with pllm.make_llm(settings, workload=workload) as llm:
+        outputs = llm.generate(PROMPTS, sampling, batch=batch, use_tqdm=False)
+    return [
+        (
+            tuple(o.outputs[0].token_ids),
+            tuple(s[t].logprob for t, s in zip(o.outputs[0].token_ids, o.outputs[0].logprobs)),
+        )
+        for o in outputs
+    ]
+
+
+def test_activation_patch_steers_replicated_streams():
+    """ActivationPatch runs in ModelSites' norm hooks after the MLP all-reduce: a zero vector is the model bitwise, and
+    a steering vector moves TP=2 exactly as far as TP=1 (an edit applied per rank before the reduce would double)."""
+    settings = config(graphs=False)
+    vector = torch.randn(896, generator=torch.Generator().manual_seed(3)) * 4
+    assert _greedy(settings, Steering(), pllm.io.StateImport((torch.zeros(896),))) == _greedy(settings, Observe())
+    steered = _greedy(settings, Steering(), pllm.io.StateImport((vector,)))
+    single = _greedy(replace(settings, tensor_parallel_size=1), Steering(), pllm.io.StateImport((vector,)))
+    assert steered != _greedy(settings, Observe())
+    agreeing, gap = 0, 0.0
+    for (tokens, logprobs), (reference, expected) in zip(steered, single, strict=True):
+        for token, other, value, target in zip(tokens, reference, logprobs, expected):
+            if token != other:
+                break
+            agreeing, gap = agreeing + 1, max(gap, abs(value - target))
+    print(f"TP=2 steering vs TP=1: {agreeing}/{24 * len(PROMPTS)} leading tokens agree, logprob gap {gap:.4f}")
+    # TP=1 and TP=2 reduce in different orders (bf16 logprobs differ by ~0.2); a doubled edit diverges the tokens.
+    assert agreeing >= 0.75 * 24 * len(PROMPTS) and gap < 0.5
