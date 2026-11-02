@@ -24,7 +24,7 @@ from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.scheduler import compile_state_schedule, intern_tensor_layouts
 from pllm.execution.state_execution import MathBinding
 from pllm.execution.tensor_program import FunctionMath
-from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
+from test.dense_update import DenseUpdate, DenseUpdateConfig
 
 
 class StorageObserver(TorchDispatchMode):
@@ -65,7 +65,7 @@ def inplace_plan(device: torch.device, provider: PageBundleProviderFacts, capabi
     facts = testing.backend_facts(
         3, (), timeline, provider, memory_bytes=4096, max_rows=8, targets=(ProjectionShape(target, 3, 2),)
     )
-    workload = InPlaceTTTWorkload(InPlaceTTTConfig((target,), chunk_size=2))
+    workload = DenseUpdate(DenseUpdateConfig((target,), chunk_size=2))
     return workload.plan_backend(*workload.specialize(facts, ExecutionOptions())).plan
 
 

@@ -26,6 +26,7 @@ from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.host_batch import CausalTrainBatch, WeightedCEBatch, WeightedRowBatch, validate_host_batch
 from pllm.contracts.parameter_overlay import (
+    FieldView,
     ParameterOverlayFieldBinding,
     ParameterOverlayOperator,
     Projection,
@@ -53,6 +54,7 @@ from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 from pllm.contracts.visibility import VisibilityKind
 from pllm.execution.binding_base import SGD as SGD, Field as Field, layout_field, overlay_fields
 from pllm.execution.causal_batch import CausalBinder, CausalModel, CausalPort, declare_batch_train
+from pllm.execution.checkpoint import initialize_checkpoint
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import Call, Dimensions, LayoutField, Shape, State, When
 from pllm.execution.freeze import (
@@ -485,8 +487,26 @@ class InstanceState:
     # module initializes them (every request starts from the same values).
     module: ModuleFactory | None = field(default=None, kw_only=True)
     imported: bool = field(default=False, kw_only=True)
+    checkpoint: Mapping[str, str] = field(default_factory=lambda: dict[str, str](), kw_only=True)
+    layers: tuple[int, ...] = field(default=(), kw_only=True)
 
     def __post_init__(self) -> None:
+        if self.checkpoint and (
+            self.scope is not StateScope.INSTANCE
+            or self.optimizer is not None
+            or self.initialize is not None
+            or self.module is not None
+            or self.feed
+            or self.imported
+            or set(self.checkpoint) != set(self.fields)
+        ):
+            raise ValueError("checkpoint state needs an immutable InstanceState with a tensor name for every field")
+        if self.layers and (
+            self.scope is not StateScope.INSTANCE
+            or tuple(sorted(set(self.layers))) != self.layers
+            or self.layers[0] < 0
+        ):
+            raise ValueError("layers needs sorted unique nonnegative indices on an InstanceState")
         if self.feed not in (None, "ordered", "latest"):
             raise ValueError(f'feed={self.feed!r}: use "ordered", "latest" or None')
         if self.module is not None:
@@ -542,12 +562,38 @@ class InstanceState:
             ),
         )
         context.parameters.update({(name, field): port for field, port in ports.items()})
+        if self.checkpoint:
+            context.binding.initializers[name] = partial(
+                initialize_checkpoint, context.binding.checkpoint, self.checkpoint_names()
+            )
         if self.module is not None:
             context.binding.initial_values[name] = partial(initial_values, self.module, dtype=self.dtype)
+
+    def checkpoint_names(self) -> tuple[str, ...]:
+        """Exact checkpoint tensor names, in the same order as the allocated fields."""
+        if not self.checkpoint:
+            return ()
+        return (
+            tuple(
+                pattern.format(layer=layer)
+                for layer in self.layers
+                for pattern in (self.checkpoint[key] for key in self.fields)
+            )
+            if self.layers
+            else tuple(self.checkpoint[key] for key in self.fields)
+        )
 
     def layout_fields(self, name: str, context: _Reflection) -> tuple[LayoutField, ...]:
         """The allocated fields: plain shapes in the state's dtype, or pllm.Field values sized by the hidden width or,
         when a pllm.model.Adapter reads the state, once per adapter target."""
+        if self.layers:
+            if self.layers[-1] >= context.binding.dimensions.layer_count:
+                raise ValueError(f"{name}.layers exceeds the model layer count")
+            return tuple(
+                layout_field(f"{key}_{layer}", value, lambda m: (m.hidden_size, m.hidden_size))
+                for layer in self.layers
+                for key, value in _fields(self, context.binding.dimensions.dtype).items()
+            )
         consumer = next((adapter for adapter in context.adapters.values() if adapter.state == name), None)
         shapes = {key: spec for key, spec in self.fields.items() if not isinstance(spec, Field)}
         if consumer is None and len(shapes) == len(self.fields):
@@ -1024,12 +1070,13 @@ def _chunked_in_forward(
     chunk: int,
     optimizer: SGD | None,
     flush: str | None,
+    invariants: tuple[str, ...],
 ) -> tuple[Callable[..., UpdateOutput], Initializer | None]:
     """Generate pending state before layout interning and bind the existing chunk executor."""
     if initialize is not None:
         initialize = partial(_author_fields, initialize, tuple(fields))
-    arguments = tuple(bindings)
-    sources = tuple(bindings.values())
+    arguments = tuple(key for key in bindings if key not in invariants)
+    sources = tuple(bindings[key] for key in arguments)
     if chunk < 1:
         raise ValueError("@pllm.train_in_forward(chunk=) must be positive")
     if optimizer is None:
@@ -1042,7 +1089,9 @@ def _chunked_in_forward(
             )
             for name, source in zip(arguments[1:], sources[1:], strict=True)
         }
-        update = ChunkUpdate(function, chunk, arguments)
+        if tuple(bindings) != (*arguments, *invariants):
+            raise ValueError("put scan invariant arguments after the weight carry and input/target operands")
+        update = ChunkUpdate(function, chunk, arguments, invariants)
     else:
         if (
             "input" not in sources
@@ -1110,6 +1159,46 @@ class _TrainInForward(_Effect):
             _setting(self.scale, owner, float),
         ).expand(layers)
 
+    def bindings(
+        self, operation: _Operation, fields: Mapping[str, Field], targets: tuple[Projection, ...], optimizer: SGD | None
+    ) -> tuple[dict[str, str], dict[str, tuple[str, tuple[FieldView, ...]]], tuple[str, ...]]:
+        """Resolve carried operands and shared, per-layer invariant views at declaration time."""
+        context = operation.context
+        sources = _arguments(operation.function)
+        invariants: dict[str, tuple[str, tuple[FieldView, ...]]] = {}
+        bindings: dict[str, str] = {}
+        for key, source in sources.items():
+            if isinstance(source, Parameter) and source.state != self.state:
+                declared = context.state_definition(source.state, "scan invariant needs a declared state")
+                if (
+                    declared.scope is not StateScope.INSTANCE
+                    or source.per_row
+                    or self.chunk is None
+                    or optimizer is not None
+                ):
+                    raise ValueError(
+                        "chunk recurrences read other InstanceState fields as invariants; remove per_row and optimizer"
+                    )
+                views = tuple(
+                    context.binding.field_views[
+                        source.state, f"{source.field}_{target.layer}" if declared.layers else source.field
+                    ]
+                    for target in targets
+                )
+                name = f"__invariant_{key}"
+                if name in fields:
+                    raise ValueError("rename fields starting with __invariant_; pllm reserves them")
+                invariants[name] = (source.state, views)
+                bindings[key] = name
+            else:
+                bindings[key] = source.in_forward_binding(self.state, fields)
+        invariant_names = tuple(
+            key
+            for key, source in sources.items()
+            if (isinstance(source, Parameter) and source.state != self.state) or source is Operand.WEIGHT
+        )
+        return bindings, invariants, invariant_names
+
     def declare(self, operation: _Operation) -> None:
         """Declare the request state's in-forward transition and the delta it applies at the target projections."""
         if operation.gradient is not None or operation.rows:
@@ -1133,12 +1222,10 @@ class _TrainInForward(_Effect):
         if self.flush is not None and optimizer is None:
             raise ValueError(f"flush='prompt_end' trains a short final chunk; declare {self.state!r} with an optimizer")
         fields = _fields(definition, context.binding.dimensions.dtype)
-        bindings = {
-            key: source.in_forward_binding(self.state, fields) for key, source in _arguments(operation.function).items()
-        }
+        effect = self.projection_delta(context.owner, context.binding.dimensions.layer_count)
+        bindings, invariants, invariant_names = self.bindings(operation, fields, effect.targets, optimizer)
         if set(fields) & {source.value for source in Operand}:
             raise ValueError("rename the state fields that repeat an operand name (input, target, weight, prompt_end)")
-        effect = self.projection_delta(context.owner, context.binding.dimensions.layer_count)
         identity = fingerprint(operation.function)
         function: Callable[..., UpdateOutput] = freeze(operation.function)
         initialize = _frozen(definition.initialize)
@@ -1152,6 +1239,7 @@ class _TrainInForward(_Effect):
                 _setting(self.chunk, context.owner, int),
                 optimizer,
                 self.flush,
+                invariant_names,
             )
         declare_parameter_overlay(
             context.binding,
@@ -1166,6 +1254,10 @@ class _TrainInForward(_Effect):
             arguments=bindings,
             visibility=_option(self.visibility, context.owner, ("forward_pinned", "exact"), "visibility"),
             equations_digest=boundary_digest(context.signature, context.bindings, self.chunk, self.flush),
+            invariants=invariants,
+            reads=tuple(
+                context.states[name] for name in dict.fromkeys(resource for resource, _ in invariants.values())
+            ),
         )
         context.signature.append(
             (
@@ -1822,10 +1914,17 @@ class _Reflection:
                 function=lambda data, batch: TaskOutput(),
             )
 
+        for name, state in self.state_definitions.items():
+            if state.checkpoint and any(
+                effect.resource == name and effect.kind is not StateEffectKind.READ
+                for task in b.graph.tasks
+                for effect in task.effects
+            ):
+                raise ValueError(f"checkpoint state {name!r} is frozen; write to a separate state")
         frozen = {
             name
             for name, state in self.state_definitions.items()
-            if state.module is not None
+            if (state.module is not None or state.checkpoint)
             and state.optimizer is None
             and not state.imported
             and state.feed is None
@@ -1883,6 +1982,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         )
         b = TensorBinding(type(self).__qualname__, boundary_digest(dimensions, facts.initialization_seed), dimensions)
         b.probe = facts.probe
+        b.checkpoint = facts.checkpoint
         b.causal = causal
         self._declare(b, capabilities=facts.timeline.capabilities)
         # Executable ports retain their dependencies; an unused factory must not pin the decoder.
@@ -1907,8 +2007,19 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         inputs = tuple(source for name in sorted(sources) for source in sources[name])
         sampler = context.sampler
         return BackendRequirements(
-            tuple(dict.fromkeys(source.resolve(context.owner) for source in inputs if isinstance(source, Hidden))),
-            targets,
+            checkpoint_names=tuple(
+                name for state in context.state_definitions.values() for name in state.checkpoint_names()
+            ),
+            exact_decode=any(
+                isinstance(op.effect, _TrainInForward)
+                and _option(op.effect.visibility, context.owner, ("exact", "forward_pinned"), "visibility") == "exact"
+                and _option(op.effect.tokens, context.owner, get_args(Tokens), "tokens") in ("all", "decode")
+                for op in context.operations
+            ),
+            hidden_inputs=tuple(
+                dict.fromkeys(source.resolve(context.owner) for source in inputs if isinstance(source, Hidden))
+            ),
+            parameter_targets=targets,
             activation_layers=tuple(layer for value in context.activations.values() for layer in value.layers),
             sampler_stage=None if sampler is None else sampler.stage,
             sampler_feedback=any(isinstance(source, (BaseLogits, SampledTokens)) for source in inputs),

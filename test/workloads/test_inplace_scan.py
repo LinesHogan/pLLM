@@ -31,7 +31,7 @@ from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.scan import ScanContext, ScanTemplate
 from pllm.execution.scan_analysis import analyze
 from pllm.testing import backend_facts
-from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
+from test.dense_update import DenseUpdate, DenseUpdateConfig
 from test.workloads.test_inplace_ttt import _input
 
 TARGET = Projection("down_proj", 0)
@@ -58,7 +58,7 @@ def test_bound_scan_matches_original_chunk_math_bitwise(device, dtype, numerics)
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("CUDA required")
     device = torch.device(device)
-    workload = InPlaceTTTWorkload(InPlaceTTTConfig((TARGET,), chunk_size=3, learning_rate=0.017, tokens="all"))
+    workload = DenseUpdate(DenseUpdateConfig((TARGET,), chunk_size=3, learning_rate=0.017, tokens="all"))
     facts = facts_for(device, dtype)
     facts = replace(facts, timeline=replace(facts.timeline, tensor_policy=TensorPolicy(numerics)))
     execution = workload.compile_backend(facts).execution
@@ -109,7 +109,7 @@ def test_bound_scan_matches_original_chunk_math_bitwise(device, dtype, numerics)
 
 
 def test_production_tuning_policy_is_signed_into_worker_facts():
-    workload = InPlaceTTTWorkload(InPlaceTTTConfig((TARGET,), chunk_size=3))
+    workload = DenseUpdate(DenseUpdateConfig((TARGET,), chunk_size=3))
     options = pllm.ExecutionOptions(allow_numerical_transforms=False, tuning="measured", memory_budget_bytes=1 << 20)
     facts, _ = workload.specialize(facts_for(torch.device("cpu"), torch.float32), options)
     policy = TensorPolicy(False, "measured")
@@ -149,7 +149,7 @@ def test_scan_matches_the_serial_loop_including_carry_views(device):
     carry = torch.randn(11, 13, device=device, generator=generator) * 0.01
     x = torch.randn(20, 13, device=device, generator=generator)
     y = torch.randn(20, 11, device=device, generator=generator)
-    workload = InPlaceTTTWorkload(InPlaceTTTConfig((TARGET,), chunk_size=4, learning_rate=0.013))
+    workload = DenseUpdate(DenseUpdateConfig((TARGET,), chunk_size=4, learning_rate=0.013))
 
     for kind in ("additive", "nonlinear", "bilinear", "downcast", "random", "alpha"):
 

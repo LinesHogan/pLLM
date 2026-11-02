@@ -78,9 +78,15 @@ def declare_parameter_overlay(
     arguments: Mapping[str, str],
     visibility: VisibilityKind,
     equations_digest: str,
+    invariants: Mapping[str, tuple[str, tuple[FieldView, ...]]],
+    reads: tuple[State, ...],
 ) -> None:
     """Declare a parameter overlay and its request-state transition."""
-    if b.graph.tasks or b.graph.states or b.host:
+    if (
+        b.graph.tasks
+        or any(state.resource not in {read.declaration.resource for read in reads} for state in b.graph.states)
+        or b.host
+    ):
         raise ValueError("ordinary overlay requires a sole request state and model transition")
     layout = overlay_fields(fields, effect, b.dimensions)
     targets = effect.targets
@@ -109,7 +115,9 @@ def declare_parameter_overlay(
             sorted(
                 {
                     index
-                    for row, index in zip(selection.rows, selection.state_indices, strict=True)
+                    for row, index in zip(
+                        selection.rows, selection.for_resource(state.declaration.resource).state_indices, strict=True
+                    )
                     if row.identity in active
                 }
             )
@@ -133,6 +141,8 @@ def declare_parameter_overlay(
         source,
         TaskSymbol(name),
         effect.operator,
+        state.declaration.resource,
+        invariants,
         function if isinstance(function, (ChunkUpdate, GradientUpdate)) else None,
     )
     b.overlay_math = math
@@ -140,6 +150,7 @@ def declare_parameter_overlay(
         name,
         inputs={"operands": b.input("parameter.operands", "dense_pairs", "dense_operand_pairs@1")},
         outputs=("transition",),
+        reads=tuple(read.version() for read in reads),
         changes=state,
         effect=StateEffectKind.TRANSITION_MAYBE,
         when=When.IN_FORWARD,

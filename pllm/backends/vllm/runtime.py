@@ -30,6 +30,7 @@ from pllm.authoring import (
     map_host_batch,
 )
 from pllm.backends.vllm import compat
+from pllm.backends.vllm.checkpoint import CHECKPOINT_ENV
 from pllm.backends.vllm.hidden_taps import TAPS_ENV, HiddenTapAnnouncement, HiddenTapLayout
 from pllm.backends.vllm.overlay_graph import (
     GraphOptions,
@@ -65,6 +66,7 @@ from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import SchedulerTimeline, TaskId
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorFieldSpec
+from pllm.execution.checkpoint import checkpoint_directory
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.host_runtime import CompletionInput
@@ -665,6 +667,8 @@ def _eager_reason(config: ModelConfig, requirements: BackendRequirements) -> str
         return "ModelConfig(cuda_graphs=False)"
     if config.runner == "mrv1":
         return 'runner="mrv1" runs workloads without CUDA graphs'
+    if requirements.exact_decode and config.cuda_graphs == "auto":
+        return "exact train_in_forward decode updates run outside CUDA graphs"
     if requirements.activation_layers:
         return "activation patches run outside CUDA graphs"
     if requirements.custom_forward:
@@ -696,6 +700,7 @@ def create_vllm_llm(
             HiddenTapAnnouncement(requirements.hidden_inputs, config.max_num_seqs, TensorDType(config.dtype))
         ),
         POSITION_ENV: encode_boundary(PositionAnnouncement(requirements.position_states)),
+        CHECKPOINT_ENV: encode_boundary(requirements.checkpoint_names),
     }
     if config.multiprocessing or config.tensor_parallel_size > 1:
         environment["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -709,6 +714,7 @@ def create_vllm_llm(
         config,
         {
             **options,
+            **({"load_format": "pllm"} if requirements.checkpoint_names else {}),
             "worker_cls": _WORKER_CLASS,
             # The supported uni-process, non-speculative decoder enables async by default.
             "async_scheduling": config.runner == "mrv2",
@@ -861,6 +867,9 @@ def probe_backend(
         runner.model_config.seed,
         model.config.vocab_size,
         layer_count,
+        checkpoint_directory(runner.model_config.model, runner.model_config.revision)
+        if requirements.checkpoint_names
+        else "",
     )
     return facts
 

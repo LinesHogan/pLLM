@@ -160,9 +160,9 @@ class _ExactProjection:
             assert self.transition is not None
             residuals = self.transition.run(operands, complete=complete)
         for item, selected in zip(prepared, inputs, strict=True):
-            delta = (residuals[item.source.identity, item.binding.target] * item.binding.scale).to(output.dtype)
+            delta = residuals[item.source.identity, item.binding.target] * item.binding.scale
             columns = output[:, item.offset : item.offset + item.size]
-            columns.index_add_(0, item.rows, delta)
+            columns.index_copy_(0, item.rows, (columns.index_select(0, item.rows) + delta).to(output.dtype))
             self.apply_count += selected.shape[0]
             if item.ref.version_id > 0:
                 self.updated_apply_count += selected.shape[0]
@@ -243,14 +243,22 @@ class ExactParameterOverlay:
         indices = torch.split(table[: len(rows.rows)], [len(source) for source in grouped.values()])
         prompt_ends = table[len(rows.rows) :].bool().unbind()
         requests = tuple(
-            (source[0], context.selection.ref_for(identity), index, prompt_end)
-            for ((identity, _), source), index, prompt_end in zip(grouped.items(), indices, prompt_ends, strict=True)
+            (source[0], index, prompt_end)
+            for (_, source), index, prompt_end in zip(grouped.items(), indices, prompt_ends, strict=True)
         )
         for handle in self._modules:
             handle.transition = transition
             handle.prepared = tuple(
-                _PreparedRows(source, ref, index, binding, offset, size, prompt_end)
-                for source, ref, index, prompt_end in requests
+                _PreparedRows(
+                    source,
+                    context.selection.ref_for(source.identity, StateResource(binding.resource)),
+                    index,
+                    binding,
+                    offset,
+                    size,
+                    prompt_end,
+                )
+                for source, index, prompt_end in requests
                 for binding, offset, size in handle.bindings
             )
             handle.total_rows = rows.total_rows

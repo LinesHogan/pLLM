@@ -21,6 +21,7 @@ class BackendCompileFacts:
     initialization_seed: int
     vocab_size: int = 0
     layer_count: int = 0
+    checkpoint: str = ""
 
     @property
     def device(self) -> torch.device:

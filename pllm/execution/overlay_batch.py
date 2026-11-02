@@ -66,10 +66,11 @@ class OverlayBatch:
         pools = tuple(pool for pool, _ in fields)
         slots = np.array(tuple(slots for _, slots in fields))
         train = operands[0].phase in self.math.phases
+        invariants = self.math.invariant_values(target, batch)
         for rows, members in groups.items():
             for start in range(0, len(members), self.states):
                 selected = members[start : start + self.states]
-                tile = self.tile(target, train, rows, pools, operands[selected[0]], len(selected))
+                tile = self.tile(target, train, rows, pools, operands[selected[0]], len(selected), invariants)
                 items = tuple(operands[i] for i in selected)
                 if not tile.batchable:
                     values, counts = self.math.serial(items, target, tuple(indices[i] for i in selected), batch)
@@ -87,16 +88,18 @@ class OverlayBatch:
         pools: tuple[torch.Tensor, ...],
         operand: ProjectionOperands,
         count: int,
+        invariants: Tensors,
     ) -> OverlayTile:
         key = target, train, rows
         bounded = self.budget is not None and self.budget.resident_bytes > 0 and rows in self.capacities()
         capture = bounded and pools[0].is_cuda
         tile = self.tiles.get(key)
         if tile is not None:
+            tile.invariants = invariants
             if tile.capture is not None and self.budget is not None:
                 tile.capture.budget = replace(self.budget, resident_bytes=self.available(key))
             return tile
-        tile = OverlayTile(self.math, pools, operand, self.states if bounded else count, rows, train)
+        tile = OverlayTile(self.math, pools, operand, self.states if bounded else count, rows, train, invariants)
         self.batchable |= tile.batchable
         if capture and key not in self.tiles and self.budget is not None:
             remaining = self.available(key)
@@ -132,8 +135,10 @@ class OverlayTile:
         states: int,
         rows: int,
         train: bool,
+        invariants: Tensors,
     ) -> None:
         self.math, self.pools, self.train = math, pools, train
+        self.invariants = invariants
         self.prompt_end = operand.prompt_end.new_zeros((states,))
         self.table = torch.zeros((2 * len(pools) + 1, states), device=pools[0].device, dtype=torch.int64)
         self.hidden = operand.hidden.new_zeros((states, rows, operand.hidden.shape[1]))
@@ -173,7 +178,14 @@ class OverlayTile:
         return sum(value.untyped_storage().nbytes() for value in (self.table, *self.buffers))
 
     def arguments(self, values: Tensors, hidden: torch.Tensor, desired: torch.Tensor, base: torch.Tensor) -> Tensors:
-        inputs = {**values, "input": hidden, "target": desired, "weight": base, "prompt_end": self.prompt_end}
+        inputs = {
+            **values,
+            **self.invariants,
+            "input": hidden,
+            "target": desired,
+            "weight": base,
+            "prompt_end": self.prompt_end,
+        }
         return {key: inputs[source] for key, source in self.math.arguments.items()}
 
     def one(
@@ -256,7 +268,11 @@ class OverlayTile:
                 partial(self.body, base),
                 self.table,
                 self.table[width : 2 * width],
-                (*tuple(pool.data_ptr() for pool in pools), base.data_ptr()),
+                (
+                    *tuple(pool.data_ptr() for pool in pools),
+                    base.data_ptr(),
+                    *(value.data_ptr() for value in self.invariants.values()),
+                ),
                 partial(self.staging.copy_to, self.table),
                 self.buffers,
             )

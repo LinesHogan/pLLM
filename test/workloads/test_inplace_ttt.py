@@ -27,8 +27,8 @@ from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.step_input import StepInput
 from pllm.testing import backend_facts
-from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
 from test.backend_facts import assert_finite_resources
+from test.dense_update import DenseUpdate, DenseUpdateConfig
 
 
 def _input(operands: tuple[ProjectionOperands, ...]) -> StepInput:
@@ -42,8 +42,8 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     _check_exact_projection_lifecycle()
     _check_exact_additive_projection()
     targets = tuple(Projection("down_proj", layer) for layer in (0, 1))
-    config = InPlaceTTTConfig(targets, chunk_size=2, learning_rate=0.3)
-    workload = InPlaceTTTWorkload(config, dtype=torch.float64)
+    config = DenseUpdateConfig(targets, chunk_size=2, learning_rate=0.3)
+    workload = DenseUpdate(config, dtype=torch.float64)
     facts = backend_facts(
         3,
         (),
@@ -63,7 +63,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     pllm.train_in_forward(state="dense_fast_weights", targets=targets, visibility="exact")
     declaration = workload.build(facts).graph
     assert next(task.visibility for task in declaration.tasks if task.visibility is not None) == visibility
-    changed = InPlaceTTTWorkload(replace(config, chunk_size=3)).build(facts).graph
+    changed = DenseUpdate(replace(config, chunk_size=3)).build(facts).graph
     changed_visibility = next(task.visibility for task in changed.tasks if task.visibility is not None)
     assert changed_visibility.equations_digest != visibility.equations_digest
     identities = (RequestIdentity("same", 0, 0), RequestIdentity("same", 0, 1))
@@ -465,7 +465,7 @@ def _check_exact_additive_projection():
     from pllm.execution.overlay_task import ProjectionTask
 
     targets = tuple(Projection("down_proj", layer) for layer in (0, 1))
-    workload = InPlaceTTTWorkload(InPlaceTTTConfig(targets, chunk_size=2, learning_rate=0.01, visibility="exact"))
+    workload = DenseUpdate(DenseUpdateConfig(targets, chunk_size=2, learning_rate=0.01, visibility="exact"))
     facts = backend_facts(
         1,
         (),

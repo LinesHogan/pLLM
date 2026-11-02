@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Generic, TypeVar
 
 from pllm.config import ExecutionOptions
@@ -60,6 +60,8 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class BackendRequirements:
+    checkpoint_names: tuple[str, ...] = field(default=(), kw_only=True)
+    exact_decode: bool = field(default=False, kw_only=True)
     hidden_inputs: tuple[HiddenInputSource, ...] = ()
     parameter_targets: tuple[Projection, ...] = ()
     activation_layers: tuple[int, ...] = ()

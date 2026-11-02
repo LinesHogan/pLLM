@@ -1,0 +1,16 @@
+"""The safetensors reader methods used to initialize checkpoint fields."""
+
+from os import PathLike
+from types import TracebackType
+from typing import Self
+
+import torch
+
+class safe_open:
+    def __init__(self, filename: str | PathLike[str], framework: str, device: str = "cpu") -> None: ...
+    def __enter__(self) -> Self: ...
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, traceback: TracebackType | None
+    ) -> None: ...
+    def keys(self) -> list[str]: ...
+    def get_tensor(self, name: str) -> torch.Tensor: ...

@@ -30,7 +30,7 @@ from pllm.contracts.request_state import RequestStateKey
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.scan_execution import PreparedScan
 from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
-from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
+from test.dense_update import DenseUpdate, DenseUpdateConfig
 
 TARGET = Projection("down_proj", 0)
 PROMPTS = ["The sky is", "Water freezes at"]
@@ -345,6 +345,71 @@ def _check_routed(handle: VllmLlm[object, object]) -> tuple[str, ...]:
     return outputs
 
 
+def checkpoint_ttt() -> None:
+    """A tiny learned checkpoint exercises loading, exact decode, mixed requests and fresh state."""
+    from tempfile import TemporaryDirectory
+
+    from safetensors.torch import load_file, save_file
+    from transformers import AutoTokenizer, Qwen3Config, Qwen3ForCausalLM
+
+    from pllm.workloads.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
+
+    with TemporaryDirectory(prefix="pllm-ttt-") as directory:
+        config = Qwen3Config(
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=64,
+            vocab_size=151936,
+            tie_word_embeddings=True,
+            ttt_mode=True,
+            ttt_layers=[0, 1],
+            ttt_chunk=4,
+            ttt_lr=0.01,
+            ttt_target="hidden_states",
+            ttt_proj=True,
+        )
+        torch.manual_seed(41)
+        Qwen3ForCausalLM(config).to(torch.bfloat16).save_pretrained(directory)
+        AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct").save_pretrained(directory)
+        weights = load_file(str(Path(directory) / "model.safetensors"))
+        weights.update(
+            {
+                f"model.layers.{layer}.mlp.ttt_{name}.weight": torch.randn(shape, dtype=torch.bfloat16) * 0.01
+                for layer in (0, 1)
+                for name, shape in (("conv", (128, 1, 5)), ("proj", (128, 128)))
+            }
+        )
+        save_file(weights, str(Path(directory) / "model.safetensors"))
+        del weights
+        for dtype in (torch.float32, torch.bfloat16):
+            workload = InPlaceTTTWorkload(InPlaceTTTConfig.from_checkpoint(directory), dtype=dtype)
+            with (
+                patch("pllm.backends.vllm.runtime.LLM", partial(LLM, kv_cache_memory_bytes=32 << 20)),
+                pllm.make_llm(
+                    ModelConfig(
+                        directory,
+                        max_num_seqs=2,
+                        max_model_len=32,
+                        max_num_batched_tokens=32,
+                        execution=pllm.ExecutionOptions(allow_numerical_transforms=False),
+                    ),
+                    workload=workload,
+                ) as handle,
+            ):
+                prompts = [{"prompt_token_ids": [100, 101, 102]}, {"prompt_token_ids": [103] * 8}]
+                sampling = SamplingParams(temperature=0, max_tokens=3, ignore_eos=True)
+                first = handle.generate(prompts, sampling)
+                second = handle.generate(prompts, sampling)
+                assert texts(first) == texts(second)
+                diagnostics = handle.diagnostics()
+                assert diagnostics.update_count == 12 and diagnostics.trained_rows == 48
+                assert diagnostics.active_states == 1 and diagnostics.pending_state_releases == 0
+                assert "exact" in diagnostics.eager_reason
+
+
 def main() -> int:
     from pllm.workloads.prefill_adapters import PrefillAdaptersWorkload
 
@@ -360,7 +425,7 @@ def main() -> int:
             assert diagnostics.trained_rows == 5 * sum(len(output.prompt_token_ids) for output in outputs)
             assert diagnostics.active_states == diagnostics.pending_state_releases == 0
     assert adapter_tokens[0] == adapter_tokens[1]
-    dense = InPlaceTTTWorkload(InPlaceTTTConfig((TARGET,), chunk_size=1, learning_rate=1e-4, tokens="prefill"))
+    dense = DenseUpdate(DenseUpdateConfig((TARGET,), chunk_size=1, learning_rate=1e-4, tokens="prefill"))
     headwise = GatedDeltaWorkload(GatedDeltaConfig((Projection("q_proj", 0),), chunk_size=64))
     scenarios = (
         (
@@ -592,5 +657,6 @@ def preemption_replays():
 
 
 if __name__ == "__main__":
+    checkpoint_ttt()
     preemption_replays()
     raise SystemExit(main())

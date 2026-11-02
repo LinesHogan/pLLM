@@ -30,15 +30,15 @@ from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
 from pllm.workloads.esamp import ESampConfig, ESampWorkload
-from pllm.workloads.inplace_ttt import (
-    InPlaceTTTConfig,
-    InPlaceTTTWorkload,
+from test.dense_update import (
+    DenseUpdate,
+    DenseUpdateConfig,
 )
 
 
 def overlay_facts():
     target = Projection("down_proj", 0)
-    workload = InPlaceTTTWorkload(InPlaceTTTConfig((target,), chunk_size=2))
+    workload = DenseUpdate(DenseUpdateConfig((target,), chunk_size=2))
     probe = ModelProbe(
         "c" * 64,
         AttachmentGraphMode.EAGER,

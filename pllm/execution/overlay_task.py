@@ -15,6 +15,7 @@ import torch
 
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
+    FieldView,
     ParameterOverlayOperator,
     Projection,
     ProjectionDelta,
@@ -22,7 +23,7 @@ from pllm.contracts.parameter_overlay import (
 )
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import PackedSamplerRowBatch
-from pllm.contracts.semantic_graph import TaskId, TaskSymbol
+from pllm.contracts.semantic_graph import StateResource, TaskId, TaskSymbol
 from pllm.contracts.visibility import VisibilitySource
 from pllm.execution.cuda_stream import upload
 from pllm.execution.parameter_projection import parameter_correction
@@ -75,6 +76,7 @@ class ChunkUpdate:
     step: Step
     chunk: int
     arguments: tuple[str, ...]
+    invariants: tuple[str, ...] = ()
 
     def __call__(self, **values: torch.Tensor) -> UpdateOutput:
         plan = self.prepare(values)
@@ -91,7 +93,14 @@ class ChunkUpdate:
             )
             for name in columns
         )
-        return prepare_scan(self.step, values[carry], over, self.chunk, valid_rows=values["_pending_length"])
+        return prepare_scan(
+            self.step,
+            values[carry],
+            over,
+            self.chunk,
+            tuple(values[name] for name in self.invariants),
+            valid_rows=values["_pending_length"],
+        )
 
     def counted(self, plan: PreparedScan, count: torch.Tensor, values: Tensors) -> UpdateOutput:
         """Advance complete chunks only; padded requests and rows contribute no updates."""
@@ -103,7 +112,9 @@ class ChunkUpdate:
         valid = length + count
         positions = torch.arange(len(rows[0]), device=length.device) + length
         trained = valid // self.chunk * self.chunk
-        updated, outputs = execute_scan(plan, values[carry], joined, (), trained)
+        updated, outputs = execute_scan(
+            plan, values[carry], joined, tuple(values[name] for name in self.invariants), trained
+        )
         values[carry].copy_(updated)
         remaining = save_tail(tails, joined, length, valid, trained)
         return UpdateOutput(
@@ -306,10 +317,20 @@ class OverlayTransition:
     visibility: VisibilitySource
     task: TaskSymbol
     operator: ParameterOverlayOperator
+    resource: StateResource
+    invariants: Mapping[str, tuple[str, tuple[FieldView, ...]]]
     chunk: ChunkUpdate | GradientUpdate | None = None
     executor: OverlayBatch | None = None
 
+    def invariant_values(self, target: int, batch: TensorBatch) -> Tensors:
+        """Borrow each shared field at this projection's layer without request copies."""
+        return {
+            name: views[target].read(batch.parameter_root(resource)[views[target].field])
+            for name, (resource, views) in self.invariants.items()
+        }
+
     def __call__(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
+        batch = batch.for_resource(self.resource)
         operands = {
             (operand.identity, operand.target): operand
             for operand in data.step.operands
@@ -391,8 +412,9 @@ class OverlayTransition:
         pools = tuple(pool for pool, _ in fields)
         slots = upload(tuple(tuple(slots[i] for i in indices) for _, slots in fields), pools[0].device)
         values = tuple(pool.index_select(0, row) for pool, row in zip(pools, slots, strict=True))
+        invariants = self.invariant_values(target, batch)
         results = tuple(
-            self.result(operand, dict(zip(self.buffers, (value[i] for value in values), strict=True)))
+            self.result(operand, {**dict(zip(self.buffers, (value[i] for value in values), strict=True)), **invariants})
             for i, operand in enumerate(operands)
         )
         if operands[0].phase in self.phases:
@@ -475,7 +497,8 @@ class ProgramOverlay:
         entry: TensorBatch,
         data: TensorFrame,
     ) -> None:
-        self.math, self.batch, self.entry, self.data = math, batch, entry, data
+        self.math, self.data = math, data
+        self.batch, self.entry = batch.for_resource(math.resource), entry.for_resource(math.resource)
         self.entry_fields: tuple[torch.Tensor, ...] = ()
         self.fields: tuple[torch.Tensor, ...] = ()
         self.saved: tuple[torch.Tensor, ...] = ()
@@ -513,13 +536,16 @@ class ProgramOverlay:
     def values(self, target: Projection, private: bool) -> Tensors:
         width = len(self.math.buffers)
         start = self.math.targets.index(target) * width
-        return dict(
-            zip(
-                self.math.buffers,
-                (self.fields if private else self.entry_fields)[start : start + width],
-                strict=True,
-            )
-        )
+        return {
+            **self.math.invariant_values(self.math.targets.index(target), self.batch),
+            **dict(
+                zip(
+                    self.math.buffers,
+                    (self.fields if private else self.entry_fields)[start : start + width],
+                    strict=True,
+                )
+            ),
+        }
 
     def run(
         self, operands: tuple[ProjectionOperands, ...]

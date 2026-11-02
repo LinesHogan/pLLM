@@ -114,6 +114,7 @@ class TensorBinding(Builder[TensorFrame]):
         super().__init__(name, digest, dimensions)
         self.dimensions = dimensions
         self.host = host
+        self.checkpoint = ""
         self.feeds: tuple[FeedBinding, ...] = ()
         self.tensor_tasks: dict[TaskSymbol, TensorTask] = {}
         self.initializers: dict[str, Callable[[tuple[torch.Tensor, ...], torch.Generator], None]] = {}

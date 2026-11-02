@@ -27,6 +27,7 @@ from pllm.authoring import (
     ResultT,
 )
 from pllm.backends.vllm.architecture import Decoder
+from pllm.backends.vllm.checkpoint import CheckpointLoader as CheckpointLoader
 from pllm.backends.vllm.hidden_taps import (
     TAPS_ENV,
     HiddenTapAnnouncement,
