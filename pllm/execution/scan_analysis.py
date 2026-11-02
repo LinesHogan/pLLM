@@ -3,6 +3,7 @@
 import operator
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Literal
 
 import torch
@@ -436,8 +437,8 @@ class _Extract:
         return ScanAnalysis(kind, GraphModule(self.source, self.graph), GraphModule(self.source, read), scale=scale)
 
 
-def analyze(step: Callable[..., tuple[torch.Tensor, torch.Tensor]], specs: Specs) -> ScanAnalysis | None:
-    """Trace shape-only inputs, reject effects, and normalize the returned carry map."""
+def functional_graph(step: Callable[..., tuple[torch.Tensor, torch.Tensor]], specs: Specs) -> GraphModule | None:
+    """Trace shape-only inputs and reject effects before removing unused computations."""
     with disable_current_modes(), torch.inference_mode(False), FakeTensorMode(allow_non_fake_inputs=True):
         samples = tuple(
             torch.empty_strided(shape, stride, dtype=dtype, device=device) for shape, stride, dtype, device in specs
@@ -454,4 +455,61 @@ def analyze(step: Callable[..., tuple[torch.Tensor, torch.Tensor]], specs: Specs
                     or torch.Tag.nondeterministic_seeded in target.tags
                 ):  # pyright: ignore[reportPrivateUsage]
                     return None
-        return _Extract(source, samples[0]).run()
+        return source
+
+
+def analyze(step: Callable[..., tuple[torch.Tensor, torch.Tensor]], specs: Specs) -> ScanAnalysis | None:
+    """Normalize the returned carry map of a deterministic functional step."""
+    source = functional_graph(step, specs)
+    if source is None:
+        return None
+    carry = next(node for node in source.graph.nodes if node.op == "placeholder")
+    return _Extract(source, carry.meta["val"]).run()
+
+
+@lru_cache(maxsize=128)
+def chunk_readout(
+    step: Callable[..., tuple[torch.Tensor, torch.Tensor]], specs: Specs
+) -> Callable[..., torch.Tensor] | None:
+    """Keep the exact readout arithmetic and shapes while dropping unused carry updates."""
+    source = functional_graph(step, specs)
+    if source is None:
+        return None
+    output = next(node for node in source.graph.nodes if node.op == "output")
+    match output.args[0]:
+        case (Node(), Node() as readout):
+            output.args = (readout,)
+        case _:
+            return None
+    source.graph.eliminate_dead_code()
+    source.recompile()
+    return prepare_readout(source) if specs[0][3].type == "cuda" else source
+
+
+def prepare_readout(source: GraphModule) -> Callable[..., torch.Tensor]:
+    """Fuse casts and pointwise projection arithmetic without changing BLAS reductions."""
+    supported = (
+        torch.ops.aten.mm.default,
+        torch.ops.aten.permute.default,
+        torch.ops.aten.t.default,
+        torch.ops.aten.transpose.int,
+        torch.ops.aten._to_copy.default,
+        torch.ops.aten.add.Tensor,
+        torch.ops.aten.sub.Tensor,
+    )
+    if any(
+        node.op == "call_function" and (node.target not in supported or node.kwargs.get("alpha", 1) != 1)
+        for node in source.graph.nodes
+    ):
+        return source
+    return torch.compile(  # pyright: ignore[reportUnknownMemberType]
+        source,
+        fullgraph=True,
+        dynamic=False,
+        options={
+            "triton.cudagraphs": False,
+            "emulate_precision_casts": True,
+            "epilogue_fusion": False,
+            "max_autotune_gemm_backends": "ATEN",
+        },
+    )

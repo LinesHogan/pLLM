@@ -434,6 +434,9 @@ class TensorOperation(Generic[D]):
     publish: bool = False
     version: Literal["input", "private", "published"] = "input"
     copy_fields: tuple[LayoutFieldId, ...] | None = None
+    select_fields: (
+        Callable[[D, RequestStateSelection, tuple[int, ...]], tuple[tuple[LayoutFieldId, ...], ...]] | None
+    ) = None
     capture_resident: Callable[[int], int] = _no_resident
 
     def input_shapes(
@@ -478,7 +481,12 @@ class TensorOperation(Generic[D]):
             write: PageWrite | None = None
             if self.mode == "transition" and selected:
                 if self.version == "input" or context.sole_write() is None:
-                    write = context.prepare_owned_write(context.pin.refs.take(selected), copy_fields=self.copy_fields)
+                    fields = (
+                        None if self.select_fields is None else self.select_fields(data, context.selection, selected)
+                    )
+                    write = context.prepare_owned_write(
+                        context.pin.refs.take(selected), fields=fields, copy_fields=self.copy_fields
+                    )
                 batch = read_batch(context, "private")
             output = self.body(data, batch, context)
             if output.gradient_indices:

@@ -110,7 +110,11 @@ def declare_parameter_overlay(
     apply = partial(overlay_apply, effect)
 
     def select(data: TensorFrame, selection: RequestStateSelection) -> tuple[int, ...]:
-        active = {operand.identity for operand in data.step.operands if operand.phase in phases}
+        active = (
+            {row.identity for row in data.step.rows.rows if row.phase in phases}
+            if visibility == "exact"
+            else {operand.identity for operand in data.step.operands if operand.phase in phases}
+        )
         return tuple(
             sorted(
                 {
@@ -163,7 +167,9 @@ def declare_parameter_overlay(
     )
     _bind_visibility(b, transition, source)
     if visibility == "exact":
-        b.operations[transition.symbol] = replace(b.operations[transition.symbol], version="private")
+        b.operations[transition.symbol] = replace(
+            b.operations[transition.symbol], version="private", select_fields=math.written_fields
+        )
     publication = b.publish(
         transition,
         state,

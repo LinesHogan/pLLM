@@ -61,6 +61,7 @@ def attachment_buffer_bytes(
         for field in layout.layout.fields
     }
     buffers = 1024 if attachment.overlay_bindings else 0
+    projection_operands: list[int] = []
     pinned = uses_pinned_projection(
         in_forward=graph.updates_in_forward, graphs=probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH
     )
@@ -71,8 +72,14 @@ def attachment_buffer_bytes(
         first = binding.fields[0].shape
         if binding.operator is ParameterOverlayOperator.DENSE_ADD:
             outputs, inputs = first
-            # Owned hidden/MLP snapshots survive forward; base weights are borrowed.
-            buffers += rows * (width * (inputs + hidden + outputs) + 8)
+            operands = rows * (width * (inputs + hidden) + 8)
+            buffers += rows * width * outputs
+            if pinned or graph.custom_forward_task is not None:
+                buffers += operands
+            else:
+                # Exact projections consume each layer's operands immediately.
+                # The context retains the previous segment until the next replaces it.
+                projection_operands.append(operands)
         elif binding.operator is ParameterOverlayOperator.HEAD_ADD:
             heads, width_per_head, _ = first
             inputs = outputs = heads * width_per_head
@@ -104,7 +111,7 @@ def attachment_buffer_bytes(
                     )
             case None:
                 pass
-    return buffers
+    return buffers + sum(sorted(projection_operands, reverse=True)[:2])
 
 
 def derive_attachment_resources(

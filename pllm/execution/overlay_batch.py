@@ -34,7 +34,7 @@ class OverlayBatch:
         self.math, self.budget = math, budget
         if budget is not None:
             self.states = min(self.states, budget.input_shapes[0][0])
-        self.tiles: dict[tuple[int, bool, int], OverlayTile | None] = {}
+        self.tiles: dict[tuple[int, bool, int], OverlayTile] = {}
         self.batchable = False
 
     def resident(self, capture_bytes: int) -> int:
@@ -59,13 +59,17 @@ class OverlayBatch:
         for i, operand in enumerate(operands):
             rows = len(operand.hidden)
             groups[next((size for size in self.capacities() if rows <= size), rows)].append(i)
+        train = operands[0].phase in self.math.phases
+        keys = tuple((target, train, rows) for rows in groups)
+        tile = self.tiles.get(keys[0]) if len(keys) == 1 else None
+        if tile is not None and not tile.batchable:
+            return self.math.serial(operands, target, indices, batch, plan=tile.plan)
         results: dict[int, UpdateOutput] = {}
         counters: list[torch.Tensor] = []
         width = len(self.math.buffers)
         fields = tuple(batch.field_slots(target * width + i) for i in range(width))
         pools = tuple(pool for pool, _ in fields)
         slots = np.array(tuple(slots for _, slots in fields))
-        train = operands[0].phase in self.math.phases
         invariants = self.math.invariant_values(target, batch)
         for rows, members in groups.items():
             for start in range(0, len(members), self.states):
@@ -73,7 +77,9 @@ class OverlayBatch:
                 tile = self.tile(target, train, rows, pools, operands[selected[0]], len(selected), invariants)
                 items = tuple(operands[i] for i in selected)
                 if not tile.batchable:
-                    values, counts = self.math.serial(items, target, tuple(indices[i] for i in selected), batch)
+                    values, counts = self.math.serial(
+                        items, target, tuple(indices[i] for i in selected), batch, plan=tile.plan
+                    )
                 else:
                     values, counts = tile.run(items, slots[:, [indices[i] for i in selected]], pools, batch.stream)
                 results.update(zip(selected, values, strict=True))
@@ -93,25 +99,26 @@ class OverlayBatch:
         key = target, train, rows
         bounded = self.budget is not None and self.budget.resident_bytes > 0 and rows in self.capacities()
         capture = bounded and pools[0].is_cuda
-        tile = self.tiles.get(key)
-        if tile is not None:
+        if key in self.tiles:
+            tile = self.tiles[key]
             tile.invariants = invariants
             if tile.capture is not None and self.budget is not None:
                 tile.capture.budget = replace(self.budget, resident_bytes=self.available(key))
             return tile
         tile = OverlayTile(self.math, pools, operand, self.states if bounded else count, rows, train, invariants)
-        self.batchable |= tile.batchable
-        if capture and key not in self.tiles and self.budget is not None:
+        if not tile.batchable:
+            self.tiles[key] = tile
+            return tile
+        self.batchable = True
+        if capture and self.budget is not None:
             remaining = self.available(key)
-            if tile.batchable:
-                with FakeTensorMode(allow_non_fake_inputs=True):
-                    capture_bytes = measure(partial(tile.body, operand.base_weight)).capture
-                needed = capture_bytes + tile.buffer_bytes
-                if needed <= remaining:
-                    tile.capture = StepCapture(replace(self.budget, resident_bytes=remaining), self.states)
-                    self.tiles[key] = tile
-                else:
-                    self.tiles[key] = None
+            with FakeTensorMode(allow_non_fake_inputs=True):
+                capture_bytes = measure(partial(tile.body, operand.base_weight)).capture
+            needed = capture_bytes + tile.buffer_bytes
+            if needed <= remaining:
+                tile.capture = StepCapture(replace(self.budget, resident_bytes=remaining), self.states)
+                self.tiles[key] = tile
+
         return tile
 
     def available(self, key: tuple[int, bool, int]) -> int:
@@ -120,7 +127,7 @@ class OverlayBatch:
         return self.budget.resident_bytes - sum(
             tile.capture.resident_bytes
             for shape, tile in self.tiles.items()
-            if shape != key and tile is not None and tile.capture is not None
+            if shape != key and tile.capture is not None
         )
 
 
@@ -139,6 +146,19 @@ class OverlayTile:
     ) -> None:
         self.math, self.pools, self.train = math, pools, train
         self.invariants = invariants
+        chunk = math.chunk
+        assert chunk is not None
+        values = dict(zip(math.buffers, (pool[0] for pool in pools), strict=True))
+        self.plan = (
+            chunk.prepare(
+                self.arguments(values, operand.hidden, operand.desired, operand.base_weight, operand.prompt_end)
+            )
+            if train
+            else None
+        )
+        # Serial execution retains its prepared plan without padded tensor capacity.
+        if not self.batchable:
+            states = rows = 0
         self.prompt_end = operand.prompt_end.new_zeros((states,))
         self.table = torch.zeros((2 * len(pools) + 1, states), device=pools[0].device, dtype=torch.int64)
         self.hidden = operand.hidden.new_zeros((states, rows, operand.hidden.shape[1]))
@@ -147,14 +167,6 @@ class OverlayTile:
         self.staging = PinnedStaging()
         self.capture: StepCapture | None = None
         self.output: tuple[torch.Tensor, ...] = ()
-        chunk = math.chunk
-        assert chunk is not None
-        values = dict(zip(math.buffers, (pool[0] for pool in pools), strict=True))
-        self.plan = (
-            chunk.prepare(self.arguments(values, operand.hidden, operand.desired, operand.base_weight))
-            if train
-            else None
-        )
 
     @property
     def batchable(self) -> bool:
@@ -177,14 +189,16 @@ class OverlayTile:
     def buffer_bytes(self) -> int:
         return sum(value.untyped_storage().nbytes() for value in (self.table, *self.buffers))
 
-    def arguments(self, values: Tensors, hidden: torch.Tensor, desired: torch.Tensor, base: torch.Tensor) -> Tensors:
+    def arguments(
+        self, values: Tensors, hidden: torch.Tensor, desired: torch.Tensor, base: torch.Tensor, prompt_end: torch.Tensor
+    ) -> Tensors:
         inputs = {
             **values,
             **self.invariants,
             "input": hidden,
             "target": desired,
             "weight": base,
-            "prompt_end": self.prompt_end,
+            "prompt_end": prompt_end,
         }
         return {key: inputs[source] for key, source in self.math.arguments.items()}
 
@@ -195,7 +209,7 @@ class OverlayTile:
         assert chunk is not None
         if self.train:
             assert isinstance(chunk, ChunkUpdate) and self.plan is not None
-            result = chunk.counted(self.plan, count, self.arguments(values, hidden, desired, base))
+            result = chunk.counted(self.plan, count, self.arguments(values, hidden, desired, base, self.prompt_end))
         else:
             result = UpdateOutput.unchanged(self.math.apply(hidden, values))
         return values, result.output, result.changed, result.update_count, result.trained_rows
@@ -211,7 +225,9 @@ class OverlayTile:
             values["_pending_length"].masked_fill_(self.table[width] < 0, 0)
         chunk = self.math.chunk
         if self.train and isinstance(chunk, GradientUpdate):
-            result = chunk.counted(None, self.table[-1], self.arguments(values, self.hidden, self.desired, base))
+            result = chunk.counted(
+                None, self.table[-1], self.arguments(values, self.hidden, self.desired, base, self.prompt_end)
+            )
             fields, output, changed, updates, trained = (
                 values,
                 result.output,

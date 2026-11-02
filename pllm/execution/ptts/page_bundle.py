@@ -655,7 +655,7 @@ class PageBundleArena:
                 else:
                     origin = write.sources[index].slots[rows, field].tolist()
                     pairs = upload([origin, destination], self.device)
-                    pool.index_copy_(0, pairs[1], pool.index_select(0, pairs[0]))
+                    target.table.pools.copy_from(field, pool, pairs[0], pairs[1])
 
     def write_field(self, token: PageWrite, root_index: int, field: LayoutFieldId) -> torch.Tensor:
         (root,) = self._held_fields(token, token.after_refs.take((root_index,)), (field,))
@@ -833,10 +833,19 @@ class PageBundleArena:
         return descriptor, RemoteCompletion(connection, encode_boundary(descriptor).encode())
 
     def snapshot(self, pin: PagePin, ref: StateRef) -> tuple[torch.Tensor, ...]:
+        """Clone a pinned version and make the owned copies ready on the caller's stream."""
         ((root, _),) = self._held_roots((pin,), StateRefs.of((ref,)))
         pools = self._pools[root.resource]
         with self._scope(pin.stream):
-            return tuple(pools.tensor(field, page).detach().clone() for field, page in enumerate(root.pages))
+            copies = tuple(pools.tensor(field, page).detach().clone() for field, page in enumerate(root.pages))
+        if self.device.type == "cuda":
+            assert pin.stream is not None
+            consumer = torch.cuda.current_stream(self.device)
+            if consumer != pin.stream:
+                consumer.wait_stream(pin.stream)
+                for value in copies:
+                    value.record_stream(consumer)
+        return copies
 
     def numeric_health(self) -> tuple[FieldNumericHealth, ...]:
         """Inspect current published roots via their exact snapshots; no work runs on the publish/step path."""

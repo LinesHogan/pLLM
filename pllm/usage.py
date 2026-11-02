@@ -1086,7 +1086,7 @@ def _chunked_in_forward(
             raise ValueError("a chunked update without an optimizer takes the weight carry, then input/target operands")
         pending = {
             f"_pending_rows_{name}": Field(
-                lambda inputs, outputs, source=source: (max(1, chunk - 1), inputs if source == "input" else outputs),
+                lambda inputs, outputs, source=source: (chunk, inputs if source == "input" else outputs),
                 dtype=None,
             )
             for name, source in zip(arguments[1:], sources[1:], strict=True)

@@ -586,10 +586,10 @@ def main() -> int:
 
             with patch.object(PreparedScan, "windows", record):
                 results[name] = check(handle)
-            if name == "dense_1536" and not any(form == "hillis_steele" for form, _ in forms):
-                raise RuntimeError("large-budget dense overlay did not exercise a tree window")
-            if name == "gated" and not any(form.startswith("right_matrix:") for form, _ in forms):
-                raise RuntimeError("Gated delta overlay did not exercise a right-matrix scan")
+            if name == "dense_1536" and forms:
+                raise RuntimeError("large dense carry materialized per-chunk weights")
+            if name == "gated" and not any(form == "right_matrix:hillis_steele" for form, _ in forms):
+                raise RuntimeError("Gated delta overlay did not exercise a right-matrix tree window")
             if name == "gated_exact" and not any(form.startswith("right_matrix:") for form, _ in forms):
                 raise RuntimeError("Exact overlay did not select its right-matrix prefix")
             after = (cache.num_blocks, tuple(tensor.size for tensor in cache.kv_cache_tensors))

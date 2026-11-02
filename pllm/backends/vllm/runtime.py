@@ -30,7 +30,7 @@ from pllm.authoring import (
     map_host_batch,
 )
 from pllm.backends.vllm import compat
-from pllm.backends.vllm.checkpoint import CHECKPOINT_ENV
+from pllm.backends.vllm.checkpoint import load_options
 from pllm.backends.vllm.hidden_taps import TAPS_ENV, HiddenTapAnnouncement, HiddenTapLayout
 from pllm.backends.vllm.overlay_graph import (
     GraphOptions,
@@ -700,7 +700,6 @@ def create_vllm_llm(
             HiddenTapAnnouncement(requirements.hidden_inputs, config.max_num_seqs, TensorDType(config.dtype))
         ),
         POSITION_ENV: encode_boundary(PositionAnnouncement(requirements.position_states)),
-        CHECKPOINT_ENV: encode_boundary(requirements.checkpoint_names),
     }
     if config.multiprocessing or config.tensor_parallel_size > 1:
         environment["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -714,7 +713,7 @@ def create_vllm_llm(
         config,
         {
             **options,
-            **({"load_format": "pllm"} if requirements.checkpoint_names else {}),
+            **load_options(requirements.checkpoint_names),
             "worker_cls": _WORKER_CLASS,
             # The supported uni-process, non-speculative decoder enables async by default.
             "async_scheduling": config.runner == "mrv2",
@@ -847,11 +846,10 @@ def probe_backend(
     )
     required = tuple(value + runner.overlay_graph_bytes for value in required)
     free_bytes, _total_bytes = torch.cuda.mem_get_info(runner.device)
-    # Per scheduled request: the current root, the private root being written, and the root the GPU
-    # may still read from the step before, because the host prepares a step while the GPU runs the last.
-    # Each lagged step additionally retains its exact input root for readers. No host wait
-    # is hidden in this capacity: current + private + GPU reader + publish_lag retained roots.
-    capacity = (3 + publish_lag) * runner.max_num_reqs + 2
+    # Exact in-forward transitions retain current/private roots, without a
+    # post-sampler history. Released GPU reads are fenced by SlotPools on reuse;
+    # they do not need another physically reserved root per request.
+    capacity = (2 if requirements.exact_decode else 3 + publish_lag) * runner.max_num_reqs + 2
     facts = BackendCompileFacts(
         replace(probe, targets=targets, position_states=requirements.position_states),
         replace(observed, reserved_bytes=required),

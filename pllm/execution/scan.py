@@ -6,6 +6,7 @@ from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import replace
 from functools import lru_cache
+from math import prod
 from threading import Lock
 from time import perf_counter
 from typing import ParamSpec, TypeVar
@@ -106,9 +107,12 @@ class ScanTemplate:
             self.budget -= trace.live
         self.maximum = (context.max_rows + chunk - 1) // chunk + 1
         sequences = specs[1 + invariants : -1] if counted else specs[1 + invariants :]
+        # A prefix would replicate a carry larger than the rows it serves.
+        # Keep those recurrences sequential instead of materializing per-chunk weights.
         self.analysis = (
             analyze(step, (specs[0], *sequences, *specs[1 : 1 + invariants]))
             if context.policy.allow_numerical_transforms
+            and prod(specs[0][0]) <= sum(prod(spec[0]) for spec in sequences)
             else None
         )
         self.candidates: dict[int, tuple[PreparedScan, ...]] = {}

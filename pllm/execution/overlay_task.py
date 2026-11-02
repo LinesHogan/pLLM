@@ -7,6 +7,7 @@ declares them; the vLLM backend calls ProjectionTask from its projection hooks.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Generic, NamedTuple, Protocol, TypeVar
@@ -14,6 +15,7 @@ from typing import TYPE_CHECKING, Generic, NamedTuple, Protocol, TypeVar
 import torch
 
 from pllm.contracts.hidden_locator import HiddenPhase
+from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.parameter_overlay import (
     FieldView,
     ParameterOverlayOperator,
@@ -24,15 +26,17 @@ from pllm.contracts.parameter_overlay import (
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import PackedSamplerRowBatch
 from pllm.contracts.semantic_graph import StateResource, TaskId, TaskSymbol
+from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.contracts.visibility import VisibilitySource
-from pllm.execution.cuda_stream import upload
 from pllm.execution.parameter_projection import parameter_correction
+from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.scan import execute_scan, prepare_scan
+from pllm.execution.scan_analysis import chunk_readout
 from pllm.execution.scan_execution import PreparedScan, Step
 from pllm.execution.tensor_frame import OverlayEntry, OverlayTargetResult, TensorFrame, Tensors, UpdateOutput
 from pllm.execution.tensor_program import PoolSGD, TaskOutput, TensorBatch
 from pllm.execution.torch_private import MemoryTrace
-from pllm.kernels.page_copy import chunk_capacity, copy_pages, prepend_rows
+from pllm.kernels.page_copy import chunk_capacity, prepend_rows
 
 DataT = TypeVar("DataT")
 ResultT = TypeVar("ResultT")
@@ -122,6 +126,60 @@ class ChunkUpdate:
             trained > 0,
             trained // self.chunk,
             trained,
+            {"tail_rows": remaining},
+        )
+
+    def contiguous(self, values: Tensors, offset: int) -> UpdateOutput:
+        """Use the scheduler's contiguous token frontier without reading a device counter.
+
+        Incomplete chunks evaluate only their readout. Full chunks retain the
+        authored operation order, including GEMM shapes and rounding.
+        """
+        carry, *columns = self.arguments
+        rows = tuple(values[name] for name in columns)
+        tails = tuple(values[f"_pending_rows_{name}"] for name in columns)
+        length = values["_pending_length"]
+        pending = offset % self.chunk
+        total = pending + len(rows[0])
+        invariants = tuple(values[name] for name in self.invariants)
+        samples = (values[carry], *tails, *invariants)
+        readout = chunk_readout(self.step, tuple((t.shape, t.stride(), t.dtype, t.device) for t in samples))
+        if readout is None:
+            return self(**values)
+        trained = total // self.chunk * self.chunk
+        state = values[carry]
+        outputs: list[torch.Tensor] = []
+        start = 0
+        while start < len(rows[0]):
+            count = min(self.chunk - pending, len(rows[0]) - start)
+            complete = pending + count == self.chunk
+            if pending == 0 and complete:
+                operands = tuple(value[start : start + count].contiguous() for value in rows)
+            else:
+                for tail, row in zip(tails, rows, strict=True):
+                    tail[pending : pending + count].copy_(row[start : start + count])
+                operands = tails
+            if complete:
+                state, output = self.step(state, *operands, *invariants)
+            else:
+                output = readout(state, *operands, *invariants)
+            output = output[pending : pending + count]
+            outputs.append(output.clone() if operands is tails and complete else output)
+            if operands is tails and complete:
+                for tail in tails:
+                    tail.zero_()
+            pending = (pending + count) % self.chunk
+            start += count
+        if trained:
+            values[carry].copy_(state)
+        trained_rows = length.new_full((), trained)
+        remaining = length.new_full((), pending)
+        length.copy_(remaining)
+        return UpdateOutput(
+            torch.cat(outputs),
+            length.new_full((), trained > 0, dtype=torch.bool),
+            length.new_full((), trained // self.chunk),
+            trained_rows,
             {"tail_rows": remaining},
         )
 
@@ -324,8 +382,12 @@ class OverlayTransition:
 
     def invariant_values(self, target: int, batch: TensorBatch) -> Tensors:
         """Borrow each shared field at this projection's layer without request copies."""
+        roots = {
+            resource: batch.parameter_root(resource)
+            for resource in dict.fromkeys(resource for resource, _ in self.invariants.values())
+        }
         return {
-            name: views[target].read(batch.parameter_root(resource)[views[target].field])
+            name: views[target].read(roots[resource][views[target].field])
             for name, (resource, views) in self.invariants.items()
         }
 
@@ -405,26 +467,77 @@ class OverlayTransition:
         target: int,
         indices: tuple[int, ...],
         batch: TensorBatch,
+        *,
+        plan: PreparedScan | None = None,
     ) -> tuple[tuple[UpdateOutput, ...], torch.Tensor]:
         """Keep unbatchable implementations on their selected numerical path."""
         width = len(self.buffers)
         fields = tuple(batch.field_slots(target * width + i) for i in range(width))
-        pools = tuple(pool for pool, _ in fields)
-        slots = upload(tuple(tuple(slots[i] for i in indices) for _, slots in fields), pools[0].device)
-        values = tuple(pool.index_select(0, row) for pool, row in zip(pools, slots, strict=True))
         invariants = self.invariant_values(target, batch)
+        rows = {row.identity: row for row in batch.selection.rows}
+        # The task already owns these private pages. Serial execution can borrow
+        # their views; gathering and scattering would copy every dense carry twice.
         results = tuple(
-            self.result(operand, {**dict(zip(self.buffers, (value[i] for value in values), strict=True)), **invariants})
-            for i, operand in enumerate(operands)
+            self.serial_result(
+                operand,
+                {
+                    **{name: pool[slots[index]] for name, (pool, slots) in zip(self.buffers, fields, strict=True)},
+                    **invariants,
+                },
+                rows[operand.identity],
+                plan,
+            )
+            for operand, index in zip(operands, indices, strict=True)
         )
-        if operands[0].phase in self.phases:
-            sources = torch.arange(len(operands), device=pools[0].device)
-            for value, pool, destinations in zip(values, pools, slots, strict=True):
-                copy_pages(value, pool, sources, destinations)
         return results, torch.stack(tuple(torch.stack((r.update_count, r.trained_rows)) for r in results)).sum(0)
 
-    def result(self, operand: ProjectionOperands, values: Tensors) -> UpdateOutput:
-        """Validate the author's result at its tensor boundary without observing CUDA values."""
+    def serial_result(
+        self, operand: ProjectionOperands, values: Tensors, row: PackedPhaseRow, plan: PreparedScan | None
+    ) -> UpdateOutput:
+        """Use contiguous backend rows for ordinary exact chunk transitions."""
+        offset = self.chunk_offset(row, len(operand.hidden)) if row.phase is operand.phase else None
+        if offset is not None and plan is not None:
+            assert isinstance(self.chunk, ChunkUpdate)
+            if plan.analysis is None or offset % self.chunk.chunk + len(operand.hidden) < self.chunk.chunk:
+                return self.validate(self.chunk.contiguous(self.inputs(operand, values), offset), operand)
+        return self.result(operand, values)
+
+    def chunk_offset(self, row: PackedPhaseRow, count: int) -> int | None:
+        """The contiguous training frontier, when the backend supplied complete row metadata."""
+        if (
+            isinstance(self.chunk, ChunkUpdate)
+            and self.visibility.in_forward
+            and row.prompt_length
+            and row.phase in self.phases
+        ):
+            offset = row.token_offset + 1 - count
+            if HiddenPhase.PREFILL not in self.phases:
+                offset -= row.prompt_length
+            return offset
+        return None
+
+    def written_fields(
+        self, data: TensorFrame, selection: RequestStateSelection, selected: tuple[int, ...]
+    ) -> tuple[tuple[LayoutFieldId, ...], ...]:
+        """Share unchanged chunk carries; tails still receive private writable pages."""
+        fields = tuple(LayoutFieldId(i) for i in range(len(self.targets) * len(self.buffers)))
+        if not isinstance(self.chunk, ChunkUpdate):
+            return (fields,) * len(selected)
+        carry = self.buffers.index(self.arguments[self.chunk.arguments[0]])
+        tails = tuple(field for field in fields if field % len(self.buffers) != carry)
+        counts = Counter(row.identity for row in data.step.rows.rows if row.phase in self.phases)
+        rows = dict(zip(selection.for_resource(self.resource).state_indices, selection.rows, strict=True))
+        writes: list[tuple[LayoutFieldId, ...]] = []
+        for index in selected:
+            row = rows[index]
+            count = counts[row.identity]
+            offset = self.chunk_offset(row, count)
+            complete = offset is None or offset % self.chunk.chunk + count >= self.chunk.chunk
+            writes.append(fields if complete else tails)
+        return tuple(writes)
+
+    def inputs(self, operand: ProjectionOperands, values: Tensors) -> Tensors:
+        """Bind state, shared fields and projection operands to the author's parameter names."""
         inputs = {
             **values,
             "input": operand.hidden,
@@ -432,8 +545,12 @@ class OverlayTransition:
             "weight": operand.base_weight,
             "prompt_end": operand.prompt_end,
         }
+        return {key: inputs[source] for key, source in self.arguments.items()}
+
+    def result(self, operand: ProjectionOperands, values: Tensors) -> UpdateOutput:
+        """Validate the author's result at its tensor boundary without observing CUDA values."""
         result = (
-            self.function(**{key: inputs[source] for key, source in self.arguments.items()})
+            self.function(**self.inputs(operand, values))
             if operand.phase in self.phases
             else UpdateOutput.unchanged(self.apply(operand.hidden, values))
         )
