@@ -2,8 +2,8 @@
 
 import pytest
 
-from pllm.backends.vllm.packed_rows import label_rows
 from pllm.contracts.hidden_locator import HiddenPhase
+from pllm.contracts.packed_rows import label_rows
 from pllm.contracts.request_identity import RequestIdentity
 
 

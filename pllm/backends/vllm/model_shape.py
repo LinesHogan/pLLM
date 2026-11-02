@@ -1,0 +1,98 @@
+"""Model dimensions read by CPU diagnostics and by the loaded vLLM backend probe."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Self
+
+from cattrs import structure
+from vllm.config import ModelConfig as VllmModelConfig
+from vllm.model_executor.layers.vocab_parallel_embedding import pad_vocab_size
+from vllm.model_executor.models import ModelRegistry
+
+from pllm.config import ModelConfig
+from pllm.contracts.parameter_overlay import Projection, ProjectionShape, expand_targets
+
+if TYPE_CHECKING:
+    import torch
+
+    from pllm.backends.vllm.architecture import Decoder
+
+
+@dataclass(frozen=True)
+class _ConfigShape:
+    architectures: tuple[str, ...]
+    hidden_size: int
+    num_hidden_layers: int
+    vocab_size: int
+    intermediate_size: int
+    num_attention_heads: int
+    num_key_value_heads: int | None = None
+    head_dim: int | None = None
+
+    def projections(self, targets: tuple[Projection, ...]) -> tuple[ProjectionShape, ...]:
+        if targets and self.architectures[0] not in ("Qwen2ForCausalLM", "Qwen3ForCausalLM", "LlamaForCausalLM"):
+            raise ValueError(
+                "projection shapes for this architecture are decided at make_llm; use a dense Qwen2, Qwen3 or Llama config for CPU checks"
+            )
+        head = self.head_dim or self.hidden_size // self.num_attention_heads
+        kv_heads = self.num_key_value_heads or self.num_attention_heads
+        sizes = {
+            "q_proj": (self.hidden_size, head * self.num_attention_heads),
+            "v_proj": (self.hidden_size, head * kv_heads),
+            "down_proj": (self.intermediate_size, self.hidden_size),
+        }
+        expanded = expand_targets(targets, self.num_hidden_layers)
+        if any(target.layer is None or target.layer >= self.num_hidden_layers for target in expanded):
+            raise ValueError("choose projection layers below the model's num_hidden_layers")
+        return tuple(ProjectionShape(target, *sizes[target.name]) for target in expanded)
+
+
+@dataclass(frozen=True, slots=True)
+class ModelShape:
+    """Geometry shared by config-only planning and loaded-model probing, without weights."""
+
+    architecture: str
+    hidden_size: int
+    layer_count: int
+    vocab_size: int
+    padded_vocab_size: int
+    targets: tuple[ProjectionShape, ...]
+
+    @classmethod
+    def of_config(cls, config: ModelConfig, targets: tuple[Projection, ...] = ()) -> Self:
+        """Read only config.json; dense projection widths follow the decoder's q/v/down layouts."""
+        model = VllmModelConfig(
+            model=config.model,
+            revision=config.revision,
+            dtype=config.dtype,
+            max_model_len=config.max_model_len,
+            trust_remote_code=config.trust_remote_code,
+        )
+        model_class, _ = ModelRegistry.resolve_model_cls(model.architectures, model)
+        shape = structure(model.hf_text_config.to_dict(), _ConfigShape)
+        return cls(
+            model_class.__name__,
+            shape.hidden_size,
+            shape.num_hidden_layers,
+            shape.vocab_size,
+            pad_vocab_size(shape.vocab_size),
+            shape.projections(targets),
+        )
+
+    @classmethod
+    def of_model(cls, decoder: Decoder, targets: tuple[Projection, ...], dtype: torch.dtype) -> Self:
+        """Inspect the actual loaded projection slices, including architecture-specific admission."""
+        from pllm.backends.vllm.parameter_overlay import inspect_parameter_targets
+
+        model = decoder.model
+        layers = len(model.model.layers)
+        shapes = inspect_parameter_targets(decoder, expand_targets(targets, layers), dtype)
+        return cls(
+            type(model).__name__,
+            model.config.hidden_size,
+            layers,
+            model.config.vocab_size,
+            model.lm_head.num_embeddings_padded,
+            shapes,
+        )

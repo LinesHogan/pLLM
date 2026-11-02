@@ -9,12 +9,9 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu_input_batch import InputBatch as Mrv1InputBatch
 
-from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import (
-    PackedPhaseRow,
-    PackedPhaseRowBatch,
     PackedSamplerRowBatch,
-    PackedSamplerRowLink,
+    label_rows,
 )
 from pllm.contracts.request_identity import RequestIdentity
 
@@ -78,22 +75,3 @@ def encode_mrv1_rows(
         [int(value) for value in batch.num_computed_tokens_cpu[: batch.num_reqs]],
         step_id,
     )
-
-
-def label_rows(
-    identities: tuple[RequestIdentity, ...],
-    scheduled: list[int],
-    prompt: list[int],
-    computed: list[int],
-    step_id: int,
-) -> PackedSamplerRowBatch:
-    """One row per scheduled token in request order; token positions below the prompt length are prefill."""
-    rows: list[PackedPhaseRow] = []
-    links: list[PackedSamplerRowLink] = []
-    for request, (count, length, done) in enumerate(zip(scheduled, prompt, computed, strict=True)):
-        for offset in range(done, done + count):
-            phase = HiddenPhase.PREFILL if offset < length else HiddenPhase.DECODE
-            rows.append(PackedPhaseRow(len(rows), request, offset, phase, identities[request], length))
-        # vLLM samples each request's last scheduled token, which is the last packed row of its span.
-        links.append(PackedSamplerRowLink(request, len(rows) - 1))
-    return PackedSamplerRowBatch(PackedPhaseRowBatch(step_id, len(rows), tuple(rows)), tuple(links))

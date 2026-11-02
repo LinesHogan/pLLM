@@ -87,7 +87,27 @@ class PackedSamplerRowBatch:
         return tuple(self.row_batch.rows[link.packed_row_index].identity for link in self.links)
 
 
+def label_rows(
+    identities: tuple[RequestIdentity, ...],
+    scheduled: list[int],
+    prompt: list[int],
+    computed: list[int],
+    step_id: int,
+) -> PackedSamplerRowBatch:
+    """One row per scheduled token in request order; token positions below the prompt length are prefill."""
+    rows: list[PackedPhaseRow] = []
+    links: list[PackedSamplerRowLink] = []
+    for request, (count, length, done) in enumerate(zip(scheduled, prompt, computed, strict=True)):
+        for offset in range(done, done + count):
+            phase = HiddenPhase.PREFILL if offset < length else HiddenPhase.DECODE
+            rows.append(PackedPhaseRow(len(rows), request, offset, phase, identities[request], length))
+        # vLLM samples each request's last scheduled token, which is the last packed row of its span.
+        links.append(PackedSamplerRowLink(request, len(rows) - 1))
+    return PackedSamplerRowBatch(PackedPhaseRowBatch(step_id, len(rows), tuple(rows)), tuple(links))
+
+
 __all__ = [
+    "label_rows",
     "PackedPhaseRow",
     "PackedPhaseRowBatch",
     "PackedSamplerRowBatch",

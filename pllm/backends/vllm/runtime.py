@@ -31,24 +31,17 @@ from pllm.authoring import (
 )
 from pllm.backends.vllm import compat
 from pllm.backends.vllm.checkpoint import load_options
-from pllm.backends.vllm.hidden_taps import TAPS_ENV, HiddenTapAnnouncement, HiddenTapLayout
+from pllm.backends.vllm.compile_facts import compile_facts
+from pllm.backends.vllm.hidden_taps import TAPS_ENV, HiddenTapAnnouncement
+from pllm.backends.vllm.model_shape import ModelShape
 from pllm.backends.vllm.overlay_graph import (
     GraphOptions,
-    graph_mode,
     graph_options,
 )
-from pllm.backends.vllm.parameter_overlay import (
-    inspect_parameter_targets,
-)
 from pllm.backends.vllm.training import CausalTraining
-from pllm.config import ModelConfig
+from pllm.config import ExecutionOptions, ModelConfig, ModelDType
 from pllm.contracts.backend_attachment import (
-    TOKEN_CAPTURE_CAPABILITY,
-    AttachmentGraphMode,
-    AttachmentHiddenResource,
     BackendAttachment,
-    CausalModelDomain,
-    ModelProbe,
 )
 from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.feedback import (
@@ -60,18 +53,13 @@ from pllm.contracts.feedback import (
     RetryAction,
 )
 from pllm.contracts.host_batch import validate_host_batch
-from pllm.contracts.parameter_overlay import expand_targets
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
-from pllm.contracts.sampler import SamplerStage
-from pllm.contracts.semantic_graph import SchedulerTimeline, TaskId
-from pllm.contracts.state_representation import StateDeviceKind
+from pllm.contracts.semantic_graph import TaskId
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorFieldSpec
 from pllm.execution.checkpoint import checkpoint_directory
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.host_runtime import CompletionInput
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.state_execution import StateDiagnostics
 from pllm.execution.state_feed import Feed
@@ -81,11 +69,9 @@ if TYPE_CHECKING:
     from pllm.backends.vllm.mrv1 import Mrv1Runner
 
 
-from pllm.backends.vllm.architecture import hidden_binding
 from pllm.backends.vllm.position_state import POSITION_ENV
 from pllm.backends.vllm.prefix_cache import CachePolicy
 from pllm.backends.vllm.runner import BackendWorkerState, WorkloadModelRunner
-from pllm.contracts.hidden_locator import HiddenPhase, logit_layers
 from pllm.execution.position_state import PositionAnnouncement
 
 _logger = logging.getLogger(__name__)
@@ -97,34 +83,6 @@ _V2_RUNNER_ENV = "VLLM_USE_V2_MODEL_RUNNER"
 
 
 _WORKER_CLASS = "pllm.worker.GPUWorker"
-
-
-_REQUEST_CAPABILITIES = (
-    "producer/packed_hidden@1",
-    "sampler/post_filter_exact@1",
-    "sampler/pre_filter_add@1",
-)
-
-
-_OVERLAY_CAPABILITIES = (
-    "operand_capture/mlp_down_projection_pair@1",
-    "overlay/dense_add@1",
-    "overlay/low_rank_add@1",
-    "overlay/head_add_fp32@1",
-    "operand_capture/projection_input@1",
-)
-
-
-def _digest(fields: tuple[str, ...]) -> str:
-    return sha256("\x00".join(fields).encode("utf-8")).hexdigest()
-
-
-def _tensor_dtype(dtype: torch.dtype) -> TensorDType:
-    return {
-        torch.float16: TensorDType.FLOAT16,
-        torch.bfloat16: TensorDType.BFLOAT16,
-        torch.float32: TensorDType.FLOAT32,
-    }[dtype]
 
 
 class BackendCommand(StrEnum):
@@ -781,135 +739,34 @@ def probe_backend(
     *,
     publish_lag: int = 1,
 ) -> BackendCompileFacts:
-    decoder = runner.decoder
-    model = decoder.model
-    layer_count = len(model.model.layers)
-    if any(layer < 0 or layer >= layer_count for layer in requirements.activation_layers):
-        raise ValueError("activation layer is outside the backend model")
-    if any(not -layer_count <= layer < layer_count for layer in requirements.layer_logits):
-        raise ValueError(
-            f"pllm.layer_logits{requirements.layer_logits} names a layer outside the model's {layer_count} layers"
-        )
-    hidden_resources = tuple(
-        sorted(
-            (
-                AttachmentHiddenResource(hidden_binding(source.layer, source.site, layer_count), source.phase)
-                for source in requirements.hidden_inputs
-            ),
-            key=lambda resource: (*resource.resource_key, resource.phase is HiddenPhase.DECODE),
-        )
-    )
-    layer_logits = logit_layers(requirements.layer_logits, layer_count)
-    requested_targets = expand_targets(requirements.parameter_targets, layer_count)
-    targets = inspect_parameter_targets(decoder, requested_targets, runner.dtype) if requested_targets else ()
-    custom_forward_capabilities = (
-        ("model/custom_forward@1", TOKEN_CAPTURE_CAPABILITY)
-        if runner.runner_kind == "mrv2" and graph_mode(runner.overlay_graph_bytes) is AttachmentGraphMode.EAGER
-        else ()
-    )
-    probe = _base_probe(
-        runner,
-        model_fingerprint=_digest(
-            (
-                f"model={runner.model_config.model}",
-                f"revision={runner.model_config.revision or ''}",
-                f"class={decoder.identity}",
-                f"hidden_size={model.config.hidden_size}",
-                f"layers={layer_count}",
-                f"vocab_size={model.config.vocab_size}",
-                *(f"hidden={resource.binding.tap}" for resource in hidden_resources),
-                f"layer_logits={layer_logits}",
-                *(f"activation_layer={layer}" for layer in requirements.activation_layers),
-                *(f"target={target.target}:{target.input_size}:{target.output_size}" for target in targets),
-            )
-        ),
-        hidden_size=model.config.hidden_size,
-        layer_count=layer_count,
-        hidden_resources=hidden_resources,
-        layer_logits=layer_logits,
-        capabilities=tuple(
-            sorted(
-                set(
-                    (
-                        *_REQUEST_CAPABILITIES,
-                        *_OVERLAY_CAPABILITIES,
-                        *custom_forward_capabilities,
-                        f"backend/vllm_{runner.runner_kind}@1",
-                    )
-                )
-            )
-        ),
-    )
-    observed = model_timeline(
-        runner.device,
-        (
-            "state/dense_page_cuda@1",
-            "state/fenced_reclaim@1",
-            "transition/full_root@1",
-            "optimizer/adamw@1",
-            *(("backend/tensor_parallel@1",) if runner.parallel_config.tensor_parallel_size > 1 else ()),
-            *custom_forward_capabilities,
-        ),
-    )
-    required = input_reservations(
-        probe,
-        runner.hidden_layouts,
-        observed,
-        runner.max_num_reqs,
-        model.lm_head.num_embeddings_padded,
-        requirements.sampler_stage,
-        requirements.sampler_feedback,
-    )
-    required = tuple(value + runner.overlay_graph_bytes for value in required)
+    shape = ModelShape.of_model(runner.decoder, requirements.parameter_targets, runner.dtype)
     free_bytes, _total_bytes = torch.cuda.mem_get_info(runner.device)
-    # Exact in-forward transitions retain current/private roots, without a
-    # post-sampler history. Released GPU reads are fenced by SlotPools on reuse;
-    # they do not need another physically reserved root per request.
-    capacity = (2 if requirements.exact_decode else 3 + publish_lag) * runner.max_num_reqs + 2
-    facts = BackendCompileFacts(
-        replace(probe, targets=targets, position_states=requirements.position_states),
-        replace(observed, reserved_bytes=required),
-        (
-            PageBundleProviderFacts(
-                "page_bundle_cuda@1",
-                capacity,
-                probe.device_kind,
-            ),
-        ),
-        runner.max_num_reqs,
-        free_bytes,
-        runner.model_config.seed,
-        model.config.vocab_size,
-        layer_count,
-        checkpoint_directory(runner.model_config.model, runner.model_config.revision)
-        if requirements.checkpoint_names
-        else "",
+    dtypes: dict[torch.dtype, ModelDType] = {
+        torch.float16: "float16",
+        torch.bfloat16: "bfloat16",
+        torch.float32: "float32",
+    }
+    config = ModelConfig(
+        runner.model_config.model,
+        revision=runner.model_config.revision,
+        dtype=dtypes[runner.dtype],
+        max_model_len=runner.model_config.max_model_len,
+        max_num_seqs=runner.max_num_reqs,
+        max_num_batched_tokens=runner.max_num_tokens,
+        seed=runner.model_config.seed,
+        runner=runner.runner_kind,
+        tensor_parallel_size=runner.parallel_config.tensor_parallel_size,
+        execution=ExecutionOptions(publish_lag=publish_lag),
     )
-    return facts
-
-
-def _base_probe(
-    runner: WorkloadModelRunner | Mrv1Runner,
-    *,
-    model_fingerprint: str,
-    hidden_size: int,
-    layer_count: int,
-    hidden_resources: tuple[AttachmentHiddenResource, ...],
-    layer_logits: tuple[int, ...],
-    capabilities: tuple[str, ...],
-) -> ModelProbe:
-    return ModelProbe(
-        model_fingerprint=model_fingerprint,
-        graph_mode=graph_mode(runner.overlay_graph_bytes),
-        device_kind=StateDeviceKind.CUDA,
-        tensor_dtype=_tensor_dtype(runner.dtype),
-        hidden_size=hidden_size,
-        max_packed_rows=runner.max_num_tokens,
-        hidden_resources=hidden_resources,
-        capabilities=capabilities,
-        causal_domain=CausalModelDomain(runner.max_num_reqs, layer_count, runner.model_config.max_model_len),
-        position_states=runner.position_states,
-        layer_logits=layer_logits,
+    return compile_facts(
+        shape,
+        requirements,
+        config,
+        model_identity=runner.decoder.identity,
+        hidden_layouts=runner.hidden_layouts,
+        overlay_graph_bytes=runner.overlay_graph_bytes,
+        memory_bytes=free_bytes,
+        checkpoint=checkpoint_directory(config.model, config.revision) if requirements.checkpoint_names else "",
     )
 
 
@@ -917,43 +774,3 @@ __all__ = [
     "VllmLlm",
     "create_vllm_llm",
 ]
-
-
-def input_reservations(
-    probe: ModelProbe,
-    hidden_layouts: tuple[HiddenTapLayout, ...],
-    timeline: SchedulerTimeline,
-    rows: int,
-    vocab: int,
-    stage: SamplerStage | None,
-    feedback: bool,
-) -> tuple[int, ...]:
-    """Reserve persistent capture storage and sampler scratch across model-step anchors."""
-    # Layouts union aliases and phases per module. Slots and capture indices stay
-    # resident across steps; task_memory traces consumer tables, gathers and casts.
-    hidden = sum(layout.resident_bytes for layout in hidden_layouts)
-    # FP32 envelope for original logits, conversion, projection and rowwise arithmetic.
-    # Excludes upstream sampling/GEMM library scratch, model weights and KV storage.
-    workspace = (
-        rows * (36 * vocab + 4 * probe.hidden_size + 8)
-        if stage is SamplerStage.PACKED_POST_FILTER_EXACT
-        else rows * (12 * vocab + 8)
-        if stage is SamplerStage.PACKED_PRE_FILTER_ADD
-        else 0
-    )
-    # Layer logits at the LM head: the gathered streams, their norm and logits in the model dtype, and the FP32
-    # [rows, layers, vocab] values before they are copied into their slots.
-    width = probe.tensor_dtype.itemsize
-    workspace += rows * len(probe.layer_logits) * (2 * width * probe.hidden_size + (width + 4) * vocab)
-    retained = rows * (4 * vocab + 8) if feedback else 0
-    # StepCapture retains its feedback pointers until the next table is prepared.
-    # Budget both old and new private copies during handoff, including next forward.
-    private_feedback = 2 * retained
-    sampler = next(anchor.ordinal for anchor in timeline.anchors if anchor.symbol == "sampler.pre_draw")
-    return tuple(
-        hidden
-        + private_feedback
-        + (workspace if anchor.symbol in ("sampler.pre_draw", "sampler.complete") else 0)
-        + (retained if anchor.ordinal >= sampler else 0)
-        for anchor in timeline.anchors
-    )

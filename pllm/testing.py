@@ -36,7 +36,13 @@ from pllm.contracts.packed_hidden import (
     HiddenRows,
     PackedHiddenResourceBinding,
 )
-from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
+from pllm.contracts.packed_rows import (
+    PackedPhaseRow,
+    PackedPhaseRowBatch,
+    PackedSamplerRowBatch,
+    PackedSamplerRowLink,
+    label_rows,
+)
 from pllm.contracts.parameter_overlay import ProjectionOperands
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
@@ -170,6 +176,40 @@ def step_input(
     )
 
 
+def scheduled_step(
+    identities: tuple[RequestIdentity, ...],
+    scheduled: list[int],
+    prompt: list[int],
+    computed: list[int],
+    hidden: Mapping[AttachmentHiddenResource, torch.Tensor],
+    *,
+    step_id: int = 0,
+    operands: tuple[ProjectionOperands, ...] = (),
+) -> StepInput:
+    """Build a CPU step from scheduler counts, selecting only the runners' tapped rows.
+
+    Hidden inputs contain one value per packed token. Only completed prompt endings
+    and latest decode rows are retained, just as in HiddenTaps.prepare.
+    """
+    sampler = label_rows(identities, scheduled, prompt, computed, step_id)
+    rows = sampler.row_batch
+    taps: list[HiddenRows] = []
+    for binding in dict.fromkeys(resource.binding for resource in hidden):
+        sources = tuple((resource, value) for resource, value in hidden.items() if resource.binding == binding)
+        selected = tuple(row for resource, _ in sources for row in rows.producer_rows(resource.phase))
+        storage = torch.cat(
+            tuple(
+                value[[row.packed_row_index for row in rows.producer_rows(resource.phase)]]
+                for resource, value in sources
+            )
+        )
+        mapping = np.zeros(rows.total_rows, dtype=np.int64)
+        for index, row in enumerate(selected):
+            mapping[row.packed_row_index] = index
+        taps.append(HiddenRows(binding, storage, mapping))
+    return StepInput(rows, sampler, HiddenRowBatch(rows, tuple(taps)) if taps else None, operands=operands)
+
+
 def run_step(
     execution: StateExecution[StepInput, DataT, ResultT],
     value: StepInput,
@@ -210,4 +250,5 @@ __all__ = [
     "run_guided_step",
     "run_step",
     "step_input",
+    "scheduled_step",
 ]

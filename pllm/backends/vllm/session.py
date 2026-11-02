@@ -39,6 +39,7 @@ from pllm.execution.backend_attachment import attachment_buffer_bytes
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.host_runtime import CompletionRows
 from pllm.execution.overlay_task import ProjectionTask
+from pllm.execution.preemption import preemption_policy
 from pllm.execution.state_execution import HeldInput, StateDiagnostics, StateTaskContext
 from pllm.execution.state_feed import (
     Feed,
@@ -239,8 +240,7 @@ class VllmSession(Generic[DataT, ResultT]):
             for request_id in sorted(self._identities.keys() & scheduler_output.finished_req_ids)
         )
         self._retire(finished)
-        # Sampler/hidden-only workloads retain their current state and preemption behavior.
-        if self._overlay is not None or self._activation is not None or self._sites is not None:
+        if preemption_policy(self.attachment, execution.math.model_sites) == "reset":
             for request_id in scheduler_output.finished_req_ids:
                 self._pending_identities.pop(request_id, None)
             # Installed vLLM 0.27.1 emits this set for both runners, despite its MRv2-only field comment.
