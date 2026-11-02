@@ -384,10 +384,17 @@ class TensorBinding(Builder[TensorFrame]):
             ):
                 raise ValueError("replacement tensors must match the declared layout shape, dtype and device")
 
+    @property
+    def uses_sampler_rows(self) -> bool:
+        """Additive sampler frames include completed prompt endings as well as decode rows."""
+        sampler = self.effects.sampler
+        return sampler is not None and sampler.stage is SamplerStage.PACKED_PRE_FILTER_ADD
+
     def row_phase(self) -> HiddenPhase | None:
         """The frame's preselected phase; None keeps every request's final row for model effects or prefill."""
         if (
-            self.overlay_targets
+            self.uses_sampler_rows
+            or self.overlay_targets
             or self.effects.activation_bindings
             or any(
                 isinstance(port.source, HiddenInputSource) and port.source.phase is HiddenPhase.PREFILL
@@ -408,7 +415,7 @@ class TensorBinding(Builder[TensorFrame]):
         """Prepare independent input channels into the same invocation frame."""
         read = self.row_reader()
         # Additive logits read the rows the sampler draws from that complete a prompt or decode, in sampler order.
-        sampled = self.effects.sampler is not None and self.effects.sampler.stage is SamplerStage.PACKED_PRE_FILTER_ADD
+        sampled = self.uses_sampler_rows
 
         def prepare(value: StepInput, batch: TensorBatch) -> TensorFrame:
             rows = read(value.rows)
