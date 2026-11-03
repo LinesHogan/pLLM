@@ -1,0 +1,363 @@
+"""Real-engine contract checks for workload authors, exposed by pllm.testing.check_on_gpu."""
+
+from __future__ import annotations
+
+# Diagnostics deliberately inspect the installed session and in-process engine.
+# pyright: reportPrivateUsage=false
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
+from traceback import extract_tb
+from typing import Concatenate, ParamSpec
+from unittest.mock import patch
+
+import torch
+from vllm import SamplingParams
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.request import Request
+
+import pllm
+from pllm.backends.vllm.checkpoint import load_options
+from pllm.backends.vllm.model_shape import ModelShape
+from pllm.backends.vllm.overlay_graph import GraphOptions, graph_options
+from pllm.backends.vllm.runtime import VllmLlm, probe_backend, vllm_engine
+from pllm.config import ExecutionOptions, ModelConfig
+from pllm.contracts.hidden_locator import HiddenPhase
+from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
+from pllm.contracts.parameter_overlay import Projection, ProjectionOperands
+from pllm.contracts.request_identity import RequestIdentity
+from pllm.contracts.semantic_graph import AnchorId, TaskId
+from pllm.contracts.state_ref import StateRef
+from pllm.execution.cuda_stream import CudaStreamReadiness
+from pllm.execution.state_execution import ProjectionResiduals, StateTaskContext
+from pllm.execution.step_input import StepInput
+from pllm.execution.tensor_binding import TensorOutput
+from pllm.execution.tensor_frame import TensorFrame
+from pllm.explanation import explain, explain_facts
+from pllm.testing_contracts import CheckResult, CheckSkip, ContractError
+from pllm.usage import Workload
+
+_Allocation = ParamSpec("_Allocation")
+
+# Sequence continuations avoid near-tied prose tokens whose greedy choice changes with vLLM batch geometry.
+_PROMPTS = ["Continue the sequence: 1, 2, 3,", "Continue the alphabet: A, B, C,"]
+
+
+def check_probe(workload: Workload, config: ModelConfig, handle: VllmLlm[TensorFrame, TensorOutput]) -> None:
+    """Compare config-only and loaded-model reports through the same pure computation."""
+    expected = explain(workload, config)
+    runner = handle.runner
+    requirements = workload.backend_requirements()
+    shape = ModelShape.of_model(runner.decoder, requirements.parameter_targets, runner.dtype)
+    facts = probe_backend(requirements, runner, publish_lag=config.execution.publish_lag)
+    # The installed state already consumed memory; replay planning against its load-time capacity.
+    facts = replace(facts, state_memory_budget_bytes=handle._facts.state_memory_budget_bytes)
+    actual = explain_facts(workload, config, shape, facts, runner.hidden_layouts)
+    failures: list[str] = []
+    if expected != actual:
+        failures.append("[explain/probe] config and loaded-model costs differ; report a pllm planning bug")
+    if expected.eager_reason != handle.diagnostics().eager_reason:
+        failures.append("[explain/graphs] engine graph mode differs from explain; report a pllm admission bug")
+    if sum(state.reserved_bytes for state in actual.states) != handle.attachment.plan.states.reserved_bytes:
+        failures.append("[explain/state] allocated state reservations differ; report a pllm allocation bug")
+    if not requirements.parameter_targets:
+        plan = handle.attachment.plan
+        if (
+            actual.peak_memory_bytes != plan.schedule.peak_memory_bytes
+            or tuple(anchor.reserved_bytes for anchor in actual.anchors) != plan.timeline.reserved_bytes
+        ):
+            failures.append("[explain/reservations] installed plan differs from the probe; report a pllm planning bug")
+    if failures:
+        raise ContractError(tuple(failures))
+
+
+class _SyncCheck:
+    """Restrict sync-debug to pllm anchors after two decode warmup steps."""
+
+    def __init__(self, handle: VllmLlm[TensorFrame, TensorOutput]) -> None:
+        execution = handle.runner.require_session()._deployment.execution
+        self.execute = execution.execute_anchor
+        self.execute_part = execution.execute_part
+        self.steps: set[int] = set()
+        self.checked: set[int] = set()
+
+    @contextmanager
+    def scope(self, context: StateTaskContext[TensorFrame]) -> Generator[None]:
+        rows = context.selection.rows
+        if not rows and context.value is not None:
+            rows = context.value.step.rows.rows
+        if rows and all(row.phase is HiddenPhase.DECODE for row in rows):
+            self.steps.add(context.invocation_id)
+        enabled = len(self.steps) > 2 and context.invocation_id in self.steps
+        mode = torch.cuda.get_sync_debug_mode()
+        try:
+            if enabled:
+                torch.cuda.set_sync_debug_mode("error")
+                self.checked.add(context.invocation_id)
+            yield
+        except RuntimeError as error:
+            locations = "; ".join(
+                f"{frame.filename}:{frame.lineno} ({frame.name})" for frame in extract_tb(error.__traceback__)[-5:]
+            )
+            raise RuntimeError(f"{error}; {locations}") from error
+        finally:
+            torch.cuda.set_sync_debug_mode(mode)
+
+    def anchor(self, context: StateTaskContext[TensorFrame], anchor: AnchorId) -> None:
+        with self.scope(context):
+            self.execute(context, anchor)
+
+    def part(
+        self, context: StateTaskContext[TensorFrame], value: StepInput, task: TaskId, *, complete: bool
+    ) -> ProjectionResiduals:
+        with self.scope(context):
+            return self.execute_part(context, value, task, complete=complete)
+
+
+def _tokens(handle: VllmLlm[TensorFrame, TensorOutput], temperature: float = 0) -> tuple[tuple[int, ...], ...]:
+    params = SamplingParams(temperature=temperature, seed=17, max_tokens=16, ignore_eos=True)
+    return tuple(tuple(output.outputs[0].token_ids) for output in handle.generate(_PROMPTS, params))
+
+
+@dataclass
+class _Generation:
+    """Token IDs and terminal request states, synchronized only by explicit diagnostics."""
+
+    tokens: tuple[tuple[int, ...], ...] = ()
+    states: dict[int, tuple[torch.Tensor, ...]] = field(default_factory=lambda: dict[int, tuple[torch.Tensor, ...]]())
+    taps: dict[tuple[PackedHiddenResourceBinding, int, int], torch.Tensor] = field(
+        default_factory=lambda: dict[tuple[PackedHiddenResourceBinding, int, int], torch.Tensor]()
+    )
+
+    projections: dict[tuple[Projection, int, int], tuple[torch.Tensor, torch.Tensor]] = field(
+        default_factory=lambda: dict[tuple[Projection, int, int], tuple[torch.Tensor, torch.Tensor]]()
+    )
+
+    def operands(self, value: StepInput, reference: _Generation | None) -> StepInput:
+        """Hold projection inputs fixed per token when the scheduler rebuilds a model-state history."""
+        operands: list[ProjectionOperands] = []
+        for operand in value.operands:
+            rows = tuple(
+                row for row in value.rows.rows if row.identity == operand.identity and row.phase is operand.phase
+            )
+            assert len(rows) == len(operand.hidden)
+            inputs: list[torch.Tensor] = []
+            targets: list[torch.Tensor] = []
+            for index, row in enumerate(rows):
+                key = operand.target, row.identity.prompt_index % len(_PROMPTS), row.token_offset
+                pair = operand.hidden[index], operand.desired[index]
+                if reference is not None:
+                    pair = reference.projections.get(key, pair)
+                self.projections[key] = pair[0].clone(), pair[1].clone()
+                inputs.append(pair[0])
+                targets.append(pair[1])
+            operands.append(replace(operand, hidden=torch.stack(inputs), desired=torch.stack(targets)))
+        return replace(value, operands=tuple(operands))
+
+    def hidden(self, value: StepInput, reference: _Generation | None) -> StepInput:
+        """Keep per-token tap inputs fixed, as in the CPU schedule script, despite base-model rounding."""
+        hidden = value.hidden
+        assert hidden is not None
+        for tap in hidden.taps:
+            # Preserve the producer pool addresses that the workload CUDA graphs captured.
+            storage = tap.storage
+            for row in value.rows.rows:
+                if row.recomputed:
+                    continue
+                if row.phase is HiddenPhase.PREFILL and row.token_offset != row.prompt_length - 1:
+                    continue
+                key = tap.resource, row.identity.prompt_index % len(_PROMPTS), row.token_offset
+                slot = int(tap.slots[row.packed_row_index])
+                if reference is not None and key in reference.taps:
+                    storage[slot].copy_(reference.taps[key])
+                self.taps[key] = storage[slot].clone()
+        return replace(
+            value,
+            hidden_readiness=CudaStreamReadiness(torch.cuda.current_stream()),
+        )
+
+    def compare(self, replayed: _Generation) -> None:
+        if self.tokens != replayed.tokens:
+            raise ContractError(
+                (
+                    f"[preempted] greedy tokens changed after KV eviction: {self.tokens} -> {replayed.tokens}; report a pllm recompute bug",
+                )
+            )
+        if self.states.keys() != replayed.states.keys():
+            raise ContractError(
+                ("[preempted] request states disappeared after KV eviction; report a pllm retirement bug",)
+            )
+        for request, fields in self.states.items():
+            for index, (expected, actual) in enumerate(zip(fields, replayed.states[request], strict=True)):
+                try:
+                    torch.testing.assert_close(actual, expected)
+                except AssertionError as error:
+                    raise ContractError(
+                        (f"[preempted] request {request}, field {index}: {error}; report a pllm recompute bug",)
+                    ) from error
+
+
+def _state_tokens(handle: VllmLlm[TensorFrame, TensorOutput], reference: _Generation | None = None) -> _Generation:
+    session = handle.runner.require_session()
+    execution = session._deployment.execution
+    retire = execution.retire
+    execute_part = execution.execute_part
+    result = _Generation()
+
+    def snapshot(identities: tuple[RequestIdentity, ...], *, wait: bool = False) -> tuple[StateRef, ...]:
+        for identity in identities:
+            result.states[identity.prompt_index % len(_PROMPTS)] = tuple(
+                tensor.detach().cpu()
+                for ref in execution.latest((identity,))
+                for tensor in execution.snapshot(ref, torch.cuda.current_stream(execution.device))
+            )
+        return retire(identities, wait=wait)
+
+    def part(
+        context: StateTaskContext[TensorFrame], value: StepInput, task: TaskId, *, complete: bool
+    ) -> ProjectionResiduals:
+        return execute_part(context, result.operands(value, reference), task, complete=complete)
+
+    with patch.object(execution, "retire", snapshot), patch.object(execution, "execute_part", part):
+        if session._taps is None:
+            result.tokens = _tokens(handle)
+        else:
+            publish = session._taps.publish
+
+            def hidden(value: StepInput, resources: tuple[PackedHiddenResourceBinding, ...]) -> StepInput:
+                return result.hidden(publish(value, resources), reference)
+
+            with patch.object(session._taps, "publish", hidden):
+                result.tokens = _tokens(handle)
+    return result
+
+
+class _Eviction:
+    """Make the real KV allocator fail once, then let vLLM evict and recompute normally."""
+
+    def __init__(self) -> None:
+        self.request: Request | None = None
+        self.requests: dict[str, Request] = {}
+
+    def wrap(
+        self, allocate: Callable[Concatenate[Request, _Allocation], KVCacheBlocks | None]
+    ) -> Callable[Concatenate[Request, _Allocation], KVCacheBlocks | None]:
+        def allocation(request: Request, *args: _Allocation.args, **kwargs: _Allocation.kwargs) -> KVCacheBlocks | None:
+            self.requests[request.request_id] = request
+            if self.request is None and request.num_output_tokens >= 4:
+                self.request = request
+                return None
+            return allocate(request, *args, **kwargs)
+
+        return allocation
+
+
+def _preemption(handle: VllmLlm[TensorFrame, TensorOutput], reference: _Generation) -> _Generation:
+    manager = handle._require_open().llm_engine.engine_core.engine_core.scheduler.kv_cache_manager
+    eviction = _Eviction()
+    with patch.object(manager, "allocate_slots", new=eviction.wrap(manager.allocate_slots)):
+        result = _state_tokens(handle, reference)
+    if eviction.request is None or not any(request.num_preemptions for request in eviction.requests.values()):
+        raise ContractError(("[preempted] no KV eviction occurred; report a pllm GPU checker bug",))
+    return result
+
+
+def _neutral(workload: Workload, config: ModelConfig) -> None:
+    report = explain(workload, config)
+    with pllm.make_llm(config, workload=workload) as handle:
+        observed = (_tokens(handle), _tokens(handle, 0.8))
+    requirements = workload.backend_requirements()
+    options: GraphOptions = {} if report.eager_reason else graph_options(config, requirements)
+    vanilla = vllm_engine(
+        replace(config, execution=ExecutionOptions()),
+        {**options, "worker_cls": "auto", **load_options(requirements.checkpoint_names)},
+        {},
+        cuda_graphs=not bool(report.eager_reason),
+    )
+    try:
+        expected = tuple(
+            tuple(
+                tuple(output.outputs[0].token_ids)
+                for output in vanilla.generate(
+                    _PROMPTS, SamplingParams(temperature=temp, seed=17, max_tokens=16, ignore_eos=True), use_tqdm=False
+                )
+            )
+            for temp in (0, 0.8)
+        )
+    finally:
+        vanilla.llm_engine.engine_core.shutdown()
+    if observed != expected:
+        raise ContractError(
+            (
+                "[neutral] generated token IDs differ from vanilla in the same graph mode; "
+                "check that neutral= disables every model/sampler effect, then report a pllm bug if it does",
+            )
+        )
+
+
+def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload | None = None) -> CheckResult:
+    """Load real engines to check planning, eight steady decode anchors, replay and neutral sampling.
+
+    Neutral checks compare greedy and seeded sampled token IDs bitwise in the workload's graph mode.
+    Forced KV allocation failure exercises vLLM's real eviction/recompute path. Tap and projection inputs are recorded
+    and replayed per token, as in the CPU script, to exclude base-model rounding differences. Host-batch training
+    and declared replay rejections are reported as explicit skips.
+    Run in an isolated process with a CUDA device; multiprocessing and parallel workers are unsupported.
+    """
+    if (
+        config.multiprocessing
+        or max(config.tensor_parallel_size, config.pipeline_parallel_size, config.data_parallel_size) > 1
+    ):
+        raise ValueError("check_on_gpu needs multiprocessing=False and all parallel sizes=1")
+    if config.max_num_seqs < 2 or config.max_model_len < 32:
+        raise ValueError("check_on_gpu needs max_num_seqs >= 2 and max_model_len >= 32 for its fixed script")
+    passed: list[str] = []
+    skipped: list[CheckSkip] = []
+    failures: list[str] = []
+    report = explain(workload, config)
+    with pllm.make_llm(config, workload=workload) as handle:
+        try:
+            check_probe(workload, config, handle)
+            passed.append("explain/probe")
+        except ContractError as error:
+            failures.extend(error.failures)
+        sync = _SyncCheck(handle)
+        execution = handle.runner.require_session()._deployment.execution
+        try:
+            with (
+                patch.object(execution, "execute_anchor", sync.anchor),
+                patch.object(execution, "execute_part", sync.part),
+            ):
+                baseline = _state_tokens(handle)
+            if len(sync.checked) < 8:
+                raise ContractError(("[host syncs] fewer than eight steady decode steps; report a pllm checker bug",))
+            passed.append("host syncs: eight steady decode steps")
+        except (RuntimeError, ContractError) as error:
+            failures.append(f"[host syncs] {error}; remove host reads/synchronization from the named per-step path")
+            baseline = None
+        if report.preemption == "reset" and report.recompute_rejection:
+            skipped.append(CheckSkip("preempted", report.recompute_rejection))
+        elif (
+            any(state.scope == "instance" for state in report.states)
+            and handle.attachment.plan.semantic_graph.trains_on_batch
+        ):
+            skipped.append(CheckSkip("preempted", "instance training needs a caller-provided host batch"))
+        else:
+            try:
+                replayed = _preemption(handle, baseline or _Generation())
+                if baseline is not None:
+                    baseline.compare(replayed)
+                    passed.append("preempted: fixed per-token inputs, token IDs and terminal request state")
+            except (RuntimeError, ContractError) as error:
+                failures.append(f"[preempted] {error}")
+    if neutral is None:
+        skipped.append(CheckSkip("neutral", "pass neutral= with the author's disabled settings"))
+    else:
+        try:
+            _neutral(neutral, config)
+            passed.append("neutral: greedy and seeded sampling bitwise")
+        except ContractError as error:
+            failures.extend(error.failures)
+    if failures:
+        raise ContractError(tuple(failures))
+    return CheckResult(tuple(passed), tuple(skipped))

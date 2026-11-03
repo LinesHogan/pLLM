@@ -29,9 +29,9 @@ from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.scan_execution import PreparedScan
+from pllm.testing_gpu import check_probe
 from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
 from test.dense_update import DenseUpdate, DenseUpdateConfig
-from test.explain_probe import assert_explanation
 
 TARGET = Projection("down_proj", 0)
 PROMPTS = ["The sky is", "Water freezes at"]
@@ -398,7 +398,7 @@ def checkpoint_ttt() -> None:
                 patch("pllm.backends.vllm.runtime.LLM", partial(LLM, kv_cache_memory_bytes=32 << 20)),
                 pllm.make_llm(model_config, workload=workload) as handle,
             ):
-                assert_explanation(workload, model_config, handle)
+                check_probe(workload, model_config, handle)
                 prompts = [{"prompt_token_ids": [100, 101, 102]}, {"prompt_token_ids": [103] * 8}]
                 sampling = SamplingParams(temperature=0, max_tokens=3, ignore_eos=True)
                 first = handle.generate(prompts, sampling)

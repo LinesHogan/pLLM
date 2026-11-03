@@ -1,10 +1,11 @@
 """Explanation costs compared against loaded Qwen2.5 probes for sampling and prompt-produced LoRA."""
 
 import pytest
+import torch
 
 import pllm
+from pllm.testing_gpu import check_probe
 from pllm.workloads import ESampConfig, ESampWorkload, PromptFactorsWorkload
-from test.explain_probe import assert_explanation
 
 
 @pytest.mark.parametrize(
@@ -14,7 +15,7 @@ from test.explain_probe import assert_explanation
         PromptFactorsWorkload(rank=2),
     ),
 )
-def test_explain_matches_loaded_probe(workload):
+def test_explain_matches_loaded_probe(workload, monkeypatch):
     config = pllm.ModelConfig(
         "Qwen/Qwen2.5-0.5B-Instruct",
         max_model_len=64,
@@ -24,5 +25,7 @@ def test_explain_matches_loaded_probe(workload):
     )
     report = pllm.explain(workload, config)
     with pllm.make_llm(config, workload=workload) as handle:
-        assert_explanation(workload, config, handle)
+        with monkeypatch.context() as capacity:
+            capacity.setattr(torch.cuda, "mem_get_info", lambda device=None: (1, 1))
+            check_probe(workload, config, handle)
         assert report == pllm.explain(workload, config)

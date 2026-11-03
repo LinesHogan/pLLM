@@ -1,4 +1,4 @@
-"""Check schedule contracts or step workloads on CPU, for unit tests and notebooks.
+"""Check schedule contracts on CPU/GPU or step workloads on CPU, for unit tests and notebooks.
 
 `check(workload, config)` compares fixed request schedules and diagnoses row mixing or routing errors.
 
@@ -61,6 +61,7 @@ from pllm.testing_contracts import (
     check as check,
     scheduled_step as scheduled_step,
 )
+from pllm.testing_gpu import check_on_gpu as check_on_gpu
 
 if TYPE_CHECKING:
     from pllm.authoring import BackendWorkload
@@ -217,6 +218,7 @@ __all__ = [
     "CheckResult",
     "ContractError",
     "check",
+    "check_on_gpu",
     "RequestIdentity",
     "SamplerFeedback",
     "backend_facts",

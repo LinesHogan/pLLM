@@ -404,7 +404,7 @@ def explain(workload: Workload, config: ModelConfig) -> ExplainResult:
     Memory excludes base-model weights, KV cache and vLLM activations. GPU fit is decided by make_llm.
     A too-small declared execution/state budget returns the unrestricted plan with actionable budget_errors.
     """
-    from pllm.backends.vllm.admission import admit_workload, eager_reasons
+    from pllm.backends.vllm.admission import admit_workload
     from pllm.backends.vllm.compile_facts import compile_facts
     from pllm.backends.vllm.hidden_taps import HiddenTapAnnouncement
     from pllm.backends.vllm.model_shape import ModelShape
@@ -427,7 +427,25 @@ def explain(workload: Workload, config: ModelConfig) -> ExplainResult:
         else 0,
         memory_bytes=1 << 60,
     )
-    facts = replace(facts, probe=replace(facts.probe, device_index=0))
+    return explain_facts(workload, config, shape, facts, layouts)
+
+
+def explain_facts(
+    workload: Workload,
+    config: ModelConfig,
+    shape: ModelShape,
+    facts: BackendCompileFacts,
+    layouts: tuple[HiddenTapLayout, ...],
+) -> ExplainResult:
+    """Render one pure planning computation for both config facts and the loaded GPU probe.
+
+    BLAS scratch is excluded from this CPU-comparable report; make_llm funds it separately.
+    """
+    from pllm.backends.vllm.admission import admit_workload, eager_reasons
+
+    requirements = workload.backend_requirements()
+    reason = admit_workload(config, requirements)
+    facts = replace(facts, probe=replace(facts.probe, blas_workspace_bytes=0, device_index=0))
     facts, binding, specialization_errors = _specialize(workload, facts, config)
     attachment, threshold, inline_peak, errors = _plans(workload, facts, binding, config)
     plan = attachment.plan

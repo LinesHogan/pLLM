@@ -8,6 +8,7 @@ from pllm.backends.vllm.mrv1 import Mrv1Runner
 from pllm.backends.vllm.runner import WorkloadModelRunner
 from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.config import VllmConfig
+from vllm.v1.core.sched.scheduler import Scheduler
 
 class _Worker:
     model_runner: WorkloadModelRunner | Mrv1Runner
@@ -19,6 +20,7 @@ class _Executor:
     driver_worker: _WorkerWrapper
 
 class _EngineCore:
+    scheduler: Scheduler
     model_executor: _Executor
 
 class _CoreClient:
