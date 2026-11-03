@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from math import isfinite
+from typing import Literal
 
 import torch
 
@@ -28,34 +29,31 @@ class SGD:
 @dataclass(frozen=True)
 class Field:
     """A state field with an explicit dtype, or a shape computed from a projection's (in_features, out_features);
-    a field read by an adapter gets one copy per target projection. Stored in FP32 by default; dtype=None follows
-    the model."""
+    a field read by an adapter gets one copy per target projection. Storage follows its declared role by default:
+    accumulators use FP32, other fields use model precision. An explicit dtype overrides this; None follows the model."""
 
     shape: tuple[int, ...] | Callable[[int, int], tuple[int, ...]]
-    dtype: torch.dtype | None = torch.float32
+    dtype: torch.dtype | Literal["auto"] | None = "auto"
 
     def size(self, in_features: int, out_features: int) -> tuple[int, ...]:
         """The shape for one target projection's widths, or for the hidden width outside adapters."""
         return self.shape(in_features, out_features) if callable(self.shape) else self.shape
 
-    @property
-    def tensor_dtype(self) -> TensorDType | None:
-        """The declared storage dtype; None follows the model."""
-        return None if self.dtype is None else TensorDType(str(self.dtype).removeprefix("torch."))
 
-
-def layout_field(name: str, field: Field, dimensions: Callable[[Dimensions], tuple[int, int]]) -> LayoutField:
-    dtype = field.tensor_dtype
+def layout_field(
+    name: str, field: Field, dimensions: Callable[[Dimensions], tuple[int, int]], dtype: TensorDType
+) -> LayoutField:
+    """Resolve a projection-sized field with the storage dtype chosen by authoring."""
     return LayoutField(
-        name,
-        lambda model: field.size(*dimensions(model)),
-        (lambda model: model.dtype) if dtype is None else dtype,
-        8 if field.dtype is torch.int64 else 16,
+        name, lambda model: field.size(*dimensions(model)), dtype, 8 if dtype is TensorDType.INT64 else 16
     )
 
 
 def overlay_fields(
-    fields: Mapping[str, Field], effect: ProjectionDelta, dimensions: Dimensions
+    fields: Mapping[str, Field],
+    effect: ProjectionDelta,
+    dimensions: Dimensions,
+    dtype: Callable[[str, Field], TensorDType],
 ) -> tuple[LayoutField, ...]:
     """One copy of the fields per overlay target, laid out target by target and shaped by that target."""
     arity = 2 if effect.operator is ParameterOverlayOperator.LOW_RANK_ADD else 1
@@ -69,12 +67,18 @@ def overlay_fields(
         or not isfinite(effect.scale)
     ):
         raise ValueError("an adapter needs sorted unique targets, the fields its operator applies and a finite scale")
-    for target, (inputs, outputs) in zip(effect.targets, dimensions.target_shapes, strict=True):
+    for index, (target, (inputs, outputs)) in enumerate(zip(effect.targets, dimensions.target_shapes, strict=True)):
         _check_target_fields(
-            effect, fields, f"{target.name} of layer {target.layer}", inputs, outputs, dimensions.dtype
+            effect,
+            fields,
+            f"{target.name} of layer {target.layer}",
+            inputs,
+            outputs,
+            dimensions.dtype,
+            {key: dtype(f"{key}_{index}", value) for key, value in fields.items()},
         )
     return tuple(
-        layout_field(f"{key}_{index}", field, lambda m, i=index: m.target_shapes[i])
+        layout_field(f"{key}_{index}", field, lambda m, i=index: m.target_shapes[i], dtype(f"{key}_{index}", field))
         for index in range(len(effect.targets))
         for key, field in fields.items()
     )
@@ -87,6 +91,7 @@ def _check_target_fields(
     inputs: int,
     outputs: int,
     model: TensorDType,
+    dtypes: Mapping[str, TensorDType],
 ) -> None:
     """Reject the fields one target projection cannot read, naming the field to fix."""
     keys = effect.applied_fields
@@ -114,5 +119,5 @@ def _check_target_fields(
         else (model, TensorDType.FLOAT32, TensorDType.FLOAT64)
     )
     for key in keys:
-        if (fields[key].tensor_dtype or model) not in allowed:
+        if dtypes[key] not in allowed:
             raise ValueError(f"field {key!r} must hold one of {allowed} for {effect.operator}; set dtype=torch.float32")

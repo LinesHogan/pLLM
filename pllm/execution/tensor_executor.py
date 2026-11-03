@@ -260,7 +260,9 @@ class TensorExecutor:
                 for (key, pool), slots in zip((self.hidden_inputs or {}).items(), self.hidden_slots, strict=True)
             },
             self._feedback(columns[0]),
-            fields[0].detach().requires_grad_(True) if self.differentiates else None,
+            fields[0].detach().to(torch.promote_types(fields[0].dtype, torch.float32)).requires_grad_(True)
+            if self.differentiates
+            else None,
         )
         return rows, replace(batch, roots=FieldRoots(fields), results={}, observing=False)
 

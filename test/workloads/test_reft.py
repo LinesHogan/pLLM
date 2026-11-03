@@ -175,7 +175,7 @@ def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:
             for index, identity in enumerate((identities[0], identities[0], identities[1]))
         ),
     )
-    delta = torch.tensor([[-0.25, 0.5, -1.0, 0.75], [1.0, -2.0, 3.0, -4.0]])
+    delta = torch.tensor([[-0.25, 0.5, -1.0, 0.75], [1.0, -2.0, 3.0, -4.0]], dtype=facts.probe.tensor_dtype.torch)
     keys = tuple(
         RequestStateKey.project(identity, (RequestKeyField.PROMPT_INDEX,)) for identity in reversed(identities)
     )

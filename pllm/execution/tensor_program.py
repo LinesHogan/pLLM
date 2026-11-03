@@ -144,7 +144,9 @@ def autograd_loss(
         (root,) = batch.roots
         with torch.enable_grad():
             (name,) = names
-            parameters = {name: root[0].detach().requires_grad_(True)}
+            parameters = {
+                name: root[0].detach().to(torch.promote_types(root[0].dtype, torch.float32)).requires_grad_(True)
+            }
             sample = root[0]
             call = function if sample.device.type != "cuda" or MemoryTrace.active.get() is not None else compiled
             loss = call(data, parameters)
@@ -298,8 +300,9 @@ class PoolSGD:
     @torch.no_grad()
     def tensors(self, parameters: tuple[torch.Tensor, ...], gradients: tuple[torch.Tensor, ...]) -> None:
         """Update private tensors without requiring pooled field slots."""
+        values = tuple(parameter.to(torch.promote_types(parameter.dtype, torch.float32)) for parameter in parameters)
         sgd(
-            list(parameters),
+            list(values),
             list(gradients),
             [],
             weight_decay=0,
@@ -310,6 +313,10 @@ class PoolSGD:
             maximize=False,
             foreach=False,
         )
+
+        for parameter, value in zip(parameters, values, strict=True):
+            if value is not parameter:
+                parameter.copy_(value)
 
 
 def apply_adamw_or_reserve(

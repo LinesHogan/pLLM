@@ -15,6 +15,7 @@ from pllm.contracts.semantic_graph import (
     StateSelectionInputSource,
     TaskResourceFact,
 )
+from pllm.contracts.tensor_layout import TensorFieldSpec
 from pllm.execution.preemption import preemption_policy
 from pllm.execution.ptts.page_bundle_planning import page_stride_bytes
 
@@ -61,6 +62,7 @@ class StateCost:
     bytes_per_root: int
     reserved_bytes: int
     max_admitted_lineages: int
+    fields: tuple[TensorFieldSpec, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,7 +146,8 @@ class ExplainResult:
         )
         lines.append("state  scope  roots  bytes/root  reserved bytes [exact]")
         lines.extend(
-            f"{state.name}  {state.scope}  {state.roots}  {state.bytes_per_root}  {state.reserved_bytes}"
+            f"{state.name}  {state.scope}  {state.roots}  {state.bytes_per_root}  {state.reserved_bytes}  "
+            + ", ".join(f"field {field.field_id}: {field.dtype}" for field in state.fields)
             for state in self.states
         )
         lines.append(f"memory   peak {self.peak_memory_bytes} bytes funded by pllm [{self.memory_label}]")
@@ -255,6 +258,7 @@ def _states(plan: PlanBundle) -> tuple[StateCost, ...]:
             sum(page_stride_bytes(field) for field in layouts[state.resource].fields),
             state.reserved_bytes,
             state.max_admitted_lineages,
+            layouts[state.resource].fields,
         )
         for state in plan.states.plans
     )

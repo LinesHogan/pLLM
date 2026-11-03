@@ -51,6 +51,7 @@ class Laurel(pllm.Workload):
                 "b": lambda m: (2 * m.layer_count, m.hidden_size, rank),
             },
             initialize=self.initial,
+            dtype=torch.float32,
         )
 
     def initial(self, fields: Mapping[str, torch.Tensor], generator: torch.Generator) -> None:
@@ -85,7 +86,7 @@ class ValueResidual(pllm.Workload):
 
     @property
     def gates(self) -> pllm.InstanceState:
-        return pllm.InstanceState({"lam": lambda m: (m.layer_count,)}, initialize=self.initial)
+        return pllm.InstanceState({"lam": lambda m: (m.layer_count,)}, initialize=self.initial, dtype=torch.float32)
 
     def initial(self, fields: Mapping[str, torch.Tensor], generator: torch.Generator) -> None:
         fields["lam"].fill_(self.mixing)
@@ -122,6 +123,7 @@ class StaticHyperConnections(pllm.Workload):
                 "write": lambda m: (2 * m.layer_count, n),
             },
             initialize=self.initial,
+            dtype=torch.float32,
         )
 
     def initial(self, fields: Mapping[str, torch.Tensor], generator: torch.Generator) -> None:

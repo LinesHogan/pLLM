@@ -597,7 +597,7 @@ class InstanceState:
     # Run once per resource when binding; every admission copies the same seeded initial tensors.
     initialize: Callable[[Tensors, torch.Generator], None] | None = None
     shape: Shape | None = None
-    dtype: torch.dtype = torch.float32
+    dtype: torch.dtype | Literal["auto"] | None = "auto"
     alignment: int = field(default=16, kw_only=True)
     # A fed state is filled by a producer process (VllmLlm.feed): "ordered" consumes every publication in order,
     # "latest" only the newest.
@@ -657,10 +657,6 @@ class InstanceState:
     def request_keys(self) -> tuple[RequestKeyField, ...]:
         return ()
 
-    @property
-    def tensor_dtype(self) -> TensorDType:
-        return TensorDType(str(self.dtype).removeprefix("torch."))
-
     def declare(self, name: str, context: _Reflection) -> None:
         """Allocate tensor parameters; the layout of fields an adapter reads follows its targets."""
         context.signature.append((name, boundary_digest(fingerprint(self), tuple(self.fields))))
@@ -679,7 +675,8 @@ class InstanceState:
             scope=self.scope,
             keys=self.request_keys,
             carry=tuple(
-                LayoutField(key, shape, self.tensor_dtype, self.alignment) for key, shape in self.carry.items()
+                LayoutField(key, shape, context.field_dtype(name, key, self.dtype), self.alignment)
+                for key, shape in self.carry.items()
             ),
         )
         context.parameters.update({(name, field): port for field, port in ports.items()})
@@ -688,7 +685,9 @@ class InstanceState:
                 initialize_checkpoint, context.binding.checkpoint, self.checkpoint_names()
             )
         if self.module is not None:
-            context.binding.initial_values[name] = partial(initial_values, self.module, dtype=self.dtype)
+            context.binding.initial_values[name] = partial(
+                initial_values, self.module, dtype=context.field_dtype(name, "parameters", self.dtype).torch
+            )
 
     def checkpoint_names(self) -> tuple[str, ...]:
         """Exact checkpoint tensor names, in the same order as the allocated fields."""
@@ -711,21 +710,34 @@ class InstanceState:
             if self.layers[-1] >= context.binding.dimensions.layer_count:
                 raise ValueError(f"{name}.layers exceeds the model layer count")
             return tuple(
-                layout_field(f"{key}_{layer}", value, lambda m: (m.hidden_size, m.hidden_size))
+                layout_field(
+                    f"{key}_{layer}",
+                    value,
+                    lambda m: (m.hidden_size, m.hidden_size),
+                    context.field_dtype(name, f"{key}_{layer}", value.dtype),
+                )
                 for layer in self.layers
-                for key, value in _fields(self, context.binding.dimensions.dtype).items()
+                for key, value in _fields(self).items()
             )
         consumer = next((adapter for adapter in context.adapters.values() if adapter.state == name), None)
         shapes = {key: spec for key, spec in self.fields.items() if not isinstance(spec, Field)}
         if consumer is None and len(shapes) == len(self.fields):
-            return tuple(LayoutField(key, shape, self.tensor_dtype, self.alignment) for key, shape in shapes.items())
-        fields = _fields(self, context.binding.dimensions.dtype)
+            return tuple(
+                LayoutField(key, shape, context.field_dtype(name, key, self.dtype), self.alignment)
+                for key, shape in shapes.items()
+            )
+        fields = _fields(self)
         if consumer is None:
             return tuple(
-                layout_field(key, value, lambda m: (m.hidden_size, m.hidden_size)) for key, value in fields.items()
+                layout_field(
+                    key, value, lambda m: (m.hidden_size, m.hidden_size), context.field_dtype(name, key, value.dtype)
+                )
+                for key, value in fields.items()
             )
         context.binding.overlay_targets = consumer.targets
-        return overlay_fields(fields, consumer, context.binding.dimensions)
+        return overlay_fields(
+            fields, consumer, context.binding.dimensions, lambda key, value: context.field_dtype(name, key, value.dtype)
+        )
 
 
 @dataclass(frozen=True)
@@ -832,14 +844,14 @@ def _frozen(initialize: Initializer | None) -> Initializer | None:
     return None if initialize is None else freeze(initialize)
 
 
-def _fields(state: InstanceState, model: TensorDType) -> dict[str, Field]:
-    """The state's fields as pllm.Field values with model precision resolved (before optimizer fields are derived);
+def _fields(state: InstanceState) -> dict[str, Field]:
+    """The state's projection-sized fields as pllm.Field values;
     a fixed shape takes the state's dtype."""
     fields: dict[str, Field] = {}
     for key, value in state.fields.items():
         match value:
             case Field():
-                fields[key] = replace(value, dtype=value.dtype or model.torch)
+                fields[key] = value
             case tuple():
                 fields[key] = Field(value, state.dtype)
             case _:
@@ -868,6 +880,10 @@ class _Effect:
         """The public effect name, with timing settings resolved at the authoring boundary."""
         return MemberDeclaration(self.kind)
 
+    def accumulates(self, operation: _Operation, field: str) -> bool:
+        """Whether this effect carries the field's previous value into its next version."""
+        return False
+
     def declare(self, operation: _Operation) -> None:
         operation.tensor()
 
@@ -886,6 +902,9 @@ class _Write(_Effect):
     fields: tuple[str, ...]
 
     phase: ClassVar[Phase | None] = Phase.AUTOMATIC
+
+    def accumulates(self, operation: _Operation, field: str) -> bool:
+        return field in self.fields and operation.reads_field(self.state, field)
 
     def declare(self, operation: _Operation) -> None:
         context = operation.context
@@ -1287,6 +1306,9 @@ class _TrainInForward(_Effect):
         if self.flush not in (None, "prompt_end"):
             raise ValueError("@pllm.train_in_forward(flush=...) takes 'prompt_end' or None")
 
+    def accumulates(self, operation: _Operation, field: str) -> bool:
+        return (self.chunk is not None and field == self.weight) or operation.reads_field(self.state, field)
+
     def projection_delta(self, owner: Workload, layers: int) -> ProjectionDelta:
         """The configured projection delta, with all-layer targets resolved against the model."""
         return ProjectionDelta(
@@ -1367,7 +1389,10 @@ class _TrainInForward(_Effect):
             )
         if self.flush is not None and optimizer is None:
             raise ValueError(f"flush='prompt_end' trains a short final chunk; declare {self.state!r} with an optimizer")
-        fields = _fields(definition, context.binding.dimensions.dtype)
+        fields = {
+            key: replace(value, dtype=context.field_dtype(self.state, key, value.dtype).torch)
+            for key, value in _fields(definition).items()
+        }
         effect = self.projection_delta(context.owner, context.binding.dimensions.layer_count)
         bindings, invariants, invariant_names = self.bindings(operation, fields, effect.targets, optimizer)
         if set(fields) & {source.value for source in Operand}:
@@ -1471,6 +1496,9 @@ class _CustomResidual(_Effect):
                 f"@pllm.custom_residual(site={self.site!r}): use one of {', '.join(map(repr, _SITE_TENSORS))}"
             )
 
+    def accumulates(self, operation: _Operation, field: str) -> bool:
+        return bool(self.state) and self.chunk is not None
+
     def places(self, owner: Workload, count: int) -> tuple[Place, ...]:
         """The owned places: the chosen layers' sublayer adds or value rows, or the final stream."""
         if self.site == "final":
@@ -1570,7 +1598,7 @@ class _CustomResidual(_Effect):
             b,
             self.state,
             (
-                LayoutField(name, shape, definition.tensor_dtype, definition.alignment),
+                LayoutField(name, shape, context.field_dtype(self.state, name, definition.dtype), definition.alignment),
                 LayoutField("_pending_rows_x", rows, lambda dimensions: dimensions.dtype),
                 LayoutField("_pending_rows_y", rows, lambda dimensions: dimensions.dtype),
                 LayoutField("_pending_length", (), TensorDType.INT64),
@@ -1826,6 +1854,22 @@ class _Operation:
         """Where this method's state transition runs; host workloads have their own step anchors."""
         return When.HOST_COMPUTE if self.context.binding.host else self.phase.value
 
+    def reads_field(self, state: str, field: str) -> bool:
+        """Follow declared parameter and method-result inputs to a previous field version."""
+        pending, visited = [self.name], set[str]()
+        while pending:
+            name = pending.pop()
+            if name in visited:
+                continue
+            visited.add(name)
+            sources, _ = next(operation for operation in self.context.operations if operation.name == name).arguments()
+            for source in sources.values():
+                if isinstance(source, Parameter) and (source.state, source.field) == (state, field):
+                    return True
+                if isinstance(source, Result):
+                    pending.append(source.operation)
+        return False
+
     def arguments(self) -> tuple[dict[str, _Source], dict[str, Carry]]:
         """Split carried inputs into their read source and the carried field the update writes."""
         sources, carries = _arguments(self.function), dict[str, Carry]()
@@ -2000,6 +2044,18 @@ class _Reflection:
     prediction: tuple[Call, _Sampler] | None = None
     # Each @pllm.train method and the state it trains.
     trainers: list[tuple[Call, State]] = field(default_factory=lambda: [])
+
+    def field_dtype(self, state: str, field: str, dtype: torch.dtype | Literal["auto"] | None) -> TensorDType:
+        """Choose storage once from the declared field role; explicit precision always wins."""
+        if dtype != "auto":
+            return self.binding.dimensions.dtype if dtype is None else TensorDType(str(dtype).removeprefix("torch."))
+        definition = self.state_definitions[state]
+        if definition.optimizer is not None or any(
+            operation.effect.state == state and operation.effect.accumulates(operation, field)
+            for operation in self.operations
+        ):
+            return TensorDType.FLOAT32
+        return self.binding.dimensions.dtype
 
     @property
     def sampler(self) -> _Sampler | None:

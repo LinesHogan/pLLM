@@ -92,7 +92,14 @@ def declare_parameter_overlay(
         raise ValueError(
             f"declare one @pllm.train_in_forward method per workload; {b.effects.in_forward} already is one"
         )
-    layout = overlay_fields(fields, effect, b.dimensions)
+    layout = overlay_fields(
+        fields,
+        effect,
+        b.dimensions,
+        lambda key, value: (
+            b.dimensions.dtype if value.dtype is None else TensorDType(str(value.dtype).removeprefix("torch."))
+        ),
+    )
     targets = effect.targets
     b.overlay_targets = targets
     b.parameter_phases = phases
@@ -319,19 +326,20 @@ def _check_activation_fields(
     hidden, names = b.dimensions.hidden_size, tuple(state.fields[view.field].name for view in views)
     shapes = tuple(view.shape for view in views)
     if operator is ActivationPatchOperator.ADD:
-        rule, valid, required = f"({hidden},)", shapes == ((hidden,),), TensorDType.FLOAT32
+        rule, valid = f"({hidden},)", shapes == ((hidden,),)
+        allowed = (b.dimensions.dtype, TensorDType.FLOAT32, TensorDType.FLOAT64)
     else:
         rank = shapes[0][0] if shapes[0] else 0
         rule = f"(rank, {hidden}), (rank,) and ({hidden}, rank) with 0 < rank <= {hidden}"
         valid = 0 < rank <= hidden and shapes == ((rank, hidden), (rank,), (hidden, rank))
-        required = b.dimensions.dtype
+        allowed = (b.dimensions.dtype,)
     if not valid:
         raise ValueError(f"activation fields {names} must be shaped {rule} for {operator}; got {shapes}")
     (layout,) = (entry.layout for entry in b.layouts.layouts if entry.resource == state.declaration.resource)
     for name, view in zip(names, views, strict=True):
-        if layout.fields[view.field].dtype is not required:
+        if layout.fields[view.field].dtype not in allowed:
             raise ValueError(
-                f"activation field {name!r} must hold {required} for {operator}; set dtype=torch.{required}"
+                f"activation field {name!r} must hold one of {allowed} for {operator}; set dtype=torch.{allowed[0]}"
             )
 
 

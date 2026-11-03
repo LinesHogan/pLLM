@@ -167,7 +167,10 @@ def prepare_weighted_batch(
     valid = (labels >= 0) & (labels < dimensions.vocab_size) & (weights > 0)
     hidden, logits = (tensor.masked_fill(~valid.unsqueeze(-1), 0) for tensor in (hidden, logits))
     labels, weights = (tensor.masked_fill(~valid, 0) for tensor in (labels, weights))
-    parameters = tuple(tensor.new_empty((len(selected), *tensor.shape)) for tensor in root)
+    parameters = tuple(
+        tensor.new_empty((len(selected), *tensor.shape), dtype=torch.promote_types(tensor.dtype, torch.float32))
+        for tensor in root
+    )
     data.weighted = WeightedBatch(
         selected,
         parameters,
@@ -330,7 +333,11 @@ def declare_weighted_train(
             def step() -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
                 losses = function(**inputs)
                 gradients = (
-                    torch.autograd.grad(losses.mean(), tuple(parameters.values()), materialize_grads=True)
+                    torch.autograd.grad(
+                        losses.to(torch.promote_types(losses.dtype, torch.float32)).mean(),
+                        tuple(parameters.values()),
+                        materialize_grads=True,
+                    )
                     if losses.requires_grad
                     else tuple(torch.zeros_like(parameter) for parameter in parameters.values())
                 )

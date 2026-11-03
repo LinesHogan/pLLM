@@ -61,12 +61,12 @@ class ReFTWorkload(pllm.Workload):
     def intervention(self) -> pllm.InstanceState:
         rank = self.config.rank
         fields = (
-            pllm.Field(lambda in_features, out_features: (rank, in_features), dtype=None),
-            pllm.Field((rank,), dtype=None),
-            pllm.Field(lambda in_features, out_features: (out_features, rank), dtype=None),
+            pllm.Field(lambda in_features, out_features: (rank, in_features)),
+            pllm.Field((rank,)),
+            pllm.Field(lambda in_features, out_features: (out_features, rank)),
         )
         if self.config.operator == "add":
-            fields = (pllm.Field(lambda in_features, out_features: (in_features,), dtype=torch.float32),)
+            fields = (pllm.Field(lambda in_features, out_features: (in_features,)),)
         state = pllm.RequestState if self.config.scope == "request" else pllm.InstanceState
         return state(
             {f"layer_{layer}_{offset}": field for layer in self.config.layers for offset, field in enumerate(fields)},

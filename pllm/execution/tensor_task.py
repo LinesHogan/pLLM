@@ -366,7 +366,7 @@ class TensorTask:
 
         `torch.where`, not a product, drops unselected rows, so a NaN or Inf there cannot reach the sums.
         """
-        loss = torch.where(rows, loss, 0)
+        loss = torch.where(rows, loss.to(torch.promote_types(loss.dtype, torch.float32)), 0)
         if self.policy.reduction == "state_mean":
             states = data.table.index.states
             size = data.table.states + 1

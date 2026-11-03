@@ -82,8 +82,8 @@ class InPlaceTTTWorkload(pllm.Workload):
         """Learned target tensors, shared by requests and selected by projection layer."""
         return pllm.InstanceState(
             {
-                "conv": pllm.Field(lambda d, _: (d, 1, 5), dtype=None),
-                "proj": pllm.Field(lambda d, _: (d, d), dtype=None),
+                "conv": pllm.Field(lambda d, _: (d, 1, 5)),
+                "proj": pllm.Field(lambda d, _: (d, d)),
             },
             layers=tuple(target.layer for target in self.config.targets if target.layer is not None),
             checkpoint={
@@ -122,12 +122,13 @@ class InPlaceTTTWorkload(pllm.Workload):
             torch.nn.functional.conv1d(targets.T.unsqueeze(0), conv, padding=2, groups=targets.shape[1]).squeeze(0).T
             @ proj
         )
-        update = (values.T @ inputs) * self.config.learning_rate
         if self.dtype is torch.bfloat16:
+            update = (values.T @ inputs) * self.config.learning_rate
             weight = (base.float() + delta).to(torch.bfloat16)
             output = (inputs @ weight.T).float() - (inputs @ base.T).float()
             return (weight + update).float() - base.float(), output
-        return delta + update.float(), inputs @ delta.to(inputs.dtype).T
+        update = (values.float().T @ inputs.float()) * self.config.learning_rate
+        return delta + update, inputs @ delta.to(inputs.dtype).T
 
 
 __all__ = ["InPlaceTTTConfig", "InPlaceTTTWorkload"]

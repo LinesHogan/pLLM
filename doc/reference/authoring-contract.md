@@ -281,8 +281,9 @@ chunk 开始时的携带量；chunk 的最后一行运行后才应用更新，�
 值；状态声明 `optimizer=pllm.SGD(lr)` 时，方法返回每行一个 loss，框架按 `chunk=`
 累积梯度并做 SGD（`flush="prompt_end"` 让 prompt 末尾的短 chunk 也训练）。
 `@train_in_forward` 不接受 `optimizer=`。固定 `shape=` 使用默认的 `value` 字段；具名 `pllm.Field` 字段可以按每个 target
-解析 `(in_features, out_features)`。`pllm.Field` 默认以 FP32 存储并累积状态，独立于
-模型 dtype；字段自身的 `dtype=` 覆盖默认值（不会继承 `RequestState.dtype`）。
+解析 `(in_features, out_features)`。`pllm.Field` 默认按角色选择存储：优化器参数、
+chunk carry 和声明读取旧值的写回字段使用 FP32；其余使用模型 dtype。
+字段自身的 `dtype=` 覆盖默认值（不会继承 `RequestState.dtype`）。
 `dtype=None` 显式选择模型 dtype，整数字段 保留自己的 dtype。
 Dense / low-rank overlay 在投影读取时转换到输入 dtype，"per_head" 始终要求 FP32；
 FP64 可用于数值 oracle。SGD 的梯度累积至少使用 FP32，显式选择模型 dtype 时也一样。

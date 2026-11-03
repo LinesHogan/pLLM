@@ -165,10 +165,17 @@ class TensorBinding(Builder[TensorFrame]):
         if init is None:
             return lambda roots, keys: None
         layout = next(item.layout for item in self.layouts.layouts if item.resource == resource)
-        tensors = tuple(torch.zeros(field.shape, dtype=field.dtype.torch, device=device) for field in layout.fields)
+        tensors = tuple(
+            torch.zeros(
+                field.shape,
+                dtype=torch.float32 if field.dtype.torch in (torch.float16, torch.bfloat16) else field.dtype.torch,
+                device=device,
+            )
+            for field in layout.fields
+        )
         # A resource's initial tensors are shared values, independent of admission history.
         init(tensors, torch.Generator(device=device).manual_seed(seed))
-        values = {i: tensors[i] for i in self.retained_fields(resource)}
+        values = {i: tensors[i].to(field.dtype.torch) for i, field in self.retained_fields(resource).items()}
 
         def initialize(roots: Roots, keys: tuple[RequestStateKey | None, ...]) -> None:
             for root in roots:

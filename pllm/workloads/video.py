@@ -44,7 +44,7 @@ class VideoWorkload(pllm.Workload):
     def inject(self) -> pllm.InstanceState:
         """Declare the local state written by the encoder and read by the ActivationPatch."""
         return pllm.InstanceState(
-            {"delta": pllm.Field(injection_shape, dtype=torch.float32)},
+            {"delta": pllm.Field(injection_shape)},
         )
 
     @property

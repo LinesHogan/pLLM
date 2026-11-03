@@ -44,7 +44,9 @@ class ModuleCall:
     def _run(self, module: torch.nn.Module, prefix: str, args: tuple[torch.Tensor, ...]) -> torch.Tensor:
         def call(flat: torch.Tensor, *call_args: torch.Tensor) -> torch.Tensor:
             parameters = {prefix + name: view for name, view in _views(self._module, flat)}
-            return functional_call(module, parameters, call_args)
+            return functional_call(
+                module, parameters, tuple(arg.to(flat.dtype) if arg.is_floating_point() else arg for arg in call_args)
+            )
 
         def row(flat: torch.Tensor, *row_args: torch.Tensor) -> torch.Tensor:
             # The module sees a batch of one row, as it would in ordinary PyTorch code.

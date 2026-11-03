@@ -199,7 +199,7 @@ def overlay_gradient(function: Callable[..., torch.Tensor], *, batched: bool = F
         rows = function(**parameters, **operands, **constants)
         if rows.shape != valid.shape:
             raise ValueError("autograd overlays must return one loss per input row")
-        return torch.where(valid, rows, 0).sum()
+        return torch.where(valid, rows.to(torch.promote_types(rows.dtype, torch.float32)), 0).sum()
 
     eager = torch.func.grad(loss)
     if batched:
@@ -268,10 +268,7 @@ class GradientUpdate:
             total.add_(grad)
         self.optimizer.tensors(
             parameters,
-            tuple(
-                torch.where(complete, total / length.clamp_min(1), 0).to(parameter.dtype)
-                for total, parameter in zip(sums, parameters, strict=True)
-            ),
+            tuple(torch.where(complete, total / length.clamp_min(1), 0) for total in sums),
         )
         for total in sums:
             total.masked_fill_(complete, 0)
@@ -298,7 +295,13 @@ class GradientUpdate:
                 operands, valid, output = select(fields, count, offset, start)
                 outputs.append(output)
                 gradients = gradient(
-                    {name: value.clone() for name, value in parameters.items()}, operands, constants, valid
+                    {
+                        name: value.to(torch.promote_types(value.dtype, torch.float32)).clone()
+                        for name, value in parameters.items()
+                    },
+                    operands,
+                    constants,
+                    valid,
                 )
                 total = length + valid.sum(-1)
                 complete = (total == self.chunk) | (

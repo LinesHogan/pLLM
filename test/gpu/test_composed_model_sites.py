@@ -73,6 +73,7 @@ class LoopedTTT(pllm.Workload):
         return pllm.InstanceState(
             {"alpha": lambda m: (2 * m.layer_count,), "beta": lambda m: (2 * m.layer_count,)},
             initialize=self.initial_gains,
+            dtype=torch.float32,
         )
 
     def initial_gains(self, fields: Mapping[str, torch.Tensor], generator: torch.Generator) -> None:

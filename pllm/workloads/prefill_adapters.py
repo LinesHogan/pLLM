@@ -7,6 +7,7 @@ the adapter the prompt ended with.
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 
@@ -28,7 +29,7 @@ class PrefillAdaptersWorkload(pllm.Workload):
     chunk_size: int = 128
     rank: int = 8
     learning_rate: float = 1e-3
-    dtype: torch.dtype = torch.float32
+    dtype: torch.dtype | Literal["auto"] = "auto"
 
     @property
     def adapters(self) -> pllm.RequestState:

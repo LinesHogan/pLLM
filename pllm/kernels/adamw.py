@@ -60,16 +60,16 @@ def apply_adamw(
     """Apply the bound optimizer to validated page views and matching gradients."""
     assert roots and len(roots) == len(gradients)
     assert all(
-        (gradient.shape, gradient.dtype, gradient.device)
-        == (root[fields.parameter].shape, root[fields.parameter].dtype, root[fields.parameter].device)
+        (gradient.shape, gradient.device) == (root[fields.parameter].shape, root[fields.parameter].device)
         for root, gradient in zip(roots, gradients, strict=True)
     )
     with torch.no_grad():
         for root, gradient in zip(roots, gradients, strict=True):
             root[fields.gradient].copy_(gradient)
         cuda = roots[0][fields.parameter].is_cuda
+        parameters = [root[fields.parameter].to(root[fields.exp_avg].dtype) for root in roots]
         adamw(
-            params=[root[fields.parameter] for root in roots],
+            params=parameters,
             grads=[root[fields.gradient] for root in roots],
             exp_avgs=[root[fields.exp_avg] for root in roots],
             exp_avg_sqs=[root[fields.exp_avg_sq] for root in roots],
@@ -87,6 +87,10 @@ def apply_adamw(
             eps=config.eps,
             maximize=False,
         )
+
+        for root, parameter in zip(roots, parameters, strict=True):
+            if parameter is not root[fields.parameter]:
+                root[fields.parameter].copy_(parameter)
 
 
 @triton.jit

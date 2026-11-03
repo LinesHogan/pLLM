@@ -250,7 +250,13 @@ class Builder(Generic[D]):
                     parameters,
                     name=f"{parameters.name}.{name}",
                     shape=() if name == "step" else parameters.shape,
-                    dtype=TensorDType.FLOAT32 if name == "step" else parameters.dtype,
+                    dtype=TensorDType.FLOAT32
+                    if name == "step"
+                    else (
+                        parameters.dtype
+                        if name == "parameters" or parameters.dtype is TensorDType.FLOAT64
+                        else TensorDType.FLOAT32
+                    ),
                 )
                 for name in ADAM_FIELDS
             )

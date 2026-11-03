@@ -9,7 +9,8 @@
 声明这两件事，以及一个常见的后续问题：补丁的字段值不来自引擎内训练行不行？
 （行，见下文「外部生产的 overlay」。）
 
-`pllm.Field` 默认使用 FP32 保存累积状态。Dense / low-rank 投影读取时转换到模型输入 dtype；
+`pllm.Field` 默认按角色选择精度：优化器参数、chunk carry 和读改写字段为 FP32；
+只读或只写字段为模型 dtype。Dense / low-rank 投影读取时转换到模型输入 dtype；
 "per_head" 保持 FP32。`pllm.Field(shape, dtype=torch.bfloat16)` 可显式节省一半字段显存，
 代价是小更新可能被舍入掉；`dtype=None` 显式跟随模型 dtype。
 `InPlaceTTTWorkload(..., dtype=...)` 与 `PrefillAdaptersWorkload(dtype=...)` 均可配置状态精度，默认 FP32。
@@ -202,7 +203,7 @@ def adapter(self) -> pllm.model.Adapter:
 
 声明 `imported=True` 的 buffer 状态加一个 `pllm.model.ActivationPatch` property（命名状态、层、首/末 prefill
 token、算子），同样经 `batch=` 送入。`LOW_RANK_AFFINE` 每层用
-weight/bias/rotation 字段，`ADD` 用一个 FP32 向量。见维护中的
+weight/bias/rotation 字段，`ADD` 用一个默认模型 dtype 的向量。见维护中的
 [ReFT](../../pllm/workloads/reft.py)。
 
 `first_tokens/last_tokens` 仍只选择 prefill 行。逐 decode 通过三个 keyword-only
