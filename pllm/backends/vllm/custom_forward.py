@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
 from typing import Generic
@@ -30,6 +30,7 @@ from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.semantic_graph import AnchorId, SemanticTask, TokenProgramEffect
 from pllm.execution.cuda_stream import PinnedStaging, upload
 from pllm.execution.custom_forward import CustomForwardPrimitive, CustomForwardTask
+from pllm.execution.model_sites import StateInput
 from pllm.execution.overlay_task import ProgramOperand, ProgramOverlay
 from pllm.execution.state_execution import StateExecution, StateTaskContext
 from pllm.execution.step_capture import capture_graph
@@ -123,6 +124,7 @@ class ProgramWave(Generic[DataT, ResultT]):
                     self.apply_updates,
                     stream,
                     self.adaptive,
+                    parameters=self.custom_forward.parameters,
                 )
             else:
                 count = self.custom_forward.effect.layer_count
@@ -210,6 +212,7 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
         self.observations: torch.Tensor | None = None
         self.captures: dict[tuple[int, Signature], ProgramWave[DataT, ResultT]] = {}
         self.pool = torch.cuda.graph_pool_handle()
+        self.parameters: dict[StateInput, torch.Tensor] = {}
         self.identity: tuple[int, ...] = ()
         self.stream: torch.cuda.Stream | None = None
         execution.rebind_implementation(replace(binding, primitive=self))
@@ -261,13 +264,21 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
         return self.output
 
     def run(
-        self, program: dict[str, TokenProgram], effect: TokenProgramEffect, observe: Callable[[int, torch.Tensor], None]
+        self,
+        program: dict[str, TokenProgram],
+        effect: TokenProgramEffect,
+        observe: Callable[[int, torch.Tensor], None],
+        parameters: Mapping[StateInput, torch.Tensor],
     ) -> None:
         assert self.hidden is not None and self.positions is not None
         stream = torch.cuda.current_stream(self.hidden.device)
         if self.stream is not None and self.stream != stream:
             stream.wait_stream(self.stream)
         self.stream = stream
+        for source, value in parameters.items():
+            if source not in self.parameters:
+                self.parameters[source] = torch.empty_like(value)
+            self.parameters[source].copy_(value)
         identity = tuple(
             tensor.data_ptr()
             for tensor in (
@@ -398,6 +409,7 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
                     layer,
                     apply_updates,
                     stream,
+                    parameters=self.parameters,
                 )
             self.output.index_copy_(0, packed, self.model.norm(hidden))
             assert self.observations is not None

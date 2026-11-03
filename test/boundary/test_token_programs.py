@@ -137,3 +137,40 @@ def test_constant_cells_expand_without_reading_other_requests(width):
         lambda: None,
     )
     torch.testing.assert_close(hidden, torch.full((width, 4), 2.0))
+
+
+@pytest.mark.parametrize("width", (1, 3, 8))
+@pytest.mark.parametrize("direct", (False, True))
+def test_custom_forward_parameters_are_invariant_across_cells(width, direct):
+    from pllm.contracts.parameter_overlay import FieldView
+    from pllm.contracts.semantic_graph import StateResource
+    from pllm.contracts.tensor_layout import LayoutFieldId
+    from pllm.execution.model_sites import StateInput
+    from pllm.execution.token_program import TokenProgram
+    from pllm.execution.token_program_executor import execute_token_program
+
+    source = StateInput(StateResource("gate"), FieldView(LayoutFieldId(0), 0, (1, 4)), False)
+
+    def gated(layers, gate):
+        if direct:
+            return layers(hidden=gate)[-1]
+        before = layers(hidden=layers.embeddings + gate)[-1]
+        return layers(hidden=before * (1 + gate))[-1] + gate
+
+    program = TokenProgram.trace(
+        gated, TokenTensor((1, 4), torch.float32, "cpu"), 1, parameters=(("gate", source, torch.float32),)
+    )
+    seed = torch.arange(width * 4, dtype=torch.float32).reshape(width, 4)
+    for gate in (torch.zeros(1, 4), torch.tensor([[1.0, 2.0, 3.0, 4.0]])):
+        output, _ = execute_token_program(
+            program,
+            seed,
+            torch.arange(width),
+            torch.zeros(width, 1, dtype=torch.bool),
+            (),
+            lambda layer, h, r, kv: (h + 1, torch.zeros_like(h)),
+            lambda: None,
+            parameters={source: gate},
+        )
+        expected = (gate + 1).expand_as(seed) if direct else ((seed + gate) + 1) * (1 + gate) + 1 + gate
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)

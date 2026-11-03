@@ -33,6 +33,7 @@ from pllm.contracts.state_ref import StateRef
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.checkpoint import checkpoint_directory
 from pllm.execution.compile_facts import BackendCompileFacts
+from pllm.execution.model_sites import StateInput
 from pllm.execution.preemption import preemption_policy, retained_rows
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.state_execution import StateExecution, StateTaskContext
@@ -41,7 +42,9 @@ from pllm.execution.tensor_binding import TensorBinding, TensorOutput
 from pllm.execution.tensor_executor import reads_rows
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_task import TensorTask
+from pllm.execution.token_program import TokenProgram
 from pllm.execution.trace import TraceEventKind
+from pllm.testing_forward import CheckForward
 from pllm.testing_timing import VersionChecks
 from pllm.usage import Workload
 
@@ -464,6 +467,7 @@ def _run(
     finally:
         declaration.tensor_tasks = tasks
     execution = deployment.execution
+    forward = None if declaration.custom_forward_programs is None else CheckForward(execution)
     policy = preemption_policy(deployment.attachment, execution.math.model_sites)
     if (
         preempted != "none"
@@ -494,7 +498,28 @@ def _run(
                     sampler_rows=sampler,
                     hidden=None if value.hidden is None else replace(value.hidden, row_batch=sampler.row_batch),
                 )
+            if forward is not None:
+                forward.prepare(
+                    value,
+                    torch.cat(
+                        tuple(
+                            _token_values(
+                                row.identity.prompt_index,
+                                range(row.token_offset, row.token_offset + 1),
+                                shape.hidden_size,
+                                0,
+                                perturbed,
+                            )
+                            for row in value.rows.rows
+                        )
+                    ).to(facts.probe.tensor_dtype.torch),
+                )
             _execute_step(execution, value, _feedback(value, shape, perturbed), run)
+            if forward is not None:
+                run.values.update(
+                    ((row.identity.request_id, row.token_offset, "custom_forward"), output.detach().clone())
+                    for row, output in zip(value.rows.rows, forward.output, strict=True)
+                )
             for row in value.rows.producer_rows(None):
                 for group in execution.directory.select((row,)).groups:
                     if str(group.resource) in run.shared_resources and any(ref.version_id > 0 for ref in group.refs):
@@ -692,6 +717,21 @@ def _neutral_failures(neutral: Workload, config: ModelConfig) -> list[str]:
     return failures
 
 
+def _initial_parameters(
+    declaration: TensorBinding, programs: tuple[TokenProgram, ...], seed: int
+) -> dict[StateInput, torch.Tensor]:
+    """Give the adaptive oracle the same declared initial fields as the state executor."""
+    sources = tuple(dict.fromkeys(source for program in programs for _, source in program.parameters))
+    layouts = {entry.resource: entry.layout for entry in declaration.layouts.layouts}
+    roots = {
+        resource: tuple(torch.zeros(field.shape, dtype=field.dtype.torch) for field in layouts[resource].fields)
+        for resource in dict.fromkeys(source.resource for source in sources)
+    }
+    for resource, root in roots.items():
+        declaration.initializer(resource, torch.device("cpu"), seed)((root,), (None,))
+    return {source: source.view.read(roots[source.resource][source.view.field]) for source in sources}
+
+
 def _check(workload: Workload, config: ModelConfig) -> CheckResult:
     """Check request schedules, replay and state visibility on CPU, without loading a model.
 
@@ -712,27 +752,55 @@ def _check(workload: Workload, config: ModelConfig) -> CheckResult:
     except (ValueError, RuntimeError, TypeError) as error:
         raise ContractError((f"[compile] {''.join(format_exception_only(error)).strip()}",)) from error
     passed.append("compile")
-    if requirements.custom_forward and declaration.custom_forward_programs is not None:
+    programs = tuple((declaration.custom_forward_programs or {}).values())
+    if any(program.adaptive for program in programs):
         from pllm.testing_depth import check_depth, check_never_exit
 
-        for program in declaration.custom_forward_programs.values():
-            if program.adaptive:
-                if program.entries or declaration.overlay_targets or declaration.sites.rewrites:
-                    skipped.append(CheckSkip("adaptive decoder", "PositionState and model-site composition need GPU"))
-                    continue
-                try:
-                    passed.extend(
-                        check_depth(program, shape.layer_count, shape.hidden_size, facts.probe.tensor_dtype.torch)
+        parameters = _initial_parameters(declaration, programs, config.seed)
+        for program in programs:
+            if not program.adaptive:
+                continue
+            if program.entries or declaration.overlay_targets or declaration.sites.rewrites:
+                skipped.append(CheckSkip("adaptive decoder", "PositionState and model-site composition need GPU"))
+                continue
+            try:
+                passed.extend(
+                    check_depth(
+                        program, shape.layer_count, shape.hidden_size, facts.probe.tensor_dtype.torch, parameters
                     )
-                    check_never_exit(program, shape.layer_count, shape.hidden_size, facts.probe.tensor_dtype.torch)
-                    passed.append("never exit bitwise")
-                except AssertionError as error:
-                    raise ContractError((f"[adaptive depth] {error}",)) from error
+                )
+                check_never_exit(
+                    program, shape.layer_count, shape.hidden_size, facts.probe.tensor_dtype.torch, parameters
+                )
+                passed.append("never exit bitwise")
+            except AssertionError as error:
+                raise ContractError((f"[adaptive depth] {error}",)) from error
+        if parameters:
+            passed.append("custom-forward instance reads / CPU decoder")
         skipped.append(CheckSkip("model arithmetic", "CPU fake decoder; native kernels need GPU"))
         return CheckResult(tuple(passed), tuple(skipped))
-    if requirements.custom_residual:
+    if (
+        requirements.custom_residual
+        or programs
+        and (
+            requirements.parameter_targets
+            or requirements.activation_layers
+            or any(program.over == "span" or program.entries for program in programs)
+        )
+    ):
         return CheckResult(
-            tuple(passed), (CheckSkip("model-site execution", "custom_forward/custom_residual need a loaded model"),)
+            tuple(passed),
+            (
+                CheckSkip(
+                    "model-site execution",
+                    "CPU decoder does not execute residual hooks, overlays, spans or PositionState",
+                ),
+            ),
+        )
+    if programs:
+        passed.append("custom-forward instance reads / CPU decoder")
+        skipped.append(
+            CheckSkip("model attention / KV", "CPU decoder checks token math and state reads; real attention needs GPU")
         )
     if requirements.parameter_targets:
         skipped.append(

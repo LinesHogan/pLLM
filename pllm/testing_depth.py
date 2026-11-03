@@ -1,6 +1,6 @@
 """CPU adaptive-depth contracts: compact execution against a rowwise masked decoder oracle."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 
 import torch
@@ -10,6 +10,7 @@ from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import TokenProgramEffect
 from pllm.execution.custom_forward import SerialCustomForward
+from pllm.execution.model_sites import StateInput
 from pllm.execution.token_program import KV, Segment, TokenProgram
 from pllm.execution.token_program_executor import execute_segment, execute_token_program
 
@@ -17,8 +18,15 @@ from pllm.execution.token_program_executor import execute_segment, execute_token
 class _Decoder(SerialCustomForward):
     """Small deterministic causal decoder with distinct layer K/V and explicit slot ownership."""
 
-    def __init__(self, program: TokenProgram, layers: int, hidden: int, dtype: torch.dtype) -> None:
-        self.program = program
+    def __init__(
+        self,
+        program: TokenProgram,
+        layers: int,
+        hidden: int,
+        dtype: torch.dtype,
+        parameters: Mapping[StateInput, torch.Tensor],
+    ) -> None:
+        self.program, self.parameters = program, parameters
         self.cache = torch.full((3, layers, 4, 2, hidden), float("nan"), dtype=dtype)
         self.seed = torch.sin(torch.arange(3 * hidden).reshape(3, hidden).float() * 0.17).to(dtype)
         self.batch: tuple[PackedPhaseRow, ...] = ()
@@ -122,15 +130,22 @@ class _Decoder(SerialCustomForward):
             self.batch_layer,
             lambda: None,
             adaptive=self.compact,
+            parameters=self.parameters,
         )
 
 
-def check_depth(program: TokenProgram, layers: int, hidden: int, dtype: torch.dtype) -> tuple[str, ...]:
+def check_depth(
+    program: TokenProgram,
+    layers: int,
+    hidden: int,
+    dtype: torch.dtype,
+    parameters: Mapping[StateInput, torch.Tensor] = {},
+) -> tuple[str, ...]:
     """Compare output, decisions and every KV slot across compaction, masking and row schedules."""
-    reference = _Decoder(program, layers, hidden, dtype)
+    reference = _Decoder(program, layers, hidden, dtype, parameters)
     observations: list[tuple[torch.Tensor, tuple[torch.Tensor, ...]]] = []
     for order in ((0, 1, 2), (2, 1, 0), (0,), (0, 2, 1)):
-        compact, masked = (_Decoder(program, layers, hidden, dtype) for _ in range(2))
+        compact, masked = (_Decoder(program, layers, hidden, dtype, parameters) for _ in range(2))
         if order == (0, 2, 1):
             compact.seed[1:] *= -7
             masked.seed[1:] *= -7
@@ -138,7 +153,7 @@ def check_depth(program: TokenProgram, layers: int, hidden: int, dtype: torch.dt
             compact.stage(order, position)
             masked.stage(order, position)
             compact.run_compacted()
-            masked.run({"decode": program}, TokenProgramEffect(layers, "decode"), lambda index, value: None)
+            masked.run({"decode": program}, TokenProgramEffect(layers, "decode"), lambda index, value: None, parameters)
             torch.testing.assert_close(compact.output, masked.output)
             decisions = len(compact.decisions)
             for index, active in enumerate(compact.decisions):
@@ -164,7 +179,13 @@ def check_depth(program: TokenProgram, layers: int, hidden: int, dtype: torch.dt
     return ("adaptive compaction = masked oracle", "adaptive row permutation / isolation", "adaptive KV policy")
 
 
-def check_never_exit(program: TokenProgram, layers: int, hidden: int, dtype: torch.dtype) -> None:
+def check_never_exit(
+    program: TokenProgram,
+    layers: int,
+    hidden: int,
+    dtype: torch.dtype,
+    parameters: Mapping[StateInput, torch.Tensor] = {},
+) -> None:
     """Force every active decision true and compare bitwise with the same slices without active=."""
     plain = replace(
         program,
@@ -172,7 +193,7 @@ def check_never_exit(program: TokenProgram, layers: int, hidden: int, dtype: tor
             replace(step, active=None, propagate=()) if isinstance(step, Segment) else step for step in program.steps
         ),
     )
-    compact, vanilla = (_Decoder(item, layers, hidden, dtype) for item in (program, plain))
+    compact, vanilla = (_Decoder(item, layers, hidden, dtype, parameters) for item in (program, plain))
 
     def all_active(step: Segment, seed: torch.Tensor, active: torch.Tensor) -> tuple[torch.Tensor, ...]:
         return compact.compact(step, seed, torch.ones_like(active))
@@ -189,6 +210,7 @@ def check_never_exit(program: TokenProgram, layers: int, hidden: int, dtype: tor
             compact.batch_layer,
             lambda: None,
             adaptive=all_active,
+            parameters=parameters,
         )
         vanilla.run_compacted()
         torch.testing.assert_close(output, vanilla.output, rtol=0, atol=0)

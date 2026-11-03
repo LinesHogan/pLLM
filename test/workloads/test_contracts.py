@@ -152,3 +152,48 @@ def test_check_reports_unsupported_replay_with_actionable_visibility(model_confi
     assert 'visibility="exact"' in skipped["preempted"]
     assert "GPU" in skipped["visibility=forward_pinned"]
     assert "preempted" not in result.passed
+
+
+class LoopedDepth(pllm.Workload):
+    """A learned scalar exit gate, expressed as masking until active slices are available."""
+
+    steps = 2
+
+    @property
+    def gate(self) -> pllm.InstanceState:
+        return pllm.InstanceState({"w": lambda m: (m.hidden_size,), "b": (1,)}, dtype=torch.float32)
+
+    @pllm.custom_forward()
+    def forward(self, layers, w=pllm.parameter("gate", "w"), b=pllm.parameter("gate", "b"), steps=pllm.Attr("steps")):
+        hidden = layers()[-1]
+        for _ in range(steps):
+            after = layers(hidden=hidden)[-1]
+            hidden = torch.where(torch.sigmoid(hidden.float() @ w + b)[:, None] > 0.6, hidden, after)
+        return hidden
+
+
+class MoR(pllm.Workload):
+    """A module router selects each token's recursion depth."""
+
+    @property
+    def router(self) -> pllm.InstanceState:
+        return pllm.InstanceState(module=lambda m: torch.nn.Linear(m.hidden_size, 1), dtype=torch.float32)
+
+    @pllm.custom_forward(tokens="decode")
+    def forward(self, layers, router=pllm.module("router")):
+        hidden = layers()[-1]
+        depth = 1 + (torch.sigmoid(router(hidden.float())) * 2).round()
+        for step in range(3):
+            after = layers(hidden=hidden)[-1]
+            hidden = torch.where(depth > step, after, hidden)
+        return hidden
+
+
+@pytest.mark.parametrize("workload,state", ((LoopedDepth(), "gate"), (MoR(), "router")))
+def test_custom_forward_state_check_and_explain(workload, state, model_config):
+    result = testing.check(workload, model_config)
+    assert "custom-forward instance reads / CPU decoder" in result.passed
+    assert "request isolation" in result.passed
+    report = pllm.explain(workload, model_config)
+    member = next(member for member in report.members if member.name == "forward")
+    assert state in member.tasks[0].reads

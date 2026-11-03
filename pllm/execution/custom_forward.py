@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from functools import partial
@@ -14,10 +14,11 @@ import torch
 from pllm.contracts.backend_attachment import CausalModelDomain
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.semantic_graph import ImplementationId, SemanticTask, TaskId, TokenProgramEffect
+from pllm.execution.model_sites import StateInput
 from pllm.execution.overlay_task import OverlayTransition, ProgramOverlay
 from pllm.execution.position_state import PositionBuffers
 from pllm.execution.tensor_frame import TensorFrame
-from pllm.execution.tensor_program import TaskOutput, TensorBatch, TensorOperation
+from pllm.execution.tensor_program import TaskOutput, TensorBatch, TensorOperation, read_batch
 from pllm.execution.token_program import KV, Segment, TokenProgram
 from pllm.execution.token_program_executor import execute_segment, execute_token_program, ordinary_pass
 from pllm.execution.trace import TraceEventKind
@@ -41,7 +42,11 @@ class CustomForwardPrimitive(ABC):
 
     @abstractmethod
     def run(
-        self, program: dict[str, TokenProgram], effect: TokenProgramEffect, observe: Callable[[int, torch.Tensor], None]
+        self,
+        program: dict[str, TokenProgram],
+        effect: TokenProgramEffect,
+        observe: Callable[[int, torch.Tensor], None],
+        parameters: Mapping[StateInput, torch.Tensor],
     ) -> None: ...
 
 
@@ -95,7 +100,11 @@ class SerialCustomForward(CustomForwardPrimitive):
     def finish(self, outputs: tuple[torch.Tensor, ...]) -> None: ...
 
     def run(
-        self, program: dict[str, TokenProgram], effect: TokenProgramEffect, observe: Callable[[int, torch.Tensor], None]
+        self,
+        program: dict[str, TokenProgram],
+        effect: TokenProgramEffect,
+        observe: Callable[[int, torch.Tensor], None],
+        parameters: Mapping[StateInput, torch.Tensor],
     ) -> None:
         """Run every row's program, or its ordinary pass when the program skips its phase."""
         assert all(item.over == "token" for item in program.values()), (
@@ -125,6 +134,7 @@ class SerialCustomForward(CustomForwardPrimitive):
                     layer,
                     (lambda: None) if self.overlay is None else self.overlay.apply_updates,
                     adaptive=partial(self.masked_segment, row, positions),
+                    parameters=parameters,
                 )
                 if self.position is not None:
                     self.position.exit(saved)
@@ -192,4 +202,12 @@ class CustomForwardTask(Generic[DataT]):
             )
 
         with torch.no_grad(), nullcontext() if context.pin.stream is None else torch.cuda.stream(context.pin.stream):
-            primitive.run(self.program, effect, observe)
+            parameters = {
+                source: source.view.read(
+                    read_batch(context, "published", source.resource).parameter_root(source.resource)[source.view.field]
+                )
+                for source in dict.fromkeys(
+                    source for program in self.program.values() for _, source in program.parameters
+                )
+            }
+            primitive.run(self.program, effect, observe, parameters)

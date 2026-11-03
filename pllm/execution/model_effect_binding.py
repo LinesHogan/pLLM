@@ -19,7 +19,6 @@ from pllm.contracts.backend_attachment import (
     DecodeRefresh,
     DecodeWindow,
     MissingPolicy,
-    ModelProbe,
 )
 from pllm.contracts.codec import boundary_digest
 from pllm.contracts.hidden_locator import HiddenPhase
@@ -47,7 +46,7 @@ from pllm.contracts.visibility import VisibilityKind, VisibilitySource
 from pllm.execution.binding_base import Field, overlay_fields
 from pllm.execution.custom_forward import CUSTOM_FORWARD_IMPLEMENTATION
 from pllm.execution.declaration import Call, State, When, native
-from pllm.execution.model_sites import PatchInput, ResidualRewrite, activation_write
+from pllm.execution.model_sites import PatchInput, ResidualRewrite, StateInput, activation_write
 from pllm.execution.overlay_task import ChunkUpdate, GradientUpdate, OverlayTransition, overlay_apply
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.tensor_frame import (
@@ -57,7 +56,7 @@ from pllm.execution.tensor_frame import (
 )
 from pllm.execution.tensor_program import TaskOutput, TensorBatch
 from pllm.execution.tensor_task import FieldWriter, TensorTask
-from pllm.execution.token_program import ApplyUpdates, Cell, Layers, Over, Segment, TokenProgram, Tokens, TokenTensor
+from pllm.execution.token_program import ApplyUpdates, Cell, Over, Segment, TokenProgram, Tokens, TokenTensor
 
 if TYPE_CHECKING:
     from pllm.execution.tensor_binding import TensorBinding
@@ -345,7 +344,7 @@ def _check_activation_fields(
 
 def declare_custom_forward(
     b: TensorBinding,
-    forwards: tuple[tuple[Tokens, Over, Callable[[Layers], torch.Tensor]], ...],
+    forwards: tuple[tuple[Tokens, Over, Callable[..., torch.Tensor], tuple[tuple[str, StateInput], ...]], ...],
     position_states: tuple[tuple[str, float], ...],
     publications: tuple[Call, ...],
 ) -> None:
@@ -364,7 +363,25 @@ def declare_custom_forward(
         b.update_task(symbol, partial(_read_publications, b, publications))
     probe = b.probe
     assert probe is not None and probe.causal_domain is not None
-    captured = _trace_programs(probe, forwards, position_states)
+    reads = tuple(dict.fromkeys(source.resource for _, _, _, inputs in forwards for _, source in inputs))
+    b.model_reads(reads)
+    b.update_task(
+        symbol,
+        lambda task: replace(
+            task,
+            effects=(
+                *task.effects,
+                *(
+                    SemanticEffect(resource, StateEffectKind.READ)
+                    for resource in reads
+                    if not any(
+                        effect.resource == resource and effect.kind is StateEffectKind.READ for effect in task.effects
+                    )
+                ),
+            ),
+        ),
+    )
+    captured = _trace_programs(b, forwards, position_states)
     programs = {
         role: program for selected, program in captured for role in ("prefill", "decode") if selected in (role, "all")
     }
@@ -386,6 +403,7 @@ def declare_custom_forward(
                 (
                     role,
                     program.over,
+                    tuple((name, source.resource, source.view) for name, source in program.parameters),
                     tuple(str(step.graph.graph) if isinstance(step, Cell) else step for step in program.steps),
                 )
                 for role, program in programs.items()
@@ -512,12 +530,14 @@ def _attach_custom_forward(b: TensorBinding, composed: bool, effect: TokenProgra
 
 
 def _trace_programs(
-    probe: ModelProbe,
-    forwards: tuple[tuple[Tokens, Over, Callable[[Layers], torch.Tensor]], ...],
+    b: TensorBinding,
+    forwards: tuple[tuple[Tokens, Over, Callable[..., torch.Tensor], tuple[tuple[str, StateInput], ...]], ...],
     position_states: tuple[tuple[str, float], ...],
 ) -> tuple[tuple[Tokens, TokenProgram], ...]:
     """Trace each @pllm.custom_forward method into a token program over the model's layers."""
-    assert probe.causal_domain is not None
+    probe = b.probe
+    assert probe is not None and probe.causal_domain is not None
+    layouts = {entry.resource: entry.layout for entry in b.layouts.layouts}
     tensor = TokenTensor(
         (1, probe.hidden_size),
         probe.tensor_dtype.torch,
@@ -525,8 +545,21 @@ def _trace_programs(
     )
     names = tuple(name for name, _ in position_states)
     return tuple(
-        (selected, TokenProgram.trace(function, tensor, probe.causal_domain.layers, names, over))
-        for selected, over, function in forwards
+        (
+            selected,
+            TokenProgram.trace(
+                function,
+                tensor,
+                probe.causal_domain.layers,
+                names,
+                over,
+                tuple(
+                    (name, source, layouts[source.resource].fields[source.view.field].dtype.torch)
+                    for name, source in inputs
+                ),
+            ),
+        )
+        for selected, over, function, inputs in forwards
     )
 
 

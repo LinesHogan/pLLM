@@ -301,3 +301,19 @@ def test_composed_effects_match_each_effect_alone() -> None:
         torch.testing.assert_close(composed_states[key], value, rtol=0, atol=0)
     assert len(composed_exports) == len(exports) == 1
     torch.testing.assert_close(composed_exports[0], exports[0], rtol=0, atol=0)
+
+
+class ForwardReads(pllm.Workload):
+    @pllm.custom_forward()
+    def route(self, layers, v=pllm.parameter("written", "v")):
+        return layers(hidden=layers.embeddings + v.to(layers.embeddings.dtype))[-1]
+
+
+@pytest.mark.parametrize("effect", (TrainBatch, InForward, Residual, Patch))
+def test_custom_forward_reads_compose_per_effect(effect):
+    workload = type("ReadsWithEffects", (ForwardReads, Write, effect), {})()
+    facts, declaration = workload.specialize(FACTS, pllm.ExecutionOptions())
+    workload.plan_backend(facts, declaration)
+    task = declaration.graph.custom_forward_task
+    assert "written" in declaration.graph.model_reads
+    assert any(item.resource == "written" and item.kind.value == "read" for item in task.effects)

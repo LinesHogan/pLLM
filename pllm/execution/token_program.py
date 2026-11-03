@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from operator import getitem
 from typing import Literal
 
 import torch
@@ -10,6 +11,8 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
+from pllm.execution.model_sites import StateInput
+from pllm.execution.module_graph import ModuleCall
 from pllm.execution.position_state import position_save
 from pllm.execution.torch_private import check_functional_aten, tensor_decompositions, tensor_node_metadata
 
@@ -197,7 +200,7 @@ def _tensor(node: torch.fx.Node) -> torch.Tensor:
     return value
 
 
-def _cell(nodes: list[torch.fx.Node], over: Over) -> Cell:
+def _cell(nodes: list[torch.fx.Node], over: Over, invariants: tuple[str, ...]) -> Cell:
     # Recompute symbolic sizes in each fragment so program boundaries carry tensors only.
     needed = set(nodes)
     for node in reversed(tuple(nodes[0].graph.nodes)):
@@ -219,15 +222,19 @@ def _cell(nodes: list[torch.fx.Node], over: Over) -> Cell:
     graph.output(tuple(mapped[node] for node in outputs))
     for node in nodes:
         assert node.op == "call_function"
-        check_functional_aten(node.target)
+        # Module parameters are unpacked by split followed by tuple indexing.
+        if node.target is not getitem:
+            check_functional_aten(node.target)
     module = torch.fx.GraphModule({}, graph)
-    input_rows = tuple(bool(_tensor(node).ndim and _tensor(node).shape[0] == 1) for node in inputs)
+    input_rows = tuple(
+        node.name not in invariants and bool(_tensor(node).ndim and _tensor(node).shape[0] == 1) for node in inputs
+    )
     output_rows = tuple(bool(_tensor(node).ndim and _tensor(node).shape[0] == 1) for node in outputs)
 
     def per_row(_seed: torch.Tensor, *args: torch.Tensor) -> tuple[torch.Tensor, ...]:
         return module(*args)
 
-    mapped_function = torch.vmap(per_row)
+    mapped_function = torch.vmap(per_row, in_dims=(0, *(None if node.name in invariants else 0 for node in inputs)))
 
     def batched(seed: torch.Tensor, *args: torch.Tensor) -> tuple[torch.Tensor, ...]:
         # vmap preserves the single-position meaning of reductions and reshapes;
@@ -254,17 +261,19 @@ class TokenProgram:
     position: str
     generated: str
     entries: tuple[tuple[str, str], ...]
+    parameters: tuple[tuple[str, StateInput], ...] = ()
     prompt_pass_is_identity: bool = False
     over: Over = "token"
 
     @classmethod
     def trace(
         cls,
-        function: Callable[[Layers], torch.Tensor | None],
+        function: Callable[..., torch.Tensor | None],
         tensor: TokenTensor,
         layer_count: int,
         names: tuple[str, ...] = (),
         over: Over = "token",
+        parameters: tuple[tuple[str, StateInput, torch.dtype], ...] = (),
     ) -> "TokenProgram":
         """Trace on fake tensors; Torch rejects data-dependent Python control flow."""
 
@@ -272,7 +281,13 @@ class TokenProgram:
             seed: torch.Tensor, position: torch.Tensor, generated: torch.Tensor, *entries: torch.Tensor
         ) -> torch.Tensor:
             result = function(
-                Layers(seed, position, layer_count, generated, dict(zip(names, entries, strict=True)), over)
+                Layers(
+                    seed, position, layer_count, generated, dict(zip(names, entries[: len(names)], strict=True)), over
+                ),
+                **{
+                    name: value if source.module is None else ModuleCall(source.module, value, False)
+                    for (name, source, _), value in zip(parameters, entries[len(names) :], strict=True)
+                },
             )
             if (
                 not isinstance(result, torch.Tensor)
@@ -294,7 +309,13 @@ class TokenProgram:
             seed = torch.empty(shape, dtype=tensor.dtype, device=tensor.device)
             position = torch.empty((shape[0], 1), dtype=torch.int64, device=tensor.device)
             generated = torch.empty((shape[0], 1), dtype=torch.bool, device=tensor.device)
-            arguments = (seed, position, generated, *(torch.empty_like(seed) for _ in names))
+            arguments = (
+                seed,
+                position,
+                generated,
+                *(torch.empty_like(seed) for _ in names),
+                *(torch.empty(source.view.shape, dtype=dtype, device=tensor.device) for _, source, dtype in parameters),
+            )
             graph = make_fx(
                 invoke,
                 decomposition_table=tensor_decompositions((torch.ops.aten.linalg_vector_norm.default,)),
@@ -307,6 +328,7 @@ class TokenProgram:
             pending: list[torch.fx.Node] = []
             committed: set[int] = set()
             placeholders = tuple(node.name for node in graph.graph.nodes if node.op == "placeholder")
+            invariants = placeholders[3 + len(names) :]
             for node in graph.graph.nodes:
                 if node.target == torch.ops.higher_order.while_loop:
                     raise ValueError("@pllm.custom_forward does not support traced while_loop; use a bounded for-loop")
@@ -320,7 +342,7 @@ class TokenProgram:
                     or node.op == "output"
                 ):
                     if pending:
-                        steps.append(_cell(pending, over))
+                        steps.append(_cell(pending, over, invariants))
                         pending = []
                     if node.target == torch.ops.pllm.position_save.default:
                         steps.append(Save(str(node.args[1]), node.all_input_nodes[0].name))
@@ -362,7 +384,8 @@ class TokenProgram:
             placeholders[0],
             placeholders[1],
             placeholders[2],
-            tuple(zip(names, placeholders[3:], strict=True)),
+            tuple(zip(names, placeholders[3 : 3 + len(names)], strict=True)),
+            parameters=tuple((key, source) for key, (_, source, _) in zip(invariants, parameters, strict=True)),
             over=over,
         )
 

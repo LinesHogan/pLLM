@@ -318,7 +318,7 @@ class Parameter(_Source):
             return super().batch(state, definition)
         return "parameter", self.field
 
-    def site_input(self, context: _Reflection) -> SiteInput:
+    def site_input(self, context: _Reflection) -> StateInput:
         context.parameter(self.state, self.field)
         return StateInput(
             context.states[self.state].declaration.resource,
@@ -369,7 +369,7 @@ class _Module(Parameter):
     def request(self, context: _Reflection) -> bool:
         return context.state_definition(self.state, "pllm.module needs a declared state").scope is StateScope.REQUEST
 
-    def site_input(self, context: _Reflection) -> SiteInput:
+    def site_input(self, context: _Reflection) -> StateInput:
         return replace(super().site_input(context), module=self.skeleton(context))
 
 
@@ -1799,6 +1799,8 @@ def custom_forward(*, tokens: Tokens = "all", over: Over = "token") -> Callable[
     ``over="token"`` runs each position independently in causal order. ``over="span"``
     packs each request's contiguous scheduled tokens into [M, H] hidden tensors;
     position and generated flags have shape [M, 1]. Spans cannot load predecessors.
+    Inputs after layers use pllm.parameter / pllm.module to read InstanceState, shared
+    by every token, or pllm.Attr for a static constant.
     """
     if tokens not in ("prefill", "decode", "all"):
         raise ValueError('set @pllm.custom_forward(tokens=) to "prefill", "decode" or "all"')
@@ -2124,11 +2126,11 @@ class _Reflection:
             return
         markers = vars(function)
         if (tokens := markers.get("__pllm_tokens__")) is not None:
-            if tuple(signature(function).parameters) != ("self", "layers") or any(
+            if tuple(signature(function).parameters)[:2] != ("self", "layers") or any(
                 markers.get(f"__pllm_{marker}__") is not None for marker in ("phase", "effect", "gradient", "rows")
             ):
                 raise ValueError(
-                    "@pllm.custom_forward methods take (self, layers) and no other pllm decorator; use layers.save instead of @write"
+                    "@pllm.custom_forward methods take (self, layers, marker inputs...) and no other pllm decorator; use layers.save instead of @write"
                 )
             overlap = {
                 role
@@ -2253,7 +2255,7 @@ class _Reflection:
         if self.custom_forwards:
             declare_custom_forward(
                 self.binding,
-                tuple((tokens, over, self.method(name)) for name, tokens, over in self.custom_forwards),
+                tuple((tokens, over, *self.forward_inputs(name)) for name, tokens, over in self.custom_forwards),
                 self.positions,
                 publications,
             )
@@ -2270,6 +2272,27 @@ class _Reflection:
                     "pllm.model.ActivationPatch reads"
                 )
             self.binding.conditional_input(tuple(feed.resource for feed in self.binding.feeds), publications[0])
+
+    def forward_inputs(self, name: str) -> tuple[Callable[..., torch.Tensor], tuple[tuple[str, StateInput], ...]]:
+        """Bind each forward's instance fields and resolve static attribute defaults."""
+        function = self.method(name)
+        inputs: list[tuple[str, StateInput]] = []
+        for key, parameter in tuple(signature(function).parameters.items())[1:]:
+            source = parameter.default
+            if isinstance(source, Attr):
+                function = partial(function, **{key: Attr.resolve(source, self.owner)})
+                continue
+            if not isinstance(source, Parameter):
+                raise TypeError(
+                    f"{name}.{key}: use pllm.parameter or pllm.module after layers, or pllm.Attr for a constant"
+                )
+            binding = source.site_input(self)
+            if binding.request or source.per_row:
+                raise ValueError(
+                    f"{name}.{key}: custom forwards read shared InstanceState; use InstanceState and remove per_row=True"
+                )
+            inputs.append((key, binding))
+        return function, tuple(inputs)
 
     def position_states(self) -> tuple[tuple[str, float], ...]:
         """Resolve the pre-allocation schema without tracing tensors."""

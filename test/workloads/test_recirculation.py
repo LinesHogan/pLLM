@@ -221,6 +221,7 @@ def test_route_observation_precedes_sampling_normalization():
         {"prefill": program, "decode": program},
         TokenProgramEffect(3),
         lambda index, hidden: observed.append(hidden.clone()),
+        {},
     )
     _, expected = serial_oracle()
     torch.testing.assert_close(torch.cat(observed), torch.stack(expected))

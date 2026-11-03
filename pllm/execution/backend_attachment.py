@@ -91,6 +91,13 @@ def attachment_buffer_bytes(
     for task in graph.tasks:
         match task.custom_forward:
             case TokenProgramEffect():
+                reads = {effect.resource for effect in task.effects if effect.kind is StateEffectKind.READ}
+                buffers += sum(
+                    prod(field.shape) * field.dtype.itemsize
+                    for layout in layouts.layouts
+                    if layout.resource in reads
+                    for field in layout.layout.fields
+                )
                 buffers += 2 * rows * hidden * width
                 buffers += (3 * hidden * width + 16) * len(task.custom_forward.position_states) + 2
                 if probe.causal_domain is not None and attachment.overlay_bindings:

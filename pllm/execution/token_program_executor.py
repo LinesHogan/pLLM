@@ -1,9 +1,10 @@
 """Execute a traced token program's steps on a batch of independent token positions."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import torch
 
+from pllm.execution.model_sites import StateInput
 from pllm.execution.token_program import KV, ApplyUpdates, Cell, Save, Segment, TokenProgram
 
 Layer = Callable[[int, torch.Tensor, torch.Tensor | None, KV], tuple[torch.Tensor, torch.Tensor]]
@@ -16,6 +17,14 @@ def add(layer: int, hidden: torch.Tensor, residual: torch.Tensor) -> torch.Tenso
     return hidden + residual
 
 
+def _row_value(
+    program: TokenProgram, values: Mapping[str, torch.Tensor], name: str, seed: torch.Tensor
+) -> torch.Tensor:
+    """A field used directly as a stream supplies the same stream to every row."""
+    value = values[name]
+    return value.expand_as(seed) if any(name == parameter for parameter, _ in program.parameters) else value
+
+
 def execute_token_program(
     program: TokenProgram,
     seed: torch.Tensor,
@@ -26,19 +35,24 @@ def execute_token_program(
     apply_updates: Callable[[], None],
     stream: Stream = add,
     adaptive: Adaptive | None = None,
+    *,
+    parameters: Mapping[StateInput, torch.Tensor] = {},
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
     """Preserve segment residuals and snapshot taps before subsequent in-place layer calls."""
     values = {program.seed: seed, program.position: positions.reshape(-1, 1), program.generated: generated}
     values.update((name, value) for (_, name), value in zip(program.entries, entries, strict=True))
+    values.update((name, parameters[source]) for name, source in program.parameters)
     saved = dict(zip((name for name, _ in program.entries), entries, strict=True))
     output = seed
     for step in program.steps:
         if isinstance(step, Segment):
+            hidden = _row_value(program, values, step.input, seed)
             if step.active is None:
-                outputs = execute_segment(step, values[step.input], layer, stream)
+                outputs = execute_segment(step, hidden, layer, stream)
             else:
                 assert adaptive is not None
-                outputs = adaptive(step, values[step.input], values[step.active])
+                active = _row_value(program, values, step.active, seed[:, :1])
+                outputs = adaptive(step, hidden, active)
             values.update(zip((name for _, name in step.taps), outputs, strict=True))
         elif isinstance(step, Cell):
             results = step.function(seed, *(values[name] for name in step.inputs))
@@ -48,7 +62,7 @@ def execute_token_program(
         elif isinstance(step, Save):
             saved[step.name] = values[step.value]
         else:
-            output = values[step.value]
+            output = _row_value(program, values, step.value, seed)
     return output, tuple(saved.values())
 
 

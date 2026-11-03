@@ -82,10 +82,11 @@ class LoopedTTT(pllm.Workload):
         fields["beta"].copy_(beta)
 
     @pllm.custom_forward(tokens="all")
-    def settle(self, layers: pllm.model.Layers) -> torch.Tensor:
+    def settle(self, layers: pllm.model.Layers, alpha=pllm.parameter("laurel", "alpha")) -> torch.Tensor:
         taps = layers()
         layers.apply_updates()
-        return layers(start=LOOPED[0], stop=LOOPED[-1] + 1, hidden=taps[LOOPED[0] - 1])[-1]
+        hidden = layers(start=LOOPED[0], stop=LOOPED[-1] + 1, hidden=taps[LOOPED[0] - 1])[-1]
+        return torch.lerp(taps[-1], hidden, alpha[0].sigmoid().to(hidden.dtype))
 
     @pllm.train_in_forward(
         visibility="exact",
@@ -212,6 +213,7 @@ def _oracle(tokens: list[int], workload: LoopedTTT) -> torch.Tensor:
         stream = after[LOOPED[0] - 1]
         for index in LOOPED:  # the re-run reads the updated fast weights; its operands are not trained
             stream = visit(index, stream, position, [])
+        stream = torch.lerp(after[len(body.layers) - 1], stream, alpha[0].sigmoid())
         logprobs.append(model.lm_head(_rms(body.norm, stream)).log_softmax(-1))
     return torch.stack(logprobs)
 
