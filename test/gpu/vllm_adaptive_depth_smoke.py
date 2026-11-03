@@ -20,15 +20,28 @@ from pllm.execution.step_capture import capture_graph
 class Exit(pllm.Workload):
     rule: str = "none"
 
+    @property
+    def gate(self) -> pllm.InstanceState:
+        return pllm.InstanceState({"threshold": (1,)}, dtype=torch.float32)
+
+    @property
+    def router(self) -> pllm.InstanceState:
+        return pllm.InstanceState(
+            module=lambda m: torch.nn.Linear(m.hidden_size, 1), initialize=self.zero_router, dtype=torch.float32
+        )
+
+    def zero_router(self, fields: pllm.Tensors, generator: torch.Generator) -> None:
+        fields["parameters"].zero_()
+
     @pllm.custom_forward(tokens="decode")
-    def forward(self, layers):
+    def forward(self, layers, threshold=pllm.parameter("gate", "threshold"), router=pllm.module("router")):
         middle = layers.layer_count // 2
         hidden = layers(stop=middle)[middle - 1]
-        active = torch.ones_like(hidden[:, :1], dtype=torch.bool)
+        active = router(hidden.float()).sigmoid() > threshold
         if self.rule == "none":
             active = ~active
         elif self.rule == "mixed":
-            active = layers.position % 2 == 0
+            active = (layers.position % 2 == 0) & active
         return (
             layers(middle, hidden=hidden)[-1]
             if self.rule == "vanilla"
