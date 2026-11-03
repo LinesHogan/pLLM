@@ -101,7 +101,7 @@ def main() -> int:
         if not outputs[0].outputs[0].text:
             raise RuntimeError("plain public inference produced no text")
     finally:
-        plain.llm_engine.engine_core.shutdown()
+        plain.close()
         del plain
         gc.collect()
         torch.cuda.empty_cache()

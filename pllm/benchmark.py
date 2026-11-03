@@ -185,19 +185,16 @@ class _Setup(Generic[D, R]):
 
 def _vanilla(options: BenchmarkOptions, requests: _Requests) -> float:
     """Plain vLLM's median round rate for the same prompts and sampling, in the arms' CUDA-graph mode."""
-    llm = make_llm(options.model_config())
-    for _ in range(options.warmup):
-        llm.generate(requests.prompts, requests.sampling, use_tqdm=False)
-    torch.cuda.synchronize()
     round_seconds: list[float] = []
-    for _ in range(options.rounds):
-        started = perf_counter()
-        llm.generate(requests.prompts, requests.sampling, use_tqdm=False)
+    with make_llm(options.model_config()) as llm:
+        for _ in range(options.warmup):
+            llm.generate(requests.prompts, requests.sampling, use_tqdm=False)
         torch.cuda.synchronize()
-        round_seconds.append(perf_counter() - started)
-    del llm
-    gc.collect()
-    torch.cuda.empty_cache()
+        for _ in range(options.rounds):
+            started = perf_counter()
+            llm.generate(requests.prompts, requests.sampling, use_tqdm=False)
+            torch.cuda.synchronize()
+            round_seconds.append(perf_counter() - started)
     rates = requests.rates(tuple(round_seconds))
     mode = "graph" if options.cuda_graphs else "eager"
     print(

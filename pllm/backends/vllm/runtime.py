@@ -5,6 +5,7 @@ Sessions live in session.py and runners in runner.py; this module builds the eng
 
 from __future__ import annotations
 
+import gc
 import logging
 import os
 from collections.abc import Callable, Iterator
@@ -141,15 +142,15 @@ class _Generation:
 
 @dataclass(slots=True)
 class VllmLlm(Generic[DataT, ResultT]):
-    """The handle make_llm returns for a workload: vLLM generate plus pllm diagnostics, traces and feeds."""
+    """The engine handle returned by make_llm, with workload diagnostics, traces and feeds when installed."""
 
     _llm: LLM | None
-    _runner: WorkloadModelRunner | Mrv1Runner | None
-    attachment: BackendAttachment
-    _facts: BackendCompileFacts
-    _cache_policy: CachePolicy
-    _sample_limit: int | None
-    _eager_reason: str
+    _runner: WorkloadModelRunner | Mrv1Runner | None = None
+    _attachment: BackendAttachment | None = None
+    _facts: BackendCompileFacts | None = None
+    _cache_policy: CachePolicy | None = None
+    _sample_limit: int | None = None
+    _eager_reason: str = ""
     _closed: bool = False
     _next_prompt_index: int = 0
     _pending_input: ExitStack | None = None
@@ -161,11 +162,27 @@ class VllmLlm(Generic[DataT, ResultT]):
 
     @property
     def hidden_size(self) -> int:
-        return self._facts.probe.hidden_size
+        return (
+            self._facts.probe.hidden_size
+            if self._facts is not None
+            else self._require_open().llm_engine.vllm_config.model_config.get_hidden_size()
+        )
 
     @property
     def vocab_size(self) -> int:
-        return self._facts.vocab_size
+        return (
+            self._facts.vocab_size
+            if self._facts is not None
+            else self._require_open().llm_engine.vllm_config.model_config.get_vocab_size()
+        )
+
+    @property
+    def attachment(self) -> BackendAttachment:
+        """The installed workload's plan; workload-only operations require one."""
+        self._require_open()
+        if self._attachment is None:
+            raise ValueError("pass workload= to make_llm to use workload operations")
+        return self._attachment
 
     @property
     def device(self) -> torch.device:
@@ -206,6 +223,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         return self._runner
 
     def _command(self, command: BackendCommand, payload: str = "", *, timeout: float = 30.0) -> list[str]:
+        self.attachment
         replies = self._require_open().collective_rpc(
             "workload_command", timeout=timeout, args=(command.value, payload)
         )
@@ -237,7 +255,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         if self._llm is None and self._pending_input is None:
             return
         try:
-            if not self._closed:
+            if not self._closed and self._attachment is not None:
                 self._command(BackendCommand.DETACH)
         finally:
             self._shutdown()
@@ -251,6 +269,11 @@ class VllmLlm(Generic[DataT, ResultT]):
         if self._pending_input is not None:
             self._pending_input.close()
             self._pending_input = None
+        # vLLM's shutdown runs its collection while this handle still owns the
+        # runner. Collect model/session cycles only after dropping those owners.
+        gc.collect()
+        if torch.cuda.is_initialized():
+            torch.cuda.empty_cache()
 
     def generate_feedback(
         self,
@@ -356,6 +379,10 @@ class VllmLlm(Generic[DataT, ResultT]):
         `batch` feeds the methods that read pllm.batch fields this call; `sample_index` numbers the first sample of
         each prompt; `routes` gives one routing value per prompt for request states keyed by "route".
         """
+        if self._attachment is None:
+            if batch is not None or sample_index or prompt_indices is not None or routes is not None:
+                raise ValueError("batch, sample_index, prompt_indices and routes need workload= in make_llm")
+            return self._require_open().generate(prompts, sampling_params, use_tqdm=use_tqdm)
         run = self._generate(prompts, sampling_params, use_tqdm, batch, sample_index, prompt_indices, routes, None)
         return _per_prompt(run.outputs, run.n)
 
@@ -444,6 +471,7 @@ class VllmLlm(Generic[DataT, ResultT]):
             vocab_size=self.vocab_size,
         )
         llm = self._require_open()
+        assert self._cache_policy is not None
         llm.sleep(level=0, mode="keep")
         request_ids: list[str] = []
         lifetime = ExitStack()

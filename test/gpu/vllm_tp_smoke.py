@@ -111,7 +111,8 @@ def tokens(outputs):
 def test_j1_tokens(graphs):
     settings = config(graphs)
     sampling = [SamplingParams(max_tokens=64, temperature=t, seed=7, ignore_eos=True) for t in (0.0, 0.8)]
-    plain = pllm.make_llm(replace(settings, execution=ExecutionOptions()))
+    plain_handle = pllm.make_llm(replace(settings, execution=ExecutionOptions()))
+    plain = plain_handle._require_open()
     try:
         expected = []
         for params in sampling:
@@ -121,7 +122,7 @@ def test_j1_tokens(graphs):
             plain.wake_up(tags=["scheduling"])
             expected.append(tokens(plain.wait_for_completion(RequestOutput, use_tqdm=False)))
     finally:
-        plain.llm_engine.engine_core.shutdown()
+        plain_handle.close()
     for workload in (
         ExportingDummy(DummyConfig(export_every_n_steps=1)),
         ESampWorkload(ESampConfig(rank=4)),

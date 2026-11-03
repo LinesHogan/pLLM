@@ -61,8 +61,6 @@ from pllm.usage import (
 )
 
 if TYPE_CHECKING:
-    from vllm import LLM
-
     from pllm.authoring import BackendWorkload
     from pllm.backends.vllm.runtime import VllmLlm
 
@@ -75,19 +73,23 @@ def make_llm(config: ModelConfig, *, workload: BackendWorkload[D, R]) -> VllmLlm
 
 
 @overload
-def make_llm(config: ModelConfig, *, workload: None = None) -> LLM: ...
+def make_llm(config: ModelConfig, *, workload: None = None) -> VllmLlm[None, None]: ...
 
 
-def make_llm(config: ModelConfig, *, workload: BackendWorkload[D, R] | None = None) -> LLM | VllmLlm[D, R]:
-    """A vLLM engine for `config`, running `workload` inside it; plain vLLM `LLM` without a workload."""
+def make_llm(
+    config: ModelConfig, *, workload: BackendWorkload[D, R] | None = None
+) -> VllmLlm[D, R] | VllmLlm[None, None]:
+    """A context-managed vLLM engine for `config`, optionally running `workload` inside it."""
     if workload is None:
         if config.execution != ExecutionOptions():
             raise ValueError("workload execution options require a workload")
         from pllm.backends.vllm.compat import admit_parallel
-        from pllm.backends.vllm.runtime import vllm_engine
+        from pllm.backends.vllm.runtime import VllmLlm, vllm_engine
 
         admit_parallel(config)
-        return vllm_engine(config, {"worker_cls": "auto"}, {}, cuda_graphs=config.cuda_graphs is not False)
+        return VllmLlm[None, None](
+            vllm_engine(config, {"worker_cls": "auto"}, {}, cuda_graphs=config.cuda_graphs is not False)
+        )
     from pllm.backends.vllm.runtime import create_vllm_llm
 
     definition = None
