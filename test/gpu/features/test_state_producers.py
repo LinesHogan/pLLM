@@ -1,12 +1,13 @@
 """Internal q/v projection oracle on Qwen2 for each independent state producer."""
 
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import pytest
 import torch
 from vllm import SamplingParams
 
+import pllm
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.semantic_graph import StateResource
 from pllm.execution.tensor_executor import TensorExecutor
@@ -225,3 +226,77 @@ def test_chunked_runners_discard_partial_prompt_feedback(runner, budget, seqs):
             # Releases finish asynchronously; their completion is covered by the page-arena tests.
             assert diagnostics.active_states == 0
     assert tokens[0] == tokens[1]
+
+
+@dataclass(frozen=True)
+class PretrainedProbe(pllm.Workload):
+    """Export the tutorial's probe scores with hidden rows for an independent arithmetic oracle."""
+
+    state: pllm.InstanceState
+
+    @pllm.export(name="probe", max_rows=2, max_cols=897)
+    def score(self, h=pllm.final_hidden(), w=pllm.parameter("state", "w"), b=pllm.parameter("state", "b")):
+        scores = torch.sigmoid((h.float() * w).sum(-1, keepdim=True) + b)
+        return torch.cat((scores, h.float()), dim=-1)
+
+
+def test_hf_trained_probe_deploys_from_safetensors(tmp_path):
+    import gc
+
+    from safetensors.torch import save_file
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from pllm import testing
+
+    model = "Qwen/Qwen2.5-0.5B-Instruct"
+    tokenizer = AutoTokenizer.from_pretrained(model)
+    hf = AutoModelForCausalLM.from_pretrained(model, dtype=torch.bfloat16).cuda()
+    texts = [
+        "I love this movie, it is wonderful.",
+        "What a fantastic and joyful day.",
+        "I hate this movie, it is awful.",
+        "What a terrible and miserable day.",
+    ]
+    with torch.no_grad():
+        rows = [
+            hf(**tokenizer(text, return_tensors="pt").to("cuda"), output_hidden_states=True)
+            .hidden_states[-1][0]
+            .float()
+            for text in texts
+        ]
+    features = torch.cat(rows)
+    labels = torch.cat([torch.full((len(row),), float(i < 2), device="cuda") for i, row in enumerate(rows)])
+    del hf, rows
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.manual_seed(0)
+    probe = torch.nn.Linear(features.shape[1], 1).cuda()
+    optimizer = torch.optim.Adam(probe.parameters(), lr=1e-2)
+    for _ in range(100):
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(probe(features).squeeze(-1), labels)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    path = str(tmp_path / "sentiment_probe.safetensors")
+    weights = {"w": probe.weight.detach()[0].cpu().contiguous(), "b": probe.bias.detach().cpu()}
+    save_file(weights, path)
+    del probe, optimizer, features, labels, loss
+    gc.collect()
+    torch.cuda.empty_cache()
+    workload = PretrainedProbe(pllm.InstanceState({"w": (896,), "b": (1,)}, pretrained=path))
+    config = pllm.ModelConfig(
+        model, max_model_len=64, max_num_seqs=2, max_num_batched_tokens=64, gpu_memory_utilization=0.25
+    )
+    assert testing.check(workload, config).passed
+    assert path in pllm.explain(workload, config).states[0].source
+    with pllm.make_llm(config, workload=workload) as handle:
+        handle.generate(
+            ["The sky is", "What a wonderful day"], SamplingParams(max_tokens=4, temperature=0, ignore_eos=True)
+        )
+        events = [event for event in handle.trace_snapshot().events if event.tensor_name == "probe"]
+        assert len(events) == 3
+        for event in events:
+            values = event.tensor()
+            expected = torch.sigmoid((values[:, 1:] * weights["w"].bfloat16()).sum(-1) + weights["b"].bfloat16())
+            torch.testing.assert_close(values[:, 0], expected)
+        assert handle.diagnostics().eager_reason == ""

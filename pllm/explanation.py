@@ -169,7 +169,7 @@ class ExplainResult:
         lines.extend(
             f"{state.name}  {state.scope}  {state.roots}  {state.bytes_per_root}  {state.reserved_bytes}  "
             + ", ".join(f"field {field.field_id}: {field.dtype}" for field in state.fields)
-            + f"; {state.source}"
+            + f"; source: {state.source}"
             for state in self.states
         )
         lines.append(f"memory   peak {self.peak_memory_bytes} bytes funded by pllm [{self.memory_label}]")
@@ -438,7 +438,9 @@ def _specialize(
 
 
 def explain(workload: Workload, config: ModelConfig) -> ExplainResult:
-    """Plan using config.json and shape-only tensor tracing; never load weights or allocate CUDA storage.
+    """Plan using config.json and shape-only tensor tracing; never load base-model weights or allocate CUDA storage.
+
+    Declared pretrained state files are read and validated on CPU.
 
     Memory excludes base-model weights, KV cache and vLLM activations. GPU fit is decided by make_llm.
     A too-small declared execution/state budget returns the unrestricted plan with actionable budget_errors.

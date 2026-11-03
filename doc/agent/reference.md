@@ -582,7 +582,7 @@ execution.retire(rows, wait=True)
 pllm.make_llm(config: 'ModelConfig', *, workload: 'BackendWorkload[D, R] | None' = None) -> 'VllmLlm[D, R] | VllmLlm[None, None]'
     A context-managed vLLM engine for `config`, optionally running `workload` inside it.
 pllm.explain(workload: 'Workload', config: 'ModelConfig') -> 'ExplainResult'
-    Plan using config.json and shape-only tensor tracing; never load weights or allocate CUDA storage.
+    Plan using config.json and shape-only tensor tracing; never load base-model weights or allocate CUDA storage.
 pllm.scan(step: collections.abc.Callable[..., tuple[torch.Tensor, torch.Tensor]], *, carry: torch.Tensor, over: tuple[torch.Tensor, ...], chunk: int, invariants: tuple[torch.Tensor, ...] = (), valid_rows: torch.Tensor | None = None) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]
     Run ``step(carry, *slices, *invariants)`` in chunk order, returning exclusive readouts.
 pllm.custom_forward(*, tokens: 'Tokens' = 'all', over: 'Over' = 'token') -> 'Callable[[F], F]'
@@ -651,8 +651,9 @@ pllm.causal_model(adapter: 'str') -> 'Any'
     The causal LM with the named pllm.model.Adapter applied, as a pllm.model.CausalModel; .base skips it.
 pllm.batch(field: "Literal['hidden', 'base_logits', 'labels', 'weights', 'targets', 'input_ids', 'attention_mask']") -> 'Any'
     One field of the host batch passed to generate.
-pllm.InstanceState(fields: 'Mapping[str, Shape | Field]' = <factory>, initialize: 'Callable[[Tensors, torch.Generator], None] | None' = None, shape: 'Shape | None' = None, dtype: "torch.dtype | Literal['auto'] | None" = 'auto', *, optimizer: 'AdamWConfig | SGD | None' = None, alignment: 'int' = 16, feed: "Literal['ordered', 'latest'] | None" = None, carry: 'Mapping[str, Shape]' = <factory>, module: 'ModuleFactory | None' = None, imported: 'bool' = False, checkpoint: 'Mapping[str, str]' = <factory>, layers: 'tuple[int, ...]' = ())
-pllm.RequestState(fields: 'Mapping[str, Shape | Field]' = <factory>, initialize: 'Callable[[Tensors, torch.Generator], None] | None' = None, shape: 'Shape | None' = None, dtype: "torch.dtype | Literal['auto'] | None" = 'auto', key_fields: 'tuple[KeyField, ...]' = ('request_id',), *, optimizer: 'AdamWConfig | SGD | None' = None, alignment: 'int' = 16, feed: "Literal['ordered', 'latest'] | None" = None, carry: 'Mapping[str, Shape]' = <factory>, module: 'ModuleFactory | None' = None, imported: 'bool' = False, checkpoint: 'Mapping[str, str]' = <factory>, layers: 'tuple[int, ...]' = ())
+pllm.InstanceState(fields: 'Mapping[str, Shape | Field]' = <factory>, initialize: 'Callable[[Tensors, torch.Generator], None] | None' = None, shape: 'Shape | None' = None, dtype: "torch.dtype | Literal['auto'] | None" = 'auto', *, optimizer: 'AdamWConfig | SGD | None' = None, alignment: 'int' = 16, feed: "Literal['ordered', 'latest'] | None" = None, carry: 'Mapping[str, Shape]' = <factory>, module: 'ModuleFactory | None' = None, imported: 'bool' = False, pretrained: 'str' = '', checkpoint: 'Mapping[str, str]' = <factory>, layers: 'tuple[int, ...]' = ())
+    State shared by requests; pretrained= supplies safetensors starting values instead of initialize=.
+pllm.RequestState(fields: 'Mapping[str, Shape | Field]' = <factory>, initialize: 'Callable[[Tensors, torch.Generator], None] | None' = None, shape: 'Shape | None' = None, dtype: "torch.dtype | Literal['auto'] | None" = 'auto', key_fields: 'tuple[KeyField, ...]' = ('request_id',), *, optimizer: 'AdamWConfig | SGD | None' = None, alignment: 'int' = 16, feed: "Literal['ordered', 'latest'] | None" = None, carry: 'Mapping[str, Shape]' = <factory>, module: 'ModuleFactory | None' = None, imported: 'bool' = False, pretrained: 'str' = '', checkpoint: 'Mapping[str, str]' = <factory>, layers: 'tuple[int, ...]' = ())
     Per-request parameters, read as tensors aligned to the current operation's rows.
 pllm.PositionState(initial: float = 0.0)
     One model-hidden vector per KV allocation block, initialized at token zero.

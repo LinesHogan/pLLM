@@ -13,6 +13,7 @@ from collections.abc import Callable
 import torch
 from torch import nn
 
+from pllm.execution.checkpoint import PretrainedFile
 from pllm.execution.declaration import Dimensions
 from pllm.execution.torch_private import fork_rng, manual_seed
 
@@ -33,11 +34,27 @@ def parameter_count(factory: ModuleFactory) -> Callable[[Dimensions], tuple[int]
     return lambda dimensions: (sum(p.numel() for p in skeleton(factory, dimensions).parameters()),)
 
 
-def initial_values(factory: ModuleFactory, dimensions: Dimensions, seed: int, dtype: torch.dtype) -> torch.Tensor:
+def initial_values(
+    factory: ModuleFactory,
+    dimensions: Dimensions,
+    seed: int,
+    dtype: torch.dtype,
+    pretrained: PretrainedFile | None = None,
+) -> torch.Tensor:
     """The module's own initialization (or loaded weights), flattened; one build per bind."""
-    with fork_rng([]):
-        manual_seed(seed)
-        module = factory(dimensions)
+    if pretrained is None:
+        with fork_rng([]):
+            manual_seed(seed)
+            module = factory(dimensions)
+    else:
+        module = skeleton(factory, dimensions)
+        try:
+            module.load_state_dict(pretrained.module_values(), strict=True, assign=True)
+        except RuntimeError as error:
+            raise ValueError(
+                f"{pretrained.path} cannot load module state {pretrained.state!r}: {error}; "
+                "save the file with safetensors.torch.save_file(module.state_dict(), path) from the same module class"
+            ) from error
     return torch.cat([p.detach().reshape(-1) for p in module.parameters()]).to(dtype)
 
 

@@ -51,8 +51,8 @@ class GPUWorker(compat.Worker):
         declaration = workload.funded_declaration(install.facts, causal=partial(CausalTraining, runner.decoder))
         if (declaration.graph, declaration.layouts) != (plan.semantic_graph, plan.tensor_layout_request):
             raise ValueError(
-                "the EngineCore worker imported workload code that differs from the driver's; "
-                "run both processes from the same installed sources"
+                "the EngineCore worker imported a workload (code or pretrained weights) that differs from the driver's; "
+                "run both processes from the same installed sources and do not rewrite pretrained files while the engine starts"
             )
         runner.attach_workload(
             workload.bind_backend(install.facts, install.attachment, declaration, is_output_rank=self.rank == 0),

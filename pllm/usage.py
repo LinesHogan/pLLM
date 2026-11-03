@@ -57,7 +57,7 @@ from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 from pllm.contracts.visibility import VisibilityKind
 from pllm.execution.binding_base import SGD as SGD, Field as Field, layout_field, overlay_fields
 from pllm.execution.causal_batch import CausalBinder, CausalModel, CausalPort, TrainingBatch, declare_batch_train
-from pllm.execution.checkpoint import initialize_checkpoint
+from pllm.execution.checkpoint import PretrainedFile, initialize_checkpoint
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import Call, Dimensions, LayoutField, Shape, State, When
 from pllm.execution.freeze import (
@@ -621,6 +621,12 @@ def batch(
 
 @dataclass(frozen=True)
 class InstanceState:
+    """State shared by requests; pretrained= supplies safetensors starting values instead of initialize=.
+
+    Plain states load tensor names matching their fields. Module states load a strict state_dict on meta,
+    skipping random initialization. Values convert to the declared storage dtype, including trainable states.
+    """
+
     fields: Mapping[str, Shape | Field] = field(default_factory=lambda: dict[str, Shape | Field]())
     # How @pllm.train or @pllm.train_in_forward updates the state. Training on request rows or on WeightedRowBatch
     # and CausalTrainBatch fields takes pllm.AdamW; WeightedCEBatch training and @pllm.train_in_forward take pllm.SGD.
@@ -639,10 +645,15 @@ class InstanceState:
     # module initializes them (every request starts from the same values).
     module: ModuleFactory | None = field(default=None, kw_only=True)
     imported: bool = field(default=False, kw_only=True)
+    pretrained: str = field(default="", kw_only=True)
     checkpoint: Mapping[str, str] = field(default_factory=lambda: dict[str, str](), kw_only=True)
     layers: tuple[int, ...] = field(default=(), kw_only=True)
 
     def __post_init__(self) -> None:
+        if self.pretrained and (self.initialize is not None or self.checkpoint or self.feed or self.imported):
+            raise ValueError(
+                "pretrained= supplies starting values; drop initialize=, checkpoint=, feed= and imported=True"
+            )
         if self.checkpoint and (
             self.scope is not StateScope.INSTANCE
             or self.optimizer is not None
@@ -690,32 +701,31 @@ class InstanceState:
 
     def declare(self, name: str, context: _Reflection) -> None:
         """Allocate tensor parameters; the layout of fields an adapter reads follows its targets."""
-        context.signature.append((name, boundary_digest(fingerprint(self), tuple(self.fields))))
+        pretrained = PretrainedFile.read(self.pretrained, name) if self.pretrained else None
+        context.signature.append(
+            (
+                name,
+                boundary_digest(fingerprint(self), tuple(self.fields), "" if pretrained is None else pretrained.sha256),
+            )
+        )
+        context.binding.state_sources[name] = self.source() if pretrained is None else pretrained.source
+        if pretrained is not None:
+            context.pretrained[name] = pretrained
         if name in context.in_forward_states or name in context.states:
             return
         if self.feed is not None:
             if context.binding.feeds:
                 raise ValueError(f"{context.binding.feeds[0].resource} and {name}: declare one fed state per workload")
             context.binding.feeds = (FeedBinding(name, FeedOrder(self.feed), tuple(self.fields)),)
-        context.binding.state_sources[name] = (
-            "imported: "
-            + ("one row per prompt" if self.scope is StateScope.REQUEST else "field tensors")
-            + " via generate(batch=pllm.io.StateImport(...)), applied before the request's first forward"
-            if self.imported
-            else "fed"
-            if self.feed
-            else "base checkpoint"
-            if self.checkpoint
-            else "module init"
-            if self.module
-            else "initialize"
-        )
+        fields = self.layout_fields(name, context)
         context.states[name], ports = declare_parameters(
             context.binding,
             name,
-            self.layout_fields(name, context),
+            fields,
             optimizer=self.optimizer,
-            initialize=_frozen(self.initialize),
+            initialize=context.initializer(name, tuple(item.name for item in fields) + tuple(self.carry))
+            if self.module is None
+            else None,
             scope=self.scope,
             keys=self.request_keys,
             carry=tuple(
@@ -730,8 +740,27 @@ class InstanceState:
             )
         if self.module is not None:
             context.binding.initial_values[name] = partial(
-                initial_values, self.module, dtype=context.field_dtype(name, "parameters", self.dtype).torch
+                initial_values,
+                self.module,
+                dtype=context.field_dtype(name, "parameters", self.dtype).torch,
+                pretrained=pretrained,
             )
+
+    def source(self) -> str:
+        """Describe where this state's version-zero values come from."""
+        if self.imported:
+            return (
+                "imported: "
+                + ("one row per prompt" if self.scope is StateScope.REQUEST else "field tensors")
+                + " via generate(batch=pllm.io.StateImport(...)), applied before the request's first forward"
+            )
+        if self.feed:
+            return "fed"
+        if self.checkpoint:
+            return "base checkpoint"
+        if self.module is not None:
+            return "module init"
+        return "initialize" if self.initialize is not None else "zeros"
 
     def checkpoint_names(self) -> tuple[str, ...]:
         """Exact checkpoint tensor names, in the same order as the allocated fields."""
@@ -1466,7 +1495,7 @@ class _TrainInForward(_Effect):
             )
         identity = fingerprint(operation.function)
         function: Callable[..., UpdateOutput] = freeze(operation.function)
-        initialize = _frozen(definition.initialize)
+        initialize = context.initializer(self.state, tuple(definition.fields))
         if self.chunk is not None:
             function, initialize = _chunked_in_forward(
                 function,
@@ -1659,9 +1688,9 @@ class _CustomResidual(_Effect):
         if isinstance(shape, Field):
             raise TypeError(f"{name}: give the carry a fixed shape or a function of the model dimensions")
         rows: Shape = lambda dimensions: (max(1, chunk - 1), dimensions.hidden_size)  # noqa: E731
-        initialize = (
-            None if definition.initialize is None else partial(_author_fields, freeze(definition.initialize), (name,))
-        )
+        initialize = context.initializer(self.state, (name,))
+        if initialize is not None:
+            initialize = partial(_author_fields, initialize, (name,))
         state, ports = declare_parameters(
             b,
             self.state,
@@ -2147,6 +2176,7 @@ class _Reflection:
     # The owner's values, signed; the declared states and model values among them, by type.
     bindings: tuple[tuple[str, str], ...] = ()
     state_definitions: dict[str, InstanceState] = field(default_factory=lambda: {})
+    pretrained: dict[str, PretrainedFile] = field(default_factory=lambda: {})
     # Each declared pllm.model.Adapter as the projection delta it applies.
     adapters: dict[str, ProjectionDelta] = field(default_factory=lambda: {})
     activations: dict[str, ActivationPatch] = field(default_factory=lambda: {})
@@ -2163,6 +2193,24 @@ class _Reflection:
     predictions: list[tuple[Call, _Sampler]] = field(default_factory=lambda: [])
     # Each @pllm.train method and the state it trains.
     trainers: list[tuple[Call, State]] = field(default_factory=lambda: [])
+
+    def initializer(self, name: str, fields: tuple[str, ...]) -> Initializer | None:
+        """One starting-value source for ordinary state and model-side state lowerings."""
+        if name in self.pretrained:
+            return partial(self.pretrained[name].initialize, fields)
+        return _frozen(self.state_definitions[name].initialize)
+
+    def validate_pretrained(self) -> None:
+        """Validate declared weights on CPU after every lowering has resolved its field shapes."""
+        for resource in self.pretrained:
+            if resource in self.binding.initial_values:
+                self.binding.initial_values[resource](self.binding.dimensions, 0)
+            else:
+                layout = next(item.layout for item in self.binding.layouts.layouts if item.resource == resource)
+                tensors = tuple(
+                    torch.empty(field.shape, dtype=field.dtype.torch, device="meta") for field in layout.fields
+                )
+                self.binding.initializers[resource](tensors, torch.Generator())
 
     def field_dtype(self, state: str, field: str, dtype: torch.dtype | Literal["auto"] | None) -> TensorDType:
         """Choose storage once from the declared field role; explicit precision always wins."""
@@ -2763,6 +2811,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             for capability in ("compute/cuda@1", "transition/full_root@1", "backend/tensor_parallel@1")
         ):
             context.overlap_sampler()
+        context.validate_pretrained()
         context.sign_composition()
 
     def build(self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None) -> TensorBinding:

@@ -86,6 +86,11 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
             f"{value.__qualname__}: workload methods may reference torch and pllm classes and the author's "
             "nn.Module subclasses, enums and dataclasses"
         )
+    if isinstance(value, (torch.nn.Module, torch.Tensor)):
+        raise ValueError(
+            f"{type(value).__name__}: a workload cannot hold a module or tensor; save its weights and declare "
+            "pllm.InstanceState(module=<factory>, pretrained=path) or field state with pretrained=path"
+        )
     if is_dataclass(value):
         return boundary_digest(
             type(value).__qualname__,
