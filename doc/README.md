@@ -32,6 +32,7 @@
 - [状态与记忆：作用域、冻结、route 键、memory 与捕获](guides/state-and-memory.md)
 - [训练与观测：loss 约定、梯度边、导出与 trace](guides/training-and-observation.md)
 - [Overlay 与重放：引擎内训练、外部导入、激活检查点](guides/overlays-and-replay.md)
+- [用 agent 开发 pllm workload：agent skill](agent/SKILL.md)（配套[按任务组织的 API 参考](agent/reference.md)）
 - [让代理写负载：输入与工作流](guides/agent-workloads.md)
 - [验证与发布检查](guides/validation.md)
 - [基准解读](guides/benchmarking.md)
