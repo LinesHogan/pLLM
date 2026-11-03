@@ -599,7 +599,7 @@ pllm.ExecutionOptions(max_training_rows: int = 1, capture_memory_bytes: int | No
 pllm.KVOffload(connector: Literal['OffloadingConnector', 'SimpleCPUOffloadConnector'] = 'OffloadingConnector', cpu_bytes: int = 536870912, prompt_only: bool = False)
     Batched same-engine CPU offload of complete allocation pages.
 pllm.Workload()
-    Python methods and effects compiled once, not runtime hooks or a second IR.
+    Python methods and effects compiled once, with independent sub-workloads in dataclass fields.
 pllm.Phase: BEFORE_FORWARD | AFTER_FORWARD | BEFORE_SAMPLE | AFTER_SAMPLE | IN_FORWARD | AUTOMATIC
 pllm.on(phase: 'Phase | Attr') -> 'Callable[[F], F]'
     Run the method in `phase`; needed for methods without an effect or to move an effect's phase.
@@ -643,8 +643,8 @@ pllm.base_logits() -> 'Any'
     The model's logits before any workload adjustment.
 pllm.sampled_tokens() -> 'Any'
     The tokens the sampler drew this step.
-pllm.operand(name: "Literal['input', 'target', 'weight', 'prompt_end']") -> 'Any'
-    A projection tensor or scalar bool marking the span that completes the prompt.
+pllm.operand(name: 'OperandName | Attr') -> 'Any'
+    A projection input/target/weight, input token embedding, or scalar prompt-end bool.
 pllm.carry(source: '_Source', *, state: 'str', field: 'str') -> 'Any'
     Read `source` and, when the training update publishes, write its value into the carried `state.field`.
 pllm.causal_model(adapter: 'str') -> 'Any'
@@ -676,7 +676,7 @@ pllm.model.CausalModel(forward: 'CausalForward | None', factors: 'tuple[torch.Te
     The method's callable model argument and its overlay-free base forward.
 pllm.model.LayerOutputs(values: tuple[torch.Tensor, ...], start: int, layer_count: int)
     Post-layer residual streams indexed by absolute layer, negative from the model end.
-pllm.model.Layers(embeddings: torch.Tensor, position: torch.Tensor, layer_count: int, generated: torch.Tensor, entries: dict[str, torch.Tensor], over: Literal['token', 'span'] = 'token')
+pllm.model.Layers(embeddings: torch.Tensor, position: torch.Tensor, layer_count: int, generated: torch.Tensor, entries: dict[str, torch.Tensor], over: Literal['token', 'span'] = 'token', namespace: str = '')
     Public model slices and position state used inside custom_forward methods.
 pllm.model.Projection(name: 'ProjectionName', layer: 'int | None' = None)
     One linear projection of the base model by its Hugging Face module name; `layer=None` means every layer.
@@ -746,8 +746,8 @@ pllm.testing.final_hidden_binding(layer_count: 'int') -> 'PackedHiddenResourceBi
     The tap `pllm.final_hidden()` reads, named as the vLLM runner names it.
 pllm.testing.hidden_binding(layer: 'int', layer_count: 'int') -> 'PackedHiddenResourceBinding'
     The tap `pllm.hidden(layer)` reads, named as the vLLM runner names it.
-pllm.testing.run_guided_step(execution: 'StateExecution[StepInput, DataT, ResultT]', value: 'StepInput', *, feedback: 'SamplerFeedback | None' = None, stream: 'torch.cuda.Stream | None' = None) -> 'tuple[PackedSamplerGuidanceBatch, ResultT]'
-    Like `run_step`, also returning the sampler guidance the workload produced before sampling.
+pllm.testing.run_guided_step(execution: 'StateExecution[StepInput, DataT, ResultT]', value: 'StepInput', *, feedback: 'SamplerFeedback | None' = None, stream: 'torch.cuda.Stream | None' = None) -> 'tuple[tuple[PackedSamplerGuidanceBatch, ...], ResultT]'
+    Like `run_step`, also returning additions in declaration order, followed by any guidance stage.
 pllm.testing.run_step(execution: 'StateExecution[StepInput, DataT, ResultT]', value: 'StepInput', *, feedback: 'SamplerFeedback | None' = None, stream: 'torch.cuda.Stream | None' = None) -> 'ResultT'
     Execute every anchor of one step, completing the sampler with `feedback` when the workload reads it.
 pllm.testing.step_input(identities: 'Sequence[RequestIdentity]', hidden: 'Mapping[PackedHiddenResourceBinding, torch.Tensor] | None' = None, *, step_id: 'int' = 0, token_offset: 'int' = 0, tokens: "Sequence[Literal['prefill', 'decode']] | None" = None, sampler_order: 'Sequence[int] | None' = None, batch: 'HostBatch[torch.Tensor] | None' = None, operands: 'tuple[ProjectionOperands, ...]' = (), stream: 'torch.cuda.Stream | None' = None) -> 'StepInput'
