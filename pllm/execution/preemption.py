@@ -18,7 +18,15 @@ def preemption_policy(attachment: BackendAttachment, sites: tuple[ResidualRewrit
 
     A reset also needs the plan's recompute_rejection to be empty before replay begins.
     """
-    return "reset" if attachment.spec.overlay_bindings or attachment.spec.activation_bindings or sites else "keep"
+    adaptive = any(
+        task.custom_forward is not None and task.custom_forward.adaptive
+        for task in attachment.plan.semantic_graph.tasks
+    )
+    return (
+        "reset"
+        if attachment.spec.overlay_bindings or attachment.spec.activation_bindings or sites or adaptive
+        else "keep"
+    )
 
 
 def retained_rows(rows: PackedSamplerRowBatch, frontiers: dict[RequestIdentity, int]) -> PackedSamplerRowBatch:

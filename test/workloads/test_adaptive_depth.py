@@ -32,6 +32,7 @@ def test_adaptive_contracts_and_explanation():
     assert "CUDA conditional nodes" in str(report)
     assert "0 blocking host syncs" in str(report)
     assert "adaptive depth" in report.recompute_rejection
+    assert report.preemption == "reset"
 
 
 @pytest.mark.parametrize("rule", ("all", "none", "mixed", "cosine"))

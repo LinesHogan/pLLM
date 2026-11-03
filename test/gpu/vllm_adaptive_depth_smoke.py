@@ -14,6 +14,8 @@ from pllm.backends.vllm.adaptive_depth import AdaptiveSlice
 from pllm.backends.vllm.custom_forward import ProgramWave
 from pllm.backends.vllm.custom_forward_attention import BatchAttentionBuffers
 from pllm.execution.step_capture import capture_graph
+from pllm.execution.token_program_executor import execute_segment
+from pllm.execution.torch_private import cuda_graph_pool_bytes
 
 
 @dataclass(frozen=True)
@@ -144,16 +146,50 @@ class Audit:
         self.steady = []
         self.native_capture = ProgramWave.capture
         self.native_replay = torch.cuda.CUDAGraph.replay
+        self.counts = set()
+        self.capture_bytes = 0
 
-    def select(self, selection, step, hidden, active):
+    def mask(self, wave, active):
         # The acceptance fixture forces persistent request parity; workload routing
         # still accepts only per-token tensor decisions in production.
         if self.rule == "mixed":
-            active = selection.wave.indices[1].reshape(-1, 1) % 2 == 1
+            return wave.indices[1].reshape(-1, 1) % 2 == 1
+        if self.rule == "buckets":
+            count = wave.positions[0] % (len(wave.seed) + 1)
+            return (torch.arange(len(wave.seed), device=active.device) < count).reshape(-1, 1)
+        return active
+
+    def select(self, selection, step, hidden, active):
+        active = self.mask(selection.wave, active)
         return self.native_selection(selection, step, hidden, active)
+
+    def eager_selection(self, selection, step, hidden, active):
+        """Diagnostic host selection checks captured buckets against the same native eager kernels."""
+        count = int(active.sum())
+        self.counts.add(count)
+        wave = selection.wave
+        if count == len(hidden):
+            with wave.custom_forward.sites_rows(wave.indices[0], wave.packed) as stream:
+                return execute_segment(step, hidden, wave.layer, stream)
+        selection.propagate(step, hidden, active)
+        output = tuple(hidden.clone() for _ in step.taps)
+        if count:
+            size = next(size for size in selection.widths if count <= size)
+            rows = torch.argsort(~active.flatten(), stable=True)[:size]
+            selection.compact(step, hidden, active, rows, output)
+        return output
 
     def capture(self, wave):
         self.native_capture(wave)
+        self.capture_bytes = max(
+            self.capture_bytes,
+            cuda_graph_pool_bytes(wave.graph.pool(), wave.seed.device.index or 0)
+            + sum(
+                captured.adaptive.resident_bytes
+                for captured in wave.custom_forward.captures.values()
+                if captured.adaptive is not None
+            ),
+        )
         saved = read_cells(wave)
         with override_forward_context(wave.attention.context):
             graph, output, _ = capture_graph(
@@ -178,28 +214,11 @@ class Audit:
             torch.cuda.set_sync_debug_mode(mode)
         events[1].record()
         live = read_cells(wave)
+        self.check_eager(wave, live)
         events[2].record()
         self.native_replay(baseline)
         events[3].record()
-        active = torch.full((len(wave.seed), 1), self.rule == "all", device=wave.seed.device)
-        if self.rule == "mixed":
-            active = wave.indices[1].reshape(-1, 1) % 2 == 1
-            split = split_full(wave)
-            bound = float((self.logits(full) - self.logits(split)).abs().max())
-            error = float(
-                (self.logits(wave.output)[active.flatten()] - self.logits(full)[active.flatten()]).abs().max()
-            )
-            self.max_error, self.max_bound = max(self.max_error, error), max(self.max_bound, bound)
-        with override_forward_context(wave.attention.context):
-            expected = reference(wave, active)
-        if self.rule != "mixed":
-            torch.testing.assert_close(wave.output, expected, atol=0, rtol=0)
-        for value, oracle in zip(live, read_cells(wave), strict=True):
-            if self.rule == "mixed":
-                value, oracle = value[~active.flatten()], oracle[~active.flatten()]
-            torch.testing.assert_close(value, oracle, atol=0, rtol=0)
-        if self.rule == "all":
-            torch.testing.assert_close(wave.output, full, atol=0, rtol=0)
+        self.check_reference(wave, live, full)
         if self.checked == self.measure_at:
             # Keep both measurements at steady GPU clocks; oracle assertions otherwise idle
             # the GPU before the adaptive replay but leave it warm for the paired baseline.
@@ -216,6 +235,40 @@ class Audit:
         self.checked += 1
         self.timings.append(events)
 
+    def check_eager(self, wave, live):
+        """Check every computed output and owned KV slot before running the independent oracle."""
+        observation, results = wave.observation, wave.results
+        with (
+            override_forward_context(wave.attention.context),
+            patch.object(self, "native_selection", self.eager_selection),
+        ):
+            eager = wave.body()
+        wave.observation, wave.results = observation, results
+        torch.testing.assert_close(wave.output, eager, atol=0, rtol=0)
+        for value, uncaptured in zip(live, read_cells(wave), strict=True):
+            torch.testing.assert_close(value, uncaptured, atol=0, rtol=0)
+
+    def check_reference(self, wave, live, full):
+        """Match native propagation bitwise and bound compacted rows by batch numerics."""
+        active = self.mask(wave, torch.full((len(wave.seed), 1), self.rule == "all", device=wave.seed.device))
+        if self.rule == "mixed":
+            split = split_full(wave)
+            bound = float((self.logits(full) - self.logits(split)).abs().max())
+            error = float(
+                (self.logits(wave.output)[active.flatten()] - self.logits(full)[active.flatten()]).abs().max()
+            )
+            self.max_error, self.max_bound = max(self.max_error, error), max(self.max_bound, bound)
+        with override_forward_context(wave.attention.context):
+            expected = reference(wave, active)
+        if self.rule not in ("mixed", "buckets"):
+            torch.testing.assert_close(wave.output, expected, atol=0, rtol=0)
+        for value, oracle in zip(live, read_cells(wave), strict=True):
+            if self.rule in ("mixed", "buckets"):
+                value, oracle = value[~active.flatten()], oracle[~active.flatten()]
+            torch.testing.assert_close(value, oracle, atol=0, rtol=0)
+        if self.rule == "all":
+            torch.testing.assert_close(wave.output, full, atol=0, rtol=0)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -224,7 +277,7 @@ def main():
     parser.add_argument("--tokens", type=int, default=16)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--value-rewrite", action="store_true")
-    parser.add_argument("--rule", choices=("none", "all", "mixed"), default="none")
+    parser.add_argument("--rule", choices=("none", "all", "mixed", "buckets"), default="none")
     args = parser.parse_args()
     config = pllm.ModelConfig(
         args.model,
@@ -277,6 +330,9 @@ def main():
         adaptive, baseline = (sum(values) / len(elapsed) for values in zip(*elapsed))
         steady = [start.elapsed_time(end) / 100 for start, end in audit.steady]
         print(f"steady_replay_ms={steady} ratio={(steady[0] + steady[2]) / (steady[1] + steady[3]):.4f}")
+        print(
+            f"graph_eager_bitwise_counts={sorted(audit.counts)} capture_bytes={audit.capture_bytes} budget_bytes={config.execution.capture_memory_bytes}"
+        )
         print(
             f"adaptive_depth model={args.model} batch={args.batch} rule={args.rule} checked={audit.checked} adaptive_ms={adaptive:.4f} baseline_ms={baseline:.4f} ratio={adaptive / baseline:.4f} blocking_syncs=0"
         )

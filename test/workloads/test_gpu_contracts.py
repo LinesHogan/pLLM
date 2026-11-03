@@ -11,6 +11,7 @@ from pllm.backends.vllm import runtime
 from pllm.testing import check_on_gpu
 from pllm.workloads import DoLaWorkload, ESampConfig, ESampWorkload, OutputLoRAWorkload, PromptFactorsWorkload
 from pllm.workloads.state_producers import FactorAdapterWorkload
+from test.gpu.vllm_adaptive_depth_smoke import Exit
 
 pytestmark = pytest.mark.gpu
 
@@ -43,8 +44,9 @@ class Steering(pllm.Workload):
         (Steering(), Steering()),
         (DoLaWorkload(layers=(0, 2)), None),
         (PromptFactorsWorkload(), None),
+        (Exit("mixed"), None),
     ],
-    ids=("esamp", "output_lora", "adapter", "caa", "dola", "prompt_factors"),
+    ids=("esamp", "output_lora", "adapter", "caa", "dola", "prompt_factors", "adaptive"),
 )
 def test_gpu_contracts(workload, neutral):
     config = pllm.ModelConfig(
@@ -53,6 +55,7 @@ def test_gpu_contracts(workload, neutral):
         max_num_seqs=2,
         max_num_batched_tokens=64,
         gpu_memory_utilization=0.25,
+        execution=pllm.ExecutionOptions(capture_memory_bytes=256 << 20),
     )
     result = check_on_gpu(workload, config, neutral=neutral)
     assert "explain/probe" in result.passed
