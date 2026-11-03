@@ -62,10 +62,10 @@ print(testing.check(Lens(), CONFIG).passed)
 
 | Name | Meaning |
 | --- | --- |
-| `@pllm.export(*, name="value", every=1, max_rows=1, max_cols=16, enabled=True, overflow="drop")` | Deliver the method's `[rows, cols]` result to `on_export`, at most `max_rows` rows and `max_cols` columns, every `every` steps. Runs after the forward by default. `overflow="block"` waits on a full queue instead of dropping. |
+| `@pllm.export(*, name="value", every=1, max_rows=1, max_cols=16, enabled=True, overflow="drop")` | Deliver the method's `[rows, cols]` result to `on_export`: per step at most `max_rows` rows (the rest of that step's rows are dropped and counted in `event.dropped_rows`) and the first `max_cols` columns, every `every` steps. `max_rows * max_cols * 8` must be at most 32768 bytes. Runs after the forward by default. `overflow="block"` waits on a full delivery queue instead of dropping the event. |
 | `pllm.Workload.on_export(self, event)` | Override to receive each export as a `pllm.io.TraceEvent`, in the process that runs the model, asynchronously; `close()` (or leaving `with`) drains delivery. Never call the engine from it. |
-| `pllm.io.TraceEvent` | One trace record. For exports: `tensor_name` (the export name), `identities` (one `pllm.testing.RequestIdentity` per row, with `request_id`, `prompt_index`, `sample_index`), `step_id`, `tensor()` (an independent CPU tensor). |
-| `pllm.io.TraceSnapshot` | `llm.trace_snapshot()`: the retained events (`events`), drop counters and host/device task timings. |
+| `pllm.io.TraceEvent` | One trace record. For exports: `tensor_name` (the export name), `identities` (one `pllm.testing.RequestIdentity` per row: `prompt_index` is the prompt's position in the `generate` call, or the value from `generate(..., prompt_indices=...)`; `sample_index`; `request_id` is pllm's internal id, not vLLM's `RequestOutput.request_id`), `step_id`, `dropped_rows`, `tensor()` (an independent CPU tensor). |
+| `pllm.io.TraceSnapshot` | `llm.trace_snapshot()`: the retained events (`events`), drop counters (`export_dropped`: events dropped on a full queue) and host/device task timings. |
 | `pllm.io.TraceSelection` | `llm.select_trace(TraceSelection(...))` opts into extra tensor/gradient snapshots and kernel profiling; empty filters match everything. |
 
 ```python
@@ -93,7 +93,39 @@ GREEDY = SamplingParams(max_tokens=8, temperature=0.0)
 with pllm.make_llm(GPU_CONFIG, workload=StreamNorm()) as llm:
     llm.generate(["The capital of France is", "One plus one is"], GREEDY)
     assert llm.diagnostics().eager_reason == ""  # reading the residual stream keeps CUDA graphs
-print({prompt: len(norms) for prompt, norms in seen.items()})  # one value per decode step and prompt
+print({prompt: len(norms) for prompt, norms in seen.items()})  # 7: the first of 8 tokens comes from the prompt
+```
+
+A full hidden-width row is 896 columns for Qwen2.5-0.5B, so at most 4 rows fit one export
+(4 * 896 * 8 = 28672 bytes). To capture one full row per prompt at the prompt's last token, read with
+`tokens="prefill"` and pass at most `max_rows` prompts per `generate` call: prompts that finish prefill in
+the same step share one export.
+
+```python
+prompt_ends: dict[int, torch.Tensor] = {}
+
+
+class PromptEnd(pllm.Workload):
+    @pllm.export(name="prompt_end", max_rows=4, max_cols=896)
+    def last_token(self, r: torch.Tensor = pllm.residual(12, tokens="prefill")) -> torch.Tensor:
+        return r.float()  # [rows, 896]: one row per prompt whose prefill just finished
+
+    def on_export(self, event: pllm.io.TraceEvent) -> None:
+        assert event.dropped_rows == 0
+        for identity, row in zip(event.identities, event.tensor()):
+            prompt_ends[identity.prompt_index] = row
+```
+
+```python gpu
+texts = ["I love this", "I hate this", "This is wonderful", "This is terrible", "I feel happy", "I feel sad"]
+with pllm.make_llm(GPU_CONFIG, workload=PromptEnd()) as llm:
+    for start in range(0, len(texts), 4):  # at most max_rows prompts per call
+        chunk = texts[start : start + 4]
+        # prompt_indices numbers the prompts across calls; identity.prompt_index reports it back.
+        llm.generate(chunk, SamplingParams(max_tokens=1), prompt_indices=tuple(range(start, start + len(chunk))))
+# Leaving `with` drained on_export, so every row has arrived.
+rows = torch.stack([prompt_ends[index] for index in range(len(texts))])
+print(rows.shape)  # torch.Size([6, 896])
 ```
 
 ## Own state per request or per instance

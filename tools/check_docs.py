@@ -24,6 +24,7 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -232,24 +233,25 @@ class _Default:
         return self.text
 
 
-def public_names() -> list[tuple[str, object]]:
+def public_names() -> list[tuple[str, Callable[..., object]]]:
     """Every public value of the documented namespaces as (qualified name, value), sub-namespaces excluded."""
-    names: list[tuple[str, object]] = []
+    names: list[tuple[str, Callable[..., object]]] = []
     for namespace in PUBLIC_NAMESPACES:
         module = importlib.import_module(namespace)
         for name in module.__all__:
-            value = getattr(module, name)
+            value: object = getattr(module, name)
             if not isinstance(value, ModuleType):
+                assert callable(value), name  # every public value is a class or a function
                 names.append((f"{namespace}.{name}", value))
     return names
 
 
-def signature_line(name: str, value: object) -> str:
+def signature_line(name: str, value: Callable[..., object]) -> str:
     """`name(parameters)` for callables, `name: A | B` for enums, with the docstring's first line beneath."""
-    if isinstance(value, type) and issubclass(value, Enum):
+    is_class = inspect.isclass(value)
+    if is_class and issubclass(value, Enum):
         head = f"{name}: {' | '.join(member.name for member in value)}"
     else:
-        assert callable(value)
         signature = inspect.signature(value)
         parameters = [
             parameter.replace(default=_Default(parameter.default))
@@ -257,13 +259,13 @@ def signature_line(name: str, value: object) -> str:
             else parameter
             for parameter in signature.parameters.values()
         ]
-        if isinstance(value, type):
+        if is_class:
             signature = signature.replace(return_annotation=inspect.Signature.empty)
         head = f"{name}{signature.replace(parameters=parameters)}"
     # A class's own docstring only: inherited ones and dataclass-generated `Name(fields)` say nothing new.
-    own = vars(value).get("__doc__") if isinstance(value, type) else value.__doc__
+    own = vars(value).get("__doc__") if is_class else value.__doc__
     summary = inspect.cleandoc(own or "").split("\n\n")[0].replace("\n", " ")
-    generated = isinstance(value, type) and summary.startswith(f"{value.__name__}(")
+    generated = is_class and summary.startswith(f"{value.__name__}(")
     return head if generated or not summary else f"{head}\n    {summary}"
 
 
