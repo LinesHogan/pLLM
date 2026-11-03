@@ -83,8 +83,8 @@ def native(args):
         args.model,
         max_num_seqs=8,
         max_num_batched_tokens=512,
-        gpu_memory_utilization=0.85,
-        execution=pllm.ExecutionOptions(capture_memory_bytes=1024 << 20),
+        gpu_memory_utilization=0.75,
+        execution=pllm.ExecutionOptions(capture_memory_bytes=2048 << 20),
     )
     result = {"model": args.model, "tokens": args.tokens, "prompts": prompts, "runs": []}
     call, capture, replay = AdaptiveSlice.__call__, ProgramWave.capture, torch.cuda.CUDAGraph.replay
@@ -107,7 +107,12 @@ def native(args):
                 rows = tuple(wave.custom_forward.rows[index] for index in wave.packed)
                 for start, (stop, mask) in buffers[wave].items():
                     observations.append(
-                        (tuple((row.identity.request_id, row.token_offset) for row in rows), start, stop, mask.clone())
+                        (
+                            tuple((row.identity.prompt_index, row.token_offset - row.prompt_length) for row in rows),
+                            start,
+                            stop,
+                            mask.clone(),
+                        )
                     )
 
         handle = pllm.make_llm(config, workload=Saturation(threshold))
@@ -121,8 +126,8 @@ def native(args):
             depth = {}
             skipped = total = 0
             for rows, start, stop, mask in observations:
-                for (request, position), active in zip(rows, mask.cpu().flatten().tolist(), strict=True):
-                    key = (request, position)
+                for (prompt_index, token), active in zip(rows, mask.cpu().flatten().tolist(), strict=True):
+                    key = (prompt_index, token)
                     depth[key] = max(depth.get(key, 0), stop if active else 0)
                     skipped += (stop - start) * (not active)
                     total += stop - start
@@ -134,12 +139,9 @@ def native(args):
                     {
                         "prompt": output.prompt_token_ids,
                         "tokens": list(output.outputs[0].token_ids),
-                        "depths": [
-                            depth[(output.request_id, len(output.prompt_token_ids) + token)]
-                            for token in range(args.tokens - 1)
-                        ],
+                        "depths": [depth[(prompt_index, token)] for token in range(args.tokens - 1)],
                     }
-                    for output in outputs
+                    for prompt_index, output in enumerate(outputs)
                 ],
             }
             result["runs"].append(run)
@@ -149,8 +151,9 @@ def native(args):
                 for request, full in zip(run["requests"], baseline, strict=True)
                 for a, b in zip(request["tokens"], full["tokens"], strict=True)
             )
+            run["greedy_matches"], run["greedy_total"] = agree, len(prompts) * args.tokens
             print(
-                f"threshold={threshold} skipped={skipped}/{total} greedy_agreement={agree}/{32 * args.tokens}",
+                f"threshold={threshold} skipped={skipped}/{total} greedy_agreement={agree}/{len(prompts) * args.tokens}",
                 flush=True,
             )
             Path(args.output).write_text(json.dumps(result, indent=2))
