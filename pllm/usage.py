@@ -168,7 +168,7 @@ class _Source:
     def port(self, context: _Reflection) -> TensorPort:
         raise TypeError(f"unsupported tensor source: {type(self).__name__}")
 
-    def training_port(self, context: _Reflection) -> CausalPort:
+    def training_port(self, context: _Reflection, schema: str) -> CausalPort:
         raise ValueError("causal training inputs must name Batch, Parameter or causal_model ports")
 
     def in_forward_binding(self, state: str, fields: Mapping[str, Field]) -> str:
@@ -266,17 +266,9 @@ class SampleIndex(_Source):
 class Batch(_Source):
     field: str
 
-    def training_port(self, context: _Reflection) -> CausalPort:
-        variant = next(
-            (variant for variant in (CausalTrainBatch, WeightedRowBatch) if self.field in variant.names), None
-        )
-        if variant is None:
-            raise ValueError(
-                "training batches provide input_ids, labels, attention_mask or hidden, targets, weights; "
-                f"got {self.field!r}"
-            )
+    def training_port(self, context: _Reflection, schema: str) -> CausalPort:
         return CausalPort(
-            context.binding.input("training", self.field, variant.schema),
+            context.binding.input("training", self.field, schema),
             self.training_value,
         )
 
@@ -297,7 +289,7 @@ class Parameter(_Source):
     field: str
     per_row: bool = False
 
-    def training_port(self, context: _Reflection) -> CausalPort:
+    def training_port(self, context: _Reflection, schema: str) -> CausalPort:
         context.parameter(self.state, self.field)
         view = context.binding.field_views[self.state, self.field]
         return CausalPort(
@@ -333,7 +325,7 @@ class _CausalModelMarker(_Source):
 
     name: str
 
-    def training_port(self, context: _Reflection) -> CausalPort:
+    def training_port(self, context: _Reflection, schema: str) -> CausalPort:
         adapter = context.adapters.get(self.name)
         if adapter is None:
             raise ValueError(f"pllm.causal_model({self.name!r}) must name a pllm.model.Adapter of the workload")
@@ -593,8 +585,8 @@ def batch(
     """One field of the host batch passed to generate.
 
     The fields a @pllm.train method reads pick its batch: WeightedRowBatch (hidden, targets, weights) or
-    CausalTrainBatch (input_ids, labels, attention_mask) take one AdamW step; WeightedCEBatch (hidden, base_logits,
-    labels, weights) runs SGD steps per state.
+    CausalTrainBatch (input_ids, labels, attention_mask, weights) take one AdamW step;
+    WeightedCEBatch (hidden, base_logits, labels, weights) runs SGD steps per state.
     """
     return Batch(field)
 
@@ -982,20 +974,26 @@ _TRAINING_INPUTS: dict[TrainingMode, str] = {
 }
 
 
-def _training_mode(arguments: Mapping[str, _Source]) -> TrainingMode:
-    """The batch is the first of WeightedRowBatch, CausalTrainBatch and WeightedCEBatch that has every pllm.batch
-    field the method reads; without batch fields or a causal model it trains on request rows."""
+def _training_schema(arguments: Mapping[str, _Source]) -> str:
+    """Choose one batch from the method's complete field set; shared field names keep that schema."""
     fields = {source.field for source in arguments.values() if isinstance(source, Batch)}
     if not fields:
-        return "batch" if any(isinstance(source, _CausalModelMarker) for source in arguments.values()) else "request"
-    if any(fields <= set(batch.names) for batch in (WeightedRowBatch, CausalTrainBatch)):
-        return "batch"
-    if fields <= set(WeightedCEBatch.names):
-        return "weighted_batch"
+        return ""
+    for batch in (WeightedRowBatch, CausalTrainBatch, WeightedCEBatch):
+        if fields <= set(batch.names):
+            return batch.schema
     raise ValueError(
         f"pllm.batch fields {sorted(fields)} must all come from one batch: WeightedRowBatch {WeightedRowBatch.names}, "
         f"CausalTrainBatch {CausalTrainBatch.names} or WeightedCEBatch {WeightedCEBatch.names}"
     )
+
+
+def _training_mode(arguments: Mapping[str, _Source]) -> TrainingMode:
+    """Batch fields choose the batch; without them or a causal model, train on request rows."""
+    schema = _training_schema(arguments)
+    if not schema:
+        return "batch" if any(isinstance(source, _CausalModelMarker) for source in arguments.values()) else "request"
+    return "weighted_batch" if schema == WeightedCEBatch.schema else "batch"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1040,12 +1038,13 @@ class _Train(_Effect):
                 "training on WeightedRowBatch or CausalTrainBatch fields takes one AdamW step over the whole batch: "
                 "remove rows=, update_rows=, steps=, reset=, @pllm.differentiate and pllm.carry"
             )
+        schema = _training_schema(arguments) or CausalTrainBatch.schema
         context.train(
             declare_batch_train(
                 context.binding,
                 operation.name,
                 context.states[self.state],
-                ports={key: source.training_port(context) for key, source in arguments.items()},
+                ports={key: source.training_port(context, schema) for key, source in arguments.items()},
                 function=freeze(operation.function),
                 identity=f"python:{fingerprint(operation.function)}",
                 when=operation.transition_window,

@@ -11,7 +11,7 @@ import torch
 
 from pllm.authoring import FunctionMath, StepInput, WeightedRowBatch
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.contracts.semantic_graph import AnchorId
+from pllm.contracts.semantic_graph import AnchorId, HostServiceInputSource
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.state_execution import PartialCommitError
 from pllm.host import (
@@ -57,6 +57,12 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
     )
     execution = make_host(facts, workload)
     plan = execution.arena.plan
+    assert {
+        port.source.schema
+        for task in plan.semantic_graph.tasks
+        for port in task.inputs
+        if isinstance(port.source, HostServiceInputSource)
+    } == {WeightedRowBatch.schema}
     peak = plan.schedule.peak_memory_bytes
     with pytest.raises(ValueError):
         make_host(replace(facts, memory_budget_bytes=peak - 1), workload)

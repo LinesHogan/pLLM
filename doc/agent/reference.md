@@ -697,7 +697,8 @@ pllm.host.WeightedCEBatch(hidden: ~T, base_logits: ~T, labels: ~T, weights: ~T, 
     Shared [rows, ...] or independently keyed [adapters, rows, ...] weighted CE.
 pllm.host.WeightedRowBatch(hidden: ~T, targets: ~T, weights: ~T)
     [rows, hidden_size] features with one target (a value or a fixed-shape tensor) and one weight per row; weight 0 skips a row.
-pllm.host.CausalTrainBatch(input_ids: ~T, labels: ~T, attention_mask: Optional[~T] = None)
+pllm.host.CausalTrainBatch(input_ids: ~T, labels: ~T, attention_mask: Optional[~T] = None, weights: Optional[~T] = None)
+    Token sequences for host training; optional floating weights have one value per sequence.
 pllm.host.BarrierState: READY | BLOCKED
 pllm.host.Completion(identity: pllm.contracts.request_identity.RequestIdentity, output_index: int, group_id: str, token_ids: tuple[int, ...], text: str, finish_reason: pllm.contracts.feedback.FinishReason)
 pllm.host.CompletionBatch(entries: tuple[pllm.contracts.feedback.Completion, ...])

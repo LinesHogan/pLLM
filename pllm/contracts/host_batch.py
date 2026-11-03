@@ -15,14 +15,22 @@ U = TypeVar("U")
 
 @dataclass(frozen=True, slots=True)
 class CausalTrainBatch(Generic[T]):
-    schema: ClassVar[str] = "causal_tokens@1"
-    names: ClassVar[tuple[str, ...]] = ("input_ids", "labels", "attention_mask")
+    """Token sequences for host training; optional floating weights have one value per sequence."""
+
+    schema: ClassVar[str] = "causal_tokens@2"
+    names: ClassVar[tuple[str, ...]] = ("input_ids", "labels", "attention_mask", "weights")
     input_ids: T
     labels: T
     attention_mask: T | None = None
+    weights: T | None = None
 
     def tensor(self, name: str) -> T | None:
-        return {"input_ids": self.input_ids, "labels": self.labels, "attention_mask": self.attention_mask}[name]
+        return {
+            "input_ids": self.input_ids,
+            "labels": self.labels,
+            "attention_mask": self.attention_mask,
+            "weights": self.weights,
+        }[name]
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,7 +122,7 @@ def validate_host_batch(
         return describe(tensor).shape
 
     match value:
-        case CausalTrainBatch(input_ids=ids, labels=labels, attention_mask=mask):
+        case CausalTrainBatch(input_ids=ids, labels=labels, attention_mask=mask, weights=weights):
             tokens = shape(ids)
             if (
                 len(tokens) != 2
@@ -127,6 +135,21 @@ def validate_host_batch(
                 or describe(labels).dtype is not TensorDType.INT64
             ):
                 raise ValueError("causal batch must contain aligned token/label tensors")
+            if weights is not None and (
+                shape(weights) != tokens[:1] or not describe(weights).dtype.torch.is_floating_point
+            ):
+                raise ValueError(
+                    f"CausalTrainBatch weights need one floating value per sequence: shape {tokens[:1]}, "
+                    f"got {shape(weights)} ({describe(weights).dtype})"
+                )
+            for task in consumers:
+                if weights is None and any(
+                    isinstance(port.source, HostServiceInputSource) and port.source.port == "weights"
+                    for port in task.inputs
+                ):
+                    raise ValueError(
+                        f"{task.symbol} reads pllm.batch('weights'); pass CausalTrainBatch(..., weights=...)"
+                    )
             actual = (tokens,)
         case WeightedCEBatch(hidden=hidden, base_logits=logits, labels=labels, weights=weights, keys=keys):
             prefix = () if keys else (1,)
@@ -195,8 +218,13 @@ def map_host_batch(value: HostBatch[T] | None, convert: Callable[[T], U]) -> Hos
     match value:
         case None:
             return None
-        case CausalTrainBatch(input_ids=ids, labels=labels, attention_mask=mask):
-            return CausalTrainBatch(convert(ids), convert(labels), None if mask is None else convert(mask))
+        case CausalTrainBatch(input_ids=ids, labels=labels, attention_mask=mask, weights=weights):
+            return CausalTrainBatch(
+                convert(ids),
+                convert(labels),
+                None if mask is None else convert(mask),
+                None if weights is None else convert(weights),
+            )
         case StateImport(values=values, keys=keys):
             return StateImport(tuple(convert(item) for item in values), keys)
         case WeightedCEBatch(hidden=hidden, base_logits=logits, labels=labels, weights=weights, keys=keys):

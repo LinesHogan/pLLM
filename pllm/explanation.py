@@ -9,8 +9,10 @@ from pllm.config import ModelConfig
 from pllm.contracts.backend_attachment import TOKEN_CAPTURE_CAPABILITY, BackendAttachment
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenSite
+from pllm.contracts.host_batch import CausalTrainBatch
 from pllm.contracts.semantic_graph import (
     HiddenInputSource,
+    HostServiceInputSource,
     StateEffectKind,
     StateSelectionInputSource,
     TaskResourceFact,
@@ -52,6 +54,7 @@ class MemberCost:
     effect: str
     tasks: tuple[TaskCost, ...]
     eager_reason: str
+    host_batch: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +155,8 @@ class ExplainResult:
                     )
             if not member.tasks:
                 lines.append(f"{member.name}  {member.effect}  model site or inactive method")
+            if member.host_batch:
+                lines.append(f"  {member.host_batch}")
             if member.eager_reason:
                 lines.append(f"  forward eager because {member.name}: {member.eager_reason}")
         lines.extend(
@@ -227,11 +232,27 @@ def _task_costs(plan: PlanBundle, estimates: dict[str, CostEstimate]) -> dict[st
     return costs
 
 
-def _members(binding: TensorBinding, costs: dict[str, TaskCost], reasons: dict[str, str]) -> tuple[MemberCost, ...]:
+def _members(
+    binding: TensorBinding, costs: dict[str, TaskCost], reasons: dict[str, str], max_training_rows: int
+) -> tuple[MemberCost, ...]:
     result: list[MemberCost] = []
     for name, member in binding.members.items():
         tasks = tuple(costs[symbol] for symbol, names in binding.task_members.items() if name in names)
-        result.append(MemberCost(name, member.effect, tasks, reasons.get(member.effect, "")))
+        causal = any(
+            name in binding.task_members.get(task.symbol, ())
+            and any(
+                isinstance(port.source, HostServiceInputSource) and port.source.schema == CausalTrainBatch.schema
+                for port in task.inputs
+            )
+            for task in binding.graph.tasks
+        )
+        host_batch = (
+            f"host batch CausalTrainBatch ({', '.join(CausalTrainBatch.names)}), at most {max_training_rows} "
+            "sequences, one AdamW step at the start of generate(batch=...)"
+            if causal
+            else ""
+        )
+        result.append(MemberCost(name, member.effect, tasks, reasons.get(member.effect, ""), host_batch))
     return tuple(result)
 
 
@@ -472,7 +493,7 @@ def explain_facts(
         config.dtype,
         config.runner,
         reason,
-        _members(binding, costs, dict(eager_reasons(config, requirements))),
+        _members(binding, costs, dict(eager_reasons(config, requirements)), config.execution.max_training_rows),
         tuple(cost for symbol, cost in costs.items() if symbol not in binding.task_members),
         _states(plan),
         tuple(

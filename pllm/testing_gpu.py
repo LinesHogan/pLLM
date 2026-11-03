@@ -24,6 +24,7 @@ from pllm.backends.vllm.overlay_graph import GraphOptions, graph_options
 from pllm.backends.vllm.runtime import VllmLlm, probe_backend, vllm_engine
 from pllm.config import ExecutionOptions, ModelConfig
 from pllm.contracts.hidden_locator import HiddenPhase
+from pllm.contracts.host_batch import CausalTrainBatch, map_host_batch
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from pllm.contracts.packed_rows import PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import Projection, ProjectionOperands
@@ -323,6 +324,46 @@ def _neutral(workload: Workload, config: ModelConfig) -> None:
         )
 
 
+def _sequence_update(
+    handle: VllmLlm[TensorFrame, TensorOutput], batch: CausalTrainBatch[torch.Tensor]
+) -> tuple[torch.Tensor, ...]:
+    """Exercise the host-to-worker path and read the complete published optimizer state."""
+    handle.generate(_PROMPTS, SamplingParams(temperature=0, max_tokens=1, ignore_eos=True), batch=batch)
+    execution = handle.runner.require_session()._deployment.execution
+    return tuple(
+        tensor.detach().cpu()
+        for ref in execution.directory.select(()).refs
+        for tensor in execution.snapshot(ref, torch.cuda.current_stream())
+    )
+
+
+def _sequence_trial(
+    workload: Workload, config: ModelConfig, batch: CausalTrainBatch[torch.Tensor]
+) -> tuple[torch.Tensor, ...]:
+    """End the engine's scope before freeing its model and opening the next engine."""
+    with pllm.make_llm(config, workload=workload) as handle:
+        return _sequence_update(handle, batch)
+
+
+def _sequence_permutation(workload: Workload, config: ModelConfig) -> None:
+    """Fresh engines give both sequence orders identical starting parameters and Adam moments."""
+    ids = torch.tensor([[1, 2, 3, 4], [4, 3, 2, 1]])
+    labels = torch.tensor([[-100, -100, 3, 4], [-100, 3, 2, -100]])
+    batch = CausalTrainBatch(ids, labels, torch.ones_like(ids), torch.tensor([-0.5, 1.5]))
+    expected = _sequence_trial(workload, config, batch)
+    _release_models()
+    permuted = map_host_batch(batch, lambda tensor: tensor.flip(0))
+    assert isinstance(permuted, CausalTrainBatch)
+    actual = _sequence_trial(workload, config, permuted)
+    try:
+        for value, reference in zip(actual, expected, strict=True):
+            torch.testing.assert_close(value, reference, rtol=1e-4, atol=1e-5)
+    except (AssertionError, ValueError) as error:
+        raise ContractError(
+            (f"[sequence permutation] sequences and weights permuted together changed the update: {error}",)
+        ) from error
+
+
 def _workload_checks(workload: Workload, config: ModelConfig) -> CheckResult:
     passed: list[str] = []
     skipped: list[CheckSkip] = []
@@ -375,8 +416,9 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
 
     Neutral checks compare greedy and seeded sampled token IDs bitwise in the workload's graph mode.
     Forced KV allocation failure exercises vLLM's real eviction/recompute path. Tap and projection inputs are recorded
-    and replayed per token, as in the CPU script, to exclude base-model rounding differences. Host-batch training
-    and declared replay rejections are reported as explicit skips.
+    and replayed per token, as in the CPU script, to exclude base-model rounding differences. Causal
+    batches also check that permuting sequences and weights preserves an AdamW update.
+    Declared replay rejections are reported as explicit skips.
     Run in an isolated process with a CUDA device; multiprocessing and parallel workers are unsupported.
     """
     if (
@@ -398,6 +440,17 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
         failures.extend(error.failures)
     finally:
         _release_models()
+    if any(member.host_batch for member in explain(workload, config).members):
+        if config.execution.max_training_rows < 2:
+            skipped.append(CheckSkip("sequence permutation", "set max_training_rows >= 2"))
+        else:
+            try:
+                _sequence_permutation(workload, config)
+                passed.append("sequence permutation: aligned sequences and weights preserve the AdamW update")
+            except ContractError as error:
+                failures.extend(error.failures)
+            finally:
+                _release_models()
     if neutral is None:
         skipped.append(CheckSkip("neutral", "pass neutral= with the author's disabled settings"))
     else:

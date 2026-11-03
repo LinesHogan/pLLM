@@ -26,7 +26,7 @@ def test_codec_round_trips_payloads_and_shared_tensors_own_their_mapping() -> No
         source = torch.arange(6, dtype=torch.float32).reshape(2, 3).T
         descriptor = SharedTensor.export(source, lifetime)
         for value, target in (
-            (CausalTrainBatch(descriptor, descriptor), CausalTrainBatch[SharedTensor]),
+            (CausalTrainBatch(descriptor, descriptor, weights=descriptor), CausalTrainBatch[SharedTensor]),
             (StateImport((descriptor,)), StateImport[SharedTensor]),
             (BATCH, CompletionBatch),
         ):

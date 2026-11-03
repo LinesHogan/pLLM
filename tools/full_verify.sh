@@ -97,7 +97,7 @@ run_stage() {
     positions) smoke vllm_step_loop_smoke ;;
     feeds) pytest_gpu test/gpu/features/test_state_feed_cuda.py test/gpu/features/test_video_session.py ;;
     esamp) smoke vllm_esamp_smoke ;;
-    feedback) smoke vllm_override_smoke || rc=1; smoke fttt_cuda_smoke || rc=1; return "$rc" ;;
+    feedback) smoke vllm_override_smoke || rc=1; smoke fttt_cuda_smoke || rc=1; smoke vllm_grpo_smoke || rc=1; return "$rc" ;;
     reft) smoke vllm_reft_smoke ;;
     inplace) smoke vllm_inplace_ttt_smoke ;;
     tlm) smoke vllm_tlm_smoke ;;
