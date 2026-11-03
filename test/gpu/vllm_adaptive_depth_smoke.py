@@ -26,12 +26,14 @@ class Exit(pllm.Workload):
 
     @property
     def router(self) -> pllm.InstanceState:
-        return pllm.InstanceState(
-            module=lambda m: torch.nn.Linear(m.hidden_size, 1), initialize=self.zero_router, dtype=torch.float32
-        )
+        return pllm.InstanceState(module=self.zero_router, dtype=torch.float32)
 
-    def zero_router(self, fields: pllm.Tensors, generator: torch.Generator) -> None:
-        fields["parameters"].zero_()
+    def zero_router(self, dimensions: pllm.Dimensions) -> torch.nn.Module:
+        """Build a learned head whose initial decision equals a constant gate."""
+        router = torch.nn.Linear(dimensions.hidden_size, 1)
+        for parameter in router.parameters():
+            torch.nn.init.zeros_(parameter)
+        return router
 
     @pllm.custom_forward(tokens="decode")
     def forward(self, layers, threshold=pllm.parameter("gate", "threshold"), router=pllm.module("router")):
