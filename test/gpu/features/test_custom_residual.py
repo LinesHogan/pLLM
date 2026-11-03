@@ -3,8 +3,9 @@ and static hyper-connections follow an independent FP32 Hugging Face oracle as c
 
 import math
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cache
+from typing import Literal
 
 import pytest
 import torch
@@ -12,6 +13,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import SamplingParams
 
 import pllm
+from pllm.testing import check_on_gpu
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 PROMPTS = ("The capital of France is", "Water boils at a temperature of", "def fibonacci(n):")
@@ -183,9 +185,9 @@ class FastWeightMemory(pllm.Workload):
         return (x.float() + y.float() + self.gate * read).to(x.dtype), M - self.lr / len(x) * (read - y.float()).T @ k
 
 
-def _generate(workload: pllm.Workload) -> list[tuple[list[int], list[float]]]:
+def _generate(workload: pllm.Workload, config: pllm.ModelConfig = CONFIG) -> list[tuple[list[int], list[float]]]:
     """Greedy tokens and their logprobs."""
-    with pllm.make_llm(CONFIG, workload=workload) as handle:
+    with pllm.make_llm(config, workload=workload) as handle:
         outputs = handle.generate(list(PROMPTS), SAMPLING)
     return [
         (
@@ -207,8 +209,10 @@ def _vanilla() -> list[tuple[list[int], list[float]]]:
 @pytest.mark.parametrize(
     "workload", [Laurel(), ValueResidual(), StaticHyperConnections(), FastWeightMemory(gate=0.0)], ids=type
 )
-def test_identity_rewrites_reproduce_the_model_bitwise(workload: pllm.Workload) -> None:
-    assert _generate(workload) == _vanilla()
+@pytest.mark.parametrize("graphs", (False, "auto"))
+def test_identity_rewrites_reproduce_the_model_bitwise(workload: pllm.Workload, graphs: bool | Literal["auto"]) -> None:
+    config = replace(CONFIG, cuda_graphs=graphs)
+    assert _generate(workload, config) == _vanilla()
 
 
 @cache
@@ -334,7 +338,10 @@ def test_rewrites_follow_fp32_oracle() -> None:
         ),
     )
     for name, (workload, oracle) in workloads.items():
-        deviation, misses = _deviation(_generate(workload), oracle)
+        eager = _generate(workload)
+        captured = _generate(workload, replace(CONFIG, cuda_graphs=True))
+        assert captured == eager
+        deviation, misses = _deviation(captured, oracle)
         print(
             f"{name}: max logprob gap to FP32 {deviation:.4f} (plain bf16 vLLM {baseline:.4f}), {misses} non-argmax tokens"
         )
@@ -368,3 +375,11 @@ def test_memory_sublayer_follows_fp32_chunk_oracle() -> None:
             f"memory chunk={chunk}: max logprob gap to FP32 {deviation:.4f} (plain bf16 vLLM {baseline:.4f}), {misses} non-argmax tokens"
         )
         assert deviation <= max(2 * baseline, BF16_NOISE) and misses <= 2
+
+
+@pytest.mark.parametrize(
+    "workload", (Laurel(), ValueResidual(mixing=0.3), StaticHyperConnections(perturb=0.05)), ids=type
+)
+def test_captured_rewrites_have_no_host_syncs(workload: pllm.Workload) -> None:
+    result = check_on_gpu(workload, replace(CONFIG, cuda_graphs=True))
+    assert "host syncs: eight steady decode steps" in result.passed

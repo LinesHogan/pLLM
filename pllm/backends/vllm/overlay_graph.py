@@ -1,6 +1,6 @@
-"""vLLM graph startup for parameter overlays: deferred compilation/capture and hybrid dispatch.
+"""vLLM graph startup for parameter overlays and custom residuals: deferred capture and hybrid dispatch.
 
-This file holds only what a vLLM upgrade rewrites; the overlays themselves live in parameter_overlay.py.
+This file holds only what a vLLM upgrade rewrites; hook math lives in parameter_overlay.py and model_sites.py.
 
 Depends on GPUModelRunner.load_model/profile_run/capture_model, the capture call
 from Worker.compile_or_warm_up_model, the decoder body’s do_not_compile flag,
@@ -64,8 +64,8 @@ class GraphOptions(TypedDict, total=False):
 
 
 def graph_options(config: ModelConfig, requirements: BackendRequirements) -> GraphOptions:
-    """Announce overlays before profiling; ordinary workloads keep vLLM's capture sizes."""
-    if not requirements.parameter_targets:
+    """Announce model hooks before profiling; ordinary workloads keep vLLM's capture sizes."""
+    if not (requirements.parameter_targets or requirements.custom_residual):
         return {}
     return {
         "additional_config": {_BUDGET: config.execution.model_capture_bytes},
@@ -201,5 +201,5 @@ class OverlayGraphRunner(compat.ModelRunner):
         used = cuda_graph_pool_bytes(pool, self.device.index or 0) - before
         if used > self.overlay_graph_bytes:
             raise ValueError(
-                f"CUDA graphs of the adapted projections need {used} bytes; raise ExecutionOptions.capture_memory_bytes"
+                f"CUDA graphs of the adapted model need {used} bytes; raise ExecutionOptions.capture_memory_bytes"
             )

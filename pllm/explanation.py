@@ -438,7 +438,7 @@ def explain(workload: Workload, config: ModelConfig) -> ExplainResult:
         model_identity=shape.architecture,
         hidden_layouts=layouts,
         overlay_graph_bytes=config.execution.model_capture_bytes
-        if requirements.parameter_targets and not reason
+        if (requirements.parameter_targets or requirements.custom_residual) and not reason
         else 0,
         memory_bytes=1 << 60,
     )

@@ -5,7 +5,7 @@ from __future__ import annotations
 # Diagnostics deliberately inspect the installed session and in-process engine.
 # pyright: reportPrivateUsage=false
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from traceback import extract_tb
 from typing import Concatenate, ParamSpec
@@ -25,11 +25,13 @@ from pllm.backends.vllm.runtime import VllmLlm, probe_backend, vllm_engine
 from pllm.config import ExecutionOptions, ModelConfig
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
+from pllm.contracts.packed_rows import PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import Projection, ProjectionOperands
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId, TaskId
 from pllm.contracts.state_ref import StateRef
 from pllm.execution.cuda_stream import CudaStreamReadiness
+from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.state_execution import ProjectionResiduals, StateTaskContext
 from pllm.execution.step_input import StepInput
 from pllm.execution.tensor_binding import TensorOutput
@@ -74,10 +76,12 @@ def check_probe(workload: Workload, config: ModelConfig, handle: VllmLlm[TensorF
 
 
 class _SyncCheck:
-    """Restrict sync-debug to pllm anchors after two decode warmup steps."""
+    """Check pllm anchors and model-site staging after two decode warmup steps."""
 
     def __init__(self, handle: VllmLlm[TensorFrame, TensorOutput]) -> None:
-        execution = handle.runner.require_session()._deployment.execution
+        session = handle.runner.require_session()
+        execution = session._deployment.execution
+        self.prepare_sites = None if session._sites is None else session._sites.prepare
         self.execute = execution.execute_anchor
         self.execute_part = execution.execute_part
         self.steps: set[int] = set()
@@ -104,6 +108,14 @@ class _SyncCheck:
             raise RuntimeError(f"{error}; {locations}") from error
         finally:
             torch.cuda.set_sync_debug_mode(mode)
+
+    def prepare(
+        self, rows: PackedPhaseRowBatch, context: StateTaskContext[TensorFrame], directory: RequestStateDirectory
+    ) -> None:
+        """Include uploads and state staging between anchors in the model-site sync check."""
+        assert self.prepare_sites is not None
+        with self.scope(context):
+            self.prepare_sites(rows, context, directory)
 
     def anchor(self, context: StateTaskContext[TensorFrame], anchor: AnchorId) -> None:
         with self.scope(context):
@@ -323,11 +335,13 @@ def _workload_checks(workload: Workload, config: ModelConfig) -> CheckResult:
         except ContractError as error:
             failures.extend(error.failures)
         sync = _SyncCheck(handle)
+        sites = handle.runner.require_session()._sites
         execution = handle.runner.require_session()._deployment.execution
         try:
             with (
                 patch.object(execution, "execute_anchor", sync.anchor),
                 patch.object(execution, "execute_part", sync.part),
+                patch.object(sites, "prepare", sync.prepare) if sites is not None else nullcontext(),
             ):
                 baseline = _state_tokens(handle)
             if len(sync.checked) < 8:

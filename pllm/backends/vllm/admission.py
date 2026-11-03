@@ -19,8 +19,8 @@ def eager_reasons(config: ModelConfig, requirements: BackendRequirements) -> Ite
         yield "ActivationPatch", "activation patches run outside CUDA graphs"
     if requirements.custom_forward:
         yield "custom_forward", "@pllm.custom_forward schedules model slices and owns their wave graphs"
-    if requirements.custom_residual:
-        yield "custom_residual", "@pllm.custom_residual runs the model without CUDA graphs"
+    if requirements.stateful_residual:
+        yield "custom_residual", "stateful @pllm.custom_residual advances per-request chunks outside CUDA graphs"
     if requirements.instance_adapter:
         yield "Adapter", "CUDA-graph overlays do not support adapters backed by shared InstanceState"
 

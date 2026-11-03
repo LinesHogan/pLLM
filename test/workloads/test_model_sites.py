@@ -125,7 +125,7 @@ def test_stateful_custom_residual_matches_serial_chunk_oracle(chunk: int) -> Non
     )
     execution = testing.compile_execution(workload, facts)
     (rewrite,) = execution.math.model_sites
-    sites = ModelSites(decoder, (rewrite,), None, None, 16, 2)
+    sites = ModelSites(decoder, (rewrite,), None, None, 16, 2, execution.arena)
     identities = (testing.RequestIdentity("a", 0, 0), testing.RequestIdentity("b", 1, 0))
     refs = execution.admit(identities)
     prompts = (torch.randn(5, WIDTH, dtype=torch.float64), torch.randn(3, WIDTH, dtype=torch.float64))

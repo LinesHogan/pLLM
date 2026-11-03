@@ -72,8 +72,9 @@ class BackendRequirements:
     position_states: tuple[tuple[str, float], ...] = ()
     # Whether a @pllm.custom_forward reruns model layers, which vLLM's CUDA graphs cannot capture.
     custom_forward: bool = False
-    # Whether a @pllm.custom_residual rewrites sublayer adds or value rows; these hooks run eagerly.
+    # Whether a @pllm.custom_residual rewrites sublayer adds or value rows.
     custom_residual: bool = False
+    stateful_residual: bool = False
     # Whether a pllm.model.Adapter reads an InstanceState; CUDA-graph overlays bind request state only.
     instance_adapter: bool = False
     causal_training: bool = False

@@ -2550,6 +2550,10 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             position_states=context.position_states(),
             custom_forward=bool(context.custom_forwards),
             custom_residual=any(isinstance(operation.effect, _CustomResidual) for operation in context.operations),
+            stateful_residual=any(
+                isinstance(operation.effect, _CustomResidual) and bool(operation.effect.state)
+                for operation in context.operations
+            ),
             instance_adapter=any(
                 context.state_definitions[value.state].scope is StateScope.INSTANCE
                 for value in context.adapters.values()

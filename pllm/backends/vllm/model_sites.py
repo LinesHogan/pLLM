@@ -5,7 +5,10 @@ kernel that returns (normalized branch input, stream). A hook on that norm compl
 method's write instead of the plain add, keeps copies the methods read later in the forward, forms the next
 branch input with a read method, and normalizes with the kernel the model uses. Boundaries nothing applies to are
 not wrapped. The value hook replaces a layer's V slice of its qkv projection before attention reads and caches it.
-Used by VllmSession; a custom forward points `rows` at the packed rows of the layers it runs.
+Used by VllmSession; a custom forward points `rows` at the packed rows of the layers it runs. Stateless hooks enter
+vLLM's per-capacity model graphs through one opaque custom op per hook. State fields and the row-to-request table
+are staged before replay; the same eager kernels are captured, preserving arithmetic and leaving capacity graphs,
+their allocation pool and memory budget with the upstream graph runner.
 """
 
 from __future__ import annotations
@@ -30,11 +33,27 @@ from pllm.execution.model_sites import (
     StateInput,
     position,
 )
+from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.state_execution import DataT, StateTaskContext
 
 Forward = Callable[..., Tensor | tuple[Tensor, ...]] | Callable[[Tensor], LinearOutput]
+
+_SITES: dict[int, "ModelSites"] = {}
+
+
+@torch.library.custom_op("pllm::model_site", mutates_args={"inputs", "outputs", "buffers"})
+def model_site(inputs: list[Tensor], outputs: list[Tensor], buffers: list[Tensor], hook: int) -> None:
+    """Run a bound hook inside vLLM's capture, with stable state and same-forward scratch ports."""
+    _SITES[buffers[0].data_ptr()].hooks[hook].emit(inputs, outputs)
+
+
+def _model_site_meta(inputs: list[Tensor], outputs: list[Tensor], buffers: list[Tensor], hook: int) -> None:
+    return None
+
+
+model_site.register_fake(_model_site_meta)  # pyright: ignore[reportUnknownMemberType]
 
 
 def _request_spans(rows: PackedPhaseRowBatch) -> tuple[tuple[int, int], ...]:
@@ -60,6 +79,9 @@ class ModelSites:
         activation: VllmActivationPatch | None,
         rows: int,
         requests: int,
+        arena: PageBundleArena,
+        *,
+        graphs: bool = False,
     ) -> None:
         body = decoder.model.model
         count, weight = len(body.layers), body.norm.weight
@@ -89,8 +111,12 @@ class ModelSites:
             if rewrite.memory is not None
         }
         self._spans: dict[str, tuple[tuple[int, int, dict[str, Tensor]], ...]] = {}
-        self._requests = requests
         self._states: dict[StateInput, Tensor] = {}
+        for source in self._sources:
+            field = source.view.read(arena.field_pool(source.resource, source.view.field), pooled=True)[0]
+            leading = (requests,) if source.request else ()
+            self._states[source] = field.new_zeros((*leading, *field.shape))
+        self.hooks: list[_Boundary | _Value] = []
         self._installed: list[tuple[torch.nn.Module, Forward]] = []
         self._ends: dict[int, _Boundary] = {}
         values = {
@@ -138,7 +164,9 @@ class ModelSites:
             if before is not None and before[0] == "mlp":
                 self._ends[before[1]] = boundary
             if boundary.owner or boundary.reader or boundary.final or boundary.keeps or self.streams > 1:
-                self._install(norm, boundary)
+                boundary.index = len(self.hooks)
+                self._install(norm, boundary.graph_forward if graphs else boundary)
+                self.hooks.append(boundary)
         for layer, (module, start, width, head_dim) in values.items():
             keeps = EarlierInput("value", layer)
             hook = _Value(
@@ -151,7 +179,20 @@ class ModelSites:
                 width,
                 head_dim,
             )
-            self._install(module, hook)
+            hook.index = len(self.hooks)
+            self._install(module, hook.graph_forward if graphs else hook)
+            self.hooks.append(hook)
+        if graphs:
+            _SITES[self._requests_of.data_ptr()] = self
+
+    @property
+    def buffers(self) -> list[Tensor]:
+        """The uploaded row-to-request table, staged fields and same-forward scratch used by captured hooks."""
+        return [self._requests_of, *self._states.values(), *self._earlier.values()]
+
+    def run_hook(self, hook: int, inputs: list[Tensor], outputs: list[Tensor]) -> None:
+        """Keep orchestration opaque to Dynamo; upstream owns each capacity's graph and its allocations."""
+        model_site(inputs, outputs, self.buffers, hook)
 
     def _install(self, module: torch.nn.Module, hook: Forward) -> None:
         self._installed.append((module, module.forward))
@@ -178,9 +219,6 @@ class ModelSites:
             )
             for index, (pin, ref) in enumerate(versions):
                 field = source.view.read(context.arena.borrow_field(pin, ref, source.view.field))
-                if source not in self._states:
-                    leading = (self._requests,) if source.request else ()
-                    self._states[source] = field.new_empty((*leading, *field.shape))
                 (self._states[source][index] if source.request else self._states[source]).copy_(field)
         for name, (memory, _) in self._memories.items():
             self._spans[name] = self._memory_spans(rows, context, memory)
@@ -258,6 +296,7 @@ class ModelSites:
         for module, forward in reversed(self._installed):
             module.forward = forward
         self._installed.clear()
+        _SITES.pop(self._requests_of.data_ptr(), None)
 
 
 @dataclass
@@ -275,6 +314,30 @@ class _Boundary:
     keeps: tuple[EarlierInput, ...]
     # The taps of the module's normalized output and residual stream, which this hook copies itself.
     taps: tuple[Tap | None, Tap | None]
+    index: int = 0
+
+    def graph_forward(self, branch: Tensor, stream: Tensor | None = None) -> Tensor | tuple[Tensor, Tensor]:
+        """Expose fresh outputs with the shapes vLLM's compiled model carries between boundaries."""
+        normed = torch.empty_like(branch)
+        if stream is None:
+            self.sites.run_hook(self.index, [branch], [normed])
+            return normed
+        width = self.sites.hidden * (self.sites.streams if self.final is None else 1)
+        residual = branch.new_empty((branch.shape[0], width))
+        self.sites.run_hook(self.index, [branch, stream], [normed, residual])
+        return normed, residual
+
+    def emit(self, inputs: list[Tensor], outputs: list[Tensor]) -> None:
+        """Materialize the hook's results into the graph's declared outputs."""
+        if len(inputs) == 1:
+            result = self(inputs[0])
+            assert isinstance(result, Tensor)
+            outputs[0].copy_(result)
+        else:
+            result = self(inputs[0], inputs[1])
+            assert isinstance(result, tuple)
+            outputs[0].copy_(result[0])
+            outputs[1].copy_(result[1])
 
     def streams_of(self, stream: Tensor) -> Tensor:
         """The stream as [rows, n, d] with n residual streams. vLLM passes the embedding to the first layer's
@@ -364,10 +427,24 @@ class _Value:
     start: int
     width: int
     head_dim: int
+    index: int = 0
 
     def __call__(self, hidden: Tensor) -> LinearOutput:
         output = self.native(hidden)
         projected = output if isinstance(output, Tensor) else output[0]
+        self.emit([projected], [])
+        return output
+
+    def graph_forward(self, hidden: Tensor) -> LinearOutput:
+        """Keep the native projection compiled and capture just its value rewrite as a model-site op."""
+        output = self.native(hidden)
+        projected = output if isinstance(output, Tensor) else output[0]
+        self.sites.run_hook(self.index, [projected], [])
+        return output
+
+    def emit(self, inputs: list[Tensor], outputs: list[Tensor]) -> None:
+        """Rewrite and retain the value slice in place before attention reads it."""
+        (projected,) = inputs
         self.sites.count = len(projected)
         value = projected[:, self.start : self.start + self.width].view(len(projected), -1, self.head_dim)
         if self.owner is not None:
@@ -379,4 +456,3 @@ class _Value:
             value.copy_(written)
         if self.keeps is not None:
             self.sites.keep(self.keeps, value)
-        return output

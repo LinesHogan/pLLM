@@ -129,7 +129,16 @@ class VllmSession(Generic[DataT, ResultT]):
         )
         model_sites = deployment.execution.math.model_sites
         self._sites = (
-            ModelSites(decoder, model_sites, taps, self._activation, probe.max_packed_rows, max_sampler_rows)
+            ModelSites(
+                decoder,
+                model_sites,
+                taps,
+                self._activation,
+                probe.max_packed_rows,
+                max_sampler_rows,
+                arena=deployment.execution.arena,
+                graphs=probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH,
+            )
             if model_sites
             else None
         )
