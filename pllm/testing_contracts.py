@@ -712,7 +712,25 @@ def _check(workload: Workload, config: ModelConfig) -> CheckResult:
     except (ValueError, RuntimeError, TypeError) as error:
         raise ContractError((f"[compile] {''.join(format_exception_only(error)).strip()}",)) from error
     passed.append("compile")
-    if requirements.custom_forward or requirements.custom_residual:
+    if requirements.custom_forward and declaration.custom_forward_programs is not None:
+        from pllm.testing_depth import check_depth, check_never_exit
+
+        for program in declaration.custom_forward_programs.values():
+            if program.adaptive:
+                if program.entries or declaration.overlay_targets or declaration.sites.rewrites:
+                    skipped.append(CheckSkip("adaptive decoder", "PositionState and model-site composition need GPU"))
+                    continue
+                try:
+                    passed.extend(
+                        check_depth(program, shape.layer_count, shape.hidden_size, facts.probe.tensor_dtype.torch)
+                    )
+                    check_never_exit(program, shape.layer_count, shape.hidden_size, facts.probe.tensor_dtype.torch)
+                    passed.append("never exit bitwise")
+                except AssertionError as error:
+                    raise ContractError((f"[adaptive depth] {error}",)) from error
+        skipped.append(CheckSkip("model arithmetic", "CPU fake decoder; native kernels need GPU"))
+        return CheckResult(tuple(passed), tuple(skipped))
+    if requirements.custom_residual:
         return CheckResult(
             tuple(passed), (CheckSkip("model-site execution", "custom_forward/custom_residual need a loaded model"),)
         )

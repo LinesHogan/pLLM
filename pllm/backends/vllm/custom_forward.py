@@ -14,6 +14,7 @@ from vllm.sequence import IntermediateTensors
 
 from pllm.authoring import DataT, ResultT
 from pllm.backends.vllm.activation import VllmActivationPatch
+from pllm.backends.vllm.adaptive_depth import AdaptiveSlice
 from pllm.backends.vllm.architecture import KvLM
 from pllm.backends.vllm.custom_forward_attention import (
     BatchAttentionBuffers,
@@ -51,6 +52,7 @@ class ProgramWave(Generic[DataT, ResultT]):
         self.staging = PinnedStaging()
         self.indices = torch.empty((3, width), device=tensor.device, dtype=torch.long)
         self.attention = BatchAttentionBuffers(get_forward_context(), owner.attentions, owner.domain.positions, width)
+        self.adaptive = AdaptiveSlice(self) if owner.effect.adaptive else None
         self.position = PositionCacheProvider(
             owner.position_layers,
             tuple(value for _, value in owner.effect.position_states),
@@ -120,6 +122,7 @@ class ProgramWave(Generic[DataT, ResultT]):
                     self.layer,
                     self.apply_updates,
                     stream,
+                    self.adaptive,
                 )
             else:
                 count = self.custom_forward.effect.layer_count
@@ -154,6 +157,11 @@ class ProgramWave(Generic[DataT, ResultT]):
                 self.graph, self.output, resident = capture_graph(
                     self.seed.device, self.body, restore=restore, pool=self.custom_forward.pool
                 )
+            resident += sum(
+                wave.adaptive.resident_bytes
+                for wave in self.custom_forward.captures.values()
+                if wave.adaptive is not None
+            )
             if resident > self.custom_forward.resident_bytes:
                 raise ValueError(
                     f"custom-forward CUDA graphs need {resident} bytes; raise ExecutionOptions.capture_memory_bytes above {self.custom_forward.resident_bytes}"
@@ -218,11 +226,12 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
         if self.sites is None:
             yield add
             return
+        previous = self.sites.rows, self.sites.packed
         self.sites.rows, self.sites.packed = packed, rows
         try:
             yield self.sites.stream_after
         finally:
-            self.sites.rows, self.sites.packed = None, ()
+            self.sites.rows, self.sites.packed = previous
 
     def prepare(self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT]) -> None:
         self.clear()

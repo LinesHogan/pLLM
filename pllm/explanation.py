@@ -301,6 +301,18 @@ def _settings(binding: TensorBinding, config: ModelConfig, plan: PlanBundle) -> 
         if member.effect in ("custom_forward", "custom_residual"):
             result.append(EscapeHatch(name, member.effect, "enabled", False, "model forward runs eagerly"))
     for task in plan.semantic_graph.tasks:
+        if task.custom_forward is not None and task.custom_forward.adaptive:
+            result.append(
+                EscapeHatch(
+                    task.symbol,
+                    "active",
+                    "CUDA conditional nodes",
+                    True,
+                    "stable compaction into power-of-two buckets plus exact all-active width; 0 blocking host syncs per step; "
+                    "first skipped commit propagates native norm/QKV/RoPE, later skips retain KV; "
+                    "decode GEMMs save most when all rows exit; propagation costs about 7% per skipped layer (estimate)",
+                )
+            )
         phases = tuple(
             dict.fromkeys(
                 port.source.phase.value

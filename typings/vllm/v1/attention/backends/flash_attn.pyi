@@ -29,3 +29,5 @@ class FlashAttentionImpl:
     scale: float
     sliding_window: tuple[int, int]
     vllm_flash_attn_version: int | None
+
+    def do_kv_cache_update(self, layer: torch.nn.Module, key: torch.Tensor, value: torch.Tensor, kv_cache: torch.Tensor, slot_mapping: torch.Tensor) -> None: ...

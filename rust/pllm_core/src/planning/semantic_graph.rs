@@ -107,6 +107,8 @@ pub(crate) struct ImplementationCandidate {
 pub(crate) struct TokenProgramEffect {
     #[serde(default)]
     pub(crate) span: bool,
+    #[serde(default)]
+    pub(crate) adaptive: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]

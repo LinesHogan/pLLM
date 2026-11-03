@@ -28,11 +28,13 @@ class TokenTensor:
 
 
 @torch.library.custom_op("pllm::layers", mutates_args=())
-def _layers(hidden: torch.Tensor, start: int, stop: int, kv: str) -> list[torch.Tensor]:
+def _layers(hidden: torch.Tensor, start: int, stop: int, kv: str, active: torch.Tensor | None) -> list[torch.Tensor]:
     raise RuntimeError("call Layers only inside a @pllm.custom_forward method")
 
 
-def _fake_layers(hidden: torch.Tensor, start: int, stop: int, kv: str) -> list[torch.Tensor]:
+def _fake_layers(
+    hidden: torch.Tensor, start: int, stop: int, kv: str, active: torch.Tensor | None
+) -> list[torch.Tensor]:
     return [torch.empty_like(hidden) for _ in range(start, stop)]
 
 
@@ -96,18 +98,40 @@ class Layers:
         position_save(value.clone(), name)
 
     def __call__(
-        self, start: int = 0, stop: int | None = None, hidden: torch.Tensor | None = None, *, kv: KV = "commit"
+        self,
+        start: int = 0,
+        stop: int | None = None,
+        hidden: torch.Tensor | None = None,
+        *,
+        kv: KV = "commit",
+        active: torch.Tensor | None = None,
     ) -> LayerOutputs:
         """Commit causal K/V, or peek at earlier committed positions plus fresh own K/V.
 
         A peek leaves the cache untouched and requires an earlier commit to every
         layer in this slice within the same custom forward.
+        active is a bool [rows, 1] tensor in token mode. False rows keep hidden
+        at every layer. On a first commit their K/V is propagated through each
+        skipped layer's own norm, QKV and RoPE; later skips retain the last commit.
+        Peek never writes, including skipped rows.
         """
+        if active is not None:
+            if self.over != "token":
+                raise ValueError('active= needs over="token": a span method sees the whole prompt chunk')
+            if (
+                active.dtype != torch.bool
+                or active.shape != self.embeddings[:, :1].shape
+                or active.device != self.embeddings.device
+            ):
+                raise ValueError("pass active as a bool tensor [rows, 1] computed in this method")
+        if kv not in ("commit", "peek"):
+            raise ValueError(
+                "skipped tokens cannot be left out of a layer's attention: skipped rows get K/V propagated; pass kv='commit' or 'peek'"
+            )
         stop = self.layer_count if stop is None else stop
         value = self.embeddings if hidden is None else hidden
         if (
-            kv not in ("commit", "peek")
-            or not 0 <= start < stop <= self.layer_count
+            not 0 <= start < stop <= self.layer_count
             or (hidden is None and start != 0)
             or value.shape != self.embeddings.shape
             or value.dtype != self.embeddings.dtype
@@ -117,7 +141,7 @@ class Layers:
                 "use 0 <= start < stop <= layer_count, kv in ('commit', 'peek'), "
                 "and supply a hidden tensor with the model shape, dtype and device when start > 0"
             )
-        return LayerOutputs(tuple(_layers(value, start, stop, kv)), start, self.layer_count)
+        return LayerOutputs(tuple(_layers(value, start, stop, kv, active)), start, self.layer_count)
 
     def apply_updates(self) -> None:
         """Apply operands captured since the previous boundary to this token's private overlay."""
@@ -133,6 +157,8 @@ class Segment:
     input: str
     taps: tuple[tuple[int, str], ...]
     kv: KV = "commit"
+    active: str | None = None
+    propagate: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -299,10 +325,13 @@ class TokenProgram:
                     elif node.op == "output":
                         steps.append(Output(node.all_input_nodes[0].name))
                     else:
-                        _, start, stop, kv = node.args
+                        _, start, stop, kv, active = node.args
                         assert type(start) is int and type(stop) is int and kv in ("commit", "peek")
                         if kv == "peek" and not set(range(start, stop)) <= committed:
                             raise ValueError("commit every layer in a slice before calling it with kv=peek")
+                        propagate = tuple(
+                            layer for layer in range(start, stop) if kv == "commit" and layer not in committed
+                        )
                         if kv == "commit":
                             committed.update(range(start, stop))
                         steps.append(
@@ -316,6 +345,8 @@ class TokenProgram:
                                     if projection.users and type(projection.args[1]) is int
                                 ),
                                 kv,
+                                active.name if isinstance(active, torch.fx.Node) else None,
+                                propagate if active is not None else (),
                             )
                         )
                 elif node.op != "placeholder" and not any(
@@ -332,6 +363,11 @@ class TokenProgram:
         )
 
         return replace(program, prompt_pass_is_identity=program._prompt_identity(layer_count))
+
+    @property
+    def adaptive(self) -> bool:
+        """Whether any slice selects active rows on the device."""
+        return any(isinstance(step, Segment) and step.active is not None for step in self.steps)
 
     @property
     def role_sensitive(self) -> bool:
@@ -368,7 +404,7 @@ class TokenProgram:
                         else:
                             values[node] = node.name
                 case Segment():
-                    if aliases.get(step.input, step.input) != self.seed or step.start != 0:
+                    if step.active is not None or aliases.get(step.input, step.input) != self.seed or step.start != 0:
                         return False
                     segments.append(step)
                 case Save():

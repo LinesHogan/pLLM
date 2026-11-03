@@ -360,6 +360,7 @@ def declare_custom_forward(
     programs = {
         role: program for selected, program in captured for role in ("prefill", "decode") if selected in (role, "all")
     }
+    _check_adaptive(b, captured)
     _count_program_work(b, tuple(program for _, program in captured))
     applies_updates = any(isinstance(step, ApplyUpdates) for _, program in captured for step in program.steps)
     if composed:
@@ -385,8 +386,44 @@ def declare_custom_forward(
         len(forwards) > 1 or any(program.role_sensitive for program in programs.values()),
         applies_updates,
         any(program.over == "span" for program in programs.values()),
+        any(program.adaptive for program in programs.values()),
     )
     b.update_task(symbol, lambda task: replace(task, custom_forward=program_effect))
+
+
+def _check_adaptive(b: TensorBinding, programs: tuple[tuple[Tokens, TokenProgram], ...]) -> None:
+    """Reject declarations whose row or layer dependencies adaptive decode cannot yet replay."""
+    for tokens, program in programs:
+        if not program.adaptive:
+            continue
+        if tokens != "decode":
+            raise ValueError(
+                'active= currently needs @pllm.custom_forward(tokens="decode"); keep prompt layers unmasked'
+            )
+        for step in program.steps:
+            if not isinstance(step, Segment) or step.active is None:
+                continue
+            for target in b.overlay_targets:
+                if target.layer is not None and step.start <= target.layer < step.stop:
+                    raise ValueError(
+                        f"train_in_forward targets layer {target.layer}, which tokens skip; target layers below {step.start} or remove active="
+                    )
+            for rewrite in b.sites.rewrites:
+                if rewrite.memory is not None and any(step.start <= layer < step.stop for _, layer in rewrite.places):
+                    raise ValueError(
+                        f"{rewrite.name} has state on layers tokens skip; move it below {step.start} or remove active="
+                    )
+                if any(step.start <= source.layer < step.stop for source in rewrite.earlier):
+                    raise ValueError(f"{rewrite.name} reads a layer tokens skip; read layers below {step.start}")
+        committed = {
+            layer
+            for step in program.steps
+            if isinstance(step, Segment) and step.kv == "commit"
+            for layer in range(step.start, step.stop)
+        }
+        missing = set(range(b.dimensions.layer_count)) - committed
+        if missing:
+            raise ValueError(f"adaptive forward leaves KV holes at layers {sorted(missing)}; commit every layer")
 
 
 def _check_custom_forward(b: TensorBinding) -> None:

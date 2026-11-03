@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
+from functools import partial
 from typing import TYPE_CHECKING, Generic, TypeVar
 
 import torch
@@ -17,8 +18,8 @@ from pllm.execution.overlay_task import OverlayTransition, ProgramOverlay
 from pllm.execution.position_state import PositionBuffers
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import TaskOutput, TensorBatch, TensorOperation
-from pllm.execution.token_program import KV, TokenProgram
-from pllm.execution.token_program_executor import execute_token_program, ordinary_pass
+from pllm.execution.token_program import KV, Segment, TokenProgram
+from pllm.execution.token_program_executor import execute_segment, execute_token_program, ordinary_pass
 from pllm.execution.trace import TraceEventKind
 
 if TYPE_CHECKING:
@@ -63,6 +64,27 @@ class SerialCustomForward(CustomForwardPrimitive):
         kv: KV = "commit",
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
+    def propagate(self, row: PackedPhaseRow, ordinal: int, positions: torch.Tensor, hidden: torch.Tensor) -> None:
+        """Store this layer's K/V from a frozen stream without attention or MLP."""
+        raise NotImplementedError("the CPU decoder must implement skipped-layer KV propagation")
+
+    def masked_segment(
+        self, row: PackedPhaseRow, positions: torch.Tensor, step: Segment, hidden: torch.Tensor, active: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        """Independent CPU oracle: branch on one row, never pack or reorder rows."""
+        assert hidden.device.type == "cpu" and len(hidden) == 1
+
+        def layer(
+            ordinal: int, value: torch.Tensor, residual: torch.Tensor | None, kv: KV
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return self.layer(row, ordinal, positions, value, residual, kv)
+
+        if bool(active[0, 0]):
+            return execute_segment(step, hidden, layer)
+        for ordinal in step.propagate:
+            self.propagate(row, ordinal, positions, hidden)
+        return tuple(hidden.clone() for _ in step.taps)
+
     @abstractmethod
     def normalize(self, row: PackedPhaseRow, hidden: torch.Tensor, residual: torch.Tensor) -> torch.Tensor: ...
 
@@ -102,6 +124,7 @@ class SerialCustomForward(CustomForwardPrimitive):
                     entries,
                     layer,
                     (lambda: None) if self.overlay is None else self.overlay.apply_updates,
+                    adaptive=partial(self.masked_segment, row, positions),
                 )
                 if self.position is not None:
                     self.position.exit(saved)

@@ -154,6 +154,7 @@ class TokenProgramEffect:
     role_sensitive: bool = False
     apply_updates: bool = False
     span: bool = False
+    adaptive: bool = False
 
 
 # How a request-training loss averages its rows: the author's @pllm.train choice ("mean", "state_mean"), or "none".

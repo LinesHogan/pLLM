@@ -9,6 +9,7 @@ from pllm.execution.token_program import KV, ApplyUpdates, Cell, Save, Segment, 
 Layer = Callable[[int, torch.Tensor, torch.Tensor | None, KV], tuple[torch.Tensor, torch.Tensor]]
 # The residual stream after a layer from its (fresh output, residual): their sum, unless a custom residual owns it.
 Stream = Callable[[int, torch.Tensor, torch.Tensor], torch.Tensor]
+Adaptive = Callable[[Segment, torch.Tensor, torch.Tensor], tuple[torch.Tensor, ...]]
 
 
 def add(layer: int, hidden: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
@@ -24,6 +25,7 @@ def execute_token_program(
     layer: Layer,
     apply_updates: Callable[[], None],
     stream: Stream = add,
+    adaptive: Adaptive | None = None,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
     """Preserve segment residuals and snapshot taps before subsequent in-place layer calls."""
     values = {program.seed: seed, program.position: positions.reshape(-1, 1), program.generated: generated}
@@ -32,12 +34,12 @@ def execute_token_program(
     output = seed
     for step in program.steps:
         if isinstance(step, Segment):
-            hidden, residual = values[step.input].clone(), None
-            taps = dict(step.taps)
-            for ordinal in range(step.start, step.stop):
-                hidden, residual = layer(ordinal, hidden, residual, step.kv)
-                if ordinal in taps:
-                    values[taps[ordinal]] = stream(ordinal, hidden, residual)
+            if step.active is None:
+                outputs = execute_segment(step, values[step.input], layer, stream)
+            else:
+                assert adaptive is not None
+                outputs = adaptive(step, values[step.input], values[step.active])
+            values.update(zip((name for _, name in step.taps), outputs, strict=True))
         elif isinstance(step, Cell):
             results = step.function(seed, *(values[name] for name in step.inputs))
             values.update(zip(step.outputs, results, strict=True))
@@ -57,3 +59,15 @@ def ordinary_pass(seed: torch.Tensor, count: int, layer: Layer, stream: Stream =
         hidden, residual = layer(ordinal, hidden, residual, "commit")
     assert residual is not None
     return stream(count - 1, hidden, residual)
+
+
+def execute_segment(step: Segment, seed: torch.Tensor, layer: Layer, stream: Stream = add) -> tuple[torch.Tensor, ...]:
+    """Run an intact slice, retaining fused residual additions between layers."""
+    hidden, residual = seed.clone(), None
+    taps = dict(step.taps)
+    outputs: dict[int, torch.Tensor] = {}
+    for ordinal in range(step.start, step.stop):
+        hidden, residual = layer(ordinal, hidden, residual, step.kv)
+        if ordinal in taps:
+            outputs[ordinal] = stream(ordinal, hidden, residual)
+    return tuple(outputs[ordinal] for ordinal, _ in step.taps)

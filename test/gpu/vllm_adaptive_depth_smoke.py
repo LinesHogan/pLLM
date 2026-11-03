@@ -1,0 +1,260 @@
+"""RTX 4090 adaptive-depth acceptance: native KV oracle, sync-debug replay and paired decode timings."""
+
+import argparse
+from dataclasses import dataclass
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import torch
+from vllm import SamplingParams
+from vllm.forward_context import override_forward_context
+
+import pllm
+from pllm.backends.vllm.adaptive_depth import AdaptiveSlice
+from pllm.backends.vllm.custom_forward import ProgramWave
+from pllm.backends.vllm.custom_forward_attention import BatchAttentionBuffers
+from pllm.execution.step_capture import capture_graph
+
+
+@dataclass(frozen=True)
+class Exit(pllm.Workload):
+    rule: str = "none"
+
+    @pllm.custom_forward(tokens="decode")
+    def forward(self, layers):
+        middle = layers.layer_count // 2
+        hidden = layers(stop=middle)[middle - 1]
+        active = torch.ones_like(hidden[:, :1], dtype=torch.bool)
+        if self.rule == "none":
+            active = ~active
+        elif self.rule == "mixed":
+            active = layers.position % 2 == 0
+        return (
+            layers(middle, hidden=hidden)[-1]
+            if self.rule == "vanilla"
+            else layers(middle, hidden=hidden, active=active)[-1]
+        )
+
+
+def cells(wave):
+    return tuple(
+        (attention.kv_cache, wave.attention.metadata[attention.layer_name].slot_mapping)
+        for attention in wave.custom_forward.attentions
+    )
+
+
+def read_cells(wave):
+    return tuple(cache[slots // cache.shape[2], :, slots % cache.shape[2]].clone() for cache, slots in cells(wave))
+
+
+def write_cells(wave, values):
+    for (cache, slots), value in zip(cells(wave), values, strict=True):
+        cache[slots // cache.shape[2], :, slots % cache.shape[2]] = value
+
+
+def full_depth(wave):
+    hidden = wave.seed.clone()
+    middle = len(wave.custom_forward.model.layers) // 2
+    for start, stop in ((0, middle), (middle, len(wave.custom_forward.model.layers))):
+        residual = None
+        for index in range(start, stop):
+            hidden, residual = wave.custom_forward.model.layers[index](wave.positions, hidden, residual)
+        hidden = hidden + residual
+    return wave.custom_forward.model.norm(hidden)
+
+
+def reference(wave, active):
+    """Separate, full-width masked oracle; direct QKV/RoPE verifies each skipped layer's cache."""
+    body = wave.custom_forward.model
+    middle = len(body.layers) // 2
+    hidden, residual = wave.seed.clone(), None
+    for layer in body.layers[:middle]:
+        hidden, residual = layer(wave.positions, hidden, residual)
+    frozen = hidden + residual
+    hidden, residual = frozen.clone(), None
+    for ordinal, layer in enumerate(body.layers[middle:], middle):
+        # Every skipped layer receives the same frozen stream and its own weights.
+        attn = layer.self_attn
+        qkv, _ = attn.qkv_proj(layer.input_layernorm(frozen))
+        q, k, v = qkv.split((attn.q_size, attn.kv_size, attn.kv_size), -1)
+        q, k = attn.rotary_emb(wave.positions, q, k)
+        hidden, residual = layer(wave.positions, hidden, residual)
+        cache, slots = cells(wave)[ordinal]
+        kv = torch.cat(
+            (
+                k.reshape(len(frozen), attn.num_kv_heads, attn.head_dim),
+                v.reshape(len(frozen), attn.num_kv_heads, attn.head_dim),
+            ),
+            -1,
+        )
+        live = cache[slots // cache.shape[2], :, slots % cache.shape[2]]
+        cache[slots // cache.shape[2], :, slots % cache.shape[2]] = torch.where(active[:, :, None], live, kv)
+    return body.norm(torch.where(active, hidden + residual, frozen))
+
+
+def split_full(wave):
+    """Native full-depth outputs at half width, measuring batch numerics on the same history."""
+    outputs = []
+    for rows in torch.arange(len(wave.seed), device=wave.seed.device).chunk(2):
+        buffers = BatchAttentionBuffers(
+            wave.attention.context, wave.custom_forward.attentions, wave.custom_forward.domain.positions, len(rows)
+        )
+        buffers.refresh(
+            buffers.bind(wave.attention.context, wave.custom_forward.attentions, wave.positions + 1), rows, rows
+        )
+        part = SimpleNamespace(seed=wave.seed[rows], positions=wave.positions[rows], custom_forward=wave.custom_forward)
+        with override_forward_context(buffers.context):
+            outputs.append(full_depth(part))
+    return torch.cat(outputs)
+
+
+class Audit:
+    def __init__(self, rule, logits, measure_at):
+        self.rule, self.logits, self.measure_at = rule, logits, measure_at
+        self.max_error = self.max_bound = 0.0
+        self.native_selection = AdaptiveSlice.__call__
+        self.waves = {}
+        self.baselines = {}
+        self.timings = []
+        self.checked = 0
+        self.steady = []
+        self.native_capture = ProgramWave.capture
+        self.native_replay = torch.cuda.CUDAGraph.replay
+
+    def select(self, selection, step, hidden, active):
+        # The acceptance fixture forces persistent request parity; workload routing
+        # still accepts only per-token tensor decisions in production.
+        if self.rule == "mixed":
+            active = selection.wave.indices[1].reshape(-1, 1) % 2 == 1
+        return self.native_selection(selection, step, hidden, active)
+
+    def capture(self, wave):
+        self.native_capture(wave)
+        saved = read_cells(wave)
+        with override_forward_context(wave.attention.context):
+            graph, output, _ = capture_graph(
+                wave.seed.device, lambda: full_depth(wave), restore=lambda: write_cells(wave, saved)
+            )
+        write_cells(wave, saved)
+        self.waves[wave.graph] = wave
+        self.baselines[wave.graph] = graph, output
+
+    def replay(self, graph):
+        if graph not in self.waves:
+            return self.native_replay(graph)
+        wave = self.waves[graph]
+        baseline, full = self.baselines[graph]
+        events = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+        events[0].record()
+        mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            self.native_replay(graph)
+        finally:
+            torch.cuda.set_sync_debug_mode(mode)
+        events[1].record()
+        live = read_cells(wave)
+        events[2].record()
+        self.native_replay(baseline)
+        events[3].record()
+        active = torch.full((len(wave.seed), 1), self.rule == "all", device=wave.seed.device)
+        if self.rule == "mixed":
+            active = wave.indices[1].reshape(-1, 1) % 2 == 1
+            split = split_full(wave)
+            bound = float((self.logits(full) - self.logits(split)).abs().max())
+            error = float(
+                (self.logits(wave.output)[active.flatten()] - self.logits(full)[active.flatten()]).abs().max()
+            )
+            assert error <= bound + 1e-6, (error, bound)
+            self.max_error, self.max_bound = max(self.max_error, error), max(self.max_bound, bound)
+        with override_forward_context(wave.attention.context):
+            expected = reference(wave, active)
+        if self.rule != "mixed":
+            torch.testing.assert_close(wave.output, expected, atol=0, rtol=0)
+        for value, oracle in zip(live, read_cells(wave), strict=True):
+            if self.rule == "mixed":
+                value, oracle = value[~active.flatten()], oracle[~active.flatten()]
+            torch.testing.assert_close(value, oracle, atol=0, rtol=0)
+        if self.rule == "all":
+            torch.testing.assert_close(wave.output, full, atol=0, rtol=0)
+        if self.checked == self.measure_at:
+            # Keep both measurements at steady GPU clocks; oracle assertions otherwise idle
+            # the GPU before the adaptive replay but leave it warm for the paired baseline.
+            for selected in (graph, baseline, graph, baseline):
+                for _ in range(10):
+                    self.native_replay(selected)
+                start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+                start.record()
+                for _ in range(100):
+                    self.native_replay(selected)
+                end.record()
+                self.steady.append((start, end))
+        write_cells(wave, live)
+        self.checked += 1
+        self.timings.append(events)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
+    parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--tokens", type=int, default=16)
+    parser.add_argument("--rule", choices=("none", "all", "mixed"), default="none")
+    args = parser.parse_args()
+    config = pllm.ModelConfig(
+        args.model,
+        max_model_len=max(512, args.tokens + 64),
+        max_num_seqs=args.batch,
+        max_num_batched_tokens=512,
+        gpu_memory_utilization=0.85,
+        execution=pllm.ExecutionOptions(capture_memory_bytes=512 << 20),
+    )
+    prompts = ["The capital of France is" + " very" * i for i in range(args.batch)]
+    params = SamplingParams(max_tokens=args.tokens, temperature=0, ignore_eos=True)
+    vanilla = None
+    if args.rule == "mixed":
+        import gc
+
+        baseline = pllm.make_llm(workload=Exit("vanilla"), config=config)
+        vanilla = baseline.generate(prompts, params)
+        baseline.close()
+        del baseline
+        gc.collect()
+        torch.cuda.empty_cache()
+    handle = pllm.make_llm(workload=Exit(args.rule), config=config)
+    audit = Audit(
+        args.rule,
+        lambda hidden: torch.nn.functional.linear(hidden, handle.runner.model.lm_head.weight),
+        min(128, max(1, (args.tokens - 1) // 2)),
+    )
+    try:
+        with (
+            patch.object(
+                AdaptiveSlice,
+                "__call__",
+                lambda selection, step, hidden, active: audit.select(selection, step, hidden, active),
+            ),
+            patch.object(ProgramWave, "capture", lambda wave: audit.capture(wave)),
+            patch.object(torch.cuda.CUDAGraph, "replay", lambda graph: audit.replay(graph)),
+        ):
+            outputs = handle.generate(prompts, params)
+        if vanilla is not None:
+            for index in range(1, args.batch, 2):
+                assert outputs[index].outputs[0].token_ids == vanilla[index].outputs[0].token_ids
+            print(
+                f"non_exited_greedy_equal={args.batch // 2}x{args.tokens} max_logit_error={audit.max_error} batch_numerics_bound={audit.max_bound}"
+            )
+        torch.cuda.synchronize()
+        elapsed = [(a.elapsed_time(b), c.elapsed_time(d)) for a, b, c, d in audit.timings[1:]]
+        adaptive, baseline = (sum(values) / len(elapsed) for values in zip(*elapsed))
+        steady = [start.elapsed_time(end) / 100 for start, end in audit.steady]
+        print(f"steady_replay_ms={steady} ratio={(steady[0] + steady[2]) / (steady[1] + steady[3]):.4f}")
+        print(
+            f"adaptive_depth model={args.model} batch={args.batch} rule={args.rule} checked={audit.checked} adaptive_ms={adaptive:.4f} baseline_ms={baseline:.4f} ratio={adaptive / baseline:.4f} blocking_syncs=0"
+        )
+    finally:
+        handle.close()
+
+
+if __name__ == "__main__":
+    main()
