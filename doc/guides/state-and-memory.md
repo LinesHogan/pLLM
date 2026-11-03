@@ -46,7 +46,7 @@ class Probe(pllm.Workload):
 声明读取并写回同一字段的方法使用 FP32；其他字段使用模型 dtype。`pllm.Field.dtype`
 覆盖该字段的默认值，`dtype=None` 显式跟随模型。`RequestState.dtype` 只作用于普通形状字段。
 梯度与 loss 归约至少使用 FP32，不随存储精度降低；布局的 `dtype` 是解析后的具体值。
-导入张量必须匹配该布局的 dtype。只读字段若参与固定 FP32 的矩阵乘法，
+浮点导入值在边界转换为布局的 dtype；整数字段仍需匹配。只读字段若参与固定 FP32 的矩阵乘法，
 请显式声明 `dtype=torch.float32` 或在数学函数中转换操作数。
 FP32 相对 BF16 使该字段的 payload 翻倍，也增加投影读取的转换工作区。旧的紧预算
 可能在规划或图捕获时报错；提高 state / capture / execution 预算，或显式选择 BF16。

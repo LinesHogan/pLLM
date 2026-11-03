@@ -42,7 +42,7 @@ class WeightedRowBatch(Generic[T]):
 
 @dataclass(frozen=True, slots=True)
 class StateImport(Generic[T]):
-    """Original external tensors in the signed layout's field order."""
+    """External tensors in field order; floating values convert to the declared storage precision on import."""
 
     schema: ClassVar[str] = "state_tensors@1"
     values: tuple[T, ...]

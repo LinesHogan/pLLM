@@ -397,13 +397,22 @@ class TensorBinding(Builder[TensorFrame]):
             data.replacements = tuple(
                 (index, tuple(tensor[row] for tensor in update.values)) for index, row in sorted(selected.items())
             )
+        replacements: list[tuple[int, tuple[torch.Tensor, ...]]] = []
         for index, values in data.replacements:
             root = tuple(view.read(batch.roots[index][view.field]) for view in self.imports[resource])
             if len(values) != len(root) or any(
-                source.shape != target.shape or source.dtype != target.dtype or source.device != target.device
+                source.shape != target.shape
+                or (source.dtype != target.dtype and not (source.is_floating_point() and target.is_floating_point()))
+                or source.device != target.device
                 for source, target in zip(values, root, strict=True)
             ):
-                raise ValueError("replacement tensors must match the declared layout shape, dtype and device")
+                raise ValueError(
+                    "replacement tensors must match layout shape/device and use floating or matching integer dtypes"
+                )
+            replacements.append(
+                (index, tuple(source.to(target.dtype) for source, target in zip(values, root, strict=True)))
+            )
+        data.replacements = tuple(replacements)
 
     @property
     def uses_sampler_rows(self) -> bool:
