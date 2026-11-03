@@ -281,8 +281,7 @@ fn select_lanes(
     else {
         return;
     };
-    if !timeline.capabilities.iter().any(|c| c == "compute/cuda@1")
-        || source.lag == 0 && graph.model_reads.is_empty()
+    if source.lag == 0 && graph.model_reads.is_empty()
         || graph
             .tasks
             .iter()

@@ -8,6 +8,7 @@ the latest version. CUDA completion never determines which version a reader sele
 from __future__ import annotations
 
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, TypeVar
 
@@ -34,7 +35,7 @@ class PostSampleOverlap:
         arena: PageBundleArena,
         directory: RequestStateDirectory,
         lag: int,
-        stream: torch.cuda.Stream,
+        stream: torch.cuda.Stream | None,
         anchor: int,
     ) -> None:
         self.arena, self.directory, self.lag, self.stream, self.anchor = arena, directory, lag, stream, anchor
@@ -51,7 +52,7 @@ class PostSampleOverlap:
             return
         self._copy_inputs(context)
         if self.lag or context.pin.stream != self.stream:
-            with torch.cuda.stream(self.stream):
+            with nullcontext() if self.stream is None else torch.cuda.stream(self.stream):
                 self._resume_latest(context)
                 if self.lag:
                     # Expired history is released on the writer stream that owns it.
@@ -71,11 +72,13 @@ class PostSampleOverlap:
         reader = context.pin
         context.selection = self.directory.select(context.selection.rows)
         if reader.refs == context.selection.refs:
-            context.pin = context.move_owned_pin(reader, self.stream)
+            if self.stream is not None:
+                context.pin = context.move_owned_pin(reader, self.stream)
         else:
             context.pin = self.arena.pin_exact(context.selection.refs, self.stream)
             context.register_pin(context.pin)
-            context.move_owned_pin(reader, self.stream)
+            if self.stream is not None:
+                context.move_owned_pin(reader, self.stream)
         context.move_slots()
 
     def _copy_inputs(self, context: StateTaskContext[_DataT]) -> None:
@@ -84,6 +87,11 @@ class PostSampleOverlap:
         Hidden rows stay in held slots. Only copies of reusable feedback and result
         tensors fence the main stream; writer execution follows on its serial lane.
         """
+        if self.stream is None:
+            data = context.data()
+            assert isinstance(data, TensorFrame)
+            context.value = replace(data, plan=None)
+            return
         main = torch.cuda.current_stream(self.stream.device)
         self.stream.wait_stream(main)
         with torch.cuda.stream(self.stream):
@@ -112,6 +120,7 @@ class PostSampleOverlap:
 
     def _record_input(self, tensor: torch.Tensor) -> torch.Tensor:
         if tensor.is_cuda:
+            assert self.stream is not None
             tensor.record_stream(self.stream)
         return tensor
 

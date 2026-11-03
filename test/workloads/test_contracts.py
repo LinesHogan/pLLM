@@ -1,6 +1,8 @@
 """One CPU schedule contract table for the maintained model workloads."""
 
 import json
+from dataclasses import asdict, replace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -8,6 +10,7 @@ from safetensors.torch import save_file
 
 import pllm
 from pllm import testing
+from pllm.execution.post_sample import PostSampleOverlap
 from pllm.workloads import (
     DecodeFactorsWorkload,
     DummyWorkload,
@@ -37,10 +40,23 @@ from pllm.workloads.state_producers import FactorAdapterWorkload
 from pllm.workloads.video import VideoWorkload
 
 
+class PrefillTrainer(pllm.Workload):
+    """A prompt-only update must not run a second time when request state is retained."""
+
+    @property
+    def learned(self) -> pllm.RequestState:
+        return pllm.RequestState({"w": (8,)}, optimizer=pllm.AdamW(lr=0.01))
+
+    @pllm.train(state="learned", reduction="state_mean")
+    def learn(self, x=pllm.hidden(0, tokens="prefill"), w=pllm.parameter("learned", "w")):
+        return (w - x).square().mean(-1)
+
+
 @pytest.mark.parametrize(
     "workload",
     (
         DummyWorkload(),
+        PrefillTrainer(),
         DoLaWorkload(layers=(0, 2, 4, 6, 8)),
         ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5)),
         FactorAdapterWorkload(),
@@ -63,7 +79,20 @@ from pllm.workloads.video import VideoWorkload
     ),
     ids=lambda workload: type(workload).__name__,
 )
-def test_builtin_schedule_contracts(workload, tmp_path):
+def test_builtin_schedule_contracts(workload, model_config):
+    cuda_initialized = torch.cuda.is_initialized()
+    result = testing.check(workload, model_config)
+    assert torch.cuda.is_initialized() == cuda_initialized
+    assert result.passed or result.skipped
+    json.dumps(asdict(result))
+    if isinstance(workload, (ESampWorkload, PrefillTrainer, InPlaceTTTWorkload, PrefillAdaptersWorkload)):
+        assert "preempted" in result.passed
+    if isinstance(workload, (InPlaceTTTWorkload, PrefillAdaptersWorkload)):
+        assert "visibility=exact (chunking / replay)" in result.passed
+
+
+@pytest.fixture
+def model_config(tmp_path):
     (tmp_path / "config.json").write_text(
         json.dumps(
             {
@@ -85,7 +114,41 @@ def test_builtin_schedule_contracts(workload, tmp_path):
         },
         tmp_path / "model.safetensors",
     )
-    cuda_initialized = torch.cuda.is_initialized()
-    result = testing.check(workload, pllm.ModelConfig(str(tmp_path)))
-    assert torch.cuda.is_initialized() == cuda_initialized
-    assert result.passed or result.skipped
+    return pllm.ModelConfig(str(tmp_path))
+
+
+@pytest.mark.parametrize("workload", (PrefillTrainer(), ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5))))
+def test_check_detects_duplicate_updates_on_split_replay(workload, model_config):
+    with patch("pllm.testing_contracts.retained_rows", side_effect=lambda rows, frontiers: rows):
+        with pytest.raises(testing.ContractError, match=r"\[preempted\].*state"):
+            testing.check(workload, model_config)
+
+
+@pytest.mark.parametrize("lag", (0, 1, 2))
+def test_check_versions_follow_lag_and_detect_wrong_history(lag, model_config):
+    workload = ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5))
+    config = replace(model_config, execution=pllm.ExecutionOptions(publish_lag=lag))
+    assert "publish_lag" in testing.check(workload, config).passed
+    if lag == 1:
+        initialize = PostSampleOverlap.__init__
+        for wrong_lag in (0, 2):
+
+            def wrong_history(self, arena, directory, lag, stream, anchor):
+                initialize(self, arena, directory, wrong_lag, stream, anchor)
+
+            with patch.object(PostSampleOverlap, "__init__", wrong_history):
+                with pytest.raises(testing.ContractError, match=r"\[publish_lag / visibility\].*read version"):
+                    testing.check(workload, config)
+
+
+def test_check_reports_unsupported_replay_with_actionable_visibility(model_config):
+    workload = GatedDeltaWorkload(
+        GatedDeltaConfig(
+            (pllm.model.Projection("down_proj", 0),), head_width=4, chunk_size=4, visibility="forward_pinned"
+        )
+    )
+    result = testing.check(workload, model_config)
+    skipped = {item.property: item.reason for item in result.skipped}
+    assert 'visibility="exact"' in skipped["preempted"]
+    assert "GPU" in skipped["visibility=forward_pinned"]
+    assert "preempted" not in result.passed

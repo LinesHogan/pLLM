@@ -408,7 +408,7 @@ class TensorBinding(Builder[TensorFrame]):
     def row_reader(self) -> Callable[[PackedPhaseRowBatch], tuple[PackedPhaseRow, ...]]:
         """Bind the frame's row selection once; tasks filter only when they need a narrower phase."""
         if self.row_phase() is None:
-            return lambda rows: rows.request_rows
+            return lambda rows: rows.producer_rows(None)
         return lambda rows: rows.latest_decode_rows
 
     def bind_prepare(self) -> Callable[[StepInput, TensorBatch], TensorFrame]:
@@ -424,7 +424,8 @@ class TensorBinding(Builder[TensorFrame]):
                     row
                     for link in value.sampler_rows.links
                     for row in (value.rows.rows[link.packed_row_index],)
-                    if row.phase is HiddenPhase.DECODE or row.token_offset == row.prompt_length - 1
+                    if not row.recomputed
+                    and (row.phase is HiddenPhase.DECODE or row.token_offset == row.prompt_length - 1)
                 )
             data = TensorFrame(value, rows)
             match value.batch:

@@ -39,7 +39,7 @@ from pllm.execution.backend_attachment import attachment_buffer_bytes
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.host_runtime import CompletionRows
 from pllm.execution.overlay_task import ProjectionTask
-from pllm.execution.preemption import preemption_policy
+from pllm.execution.preemption import preemption_policy, retained_rows
 from pllm.execution.state_execution import HeldInput, StateDiagnostics, StateTaskContext
 from pllm.execution.state_feed import (
     Feed,
@@ -151,6 +151,7 @@ class VllmSession(Generic[DataT, ResultT]):
             )
         self._sampler = sampler
         self._identities: dict[str, RequestIdentity] = {}
+        self._token_frontiers: dict[RequestIdentity, int] = {}
         self._pending_identities: dict[str, RequestIdentity] = {}
         self._next_step_id = 0
         self._step: _PackedStep[DataT] | None = None
@@ -290,6 +291,9 @@ class VllmSession(Generic[DataT, ResultT]):
     def prepare_input(self, rows: PackedSamplerRowBatch) -> None:
         self._require_input_live()
         self._next_step_id += 1
+        execution = self._deployment.execution
+        if preemption_policy(self.attachment, execution.math.model_sites) == "keep":
+            rows = retained_rows(rows, self._token_frontiers)
         step = _PackedStep[DataT](rows)
         self._step = step
         if self._taps is not None:
@@ -494,6 +498,7 @@ class VllmSession(Generic[DataT, ResultT]):
             execution.retire(held)
         for identity in identities:
             self._identities.pop(identity.request_id)
+            self._token_frontiers.pop(identity, None)
 
     @torch.inference_mode(False)
     def retire_all(self, *, wait: bool = False) -> None:

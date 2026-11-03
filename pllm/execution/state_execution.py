@@ -504,9 +504,13 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         if not any(task.read_origin == "latest" for task in tasks):
             return None
         stream = (
-            torch.cuda.Stream(device=self.device)
-            if any(task.lane == "side" for task in tasks)
-            else torch.cuda.current_stream(self.device)
+            None
+            if self.device.type == "cpu"
+            else (
+                torch.cuda.Stream(device=self.device)
+                if any(task.lane == "side" for task in tasks)
+                else torch.cuda.current_stream(self.device)
+            )
         )
         anchor = min(task.anchor_id for task in tasks if task.read_origin == "latest")
         return PostSampleOverlap(self.arena, self.directory, max(task.read_distance for task in tasks), stream, anchor)
@@ -811,7 +815,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         except Exception as exc:
             self._failed(context, exc)
             raise
-        if self.post_sample is not None and stream is not None:
+        if self.post_sample is not None and self.post_sample.stream is not None and stream is not None:
             CudaStreamReadiness(self.post_sample.stream).order_on(stream)
         return result
 

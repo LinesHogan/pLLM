@@ -18,6 +18,8 @@ class PackedPhaseRow:
     phase: HiddenPhase
     identity: RequestIdentity
     prompt_length: int = 0
+    # Retained auxiliary state has already consumed this token; reset-and-replay leaves it false.
+    recomputed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,11 +41,11 @@ class PackedPhaseRowBatch:
         return tuple(last.values())
 
     def producer_rows(self, phase: HiddenPhase | None) -> tuple[PackedPhaseRow, ...]:
-        """Completed prompt endings or latest decode rows; None selects every request."""
+        """Fresh prompt endings or latest decode rows; retained-state replay never produces again."""
         if phase is None:
-            return self.request_rows
+            return tuple(row for row in self.request_rows if not row.recomputed)
         return (
-            tuple(row for row in self.prefill_rows if row.token_offset == row.prompt_length - 1)
+            tuple(row for row in self.prefill_rows if row.token_offset == row.prompt_length - 1 and not row.recomputed)
             if phase is HiddenPhase.PREFILL
             else self.latest_decode_rows
         )
@@ -58,9 +60,13 @@ class PackedPhaseRowBatch:
 
     @property
     def latest_decode_rows(self) -> tuple[PackedPhaseRow, ...]:
-        """Each request's final decode row; earlier ones in its span recompute output history after preemption."""
+        """Each request's final fresh decode row; a partial retained-state replay has none."""
         last = {row.request_ordinal: row for row in self.rows}
-        return tuple(row for row in self.rows if row.phase is HiddenPhase.DECODE and last[row.request_ordinal] is row)
+        return tuple(
+            row
+            for row in self.rows
+            if row.phase is HiddenPhase.DECODE and last[row.request_ordinal] is row and not row.recomputed
+        )
 
 
 @dataclass(frozen=True, slots=True)

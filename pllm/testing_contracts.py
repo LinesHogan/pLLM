@@ -8,6 +8,7 @@ from functools import partial
 from math import lcm
 from traceback import format_exception_only
 from types import MappingProxyType
+from typing import Literal
 
 import numpy as np
 import torch
@@ -23,7 +24,6 @@ from pllm.contracts.parameter_overlay import ProjectionOperands
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import SamplerFeedback, SamplerStage
 from pllm.contracts.semantic_graph import (
-    AnchorId,
     StateResource,
     StateScope,
     StateSelectionInputSource,
@@ -33,14 +33,16 @@ from pllm.contracts.state_ref import StateRef
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.checkpoint import checkpoint_directory
 from pllm.execution.compile_facts import BackendCompileFacts
+from pllm.execution.preemption import preemption_policy, retained_rows
 from pllm.execution.runtime_facts import model_timeline
-from pllm.execution.state_execution import StateExecution
+from pllm.execution.state_execution import StateExecution, StateTaskContext
 from pllm.execution.step_input import StepInput
 from pllm.execution.tensor_binding import TensorBinding, TensorOutput
 from pllm.execution.tensor_executor import reads_rows
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_task import TensorTask
 from pllm.execution.trace import TraceEventKind
+from pllm.testing_timing import VersionChecks
 from pllm.usage import Workload
 
 
@@ -92,6 +94,8 @@ Values = dict[tuple[str, int, str], torch.Tensor]
 
 @dataclass
 class _Run:
+    timing: VersionChecks = field(default_factory=VersionChecks)
+    preemption_skip: str | None = None
     values: Values = field(default_factory=lambda: {})
     operations: dict[tuple[str, int, str], OperationResult] = field(default_factory=lambda: {})
 
@@ -110,6 +114,7 @@ class _Run:
                 for index in data.fixed.index.sampler
             )
         )
+        self.timing.record(task, data, rows)
         for index, row in enumerate(rows):
             if task.phase is not None and row not in data.step.rows.producer_rows(task.phase):
                 self.failures.append(
@@ -158,7 +163,9 @@ _IDS = tuple(RequestIdentity(name, index, index) for index, name in enumerate(("
 _PROMPTS = (5, 1, 9)
 
 
-def _schedule(order: tuple[int, ...], mixed: bool) -> tuple[tuple[tuple[int, int, int], ...], ...]:
+def _schedule(
+    order: tuple[int, ...], mixed: bool, preempted: str = "none"
+) -> tuple[tuple[tuple[int, int, int], ...], ...]:
     if mixed:
         return (
             ((0, 4, 0), (1, 1, 0)),
@@ -170,10 +177,17 @@ def _schedule(order: tuple[int, ...], mixed: bool) -> tuple[tuple[tuple[int, int
             ((2, 1, 11),),
             ((2, 1, 12),),
         )
-    return (
+    steps = (
         tuple((i, _PROMPTS[i], 0) for i in order),
         *(tuple((i, 1, _PROMPTS[i] + offset) for i in order) for offset in range(4)),
     )
+
+    if preempted == "none":
+        return steps
+    replay = ((1, 1, 0),), ((1, 1, 1),)
+    resume = ((1, 2, 2),) if preempted == "chunked" else ((1, _PROMPTS[1] + 3, 0),)
+    resumed = tuple(item for item in steps[3] if item[0] != 1) + resume
+    return (*steps[:3], *(replay if preempted == "chunked" else ()), resumed, steps[4])
 
 
 def _random(shape: tuple[int, ...], seed: int) -> torch.Tensor:
@@ -274,12 +288,16 @@ def _step(
             _token_values(i, offsets, target.input_size, 30 + channel, perturbed).to(dtype),
             _token_values(i, offsets, target.output_size, 50 + channel, perturbed).to(dtype),
             _random((target.output_size, target.input_size), 80 + channel).to(dtype),
-            torch.tensor(done + n == _PROMPTS[i]),
+            torch.tensor(offsets.stop == _PROMPTS[i]),
         )
         for i, n, done in counts
         for channel, target in enumerate(shape.targets)
-        for phase in (HiddenPhase.PREFILL if done < _PROMPTS[i] else HiddenPhase.DECODE,)
-        for offsets in (range(done, done + n),)
+        for phase, start, end in (
+            (HiddenPhase.PREFILL, done, min(done + n, _PROMPTS[i])),
+            (HiddenPhase.DECODE, max(done, _PROMPTS[i]), done + n),
+        )
+        if start < end
+        for offsets in (range(start, end),)
     )
     return scheduled_step(
         tuple(identities[i] for i, _, _ in counts),
@@ -356,19 +374,45 @@ def _check_idle_state(
     )
 
 
+def _projection_step(
+    execution: StateExecution[StepInput, TensorFrame, TensorOutput],
+    context: StateTaskContext[TensorFrame],
+    value: StepInput,
+    run: _Run,
+) -> None:
+    """Exercise the model driver's prompt-before-decode projection segments without a loaded model."""
+    task = execution.plan.tasks[context.next_task]
+    phases = tuple(phase for phase in HiddenPhase if any(o.phase is phase for o in value.operands))
+    for phase in phases:
+        operands = tuple(o for o in value.operands if o.phase is phase)
+        outputs = execution.execute_part(
+            context, replace(value, operands=operands), task.task_id, complete=phase is phases[-1]
+        )
+        for operand in operands:
+            rows = tuple(row for row in value.rows.rows if row.identity == operand.identity and row.phase is phase)
+            for row, tensor in zip(rows, outputs[operand.identity, operand.target], strict=True):
+                run.values[row.identity.request_id, row.token_offset, f"projection {operand.target}"] = (
+                    tensor.detach().clone()
+                )
+
+
 def _execute_step(
     execution: StateExecution[StepInput, TensorFrame, TensorOutput],
     value: StepInput,
     feedback: SamplerFeedback,
     run: _Run,
 ) -> None:
-    context = execution.start_step(value)
+    run.timing.begin(execution, value)
+    overlap = execution.post_sample
+    context = execution.start_step(value, history=() if overlap is None else overlap.history)
     versions = tuple(
         (group.resource, ref) for group in context.selection.groups if group.keys != (None,) for ref in group.refs
     )
     observed = len(run.operations)
     for anchor in execution.arena.plan.timeline.anchors:
-        execution.execute_anchor(context, AnchorId(anchor.ordinal))
+        if anchor.symbol == "model.execute" and execution.arena.plan.semantic_graph.updates_in_forward:
+            _projection_step(execution, context, value, run)
+        execution.advance_to(context, anchor.symbol)
         if anchor.ordinal == execution.sampler_anchor_id:
             guidance = context.guidance
             if guidance is not None:
@@ -379,7 +423,7 @@ def _execute_step(
                     if guidance.row_weights is not None:
                         run.values[*point, "sampler weight"] = guidance.row_weights[index].detach().clone()
             execution.complete_sampler(context, feedback=feedback)
-    for entry in context.data().entries:
+    for entry in () if execution.arena.plan.semantic_graph.updates_in_forward else context.data().entries:
         rows = tuple(row for row in value.rows.rows if row.identity == entry.identity)
         for target in entry.targets:
             for row, tensor in zip(rows, target.update.output, strict=True):
@@ -404,6 +448,7 @@ def _run(
     *,
     mixed: bool = False,
     perturbed: int | None = None,
+    preempted: Literal["none", "full", "chunked"] = "none",
 ) -> _Run:
     run = _Run(shared_resources=_shared_resources(declaration))
     tasks = declaration.tensor_tasks
@@ -414,20 +459,43 @@ def _run(
         else task
         for symbol, task in tasks.items()
     }
-    deployment = workload.bind_backend(facts, workload.plan_backend(facts, declaration), declaration)
-    declaration.tensor_tasks = tasks
+    try:
+        deployment = workload.bind_backend(facts, workload.plan_backend(facts, declaration), declaration)
+    finally:
+        declaration.tensor_tasks = tasks
     execution = deployment.execution
+    policy = preemption_policy(deployment.attachment, execution.math.model_sites)
+    if (
+        preempted != "none"
+        and policy == "reset"
+        and deployment.attachment.plan.schedule.recompute_rejection is not None
+    ):
+        run.preemption_skip = deployment.attachment.plan.schedule.recompute_rejection
+        execution.close()
+        return run
     execution.admit_instances()
     limit = workload.backend_requirements().sample_limit or 3
     script = tuple(replace(identity, sample_index=identity.sample_index % limit) for identity in _IDS)
     identities = tuple(script[i] for i in order)
     execution.admit(identities)
+    frontiers: dict[RequestIdentity, int] = {}
     try:
         stride = lcm(*(task.export.every for task in tasks.values() if task.export is not None))
-        for step, counts in enumerate(_schedule(order, mixed)):
+        for step, counts in enumerate(_schedule(order, mixed, preempted)):
+            if preempted != "none" and step == 3 and policy == "reset":
+                execution.retire((script[1],), wait=True)
+                execution.admit((script[1],))
             value = _step(shape, facts, counts, step * stride, perturbed, script)
+            if policy == "keep":
+                sampler = retained_rows(value.sampler_rows, frontiers)
+                value = replace(
+                    value,
+                    rows=sampler.row_batch,
+                    sampler_rows=sampler,
+                    hidden=None if value.hidden is None else replace(value.hidden, row_batch=sampler.row_batch),
+                )
             _execute_step(execution, value, _feedback(value, shape, perturbed), run)
-            for row in value.rows.request_rows:
+            for row in value.rows.producer_rows(None):
                 for group in execution.directory.select((row,)).groups:
                     if str(group.resource) in run.shared_resources and any(ref.version_id > 0 for ref in group.refs):
                         run.shared_values.update(
@@ -440,8 +508,11 @@ def _run(
                     for name, tensor in _state_values(execution, row, declaration).items()
                 )
     finally:
+        execution.release_history()
         execution.retire(identities, wait=True)
         execution.retire((), wait=True)
+        execution.close()
+    run.failures.extend(run.timing.failures)
     return run
 
 
@@ -498,6 +569,13 @@ def _compare(
             continue
         if shared and key in reference.shared_values | candidate.shared_values:
             continue
+        if (
+            variant in ("mixed", "preempted")
+            and key in reference.timing.values
+            and key in candidate.timing.values
+            and reference.timing.values[key] != candidate.timing.values[key]
+        ):
+            continue
         left, right = expected.get(key), actual.get(key)
         if (left is None or right is None) and any(output.startswith(prefix) for prefix in exports):
             continue
@@ -547,6 +625,7 @@ def _variants(
     declaration: TensorBinding,
     shape: ModelShape,
     exports: frozenset[str],
+    skipped: list[CheckSkip],
 ) -> list[str]:
     failures: list[str] = []
     shared = bool(_shared_resources(declaration))
@@ -558,6 +637,7 @@ def _variants(
         alone.values.update(single.values)
         alone.operations.update(single.operations)
         alone.shared_values.update(single.shared_values)
+        alone.timing.values.update(single.timing.values)
     failures.extend(_compare(alone, together, "row permutation", shared=bool(shared), exports=exports))
     failures.extend(
         _compare(together, _run(workload, facts, declaration, shape, (2, 1, 0)), "reversed", exports=exports)
@@ -582,6 +662,12 @@ def _variants(
             exports=exports,
         )
     )
+    for replay in ("full", "chunked"):
+        preempted = _run(workload, facts, declaration, shape, (0, 1, 2), preempted=replay)
+        if preempted.preemption_skip is not None:
+            skipped.append(CheckSkip("preempted", preempted.preemption_skip))
+            break
+        failures.extend(_compare(alone, preempted, "preempted", shared=shared, exports=exports))
     return failures
 
 
@@ -607,7 +693,7 @@ def _neutral_failures(neutral: Workload, config: ModelConfig) -> list[str]:
 
 
 def _check(workload: Workload, config: ModelConfig) -> CheckResult:
-    """Check request permutation, isolation and mixed/chunked schedules on CPU, without loading a model.
+    """Check request schedules, replay and state visibility on CPU, without loading a model.
 
     Uses fixed per-token inputs, real planner/executor paths and the runners' row labeller.
     ContractError lists every discrepancy; unsupported model and host effects have explicit skips.
@@ -622,7 +708,7 @@ def _check(workload: Workload, config: ModelConfig) -> CheckResult:
     try:
         shape, facts = _facts(workload, config)
         facts, declaration = workload.specialize(facts, config.execution)
-        workload.plan_backend(facts, declaration)
+        attachment = workload.plan_backend(facts, declaration)
     except (ValueError, RuntimeError, TypeError) as error:
         raise ContractError((f"[compile] {''.join(format_exception_only(error)).strip()}",)) from error
     passed.append("compile")
@@ -665,8 +751,36 @@ def _check(workload: Workload, config: ModelConfig) -> CheckResult:
                 "every= is exercised at aligned step ids; max_rows omissions are allowed, delivered values are compared",
             )
         )
-    failures.extend(_variants(workload, facts, declaration, shape, exports))
+    if any(task.read_distance for task in attachment.plan.schedule.tasks):
+        skipped.append(
+            CheckSkip(
+                "timing-dependent values",
+                "publish_lag counts engine steps: mixed/preempted values reading different permitted versions are not compared; every version read is checked",
+            )
+        )
+    failures.extend(_variants(workload, facts, declaration, shape, exports, skipped))
     passed.extend(("row permutation", "request isolation", "mixed prefill/decode", "chunking / tokens="))
+    if any(
+        isinstance(source, StateSelectionInputSource)
+        for task in declaration.tensor_tasks.values()
+        for source in task.sources.values()
+    ):
+        passed.append("publish_lag")
+    else:
+        skipped.append(CheckSkip("publish_lag", "no row method reads versioned state"))
+    if declaration.graph.updates_in_forward:
+        passed.append("visibility=exact (chunking / replay)")
+    if any(
+        task.visibility is not None and task.visibility.policy == "forward_pinned" for task in declaration.graph.tasks
+    ):
+        skipped.append(
+            CheckSkip(
+                "visibility=forward_pinned",
+                "model application needs GPU; operand math and step-entry state are checked",
+            )
+        )
+    if not any(skip.property == "preempted" for skip in skipped):
+        passed.append("preempted")
     if failures:
         raise ContractError(tuple(failures))
     return CheckResult(tuple(passed), tuple(skipped))
@@ -675,7 +789,8 @@ def _check(workload: Workload, config: ModelConfig) -> CheckResult:
 def check(workload: Workload, config: ModelConfig, *, neutral: Workload | None = None) -> CheckResult:
     """Check fixed request schedules on CPU using config shapes and the real planner/executor.
 
-    Permutes rows, perturbs neighboring requests, and mixes prefill/decode with chunked prompts.
+    Permutes rows, perturbs neighbors, mixes chunked prompts, and replays preempted histories.
+    Checks actual state versions against publish_lag; exact projection visibility uses chunk/replay equivalence.
     ContractError lists discrepancies and identifies workload row mixing or framework routing.
     Pass neutral= with disabled author settings to check zero additive logits or absent guidance.
     Model execution, host inputs and shared training exceptions are reported as explicit skips.
