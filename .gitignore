@@ -234,3 +234,4 @@ rust/target/
 
 # Tutorial outputs
 doc/tutorials/*.pkl
+tools/ai_eval/results/

@@ -13,6 +13,7 @@ PATH_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("pllm/workloads/dummy*", ("enginecore", "tp")),
     ("examples/huber.py", ("enginecore",)),
     ("tools/benchmark*", ()),
+    ("tools/ai_eval/*", ()),
     ("pllm/workloads/adaptive*", ("adaptive",)),
     ("pllm/workloads/state_producers*", ("producers", "enginecore")),
     ("pllm/workloads/esamp*", ("esamp", "enginecore")),

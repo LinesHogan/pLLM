@@ -1,0 +1,4 @@
+# Transient author homes contain credentials and must never enter an index.
+results/**/home/
+results/**/workspace/
+results/**/model/
