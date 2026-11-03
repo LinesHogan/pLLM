@@ -106,10 +106,19 @@ run_stage() {
     *) echo "Unknown stage: $1; use --help" >&2; return 2 ;;
   esac
 }
+gpu_lock_held() {
+  [ -z "${PLLM_GPU_LEASE:-}" ] || return 0
+  local descriptor
+  # An outer flock passes its open file description; reopening the file would deadlock.
+  for descriptor in /proc/$$/fd/*; do
+    if [ "$(readlink "$descriptor")" = /tmp/pllm-gpu.lock ] && flock -n "${descriptor##*/}"; then return 0; fi
+  done
+  return 1
+}
 failed=0
 for stage in "${stages[@]}"; do
   gpu_lock=''
-  if [ -z "${SLURM_JOB_ID:-}" ]; then
+  if [ -z "${SLURM_JOB_ID:-}" ] && ! gpu_lock_held; then
     case "$stage" in
       ruff|format|pyright|typing|layers|docs|cpu|release) ;;
       *) exec {gpu_lock}>/tmp/pllm-gpu.lock; flock "$gpu_lock" ;;
