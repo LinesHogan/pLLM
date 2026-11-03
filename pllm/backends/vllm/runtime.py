@@ -610,13 +610,21 @@ def vllm_engine(
     config: ModelConfig, workload_options: dict[str, Any], environment: dict[str, str], *, cuda_graphs: bool
 ) -> LLM:
     """Build the vLLM engine; a workload adds its worker, scheduler and graph options."""
+    environment = {
+        _MP_ENV: "1" if config.multiprocessing else "0",
+        _V2_RUNNER_ENV: "1" if config.runner == "mrv2" else "0",
+        **environment,
+    }
     if config.tensor_parallel_size > 1:
         if cuda_graphs:
             workload_options = {**graph_options(config, BackendRequirements()), **workload_options}
         environment.update(VLLM_USE_V2_MODEL_RUNNER="1", VLLM_WORKER_MULTIPROC_METHOD="spawn")
     previous = {name: os.environ.get(name) for name in environment}
-    if any(previous[name] not in (None, value) for name, value in environment.items()):
-        raise RuntimeError("vLLM workload conflicts with explicit MP, spawn or legacy-runner environment")
+    conflicts = tuple(name for name, value in environment.items() if previous[name] not in (None, value))
+    if conflicts:
+        raise RuntimeError(
+            f"ModelConfig conflicts with {', '.join(conflicts)}; unset these variables or choose matching runner/multiprocessing settings"
+        )
     os.environ.update(environment)
     try:
         return LLM(
@@ -658,8 +666,6 @@ def create_vllm_llm(
     if config.cuda_graphs == "auto" and eager_reason:
         _logger.warning("running the model without CUDA graphs: %s", eager_reason)
     environment = {
-        _MP_ENV: "1" if config.multiprocessing else "0",
-        _V2_RUNNER_ENV: "1" if config.runner == "mrv2" else "0",
         TAPS_ENV: encode_boundary(
             HiddenTapAnnouncement(
                 requirements.hidden_inputs, config.max_num_seqs, TensorDType(config.dtype), requirements.layer_logits
