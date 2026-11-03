@@ -64,6 +64,7 @@ from pllm.execution.host_runtime import CompletionInput
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.state_execution import StateDiagnostics
 from pllm.execution.state_feed import Feed
+from pllm.execution.torch_private import blas_workspace_bytes
 from pllm.execution.trace import TraceSelection, TraceSnapshot
 
 if TYPE_CHECKING:
@@ -771,8 +772,7 @@ def probe_backend(
         hidden_layouts=runner.hidden_layouts,
         overlay_graph_bytes=runner.overlay_graph_bytes,
         memory_bytes=free_bytes,
-        blas_workspace_bytes=torch.backends.cuda.cublas_workspace_size()
-        + torch.backends.cuda.cublaslt_workspace_size(),
+        blas_workspace_bytes=blas_workspace_bytes(),
         checkpoint=checkpoint_directory(config.model, config.revision) if requirements.checkpoint_names else "",
     )
 

@@ -17,7 +17,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from pllm.contracts.tensor_policy import ScanForm, TensorPolicy
 from pllm.execution.scan_analysis import Specs, analyze
 from pllm.execution.scan_execution import PreparedScan, Step, associative_prefix, competitive
-from pllm.execution.torch_private import MemoryTrace, disable_current_modes, measure
+from pllm.execution.torch_private import MemoryTrace, blas_workspace_bytes, disable_current_modes, measure
 
 R = TypeVar("R")
 P = ParamSpec("P")
@@ -156,11 +156,7 @@ class ScanTemplate:
             args = self.samples(capacity)
             scratch = self.context.blas_workspace_bytes
             if scratch is None:
-                scratch = (
-                    torch.backends.cuda.cublas_workspace_size() + torch.backends.cuda.cublaslt_workspace_size()
-                    if self.context.device.type == "cuda"
-                    else 0
-                )
+                scratch = blas_workspace_bytes() if self.context.device.type == "cuda" else 0
             for choice in choices:
                 if choice.analysis is not None:
                     carry, over, invariants, _ = args

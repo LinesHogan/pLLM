@@ -39,6 +39,7 @@ from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.ptts.slot_pools import Slots
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.state_execution import DataT, StateTaskContext
+from pllm.execution.torch_private import blas_workspace_bytes
 
 
 def inspect_parameter_targets(
@@ -373,6 +374,7 @@ class _ProjectionReader:
         self.staging = PinnedStaging(capacity=self.table.numel(), slots=2)
         self.host = np.empty(0, dtype=np.int64)
         self.programs: dict[int, Callable[..., tuple[torch.Tensor, ...]]] = {}
+        blas_bytes = blas_workspace_bytes()
         for count in capacities(rows):
             with torch.inference_mode(False), FakeTensorMode(allow_non_fake_inputs=True):
                 examples = (
@@ -380,7 +382,9 @@ class _ProjectionReader:
                     *self.ports(self.table, count),
                     *self.pools,
                 )
-            self.programs[count] = prepare_projection_read(examples, binding.operator, budget)
+            self.programs[count] = prepare_projection_read(
+                examples, binding.operator, budget, blas_workspace_bytes=blas_bytes
+            )
             # Warm every row bucket against the actual readonly pools before graph capture.
             self.read(self.captured[:count], self.pools, self.table, count)
         _READERS[self.table.data_ptr()] = self

@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator
+from pllm.execution.torch_private import blas_workspace_bytes
 
 
 @pytest.mark.gpu
@@ -19,7 +20,9 @@ def test_pinned_projection_borrows():
     rows = torch.tensor([[0, 1, 2, 0], [3, 4, 5, 6]], device="cuda")
     owners = torch.tensor([0, 1, 2, 4, 5, 6, 7, -1], device="cuda")
     values = (hidden, slots, rows, owners, pool)
-    execution = prepare_projection_read(values, ParameterOverlayOperator.HEAD_ADD, 128 << 20)
+    execution = prepare_projection_read(
+        values, ParameterOverlayOperator.HEAD_ADD, 128 << 20, blas_workspace_bytes=blas_workspace_bytes()
+    )
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU], record_shapes=True) as profile:
         result = execution(*values)[0]
     assert not any(
@@ -68,12 +71,11 @@ def test_projection_math_budget_and_allocator_peak(operator):
             torch.empty_strided(value.shape, value.stride(), dtype=value.dtype, device=value.device) for value in values
         )
         usage = measure(lambda: projection_read(*samples, operator=operator))
-    budget = (
-        usage.workspace + torch.backends.cuda.cublas_workspace_size() + torch.backends.cuda.cublaslt_workspace_size()
-    )
+    scratch = blas_workspace_bytes()
+    budget = usage.workspace + scratch
     with pytest.raises(ValueError, match="budget"):
-        prepare_projection_read(values, operator, budget - 1)
-    execute = prepare_projection_read(values, operator, budget)
+        prepare_projection_read(values, operator, budget - 1, blas_workspace_bytes=scratch)
+    execute = prepare_projection_read(values, operator, budget, blas_workspace_bytes=scratch)
     execute(*values)
     torch.cuda.synchronize()
     baseline = torch.cuda.memory_allocated()

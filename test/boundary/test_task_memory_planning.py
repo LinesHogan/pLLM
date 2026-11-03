@@ -34,7 +34,7 @@ with patch.object(torch.cuda, '_lazy_init', forbidden):
             torch.empty((8,), device="cuda", dtype=torch.int64),
             torch.empty((32, 2, 4, 4), device="cuda"),
         )
-        prepare_projection_read(examples, ParameterOverlayOperator.HEAD_ADD, 128 << 20)
+        prepare_projection_read(examples, ParameterOverlayOperator.HEAD_ADD, 128 << 20, blas_workspace_bytes=0)
 assert not torch.cuda.is_initialized()
 """
     subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True, timeout=45)

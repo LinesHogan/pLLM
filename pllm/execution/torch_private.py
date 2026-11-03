@@ -182,6 +182,11 @@ class MemoryTrace(TorchDispatchMode):
             trace._capture_allocation(size)
 
 
+def blas_workspace_bytes() -> int:
+    """Read the current CUDA device's configured BLAS scratch at GPU planning boundaries."""
+    return torch.backends.cuda.cublas_workspace_size() + torch.backends.cuda.cublaslt_workspace_size()
+
+
 def measure(function: Callable[[], object]) -> MemoryUsage:
     """Trace the actual callable; keep its return alive while measuring retained storage."""
     with torch.inference_mode(False), MemoryTrace() as trace:

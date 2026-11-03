@@ -65,19 +65,15 @@ def prepare_projection_read(
     examples: tuple[torch.Tensor, ...],
     operator: ParameterOverlayOperator,
     budget: int,
+    *,
+    blas_workspace_bytes: int,
 ) -> Callable[..., tuple[torch.Tensor, ...]]:
     """Fund direct ATen temporaries without charging borrowed field-pool storage."""
     function = partial(projection_read, operator=operator)
     with disable_current_modes(), torch.inference_mode(False), FakeTensorMode():
         samples = tuple(torch.empty_strided(t.shape, t.stride(), dtype=t.dtype, device=t.device) for t in examples)
         usage = measure(lambda: function(*samples))
-    # BLAS handles own scratch outside the ATen allocation trace. Charge both
-    # configured libraries, even though a particular bmm may only use cuBLAS.
-    scratch = (
-        torch.backends.cuda.cublas_workspace_size() + torch.backends.cuda.cublaslt_workspace_size()
-        if examples[0].device.type == "cuda"
-        else 0
-    )
-    if usage.workspace + scratch > budget:
+    # The GPU boundary supplies library scratch; shape tracing itself never queries CUDA.
+    if usage.workspace + blas_workspace_bytes > budget:
         raise ValueError("increase the projection execution budget to fund its tensor and BLAS workspace")
     return function
