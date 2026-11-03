@@ -18,8 +18,14 @@ class PackedPhaseRow:
     phase: HiddenPhase
     identity: RequestIdentity
     prompt_length: int = 0
+
     # Retained auxiliary state has already consumed this token; reset-and-replay leaves it false.
     recomputed: bool = False
+
+    @property
+    def role(self) -> HiddenPhase:
+        """Prompt or generated token, also when generated history arrives in a prefill phase."""
+        return HiddenPhase.DECODE if self.token_offset >= self.prompt_length else HiddenPhase.PREFILL
 
 
 @dataclass(frozen=True, slots=True)

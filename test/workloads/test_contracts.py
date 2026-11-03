@@ -282,10 +282,11 @@ class LoopedDepth(pllm.Workload):
 
     @pllm.custom_forward(tokens="decode")
     def forward(self, layers, w=pllm.parameter("gate", "w"), b=pllm.parameter("gate", "b"), steps=pllm.Attr("steps")):
-        hidden = layers()[-1]
-        for _ in range(steps):
+        hidden = layers(stop=1)[0]
+        hidden = layers(hidden=hidden, active=layers.generated & (layers.position % 2 == 0))[-1]
+        for step in range(steps):
             active = torch.sigmoid(hidden.float() @ w + b)[:, None] <= 0.6
-            hidden = layers(hidden=hidden, active=active)[-1]
+            hidden = layers(hidden=hidden, active=active, kv="peek" if step == steps - 1 else "commit")[-1]
         return hidden
 
 
@@ -313,9 +314,16 @@ class MoR(pllm.Workload):
 @pytest.mark.parametrize("workload,state", ((LoopedDepth(), "gate"), (MoR(), "router")))
 def test_custom_forward_state_check_and_explain(workload, state, model_config):
     result = testing.check(workload, model_config)
-    assert "custom-forward instance reads / CPU decoder" in result.passed
-    assert "adaptive row permutation / isolation" in result.passed
-    assert "adaptive KV policy" in result.passed
+    assert {
+        "custom-forward instance reads / CPU decoder",
+        "adaptive row permutation / isolation",
+        "adaptive KV policy",
+        "preempted",
+        "never exit bitwise",
+    } <= set(result.passed)
     report = pllm.explain(workload, model_config)
+    assert report.recompute_rejection is None
+    assert report.preemption == "reset"
+    assert "CUDA conditional nodes" in str(report) and "0 blocking host syncs" in str(report)
     member = next(member for member in report.members if member.name == "forward")
     assert state in member.tasks[0].reads

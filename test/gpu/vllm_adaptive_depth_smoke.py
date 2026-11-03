@@ -11,16 +11,22 @@ from vllm.forward_context import override_forward_context
 
 import pllm
 from pllm.backends.vllm.adaptive_depth import AdaptiveSlice
+from pllm.backends.vllm.architecture import hidden_binding
 from pllm.backends.vllm.custom_forward import ProgramWave
 from pllm.backends.vllm.custom_forward_attention import BatchAttentionBuffers
+from pllm.backends.vllm.hidden_taps import HiddenTaps
+from pllm.contracts.hidden_locator import HiddenSite
 from pllm.execution.step_capture import capture_graph
 from pllm.execution.token_program_executor import execute_segment
 from pllm.execution.torch_private import cuda_graph_pool_bytes
+from pllm.testing import check_on_gpu
+from pllm.workloads.dola import DoLaWorkload
 
 
 @dataclass(frozen=True)
 class Exit(pllm.Workload):
     rule: str = "none"
+    exit_layer: int | None = None
 
     @property
     def gate(self) -> pllm.InstanceState:
@@ -39,7 +45,17 @@ class Exit(pllm.Workload):
 
     @pllm.custom_forward(tokens="decode")
     def forward(self, layers, threshold=pllm.parameter("gate", "threshold"), router=pllm.module("router")):
-        middle = layers.layer_count // 2
+        if self.rule == "loop":
+            taps = layers()
+            hidden = taps[-3]
+            for _ in range(2):
+                hidden = layers(
+                    layers.layer_count - 2,
+                    hidden=torch.lerp(taps[-3], hidden, 0.01),
+                    active=layers.position % 2 == 0,
+                )[-1]
+            return taps[-1]
+        middle = layers.layer_count // 2 if self.exit_layer is None else self.exit_layer
         hidden = layers(stop=middle)[middle - 1]
         active = router(hidden.float()).sigmoid() > threshold
         if self.rule == "none":
@@ -60,6 +76,52 @@ class ValueExit(Exit):
     @pllm.custom_residual(site="value")
     def rewrite(self, v):
         return v * 0.9
+
+
+@dataclass(frozen=True)
+class ReadoutExit(Exit, DoLaWorkload):
+    """DoLa reads skipped layers while C2 changes computed MLP residuals."""
+
+    @pllm.custom_residual(site="mlp", layers=(23,))
+    def residual(self, x, y, earlier=pllm.residual(22)):
+        return x + y * 0.9 + earlier * 0.01
+
+
+def replay_contracts(config):
+    """Check real eviction and frozen-stream DoLa inputs beside C2 rewrites on Qwen2.5-0.5B."""
+    snapshots, current = [], []
+    prepare, read = HiddenTaps.prepare, HiddenTaps.read
+    sources = tuple(hidden_binding(layer, HiddenSite.RESIDUAL, 24).tap for layer in (21, 22, 23))
+
+    def prepared(taps, rows):
+        current[:] = rows.rows
+        return prepare(taps, rows)
+
+    def observed(taps, tap, packed):
+        value = read(taps, tap, packed)
+        if tap in sources[1:]:
+            selected = [
+                index
+                for index, row in enumerate(packed)
+                if current[row].role.value == "decode" and (rule == "none" or current[row].token_offset % 2 != 0)
+            ]
+            if selected:
+                snapshots.append((value[selected].clone(), read(taps, sources[0], packed)[selected].clone()))
+        return value
+
+    for rule, workload in (
+        ("loop", Exit("loop")),
+        ("none", ReadoutExit(rule="none", exit_layer=22, layers=(0, 21, 22), plausibility=0.99)),
+        ("mixed", ReadoutExit(rule="mixed", exit_layer=22, layers=(0, 21, 22), plausibility=0.99)),
+    ):
+        with patch.object(HiddenTaps, "prepare", prepared), patch.object(HiddenTaps, "read", observed):
+            result = check_on_gpu(workload, config)
+        assert any(value.startswith("preempted:") for value in result.passed), result
+        assert rule == "loop" or snapshots
+        for actual, expected in snapshots:
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        snapshots.clear()
+        print(type(workload).__name__, result)
 
 
 def cells(wave):
@@ -277,7 +339,7 @@ def main():
     parser.add_argument("--tokens", type=int, default=16)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--value-rewrite", action="store_true")
-    parser.add_argument("--rule", choices=("none", "all", "mixed", "buckets"), default="none")
+    parser.add_argument("--rule", choices=("none", "all", "mixed", "buckets", "contracts"), default="none")
     args = parser.parse_args()
     config = pllm.ModelConfig(
         args.model,
@@ -287,6 +349,9 @@ def main():
         gpu_memory_utilization=args.gpu_memory_utilization,
         execution=pllm.ExecutionOptions(capture_memory_bytes=512 << 20),
     )
+    if args.rule == "contracts":
+        replay_contracts(config)
+        return
     prompts = ["The capital of France is" + " very" * i for i in range(args.batch)]
     params = SamplingParams(max_tokens=args.tokens, temperature=0, ignore_eos=True)
     vanilla = None

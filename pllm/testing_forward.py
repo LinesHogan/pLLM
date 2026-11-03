@@ -55,6 +55,9 @@ class CheckForward(SerialCustomForward):
         stream = hidden if residual is None else hidden + residual
         return (stream.float() * 0.5 + (ordinal + 1) * 0.01).tanh().to(hidden.dtype), torch.zeros_like(hidden)
 
+    def propagate(self, row: PackedPhaseRow, ordinal: int, positions: torch.Tensor, hidden: torch.Tensor) -> None:
+        """Pointwise fake layers have no KV; the causal decoder oracle checks propagation."""
+
     def normalize(self, row: PackedPhaseRow, hidden: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
         return hidden + residual
 

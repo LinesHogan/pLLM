@@ -56,6 +56,7 @@ ROWS = PackedPhaseRowBatch(
             i if i < 3 else 0,
             HiddenPhase.PREFILL if i < 3 else HiddenPhase.DECODE,
             IDENTITIES[int(i == 3)],
+            prompt_length=3 if i < 3 else 0,
         )
         for i in range(4)
     ),

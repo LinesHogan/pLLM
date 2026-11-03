@@ -1850,6 +1850,7 @@ def _targets(value: tuple[object, ...]) -> tuple[Projection, ...]:
 def custom_forward(*, tokens: Tokens = "all", over: Over = "token") -> Callable[[F], F]:
     """Replace the forward of the selected tokens with this method's program over model layer slices and tensor math.
 
+    ``tokens`` follows the token's prompt/generated role, including after preemption.
     ``over="token"`` runs each position independently in causal order. ``over="span"``
     packs each request's contiguous scheduled tokens into [M, H] hidden tensors;
     position and generated flags have shape [M, 1]. Spans cannot load predecessors.

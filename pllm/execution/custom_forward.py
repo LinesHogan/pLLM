@@ -106,14 +106,14 @@ class SerialCustomForward(CustomForwardPrimitive):
         observe: Callable[[int, torch.Tensor], None],
         parameters: Mapping[StateInput, torch.Tensor],
     ) -> None:
-        """Run every row's program, or its ordinary pass when the program skips its phase."""
+        """Run each token's role program, including generated tokens inside prefill replay."""
         assert all(item.over == "token" for item in program.values()), (
             'over="span" programs need a backend span executor'
         )
         outputs: list[torch.Tensor] = []
         for index, row in enumerate(self.rows):
             positions, seed = self.begin(row)
-            selected = effect.rows == "all" or row.phase.value == effect.rows
+            selected = effect.rows == "all" or row.role.value == effect.rows
             if self.overlay is not None:
                 self.overlay.stage(index, selected)
                 self.overlay.reset()
@@ -126,10 +126,10 @@ class SerialCustomForward(CustomForwardPrimitive):
             if selected:
                 entries = () if self.position is None else self.position.entry(())[1:]
                 hidden, saved = execute_token_program(
-                    program[row.phase.value],
+                    program[row.role.value],
                     seed,
                     positions,
-                    torch.full((seed.shape[0], 1), row.phase.value == "decode", device=seed.device),
+                    torch.full((seed.shape[0], 1), row.role.value == "decode", device=seed.device),
                     entries,
                     layer,
                     (lambda: None) if self.overlay is None else self.overlay.apply_updates,

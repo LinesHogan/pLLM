@@ -349,7 +349,7 @@ def _settings(binding: TensorBinding, config: ModelConfig, plan: PlanBundle) -> 
                     "CUDA conditional nodes",
                     True,
                     "stable compaction into power-of-two buckets plus exact all-active width; 0 blocking host syncs per step; "
-                    "first skipped commit propagates native norm/QKV/RoPE, later skips retain KV; "
+                    "first skipped commit propagates native norm/QKV/RoPE, later skips retain KV; recompute replays by token role; "
                     "decode GEMMs save most when all rows exit; full-QKV propagation is about 7% of Qwen2.5 layer FLOPs (estimate)",
                 )
             )

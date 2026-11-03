@@ -144,7 +144,7 @@ def check_depth(
     """Compare output, decisions and every KV slot across compaction, masking and row schedules."""
     reference = _Decoder(program, layers, hidden, dtype, parameters)
     observations: list[tuple[torch.Tensor, tuple[torch.Tensor, ...]]] = []
-    for order in ((0, 1, 2), (2, 1, 0), (0,), (0, 2, 1)):
+    for order in ((0, 1, 2), (2, 1, 0), (0,), (0, 2, 1), (1,)):
         compact, masked = (_Decoder(program, layers, hidden, dtype, parameters) for _ in range(2))
         if order == (0, 2, 1):
             compact.seed[1:] *= -7
@@ -153,6 +153,15 @@ def check_depth(
             compact.stage(order, position)
             masked.stage(order, position)
             compact.run_compacted()
+            if order == (1,):
+                # A preempted generated prefix arrives in a prefill execution phase.
+                masked.cache.fill_(float("nan"))
+                for offset in range(position):
+                    masked.stage(order, offset)
+                    masked.batch = tuple(replace(row, phase=HiddenPhase.PREFILL) for row in masked.rows)
+                    masked.run({"decode": program}, TokenProgramEffect(layers, "decode"), lambda i, v: None, parameters)
+                masked.stage(order, position)
+                masked.batch = tuple(replace(row, phase=HiddenPhase.PREFILL) for row in masked.rows)
             masked.run({"decode": program}, TokenProgramEffect(layers, "decode"), lambda index, value: None, parameters)
             torch.testing.assert_close(compact.output, masked.output)
             decisions = len(compact.decisions)

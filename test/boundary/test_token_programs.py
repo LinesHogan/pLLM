@@ -103,11 +103,15 @@ def test_prompt_classification_is_structural_and_requires_the_complete_stack():
     assert not TokenProgram.trace(lambda layers: layers(stop=2)[-2], tensor, 3).prompt_pass_is_identity
 
 
-@pytest.mark.parametrize("kind", ("shape", "dtype", "device"))
-def test_segments_reject_incompatible_hidden_tensors(kind):
+@pytest.mark.parametrize("kind", ("shape", "dtype", "device", "active_dtype", "active_shape", "active_span"))
+def test_segments_reject_incompatible_tensors(kind):
     from pllm.execution.token_program import TokenProgram
 
     def route(layers):
+        if kind.startswith("active_"):
+            mask = torch.ones_like(layers.embeddings[:, :1], dtype=torch.bool)
+            mask = mask.float() if kind == "active_dtype" else mask.flatten() if kind == "active_shape" else mask
+            return layers(active=mask)[-1]
         hidden = {
             "shape": layers.embeddings[:, :1],
             "dtype": layers.embeddings.double(),
@@ -115,8 +119,10 @@ def test_segments_reject_incompatible_hidden_tensors(kind):
         }[kind]
         return layers(hidden=hidden)[-1]
 
-    with pytest.raises(ValueError, match="hidden tensor"):
-        TokenProgram.trace(route, TokenTensor((1, 4), torch.float32, "cpu"), 3)
+    with pytest.raises(ValueError, match="active" if kind.startswith("active_") else "hidden tensor"):
+        TokenProgram.trace(
+            route, TokenTensor((1, 4), torch.float32, "cpu"), 3, over="span" if kind == "active_span" else "token"
+        )
 
 
 @pytest.mark.parametrize("width", (1, 8))

@@ -66,7 +66,8 @@ class ProgramWave(Generic[DataT, ResultT]):
         self.graph: torch.cuda.CUDAGraph | None = None
         self.output = self.observation = self.seed
         self.results: tuple[tuple[tuple[OverlayTargetResult, ...], tuple[ProgramOperand, ...]], ...] = ()
-        self.lanes = tuple(torch.tensor([i], device=tensor.device) for i in range(width))
+        lanes = torch.arange(width, device=tensor.device)
+        self.lanes = tuple(lanes[i : i + 1] for i in range(width))
 
     def stage(self, rows: tuple[PackedPhaseRow, ...]) -> None:
         """Queue complete wave input copies without reading any device scalar."""
@@ -75,7 +76,7 @@ class ProgramWave(Generic[DataT, ResultT]):
         assert owner.hidden is not None and owner.positions is not None
         host = self.staging.take(self.indices.numel()).reshape(self.indices.shape)
         host[:] = np.asarray(
-            [(row.packed_row_index, row.request_ordinal, int(row.phase.value == "decode")) for row in rows],
+            [(row.packed_row_index, row.request_ordinal, int(row.role.value == "decode")) for row in rows],
             dtype=np.int64,
         ).T
         self.staging.copy_to(self.indices)
@@ -223,7 +224,9 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
         return self._rows
 
     @contextmanager
-    def sites_rows(self, packed: torch.Tensor, rows: tuple[int, ...]) -> Generator[Stream]:
+    def sites_rows(
+        self, packed: torch.Tensor, rows: tuple[int, ...], active: torch.Tensor | None = None
+    ) -> Generator[Stream]:
         """Select device rows for residual inputs and host rows for patch presence.
 
         Compacted waves retain their parent's homogeneous patch presence; device indices
@@ -232,12 +235,18 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
         if self.sites is None:
             yield add
             return
-        previous = self.sites.rows, self.sites.packed
-        self.sites.rows, self.sites.packed = packed, rows
+        sites = self.sites
+        previous = sites.rows, sites.packed, sites.active
+        sites.rows, sites.packed, sites.active = packed, rows, active
+        taps = () if sites.taps is None else tuple(sites.taps.taps.values())
+        for tap in taps:
+            tap.rows, tap.active = packed, active
         try:
-            yield self.sites.stream_after
+            yield sites.stream_after
         finally:
-            self.sites.rows, self.sites.packed = previous
+            sites.rows, sites.packed, sites.active = previous
+            for tap in taps:
+                tap.rows, tap.active = previous[0], previous[2]
 
     def prepare(self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT]) -> None:
         self.clear()
@@ -295,11 +304,9 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
         self.output = torch.empty_like(self.hidden)
         self.observations = torch.empty_like(self.hidden)
         ordinary = tuple(
-            (effect.rows != "all" and row.phase.value != effect.rows)
+            (effect.rows != "all" and row.role.value != effect.rows)
             or (
-                row.phase.value == "prefill"
-                and program[row.phase.value].prompt_pass_is_identity
-                and self.overlay is None
+                row.role.value == "prefill" and program[row.role.value].prompt_pass_is_identity and self.overlay is None
             )
             for row in self.rows
         )
@@ -312,18 +319,18 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
             groups: dict[Signature, list[PackedPhaseRow]] = {}
             for request in requests:
                 while request and (
-                    ordinary[request[0].packed_row_index] or program[request[0].phase.value].over == "span"
+                    ordinary[request[0].packed_row_index] or program[request[0].role.value].over == "span"
                 ):
                     row = request.pop(0)
-                    spans.setdefault(None if ordinary[row.packed_row_index] else program[row.phase.value], []).append(
+                    spans.setdefault(None if ordinary[row.packed_row_index] else program[row.role.value], []).append(
                         row
                     )
                 if request:
                     row = request.pop(0)
                     signature = (
-                        effect.rows == "all" or row.phase.value == effect.rows,
+                        effect.rows == "all" or row.role.value == effect.rows,
                         () if self.activation is None else self.activation.presence(row.packed_row_index),
-                        row.phase.value == "decode",
+                        row.role.value == "decode",
                     )
                     groups.setdefault(signature, []).append(row)
             for selected_program, span in spans.items():
@@ -346,7 +353,7 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
                     assert self.overlay is not None
                     self.overlay.ordinary.extend(row_overlay.ordinary)
         for row in self.rows:
-            if effect.rows == "all" or row.phase.value == effect.rows:
+            if effect.rows == "all" or row.role.value == effect.rows:
                 observe(row.packed_row_index, self.observations[row.packed_row_index : row.packed_row_index + 1])
 
     def span(self, rows: tuple[PackedPhaseRow, ...], program: TokenProgram | None = None) -> None:
@@ -404,7 +411,7 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
                     program,
                     seed,
                     positions,
-                    upload(tuple(row.phase.value == "decode" for row in rows), seed.device, torch.bool).reshape(-1, 1),
+                    upload(tuple(row.role.value == "decode" for row in rows), seed.device, torch.bool).reshape(-1, 1),
                     tuple(torch.empty_like(seed) for _ in program.entries),
                     layer,
                     apply_updates,
@@ -457,7 +464,7 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
         for index, row in enumerate(rows):
             page = row.request_ordinal, row.token_offset // self.allocation
             tails[page] = index
-            if row.phase.value == "prefill" and self.effect.rows in ("all", "prefill"):
+            if row.role.value == "prefill" and self.effect.rows in ("all", "prefill"):
                 saved[row.request_ordinal] = index
             sources[page] = saved.get(row.request_ordinal, -1)
         indices = upload(tuple(sources.values()), hidden.device)

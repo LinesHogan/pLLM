@@ -125,7 +125,8 @@ class Layers:
         active is a bool [rows, 1] tensor in token mode. False rows keep hidden
         at every layer. On a first commit their K/V is propagated through each
         skipped layer's own norm, QKV and RoPE; later skips retain the last commit.
-        Peek never writes, including skipped rows.
+        Peek never writes, including skipped rows. Residual and layer-logit readouts
+        see the frozen stream of skipped layers; custom residual writes run on computed rows.
         """
         if active is not None:
             if self.over != "token":

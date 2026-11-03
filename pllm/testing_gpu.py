@@ -77,7 +77,7 @@ def check_probe(workload: Workload, config: ModelConfig, handle: VllmLlm[TensorF
 
 
 class _SyncCheck:
-    """Check pllm anchors and model-site staging after two decode warmup steps."""
+    """Check pllm anchors and model-site staging after two decode warmup steps at each packed width."""
 
     def __init__(self, handle: VllmLlm[TensorFrame, TensorOutput]) -> None:
         session = handle.runner.require_session()
@@ -85,7 +85,7 @@ class _SyncCheck:
         self.prepare_sites = None if session._sites is None else session._sites.prepare
         self.execute = execution.execute_anchor
         self.execute_part = execution.execute_part
-        self.steps: set[int] = set()
+        self.steps: dict[int, set[int]] = {}
         self.checked: set[int] = set()
 
     @contextmanager
@@ -93,9 +93,10 @@ class _SyncCheck:
         rows = context.selection.rows
         if not rows and context.value is not None:
             rows = context.value.step.rows.rows
-        if rows and all(row.phase is HiddenPhase.DECODE for row in rows):
-            self.steps.add(context.invocation_id)
-        enabled = len(self.steps) > 2 and context.invocation_id in self.steps
+        steps = self.steps.setdefault(len(rows), set())
+        if rows and all(row.role is HiddenPhase.DECODE for row in rows):
+            steps.add(context.invocation_id)
+        enabled = len(steps) > 2 and context.invocation_id in steps
         mode = torch.cuda.get_sync_debug_mode()
         try:
             if enabled:
@@ -240,7 +241,9 @@ def _state_tokens(handle: VllmLlm[TensorFrame, TensorOutput], reference: _Genera
             publish = session._taps.publish
 
             def hidden(value: StepInput, resources: tuple[PackedHiddenResourceBinding, ...]) -> StepInput:
-                return result.hidden(publish(value, resources), reference)
+                return result.hidden(
+                    publish(value, resources), None if session._custom_forward is not None else reference
+                )
 
             with patch.object(session._taps, "publish", hidden):
                 result.tokens = _tokens(handle)
@@ -400,7 +403,11 @@ def _workload_checks(workload: Workload, config: ModelConfig) -> CheckResult:
             skipped.append(CheckSkip("preempted", "instance training needs a caller-provided host batch"))
         else:
             try:
-                replayed = _preemption(handle, baseline or _Generation())
+                with (
+                    patch.object(execution, "execute_anchor", sync.anchor),
+                    patch.object(execution, "execute_part", sync.part),
+                ):
+                    replayed = _preemption(handle, baseline or _Generation())
                 if baseline is not None:
                     baseline.compare(replayed)
                     passed.append("preempted: fixed per-token inputs, token IDs and terminal request state")
@@ -416,7 +423,8 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
 
     Neutral checks compare greedy and seeded sampled token IDs bitwise in the workload's graph mode.
     Forced KV allocation failure exercises vLLM's real eviction/recompute path. Tap and projection inputs are recorded
-    and replayed per token, as in the CPU script, to exclude base-model rounding differences. Causal
+    and replayed per token, as in the CPU script, to exclude base-model rounding differences; custom forwards
+    regenerate their readouts. Causal
     batches also check that permuting sequences and weights preserves an AdamW update.
     Declared replay rejections are reported as explicit skips.
     Run in an isolated process with a CUDA device; multiprocessing and parallel workers are unsupported.

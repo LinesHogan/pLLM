@@ -122,15 +122,26 @@ class HiddenTapAnnouncement:
 P = ParamSpec("P")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class Tap:
     """Copies one module output's selected rows into its slots; the slot table is uploaded before each forward."""
 
     pool: SlotPools
     indices: Tensor
 
+    rows: Tensor | None = None
+    active: Tensor | None = None
+
     def copy(self, output: Tensor) -> None:
-        self.pool.copy_from(0, output, self.indices[0], self.indices[1])
+        """Map packed selections to the current wave; padded bucket rows never publish."""
+        rows, slots = self.indices
+        if self.rows is not None:
+            matches = rows[:, None] == self.rows[None, :]
+            if self.active is not None:
+                matches = matches & self.active.flatten()[None, :]
+            rows = matches.long().argmax(1)
+            slots = slots.masked_fill(~matches.any(1), -1)
+        self.pool.copy_from(0, output, rows, slots)
 
 
 def _tapped(

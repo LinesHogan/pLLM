@@ -21,7 +21,7 @@ from pllm.contracts.backend_attachment import (
     MissingPolicy,
 )
 from pllm.contracts.codec import boundary_digest
-from pllm.contracts.hidden_locator import HiddenPhase
+from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.host_batch import StateImport
 from pllm.contracts.parameter_overlay import (
     FieldView,
@@ -420,7 +420,7 @@ def declare_custom_forward(
 
 
 def _check_adaptive(b: TensorBinding, programs: tuple[tuple[Tokens, TokenProgram], ...]) -> None:
-    """Reject declarations whose row or layer dependencies adaptive decode cannot yet replay."""
+    """Reject adaptive declarations that need operands from layers a token skips."""
     for tokens, program in programs:
         if not program.adaptive:
             continue
@@ -442,7 +442,7 @@ def _check_adaptive(b: TensorBinding, programs: tuple[tuple[Tokens, TokenProgram
                     raise ValueError(
                         f"{rewrite.name} has state on layers tokens skip; move it below {step.start} or remove active="
                     )
-                if any(step.start <= source.layer < step.stop for source in rewrite.earlier):
+                if any(source.kind == "value" and step.start <= source.layer < step.stop for source in rewrite.earlier):
                     raise ValueError(f"{rewrite.name} reads a layer tokens skip; read layers below {step.start}")
         committed = {
             layer
@@ -459,11 +459,14 @@ def _check_custom_forward(b: TensorBinding) -> None:
     """Reject effects whose backend hooks index the forward's packed rows, which a custom forward replaces with its
     own row waves and layer visits."""
     for task in b.graph.tasks:
-        if any(isinstance(port.source, HiddenInputSource) for port in task.inputs):
+        if any(
+            isinstance(port.source, HiddenInputSource)
+            and port.source.site not in (HiddenSite.RESIDUAL, HiddenSite.ATTENTION_RESIDUAL, HiddenSite.LAYER_LOGITS)
+            for port in task.inputs
+        ):
             raise ValueError(
-                f"{task.symbol} reads hidden rows (pllm.hidden, pllm.residual, pllm.layer_logits or "
-                "pllm.final_hidden), which a @pllm.custom_forward does not produce: it may run a layer several "
-                "times or not at all per token; move this method to a workload without the custom forward"
+                f"{task.symbol} reads block or model outputs, which a @pllm.custom_forward does not produce; "
+                "use pllm.residual or pllm.layer_logits to read each layer's last visited stream"
             )
     adapters = {binding.resource for binding in b.effects.overlay_bindings} - {
         str(effect.resource) for task in b.graph.tasks if task.symbol == b.effects.in_forward for effect in task.effects

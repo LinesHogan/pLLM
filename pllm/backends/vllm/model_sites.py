@@ -20,8 +20,9 @@ import torch
 from torch import Tensor
 
 from pllm.backends.vllm.activation import VllmActivationPatch
-from pllm.backends.vllm.architecture import Decoder, LinearOutput, NormForward, sublayer_norms
+from pllm.backends.vllm.architecture import Decoder, LinearOutput, NormForward, hidden_binding, sublayer_norms
 from pllm.backends.vllm.hidden_taps import HiddenTaps, Tap
+from pllm.contracts.hidden_locator import HiddenSite
 from pllm.contracts.packed_rows import PackedPhaseRowBatch
 from pllm.execution.cuda_stream import upload
 from pllm.execution.model_sites import (
@@ -87,7 +88,9 @@ class ModelSites:
         count, weight = len(body.layers), body.norm.weight
         owners = {place: rewrite for rewrite in rewrites for place in rewrite.places}
         earlier = {source for rewrite in rewrites for source in rewrite.earlier}
-        self.streams, self.hidden = max(rewrite.streams for rewrite in rewrites), weight.shape[0]
+        self.streams, self.hidden = max((rewrite.streams for rewrite in rewrites), default=1), weight.shape[0]
+        self.taps = taps
+        self.active: Tensor | None = None
         # The packed rows of the layer call a custom forward is running (on the device and the host); None while
         # vLLM runs the whole step.
         self.rows: Tensor | None = None
@@ -163,7 +166,14 @@ class ModelSites:
             )
             if before is not None and before[0] == "mlp":
                 self._ends[before[1]] = boundary
-            if boundary.owner or boundary.reader or boundary.final or boundary.keeps or self.streams > 1:
+            if (
+                boundary.owner
+                or boundary.reader
+                or boundary.final
+                or boundary.keeps
+                or any(boundary.taps)
+                or self.streams > 1
+            ):
                 boundary.index = len(self.hooks)
                 self._install(norm, boundary.graph_forward if graphs else boundary)
                 self.hooks.append(boundary)
@@ -285,12 +295,29 @@ class ModelSites:
         if self.rows is None:
             buffer[: len(shaped)].copy_(shaped)
         else:
+            if self.active is not None:
+                shaped = torch.where(self.active, shaped, buffer.index_select(0, self.rows))
             buffer.index_copy_(0, self.rows, shaped)
+
+    def frozen(self, start: int, stop: int, hidden: Tensor) -> None:
+        """Seed skipped layers' readouts with the frozen stream before computed rows overwrite them."""
+        for source in self._earlier:
+            if source.kind != "value" and start <= source.layer < stop:
+                self.keep(source, hidden)
+        if self.taps is not None:
+            for layer in range(start, stop):
+                for site in (HiddenSite.RESIDUAL, HiddenSite.ATTENTION_RESIDUAL):
+                    tap = self.taps.taps.get(hidden_binding(layer, site, len(self._ends)).tap)
+                    if tap is not None:
+                        tap.copy(hidden)
 
     def stream_after(self, layer: int, branch: Tensor, stream: Tensor) -> Tensor:
         """The stream after layer `layer`, for a custom forward that adds the last layer of a slice itself."""
         self.count = len(branch)
-        return self._ends[layer].complete(branch, stream)
+        boundary = self._ends[layer]
+        completed = boundary.complete(branch, stream)
+        boundary.keep_stream(completed)
+        return completed
 
     def close(self) -> None:
         for module, forward in reversed(self._installed):
@@ -384,7 +411,12 @@ class _Boundary:
         u = x if self.reader is None else self._read(self.reader, x)
         # The fused kernel over (u, 0) normalizes exactly u; the first norm has no residual and uses the plain one.
         normed = self.norm(u) if stream is None else self.norm(u.clone(), torch.zeros_like(u))[0]
-        self._keep(normed, x)
+        if stream is None:
+            normalized = self.taps[0]
+            if normalized is not None:
+                normalized.copy(normed)
+        else:
+            self._keep(normed, x)
         return normed if stream is None else (normed, x)
 
     def _read(self, reader: ResidualRewrite, stream: Tensor) -> Tensor:
@@ -405,14 +437,19 @@ class _Boundary:
             )
         return collapsed
 
-    def _keep(self, normed: Tensor, stream: Tensor) -> None:
+    def keep_stream(self, stream: Tensor) -> None:
+        """Publish a completed stream even when a slice ends before the next norm runs."""
         for source in self.keeps:
             self.sites.keep(source, stream)
-        normalized, residual = self.taps
-        if normalized is not None:
-            normalized.copy(normed)
+        residual = self.taps[1]
         if residual is not None:
             residual.copy(stream)
+
+    def _keep(self, normed: Tensor, stream: Tensor) -> None:
+        self.keep_stream(stream)
+        normalized = self.taps[0]
+        if normalized is not None:
+            normalized.copy(normed)
 
 
 @dataclass

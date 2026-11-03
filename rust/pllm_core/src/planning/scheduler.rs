@@ -608,13 +608,6 @@ fn recompute_rejection(
                 _ => {}
             }
         }
-        if task
-            .custom_forward
-            .as_ref()
-            .is_some_and(|program| program.adaptive)
-        {
-            return Some("adaptive depth in @pllm.custom_forward cannot recompute generated tokens after preemption yet; raise gpu_memory_utilization or lower max_num_seqs");
-        }
         if task.custom_forward.as_ref().is_some_and(|program| program.span) {
             return Some("use over=\"token\" in @pllm.custom_forward instead of over=\"span\"");
         }

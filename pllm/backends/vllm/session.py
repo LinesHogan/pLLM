@@ -140,7 +140,7 @@ class VllmSession(Generic[DataT, ResultT]):
                 arena=deployment.execution.arena,
                 graphs=probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH,
             )
-            if model_sites
+            if model_sites or (custom_forward_task is not None and taps is not None)
             else None
         )
         self._feed: FeedReceiver | None = None

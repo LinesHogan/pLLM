@@ -834,7 +834,6 @@ def _check(workload: Workload, config: ModelConfig) -> CheckResult:
         if parameters:
             passed.append("custom-forward instance reads / CPU decoder")
         skipped.append(CheckSkip("model arithmetic", "CPU fake decoder; native kernels need GPU"))
-        return CheckResult(tuple(passed), tuple(skipped))
     if (
         requirements.custom_residual
         or programs

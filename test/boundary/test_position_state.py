@@ -62,6 +62,7 @@ def test_span_saves_every_page_and_fills_unselected_generated_pages(span):
                 ROWS.rows[0],
                 packed_row_index=i - start,
                 token_offset=i,
+                prompt_length=12 if span else 3,
                 phase=HiddenPhase.PREFILL if span or i < 3 else HiddenPhase.DECODE,
             )
             for i in range(start, stop)
