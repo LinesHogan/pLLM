@@ -6,7 +6,7 @@ from typing import Any, NotRequired, TypedDict
 class Score(TypedDict):
     """Independent gates, diagnostics and reviewed failure attribution for one submission."""
 
-    score: int
+    score: int | None
     imports_declares: bool
     check: bool
     oracle_cpu: bool
@@ -24,7 +24,7 @@ class TaskResult(Score):
     task: str
     author_exit: int
     wall_seconds: float
-    kimi_turns: int
+    author_turns: int
     input_sha256: str
     transcript: str
 
@@ -34,9 +34,10 @@ class Metadata(TypedDict):
 
     base_commit: str
     runtime_commit: str
+    agent: str
     model: str
     gpu: bool
-    kimi_version: str
+    author_version: str
     timeout_seconds: int
     jobs: int
     python: str
