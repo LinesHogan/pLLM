@@ -1,16 +1,24 @@
 """Public GPU contract checks over sampling, adapters, activation steering and exact training."""
 
 from dataclasses import dataclass, replace
+from functools import partial
 
 import pytest
 import torch
 
 import pllm
+from pllm.backends.vllm import runtime
 from pllm.testing import check_on_gpu
 from pllm.workloads import DoLaWorkload, ESampConfig, ESampWorkload, OutputLoRAWorkload, PromptFactorsWorkload
 from pllm.workloads.state_producers import FactorAdapterWorkload
 
 pytestmark = pytest.mark.gpu
+
+
+@pytest.fixture(autouse=True)
+def fixed_kv_cache(monkeypatch):
+    """Keep small contract models independent of desktop free-memory fluctuations."""
+    monkeypatch.setattr(runtime, "LLM", partial(runtime.LLM, kv_cache_memory_bytes=32 << 20))
 
 
 @dataclass(frozen=True)
