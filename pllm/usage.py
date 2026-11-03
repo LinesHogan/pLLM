@@ -1678,7 +1678,12 @@ def export(
     enabled: bool | Attr = True,
     overflow: Literal["drop", "block"] = "drop",
 ) -> Callable[[F], F]:
-    """Deliver bounded observations to on_export; block only when explicitly requested."""
+    """Deliver bounded observations of executed forward rows to on_export.
+
+    Async scheduling can execute one extra decode row before learning that a request
+    stopped at EOS; that row is observed too. Callbacks run asynchronously and close()
+    drains their delivery. Block on a full export queue only when explicitly requested.
+    """
     if overflow not in ("drop", "block"):
         raise ValueError("export overflow must be 'drop' or 'block'")
     return _mark(effect=_Export(name, every, max_rows, max_cols, enabled, overflow))

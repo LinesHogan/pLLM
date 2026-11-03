@@ -411,7 +411,7 @@ class TensorBinding(Builder[TensorFrame]):
             or self.overlay_targets
             or self.effects.activation_bindings
             or any(
-                isinstance(port.source, HiddenInputSource) and port.source.phase is HiddenPhase.PREFILL
+                isinstance(port.source, HiddenInputSource) and port.source.phase is not HiddenPhase.DECODE
                 for task in self.graph.tasks
                 for port in task.inputs
             )

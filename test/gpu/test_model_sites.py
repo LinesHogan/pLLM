@@ -25,7 +25,7 @@ CONFIG = pllm.ModelConfig(
 
 @dataclass(frozen=True)
 class Lens(pllm.Workload):
-    """Export layer logits and residual streams of decode rows."""
+    """Export layer logits of sampling rows and residual streams of decode rows."""
 
     events: list[pllm.io.TraceEvent] = field(default_factory=lambda: [], compare=False)
 
@@ -98,8 +98,7 @@ def test_layer_logits_and_residuals_match_fp32_oracle():
     lens_error, stream_error = torch.zeros(len(LAYERS)), 0.0
     for index, (prompt, output) in enumerate(zip(PROMPTS, outputs, strict=True)):
         prompt_ids, generated = tokenizer(prompt).input_ids, list(output.outputs[0].token_ids)
-        # Decode row k reads generated token k at position len(prompt) + k.
-        rows = list(range(len(prompt_ids), len(prompt_ids) + len(generated) - 1))
+        rows = list(range(len(prompt_ids) - 1, len(prompt_ids) + len(generated) - 1))
         logits = _layer_logits(prompt_ids + generated, LAYERS, rows)
         expected = torch.cat((logits.logsumexp(-1).unsqueeze(-1), logits[:, :, IDS]), -1).cpu()
         lens = exports["lens", index]
@@ -107,6 +106,8 @@ def test_layer_logits_and_residuals_match_fp32_oracle():
             (lens[:, : len(LAYERS)].unsqueeze(-1), lens[:, len(LAYERS) :].view(len(rows), len(LAYERS), -1)), -1
         )
         lens_error = torch.maximum(lens_error, (actual - expected).abs().amax((0, 2)))
+        # Residual markers still select decode only; the lens also includes the prompt end.
+        rows = rows[1:]
         hidden, _, middle = _hidden(prompt_ids + generated)
         streams = torch.cat((hidden[13][rows, :WIDTH], middle[rows, :WIDTH]), 1).cpu()
         stream_error = max(
