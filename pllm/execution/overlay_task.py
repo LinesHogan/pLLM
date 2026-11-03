@@ -250,7 +250,9 @@ class GradientUpdate:
         self, values: Tensors, count: torch.Tensor, offset: torch.Tensor, start: int
     ) -> tuple[Tensors, torch.Tensor, torch.Tensor]:
         """Gather a request's chunk and read its incoming parameters before the update."""
-        inputs = {name: values[name] for name, source in self.bindings.items() if source in ("input", "target")}
+        inputs = {
+            name: values[name] for name, source in self.bindings.items() if source in ("input", "target", "embedding")
+        }
         hidden = inputs[self.input_name]
         indices = torch.arange(self.chunk, device=hidden.device) + start - offset
         valid = (indices >= 0) & (indices < count)
@@ -545,6 +547,7 @@ class OverlayTransition:
             **values,
             "input": operand.hidden,
             "target": operand.desired,
+            "embedding": operand.embedding,
             "weight": operand.base_weight,
             "prompt_end": operand.prompt_end,
         }
@@ -587,6 +590,7 @@ class ProgramOperand(NamedTuple):
     hidden: torch.Tensor
     desired: torch.Tensor
     weight: torch.Tensor
+    embedding: torch.Tensor
 
 
 def join_encounters(
@@ -601,6 +605,7 @@ def join_encounters(
             records[0],
             hidden=torch.cat(tuple(record.hidden for record in records)),
             desired=torch.cat(tuple(record.desired for record in records)),
+            embedding=torch.cat(tuple(record.embedding for record in records)),
             prompt_end=records[-1].prompt_end,
         )
         for records in groups.values()
@@ -674,7 +679,10 @@ class ProgramOverlay:
         outputs: dict[tuple[RequestIdentity, Projection], torch.Tensor] = {}
         for operand in operands:
             captured = replace(
-                operand, hidden=operand.hidden.detach().clone(), desired=operand.desired.detach().clone()
+                operand,
+                hidden=operand.hidden.detach().clone(),
+                desired=operand.desired.detach().clone(),
+                embedding=operand.embedding.detach().clone(),
             )
             if not self.in_program and self.math.visibility.in_forward:
                 result = self.math.result(captured, self.values(operand.target, True))
@@ -707,7 +715,7 @@ class ProgramOverlay:
     def operands(self) -> tuple[ProgramOperand, ...]:
         """Export graph outputs independently of the cold request identity."""
         return tuple(
-            ProgramOperand(operand.target, operand.hidden, operand.desired, operand.base_weight)
+            ProgramOperand(operand.target, operand.hidden, operand.desired, operand.base_weight, operand.embedding)
             for operand in self.pending
         )
 
@@ -748,6 +756,7 @@ class ProgramOverlay:
                     operand.hidden.new_full(
                         (), row.token_offset + len(operand.hidden) == row.prompt_length, dtype=torch.bool
                     ),
+                    operand.embedding.clone(),
                 )
                 for operand in pending
             )

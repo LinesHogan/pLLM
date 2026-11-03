@@ -68,6 +68,7 @@ class PrefillTrainer(pllm.Workload):
         PrefillAdaptersWorkload(rank=2, chunk_size=4),
         GatedDeltaWorkload(GatedDeltaConfig((pllm.model.Projection("down_proj", 0),), head_width=4, chunk_size=4)),
         InPlaceTTTWorkload(InPlaceTTTConfig((pllm.model.Projection("down_proj", 0),), 4, 0.01), dtype=torch.bfloat16),
+        InPlaceTTTWorkload(InPlaceTTTConfig((pllm.model.Projection("down_proj", 0),), 4, 0.3, track="T2")),
         ReFTWorkload(ReFTConfig((0,))),
         RecirculationWorkload(),
         JacobiRecirculationWorkload(),

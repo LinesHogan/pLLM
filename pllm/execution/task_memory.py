@@ -173,6 +173,7 @@ def example(
             meta(length, target.output_size, dtype=dtype),
             meta(target.output_size, target.input_size, dtype=dtype),
             meta(dtype=torch.bool),
+            meta(length, facts.probe.hidden_size, dtype=dtype),
         )
         for row, length in zip(rows, lengths, strict=True)
         for target in facts.probe.targets

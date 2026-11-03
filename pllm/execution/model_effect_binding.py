@@ -194,7 +194,9 @@ def declare_parameter_overlay(
         ),
     )
     views = effect.field_bindings(
-        lambda name: state.view(name, b.dimensions), reads_weight="weight" in arguments.values()
+        lambda name: state.view(name, b.dimensions),
+        reads_weight="weight" in arguments.values(),
+        reads_embedding="embedding" in arguments.values(),
     )
     b.overlay(views, transition)
 

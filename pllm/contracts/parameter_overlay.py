@@ -90,6 +90,7 @@ class ParameterOverlayFieldBinding:
     scale: float = 1.0
     # The overlay function reads operand("weight"): only then does a quantized projection get a dense copy.
     reads_weight: bool = False
+    reads_embedding: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +104,7 @@ class ProjectionOperands:
     desired: torch.Tensor
     base_weight: torch.Tensor
     prompt_end: torch.Tensor
+    embedding: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -126,7 +128,7 @@ class ProjectionDelta:
         return replace(self, targets=expand_targets(self.targets, layers))
 
     def field_bindings(
-        self, view: Callable[[str], FieldView], *, reads_weight: bool = False
+        self, view: Callable[[str], FieldView], *, reads_weight: bool = False, reads_embedding: bool = False
     ) -> tuple[ParameterOverlayFieldBinding, ...]:
         """One binding per target; `view` finds each applied field's copy for target i, named `{field}_{i}`."""
         return tuple(
@@ -137,6 +139,7 @@ class ProjectionDelta:
                 self.state,
                 self.scale,
                 reads_weight,
+                reads_embedding,
             )
             for i, target in enumerate(self.targets)
         )

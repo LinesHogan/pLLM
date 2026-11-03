@@ -292,6 +292,7 @@ def _step(
             _token_values(i, offsets, target.output_size, 50 + channel, perturbed).to(dtype),
             _random((target.output_size, target.input_size), 80 + channel).to(dtype),
             torch.tensor(offsets.stop == _PROMPTS[i]),
+            _token_values(i, offsets, shape.hidden_size, 70, perturbed).to(dtype),
         )
         for i, n, done in counts
         for channel, target in enumerate(shape.targets)

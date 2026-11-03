@@ -385,8 +385,13 @@ def checkpoint_ttt() -> None:
         )
         save_file(weights, str(Path(directory) / "model.safetensors"))
         del weights
-        for dtype in (torch.float32, torch.bfloat16):
-            workload = InPlaceTTTWorkload(InPlaceTTTConfig.from_checkpoint(directory), dtype=dtype)
+        for track, dtype in (
+            ("T1", torch.float32),
+            ("T1", torch.bfloat16),
+            ("T2", torch.float32),
+            ("T2", torch.bfloat16),
+        ):
+            workload = InPlaceTTTWorkload(InPlaceTTTConfig.from_checkpoint(directory, track=track), dtype=dtype)
             model_config = ModelConfig(
                 directory,
                 max_num_seqs=2,
@@ -408,6 +413,78 @@ def checkpoint_ttt() -> None:
                 assert diagnostics.update_count == 12 and diagnostics.trained_rows == 48
                 assert diagnostics.active_states == 1 and diagnostics.pending_state_releases == 0
                 assert "exact" in diagnostics.eager_reason
+
+
+def community_t2(checkpoint: str) -> None:
+    """Report clipping on community weights; these hidden-target weights establish no T2 quality claim.
+
+    Run explicitly with --community-t2 CHECKPOINT; ordinary verification uses the tiny fixture.
+    """
+    from time import perf_counter
+
+    from pllm.execution.overlay_task import OverlayTransition
+    from pllm.workloads import InPlaceTTTConfig, InPlaceTTTWorkload
+
+    options = InPlaceTTTConfig.from_checkpoint(checkpoint, track="T2")
+    measurements = []
+    execute = OverlayTransition.serial_result
+
+    def record(math, operand, values, row, plan):
+        arguments = math.inputs(operand, values)
+        before = arguments["delta"].clone()
+        result = execute(math, operand, values, row, plan)
+        if result.update_count.item():
+            source = operand.embedding
+            wanted = (
+                torch.nn.functional.conv1d(source.T.unsqueeze(0), arguments["conv"], padding=2, groups=source.shape[1])
+                .squeeze(0)
+                .T
+                @ arguments["proj"]
+            )
+            raw_norm = (wanted.float().T @ operand.hidden.float()).norm().item()
+            applied_norm = (arguments["delta"] - before).norm().item()
+            assert raw_norm > 1e-5
+            assert abs(applied_norm - options.learning_rate * 1e-5) < 1e-9
+            measurements.append({"layer": operand.target.layer, "raw_norm": raw_norm, "applied_norm": applied_norm})
+        return result
+
+    config = ModelConfig(
+        checkpoint,
+        max_model_len=options.chunk_size + 8,
+        max_num_seqs=1,
+        max_num_batched_tokens=options.chunk_size + 8,
+        cuda_graphs=False,
+        execution=pllm.ExecutionOptions(allow_numerical_transforms=False, memory_budget_bytes=5 << 30),
+    )
+    with (
+        patch("pllm.backends.vllm.runtime.LLM", partial(LLM, kv_cache_memory_bytes=512 << 20)),
+        pllm.make_llm(config, workload=InPlaceTTTWorkload(options)) as handle,
+        patch.object(OverlayTransition, "serial_result", record),
+    ):
+        started = perf_counter()
+        outputs = handle.generate(
+            [{"prompt_token_ids": [100 + i % 100 for i in range(options.chunk_size)]}],
+            SamplingParams(temperature=0, max_tokens=3, ignore_eos=True),
+        )
+        diagnostics = handle.diagnostics()
+        assert len(outputs[0].outputs[0].token_ids) == 3
+        assert len(measurements) == diagnostics.update_count == len(options.targets)
+        assert diagnostics.pending_state_releases == 0
+        print(
+            json.dumps(
+                {
+                    "track": "T2",
+                    "dtype": "float32 delta / bfloat16 model",
+                    "eta": options.learning_rate,
+                    "tau": 1e-5,
+                    "chunk": options.chunk_size,
+                    "generated": 3,
+                    "seconds": perf_counter() - started,
+                    "clipping": measurements,
+                }
+            ),
+            flush=True,
+        )
 
 
 def main() -> int:
@@ -657,6 +734,9 @@ def preemption_replays():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--community-t2":
+        community_t2(sys.argv[2])
+        raise SystemExit(0)
     checkpoint_ttt()
     preemption_replays()
     raise SystemExit(main())

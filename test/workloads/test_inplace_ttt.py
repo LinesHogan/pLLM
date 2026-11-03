@@ -85,6 +85,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
                 desired[index, row : row + 1],
                 bases[index],
                 hidden[row : row + 1].new_full((), False, dtype=torch.bool),
+                embedding=torch.empty((0, 0)),
             )
             for index, target in enumerate(targets)
         )
@@ -109,6 +110,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
                     desired[index, :1],
                     bases[index],
                     hidden[:1].new_full((), False, dtype=torch.bool),
+                    embedding=torch.empty((0, 0)),
                 )
                 for index, target in enumerate(targets)
             )
@@ -182,6 +184,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
                     desired[0],
                     bases[0],
                     hidden.new_full((), False, dtype=torch.bool),
+                    embedding=torch.empty((0, 0)),
                 ),
             )
         )
@@ -206,6 +209,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
                     desired[0],
                     bases[0],
                     hidden.new_full((), False, dtype=torch.bool),
+                    embedding=torch.empty((0, 0)),
                 ),
             )
         )
@@ -349,6 +353,7 @@ def _check_exact_projection_lifecycle():
                 torch.full((count, 1), float(i + 1)),
                 torch.zeros(1, 1),
                 torch.full((count, 1), float(i + 1)).new_full((), False, dtype=torch.bool),
+                embedding=torch.empty((0, 0)),
             )
             for i, identity in enumerate(requests)
             for target in targets
@@ -440,6 +445,7 @@ def _check_causality_witness(workload, facts, requests, targets):
             torch.ones(2, 1),
             torch.zeros(1, 1),
             torch.ones(2, 1).new_full((), False, dtype=torch.bool),
+            embedding=torch.empty((0, 0)),
         )
         for target in targets
     )
@@ -489,6 +495,7 @@ def _check_exact_additive_projection():
             hidden * (index + 1),
             torch.full((1, 1), 17.0),
             hidden.new_full((), False, dtype=torch.bool),
+            embedding=torch.empty((0, 0)),
         )
         for index, target in enumerate(targets)
     )
@@ -595,6 +602,7 @@ def test_prefill_adapters_keep_prompt_chunks_across_scheduler_spans(span):
                 desired[start:end],
                 base,
                 x[start:end].new_full((), end == len(x), dtype=torch.bool),
+                embedding=torch.empty((0, 0)),
             )
             for identity, phase in zip(ids, (HiddenPhase.PREFILL, HiddenPhase.DECODE), strict=True)
             for target in TARGETS
@@ -658,6 +666,7 @@ def test_prompt_end_operand_stays_live_during_replay():
         x[:, :2],
         base,
         torch.zeros((), dtype=torch.bool, device="cuda"),
+        embedding=x.new_empty((0, 0)),
     )
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -676,3 +685,176 @@ def test_prompt_end_operand_stays_live_during_replay():
     assert values["_pending_length"].item() == 0 and result.update_count.item() == 1
     assert result.trained_rows.item() == 2
     torch.testing.assert_close(values["b"], torch.full_like(values["b"], 0.003))
+
+
+class CpuOperandStaging:
+    """CPU transport replacing CUDA's pinned index transfer in the fake backend."""
+
+    def take(self, size):
+        self.host = torch.zeros(size, dtype=torch.int64)
+        return self.host.numpy()
+
+    def copy_to(self, target):
+        target.copy_(self.host)
+
+
+class PaperMlp(torch.nn.Module):
+    """Small gated MLP; the fake decoder uses the same projection interface as vLLM."""
+
+    def __init__(self):
+        super().__init__()
+        self.gate, self.up = torch.nn.Linear(3, 5, bias=False), torch.nn.Linear(3, 5, bias=False)
+        self.down_proj = torch.nn.Linear(5, 3, bias=False)
+        self.down_proj.params_dtype = torch.float32
+        self.down_proj.input_size_per_partition = 5
+
+    def forward(self, x):
+        return self.down_proj(torch.nn.functional.silu(self.gate(x)) * self.up(x))
+
+
+class PaperDecoder(torch.nn.Module):
+    """Pointwise two-layer CPU decoder whose embedding stream differs from every MLP input."""
+
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(
+            torch.nn.ModuleDict({"input_layernorm": torch.nn.LayerNorm(3), "mlp": PaperMlp()}) for _ in range(2)
+        )
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = x + layer["mlp"](layer["input_layernorm"](x))
+        return x
+
+    def projection(self, target):
+        mlp = self.layers[target.layer]["mlp"]
+        return mlp.down_proj, 0, 3, mlp
+
+
+def paper_oracle(body, x0, convs, projs, track, eta):
+    """Paper equations with an explicit kernel sum and autograd of the negative inner product."""
+    x, states, local_norms = x0, [], []
+    for layer, conv, proj in zip(body.layers, convs, projs, strict=True):
+        h = layer["input_layernorm"](x)
+        mlp = layer["mlp"]
+        z = torch.nn.functional.silu(mlp.gate(h)) * mlp.up(h)
+        source = x0 if track == "T2" else h
+        delta, outputs = torch.zeros(3, 5), []
+        prefixes = [delta]
+        for start in range(0, len(x), 4):
+            end = min(start + 4, len(x))
+            outputs.append(z[start:end] @ (mlp.down_proj.weight.T + delta.T))
+            if end - start == 4:
+                padded = torch.nn.functional.pad(source[start:end], (0, 0, 2, 2))
+                v = sum(padded[k : k + 4] * conv[:, 0, k] for k in range(5)) @ proj
+                weight = torch.zeros(3, 5, requires_grad=True)
+                (gradient,) = torch.autograd.grad(-((z[start:end] @ weight.T) * v).sum(), (weight,))
+                update = -gradient
+                norm = float(update.norm())
+                local_norms.append(norm)
+                if track == "T2" and norm > 1e-5:
+                    update *= 1e-5 / norm
+                delta = delta + eta * update
+                prefixes.append(delta)
+        x = x + torch.cat(outputs)
+        states.append(prefixes)
+    return x, states, local_norms
+
+
+def run_paper_schedule(deployed, body, overlay, ids, prompts, expected, track):
+    """Check every completed chunk's state and each token's exclusive read across mixed scheduling."""
+    from pllm.execution.overlay_task import ProjectionTask
+    from pllm.testing_contracts import scheduled_step
+
+    execution = deployed.execution
+    refs = tuple(ref for ref in execution.admit(ids) if execution.arena.root(ref).resource == "dense_fast_weights")
+    task_id = deployed.attachment.plan.scheduled(deployed.attachment.spec.in_forward).task_id
+    targets = tuple(binding.target for binding in deployed.attachment.spec.overlay_bindings)
+    done = [0, 0]
+    output_error = state_error = 0.0
+    # Request b starts with a longer prompt; request a's first chunk completes in decode.
+    for counts in ((3, 5), (2, 1), (1, 1), (1, 1), (1, 1), (1, 0)):
+        value = scheduled_step(ids, list(counts), [3, 5], done, {})
+        context = execution.start_step(value)
+        execution.advance_to(context, "request.prepare")
+        task = ProjectionTask(execution, context, value.sampler_rows, task_id, targets)
+        overlay.prepare(value.rows, context, execution.directory, task)
+        result = body(torch.cat(tuple(x[start : start + n] for x, start, n in zip(prompts, done, counts, strict=True))))
+        overlay.take_operands()
+        overlay.clear()
+        _publish_projection(execution, context)
+        execution.finish_step(context)
+        for i, (ref, actual) in enumerate(zip(refs, torch.split(result, counts), strict=True)):
+            end = done[i] + counts[i]
+            wanted = expected[i][0][done[i] : end]
+            torch.testing.assert_close(actual, wanted, rtol=2e-6, atol=2e-7)
+            if actual.numel():
+                output_error = max(output_error, (actual - wanted).abs().max().item())
+            fields = execution.snapshot(execution.arena.latest(ref.lineage_id))
+            for layer in range(2):
+                state = expected[i][1][layer][end // 4]
+                torch.testing.assert_close(fields[4 * layer], state, rtol=1e-5, atol=1e-6 if track == "T1" else 2e-11)
+                state_error = max(state_error, (fields[4 * layer] - state).abs().max().item())
+                assert fields[4 * layer + 3] == end % 4
+            done[i] = end
+    execution.retire(ids, wait=True)
+    print(f"{track}: output max_abs={output_error:.9g}, state max_abs={state_error:.9g}")
+
+
+@pytest.mark.parametrize("track,scale", (("T1", 1.0), ("T2", 1.0), ("T2", 1e-8), ("T2", 0.0)))
+def test_paper_ttt_matches_fake_decoder_oracle(tmp_path, track, scale):
+    """A paper-formula oracle checks X0 routing, local clipping, tails, visibility and fresh requests."""
+    from types import SimpleNamespace
+
+    from safetensors.torch import save_file
+
+    from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay
+    from pllm.workloads import InPlaceTTTConfig, InPlaceTTTWorkload
+
+    torch.manual_seed(19)
+    body = PaperDecoder()
+    convs = tuple(torch.randn(3, 1, 5) * scale for _ in range(2))
+    projs = tuple(torch.randn(3, 3) for _ in range(2))
+    save_file(
+        {
+            f"model.layers.{i}.mlp.ttt_{name}.weight": tensor
+            for i, pair in enumerate(zip(convs, projs, strict=True))
+            for name, tensor in zip(("conv", "proj"), pair, strict=True)
+        },
+        tmp_path / "model.safetensors",
+    )
+    targets = tuple(Projection("down_proj", i) for i in range(2))
+    workload = InPlaceTTTWorkload(InPlaceTTTConfig(targets, 4, 3.0, track=track))
+    facts = replace(
+        backend_facts(
+            3,
+            timeline=model_timeline(torch.device("cpu"), ("transition/full_root@1",)),
+            memory_bytes=1 << 20,
+            max_rows=16,
+            layer_count=2,
+            targets=tuple(ProjectionShape(t, 5, 3) for t in targets),
+        ),
+        checkpoint=str(tmp_path),
+    )
+    deployed = workload.compile_backend(facts)
+    execution = deployed.execution
+    execution.admit_instances()
+    ids = (RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0))
+    prompts = (torch.randn(9, 3), torch.randn(9, 3))
+    expected = tuple(paper_oracle(body, x, convs, projs, track, 3.0) for x in prompts)
+    decoder = SimpleNamespace(model=SimpleNamespace(model=body), projection=body.projection)
+    overlay = ExactParameterOverlay(decoder, deployed.attachment.spec.overlay_bindings, torch.device("cpu"), 16)
+    overlay._staging = CpuOperandStaging()
+    try:
+        # A partial prefill chunk completes in decode; the completing token reads old state.
+        with (
+            patch("pllm.backends.vllm.parameter_overlay.frozen_weight", side_effect=lambda m: m.weight.detach()),
+            torch.no_grad(),
+        ):
+            for _ in range(2):
+                run_paper_schedule(deployed, body, overlay, ids, prompts, expected, track)
+    finally:
+        overlay.close()
+    if track == "T2":
+        assert all((norm > 1e-5) == (scale == 1.0) for _, _, norms in expected for norm in norms)
+    assert not body.layers[0]["input_layernorm"]._forward_pre_hooks

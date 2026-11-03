@@ -1,10 +1,10 @@
-"""Official In-Place TTT chunk arithmetic, used with checkpoints containing learned targets."""
+"""In-Place TTT chunk arithmetic for checkpoints with learned targets, used by model workloads."""
 
 import json
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
-from typing import Self
+from typing import Literal, Self
 
 import torch
 from cattrs import structure
@@ -25,13 +25,27 @@ class _CheckpointConfig:
 
 @dataclass(frozen=True, slots=True)
 class InPlaceTTTConfig:
-    """Checkpoint hyperparameters for hidden-state targets, without paper-only clipping."""
+    """Checkpoint hyperparameters with T1 (official code) or T2 (paper text) arithmetic.
+
+    T1 uses hidden-state targets without clipping. T2 uses input token embeddings and clips
+    each unscaled local delta to Frobenius norm 1e-5 before multiplying by eta, following
+    Algorithm 1. Eta placement remains unresolved upstream (issue #7); no alternative is exposed.
+    Switching a hidden-target checkpoint to T2 does not establish paper quality.
+    """
 
     targets: tuple[Projection, ...]
     chunk_size: int
     learning_rate: float
+    track: Literal["T1", "T2"] = "T1"
+
+    @property
+    def target_source(self) -> Literal["embedding", "target"]:
+        """The ordinary row operand supplying learned targets for this track."""
+        return "embedding" if self.track == "T2" else "target"
 
     def __post_init__(self) -> None:
+        if self.track not in ("T1", "T2"):
+            raise ValueError("InPlaceTTT track must be T1 (official code) or T2 (paper text)")
         if (
             not self.targets
             or tuple(sorted(set(self.targets))) != self.targets
@@ -45,7 +59,7 @@ class InPlaceTTTConfig:
             )
 
     @classmethod
-    def from_checkpoint(cls, model: str, *, revision: str | None = None) -> Self:
+    def from_checkpoint(cls, model: str, *, revision: str | None = None, track: Literal["T1", "T2"] = "T1") -> Self:
         """Read the served checkpoint's layer list, chunk size and learning rate."""
         from huggingface_hub import hf_hub_download  # pyright: ignore[reportUnknownVariableType]
 
@@ -58,7 +72,7 @@ class InPlaceTTTConfig:
         if not config.ttt_mode or config.ttt_target != "hidden_states" or not config.ttt_proj:
             raise ValueError("InPlaceTTT needs a TTT checkpoint with hidden_states targets and ttt_proj enabled")
         return cls(
-            tuple(Projection("down_proj", layer) for layer in config.ttt_layers), config.ttt_chunk, config.ttt_lr
+            tuple(Projection("down_proj", layer) for layer in config.ttt_layers), config.ttt_chunk, config.ttt_lr, track
         )
 
 
@@ -112,7 +126,7 @@ class InPlaceTTTWorkload(pllm.Workload):
         self,
         delta: torch.Tensor = pllm.parameter("dense_fast_weights", "delta"),
         inputs: torch.Tensor = pllm.operand("input"),
-        targets: torch.Tensor = pllm.operand("target"),
+        targets: torch.Tensor = pllm.operand(pllm.Attr("config.target_source")),
         base: torch.Tensor = pllm.operand("weight"),
         conv: torch.Tensor = pllm.parameter("target_parameters", "conv"),
         proj: torch.Tensor = pllm.parameter("target_parameters", "proj"),
@@ -122,12 +136,15 @@ class InPlaceTTTWorkload(pllm.Workload):
             torch.nn.functional.conv1d(targets.T.unsqueeze(0), conv, padding=2, groups=targets.shape[1]).squeeze(0).T
             @ proj
         )
+        update = values.T @ inputs if self.dtype is torch.bfloat16 else values.float().T @ inputs.float()
+        if self.config.track == "T2":
+            norm = update.float().square().sum().sqrt()
+            update = update * (1e-5 / norm.clamp_min(1e-5)).to(update.dtype)
+        update = update * self.config.learning_rate
         if self.dtype is torch.bfloat16:
-            update = (values.T @ inputs) * self.config.learning_rate
             weight = (base.float() + delta).to(torch.bfloat16)
             output = (inputs @ weight.T).float() - (inputs @ base.T).float()
             return (weight + update).float() - base.float(), output
-        update = (values.float().T @ inputs.float()) * self.config.learning_rate
         return delta + update, inputs @ delta.to(inputs.dtype).T
 
 

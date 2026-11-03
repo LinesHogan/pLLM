@@ -449,14 +449,14 @@ class SampledTokens(_Source):
         return sampled_token_port()
 
 
-class Operand(_Source, Enum):
-    INPUT = "input"
-    TARGET = "target"
-    WEIGHT = "weight"
-    PROMPT_END = "prompt_end"
+OperandName = Literal["input", "target", "embedding", "weight", "prompt_end"]
 
-    def in_forward_binding(self, state: str, fields: Mapping[str, Field]) -> str:
-        return self.value
+
+@dataclass(frozen=True)
+class Operand(_Source):
+    """A named model operand, selected when the workload is declared."""
+
+    name: OperandName | Attr
 
 
 @dataclass(frozen=True)
@@ -570,8 +570,12 @@ def sampled_tokens() -> Any:
     return SampledTokens()
 
 
-def operand(name: Literal["input", "target", "weight", "prompt_end"]) -> Any:
-    """A projection tensor or scalar bool marking the span that completes the prompt."""
+def operand(name: OperandName | Attr) -> Any:
+    """A projection input/target/weight, input token embedding, or scalar prompt-end bool.
+
+    An Attr selects the operand name at declaration time. Embeddings are the residual stream
+    entering the first decoder layer, before its input norm, aligned with each projection row.
+    """
     return Operand(name)
 
 
@@ -1234,6 +1238,7 @@ def _chunked_in_forward(
     optimizer: SGD | None,
     flush: str | None,
     invariants: tuple[str, ...],
+    hidden_size: int,
 ) -> tuple[Callable[..., UpdateOutput], Initializer | None]:
     """Generate pending state before layout interning and bind the existing chunk executor."""
     if initialize is not None:
@@ -1243,22 +1248,33 @@ def _chunked_in_forward(
     if chunk < 1:
         raise ValueError("@pllm.train_in_forward(chunk=) must be positive")
     if optimizer is None:
-        if len(sources) < 2 or sources[0] != effect.weight or any(s not in ("input", "target") for s in sources[1:]):
-            raise ValueError("a chunked update without an optimizer takes the weight carry, then input/target operands")
+        if (
+            len(sources) < 2
+            or sources[0] != effect.weight
+            or any(s not in ("input", "target", "embedding") for s in sources[1:])
+        ):
+            raise ValueError(
+                "a chunked update without an optimizer takes the weight carry, then input/target/embedding operands"
+            )
         pending = {
             f"_pending_rows_{name}": Field(
-                lambda inputs, outputs, source=source: (chunk, inputs if source == "input" else outputs),
+                lambda inputs, outputs, source=source: (
+                    chunk,
+                    hidden_size if source == "embedding" else inputs if source == "input" else outputs,
+                ),
                 dtype=None,
             )
             for name, source in zip(arguments[1:], sources[1:], strict=True)
         }
         if tuple(bindings) != (*arguments, *invariants):
-            raise ValueError("put scan invariant arguments after the weight carry and input/target operands")
+            raise ValueError("put scan invariant arguments after the weight carry and input/target/embedding operands")
         update = ChunkUpdate(function, chunk, arguments, invariants)
     else:
         if (
             "input" not in sources
-            or any(source not in (*effect.applied_fields, "input", "target", "weight") for source in sources)
+            or any(
+                source not in (*effect.applied_fields, "input", "target", "embedding", "weight") for source in sources
+            )
             or any(sources.count(name) != 1 for name in effect.applied_fields)
         ):
             raise ValueError('a chunked loss reads pllm.operand("input") and each applied state field exactly once')
@@ -1358,12 +1374,14 @@ class _TrainInForward(_Effect):
                     raise ValueError("rename fields starting with __invariant_; pllm reserves them")
                 invariants[name] = (source.state, views)
                 bindings[key] = name
+            elif isinstance(source, Operand):
+                bindings[key] = _option(source.name, context.owner, get_args(OperandName), "operand")
             else:
                 bindings[key] = source.in_forward_binding(self.state, fields)
         invariant_names = tuple(
             key
             for key, source in sources.items()
-            if (isinstance(source, Parameter) and source.state != self.state) or source is Operand.WEIGHT
+            if (isinstance(source, Parameter) and source.state != self.state) or bindings[key] == "weight"
         )
         return bindings, invariants, invariant_names
 
@@ -1402,8 +1420,10 @@ class _TrainInForward(_Effect):
         }
         effect = self.projection_delta(context.owner, context.binding.dimensions.layer_count)
         bindings, invariants, invariant_names = self.bindings(operation, fields, effect.targets, optimizer)
-        if set(fields) & {source.value for source in Operand}:
-            raise ValueError("rename the state fields that repeat an operand name (input, target, weight, prompt_end)")
+        if set(fields) & set(get_args(OperandName)):
+            raise ValueError(
+                "rename the state fields that repeat an operand name (input, target, embedding, weight, prompt_end)"
+            )
         identity = fingerprint(operation.function)
         function: Callable[..., UpdateOutput] = freeze(operation.function)
         initialize = _frozen(definition.initialize)
@@ -1418,6 +1438,7 @@ class _TrainInForward(_Effect):
                 optimizer,
                 self.flush,
                 invariant_names,
+                context.binding.dimensions.hidden_size,
             )
         declare_parameter_overlay(
             context.binding,
@@ -1678,7 +1699,7 @@ def train_in_forward(
     pllm.model.Adapter. visibility="forward_pinned" reads the state the forward started with; "exact" also reads
     every chunk already trained in this forward.
 
-    With ``chunk``, the function takes the weight carry followed by input/target row operands and returns
+    With ``chunk``, the function takes the weight carry followed by input/target/embedding row operands and returns
     (next carry, readouts). Pending rows belong to the framework. When ``state`` declares
     ``optimizer=pllm.SGD(lr)``, return one loss per row instead; gradients accumulate until a chunk completes,
     including a short final chunk with ``flush="prompt_end"``.

@@ -52,12 +52,16 @@ def attachment_buffer_bytes(
     fields = tuple(field for layout in layouts.layouts if layout.resource in overlaid for field in layout.layout.fields)
     buffers = 1024 if attachment.overlay_bindings else 0
     projection_operands: list[int] = []
+    if any(binding.reads_embedding for binding in attachment.overlay_bindings):
+        buffers += rows * hidden * width
     pinned = uses_pinned_projection(
         in_forward=graph.updates_in_forward, graphs=probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH
     )
     if attachment.overlay_bindings and probe.device_kind is StateDeviceKind.CUDA and pinned:
         buffers += probe.blas_workspace_bytes
     for binding in attachment.overlay_bindings:
+        if binding.reads_embedding:
+            buffers += rows * hidden * width
         buffers += rows  # Scalar prompt-end operands for the largest request set.
         first = binding.fields[0].shape
         if binding.operator is ParameterOverlayOperator.DENSE_ADD:

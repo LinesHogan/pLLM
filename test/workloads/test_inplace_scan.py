@@ -90,7 +90,14 @@ def test_bound_scan_matches_original_chunk_math_bitwise(device, dtype, numerics)
             _pending_length=reference[3],
         )
         operand = ProjectionOperands(
-            identity, TARGET, phase, hidden, desired, base, hidden.new_full((), False, dtype=torch.bool)
+            identity,
+            TARGET,
+            phase,
+            hidden,
+            desired,
+            base,
+            hidden.new_full((), False, dtype=torch.bool),
+            embedding=hidden.new_empty((0, 0)),
         )
         (result,) = execution.step(_input((operand,)), stream=stream).entries
         got = result.targets[0].update

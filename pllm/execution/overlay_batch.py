@@ -151,7 +151,9 @@ class OverlayTile:
         values = dict(zip(math.buffers, (pool[0] for pool in pools), strict=True))
         self.plan = (
             chunk.prepare(
-                self.arguments(values, operand.hidden, operand.desired, operand.base_weight, operand.prompt_end)
+                self.arguments(
+                    values, operand.hidden, operand.desired, operand.embedding, operand.base_weight, operand.prompt_end
+                )
             )
             if train
             else None
@@ -163,6 +165,7 @@ class OverlayTile:
         self.table = torch.zeros((2 * len(pools) + 1, states), device=pools[0].device, dtype=torch.int64)
         self.hidden = operand.hidden.new_zeros((states, rows, operand.hidden.shape[1]))
         self.desired = operand.desired.new_zeros((states, rows, operand.desired.shape[1]))
+        self.embedding = operand.embedding.new_zeros((states, rows, operand.embedding.shape[-1]))
         self.sources = torch.arange(states, device=pools[0].device)
         self.staging = PinnedStaging()
         self.capture: StepCapture | None = None
@@ -183,33 +186,48 @@ class OverlayTile:
 
     @property
     def buffers(self) -> tuple[torch.Tensor, ...]:
-        return self.hidden, self.desired, self.sources, self.prompt_end
+        return self.hidden, self.desired, self.embedding, self.sources, self.prompt_end
 
     @property
     def buffer_bytes(self) -> int:
         return sum(value.untyped_storage().nbytes() for value in (self.table, *self.buffers))
 
     def arguments(
-        self, values: Tensors, hidden: torch.Tensor, desired: torch.Tensor, base: torch.Tensor, prompt_end: torch.Tensor
+        self,
+        values: Tensors,
+        hidden: torch.Tensor,
+        desired: torch.Tensor,
+        embedding: torch.Tensor,
+        base: torch.Tensor,
+        prompt_end: torch.Tensor,
     ) -> Tensors:
         inputs = {
             **values,
             **self.invariants,
             "input": hidden,
             "target": desired,
+            "embedding": embedding,
             "weight": base,
             "prompt_end": prompt_end,
         }
         return {key: inputs[source] for key, source in self.math.arguments.items()}
 
     def one(
-        self, values: Tensors, hidden: torch.Tensor, desired: torch.Tensor, count: torch.Tensor, base: torch.Tensor
+        self,
+        values: Tensors,
+        hidden: torch.Tensor,
+        desired: torch.Tensor,
+        embedding: torch.Tensor,
+        count: torch.Tensor,
+        base: torch.Tensor,
     ):
         chunk = self.math.chunk
         assert chunk is not None
         if self.train:
             assert isinstance(chunk, ChunkUpdate) and self.plan is not None
-            result = chunk.counted(self.plan, count, self.arguments(values, hidden, desired, base, self.prompt_end))
+            result = chunk.counted(
+                self.plan, count, self.arguments(values, hidden, desired, embedding, base, self.prompt_end)
+            )
         else:
             result = UpdateOutput.unchanged(self.math.apply(hidden, values))
         return values, result.output, result.changed, result.update_count, result.trained_rows
@@ -226,7 +244,9 @@ class OverlayTile:
         chunk = self.math.chunk
         if self.train and isinstance(chunk, GradientUpdate):
             result = chunk.counted(
-                None, self.table[-1], self.arguments(values, self.hidden, self.desired, base, self.prompt_end)
+                None,
+                self.table[-1],
+                self.arguments(values, self.hidden, self.desired, self.embedding, base, self.prompt_end),
             )
             fields, output, changed, updates, trained = (
                 values,
@@ -236,8 +256,8 @@ class OverlayTile:
                 result.trained_rows,
             )
         else:
-            fields, output, changed, updates, trained = torch.vmap(self.one, in_dims=(0, 0, 0, 0, None))(
-                values, self.hidden, self.desired, self.table[-1], base
+            fields, output, changed, updates, trained = torch.vmap(self.one, in_dims=(0, 0, 0, 0, 0, None))(
+                values, self.hidden, self.desired, self.embedding, self.table[-1], base
             )
         self.output = (
             output,
@@ -272,10 +292,13 @@ class OverlayTile:
             host[-1, :count] = tuple(len(o.hidden) for o in operands)
         self.hidden.zero_()
         self.desired.zero_()
+        self.embedding.zero_()
         self.prompt_end.zero_()
         for i, operand in enumerate(operands):
             self.hidden[i, : len(operand.hidden)].copy_(operand.hidden)
             self.desired[i, : len(operand.hidden)].copy_(operand.desired)
+            if "embedding" in self.math.arguments.values():
+                self.embedding[i, : len(operand.hidden)].copy_(operand.embedding)
             self.prompt_end[i].copy_(operand.prompt_end)
         if self.capture is None:
             self.body(base)

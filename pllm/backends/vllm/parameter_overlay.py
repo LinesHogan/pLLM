@@ -81,8 +81,31 @@ class _PreparedRows:
     prompt_end: torch.Tensor
 
 
+class _EmbeddingRows:
+    """Own X0 rows before the first norm can reuse their storage, including during graph replay."""
+
+    def __init__(self, decoder: Decoder, rows: int, device: torch.device, *, enabled: bool) -> None:
+        norm = decoder.model.model.layers[0].input_layernorm
+        self.values = torch.empty(
+            (rows, norm.weight.numel()) if enabled else (0, 0), device=device, dtype=norm.weight.dtype
+        )
+        self.hook = norm.register_forward_pre_hook(self.capture) if enabled else None
+
+    def capture(self, module: torch.nn.Module, args: tuple[torch.Tensor, ...]) -> None:
+        """Copy the embedding stream once per model invocation, in its packed row order."""
+        self.values[: len(args[0])].copy_(args[0])
+
+    def close(self) -> None:
+        """Remove the model hook when the overlay closes."""
+        if self.hook is not None:
+            self.hook.remove()
+
+
 class _ExactProjection:
-    def __init__(self, module: LinearBase, mlp: Mlp | None, slices: tuple[Slice, ...]) -> None:
+    def __init__(
+        self, module: LinearBase, mlp: Mlp | None, slices: tuple[Slice, ...], embedding: _EmbeddingRows
+    ) -> None:
+        self.embedding = embedding
         self.module, self.mlp = module, mlp
         self.bindings = slices
         self.original_forward = module.forward
@@ -184,6 +207,9 @@ class _ExactProjection:
             desired.detach(),
             weight[item.offset : item.offset + item.size] if item.binding.reads_weight else weight[:0],
             item.prompt_end,
+            self.embedding.values.index_select(0, item.rows)
+            if item.binding.reads_embedding
+            else selected.new_empty((0, 0)),
         )
 
     def clear(self) -> None:
@@ -198,13 +224,18 @@ class ExactParameterOverlay:
     """Eager Exact projection-task driver; pinned reads use the shared tensor op."""
 
     def __init__(
-        self, decoder: Decoder, bindings: tuple[ParameterOverlayFieldBinding, ...], device: torch.device
+        self, decoder: Decoder, bindings: tuple[ParameterOverlayFieldBinding, ...], device: torch.device, rows: int
     ) -> None:
+        self.embedding = _EmbeddingRows(
+            decoder, rows, device, enabled=any(binding.reads_embedding for binding in bindings)
+        )
         modules: dict[int, tuple[LinearBase, Mlp | None, list[Slice]]] = {}
         for binding in bindings:
             module, offset, size, mlp = decoder.projection(binding.target)
             modules.setdefault(id(module), (module, mlp, []))[2].append((binding, offset, size))
-        self._modules = tuple(_ExactProjection(module, mlp, tuple(slices)) for module, mlp, slices in modules.values())
+        self._modules = tuple(
+            _ExactProjection(module, mlp, tuple(slices), self.embedding) for module, mlp, slices in modules.values()
+        )
         self.device = device
         self._staging = PinnedStaging()
         for handle in self._modules:
@@ -305,6 +336,7 @@ class ExactParameterOverlay:
 
     def close(self) -> None:
         self.clear()
+        self.embedding.close()
         for handle in self._modules:
             handle.module.forward = handle.original_forward
             if handle.mlp is not None and handle.original_mlp_forward is not None:
@@ -485,6 +517,9 @@ class PinnedParameterOverlay:
     ) -> None:
         self.readers = tuple(_ProjectionReader(decoder, binding, arena, rows, requests, budget) for binding in bindings)
         self.phases = phases
+        self.embedding = _EmbeddingRows(
+            decoder, rows, arena.device, enabled=bool(phases) and any(binding.reads_embedding for binding in bindings)
+        )
         self.sources: tuple[PackedPhaseRow, ...] = ()
         self.starts: Slots = np.empty(0, dtype=np.int64)
         self.total_rows = 0
@@ -524,6 +559,7 @@ class PinnedParameterOverlay:
             for value in (*reader.pools, reader.table, reader.captured, reader.desired):
                 value.record_stream(self.stream)
             reader.prepare(slots, self.starts, rows.total_rows)
+        self.embedding.values.record_stream(self.stream)
         self.apply_count += len(rows.rows) * len(self.readers)
 
     def take_operands(self) -> tuple[ProjectionOperands, ...]:
@@ -550,6 +586,9 @@ class PinnedParameterOverlay:
                         hidden if reader.mlp is None else reader.desired[first:last].clone(),
                         weight[reader.offset : reader.offset + reader.width],
                         hidden.new_full((), row.token_offset + last - first == row.prompt_length, dtype=torch.bool),
+                        self.embedding.values[first:last].clone()
+                        if reader.binding.reads_embedding
+                        else hidden.new_empty((0, 0)),
                     )
                 )
         return tuple(results)
@@ -561,6 +600,7 @@ class PinnedParameterOverlay:
         self.sources = ()
 
     def close(self) -> None:
+        self.embedding.close()
         for reader in reversed(self.readers):
             reader.close()
 
@@ -631,10 +671,10 @@ def parameter_overlay(
 ) -> PinnedParameterOverlay | ExactParameterOverlay | HybridParameterOverlay:
     """Install each projection wrapper once, before compiling or capturing the model."""
     if in_program or not uses_pinned_projection(in_forward=in_forward, graphs=graphs):
-        return ExactParameterOverlay(decoder, bindings, arena.device)
+        return ExactParameterOverlay(decoder, bindings, arena.device, rows)
     pinned = PinnedParameterOverlay(
         decoder, bindings, arena, rows, requests, budget, phases=() if in_forward else phases
     )
     if not in_forward:
         return pinned
-    return HybridParameterOverlay(pinned, ExactParameterOverlay(decoder, bindings, arena.device), phases)
+    return HybridParameterOverlay(pinned, ExactParameterOverlay(decoder, bindings, arena.device, rows), phases)

@@ -90,6 +90,7 @@ class UpdatingDecoder(Decoder):
                 output,
                 torch.eye(4),
                 hidden.new_full((), False, dtype=torch.bool),
+                embedding=torch.empty((0, 0)),
             )
             output = output + self.overlay.run((operand,))[row.identity, TARGET]
         return output, carry
