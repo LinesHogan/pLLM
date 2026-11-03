@@ -38,10 +38,10 @@ class InPlaceTTTConfig:
             or any(target.name != "down_proj" or target.layer is None for target in self.targets)
             or self.chunk_size < 1
             or not isfinite(self.learning_rate)
-            or self.learning_rate <= 0
+            or self.learning_rate < 0
         ):
             raise ValueError(
-                "InPlaceTTT needs sorted down_proj layers, chunk_size >= 1 and a positive finite learning_rate"
+                "InPlaceTTT needs sorted down_proj layers, chunk_size >= 1 and a nonnegative finite learning_rate"
             )
 
     @classmethod
