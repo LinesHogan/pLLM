@@ -1,7 +1,7 @@
 """One CPU schedule contract table for the maintained model workloads."""
 
 import json
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from unittest.mock import patch
 
 import pytest
@@ -52,10 +52,32 @@ class PrefillTrainer(pllm.Workload):
         return (w - x).square().mean(-1)
 
 
+class Steering(pllm.Workload):
+    """User tensor math independent of the other sampler stages."""
+
+    @pllm.add_logits()
+    def bias(self, logits=pllm.layer_logits((-1,))):
+        return logits[:, -1].tanh() * 0.1
+
+
+@dataclass(frozen=True)
+class Stack(pllm.Workload):
+    esamp: ESampWorkload = ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5))
+    dola: DoLaWorkload = DoLaWorkload(layers=(0, 2, 4))
+    steer: Steering = Steering()
+
+
+@dataclass(frozen=True)
+class PositionStack(pllm.Workload):
+    loop: StepLoopWorkload = StepLoopWorkload()
+
+
 @pytest.mark.parametrize(
     "workload",
     (
         DummyWorkload(),
+        Stack(),
+        PositionStack(),
         PrefillTrainer(),
         DoLaWorkload(layers=(0, 2, 4, 6, 8)),
         ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5)),
@@ -86,6 +108,15 @@ def test_builtin_schedule_contracts(workload, model_config):
     assert torch.cuda.is_initialized() == cuda_initialized
     assert result.passed or result.skipped
     json.dumps(asdict(result))
+    if isinstance(workload, Stack):
+        assert "component independence" in result.passed
+        report = pllm.explain(workload, model_config)
+        assert {member.name for member in report.members} >= {
+            "esamp.loss",
+            "esamp.predict",
+            "dola.contrast",
+            "steer.bias",
+        }
     if isinstance(workload, (ESampWorkload, PrefillTrainer, InPlaceTTTWorkload, PrefillAdaptersWorkload)):
         assert "preempted" in result.passed
     if isinstance(workload, (InPlaceTTTWorkload, PrefillAdaptersWorkload)):

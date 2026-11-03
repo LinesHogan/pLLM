@@ -73,7 +73,7 @@ class VersionChecks:
                     versions.update(self.values.get((*point, f"method {source.task}.{source.output}"), ()))
             names = [f"method {task.symbol}.{name}" for name in task.outputs]
             if task.sampler_stage is not None:
-                names.extend(("sampler", "sampler weight"))
+                names.extend((f"sampler {task.symbol}", f"sampler weight {task.symbol}"))
             if task.export is not None:
                 names.append(f"export {task.export.name}")
             for name in names:

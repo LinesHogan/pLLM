@@ -2,7 +2,7 @@
 CPU step showing that composed effects compute exactly what each computes alone."""
 
 import itertools
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, make_dataclass, replace
 
 import pytest
 import torch
@@ -220,7 +220,6 @@ REJECTED = {
     "InForward+Positions": POSITIONS,
     "Patch+Positions": POSITIONS,
     "Positions+Feed": POSITIONS,
-    "AddLogits+Guide": "both send a result to vLLM's sampler",
     "Train+Feed": FEED_STATES,
     "TrainOther+Feed": FEED_STATES,
     "TrainBatch+Feed": FEED_STATES,
@@ -239,12 +238,20 @@ REJECTED = {
 CASES = tuple("+".join(names) for count in (1, 2) for names in itertools.combinations(EFFECTS, count))
 
 
+@pytest.mark.parametrize("as_fields", (False, True))
 @pytest.mark.parametrize("case", CASES)
-def test_effects_compose_unless_they_conflict(case: str) -> None:
+def test_effects_compose_unless_they_conflict(case: str, as_fields: bool) -> None:
     chosen = tuple(EFFECTS[name] for name in case.split("+"))
     # Feed extends Patch and Positions extends Forward; such a pair is the subclass alone.
     bases = tuple(cls for cls in chosen if not any(other is not cls and issubclass(other, cls) for other in chosen))
     workload = type(f"Composed_{case.replace('+', '_')}", bases, {})()
+    if as_fields:
+        workload = make_dataclass(
+            "Fields",
+            [(cls.__name__.lower(), cls, field(default_factory=cls)) for cls in bases],
+            bases=(pllm.Workload,),
+            frozen=True,
+        )()
     expected = REJECTED.get(case)
     if expected is None:
         facts, declaration = workload.specialize(FACTS, pllm.ExecutionOptions())
@@ -280,7 +287,7 @@ def _step(workload: pllm.Workload) -> tuple[dict[str, torch.Tensor], list[torch.
         resource = str(execution.arena.root(latest).resource)
         index = sum(key.startswith(resource) for key in states)
         states[f"{resource}:{index}"] = torch.cat(tuple(value.flatten() for value in execution.snapshot(latest)))
-    states["guidance"] = guidance.values
+    states["guidance"] = guidance[0].values
     assert isinstance(workload, Exported)
     return states, [event.tensor() for event in workload.events if event.tensor_name is not None]
 
@@ -317,3 +324,72 @@ def test_custom_forward_reads_compose_per_effect(effect):
     task = declaration.graph.custom_forward_task
     assert "written" in declaration.graph.model_reads
     assert any(item.resource == "written" and item.kind.value == "read" for item in task.effects)
+
+
+def test_component_boundaries_and_base_collisions() -> None:
+    """Names never silently shadow, reference siblings, or choose independent engine timing."""
+    collision = type("MyTrainer", (pllm.Workload,), {"loss": Train.train_rows})
+    from pllm.workloads import ESampWorkload
+
+    @dataclass(frozen=True)
+    class TwoGuides(pllm.Workload):
+        first: Guide = field(default_factory=Guide)
+        second: Guide = field(default_factory=Guide)
+
+    class CrossRead(pllm.Workload):
+        @pllm.add_logits()
+        def read(self, v=pllm.parameter("first.trained", "w")):
+            return v
+
+    class Serial(AddLogits):
+        required_publish_lag = 0
+
+    @dataclass(frozen=True)
+    class Lag(pllm.Workload):
+        serial: Serial = field(default_factory=Serial)
+
+    for workload, message in (
+        (type("Collision", (ESampWorkload, collision), {})(), "ESampWorkload and MyTrainer both declare 'loss'"),
+        (TwoGuides(), "first.guide and second.guide"),
+        (CrossRead(), "components are independent"),
+        (Lag(), "serial requires publish_lag=0.*engine uses publish_lag=1"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            workload.specialize(FACTS, pllm.ExecutionOptions())
+    facts, declaration = Lag().specialize(FACTS, pllm.ExecutionOptions(publish_lag=0))
+    Lag().plan_backend(facts, declaration)
+
+
+def test_nested_components_route_only_their_local_exports() -> None:
+    """Two instances with identical local names keep disjoint state, tasks and export callbacks."""
+
+    class ParentExport(Exported):
+        @pllm.export(name="right.value")
+        def root_export(self, h=pllm.hidden(0)):
+            return h + 2
+
+    leaf = type("Leaf", (Exported, Write, AddLogits, Export), {})
+    inner = make_dataclass("Inner", [("left", leaf, field(default_factory=leaf))], bases=(Exported,), frozen=True)
+    outer = make_dataclass(
+        "Outer",
+        [("inner", inner, field(default_factory=inner)), ("right", leaf, field(default_factory=leaf))],
+        bases=(ParentExport,),
+        frozen=True,
+    )()
+    execution = testing.compile_execution(outer, FACTS)
+    try:
+        identities = (testing.RequestIdentity("a", 0, 0),)
+        execution.admit(identities)
+        guidance, _ = testing.run_guided_step(execution, testing.step_input(identities, {BINDING: torch.ones(1, 4)}))
+        execution.trace.drain()
+        assert [stage.member for stage in guidance] == ["inner.left.logits", "right.logits"]
+        assert {str(state.resource) for state in execution.arena.plan.semantic_graph.states} == {
+            "inner.left.written",
+            "right.written",
+        }
+        assert [event.tensor_name for event in outer.events] == ["right.value"]
+        assert not outer.inner.events
+        assert [event.tensor_name for event in outer.inner.left.events] == ["value"]
+        assert [event.tensor_name for event in outer.right.events] == ["value"]
+    finally:
+        execution.close()

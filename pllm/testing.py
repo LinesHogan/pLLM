@@ -201,16 +201,16 @@ def run_guided_step(
     *,
     feedback: SamplerFeedback | None = None,
     stream: torch.cuda.Stream | None = None,
-) -> tuple[PackedSamplerGuidanceBatch, ResultT]:
-    """Like `run_step`, also returning the sampler guidance the workload produced before sampling."""
+) -> tuple[tuple[PackedSamplerGuidanceBatch, ...], ResultT]:
+    """Like `run_step`, also returning additions in declaration order, followed by any guidance stage."""
     context = execution.start_step(value, stream)
-    guidance: PackedSamplerGuidanceBatch | None = None
+    guidance: tuple[PackedSamplerGuidanceBatch, ...] = ()
     for anchor in execution.arena.plan.timeline.anchors:
         execution.execute_anchor(context, AnchorId(anchor.ordinal))
         if anchor.ordinal == execution.sampler_anchor_id:
             guidance = execution.sampler_guidance(context, stream)
             execution.complete_sampler(context, stream, feedback=feedback)
-    assert guidance is not None
+    assert guidance
     return guidance, execution.finish_step(context, stream)
 
 

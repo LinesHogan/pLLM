@@ -225,7 +225,7 @@ def _check_training(attachment: BackendAttachment) -> None:
     spec, graph = attachment.spec, attachment.plan.semantic_graph
     if not graph.trains_on_batch and not attachment.probe.hidden_resources:
         raise ValueError("train and sampler operations need a hidden input, e.g. `h: torch.Tensor = pllm.hidden(0)`")
-    adds_logits = spec.sampler is not None and spec.sampler.stage is SamplerStage.PACKED_PRE_FILTER_ADD
+    adds_logits = any(sampler.stage is SamplerStage.PACKED_PRE_FILTER_ADD for sampler in spec.sampler)
     scopes = {state.resource: state.scope for state in graph.states}
     tasks = {task.symbol: task for task in graph.tasks}
     for symbol in spec.training:

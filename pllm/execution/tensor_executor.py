@@ -108,6 +108,7 @@ class TensorExecutor:
     table: torch.Tensor | None = None
     pools: tuple[torch.Tensor, ...] = ()
     results: tuple[torch.Tensor, ...] = ()
+    forward_weights: torch.Tensor | None = None
     gradients: torch.Tensor | None = None
     # Device [applied updates, trained rows] of the last training body.
     counters: torch.Tensor | None = None
@@ -281,6 +282,11 @@ class TensorExecutor:
             sources |= dependency.evaluate(frame, operands)
         if self.optimizer is None:
             self.task.evaluate(frame, operands)
+            self.forward_weights = (
+                self.task.ports[self.task.policy.forward_rows].read(frame, operands)
+                if self.task.policy.forward_rows
+                else None
+            )
             self.results = tuple(operands.results[self.task.symbol, name] for name in self.task.outputs)
             return
         with torch.enable_grad():
@@ -465,7 +471,7 @@ class TensorExecutor:
             if self.task.export is not None:
                 return self.task.export.output(values[0], data, source_rows)
             if self.task.sampler_stage is not None:
-                return self.task.sampler_output(data, batch)
+                return self.task.sampler_output(data, batch, self.forward_weights)
             return TaskOutput()
         assert self.gradients is not None
         if batch.retain_gradients:

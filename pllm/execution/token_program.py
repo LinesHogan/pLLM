@@ -82,9 +82,17 @@ class Layers:
     generated: torch.Tensor
     entries: dict[str, torch.Tensor] = field(repr=False)
     over: Over = "token"
+    namespace: str = ""
+
+    def _state_name(self, name: str) -> str:
+        """Resolve position memory within the forward owner, keeping components closed."""
+        if "." in name:
+            raise ValueError("components are independent; to share state, put both methods in one workload")
+        return f"{self.namespace}.{name}" if self.namespace else name
 
     def load(self, name: str, offset: int = -1) -> torch.Tensor:
         """Read the previous token's state, even after a save in this token."""
+        name = self._state_name(name)
         if self.over == "span" or offset != -1 or name not in self.entries:
             raise ValueError(
                 f'use layers.load({name!r}, offset=-1) in over="token" custom forwards with a declared PositionState {name!r} '
@@ -94,6 +102,7 @@ class Layers:
 
     def save(self, name: str, value: torch.Tensor) -> None:
         """Save a snapshot at this position; the last save wins."""
+        name = self._state_name(name)
         entry = self.entries.get(name)
         if entry is None or value.shape != entry.shape or value.dtype != entry.dtype or value.device != entry.device:
             expected = "" if entry is None else f" with shape {tuple(entry.shape)} and dtype {entry.dtype}"
@@ -274,6 +283,7 @@ class TokenProgram:
         names: tuple[str, ...] = (),
         over: Over = "token",
         parameters: tuple[tuple[str, StateInput, torch.dtype], ...] = (),
+        namespace: str = "",
     ) -> "TokenProgram":
         """Trace on fake tensors; Torch rejects data-dependent Python control flow."""
 
@@ -282,7 +292,13 @@ class TokenProgram:
         ) -> torch.Tensor:
             result = function(
                 Layers(
-                    seed, position, layer_count, generated, dict(zip(names, entries[: len(names)], strict=True)), over
+                    seed,
+                    position,
+                    layer_count,
+                    generated,
+                    dict(zip(names, entries[: len(names)], strict=True)),
+                    over,
+                    namespace,
                 ),
                 **{
                     name: value if source.module is None else ModuleCall(source.module, value, False)

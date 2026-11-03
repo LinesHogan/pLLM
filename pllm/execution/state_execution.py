@@ -129,7 +129,7 @@ class StateTaskContext(Generic[DataT]):
     # Receipts are ordered history; only outstanding obligations drive cleanup.
     publications: list[PagePublication] = field(default_factory=lambda: list[PagePublication]())
     releases: list[PageRelease] = field(default_factory=lambda: list[PageRelease]())
-    guidance: PackedSamplerGuidanceBatch | None = None
+    guidance: tuple[PackedSamplerGuidanceBatch, ...] = ()
     loss: torch.Tensor | None = None
     guidance_ready: CudaStreamReadiness | None = None
     sampler_feedback: SamplerFeedback | None = None
@@ -778,9 +778,9 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         self,
         context: StateTaskContext[DataT],
         stream: torch.cuda.Stream | None = None,
-    ) -> PackedSamplerGuidanceBatch:
+    ) -> tuple[PackedSamplerGuidanceBatch, ...]:
         self._require_borrow_live()
-        assert context.guidance is not None
+        assert context.guidance
         if stream is not None:
             assert context.guidance_ready is not None
             context.guidance_ready.order_on(stream)
@@ -866,7 +866,8 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         context.value = None
         context.results.clear()
         context.loss = None
-        context.guidance = context.sampler_feedback = None
+        context.guidance = ()
+        context.sampler_feedback = None
         context.guidance_ready = None
         for root in context.borrowed_roots:
             root.close()

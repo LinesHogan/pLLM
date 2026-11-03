@@ -31,6 +31,8 @@ class PackedSamplerGuidanceBatch:
     affected_row_ids: tuple[int, ...]
     beta: float = 0.0
     stage: SamplerStage = SamplerStage.PACKED_POST_FILTER_EXACT
+    member: str = ""
+    order: int = 0
     # Optional per-row multiplier of beta on the device; rows with weight 0 are left unchanged.
     row_weights: torch.Tensor | None = None
 

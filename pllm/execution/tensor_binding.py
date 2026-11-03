@@ -92,7 +92,7 @@ class StepResult:
         return self.invocation.loss
 
     @property
-    def guidance(self) -> PackedSamplerGuidanceBatch | None:
+    def guidance(self) -> tuple[PackedSamplerGuidanceBatch, ...]:
         return self.invocation.guidance
 
     @property
@@ -401,7 +401,7 @@ class TensorBinding(Builder[TensorFrame]):
     def uses_sampler_rows(self) -> bool:
         """Additive sampler frames include completed prompt endings as well as decode rows."""
         sampler = self.effects.sampler
-        return sampler is not None and sampler.stage is SamplerStage.PACKED_PRE_FILTER_ADD
+        return any(item.stage is SamplerStage.PACKED_PRE_FILTER_ADD for item in sampler)
 
     def row_phase(self) -> HiddenPhase | None:
         """The frame's preselected phase; None keeps every request's final row for model effects or prefill."""

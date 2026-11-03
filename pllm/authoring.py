@@ -67,7 +67,7 @@ class BackendRequirements:
     layer_logits: tuple[int, ...] = ()
     parameter_targets: tuple[Projection, ...] = ()
     activation_layers: tuple[int, ...] = ()
-    sampler_stage: SamplerStage | None = None
+    sampler_stages: tuple[SamplerStage, ...] = ()
     sampler_feedback: bool = False
     position_states: tuple[tuple[str, float], ...] = ()
     # Whether a @pllm.custom_forward reruns model layers, which vLLM's CUDA graphs cannot capture.

@@ -151,26 +151,25 @@ class TensorTask:
     export: TensorExport | None = None
     sampler_stage: SamplerStage | None = None
     sampler_beta: float = 0.0
+    sampler_order: int = 0
     training: State | None = None
     # CPU contract diagnostics attach after shape tracing; ordinary execution keeps this unset.
     observe: Callable[[TensorFrame, Mapping[str, torch.Tensor], tuple[torch.Tensor, ...]], None] | None = None
 
-    def sampler_output(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
+    def sampler_output(self, data: TensorFrame, batch: TensorBatch, weights: torch.Tensor | None) -> TaskOutput:
         """Adapt a computed prediction to sampler rows without executing its mathematics."""
         result = batch.results[self.symbol, self.outputs[0]]
         stage = self.sampler_stage
         assert stage is not None
-        mask = self.ports[self.policy.forward_rows] if self.policy.forward_rows else None
         local = {row.packed_row_index: index for index, row in enumerate(data.rows)}
         links = tuple(link for link in data.step.sampler_rows.links if link.packed_row_index in local)
-        weights = None
         if stage is SamplerStage.PACKED_POST_FILTER_EXACT:
             positions = tuple(local[link.packed_row_index] for link in links)
             result = take_rows(result, positions)
             # Unselected rows keep weight 0, so the sampler leaves their logits unchanged;
             # selecting rows on the host would need a device-to-host read.
-            if mask is not None:
-                weights = take_rows(mask.read(data, batch), positions).to(result.dtype)
+            if weights is not None:
+                weights = take_rows(weights, positions).to(result.dtype)
         observations = (
             tuple(
                 Observation(
@@ -193,6 +192,8 @@ class TensorTask:
                 self.sampler_beta,
                 stage=stage,
                 row_weights=weights,
+                member=str(self.symbol),
+                order=self.sampler_order,
             ),
             observations=observations,
         )

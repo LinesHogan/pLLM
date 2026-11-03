@@ -155,7 +155,7 @@ def _request_lifecycle(monkeypatch):
             execution.execute_anchor(handle, AnchorId(anchor.ordinal))
         result = execution.finish_step(handle)
         # Only a trained (version > 0) distiller guides sampling.
-        rows, values = effective(guidance)
+        rows, values = effective(guidance[0])
         if step_id == 0:
             assert rows == ()
         else:
@@ -237,7 +237,7 @@ def _esamp_native_oracle(device, normalized):
             sum(expected_losses.values()).backward()
             result = execution.step(value, stream)
             if step_id:
-                torch.testing.assert_close(result.guidance.values, prediction, rtol=1e-5, atol=1e-6)
+                torch.testing.assert_close(result.guidance[0].values, prediction, rtol=1e-5, atol=1e-6)
             for ref, loss in zip(result.publication.after_refs, result.loss, strict=True):
                 owner = next(i for i, first in enumerate(initial) if first.lineage_id == ref.lineage_id)
                 torch.testing.assert_close(loss, expected_losses[owner], rtol=1e-5, atol=1e-6)
@@ -309,8 +309,8 @@ def _ordinary_request_distillation(device_name) -> None:
         weight_of = lambda link: weights[owners[link.packed_row_index]].detach()
         expected = [source[link.packed_row_index] @ weight_of(link) for link in active]
         result = execution.step(value, stream)
-        rows, values = effective(result.guidance)
-        assert rows == tuple(link.sampler_row_index for link in active) and result.guidance.beta == 0.2
+        rows, values = effective(result.guidance[0])
+        assert rows == tuple(link.sampler_row_index for link in active) and result.guidance[0].beta == 0.2
         torch.testing.assert_close(values, torch.stack(expected) if expected else source.new_empty((0, 4)))
         for before, after, loss in zip(
             result.publication.before_refs, result.publication.after_refs, result.loss, strict=True
@@ -353,8 +353,9 @@ def test_sampler_adapts_step_results_in_memory_trace_and_runtime(monkeypatch: py
         task: TensorTask,
         data: TensorFrame,
         batch: TensorBatch,
+        weights: torch.Tensor | None,
     ) -> TaskOutput:
-        result = adapt(task, data, batch)
+        result = adapt(task, data, batch, weights)
         assert result.guidance is not None
         devices.append(result.guidance.values.device.type)
         return result
@@ -373,9 +374,9 @@ def test_sampler_adapts_step_results_in_memory_trace_and_runtime(monkeypatch: py
         expected = reference(source, torch.stack([execution.snapshot(ref)[0] for ref in latest]))
         result = execution.step(step_input(identities, source, source.flip(1), step, (1, 0)))
         latest = result.publication.after_refs
-        assert result.guidance.affected_row_ids == (0, 1)
-        torch.testing.assert_close(result.guidance.row_weights, torch.full((2,), float(step)))
-        torch.testing.assert_close(result.guidance.values, expected.flip(0) if step else torch.zeros_like(expected))
+        assert result.guidance[0].affected_row_ids == (0, 1)
+        torch.testing.assert_close(result.guidance[0].row_weights, torch.full((2,), float(step)))
+        torch.testing.assert_close(result.guidance[0].values, expected.flip(0) if step else torch.zeros_like(expected))
     assert devices == ["cpu", "cpu"] and calls.count(TaskSymbol("predict")) == 2
     execution.retire(identities)
 
@@ -429,7 +430,7 @@ def _module_request_distillation(device_name) -> None:
     target = torch.linspace(0.7, -0.3, 8, device=device).reshape(2, 4)
     for step_id in range(3):
         result = execution.step(step_input(identities, source, target, step_id, stream=stream), stream)
-        rows, values = effective(result.guidance)
+        rows, values = effective(result.guidance[0])
         if step_id:  # predictions use each request's own parameters once it has trained
             assert rows == (0, 1)
             with torch.no_grad():

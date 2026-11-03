@@ -346,7 +346,7 @@ def _check_activation_fields(
 
 def declare_custom_forward(
     b: TensorBinding,
-    forwards: tuple[tuple[Tokens, Over, Callable[..., torch.Tensor], tuple[tuple[str, StateInput], ...]], ...],
+    forwards: tuple[tuple[str, Tokens, Over, Callable[..., torch.Tensor], tuple[tuple[str, StateInput], ...]], ...],
     position_states: tuple[tuple[str, float], ...],
     publications: tuple[Call, ...],
 ) -> None:
@@ -354,7 +354,7 @@ def declare_custom_forward(
 
     The forward reads every version in `publications`: the writes of states its activation patches read.
     """
-    tokens: Tokens = forwards[0][0] if len(forwards) == 1 else "all"
+    tokens: Tokens = forwards[0][1] if len(forwards) == 1 else "all"
     composed = b.effects.in_forward is not None
     _check_custom_forward(b)
     if position_states and (composed or b.effects.activation_bindings):
@@ -365,7 +365,7 @@ def declare_custom_forward(
         b.update_task(symbol, partial(_read_publications, b, publications))
     probe = b.probe
     assert probe is not None and probe.causal_domain is not None
-    reads = tuple(dict.fromkeys(source.resource for _, _, _, inputs in forwards for _, source in inputs))
+    reads = tuple(dict.fromkeys(source.resource for _, _, _, _, inputs in forwards for _, source in inputs))
     b.model_reads(reads)
     b.update_task(
         symbol,
@@ -533,7 +533,7 @@ def _attach_custom_forward(b: TensorBinding, composed: bool, effect: TokenProgra
 
 def _trace_programs(
     b: TensorBinding,
-    forwards: tuple[tuple[Tokens, Over, Callable[..., torch.Tensor], tuple[tuple[str, StateInput], ...]], ...],
+    forwards: tuple[tuple[str, Tokens, Over, Callable[..., torch.Tensor], tuple[tuple[str, StateInput], ...]], ...],
     position_states: tuple[tuple[str, float], ...],
 ) -> tuple[tuple[Tokens, TokenProgram], ...]:
     """Trace each @pllm.custom_forward method into a token program over the model's layers."""
@@ -553,15 +553,16 @@ def _trace_programs(
                 function,
                 tensor,
                 probe.causal_domain.layers,
-                names,
+                tuple(name for name in names if name.rpartition(".")[0] == namespace),
                 over,
                 tuple(
                     (name, source, layouts[source.resource].fields[source.view.field].dtype.torch)
                     for name, source in inputs
                 ),
+                namespace=namespace,
             ),
         )
-        for selected, over, function, inputs in forwards
+        for namespace, selected, over, function, inputs in forwards
     )
 
 

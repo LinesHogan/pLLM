@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
-from dataclasses import KW_ONLY, dataclass, field, replace
+from dataclasses import KW_ONLY, dataclass, field, fields, is_dataclass, replace
 from enum import Enum
 from functools import partial
 from inspect import Parameter as SignatureParameter, signature
@@ -41,10 +41,12 @@ from pllm.contracts.semantic_graph import (
     MathContract,
     SamplerFeedbackInputSource,
     SchedulerTimeline,
+    SemanticGraph,
     SemanticOutputKind,
     SemanticTask,
     StateEffectKind,
     StateScope,
+    TaskId,
     TaskResultInputSource,
     TaskSymbol,
     TimingConstraint,
@@ -164,6 +166,10 @@ class _Source:
     """An argument marker owns its graph input and derivative eligibility."""
 
     differentiable: ClassVar[bool] = True
+
+    def qualify(self, context: _Reflection) -> _Source:
+        """Resolve component-local references once at the declaration boundary."""
+        return self
 
     def port(self, context: _Reflection) -> TensorPort:
         raise TypeError(f"unsupported tensor source: {type(self).__name__}")
@@ -289,6 +295,9 @@ class Parameter(_Source):
     field: str
     per_row: bool = False
 
+    def qualify(self, context: _Reflection) -> Parameter:
+        return replace(self, state=context.qualify(self.state))
+
     def training_port(self, context: _Reflection, schema: str) -> CausalPort:
         context.parameter(self.state, self.field)
         view = context.binding.field_views[self.state, self.field]
@@ -324,6 +333,9 @@ class _CausalModelMarker(_Source):
     """An adapter's differentiable views adapted to a worker-local model callable."""
 
     name: str
+
+    def qualify(self, context: _Reflection) -> _CausalModelMarker:
+        return replace(self, name=context.qualify(self.name))
 
     def training_port(self, context: _Reflection, schema: str) -> CausalPort:
         adapter = context.adapters.get(self.name)
@@ -389,6 +401,9 @@ class StateIndex(_Source):
 
     differentiable: ClassVar[bool] = False
 
+    def qualify(self, context: _Reflection) -> StateIndex:
+        return replace(self, state=context.qualify(self.state))
+
     def port(self, context: _Reflection) -> TensorPort:
         return state_metadata(context.state(self.state, "pllm.index needs a declared state"), version=False)
 
@@ -399,6 +414,9 @@ class StateVersion(_Source):
 
     differentiable: ClassVar[bool] = False
 
+    def qualify(self, context: _Reflection) -> StateVersion:
+        return replace(self, state=context.qualify(self.state))
+
     def port(self, context: _Reflection) -> TensorPort:
         return state_metadata(context.state(self.state, "pllm.version needs a declared state"), version=True)
 
@@ -406,6 +424,9 @@ class StateVersion(_Source):
 @dataclass(frozen=True)
 class Result(_Source):
     operation: str
+
+    def qualify(self, context: _Reflection) -> Result:
+        return replace(self, operation=context.qualify(self.operation))
 
     def port(self, context: _Reflection) -> TensorPort:
         return result_port(TaskResultInputSource(TaskSymbol(self.operation), "value"))
@@ -457,6 +478,13 @@ class _Carried(_Source):
 
     source: _Source
     carry: Carry
+
+    def qualify(self, context: _Reflection) -> _Carried:
+        return replace(
+            self,
+            source=self.source.qualify(context),
+            carry=replace(self.carry, state=context.qualify(self.carry.state)),
+        )
 
 
 # Inputs are declared as parameter defaults: `h: torch.Tensor = pllm.hidden(0)`. The factories return the
@@ -667,7 +695,7 @@ class InstanceState:
             return
         if self.feed is not None:
             if context.binding.feeds:
-                raise ValueError("declare one fed state per workload")
+                raise ValueError(f"{context.binding.feeds[0].resource} and {name}: declare one fed state per workload")
             context.binding.feeds = (FeedBinding(name, FeedOrder(self.feed), tuple(self.fields)),)
         context.states[name], ports = declare_parameters(
             context.binding,
@@ -957,7 +985,7 @@ class _Export(_Effect):
         """Publish bounded tensor observations to the host."""
         owner = operation.context.owner
         export = TensorExport(
-            name=_setting(self.name, owner, str),
+            name=operation.context.emitted(_setting(self.name, owner, str)),
             every=_setting(self.every, owner, int),
             max_rows=_setting(self.max_rows, owner, int),
             max_cols=_setting(self.max_cols, owner, int),
@@ -1046,7 +1074,7 @@ class _Train(_Effect):
                 context.states[self.state],
                 ports={key: source.training_port(context, schema) for key, source in arguments.items()},
                 function=freeze(operation.function),
-                identity=f"python:{fingerprint(operation.function)}",
+                identity=operation.identity,
                 when=operation.transition_window,
             ),
             self.state,
@@ -1117,7 +1145,7 @@ class _Train(_Effect):
                 context.binding,
                 operation.name,
                 context.states[self.state],
-                identity=f"python:{identity}",
+                identity=f"{operation.identity}:{identity}",
                 optimizer=optimizer,
                 steps=_setting(self.steps, context.owner, int),
                 reset=freeze(reset),
@@ -1151,13 +1179,11 @@ class _Sampler(_Effect):
                 sampler_stage=self.stage,
                 sampler_beta=0.0 if self.beta is None else _setting(self.beta, operation.context.owner, float),
             )
-            if operation.context.prediction is not None:
-                raise ValueError(
-                    f"{operation.context.prediction[0].symbol} and {operation.name} both send a result to vLLM's "
-                    "sampler, which applies one @pllm.add_logits or @pllm.guide_sampling method per step; combine "
-                    "them into one method"
-                )
-            operation.context.prediction = call, self
+            binding = operation.context.binding
+            binding.tensor_tasks[call.symbol] = replace(
+                binding.tensor_tasks[call.symbol], sampler_order=len(operation.context.predictions)
+            )
+            operation.context.predictions.append((call, self))
 
 
 @dataclass(frozen=True)
@@ -1347,7 +1373,7 @@ class _TrainInForward(_Effect):
     ) -> tuple[dict[str, str], dict[str, tuple[str, tuple[FieldView, ...]]], tuple[str, ...]]:
         """Resolve carried operands and shared, per-layer invariant views at declaration time."""
         context = operation.context
-        sources = _arguments(operation.function)
+        sources = context.arguments(operation.function)
         invariants: dict[str, tuple[str, tuple[FieldView, ...]]] = {}
         bindings: dict[str, str] = {}
         for key, source in sources.items():
@@ -1447,7 +1473,7 @@ class _TrainInForward(_Effect):
             initialize=initialize,
             keys=definition.request_keys,
             phases=_TOKEN_PHASES[_option(self.tokens, context.owner, get_args(Tokens), "tokens")],
-            identity=f"python:{identity}",
+            identity=operation.identity,
             function=function,
             arguments=bindings,
             visibility=_option(self.visibility, context.owner, ("forward_pinned", "exact"), "visibility"),
@@ -1499,7 +1525,7 @@ def _site_inputs(
         source = _typed(parameter.default, _Source)
         if source is None:
             raise TypeError(f"{name}: give every input after the site tensors a source as its default")
-        inputs.append((name, source.site_input(context)))
+        inputs.append((name, source.qualify(context).site_input(context)))
     return tuple(inputs)
 
 
@@ -1830,11 +1856,11 @@ def custom_forward(*, tokens: Tokens = "all", over: Over = "token") -> Callable[
 
 
 def _values(owner: object) -> dict[str, object]:
-    return owner_values(owner, (InstanceState, ActivationPatch, Adapter, PositionState))
+    return owner_values(owner, (InstanceState, ActivationPatch, Adapter, PositionState, Workload))
 
 
 def _snapshot(owner: C, borrowed: tuple[object, ...] = ()) -> C:
-    return owner_snapshot(owner, (InstanceState, ActivationPatch, Adapter, PositionState), borrowed)
+    return owner_snapshot(owner, (InstanceState, ActivationPatch, Adapter, PositionState, Workload), borrowed)
 
 
 def _of_type(values: dict[str, object], expected: type[C]) -> dict[str, C]:
@@ -1879,6 +1905,11 @@ class _Operation:
         return self.context.method(self.name)
 
     @property
+    def identity(self) -> str:
+        """Identify a method implementation within its component's namespace."""
+        return f"python:{self.name}:{fingerprint(self.function)}"
+
+    @property
     def transition_window(self) -> When:
         """Where this method's state transition runs; host workloads have their own step anchors."""
         return When.HOST_COMPUTE if self.context.binding.host else self.phase.value
@@ -1901,7 +1932,7 @@ class _Operation:
 
     def arguments(self) -> tuple[dict[str, _Source], dict[str, Carry]]:
         """Split carried inputs into their read source and the carried field the update writes."""
-        sources, carries = _arguments(self.function), dict[str, Carry]()
+        sources, carries = self.context.arguments(self.function), dict[str, Carry]()
         for key, source in sources.items():
             if (carried := _typed(source, _Carried)) is not None:
                 sources[key], carries[key] = carried.source, carried.carry
@@ -1945,7 +1976,7 @@ class _Operation:
             self.name,
             inputs=inputs,
             when=self.phase.value if when is None else when,
-            identity=f"python:{identity}",
+            identity=self.identity,
             update=update,
             math=math,
             carries=writes,
@@ -1975,7 +2006,9 @@ class _Operation:
         tasks = {self.name: self.arguments()[0]}
         for method in self.domains.values():
             if method:
-                tasks[f"__{self.name}_{method}"] = _arguments(self.context.method(method))
+                tasks[self.context.selector_name(self.name, method)] = self.context.arguments(
+                    self.context.method(method)
+                )
         return tasks
 
     def selectors(
@@ -1996,12 +2029,12 @@ class _Operation:
                 self.context.signature.append((method, identity))
                 selectors[method] = declare_tensor(
                     self.context.binding,
-                    f"__{self.name}_{method}",
+                    self.context.selector_name(self.name, method),
                     when=self.phase.value,
                     identity=f"python:{identity}:{self.name}:{method}",
                     inputs={
                         key: inputs[key] if arguments.get(key) == source else source.port(self.context)
-                        for key, source in sources[f"__{self.name}_{method}"].items()
+                        for key, source in sources[self.context.selector_name(self.name, method)].items()
                     },
                 )(freeze(selector))
             key = f"__{domain}"
@@ -2048,12 +2081,47 @@ def _candidates(owner: Workload, values: dict[str, object], members: dict[str, o
     }
 
 
+def _own_fields(base: type) -> set[str]:
+    """Dataclass fields introduced by this base, excluding inherited declarations."""
+    if not is_dataclass(base):
+        return set()
+    return {item.name for item in fields(base) if item.name in vars(base).get("__annotations__", {})}
+
+
+def _check_base_collisions(owner: Workload) -> None:
+    """Reject unrelated declaration owners whose common name Python would silently discard."""
+    declarations: dict[str, list[type]] = {}
+    for base in type(owner).__mro__:
+        if base in (Workload, BackendWorkload, object):
+            continue
+        own_fields = _own_fields(base)
+        for name in dict.fromkeys((*vars(base), *sorted(own_fields))):
+            value = vars(base).get(name)
+            if (
+                name in own_fields
+                or _property(value) is not None
+                or isinstance(value, (InstanceState, ActivationPatch, Adapter, PositionState))
+                or isinstance(value, FunctionType)
+                and any(key.startswith("__pllm_") for key in vars(value))
+            ):
+                declarations.setdefault(name, []).append(base)
+    for name, bases in declarations.items():
+        for index, left in enumerate(bases):
+            for right in bases[index + 1 :]:
+                if not issubclass(left, right) and not issubclass(right, left):
+                    raise ValueError(
+                        f"{left.__name__} and {right.__name__} both declare {name!r}; compose them as fields instead of inheriting from both"
+                    )
+
+
 @dataclass
 class _Reflection:
     """Own the binding, reflected owner and ordered definitions during one build."""
 
     owner: Workload
     binding: TensorBinding = field(init=False)
+    prefix: str = ""
+    components: tuple[_Reflection, ...] = ()
     # The owner's values, signed; the declared states and model values among them, by type.
     bindings: tuple[tuple[str, str], ...] = ()
     state_definitions: dict[str, InstanceState] = field(default_factory=lambda: {})
@@ -2070,7 +2138,7 @@ class _Reflection:
     states: dict[str, State] = field(default_factory=lambda: {})
     parameters: dict[tuple[str, str], TensorPort] = field(default_factory=lambda: {})
     writes: dict[str, tuple[Call, Call]] = field(default_factory=lambda: {})
-    prediction: tuple[Call, _Sampler] | None = None
+    predictions: list[tuple[Call, _Sampler]] = field(default_factory=lambda: [])
     # Each @pllm.train method and the state it trains.
     trainers: list[tuple[Call, State]] = field(default_factory=lambda: [])
 
@@ -2089,13 +2157,14 @@ class _Reflection:
     @property
     def sampler(self) -> _Sampler | None:
         """Find active guidance before either prediction or training is emitted."""
+        samplers = tuple(
+            sampler
+            for operation in self.operations
+            if (sampler := _typed(operation.effect, _Sampler)) is not None and sampler.enabled(operation.context.owner)
+        )
         return next(
-            (
-                sampler
-                for operation in self.operations
-                if (sampler := _typed(operation.effect, _Sampler)) is not None and sampler.enabled(self.owner)
-            ),
-            None,
+            (sampler for sampler in samplers if sampler.stage is SamplerStage.PACKED_POST_FILTER_EXACT),
+            next(iter(samplers), None),
         )
 
     @property
@@ -2110,11 +2179,12 @@ class _Reflection:
         return delta.field_bindings(lambda name: self.binding.field_views[delta.state, name])
 
     @classmethod
-    def read(cls, workload: Workload) -> _Reflection:
+    def read_local(cls, workload: Workload, prefix: str) -> _Reflection:
         """Snapshot and sign reachable mathematics before evaluating state properties."""
         owner = _snapshot(workload)
         values, members = _values(owner), _members(owner)
-        context, candidates = cls(owner), _candidates(owner, values, members)
+        _check_base_collisions(owner)
+        context, candidates = cls(owner, prefix=prefix), _candidates(owner, values, members)
         seeds: list[FunctionType] = []
         for name, member in members.items():
             context.read_operation(name, member, candidates, seeds)
@@ -2128,7 +2198,9 @@ class _Reflection:
                 ) is not None:
                     seeds.append(function)
         context.freeze_helpers(candidates, seeds)
-        context.bindings = tuple((key, fingerprint(value)) for key, value in sorted(values.items()))
+        context.bindings = tuple(
+            (key, fingerprint(value)) for key, value in sorted(values.items()) if not isinstance(value, Workload)
+        )
         for name, member in members.items():
             if _property(member):
                 values[name] = object.__getattribute__(owner, name)
@@ -2136,7 +2208,113 @@ class _Reflection:
         context.adapters = {key: value.delta for key, value in _of_type(values, Adapter).items()}
         context.activations = _of_type(values, ActivationPatch)
         context.position_definitions = _of_type(values, PositionState)
+        context.namespace()
         return context
+
+    @classmethod
+    def read(cls, workload: Workload) -> _Reflection:
+        """Flatten independent field components into one declaration and one conflict domain."""
+        contexts = tuple(cls.read_local(owner, path) for path, owner in component_workloads(workload))
+        root = contexts[0]
+        root.components = contexts
+        root.state_definitions = {
+            key: value for context in contexts for key, value in context.state_definitions.items()
+        }
+        root.adapters = {key: value for context in contexts for key, value in context.adapters.items()}
+        root.activations = {key: value for context in contexts for key, value in context.activations.items()}
+        root.position_definitions = {
+            key: value for context in contexts for key, value in context.position_definitions.items()
+        }
+        roles: dict[str, str] = {}
+        for context in contexts:
+            for name, tokens, _ in context.custom_forwards:
+                for role in ("prefill", "decode"):
+                    if tokens not in (role, "all"):
+                        continue
+                    if role in roles:
+                        raise ValueError(f"{roles[role]} and {name}: @pllm.custom_forward tokens overlap: {role}")
+                    roles[role] = name
+        root.operations = [operation for context in contexts for operation in context.operations]
+        root.custom_forwards = [forward for context in contexts for forward in context.custom_forwards]
+        root.signature = [item for context in contexts for item in context.signature]
+        root.bindings = tuple(item for context in contexts for item in context.bindings)
+        root.in_forward_states = {name for context in contexts for name in context.in_forward_states}
+        for context in contexts:
+            context.components = contexts
+            context.state_definitions = root.state_definitions
+            context.adapters = root.adapters
+            context.activations = root.activations
+            context.position_definitions = root.position_definitions
+            context.operations = root.operations
+            context.custom_forwards = root.custom_forwards
+            context.signature = root.signature
+            context.states = root.states
+            context.parameters = root.parameters
+            context.writes = root.writes
+            context.trainers = root.trainers
+            context.predictions = root.predictions
+            context.in_forward_states = root.in_forward_states
+        return root
+
+    def qualify(self, name: str) -> str:
+        """Keep references within one component; dots are reserved for framework paths."""
+        if "." in name:
+            raise ValueError(
+                f"{self.prefix or type(self.owner).__name__}: {name!r}: components are independent; to share state, put both methods in one workload"
+            )
+        return self.emitted(name)
+
+    def emitted(self, name: str) -> str:
+        """Prefix generated names and export labels, which may themselves contain dots."""
+        return f"{self.prefix}.{name}" if self.prefix else name
+
+    def selector_name(self, operation: str, method: str) -> str:
+        """Give generated selectors the same component namespace as their method."""
+        prefix = self.prefix + "." if self.prefix else ""
+        return self.emitted(f"__{operation.removeprefix(prefix)}_{method.removeprefix(prefix)}")
+
+    def arguments(
+        self, function: Callable[..., torch.Tensor | tuple[torch.Tensor, ...] | UpdateOutput | None]
+    ) -> dict[str, _Source]:
+        """Resolve local marker names against this method's component."""
+        return {key: source.qualify(self) for key, source in _arguments(function).items()}
+
+    def namespace(self) -> None:
+        """Qualify emitted names while retaining each method's bound owner and local configuration."""
+        self.bindings = tuple((self.qualify(key), value) for key, value in self.bindings)
+        self.state_definitions = {self.qualify(key): value for key, value in self.state_definitions.items()}
+        self.adapters = {
+            self.qualify(key): replace(value, state=self.qualify(value.state)) for key, value in self.adapters.items()
+        }
+        self.activations = {
+            self.qualify(key): replace(value, state=self.qualify(value.state))
+            for key, value in self.activations.items()
+        }
+        self.position_definitions = {self.qualify(key): value for key, value in self.position_definitions.items()}
+        self.in_forward_states = {self.qualify(key) for key in self.in_forward_states}
+        self.custom_forwards = [(self.qualify(key), tokens, over) for key, tokens, over in self.custom_forwards]
+        for operation in self.operations:
+            operation.name = self.qualify(operation.name)
+            operation.rows = self.qualify(operation.rows) if operation.rows else ""
+            effect = operation.effect
+            if is_dataclass(effect):
+                references = {
+                    item.name: self.qualify(value)
+                    for item in fields(effect)
+                    if item.name in ("state", "update_rows", "reset", "read") and (value := vars(effect)[item.name])
+                }
+                operation.effect = replace(effect, **references)
+            if operation.gradient is not None:
+                gradient = operation.gradient
+                operation.gradient = replace(
+                    gradient,
+                    input_rows=self.qualify(gradient.input_rows) if gradient.input_rows else "",
+                    parameter_rows=self.qualify(gradient.parameter_rows) if gradient.parameter_rows else "",
+                )
+
+    def component(self, name: str) -> _Reflection:
+        """Find the owner of a qualified member, including nested field paths."""
+        return next(context for context in reversed(self.components) if name.rpartition(".")[0] == context.prefix)
 
     def read_operation(
         self, name: str, member: object, candidates: dict[str, FunctionType], seeds: list[FunctionType]
@@ -2159,7 +2337,9 @@ class _Reflection:
                 if selected in (role, "all") and tokens in (role, "all")
             }
             if overlap:
-                raise ValueError(f"@pllm.custom_forward tokens overlap: {', '.join(sorted(overlap))}")
+                raise ValueError(
+                    f"{self.qualify(name)}: @pllm.custom_forward tokens overlap: {', '.join(sorted(overlap))}"
+                )
             self.custom_forwards.append((name, tokens, markers["__pllm_over__"]))
             seeds.append(function)
             return
@@ -2187,7 +2367,10 @@ class _Reflection:
     def method(self, name: str) -> FunctionType | MethodType:
         """Bind a named authoring method, including an instance-local replacement."""
         try:
-            return object.__getattribute__(self.owner, name)
+            context = self.component(name) if self.components else self
+            return object.__getattribute__(
+                context.owner, name.removeprefix(f"{context.prefix}.") if context.prefix else name
+            )
         except AttributeError:
             raise ValueError(f"{name!r} names no method of {type(self.owner).__name__}") from None
 
@@ -2209,7 +2392,9 @@ class _Reflection:
         try:
             yield
         except (ValueError, TypeError) as error:
-            error.add_note(f"while declaring {type(self.owner).__name__}.{member}")
+            if self.prefix:
+                error.args = (f"{member}: {error}", *error.args[1:])
+            error.add_note(f"while declaring {member if self.prefix else type(self.owner).__name__ + chr(46) + member}")
             raise
 
     def state_definition(self, name: str, error: str) -> InstanceState:
@@ -2275,7 +2460,10 @@ class _Reflection:
         if self.custom_forwards:
             declare_custom_forward(
                 self.binding,
-                tuple((tokens, over, *self.forward_inputs(name)) for name, tokens, over in self.custom_forwards),
+                tuple(
+                    (self.component(name).prefix, tokens, over, *self.forward_inputs(name))
+                    for name, tokens, over in self.custom_forwards
+                ),
                 self.positions,
                 publications,
             )
@@ -2300,13 +2488,13 @@ class _Reflection:
         for key, parameter in tuple(signature(function).parameters.items())[1:]:
             source = parameter.default
             if isinstance(source, Attr):
-                function = partial(function, **{key: Attr.resolve(source, self.owner)})
+                function = partial(function, **{key: Attr.resolve(source, self.component(name).owner)})
                 continue
             if not isinstance(source, Parameter):
                 raise TypeError(
                     f"{name}.{key}: use pllm.parameter or pllm.module after layers, or pllm.Attr for a constant"
                 )
-            binding = source.site_input(self)
+            binding = source.qualify(self.component(name)).site_input(self)
             if binding.request or source.per_row:
                 raise ValueError(
                     f"{name}.{key}: custom forwards read shared InstanceState; use InstanceState and remove per_row=True"
@@ -2337,8 +2525,12 @@ class _Reflection:
     def attach_training(self) -> None:
         """Validate gradients and record the sampler and training operations."""
         validate_gradients(self.binding, tuple(call for call, _ in self.trainers))
-        if self.prediction is not None:
-            call, sampler = self.prediction
+        guides = [call for call, sampler in self.predictions if sampler.stage is SamplerStage.PACKED_POST_FILTER_EXACT]
+        if len(guides) > 1:
+            raise ValueError(
+                f"{guides[0].symbol} and {guides[1].symbol} both declare @pllm.guide_sampling; keep at most one guidance method"
+            )
+        for call, sampler in self.predictions:
             declare_logits(self.binding, call, stage=sampler.stage)
         for call, _ in self.trainers:
             self.binding.trains(call)
@@ -2397,7 +2589,9 @@ class _Reflection:
             ),
         )
         if len(b.imports) > 1:
-            raise ValueError("StateImport supplies one imported resource per workload")
+            raise ValueError(
+                f"StateImport supplies one imported resource per workload; {', '.join(b.imports)} are imported"
+            )
         if not b.graph.tasks and b.graph.model_reads:
             states = tuple(self.states[str(resource)] for resource in b.graph.model_reads)
             b.compute(
@@ -2436,8 +2630,67 @@ class _Reflection:
         )
 
 
+def component_workloads(workload: Workload) -> tuple[tuple[str, Workload], ...]:
+    """This workload and its nested dataclass fields, in field declaration order."""
+    children = (
+        tuple((item.name, object.__getattribute__(workload, item.name)) for item in fields(workload))
+        if is_dataclass(workload)
+        else ()
+    )
+    return (
+        ("", workload),
+        *(
+            (f"{name}.{path}" if path else name, owner)
+            for name, child in children
+            if isinstance(child, Workload)
+            for path, owner in component_workloads(child)
+        ),
+    )
+
+
 class Workload(BackendWorkload[TensorFrame, TensorOutput]):
-    """Python methods and effects compiled once, not runtime hooks or a second IR."""
+    """Python methods and effects compiled once, with independent sub-workloads in dataclass fields.
+
+    Sampler additions follow member declaration order (parent methods, then fields recursively), before
+    vLLM filters and at most one guide. Set required_publish_lag when the algorithm requires a fixed
+    value; every component must agree with the engine's ExecutionOptions.publish_lag.
+    """
+
+    required_publish_lag: ClassVar[int | None] = None
+
+    def specialize(
+        self, facts: BackendCompileFacts, options: ExecutionOptions, *, causal: CausalBinder | None = None
+    ) -> tuple[BackendCompileFacts, TensorBinding]:
+        """Check component timing requirements against the single engine setting."""
+        for path, component in component_workloads(self):
+            required = component.required_publish_lag
+            if required is not None and required != options.publish_lag:
+                raise ValueError(
+                    f"{path or type(component).__name__} requires publish_lag={required}; the engine uses publish_lag={options.publish_lag}; all components must use the engine-wide lag"
+                )
+        return super().specialize(facts, options, causal=causal)
+
+    def _export_handler(self, declaration: TensorBinding, graph: SemanticGraph) -> Callable[[TraceEvent], None] | None:
+        """Bind export ownership by task identity; author labels may contain dots."""
+        if not declaration.has_exports:
+            return None
+        owners = dict(component_workloads(self))
+        routes = {
+            TaskId(index): (path, owners[path])
+            for index, task in enumerate(graph.tasks)
+            if task.symbol in declaration.tensor_tasks and declaration.tensor_tasks[task.symbol].export is not None
+            for path in (str(task.symbol).rpartition(".")[0],)
+        }
+        return partial(self._route_export, routes)
+
+    @staticmethod
+    def _route_export(routes: Mapping[TaskId, tuple[str, Workload]], event: TraceEvent) -> None:
+        """Deliver each component's export with its local label, even when labels overlap."""
+        assert event.task_id is not None and event.tensor_name is not None
+        path, owner = routes[event.task_id]
+        owner.on_export(
+            replace(event, tensor_name=event.tensor_name.removeprefix(path + ".") if path else event.tensor_name)
+        )
 
     def on_export(self, event: TraceEvent) -> None:
         """Consume ordered CPU snapshots in the execution process; never reenter execution.
@@ -2449,14 +2702,16 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
     def _declare(self, b: TensorBinding, *, capabilities: tuple[str, ...] = ()) -> None:
         """Declare owner values and operations, then compose and sign their graph."""
         context = _Reflection.read(self)
-        context.binding = b
-        context.adapters = {key: value.expand(b.dimensions.layer_count) for key, value in context.adapters.items()}
+        adapters = {key: value.expand(b.dimensions.layer_count) for key, value in context.adapters.items()}
+        for component in context.components:
+            component.binding = b
+            component.adapters = adapters
         context.declare_values()
-        for operation in sorted(context.operations, key=lambda operation: operation.name):
-            description = operation.effect.description(context.owner)
+        for operation in context.operations:
+            description = operation.effect.description(operation.context.owner)
             if operation.phase_override:
                 description = replace(description, phase=operation.phase.name.lower())
-            with context.declaring(operation.name), b.member(operation.name, description):
+            with operation.context.declaring(operation.name), b.member(operation.name, description):
                 operation.effect.declare(operation)
         context.attach_effects()
         context.attach_training()
@@ -2489,36 +2744,40 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
     def backend_requirements(self) -> BackendRequirements:
         """Read model dependencies from markers before dimensions or tensor readers exist."""
         context = _Reflection.read(self)
-        sources: dict[str, tuple[_Source, ...]] = {}
+        sources: dict[str, tuple[tuple[_Source, Workload], ...]] = {}
         targets = tuple(target for value in context.adapters.values() for target in value.targets)
-        for operation in sorted(context.operations, key=lambda operation: operation.name):
+        for operation in context.operations:
             effect = operation.effect
             if isinstance(effect, _TrainInForward):
-                targets = _targets(_setting(effect.targets, context.owner, tuple))
+                targets += _targets(_setting(effect.targets, operation.context.owner, tuple))
                 continue
             # Custom residual methods read state and earlier values of the forward, never tapped rows.
             if isinstance(effect, _CustomResidual) or (
-                isinstance(effect, _Sampler) and not effect.enabled(context.owner)
+                isinstance(effect, _Sampler) and not effect.enabled(operation.context.owner)
             ):
                 continue
-            with context.declaring(operation.name):
-                sources.update((name, tuple(arguments.values())) for name, arguments in operation.sources().items())
-        inputs = tuple(source for name in sorted(sources) for source in sources[name])
-        sampler = context.sampler
+            with operation.context.declaring(operation.name):
+                sources.update(
+                    (name, tuple((source, operation.context.owner) for source in arguments.values()))
+                    for name, arguments in operation.sources().items()
+                )
+        owned_inputs = tuple(source for name in sorted(sources) for source in sources[name])
+        inputs = tuple(source for source, _ in owned_inputs)
         return BackendRequirements(
             checkpoint_names=tuple(
                 name for state in context.state_definitions.values() for name in state.checkpoint_names()
             ),
             exact_decode=any(
                 isinstance(op.effect, _TrainInForward)
-                and _option(op.effect.visibility, context.owner, ("exact", "forward_pinned"), "visibility") == "exact"
-                and _option(op.effect.tokens, context.owner, get_args(Tokens), "tokens") in ("all", "decode")
+                and _option(op.effect.visibility, op.context.owner, ("exact", "forward_pinned"), "visibility")
+                == "exact"
+                and _option(op.effect.tokens, op.context.owner, get_args(Tokens), "tokens") in ("all", "decode")
                 for op in context.operations
             ),
             hidden_inputs=tuple(
                 dict.fromkeys(
                     (
-                        *(source.resolve(context.owner) for source in inputs if isinstance(source, Hidden)),
+                        *(source.resolve(owner) for source, owner in owned_inputs if isinstance(source, Hidden)),
                         *(
                             HiddenInputSource(-1, HiddenSite.LAYER_LOGITS, phase)
                             for source in inputs
@@ -2530,18 +2789,22 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             ),
             layer_logits=tuple(
                 layer
-                for source in inputs
+                for source, owner in owned_inputs
                 if isinstance(source, LayerLogits)
-                for layer in source.layer_tuple(context.owner)
+                for layer in source.layer_tuple(owner)
             ),
             parameter_targets=targets,
             activation_layers=tuple(layer for value in context.activations.values() for layer in value.layers),
-            sampler_stage=None if sampler is None else sampler.stage,
+            sampler_stages=tuple(
+                op.effect.stage
+                for op in context.operations
+                if isinstance(op.effect, _Sampler) and op.effect.enabled(op.context.owner)
+            ),
             sampler_feedback=any(isinstance(source, (BaseLogits, SampledTokens)) for source in inputs),
             sample_limit=min(
                 (
-                    _setting(source.limit, context.owner, int)
-                    for source in inputs
+                    _setting(source.limit, owner, int)
+                    for source, owner in owned_inputs
                     if isinstance(source, SampleIndex) and source.limit is not None
                 ),
                 default=None,
@@ -2593,7 +2856,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             declaration.function_math(facts.device, facts.initialization_seed),
             declaration.bind_all(plan, model_probe=facts.probe, operations=operations),
             feeds=declaration.feeds,
-            on_export=self.on_export if declaration.has_exports else None,
+            on_export=self._export_handler(declaration, plan.semantic_graph),
         )
 
     def compile_host(self, config: HostConfig) -> StateExecution[StepInput, TensorFrame, TensorOutput]:
@@ -2630,7 +2893,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             MathBinding(
                 replace(math, prepare_data=checked_prepare),
                 b.bind_all(operations=b.executables(None, ())),
-                on_export=self.on_export if b.has_exports else None,
+                on_export=self._export_handler(b, b.graph),
             ),
             config,
             timeline,

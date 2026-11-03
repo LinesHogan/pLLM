@@ -17,6 +17,7 @@ from pllm.backends.vllm.compile_facts import compile_facts
 from pllm.backends.vllm.model_shape import ModelShape
 from pllm.config import ModelConfig
 from pllm.contracts.backend_attachment import AttachmentHiddenResource
+from pllm.contracts.codec import boundary_digest
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.packed_hidden import HiddenRowBatch, HiddenRows
 from pllm.contracts.packed_rows import PackedPhaseRow, label_rows
@@ -46,7 +47,7 @@ from pllm.execution.token_program import TokenProgram
 from pllm.execution.trace import TraceEventKind
 from pllm.testing_forward import CheckForward
 from pllm.testing_timing import VersionChecks
-from pllm.usage import Workload
+from pllm.usage import Workload, component_workloads
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,7 +138,9 @@ class _Run:
             if self.reads_shared(task, data, index, point[:2]):
                 self.shared_values.update((*point[:2], f"method {task.symbol}.{name}") for name in results)
                 if task.sampler_stage is not None:
-                    self.shared_values.update((*point[:2], name) for name in ("sampler", "sampler weight"))
+                    self.shared_values.update(
+                        (*point[:2], name) for name in (f"sampler {task.symbol}", f"sampler weight {task.symbol}")
+                    )
                 if task.export is not None:
                     self.shared_values.add((*point[:2], f"export {task.export.name}"))
 
@@ -281,7 +284,8 @@ def _step(
         resource: _hidden_values(shape, facts, resource, counts, channel, perturbed).to(
             torch.float32 if resource.binding.site is HiddenSite.LAYER_LOGITS else dtype
         )
-        for channel, resource in enumerate(facts.probe.hidden_resources)
+        for resource in facts.probe.hidden_resources
+        for channel in (int(boundary_digest(resource.binding.locator_key)[:8], 16),)
     }
     operands = tuple(
         ProjectionOperands(
@@ -419,13 +423,13 @@ def _execute_step(
         execution.advance_to(context, anchor.symbol)
         if anchor.ordinal == execution.sampler_anchor_id:
             guidance = context.guidance
-            if guidance is not None:
-                for index, sampler_index in enumerate(guidance.affected_row_ids):
+            for stage in guidance:
+                for index, sampler_index in enumerate(stage.affected_row_ids):
                     row = value.rows.rows[value.sampler_rows.links[sampler_index].packed_row_index]
                     point = row.identity.request_id, row.token_offset
-                    run.values[*point, "sampler"] = guidance.values[index].detach().clone()
-                    if guidance.row_weights is not None:
-                        run.values[*point, "sampler weight"] = guidance.row_weights[index].detach().clone()
+                    run.values[*point, f"sampler {stage.member}"] = stage.values[index].detach().clone()
+                    if stage.row_weights is not None:
+                        run.values[*point, f"sampler weight {stage.member}"] = stage.row_weights[index].detach().clone()
             execution.complete_sampler(context, feedback=feedback)
     for entry in () if execution.arena.plan.semantic_graph.updates_in_forward else context.data().entries:
         rows = tuple(row for row in value.rows.rows if row.identity == entry.identity)
@@ -697,13 +701,44 @@ def _variants(
     return failures
 
 
+def _component_independence(workload: Workload, config: ModelConfig) -> list[str]:
+    """Compare each field's state, methods and sampler stages with its standalone execution."""
+    failures: list[str] = []
+    shape, facts = _facts(workload, config)
+    facts, declaration = workload.specialize(facts, config.execution)
+    composite = _run(workload, facts, declaration, shape, (0, 1, 2))
+    outputs = composite.outputs()
+    for path, component in component_workloads(workload)[1:]:
+        shape, facts = _facts(component, config)
+        facts, declaration = component.specialize(facts, config.execution)
+        alone = _run(component, facts, declaration, shape, (0, 1, 2))
+        for (request, token, output), expected in alone.outputs().items():
+            kind = next(
+                (
+                    kind
+                    for kind in ("sampler weight", "sampler", "method", "state", "export")
+                    if output.startswith(kind + " ")
+                ),
+                None,
+            )
+            if kind is None:
+                continue
+            qualified = f"{kind} {path}.{output.removeprefix(kind + ' ')}"
+            actual = outputs.get((request, token, qualified))
+            try:
+                assert actual is not None, "missing component output"
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            except AssertionError as error:
+                failures.append(f"[component independence] {qualified}, request {request!r} at token {token}: {error}")
+    return failures
+
+
 def _neutral_failures(neutral: Workload, config: ModelConfig) -> list[str]:
     failures: list[str] = []
     neutral_shape, neutral_facts = _facts(neutral, config)
     neutral_facts, neutral_declaration = neutral.specialize(neutral_facts, config.execution)
     sampler = neutral.plan_backend(neutral_facts, neutral_declaration).spec.sampler
-    stage = None if sampler is None else sampler.stage
-    if stage is SamplerStage.PACKED_POST_FILTER_EXACT:
+    if any(stage.stage is SamplerStage.PACKED_POST_FILTER_EXACT for stage in sampler):
         failures.append("[neutral] guide_sampling still declares a sampler stage; set its beta to zero.")
     if neutral.backend_requirements().custom_forward or neutral.backend_requirements().custom_residual:
         neutral.plan_backend(neutral_facts, neutral_declaration)
@@ -713,7 +748,7 @@ def _neutral_failures(neutral: Workload, config: ModelConfig) -> list[str]:
     failures.extend(
         f"[neutral] {key}: add_logits must return exactly zero"
         for key, value in result.values.items()
-        if key[2] == "sampler" and torch.count_nonzero(value)
+        if key[2].startswith("sampler ") and torch.count_nonzero(value)
     )
     return failures
 
@@ -814,7 +849,7 @@ def _check(workload: Workload, config: ModelConfig) -> CheckResult:
         skipped.append(CheckSkip("activation application", "needs a loaded model; state producers are checked"))
     if declaration.graph.trains_on_batch:
         skipped.append(CheckSkip("host training", "no host batch in the request script; inference is checked"))
-        if not requirements.hidden_inputs and requirements.sampler_stage is None:
+        if not requirements.hidden_inputs and not requirements.sampler_stages:
             return CheckResult(
                 tuple(passed), (CheckSkip("CPU schedules", "host-batch-only workload; no request computation"),)
             )
@@ -879,6 +914,7 @@ def check(workload: Workload, config: ModelConfig, *, neutral: Workload | None =
     Permutes rows, perturbs neighbors, mixes chunked prompts, and replays preempted histories.
     Checks actual state versions against publish_lag; exact projection visibility uses chunk/replay equivalence.
     ContractError lists discrepancies and identifies workload row mixing or framework routing.
+    Composites also compare each field component with its standalone outputs, bitwise.
     Pass neutral= with disabled author settings to check zero additive logits or absent guidance.
     Model execution, host inputs and shared training exceptions are reported as explicit skips.
     """
@@ -886,6 +922,11 @@ def check(workload: Workload, config: ModelConfig, *, neutral: Workload | None =
     result = CheckResult((), ())
     try:
         result = _check(workload, config)
+        if len(component_workloads(workload)) > 1 and not any(
+            skip.property in ("CPU schedules", "model-site execution", "adaptive decoder") for skip in result.skipped
+        ):
+            failures.extend(_component_independence(workload, config))
+            result = replace(result, passed=(*result.passed, "component independence"))
     except ContractError as error:
         failures.extend(error.failures)
     except (RuntimeError, ValueError, TypeError) as error:

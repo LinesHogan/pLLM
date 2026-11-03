@@ -54,6 +54,7 @@ PATH_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("test/workloads/*grpo*", ("feedback",)),
     ("test/workloads/*", ()),
     ("test/boundary/*", ()),
+    ("test/gpu/core/test_sampler_composition.py", ()),
     ("test/gpu/core/*", ()),
     ("test/gpu/esamp_cuda_graph_replay_smoke.py", ()),
     ("doc/*", ()),

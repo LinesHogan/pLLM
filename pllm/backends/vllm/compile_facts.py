@@ -142,7 +142,7 @@ def compile_facts(
         observed,
         config.max_num_seqs,
         shape.padded_vocab_size,
-        requirements.sampler_stage,
+        requirements.sampler_stages,
         requirements.sampler_feedback,
     )
     required = tuple(value + overlay_graph_bytes for value in required)
@@ -173,7 +173,7 @@ def input_reservations(
     timeline: SchedulerTimeline,
     rows: int,
     vocab: int,
-    stage: SamplerStage | None,
+    stages: tuple[SamplerStage, ...],
     feedback: bool,
 ) -> tuple[int, ...]:
     """Reserve persistent capture storage and sampler scratch across model-step anchors."""
@@ -182,12 +182,11 @@ def input_reservations(
     hidden = sum(layout.resident_bytes for layout in hidden_layouts)
     # FP32 envelope for original logits, conversion, projection and rowwise arithmetic.
     # Excludes upstream sampling/GEMM library scratch, model weights and KV storage.
-    workspace = (
+    workspace = sum(
         rows * (36 * vocab + 4 * probe.hidden_size + 8)
         if stage is SamplerStage.PACKED_POST_FILTER_EXACT
         else rows * (12 * vocab + 8)
-        if stage is SamplerStage.PACKED_PRE_FILTER_ADD
-        else 0
+        for stage in stages
     )
     # Layer-logit projection retains gathered streams, norm operands and both model/FP32 logits.
     width = probe.tensor_dtype.itemsize

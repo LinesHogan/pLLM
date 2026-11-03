@@ -25,6 +25,7 @@ from pllm.backends.vllm.prefix_cache import POLICY_KEY, CachePolicy
 from pllm.backends.vllm.sampler import (
     SamplerGuidance,
     SignedSamplerGuidance,
+    SignedSamplerStages,
 )
 from pllm.contracts.backend_attachment import AttachmentGraphMode, BackendAttachment
 from pllm.contracts.codec import encode_boundary
@@ -440,23 +441,25 @@ class VllmSession(Generic[DataT, ResultT]):
             assert logits is not None
             self._layer_logits.compute(step.rows, logits)
         self.complete_forward()
-        if self._step is None or self._sampler is None or self._context().guidance is None:
+        if self._step is None or self._sampler is None or not self._context().guidance:
             return lm_head(hidden) if logits is None else logits
-        guidance = self._sampler_guidance()
-        if guidance.stage is not SamplerStage.PACKED_POST_FILTER_EXACT:
-            predicted = guidance.values
-        elif logits is None:
-            projected = lm_head(torch.cat((hidden, guidance.values.to(hidden.dtype))))
-            assert projected is not None
-            logits, predicted = projected[: len(hidden)], projected[len(hidden) :]
-        else:
-            predicted = lm_head(guidance.values.to(hidden.dtype))
-            assert predicted is not None
+        stages: list[SignedSamplerGuidance] = []
+        for guidance in self._sampler_guidance():
+            if guidance.stage is not SamplerStage.PACKED_POST_FILTER_EXACT:
+                predicted = guidance.values
+            elif logits is None:
+                projected = lm_head(torch.cat((hidden, guidance.values.to(hidden.dtype))))
+                assert projected is not None
+                logits, predicted = projected[: len(hidden)], projected[len(hidden) :]
+            else:
+                predicted = lm_head(guidance.values.to(hidden.dtype))
+                assert predicted is not None
+            stages.append(SignedSamplerGuidance(guidance, predicted))
         logits = lm_head(hidden) if logits is None else logits
-        self._sampler.begin_guidance(SignedSamplerGuidance(guidance, predicted, self._capture_feedback))
+        self._sampler.begin_guidance(SignedSamplerStages(tuple(stages), self._capture_feedback))
         return logits
 
-    def _sampler_guidance(self) -> PackedSamplerGuidanceBatch:
+    def _sampler_guidance(self) -> tuple[PackedSamplerGuidanceBatch, ...]:
         execution = self._deployment.execution
         return execution.sampler_guidance(self._context(), torch.cuda.current_stream(execution.device))
 

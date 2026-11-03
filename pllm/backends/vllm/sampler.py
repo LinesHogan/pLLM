@@ -20,6 +20,17 @@ from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback, 
 from pllm.execution.cuda_stream import upload
 
 
+def add_logits(logits: torch.Tensor, guidance: SignedSamplerGuidance) -> torch.Tensor:
+    """Add one declared contribution at its packed sampler rows."""
+    assert logits.shape == (guidance.guidance.total_rows, guidance.pred_dense_logits.shape[1])
+    if guidance.guidance.affected_row_ids == tuple(range(logits.shape[0])):
+        return logits + guidance.pred_dense_logits.to(logits)
+    rows = upload(guidance.guidance.affected_row_ids, logits.device)
+    output = logits.clone()
+    output.index_add_(0, rows, guidance.pred_dense_logits.to(logits))
+    return output
+
+
 def _reweight_unfused(survivors: torch.Tensor, prediction: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
     """(1 + beta) * logits - beta * prediction on the finite survivors, as one fused kernel.
 
@@ -39,7 +50,28 @@ class SignedSamplerGuidance:
 
     guidance: PackedSamplerGuidanceBatch
     pred_dense_logits: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class SignedSamplerStages:
+    """Declared-order additions followed by the optional filtered-distribution guide."""
+
+    stages: tuple[SignedSamplerGuidance, ...]
     capture_feedback: bool = False
+
+    @property
+    def guide(self) -> SignedSamplerGuidance | None:
+        """The at-most-one post-filter stage admitted by the authoring boundary."""
+        return next(
+            (stage for stage in self.stages if stage.guidance.stage is SamplerStage.PACKED_POST_FILTER_EXACT), None
+        )
+
+    def add_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Sum additions in their declared order before vLLM applies its filters."""
+        for stage in self.stages:
+            if stage.guidance.stage is SamplerStage.PACKED_PRE_FILTER_ADD:
+                logits = add_logits(logits, stage)
+        return logits
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,9 +82,9 @@ class _SampledGuidance:
 class SamplerGuidance:
     """One intervention lifecycle and mathematical boundary shared by both runner ABIs."""
 
-    _active_guidance: SignedSamplerGuidance | _SampledGuidance | None = None
+    _active_guidance: SignedSamplerStages | _SampledGuidance | None = None
 
-    def begin_guidance(self, guidance: SignedSamplerGuidance) -> None:
+    def begin_guidance(self, guidance: SignedSamplerStages) -> None:
         assert self._active_guidance is None
         self._active_guidance = guidance
 
@@ -68,16 +100,6 @@ class SamplerGuidance:
 
     def abort_guidance(self) -> None:
         self._active_guidance = None
-
-    @staticmethod
-    def _add_logits(logits: torch.Tensor, guidance: SignedSamplerGuidance) -> torch.Tensor:
-        assert logits.shape == (guidance.guidance.total_rows, guidance.pred_dense_logits.shape[1])
-        if guidance.guidance.affected_row_ids == tuple(range(logits.shape[0])):
-            return logits + guidance.pred_dense_logits.to(logits)
-        rows = upload(guidance.guidance.affected_row_ids, logits.device)
-        output = logits.clone()
-        output.index_add_(0, rows, guidance.pred_dense_logits.to(logits))
-        return output
 
     @staticmethod
     def _reweight_finite_survivors(processed_logits: torch.Tensor, guidance: SignedSamplerGuidance) -> torch.Tensor:
@@ -123,27 +145,26 @@ class GuidedSampler(compat.Sampler, SamplerGuidance):
             raise ValueError("pllm workloads need non-speculative decoding; disable speculative decoding")
         # The loaded vLLM instance's whole state: the inherited apply, draw and logprob methods read it.
         vars(self).update(vars(upstream))
-        self._active_guidance: SignedSamplerGuidance | _SampledGuidance | None = None
+        self._active_guidance: SignedSamplerStages | _SampledGuidance | None = None
 
     def __call__(self, logits: torch.Tensor, input_batch: InputBatch) -> SamplerOutput:
         match self._active_guidance:
             case None:
                 return super().__call__(logits, input_batch)
-            case SignedSamplerGuidance() as guidance:
-                feedback = None
-                if guidance.guidance.stage is SamplerStage.PACKED_PRE_FILTER_ADD:
-                    with torch.inference_mode(False):
-                        base_logits = logits.detach().clone() if guidance.capture_feedback else None
-                    output = super().__call__(self._add_logits(logits, guidance), input_batch)
-                    if base_logits is not None:
-                        with torch.inference_mode(False):
-                            feedback = SamplerFeedback(
-                                guidance.guidance.sampler_rows,
-                                base_logits,
-                                output.sampled_token_ids.detach().reshape(-1).clone(),
-                            )
-                else:
-                    output = super().__call__(logits, input_batch)
+            case SignedSamplerStages() as stages:
+                with torch.inference_mode(False):
+                    base_logits = logits.detach().clone() if stages.capture_feedback else None
+                output = super().__call__(stages.add_logits(logits), input_batch)
+                with torch.inference_mode(False):
+                    feedback = (
+                        SamplerFeedback(
+                            stages.stages[0].guidance.sampler_rows,
+                            base_logits,
+                            output.sampled_token_ids.detach().reshape(-1).clone(),
+                        )
+                        if base_logits is not None
+                        else None
+                    )
                 self._active_guidance = _SampledGuidance(feedback)
                 return output
             case _SampledGuidance():
@@ -160,9 +181,7 @@ class GuidedSampler(compat.Sampler, SamplerGuidance):
         use_fused_sampler: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         match self._active_guidance:
-            case SignedSamplerGuidance() as guidance if (
-                guidance.guidance.stage is not SamplerStage.PACKED_PRE_FILTER_ADD
-            ):
+            case SignedSamplerStages(guide=SignedSamplerGuidance() as guidance):
                 survivors = apply_top_k_top_p(processed_logits, top_k, top_p)
                 reweighted = self._reweight_finite_survivors(survivors, guidance)
                 return super()._sample_random(reweighted, expanded_idx_mapping, idx_mapping_np, pos, None, None, False)
@@ -191,16 +210,16 @@ class Mrv1Sampler(UpstreamMrv1Sampler, SamplerGuidance):
         match self._active_guidance:
             case None:
                 return super().forward(logits, sampling_metadata, predict_bonus_token, logprobs_mode_override)
-            case SignedSamplerGuidance() as guidance if not predict_bonus_token:
+            case SignedSamplerStages() as stages if not predict_bonus_token:
                 with torch.inference_mode(False):
-                    base = logits.detach().clone() if guidance.capture_feedback else None
-                if guidance.guidance.stage is SamplerStage.PACKED_PRE_FILTER_ADD:
-                    logits = self._add_logits(logits, guidance)
-                result = super().forward(logits, sampling_metadata, False, logprobs_mode_override)
+                    base = logits.detach().clone() if stages.capture_feedback else None
+                result = super().forward(stages.add_logits(logits), sampling_metadata, False, logprobs_mode_override)
                 with torch.inference_mode(False):
                     feedback = (
                         SamplerFeedback(
-                            guidance.guidance.sampler_rows, base, result.sampled_token_ids.detach().reshape(-1).clone()
+                            stages.stages[0].guidance.sampler_rows,
+                            base,
+                            result.sampled_token_ids.detach().reshape(-1).clone(),
                         )
                         if base is not None
                         else None
@@ -217,9 +236,7 @@ class Mrv1Sampler(UpstreamMrv1Sampler, SamplerGuidance):
         logprobs_mode_override: LogprobsMode | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         match self._active_guidance:
-            case SignedSamplerGuidance() as guidance if (
-                guidance.guidance.stage is not SamplerStage.PACKED_PRE_FILTER_ADD
-            ):
+            case SignedSamplerStages(guide=SignedSamplerGuidance() as guidance):
                 pass
             case _:
                 return super().sample(logits, sampling_metadata, logprobs_mode_override)
@@ -249,4 +266,5 @@ class Mrv1Sampler(UpstreamMrv1Sampler, SamplerGuidance):
 __all__ = [
     "GuidedSampler",
     "SignedSamplerGuidance",
+    "SignedSamplerStages",
 ]

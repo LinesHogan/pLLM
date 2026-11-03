@@ -95,7 +95,7 @@ class Runner:
             raise ValueError("disable prefix caching when using parameter overlays or activation patches")
         if deployment.attachment.probe.position_states != self.position_states:
             raise ValueError("PositionState schema changed; create a new engine with this workload")
-        adapter = self._sampler_guidance if spec.sampler is not None else None
+        adapter = self._sampler_guidance if spec.sampler else None
         session = VllmSession(
             deployment,
             self.decoder,

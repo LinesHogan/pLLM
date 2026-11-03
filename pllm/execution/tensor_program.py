@@ -22,7 +22,7 @@ from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.parameter_overlay import Projection
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.request_state import RequestStateKey
-from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
+from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback, SamplerStage
 from pllm.contracts.semantic_graph import ImplementationId, SemanticOutputKind, StateResource, TaskSymbol
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
@@ -168,7 +168,7 @@ def autograd_loss(
 @dataclass(frozen=True, slots=True)
 class InvocationOutput:
     selection: RequestStateSelection
-    guidance: PackedSamplerGuidanceBatch | None
+    guidance: tuple[PackedSamplerGuidanceBatch, ...]
     publication: PagePublication | None
     loss: torch.Tensor | None = None
     value: torch.Tensor | None = None
@@ -548,7 +548,12 @@ class TensorOperation(Generic[D]):
                     else context.training_counters + output.counters
                 )
             if output.guidance is not None:
-                context.guidance = output.guidance
+                context.guidance = tuple(
+                    sorted(
+                        (*context.guidance, output.guidance),
+                        key=lambda item: (item.stage is SamplerStage.PACKED_POST_FILTER_EXACT, item.order),
+                    )
+                )
                 context.guidance_ready = CudaStreamReadiness(stream) if stream is not None else None
             if output.loss is not None:
                 context.loss = output.loss

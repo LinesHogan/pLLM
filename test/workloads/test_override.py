@@ -118,8 +118,8 @@ def _reweight_oracle():
         ).detach()
         before = execution.snapshot(latest)
         result = run(execution, value)
-        torch.testing.assert_close(result.guidance.values, expected)
-        assert result.guidance.affected_row_ids == tuple(link.sampler_row_index for link in decode)
+        torch.testing.assert_close(result.guidance[0].values, expected)
+        assert result.guidance[0].affected_row_ids == tuple(link.sampler_row_index for link in decode)
         selected = [link for link in decode if sample(link) < 2]
         if not selected:
             # No eligible row: the state republishes its exact values.
@@ -148,7 +148,7 @@ def _reweight_oracle():
     single = OverRIDEWorkload(replace(config, num_iterations=1)).compile_backend(facts).execution
     single.admit(())
     result = run(single, samples((0,), 6), BASE[:1], TOKENS[:1])
-    assert not result.guidance.values.any() and result.loss.item() == 0
+    assert not result.guidance[0].values.any() and result.loss.item() == 0
     single.retire(())
 
     def zero_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -264,7 +264,7 @@ def _chained_heads(facts) -> None:
     loss.backward()
     optimizer.step()
     result = run(chain, samples((0, 2, 0), 9))
-    torch.testing.assert_close(result.guidance.values, predicted.detach())
+    torch.testing.assert_close(result.guidance[0].values, predicted.detach())
     torch.testing.assert_close(result.loss, loss.detach())
     torch.testing.assert_close(result.input_gradients["reweight", "hidden"], oracle_input.grad)
     torch.testing.assert_close(chain.snapshot(result.publication.after_refs[0])[0].reshape(4, 7), weight)
@@ -409,7 +409,7 @@ def _domains_oracle(device, request, identities) -> None:
         value = step_input(sampled, hidden, step_id, stream=stream)
         tokens = torch.full((4,), int(no_feedback_update), device=device, dtype=torch.long)
         result = run(execution, value, torch.zeros((4, 7), device=device), tokens, stream)
-        torch.testing.assert_close(result.guidance.values, expected_output)
+        torch.testing.assert_close(result.guidance[0].values, expected_output)
         if loss is None:
             assert result.loss.item() == 0 and not result.input_gradients["reweight", "hidden"].any()
         else:

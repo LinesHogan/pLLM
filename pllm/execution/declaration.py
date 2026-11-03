@@ -497,9 +497,10 @@ class Builder(Generic[D]):
         output: str = "publication",
         implementations: tuple[TaskImplementationSpec, ...] = (),
     ) -> Call:
-        implementations = implementations or (native("state:publish@1", "transition/full_root@1"),)
+        name = name or f"{state.declaration.resource}.publish"
+        implementations = implementations or (native(f"state:{name}@1", "transition/full_root@1"),)
         call = self.compute(
-            name or f"{state.declaration.resource}.publish",
+            name,
             inputs={"transition": transition[transition.outputs[0]]},
             outputs=(output,),
             changes=state,
@@ -516,7 +517,7 @@ class Builder(Generic[D]):
 
     def sampler(self, prediction: Call, stage: SamplerStage) -> None:
         """Send `prediction`'s result to vLLM's sampler at `stage`."""
-        self.effects = replace(self.effects, sampler=SamplerBinding(prediction.symbol, stage))
+        self.effects = replace(self.effects, sampler=(*self.effects.sampler, SamplerBinding(prediction.symbol, stage)))
 
     def trains(self, transition: Call) -> None:
         """Record a @pllm.train method."""

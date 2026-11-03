@@ -74,7 +74,7 @@ def test_weighted_ce_shared_update_matches_sgd_and_preserves_original_pins() -> 
     for actual, expected in zip(execution.snapshot(latest), (a, b), strict=True):
         torch.testing.assert_close(actual, expected)
     guidance, idle = testing.run_guided_step(execution, replace(value, batch=None))
-    torch.testing.assert_close(guidance.values, hidden @ a @ b * 1.5)
+    torch.testing.assert_close(guidance[0].values, hidden @ a @ b * 1.5)
     assert idle.publication is None and idle.loss is None
     for actual, expected in zip(execution.arena.snapshot(old_pin, initial), original, strict=True):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -137,7 +137,7 @@ def test_independent_lora_bmm_preserves_keyed_mean_and_private_publication(devic
                 for factors in (references[1], references[0], original[2])
             ]
         )
-        torch.testing.assert_close(guidance.values, expected, rtol=1e-5, atol=1e-7)
+        torch.testing.assert_close(guidance[0].values, expected, rtol=1e-5, atol=1e-7)
         for ref, expected in zip(initial, original, strict=True):
             for actual, target in zip(execution.arena.snapshot(old_pin, ref), expected, strict=True):
                 torch.testing.assert_close(actual, target, rtol=0, atol=0)

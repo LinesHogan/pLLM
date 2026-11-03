@@ -19,10 +19,10 @@ from test import reference_huber as oracle
 
 def effective(guidance):
     """Rows the guidance actually changes (nonzero weight) and their predictions."""
-    if guidance.row_weights is None:
-        return guidance.affected_row_ids, guidance.values
-    keep = [index for index, weight in enumerate(guidance.row_weights.tolist()) if weight]
-    return tuple(guidance.affected_row_ids[index] for index in keep), guidance.values[keep]
+    if guidance[0].row_weights is None:
+        return guidance[0].affected_row_ids, guidance[0].values
+    keep = [index for index, weight in enumerate(guidance[0].row_weights.tolist()) if weight]
+    return tuple(guidance[0].affected_row_ids[index] for index in keep), guidance[0].values[keep]
 
 
 def test_huber(device_name) -> None:
@@ -108,7 +108,7 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
         guidance = execution.sampler_guidance(handle, stream)
         rows, values = effective(guidance)
         assert rows == tuple(link.sampler_row_index for link in active)
-        assert guidance.beta == 0.2
+        assert guidance[0].beta == 0.2
         torch.testing.assert_close(values, predicted)
         for ref, snapshot in zip(latest, before, strict=True):
             for actual, expected in zip(execution.snapshot(ref, stream), snapshot, strict=True):

@@ -308,13 +308,13 @@ def declare_weighted_train(
     application = PoolSGD(optimizer.lr)
     prepare_function = partial(prepare_weighted_batch, b.dimensions, fields, reset)
     prepared = b.compute(
-        f"__{name}_prepare",
+        f"{name}.prepare",
         inputs={"state": state.read(), "batch": b.input("training", "batch", WeightedCEBatch.schema)},
         outputs=("batch",),
         when=When.BEFORE_SAMPLE,
         function=prepare_function,
         operation_type=BatchPreparation,
-        implementations=(native("weighted_batch:prepare@1"),),
+        implementations=(native(f"{name}:weighted_batch:prepare@1"),),
     )
 
     def execute(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
