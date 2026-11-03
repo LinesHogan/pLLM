@@ -10,6 +10,7 @@ from safetensors.torch import save_file
 
 import pllm
 from pllm import testing
+from pllm.backends.vllm import compat
 from pllm.contracts.host_batch import validate_host_batch
 from pllm.execution.post_sample import PostSampleOverlap
 from pllm.execution.runtime_facts import model_timeline
@@ -317,7 +318,13 @@ class MoR(pllm.Workload):
 
 
 @pytest.mark.parametrize("workload,state", ((LoopedDepth(), "gate"), (MoR(), "router")))
-def test_custom_forward_state_check_and_explain(workload, state, model_config):
+@pytest.mark.parametrize("tp", (1, 2))
+def test_custom_forward_state_check_and_explain(workload, state, model_config, tp):
+    model_config = replace(model_config, tensor_parallel_size=tp)
+    if tp > 1 and compat.VLLM_027:
+        with pytest.raises(testing.ContractError, match="vLLM 0.32.0"):
+            testing.check(workload, model_config)
+        return
     result = testing.check(workload, model_config)
     assert {
         "custom-forward instance reads / CPU decoder",
@@ -329,6 +336,7 @@ def test_custom_forward_state_check_and_explain(workload, state, model_config):
     report = pllm.explain(workload, model_config)
     assert report.recompute_rejection is None
     assert report.preemption == "reset"
+    assert report.tensor_parallel_size == tp
     assert "CUDA conditional nodes" in str(report) and "0 blocking host syncs" in str(report)
     member = next(member for member in report.members if member.name == "forward")
     assert state in member.tasks[0].reads

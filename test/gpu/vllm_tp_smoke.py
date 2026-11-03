@@ -153,12 +153,12 @@ def test_j1_admission():
     for name in ("pipeline_parallel_size", "data_parallel_size"):
         with pytest.raises(ValueError, match=name + "=1"):
             pllm.make_llm(replace(config(), **{name: 2}), workload=DummyWorkload())
-    for workload, message in (
-        (PrefillAdaptersWorkload(), "parameter overlays"),
-        (TLMWorkload(TLMConfig()), "causal_model"),
-        (VideoWorkload(), "state feeds"),
+    for workload, message, milestone in (
+        (PrefillAdaptersWorkload(), "parameter overlays", "M3/M4"),
+        (TLMWorkload(TLMConfig()), "causal_model", "M5"),
+        (VideoWorkload(), "state feeds", "E1"),
     ):
-        with pytest.raises(ValueError, match=message + ".*tensor_parallel_size=1"):
+        with pytest.raises(ValueError, match=message + ".*tensor_parallel_size=1.*" + milestone):
             pllm.make_llm(config(), workload=workload)
     with pytest.raises(ValueError, match='runner="mrv2"'):
         pllm.make_llm(replace(config(), runner="mrv1"), workload=DummyWorkload())
@@ -270,3 +270,156 @@ def test_activation_patch_steers_replicated_streams():
     print(f"TP=2 steering vs TP=1: {agreeing}/{24 * len(PROMPTS)} leading tokens agree, logprob gap {gap:.4f}")
     # TP=1 and TP=2 reduce in different orders (bf16 logprobs differ by ~0.2); a doubled edit diverges the tokens.
     assert agreeing >= 0.75 * 24 * len(PROMPTS) and gap < 0.5
+
+
+class EarlyExit(pllm.Workload):
+    """Exercise empty, full and compact active slices with replicated hidden decisions."""
+
+    @pllm.custom_forward(tokens="decode")
+    def forward(self, layers):
+        middle = layers.layer_count // 2
+        hidden = layers(stop=middle)[middle - 1]
+        active = (hidden.float().square().mean(-1, keepdim=True) > 0) & (layers.position % 4 < 2)
+        return layers(middle, hidden=hidden, active=active)[-1]
+
+    @pllm.export(max_cols=1)
+    def readout(self, hidden=pllm.residual(22)):
+        return hidden.float().mean(-1, keepdim=True)
+
+
+_ROUTE = []
+_SAMPLES = []
+
+
+def _record_routes(worker, forced=()):
+    from vllm.forward_context import get_forward_context
+
+    from test.gpu.vllm_tp_smoke import _ROUTE, _SAMPLES
+
+    _ROUTE.clear()
+    _SAMPLES.clear()
+    runner = worker.workload_runner
+    primitive = runner.require_session()._custom_forward
+    forward = primitive.model.forward
+    sample = runner.sampler._sample_random
+
+    def record(*args, **kwargs):
+        output = forward(*args, **kwargs)
+        context = get_forward_context()
+        pages = tuple(
+            layer.kv_cache.view(-1, output.shape[-1])[
+                context.slot_mapping[layer.layer_name] // primitive.allocation
+            ].cpu()
+            for layer in primitive.position_layers
+        )
+        _ROUTE.append((output.cpu(), primitive.observations.cpu(), pages))
+        return output
+
+    def sampled(*args, **kwargs):
+        result = sample(*args, **kwargs)
+        natural, logits = result
+        target = forced[len(_SAMPLES)].to(natural.device) if forced else natural
+        chosen = logits.gather(1, target.reshape(-1, 1)).flatten()
+        regret = logits.max(-1).values - chosen
+        _SAMPLES.append((natural.cpu(), chosen.cpu(), regret.cpu()))
+        _ROUTE.append(natural.cpu())
+        # A shared token history distinguishes TP rounding from an autoregressive cascade.
+        natural.copy_(target)
+        return result
+
+    primitive.model.forward = record
+    runner.sampler._sample_random = sampled
+
+
+def _route_digest(worker):
+    from test.gpu.vllm_tp_smoke import _ROUTE
+
+    def digest(value):
+        if isinstance(value, torch.Tensor):
+            return sha256(value.view(torch.uint8).numpy().tobytes()).hexdigest()
+        return tuple(digest(item) for item in value)
+
+    return digest(_ROUTE)
+
+
+def _route_samples(worker):
+    from test.gpu.vllm_tp_smoke import _SAMPLES
+
+    return _SAMPLES
+
+
+def _native_steps(worker, enabled):
+    from test.gpu.native_replay import NativeSteps
+
+    if enabled:
+        NativeSteps.begin_native_steps(worker)
+    else:
+        NativeSteps.end_native_steps(worker)
+
+
+_ROUTE_PROMPTS = ["Continue the alphabet: A, B, C,", "One plus one is", "Water is"]
+
+
+def _route_generation(settings, workload, forced, native):
+    with pllm.make_llm(settings, workload=workload) as handle:
+        llm = handle._require_open()
+        if native:
+            llm.collective_rpc(_native_steps, args=(True,))
+        try:
+            llm.collective_rpc(_record_routes, args=(forced,))
+            output = handle.generate(
+                _ROUTE_PROMPTS, SamplingParams(max_tokens=16, temperature=0, ignore_eos=True), use_tqdm=False
+            )
+            digests = llm.collective_rpc(_route_digest)
+            assert digests[0] and all(item == digests[0] for item in digests)
+            samples = llm.collective_rpc(_route_samples)[0]
+            handle.diagnostics()
+            return tokens(output), digests[0], samples
+        finally:
+            if native:
+                llm.collective_rpc(_native_steps, args=(False,))
+
+
+@pytest.mark.parametrize("graphs", [False, "auto"])
+@pytest.mark.parametrize("route", ["step_loop", "recirculation", "early_exit"])
+def test_j5_routes(route, graphs):
+    """Compare TP choices on shared histories, with strict rank/run/native equality.
+
+    BF16 GEMMs/reduction order change across TP sizes. Allow 0.5 logit for
+    recirculation/exit and 1.0 for the repeatedly fed-back StepLoop carry over
+    sixteen steps. Teacher forcing avoids changes to later token inputs. The
+    independent native StepLoop oracle must match every carry, norm and KV bit.
+    """
+    from pllm.workloads.recirculation import RecirculationWorkload
+    from pllm.workloads.step_loop import StepLoopWorkload
+
+    workloads = {"step_loop": StepLoopWorkload(), "recirculation": RecirculationWorkload(), "early_exit": EarlyExit()}
+    settings = replace(config(graphs=graphs), execution=ExecutionOptions(capture_memory_bytes=256 << 20))
+    reference = repeated = None
+    forced = reference_scores = ()
+    tolerance = 1.0 if route == "step_loop" else 0.5
+    for tp in (1, 2, 2):
+        observed, digest, samples = _route_generation(
+            replace(settings, tensor_parallel_size=tp), workloads[route], forced, route == "step_loop"
+        )
+        if tp == 1:
+            reference = observed
+            forced = tuple(sample[0] for sample in samples)
+            reference_scores = tuple(sample[1] for sample in samples)
+            continue
+        assert observed == reference
+        regret = max(float(sample[2].max()) for sample in samples)
+        agreeing = sum(int((sample[0] == target).sum()) for sample, target in zip(samples, forced, strict=True))
+        score_error = max(
+            float((sample[1] - score).abs().max()) for sample, score in zip(samples, reference_scores, strict=True)
+        )
+        assert regret <= tolerance and score_error <= tolerance, (route, graphs, regret, score_error)
+        if repeated is not None:
+            assert (observed, digest) == repeated
+        repeated = observed, digest
+        print(
+            f"J5 {route} graphs={graphs}: {agreeing}/{16 * len(_ROUTE_PROMPTS)} natural TP=1/2 tokens agree; "
+            f"max greedy regret={regret:.6f}, selected-logit error={score_error:.6f} (bound {tolerance}); "
+            "ranks/runs bitwise equal",
+            flush=True,
+        )

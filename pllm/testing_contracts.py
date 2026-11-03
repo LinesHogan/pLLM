@@ -13,6 +13,7 @@ from typing import Literal
 import numpy as np
 import torch
 
+from pllm.backends.vllm.compat import admit_parallel
 from pllm.backends.vllm.compile_facts import compile_facts
 from pllm.backends.vllm.model_shape import ModelShape
 from pllm.config import ModelConfig
@@ -819,9 +820,13 @@ def _check(workload: Workload, config: ModelConfig) -> CheckResult:
     skipped: list[CheckSkip] = []
     failures: list[str] = []
     requirements = workload.backend_requirements()
+    admit_parallel(config, requirements)
+    passed.append(f"tensor_parallel_size={config.tensor_parallel_size}: admission")
+    if config.tensor_parallel_size > 1:
+        skipped.append(CheckSkip("TP rank equality", "CPU schedules do not run TP workers; verify on multiple GPUs"))
     if requirements.causal_training or requirements.feeds:
         reason = "requires a causal model" if requirements.causal_training else "requires a host feed"
-        return CheckResult((), (CheckSkip("CPU schedules", reason),))
+        return CheckResult(tuple(passed), (*skipped, CheckSkip("CPU schedules", reason)))
     try:
         shape, facts = _facts(workload, config)
         facts, declaration = workload.specialize(facts, config.execution)
@@ -879,6 +884,7 @@ def _check(workload: Workload, config: ModelConfig) -> CheckResult:
         return CheckResult(
             tuple(passed),
             (
+                *skipped,
                 CheckSkip(
                     "model-site execution",
                     "CPU decoder does not execute residual hooks, overlays, spans or PositionState",

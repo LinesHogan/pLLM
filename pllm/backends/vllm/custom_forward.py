@@ -9,6 +9,7 @@ from typing import Generic
 
 import numpy as np
 import torch
+from vllm.distributed.parallel_state import GraphCaptureContext, get_tp_group
 from vllm.forward_context import get_forward_context, override_forward_context
 from vllm.sequence import IntermediateTensors
 
@@ -156,7 +157,11 @@ class ProgramWave(Generic[DataT, ResultT]):
             self.position.reset()
 
         try:
-            with override_forward_context(self.attention.context):
+            # Native decoder all-reduces must register every captured buffer on all TP ranks.
+            with (
+                override_forward_context(self.attention.context),
+                get_tp_group().graph_capture(GraphCaptureContext(torch.cuda.current_stream(self.seed.device))),
+            ):
                 self.graph, self.output, resident = capture_graph(
                     self.seed.device, self.body, restore=restore, pool=self.custom_forward.pool
                 )

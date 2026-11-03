@@ -144,3 +144,23 @@ def test_declared_flop_estimates(model_config):
     )
     assert "estimate / step" in str(report)
     assert all(field.dtype for state in report.states for field in state.fields)
+
+
+@pytest.mark.parametrize("workload", (StepLoopWorkload(), RecirculationWorkload()))
+def test_tp_route_reports_and_cpu_check(workload, model_config):
+    from pllm import testing
+    from pllm.backends.vllm import compat
+
+    config = replace(model_config, tensor_parallel_size=2)
+    if compat.VLLM_027:
+        with pytest.raises(ValueError, match="vLLM 0.32.0"):
+            pllm.explain(workload, config)
+        with pytest.raises(testing.ContractError, match="vLLM 0.32.0"):
+            testing.check(workload, config)
+        return
+    report = pllm.explain(workload, config)
+    assert asdict(report)["tensor_parallel_size"] == 2
+    assert "per-rank" in report.memory_label and "replicated across TP ranks" in str(report)
+    checked = testing.check(workload, config)
+    assert "tensor_parallel_size=2: admission" in checked.passed
+    assert any(item.property == "TP rank equality" for item in checked.skipped)

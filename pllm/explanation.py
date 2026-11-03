@@ -108,6 +108,7 @@ class ExplainResult:
     model: ModelShape
     dtype: str
     runner: str
+    tensor_parallel_size: int
     eager_reason: str
     members: tuple[MemberCost, ...]
     framework_tasks: tuple[TaskCost, ...]
@@ -131,6 +132,7 @@ class ExplainResult:
         lines = [
             f"model    {self.model.architecture}, hidden {self.model.hidden_size}, {self.model.layer_count} layers, "
             f"vocab {self.model.vocab_size}, {self.dtype} [exact, config.json]",
+            f"parallel tensor_parallel_size={self.tensor_parallel_size}; reservations are per rank",
             f"forward  {forward}",
             f"base     {self.model.base_forward_flops_per_token_estimate} FLOP/token [estimate: dense projections and LM head; excludes attention over KV history]",
             "member  effect  anchor / lane / graph  state reads (origin, distance)",
@@ -497,6 +499,7 @@ def explain_facts(
         shape,
         config.dtype,
         config.runner,
+        config.tensor_parallel_size,
         reason,
         _members(binding, costs, dict(eager_reasons(config, requirements)), config.execution.max_training_rows),
         tuple(cost for symbol, cost in costs.items() if symbol not in binding.task_members),
@@ -507,7 +510,7 @@ def explain_facts(
         ),
         _taps(binding, facts, layouts),
         plan.schedule.peak_memory_bytes,
-        "tensor reservations; excludes GPU-dependent BLAS workspace",
+        "per-rank tensor reservations; excludes GPU-dependent BLAS workspace",
         threshold,
         inline_peak,
         (*specialization_errors, *errors),
@@ -517,6 +520,7 @@ def explain_facts(
         tuple(attachment.spec.exports),
         _settings(binding, config, plan),
         (
+            "Hidden taps, route math and PositionState are replicated across TP ranks; pllm issues no tensor collectives. PositionState uses each rank's KV budget.",
             "GPU fit is decided at make_llm after vLLM allocates; weights, KV cache, vLLM activations and fragmentation are excluded.",
             "Projection and scan BLAS workspace depends on the GPU; affected peaks and overlap thresholds are lower bounds until make_llm.",
             "FLOP and byte estimates use max_num_seqs decode rows, declared-field reads and full-root transitions including optimizer fields, no cache reuse; prompt/model-site costs can differ.",
