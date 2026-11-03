@@ -353,7 +353,7 @@ def _plans(
         try:
             selected = workload.plan_backend(limited, binding)
         except ValueError as error:
-            errors.append(f"{error}; lower max_num_seqs or max_num_batched_tokens, or raise the named execution budget")
+            errors.append(str(error))
     return selected, threshold, inline.plan.schedule.peak_memory_bytes, tuple(errors)
 
 

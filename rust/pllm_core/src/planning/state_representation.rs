@@ -193,7 +193,27 @@ pub(super) fn compile(
     )?;
     best.ok_or_else(|| {
         failure.unwrap_or_else(|| {
-            "state representations exceed ExecutionOptions.memory_budget_bytes".into()
+            let required: u64 = request
+                .states
+                .iter()
+                .map(|state| {
+                    request
+                        .candidates
+                        .iter()
+                        .filter(|candidate| candidate.resource == state.resource)
+                        .map(|candidate| candidate.reserved_bytes)
+                        .min()
+                        .unwrap()
+                })
+                .sum();
+            format!(
+                "state needs at least {required} bytes, but the state memory budget is {} bytes; \
+                 lower gpu_memory_utilization to leave at least {} more bytes free, \
+                 or lower max_num_seqs to reduce request-state storage. \
+                 If you set ExecutionOptions.state_memory_bytes, raise it to at least {required}",
+                request.memory_budget_bytes,
+                required.saturating_sub(request.memory_budget_bytes),
+            )
         })
     })
 }
