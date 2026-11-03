@@ -294,11 +294,15 @@ class TokenProgram:
             seed = torch.empty(shape, dtype=tensor.dtype, device=tensor.device)
             position = torch.empty((shape[0], 1), dtype=torch.int64, device=tensor.device)
             generated = torch.empty((shape[0], 1), dtype=torch.bool, device=tensor.device)
+            arguments = (seed, position, generated, *(torch.empty_like(seed) for _ in names))
             graph = make_fx(
-                torch.func.functionalize(invoke),
+                invoke,
                 decomposition_table=tensor_decompositions((torch.ops.aten.linalg_vector_norm.default,)),
                 tracing_mode="fake",
-            )(seed, position, generated, *(torch.empty_like(seed) for _ in names))
+            )(*arguments)
+            # Composite ATen decompositions (notably cosine_similarity) can introduce
+            # mutations after dispatch functionalization, so functionalize their graph.
+            graph = make_fx(torch.func.functionalize(graph), tracing_mode="fake")(*arguments)
             steps: list[Segment | Cell | ApplyUpdates | Save | Output] = []
             pending: list[torch.fx.Node] = []
             committed: set[int] = set()

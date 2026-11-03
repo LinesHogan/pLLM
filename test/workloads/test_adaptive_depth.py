@@ -34,7 +34,7 @@ def test_adaptive_contracts_and_explanation():
     assert "adaptive depth" in report.recompute_rejection
 
 
-@pytest.mark.parametrize("rule", ("all", "none", "mixed"))
+@pytest.mark.parametrize("rule", ("all", "none", "mixed", "cosine"))
 def test_masked_oracle_and_compaction(rule):
     def forward(layers):
         hidden = layers(0, 1)[0]
@@ -42,6 +42,10 @@ def test_masked_oracle_and_compaction(rule):
             "all": torch.ones_like(hidden[:, :1], dtype=torch.bool),
             "none": torch.zeros_like(hidden[:, :1], dtype=torch.bool),
             "mixed": hidden[:, :1] > 0,
+            "cosine": torch.nn.functional.cosine_similarity(
+                hidden.float(), layers.embeddings.float(), dim=-1
+            ).unsqueeze(-1)
+            < 0.99,
         }[rule]
         return layers(1, hidden=hidden, active=active)[-1]
 

@@ -221,8 +221,11 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
 
     @contextmanager
     def sites_rows(self, packed: torch.Tensor, rows: tuple[int, ...]) -> Generator[Stream]:
-        """Point the custom residual hooks at the packed rows of the layers run inside (on the device and the host),
-        and give the program the stream after a layer as those hooks complete it."""
+        """Select device rows for residual inputs and host rows for patch presence.
+
+        Compacted waves retain their parent's homogeneous patch presence; device indices
+        still gather each selected request's fields. Return the hooks' completed stream.
+        """
         if self.sites is None:
             yield add
             return

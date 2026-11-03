@@ -310,7 +310,7 @@ def _settings(binding: TensorBinding, config: ModelConfig, plan: PlanBundle) -> 
                     True,
                     "stable compaction into power-of-two buckets plus exact all-active width; 0 blocking host syncs per step; "
                     "first skipped commit propagates native norm/QKV/RoPE, later skips retain KV; "
-                    "decode GEMMs save most when all rows exit; propagation costs about 7% per skipped layer (estimate)",
+                    "decode GEMMs save most when all rows exit; full-QKV propagation is about 7% of Qwen2.5 layer FLOPs (estimate)",
                 )
             )
         phases = tuple(

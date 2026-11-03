@@ -36,6 +36,15 @@ class Exit(pllm.Workload):
         )
 
 
+@dataclass(frozen=True)
+class ValueExit(Exit):
+    """Exercise value rewrites on both computed and propagated K/V."""
+
+    @pllm.custom_residual(site="value")
+    def rewrite(self, v):
+        return v * 0.9
+
+
 def cells(wave):
     return tuple(
         (attention.kv_cache, wave.attention.metadata[attention.layer_name].slot_mapping)
@@ -199,6 +208,7 @@ def main():
     parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--tokens", type=int, default=16)
+    parser.add_argument("--value-rewrite", action="store_true")
     parser.add_argument("--rule", choices=("none", "all", "mixed"), default="none")
     args = parser.parse_args()
     config = pllm.ModelConfig(
@@ -221,7 +231,7 @@ def main():
         del baseline
         gc.collect()
         torch.cuda.empty_cache()
-    handle = pllm.make_llm(workload=Exit(args.rule), config=config)
+    handle = pllm.make_llm(workload=ValueExit(args.rule) if args.value_rewrite else Exit(args.rule), config=config)
     audit = Audit(
         args.rule,
         lambda hidden: torch.nn.functional.linear(hidden, handle.runner.model.lm_head.weight),

@@ -18,7 +18,7 @@ def eager_reasons(config: ModelConfig, requirements: BackendRequirements) -> Ite
     if requirements.activation_layers:
         yield "ActivationPatch", "activation patches run outside CUDA graphs"
     if requirements.custom_forward:
-        yield "custom_forward", "@pllm.custom_forward reruns model layers outside CUDA graphs"
+        yield "custom_forward", "@pllm.custom_forward schedules model slices and owns their wave graphs"
     if requirements.custom_residual:
         yield "custom_residual", "@pllm.custom_residual runs the model without CUDA graphs"
     if requirements.instance_adapter:

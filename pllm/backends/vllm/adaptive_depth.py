@@ -90,12 +90,16 @@ class AdaptiveSlice:
     def propagate(self, step: Segment, hidden: torch.Tensor, active: torch.Tensor) -> None:
         """Use native QKV/QK-norm/RoPE and value rewrites, omitting attention and the output projection."""
         owner = self.wave.custom_forward
+        mappings: dict[int, torch.Tensor] = {}
         for ordinal in step.propagate:
             layer = owner.model.layers[ordinal]
             attention = layer.self_attn
-            slots = self.wave.attention.metadata[attention.attn.layer_name].slot_mapping.masked_fill(
-                active.flatten(), -1
-            )
+            group = self.wave.attention.group_ids[ordinal]
+            if group not in mappings:
+                mappings[group] = self.wave.attention.metadata[attention.attn.layer_name].slot_mapping.masked_fill(
+                    active.flatten(), -1
+                )
+            slots = mappings[group]
             endpoint, projection = attention.attn.forward, attention.o_proj.forward
             try:
                 attention.attn.forward = partial(_store, attention.attn, slots)
@@ -150,9 +154,11 @@ class AdaptiveSlice:
                 metadata.seq_lens.masked_fill_(~selected.flatten(), 1)
         self.positions = wave.positions.index_select(0, rows)
         seed = hidden.index_select(0, rows)
+        # A wave already groups equal patch presence. Keep its host presence rows;
+        # per-request patch fields are gathered with the compacted device indices.
         with (
             override_forward_context(bucket.context),
-            owner.sites_rows(wave.indices[0].index_select(0, rows), ()) as stream,
+            owner.sites_rows(wave.indices[0].index_select(0, rows), wave.packed) as stream,
         ):
             computed = execute_segment(step, seed, self.layer, stream)
             for destination, value in zip(output, computed, strict=True):
