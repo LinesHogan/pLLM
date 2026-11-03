@@ -689,7 +689,7 @@ pllm.host.make_host(config: 'HostConfig', workload: 'Workload') -> 'StateExecuti
     Compile `workload` without a model; each `step(StepInput.of_batch(batch))` trains on one host batch and returns a StepResult.
 pllm.host.HostConfig(device: 'torch.device', hidden_size: 'int' = 0, target_shape: 'tuple[int, ...]' = (), seed: 'int' = 0, state_memory_bytes: 'int' = 67108864, max_input_rows: 'int | None' = None, memory_budget_bytes: 'int | None' = None)
     What pllm.host.make_host compiles a workload against: the device, the width of hidden rows in host batches and the shape of each row's target (() for one value per row), the seed of initial state values, and the state and per-step memory limits (max_input_rows bounds a batch).
-pllm.host.StepInput(rows: 'PackedPhaseRowBatch', sampler_rows: 'PackedSamplerRowBatch', hidden: 'HiddenRowBatch | None' = None, operands: 'tuple[ProjectionOperands, ...]' = (), batch: 'HostBatch[torch.Tensor] | None' = None, hidden_readiness: 'CudaStreamReadiness | None' = None, batch_readiness: 'CudaStreamReadiness | None' = None)
+pllm.host.StepInput(rows: 'PackedPhaseRowBatch', sampler_rows: 'PackedSamplerRowBatch', hidden: 'HiddenRowBatch | None' = None, operands: 'tuple[ProjectionOperands, ...]' = (), batch: 'HostBatch[torch.Tensor] | None' = None, hidden_readiness: 'CudaStreamReadiness | None' = None, batch_readiness: 'CudaStreamReadiness | None' = None, import_rows: 'Mapping[str, int]' = <factory>)
 pllm.host.StepResult(value: 'torch.Tensor | None', invocation: 'InvocationOutput', entries: 'tuple[OverlayEntry, ...]' = (), input_gradients: 'Mapping[tuple[str, str], torch.Tensor]' = <factory>, parameter_gradient_fields: 'Mapping[StateRef, tuple[torch.Tensor, ...]]' = <factory>, metrics: 'Mapping[str, torch.Tensor]' = <factory>, parameters: 'Mapping[str, torch.Tensor]' = <factory>)
 pllm.host.CompletionInput(completions: 'CompletionBatch', hidden: 'torch.Tensor', readiness: 'CudaStreamReadiness | None' = None)
     One owned completion/hidden boundary, shared by host consumers.
@@ -715,8 +715,8 @@ pllm.host.UpdateBarrier(barrier_id: str, group_id: str, state: pllm.contracts.fe
 ```text
 pllm.io.Feed(plan: 'PlanBundle', binding: 'FeedBinding', control: 'Connection', channels: 'Channels', peer: 'int', device: 'torch.device')
     Publish complete tensor fields into a declared state, with bounded backpressure.
-pllm.io.StateImport(values: tuple[~T, ...], keys: tuple[pllm.contracts.request_state.RequestStateKey, ...] = ())
-    External tensors in field order; floating values convert to the declared storage precision on import.
+pllm.io.StateImport(values: tuple[~T, ...])
+    External tensors in field order, visible from the importing call's first step.
 pllm.io.TraceEvent(sequence: 'int', host_time_ns: 'int', kind: 'TraceEventKind', invocation_id: 'int', task_id: 'TaskId | None' = None, identities: 'tuple[RequestIdentity, ...]' = (), refs: 'tuple[StateRef, ...]' = (), operation_id: 'int | None' = None, pin_id: 'int | None' = None, release_id: 'int | None' = None, row: 'PackedPhaseRow | None' = None, iteration: 'int | None' = None, relative_l2: 'float | None' = None, device_ordinal: 'int | None' = None, device_duration_ns: 'int | None' = None, tensor_name: 'str | None' = None, tensor_dtype: 'TensorDType | None' = None, tensor_shape: 'tuple[int, ...]' = (), tensor_data: 'str | None' = None, step_id: 'int | None' = None, source_shape: 'tuple[int, ...]' = (), dropped_rows: 'int' = 0, kernel_name: 'str | None' = None)
 pllm.io.TraceSelection(tasks: 'tuple[TaskId, ...]' = (), identities: 'tuple[RequestIdentity, ...]' = (), iterations: 'tuple[int, ...]' = (), names: 'tuple[str, ...]' = (), tensors: 'bool' = False, gradients: 'bool' = False, max_events: 'int' = 0, max_tensor_bytes: 'int' = 32768, kernel_calls: 'int' = 0)
     Explicit observations only; empty filters match all, disabled flags retain nothing.

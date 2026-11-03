@@ -697,6 +697,19 @@ class InstanceState:
             if context.binding.feeds:
                 raise ValueError(f"{context.binding.feeds[0].resource} and {name}: declare one fed state per workload")
             context.binding.feeds = (FeedBinding(name, FeedOrder(self.feed), tuple(self.fields)),)
+        context.binding.state_sources[name] = (
+            "imported: "
+            + ("one row per prompt" if self.scope is StateScope.REQUEST else "field tensors")
+            + " via generate(batch=pllm.io.StateImport(...)), applied before the request's first forward"
+            if self.imported
+            else "fed"
+            if self.feed
+            else "base checkpoint"
+            if self.checkpoint
+            else "module init"
+            if self.module
+            else "initialize"
+        )
         context.states[name], ports = declare_parameters(
             context.binding,
             name,
@@ -2441,6 +2454,14 @@ class _Reflection:
                 state.declare(name, self)
             if state.imported:
                 allocated = self.states[name]
+                self.binding.effects = replace(
+                    self.binding.effects,
+                    import_fields=tuple(
+                        (field, view)
+                        for (resource, field), view in self.binding.field_views.items()
+                        if resource == name
+                    ),
+                )
                 self.binding.imports[name] = tuple(
                     view for (resource, _), view in self.binding.field_views.items() if resource == name
                 )
@@ -2452,6 +2473,18 @@ class _Reflection:
         self.signature.extend(
             (name, fingerprint(value)) for name, value in {**self.activations, **self.adapters}.items()
         )
+
+    def attach_imports(self) -> None:
+        """Make every imported-state reader consume the call's before-forward publication."""
+        for task in self.binding.graph.tasks:
+            effects = tuple(
+                replace(effect, version=self.writes[str(effect.resource)][1].symbol)
+                if effect.kind is StateEffectKind.READ and str(effect.resource) in self.binding.imports
+                else effect
+                for effect in task.effects
+            )
+            if effects != task.effects:
+                self.binding.update_task(task.symbol, lambda task, effects=effects: replace(task, effects=effects))
 
     def attach_effects(self) -> None:
         """Connect publications before the custom forward and missing-input branches."""
@@ -2722,6 +2755,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
                 description = replace(description, phase=operation.phase.name.lower())
             with operation.context.declaring(operation.name), b.member(operation.name, description):
                 operation.effect.declare(operation)
+        context.attach_imports()
         context.attach_effects()
         context.attach_training()
         if all(
@@ -2893,6 +2927,8 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
                 hidden_size=config.hidden_size,
                 vocab_size=0,
                 target_shape=config.target_shape,
+                prompt_count=len(set(value.import_rows.values())),
+                import_fields=b.effects.import_fields,
             )
             return prepare(value, batch)
 

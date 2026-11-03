@@ -10,7 +10,12 @@ from safetensors.torch import save_file
 
 import pllm
 from pllm import testing
+from pllm.contracts.host_batch import validate_host_batch
 from pllm.execution.post_sample import PostSampleOverlap
+from pllm.execution.runtime_facts import model_timeline
+from pllm.execution.shared_tensor import SharedTensor
+from pllm.execution.tensor_binding import TensorBinding
+from pllm.execution.trace import TraceEventKind, TraceSelection
 from pllm.workloads import (
     DecodeFactorsWorkload,
     DummyWorkload,
@@ -327,3 +332,99 @@ def test_custom_forward_state_check_and_explain(workload, state, model_config):
     assert "CUDA conditional nodes" in str(report) and "0 blocking host syncs" in str(report)
     member = next(member for member in report.members if member.name == "forward")
     assert state in member.tasks[0].reads
+
+
+@dataclass(frozen=True)
+class ImportedRows(pllm.Workload):
+    """Expose imported rows directly, so the checker can observe their routing."""
+
+    request: bool = True
+
+    @property
+    def steer(self) -> pllm.InstanceState:
+        fields = {"vector": pllm.Field(lambda width, _: (width,))}
+        return pllm.RequestState(fields, imported=True) if self.request else pllm.InstanceState(fields, imported=True)
+
+    @pllm.export(name="imported", every=1, max_rows=3, max_cols=8)
+    def observe(self, hidden=pllm.hidden(0), vector=pllm.parameter("steer", "vector", per_row=True)):
+        return vector + hidden * 0
+
+
+class ImportedTrainer(ImportedRows):
+    """Training one state must read another state's import on the same step."""
+
+    @property
+    def learned(self) -> pllm.RequestState:
+        return pllm.RequestState({"w": (8,)}, optimizer=pllm.AdamW(lr=0.01))
+
+    @pllm.train(state="learned", reduction="state_mean")
+    def learn(self, hidden=pllm.hidden(0), w=pllm.parameter("learned", "w"), vector=pllm.parameter("steer", "vector")):
+        return (w - vector + hidden * 0).square().mean(-1)
+
+
+@pytest.mark.parametrize("workload", (ImportedRows(), ImportedTrainer()))
+def test_check_detects_imports_routed_by_sorted_request_id(workload, model_config):
+    assert "imported rows / request isolation" in testing.check(workload, model_config).passed
+    prepare = TensorBinding.prepare_import
+
+    def sorted_requests(self, update, batch, data):
+        # 499e3a26 class: request-id order is not packed-row order.
+        rows = dict(zip(sorted(data.step.import_rows), data.step.import_rows.values(), strict=True))
+        data.step = replace(data.step, import_rows=rows)
+        prepare(self, update, batch, data)
+
+    with patch.object(TensorBinding, "prepare_import", sorted_requests):
+        with pytest.raises(testing.ContractError, match="misrouted rows"):
+            testing.check(workload, model_config)
+
+
+@pytest.mark.parametrize("per_request", (True, False))
+def test_import_shape_boundary_and_first_export(per_request):
+    workload = ImportedRows(per_request)
+    tap = testing.hidden_binding(0, layer_count=1)
+    facts = testing.backend_facts(
+        8, (tap,), model_timeline(torch.device("cpu"), ("transition/full_root@1",)), layer_count=1, memory_bytes=1 << 20
+    )
+    declaration = workload.build(facts)
+    values = torch.arange(16 if per_request else 8, dtype=torch.float32).reshape((2, 8) if per_request else (8,))
+    for tensor, error in (
+        (values, None),
+        (torch.zeros(3, 8), "one row per prompt" if per_request else "field tensors themselves"),
+    ):
+
+        def validate():
+            validate_host_batch(
+                pllm.io.StateImport((tensor,)),
+                declaration.graph,
+                declaration.layouts,
+                facts.timeline,
+                SharedTensor.describe,
+                hidden_size=8,
+                vocab_size=0,
+                prompt_count=2,
+                import_fields=declaration.effects.import_fields,
+            )
+
+        if error is None:
+            validate()
+        else:
+            with pytest.raises(ValueError, match=error):
+                validate()
+    execution = testing.compile_execution(workload, facts)
+    identities = (testing.RequestIdentity("second", 91, 0), testing.RequestIdentity("first", 17, 0))
+    execution.admit(identities)
+    execution.trace.configure(TraceSelection(tensors=True, max_tensor_bytes=128))
+    try:
+        testing.run_step(
+            execution, testing.step_input(identities, {tap: torch.zeros(2, 8)}, batch=pllm.io.StateImport((values,)))
+        )
+        event = next(
+            event
+            for event in execution.trace.snapshot().events
+            if event.kind is TraceEventKind.TENSOR and event.tensor_name == "imported"
+        )
+        torch.testing.assert_close(event.tensor(), values if per_request else values.expand(2, -1))
+    finally:
+        execution.retire(identities, wait=True)
+        execution.retire((), wait=True)
+        execution.close()

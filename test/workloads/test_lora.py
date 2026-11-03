@@ -11,8 +11,7 @@ import pllm
 from pllm import testing
 from pllm.authoring import WeightedCEBatch
 from pllm.config import ExecutionOptions
-from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
-from pllm.contracts.request_state import RequestStateKey
+from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.state_refs import StateRefs
@@ -98,10 +97,6 @@ def sgd_reference(config, seed, hidden, logits, labels, weights, groups):
 
 def test_independent_lora_bmm_preserves_keyed_mean_and_private_publication(device_name) -> None:
     identities = tuple(RequestIdentity(str(index), index, 0) for index in range(3))
-    keys = tuple(
-        RequestStateKey.project(identity, (RequestKeyField.PROMPT_INDEX, RequestKeyField.SAMPLE_INDEX))
-        for identity in identities
-    )
     config = OutputLoRAConfig(rank=2, alpha=3.0, learning_rate=0.2, steps=3, seed=11, scope="request")
     device = torch.device(device_name)
     stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
@@ -116,7 +111,6 @@ def test_independent_lora_bmm_preserves_keyed_mean_and_private_publication(devic
         weights = torch.tensor([[1.0, 3.0, 1.0, 0.0], [2.0, 1.0, 0.0, 4.0]], device=device)
         hidden[0, 2].fill_(float("nan"))
         batch = pllm.host.WeightedCEBatch.for_prompts(hidden, logits, labels, weights, (1, 0))
-        assert batch.keys == (keys[1], keys[0])
         value = step_input(identities, torch.ones((3, 4), device=device), batch, stream)
         generator = torch.Generator(device=device).manual_seed(config.seed)
         seed = torch.randn((2, 4, 2), device=device, generator=generator) * 0.01

@@ -87,6 +87,7 @@ class GPUWorker(compat.Worker):
                         host_batch,
                         stage.identities,
                         None if stage.completion is None or self.rank != 0 else stage.completion.map(peer, stream),
+                        samples_per_prompt=stage.samples_per_prompt,
                     )
                 case BackendCommand.FINISH:
                     runner.require_session().finish_requests()

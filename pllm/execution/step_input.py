@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 
 import torch
 
@@ -22,6 +23,7 @@ class StepInput:
     batch: HostBatch[torch.Tensor] | None = None
     hidden_readiness: CudaStreamReadiness | None = None
     batch_readiness: CudaStreamReadiness | None = None
+    import_rows: Mapping[str, int] = field(default_factory=lambda: dict[str, int]())
 
     def __post_init__(self) -> None:
         assert self.sampler_rows.row_batch is self.rows

@@ -17,8 +17,7 @@ from pllm.contracts.backend_attachment import (
 )
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch
-from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
-from pllm.contracts.request_state import RequestStateKey
+from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
@@ -176,10 +175,7 @@ def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:
         ),
     )
     delta = torch.tensor([[-0.25, 0.5, -1.0, 0.75], [1.0, -2.0, 3.0, -4.0]])
-    keys = tuple(
-        RequestStateKey.project(identity, (RequestKeyField.PROMPT_INDEX,)) for identity in reversed(identities)
-    )
-    value = StepInput(rows, PackedSamplerRowBatch(rows, ()), batch=StateImport((delta,), keys))
+    value = StepInput(rows, PackedSamplerRowBatch(rows, ()), batch=StateImport((delta,)), import_rows={"b": 0, "a": 1})
     invocation = execution.start_step(value)
     execution.execute_anchor(invocation, AnchorId(0))
     context = invocation

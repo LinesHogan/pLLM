@@ -30,11 +30,13 @@ from pllm.backends.vllm.sampler import (
 from pllm.contracts.backend_attachment import AttachmentGraphMode, BackendAttachment
 from pllm.contracts.codec import encode_boundary
 from pllm.contracts.hidden_locator import HiddenPhase
+from pllm.contracts.host_batch import StateImport
 from pllm.contracts.packed_rows import PackedSamplerRowBatch
-from pllm.contracts.request_identity import RequestIdentity
+from pllm.contracts.request_identity import RequestIdentity, prompt_rows
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
 from pllm.contracts.semantic_graph import (
     SamplerFeedbackInputSource,
+    StateScope,
 )
 from pllm.execution.backend_attachment import attachment_buffer_bytes
 from pllm.execution.cuda_stream import CudaStreamReadiness
@@ -166,6 +168,7 @@ class VllmSession(Generic[DataT, ResultT]):
         self._next_step_id = 0
         self._step: _PackedStep[DataT] | None = None
         self._host_batch: HostBatch[torch.Tensor] | None = None
+        self._import_rows: dict[str, int] = {}
         self.completion_rows: CompletionRows | None = None
         execution = deployment.execution
         execution.admit_instances(torch.cuda.current_stream(execution.device))
@@ -183,11 +186,14 @@ class VllmSession(Generic[DataT, ResultT]):
         batch: HostBatch[torch.Tensor] | None,
         identities: tuple[RequestIdentity, ...],
         completion: torch.Tensor | None = None,
+        *,
+        samples_per_prompt: int = 1,
     ) -> None:
         """Stage request inputs, already validated by generate, and their optional completion destination."""
         self._require_input_live()
         self.completion_rows = None if completion is None else CompletionRows(identities, completion)
         self._host_batch = batch
+        self._import_rows = prompt_rows(identities, samples_per_prompt)
         self._pending_identities = {identity.request_id: identity for identity in identities}
 
     def feed(self, name: str) -> Feed:
@@ -329,10 +335,16 @@ class VllmSession(Generic[DataT, ResultT]):
         stream = torch.cuda.current_stream(execution.device)
         if not self._in_forward_overlay:
             held_input = self._receive_readonly(rows, stream)
-            value = StepInput(rows.row_batch, rows, batch=self._host_batch)
+            value = StepInput(rows.row_batch, rows, batch=self._host_batch, import_rows=self._import_rows)
             context = execution.start_step(value, stream, held_input=held_input, retain_gradients=False)
             instance_states = bool(execution.directory.instance_states)
-            if instance_states or not self._pending_identities:
+            imported_state = self.attachment.plan.semantic_graph.host_state(StateImport.schema)
+            request_import = (
+                isinstance(self._host_batch, StateImport)
+                and imported_state is not None
+                and imported_state.scope is StateScope.REQUEST
+            )
+            if not self._pending_identities or instance_states and not request_import:
                 self._host_batch = None
             step.context = context
             execution.advance_to(context, "request.prepare")
@@ -377,7 +389,9 @@ class VllmSession(Generic[DataT, ResultT]):
         execution = self._deployment.execution
         stream = torch.cuda.current_stream(execution.device)
         operands = () if self._overlay is None else self._overlay.take_operands()
-        value = StepInput(step.rows.row_batch, step.rows, operands=operands, batch=self._host_batch)
+        value = StepInput(
+            step.rows.row_batch, step.rows, operands=operands, batch=self._host_batch, import_rows=self._import_rows
+        )
         if self._taps is not None and self._hidden_resources:
             value = self._taps.publish(value, self._hidden_resources)
         if (

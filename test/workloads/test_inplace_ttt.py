@@ -19,8 +19,7 @@ from pllm.contracts.parameter_overlay import (
     ProjectionOperands,
     ProjectionShape,
 )
-from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
-from pllm.contracts.request_state import RequestStateKey
+from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.overlay_task import ChunkUpdate
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
@@ -249,13 +248,12 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     ).execution
     prompts = (RequestIdentity("first", 0, 0), RequestIdentity("second", 1, 0))
     initial = imported.admit(prompts)
-    keys = tuple(RequestStateKey.project(identity, (RequestKeyField.PROMPT_INDEX,)) for identity in prompts)
     # Each prompt imports its externally produced factors on its own, at its own version.
     published = []
-    for index, key in enumerate(keys):
-        update = StateImport(tuple(tensor.unsqueeze(0) for tensor in generated), (key,))
+    for index, identity in enumerate(prompts):
+        update = StateImport(tuple(tensor.unsqueeze(0) for tensor in generated))
         publication = imported.step(
-            testing.step_input(prompts, tokens=(HiddenPhase.PREFILL,) * 2, sampler_order=(), batch=update)
+            testing.step_input((identity,), tokens=(HiddenPhase.PREFILL,), sampler_order=(), batch=update)
         ).publication
         (ref,) = publication.after_refs
         assert ref.lineage_id == initial[index].lineage_id and ref.version_id == 1
@@ -266,7 +264,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
             assert all(not tensor.any() for tensor in imported.snapshot(initial[1]))
             # A staged batch does not import twice: the published version no longer matches.
             again = imported.step(
-                testing.step_input(prompts, tokens=(HiddenPhase.PREFILL,) * 2, sampler_order=(), batch=update)
+                testing.step_input((identity,), tokens=(HiddenPhase.PREFILL,), sampler_order=(), batch=update)
             )
             assert again.publication is None
         published.append(ref)

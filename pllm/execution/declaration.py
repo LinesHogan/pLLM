@@ -394,19 +394,15 @@ class Builder(Generic[D]):
                 effect for effect in task.effects if effect.kind is StateEffectKind.READ and effect.version is not None
             )
             operation = replace(operations[task.symbol], implementation_id=identity)
-            if versions:
-                producer = next(item for item in graph.tasks if item.symbol == versions[0].version)
-                operation = replace(
-                    operation,
-                    version="private"
-                    if any(
-                        effect.kind in (StateEffectKind.TRANSITION, StateEffectKind.TRANSITION_MAYBE)
-                        for effect in producer.effects
-                    )
-                    else "published",
-                    # A reader of a produced version reads that state's private write or publication.
-                    resource=operation.resource or versions[0].resource,
+            produced: list[tuple[StateResource, Literal["private", "published"]]] = []
+            for effect in versions:
+                producer = next(item for item in graph.tasks if item.symbol == effect.version)
+                private = any(
+                    effect.kind in (StateEffectKind.TRANSITION, StateEffectKind.TRANSITION_MAYBE)
+                    for effect in producer.effects
                 )
+                produced.append((effect.resource, "private" if private else "published"))
+            operation = replace(operation, produced=tuple(produced))
             if task.custom_forward is None:
                 functions.append(operation)
         return tuple(functions)

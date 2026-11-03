@@ -117,6 +117,7 @@ class BackendAttachmentSpec:
     their tasks; the backend installs each model-side binding on its own hook.
     """
 
+    import_fields: tuple[tuple[str, FieldView], ...] = ()
     sampler: tuple[SamplerBinding, ...] = ()
     # The @pllm.train methods (request rows or a host batch).
     training: tuple[TaskSymbol, ...] = ()

@@ -2,6 +2,7 @@
 output, which joins the residual stream in the final norm."""
 
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -11,9 +12,73 @@ from vllm import SamplingParams
 
 import pllm
 from pllm.config import ModelConfig
+from pllm.execution.trace import TraceEventKind, TraceSelection
 from pllm.workloads.reft import ReFTConfig, ReFTWorkload
 
 BUDGET = pllm.ExecutionOptions(memory_budget_bytes=1 << 30)
+
+
+@dataclass(frozen=True)
+class PromptSteering(pllm.Workload):
+    """Per-prompt steering also exports the values used by the first forward."""
+
+    request: bool = True
+
+    @property
+    def steer(self) -> pllm.InstanceState:
+        fields = {"vector": pllm.Field(lambda width, _: (width,))}
+        return pllm.RequestState(fields, imported=True) if self.request else pllm.InstanceState(fields, imported=True)
+
+    @property
+    def offset(self) -> pllm.InstanceState:
+        return pllm.InstanceState({"value": (1,)})
+
+    @property
+    def patch(self) -> pllm.model.ActivationPatch:
+        return pllm.model.ActivationPatch("steer", (23,), operator="add")
+
+    @pllm.export(name="imported", every=1, max_rows=4, max_cols=1)
+    def observe(
+        self,
+        hidden=pllm.hidden(23, tokens="prefill"),
+        vector=pllm.parameter("steer", "vector", per_row=True),
+        offset=pllm.parameter("offset", "value", per_row=True),
+    ):
+        return vector[:, :1] + hidden[:, :1] * 0 + offset
+
+
+def check_prompt_steering() -> None:
+    """Check prompt rows, n samples, later generate calls and first-step export visibility."""
+    config = ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", "bfloat16", 64, 2, 64, 0.25, seed=7, execution=BUDGET)
+    for request in (True, False):
+        with pllm.make_llm(workload=PromptSteering(request), config=config) as handle:
+            handle.select_trace(TraceSelection(tensors=True, max_tensor_bytes=64))
+            values = torch.stack((torch.ones(896), torch.full((896,), 2.0))) if request else torch.ones(896)
+            for call, multiplier in enumerate((1, 3)):
+                handle.generate(
+                    ["The sky is", "Water freezes at"],
+                    SamplingParams(n=2, max_tokens=1, temperature=0.8),
+                    batch=pllm.io.StateImport((values * multiplier,)),
+                )
+                events = [
+                    event
+                    for event in handle.trace_snapshot().events
+                    if event.kind is TraceEventKind.TENSOR and event.tensor_name == "imported"
+                ]
+                observed = {
+                    identity.request_id: (identity, row.item())
+                    for event in events
+                    for identity, row in zip(event.identities, event.tensor(), strict=True)
+                    if identity.prompt_index // 2 == call
+                }
+                assert len(observed) == 4
+                for identity, value in observed.values():
+                    expected = multiplier * (1 + identity.prompt_index % 2 if request else 1)
+                    assert value == expected, (identity, value, expected)
+            diagnostics = handle.diagnostics()
+            assert diagnostics.active_states == (1 if request else 2)
+            assert diagnostics.inference_pins == diagnostics.pending_state_releases == 0
+    print("StateImport: per-prompt rows shared by n=2; request/instance exports visible on first step across calls")
 
 
 def main() -> None:
@@ -79,6 +144,7 @@ def main() -> None:
             hook.remove()
         handle.close()
     assert execution.diagnostics().active_states == 0
+    check_prompt_steering()
 
 
 if __name__ == "__main__":

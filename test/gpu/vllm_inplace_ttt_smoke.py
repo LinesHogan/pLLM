@@ -25,8 +25,7 @@ from pllm.config import ModelConfig
 from pllm.contracts.parameter_overlay import (
     Projection,
 )
-from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
-from pllm.contracts.request_state import RequestStateKey
+from pllm.contracts.request_identity import RequestIdentity
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.scan_execution import PreparedScan
 from pllm.testing_gpu import check_probe
@@ -177,7 +176,6 @@ def _check_cancelled_projection(handle):
     """A captured real projection retains its pinned page through cancellation."""
     from pllm.contracts.hidden_locator import HiddenPhase
     from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
-    from pllm.contracts.request_identity import RequestIdentity
 
     execution = handle.runner.require_session()._deployment.execution
     from pllm.backends.vllm.parameter_overlay import HybridParameterOverlay
@@ -287,10 +285,6 @@ def _check_hybrid(handle):
     return first
 
 
-def _key(prompt_index: int) -> RequestStateKey:
-    return RequestStateKey.project(RequestIdentity("", prompt_index, 0), (RequestKeyField.PROMPT_INDEX,))
-
-
 def _check_imported(handle: VllmLlm[object, object]) -> tuple[str, ...]:
     (layout,) = handle.attachment.plan.tensor_layout_request.layouts
     down_shape, up_shape = (tuple(field.shape) for field in layout.layout.fields[:2])
@@ -303,7 +297,7 @@ def _check_imported(handle: VllmLlm[object, object]) -> tuple[str, ...]:
     generator = torch.Generator().manual_seed(11)
     down = torch.randn(down_shape, generator=generator).to(device=device, dtype=torch.float32)
     up = torch.randn(up_shape, generator=generator).to(device=device, dtype=torch.float32)
-    update = pllm.io.StateImport((down.unsqueeze(0), up.unsqueeze(0)), (_key(2),))
+    update = pllm.io.StateImport((torch.stack((down, torch.zeros_like(down))), torch.stack((up, torch.zeros_like(up)))))
     mixed = texts(handle.generate(PROMPTS, SAMPLING, prompt_indices=(2, 3), batch=update))
     if mixed[0] == baseline[0] or mixed[1] != baseline[1]:
         raise RuntimeError("imported factors must move exactly their own request's outputs")
@@ -312,11 +306,11 @@ def _check_imported(handle: VllmLlm[object, object]) -> tuple[str, ...]:
         torch.zeros((2, *down_shape), device=device, dtype=torch.float32),
         torch.zeros((2, *up_shape), device=device, dtype=torch.float32),
     )
-    update = pllm.io.StateImport(zeros, (_key(4), _key(5)))
+    update = pllm.io.StateImport(zeros)
     if texts(handle.generate(PROMPTS, SAMPLING, prompt_indices=(4, 5), batch=update)) != baseline:
         raise RuntimeError("imported zero factors must reproduce the base model exactly")
     diagnostics = handle.diagnostics()
-    if diagnostics.update_count != 3 or diagnostics.active_states != 0 or diagnostics.pending_state_releases != 0:
+    if diagnostics.update_count != 4 or diagnostics.active_states != 0 or diagnostics.pending_state_releases != 0:
         raise RuntimeError("imported overlay lifecycle evidence is incomplete")
     return mixed
 

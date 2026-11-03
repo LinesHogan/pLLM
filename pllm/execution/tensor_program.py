@@ -45,6 +45,7 @@ I = TypeVar("I", bound=StepInput)
 D = TypeVar("D")
 R = TypeVar("R")
 Roots = tuple[tuple[torch.Tensor, ...], ...]
+ProducedVersions = tuple[tuple[StateResource, Literal["private", "published"]], ...]
 # An AdamW state's leading fields, in layout order: one flat parameter field and its optimizer fields.
 ADAM_FIELDS = ("parameters", "gradient", "step", "exp_avg", "exp_avg_sq")
 ADAM = len(ADAM_FIELDS)
@@ -178,22 +179,31 @@ def read_batch(
     context: StateTaskContext[D],
     version: Literal["input", "private", "published"] = "input",
     resource: StateResource = StateResource(""),
+    produced: ProducedVersions = (),
 ) -> TensorBatch:
     """Borrow the invocation's selected version for tensor operations and layer replay: the input version, or the
-    pending private write / the publication of `resource` this invocation made."""
+    pending private write / the publication of `resource` this invocation made. Produced reads are
+    selected independently, so a writer can consume another state's new values in the same step."""
     refs = context.pin.refs
     access: tuple[PagePin | PageWrite, ...] = (context.pin,) * len(refs)
-    write = context.pending_write(resource)
-    receipt = context.publication_of(resource)
-    if version == "private" and write is not None:
-        positions = write.before_refs.positions(refs)
-        refs = refs.replace_versions(write.before_refs, write.after_refs)
-        access = tuple(write if index >= 0 else context.pin for index in positions.tolist())
-    elif version in ("private", "published") and receipt is not None:
-        pin = context.borrow_published(receipt.after_refs)
-        positions = receipt.before_refs.positions(refs)
-        refs = refs.replace_versions(receipt.before_refs, receipt.after_refs)
-        access = tuple(pin if index >= 0 else context.pin for index in positions.tolist())
+    for selected, origin in (*produced, (resource, version)):
+        if origin == "input":
+            continue
+        write = context.pending_write(selected)
+        receipt = context.publication_of(selected)
+        if origin == "private" and write is not None:
+            positions = write.before_refs.positions(refs)
+            refs = refs.replace_versions(write.before_refs, write.after_refs)
+            access = tuple(
+                write if index >= 0 else previous for index, previous in zip(positions.tolist(), access, strict=True)
+            )
+        elif receipt is not None:
+            pin = context.borrow_published(receipt.after_refs)
+            positions = receipt.before_refs.positions(refs)
+            refs = refs.replace_versions(receipt.before_refs, receipt.after_refs)
+            access = tuple(
+                pin if index >= 0 else previous for index, previous in zip(positions.tolist(), access, strict=True)
+            )
     roots = context.arena.lazy_roots(access, refs)
 
     def scoped(resource: StateResource) -> TensorBatch:
@@ -454,6 +464,7 @@ class TensorOperation(Generic[D]):
     optimizer: PageUpdate | None = None
     publish: bool = False
     version: Literal["input", "private", "published"] = "input"
+    produced: ProducedVersions = ()
     copy_fields: tuple[LayoutFieldId, ...] | None = None
     select_fields: (
         Callable[[D, RequestStateSelection, tuple[int, ...]], tuple[tuple[LayoutFieldId, ...], ...]] | None
@@ -499,11 +510,11 @@ class TensorOperation(Generic[D]):
                     torch.where(output.update_mask, value, previous, out=value)
 
     def scoped(self, batch: TensorBatch) -> TensorBatch:
-        """The roots the body reads: the operation's own state when it changes or reads a produced version of one."""
+        """The roots the body writes, or every readable state for a read-only operation."""
         return batch.for_resource(self.resource) if self.resource else batch
 
     def batch(self, context: StateTaskContext[D], version: Literal["input", "private", "published"]) -> TensorBatch:
-        return self.scoped(read_batch(context, version, self.resource))
+        return self.scoped(read_batch(context, version, self.resource, self.produced))
 
     def execute(self, context: StateTaskContext[D]) -> ProjectionResiduals:
         data, stream = context.data(), context.pin.stream

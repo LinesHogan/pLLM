@@ -123,6 +123,7 @@ class BackendStage:
     identities: tuple[RequestIdentity, ...]
     batch: HostBatch[SharedTensor] | None
     completion: SharedTensor | None
+    samples_per_prompt: int = 1
     driver_pid: int = field(default_factory=os.getpid)
 
 
@@ -470,6 +471,8 @@ class VllmLlm(Generic[DataT, ResultT]):
             SharedTensor.describe,
             hidden_size=self.hidden_size,
             vocab_size=self.vocab_size,
+            prompt_count=len(texts),
+            import_fields=self.attachment.spec.import_fields,
         )
         llm = self._require_open()
         assert self._cache_policy is not None
@@ -489,7 +492,7 @@ class VllmLlm(Generic[DataT, ResultT]):
                 llm.llm_engine.output_processor.request_states[identity.request_id].external_req_id: identity
                 for identity in identities
             }
-            destination = self._stage(identities, batch, completion_device, lifetime)
+            destination = self._stage(identities, batch, completion_device, lifetime, n)
             self._next_prompt_index = max(self._next_prompt_index, max(indices) + 1)
             llm.wake_up(tags=["scheduling"])
             outputs = llm.wait_for_completion(RequestOutput, use_tqdm=use_tqdm)
@@ -554,6 +557,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         batch: HostBatch[torch.Tensor] | None,
         completion_device: torch.device | None,
         lifetime: ExitStack,
+        samples_per_prompt: int,
     ) -> torch.Tensor | None:
         destination = None
         completion_wire = None
@@ -579,11 +583,13 @@ class VllmLlm(Generic[DataT, ResultT]):
             )
             self._command(
                 BackendCommand.STAGE,
-                encode_boundary(BackendStage(identities, batch_wire, completion_wire)),
+                encode_boundary(BackendStage(identities, batch_wire, completion_wire, samples_per_prompt)),
             )
         else:
             batch = map_host_batch(batch, lambda tensor: tensor.to(self.device))
-            self.runner.require_session().stage_input(batch, identities, destination)
+            self.runner.require_session().stage_input(
+                batch, identities, destination, samples_per_prompt=samples_per_prompt
+            )
         return destination
 
 

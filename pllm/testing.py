@@ -45,7 +45,7 @@ from pllm.contracts.packed_rows import (
     PackedSamplerRowLink,
 )
 from pllm.contracts.parameter_overlay import ProjectionOperands
-from pllm.contracts.request_identity import RequestIdentity
+from pllm.contracts.request_identity import RequestIdentity, prompt_rows
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
 from pllm.contracts.semantic_graph import AnchorId, SchedulerTimeline
 from pllm.contracts.tensor_layout import TensorDType
@@ -180,6 +180,7 @@ def step_input(
         HiddenRowBatch(rows, taps) if taps else None,
         operands=operands,
         batch=batch,
+        import_rows=prompt_rows(identities),
         hidden_readiness=None if stream is None else CudaStreamReadiness(stream),
     )
 

@@ -22,7 +22,6 @@ from pllm.contracts.host_batch import StateImport
 from pllm.contracts.member import MemberDeclaration
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import FieldView, Projection
-from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
 from pllm.contracts.semantic_graph import (
@@ -120,6 +119,7 @@ class TensorBinding(Builder[TensorFrame]):
         self.members: dict[str, MemberDeclaration] = {}
         self.task_members: dict[TaskSymbol, tuple[str, ...]] = {}
         self.checkpoint = ""
+        self.state_sources: dict[str, str] = {}
         self.feeds: tuple[FeedBinding, ...] = ()
         self.tensor_tasks: dict[TaskSymbol, TensorTask] = {}
         self.initializers: dict[str, Callable[[tuple[torch.Tensor, ...], torch.Generator], None]] = {}
@@ -351,50 +351,28 @@ class TensorBinding(Builder[TensorFrame]):
         return StepCapture(limits[task.symbol], facts.max_admitted_lineages if request else 1)
 
     def prepare_import(self, update: StateImport[torch.Tensor], batch: TensorBatch, data: TensorFrame) -> None:
-        """Validate imported fields and map them onto resource-specific private roots."""
-        if not update.values:
-            return
+        """Convert validated fields to storage precision and select their private roots."""
         (resource,) = self.imports
         selection = batch.selection
         group = selection.for_resource(StateResource(resource))
         if group.keys == (None,):
-            if update.keys:
-                raise ValueError("instance replacement does not accept request keys")
             data.replacements = ((selection.refs.index(group.refs[0]), update.values),)
         else:
-            if (
-                not update.keys
-                or len(set(update.keys)) != len(update.keys)
-                or any(
-                    key.fields != (RequestKeyField.PROMPT_INDEX,)
-                    or key.request_id
-                    or key.sample_index != -1
-                    or key.prompt_index < 0
-                    for key in update.keys
-                )
-                or any(tensor.ndim < 1 or tensor.shape[0] != len(update.keys) for tensor in update.values)
-            ):
-                raise ValueError("request replacement requires distinct original prompt keys and aligned field rows")
-            indices = {key: index for index, key in enumerate(update.keys)}
             selected: dict[int, int] = {}
             for row, index in zip(selection.rows, group.state_indices, strict=True):
-                if (key := RequestStateKey.project(row.identity, (RequestKeyField.PROMPT_INDEX,))) in indices:
-                    if selection.refs[index].version_id != 0:
-                        continue
-                    # Several packed rows of one request share its state; two
-                    # different import values for one root would be ambiguous.
-                    if index in selected:
-                        if selected[index] != indices[key]:
-                            raise ValueError("one import batch cannot replace a shared request state with two values")
-                        continue
-                    selected[index] = indices[key]
+                if selection.refs[index].version_id != 0:
+                    continue
+                source = data.step.import_rows[row.identity.request_id]
+                if index in selected and selected[index] != source:
+                    raise ValueError("one import batch cannot replace a shared request state with two values")
+                selected[index] = source
             data.replacements = tuple(
-                (index, tuple(tensor[row] for tensor in update.values)) for index, row in sorted(selected.items())
+                (index, tuple(tensor[row] for tensor in update.values)) for index, row in selected.items()
             )
         replacements: list[tuple[int, tuple[torch.Tensor, ...]]] = []
         for index, values in data.replacements:
             root = tuple(view.read(batch.roots[index][view.field]) for view in self.imports[resource])
-            replacements.append((index, field_values(values, root, resource=resource, validate=True)))
+            replacements.append((index, field_values(values, root, resource=resource, validate=False)))
         data.replacements = tuple(replacements)
 
     @property
@@ -407,6 +385,7 @@ class TensorBinding(Builder[TensorFrame]):
         """The frame's preselected phase; None keeps every request's final row for model effects or prefill."""
         if (
             self.uses_sampler_rows
+            or self.imports
             or self.overlay_targets
             or self.effects.activation_bindings
             or any(
@@ -443,8 +422,6 @@ class TensorBinding(Builder[TensorFrame]):
             data = TensorFrame(value, rows)
             match value.batch:
                 case StateImport() as update:
-                    if not self.imports:
-                        raise ValueError("declare imported=True to consume StateImport")
                     self.prepare_import(update, batch, data)
                 case _:
                     pass

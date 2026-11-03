@@ -228,6 +228,19 @@ class SemanticGraph:
     model_reads: tuple[StateResource, ...] = ()
     training_mode: TrainingMode | None = None
 
+    def host_state(self, schema: str) -> SemanticState | None:
+        """The state replaced by a host input schema, or None when no such input is declared."""
+        resources = {
+            effect.resource
+            for task in self.tasks
+            if any(
+                isinstance(port.source, HostServiceInputSource) and port.source.schema == schema for port in task.inputs
+            )
+            for effect in task.effects
+            if effect.kind is StateEffectKind.TRANSITION_MAYBE
+        }
+        return next((state for state in self.states if state.resource in resources), None)
+
     @property
     def trains_on_batch(self) -> bool:
         """Whether the workload trains on a host CausalTrainBatch or WeightedRowBatch (declare_batch_train)."""

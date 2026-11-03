@@ -195,8 +195,6 @@ def test_decode_adam_matches_independent_optimizer_and_keeps_entry_pin(device):
 
 def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch, device):
     stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
-    from pllm.contracts.request_identity import RequestKeyField
-    from pllm.contracts.request_state import RequestStateKey
     from pllm.execution.state_execution import PublishStateTask
 
     class Imported(FactorAdapterWorkload):
@@ -218,12 +216,11 @@ def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch
     imported, written = deployment(Imported(), device=device), deployment(Written(), device=device)
     assert imported.attachment.spec.overlay_bindings == written.attachment.spec.overlay_bindings
     identity = RequestIdentity("swap", 0, 0)
-    key = RequestStateKey.project(identity, (RequestKeyField.PROMPT_INDEX,))
     values = tuple(
         torch.full((1, *shape), index + 1.0, device=device)
         for index, shape in enumerate(((2, 4), (4, 2), (2, 4), (2, 2)))
     )
-    for deployed, payload in ((imported, pllm.io.StateImport(values, (key,))), (written, None)):
+    for deployed, payload in ((imported, pllm.io.StateImport(values)), (written, None)):
         execution = deployed.execution
         execution.admit((identity,), stream=stream)
         result = testing.run_step(execution, testing.step_input((identity,), batch=payload), stream=stream)
@@ -249,7 +246,6 @@ def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch
             else replace(
                 payload,
                 values=tuple(torch.cat((value, value * 3)) for value in values),
-                keys=tuple(RequestStateKey.project(item, (RequestKeyField.PROMPT_INDEX,)) for item in pair),
             )
         )
         result = testing.run_step(execution, testing.step_input(pair, batch=payload), stream=stream)

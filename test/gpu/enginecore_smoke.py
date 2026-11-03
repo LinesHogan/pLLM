@@ -25,8 +25,6 @@ from vllm.sampling_params import StructuredOutputsParams
 import pllm
 from pllm.authoring import CausalTrainBatch, StateImport, WeightedCEBatch
 from pllm.config import ExecutionOptions, ModelConfig, RunnerName
-from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
-from pllm.contracts.request_state import RequestStateKey
 from pllm.execution.trace import TraceEventKind, TraceSelection
 from pllm.host import HostConfig, make_host
 from pllm.workloads.dummy import DummyConfig, DummyWorkload
@@ -375,14 +373,12 @@ def _independent_lora_input() -> None:
         sampling = greedy(4, logprobs=1)
         baseline = handle.generate(PROMPTS, sampling)
         completed = handle.generate_completions(PROMPTS, sampling, group_id="independent-lora")
-        fields = (RequestKeyField.PROMPT_INDEX, RequestKeyField.SAMPLE_INDEX)
-        keys = tuple(RequestStateKey.project(RequestIdentity("", index, 0), fields) for index in (7, 9))
-        batch = WeightedCEBatch(
+        batch = WeightedCEBatch.for_prompts(
             completed.hidden.unsqueeze(1),
             torch.zeros(2, 1, 151936),
             torch.tensor([[entry.token_ids[-1]] for entry in completed.completions.entries]),
             torch.ones(2, 1),
-            keys,
+            (7, 9),
         )
         handle.select_trace(TraceSelection(tensors=True, gradients=True, max_tensor_bytes=64))
         trained = handle.generate(PROMPTS, sampling, batch=batch, prompt_indices=(7, 9))

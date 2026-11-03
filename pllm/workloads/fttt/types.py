@@ -8,9 +8,7 @@ from math import isfinite
 import torch
 
 from pllm.authoring import AdamW
-from pllm.contracts.request_identity import RequestKeyField
-from pllm.contracts.request_state import RequestStateKey
-from pllm.host import Completion, CompletionInput, RetryControl, RewardOutcome, UpdateBarrier
+from pllm.host import Completion, CompletionInput, RetryAction, RetryControl, RewardOutcome, UpdateBarrier
 from pllm.io import StateImport
 
 
@@ -26,14 +24,18 @@ class FTTTResult:
     state_version: int
 
     def state_update(self) -> StateImport[torch.Tensor]:
-        """Borrow the delta rows for a single-layer additive patch."""
-        return StateImport(
-            (self.edit_delta,),
-            tuple(
-                RequestStateKey.project(record.completion.identity, (RequestKeyField.PROMPT_INDEX,))
-                for record in self.feedback_records
-            ),
-        )
+        """Return one row per retried prompt in feedback order, using its first retrying sample."""
+        retrying = {
+            control.completion.identity.request_id
+            for control in self.retry_controls
+            if control.action is RetryAction.RETRY
+        }
+        rows: dict[int, torch.Tensor] = {}
+        for record, delta in zip(self.feedback_records, self.edit_delta, strict=True):
+            if record.completion.identity.request_id in retrying:
+                rows.setdefault(record.completion.identity.prompt_index, delta)
+        values = torch.stack(tuple(rows.values())) if rows else self.edit_delta[:0]
+        return StateImport((values,))
 
 
 @dataclass(frozen=True, slots=True)

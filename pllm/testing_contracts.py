@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from functools import partial
-from math import lcm
+from math import lcm, prod
 from traceback import format_exception_only
 from types import MappingProxyType
 from typing import Literal
@@ -19,10 +19,11 @@ from pllm.config import ModelConfig
 from pllm.contracts.backend_attachment import AttachmentHiddenResource
 from pllm.contracts.codec import boundary_digest
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from pllm.contracts.host_batch import StateImport
 from pllm.contracts.packed_hidden import HiddenRowBatch, HiddenRows
 from pllm.contracts.packed_rows import PackedPhaseRow, label_rows
 from pllm.contracts.parameter_overlay import ProjectionOperands
-from pllm.contracts.request_identity import RequestIdentity
+from pllm.contracts.request_identity import RequestIdentity, prompt_rows
 from pllm.contracts.sampler import SamplerFeedback, SamplerStage
 from pllm.contracts.semantic_graph import (
     StateResource,
@@ -379,9 +380,10 @@ def _check_idle_state(
     versions: tuple[tuple[StateResource, StateRef], ...],
     run: _Run,
     observed: int,
+    value: StepInput,
 ) -> None:
     """A tensor step without a method invocation cannot publish request state."""
-    if execution.math.parameter_phases or len(run.operations) != observed:
+    if execution.math.parameter_phases or len(run.operations) != observed or isinstance(value.batch, StateImport):
         return
     run.failures.extend(
         f"pllm published request state {resource!r} without running a tensor method; "
@@ -448,12 +450,37 @@ def _execute_step(
                     tensor.detach().clone()
                 )
     execution.finish_step(context)
-    _check_idle_state(execution, versions, run, observed)
+    _check_idle_state(execution, versions, run, observed, value)
     for event in execution.trace.snapshot().events:
         if event.kind is TraceEventKind.TENSOR and event.step_id == value.rows.step_id:
             for identity, tensor in zip(event.identities, event.tensor(), strict=True):
                 row = next(row for row in value.rows.request_rows if row.identity == identity)
                 run.values[identity.request_id, row.token_offset, f"export {event.tensor_name}"] = tensor
+
+
+def _imported_batch(
+    declaration: TensorBinding, identities: tuple[RequestIdentity, ...], perturbed: int | None
+) -> StateImport[torch.Tensor] | None:
+    """Seed distinct per-request rows, independent of admission and packed order."""
+    if not declaration.imports:
+        return None
+    (resource,) = declaration.imports
+    state = next(state for state in declaration.graph.states if state.resource == resource)
+    if state.scope is not StateScope.REQUEST:
+        return None
+    layout = next(entry.layout for entry in declaration.layouts.layouts if entry.resource == resource)
+    values = tuple(
+        torch.stack(
+            tuple(
+                _token_values(identity.prompt_index, range(1), prod(view.shape), channel + 700, perturbed).reshape(
+                    view.shape
+                )
+                for identity in identities
+            )
+        ).to(layout.fields[view.field].dtype.torch)
+        for channel, view in enumerate(declaration.imports[resource])
+    )
+    return StateImport(values)
 
 
 def _run(
@@ -495,6 +522,8 @@ def _run(
     script = tuple(replace(identity, sample_index=identity.sample_index % limit) for identity in _IDS)
     identities = tuple(script[i] for i in order)
     execution.admit(identities)
+    imports = _imported_batch(declaration, identities, perturbed)
+    import_rows = prompt_rows(identities)
     frontiers: dict[RequestIdentity, int] = {}
     try:
         stride = lcm(*(task.export.every for task in tasks.values() if task.export is not None))
@@ -502,7 +531,11 @@ def _run(
             if preempted != "none" and step == 3 and policy == "reset":
                 execution.retire((script[1],), wait=True)
                 execution.admit((script[1],))
-            value = _step(shape, facts, counts, step * stride, perturbed, script)
+            value = replace(
+                _step(shape, facts, counts, step * stride, perturbed, script),
+                batch=imports,
+                import_rows=import_rows,
+            )
             if policy == "keep":
                 sampler = retained_rows(value.sampler_rows, frontiers)
                 value = replace(
@@ -900,6 +933,11 @@ def _check(workload: Workload, config: ModelConfig) -> CheckResult:
             )
         )
     failures.extend(_variants(workload, facts, declaration, shape, exports, skipped))
+    if any(
+        state.resource in declaration.imports and state.scope is StateScope.REQUEST
+        for state in declaration.graph.states
+    ):
+        passed.append("imported rows / request isolation")
     passed.extend(("row permutation", "request isolation", "mixed prefill/decode", "chunking / tokens="))
     if any(
         isinstance(source, StateSelectionInputSource)

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -44,3 +45,8 @@ class RequestIdentity:
     # User-computed routing value (regex, discriminator, tenant id); the framework
     # signs the key declaration and never interprets the value.
     route: str = ""
+
+
+def prompt_rows(identities: Sequence[RequestIdentity], samples_per_prompt: int = 1) -> dict[str, int]:
+    """Map prompt-major generate identities to their per-prompt input row."""
+    return {identity.request_id: index // samples_per_prompt for index, identity in enumerate(identities)}

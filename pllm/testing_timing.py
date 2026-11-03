@@ -2,8 +2,14 @@
 
 from dataclasses import dataclass, field
 
+from pllm.contracts.host_batch import StateImport
 from pllm.contracts.packed_rows import PackedPhaseRow
-from pllm.contracts.semantic_graph import StateSelectionInputSource, TaskResultInputSource, TaskSymbol
+from pllm.contracts.semantic_graph import (
+    StateEffectKind,
+    StateSelectionInputSource,
+    TaskResultInputSource,
+    TaskSymbol,
+)
 from pllm.contracts.state_ref import LineageId, StateRef
 from pllm.execution.state_execution import StateExecution
 from pllm.execution.step_input import StepInput
@@ -34,6 +40,8 @@ class VersionChecks:
             for task in execution.plan.tasks
             if task.read_origin == "boundary" and lag
         )
+        graph = execution.arena.plan.semantic_graph
+        imported_state = graph.host_state(StateImport.schema) if isinstance(value.batch, StateImport) else None
         for task in execution.plan.tasks:
             symbol = execution.arena.plan.semantic_graph.tasks[task.task_id].symbol
             for group in selection.groups:
@@ -45,7 +53,19 @@ class VersionChecks:
                             if ref.lineage_id in before:
                                 ref = before[ref.lineage_id]
                                 break
-                    self.expected[symbol, str(group.resource), row.identity.request_id] = ref.version_id
+                    produced = any(
+                        effect.resource == group.resource
+                        and effect.kind is StateEffectKind.READ
+                        and effect.version is not None
+                        for effect in graph.tasks[task.task_id].effects
+                    )
+                    imported = (
+                        produced
+                        and imported_state is not None
+                        and group.resource == imported_state.resource
+                        and ref.version_id == 0
+                    )
+                    self.expected[symbol, str(group.resource), row.identity.request_id] = ref.version_id + int(imported)
         self.history.append(entry)
 
     def record(self, task: TensorTask, data: TensorFrame, rows: tuple[PackedPhaseRow, ...]) -> None:

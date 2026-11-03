@@ -4,10 +4,17 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import ClassVar, Generic, TypeVar
 
+from pllm.contracts.parameter_overlay import FieldView
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
-from pllm.contracts.semantic_graph import HostServiceInputSource, SchedulerTimeline, SemanticGraph
-from pllm.contracts.tensor_layout import TensorDType, TensorFieldSpec, TensorLayoutRequest
+from pllm.contracts.semantic_graph import (
+    HostServiceInputSource,
+    SchedulerTimeline,
+    SemanticGraph,
+    SemanticState,
+    StateScope,
+)
+from pllm.contracts.tensor_layout import TensorDType, TensorFieldSpec, TensorLayoutRequest, TensorLayoutSpec
 
 T = TypeVar("T")
 U = TypeVar("U")
@@ -50,11 +57,14 @@ class WeightedRowBatch(Generic[T]):
 
 @dataclass(frozen=True, slots=True)
 class StateImport(Generic[T]):
-    """External tensors in field order; floating values convert to the declared storage precision on import."""
+    """External tensors in field order, visible from the importing call's first step.
+
+    RequestState values have one leading row per prompt, in generate order, shared by its n samples.
+    InstanceState values are the field tensors themselves. Floating values convert to storage precision.
+    """
 
     schema: ClassVar[str] = "state_tensors@1"
     values: tuple[T, ...]
-    keys: tuple[RequestStateKey, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +108,8 @@ def validate_host_batch(
     hidden_size: int,
     vocab_size: int,
     target_shape: tuple[int, ...] = (),
+    prompt_count: int = 0,
+    import_fields: tuple[tuple[str, FieldView], ...] = (),
 ) -> None:
     """Check a generate call's host batch once, before export, mapping or device copies; tasks trust it.
 
@@ -116,6 +128,7 @@ def validate_host_batch(
     if not consumers:
         raise ValueError(
             f"this workload reads no {type(value).__name__}; pass batch=None or add a method that reads it"
+            + (" or declare a state with imported=True" if isinstance(value, StateImport) else "")
         )
 
     def shape(tensor: T) -> tuple[int, ...]:
@@ -195,8 +208,10 @@ def validate_host_batch(
                 )
             actual = (features,)
         case StateImport():
-            # The bound import validates logical field views, including optimizer slices,
-            # against local roots before allocating or publishing any writes.
+            state = graph.host_state(StateImport.schema)
+            assert state is not None
+            layout = next(entry.layout for entry in layouts.layouts if entry.resource == state.resource)
+            _validate_state_import(value, state, layout, import_fields, describe, prompt_count)
             return
     for task in consumers:
         limit = next((fact for fact in timeline.task_resources if fact.task == task.symbol), None)
@@ -213,6 +228,35 @@ def validate_host_batch(
             )
 
 
+def _validate_state_import(
+    value: StateImport[T],
+    state: SemanticState,
+    layout: TensorLayoutSpec,
+    fields: tuple[tuple[str, FieldView], ...],
+    describe: Callable[[T], TensorFieldSpec],
+    prompt_count: int,
+) -> None:
+    """Validate logical import fields before storage mapping or execution."""
+    values = value.values
+    label = f"StateImport for {('RequestState' if state.scope is StateScope.REQUEST else 'InstanceState')} {state.resource!r}"
+    if len(values) != len(fields):
+        raise ValueError(f"{label} needs {len(fields)} field tensors in declaration order, got {len(values)}")
+    for tensor, (name, view) in zip(values, fields, strict=True):
+        spec = describe(tensor)
+        prefix = (prompt_count,) if state.scope is StateScope.REQUEST else ()
+        if prefix and spec.shape[:1] != prefix:
+            raise ValueError(
+                f"{label} needs one row per prompt: field {name!r} has {spec.shape[0] if spec.shape else 0} rows for {prompt_count} prompts"
+            )
+        if spec.shape != prefix + view.shape:
+            raise ValueError(
+                f"{label} takes {'one row per prompt' if prefix else 'the field tensors themselves'}: field {name!r} has shape {spec.shape}, declared {prefix + view.shape}"
+            )
+        dtype = layout.fields[view.field].dtype
+        if spec.dtype != dtype and not (spec.dtype.torch.is_floating_point and dtype.torch.is_floating_point):
+            raise ValueError(f"{label}: field {name!r} needs floating or matching {dtype} values")
+
+
 def map_host_batch(value: HostBatch[T] | None, convert: Callable[[T], U]) -> HostBatch[U] | None:
     """Transform tensor storage without introducing a transport-specific input."""
     match value:
@@ -225,8 +269,8 @@ def map_host_batch(value: HostBatch[T] | None, convert: Callable[[T], U]) -> Hos
                 None if mask is None else convert(mask),
                 None if weights is None else convert(weights),
             )
-        case StateImport(values=values, keys=keys):
-            return StateImport(tuple(convert(item) for item in values), keys)
+        case StateImport(values=values):
+            return StateImport(tuple(convert(item) for item in values))
         case WeightedCEBatch(hidden=hidden, base_logits=logits, labels=labels, weights=weights, keys=keys):
             return WeightedCEBatch(convert(hidden), convert(logits), convert(labels), convert(weights), keys)
         case WeightedRowBatch(hidden=hidden, targets=targets, weights=weights):
