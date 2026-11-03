@@ -1,10 +1,13 @@
 """Storage accounting oracles for task memory, independent of region planning."""
 
+import pytest
 import torch
 
+from pllm.execution.torch_private import measure
 
+
+@pytest.mark.gpu
 def test_meta_memory_tracks_aliases_saved_gradients_and_real_cuda_peaks():
-    from pllm.execution.torch_private import measure
 
     source = torch.empty(1024, device="meta")
     assert measure(lambda: source.view(32, 32)).workspace == 0
@@ -40,10 +43,10 @@ def test_meta_memory_tracks_aliases_saved_gradients_and_real_cuda_peaks():
         assert result[1].shape == actual.shape
 
 
+@pytest.mark.gpu
 def test_direct_adamw_workspace_bounds_cuda_peak():
     """The shape-only capturable batch funds the real update's temporary storage."""
     from pllm.execution.tensor_program import PageUpdate
-    from pllm.execution.torch_private import measure
     from pllm.kernels.adamw import AdamWConfig
 
     optimizer = PageUpdate(AdamWConfig(0.017))

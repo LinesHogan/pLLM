@@ -45,4 +45,4 @@ combine-as-imports = true
 [tool.pytest.ini_options]
 # Fast developer loop: pytest -m "not slow" test/boundary test/workloads
 # `slow` marks tests that spawn processes or real vLLM engines; run them before merging.
-markers = ["slow: spawns subprocesses or a real vLLM engine; excluded by -m 'not slow'"]
+markers = ["slow: spawns subprocesses or a real vLLM engine; excluded by -m 'not slow'", "gpu: needs a visible CUDA device"]

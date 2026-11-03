@@ -6,6 +6,7 @@ import torch
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator
 
 
+@pytest.mark.gpu
 def test_pinned_projection_borrows():
     """Index tables vary under replay without materializing the field pool."""
     from pllm.contracts.parameter_overlay import ParameterOverlayOperator
@@ -43,6 +44,7 @@ def test_pinned_projection_borrows():
 
 
 @pytest.mark.parametrize("operator", tuple(ParameterOverlayOperator))
+@pytest.mark.gpu
 def test_projection_math_budget_and_allocator_peak(operator):
     from torch._subclasses.fake_tensor import FakeTensorMode
 

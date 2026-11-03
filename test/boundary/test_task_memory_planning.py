@@ -1,4 +1,4 @@
-"""Shape-only scan and optimizer planning must work in a CUDA-free worker."""
+"""Shape-only planning must leave CUDA uninitialized, with device capabilities available."""
 
 import subprocess
 import sys
@@ -7,6 +7,7 @@ import pytest
 
 
 @pytest.mark.slow
+@pytest.mark.gpu
 def test_meta_scan_and_adamw_do_not_initialize_cuda():
     script = """
 from unittest.mock import patch

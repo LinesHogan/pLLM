@@ -92,6 +92,7 @@ def test_equivalent_operator_order_and_matrix_guards():
 
 @pytest.mark.parametrize("step,shape,chunk", ((additive, (3, 5), 4), (diagonal, (5,), 4), (left, (4, 4), 4)))
 @pytest.mark.parametrize("count", (0, 1, 5, 8, 17))
+@pytest.mark.gpu
 def test_public_unseen_scan_against_fp64(step, shape, chunk, count):
     torch.manual_seed(13)
     state = torch.randn(shape, device="cuda") * 0.1
@@ -127,6 +128,7 @@ def test_diagonal_prefix_matches_independent_order(dtype, window):
     torch.testing.assert_close(actual.double(), torch.stack(expected), **tolerance)
 
 
+@pytest.mark.gpu
 def test_counted_diagonal_graph_masks_nonfinite_coefficients_and_keeps_readouts():
     def step(s, x, y):
         return x[0] * s + y[0], s.tanh() + x
@@ -159,6 +161,7 @@ def test_counted_diagonal_graph_masks_nonfinite_coefficients_and_keeps_readouts(
         torch.testing.assert_close(outputs, tuple(reads), rtol=1e-5, atol=1e-6, equal_nan=True)
 
 
+@pytest.mark.gpu
 def test_budget_boundary_and_two_graph_slots():
     state = torch.zeros(3, 5, device="cuda")
     x = torch.ones(32, 5, device="cuda")
@@ -205,6 +208,7 @@ def test_budget_boundary_and_two_graph_slots():
 
 @pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
 @pytest.mark.parametrize("window", (1, 5, 64))
+@pytest.mark.gpu
 def test_pointwise_higher_order_and_fallback_share_the_fp64_oracle(dtype, window):
     from pllm.execution.scan_execution import associative_prefix
 
@@ -241,7 +245,7 @@ def test_pointwise_higher_order_and_fallback_share_the_fp64_oracle(dtype, window
             torch.testing.assert_close(result.double() / normalizer, expected / normalizer, **tolerance)
 
 
-@pytest.mark.parametrize("device", ("cpu", "cuda"))
+@pytest.mark.parametrize("device", ("cpu", pytest.param("cuda", marks=pytest.mark.gpu)))
 def test_source_aliases_autograd_and_tensor_invariants(device):
     def step(s, x, w):
         return s + x.sum(0) @ w, x + s
@@ -274,6 +278,7 @@ def test_transpose_permute_and_identity_views_classify_equally():
         assert result is not None and result.kind == "right"
 
 
+@pytest.mark.gpu
 def test_left_action_restores_rectangular_readout_layout():
     def step(s, x, y):
         return (x.T @ x * 0.1) @ s + y, s.view(-1).tanh()
@@ -291,6 +296,7 @@ def test_left_action_restores_rectangular_readout_layout():
     torch.testing.assert_close(tuple(t.double() for t in outputs), tuple(reads), rtol=2e-5, atol=2e-6)
 
 
+@pytest.mark.gpu
 def test_shape_tracing_retains_owned_prefix_outputs_when_source_returns_aliases():
     from pllm.execution.torch_private import measure
 
@@ -305,6 +311,7 @@ def test_shape_tracing_retains_owned_prefix_outputs_when_source_returns_aliases(
 
 
 @pytest.mark.parametrize("kind", ("additive", "right"))
+@pytest.mark.gpu
 def test_counted_prefix_masks_nan_inf_and_keeps_exclusive_readouts(kind):
     def step(s, x, y):
         return (s + y if kind == "additive" else s @ x + y), s
@@ -334,7 +341,7 @@ def test_counted_prefix_masks_nan_inf_and_keeps_exclusive_readouts(kind):
         torch.testing.assert_close(outputs, tuple(reads), rtol=1e-5, atol=1e-6)
 
 
-@pytest.mark.parametrize("device", ("cpu", "cuda"))
+@pytest.mark.parametrize("device", ("cpu", pytest.param("cuda", marks=pytest.mark.gpu)))
 def test_source_preserves_gradients_of_closed_parameters(device):
     weight = torch.nn.Parameter(torch.eye(3, device=device))
     state = torch.zeros(3, 3, device=device)
@@ -356,6 +363,7 @@ def test_source_preserves_gradients_of_closed_parameters(device):
         assert analyze(lambda s, x, w: (s + x @ w, s), specifications((state, rows[:3], weight))) is not None
 
 
+@pytest.mark.gpu
 def test_prefix_outputs_own_disjoint_values_even_when_readout_returns_an_input():
     def step(s, x):
         return s + x[0], x
@@ -374,6 +382,7 @@ def test_prefix_outputs_own_disjoint_values_even_when_readout_returns_an_input()
     assert not initial.any()
 
 
+@pytest.mark.gpu
 def test_scan_funding_accounts_for_live_caller_temporaries():
     from pllm.execution.torch_private import measure
 
