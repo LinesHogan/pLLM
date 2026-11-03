@@ -47,7 +47,7 @@ class PrefillTrainer(pllm.Workload):
     def learned(self) -> pllm.RequestState:
         return pllm.RequestState({"w": (8,)}, optimizer=pllm.AdamW(lr=0.01))
 
-    @pllm.train(state="learned", reduction="state_mean")
+    @pllm.train(state="learned")
     def learn(self, x=pllm.hidden(0, tokens="prefill"), w=pllm.parameter("learned", "w")):
         return (w - x).square().mean(-1)
 
@@ -72,38 +72,123 @@ class PositionStack(pllm.Workload):
     loop: StepLoopWorkload = StepLoopWorkload()
 
 
+class BatchMeanTrainer(PrefillTrainer):
+    """An explicit batch mean breaks independent request updates."""
+
+    @pllm.train(state="learned", reduction="mean")
+    def learn(self, x=pllm.hidden(0), w=pllm.parameter("learned", "w")):
+        return (w - x).square().mean(-1)
+
+
+@dataclass(frozen=True)
+class BorrowedMutation(pllm.Workload):
+    """A view write is invalid for either borrowed input kind."""
+
+    parameter: bool
+    head = pllm.InstanceState({"w": (8,)})
+
+    @pllm.export(max_rows=3)
+    def change(self, h=pllm.hidden(0), w=pllm.parameter("head", "w")):
+        target = w if self.parameter else h
+        target.view_as(target).add_(1)
+        return h + w
+
+
+class BadLogits(pllm.Workload):
+    """Hidden width is not vocabulary width."""
+
+    @pllm.add_logits()
+    def logits(self, h=pllm.hidden(0)):
+        return h
+
+
+def sampler_feedback(source):
+    """Feedback is unavailable even when a sampler reads it through a helper."""
+
+    class Feedback(pllm.Workload):
+        @pllm.on(pllm.Phase.AFTER_SAMPLE)
+        def feedback(self, value=source):
+            return value
+
+        @pllm.add_logits()
+        def logits(self, h=pllm.hidden(0), value=pllm.result("feedback")):
+            return h
+
+    return Feedback()
+
+
+class SelectedTrainer(PrefillTrainer):
+    """Standalone request training cannot select updates."""
+
+    def selected(self, h=pllm.hidden(0)):
+        return h[:, 0] > 0
+
+    @pllm.train(state="learned", rows="selected")
+    def learn(self, x=pllm.hidden(0), w=pllm.parameter("learned", "w")):
+        return (w - x).square().mean(-1)
+
+
+class PromptMask(pllm.Workload):
+    """Adaptive masks must leave prompt layers unmasked."""
+
+    @pllm.custom_forward(tokens="all")
+    def forward(self, layers):
+        return layers(active=layers.embeddings[:, :1] > 0)[-1]
+
+
 @pytest.mark.parametrize(
-    "workload",
-    (
-        DummyWorkload(),
-        Stack(),
-        PositionStack(),
-        PrefillTrainer(),
-        DoLaWorkload(layers=(0, 2, 4, 6, 8)),
-        ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5)),
-        FactorAdapterWorkload(),
-        PromptFactorsWorkload(),
-        PromptMixtureWorkload(),
-        DecodeFactorsWorkload(),
-        OutputLoRAWorkload(),
-        OverRIDEWorkload(OverRIDEConfig(rank=2, num_iterations=3)),
-        PrefillAdaptersWorkload(rank=2, chunk_size=4),
-        GatedDeltaWorkload(GatedDeltaConfig((pllm.model.Projection("down_proj", 0),), head_width=4, chunk_size=4)),
-        InPlaceTTTWorkload(InPlaceTTTConfig((pllm.model.Projection("down_proj", 0),), 4, 0.01), dtype=torch.bfloat16),
-        InPlaceTTTWorkload(InPlaceTTTConfig((pllm.model.Projection("down_proj", 0),), 4, 0.3, track="T2")),
-        ReFTWorkload(ReFTConfig((0,))),
-        RecirculationWorkload(),
-        JacobiRecirculationWorkload(),
-        StepLoopWorkload(),
-        FTTTWorkload(),
-        TTRLWorkload(),
-        TLMWorkload(TLMConfig()),
-        VideoWorkload(),
-    ),
-    ids=lambda workload: type(workload).__name__,
+    "workload, error",
+    [
+        (workload, "")
+        for workload in (
+            DummyWorkload(),
+            Stack(),
+            PositionStack(),
+            PrefillTrainer(),
+            DoLaWorkload(layers=(0, 2, 4, 6, 8)),
+            ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5)),
+            FactorAdapterWorkload(),
+            PromptFactorsWorkload(),
+            PromptMixtureWorkload(),
+            DecodeFactorsWorkload(),
+            OutputLoRAWorkload(),
+            OverRIDEWorkload(OverRIDEConfig(rank=2, num_iterations=3)),
+            PrefillAdaptersWorkload(rank=2, chunk_size=4),
+            GatedDeltaWorkload(GatedDeltaConfig((pllm.model.Projection("down_proj", 0),), head_width=4, chunk_size=4)),
+            InPlaceTTTWorkload(
+                InPlaceTTTConfig((pllm.model.Projection("down_proj", 0),), 4, 0.01), dtype=torch.bfloat16
+            ),
+            InPlaceTTTWorkload(InPlaceTTTConfig((pllm.model.Projection("down_proj", 0),), 4, 0.3, track="T2")),
+            ReFTWorkload(ReFTConfig((0,))),
+            RecirculationWorkload(),
+            JacobiRecirculationWorkload(),
+            StepLoopWorkload(),
+            FTTTWorkload(),
+            TTRLWorkload(),
+            TLMWorkload(TLMConfig()),
+            VideoWorkload(),
+        )
+    ]
+    + [
+        (BatchMeanTrainer(), 'method `learn`.*couples RequestState.*reduction="state_mean"'),
+        (BorrowedMutation(False), "method `change` mutates borrowed input `h`.*clone"),
+        (BorrowedMutation(True), "method `change` mutates borrowed input `w`.*clone"),
+        (BadLogits(), r"@pllm.add_logits.*\[rows, vocab_size\].*got \(3, 8\)"),
+        (sampler_feedback(pllm.base_logits()), r"pllm.base_logits\(\).*Phase.AFTER_SAMPLE.*pllm.layer_logits"),
+        (sampler_feedback(pllm.sampled_tokens()), r"pllm.sampled_tokens\(\).*Phase.AFTER_SAMPLE.*pllm.final_hidden"),
+        (SelectedTrainer(), "rows=.*require a model effect without sampler guidance, or @pllm.add_logits"),
+        (PromptMask(), "active=.*only in @pllm.custom_forward.*decode.*separate unmasked"),
+    ],
+    ids=lambda value: type(value).__name__ if isinstance(value, pllm.Workload) else "",
 )
-def test_builtin_schedule_contracts(workload, model_config):
+def test_schedule_contracts(workload, error, model_config):
     cuda_initialized = torch.cuda.is_initialized()
+    if error:
+        with pytest.raises(testing.ContractError, match=error) as caught:
+            testing.check(workload, model_config)
+        assert "framework bug" not in str(caught.value)
+        assert torch.cuda.is_initialized() == cuda_initialized
+        return
     result = testing.check(workload, model_config)
     assert torch.cuda.is_initialized() == cuda_initialized
     assert result.passed or result.skipped

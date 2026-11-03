@@ -1094,7 +1094,9 @@ class _Train(_Effect):
         unconditional = request_training and (sampler is None or sampler.stage is SamplerStage.PACKED_POST_FILTER_EXACT)
         if unconditional and (operation.rows or self.update_rows):
             raise ValueError(
-                "request training updates every selected state: remove rows= and update_rows= from @pllm.train"
+                "rows= and update_rows= on request training require a model effect without sampler guidance, "
+                "or @pllm.add_logits; standalone training and @pllm.guide_sampling update every selected state, "
+                "so remove rows= and update_rows="
             )
         # Selectors keep their declared phase.
         when = When.AFTER_SAMPLE if request_training and operation.phase is Phase.AUTOMATIC else operation.phase.value
@@ -1779,7 +1781,11 @@ def add_logits(*, rows: str = "") -> Callable[[F], F]:
 
 
 def guide_sampling(*, beta: float | Attr, rows: str = "") -> Callable[[F], F]:
-    """Steer sampling toward the returned hidden-state prediction with strength `beta`."""
+    """Push sampling away from the returned hidden-state prediction for positive `beta`.
+
+    On finite top-k/top-p survivors, use `(1 + beta) * logits - beta * pred_logits`, where the model's LM head
+    projects the returned hidden states to `pred_logits`.
+    """
     return _mark(effect=_Sampler(SamplerStage.PACKED_POST_FILTER_EXACT, beta), rows=rows)
 
 
@@ -1787,7 +1793,7 @@ def train(
     *,
     state: str,
     update_rows: str = "",
-    reduction: TrainReduction = "mean",
+    reduction: TrainReduction = "state_mean",
     steps: int | Attr = 1,
     reset: str = "",
     rows: str = "",
@@ -1803,9 +1809,11 @@ def train(
     step on the host batch. WeightedCEBatch fields run `steps` SGD steps per state, each state first restored by
     the `reset` method (pllm.SGD).
 
-    `reduction="mean"` averages the loss over all rows; `"state_mean"` averages each state's rows, then sums over
-    states. WeightedCEBatch training ignores it: its loss is weighted per state, then averaged. `rows=` names a
-    selector whose mask picks the rows that count; the method still runs on every row.
+    The default `reduction="state_mean"` averages each state's rows, then sums over states, so RequestState
+    updates are independent of neighboring requests. `"mean"` averages over all rows and couples request updates.
+    Host-batch training ignores it. `rows=` names a selector whose mask picks the rows that count; the method
+    still runs on every row. For request training, rows= and update_rows= require a model effect without sampler
+    guidance, or @pllm.add_logits; standalone training and @pllm.guide_sampling update every selected state.
     """
     if reduction not in ("mean", "state_mean"):
         raise ValueError(f"@pllm.train(reduction={reduction!r}): use 'mean' or 'state_mean'")

@@ -21,7 +21,7 @@ from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, Pack
 from pllm.contracts.parameter_overlay import ProjectionOperands
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.request_state import RequestStateKey
-from pllm.contracts.sampler import SamplerFeedback
+from pllm.contracts.sampler import SamplerFeedback, SamplerStage
 from pllm.contracts.semantic_graph import (
     SchedulerTimeline,
     SemanticGraph,
@@ -262,6 +262,15 @@ def derive_resources(
                 "use tensor operations such as torch.where, not .item() or Python branches on tensor values"
             )
             raise
+        if task is not None and task.sampler_stage is SamplerStage.PACKED_PRE_FILTER_ADD:
+            result = batch.results[symbol, task.outputs[0]]
+            expected = (len(data.rows), facts.vocab_size)
+            if result.shape != expected:
+                raise ValueError(
+                    f"@pllm.add_logits method `{symbol}` must return [rows, vocab_size] = {expected}; "
+                    f"got {tuple(result.shape)}. Read logits=pllm.layer_logits((-1,)) and return logits[:, -1], "
+                    "or project hidden states to the model's vocabulary."
+                )
         # Model overlays capture bounded tiles, not their whole maximum-shape operation.
         required = operation.resident(usage.capture) if task is not None else 0
         required_capture = max(required_capture, required)

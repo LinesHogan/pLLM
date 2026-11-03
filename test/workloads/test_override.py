@@ -180,7 +180,7 @@ def _request_heads() -> None:
         def eligible(self, samples: torch.Tensor = pllm.sample_index()) -> torch.Tensor:
             return samples == 0
 
-        @pllm.train(state="heads", rows="eligible")
+        @pllm.train(state="heads", rows="eligible", reduction="mean")
         def train(
             self,
             hidden: torch.Tensor = pllm.final_hidden(),
@@ -241,7 +241,7 @@ def _chained_heads(facts) -> None:
         def eligible(self, samples: torch.Tensor = pllm.sample_index()) -> torch.Tensor:
             return samples == 0
 
-        @pllm.train(state="heads", rows="eligible")
+        @pllm.train(state="heads", rows="eligible", reduction="mean")
         @pllm.differentiate(inputs=("features",))
         def train(
             self,
@@ -323,7 +323,7 @@ class Domains(pllm.Workload):
     ) -> torch.Tensor:
         return torch.bmm(hidden.unsqueeze(1), weight).squeeze(1)
 
-    @pllm.train(state="heads", update_rows="updates", rows="forward_rows")
+    @pllm.train(state="heads", update_rows="updates", rows="forward_rows", reduction="mean")
     @pllm.differentiate(inputs=("features",))
     def train(
         self,

@@ -578,4 +578,13 @@ def declare_logits(b: TensorBinding, prediction: Call, *, stage: SamplerStage) -
     """Send the prediction to the sampler: added to the logits before filtering, or guiding the draw after it."""
     if stage is SamplerStage.PACKED_PRE_FILTER_ADD and b.dimensions.vocab_size < 1:
         raise ValueError("@pllm.add_logits needs the model's vocabulary size; compile this workload with make_llm")
+    for task in b.tensor_tasks[prediction.symbol].dependencies(b.tensor_tasks):
+        for name, port in task.ports.items():
+            if port.feedback:
+                raise ValueError(
+                    f"sampler method `{prediction.symbol}` reads pllm.{port.feedback}() through `{task.symbol}.{name}`, "
+                    "which is available only in Phase.AFTER_SAMPLE. Read feedback in @pllm.train or a read-only "
+                    "helper feeding it beside @pllm.add_logits; before sampling, use pllm.layer_logits((-1,)) "
+                    "for logits or pllm.final_hidden() for hidden states."
+                )
     b.sampler(prediction, stage)

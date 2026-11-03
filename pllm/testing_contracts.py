@@ -108,8 +108,17 @@ class _Run:
     shared_values: set[tuple[str, int, str]] = field(default_factory=lambda: set())
 
     def record(
-        self, task: TensorTask, data: TensorFrame, inputs: Mapping[str, torch.Tensor], outputs: tuple[torch.Tensor, ...]
+        self,
+        task: TensorTask,
+        data: TensorFrame,
+        inputs: Mapping[str, torch.Tensor],
+        outputs: tuple[torch.Tensor, ...],
+        *,
+        rowwise: bool,
     ) -> None:
+        # Global results have no request axis; their state and export effects are still compared.
+        if not rowwise:
+            return
         rows = (
             data.rows
             if data.fixed is None
@@ -460,10 +469,9 @@ def _run(
 ) -> _Run:
     run = _Run(shared_resources=_shared_resources(declaration))
     tasks = declaration.tensor_tasks
-    # Global results have no request axis; their state and export effects are still compared.
     declaration.tensor_tasks = {
-        symbol: replace(task, observe=partial(run.record, task))
-        if task.writer is None and reads_rows(task, tasks)
+        symbol: replace(task, observe=partial(run.record, task, rowwise=reads_rows(task, tasks)))
+        if task.writer is None
         else task
         for symbol, task in tasks.items()
     }
@@ -788,6 +796,18 @@ def _check(workload: Workload, config: ModelConfig) -> CheckResult:
     except (ValueError, RuntimeError, TypeError) as error:
         raise ContractError((f"[compile] {''.join(format_exception_only(error)).strip()}",)) from error
     passed.append("compile")
+    for task in declaration.tensor_tasks.values():
+        if (
+            task.training is not None
+            and task.training.declaration.scope is StateScope.REQUEST
+            and task.policy.reduction == "mean"
+        ):
+            failures.append(
+                f'[training] method `{task.symbol}` uses reduction="mean", which couples RequestState updates '
+                'across requests; use @pllm.train(..., reduction="state_mean") or omit reduction=.'
+            )
+    if failures:
+        raise ContractError(tuple(failures))
     programs = tuple((declaration.custom_forward_programs or {}).values())
     if any(program.adaptive for program in programs):
         from pllm.testing_depth import check_depth, check_never_exit

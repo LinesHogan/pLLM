@@ -298,6 +298,22 @@ class TensorTask:
         """Diagnostics retain inputs before authored in-place math can change them."""
         return inputs if self.observe is None else {name: value.detach().clone() for name, value in inputs.items()}
 
+    def call(self, inputs: Mapping[str, torch.Tensor]) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Run authored math, checking borrowed input versions during CPU contract checks."""
+        if self.observe is None:
+            return self.function(**self.arguments(inputs))
+        versions = {name: value._version for name, value in inputs.items()}
+        try:
+            return self.function(**self.arguments(inputs))
+        finally:
+            for name, value in inputs.items():
+                if value._version != versions[name]:
+                    raise ValueError(
+                        f"method `{self.symbol}` mutates borrowed input `{name}` in place; inputs and parameters "
+                        "are read-only views. Use out-of-place tensor math or clone() before writing; "
+                        "publish state changes through @pllm.write or @pllm.train."
+                    )
+
     def evaluate(self, data: TensorFrame, batch: TensorBatch) -> dict[tuple[str, str], torch.Tensor]:
         """Run a forward method on every row and store its result for later tasks and the invocation output.
 
@@ -306,7 +322,7 @@ class TensorTask:
         with torch.set_grad_enabled(self.differentiable):
             inputs, sources = self.read(data, batch)
             observed_inputs = self.observation_inputs(inputs)
-            results = self.function(**self.arguments(inputs))
+            results = self.call(inputs)
             if not self.tuple_output:
                 if not isinstance(results, torch.Tensor):
                     raise ValueError("tensor methods must return one tensor")
@@ -340,7 +356,7 @@ class TensorTask:
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         """Forward, loss reduction over the selected `rows` and one autograd step to the parameters and `sources`."""
         observed_inputs = self.observation_inputs(inputs)
-        loss = self.function(**self.arguments(inputs))
+        loss = self.call(inputs)
         if not isinstance(loss, torch.Tensor) or loss.shape != (len(data.rows),):
             raise ValueError("training methods return one loss per row; pllm averages the selected rows")
         if self.observe is not None:

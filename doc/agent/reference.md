@@ -610,8 +610,8 @@ pllm.export(*, name: 'str | Attr' = 'value', every: 'int | Attr' = 1, max_rows: 
 pllm.add_logits(*, rows: 'str' = '') -> 'Callable[[F], F]'
     Add the returned tensor to the logits before sampling.
 pllm.guide_sampling(*, beta: 'float | Attr', rows: 'str' = '') -> 'Callable[[F], F]'
-    Steer sampling toward the returned hidden-state prediction with strength `beta`.
-pllm.train(*, state: 'str', update_rows: 'str' = '', reduction: 'TrainReduction' = 'mean', steps: 'int | Attr' = 1, reset: 'str' = '', rows: 'str' = '') -> 'Callable[[F], F]'
+    Push sampling away from the returned hidden-state prediction for positive `beta`.
+pllm.train(*, state: 'str', update_rows: 'str' = '', reduction: 'TrainReduction' = 'state_mean', steps: 'int | Attr' = 1, reset: 'str' = '', rows: 'str' = '') -> 'Callable[[F], F]'
     Minimize the returned loss with `state`'s optimizer; updates publish after sampling by default.
 pllm.differentiate(*, inputs: 'tuple[str, ...]' = (), parameters: 'bool' = False, input_rows: 'str' = '', parameter_rows: 'str' = '') -> 'Callable[[F], F]'
     Keep derivative edges; parameters may stay frozen while inputs differentiate.
