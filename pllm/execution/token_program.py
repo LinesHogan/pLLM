@@ -385,7 +385,9 @@ class TokenProgram:
             placeholders[1],
             placeholders[2],
             tuple(zip(names, placeholders[3 : 3 + len(names)], strict=True)),
-            parameters=tuple((key, source) for key, (_, source, _) in zip(invariants, parameters, strict=True)),
+            parameters=tuple(
+                (key, replace(source, module=None)) for key, (_, source, _) in zip(invariants, parameters, strict=True)
+            ),
             over=over,
         )
 

@@ -179,6 +179,11 @@ class MoR(pllm.Workload):
     def router(self) -> pllm.InstanceState:
         return pllm.InstanceState(module=lambda m: torch.nn.Linear(m.hidden_size, 1), dtype=torch.float32)
 
+    @pllm.custom_forward(tokens="prefill")
+    def prompt(self, layers, router=pllm.module("router")):
+        hidden = layers()[-1]
+        return (hidden.float() * (1 + router(hidden.float()).sigmoid() * 0.01)).to(hidden.dtype)
+
     @pllm.custom_forward(tokens="decode")
     def forward(self, layers, router=pllm.module("router")):
         hidden = layers()[-1]
