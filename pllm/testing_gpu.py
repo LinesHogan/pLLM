@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import torch
 from vllm import SamplingParams
+from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.request import Request
 
@@ -51,6 +52,7 @@ def check_probe(workload: Workload, config: ModelConfig, handle: VllmLlm[TensorF
     shape = ModelShape.of_model(runner.decoder, requirements.parameter_targets, runner.dtype)
     facts = probe_backend(requirements, runner, publish_lag=config.execution.publish_lag)
     # The installed state already consumed memory; replay planning against its load-time capacity.
+    assert handle._facts is not None
     facts = replace(facts, state_memory_budget_bytes=handle._facts.state_memory_budget_bytes)
     actual = explain_facts(workload, config, shape, facts, runner.hidden_layouts)
     failures: list[str] = []
@@ -262,19 +264,32 @@ def _preemption(handle: VllmLlm[TensorFrame, TensorOutput], reference: _Generati
     return result
 
 
+def _release_models() -> None:
+    """Drain finished diagnostic engines before vLLM samples free memory for the next one."""
+    if torch.cuda.is_initialized():
+        torch.cuda.synchronize()
+        cleanup_dist_env_and_memory()
+
+
+def _neutral_tokens(workload: Workload, config: ModelConfig) -> tuple[tuple[tuple[int, ...], ...], ...]:
+    with pllm.make_llm(config, workload=workload) as handle:
+        return (_tokens(handle), _tokens(handle, 0.8))
+
+
 def _neutral(workload: Workload, config: ModelConfig) -> None:
     report = explain(workload, config)
-    with pllm.make_llm(config, workload=workload) as handle:
-        observed = (_tokens(handle), _tokens(handle, 0.8))
+    observed = _neutral_tokens(workload, config)
+    _release_models()
     requirements = workload.backend_requirements()
     options: GraphOptions = {} if report.eager_reason else graph_options(config, requirements)
-    vanilla = vllm_engine(
-        replace(config, execution=ExecutionOptions()),
-        {**options, "worker_cls": "auto", **load_options(requirements.checkpoint_names)},
-        {},
-        cuda_graphs=not bool(report.eager_reason),
-    )
-    try:
+    with VllmLlm[None, None](
+        vllm_engine(
+            replace(config, execution=ExecutionOptions()),
+            {**options, "worker_cls": "auto", **load_options(requirements.checkpoint_names)},
+            {},
+            cuda_graphs=not bool(report.eager_reason),
+        )
+    ) as vanilla:
         expected = tuple(
             tuple(
                 tuple(output.outputs[0].token_ids)
@@ -284,8 +299,6 @@ def _neutral(workload: Workload, config: ModelConfig) -> None:
             )
             for temp in (0, 0.8)
         )
-    finally:
-        vanilla.llm_engine.engine_core.shutdown()
     if observed != expected:
         raise ContractError(
             (
@@ -295,22 +308,7 @@ def _neutral(workload: Workload, config: ModelConfig) -> None:
         )
 
 
-def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload | None = None) -> CheckResult:
-    """Load real engines to check planning, eight steady decode anchors, replay and neutral sampling.
-
-    Neutral checks compare greedy and seeded sampled token IDs bitwise in the workload's graph mode.
-    Forced KV allocation failure exercises vLLM's real eviction/recompute path. Tap and projection inputs are recorded
-    and replayed per token, as in the CPU script, to exclude base-model rounding differences. Host-batch training
-    and declared replay rejections are reported as explicit skips.
-    Run in an isolated process with a CUDA device; multiprocessing and parallel workers are unsupported.
-    """
-    if (
-        config.multiprocessing
-        or max(config.tensor_parallel_size, config.pipeline_parallel_size, config.data_parallel_size) > 1
-    ):
-        raise ValueError("check_on_gpu needs multiprocessing=False and all parallel sizes=1")
-    if config.max_num_seqs < 2 or config.max_model_len < 32:
-        raise ValueError("check_on_gpu needs max_num_seqs >= 2 and max_model_len >= 32 for its fixed script")
+def _workload_checks(workload: Workload, config: ModelConfig) -> CheckResult:
     passed: list[str] = []
     skipped: list[CheckSkip] = []
     failures: list[str] = []
@@ -350,6 +348,39 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
                     passed.append("preempted: fixed per-token inputs, token IDs and terminal request state")
             except (RuntimeError, ContractError) as error:
                 failures.append(f"[preempted] {error}")
+    if failures:
+        raise ContractError(tuple(failures))
+    return CheckResult(tuple(passed), tuple(skipped))
+
+
+def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload | None = None) -> CheckResult:
+    """Load real engines to check planning, eight steady decode anchors, replay and neutral sampling.
+
+    Neutral checks compare greedy and seeded sampled token IDs bitwise in the workload's graph mode.
+    Forced KV allocation failure exercises vLLM's real eviction/recompute path. Tap and projection inputs are recorded
+    and replayed per token, as in the CPU script, to exclude base-model rounding differences. Host-batch training
+    and declared replay rejections are reported as explicit skips.
+    Run in an isolated process with a CUDA device; multiprocessing and parallel workers are unsupported.
+    """
+    if (
+        config.multiprocessing
+        or max(config.tensor_parallel_size, config.pipeline_parallel_size, config.data_parallel_size) > 1
+    ):
+        raise ValueError("check_on_gpu needs multiprocessing=False and all parallel sizes=1")
+    if config.max_num_seqs < 2 or config.max_model_len < 32:
+        raise ValueError("check_on_gpu needs max_num_seqs >= 2 and max_model_len >= 32 for its fixed script")
+    passed: list[str] = []
+    skipped: list[CheckSkip] = []
+    failures: list[str] = []
+    _release_models()
+    try:
+        result = _workload_checks(workload, config)
+        passed.extend(result.passed)
+        skipped.extend(result.skipped)
+    except ContractError as error:
+        failures.extend(error.failures)
+    finally:
+        _release_models()
     if neutral is None:
         skipped.append(CheckSkip("neutral", "pass neutral= with the author's disabled settings"))
     else:
@@ -358,6 +389,8 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
             passed.append("neutral: greedy and seeded sampling bitwise")
         except ContractError as error:
             failures.extend(error.failures)
+        finally:
+            _release_models()
     if failures:
         raise ContractError(tuple(failures))
     return CheckResult(tuple(passed), tuple(skipped))
