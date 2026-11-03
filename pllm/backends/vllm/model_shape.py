@@ -19,6 +19,9 @@ if TYPE_CHECKING:
     from pllm.backends.vllm.architecture import Decoder
 
 
+_DENSE_ARCHITECTURES = ("Qwen2ForCausalLM", "Qwen3ForCausalLM", "LlamaForCausalLM")
+
+
 @dataclass(frozen=True)
 class _ConfigShape:
     architectures: tuple[str, ...]
@@ -30,8 +33,18 @@ class _ConfigShape:
     num_key_value_heads: int | None = None
     head_dim: int | None = None
 
+    def forward_flops(self) -> int | None:
+        """Dense projection matmuls per token, excluding attention over the growing KV history."""
+        if self.architectures[0] not in _DENSE_ARCHITECTURES:
+            return None
+        head = self.head_dim or self.hidden_size // self.num_attention_heads
+        query = head * self.num_attention_heads
+        kv = head * (self.num_key_value_heads or self.num_attention_heads)
+        parameters = self.num_hidden_layers * self.hidden_size * (2 * query + 2 * kv + 3 * self.intermediate_size)
+        return 2 * (parameters + self.hidden_size * pad_vocab_size(self.vocab_size))
+
     def projections(self, targets: tuple[Projection, ...]) -> tuple[ProjectionShape, ...]:
-        if targets and self.architectures[0] not in ("Qwen2ForCausalLM", "Qwen3ForCausalLM", "LlamaForCausalLM"):
+        if targets and self.architectures[0] not in _DENSE_ARCHITECTURES:
             raise ValueError(
                 "projection shapes for this architecture are decided at make_llm; use a dense Qwen2, Qwen3 or Llama config for CPU checks"
             )
@@ -59,6 +72,7 @@ class ModelShape:
     padded_vocab_size: int
     targets: tuple[ProjectionShape, ...]
     read_only_reason: str | None = None
+    base_forward_flops_per_token_estimate: int | None = None
 
     @classmethod
     def of_config(cls, config: ModelConfig, targets: tuple[Projection, ...] = ()) -> Self:
@@ -86,6 +100,7 @@ class ModelShape:
             pad_vocab_size(shape.vocab_size),
             shape.projections(targets),
             read_only,
+            shape.forward_flops(),
         )
 
     @classmethod
@@ -104,4 +119,5 @@ class ModelShape:
             model.lm_head.num_embeddings_padded,
             shapes,
             decoder.read_only,
+            structure(model.config.to_dict(), _ConfigShape).forward_flops(),
         )

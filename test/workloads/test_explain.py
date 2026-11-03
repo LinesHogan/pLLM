@@ -120,3 +120,27 @@ def test_esamp_attribution_and_budget_fallback(model_config):
     assert failed.peak_memory_bytes == report.peak_memory_bytes
     state_failed = pllm.explain(workload, replace(model_config, execution=pllm.ExecutionOptions(state_memory_bytes=1)))
     assert state_failed.budget_errors
+
+
+def test_declared_flop_estimates(model_config):
+    report = pllm.explain(ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5)), model_config)
+    estimates = {task.name: task.estimate for member in report.members for task in member.tasks}
+    rows, hidden, rank, vocab, padded_vocab = 3, 8, 2, 32, 64
+    assert estimates["predict"].matmul_flops_estimate == rows * 6 * hidden * rank
+    assert estimates["predict"].projection_flops_estimate == rows * 2 * hidden * padded_vocab
+    # Input hidden rows are constants: backward needs four GEMMs, forward needs three.
+    assert estimates["loss"].matmul_flops_estimate == rows * 14 * hidden * rank
+    assert estimates["loss"].optimizer_bytes_estimate > 0
+    assert estimates["predict"].sampler_bytes_estimate == rows * vocab * 10
+    dola = pllm.explain(DoLaWorkload(layers=(0, 2)), model_config)
+    contrast = next(task for member in dola.members for task in member.tasks if task.name == "contrast")
+    assert contrast.estimate.projection_flops_estimate == rows * 3 * 2 * hidden * padded_vocab
+    assert contrast.estimate.sampler_bytes_estimate == rows * vocab * 12
+    lora = pllm.explain(OutputLoRAWorkload(), model_config)
+    assert any(
+        task.estimate is not None and task.estimate.optimizer_bytes_estimate > 0
+        for member in lora.members
+        for task in member.tasks
+    )
+    assert "estimate / step" in str(report)
+    assert all(field.dtype for state in report.states for field in state.fields)

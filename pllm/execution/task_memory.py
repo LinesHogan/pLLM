@@ -217,6 +217,20 @@ def producers_first(graph: SemanticGraph, symbols: tuple[TaskSymbol, ...]) -> tu
     return tuple(symbol for symbol in ordered if symbol in symbols)
 
 
+def task_example(data: TensorFrame, phase: HiddenPhase | None) -> TensorFrame:
+    """Select a method's token phase for shared memory and arithmetic shape tracing."""
+    if phase is None:
+        return data
+    packed = replace(
+        data.step.rows, rows=tuple(replace(row, phase=phase, prompt_length=1) for row in data.step.rows.rows)
+    )
+    sampler = replace(data.step.sampler_rows, row_batch=packed)
+    hidden = None if data.step.hidden is None else replace(data.step.hidden, row_batch=packed)
+    return replace(
+        data, step=replace(data.step, rows=packed, sampler_rows=sampler, hidden=hidden), rows=packed.rows, plan=None
+    )
+
+
 def derive_resources(
     binding: TensorBinding, facts: BackendCompileFacts, options: ExecutionOptions
 ) -> SchedulerTimeline:
@@ -238,18 +252,7 @@ def derive_resources(
         operation = operations[symbol]
         task = binding.tensor_tasks.get(symbol)
         phase = None if task is None else task.phase
-        if phase is not None:
-            packed = replace(
-                data.step.rows, rows=tuple(replace(row, phase=phase, prompt_length=1) for row in data.step.rows.rows)
-            )
-            sampler = replace(data.step.sampler_rows, row_batch=packed)
-            hidden = None if data.step.hidden is None else replace(data.step.hidden, row_batch=packed)
-            data = replace(
-                data,
-                step=replace(data.step, rows=packed, sampler_rows=sampler, hidden=hidden),
-                rows=packed.rows,
-                plan=None,
-            )
+        data = task_example(data, phase)
         try:
             usage = operation.memory(data, batch)
         except (RuntimeError, ValueError, TypeError) as error:

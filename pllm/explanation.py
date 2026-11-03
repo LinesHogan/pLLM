@@ -16,6 +16,7 @@ from pllm.contracts.semantic_graph import (
     TaskResourceFact,
 )
 from pllm.contracts.tensor_layout import TensorFieldSpec
+from pllm.cost_estimates import CostEstimate, estimate_tasks
 from pllm.execution.preemption import preemption_policy
 from pllm.execution.ptts.page_bundle_planning import page_stride_bytes
 
@@ -40,6 +41,7 @@ class TaskCost:
     read_distance: int
     workspace_bytes: int
     capture_resident_bytes: int
+    estimate: CostEstimate | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,7 +99,7 @@ class TapCost:
 
 @dataclass(frozen=True, slots=True)
 class ExplainResult:
-    """Exact declared costs, not a GPU fit or throughput prediction; asdict is JSON-ready."""
+    """Exact reservations and labelled arithmetic estimates; asdict is JSON-ready, with no latency prediction."""
 
     model: ModelShape
     dtype: str
@@ -126,6 +128,7 @@ class ExplainResult:
             f"model    {self.model.architecture}, hidden {self.model.hidden_size}, {self.model.layer_count} layers, "
             f"vocab {self.model.vocab_size}, {self.dtype} [exact, config.json]",
             f"forward  {forward}",
+            f"base     {self.model.base_forward_flops_per_token_estimate} FLOP/token [estimate: dense projections and LM head; excludes attention over KV history]",
             "member  effect  anchor / lane / graph  state reads (origin, distance)",
         ]
         for member in self.members:
@@ -135,6 +138,18 @@ class ExplainResult:
                     f"{'captured' if task.captured else 'eager'}  "
                     f"{', '.join(task.reads) or '-'} ({task.read_origin}, {task.read_distance})"
                 )
+                if task.estimate is not None:
+                    estimate = task.estimate
+                    lines.append(
+                        f"  estimate / step ({estimate.rows} rows): {estimate.matmul_flops_estimate} matmul FLOP + "
+                        f"{estimate.projection_flops_estimate} projection FLOP; "
+                        f"state read/write {estimate.state_read_bytes_estimate}/{estimate.state_write_bytes_estimate} bytes, "
+                        f"optimizer {estimate.optimizer_bytes_estimate} bytes (included), sampler {estimate.sampler_bytes_estimate} bytes"
+                    )
+                else:
+                    lines.append(
+                        "  estimate / step: unavailable; profile this model-site or host-batch body with a loaded model"
+                    )
             if not member.tasks:
                 lines.append(f"{member.name}  {member.effect}  model site or inactive method")
             if member.eager_reason:
@@ -174,7 +189,7 @@ class ExplainResult:
         return "\n".join(lines)
 
 
-def _task_costs(plan: PlanBundle) -> dict[str, TaskCost]:
+def _task_costs(plan: PlanBundle, estimates: dict[str, CostEstimate]) -> dict[str, TaskCost]:
     resources = {item.task: item for item in plan.timeline.task_resources}
     costs: dict[str, TaskCost] = {}
     for physical in plan.schedule.tasks:
@@ -207,12 +222,12 @@ def _task_costs(plan: PlanBundle) -> dict[str, TaskCost]:
             physical.read_distance,
             resource.workspace_bytes,
             resource.resident_bytes,
+            estimates.get(task.symbol),
         )
     return costs
 
 
-def _members(binding: TensorBinding, plan: PlanBundle, reasons: dict[str, str]) -> tuple[MemberCost, ...]:
-    costs = _task_costs(plan)
+def _members(binding: TensorBinding, costs: dict[str, TaskCost], reasons: dict[str, str]) -> tuple[MemberCost, ...]:
     result: list[MemberCost] = []
     for name, member in binding.members.items():
         tasks = tuple(costs[symbol] for symbol, names in binding.task_members.items() if name in names)
@@ -449,13 +464,15 @@ def explain_facts(
     facts, binding, specialization_errors = _specialize(workload, facts, config)
     attachment, threshold, inline_peak, errors = _plans(workload, facts, binding, config)
     plan = attachment.plan
-    costs = _task_costs(plan)
+    costs = _task_costs(
+        plan, estimate_tasks(binding, facts, config.execution, padded_vocab_size=shape.padded_vocab_size)
+    )
     return ExplainResult(
         shape,
         config.dtype,
         config.runner,
         reason,
-        _members(binding, plan, dict(eager_reasons(config, requirements))),
+        _members(binding, costs, dict(eager_reasons(config, requirements))),
         tuple(cost for symbol, cost in costs.items() if symbol not in binding.task_members),
         _states(plan),
         tuple(
@@ -476,6 +493,7 @@ def explain_facts(
         (
             "GPU fit is decided at make_llm after vLLM allocates; weights, KV cache, vLLM activations and fragmentation are excluded.",
             "Projection and scan BLAS workspace depends on the GPU; affected peaks and overlap thresholds are lower bounds until make_llm.",
+            "FLOP and byte estimates use max_num_seqs decode rows, declared-field reads and full-root transitions including optimizer fields, no cache reuse; prompt/model-site costs can differ.",
             "Host sync count covers shape-traced workload math; model-site math and framework syncs need GPU verification.",
             "Timing settings equal to defaults are labelled default; explicit use of the same value is indistinguishable.",
         ),
