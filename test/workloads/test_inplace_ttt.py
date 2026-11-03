@@ -628,6 +628,7 @@ def test_prefill_adapters_keep_prompt_chunks_across_scheduler_spans(span):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph operand lifetime")
+@pytest.mark.gpu
 def test_prompt_end_operand_stays_live_during_replay():
     from pllm.workloads.prefill_adapters import TARGETS, PrefillAdaptersWorkload
 

@@ -80,6 +80,7 @@ def _check_right_matrix_graph(initial, values, keys):
     assert not torch.allclose(initial.double() @ prefix_a + prefix_b, expected, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.gpu
 def test_right_matrix_graph_matches_rowwise_oracle():
     """The kernel oracle remains runnable without any Region execution fixtures."""
     if not torch.cuda.is_available():

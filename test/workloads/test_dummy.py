@@ -45,6 +45,7 @@ def exported(execution, value):
     return next(event.tensor() for event in reversed(execution.trace.snapshot().events) if event.tensor_name)
 
 
+@pytest.mark.gpu
 def test_dummy_runs_graph_sign_plan_execute() -> None:
     workload = DummyWorkload(DummyConfig(export_every_n_steps=2, export_max_rows=2, export_max_cols=3))
     execution = make_host(CPU, workload)
@@ -220,7 +221,11 @@ def _frozen_state_is_readable_by_an_observation() -> None:
 
 
 @pytest.mark.parametrize(
-    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA"))]
+    "device",
+    [
+        "cpu",
+        pytest.param("cuda", marks=(pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA"))),
+    ],
 )
 @pytest.mark.parametrize("overflow", ["drop", "block"])
 def test_export_queue_delivery_and_lifecycle(device, overflow) -> None:

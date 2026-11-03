@@ -96,6 +96,7 @@ def sgd_reference(config, seed, hidden, logits, labels, weights, groups):
     return a.detach(), b.detach()
 
 
+@pytest.mark.gpu
 def test_independent_lora_bmm_preserves_keyed_mean_and_private_publication() -> None:
     identities = tuple(RequestIdentity(str(index), index, 0) for index in range(3))
     keys = tuple(

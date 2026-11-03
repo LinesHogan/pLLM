@@ -37,7 +37,7 @@ class TwoGroups(pllm.Workload):
         return (hidden @ matrix + bias).square().mean()
 
 
-@pytest.mark.parametrize("device", ("cpu", "cuda:0"))
+@pytest.mark.parametrize("device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)))
 def test_default_completion_region_keeps_multigroup_adamw_and_publication(device):
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("requires CUDA")

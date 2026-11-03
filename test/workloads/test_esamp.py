@@ -92,6 +92,7 @@ def reject_publication(arena, write):
     raise RuntimeError("injected publication failure")
 
 
+@pytest.mark.gpu
 def test_esamp_predicts_before_training_and_isolates_request_versions(monkeypatch: pytest.MonkeyPatch) -> None:
     refs = StateRefs(np.array([0, 0, 1]), np.array([1, 2, 3]), np.array([9, 5, 0]))
     history = (
@@ -336,6 +337,7 @@ def _ordinary_request_distillation() -> None:
         assert diagnostics.active_states == diagnostics.pending_state_releases == 0
 
 
+@pytest.mark.gpu
 def test_sampler_adapts_step_results_in_memory_trace_and_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     """Fixed steps never re-enter prediction evaluation, including the meta resource trace."""
     evaluate = TensorTask.evaluate

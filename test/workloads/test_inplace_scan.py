@@ -52,7 +52,9 @@ def facts_for(device, dtype):
     )
 
 
-@pytest.mark.parametrize("device,dtype", (("cpu", torch.float32), ("cuda:0", torch.bfloat16)))
+@pytest.mark.parametrize(
+    "device,dtype", (("cpu", torch.float32), pytest.param("cuda:0", torch.bfloat16, marks=pytest.mark.gpu))
+)
 @pytest.mark.parametrize("numerics", (False, True))
 def test_bound_scan_matches_original_chunk_math_bitwise(device, dtype, numerics):
     if device.startswith("cuda") and not torch.cuda.is_available():
@@ -124,7 +126,7 @@ def test_production_tuning_policy_is_signed_into_worker_facts():
     assert attachment.plan.timeline.tensor_policy == policy
 
 
-@pytest.mark.parametrize("device", ("cpu", "cuda:0"))
+@pytest.mark.parametrize("device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)))
 def test_scan_matches_the_serial_loop_including_carry_views(device):
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -218,6 +220,7 @@ def test_scan_matches_the_serial_loop_including_carry_views(device):
 
 
 @pytest.mark.parametrize("numerics", (False, True))
+@pytest.mark.gpu
 def test_counted_gated_tail_keeps_inactive_chunks_and_never_reads_device_counts(numerics):
     """An independent chunk oracle covers C=0, carried tails and inactive capacity."""
     if not torch.cuda.is_available():

@@ -28,7 +28,9 @@ from pllm.workloads.state_producers import (
 from test.backend_facts import assert_finite_resources
 
 
-@pytest.fixture(params=("cpu", "cuda:0") if torch.cuda.is_available() else ("cpu",))
+@pytest.fixture(
+    params=("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)) if torch.cuda.is_available() else ("cpu",)
+)
 def device(request):
     return torch.device(request.param)
 

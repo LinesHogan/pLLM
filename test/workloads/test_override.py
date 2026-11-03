@@ -85,6 +85,7 @@ def head_logits(down, up, row, sample):
     return HIDDEN[row] @ down[sample].T @ up[sample].T
 
 
+@pytest.mark.gpu
 def test_override_matches_reweight_adam_and_final_noop() -> None:
     facts = facts_for(torch.device("cpu"))
     config = OverRIDEConfig(rank=2, num_iterations=3, learning_rate=0.03)

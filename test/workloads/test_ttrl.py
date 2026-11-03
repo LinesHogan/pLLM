@@ -31,6 +31,7 @@ def fail_output(self, context):
     raise RuntimeError("injected output failure")
 
 
+@pytest.mark.gpu
 def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest.MonkeyPatch) -> None:
     assert boxed_label(r"old \boxed{0}, final \boxed{ \frac{ A }{ b } }") == r"\frac{a}{b}"
     assert boxed_label(r"\boxed{unfinished") == ""

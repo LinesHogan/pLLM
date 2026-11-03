@@ -25,6 +25,7 @@ from test.state_fixtures import paged_rows
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="vLLM FlashAttention backend requires CUDA")
+@pytest.mark.gpu
 def test_original_attention_resource_binds_without_a_model():
     config = VllmConfig(attention_config=AttentionConfig(flash_attn_version=2))
     with set_current_vllm_config(config):

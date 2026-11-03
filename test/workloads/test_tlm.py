@@ -162,6 +162,7 @@ def test_global_multifactor_adamw_matches_oracle_and_publishes_one_version() -> 
     assert execution.diagnostics().active_states == 0
 
 
+@pytest.mark.gpu
 def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None:
     model = TinyCausalPort()
     if torch.cuda.is_available():
