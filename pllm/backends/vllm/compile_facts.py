@@ -6,7 +6,7 @@ from hashlib import sha256
 import torch
 
 from pllm.authoring import BackendRequirements
-from pllm.backends.vllm.architecture import hidden_binding
+from pllm.backends.vllm.architecture import hidden_binding, kv_rejection
 from pllm.backends.vllm.hidden_taps import HiddenTapLayout
 from pllm.backends.vllm.model_shape import ModelShape
 from pllm.backends.vllm.overlay_graph import graph_mode
@@ -57,9 +57,16 @@ def compile_facts(
     overlay_graph_bytes: int,
     memory_bytes: int,
     checkpoint: str = "",
+    blas_workspace_bytes: int = 0,
 ) -> BackendCompileFacts:
     """Derive reservations and capabilities without allocating tensors or querying a device."""
     publish_lag = config.execution.publish_lag
+    feature = "a PositionState" if requirements.position_states else "a @pllm.custom_forward"
+    if requirements.position_states or requirements.custom_forward:
+        if rejection := shape.read_only_reason or kv_rejection(shape.architecture):
+            raise ValueError(f"{feature} {rejection}")
+    if requirements.causal_training and shape.read_only_reason:
+        raise ValueError(f"causal training {shape.read_only_reason}")
     if any(layer < 0 or layer >= shape.layer_count for layer in requirements.activation_layers):
         raise ValueError("activation layer is outside the backend model")
     if any(not -shape.layer_count <= layer < shape.layer_count for layer in requirements.layer_logits):
@@ -104,6 +111,7 @@ def compile_facts(
         causal_domain=CausalModelDomain(config.max_num_seqs, shape.layer_count, config.max_model_len),
         hidden_resources=hidden_resources,
         layer_logits=layer_logits,
+        blas_workspace_bytes=blas_workspace_bytes,
         capabilities=tuple(
             sorted(
                 set(

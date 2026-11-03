@@ -29,7 +29,7 @@ from pllm.authoring import (
     StateImport,
     map_host_batch,
 )
-from pllm.backends.vllm import compat
+from pllm.backends.vllm.admission import admit_workload
 from pllm.backends.vllm.checkpoint import load_options
 from pllm.backends.vllm.compile_facts import compile_facts
 from pllm.backends.vllm.hidden_taps import TAPS_ENV, HiddenTapAnnouncement
@@ -619,25 +619,6 @@ def vllm_engine(
                 os.environ[name] = value
 
 
-def _eager_reason(config: ModelConfig, requirements: BackendRequirements) -> str:
-    """Why the workload's model runs without vLLM's CUDA graphs; empty when it can use them."""
-    if config.cuda_graphs is False:
-        return "ModelConfig(cuda_graphs=False)"
-    if config.runner == "mrv1":
-        return 'runner="mrv1" runs workloads without CUDA graphs'
-    if requirements.exact_decode and config.cuda_graphs == "auto":
-        return "exact train_in_forward decode updates run outside CUDA graphs"
-    if requirements.activation_layers:
-        return "activation patches run outside CUDA graphs"
-    if requirements.custom_forward:
-        return "@pllm.custom_forward reruns model layers outside CUDA graphs"
-    if requirements.custom_residual:
-        return "@pllm.custom_residual runs the model without CUDA graphs"
-    if requirements.instance_adapter:
-        return "CUDA-graph overlays do not support adapters backed by shared InstanceState"
-    return ""
-
-
 def create_vllm_llm(
     workload: BackendWorkload[DataT, ResultT],
     config: ModelConfig,
@@ -645,17 +626,7 @@ def create_vllm_llm(
     definition: str | None = None,
 ) -> VllmLlm[DataT, ResultT]:
     requirements = workload.backend_requirements()
-    compat.admit_parallel(config, requirements)
-    if requirements.custom_residual and config.enable_prefix_caching:
-        raise ValueError(
-            "disable prefix caching (enable_prefix_caching=False) when a workload rewrites model sites; cached KV "
-            "would not match"
-        )
-    if requirements.position_states and config.runner == "mrv1":
-        raise ValueError('PositionState and @pllm.custom_forward need runner="mrv2"')
-    eager_reason = _eager_reason(config, requirements)
-    if config.cuda_graphs is True and eager_reason:
-        raise ValueError(f'{eager_reason}; set ModelConfig(cuda_graphs="auto") or cuda_graphs=False')
+    eager_reason = admit_workload(config, requirements)
     if config.cuda_graphs == "auto" and eager_reason:
         _logger.warning("running the model without CUDA graphs: %s", eager_reason)
     environment = {
@@ -766,6 +737,8 @@ def probe_backend(
         hidden_layouts=runner.hidden_layouts,
         overlay_graph_bytes=runner.overlay_graph_bytes,
         memory_bytes=free_bytes,
+        blas_workspace_bytes=torch.backends.cuda.cublas_workspace_size()
+        + torch.backends.cuda.cublaslt_workspace_size(),
         checkpoint=checkpoint_directory(config.model, config.revision) if requirements.checkpoint_names else "",
     )
 

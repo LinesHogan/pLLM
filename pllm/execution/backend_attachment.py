@@ -5,8 +5,6 @@ from __future__ import annotations
 from dataclasses import replace
 from math import prod
 
-import torch
-
 from pllm.contracts.backend_attachment import (
     TOKEN_CAPTURE_CAPABILITY,
     AttachmentGraphMode,
@@ -58,7 +56,7 @@ def attachment_buffer_bytes(
         in_forward=graph.updates_in_forward, graphs=probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH
     )
     if attachment.overlay_bindings and probe.device_kind is StateDeviceKind.CUDA and pinned:
-        buffers += torch.backends.cuda.cublas_workspace_size() + torch.backends.cuda.cublaslt_workspace_size()
+        buffers += probe.blas_workspace_bytes
     for binding in attachment.overlay_bindings:
         buffers += rows  # Scalar prompt-end operands for the largest request set.
         first = binding.fields[0].shape

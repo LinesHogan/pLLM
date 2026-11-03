@@ -54,6 +54,10 @@ class ModelProbe:
     position_states: tuple[tuple[str, float], ...] = ()
     # The distinct absolute layers whose logits the layer-logits input holds, in its column order.
     layer_logits: tuple[int, ...] = ()
+    # Opaque library scratch measured at model load; CPU reports exclude it explicitly.
+    blas_workspace_bytes: int = 0
+    # Shape-only planning selects an ordinal without querying CUDA; workers use their current device.
+    device_index: int | None = None
 
 
 class ActivationPatchOperator(StrEnum):

@@ -6,7 +6,8 @@ specialized plan (native implementations, scans, fixed-shape steps, input prepar
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Generator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from functools import partial
 from math import prod
@@ -18,6 +19,7 @@ from pllm.contracts.backend_attachment import ModelProbe
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.host_batch import StateImport
+from pllm.contracts.member import MemberDeclaration
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import FieldView, Projection
 from pllm.contracts.request_identity import RequestKeyField
@@ -114,6 +116,8 @@ class TensorBinding(Builder[TensorFrame]):
         super().__init__(name, digest, dimensions)
         self.dimensions = dimensions
         self.host = host
+        self.members: dict[str, MemberDeclaration] = {}
+        self.task_members: dict[TaskSymbol, tuple[str, ...]] = {}
         self.checkpoint = ""
         self.feeds: tuple[FeedBinding, ...] = ()
         self.tensor_tasks: dict[TaskSymbol, TensorTask] = {}
@@ -127,6 +131,14 @@ class TensorBinding(Builder[TensorFrame]):
         self.field_views: dict[tuple[str, str], FieldView] = {}
         self.imports: dict[str, tuple[FieldView, ...]] = {}
         self.position_states: tuple[tuple[str, float], ...] = ()
+
+    @contextmanager
+    def member(self, name: str, declaration: MemberDeclaration) -> Generator[None]:
+        """Retain author names while lowering a member into one or more physical tasks."""
+        self.members[name] = declaration
+        symbols = {task.symbol for task in self.graph.tasks}
+        yield
+        self.task_members.update((task.symbol, (name,)) for task in self.graph.tasks if task.symbol not in symbols)
 
     def retained_fields(self, resource: str) -> dict[int, TensorFieldSpec]:
         """Layout fields whose initial values admission copies; zero-start fields are left alone."""
@@ -241,6 +253,7 @@ class TensorBinding(Builder[TensorFrame]):
                     self.custom_forward_rows,
                     facts.device,
                     replay="compute/cuda_graph@1" in facts.timeline.capabilities,
+                    blas_workspace_bytes=facts.probe.blas_workspace_bytes,
                 ).bind(self.overlay_math.function),
             )
             self.overlay_math = math if math.chunk is None else replace(math, executor=OverlayBatch(math))
@@ -270,6 +283,7 @@ class TensorBinding(Builder[TensorFrame]):
             if facts.timeline.memory_budget_bytes is None
             else facts.timeline.memory_budget_bytes // max(1, facts.max_admitted_lineages),
             replay=capture,
+            blas_workspace_bytes=facts.probe.blas_workspace_bytes,
         )
         return {symbol: replace(operation, body=scans.bind(operation.body)) for symbol, operation in operations.items()}
 

@@ -31,6 +31,7 @@ from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.scan_execution import PreparedScan
 from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
 from test.dense_update import DenseUpdate, DenseUpdateConfig
+from test.explain_probe import assert_explanation
 
 TARGET = Projection("down_proj", 0)
 PROMPTS = ["The sky is", "Water freezes at"]
@@ -386,19 +387,18 @@ def checkpoint_ttt() -> None:
         del weights
         for dtype in (torch.float32, torch.bfloat16):
             workload = InPlaceTTTWorkload(InPlaceTTTConfig.from_checkpoint(directory), dtype=dtype)
+            model_config = ModelConfig(
+                directory,
+                max_num_seqs=2,
+                max_model_len=32,
+                max_num_batched_tokens=32,
+                execution=pllm.ExecutionOptions(allow_numerical_transforms=False),
+            )
             with (
                 patch("pllm.backends.vllm.runtime.LLM", partial(LLM, kv_cache_memory_bytes=32 << 20)),
-                pllm.make_llm(
-                    ModelConfig(
-                        directory,
-                        max_num_seqs=2,
-                        max_model_len=32,
-                        max_num_batched_tokens=32,
-                        execution=pllm.ExecutionOptions(allow_numerical_transforms=False),
-                    ),
-                    workload=workload,
-                ) as handle,
+                pllm.make_llm(model_config, workload=workload) as handle,
             ):
+                assert_explanation(workload, model_config, handle)
                 prompts = [{"prompt_token_ids": [100, 101, 102]}, {"prompt_token_ids": [103] * 8}]
                 sampling = SamplingParams(temperature=0, max_tokens=3, ignore_eos=True)
                 first = handle.generate(prompts, sampling)

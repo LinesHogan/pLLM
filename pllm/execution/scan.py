@@ -59,10 +59,12 @@ class ScanContext:
         payload_bytes: int | None = None,
         *,
         replay: bool = True,
+        blas_workspace_bytes: int | None = None,
     ) -> None:
         self.policy, self.max_rows, self.device = policy, max_rows, device
         self.payload_bytes = payload_bytes
         self.replay = replay
+        self.blas_workspace_bytes = blas_workspace_bytes
 
     def bind(self, function: Callable[P, R]) -> Callable[P, R]:
         """Use the same execution-owned scope for memory tracing and execution."""
@@ -152,7 +154,13 @@ class ScanTemplate:
         funded: list[PreparedScan] = []
         with disable_current_modes(), torch.inference_mode(False), FakeTensorMode(allow_non_fake_inputs=True):
             args = self.samples(capacity)
-            scratch = torch.backends.cuda.cublas_workspace_size() + torch.backends.cuda.cublaslt_workspace_size()
+            scratch = self.context.blas_workspace_bytes
+            if scratch is None:
+                scratch = (
+                    torch.backends.cuda.cublas_workspace_size() + torch.backends.cuda.cublaslt_workspace_size()
+                    if self.context.device.type == "cuda"
+                    else 0
+                )
             for choice in choices:
                 if choice.analysis is not None:
                     carry, over, invariants, _ = args

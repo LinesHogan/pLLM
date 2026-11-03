@@ -1,0 +1,448 @@
+"""CPU planning reports for workload authors, exposed as pllm.explain and JSON-ready dataclasses."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
+
+from pllm.config import ModelConfig
+from pllm.contracts.backend_attachment import TOKEN_CAPTURE_CAPABILITY, BackendAttachment
+from pllm.contracts.compilation import PlanBundle
+from pllm.contracts.hidden_locator import HiddenSite
+from pllm.contracts.semantic_graph import (
+    HiddenInputSource,
+    StateEffectKind,
+    StateSelectionInputSource,
+    TaskResourceFact,
+)
+from pllm.execution.preemption import preemption_policy
+from pllm.execution.ptts.page_bundle_planning import page_stride_bytes
+
+if TYPE_CHECKING:
+    from pllm.backends.vllm.hidden_taps import HiddenTapLayout
+    from pllm.backends.vllm.model_shape import ModelShape
+    from pllm.execution.compile_facts import BackendCompileFacts
+    from pllm.execution.tensor_binding import TensorBinding
+    from pllm.usage import Workload
+
+
+@dataclass(frozen=True, slots=True)
+class TaskCost:
+    """One planned task; byte counts and version distances come directly from the planner."""
+
+    name: str
+    anchor: str
+    lane: str
+    captured: bool
+    reads: tuple[str, ...]
+    read_origin: str
+    read_distance: int
+    workspace_bytes: int
+    capture_resident_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class MemberCost:
+    """An authored method or model value and all tasks emitted on its behalf."""
+
+    name: str
+    effect: str
+    tasks: tuple[TaskCost, ...]
+    eager_reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class StateCost:
+    """Exact physical capacity, including allocator alignment outside each root."""
+
+    name: str
+    scope: str
+    roots: int
+    bytes_per_root: int
+    reserved_bytes: int
+    max_admitted_lineages: int
+
+
+@dataclass(frozen=True, slots=True)
+class EscapeHatch:
+    """A timing or execution setting and its consequence; defaults are identified explicitly."""
+
+    member: str
+    setting: str
+    value: str
+    is_default: bool
+    consequence: str
+
+
+@dataclass(frozen=True, slots=True)
+class AnchorCost:
+    """Persistent input and attachment reservations at one engine anchor."""
+
+    name: str
+    reserved_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class TapCost:
+    """One shared tap allocation and the authored consumers that use it."""
+
+    module: str
+    output: int
+    phases: tuple[str, ...]
+    resident_bytes: int
+    members: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ExplainResult:
+    """Exact declared costs, not a GPU fit or throughput prediction; asdict is JSON-ready."""
+
+    model: ModelShape
+    dtype: str
+    runner: str
+    eager_reason: str
+    members: tuple[MemberCost, ...]
+    framework_tasks: tuple[TaskCost, ...]
+    states: tuple[StateCost, ...]
+    anchors: tuple[AnchorCost, ...]
+    taps: tuple[TapCost, ...]
+    peak_memory_bytes: int
+    memory_label: str
+    overlap_threshold_bytes: int | None
+    inline_peak_memory_bytes: int
+    budget_errors: tuple[str, ...]
+    preemption: str
+    recompute_rejection: str | None
+    workload_host_syncs: int | None
+    exports: tuple[str, ...]
+    escape_hatches: tuple[EscapeHatch, ...]
+    limitations: tuple[str, ...]
+
+    def __str__(self) -> str:
+        forward = f"eager: {self.eager_reason}" if self.eager_reason else "CUDA graphs: no effect needs eager"
+        lines = [
+            f"model    {self.model.architecture}, hidden {self.model.hidden_size}, {self.model.layer_count} layers, "
+            f"vocab {self.model.vocab_size}, {self.dtype} [exact, config.json]",
+            f"forward  {forward}",
+            "member  effect  anchor / lane / graph  state reads (origin, distance)",
+        ]
+        for member in self.members:
+            for task in member.tasks:
+                lines.append(
+                    f"{member.name}  {member.effect}  {task.anchor} / {task.lane} / "
+                    f"{'captured' if task.captured else 'eager'}  "
+                    f"{', '.join(task.reads) or '-'} ({task.read_origin}, {task.read_distance})"
+                )
+            if not member.tasks:
+                lines.append(f"{member.name}  {member.effect}  model site or inactive method")
+            if member.eager_reason:
+                lines.append(f"  forward eager because {member.name}: {member.eager_reason}")
+        lines.extend(
+            f"tap      {tap.module}[{tap.output}], {','.join(tap.phases)}: "
+            f"{tap.resident_bytes} bytes shared by {', '.join(tap.members)}"
+            for tap in self.taps
+        )
+        lines.append("state  scope  roots  bytes/root  reserved bytes [exact]")
+        lines.extend(
+            f"{state.name}  {state.scope}  {state.roots}  {state.bytes_per_root}  {state.reserved_bytes}"
+            for state in self.states
+        )
+        lines.append(f"memory   peak {self.peak_memory_bytes} bytes funded by pllm [{self.memory_label}]")
+        if self.overlap_threshold_bytes is not None:
+            lines.append(
+                f"         below {self.overlap_threshold_bytes} bytes tasks run inline; "
+                f"below {self.inline_peak_memory_bytes} bytes planning fails"
+            )
+        lines.extend(f"budget   {error}" for error in self.budget_errors)
+        lines.append(
+            f"preempt  state {self.preemption}; replay rejection: {self.recompute_rejection if self.preemption == 'reset' else 'not applicable to kept state'}"
+        )
+        lines.append(
+            f"host     {self.workload_host_syncs if self.workload_host_syncs is not None else 'unverified'} syncs in traced workload math; exports: {', '.join(self.exports) or 'none'}"
+        )
+        lines.extend(
+            f"timing   {item.member + ': ' if item.member else ''}{item.setting}={item.value} "
+            f"({'default' if item.is_default else 'you set'}): {item.consequence}"
+            for item in self.escape_hatches
+        )
+        if self.model.read_only_reason:
+            lines.append(f"model    read-only: {self.model.read_only_reason}")
+        lines.extend(f"note     {note}" for note in self.limitations)
+        return "\n".join(lines)
+
+
+def _task_costs(plan: PlanBundle) -> dict[str, TaskCost]:
+    resources = {item.task: item for item in plan.timeline.task_resources}
+    costs: dict[str, TaskCost] = {}
+    for physical in plan.schedule.tasks:
+        task = plan.semantic_graph.tasks[physical.task_id]
+        resource = resources.get(task.symbol, TaskResourceFact(task.symbol, 0))
+        implementation = next(
+            item for item in task.implementations if item.implementation_id == physical.implementation_id
+        )
+        costs[task.symbol] = TaskCost(
+            task.symbol,
+            plan.timeline.anchors[physical.anchor_id].symbol,
+            physical.lane,
+            any(
+                cap in implementation.required_capabilities
+                for cap in ("compute/cuda_graph@1", TOKEN_CAPTURE_CAPABILITY)
+            ),
+            tuple(
+                dict.fromkeys(
+                    (
+                        *(
+                            port.source.resource
+                            for port in task.inputs
+                            if isinstance(port.source, StateSelectionInputSource)
+                        ),
+                        *(effect.resource for effect in task.effects if effect.kind is StateEffectKind.READ),
+                    )
+                )
+            ),
+            physical.read_origin,
+            physical.read_distance,
+            resource.workspace_bytes,
+            resource.resident_bytes,
+        )
+    return costs
+
+
+def _members(binding: TensorBinding, plan: PlanBundle, reasons: dict[str, str]) -> tuple[MemberCost, ...]:
+    costs = _task_costs(plan)
+    result: list[MemberCost] = []
+    for name, member in binding.members.items():
+        tasks = tuple(costs[symbol] for symbol, names in binding.task_members.items() if name in names)
+        result.append(MemberCost(name, member.effect, tasks, reasons.get(member.effect, "")))
+    return tuple(result)
+
+
+def _taps(
+    binding: TensorBinding, facts: BackendCompileFacts, layouts: tuple[HiddenTapLayout, ...]
+) -> tuple[TapCost, ...]:
+    from pllm.backends.vllm.architecture import hidden_binding
+
+    logit_taps = {
+        hidden_binding(layer, HiddenSite.RESIDUAL, facts.layer_count).tap for layer in facts.probe.layer_logits
+    }
+    result: list[TapCost] = []
+    for layout in layouts:
+        users: set[str] = set()
+        for task in binding.graph.tasks:
+            for port in task.inputs:
+                source = port.source
+                if isinstance(source, HiddenInputSource) and (
+                    hidden_binding(source.layer, source.site, facts.layer_count).tap == layout.tap
+                    or (source.site is HiddenSite.LAYER_LOGITS and layout.tap in logit_taps)
+                ):
+                    users.update(binding.task_members.get(task.symbol, (task.symbol,)))
+        result.append(
+            TapCost(
+                *layout.tap, tuple(phase.value for phase in layout.phases), layout.resident_bytes, tuple(sorted(users))
+            )
+        )
+    return tuple(result)
+
+
+def _states(plan: PlanBundle) -> tuple[StateCost, ...]:
+    scopes = {str(state.resource): state.scope.value for state in plan.semantic_graph.states}
+    layouts = {entry.resource: entry.layout for entry in plan.tensor_layout_request.layouts}
+    return tuple(
+        StateCost(
+            state.resource,
+            scopes[state.resource],
+            state.page_capacity,
+            sum(page_stride_bytes(field) for field in layouts[state.resource].fields),
+            state.reserved_bytes,
+            state.max_admitted_lineages,
+        )
+        for state in plan.states.plans
+    )
+
+
+def _settings(binding: TensorBinding, config: ModelConfig, plan: PlanBundle) -> tuple[EscapeHatch, ...]:
+    lag = config.execution.publish_lag
+    result = [
+        EscapeHatch(
+            "",
+            "publish_lag",
+            str(lag),
+            lag == 1,
+            f"updates at step n become readable at n + {1 + lag}; "
+            + ("training may overlap later forwards" if lag else "updates serialize before the next forward"),
+        )
+    ]
+    for name, member in binding.members.items():
+        if member.phase is not None:
+            result.append(EscapeHatch(name, "phase", member.phase, False, "overrides automatic task timing"))
+        if member.tokens is not None:
+            default_tokens = "prefill" if member.effect == "train_in_forward" else "all"
+            result.append(
+                EscapeHatch(
+                    name,
+                    "tokens",
+                    member.tokens,
+                    member.tokens == default_tokens,
+                    "selects the rows this method processes",
+                )
+            )
+        if member.visibility is not None:
+            result.append(
+                EscapeHatch(
+                    name,
+                    "visibility",
+                    member.visibility,
+                    member.visibility == "forward_pinned",
+                    "later chunks read earlier updates"
+                    if member.visibility == "exact"
+                    else "forward reads its entry state",
+                )
+            )
+        if member.effect in ("custom_forward", "custom_residual"):
+            result.append(EscapeHatch(name, member.effect, "enabled", False, "model forward runs eagerly"))
+    for task in plan.semantic_graph.tasks:
+        phases = tuple(
+            dict.fromkeys(
+                port.source.phase.value
+                for port in task.inputs
+                if isinstance(port.source, HiddenInputSource) and port.source.site is not HiddenSite.LAYER_LOGITS
+            )
+        )
+        if phases:
+            result.append(
+                EscapeHatch(
+                    task.symbol,
+                    "tokens",
+                    ",".join(phases),
+                    phases == ("decode",),
+                    "hidden taps select completed prompt endings or latest decode rows",
+                )
+            )
+    if config.cuda_graphs is False:
+        result.append(EscapeHatch("", "cuda_graphs", "False", False, "model forward runs eagerly"))
+    if config.runner == "mrv1":
+        result.append(EscapeHatch("", "runner", "mrv1", False, "workloads run without model CUDA graphs"))
+    return tuple(result)
+
+
+def _plans(
+    workload: Workload, facts: BackendCompileFacts, binding: TensorBinding, config: ModelConfig
+) -> tuple[BackendAttachment, int | None, int, tuple[str, ...]]:
+    preferred = workload.plan_backend(facts, binding)
+    peak = preferred.plan.schedule.peak_memory_bytes
+    inline = preferred
+    threshold = None
+    if peak and any(task.lane == "side" for task in preferred.plan.schedule.tasks):
+        try:
+            inline = workload.plan_backend(
+                replace(facts, timeline=replace(facts.timeline, memory_budget_bytes=peak - 1)), binding
+            )
+        except ValueError:
+            pass  # No cheaper schedule: overlap costs no extra peak memory.
+        else:
+            threshold = peak
+    errors: list[str] = []
+    selected = preferred
+    options = config.execution
+    if options.memory_budget_bytes is not None or options.state_memory_bytes:
+        limited = replace(
+            facts,
+            timeline=replace(facts.timeline, memory_budget_bytes=options.memory_budget_bytes),
+            state_memory_budget_bytes=options.state_memory_bytes or facts.state_memory_budget_bytes,
+        )
+        try:
+            selected = workload.plan_backend(limited, binding)
+        except ValueError as error:
+            errors.append(f"{error}; lower max_num_seqs or max_num_batched_tokens, or raise the named execution budget")
+    return selected, threshold, inline.plan.schedule.peak_memory_bytes, tuple(errors)
+
+
+def _specialize(
+    workload: Workload, facts: BackendCompileFacts, config: ModelConfig
+) -> tuple[BackendCompileFacts, TensorBinding, tuple[str, ...]]:
+    errors: tuple[str, ...] = ()
+    try:
+        funded, binding = workload.specialize(facts, config.execution)
+    except ValueError as error:
+        if config.execution.memory_budget_bytes is None and not config.execution.state_memory_bytes:
+            raise
+        # If the declaration is invalid independently of a budget, this raises its own error again.
+        funded, binding = workload.specialize(
+            facts, replace(config.execution, memory_budget_bytes=None, state_memory_bytes=0)
+        )
+        errors = (str(error),)
+    return (
+        replace(
+            funded,
+            timeline=replace(funded.timeline, memory_budget_bytes=None),
+            state_memory_budget_bytes=facts.state_memory_budget_bytes,
+        ),
+        binding,
+        errors,
+    )
+
+
+def explain(workload: Workload, config: ModelConfig) -> ExplainResult:
+    """Plan using config.json and shape-only tensor tracing; never load weights or allocate CUDA storage.
+
+    Memory excludes base-model weights, KV cache and vLLM activations. GPU fit is decided by make_llm.
+    A too-small declared execution/state budget returns the unrestricted plan with actionable budget_errors.
+    """
+    from pllm.backends.vllm.admission import admit_workload, eager_reasons
+    from pllm.backends.vllm.compile_facts import compile_facts
+    from pllm.backends.vllm.hidden_taps import HiddenTapAnnouncement
+    from pllm.backends.vllm.model_shape import ModelShape
+    from pllm.contracts.tensor_layout import TensorDType
+
+    requirements = workload.backend_requirements()
+    reason = admit_workload(config, requirements)
+    shape = ModelShape.of_config(config, requirements.parameter_targets)
+    layouts = HiddenTapAnnouncement(
+        requirements.hidden_inputs, config.max_num_seqs, TensorDType(config.dtype), requirements.layer_logits
+    ).resolve(shape.layer_count, shape.hidden_size, shape.vocab_size)
+    facts = compile_facts(
+        shape,
+        requirements,
+        config,
+        model_identity=shape.architecture,
+        hidden_layouts=layouts,
+        overlay_graph_bytes=config.execution.model_capture_bytes
+        if requirements.parameter_targets and not reason
+        else 0,
+        memory_bytes=1 << 60,
+    )
+    facts = replace(facts, probe=replace(facts.probe, device_index=0))
+    facts, binding, specialization_errors = _specialize(workload, facts, config)
+    attachment, threshold, inline_peak, errors = _plans(workload, facts, binding, config)
+    plan = attachment.plan
+    costs = _task_costs(plan)
+    return ExplainResult(
+        shape,
+        config.dtype,
+        config.runner,
+        reason,
+        _members(binding, plan, dict(eager_reasons(config, requirements))),
+        tuple(cost for symbol, cost in costs.items() if symbol not in binding.task_members),
+        _states(plan),
+        tuple(
+            AnchorCost(anchor.symbol, value)
+            for anchor, value in zip(plan.timeline.anchors, plan.timeline.reserved_bytes, strict=True)
+        ),
+        _taps(binding, facts, layouts),
+        plan.schedule.peak_memory_bytes,
+        "tensor reservations; excludes GPU-dependent BLAS workspace",
+        threshold,
+        inline_peak,
+        (*specialization_errors, *errors),
+        preemption_policy(attachment, tuple(binding.sites.rewrites)),
+        plan.schedule.recompute_rejection,
+        None if plan.semantic_graph.trains_on_batch or binding.sites.rewrites else 0,
+        tuple(attachment.spec.exports),
+        _settings(binding, config, plan),
+        (
+            "GPU fit is decided at make_llm after vLLM allocates; weights, KV cache, vLLM activations and fragmentation are excluded.",
+            "Projection and scan BLAS workspace depends on the GPU; affected peaks and overlap thresholds are lower bounds until make_llm.",
+            "Host sync count covers shape-traced workload math; model-site math and framework syncs need GPU verification.",
+            "Timing settings equal to defaults are labelled default; explicit use of the same value is indistinguishable.",
+        ),
+    )

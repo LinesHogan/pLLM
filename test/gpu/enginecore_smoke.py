@@ -11,7 +11,9 @@ from __future__ import annotations
 import os
 import pickle
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -164,19 +166,30 @@ def _prefill_adapter_reconstruction() -> None:
     print(f"prefill adapters reconstructed workers={processes}; fresh requests={requests}; parent CUDA=off")
 
 
+@dataclass(frozen=True, kw_only=True)
 class ExportProbe(DummyWorkload):
+    """Worker callbacks writing only this smoke invocation's private output file."""
+
+    export_path: str
+
     def on_export(self, event: pllm.io.TraceEvent) -> None:
-        with open("build/worker_exports.pkl", "ab") as output:
+        """Append one snapshot for comparison in the parent process."""
+        with open(self.export_path, "ab") as output:
             pickle.dump((event.sequence, event.step_id, event.tensor()), output)
 
 
 def _dummy_export() -> None:
+    with TemporaryDirectory(prefix="pllm-worker-exports-") as directory:
+        _check_dummy_exports(Path(directory) / "exports.pkl")
+
+
+def _check_dummy_exports(path: Path) -> None:
     from test.gpu.enginecore_smoke import ExportProbe
 
     assert not torch.cuda.is_initialized()
-    Path("build").mkdir(exist_ok=True)
-    Path("build/worker_exports.pkl").unlink(missing_ok=True)
-    workload = ExportProbe(DummyConfig(layer=3, export_every_n_steps=2, export_max_rows=2, export_max_cols=3))
+    workload = ExportProbe(
+        DummyConfig(layer=3, export_every_n_steps=2, export_max_rows=2, export_max_cols=3), export_path=str(path)
+    )
     handle = pllm.make_llm(workload=workload, config=engine())
     try:
         handle.generate(PROMPTS, greedy(4), prompt_indices=(7, 9))
@@ -196,7 +209,7 @@ def _dummy_export() -> None:
     finally:
         handle.close()
 
-    with open("build/worker_exports.pkl", "rb") as source:
+    with path.open("rb") as source:
         for event in events:
             sequence, step, tensor = pickle.load(source)
             assert (sequence, step) == (event.sequence, event.step_id)

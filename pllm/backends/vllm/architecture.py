@@ -183,11 +183,9 @@ class Decoder:
         from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM
 
         model = self.writable(feature)
-        if isinstance(model, (Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM)):
-            raise ValueError(
-                f"{feature} recomputes layer state from KV pages, but {type(model).__name__} keeps "
-                "Gated DeltaNet recurrent state outside them; use a Qwen2, Llama, Qwen3 or Qwen3-MoE model"
-            )
+        if reason := kv_rejection(type(model).__name__):
+            raise ValueError(f"{feature} {reason}")
+        assert not isinstance(model, (Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM))
         return model
 
     @property
@@ -254,30 +252,50 @@ READ_ONLY_ARCHITECTURES: dict[type[CausalLM], str] = {
 }
 
 
-def bind_model(model: nn.Module) -> Decoder:
-    """Admit a concrete vLLM architecture at model load, before any instance wrapping."""
+_BASE_ARCHITECTURES = (*DENSE_ARCHITECTURES, Qwen3MoeForCausalLM, *READ_ONLY_ARCHITECTURES)
+_HYBRID_NAMES = ("Qwen3_5ForCausalLM", "Qwen3_5MoeForCausalLM")
+
+
+def _architectures() -> tuple[type[CausalLM], ...]:
+    # The hybrid imports initialize CUDA; only workers need the concrete classes.
     from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM
 
-    architectures = (
-        *DENSE_ARCHITECTURES,
-        Qwen3MoeForCausalLM,
-        Qwen3_5ForCausalLM,
-        Qwen3_5MoeForCausalLM,
-        *READ_ONLY_ARCHITECTURES,
-    )
-    # Exact classes: vLLM subclasses such as Phi3 or TeleFLM change weights or logits scaling.
-    if type(model) not in architectures or not isinstance(model, architectures):
+    return (*_BASE_ARCHITECTURES, Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM)
+
+
+def admit_architecture(name: str) -> str | None:
+    """Admit a registry-inspected class name without importing CUDA-initializing hybrid modules."""
+    if name not in (*_HYBRID_NAMES, *(cls.__name__ for cls in _BASE_ARCHITECTURES)):
         raise ValueError(
             "choose a Qwen2, Llama, Qwen3, Qwen3Moe, Qwen3_5, Qwen3_5Moe, DeepseekV2, DeepseekV3 or GptOss "
             "ForCausalLM model for vLLM workloads"
         )
-    family = READ_ONLY_ARCHITECTURES.get(type(model))
-    read_only = (
+    family = next((reason for cls, reason in READ_ONLY_ARCHITECTURES.items() if cls.__name__ == name), None)
+    return (
         None
         if family is None
-        else f"needs a Qwen2, Llama, Qwen3, Qwen3-MoE or Qwen3.5 model ({type(model).__name__} {family}); "
+        else f"needs a Qwen2, Llama, Qwen3, Qwen3-MoE or Qwen3.5 model ({name} {family}); "
         "hidden taps, ESamp, sampler stages and activation patches still run on this model"
     )
+
+
+def kv_rejection(name: str) -> str | None:
+    """Why a model cannot replay its layer state from KV pages alone."""
+    return (
+        f"recomputes layer state from KV pages, but {name} keeps "
+        "Gated DeltaNet recurrent state outside them; use a Qwen2, Llama, Qwen3 or Qwen3-MoE model"
+        if name in _HYBRID_NAMES
+        else None
+    )
+
+
+def bind_model(model: nn.Module) -> Decoder:
+    """Admit a concrete vLLM architecture at model load, before any instance wrapping."""
+    read_only = admit_architecture(type(model).__name__)
+    architectures = _architectures()
+    if type(model) not in architectures:
+        raise ValueError("choose a native vLLM model class; workload admission does not accept model subclasses")
+    assert isinstance(model, architectures)
     return Decoder(model, model.compute_logits, read_only, tuple(norm.forward for norm in sublayer_norms(model)))
 
 

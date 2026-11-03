@@ -58,10 +58,13 @@ class ModelShape:
     vocab_size: int
     padded_vocab_size: int
     targets: tuple[ProjectionShape, ...]
+    read_only_reason: str | None = None
 
     @classmethod
     def of_config(cls, config: ModelConfig, targets: tuple[Projection, ...] = ()) -> Self:
         """Read only config.json; dense projection widths follow the decoder's q/v/down layouts."""
+        from pllm.backends.vllm.architecture import admit_architecture
+
         model = VllmModelConfig(
             model=config.model,
             revision=config.revision,
@@ -69,15 +72,20 @@ class ModelShape:
             max_model_len=config.max_model_len,
             trust_remote_code=config.trust_remote_code,
         )
-        model_class, _ = ModelRegistry.resolve_model_cls(model.architectures, model)
+        # vLLM inspects lazy model classes in a subprocess; importing hybrids here would initialize CUDA.
+        info, _ = ModelRegistry.inspect_model_cls(model.architectures, model)
+        read_only = admit_architecture(info.architecture)
+        if targets and read_only:
+            raise ValueError(f"a parameter overlay {read_only}")
         shape = structure(model.hf_text_config.to_dict(), _ConfigShape)
         return cls(
-            model_class.__name__,
+            info.architecture,
             shape.hidden_size,
             shape.num_hidden_layers,
             shape.vocab_size,
             pad_vocab_size(shape.vocab_size),
             shape.projections(targets),
+            read_only,
         )
 
     @classmethod
@@ -95,4 +103,5 @@ class ModelShape:
             model.config.vocab_size,
             model.lm_head.num_embeddings_padded,
             shapes,
+            decoder.read_only,
         )

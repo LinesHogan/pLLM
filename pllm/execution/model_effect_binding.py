@@ -476,7 +476,7 @@ def _trace_programs(
     tensor = TokenTensor(
         (1, probe.hidden_size),
         probe.tensor_dtype.torch,
-        probe.device_kind.value,
+        probe.device_kind.value if probe.device_index is None else f"{probe.device_kind.value}:{probe.device_index}",
     )
     names = tuple(name for name, _ in position_states)
     return tuple(

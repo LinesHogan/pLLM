@@ -25,8 +25,10 @@ class BackendCompileFacts:
 
     @property
     def device(self) -> torch.device:
-        return (
-            torch.device("cuda", torch.cuda.current_device() if torch.cuda.is_initialized() else 0)
-            if self.probe.device_kind.value == "cuda"
-            else torch.device("cpu")
-        )
+        """The worker's device, or an explicitly selected ordinal for shape-only planning."""
+        if self.probe.device_kind.value != "cuda":
+            return torch.device("cpu")
+        index = self.probe.device_index
+        if index is None:
+            index = torch.cuda.current_device() if torch.cuda.is_initialized() else 0
+        return torch.device("cuda", index)

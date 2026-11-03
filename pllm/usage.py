@@ -25,6 +25,7 @@ from pllm.contracts.codec import boundary_digest
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.host_batch import CausalTrainBatch, WeightedCEBatch, WeightedRowBatch, validate_host_batch
+from pllm.contracts.member import MemberDeclaration
 from pllm.contracts.parameter_overlay import (
     FieldView,
     ParameterOverlayFieldBinding,
@@ -851,6 +852,7 @@ def _fields(state: InstanceState, model: TensorDType) -> dict[str, Field]:
 class _Effect:
     """An operation effect owns its declaration and attachment policy."""
 
+    kind: ClassVar[str] = "compute"
     training: ClassVar[bool] = False
     # Whether the effect acts inside the model forward, so it owns request training unless a sampler pairs with it.
     model_effect: ClassVar[bool] = False
@@ -862,6 +864,10 @@ class _Effect:
     update_rows: str = ""
     reduction: TrainReduction = "mean"
 
+    def description(self, owner: Workload) -> MemberDeclaration:
+        """The public effect name, with timing settings resolved at the authoring boundary."""
+        return MemberDeclaration(self.kind)
+
     def declare(self, operation: _Operation) -> None:
         operation.tensor()
 
@@ -872,6 +878,8 @@ class _Effect:
 
 @dataclass(frozen=True, kw_only=True)
 class _Write(_Effect):
+    kind: ClassVar[str] = "write"
+
     tuple_output: ClassVar[bool] = True
 
     state: str
@@ -911,6 +919,8 @@ def write(*, state: str, fields: tuple[str, ...]) -> Callable[[F], F]:
 
 @dataclass(frozen=True)
 class _Export(_Effect):
+    kind: ClassVar[str] = "export"
+
     name: str | Attr
     every: int | Attr
     max_rows: int | Attr
@@ -960,6 +970,8 @@ def _training_mode(arguments: Mapping[str, _Source]) -> TrainingMode:
 
 @dataclass(frozen=True, kw_only=True)
 class _Train(_Effect):
+    kind: ClassVar[str] = "train"
+
     state: str
     update_rows: str
     reduction: TrainReduction
@@ -1094,6 +1106,9 @@ class _Sampler(_Effect):
     beta: float | Attr | None = None  # None for additive logits, which have no guidance strength
 
     phase: ClassVar[Phase | None] = Phase.BEFORE_SAMPLE
+
+    def description(self, owner: Workload) -> MemberDeclaration:
+        return MemberDeclaration("add_logits" if self.beta is None else "guide_sampling")
 
     def enabled(self, owner: Workload) -> bool:
         """Zero-strength guidance has no sampler attachment."""
@@ -1252,6 +1267,8 @@ def _chunked_in_forward(
 
 @dataclass(frozen=True, kw_only=True)
 class _TrainInForward(_Effect):
+    kind: ClassVar[str] = "train_in_forward"
+
     state: str
     targets: tuple[Projection, ...] | Attr
     weight: str
@@ -1320,6 +1337,13 @@ class _TrainInForward(_Effect):
             if (isinstance(source, Parameter) and source.state != self.state) or source is Operand.WEIGHT
         )
         return bindings, invariants, invariant_names
+
+    def description(self, owner: Workload) -> MemberDeclaration:
+        return MemberDeclaration(
+            self.kind,
+            tokens=_option(self.tokens, owner, get_args(Tokens), "tokens"),
+            visibility=_option(self.visibility, owner, ("forward_pinned", "exact"), "visibility"),
+        )
 
     def declare(self, operation: _Operation) -> None:
         """Declare the request state's in-forward transition and the delta it applies at the target projections."""
@@ -1429,6 +1453,8 @@ def _site_inputs(
 
 @dataclass(frozen=True, kw_only=True)
 class _CustomResidual(_Effect):
+    kind: ClassVar[str] = "custom_residual"
+
     site: Site
     layers: tuple[int, ...] | Attr | None
     read: str
@@ -1784,6 +1810,7 @@ class _Operation:
     effect: _Effect
     gradient: _Gradient | None
     rows: str
+    phase_override: bool = False
 
     @property
     def function(self) -> FunctionType | MethodType:
@@ -2061,10 +2088,11 @@ class _Reflection:
             self.in_forward_states.add(trained.state)
         if (residual := _typed(effect, _CustomResidual)) is not None and residual.state:
             self.in_forward_states.add(residual.state)
+        phase_override = phase is not None
         phase = phase or effect.phase or Phase.AFTER_SAMPLE
         seeds.append(function)
         assert rows is not None
-        self.operations.append(_Operation(self, name, phase, effect, gradient, rows))
+        self.operations.append(_Operation(self, name, phase, effect, gradient, rows, phase_override))
 
     def method(self, name: str) -> FunctionType | MethodType:
         """Bind a named authoring method, including an instance-local replacement."""
@@ -2144,10 +2172,10 @@ class _Reflection:
     def attach_effects(self) -> None:
         """Connect publications before the custom forward and missing-input branches."""
         for name, patch in self.activations.items():
-            with self.declaring(name):
+            with self.declaring(name), self.binding.member(name, MemberDeclaration("ActivationPatch")):
                 patch.declare(name, self)
         for name, delta in self.adapters.items():
-            with self.declaring(name):
+            with self.declaring(name), self.binding.member(name, MemberDeclaration("Adapter")):
                 self.binding.overlay(self.adapter_bindings(delta))
         # The writes of states activation patches read: a custom forward reads their versions, and a fed chain
         # (feed -> @pllm.write -> patch) closes its conditional input at that publication.
@@ -2161,6 +2189,12 @@ class _Reflection:
                 self.positions,
                 publications,
             )
+            self.binding.members.update(
+                (name, MemberDeclaration("custom_forward", tokens=tokens)) for name, tokens, _ in self.custom_forwards
+            )
+            task = self.binding.effects.custom_forward
+            assert task is not None
+            self.binding.task_members[task] = tuple(name for name, _, _ in self.custom_forwards)
         if self.binding.feeds:
             if len(publications) != 1:
                 raise ValueError(
@@ -2235,7 +2269,8 @@ class _Reflection:
             )
 
         b.update_task(call.symbol, private)
-        b.publish(call, state, when=When.AFTER_SAMPLE, name=f"{call.symbol}.publish")
+        with b.member(operation.name, b.members[operation.name]):
+            b.publish(call, state, when=When.AFTER_SAMPLE, name=f"{call.symbol}.publish")
 
     def sign_composition(self) -> None:
         """Validate composed effects and sign ordered definitions and owner values."""
@@ -2308,7 +2343,10 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         context.adapters = {key: value.expand(b.dimensions.layer_count) for key, value in context.adapters.items()}
         context.declare_values()
         for operation in sorted(context.operations, key=lambda operation: operation.name):
-            with context.declaring(operation.name):
+            description = operation.effect.description(context.owner)
+            if operation.phase_override:
+                description = replace(description, phase=operation.phase.name.lower())
+            with context.declaring(operation.name), b.member(operation.name, description):
                 operation.effect.declare(operation)
         context.attach_effects()
         context.attach_training()
