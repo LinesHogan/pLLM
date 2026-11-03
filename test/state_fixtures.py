@@ -96,13 +96,18 @@ def replan_states(plan, graph, layouts: TensorLayoutRequest, memory_bytes: int):
     provider = PageBundleProviderFacts("test.page_bundle@1", 6)
     candidates = tuple(
         provider.materialize_plan(
-            resource=entry.resource, layout=entry.layout, binding=binding, max_admitted_lineages=2, graph=graph
+            resource=entry.resource,
+            layout=entry.layout,
+            binding=binding,
+            max_admitted_lineages=2,
+            graph=graph,
+            timeline=plan.timeline,
         )
         for entry, binding in zip(layouts.layouts, bindings.bindings, strict=True)
     )
     request = StateRepresentationRequest(
         memory_bytes,
-        tuple(StateLayoutRequirement(b.resource, b.layout_id, 2) for b in bindings.bindings),
+        tuple(StateLayoutRequirement(p.resource, p.layout_id, p.max_admitted_lineages) for p in candidates),
         candidates,
     )
     states, schedule = compile_state_schedule(graph, plan.timeline, request)

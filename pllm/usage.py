@@ -2312,8 +2312,7 @@ class _Reflection:
         frozen = {
             name
             for name, state in self.state_definitions.items()
-            if (state.module is not None or state.checkpoint)
-            and state.optimizer is None
+            if state.optimizer is None
             and not state.imported
             and state.feed is None
             and not any(

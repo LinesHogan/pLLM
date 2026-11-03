@@ -40,6 +40,7 @@ def compile_page_bundle_plan(
             binding=binding,
             max_admitted_lineages=max_admitted_lineages,
             graph=graph,
+            timeline=timeline,
         )
         for entry, binding in zip(layouts.layouts, layout_decision.bindings, strict=True)
         for provider in providers
@@ -73,6 +74,15 @@ def page_stride_bytes(field: TensorFieldSpec) -> int:
     return (size + field.alignment_bytes - 1) // field.alignment_bytes * field.alignment_bytes
 
 
+def version_capacity(lineages: int, publish_lag: int, *, exact_decode: bool = False) -> int:
+    """Current/private roots, retained readers and history, plus two rollover slots.
+
+    Exact in-forward transitions retain no post-sampler history. GPU completion
+    fences govern reuse, so outstanding GPU work needs no further reserved roots.
+    """
+    return (2 if exact_decode else 3 + publish_lag) * lineages + 2
+
+
 @dataclass(frozen=True, slots=True)
 class PageBundleProviderFacts:
     provider_id: str
@@ -87,11 +97,15 @@ class PageBundleProviderFacts:
         binding: TensorLayoutBinding,
         max_admitted_lineages: int,
         graph: SemanticGraph,
+        timeline: SchedulerTimeline,
     ) -> StateProviderPlan:
-        """Reserve one root for frozen instance state; mutable state keeps its advertised capacity."""
+        """Reserve versions of one instance lineage, or the provider's request capacity."""
         state = next(state for state in graph.states if state.resource == resource)
-        immutable_instance = state.scope is StateScope.INSTANCE and state.immutable
-        capacity = 1 if immutable_instance else self.page_capacity
+        instance = state.scope is StateScope.INSTANCE
+        lag = 0 if timeline.visibility is None else timeline.visibility.lag
+        capacity = min(self.page_capacity, version_capacity(1, lag)) if instance else self.page_capacity
+        if instance and state.immutable:
+            capacity = 1
         reserved_bytes = sum(
             capacity * page_stride_bytes(field) + max(field.alignment_bytes - field.dtype.itemsize, 0)
             for field in layout.fields
@@ -101,7 +115,7 @@ class PageBundleProviderFacts:
             provider_id=self.provider_id,
             device_kind=self.device_kind,
             layout_id=binding.layout_id,
-            max_admitted_lineages=1 if immutable_instance else max_admitted_lineages,
+            max_admitted_lineages=1 if instance else max_admitted_lineages,
             page_capacity=capacity,
             root_page_count=len(layout.fields),
             reserved_bytes=reserved_bytes,

@@ -24,7 +24,7 @@ from pllm.contracts.semantic_graph import SchedulerTimeline
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.compile_facts import BackendCompileFacts
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
+from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, version_capacity
 from pllm.execution.runtime_facts import model_timeline
 
 _REQUEST_CAPABILITIES = (
@@ -146,10 +146,7 @@ def compile_facts(
         requirements.sampler_feedback,
     )
     required = tuple(value + overlay_graph_bytes for value in required)
-    # Exact in-forward transitions retain current/private roots, without a
-    # post-sampler history. Released GPU reads are fenced by SlotPools on reuse;
-    # they do not need another physically reserved root per request.
-    capacity = (2 if requirements.exact_decode else 3 + publish_lag) * config.max_num_seqs + 2
+    capacity = version_capacity(config.max_num_seqs, publish_lag, exact_decode=requirements.exact_decode)
     facts = BackendCompileFacts(
         replace(probe, targets=shape.targets, position_states=requirements.position_states),
         replace(observed, reserved_bytes=required),
