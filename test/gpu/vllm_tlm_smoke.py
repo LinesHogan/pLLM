@@ -41,7 +41,7 @@ def main() -> None:
     workload = TLMWorkload(
         TLMConfig(TLMMode(args.mode), pllm.AdamW(0.01, (0.9, 0.999), 1e-8, 0.01), threshold=0.0), rank=2, alpha=4
     )
-    handle = pllm.make_llm(workload=workload, config=ModelConfig(model_id, "bfloat16", 64, 2, 64, 0.8, seed=7))
+    handle = pllm.make_llm(workload=workload, config=ModelConfig(model_id, "bfloat16", 64, 2, 64, 0.5, seed=7))
     execution = handle.runner.require_session()._deployment.execution
     tokens = torch.tensor([[1, 2, 3, 4]], device=device)
     batch = CausalTrainBatch(tokens, tokens)

@@ -268,7 +268,10 @@ def _release_models() -> None:
     """Drain finished diagnostic engines before vLLM samples free memory for the next one."""
     if torch.cuda.is_initialized():
         torch.cuda.synchronize()
+        # Compiled graph caches can retain a closed engine's model tensors.
+        torch.compiler.reset()
         cleanup_dist_env_and_memory()
+        torch.cuda.synchronize()
 
 
 def _neutral_tokens(workload: Workload, config: ModelConfig) -> tuple[tuple[tuple[int, ...], ...], ...]:
