@@ -47,6 +47,7 @@ from pllm.execution.tensor_executor import FieldWriteExecutor, TensorExecutor, r
 from pllm.execution.tensor_frame import (
     OverlayEntry,
     TensorFrame,
+    field_values,
     flat_gradient,
 )
 from pllm.execution.tensor_program import (
@@ -165,17 +166,10 @@ class TensorBinding(Builder[TensorFrame]):
         if init is None:
             return lambda roots, keys: None
         layout = next(item.layout for item in self.layouts.layouts if item.resource == resource)
-        tensors = tuple(
-            torch.zeros(
-                field.shape,
-                dtype=torch.float32 if field.dtype.torch in (torch.float16, torch.bfloat16) else field.dtype.torch,
-                device=device,
-            )
-            for field in layout.fields
-        )
+        tensors = tuple(torch.zeros(field.shape, dtype=field.dtype.torch, device=device) for field in layout.fields)
         # A resource's initial tensors are shared values, independent of admission history.
         init(tensors, torch.Generator(device=device).manual_seed(seed))
-        values = {i: tensors[i].to(field.dtype.torch) for i, field in self.retained_fields(resource).items()}
+        values = {i: tensors[i] for i in self.retained_fields(resource)}
 
         def initialize(roots: Roots, keys: tuple[RequestStateKey | None, ...]) -> None:
             for root in roots:
@@ -400,18 +394,7 @@ class TensorBinding(Builder[TensorFrame]):
         replacements: list[tuple[int, tuple[torch.Tensor, ...]]] = []
         for index, values in data.replacements:
             root = tuple(view.read(batch.roots[index][view.field]) for view in self.imports[resource])
-            if len(values) != len(root) or any(
-                source.shape != target.shape
-                or (source.dtype != target.dtype and not (source.is_floating_point() and target.is_floating_point()))
-                or source.device != target.device
-                for source, target in zip(values, root, strict=True)
-            ):
-                raise ValueError(
-                    "replacement tensors must match layout shape/device and use floating or matching integer dtypes"
-                )
-            replacements.append(
-                (index, tuple(source.to(target.dtype) for source, target in zip(values, root, strict=True)))
-            )
+            replacements.append((index, field_values(values, root, resource=resource, validate=True)))
         data.replacements = tuple(replacements)
 
     @property

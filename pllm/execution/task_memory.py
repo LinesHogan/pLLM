@@ -152,11 +152,12 @@ def example(
     if binding.graph.training_mode == "weighted_batch":
         keys = tuple(key for key in selection.keys if key is not None)
         shape = (len(keys), options.max_training_rows) if keys else (options.max_training_rows,)
+        batch_dtype = binding.layouts.layouts[0].layout.fields[0].dtype.torch
         host_batch = WeightedCEBatch(
-            meta(*shape, facts.probe.hidden_size),
-            meta(*shape, facts.vocab_size),
+            meta(*shape, facts.probe.hidden_size, dtype=batch_dtype),
+            meta(*shape, facts.vocab_size, dtype=batch_dtype),
             meta(*shape, dtype=torch.long),
-            meta(*shape),
+            meta(*shape, dtype=batch_dtype),
             keys,
         )
     dtype = facts.probe.tensor_dtype.torch

@@ -36,6 +36,7 @@ from pllm.execution.tensor_frame import (
     TensorFrame,
     TensorMath,
     TensorPort,
+    field_values,
     gradient_rows,
     take_rows,
 )
@@ -62,26 +63,19 @@ class FieldWriter:
     def values(
         self, data: TensorFrame, batch: TensorBatch, selected: tuple[int, ...], *, validate: bool
     ) -> tuple[torch.Tensor, ...]:
-        """Validate field metadata before staging caller-owned results."""
-        instance = batch.selection.for_resource(self.resource).keys == (None,)
-        values = (
-            tuple(batch.results[self.source.symbol, name] for name in self.source.outputs)
-            if self.source is not None
-            else tuple(
+        """Stage normalized imports or convert a method's results to their declared storage precision."""
+        if self.source is None:
+            return tuple(
                 torch.stack(tuple(fields[i] for _, fields in data.replacements)) for i in range(len(self.fields))
             )
+        values = tuple(batch.results[self.source.symbol, name] for name in self.source.outputs)
+        if batch.selection.for_resource(self.resource).keys == (None,):
+            values = tuple(value.unsqueeze(0) for value in values)
+        targets = tuple(
+            view.read(batch.roots[selected[0]][view.field]).unsqueeze(0).expand(len(selected), *view.shape)
+            for view in self.fields
         )
-        values = tuple(value.unsqueeze(0) for value in values) if instance and self.source is not None else values
-        if validate and any(
-            value.shape != (len(selected), *view.shape)
-            or value.dtype != (target := view.read(batch.roots[selected[0]][view.field])).dtype
-            or value.device != target.device
-            for view, value in zip(self.fields, values, strict=True)
-        ):
-            raise ValueError(
-                f"write to {self.resource} needs fields with their declared shape, dtype, device and request axis"
-            )
-        return values
+        return field_values(values, targets, resource=self.resource, validate=validate)
 
     def select(self, data: TensorFrame, selection: RequestStateSelection) -> tuple[int, ...]:
         """Select only this producer's eligible resource rows."""

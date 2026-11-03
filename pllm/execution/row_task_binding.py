@@ -167,6 +167,9 @@ def prepare_weighted_batch(
     valid = (labels >= 0) & (labels < dimensions.vocab_size) & (weights > 0)
     hidden, logits = (tensor.masked_fill(~valid.unsqueeze(-1), 0) for tensor in (hidden, logits))
     labels, weights = (tensor.masked_fill(~valid, 0) for tensor in (labels, weights))
+    hidden, logits, weights = (
+        tensor.to(torch.promote_types(tensor.dtype, torch.float32)) for tensor in (hidden, logits, weights)
+    )
     parameters = tuple(
         tensor.new_empty((len(selected), *tensor.shape), dtype=torch.promote_types(tensor.dtype, torch.float32))
         for tensor in root

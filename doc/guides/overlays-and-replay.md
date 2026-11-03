@@ -11,7 +11,7 @@
 
 `pllm.Field` 默认按角色选择精度：优化器参数、chunk carry 和读改写字段为 FP32；
 只读或只写字段为模型 dtype。Dense / low-rank 投影读取时转换到模型输入 dtype；
-"per_head" 保持 FP32。`pllm.Field(shape, dtype=torch.bfloat16)` 可显式节省一半字段显存，
+"per_head" 至少用 FP32 计算。`pllm.Field(shape, dtype=torch.bfloat16)` 可显式节省一半字段显存，
 代价是小更新可能被舍入掉；`dtype=None` 显式跟随模型 dtype。
 `InPlaceTTTWorkload(..., dtype=...)` 与 `PrefillAdaptersWorkload(dtype=...)` 均可配置状态精度，默认 FP32。
 

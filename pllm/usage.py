@@ -54,7 +54,7 @@ from pllm.contracts.state_feed import FeedBinding, FeedOrder
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 from pllm.contracts.visibility import VisibilityKind
 from pllm.execution.binding_base import SGD as SGD, Field as Field, layout_field, overlay_fields
-from pllm.execution.causal_batch import CausalBinder, CausalModel, CausalPort, declare_batch_train
+from pllm.execution.causal_batch import CausalBinder, CausalModel, CausalPort, TrainingBatch, declare_batch_train
 from pllm.execution.checkpoint import initialize_checkpoint
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import Call, Dimensions, LayoutField, Shape, State, When
@@ -277,8 +277,15 @@ class Batch(_Source):
             )
         return CausalPort(
             context.binding.input("training", self.field, variant.schema),
-            lambda batch, parameters: batch.tensor(self.field),
+            self.training_value,
         )
+
+    def training_value(self, batch: TrainingBatch, parameters: Tensors) -> torch.Tensor | None:
+        """Hand training math floating inputs in at least FP32, retaining integer IDs and absent masks."""
+        value = batch.tensor(self.field)
+        if value is None or not value.is_floating_point():
+            return value
+        return value.to(torch.promote_types(value.dtype, torch.float32))
 
     def batch(self, state: str, definition: InstanceState) -> tuple[str, str]:
         return "batch", self.field

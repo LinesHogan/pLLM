@@ -113,11 +113,7 @@ def _check_target_fields(
             f"fields {keys} must be shaped {rule} for the {projection} (in_features={inputs}, out_features={outputs}); "
             f"got {shapes}"
         )
-    allowed = (
-        (TensorDType.FLOAT32,)
-        if effect.operator is ParameterOverlayOperator.HEAD_ADD
-        else (model, TensorDType.FLOAT32, TensorDType.FLOAT64)
-    )
+    allowed = (model, TensorDType.FLOAT32, TensorDType.FLOAT64)
     for key in keys:
         if dtypes[key] not in allowed:
             raise ValueError(f"field {key!r} must hold one of {allowed} for {effect.operator}; set dtype=torch.float32")

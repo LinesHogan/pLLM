@@ -15,6 +15,7 @@ import pllm
 def _sentence_cross_entropy(logits: torch.Tensor, labels: torch.Tensor, ignore_index: int) -> torch.Tensor:
     shifted = labels[..., 1:].contiguous()
     valid = shifted.ne(ignore_index)
+    logits = logits.to(torch.promote_types(logits.dtype, torch.float32))
     losses = F.cross_entropy(
         logits[..., :-1, :].contiguous().view(-1, logits.shape[-1]),
         shifted.view(-1),

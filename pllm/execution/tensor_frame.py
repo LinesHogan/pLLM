@@ -44,6 +44,25 @@ TensorMath = Callable[..., torch.Tensor | tuple[torch.Tensor, ...]]
 TensorReader = Callable[["TensorFrame", TensorBatch], torch.Tensor]
 
 
+def field_values(
+    values: tuple[torch.Tensor, ...], targets: tuple[torch.Tensor, ...], *, resource: str, validate: bool
+) -> tuple[torch.Tensor, ...]:
+    """Normalize imported or authored fields to storage precision, checking metadata at their input boundary."""
+    if validate and (
+        len(values) != len(targets)
+        or any(
+            value.shape != target.shape
+            or value.device != target.device
+            or (value.dtype != target.dtype and not (value.is_floating_point() and target.is_floating_point()))
+            for value, target in zip(values, targets, strict=True)
+        )
+    ):
+        raise ValueError(
+            f"write to {resource} needs fields with layout shape/device and floating or matching integer dtypes"
+        )
+    return tuple(value.to(target.dtype) for value, target in zip(values, targets, strict=True))
+
+
 def flat_gradient(fields: tuple[torch.Tensor, ...]) -> torch.Tensor:
     return fields[0].flatten() if len(fields) == 1 else torch.cat(tuple(value.flatten() for value in fields))
 
