@@ -5,7 +5,7 @@
 一层展开，其他层只给链接。
 
 ```text
-第一次接触 → 教程 00 → 按兴趣继续 01–05
+第一次接触 → 教程 00 → 按兴趣继续 01–08
 写自己的负载 → 使用指南（任务导向）
 查某条声明的精确边界 → 参考：创作契约 / 词汇表
 理解架构与所有权 → 设计说明
@@ -13,7 +13,7 @@
 
 ## 教程（学习导向，可执行 notebook）
 
-需要 GPU。每篇围绕一个算法，在 Qwen2.5-0.5B 上跑完，输出保留在 notebook 里。
+需要 GPU。每篇围绕一个算法，大多在 Qwen2.5-0.5B 上跑完（08 用一个 4B 的 In-Place TTT 社区检查点），输出保留在 notebook 里。
 
 - [00 快速上手：把激活引导（CAA）搬进 vLLM](tutorials/00_quickstart.ipynb)
 - [01 观测：用探针逐 token 监控生成](tutorials/01_observe_probe.ipynb)
@@ -21,10 +21,14 @@
 - [03 decode 时训练：ESamp](tutorials/03_decode_training.ipynb)
 - [04 改写 forward：循环深度](tutorials/04_custom_forward.ipynb)
 - [05 反馈循环：TTRL](tutorials/05_host_feedback.ipynb)
+- [06 读模型内部：残差流、逐层 logits 与 DoLa](tutorials/06_reading_inside.ipynb)
+- [07 改写残差连接：value residual、超连接与记忆子层](tutorials/07_custom_residual.ipynb)
+- [08 In-Place TTT：一边读一边改权重的模型](tutorials/08_inplace_ttt.ipynb)
 
 ## 使用指南（任务导向）
 
 - [写一个负载：声明、时机、输入来源](guides/write-a-workload.md)
+- [写代码时就看到成本：pllm.explain](guides/explain.md)
 - [状态与记忆：作用域、冻结、route 键、memory 与捕获](guides/state-and-memory.md)
 - [训练与观测：loss 约定、梯度边、导出与 trace](guides/training-and-observation.md)
 - [Overlay 与重放：引擎内训练、外部导入、激活检查点](guides/overlays-and-replay.md)
