@@ -222,6 +222,7 @@ def main():
     parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--tokens", type=int, default=16)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--value-rewrite", action="store_true")
     parser.add_argument("--rule", choices=("none", "all", "mixed"), default="none")
     args = parser.parse_args()
@@ -230,7 +231,7 @@ def main():
         max_model_len=max(512, args.tokens + 64),
         max_num_seqs=args.batch,
         max_num_batched_tokens=512,
-        gpu_memory_utilization=0.85,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         execution=pllm.ExecutionOptions(capture_memory_bytes=512 << 20),
     )
     prompts = ["The capital of France is" + " very" * i for i in range(args.batch)]

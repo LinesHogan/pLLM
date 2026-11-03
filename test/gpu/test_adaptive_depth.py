@@ -23,6 +23,8 @@ def test_conditional_depth_native_kv_and_sync_debug(rule, batch, value):
             str(batch),
             "--tokens",
             "4",
+            "--gpu-memory-utilization",
+            "0.5",
             *(["--value-rewrite"] if value else []),
         ],
         check=True,
