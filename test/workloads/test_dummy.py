@@ -45,10 +45,12 @@ def exported(execution, value):
     return next(event.tensor() for event in reversed(execution.trace.snapshot().events) if event.tensor_name)
 
 
-@pytest.mark.gpu
-def test_dummy_runs_graph_sign_plan_execute() -> None:
+def test_dummy_runs_graph_sign_plan_execute(device_name) -> None:
     workload = DummyWorkload(DummyConfig(export_every_n_steps=2, export_max_rows=2, export_max_cols=3))
     execution = make_host(CPU, workload)
+    if device_name != "cpu":
+        _trace_selection_and_bounds(execution.plan, device_name)
+        return
     hidden = torch.arange(15, dtype=torch.float32).reshape(3, 5)
     expected = hidden[1:3, :3].clone()
     value = lambda step: step_input(step, hidden)
@@ -74,7 +76,7 @@ def test_dummy_runs_graph_sign_plan_execute() -> None:
     (observed,) = (event for event in snapshot.events if event.kind is TraceEventKind.TENSOR)
     assert observed.step_id == 2 and tuple(identity.prompt_index for identity in observed.identities) == (1, 2)
     torch.testing.assert_close(observed.tensor(), expected)
-    _trace_selection_and_bounds(execution.plan)
+    _trace_selection_and_bounds(execution.plan, device_name)
 
     facts = backend_facts(
         5,
@@ -125,7 +127,7 @@ def test_dummy_runs_graph_sign_plan_execute() -> None:
     _frozen_state_is_readable_by_an_observation()
 
 
-def _trace_selection_and_bounds(plan) -> None:
+def _trace_selection_and_bounds(plan, device) -> None:
     (task,) = plan.tasks
     trace = ExecutionTrace(plan, capacity=2)
     special = torch.tensor([float("nan"), float("inf")], dtype=torch.bfloat16)
@@ -162,9 +164,8 @@ def _trace_selection_and_bounds(plan) -> None:
     torch.testing.assert_close(grad.tensor(), (tensor + 1).flatten()[:2])
     # A bounded snapshot of a huge broadcast view must not materialize the source first.
     trace.configure(TraceSelection(tensors=True, max_tensor_bytes=128))
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     small = torch.arange(1, 2049, device=device, dtype=torch.float32)
-    if device == "cuda":
+    if device != "cpu":
         torch.cuda.synchronize()
         baseline = torch.cuda.memory_allocated()
         torch.cuda.reset_peak_memory_stats()
@@ -172,7 +173,7 @@ def _trace_selection_and_bounds(plan) -> None:
     event = trace.snapshot().events[-1]
     torch.testing.assert_close(event.tensor(), small[:1].expand(32).cpu())
     assert event.source_shape == (2048, 2048)
-    if device == "cuda":
+    if device != "cpu":
         assert torch.cuda.max_memory_allocated() - baseline < 64 * 1024
 
 

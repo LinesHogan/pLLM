@@ -7,7 +7,6 @@ import pytest
 
 
 @pytest.mark.slow
-@pytest.mark.gpu
 def test_meta_scan_and_adamw_do_not_initialize_cuda():
     script = """
 from unittest.mock import patch

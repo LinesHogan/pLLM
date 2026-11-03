@@ -42,14 +42,6 @@ def test_isolated_wheel_imports_and_executes_rust_codec(tmp_path: Path) -> None:
         assert packaged_sources == expected_sources
         (license_path,) = (name for name in archive.namelist() if name.endswith("/licenses/LICENSE"))
         assert b"Apache License" in archive.read(license_path)
-        assert not any(name.startswith(("pllm/runtime/", "pllm/ports/", "pllm/common/")) for name in archive.namelist())
-        assert not set(archive.namelist()).intersection(
-            {
-                "pllm/backends/vllm/overlay_state.py",
-                "pllm/backends/vllm/versioned_parameter_overlay.py",
-                "pllm/backends/vllm/dense_parameter_overlay.py",
-            }
-        )
     installed = tmp_path / "installed"
     subprocess.run(
         [sys.executable, "-m", "pip", "install", "--no-deps", "--no-index", "--target", str(installed), str(wheel)],

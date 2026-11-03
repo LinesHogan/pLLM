@@ -39,7 +39,6 @@ BINDINGS = tuple(
     PackedHiddenResourceBinding(str(layer), HiddenLayerKind.INDEX, HiddenSite.BLOCK_OUTPUT, f"model.layers[{layer}]")
     for layer in (0, -1)
 )
-DEVICES = ("cpu", "cuda:0") if torch.cuda.is_available() else ("cpu",)
 
 
 def facts_for(device, hidden_size, pages, lineages=2, memory_bytes=10000):
@@ -92,8 +91,16 @@ def reject_publication(arena, write):
     raise RuntimeError("injected publication failure")
 
 
-@pytest.mark.gpu
-def test_esamp_predicts_before_training_and_isolates_request_versions(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_esamp_predicts_before_training_and_isolates_request_versions(monkeypatch, device_name) -> None:
+    if device_name == "cpu":
+        _request_lifecycle(monkeypatch)
+    for normalized in (False, True):
+        _esamp_native_oracle(torch.device(device_name), normalized)
+    _ordinary_request_distillation(device_name)
+    _module_request_distillation(device_name)
+
+
+def _request_lifecycle(monkeypatch):
     refs = StateRefs(np.array([0, 0, 1]), np.array([1, 2, 3]), np.array([9, 5, 0]))
     history = (
         StateRefs(refs.layouts[:1], refs.lineages[:1], np.array([3])),
@@ -182,11 +189,6 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(monkeypatc
     assert execution.diagnostics().active_states == 0
     execution.admit(identities)
     execution.retire(identities)
-    for device in DEVICES:
-        for normalized in (False, True):
-            _esamp_native_oracle(torch.device(device), normalized)
-    _ordinary_request_distillation()
-    _module_request_distillation()
 
 
 def _esamp_native_oracle(device, normalized):
@@ -282,62 +284,60 @@ class Distillation(pllm.Workload):
         return (prediction - target).square().mean(1)
 
 
-def _ordinary_request_distillation() -> None:
-    for device_name in DEVICES:
-        device = torch.device(device_name)
-        stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
-        workload = Distillation()
-        options = ExecutionOptions(capture_memory_bytes=16 * 1024**2)
-        execution = workload.compile_backend(facts_for(device, 4, 9, lineages=3), options)
-        execution = execution.execution
-        # Same request id, different samples: the keys keep three separate lineages.
-        identities = tuple(RequestIdentity("same-id", 0, index) for index in range(3))
-        latest = list(execution.admit(identities, stream))
-        weights = [torch.nn.Parameter(torch.zeros((4, 4), device=device)) for _ in identities]
-        optimizers = [torch.optim.AdamW((weight,), lr=0.03, weight_decay=0.1) for weight in weights]
-        source = torch.linspace(-0.6, 0.8, 12, device=device).reshape(3, 4)
-        target = torch.linspace(0.7, -0.3, 12, device=device).reshape(3, 4)
-        initial = tuple(latest)
-        held = execution.arena.pin_exact(StateRefs.of(initial), stream)
-        # Cross-step memory: carries hold each lineage's last published capture; step 0 reads zeros.
-        carries = [torch.zeros(4, device=device) for _ in identities]
-        for step_id, owners in enumerate(((0, 1, 0), (2, 0, 0))):
-            value = step_input(tuple(identities[o] for o in owners), source, target, step_id, (2, 0, 1), stream)
-            links = value.sampler_rows.links
-            active = tuple(link for link in links if latest[owners[link.packed_row_index]].version_id > 0)
-            weight_of = lambda link: weights[owners[link.packed_row_index]].detach()
-            expected = [source[link.packed_row_index] @ weight_of(link) for link in active]
-            result = execution.step(value, stream)
-            rows, values = effective(result.guidance)
-            assert rows == tuple(link.sampler_row_index for link in active) and result.guidance.beta == 0.2
-            torch.testing.assert_close(values, torch.stack(expected) if expected else source.new_empty((0, 4)))
-            for before, after, loss in zip(
-                result.publication.before_refs, result.publication.after_refs, result.loss, strict=True
-            ):
-                owner = latest.index(before)
-                selected = [index for index, selected_owner in enumerate(owners) if selected_owner == owner]
-                optimizers[owner].zero_grad()
-                oracle = F.mse_loss(source[selected] @ weights[owner] + carries[owner], target[selected])
-                oracle.backward()
-                optimizers[owner].step()
-                torch.testing.assert_close(loss, oracle.detach())
-                # Each lineage's memory receives its last selected row's captured source.
-                carries[owner] = source[selected[-1]].clone()
-                weight, gradient, step, exp_avg, exp_avg_sq = adamw_roots(optimizers[owner], weights[owner])
-                expected_roots = (weight, gradient, step, exp_avg, exp_avg_sq)
-                expected_roots = (*(t.flatten() if t.dim() else t for t in expected_roots), carries[owner])
-                assert_roots(execution.snapshot(after, stream), expected_roots)
-                latest[owner] = after
-        for ref in initial:
-            assert torch.count_nonzero(execution.arena.snapshot(held, ref)[0]) == 0
-        execution.arena.wait_release(execution.arena.release_pin(held))
-        execution.retire(identities, wait=True)
-        diagnostics = execution.diagnostics()
-        assert diagnostics.loss_count == diagnostics.update_count == 4 and diagnostics.trained_rows == 6
-        assert diagnostics.active_states == diagnostics.pending_state_releases == 0
+def _ordinary_request_distillation(device_name) -> None:
+    device = torch.device(device_name)
+    stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
+    workload = Distillation()
+    options = ExecutionOptions(capture_memory_bytes=16 * 1024**2)
+    execution = workload.compile_backend(facts_for(device, 4, 9, lineages=3), options)
+    execution = execution.execution
+    # Same request id, different samples: the keys keep three separate lineages.
+    identities = tuple(RequestIdentity("same-id", 0, index) for index in range(3))
+    latest = list(execution.admit(identities, stream))
+    weights = [torch.nn.Parameter(torch.zeros((4, 4), device=device)) for _ in identities]
+    optimizers = [torch.optim.AdamW((weight,), lr=0.03, weight_decay=0.1) for weight in weights]
+    source = torch.linspace(-0.6, 0.8, 12, device=device).reshape(3, 4)
+    target = torch.linspace(0.7, -0.3, 12, device=device).reshape(3, 4)
+    initial = tuple(latest)
+    held = execution.arena.pin_exact(StateRefs.of(initial), stream)
+    # Cross-step memory: carries hold each lineage's last published capture; step 0 reads zeros.
+    carries = [torch.zeros(4, device=device) for _ in identities]
+    for step_id, owners in enumerate(((0, 1, 0), (2, 0, 0))):
+        value = step_input(tuple(identities[o] for o in owners), source, target, step_id, (2, 0, 1), stream)
+        links = value.sampler_rows.links
+        active = tuple(link for link in links if latest[owners[link.packed_row_index]].version_id > 0)
+        weight_of = lambda link: weights[owners[link.packed_row_index]].detach()
+        expected = [source[link.packed_row_index] @ weight_of(link) for link in active]
+        result = execution.step(value, stream)
+        rows, values = effective(result.guidance)
+        assert rows == tuple(link.sampler_row_index for link in active) and result.guidance.beta == 0.2
+        torch.testing.assert_close(values, torch.stack(expected) if expected else source.new_empty((0, 4)))
+        for before, after, loss in zip(
+            result.publication.before_refs, result.publication.after_refs, result.loss, strict=True
+        ):
+            owner = latest.index(before)
+            selected = [index for index, selected_owner in enumerate(owners) if selected_owner == owner]
+            optimizers[owner].zero_grad()
+            oracle = F.mse_loss(source[selected] @ weights[owner] + carries[owner], target[selected])
+            oracle.backward()
+            optimizers[owner].step()
+            torch.testing.assert_close(loss, oracle.detach())
+            # Each lineage's memory receives its last selected row's captured source.
+            carries[owner] = source[selected[-1]].clone()
+            weight, gradient, step, exp_avg, exp_avg_sq = adamw_roots(optimizers[owner], weights[owner])
+            expected_roots = (weight, gradient, step, exp_avg, exp_avg_sq)
+            expected_roots = (*(t.flatten() if t.dim() else t for t in expected_roots), carries[owner])
+            assert_roots(execution.snapshot(after, stream), expected_roots)
+            latest[owner] = after
+    for ref in initial:
+        assert torch.count_nonzero(execution.arena.snapshot(held, ref)[0]) == 0
+    execution.arena.wait_release(execution.arena.release_pin(held))
+    execution.retire(identities, wait=True)
+    diagnostics = execution.diagnostics()
+    assert diagnostics.loss_count == diagnostics.update_count == 4 and diagnostics.trained_rows == 6
+    assert diagnostics.active_states == diagnostics.pending_state_releases == 0
 
 
-@pytest.mark.gpu
 def test_sampler_adapts_step_results_in_memory_trace_and_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     """Fixed steps never re-enter prediction evaluation, including the meta resource trace."""
     evaluate = TensorTask.evaluate
@@ -411,38 +411,35 @@ class ModuleDistillation(pllm.Workload):
         return (head(source) - target).square().mean(1)
 
 
-def _module_request_distillation() -> None:
+def _module_request_distillation(device_name) -> None:
     """Module state matches one torch copy of the module per request, trained by torch AdamW."""
-    for device_name in DEVICES:
-        device = torch.device(device_name)
-        stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
-        options = ExecutionOptions(capture_memory_bytes=16 * 1024**2)
-        facts = facts_for(device, 4, 9, lineages=2)
-        execution = ModuleDistillation().compile_backend(facts, options).execution
-        identities = tuple(RequestIdentity(f"r{index}", 0, 0) for index in range(2))
-        latest = list(execution.admit(identities, stream))
-        start = initial_values(
-            lambda m: Head(m.hidden_size), Dimensions(4, 0), facts.initialization_seed, torch.float32
-        )
-        copies = [Head(4).to(device) for _ in identities]
-        for copy in copies:
-            torch.nn.utils.vector_to_parameters(start.to(device, copy=True), copy.parameters())
-        optimizers = [torch.optim.AdamW(copy.parameters(), lr=0.03, weight_decay=0.0) for copy in copies]
-        source = torch.linspace(-0.6, 0.8, 8, device=device).reshape(2, 4)
-        target = torch.linspace(0.7, -0.3, 8, device=device).reshape(2, 4)
-        for step_id in range(3):
-            result = execution.step(step_input(identities, source, target, step_id, stream=stream), stream)
-            rows, values = effective(result.guidance)
-            if step_id:  # predictions use each request's own parameters once it has trained
-                assert rows == (0, 1)
-                with torch.no_grad():
-                    torch.testing.assert_close(values, torch.cat([copies[i](source[i : i + 1]) for i in (0, 1)]))
-            for index, (copy, optimizer) in enumerate(zip(copies, optimizers, strict=True)):
-                optimizer.zero_grad()
-                F.mse_loss(copy(source[index : index + 1]), target[index : index + 1]).backward()
-                optimizer.step()
-                after = result.publication.after_refs[result.publication.before_refs.index(latest[index])]
-                flat = torch.nn.utils.parameters_to_vector(copy.parameters()).detach()
-                torch.testing.assert_close(execution.snapshot(after, stream)[0], flat)
-                latest[index] = after
-        execution.retire(identities)
+    device = torch.device(device_name)
+    stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
+    options = ExecutionOptions(capture_memory_bytes=16 * 1024**2)
+    facts = facts_for(device, 4, 9, lineages=2)
+    execution = ModuleDistillation().compile_backend(facts, options).execution
+    identities = tuple(RequestIdentity(f"r{index}", 0, 0) for index in range(2))
+    latest = list(execution.admit(identities, stream))
+    start = initial_values(lambda m: Head(m.hidden_size), Dimensions(4, 0), facts.initialization_seed, torch.float32)
+    copies = [Head(4).to(device) for _ in identities]
+    for copy in copies:
+        torch.nn.utils.vector_to_parameters(start.to(device, copy=True), copy.parameters())
+    optimizers = [torch.optim.AdamW(copy.parameters(), lr=0.03, weight_decay=0.0) for copy in copies]
+    source = torch.linspace(-0.6, 0.8, 8, device=device).reshape(2, 4)
+    target = torch.linspace(0.7, -0.3, 8, device=device).reshape(2, 4)
+    for step_id in range(3):
+        result = execution.step(step_input(identities, source, target, step_id, stream=stream), stream)
+        rows, values = effective(result.guidance)
+        if step_id:  # predictions use each request's own parameters once it has trained
+            assert rows == (0, 1)
+            with torch.no_grad():
+                torch.testing.assert_close(values, torch.cat([copies[i](source[i : i + 1]) for i in (0, 1)]))
+        for index, (copy, optimizer) in enumerate(zip(copies, optimizers, strict=True)):
+            optimizer.zero_grad()
+            F.mse_loss(copy(source[index : index + 1]), target[index : index + 1]).backward()
+            optimizer.step()
+            after = result.publication.after_refs[result.publication.before_refs.index(latest[index])]
+            flat = torch.nn.utils.parameters_to_vector(copy.parameters()).detach()
+            torch.testing.assert_close(execution.snapshot(after, stream)[0], flat)
+            latest[index] = after
+    execution.retire(identities)

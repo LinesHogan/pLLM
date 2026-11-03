@@ -13,7 +13,7 @@ from vllm import SamplingParams
 
 import pllm
 from pllm.model import Projection
-from test.gpu.test_custom_residual import BF16_NOISE, _deviation, _oracle_logprobs, _vanilla
+from test.gpu.features.test_custom_residual import BF16_NOISE, _deviation, _oracle_logprobs, _vanilla
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 PROMPTS = ("The capital of France is", "Water boils at a temperature of", "def fibonacci(n):")

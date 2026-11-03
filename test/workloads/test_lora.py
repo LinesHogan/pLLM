@@ -96,56 +96,56 @@ def sgd_reference(config, seed, hidden, logits, labels, weights, groups):
     return a.detach(), b.detach()
 
 
-@pytest.mark.gpu
-def test_independent_lora_bmm_preserves_keyed_mean_and_private_publication() -> None:
+def test_independent_lora_bmm_preserves_keyed_mean_and_private_publication(device_name) -> None:
     identities = tuple(RequestIdentity(str(index), index, 0) for index in range(3))
     keys = tuple(
         RequestStateKey.project(identity, (RequestKeyField.PROMPT_INDEX, RequestKeyField.SAMPLE_INDEX))
         for identity in identities
     )
     config = OutputLoRAConfig(rank=2, alpha=3.0, learning_rate=0.2, steps=3, seed=11, scope="request")
-    for device in (torch.device("cpu"), *([torch.device("cuda", 0)] if torch.cuda.is_available() else [])):
-        stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
-        execution = compile_lora(config, device, pages=8)
-        initial = execution.admit(identities, stream)
-        old_pin = execution.arena.pin_exact(StateRefs.of(initial), stream)
-        with nullcontext() if stream is None else torch.cuda.stream(stream):
-            original = tuple(execution.arena.snapshot(old_pin, ref) for ref in initial)
-            hidden = torch.linspace(-0.7, 0.9, 32, device=device).reshape(2, 4, 4)
-            logits = torch.linspace(-1, 1, 56, device=device).reshape(2, 4, 7)
-            labels = torch.tensor([[2, 4, -100, 1], [0, 6, 3, 2]], device=device)
-            weights = torch.tensor([[1.0, 3.0, 1.0, 0.0], [2.0, 1.0, 0.0, 4.0]], device=device)
-            hidden[0, 2].fill_(float("nan"))
-            batch = pllm.host.WeightedCEBatch.for_prompts(hidden, logits, labels, weights, (1, 0))
-            assert batch.keys == (keys[1], keys[0])
-            value = step_input(identities, torch.ones((3, 4), device=device), batch, stream)
-            generator = torch.Generator(device=device).manual_seed(config.seed)
-            seed = torch.randn((2, 4, 2), device=device, generator=generator) * 0.01
-            references = tuple(
-                sgd_reference(config, seed[i], hidden[i], logits[i], labels[i], weights[i], 2) for i in range(2)
-            )
-            publication = execution.step(value, stream).publication
-            assert tuple(publication.before_refs) == (initial[1], initial[0])
-            for ref, expected in zip(publication.after_refs, references, strict=True):
-                for actual, target in zip(execution.snapshot(ref, stream), expected, strict=True):
-                    torch.testing.assert_close(actual, target, rtol=1e-5, atol=1e-7)
-            assert execution.arena.latest(initial[2].lineage_id) == initial[2]
-            # Each row is guided by its own adapter; the untrained request keeps its initial factors.
-            guidance, _ = testing.run_guided_step(execution, replace(value, batch=None), stream=stream)
-            expected = torch.cat(
-                [
-                    torch.ones(1, 4, device=device) @ factors[0] @ factors[1] * 1.5
-                    for factors in (references[1], references[0], original[2])
-                ]
-            )
-            torch.testing.assert_close(guidance.values, expected, rtol=1e-5, atol=1e-7)
-            for ref, expected in zip(initial, original, strict=True):
-                for actual, target in zip(execution.arena.snapshot(old_pin, ref), expected, strict=True):
-                    torch.testing.assert_close(actual, target, rtol=0, atol=0)
-        execution.arena.wait_release(execution.arena.release_pin(old_pin))
-        execution.retire(identities)
-        assert execution.diagnostics().active_states == 0
-    route_keyed_lineages_until_dormant_retirement()
+    device = torch.device(device_name)
+    stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+    execution = compile_lora(config, device, pages=8)
+    initial = execution.admit(identities, stream)
+    old_pin = execution.arena.pin_exact(StateRefs.of(initial), stream)
+    with nullcontext() if stream is None else torch.cuda.stream(stream):
+        original = tuple(execution.arena.snapshot(old_pin, ref) for ref in initial)
+        hidden = torch.linspace(-0.7, 0.9, 32, device=device).reshape(2, 4, 4)
+        logits = torch.linspace(-1, 1, 56, device=device).reshape(2, 4, 7)
+        labels = torch.tensor([[2, 4, -100, 1], [0, 6, 3, 2]], device=device)
+        weights = torch.tensor([[1.0, 3.0, 1.0, 0.0], [2.0, 1.0, 0.0, 4.0]], device=device)
+        hidden[0, 2].fill_(float("nan"))
+        batch = pllm.host.WeightedCEBatch.for_prompts(hidden, logits, labels, weights, (1, 0))
+        assert batch.keys == (keys[1], keys[0])
+        value = step_input(identities, torch.ones((3, 4), device=device), batch, stream)
+        generator = torch.Generator(device=device).manual_seed(config.seed)
+        seed = torch.randn((2, 4, 2), device=device, generator=generator) * 0.01
+        references = tuple(
+            sgd_reference(config, seed[i], hidden[i], logits[i], labels[i], weights[i], 2) for i in range(2)
+        )
+        publication = execution.step(value, stream).publication
+        assert tuple(publication.before_refs) == (initial[1], initial[0])
+        for ref, expected in zip(publication.after_refs, references, strict=True):
+            for actual, target in zip(execution.snapshot(ref, stream), expected, strict=True):
+                torch.testing.assert_close(actual, target, rtol=1e-5, atol=1e-7)
+        assert execution.arena.latest(initial[2].lineage_id) == initial[2]
+        # Each row is guided by its own adapter; the untrained request keeps its initial factors.
+        guidance, _ = testing.run_guided_step(execution, replace(value, batch=None), stream=stream)
+        expected = torch.cat(
+            [
+                torch.ones(1, 4, device=device) @ factors[0] @ factors[1] * 1.5
+                for factors in (references[1], references[0], original[2])
+            ]
+        )
+        torch.testing.assert_close(guidance.values, expected, rtol=1e-5, atol=1e-7)
+        for ref, expected in zip(initial, original, strict=True):
+            for actual, target in zip(execution.arena.snapshot(old_pin, ref), expected, strict=True):
+                torch.testing.assert_close(actual, target, rtol=0, atol=0)
+    execution.arena.wait_release(execution.arena.release_pin(old_pin))
+    execution.retire(identities)
+    assert execution.diagnostics().active_states == 0
+    if device.type == "cpu":
+        route_keyed_lineages_until_dormant_retirement()
 
 
 def route_keyed_lineages_until_dormant_retirement() -> None:

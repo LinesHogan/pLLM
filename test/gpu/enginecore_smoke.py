@@ -554,13 +554,11 @@ def main() -> int:
     _output_lora_shared_input()
     _independent_lora_input()
     _fttt_activation_retry()
-    _captured_esamp()
     _dummy_export()
     _user_reference_workload()
     _prefill_adapter_reconstruction()
     _graph_overlay()
     _graph_overlay(exact=True)
-    _gpu_shared_input()
     return 0
 
 

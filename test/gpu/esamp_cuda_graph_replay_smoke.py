@@ -29,7 +29,6 @@ from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.step_input import StepInput
 from pllm.execution.tensor_task import TensorTask
 from pllm.testing import backend_facts
-from test.workloads.test_esamp import _esamp_native_oracle, _ordinary_request_distillation
 
 
 class MeanFit(pllm.Workload):
@@ -133,9 +132,6 @@ def mean_capture(publish_lag: int = 0) -> None:
 
 def main() -> None:
     """Run the shared eager/captured step against independent numerical oracles."""
-    for normalized in (False, True):
-        _esamp_native_oracle(torch.device("cuda", 0), normalized)
-    _ordinary_request_distillation()
     for lag in (0, 1, 2):
         mean_capture(lag)
     print("generic step capture: ESamp, request memory, instance mean and changing sampler buffers agree")

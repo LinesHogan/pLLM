@@ -1,16 +1,21 @@
 """CPU binding evidence only: received-page fixtures do not emulate CUDA IPC."""
 
+import os
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from importlib.util import find_spec
+from math import cos, pi, tanh
 from multiprocessing import Pipe
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
+from examples.video_session import video_frames
 from pllm.authoring import BackendDeployment
+from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import (
     ActivationPatchBinding,
     ActivationPatchOperator,
@@ -38,10 +43,12 @@ from pllm.execution.row_task_binding import (
 )
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.state_execution import MathBinding, PartialCommitError
+from pllm.execution.step_input import StepInput
 from pllm.execution.tensor_binding import TensorBinding
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import FunctionMath, TaskOutput
 from pllm.testing import backend_facts, step_input
+from pllm.workloads.video import VideoWorkload, frame_features
 
 
 @contextmanager
@@ -345,3 +352,63 @@ def _hold_steps_reuse_the_settled_injection():
             else:
                 assert not any(peer.poll() for peer in (*peers, *second_peers))
         assert refs[0] == refs[1] and refs[2] == refs[3] and refs[0] != refs[2]
+
+
+def frames(count=4):
+    path = Path(os.environ.get("PLLM_VIDEO_FIXTURE", "/home/user/TLM/data/mllm_demo_data/1.mp4"))
+    if not path.is_file():
+        pytest.skip("set PLLM_VIDEO_FIXTURE to a real video")
+    result = list(video_frames(path, 2, count))
+    assert len(result) == count
+    return result
+
+
+def test_video_real_frame_math_and_signed_composition():
+    first, second = frames(2)
+    values = frame_features(second, first, 2)
+    stationary = frame_features(first, first, 2)
+    assert torch.count_nonzero(stationary[1]) == torch.count_nonzero(stationary[2]) == 0
+    timeline = model_timeline(torch.device("cpu"), ("transition/full_root@1",))
+    facts = backend_facts(4, (), timeline, PageBundleProviderFacts("video.cpu@1", 3), layer_count=1)
+    workload = VideoWorkload(grid_size=2)
+    deployment = workload.compile_backend(facts, ExecutionOptions())
+    execution, plan = deployment.execution, deployment.attachment.plan
+    (layout,) = (item for item in plan.tensor_layout_decision.bindings if item.resource == "features")
+    ref = StateRef(layout.layout_id, LineageId(1), VersionId(1))
+    with ExitStack() as lifetime:
+        pages = []
+        for index, value in enumerate(values):
+            peer, receiver = Pipe()
+            lifetime.callback(peer.close)
+            lifetime.callback(receiver.close)
+            # Received-page fixture only; actual receive_field is CUDA-only and tested below.
+            descriptor = PageFieldTransfer(
+                execution.arena.plan_digest, 1, ref, "features", LayoutFieldId(index), PageSlot(0, 0), 0
+            )
+            pages.append(BorrowedPage(descriptor, value, receiver))
+        execution.admit(())
+        execution.stage_readonly((BorrowedStateRoot(execution.arena, "features", ref, tuple(pages)),))
+        rows = PackedPhaseRowBatch(0, 0, ())
+        result = execution.step(StepInput(rows, PackedSamplerRowBatch(rows, ())))
+        signal = torch.cat(
+            (
+                values[0].flatten() / 63,
+                values[1].flatten().sqrt(),
+                values[2].flatten() / 2**0.5,
+                values[3].flatten() / 3,
+            )
+        ).tolist()
+        expected = torch.tensor(
+            [
+                workload.gain
+                * tanh(
+                    sum(cos(pi * (k + 1) * (j + 0.5) / len(signal)) * x for j, x in enumerate(signal))
+                    / len(signal) ** 0.5
+                )
+                for k in range(4)
+            ]
+        )
+        torch.testing.assert_close(
+            execution.snapshot(result.publication.after_refs[0])[0], expected, atol=1e-6, rtol=1e-6
+        )
+        execution.retire(())

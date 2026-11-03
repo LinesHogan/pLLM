@@ -2,90 +2,22 @@
 
 import multiprocessing as mp
 import os
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from math import cos, pi, tanh
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 import torch
 
 import pllm
-from examples.video_session import video_frames
 from pllm.config import ExecutionOptions, ModelConfig
-from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.contracts.semantic_graph import StateResource
-from pllm.contracts.state_ref import LineageId, StateRef, VersionId
 from pllm.contracts.tensor_layout import LayoutFieldId
-from pllm.execution.ptts.page_borrow import BorrowedPage, BorrowedStateRoot, PageFieldTransfer
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.ptts.slot_pools import PageSlot
+from pllm.execution.ptts.page_borrow import BorrowedPage, BorrowedStateRoot
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.execution.runtime_facts import model_timeline
-from pllm.testing import backend_facts
 from pllm.workloads.recirculation import RecirculationWorkload
 from pllm.workloads.video import VideoWorkload, frame_features
-
-
-def frames(count=4):
-    path = Path(os.environ.get("PLLM_VIDEO_FIXTURE", "/home/user/TLM/data/mllm_demo_data/1.mp4"))
-    if not path.is_file():
-        pytest.skip("set PLLM_VIDEO_FIXTURE to a real video")
-    result = list(video_frames(path, 2, count))
-    assert len(result) == count
-    return result
-
-
-def test_video_real_frame_math_and_signed_composition():
-    first, second = frames(2)
-    values = frame_features(second, first, 2)
-    stationary = frame_features(first, first, 2)
-    assert torch.count_nonzero(stationary[1]) == torch.count_nonzero(stationary[2]) == 0
-    timeline = model_timeline(torch.device("cpu"), ("transition/full_root@1",))
-    facts = backend_facts(4, (), timeline, PageBundleProviderFacts("video.cpu@1", 3), layer_count=1)
-    workload = VideoWorkload(grid_size=2)
-    deployment = workload.compile_backend(facts, ExecutionOptions())
-    execution, plan = deployment.execution, deployment.attachment.plan
-    (layout,) = (item for item in plan.tensor_layout_decision.bindings if item.resource == "features")
-    ref = StateRef(layout.layout_id, LineageId(1), VersionId(1))
-    with ExitStack() as lifetime:
-        pages = []
-        for index, value in enumerate(values):
-            peer, receiver = mp.Pipe()
-            lifetime.callback(peer.close)
-            lifetime.callback(receiver.close)
-            # Received-page fixture only; actual receive_field is CUDA-only and tested below.
-            descriptor = PageFieldTransfer(
-                execution.arena.plan_digest, 1, ref, "features", LayoutFieldId(index), PageSlot(0, 0), 0
-            )
-            pages.append(BorrowedPage(descriptor, value, receiver))
-        execution.admit(())
-        execution.stage_readonly((BorrowedStateRoot(execution.arena, "features", ref, tuple(pages)),))
-        rows = PackedPhaseRowBatch(0, 0, ())
-        result = execution.step(pllm.authoring.StepInput(rows, PackedSamplerRowBatch(rows, ())))
-        signal = torch.cat(
-            (
-                values[0].flatten() / 63,
-                values[1].flatten().sqrt(),
-                values[2].flatten() / 2**0.5,
-                values[3].flatten() / 3,
-            )
-        ).tolist()
-        expected = torch.tensor(
-            [
-                workload.gain
-                * tanh(
-                    sum(cos(pi * (k + 1) * (j + 0.5) / len(signal)) * x for j, x in enumerate(signal))
-                    / len(signal) ** 0.5
-                )
-                for k in range(4)
-            ]
-        )
-        torch.testing.assert_close(
-            execution.snapshot(result.publication.after_refs[0])[0], expected, atol=1e-6, rtol=1e-6
-        )
-        execution.retire(())
+from test.workloads.test_video import frames
 
 
 @contextmanager

@@ -85,8 +85,13 @@ def head_logits(down, up, row, sample):
     return HIDDEN[row] @ down[sample].T @ up[sample].T
 
 
-@pytest.mark.gpu
-def test_override_matches_reweight_adam_and_final_noop() -> None:
+def test_override_matches_reweight_adam_and_final_noop(device_name) -> None:
+    if device_name == "cpu":
+        _reweight_oracle()
+    _independent_domains(device_name)
+
+
+def _reweight_oracle():
     facts = facts_for(torch.device("cpu"))
     config = OverRIDEConfig(rank=2, num_iterations=3, learning_rate=0.03)
     execution = assert_finite_resources(OverRIDEWorkload(config), facts).execution
@@ -157,7 +162,6 @@ def test_override_matches_reweight_adam_and_final_noop() -> None:
 
     _request_heads()
     _chained_heads(facts)
-    _independent_domains()
 
 
 def _request_heads() -> None:
@@ -341,16 +345,15 @@ class IntegerRows(Domains):
         return samples
 
 
-def _independent_domains() -> None:
+def _independent_domains(device_name) -> None:
     cpu = facts_for(torch.device("cpu"), lineages=4, pages=16)
     with pytest.raises(ValueError):  # sampled tokens do not exist before sampling
         EarlyFeedback(False).compile_backend(cpu)
     with pytest.raises(ValueError, match="boolean mask"):  # compile traces the selector with maximum-shape rows
         IntegerRows(False).compile_backend(cpu)
     identities = tuple(RequestIdentity(str(i), i, 0) for i in range(4))
-    for device_name in ("cpu", "cuda:0") if torch.cuda.is_available() else ("cpu",):
-        for request in (False, True):
-            _domains_oracle(torch.device(device_name), request, identities)
+    for request in (False, True):
+        _domains_oracle(torch.device(device_name), request, identities)
 
 
 def _domains_oracle(device, request, identities) -> None:

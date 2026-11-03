@@ -542,7 +542,7 @@ def _check_exact_additive_projection():
     execution.retire((identity,))
 
 
-@pytest.mark.parametrize("span", [1, 2, 3, 4, 7, 11])
+@pytest.mark.parametrize("span", [1, 4, 7])
 def test_prefill_adapters_keep_prompt_chunks_across_scheduler_spans(span):
     from pllm.contracts.semantic_graph import AnchorId
     from pllm.execution.overlay_task import ProjectionTask

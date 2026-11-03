@@ -5,17 +5,13 @@ import torch
 
 import pllm
 from pllm.testing_gpu import check_probe
-from pllm.workloads import ESampConfig, ESampWorkload, PromptFactorsWorkload
+from pllm.workloads import ESampConfig, ESampWorkload
+
+pytestmark = pytest.mark.gpu
 
 
-@pytest.mark.parametrize(
-    "workload",
-    (
-        ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5)),
-        PromptFactorsWorkload(rank=2),
-    ),
-)
-def test_explain_matches_loaded_probe(workload, monkeypatch):
+def test_explain_matches_loaded_probe(monkeypatch):
+    workload = ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5))
     config = pllm.ModelConfig(
         "Qwen/Qwen2.5-0.5B-Instruct",
         max_model_len=64,

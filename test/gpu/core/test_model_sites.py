@@ -5,12 +5,16 @@ import math
 from dataclasses import dataclass, field
 from functools import cache
 
+import pytest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import SamplingParams
 
 import pllm
 from pllm.workloads.dola import DoLaWorkload
+
+pytestmark = pytest.mark.gpu
+
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 PROMPTS = ("The capital of France is", "Water boils at a temperature of", "def fibonacci(n):")

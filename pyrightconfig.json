@@ -1,15 +1,27 @@
 {
   "typeCheckingMode": "strict",
-  "include": ["pllm", "tools/benchmark_esamp.py", "tools/benchmark_lora.py", "tools/check_docs.py", "examples",
-    "test/gpu/vllm_esamp_smoke.py", "test/gpu/fttt_cuda_smoke.py"],
-  "exclude": ["**/__pycache__"],
+  "include": [
+    "pllm",
+    "tools/benchmark_esamp.py",
+    "tools/benchmark_lora.py",
+    "tools/check_docs.py",
+    "examples",
+    "test/gpu/vllm_esamp_smoke.py",
+    "test/gpu/fttt_cuda_smoke.py",
+    "tools/verify_groups.py"
+  ],
+  "exclude": [
+    "**/__pycache__"
+  ],
   "reportMissingImports": true,
   "reportMissingTypeStubs": false,
   "stubPath": "typings",
   "reportUnnecessaryIsInstance": "error",
   "reportUnnecessaryComparison": "error",
   "reportUnnecessaryCast": "error",
-  "defineConstant": {"VLLM_027": true},
+  "defineConstant": {
+    "VLLM_027": true
+  },
   "venvPath": ".",
   "venv": ".venv",
   "pythonVersion": "3.11"

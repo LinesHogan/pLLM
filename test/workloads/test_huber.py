@@ -1,6 +1,5 @@
 """Independent frozen Huber/AdamW oracle through the ordinary workload API."""
 
-import pytest
 import torch
 
 from examples.huber import HuberWorkload
@@ -26,11 +25,9 @@ def effective(guidance):
     return tuple(guidance.affected_row_ids[index] for index in keep), guidance.values[keep]
 
 
-@pytest.mark.gpu
-def test_huber() -> None:
-    for device_name in ("cpu", "cuda:0") if torch.cuda.is_available() else ("cpu",):
-        for hidden, rank in ((4, 2), (8, 3)):
-            _huber_lifecycle(hidden, rank, device_name)
+def test_huber(device_name) -> None:
+    for hidden, rank in ((4, 2), (8, 3)):
+        _huber_lifecycle(hidden, rank, device_name)
 
 
 def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
