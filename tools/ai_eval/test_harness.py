@@ -7,14 +7,29 @@ from types import ModuleType
 import pytest
 import torch
 
+import pllm
 from tools.ai_eval import oracles, reference, run, score
 
 
-@pytest.mark.parametrize("task", run.TASKS)
-def test_reference_acceptance(task: str, tmp_path: Path) -> None:
+class PromptConsumer(reference.PromptLoRA):
+    """Use an author-chosen Adapter property name while preserving the required producer method."""
+
+    adapter = None
+
+    @property
+    def consume(self) -> pllm.model.Adapter:
+        """Declare the same overlay without relying on the reference's property name."""
+        return pllm.model.Adapter("factors", (pllm.model.Projection("q_proj", 1),), operator="low_rank")
+
+
+@pytest.mark.parametrize(
+    "task,workload",
+    [(task, reference.WORKLOADS[task]) for task in run.TASKS] + [("prompt_lora", PromptConsumer)],
+)
+def test_reference_acceptance(task: str, workload: type[pllm.Workload], tmp_path: Path) -> None:
     """Every task must be solvable before a failed author submission can be called a regression."""
     submission = ModuleType("reference_submission")
-    submission.__dict__["Workload"] = reference.WORKLOADS[task]
+    submission.__dict__["Workload"] = workload
     submission.__dict__["direction"] = reference.direction
     submission.__dict__["vote"] = reference.vote
     submission.__dict__["feedback"] = reference.feedback

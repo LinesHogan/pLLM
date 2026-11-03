@@ -1,5 +1,6 @@
 """Independent acceptance math and CPU state checks; only the trusted scorer imports this module."""
 
+from collections import Counter
 from dataclasses import dataclass
 from types import ModuleType
 
@@ -30,11 +31,16 @@ def declarations(task: str, workload: pllm.Workload, config: pllm.ModelConfig) -
     initial_state(actual, wanted)
     assert actual.imports == wanted.imports, "wrong imported state fields"
     assert actual.effects.overlay_bindings == wanted.effects.overlay_bindings, "wrong adapter math/scale/fields"
-    assert set(actual.members) == set(wanted.members), "missing or extra declared methods"
+    # Model property names are author choices; their effects and bindings must still match.
+    assert Counter((member.effect, member.tokens) for member in actual.members.values()) == Counter(
+        (member.effect, member.tokens) for member in wanted.members.values()
+    ), "missing, extra or incorrect declared effects"
     actual_timing = {task.symbol: task.timing for task in actual.graph.tasks}
     wanted_timing = {task.symbol: task.timing for task in wanted.graph.tasks}
     assert actual_timing == wanted_timing, "wrong effective task timing"
     for name, member in wanted.members.items():
+        if member.effect in ("Adapter", "ActivationPatch"):
+            continue
         observed = actual.members[name]
         assert observed.effect == member.effect, f"{name}: wrong effect"
         if member.tokens is not None:

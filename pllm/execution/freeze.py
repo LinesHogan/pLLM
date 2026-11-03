@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import fields, is_dataclass
-from dis import get_instructions
+from dis import Instruction, get_instructions, hasjabs, hasjrel, stack_effect
 from enum import Enum
 from hashlib import sha256
 from inspect import getclosurevars
@@ -39,11 +39,7 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
     if isinstance(value, FunctionType):
         closure = getclosurevars(value)
         globals_used = _global_names(value.__code__)
-        if globals_used & {"getattr", "setattr", "hasattr", "globals", "locals", "vars", "eval", "exec", "__import__"}:
-            raise ValueError(
-                f"{value.__qualname__}: workload methods cannot call getattr, setattr, hasattr, globals, locals, "
-                "vars, eval, exec or __import__; pllm signs code by its bytecode and cannot follow dynamic lookups"
-            )
+        imports = _builtin_dependencies(value)
         dependencies = {
             **{key: value.__globals__[key] for key in globals_used if key in value.__globals__},
             # `__class__` is zero-argument `super()`'s cell: the class being signed, not a dependency.
@@ -54,6 +50,7 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
             tuple((key, fingerprint(item, seen)) for key, item in sorted(dependencies.items())),
             fingerprint(value.__defaults__, seen),
             fingerprint(value.__kwdefaults__, seen),
+            imports,
         )
     if isinstance(value, ModuleType):
         if value.__name__ != "pllm" and not value.__name__.startswith(("torch", "math")):
@@ -141,6 +138,104 @@ def _global_names(code: CodeType) -> set[str]:
         if isinstance(value, CodeType):
             names.update(_global_names(value))
     return names
+
+
+_REJECTED_BUILTINS = {
+    "setattr": "setattr() creates hidden mutable state; return the value instead, or declare "
+    "pllm.RequestState/pllm.InstanceState and return a state update",
+    "globals": "globals() exposes unsigned globals; pass the needed values as workload config fields",
+    "locals": "locals() exposes the runtime namespace; name the needed local variables directly",
+    "eval": "eval() hides code dependencies; write the expression in a Python helper function",
+    "exec": "exec() hides code dependencies; write the statements in a Python helper function",
+}
+
+
+def _literal_call(code: CodeType, start: int, argument: int) -> tuple[int, str | None]:
+    """Read a positional literal from a builtin call without executing its argument expressions."""
+    instructions = tuple(get_instructions(code))
+    offsets = {item.offset: index for index, item in enumerate(instructions)}
+    # LOAD_GLOBAL's low bit requests NULL + callable for a direct call (Python 3.11+).
+    if not (instructions[start].arg or 0) & 1:
+        return 0, None
+    pending: list[tuple[int, int, str | None]] = [(start + 1, 2, None)]
+    visited: set[tuple[int, int, str | None]] = set()
+    results: set[tuple[int, str | None]] = set()
+    slot = 3 + argument
+    call = "PRECALL" if any(item.opname == "PRECALL" for item in instructions) else "CALL"
+    while pending:
+        index, depth, literal = pending.pop()
+        if (index, depth, literal) in visited:
+            continue
+        visited.add((index, depth, literal))
+        item = instructions[index]
+        if item.opname == call and depth == 2 + (item.arg or 0):
+            results.add((item.arg or 0, literal))
+            continue
+        if item.opname in ("RETURN_VALUE", "RETURN_CONST", "RAISE_VARARGS", "CALL_FUNCTION_EX") or depth < 2:
+            return 0, None
+        if item.opname == "LOAD_CONST" and depth == slot - 1:
+            literal = item.argval if isinstance(item.argval, str) else None
+        for successor, jump in _successors(instructions, offsets, index):
+            next_depth = depth + stack_effect(item.opcode, item.arg, jump=jump)
+            retained = literal
+            if next_depth < slot or (
+                next_depth == slot
+                and item.opname != "LOAD_CONST"
+                and not item.opname.startswith(("STORE_", "POP_", "JUMP", "NOP", "EXTENDED_ARG"))
+            ):
+                retained = None
+            pending.append((successor, next_depth, retained))
+    return results.pop() if len(results) == 1 else (0, None)
+
+
+def _successors(
+    instructions: tuple[Instruction, ...], offsets: dict[int, int], index: int
+) -> tuple[tuple[int, bool], ...]:
+    item = instructions[index]
+    if item.opcode in hasjabs or item.opcode in hasjrel:
+        target = offsets[int(item.argval)]
+        if item.opname.startswith("JUMP") and "IF" not in item.opname:
+            return ((target, True),)
+        return ((target, True), (index + 1, False))
+    return ((index + 1, False),) if index + 1 < len(instructions) else ()
+
+
+def _builtin_dependencies(function: FunctionType) -> tuple[tuple[str, str], ...]:
+    """Admit explicit attribute/object reads; reject dependencies hidden in runtime namespaces."""
+    codes = [function.__code__]
+    imports: set[tuple[str, str]] = set()
+    while codes:
+        code = codes.pop()
+        codes.extend(value for value in code.co_consts if isinstance(value, CodeType))
+        for index, item in enumerate(get_instructions(code)):
+            name = str(item.argval)
+            if item.opname != "LOAD_GLOBAL" or name in function.__globals__:
+                continue
+            if name in _REJECTED_BUILTINS:
+                raise ValueError(f"{function.__qualname__}: {_REJECTED_BUILTINS[name]}")
+            if name not in ("getattr", "hasattr", "vars", "__import__"):
+                continue
+            count, literal = _literal_call(code, index, 0 if name == "__import__" else 1)
+            if name == "vars" and count == 1:
+                continue
+            if name in ("getattr", "hasattr") and literal is not None:
+                continue
+            if name == "__import__" and literal is not None and count == 1:
+                if literal == "pllm" or literal.startswith(("torch", "math")):
+                    imports.add((literal, torch.__version__))
+                    continue
+            messages = {
+                "getattr": 'getattr needs a literal attribute name; write getattr(obj, "field") or '
+                'getattr(obj, "field", default) so the attribute dependency is recorded',
+                "hasattr": 'hasattr needs a literal attribute name; write hasattr(obj, "field") '
+                "so the attribute dependency is recorded",
+                "vars": "vars() exposes runtime locals; write vars(obj) or explicit obj.field reads",
+                "__import__": "__import__ needs a literal torch, math or pllm module name to sign its version; "
+                'write import torch, math or pllm at module scope, or __import__("torch"); '
+                "compute values from other modules outside the workload and pass them as config fields",
+            }
+            raise ValueError(f"{function.__qualname__}: {messages[name]}")
+    return tuple(sorted(imports))
 
 
 def reachable_functions(candidates: Mapping[str, FunctionType], seeds: tuple[FunctionType, ...]) -> frozenset[str]:

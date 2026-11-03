@@ -51,11 +51,12 @@ class PrefillTrainer(pllm.Workload):
 
     @property
     def learned(self) -> pllm.RequestState:
-        return pllm.RequestState({"w": (8,)}, optimizer=pllm.AdamW(lr=0.01))
+        return pllm.RequestState({"w": lambda m: (getattr(m, "hidden_size"),)}, optimizer=pllm.AdamW(lr=0.01))
 
     @pllm.train(state="learned")
     def learn(self, x=pllm.hidden(0, tokens="prefill"), w=pllm.parameter("learned", "w")):
-        return (w - x).square().mean(-1)
+        dtype = getattr(x, "dtype", torch.float32) if hasattr(x, "dtype") else torch.float32
+        return (w - x.to(dtype)).square().mean(-1)
 
 
 class Steering(pllm.Workload):
