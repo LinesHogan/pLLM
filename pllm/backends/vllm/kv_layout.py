@@ -4,7 +4,7 @@ from functools import partial
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.attention import Attention
-from vllm.v1.kv_cache_interface import RSWASpec, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, RSWASpec, SlidingWindowSpec
 
 from pllm.backends.vllm.architecture import Decoder
 from pllm.backends.vllm.model_shape import ModelShape
@@ -16,9 +16,24 @@ from pllm.execution.attention import PAGE_SIZE
 LAYOUT_ENV = "PLLM_KV_LAYOUTS"
 
 
+class SinkSpec(RSWASpec):
+    """Keep R-SWA allocation separate from full attention; the native RSWAManager owns blocks."""
+
+    def is_uniform_with_collection(self, kv_cache_specs: dict[str, KVCacheSpec]) -> bool:
+        """Only layers with the same prompt-sink window may share allocation decisions."""
+        return all(
+            isinstance(spec, RSWASpec) and spec.rswa_window == self.rswa_window for spec in kv_cache_specs.values()
+        )
+
+
+def sink_first(specs: dict[str, KVCacheSpec]) -> dict[str, KVCacheSpec]:
+    """vLLM asks the first spec about compatibility; full specs would absorb R-SWA subclasses."""
+    return dict(sorted(specs.items(), key=lambda item: not isinstance(item[1], RSWASpec)))
+
+
 def sink_spec(attention: Attention, window: int, vllm_config: VllmConfig) -> RSWASpec:
     """Use vLLM's prompt-plus-window manager, retaining ordinary unquantized page geometry."""
-    return RSWASpec(
+    return SinkSpec(
         block_size=vllm_config.cache_config.block_size,
         num_kv_heads=attention.num_kv_heads,
         head_size=attention.head_size,

@@ -15,7 +15,7 @@ import torch
 from vllm.config import CacheConfig, ModelConfig as VllmModelConfig, VllmConfig
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.gpu.async_utils import AsyncOutput
 from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -34,7 +34,7 @@ from pllm.backends.vllm.hidden_taps import (
     HiddenTapLayout,
     HiddenTaps,
 )
-from pllm.backends.vllm.kv_layout import LAYOUT_ENV, install_layouts
+from pllm.backends.vllm.kv_layout import LAYOUT_ENV, install_layouts, sink_first
 from pllm.backends.vllm.overlay_graph import (
     OverlayGraphRunner,
 )
@@ -160,6 +160,10 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
                 self.position_states, self.model_config.get_num_layers(self.vllm_config.parallel_config)
             )
         )
+
+    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        """Keep prompt-sink groups separate so full-attention blocks cannot be reclaimed."""
+        return sink_first(super().get_kv_cache_spec())
 
     def initialize_kv_cache(
         self,

@@ -211,9 +211,12 @@ def test_layout_oracle_and_reclaimed_blocks(workload):
             )
         assert errors and measurements
         if isinstance(workload, (WindowAttention, SinkAttention)):
-            layers = {model.model.layers[index].self_attn.attn.layer_name for index in (0, 1)}
+            layers = {model.model.layers[layout.layer].self_attn.attn.layer_name for layout in program.layouts}
             retained = [(held, full) for names, held, full in measurements if layers.intersection(names)]
             assert retained and all(held < full for held, full in retained)
+            full_layers = {layer.self_attn.attn.layer_name for layer in model.model.layers} - layers
+            untouched = [(held, full) for names, held, full in measurements if full_layers.intersection(names)]
+            assert untouched and all(held == full for held, full in untouched)
             print(type(workload).__name__, "allocated/full blocks:", retained[-1], "oracle max error:", max(errors))
         else:
             owned = sum(len(group.layer_names) for group in manager.kv_cache_config.kv_cache_groups)

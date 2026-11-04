@@ -194,7 +194,7 @@ class WindowAttention(pllm.Workload):
 class SinkAttention(pllm.Workload):
     """Keep prompt K/V and a recent generated tail using native R-SWA storage."""
 
-    @pllm.custom_attention(layers=(0, 1), keep="window", window=4, sink=True)
+    @pllm.custom_attention(layers=(2, 3), keep="window", window=4, sink=True)
     def read(self, q, kv):
         return kv.attend(q)[0]
 
