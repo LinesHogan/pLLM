@@ -275,13 +275,13 @@ class ModelSites:
         invariants = tuple(self.state(source) for source in memory.memory.invariants(rewrite))
         return memory(stream, branch, invariants)
 
-    def _rows_of(self, values: Tensor) -> Tensor:
+    def current_rows(self, values: Tensor) -> Tensor:
         """The current call's rows of a per-row buffer."""
         return values[: self.count] if self.rows is None else values.index_select(0, self.rows)
 
     def state(self, source: StateInput) -> Tensor:
         staged = self._states[source]
-        return staged.index_select(0, self._rows_of(self._requests_of)) if source.request else staged
+        return staged.index_select(0, self.current_rows(self._requests_of)) if source.request else staged
 
     def result(self, source: ResultInput) -> Tensor:
         if source in self._prefetch:
@@ -289,15 +289,11 @@ class ModelSites:
         return self._rows_of(self._results[source])
 
     def earlier(self, source: EarlierInput) -> Tensor:
-        return self._rows_of(self._earlier[source])
+        return self.current_rows(self._earlier[source])
 
     def patch(self, source: PatchInput, layer: int) -> Callable[[Tensor], Tensor]:
         assert self._activation is not None
         return self._activation.patch(source.resource, layer, self.rows, self.packed)
-
-    def current_rows(self, values: Tensor) -> Tensor:
-        """Read the current whole-model or custom-forward rows."""
-        return self._rows_of(values)
 
     def store_rows(self, buffer: Tensor, values: Tensor) -> None:
         """Write current rows, preserving destinations of inactive custom-forward lanes."""

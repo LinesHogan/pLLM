@@ -10,7 +10,7 @@ import pllm
 from pllm.execution.attention import DenseAttention, PagedKV
 from pllm.execution.attention_methods import TraceRead
 from pllm.testing import check_on_gpu
-from test.workloads.attention_workloads import Monitor, Quest, page_bounds
+from test.workloads.attention_workloads import InstanceAttention, Monitor, Quest, page_bounds
 
 CONFIG = pllm.ModelConfig(
     "Qwen/Qwen2.5-0.5B-Instruct",
@@ -23,7 +23,7 @@ CONFIG = pllm.ModelConfig(
 )
 
 
-@pytest.mark.parametrize("workload", (Monitor(), Quest()))
+@pytest.mark.parametrize("workload", (Monitor(), Quest(), InstanceAttention()))
 def test_attention_contracts(workload):
     result = check_on_gpu(workload, CONFIG, neutral=workload if isinstance(workload, Monitor) else None)
     assert any("host syncs" in name for name in result.passed)

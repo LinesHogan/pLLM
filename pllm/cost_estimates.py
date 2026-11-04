@@ -80,32 +80,13 @@ def _estimate_ops(binding: TensorBinding, facts: BackendCompileFacts, calls: OpC
                 with CustomOpTrace() as trace:
                     function(*args, **kwargs[name])
                 _append_calls(calls, trace, name, rows)
-    from pllm.execution.attention import PagedKV
-    from pllm.execution.attention_methods import TraceRead
+    from pllm.execution.attention_methods import TraceRead, attention_example
 
     for layer, method in binding.attention.methods.items():
         probe = facts.probe
         rows = facts.max_admitted_lineages
-        q = torch.empty((rows, probe.attention_heads, probe.head_dim), device="meta", dtype=probe.tensor_dtype.torch)
         context = probe.causal_domain.positions if probe.causal_domain is not None else 1
-        pages = (context + 15) // 16
-        cache = q.new_empty((rows * pages, 16, probe.kv_heads, probe.head_dim))
-        integer = torch.empty(rows, device="meta", dtype=torch.int32)
-        kv = PagedKV(
-            cache,
-            cache,
-            integer.new_empty((rows, pages)),
-            integer,
-            integer.new_empty(rows + 1),
-            integer,
-            TraceRead(context),
-        )
-        arguments = {
-            name: value[:rows]
-            if isinstance(value, torch.Tensor) and value.ndim and value.shape[0] == facts.probe.max_packed_rows
-            else value
-            for name, value in binding.attention.arguments[layer].items()
-        }
+        q, kv, arguments = attention_example(binding, facts, binding.attention, layer, rows, TraceRead(context))
         with CustomOpTrace() as trace:
             method.function(q, kv, **arguments)
         _append_calls(calls, trace, f"{method.name} [attention layer {layer}]", rows)

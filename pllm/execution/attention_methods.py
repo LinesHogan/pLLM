@@ -111,7 +111,6 @@ class AttentionProgram:
         self.facts: dict[AttentionFact, torch.Tensor] = {}
         self.costs: tuple[AttentionCost, ...] = ()
         self.sample_rows = torch.empty(0, dtype=torch.long, device="meta")
-        self.arguments: dict[int, dict[str, Argument]] = {}
 
     def add(self, method: AttentionMethod) -> None:
         """Reject overlapping owners and forward references at the authoring boundary."""
@@ -155,8 +154,6 @@ class AttentionProgram:
 
     def plan(self, binding: TensorBinding, facts: BackendCompileFacts) -> None:
         """Trace methods in forward order to infer fact shapes and attention work."""
-        from pllm.execution.task_memory import site_state
-
         for method in tuple(self.methods.values()):
             for _, source in method.inputs:
                 if isinstance(source, AttentionFact):
@@ -180,22 +177,7 @@ class AttentionProgram:
             if not 0 <= layer < binding.dimensions.layer_count:
                 raise ValueError(f"pllm.attention layer {layer} is outside the model")
             trace = TraceRead(context)
-            q = torch.empty((rows, heads, dim), dtype=probe.tensor_dtype.torch, device="meta")
-            pages = (context + 15) // 16
-            cache = q.new_empty((rows * pages, 16, probe.kv_heads, dim))
-            integer = torch.empty(rows, dtype=torch.int32, device="meta")
-            kv = PagedKV(
-                cache, cache, integer.new_empty((rows, pages)), integer, integer.new_empty(rows + 1), integer, trace
-            )
-            kwargs = {
-                name: site_state(binding, source, None, None)
-                if isinstance(source, StateInput)
-                else layer
-                if isinstance(source, DepthInput)
-                else self.facts[source]
-                for name, source in method.inputs
-            }
-            self.arguments[layer] = kwargs
+            q, kv, kwargs = attention_example(binding, facts, self, layer, rows, trace)
             result = method.function(q, kv, **kwargs)
             output, aux = result if isinstance(result, tuple) else (result, None)
             if output.shape != q.shape or output.dtype != q.dtype:
@@ -235,3 +217,31 @@ class AttentionProgram:
             source: torch.zeros(value.shape, dtype=value.dtype, device=device) for source, value in self.facts.items()
         }
         self.sample_rows = torch.zeros(self.sample_rows.shape, dtype=torch.long, device=device)
+
+
+def attention_example(
+    binding: TensorBinding,
+    facts: BackendCompileFacts,
+    program: AttentionProgram,
+    layer: int,
+    rows: int,
+    trace: TraceRead,
+) -> tuple[torch.Tensor, PagedKV, dict[str, Argument]]:
+    """Build meta operands from declared input types; instance fields never gain or lose a row axis."""
+    from pllm.execution.task_memory import site_state
+
+    probe = facts.probe
+    q = torch.empty((rows, probe.attention_heads, probe.head_dim), dtype=probe.tensor_dtype.torch, device="meta")
+    pages = (trace.context + 15) // 16
+    cache = q.new_empty((rows * pages, 16, probe.kv_heads, probe.head_dim))
+    integer = torch.empty(rows, dtype=torch.int32, device="meta")
+    kv = PagedKV(cache, cache, integer.new_empty((rows, pages)), integer, integer.new_empty(rows + 1), integer, trace)
+    arguments = {
+        name: site_state(binding, source, None, None)
+        if isinstance(source, StateInput)
+        else layer
+        if isinstance(source, DepthInput)
+        else torch.empty((rows, *program.facts[source].shape[1:]), dtype=program.facts[source].dtype, device="meta")
+        for name, source in program.methods[layer].inputs
+    }
+    return q, kv, arguments

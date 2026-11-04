@@ -148,3 +148,16 @@ class CoupledAttention(pllm.Workload):
     @pllm.custom_attention(layers=(0,))
     def read(self, q, kv):
         return (kv.attend(q)[0].float() + q.float().mean(0, keepdim=True)).to(q.dtype)
+
+
+@dataclass(frozen=True)
+class InstanceAttention(pllm.Workload):
+    """An instance field can have the same extent as the planned packed-row capacity."""
+
+    @property
+    def pool(self) -> pllm.InstanceState:
+        return pllm.InstanceState({"weights": (128,)})
+
+    @pllm.custom_attention(layers=(0,))
+    def read(self, q, kv, weights=pllm.parameter("pool", "weights")):
+        return (kv.attend(q)[0].float() + weights.reshape(128).sum() * 0).to(q.dtype)
