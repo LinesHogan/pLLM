@@ -116,6 +116,9 @@ class ModelSites:
                 for task in arena.plan.schedule.tasks
             )
         }
+        # An uncreated event makes wait_event a no-op, so create it before model graph capture.
+        for ready in self._prefetch.values():
+            ready.record()
         self._states: dict[StateInput, Tensor] = {}
         for source in self._sources:
             field = source.view.read(arena.field_pool(source.resource, source.view.field), pooled=True)[0]
