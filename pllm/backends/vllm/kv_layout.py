@@ -33,12 +33,15 @@ def install_layouts(decoder: Decoder, layouts: tuple[KVLayout, ...]) -> None:
         return
     model = decoder.kv_writable("static KV layouts")
     layouts = expand_layouts(layouts, len(model.model.layers))
-    for layout in layouts:
-        attention = model.model.layers[layout.layer].self_attn.attn
+    owners = {layout.layer for layout in layouts} | {storage_layout(layouts, layout.layer).layer for layout in layouts}
+    for layer in owners:
+        attention = model.model.layers[layer].self_attn.attn
         if attention.sliding_window is not None or attention.kv_sharing_target_layer_name is not None:
             raise ValueError("static KV layouts need layers with full attention and their own cache")
         if attention.kv_cache_dtype != "auto":
             raise ValueError("static KV layouts need unquantized KV; set kv_cache_dtype=auto")
+    for layout in layouts:
+        attention = model.model.layers[layout.layer].self_attn.attn
         storage = storage_layout(layouts, layout.layer)
         if layout.keep == "none":
             target = model.model.layers[storage.layer].self_attn.attn
