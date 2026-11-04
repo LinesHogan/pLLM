@@ -99,7 +99,7 @@ class _SyncCheck:
         session = handle.runner.require_session()
         execution = session._deployment.execution
         self.prepare_tokens = session.prepare_tokens
-        self.prepare_attention = None if session._attention is None else session._attention.prepare
+        self.prepare_input = session.prepare_input
         self.token_checked = 0
         self.prepare_sites = None if session._sites is None else session._sites.prepare
         self.prepare_overlay = None if session._forward_overlay is None else session._forward_overlay.prepare
@@ -107,8 +107,8 @@ class _SyncCheck:
         self.execute_part = execution.execute_part
         self.steps: dict[int, set[int]] = {}
         self.checked: set[int] = set()
-        self.attention_steps: dict[int, set[int]] = {}
-        self.attention_checked: set[int] = set()
+        self.input_steps: dict[int, set[int]] = {}
+        self.input_checked: set[int] = set()
 
     @contextmanager
     def scope(self, context: StateTaskContext[TensorFrame]) -> Generator[None]:
@@ -154,18 +154,18 @@ class _SyncCheck:
         with self.scope(context):
             self.prepare_sites(rows, context, directory)
 
-    def attention(self, rows: PackedPhaseRowBatch, sampler: PackedSamplerRowBatch) -> None:
-        """Cover sampled indices and prompt-sink uploads before model graph replay."""
-        assert self.prepare_attention is not None
+    def input(self, sampler: PackedSamplerRowBatch) -> None:
+        """Check native step staging even when a stateless hook needs no task context."""
+        rows = sampler.row_batch
         mode = torch.cuda.get_sync_debug_mode()
         try:
-            steps = self.attention_steps.setdefault(len(rows.rows), set())
+            steps = self.input_steps.setdefault(len(rows.rows), set())
             if rows.rows and all(row.role is HiddenPhase.DECODE for row in rows.rows):
                 steps.add(rows.step_id)
             if len(steps) > 2 and rows.step_id in steps:
                 torch.cuda.set_sync_debug_mode("error")
-                self.attention_checked.add(rows.step_id)
-            self.prepare_attention(rows, sampler)
+                self.input_checked.add(rows.step_id)
+            self.prepare_input(sampler)
         finally:
             torch.cuda.set_sync_debug_mode(mode)
 
@@ -461,7 +461,6 @@ def _workload_checks(workload: Workload, config: ModelConfig) -> CheckResult:
         sync = _SyncCheck(handle)
         sites = handle.runner.require_session()._sites
         overlay = handle.runner.require_session()._forward_overlay
-        attention = handle.runner.require_session()._attention
         execution = handle.runner.require_session()._deployment.execution
         try:
             with (
@@ -470,11 +469,11 @@ def _workload_checks(workload: Workload, config: ModelConfig) -> CheckResult:
                 patch.object(handle.runner.require_session(), "prepare_tokens", sync.tokens),
                 patch.object(sites, "prepare", sync.prepare) if sites is not None else nullcontext(),
                 patch.object(overlay, "prepare", sync.overlay) if overlay is not None else nullcontext(),
-                patch.object(attention, "prepare", sync.attention) if attention is not None else nullcontext(),
+                patch.object(handle.runner.require_session(), "prepare_input", sync.input),
             ):
                 baseline = _state_tokens(handle)
             if (
-                max(len(sync.checked), len(sync.attention_checked)) < 8
+                max(len(sync.checked), len(sync.input_checked)) < 8
                 or workload.backend_requirements().input_token_history >= 0
                 and sync.token_checked < 8
             ):
