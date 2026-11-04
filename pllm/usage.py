@@ -656,6 +656,8 @@ class InstanceState:
 
     Plain states load tensor names matching their fields. Module states load a strict state_dict on meta,
     skipping random initialization. Values convert to the declared storage dtype, including trainable states.
+    placement="host" explicitly keeps read-only pretrained gathered fields in pinned host memory;
+    placement="device" (default) never falls back to host. Budgets count device residency separately.
     """
 
     fields: Mapping[str, Shape | Field] = field(default_factory=lambda: dict[str, Shape | Field]())
@@ -677,10 +679,24 @@ class InstanceState:
     module: ModuleFactory | None = field(default=None, kw_only=True)
     imported: bool = field(default=False, kw_only=True)
     pretrained: str = field(default="", kw_only=True)
+    placement: Literal["device", "host"] = field(default="device", kw_only=True)
     checkpoint: Mapping[str, str] = field(default_factory=lambda: dict[str, str](), kw_only=True)
     layers: tuple[int, ...] = field(default=(), kw_only=True)
 
     def __post_init__(self) -> None:
+        if self.placement not in ("device", "host"):
+            raise ValueError('placement needs "device" or "host"')
+        if self.placement == "host" and (
+            self.scope is not StateScope.INSTANCE
+            or not self.pretrained
+            or self.optimizer is not None
+            or self.module is not None
+            or self.carry
+        ):
+            raise ValueError(
+                'placement="host" needs a read-only pretrained InstanceState of gathered fields; '
+                'use placement="device" for modules or mutable state'
+            )
         if self.pretrained and (self.initialize is not None or self.checkpoint or self.feed or self.imported):
             raise ValueError(
                 "pretrained= supplies starting values; drop initialize=, checkpoint=, feed= and imported=True"
@@ -741,7 +757,7 @@ class InstanceState:
         )
         context.binding.state_sources[name] = self.source() if pretrained is None else pretrained.source
         if pretrained is not None:
-            context.pretrained[name] = pretrained
+            context.binding.pretrained[name] = pretrained
         if name in context.in_forward_states or name in context.states:
             return
         if self.feed is not None:
@@ -2207,7 +2223,6 @@ class _Reflection:
     # The owner's values, signed; the declared states and model values among them, by type.
     bindings: tuple[tuple[str, str], ...] = ()
     state_definitions: dict[str, InstanceState] = field(default_factory=lambda: {})
-    pretrained: dict[str, PretrainedFile] = field(default_factory=lambda: {})
     # Each declared pllm.model.Adapter as the projection delta it applies.
     adapters: dict[str, ProjectionDelta] = field(default_factory=lambda: {})
     activations: dict[str, ActivationPatch] = field(default_factory=lambda: {})
@@ -2227,13 +2242,13 @@ class _Reflection:
 
     def initializer(self, name: str, fields: tuple[str, ...]) -> Initializer | None:
         """One starting-value source for ordinary state and model-side state lowerings."""
-        if name in self.pretrained:
-            return partial(self.pretrained[name].initialize, fields)
+        if name in self.binding.pretrained:
+            return partial(self.binding.pretrained[name].initialize, fields)
         return _frozen(self.state_definitions[name].initialize)
 
     def validate_pretrained(self) -> None:
         """Validate declared weights on CPU after every lowering has resolved its field shapes."""
-        for resource in self.pretrained:
+        for resource in self.binding.pretrained:
             if resource in self.binding.initial_values:
                 self.binding.initial_values[resource](self.binding.dimensions, 0)
             else:
@@ -2771,9 +2786,25 @@ class _Reflection:
                 for effect in task.effects
             )
         }
+        for name, definition in self.state_definitions.items():
+            if definition.placement == "host" and name in b.graph.model_reads:
+                raise ValueError(
+                    f"{name}: gather host rows in a helper and read pllm.result in the model site; "
+                    'or use placement="device"'
+                )
+            if definition.placement == "host" and name not in frozen:
+                raise ValueError(f'{name}: placement="host" needs read-only state; use placement="device" for writes')
         b.graph = replace(
             b.graph,
-            states=tuple(replace(state, immutable=state.resource in frozen) for state in b.graph.states),
+            states=tuple(
+                replace(
+                    state,
+                    immutable=state.resource in frozen,
+                    placement=self.state_definitions[state.resource].placement,
+                )
+                for state in b.graph.states
+            ),
+            model_results=tuple(sorted(b.model_site_tasks)),
             execution_parameters_digest=boundary_digest(
                 b.graph.execution_parameters_digest, self.signature, self.bindings
             ),

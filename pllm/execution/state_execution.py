@@ -8,6 +8,7 @@ while generate is running is unsupported.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from types import TracebackType
 from typing import TYPE_CHECKING, ClassVar, Generic, Literal, NoReturn, Protocol, Self, TypeVar
@@ -24,6 +25,7 @@ from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
 from pllm.contracts.semantic_graph import (
     AnchorId,
     ImplementationId,
+    PhysicalTask,
     ScheduleDecision,
     StateResource,
     TaskId,
@@ -122,6 +124,7 @@ class StateTaskContext(Generic[DataT]):
     last_anchor_id: int = -1
     finished: bool = False
     handed_off: bool = False
+    prefetch_stream: torch.cuda.Stream | None = None
     value: DataT | None = None
     results: dict[tuple[TaskSymbol, str], torch.Tensor] = field(
         default_factory=lambda: dict[tuple[TaskSymbol, str], torch.Tensor]()
@@ -495,6 +498,11 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         self._loss_count = self._update_count = self._trained_rows = self._sampler_count = 0
         self._training_counters = DeviceCounters(self.device)
         self.feeds = feeds
+        self.side_stream = (
+            torch.cuda.Stream(device=self.device)
+            if self.device.type == "cuda" and any(task.lane == "side" for task in self.plan.tasks)
+            else None
+        )
         self.post_sample = self._post_sample_overlap()
         self._pending_borrows: tuple[BorrowedStateRoot, ...] | None = None
         self._borrow_failed = False
@@ -513,7 +521,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             None
             if self.device.type == "cpu"
             else (
-                torch.cuda.Stream(device=self.device)
+                self.side_stream
                 if any(task.lane == "side" for task in tasks)
                 else torch.cuda.current_stream(self.device)
             )
@@ -696,6 +704,8 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         self, value: InputT, stream: torch.cuda.Stream | None = None, *, feedback: SamplerFeedback | None = None
     ) -> ResultT:
         """Run without an external sampler borrower using the same staged lifecycle."""
+        if stream is None and self.side_stream is not None:
+            stream = torch.cuda.current_stream(self.device)
         context = self.start_step(value, stream)
         try:
             for anchor in self.arena.plan.timeline.anchors:
@@ -740,10 +750,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             assert context.next_task == len(plan.tasks) or dense_anchor <= plan.tasks[context.next_task].anchor_id
             while context.next_task < len(plan.tasks) and int(plan.tasks[context.next_task].anchor_id) == dense_anchor:
                 task = plan.tasks[context.next_task]
-                with self.trace.task(context.invocation_id, task.task_id, context.pin.stream):
-                    self._runner.implementations[int(task.task_id)].execute(context)
-                    if task.release_values:
-                        self._release_values(context, task.release_values)
+                self._execute_task(context, task)
                 context.next_task += 1
             context.last_anchor_id = dense_anchor
         except WindowBackpressure:
@@ -751,6 +758,28 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             raise
         except Exception as exc:
             self._failed(context, exc)
+
+    def _execute_task(self, context: StateTaskContext[DataT], task: PhysicalTask) -> None:
+        """Borrow the same exact versions on the chosen lane until its kernels finish."""
+        prefetch = task.lane == "side" and task.read_origin != "latest"
+        stream = self.side_stream if prefetch else context.pin.stream
+        if prefetch:
+            context.prefetch_stream = stream
+            assert stream is not None
+            stream.wait_stream(torch.cuda.current_stream(self.device))
+        with nullcontext() if stream is None else torch.cuda.stream(stream):
+            pin = context.pin
+            if prefetch:
+                context.pin = self.arena.pin_exact(pin.refs, stream)
+            try:
+                with self.trace.task(context.invocation_id, task.task_id, stream):
+                    self._runner.implementations[int(task.task_id)].execute(context)
+            finally:
+                if prefetch:
+                    self.arena.release_pin(context.pin)
+                context.pin = pin
+            if task.release_values:
+                self._release_values(context, task.release_values)
 
     def execute_part(
         self,
@@ -812,6 +841,8 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         The vLLM session passes none: it discards results, and waiting would serialize the overlap.
         """
         self._require_borrow_live()
+        if context.prefetch_stream is not None and stream is not None:
+            stream.wait_stream(context.prefetch_stream)
         try:
             result = self.math.output(context)
             if not context.finished:

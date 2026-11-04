@@ -25,6 +25,8 @@ pub(crate) struct StateProviderPlan {
     pub(crate) page_capacity: u64,
     root_page_count: u64,
     pub(crate) reserved_bytes: u64,
+    #[serde(default)]
+    pub(crate) host_bytes: u64,
     capture_stable: bool,
     pub(crate) capabilities: Vec<String>,
 }
@@ -210,7 +212,8 @@ pub(super) fn compile(
                 "state needs at least {required} bytes, but the state memory budget is {} bytes; \
                  lower gpu_memory_utilization to leave at least {} more bytes free, \
                  or lower max_num_seqs to reduce request-state storage. \
-                 If you set ExecutionOptions.state_memory_bytes, raise it to at least {required}",
+                 If you set ExecutionOptions.state_memory_bytes, raise it to at least {required}; \
+                 for a read-only pretrained lookup table, reduce it or explicitly set placement=\"host\"",
                 request.memory_budget_bytes,
                 required.saturating_sub(request.memory_budget_bytes),
             )

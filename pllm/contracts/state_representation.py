@@ -27,6 +27,7 @@ class StateProviderPlan:
     reserved_bytes: int
     capture_stable: bool
     capabilities: tuple[str, ...] = ()
+    host_bytes: int = 0
 
 
 @dataclass(frozen=True, slots=True)

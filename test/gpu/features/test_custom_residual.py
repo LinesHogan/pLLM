@@ -22,7 +22,8 @@ CONFIG = pllm.ModelConfig(
     max_model_len=128,
     max_num_seqs=4,
     max_num_batched_tokens=128,
-    gpu_memory_utilization=0.3,
+    # These tiny schedules need little KV; leave room for the resident FP32 oracle on a 24 GiB GPU.
+    gpu_memory_utilization=0.2,
     cuda_graphs=False,
     execution=pllm.ExecutionOptions(capture_memory_bytes=256 << 20),
 )

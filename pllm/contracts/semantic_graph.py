@@ -129,6 +129,7 @@ class SemanticState:
     scope: StateScope
     key_fields: tuple[RequestKeyField, ...]
     immutable: bool = False
+    placement: Literal["device", "host"] = "device"
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +235,7 @@ class SemanticGraph:
     edges: tuple[SemanticEdge, ...] = ()
     input_groups: tuple[ConditionalInputGroup, ...] = ()
     model_reads: tuple[StateResource, ...] = ()
+    model_results: tuple[TaskSymbol, ...] = ()
     training_mode: TrainingMode | None = None
 
     @property

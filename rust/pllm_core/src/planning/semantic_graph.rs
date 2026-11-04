@@ -161,6 +161,8 @@ pub(crate) struct SemanticGraph {
     pub(crate) input_groups: Vec<ConditionalInputGroup>,
     #[serde(default)]
     pub(crate) model_reads: Vec<String>,
+    #[serde(default)]
+    pub(crate) model_results: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]

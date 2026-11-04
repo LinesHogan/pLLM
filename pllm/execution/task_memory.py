@@ -44,7 +44,7 @@ from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.step_input import StepInput
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import MemoryOperation, TensorBatch
-from pllm.execution.torch_private import fixed_shapes
+from pllm.execution.torch_private import GatherTrace, fixed_shapes
 
 if TYPE_CHECKING:
     from pllm.execution.tensor_binding import TensorBinding
@@ -315,9 +315,21 @@ def derive_resources(
         task = binding.tensor_tasks.get(symbol)
         phase = None if task is None else task.phase
         data = task_example(data, phase)
+        tables = tuple(
+            (str(address.resource), tensor, state.placement == "host")
+            for address, root in zip(batch.selection.addresses, batch.roots, strict=True)
+            for state in binding.graph.states
+            if state.resource == address.resource and state.immutable
+            for tensor in root
+        )
         try:
-            with fixed_shapes():
+            with fixed_shapes(), GatherTrace(tables) as gathers:
                 usage = operation.memory(data, batch)
+                gathers.check_outputs(tuple(batch.results.values()))
+            for resource, size in gathers.bytes.items():
+                binding.gather_bytes[symbol, resource] = size // (
+                    facts.probe.max_packed_rows if symbol in binding.model_site_tasks else len(data.rows)
+                )
         except (RuntimeError, ValueError, TypeError) as error:
             if "no autograd" in str(error):
                 op = str(error).split("through ", 1)[-1].split()[0]

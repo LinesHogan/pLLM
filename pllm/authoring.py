@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Generic, TypeVar
+
+import torch
 
 from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import BackendAttachment, ModelProbe
@@ -116,7 +119,9 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
         measured = self.build(facts, causal=causal)
         timeline = _fund_attachment(measured, facts.probe, self.resource_facts(measured, facts, options), options)
         facts = replace(facts, timeline=timeline)
-        return facts, self.funded_declaration(facts, causal=causal)
+        declaration = self.funded_declaration(facts, causal=causal)
+        declaration.gather_bytes = measured.gather_bytes
+        return facts, declaration
 
     def funded_declaration(self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None) -> TensorBinding:
         """The declaration on funded facts: tensor tasks funded resident memory run as captured CUDA graphs. The
@@ -157,12 +162,15 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
         declaration: TensorBinding,
         *,
         is_output_rank: bool = True,
+        map_host: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> BackendDeployment[DataT, ResultT]:
         plan = attachment.plan
         math = self.bind_math(facts, plan, declaration)
         if not is_output_rank:
             math = replace(math, on_export=None)
-        arena = PageBundleArena(plan, device=facts.device, _owned_resources=math.local_resources(plan))
+        arena = PageBundleArena(
+            plan, device=facts.device, _owned_resources=math.local_resources(plan), map_host=map_host
+        )
         (sampler,) = (
             AnchorId(anchor.ordinal) for anchor in plan.timeline.anchors if anchor.symbol == "sampler.pre_draw"
         )
@@ -174,10 +182,11 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
         options: ExecutionOptions = ExecutionOptions(),
         *,
         causal: CausalBinder | None = None,
+        map_host: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> BackendDeployment[DataT, ResultT]:
         """Specialize, plan and bind: the whole compile on probed backend facts."""
         facts, declaration = self.specialize(facts, options, causal=causal)
-        return self.bind_backend(facts, self.plan_backend(facts, declaration), declaration)
+        return self.bind_backend(facts, self.plan_backend(facts, declaration), declaration, map_host=map_host)
 
 
 def _apply_options(facts: BackendCompileFacts, options: ExecutionOptions) -> BackendCompileFacts:

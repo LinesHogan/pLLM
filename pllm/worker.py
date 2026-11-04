@@ -6,6 +6,7 @@ import os
 from functools import partial
 
 import torch
+from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 from pllm.authoring import BackendWorkload, DataT, ResultT, map_host_batch
 from pllm.backends.vllm import compat
@@ -55,7 +56,13 @@ class GPUWorker(compat.Worker):
                 "run both processes from the same installed sources and do not rewrite pretrained files while the engine starts"
             )
         runner.attach_workload(
-            workload.bind_backend(install.facts, install.attachment, declaration, is_output_rank=self.rank == 0),
+            workload.bind_backend(
+                install.facts,
+                install.attachment,
+                declaration,
+                is_output_rank=self.rank == 0,
+                map_host=get_accelerator_view_from_cpu_tensor,
+            ),
             install.cache_policy,
         )
 

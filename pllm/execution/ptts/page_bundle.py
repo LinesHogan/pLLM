@@ -5,7 +5,7 @@ A PageBundleArena is owned by the single thread that runs the model step and has
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field as dataclass_field
 from math import isfinite, prod
@@ -261,6 +261,7 @@ class PageBundleArena:
         *,
         device: torch.device | None = None,
         _owned_resources: tuple[str, ...] | None = None,
+        map_host: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> None:
         self.plan = plan
         self.plan_digest = boundary_digest(plan)
@@ -274,7 +275,11 @@ class PageBundleArena:
             # Partial materialization owns no remote pool; test_video tests the partition.
             if selected.resource in self._owned_resources:
                 self._pools[selected.resource] = SlotPools(
-                    layouts[selected.resource], selected.page_capacity, self.device
+                    layouts[selected.resource],
+                    selected.page_capacity,
+                    self.device,
+                    host=bool(selected.host_bytes),
+                    map_host=map_host,
                 )
                 self._tables[selected.resource] = _Table(selected, self._pools[selected.resource])
         self._writes: dict[PageWrite, _Write] = {}
@@ -661,9 +666,12 @@ class PageBundleArena:
         (root,) = self._held_fields(token, token.after_refs.take((root_index,)), (field,))
         return self._pools[root.resource].tensor(field, root.pages[field])
 
-    def writable_roots(self, token: PageWrite) -> tuple[tuple[torch.Tensor, ...], ...]:
+    def writable_roots(self, token: PageWrite, *, initialize: bool = False) -> tuple[tuple[torch.Tensor, ...], ...]:
         self._issued_write(token)
-        return self.borrow_roots((token,) * len(token.after_refs), token.after_refs)
+        return tuple(
+            self._pools[root.resource].views(root.slots, root.generations, host=initialize)
+            for root, _ in self._held_roots((token,) * len(token.after_refs), token.after_refs)
+        )
 
     def publish(self, token: PageWrite) -> PagePublication:
         write = self._issued_write(token)
@@ -843,18 +851,19 @@ class PageBundleArena:
         return descriptor, RemoteCompletion(connection, encode_boundary(descriptor).encode())
 
     def snapshot(self, pin: PagePin, ref: StateRef) -> tuple[torch.Tensor, ...]:
-        """Clone a pinned version and make the owned copies ready on the caller's stream."""
+        """Clone a pinned version in its declared placement, ready on the caller's stream."""
         ((root, _),) = self._held_roots((pin,), StateRefs.of((ref,)))
         pools = self._pools[root.resource]
         with self._scope(pin.stream):
-            copies = tuple(pools.tensor(field, page).detach().clone() for field, page in enumerate(root.pages))
+            copies = tuple(value.detach().clone() for value in pools.views(root.slots, root.generations, host=True))
         if self.device.type == "cuda":
             assert pin.stream is not None
             consumer = torch.cuda.current_stream(self.device)
             if consumer != pin.stream:
                 consumer.wait_stream(pin.stream)
                 for value in copies:
-                    value.record_stream(consumer)
+                    if value.is_cuda:
+                        value.record_stream(consumer)
         return copies
 
     def numeric_health(self) -> tuple[FieldNumericHealth, ...]:

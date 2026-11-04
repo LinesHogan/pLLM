@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Literal, TypeVar
 
 import numpy as np
 import torch
+from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 from pllm.backends.vllm import architecture
 from pllm.contracts.backend_attachment import (
@@ -136,7 +137,7 @@ def compile_execution(
 
     Request state is admitted per request with `execution.admit(identities)`.
     """
-    execution = workload.compile_backend(facts).execution
+    execution = workload.compile_backend(facts, map_host=get_accelerator_view_from_cpu_tensor).execution
     execution.admit_instances(stream)
     return execution
 

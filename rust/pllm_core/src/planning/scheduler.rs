@@ -255,6 +255,7 @@ fn place(
         })
         .collect();
     select_lanes(graph, timeline, &index.windows, &mut tasks);
+    select_prefetch(graph, &mut tasks);
     plan_memory(graph, timeline, index, state, &tasks).or_else(|_| {
         // Memory fallback preserves the selected logical read boundaries.
         for task in &mut tasks {
@@ -262,6 +263,32 @@ fn place(
         }
         plan_memory(graph, timeline, index, state, &tasks)
     })
+}
+
+fn select_prefetch(graph: &SemanticGraph, tasks: &mut [PhysicalTask]) {
+    // These values are consumed inside the model, whose first consuming site waits
+    // on the side lane. Mutable state must still follow the ordinary version rules.
+    for task in tasks {
+        let semantic = &graph.tasks[task.task_id as usize];
+        if graph.model_results.contains(&semantic.symbol)
+            && semantic.effects.iter().all(|effect| {
+                effect.kind == StateEffectKind::Read
+                    && graph
+                        .states
+                        .iter()
+                        .any(|state| state.resource == effect.resource && state.immutable)
+            })
+            && semantic.implementations.iter().any(|candidate| {
+                candidate.implementation_id == task.implementation_id
+                    && candidate
+                        .required_capabilities
+                        .iter()
+                        .any(|cap| cap == "compute/cuda_graph@1")
+            })
+        {
+            task.lane = Lane::Side;
+        }
+    }
 }
 
 fn select_lanes(
@@ -495,7 +522,8 @@ fn plan_memory(
     if let Some(budget) = timeline.memory_budget_bytes.filter(|&budget| peak > budget) {
         return Err(format!(
             "workload tasks need {peak} bytes at their peak but only {budget} fit; lower \
-             max_num_batched_tokens or raise ExecutionOptions.memory_budget_bytes"
+             max_num_batched_tokens or raise ExecutionOptions.memory_budget_bytes; \
+             reduce device tables or explicitly declare placement=\"host\" for read-only lookup tables"
         ));
     }
     Ok(Solution {

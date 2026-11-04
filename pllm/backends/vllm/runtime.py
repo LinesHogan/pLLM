@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Generic, TypeVar
 import torch
 from vllm import RequestOutput, SamplingParams
 from vllm.entrypoints.llm import LLM
+from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 from pllm.authoring import (
     BackendRequirements,
@@ -735,7 +736,12 @@ def create_vllm_llm(
                 config.execution,
                 causal=partial(CausalTraining, runner.decoder),
             )
-            deployment = workload.bind_backend(facts, workload.plan_backend(facts, declaration), declaration)
+            deployment = workload.bind_backend(
+                facts,
+                workload.plan_backend(facts, declaration),
+                declaration,
+                map_host=get_accelerator_view_from_cpu_tensor,
+            )
             policy = CachePolicy.for_attachment(deployment.attachment, config.generated_kv)
             runner.attach_workload(deployment, policy)
             handle = VllmLlm[DataT, ResultT](

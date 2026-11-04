@@ -194,7 +194,7 @@ class RequestStateDirectory:
                 pins.append((identity, self.arena.pin_exact(instances, stream)))
             if write is not None:
                 with nullcontext() if stream is None else torch.cuda.stream(stream):
-                    initialize(self.arena.writable_roots(write), new)
+                    initialize(self.arena.writable_roots(write, initialize=True), new)
                 lineages = dict(self._lineages)
                 for key, ref in zip(new, write.after_refs, strict=True):
                     lineages[key] = ref.lineage_id

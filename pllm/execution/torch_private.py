@@ -144,6 +144,67 @@ class CustomOpTrace(TorchDispatchMode):
         return result
 
 
+class GatherTrace(TorchDispatchMode):
+    """Validate mapped tables' row reads and count their logical transfer bytes during planning."""
+
+    def __init__(self, tables: tuple[tuple[str, torch.Tensor, bool], ...]) -> None:
+        super().__init__()  # pyright: ignore[reportUnknownMemberType]
+        self.tables = {StorageWeakRef(tensor.untyped_storage()): (name, host) for name, tensor, host in tables}
+        self.bytes: dict[str, int] = {}
+
+    def check_outputs(self, values: tuple[torch.Tensor, ...]) -> None:
+        """A helper must materialize gathered rows before exposing its output to a consumer."""
+        for value in values:
+            table = self.tables.get(StorageWeakRef(value.untyped_storage()))
+            if table is not None and table[1]:
+                raise ValueError(f'{table[0]}: gather host rows before returning a result, or use placement="device"')
+
+    def __torch_dispatch__(
+        self,
+        func: Callable[..., object],
+        types: tuple[type, ...],
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
+        reads = [
+            (value, *self.tables[StorageWeakRef(value.untyped_storage())])
+            for value in tree_leaves((args, kwargs))
+            if isinstance(value, torch.Tensor) and StorageWeakRef(value.untyped_storage()) in self.tables
+        ]
+        result = func(*args, **(kwargs or {}))
+        if not reads:
+            return result
+        name = str(func)
+        views = (
+            "aten.view.default",
+            "aten.reshape.default",
+            "aten.slice.Tensor",
+            "aten.select.int",
+            "aten.detach.default",
+            "aten.alias.default",
+            "aten.unsqueeze.default",
+        )
+        if name in views:
+            return result
+        gathers = ("aten.index.Tensor", "aten.index_select.default", "aten.embedding.default")
+        for tensor, resource, host in reads:
+            row_gather = name in gathers and tensor.ndim == 2
+            if name == "aten.index.Tensor":
+                indices = tree_leaves(args[1])
+                row_gather = row_gather and len(indices) == 1 and isinstance(indices[0], torch.Tensor)
+            elif name == "aten.index_select.default":
+                row_gather = row_gather and args[1] == 0
+            if host and not row_gather:
+                raise ValueError(
+                    f'{resource}: placement="host" supports row gathers only (got {name}); '
+                    'gather rows before tensor math, or use placement="device"'
+                )
+            if row_gather:
+                assert isinstance(result, torch.Tensor)
+                self.bytes[resource] = self.bytes.get(resource, 0) + result.numel() * result.element_size()
+        return result
+
+
 def register_gradient_hook(tensor: torch.Tensor, hook: Callable[[torch.Tensor], torch.Tensor]) -> None:
     tensor.register_hook(hook)  # pyright: ignore[reportUnknownMemberType]
 

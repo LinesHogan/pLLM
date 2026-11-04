@@ -12,6 +12,7 @@ from typing import Literal
 
 import numpy as np
 import torch
+from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 from pllm.backends.vllm.compat import admit_parallel
 from pllm.backends.vllm.compile_facts import compile_facts
@@ -531,6 +532,8 @@ def _site_step(
     run: _Run,
     context: StateTaskContext[TensorFrame],
 ) -> None:
+    if context.prefetch_stream is not None:
+        torch.cuda.current_stream().wait_stream(context.prefetch_stream)
     outputs = check_sites(
         binding,
         replace(facts, max_admitted_lineages=len(tokens)),
@@ -566,7 +569,9 @@ def _run(
         for symbol, task in tasks.items()
     }
     try:
-        deployment = workload.bind_backend(facts, workload.plan_backend(facts, declaration), declaration)
+        deployment = workload.bind_backend(
+            facts, workload.plan_backend(facts, declaration), declaration, map_host=get_accelerator_view_from_cpu_tensor
+        )
     finally:
         declaration.tensor_tasks = tasks
     execution = deployment.execution

@@ -69,6 +69,10 @@ class StateCost:
     max_admitted_lineages: int
     fields: tuple[TensorFieldSpec, ...]
     source: str
+    placement: str
+    host_bytes: int
+    transfer_bytes_per_row: int
+    transfer_bytes_per_step: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,7 +176,8 @@ class ExplainResult:
         lines.extend(
             f"{state.name}  {state.scope}  {state.roots}  {state.bytes_per_root}  {state.reserved_bytes}  "
             + ", ".join(f"field {field.field_id}: {field.dtype}" for field in state.fields)
-            + f"; source: {state.source}"
+            + f"; source: {state.source}; placement: {state.placement}; host bytes: {state.host_bytes}; "
+            + f"logical transfer bytes/row: {state.transfer_bytes_per_row}; decode bytes/step: {state.transfer_bytes_per_step}"
             for state in self.states
         )
         lines.append(f"memory   peak {self.peak_memory_bytes} bytes funded by pllm [{self.memory_label}]")
@@ -299,22 +304,34 @@ def _taps(
     return tuple(result)
 
 
-def _states(plan: PlanBundle, binding: TensorBinding) -> tuple[StateCost, ...]:
-    scopes = {str(state.resource): state.scope.value for state in plan.semantic_graph.states}
+def _states(plan: PlanBundle, binding: TensorBinding, rows: int) -> tuple[StateCost, ...]:
+    states = {str(state.resource): state for state in plan.semantic_graph.states}
     layouts = {entry.resource: entry.layout for entry in plan.tensor_layout_request.layouts}
-    return tuple(
-        StateCost(
-            state.resource,
-            scopes[state.resource],
-            state.page_capacity,
-            sum(page_stride_bytes(field) for field in layouts[state.resource].fields),
-            state.reserved_bytes,
-            state.max_admitted_lineages,
-            layouts[state.resource].fields,
-            binding.state_sources.get(state.resource, "initialize"),
+    costs: list[StateCost] = []
+    for storage in plan.states.plans:
+        state, layout = states[storage.resource], layouts[storage.resource]
+        transfer = (
+            sum(size for (_, resource), size in binding.gather_bytes.items() if resource == storage.resource)
+            if storage.host_bytes
+            else 0
         )
-        for state in plan.states.plans
-    )
+        costs.append(
+            StateCost(
+                storage.resource,
+                state.scope.value,
+                storage.page_capacity,
+                sum(page_stride_bytes(field) for field in layout.fields),
+                storage.reserved_bytes,
+                storage.max_admitted_lineages,
+                layout.fields,
+                binding.state_sources.get(storage.resource, "initialize"),
+                state.placement,
+                storage.host_bytes,
+                transfer,
+                transfer * rows,
+            )
+        )
+    return tuple(costs)
 
 
 def _settings(binding: TensorBinding, config: ModelConfig, plan: PlanBundle) -> tuple[EscapeHatch, ...]:
@@ -514,7 +531,7 @@ def explain_facts(
         reason,
         _members(binding, costs, dict(eager_reasons(config, requirements)), config.execution.max_training_rows),
         tuple(cost for symbol, cost in costs.items() if symbol not in binding.task_members),
-        _states(plan, binding),
+        _states(plan, binding, config.max_num_seqs),
         tuple(
             AnchorCost(anchor.symbol, value)
             for anchor, value in zip(plan.timeline.anchors, plan.timeline.reserved_bytes, strict=True)

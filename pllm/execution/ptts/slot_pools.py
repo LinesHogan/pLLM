@@ -6,6 +6,7 @@ PageBundleArena (versioned state) and the vLLM hidden-row capture use it; nothin
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from math import prod
 
@@ -39,21 +40,46 @@ class SlotPools:
     storage alive until GPU work completes.
     """
 
-    def __init__(self, layout: TensorLayoutSpec, capacity: int, device: torch.device) -> None:
+    def __init__(
+        self,
+        layout: TensorLayoutSpec,
+        capacity: int,
+        device: torch.device,
+        *,
+        host: bool = False,
+        map_host: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    ) -> None:
         self.layout = layout
+        self.host_tensors: list[torch.Tensor] = []
         tensors: list[torch.Tensor] = []
         for field in layout.fields:
             size = field.dtype.itemsize
             stride = page_stride_bytes(field) // size
             alignment = max(field.alignment_bytes // size, 1)
             count = capacity * stride + alignment - 1
-            pool = torch.zeros(count, dtype=field.dtype.torch, device=device)
-            offset = (-pool.data_ptr() // size) % alignment
-            tensors.append(
-                pool[offset : offset + capacity * stride]
-                .view(capacity, stride)[:, : prod(field.shape)]
-                .view(capacity, *field.shape)
-            )
+            mapped = host and device.type == "cuda"
+            try:
+                pool = torch.zeros(
+                    count, dtype=field.dtype.torch, device="cpu" if mapped else device, pin_memory=mapped
+                )
+                offset = (-pool.data_ptr() // size) % alignment
+                pool = (
+                    pool[offset : offset + capacity * stride]
+                    .view(capacity, stride)[:, : prod(field.shape)]
+                    .view(capacity, *field.shape)
+                )
+                if mapped:
+                    assert map_host is not None
+                    self.host_tensors.append(pool)
+                    pool = map_host(pool)
+            except RuntimeError as error:
+                if not mapped:
+                    raise
+                raise ValueError(
+                    "host state does not fit pinned memory or UVA is unavailable; "
+                    'reduce the table or use placement="device"'
+                ) from error
+            tensors.append(pool)
         self.tensors = tuple(tensors)
         # Per field and slot: how many owners share the page (0 = free), and how often it was reused.
         self.holders = np.zeros((len(layout.fields), capacity), dtype=np.int32)
@@ -105,11 +131,12 @@ class SlotPools:
         """Copy selected source rows into leased slots; negative destinations disable padded entries."""
         copy_pages(source, self.tensors[field], rows, slots)
 
-    def views(self, slots: Slots, generations: Slots) -> tuple[torch.Tensor, ...]:
+    def views(self, slots: Slots, generations: Slots, *, host: bool = False) -> tuple[torch.Tensor, ...]:
         """One tensor view per field of a version, after checking none of its pages was reclaimed."""
         fields = np.arange(len(slots))
         assert (self.generations[fields, slots] == generations).all() and (self.holders[fields, slots] >= 1).all()
-        return tuple(tensor[slot] for tensor, slot in zip(self.tensors, slots.tolist()))
+        tensors = self.host_tensors if host and self.host_tensors else self.tensors
+        return tuple(tensor[slot] for tensor, slot in zip(tensors, slots.tolist()))
 
     def _counts(self, slots: Slots) -> Slots:
         return np.bincount((slots + self._field_offsets).ravel(), minlength=self.holders.size).reshape(

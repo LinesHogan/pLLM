@@ -106,6 +106,16 @@ class ModelSites:
             source: torch.zeros((rows, *source.shape), device=weight.device, dtype=source.dtype)
             for source in self._result_sources
         }
+        self._prefetch = {
+            source: torch.cuda.Event(external=True)
+            for source in self._result_sources
+            if any(
+                task.lane == "side"
+                and task.read_origin != "latest"
+                and arena.plan.semantic_graph.tasks[task.task_id].symbol == source.task
+                for task in arena.plan.schedule.tasks
+            )
+        }
         self._states: dict[StateInput, Tensor] = {}
         for source in self._sources:
             field = source.view.read(arena.field_pool(source.resource, source.view.field), pooled=True)[0]
@@ -216,7 +226,13 @@ class ModelSites:
         """
         for source in self._result_sources:
             value = context.results[source.task, "value"]
-            self._results[source][: len(value)].copy_(value)
+            if source in self._prefetch:
+                assert context.prefetch_stream is not None
+                with torch.cuda.stream(context.prefetch_stream):
+                    self._results[source][: len(value)].copy_(value)
+                    self._prefetch[source].record(context.prefetch_stream)
+            else:
+                self._results[source][: len(value)].copy_(value)
         requests = tuple(dict.fromkeys(row.identity for row in rows.rows))
         # Each packed row's index into `requests`, the order request state is staged in below.
         index = {identity: position for position, identity in enumerate(requests)}
@@ -249,6 +265,8 @@ class ModelSites:
         return staged.index_select(0, self._rows_of(self._requests_of)) if source.request else staged
 
     def result(self, source: ResultInput) -> Tensor:
+        if source in self._prefetch:
+            torch.cuda.current_stream().wait_event(self._prefetch[source])
         return self._rows_of(self._results[source])
 
     def earlier(self, source: EarlierInput) -> Tensor:

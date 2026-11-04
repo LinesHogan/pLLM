@@ -32,6 +32,8 @@ PATH_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("pllm/workloads/video*", ("feeds", "tp")),
     ("examples/video_session.py", ("feeds",)),
     ("test/gpu/*adaptive*", ("adaptive",)),
+    ("test/gpu/*engram*", ("residual",)),
+    ("examples/engram_lite.py", ("residual",)),
     ("test/gpu/*custom_residual*", ("residual",)),
     ("test/gpu/*custom_kernels*", ("residual",)),
     ("test/gpu/*composed_model_sites*", ("routes", "residual", "inplace")),

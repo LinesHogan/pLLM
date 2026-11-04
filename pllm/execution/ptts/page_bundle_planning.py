@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from math import prod
+from pathlib import Path
 
 import torch
 
@@ -45,6 +46,20 @@ def compile_page_bundle_plan(
         for entry, binding in zip(layouts.layouts, layout_decision.bindings, strict=True)
         for provider in providers
     )
+    host_bytes = sum(
+        max(candidate.host_bytes for candidate in candidates if candidate.resource == entry.resource)
+        for entry in layouts.layouts
+    )
+    if host_bytes:
+        available = next(
+            int(line.split()[1]) * 1024
+            for line in Path("/proc/meminfo").read_text().splitlines()
+            if line.startswith("MemAvailable:")
+        )
+        if host_bytes > available:
+            raise ValueError(
+                'host tables do not fit available host memory; reduce the tables or declare placement="device"'
+            )
     required = (f"device/{device.type}@1", "state/exact_versions@1")
     if device.type == "cuda":
         required += ("state/fenced_reclaim@1",)
@@ -118,7 +133,8 @@ class PageBundleProviderFacts:
             max_admitted_lineages=1 if instance else max_admitted_lineages,
             page_capacity=capacity,
             root_page_count=len(layout.fields),
-            reserved_bytes=reserved_bytes,
+            reserved_bytes=0 if state.placement == "host" else reserved_bytes,
+            host_bytes=reserved_bytes if state.placement == "host" else 0,
             capture_stable=self.device_kind is StateDeviceKind.CUDA,
             capabilities=tuple(
                 sorted(

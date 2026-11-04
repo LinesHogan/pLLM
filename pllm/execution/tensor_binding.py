@@ -60,6 +60,7 @@ from pllm.execution.tensor_program import (
 from pllm.execution.tensor_task import TensorTask
 
 if TYPE_CHECKING:
+    from pllm.execution.checkpoint import PretrainedFile
     from pllm.execution.compile_facts import BackendCompileFacts
     from pllm.execution.step_input import StepInput
 
@@ -116,6 +117,8 @@ class TensorBinding(Builder[TensorFrame]):
         super().__init__(name, digest, dimensions)
         self.dimensions = dimensions
         self.host = host
+        self.gather_bytes: dict[tuple[TaskSymbol, str], int] = {}
+        self.pretrained: dict[str, PretrainedFile] = {}
         self.members: dict[str, MemberDeclaration] = {}
         self.task_members: dict[TaskSymbol, tuple[str, ...]] = {}
         self.checkpoint = ""
@@ -157,6 +160,11 @@ class TensorBinding(Builder[TensorFrame]):
         return sum(
             prod(field.shape) * field.dtype.itemsize
             for resource in {*self.initializers, *self.initial_values}
+            if resource in self.initial_values
+            or not any(
+                state.resource == resource and state.scope is StateScope.INSTANCE and state.immutable
+                for state in self.graph.states
+            )
             for field in self.retained_fields(resource).values()
         )
 
@@ -169,6 +177,15 @@ class TensorBinding(Builder[TensorFrame]):
             init = partial(copy_initial, self.initial_values[resource](self.dimensions, seed).to(device))
         if init is None:
             return lambda roots, keys: None
+        state = next(state for state in self.graph.states if state.resource == resource)
+        if state.scope is StateScope.INSTANCE and state.immutable and resource not in self.initial_values:
+            initial_device = torch.device("cpu") if state.placement == "host" else device
+
+            def seed_roots(roots: Roots, keys: tuple[RequestStateKey | None, ...]) -> None:
+                for root in roots:
+                    init(root, torch.Generator(device=initial_device).manual_seed(seed))
+
+            return seed_roots
         layout = next(item.layout for item in self.layouts.layouts if item.resource == resource)
         tensors = tuple(torch.zeros(field.shape, dtype=field.dtype.torch, device=device) for field in layout.fields)
         # A resource's initial tensors are shared values, independent of admission history.
@@ -230,6 +247,8 @@ class TensorBinding(Builder[TensorFrame]):
 
     def function_math(self, device: torch.device, seed: int) -> FunctionMath[StepInput, TensorFrame, TensorOutput]:
         """Bind state initialization, step rows and frame preparation for execution."""
+        for weights in self.pretrained.values():
+            weights.verify()
         return FunctionMath(
             {str(state.resource): self.initializer(str(state.resource), device, seed) for state in self.graph.states},
             self.step_row_reader(),
