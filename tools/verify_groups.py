@@ -35,7 +35,7 @@ PATH_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("test/gpu/*engram*", ("residual",)),
     ("examples/engram_lite.py", ("residual",)),
     ("test/gpu/*custom_residual*", ("residual",)),
-    ("test/gpu/*custom_attention*", ("residual",)),
+    ("test/gpu/*custom_attention*", ("attention",)),
     ("test/gpu/*custom_kernels*", ("residual",)),
     ("test/gpu/*composed_model_sites*", ("routes", "residual", "inplace")),
     ("test/gpu/*state_producers*", ("producers",)),
