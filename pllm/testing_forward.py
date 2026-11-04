@@ -162,7 +162,7 @@ class CheckAttention:
         q = hidden.repeat(1, (heads * dim + width - 1) // width)[:, : heads * dim].reshape(len(rows), heads, dim)
         trace = _CheckRead()
         kv = self.paged(rows, layer, q, trace)
-        trace.kernel = DenseAttention(kv, dim**-0.5)
+        trace.kernel = DenseAttention(kv, dim**-0.5, int(kv.seq_lens.max()))
         method = self.program.methods[layer]
         kwargs = {
             arg: self.parameters[source]
@@ -172,16 +172,19 @@ class CheckAttention:
             else self.program.facts[source][: len(rows)]
             for arg, source in method.inputs
         }
-        result = method.function(q, kv, **kwargs)
-        if self.device_equivalence:
-            _compare_attention_device(method.function, q, kv, kwargs, result)
-        out, aux = result if isinstance(result, tuple) else (result, None)
-        for source, target in self.program.facts.items():
-            if source.layer == layer:
-                tensor = trace.lse if source.fact == "lse" else aux
-                assert tensor is not None
-                target[: len(rows)].copy_(tensor)
-        return out.flatten(1)
+        try:
+            result = method.function(q, kv, **kwargs)
+            if self.device_equivalence:
+                _compare_attention_device(method.function, q, kv, kwargs, result)
+            out, aux = result if isinstance(result, tuple) else (result, None)
+            for source, target in self.program.facts.items():
+                if source.layer == layer:
+                    tensor = trace.lse if source.fact == "lse" else aux
+                    assert tensor is not None
+                    target[: len(rows)].copy_(tensor)
+            return out.flatten(1)
+        finally:
+            trace.kernel = None
 
 
 class _CheckRead:
@@ -217,7 +220,7 @@ def _compare_attention_device(
     kernel = _CheckRead()
     keys, values, table, lengths, starts, positions = fields
     gpu = PagedKV(keys, values, table, lengths, starts, positions, kernel)
-    kernel.kernel = DenseAttention(gpu, q.shape[-1] ** -0.5)
+    kernel.kernel = DenseAttention(gpu, q.shape[-1] ** -0.5, int(kv.seq_lens.max()))
     arguments = {
         name: value.to(torch.device("cuda")) if isinstance(value, (torch.Tensor, ModuleCall)) else value
         for name, value in kwargs.items()
@@ -229,4 +232,5 @@ def _compare_attention_device(
         actual = function(gpu_q, gpu, **arguments)
     finally:
         torch.cuda.set_sync_debug_mode(mode)
+        kernel.kernel = None
     torch.testing.assert_close(actual, expected, check_device=False)

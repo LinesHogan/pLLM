@@ -80,9 +80,11 @@ class DenseAttention:
 
     kv: PagedKV
     scale: float
+    max_seq_len: int = 0
 
     def __call__(self, q: torch.Tensor, window: int, topk: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
         if topk is None:
-            topk = torch.arange(self.kv.block_table.shape[1] * self.kv.key_cache.shape[1], device=q.device)
+            length = self.max_seq_len or self.kv.block_table.shape[1] * self.kv.key_cache.shape[1]
+            topk = torch.arange(length, device=q.device)
             topk = topk[None, :].expand(len(q), -1)
         return selected_attention(self.kv, q, self.scale, window, topk)
