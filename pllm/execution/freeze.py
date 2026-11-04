@@ -18,6 +18,7 @@ from hashlib import sha256
 from inspect import getclosurevars
 from itertools import pairwise
 from marshal import dumps
+from sys import version_info
 from types import CellType, CodeType, FunctionType, MethodType, ModuleType
 from typing import TypeGuard, TypeVar, cast
 
@@ -27,6 +28,7 @@ from pllm.contracts.codec import boundary_digest
 
 G = TypeVar("G", bound=Callable[..., object])
 C = TypeVar("C")
+_PYTHON_MODULES = ("typing", "collections.abc", "builtins")
 
 
 def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
@@ -34,6 +36,10 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
     if id(value) in seen:
         raise ValueError(f"{type(value).__name__}: workload methods cannot depend on a value that contains itself")
     seen = seen | {id(value)}
+    module = getattr(value, "__module__", None)
+    name = getattr(value, "__qualname__", None)
+    if module in _PYTHON_MODULES and isinstance(name, str):
+        return boundary_digest(module, name, version_info[:3])
     if isinstance(value, MethodType):
         return fingerprint(value.__func__, seen)
     if isinstance(value, FunctionType):
@@ -53,9 +59,12 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
             imports,
         )
     if isinstance(value, ModuleType):
+        if value.__name__ in _PYTHON_MODULES:
+            return boundary_digest(value.__name__, version_info[:3])
         if value.__name__ != "pllm" and not value.__name__.startswith(("torch", "math")):
             raise ValueError(
-                f"{value.__name__}: workload methods may use only the torch, math and pllm modules; "
+                f"{value.__name__}: workload methods may use only torch, math, pllm, typing, collections.abc "
+                "and builtins modules; "
                 "compute other values outside the workload and pass them in its config"
             )
         return boundary_digest(value.__name__, torch.__version__)
@@ -221,6 +230,9 @@ def _builtin_dependencies(function: FunctionType) -> tuple[tuple[str, str], ...]
             if name in ("getattr", "hasattr") and literal is not None:
                 continue
             if name == "__import__" and literal is not None and count == 1:
+                if literal in _PYTHON_MODULES:
+                    imports.add((literal, boundary_digest(version_info[:3])))
+                    continue
                 if literal == "pllm" or literal.startswith(("torch", "math")):
                     imports.add((literal, torch.__version__))
                     continue
@@ -230,8 +242,8 @@ def _builtin_dependencies(function: FunctionType) -> tuple[tuple[str, str], ...]
                 "hasattr": 'hasattr needs a literal attribute name; write hasattr(obj, "field") '
                 "so the attribute dependency is recorded",
                 "vars": "vars() exposes runtime locals; write vars(obj) or explicit obj.field reads",
-                "__import__": "__import__ needs a literal torch, math or pllm module name to sign its version; "
-                'write import torch, math or pllm at module scope, or __import__("torch"); '
+                "__import__": "__import__ needs a literal supported module name to sign its version; "
+                'write import torch, math or pllm at module scope, or __import__("typing"); '
                 "compute values from other modules outside the workload and pass them as config fields",
             }
             raise ValueError(f"{function.__qualname__}: {messages[name]}")

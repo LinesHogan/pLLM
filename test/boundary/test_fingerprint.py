@@ -1,7 +1,13 @@
-"""Workload identity admits literal lookups and rejects dependencies hidden in runtime namespaces."""
+"""Workload identity admits standard names and literal lookups while rejecting opaque namespaces."""
+
+import builtins
+import collections.abc
+import sys
+import typing
 
 import pytest
 
+from pllm.contracts.codec import boundary_digest
 from pllm.execution.freeze import fingerprint
 
 
@@ -17,6 +23,9 @@ from pllm.execution.freeze import fingerprint
         'hasattr(x, "dtype")',
         "vars(x)",
         '__import__("math")',
+        '__import__("typing")',
+        '__import__("collections.abc")',
+        '__import__("builtins")',
         '[getattr(item, "dtype") for item in x]',
     ),
 )
@@ -53,3 +62,31 @@ def test_hidden_dependencies_explain_the_replacement(expression, replacement):
     with pytest.raises(ValueError) as error:
         fingerprint(eval(f"lambda x, name: {expression}"))
     assert replacement in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "dependency",
+    (typing.Mapping, typing.Any, typing.cast, collections.abc.Mapping, list, len),
+)
+@pytest.mark.parametrize("body", ("return dependency", "def inner(value: dependency): return value\n return inner"))
+def test_standard_names_in_runtime_and_nested_annotations(dependency, body):
+    assert fingerprint(dependency) == boundary_digest(
+        dependency.__module__, dependency.__qualname__, sys.version_info[:3]
+    )
+    namespace = {"dependency": dependency}
+    exec("def outer():\n " + body, namespace)
+    identity = fingerprint(namespace["outer"])
+    assert identity == fingerprint(namespace["outer"])
+    namespace["dependency"] = tuple
+    assert identity != fingerprint(namespace["outer"])
+
+
+@pytest.mark.parametrize("module,member", ((typing, "Mapping"), (collections.abc, "Mapping"), (builtins, "list")))
+def test_standard_module_names(module, member):
+    assert fingerprint(module) == boundary_digest(module.__name__, sys.version_info[:3])
+    assert fingerprint(eval(f"lambda: dependency.{member}", {"dependency": module}))
+
+
+def test_opaque_namespace_explains_config_boundary():
+    with pytest.raises(ValueError, match="sys:.*compute other values outside the workload"):
+        fingerprint(eval("lambda: namespace.version", {"namespace": sys}))
