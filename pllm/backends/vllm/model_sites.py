@@ -286,7 +286,7 @@ class ModelSites:
     def result(self, source: ResultInput) -> Tensor:
         if source in self._prefetch:
             torch.cuda.current_stream().wait_event(self._prefetch[source])
-        return self._rows_of(self._results[source])
+        return self.current_rows(self._results[source])
 
     def earlier(self, source: EarlierInput) -> Tensor:
         return self.current_rows(self._earlier[source])
