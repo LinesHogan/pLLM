@@ -16,6 +16,7 @@ from test.workloads.attention_workloads import (
     Monitor,
     Quest,
     SharedAttention,
+    SharedWindowAttention,
     SinkAttention,
     WindowAttention,
     page_bounds,
@@ -33,10 +34,19 @@ CONFIG = pllm.ModelConfig(
 
 
 @pytest.mark.parametrize(
-    "workload", (Monitor(), Quest(), InstanceAttention(), WindowAttention(), SinkAttention(), SharedAttention())
+    "workload",
+    (
+        Monitor(),
+        Quest(),
+        InstanceAttention(),
+        WindowAttention(),
+        SinkAttention(),
+        SharedAttention(),
+        SharedWindowAttention(),
+    ),
 )
 def test_attention_contracts(workload, monkeypatch):
-    if isinstance(workload, SharedAttention):
+    if any(layout.keep == "none" for layout in workload.backend_requirements().kv_layouts):
         monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     result = check_on_gpu(workload, CONFIG, neutral=workload if isinstance(workload, Monitor) else None)
     assert any("host syncs" in name for name in result.passed)
@@ -151,7 +161,9 @@ def _layout_read(read, errors, kernel, q, window, topk):
     return out, lse
 
 
-@pytest.mark.parametrize("workload", (WindowAttention(), SinkAttention(), SharedAttention(tuple(range(1, 24, 2)))))
+@pytest.mark.parametrize(
+    "workload", (WindowAttention(), SinkAttention(), SharedAttention(tuple(range(1, 24, 2))), SharedWindowAttention())
+)
 def test_layout_oracle_and_reclaimed_blocks(workload):
     from vllm import SamplingParams
 

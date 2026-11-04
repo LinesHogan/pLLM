@@ -51,6 +51,7 @@ from test.workloads.attention_workloads import (
     Monitor,
     Quest,
     SharedAttention,
+    SharedWindowAttention,
     SinkAttention,
     WindowAttention,
 )
@@ -183,6 +184,7 @@ class PromptMask(pllm.Workload):
             WindowAttention(),
             SinkAttention(),
             SharedAttention(),
+            SharedWindowAttention(),
             Forward(),
             TokenHistory(),
             Stack(),

@@ -82,7 +82,7 @@ class CustomAttention:
                 )
             layout = storage_layout(program.layouts, layer)
             sharing = any(item.layer == layer and item.keep == "none" for item in program.layouts)
-            window = layout.window if layout.keep == "window" and not layout.sink else None
+            window = layout.window if layout.keep == "window" and not layout.sink and not sharing else None
             if attention.sliding_window != window or (attention.kv_sharing_target_layer_name is not None) != sharing:
                 raise ValueError("custom_attention needs full attention or a layout declared with keep/window/source")
             if attention.kv_cache_dtype != "auto":

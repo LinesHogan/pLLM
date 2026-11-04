@@ -183,7 +183,9 @@ class CacheLayout(pllm.Workload):
 class WindowAttention(pllm.Workload):
     """vLLM owns and recycles sliding-window blocks."""
 
-    @pllm.custom_attention(layers=(0, 1), keep="window", window=4)
+    layers: tuple[int, ...] = (0, 1)
+
+    @pllm.custom_attention(layers=pllm.Attr("layers"), keep="window", window=4)
     def read(self, q, kv):
         return kv.attend(q)[0]
 
@@ -205,4 +207,15 @@ class SharedAttention(pllm.Workload):
 
     @pllm.custom_attention(layers=pllm.Attr("layers"), keep="none", source=1)
     def read(self, q, kv):
+        return kv.attend(q)[0]
+
+
+@dataclass(frozen=True)
+class SharedWindowAttention(WindowAttention):
+    """Sharing inherits its owner's window and never reads that owner's freed blocks."""
+
+    layers: tuple[int, ...] = (0,)
+
+    @pllm.custom_attention(layers=(1,), keep="none", source=1)
+    def shared(self, q, kv):
         return kv.attend(q)[0]
