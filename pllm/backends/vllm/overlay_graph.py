@@ -67,6 +67,13 @@ def graph_options(config: ModelConfig, requirements: BackendRequirements) -> Gra
     """Announce model hooks before profiling; ordinary workloads keep vLLM's capture sizes."""
     if not (requirements.parameter_targets or requirements.custom_residual):
         return {}
+    # Request memories replicate a carry per scheduled request. Bound model graphs
+    # to the decode capacity; larger prefills use upstream's ordinary eager dispatch.
+    capacity = (
+        min(config.max_num_batched_tokens, config.max_num_seqs)
+        if requirements.stateful_residual
+        else config.max_num_batched_tokens
+    )
     return {
         "additional_config": {_BUDGET: config.execution.model_capture_bytes},
         "compilation_config": CompilationConfig(
@@ -74,8 +81,8 @@ def graph_options(config: ModelConfig, requirements: BackendRequirements) -> Gra
             # Capture the model's source CUDA operators; the shared region selects overlay kernels.
             backend="eager",
             cudagraph_mode=_OVERLAY_GRAPHS,
-            cudagraph_capture_sizes=list(capacities(config.max_num_batched_tokens)),
-            max_cudagraph_capture_size=config.max_num_batched_tokens,
+            cudagraph_capture_sizes=list(capacities(capacity)),
+            max_cudagraph_capture_size=capacity,
         ),
     }
 

@@ -18,7 +18,13 @@ from pllm.testing import check_on_gpu
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 PROMPTS = ("The capital of France is", "Water boils at a temperature of", "def fibonacci(n):")
 CONFIG = pllm.ModelConfig(
-    MODEL, max_model_len=128, max_num_seqs=4, max_num_batched_tokens=128, gpu_memory_utilization=0.3, cuda_graphs=False
+    MODEL,
+    max_model_len=128,
+    max_num_seqs=4,
+    max_num_batched_tokens=128,
+    gpu_memory_utilization=0.3,
+    cuda_graphs=False,
+    execution=pllm.ExecutionOptions(capture_memory_bytes=256 << 20),
 )
 # The largest per-token logprob gap of bf16 vLLM to an FP32 oracle over these prompts: one near-tie dominates it, so it
 # varies by GPU (0.24 on an RTX 4090, 0.06 on an A100) while a wrong residual update moves logprobs by more than 1.
@@ -167,10 +173,14 @@ class FastWeightMemory(pllm.Workload):
     chunk: int = 16
     lr: float = 0.5
     gate: float = 0.25
+    shared: bool = False
 
     @property
     def memory(self) -> pllm.RequestState:
-        return pllm.RequestState({"M": lambda m: (m.hidden_size, m.hidden_size)})
+        return pllm.RequestState(
+            {"M": lambda m: (m.hidden_size, m.hidden_size)},
+            key_fields=("prompt_index",) if self.shared else ("request_id",),
+        )
 
     @property
     def layers_(self) -> tuple[int, ...]:
@@ -370,7 +380,12 @@ def test_memory_sublayer_follows_fp32_chunk_oracle() -> None:
                     state = state - workload.lr / workload.chunk * (k @ state.T - v).T @ k
             return x + y + workload.gate * torch.cat(reads)
 
-        deviation, misses = _deviation(_generate(workload), lambda tokens: _oracle_logprobs(tokens, mlp=memory))
+        eager = _generate(workload)
+        captured = _generate(workload, replace(CONFIG, cuda_graphs=True))
+        for (tokens, logprobs), (expected_tokens, expected_logprobs) in zip(captured, eager, strict=True):
+            assert tokens == expected_tokens
+            torch.testing.assert_close(torch.tensor(logprobs), torch.tensor(expected_logprobs), rtol=0, atol=BF16_NOISE)
+        deviation, misses = _deviation(captured, lambda tokens: _oracle_logprobs(tokens, mlp=memory))
         print(
             f"memory chunk={chunk}: max logprob gap to FP32 {deviation:.4f} (plain bf16 vLLM {baseline:.4f}), {misses} non-argmax tokens"
         )
@@ -378,8 +393,105 @@ def test_memory_sublayer_follows_fp32_chunk_oracle() -> None:
 
 
 @pytest.mark.parametrize(
-    "workload", (Laurel(), ValueResidual(mixing=0.3), StaticHyperConnections(perturb=0.05)), ids=type
+    "workload",
+    (Laurel(), ValueResidual(mixing=0.3), StaticHyperConnections(perturb=0.05), FastWeightMemory()),
+    ids=type,
 )
 def test_captured_rewrites_have_no_host_syncs(workload: pllm.Workload) -> None:
     result = check_on_gpu(workload, replace(CONFIG, cuda_graphs=True))
     assert "host syncs: eight steady decode steps" in result.passed
+
+
+@pytest.mark.parametrize("chunk,shared", ((1, False), (4, False), (16, False), (4, True)))
+def test_memory_capture_replays_mixed_spans_and_private_slots(chunk: int, shared: bool) -> None:
+    """One graph follows the serial chunk recurrence while PTTS recycles private write slots."""
+    from pllm.contracts.hidden_locator import HiddenPhase
+    from pllm.contracts.request_identity import RequestIdentity
+    from pllm.contracts.state_representation import StateDeviceKind
+    from pllm.contracts.tensor_layout import TensorDType
+    from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
+    from pllm.execution.runtime_facts import model_timeline
+    from pllm.execution.site_memory import SiteMemorySchedule
+    from pllm.testing import backend_facts, compile_execution, step_input
+
+    device = torch.device("cuda", 0)
+    stream = torch.cuda.current_stream()
+    workload = FastWeightMemory(layer=0, chunk=chunk, shared=shared)
+    facts = backend_facts(
+        8,
+        timeline=model_timeline(device, ("transition/full_root@1",)),
+        provider=PageBundleProviderFacts("testing.cuda@1", 32, StateDeviceKind.CUDA),
+        max_lineages=3,
+        max_rows=16,
+        memory_bytes=1 << 24,
+        dtype=TensorDType.BFLOAT16,
+        layer_count=1,
+    )
+    execution = compile_execution(workload, facts, stream)
+    identities = tuple(RequestIdentity(str(i), i // 2 if shared else i, 0) for i in range(3))
+    execution.admit(identities, stream)
+    (rewrite,) = execution.math.model_sites
+    schedule = SiteMemorySchedule(rewrite, execution.arena, 3, 16)
+    names = ("carry", "_pending_rows_x", "_pending_rows_y", "_pending_length")
+    expected = [dict(zip(names, (pool[0].clone().zero_() for pool in schedule.pools), strict=True)) for _ in identities]
+    if shared:
+        expected[1] = expected[0]
+    x, y = (torch.zeros(16, 8, device=device, dtype=torch.bfloat16) for _ in range(2))
+    try:
+        schedule(x, y, ())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = schedule(x, y, ())
+        frontiers = [0, 0, 0]
+        for step, counts in enumerate(((5, 1, 0), (1, 0, 7), (1, 1, 1), (0, 9, 1), (13, 1, 1))):
+            packed = tuple(identity for identity, count in zip(identities, counts, strict=True) for _ in range(count))
+            value = step_input(packed, step_id=step, sampler_order=())
+            offsets = [0, 0, 0]
+            rows = []
+            for row in value.rows.rows:
+                request = int(row.identity.request_id)
+                rows.append(
+                    replace(
+                        row,
+                        request_ordinal=request,
+                        token_offset=frontiers[request] + offsets[request],
+                        phase=HiddenPhase.PREFILL if counts[request] > 1 else HiddenPhase.DECODE,
+                    )
+                )
+                offsets[request] += 1
+            row_batch = replace(value.rows, rows=tuple(rows))
+            value = replace(value, rows=row_batch, sampler_rows=replace(value.sampler_rows, row_batch=row_batch))
+            context = execution.start_step(value, stream)
+            execution.advance_to(context, "model.execute")
+            schedule.prepare(value.rows, context)
+            x.normal_()
+            y.normal_()
+            mode = torch.cuda.get_sync_debug_mode()
+            try:
+                torch.cuda.set_sync_debug_mode("error")
+                graph.replay()
+            finally:
+                torch.cuda.set_sync_debug_mode(mode)
+            result = x + y
+            start = 0
+            for request, count in enumerate(counts):
+                if count:
+                    result[start : start + count] = schedule.update(
+                        **expected[request], x=x[start : start + count], y=y[start : start + count]
+                    ).output
+                    start += count
+                frontiers[request] += count
+            torch.testing.assert_close(
+                actual, result, rtol=0, atol=0, msg=lambda message: f"chunk={chunk} step={step}: {message}"
+            )
+            execution.advance_to(context, "next.prepare")
+            execution.finish_step(context, stream)
+            for request, identity in enumerate(identities):
+                (ref,) = execution.latest((identity,))
+                root = execution.snapshot(ref, stream)
+                for view, name in zip(schedule.views, names, strict=True):
+                    torch.testing.assert_close(
+                        view.read(root[view.field]), expected[request][name], rtol=1e-5, atol=1e-6
+                    )
+    finally:
+        execution.close()

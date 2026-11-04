@@ -30,13 +30,12 @@ from pllm.execution.model_sites import (
     PatchInput,
     Place,
     ResidualRewrite,
-    SiteMemory,
     StateInput,
     position,
 )
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.request_state import RequestStateDirectory
-from pllm.execution.ptts.state_refs import StateRefs
+from pllm.execution.site_memory import SiteMemorySchedule
 from pllm.execution.state_execution import DataT, StateTaskContext
 
 Forward = Callable[..., Tensor | tuple[Tensor, ...]] | Callable[[Tensor], LinearOutput]
@@ -55,17 +54,6 @@ def _model_site_meta(inputs: list[Tensor], outputs: list[Tensor], buffers: list[
 
 
 model_site.register_fake(_model_site_meta)  # pyright: ignore[reportUnknownMemberType]
-
-
-def _request_spans(rows: PackedPhaseRowBatch) -> tuple[tuple[int, int], ...]:
-    """Each request's contiguous packed rows."""
-    spans: list[tuple[int, int]] = []
-    for index, row in enumerate(rows.rows):
-        if spans and rows.rows[spans[-1][0]].request_ordinal == row.request_ordinal:
-            spans[-1] = (spans[-1][0], index + 1)
-        else:
-            spans.append((index, index + 1))
-    return tuple(spans)
 
 
 class ModelSites:
@@ -107,13 +95,11 @@ class ModelSites:
                 if isinstance(source, StateInput) and source not in carries
             )
         )
-        # Each stateful method's chunk recurrence, and per step each request's rows and private memory.
         self._memories = {
-            rewrite.name: (rewrite.memory, rewrite.memory.update(rewrite, rewrite.places[0]))
+            rewrite.name: SiteMemorySchedule(rewrite, arena, requests, rows)
             for rewrite in rewrites
             if rewrite.memory is not None
         }
-        self._spans: dict[str, tuple[tuple[int, int, dict[str, Tensor]], ...]] = {}
         self._states: dict[StateInput, Tensor] = {}
         for source in self._sources:
             field = source.view.read(arena.field_pool(source.resource, source.view.field), pooled=True)[0]
@@ -198,7 +184,12 @@ class ModelSites:
     @property
     def buffers(self) -> list[Tensor]:
         """The uploaded row-to-request table, staged fields and same-forward scratch used by captured hooks."""
-        return [self._requests_of, *self._states.values(), *self._earlier.values()]
+        return [
+            self._requests_of,
+            *self._states.values(),
+            *self._earlier.values(),
+            *(buffer for memory in self._memories.values() for buffer in memory.buffers),
+        ]
 
     def run_hook(self, hook: int, inputs: list[Tensor], outputs: list[Tensor]) -> None:
         """Keep orchestration opaque to Dynamo; upstream owns each capacity's graph and its allocations."""
@@ -230,48 +221,14 @@ class ModelSites:
             for index, (pin, ref) in enumerate(versions):
                 field = source.view.read(context.arena.borrow_field(pin, ref, source.view.field))
                 (self._states[source][index] if source.request else self._states[source]).copy_(field)
-        for name, (memory, _) in self._memories.items():
-            self._spans[name] = self._memory_spans(rows, context, memory)
-
-    def _memory_spans(
-        self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT], memory: SiteMemory
-    ) -> tuple[tuple[int, int, dict[str, Tensor]], ...]:
-        """Each request's packed rows and the fields of its private memory, which the transition before the forward
-        copied from the request's version."""
-        resource = memory.carry.resource
-        write = context.pending_write(resource)
-        assert write is not None
-        roots = context.arena.lazy_roots((write,) * len(write.after_refs), write.after_refs)
-        selection = context.selection.for_resource(resource)
-        indices = dict(zip((row.identity for row in context.selection.rows), selection.state_indices, strict=True))
-        spans: list[tuple[int, int, dict[str, Tensor]]] = []
-        for start, end in _request_spans(rows):
-            ref = selection.refs[indices[rows.rows[start].identity]]
-            root = roots[int(write.before_refs.positions(StateRefs.of((ref,)))[0])]
-            carry, rows_x, rows_y, length = (
-                view.read(root[view.field]) for view in (memory.carry.view, *memory.pending)
-            )
-            spans.append(
-                (
-                    start,
-                    end,
-                    {"carry": carry, "_pending_rows_x": rows_x, "_pending_rows_y": rows_y, "_pending_length": length},
-                )
-            )
-        return tuple(spans)
+        for memory in self._memories.values():
+            memory.prepare(rows, context)
 
     def remember(self, rewrite: ResidualRewrite, stream: Tensor, branch: Tensor) -> Tensor:
-        """A stateful method's stream after its sublayer: each request's rows through its chunk recurrence, which
-        advances the private memory in place."""
-        memory, update = self._memories[rewrite.name]
-        invariants = {
-            f"__invariant_{index}": self.state(source) for index, source in enumerate(memory.invariants(rewrite))
-        }
-        written = stream + branch  # padding rows past the scheduled ones
-        for start, end, fields in self._spans[rewrite.name]:
-            result = update(**fields, **invariants, x=stream[start:end], y=branch[start:end])
-            written[start:end] = result.output
-        return written
+        """Advance private PTTS memory through device-counted request buckets."""
+        memory = self._memories[rewrite.name]
+        invariants = tuple(self.state(source) for source in memory.memory.invariants(rewrite))
+        return memory(stream, branch, invariants)
 
     def _rows_of(self, values: Tensor) -> Tensor:
         """The current call's rows of a per-row buffer."""
