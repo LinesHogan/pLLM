@@ -498,12 +498,11 @@ def test_memory_capture_replays_mixed_spans_and_private_slots(chunk: int, shared
         execution.close()
 
 
-def test_input_tokens_match_request_history() -> None:
+def _check_request_token_history(config: pllm.ModelConfig) -> None:
     from unittest.mock import patch
 
     from test.workloads.test_contracts import TokenHistory
 
-    config = replace(CONFIG, cuda_graphs=True, max_num_batched_tokens=8, enable_chunked_prefill=True)
     with pllm.make_llm(config, workload=TokenHistory()) as llm:
         session = llm.runner.require_session()
         prepare = session.prepare_input
@@ -531,6 +530,14 @@ def test_input_tokens_match_request_history() -> None:
         assert any(row.token_offset > 0 and row.phase.value == "prefill" for row, _ in seen)
         assert any(row.phase.value == "decode" for row, _ in seen)
         assert session._token_capture.graph is not None
+
+
+def test_input_tokens_match_request_history() -> None:
+    from test.workloads.test_contracts import TokenHistory
+
+    config = replace(CONFIG, cuda_graphs=True, max_num_batched_tokens=8, enable_chunked_prefill=True)
+    # Drop the inspected session and its bound callback before loading another engine.
+    _check_request_token_history(config)
     assert (
         "host syncs: eight steady decode steps"
         in check_on_gpu(TokenHistory(), replace(config, max_num_batched_tokens=128)).passed
