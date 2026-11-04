@@ -35,10 +35,28 @@ class PagedKV:
     block_table: torch.Tensor
     seq_lens: torch.Tensor
     query_start: torch.Tensor
-    positions: torch.Tensor
+    query_count: int
     _read: AttentionRead
     storage_window: int = 0
-    sink_lens: torch.Tensor | None = None
+    prompt_lens: torch.Tensor | None = None
+
+    @property
+    def requests(self) -> torch.Tensor:
+        """Request index per query, materialized only by reads that need token positions."""
+        rows = torch.arange(self.query_count, device=self.query_start.device)
+        return (rows[:, None] >= self.query_start[1:][None, :]).sum(-1)
+
+    @property
+    def positions(self) -> torch.Tensor:
+        """Logical query positions derived from vLLM's packed request metadata."""
+        requests = self.requests
+        rows = torch.arange(self.query_count, device=self.query_start.device)
+        return self.seq_lens[requests] - self.query_start[requests + 1] + rows
+
+    @property
+    def sink_lens(self) -> torch.Tensor | None:
+        """Prompt length per query for authored selection and dense reference reads."""
+        return self.prompt_lens[self.requests] if self.prompt_lens is not None else None
 
     @property
     def window_start(self) -> torch.Tensor:
@@ -58,7 +76,7 @@ class PagedKV:
         intersect causality and the optional window; an empty read returns zero
         output and negative-infinity LSE. Indices must be distinct within a head.
         """
-        if self.storage_window and self.sink_lens is None:
+        if self.storage_window and self.prompt_lens is None:
             window = min(window, self.storage_window) if window else self.storage_window
         return self._read(q, window, topk)
 

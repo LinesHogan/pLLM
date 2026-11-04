@@ -1,7 +1,7 @@
 """Install authored dense reads inside vLLM's opaque attention op, after its native KV write.
 
-The upstream op already supplies graph ordering and capture. FA2 remains the native
-read kernel; selected reads gather logical positions without changing block tables.
+The upstream op already supplies graph ordering and capture. Full reads use FA2; local and prompt-sink reads use vLLM's native Triton kernel.
+Selected reads gather logical positions without changing block tables.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from vllm.vllm_flash_attn import flash_attn_varlen_func
 from pllm.backends.vllm.architecture import Decoder
 from pllm.backends.vllm.compat import VLLM_027
 from pllm.backends.vllm.model_sites import ModelSites
+from pllm.backends.vllm.window_attention import window_attention
 from pllm.contracts.kv_layout import storage_layout
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.execution.attention import PagedKV, selected_attention
@@ -31,18 +32,28 @@ class FlashRead:
 
     impl: FlashAttentionImpl
     metadata: FlashAttentionMetadata
+    output: torch.Tensor
     kv: PagedKV | None = None
     lse: torch.Tensor | None = None
 
     def __call__(self, q: torch.Tensor, window: int, topk: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
         assert self.kv is not None
-        if self.kv.sink_lens is not None and topk is None:
+        output = (
+            self.output
+            if self.lse is None and q.shape == self.output.shape and q.dtype == self.output.dtype
+            else torch.empty_like(q)
+        )
+        if self.kv.prompt_lens is not None and window > self.kv.storage_window and topk is None:
+            # Native R-SWA expresses a union, not its intersection with a wider authored window.
             topk = torch.arange(self.metadata.max_seq_len, device=q.device)[None, :].expand(len(q), -1)
         if topk is not None:
             result = selected_attention(self.kv, q, self.impl.scale, window, topk)
+        elif window or self.kv.prompt_lens is not None:
+            result = window_attention(self.kv, q, self.impl.scale, window, output)
         else:
             out, lse = flash_attn_varlen_func(
                 q=q,
+                out=output,
                 k=self.kv.key_cache,
                 v=self.kv.value_cache,
                 cu_seqlens_q=self.metadata.query_start_loc,
@@ -95,13 +106,17 @@ class CustomAttention:
     def prepare(self, rows: PackedPhaseRowBatch, sampler: PackedSamplerRowBatch) -> None:
         """Stage sampled-to-packed indices before model and fact-snapshot tasks run."""
         if self.program.prompt_lens.numel():
-            self.program.prompt_lens[: len(rows.rows)].copy_(
-                upload(tuple(row.prompt_length for row in rows.rows), self.program.prompt_lens.device)
+            self.program.prompt_lens[: len(rows.request_rows)].copy_(
+                upload(
+                    tuple(row.prompt_length for row in rows.request_rows),
+                    self.program.prompt_lens.device,
+                )
             )
-        mapping = tuple(
-            link.packed_row_index for link in sorted(sampler.links, key=lambda link: link.sampler_row_index)
-        )
-        self.program.sample_rows[: len(mapping)].copy_(upload(mapping, self.program.sample_rows.device))
+        if self.program.sample_rows.numel():
+            mapping = tuple(
+                link.packed_row_index for link in sorted(sampler.links, key=lambda link: link.sampler_row_index)
+            )
+            self.program.sample_rows[: len(mapping)].copy_(upload(mapping, self.program.sample_rows.device))
 
     def close(self) -> None:
         """Restore the upstream reads before destroying the session scratch."""
@@ -147,12 +162,8 @@ class AttentionHook:
         count = metadata.num_actual_tokens
         q = query[:count]
         keys, values = kv_cache.transpose(1, 2).chunk(2, dim=-1)
-        rows = torch.arange(count, device=q.device)
-        requests = (rows[:, None] >= metadata.query_start_loc[1:][None, :]).sum(-1)
-        lengths = metadata.query_start_loc[1:] - metadata.query_start_loc[:-1]
-        positions = metadata.seq_lens[requests] - lengths[requests] + rows - metadata.query_start_loc[requests]
         self.owner.sites.count = count
-        read = FlashRead(self.impl, metadata)
+        read = FlashRead(self.impl, metadata, output[:count])
         layout = storage_layout(self.owner.program.layouts, self.layer)
         kv = PagedKV(
             keys,
@@ -160,10 +171,10 @@ class AttentionHook:
             metadata.block_table,
             metadata.seq_lens,
             metadata.query_start_loc,
-            positions,
+            count,
             read,
             layout.window,
-            self.owner.sites.current_rows(self.owner.program.prompt_lens)[:count] if layout.sink else None,
+            self.owner.program.prompt_lens[: len(metadata.seq_lens)] if layout.sink else None,
         )
         read.kv = kv
         program, sites = self.owner.program, self.owner.sites

@@ -1,0 +1,125 @@
+"""Expose output and LSE from vLLM's native local/R-SWA kernel for custom attention.
+
+The native launcher hides its softmax statistics. One unsplit segment exposes
+those statistics for both prefill and decode, without gathering K/V or changing
+vLLM's page ownership. Full reads keep FlashAttention's optimized GQA decode.
+"""
+
+import torch
+import triton
+import triton.language as tl
+from vllm.v1.attention.ops.triton_unified_attention import kernel_unified_attention
+
+from pllm.execution.attention import PagedKV
+
+
+@triton.jit
+def _finish(
+    partial: torch.Tensor,
+    maximum: torch.Tensor,
+    denominator: torch.Tensor,
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    dim: tl.constexpr,
+    padded: tl.constexpr,
+    heads: tl.constexpr,
+    stride: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    columns = tl.arange(0, padded)
+    total = tl.load(denominator + row)
+    values = tl.load(partial + row * padded + columns, columns < dim, other=0)
+    tl.store(output + row // heads * stride + row % heads * dim + columns, values / total, columns < dim)
+    tl.store(lse + row, tl.load(maximum + row) + tl.log(total))
+
+
+def window_attention(
+    kv: PagedKV, q: torch.Tensor, scale: float, window: int, output: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Read native window/R-SWA pages with an unsplit softmax and float32 LSE."""
+    rows, heads, dim = q.shape
+    padded = triton.next_power_of_2(dim)
+    partial = torch.empty((rows, heads, padded), dtype=torch.float32, device=q.device)
+    maximum, denominator = (torch.empty((rows, heads), dtype=torch.float32, device=q.device) for _ in range(2))
+    lse = torch.empty_like(maximum)
+    _launch(kv, q, scale, window, partial, maximum, denominator)
+    _finish[(rows * heads,)](partial, maximum, denominator, output, lse, dim, padded, heads, output.stride(0))
+    return output, lse
+
+
+def _launch(
+    kv: PagedKV,
+    q: torch.Tensor,
+    scale: float,
+    window: int,
+    partial: torch.Tensor,
+    maximum: torch.Tensor,
+    denominator: torch.Tensor,
+) -> None:
+    rows, heads, dim = q.shape
+    keys, values = kv.key_cache, kv.value_cache
+    grouped = heads // keys.shape[2]
+    block_m = max(16, triton.next_power_of_2(grouped))
+    block_q = block_m // grouped
+    kernel_unified_attention[(rows // block_q + len(kv.seq_lens), keys.shape[2], 1)](
+        output_ptr=partial,
+        query_ptr=q,
+        key_cache_ptr=keys,
+        value_cache_ptr=values,
+        sink_ptr=None,
+        block_tables_ptr=kv.block_table,
+        seq_lens_ptr=kv.seq_lens,
+        alibi_slopes_ptr=None,
+        qq_bias_ptr=None,
+        scale=scale,
+        q_scale=None,
+        k_scale=None,
+        v_scale=None,
+        out_scale=1.0,
+        softcap=0.0,
+        num_query_heads=heads,
+        num_queries_per_kv=grouped,
+        block_table_stride=kv.block_table.stride(0),
+        query_stride_0=q.stride(0),
+        query_stride_1=q.stride(1),
+        output_stride_0=0,
+        output_stride_1=0,
+        qq_bias_stride_0=0,
+        BLOCK_SIZE=keys.shape[1],
+        TILE_SIZE=32,
+        HEAD_SIZE=dim,
+        HEAD_SIZE_PADDED=triton.next_power_of_2(dim),
+        USE_ALIBI_SLOPES=False,
+        USE_ALIBI_SQRT=False,
+        USE_QQ_BIAS=False,
+        USE_SOFTCAP=False,
+        USE_SINKS=False,
+        SLIDING_WINDOW=window,
+        USE_CAUSAL=True,
+        USE_PER_SEQ_CAUSAL=False,
+        per_seq_causal_ptr=None,
+        USE_MM_PREFIX=False,
+        MAX_MM_RANGES=0,
+        mm_prefix_range_ptr=None,
+        rswa_prefix_lens_ptr=kv.prompt_lens,
+        R_SWA_WINDOW=kv.storage_window if kv.prompt_lens is not None and not window else 0,
+        USE_R_SWA=kv.prompt_lens is not None and not window,
+        stride_k_cache_0=keys.stride(0),
+        stride_k_cache_1=keys.stride(1),
+        stride_k_cache_2=keys.stride(2),
+        stride_k_cache_3=keys.stride(3),
+        stride_v_cache_0=values.stride(0),
+        stride_v_cache_1=values.stride(1),
+        stride_v_cache_2=values.stride(2),
+        stride_v_cache_3=values.stride(3),
+        query_start_len_ptr=kv.query_start,
+        BLOCK_Q=block_q,
+        num_seqs=len(kv.seq_lens),
+        BLOCK_M=block_m,
+        NUM_SEGMENTS_PER_SEQ=1,
+        USE_FP8=False,
+        IS_3D=True,
+        segm_output_ptr=partial,
+        segm_max_ptr=maximum,
+        segm_expsum_ptr=denominator,
+    )

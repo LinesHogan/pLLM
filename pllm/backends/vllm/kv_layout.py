@@ -1,12 +1,21 @@
 """Install static KV layouts before vLLM builds its native specs, groups and managers."""
 
+from collections.abc import Callable, Sequence
 from functools import partial
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.attention import Attention
+from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator, KVCacheCoordinatorNoPrefixCache
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.single_type_kv_cache_manager import (
+    FullAttentionManager,
+    SingleTypeKVCacheManager,
+    SlidingWindowManager,
+)
 from vllm.v1.kv_cache_interface import KVCacheSpec, RSWASpec, SlidingWindowSpec
 
 from pllm.backends.vllm.architecture import Decoder
+from pllm.backends.vllm.compat import VLLM_027
 from pllm.backends.vllm.model_shape import ModelShape
 from pllm.config import ModelConfig
 from pllm.contracts.kv_layout import KVCapacity, KVLayout, expand_layouts, storage_layout
@@ -98,3 +107,91 @@ def layout_capacity(shape: ModelShape, config: ModelConfig, layouts: tuple[KVLay
             )
         )
     return tuple(result)
+
+
+def allocation_blocks(
+    coordinator: KVCacheCoordinator,
+    native: Callable[..., int],
+    request_id: str,
+    num_tokens: int,
+    new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+    num_encoder_tokens: int,
+    total_computed_tokens: int,
+    num_local_computed_tokens: int,
+    num_tokens_main_model: int,
+    apply_admission_cap: bool = False,
+    prefill_end: int = 0,
+) -> int:
+    """Predict running requests once: these native groups have identical logical page counts.
+
+    Recycling leaves null placeholders, so every group's table has the same
+    length even though its live pages differ. Admission and imported prefixes
+    still use vLLM's complete predictor; native managers own all mutations.
+    """
+    first = coordinator.single_type_managers[0]
+    blocks = first.req_to_blocks.get(request_id)
+    if blocks is not None and not apply_admission_cap and total_computed_tokens <= len(blocks) * first.block_size:
+        return max((num_tokens + first.block_size - 1) // first.block_size - len(blocks), 0) * len(
+            coordinator.single_type_managers
+        )
+    kwargs = {} if VLLM_027 else {"prefill_end": prefill_end}
+    return native(
+        request_id,
+        num_tokens,
+        new_computed_blocks,
+        num_encoder_tokens,
+        total_computed_tokens,
+        num_local_computed_tokens,
+        num_tokens_main_model,
+        apply_admission_cap=apply_admission_cap,
+        **kwargs,
+    )
+
+
+def streamline_allocation(coordinator: KVCacheCoordinator) -> None:
+    """Share running-request predictions only for equal-page native static-layout groups."""
+    managers = coordinator.single_type_managers
+    if (
+        isinstance(coordinator, KVCacheCoordinatorNoPrefixCache)
+        and len(managers) > 1
+        and all(isinstance(item, (FullAttentionManager, SlidingWindowManager)) for item in managers)
+        and len({item.block_size for item in managers}) == 1
+    ):
+        coordinator.get_num_blocks_to_allocate = partial(
+            allocation_blocks, coordinator, coordinator.get_num_blocks_to_allocate
+        )
+        coordinator.allocate_new_blocks = partial(allocate_pages, coordinator, coordinator.allocate_new_blocks)
+        coordinator.remove_skipped_blocks = partial(
+            reclaim_pages,
+            tuple(item for item in managers if isinstance(item.kv_cache_spec, (SlidingWindowSpec, RSWASpec))),
+        )
+
+
+def _covered(coordinator: KVCacheCoordinator, request_id: str, num_tokens: int) -> bool:
+    first = coordinator.single_type_managers[0]
+    return num_tokens <= len(first.req_to_blocks.get(request_id, ())) * first.block_size
+
+
+def allocate_pages(
+    coordinator: KVCacheCoordinator,
+    native: Callable[..., tuple[list[KVCacheBlock], ...]],
+    request_id: str,
+    num_tokens: int,
+    num_tokens_main_model: int,
+    num_encoder_tokens: int = 0,
+) -> tuple[list[KVCacheBlock], ...]:
+    """Leave covered steps alone; native managers append every newly needed page."""
+    if _covered(coordinator, request_id, num_tokens):
+        return tuple([] for _ in coordinator.single_type_managers)
+    return native(request_id, num_tokens, num_tokens_main_model, num_encoder_tokens)
+
+
+def reclaim_pages(
+    managers: tuple[SingleTypeKVCacheManager, ...],
+    request_id: str,
+    processed_computed_tokens: int,
+    num_prompt_tokens: int | None = None,
+) -> None:
+    """Only window/R-SWA managers can reclaim pages; full managers would do nothing."""
+    for manager in managers:
+        manager.remove_skipped_blocks(request_id, processed_computed_tokens, num_prompt_tokens)

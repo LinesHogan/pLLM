@@ -21,4 +21,5 @@ def flash_attn_varlen_func(
     num_splits: int = 0,
     return_softmax_lse: bool,
     fa_version: int,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]: ...

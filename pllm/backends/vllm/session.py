@@ -363,11 +363,14 @@ class VllmSession(Generic[DataT, ResultT]):
         self._step = step
         if self._taps is not None:
             self._taps.prepare(rows.row_batch)
+        if self._attention is not None:
+            self._attention.prepare(rows.row_batch, rows)
         adapter = self._forward_overlay
         if (
             adapter is None
             and self._activation is None
-            and self._sites is None
+            and (self._sites is None or not self._sites.needs_step)
+            and (self._attention is None or not self._attention.program.facts)
             and self._custom_forward is None
             and not self._trains_on_batch
         ):
@@ -431,8 +434,6 @@ class VllmSession(Generic[DataT, ResultT]):
             self._activation.prepare(rows.row_batch, context, execution.directory)
         if self._sites is not None:
             self._sites.prepare(rows.row_batch, context, execution.directory)
-        if self._attention is not None:
-            self._attention.prepare(rows.row_batch, rows)
         if self._custom_forward is not None:
             self._custom_forward.prepare(rows.row_batch, context)
 

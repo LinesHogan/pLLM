@@ -105,7 +105,8 @@ class CheckAttention:
         mapping = tuple(
             link.packed_row_index for link in sorted(value.sampler_rows.links, key=lambda link: link.sampler_row_index)
         )
-        self.program.sample_rows[: len(mapping)].copy_(upload(mapping, torch.device("cpu")))
+        if self.program.sample_rows.numel():
+            self.program.sample_rows[: len(mapping)].copy_(upload(mapping, torch.device("cpu")))
 
     def step(self, value: StepInput, tokens: torch.Tensor) -> dict[tuple[str, int, str], torch.Tensor]:
         """Replay scheduled queries against request prefixes, including same-step causal K/V."""
@@ -152,10 +153,10 @@ class CheckAttention:
             torch.arange(len(groups) * pages, dtype=torch.int32).reshape(len(groups), pages),
             torch.tensor(lengths, dtype=torch.int32),
             torch.tensor(starts, dtype=torch.int32),
-            torch.tensor(tuple(row.token_offset for row in rows)),
+            len(rows),
             read,
             layout.window,
-            torch.tensor(tuple(row.prompt_length for row in rows)) if layout.sink else None,
+            torch.tensor(tuple(group[0].prompt_length for group in groups)) if layout.sink else None,
         )
 
     def layer(self, rows: tuple[PackedPhaseRow, ...], layer: int, hidden: torch.Tensor) -> torch.Tensor:
@@ -224,21 +225,20 @@ def _compare_attention_device(
     from pllm.execution.module_graph import ModuleCall
 
     fields = tuple(
-        value.to("cuda")
-        for value in (kv.key_cache, kv.value_cache, kv.block_table, kv.seq_lens, kv.query_start, kv.positions)
+        value.to("cuda") for value in (kv.key_cache, kv.value_cache, kv.block_table, kv.seq_lens, kv.query_start)
     )
     kernel = _CheckRead()
-    keys, values, table, lengths, starts, positions = fields
+    keys, values, table, lengths, starts = fields
     gpu = PagedKV(
         keys,
         values,
         table,
         lengths,
         starts,
-        positions,
+        kv.query_count,
         kernel,
         kv.storage_window,
-        kv.sink_lens.to("cuda") if kv.sink_lens is not None else None,
+        kv.prompt_lens.to("cuda") if kv.prompt_lens is not None else None,
     )
     kernel.kernel = DenseAttention(gpu, q.shape[-1] ** -0.5, int(kv.seq_lens.max()))
     arguments = {

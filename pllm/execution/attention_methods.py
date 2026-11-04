@@ -95,7 +95,7 @@ class TraceRead:
             if topk is not None
             else f"window {window}"
             if window
-            else "prompt sink + window (gathered)"
+            else "prompt sink + window natively"
             if self.sink
             else "all positions natively"
         )
@@ -215,7 +215,7 @@ class AttentionProgram:
                 )
             )
         self.costs = tuple(costs)
-        self.sample_rows = torch.empty(rows, dtype=torch.long, device="meta")
+        self.sample_rows = torch.empty(rows if self.facts else 0, dtype=torch.long, device="meta")
         self.prompt_lens = torch.empty(
             rows if any(layout.sink for layout in self.layouts) else 0, dtype=torch.long, device="meta"
         )
@@ -261,7 +261,7 @@ def attention_example(
         integer.new_empty((rows, pages)),
         integer,
         integer.new_empty(rows + 1),
-        integer,
+        rows,
         trace,
         layout.window,
         integer if layout.sink else None,

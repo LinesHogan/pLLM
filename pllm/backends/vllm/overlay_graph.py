@@ -81,7 +81,7 @@ def graph_options(config: ModelConfig, requirements: BackendRequirements) -> Gra
         "compilation_config": CompilationConfig(
             mode=CompilationMode.VLLM_COMPILE,
             # Capture the model's source CUDA operators; the shared region selects overlay kernels.
-            backend="eager",
+            backend="eager" if requirements.parameter_targets or requirements.custom_residual else "inductor",
             cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY if requirements.exact_phases else _OVERLAY_GRAPHS,
             cudagraph_capture_sizes=list(sizes),
             max_cudagraph_capture_size=capacity,

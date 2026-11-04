@@ -695,7 +695,7 @@ pllm.model.Layers(embeddings: torch.Tensor, position: torch.Tensor, layer_count:
     Public model slices and position state used inside custom_forward methods.
 pllm.model.Projection(name: 'ProjectionName', layer: 'int | None' = None)
     One linear projection of the base model by its Hugging Face module name; `layer=None` means every layer.
-pllm.model.PagedKV(key_cache: 'torch.Tensor', value_cache: 'torch.Tensor', block_table: 'torch.Tensor', seq_lens: 'torch.Tensor', query_start: 'torch.Tensor', positions: 'torch.Tensor', _read: 'AttentionRead', storage_window: 'int' = 0, sink_lens: 'torch.Tensor | None' = None)
+pllm.model.PagedKV(key_cache: 'torch.Tensor', value_cache: 'torch.Tensor', block_table: 'torch.Tensor', seq_lens: 'torch.Tensor', query_start: 'torch.Tensor', query_count: 'int', _read: 'AttentionRead', storage_window: 'int' = 0, prompt_lens: 'torch.Tensor | None' = None)
     Borrowed paged K/V, already including the current tokens; never changes cache storage.
 ```
 

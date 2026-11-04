@@ -1,18 +1,25 @@
 """Request cache identity and admission hashing for vLLM's scheduler process."""
 
+import os
 from collections.abc import Callable, Hashable
 from dataclasses import dataclass
 from typing import Literal
 
 from vllm import SamplingParams
+from vllm.config import VllmConfig
+from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.v1.core.kv_cache_utils import BlockHash, generate_block_hash_extra_keys, hash_block_tokens
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request
+from vllm.v1.structured_output import StructuredOutputManager
 
+from pllm.backends.vllm.kv_layout import LAYOUT_ENV, streamline_allocation
 from pllm.contracts.backend_attachment import BackendAttachment
 from pllm.contracts.codec import boundary_digest, decode_boundary, encode_boundary
+from pllm.contracts.kv_layout import KVLayout
 
 POLICY_KEY = "pllm.prefix_cache"
 
@@ -84,6 +91,31 @@ class RequestBlockHasher:
 
 class WorkloadScheduler(Scheduler):
     """Rehash before stock admission and connector callbacks, including EngineCore's initial hashes."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        kv_cache_config: KVCacheConfig,
+        structured_output_manager: StructuredOutputManager,
+        block_size: int,
+        hash_block_size: int | None = None,
+        mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
+        include_finished_set: bool = False,
+        log_stats: bool = False,
+    ) -> None:
+        super().__init__(
+            vllm_config,
+            kv_cache_config,
+            structured_output_manager,
+            block_size,
+            hash_block_size,
+            mm_registry,
+            include_finished_set,
+            log_stats,
+        )
+        layouts = decode_boundary(os.environ.get(LAYOUT_ENV, "[]"), tuple[KVLayout, ...])
+        if layouts and self.connector is None and vllm_config.speculative_config is None:
+            streamline_allocation(self.kv_cache_manager.coordinator)
 
     def add_request(self, request: Request) -> None:
         policy = CachePolicy.read(request.sampling_params)

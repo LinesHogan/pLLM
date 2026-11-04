@@ -217,6 +217,11 @@ class ModelSites:
             _SITES[self._requests_of.data_ptr()] = self
 
     @property
+    def needs_step(self) -> bool:
+        """Whether hooks consume versioned state, task results or retained request memory."""
+        return bool(self._sources or self._result_sources or self._memories)
+
+    @property
     def buffers(self) -> list[Tensor]:
         """The uploaded row-to-request table, staged fields and same-forward scratch used by captured hooks."""
         return [
@@ -243,6 +248,8 @@ class ModelSites:
         Request state is read at each request's version; instance state at the step's newest version, the one value
         every row of the forward reads.
         """
+        if not self.needs_step:
+            return
         for source in self._result_sources:
             value = context.results[source.task, "value"]
             if source in self._prefetch:

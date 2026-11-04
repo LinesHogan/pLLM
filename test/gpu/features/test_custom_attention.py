@@ -96,7 +96,7 @@ def test_native_lse_and_selected_oracle():
         positions = torch.cat(
             tuple(torch.arange(length - query, length, device="cuda") for length, query in zip((95, 81), queries))
         )
-        kv = PagedKV(keys, values, table, lengths, starts, positions, TraceRead(128))
+        kv = PagedKV(keys, values, table, lengths, starts, len(q), TraceRead(128))
         kv = replace(kv, _read=DenseAttention(kv, dim**-0.5))
         scores = page_bounds(q, keys, table, starts, positions)
         torch.testing.assert_close(
@@ -121,6 +121,18 @@ def test_native_lse_and_selected_oracle():
             captured_selected, _ = Quest().select(q, kv, layer=0)
         graph.replay()
         assert torch.equal(selected, captured_selected)
+        from pllm.backends.vllm.window_attention import window_attention
+
+        for prompt_lens in (None, torch.tensor([90, 79], device="cuda", dtype=torch.int32)):
+            local = replace(kv, storage_window=4, prompt_lens=prompt_lens)
+            window = 4 if prompt_lens is None else 0
+            expected, expected_lse = DenseAttention(local, dim**-0.5)(q, window, None)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out, lse = window_attention(local, q, dim**-0.5, window, torch.empty_like(q))
+            graph.replay()
+            torch.testing.assert_close(out, expected, atol=0.008, rtol=0.008)
+            torch.testing.assert_close(lse, expected_lse, atol=0.0001, rtol=0.0001)
 
 
 def _layout_read(read, errors, kernel, q, window, topk):
@@ -157,6 +169,7 @@ def _layout_read(read, errors, kernel, q, window, topk):
             scores = (q[row].float()[:, None] @ k.transpose(1, 2)).squeeze(1) * q.shape[-1] ** -0.5
             expected = (scores.softmax(-1)[:, None] @ v).squeeze(1)
             torch.testing.assert_close(out[row].float(), expected, atol=0.016, rtol=0.016)
+            torch.testing.assert_close(lse[row], scores.logsumexp(-1), atol=0.0001, rtol=0.0001)
             errors.append(float((out[row].float() - expected).abs().max()))
     return out, lse
 

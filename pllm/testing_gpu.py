@@ -107,6 +107,8 @@ class _SyncCheck:
         self.execute_part = execution.execute_part
         self.steps: dict[int, set[int]] = {}
         self.checked: set[int] = set()
+        self.attention_steps: dict[int, set[int]] = {}
+        self.attention_checked: set[int] = set()
 
     @contextmanager
     def scope(self, context: StateTaskContext[TensorFrame]) -> Generator[None]:
@@ -157,12 +159,12 @@ class _SyncCheck:
         assert self.prepare_attention is not None
         mode = torch.cuda.get_sync_debug_mode()
         try:
-            if (
-                rows.rows
-                and all(row.role is HiddenPhase.DECODE for row in rows.rows)
-                and len(self.steps.get(len(rows.rows), set())) > 2
-            ):
+            steps = self.attention_steps.setdefault(len(rows.rows), set())
+            if rows.rows and all(row.role is HiddenPhase.DECODE for row in rows.rows):
+                steps.add(rows.step_id)
+            if len(steps) > 2 and rows.step_id in steps:
                 torch.cuda.set_sync_debug_mode("error")
+                self.attention_checked.add(rows.step_id)
             self.prepare_attention(rows, sampler)
         finally:
             torch.cuda.set_sync_debug_mode(mode)
@@ -472,7 +474,7 @@ def _workload_checks(workload: Workload, config: ModelConfig) -> CheckResult:
             ):
                 baseline = _state_tokens(handle)
             if (
-                len(sync.checked) < 8
+                max(len(sync.checked), len(sync.attention_checked)) < 8
                 or workload.backend_requirements().input_token_history >= 0
                 and sync.token_checked < 8
             ):
